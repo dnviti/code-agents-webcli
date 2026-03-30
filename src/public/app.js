@@ -14,12 +14,13 @@ class ClaudeCodeWebInterface {
         this.currentFolderPath = null;
         this.claudeSessions = [];
         this.isCreatingNewSession = false;
+        this.pendingRuntimeStart = null;
         this.isMobile = this.detectMobile();
         this.currentMode = 'chat';
         this.planDetector = null;
         this.planModal = null;
         // Aliases for assistants (populated from /api/config)
-        this.aliases = { claude: 'Claude', codex: 'Codex' };
+        this.aliases = { claude: 'Claude', codex: 'Codex', agent: 'Cursor', terminal: 'Terminal' };
         
         
         // Initialize the session tab manager
@@ -132,7 +133,9 @@ class ClaudeCodeWebInterface {
                 if (cfg?.aliases) {
                     this.aliases = {
                         claude: cfg.aliases.claude || 'Claude',
-                        codex: cfg.aliases.codex || 'Codex'
+                        codex: cfg.aliases.codex || 'Codex',
+                        agent: cfg.aliases.agent || 'Cursor',
+                        terminal: 'Terminal'
                     };
                 }
                 if (typeof cfg.folderMode === 'boolean') {
@@ -149,7 +152,41 @@ class ClaudeCodeWebInterface {
         // Default aliases
         if (kind === 'codex') return 'Codex';
         if (kind === 'agent') return 'Cursor';
+        if (kind === 'terminal') return 'Terminal';
         return 'Claude';
+    }
+
+    getRuntimeLabel(kind, runtimeLabel, fallback = 'Claude') {
+        if (runtimeLabel) {
+            return runtimeLabel;
+        }
+        if (kind) {
+            return this.getAlias(kind);
+        }
+        return fallback;
+    }
+
+    getRuntimeStartMessage(kind, options = {}) {
+        if (kind === 'codex') {
+            return options.dangerouslySkipPermissions ?
+                `Starting ${this.getAlias('codex')} (bypassing approvals and sandbox)...` :
+                `Starting ${this.getAlias('codex')}...`;
+        }
+
+        if (kind === 'agent') {
+            return `Starting ${this.getAlias('agent')}...`;
+        }
+
+        if (kind === 'terminal') {
+            if (options.mode === 'command') {
+                return `Running ${options.command}...`;
+            }
+            return `Starting ${options.shell || this.getAlias('terminal')}...`;
+        }
+
+        return options.dangerouslySkipPermissions ?
+            `Starting ${this.getAlias('claude')} (skipping permissions)...` :
+            `Starting ${this.getAlias('claude')}...`;
     }
 
     applyAliasesToUI() {
@@ -159,11 +196,13 @@ class ClaudeCodeWebInterface {
         const startCodexBtn = document.getElementById('startCodexBtn');
         const dangerousCodexBtn = document.getElementById('dangerousCodexBtn');
         const startAgentBtn = document.getElementById('startAgentBtn');
+        const startTerminalBtn = document.getElementById('startTerminalBtn');
         if (startBtn) startBtn.textContent = `Start ${this.getAlias('claude')}`;
         if (dangerousSkipBtn) dangerousSkipBtn.textContent = `Dangerous ${this.getAlias('claude')}`;
         if (startCodexBtn) startCodexBtn.textContent = `Start ${this.getAlias('codex')}`;
         if (dangerousCodexBtn) dangerousCodexBtn.textContent = `Dangerous ${this.getAlias('codex')}`;
         if (startAgentBtn) startAgentBtn.textContent = `Start ${this.getAlias('agent')}`;
+        if (startTerminalBtn) startTerminalBtn.textContent = `Start ${this.getAlias('terminal')}`;
 
         // Plan modal title
         const planTitle = document.querySelector('#planModal .modal-header h2');
@@ -438,6 +477,7 @@ class ClaudeCodeWebInterface {
         const startCodexBtn = document.getElementById('startCodexBtn');
         const dangerousCodexBtn = document.getElementById('dangerousCodexBtn');
         const startAgentBtn = document.getElementById('startAgentBtn');
+        const startTerminalBtn = document.getElementById('startTerminalBtn');
         const settingsBtn = document.getElementById('settingsBtn');
         const retryBtn = document.getElementById('retryBtn');
         
@@ -450,6 +490,7 @@ class ClaudeCodeWebInterface {
         if (startCodexBtn) startCodexBtn.addEventListener('click', () => this.startCodexSession());
         if (dangerousCodexBtn) dangerousCodexBtn.addEventListener('click', () => this.startCodexSession({ dangerouslySkipPermissions: true }));
         if (startAgentBtn) startAgentBtn.addEventListener('click', () => this.startAgentSession());
+        if (startTerminalBtn) startTerminalBtn.addEventListener('click', () => this.showTerminalOptionsModal());
         if (settingsBtn) settingsBtn.addEventListener('click', () => this.showSettings());
         if (retryBtn) retryBtn.addEventListener('click', () => this.reconnect());
         
@@ -475,6 +516,7 @@ class ClaudeCodeWebInterface {
         this.setupSettingsModal();
         this.setupFolderBrowser();
         this.setupNewSessionModal();
+        this.setupTerminalOptionsModal();
         this.setupMobileSessionsModal();
 
         // Custom prompts dropdown removed
@@ -680,12 +722,19 @@ class ClaudeCodeWebInterface {
                     
                     if (isNewSession) {
                         console.log('[session_joined] New session detected, showing start prompt');
-                        this.showOverlay('startPrompt');
+                        if (this.pendingRuntimeStart) {
+                            this.showOverlay('loadingSpinner');
+                            document.getElementById('loadingSpinner').querySelector('p').textContent = this.getRuntimeStartMessage(
+                                this.pendingRuntimeStart.kind,
+                                this.pendingRuntimeStart.options
+                            );
+                        } else {
+                            this.showOverlay('startPrompt');
+                        }
                     } else {
-                        console.log('[session_joined] Existing session with stopped Claude, showing restart prompt');
-                        // For existing sessions where Claude has stopped, show start prompt
-                        // This allows the user to restart Claude in the same session
-                        this.terminal.writeln(`\r\n\x1b[33m${this.getAlias('claude')} has stopped in this session. Click "Start ${this.getAlias('claude')}" to restart.\x1b[0m`);
+                        const runtimeLabel = this.getRuntimeLabel(message.lastAgent, message.runtimeLabel, 'The previous process');
+                        console.log('[session_joined] Existing session with stopped runtime, showing restart prompt');
+                        this.terminal.writeln(`\r\n\x1b[33m${runtimeLabel} has stopped in this session. Choose an option to restart.\x1b[0m`);
                         this.showOverlay('startPrompt');
                     }
                 }
@@ -710,48 +759,25 @@ class ClaudeCodeWebInterface {
                 break;
                 
             case 'claude_started':
-                this.hideOverlay();
-                // Don't auto-focus to avoid focus tracking sequences
-                // User can click to focus when ready
-                this.loadSessions(); // Refresh session list
-                // Request usage stats to start tracking session usage
-                this.requestUsageStats();
-                
-                // Update tab status to active
-                if (this.sessionTabManager && this.currentClaudeSessionId) {
-                    this.sessionTabManager.updateTabStatus(this.currentClaudeSessionId, 'active');
-                }
-                break;
             case 'codex_started':
-                this.hideOverlay();
-                this.loadSessions();
-                this.requestUsageStats();
-                if (this.sessionTabManager && this.currentClaudeSessionId) {
-                    this.sessionTabManager.updateTabStatus(this.currentClaudeSessionId, 'active');
-                }
-                break;
             case 'agent_started':
+            case 'terminal_started':
+                this.pendingRuntimeStart = null;
                 this.hideOverlay();
                 this.loadSessions();
-                this.requestUsageStats();
+                if (message.agent !== 'terminal') {
+                    this.requestUsageStats();
+                }
                 if (this.sessionTabManager && this.currentClaudeSessionId) {
                     this.sessionTabManager.updateTabStatus(this.currentClaudeSessionId, 'active');
                 }
                 break;
                 
             case 'claude_stopped':
-                this.terminal.writeln(`\r\n\x1b[33m${this.getAlias('claude')} stopped\x1b[0m`);
-                // Show start prompt to allow restarting Claude in this session
-                this.showOverlay('startPrompt');
-                this.loadSessions(); // Refresh session list
-                break;
             case 'codex_stopped':
-                this.terminal.writeln(`\r\n\x1b[33mCodex Code stopped\x1b[0m`);
-                this.showOverlay('startPrompt');
-                this.loadSessions();
-                break;
             case 'agent_stopped':
-                this.terminal.writeln(`\r\n\x1b[33m${this.getAlias('agent')} stopped\x1b[0m`);
+            case 'terminal_stopped':
+                this.terminal.writeln(`\r\n\x1b[33m${this.getRuntimeLabel(message.agent, message.runtimeLabel, 'Process')} stopped\x1b[0m`);
                 this.showOverlay('startPrompt');
                 this.loadSessions();
                 break;
@@ -773,7 +799,7 @@ class ClaudeCodeWebInterface {
                 break;
                 
             case 'exit':
-                this.terminal.writeln(`\r\n\x1b[33m${this.getAlias('claude')} exited with code ${message.code}\x1b[0m`);
+                this.terminal.writeln(`\r\n\x1b[33m${this.getRuntimeLabel(message.agent, message.runtimeLabel, 'Process')} exited with code ${message.code}\x1b[0m`);
                 
                 // Mark session as error if non-zero exit code
                 if (this.sessionTabManager && this.currentClaudeSessionId && message.code !== 0) {
@@ -785,6 +811,7 @@ class ClaudeCodeWebInterface {
                 break;
                 
             case 'error':
+                this.pendingRuntimeStart = null;
                 this.showError(message.message);
                 
                 // Mark session as having an error
@@ -795,7 +822,7 @@ class ClaudeCodeWebInterface {
                 
             case 'info':
                 // Info message - show the start prompt if Claude is not running
-                if (message.message.includes('not running')) {
+                if (message.message.includes('not running') || message.message.includes('No process is running')) {
                     this.showOverlay('startPrompt');
                 }
                 break;
@@ -831,74 +858,75 @@ class ClaudeCodeWebInterface {
         }
     }
 
-    startClaudeSession(options = {}) {
-        // If no session, create one first
-        if (!this.currentClaudeSessionId) {
-            const sessionName = `Session ${new Date().toLocaleString()}`;
-            this.send({ 
-                type: 'create_session',
-                name: sessionName,
-                workingDir: this.selectedWorkingDir
-            });
-            // Wait for session creation, then start Claude
-            setTimeout(() => {
-                this.send({ type: 'start_claude', options });
-            }, 500);
-        } else {
-            this.send({ type: 'start_claude', options });
+    async ensureSessionForStart() {
+        if (this.currentClaudeSessionId) {
+            return this.currentClaudeSessionId;
         }
-        
-        this.showOverlay('loadingSpinner');
-        const loadingText = options.dangerouslySkipPermissions ? 
-            `Starting ${this.getAlias('claude')} (skipping permissions)...` : 
-            `Starting ${this.getAlias('claude')}...`;
-        document.getElementById('loadingSpinner').querySelector('p').textContent = loadingText;
+
+        const workingDir = this.selectedWorkingDir || this.currentFolderPath;
+        if (!workingDir) {
+            this.showFolderBrowser();
+            throw new Error('Please select a working directory first');
+        }
+
+        const sessionName = `Session ${new Date().toLocaleString()}`;
+        const response = await this.authFetch('/api/sessions/create', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: sessionName, workingDir })
+        });
+
+        if (!response.ok) {
+            let errorMessage = 'Failed to create session';
+            try {
+                const error = await response.json();
+                errorMessage = error.message || error.error || errorMessage;
+            } catch (_) {
+                // Keep default message.
+            }
+            throw new Error(errorMessage);
+        }
+
+        const data = await response.json();
+        if (this.sessionTabManager) {
+            this.sessionTabManager.addTab(data.sessionId, data.session.name, 'idle', data.session.workingDir, false);
+            await this.sessionTabManager.switchToTab(data.sessionId);
+        } else {
+            await this.joinSession(data.sessionId);
+        }
+
+        this.loadSessions();
+        return data.sessionId;
+    }
+
+    async startRuntimeSession(kind, options = {}) {
+        try {
+            this.pendingRuntimeStart = { kind, options };
+            this.showOverlay('loadingSpinner');
+            document.getElementById('loadingSpinner').querySelector('p').textContent = this.getRuntimeStartMessage(kind, options);
+            await this.ensureSessionForStart();
+            this.send({ type: `start_${kind}`, options });
+        } catch (error) {
+            this.pendingRuntimeStart = null;
+            console.error(`Failed to start ${kind}:`, error);
+            this.showError(error.message || `Failed to start ${this.getRuntimeLabel(kind, null, 'session')}`);
+        }
+    }
+
+    startClaudeSession(options = {}) {
+        return this.startRuntimeSession('claude', options);
     }
 
     startCodexSession(options = {}) {
-        // If no session, create one first
-        if (!this.currentClaudeSessionId) {
-            const sessionName = `Session ${new Date().toLocaleString()}`;
-            this.send({
-                type: 'create_session',
-                name: sessionName,
-                workingDir: this.selectedWorkingDir
-            });
-            // Wait for session creation, then start Codex
-            setTimeout(() => {
-                this.send({ type: 'start_codex', options });
-            }, 500);
-        } else {
-            this.send({ type: 'start_codex', options });
-        }
-
-        this.showOverlay('loadingSpinner');
-        const loadingText = options.dangerouslySkipPermissions ?
-            `Starting ${this.getAlias('codex')} (bypassing approvals and sandbox)...` :
-            `Starting ${this.getAlias('codex')}...`;
-        document.getElementById('loadingSpinner').querySelector('p').textContent = loadingText;
+        return this.startRuntimeSession('codex', options);
     }
 
     startAgentSession(options = {}) {
-        // If no session, create one first
-        if (!this.currentClaudeSessionId) {
-            const sessionName = `Session ${new Date().toLocaleString()}`;
-            this.send({
-                type: 'create_session',
-                name: sessionName,
-                workingDir: this.selectedWorkingDir
-            });
-            // Wait for session creation, then start Agent
-            setTimeout(() => {
-                this.send({ type: 'start_agent', options });
-            }, 500);
-        } else {
-            this.send({ type: 'start_agent', options });
-        }
-        
-        this.showOverlay('loadingSpinner');
-        const loadingText = `Starting ${this.getAlias('agent')}...`;
-        document.getElementById('loadingSpinner').querySelector('p').textContent = loadingText;
+        return this.startRuntimeSession('agent', options);
+    }
+
+    startTerminalSession(options = {}) {
+        return this.startRuntimeSession('terminal', options);
     }
 
     clearTerminal() {
@@ -1640,6 +1668,104 @@ class ClaudeCodeWebInterface {
                     this.createNewSession();
                 }
             });
+        });
+    }
+
+    setupTerminalOptionsModal() {
+        const modal = document.getElementById('terminalOptionsModal');
+        const closeBtn = document.getElementById('closeTerminalOptionsBtn');
+        const cancelBtn = document.getElementById('cancelTerminalOptionsBtn');
+        const runCommandBtn = document.getElementById('runTerminalCommandBtn');
+        const commandInput = document.getElementById('terminalCommandInput');
+
+        if (!modal) {
+            return;
+        }
+
+        closeBtn?.addEventListener('click', () => this.hideTerminalOptionsModal());
+        cancelBtn?.addEventListener('click', () => this.hideTerminalOptionsModal());
+        runCommandBtn?.addEventListener('click', () => this.runTerminalCommand());
+
+        modal.querySelectorAll('[data-terminal-shell]').forEach((button) => {
+            button.addEventListener('click', () => {
+                const shell = button.dataset.terminalShell;
+                this.hideTerminalOptionsModal();
+                this.startTerminalSession({ mode: 'shell', shell });
+            });
+        });
+
+        commandInput?.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                this.runTerminalCommand();
+            } else if (e.key === 'Escape') {
+                this.hideTerminalOptionsModal();
+            }
+        });
+
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) {
+                this.hideTerminalOptionsModal();
+            }
+        });
+    }
+
+    setTerminalCommandError(message = '') {
+        const errorEl = document.getElementById('terminalCommandError');
+        if (!errorEl) {
+            return;
+        }
+
+        errorEl.textContent = message;
+        errorEl.style.display = message ? 'block' : 'none';
+    }
+
+    showTerminalOptionsModal() {
+        const modal = document.getElementById('terminalOptionsModal');
+        if (!modal) {
+            return;
+        }
+
+        modal.classList.add('active');
+        if (this.isMobile) {
+            document.body.style.overflow = 'hidden';
+        }
+        this.setTerminalCommandError('');
+        document.getElementById('terminalCommandInput')?.focus();
+    }
+
+    hideTerminalOptionsModal() {
+        const modal = document.getElementById('terminalOptionsModal');
+        if (!modal) {
+            return;
+        }
+
+        modal.classList.remove('active');
+        if (this.isMobile) {
+            document.body.style.overflow = '';
+        }
+
+        const commandInput = document.getElementById('terminalCommandInput');
+        if (commandInput) {
+            commandInput.value = '';
+        }
+        this.setTerminalCommandError('');
+    }
+
+    runTerminalCommand() {
+        const commandInput = document.getElementById('terminalCommandInput');
+        const command = commandInput?.value.trim();
+
+        if (!command) {
+            this.setTerminalCommandError('Enter a command to run.');
+            commandInput?.focus();
+            return;
+        }
+
+        this.setTerminalCommandError('');
+        this.hideTerminalOptionsModal();
+        this.startTerminalSession({
+            mode: 'command',
+            command
         });
     }
     

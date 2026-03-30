@@ -32,6 +32,10 @@ class SessionStore {
                 lastActivity: session.lastActivity || new Date(),
                 workingDir: session.workingDir || process.cwd(),
                 active: false, // Always set to false when saving (processes won't persist)
+                agent: null,
+                lastAgent: session.lastAgent || session.agent || null,
+                runtimeLabel: session.runtimeLabel || null,
+                terminalOptions: session.terminalOptions || null,
                 outputBuffer: Array.isArray(session.outputBuffer) ? session.outputBuffer.slice(-100) : [], // Keep last 100 lines
                 connections: [], // Clear connections (they won't persist)
                 lastAccessed: session.lastAccessed || Date.now(),
@@ -123,6 +127,11 @@ class SessionStore {
                     created: session.created ? new Date(session.created) : new Date(),
                     lastActivity: session.lastActivity ? new Date(session.lastActivity) : new Date(),
                     active: false,
+                    agent: null,
+                    lastAgent: session.lastAgent || null,
+                    runtimeLabel: session.runtimeLabel || null,
+                    terminalOptions: session.terminalOptions || null,
+                    stopRequested: false,
                     connections: new Set(),
                     outputBuffer: session.outputBuffer || [],
                     maxBufferSize: 1000,

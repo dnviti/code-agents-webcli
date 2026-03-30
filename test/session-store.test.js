@@ -54,7 +54,18 @@ describe('SessionStore', function() {
     it('should load sessions from file', async function() {
       // First save some sessions
       const testSessions = new Map([
-        ['session1', { id: 'session1', name: 'Test Session', created: new Date() }]
+        ['session1', {
+          id: 'session1',
+          name: 'Test Session',
+          created: new Date(),
+          lastAgent: 'terminal',
+          runtimeLabel: 'watch podman ps',
+          terminalOptions: {
+            mode: 'command',
+            shell: 'bash',
+            command: 'watch podman ps'
+          }
+        }]
       ]);
       await sessionStore.saveSessions(testSessions);
       
@@ -63,6 +74,13 @@ describe('SessionStore', function() {
       assert(loadedSessions instanceof Map);
       assert.strictEqual(loadedSessions.size, 1);
       assert(loadedSessions.has('session1'));
+      assert.strictEqual(loadedSessions.get('session1').lastAgent, 'terminal');
+      assert.strictEqual(loadedSessions.get('session1').runtimeLabel, 'watch podman ps');
+      assert.deepStrictEqual(loadedSessions.get('session1').terminalOptions, {
+        mode: 'command',
+        shell: 'bash',
+        command: 'watch podman ps'
+      });
     });
   });
 });

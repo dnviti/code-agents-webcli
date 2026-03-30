@@ -119,14 +119,15 @@
                     <p>Connecting to Claude Code...</p>
                 </div>
                 <div class="start-prompt" id="startPrompt" style="display: none;">
-                    <h2>Choose Your Assistant</h2>
-                    <p>Select one to start in this directory.</p>
+                    <h2>Choose What to Start</h2>
+                    <p>Select an assistant or a terminal for this directory.</p>
                     <div class="start-buttons">
                         <button id="startBtn" class="btn btn-primary">Start Claude</button>
                         <button id="dangerousSkipBtn" class="btn btn-danger" title="Dangerously skip permissions. Use with caution.">Dangerous Claude</button>
                         <button id="startCodexBtn" class="btn btn-primary">Start Codex</button>
                         <button id="dangerousCodexBtn" class="btn btn-danger" title="Bypass approvals and sandbox. Use with caution.">Dangerous Codex</button>
                         <button id="startAgentBtn" class="btn btn-primary">Start Cursor</button>
+                        <button id="startTerminalBtn" class="btn btn-secondary">Start Terminal</button>
                     </div>
                 </div>
                 <div class="error-message" id="errorMessage" style="display: none;">
@@ -231,6 +232,33 @@
                 <div class="modal-footer">
                     <button class="btn btn-secondary" id="cancelNewSessionBtn">Cancel</button>
                     <button class="btn btn-primary" id="createSessionBtn">Create Session</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="session-modal" id="terminalOptionsModal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2>Start Terminal</h2>
+                    <button class="close-btn" id="closeTerminalOptionsBtn">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <p class="modal-description">Open an interactive shell or run a single command in this session.</p>
+                    <div class="terminal-shell-grid">
+                        <button class="btn btn-primary terminal-shell-btn" data-terminal-shell="zsh">zsh</button>
+                        <button class="btn btn-primary terminal-shell-btn" data-terminal-shell="bash">bash</button>
+                        <button class="btn btn-primary terminal-shell-btn" data-terminal-shell="sh">sh</button>
+                    </div>
+                    <div class="form-group">
+                        <label for="terminalCommandInput">Custom Command:</label>
+                        <input type="text" id="terminalCommandInput" placeholder="Examples: btop, htop, watch podman ps">
+                        <p class="form-hint">Runs through a shell with the session working directory as the current directory.</p>
+                        <p class="form-error" id="terminalCommandError" style="display: none;"></p>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" id="cancelTerminalOptionsBtn">Cancel</button>
+                    <button class="btn btn-primary" id="runTerminalCommandBtn">Run Command</button>
                 </div>
             </div>
         </div>

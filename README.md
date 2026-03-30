@@ -25,14 +25,14 @@ npx claude-code-web --disable-auth
 
 ## Features
 
-- 🌐 **Web-based terminal** - Access Claude Code from any browser
+- 🌐 **Web-based terminal** - Access Claude Code, Codex, Cursor Agent, or a classic shell from any browser
 - 🚀 **Real-time streaming** - Live output with WebSocket communication  
 - 🎨 **Terminal emulation** - Full ANSI color support and terminal features
 - 🔐 **Authentication** - Secure by default with automatic token generation
 - 📱 **Responsive design** - Works on desktop and mobile
 - ⚡ **NPX support** - Run anywhere with `npx claude-code-web`
 - 🎛️ **Customizable** - Adjustable font size, themes, and settings
-- 🔄 **Multi-Session Support** - Create and manage multiple persistent Claude sessions
+- 🔄 **Multi-Session Support** - Create and manage multiple persistent sessions for assistants or shells
 - 🌍 **Multi-Browser Access** - Connect to the same session from different browsers/devices
 - 💾 **Session Persistence** - Sessions remain active even when disconnecting
 - 📜 **Output Buffering** - Reconnect and see previous output from your session
@@ -110,6 +110,7 @@ You can customize how the assistants are labeled in the UI (for example, to disp
 - Flags:
   - `--claude-alias <name>`: Set the display name for Claude (default: env `CLAUDE_ALIAS` or "Claude").
   - `--codex-alias <name>`: Set the display name for Codex (default: env `CODEX_ALIAS` or "Codex").
+  - `--agent-alias <name>`: Set the display name for Cursor Agent (default: env `AGENT_ALIAS` or "Cursor").
 
 Examples:
 
@@ -146,11 +147,12 @@ node bin/cc-web.js --auth YOUR_TOKEN
 ## Multi-Session Features
 
 ### Creating and Managing Sessions
-- **Session Dropdown**: Click "Sessions" in the header to view all active sessions
+- **Session Tabs**: Use the tab bar to switch between active sessions
 - **New Session**: Create named sessions with custom working directories
 - **Join Session**: Connect to any existing session from any browser
-- **Leave Session**: Disconnect without stopping the Claude process
-- **Delete Session**: Stop Claude and remove the session
+- **Shell Sessions**: Start `zsh`, `bash`, `sh`, or a custom command like `htop`, `btop`, or `watch podman ps`
+- **Leave Session**: Disconnect without stopping the running process
+- **Delete Session**: Stop the running process and remove the session
 
 ### Session Persistence
 - Sessions remain active even after all browsers disconnect
@@ -194,7 +196,7 @@ node bin/cc-web.js --auth YOUR_TOKEN
 - `GET /` - Web interface
 - `GET /api/health` - Server health status
 - `GET /api/config` - Get server configuration
-- `GET /api/sessions/list` - List all active Claude sessions
+- `GET /api/sessions/list` - List all saved sessions
 - `GET /api/sessions/persistence` - Get session persistence info
 - `POST /api/sessions/create` - Create a new session
 - `GET /api/sessions/:sessionId` - Get session details
@@ -206,13 +208,16 @@ node bin/cc-web.js --auth YOUR_TOKEN
 - `POST /api/close-session` - Close a session
 
 ### WebSocket Events
-- `create_session` - Create a new Claude session
+- `create_session` - Create a new session
 - `join_session` - Join an existing session
 - `leave_session` - Leave current session
 - `start_claude` - Start Claude Code in current session
-- `input` - Send input to Claude Code
+- `start_codex` - Start Codex in current session
+- `start_agent` - Start Cursor Agent in current session
+- `start_terminal` - Start `zsh`, `bash`, `sh`, or a custom shell command in current session
+- `input` - Send input to the current session process
 - `resize` - Resize terminal
-- `stop` - Stop Claude Code session
+- `stop` - Stop the current process in the session
 - `ping/pong` - Heartbeat
 
 ## Security Considerations

@@ -14,7 +14,10 @@ class SessionTabManager {
         if (this.claudeInterface && typeof this.claudeInterface.getAlias === 'function') {
             return this.claudeInterface.getAlias(kind);
         }
-        return kind === 'codex' ? 'Codex' : 'Claude';
+        if (kind === 'codex') return 'Codex';
+        if (kind === 'agent') return 'Cursor';
+        if (kind === 'terminal') return 'Terminal';
+        return 'Claude';
     }
     
     requestNotificationPermission() {
