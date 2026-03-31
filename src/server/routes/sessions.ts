@@ -11,6 +11,7 @@ import {
   AuthContext,
   AuthenticatedUser,
 } from '../types.js';
+import { TranscriptStoreLike } from '../services/transcript-store.js';
 
 export interface SessionRoutesDeps {
   claudeSessions: Map<string, SessionRecord>;
@@ -27,6 +28,7 @@ export interface SessionRoutesDeps {
   }): SessionRecord;
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
   saveSessionsToDisk(): Promise<void>;
+  transcriptStore: TranscriptStoreLike;
   getSelectedWorkingDir(userId: number): string | null;
   sessionStore: {
     getSessionMetadata(): Promise<any>;
@@ -112,6 +114,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     });
 
     deps.claudeSessions.set(sessionId, session);
+    void deps.transcriptStore.ensureTranscript(session);
     void deps.saveSessionsToDisk();
 
     if (deps.dev) {
@@ -195,6 +198,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
 
     session.connections.clear();
     deps.claudeSessions.delete(sessionId);
+    void deps.transcriptStore.deleteTranscript(session);
     void deps.saveSessionsToDisk();
 
     res.json({ success: true, message: 'Session deleted' });

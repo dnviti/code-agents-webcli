@@ -8,6 +8,7 @@ import {
   SessionRecord,
   WebSocketInfo,
 } from '../types.js';
+import { TranscriptStoreLike } from '../services/transcript-store.js';
 import { sendToWebSocket, broadcastToSession } from './handler.js';
 
 export interface MessageProcessorDeps {
@@ -28,6 +29,7 @@ export interface MessageProcessorDeps {
   }): SessionRecord;
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
   saveSessionsToDisk(): Promise<void>;
+  transcriptStore: TranscriptStoreLike;
   usageReader: {
     getCurrentSessionStats(): Promise<any>;
     calculateBurnRate(minutes: number): Promise<any>;
@@ -156,6 +158,7 @@ export class MessageProcessor {
 
     this.deps.claudeSessions.set(sessionId, session);
     wsInfo.claudeSessionId = sessionId;
+    void this.deps.transcriptStore.ensureTranscript(session);
 
     this.deps.saveSessionsToDisk();
 
@@ -193,6 +196,10 @@ export class MessageProcessor {
     session.lastActivity = new Date();
     session.lastAccessed = Date.now();
 
+    const transcriptChunks = await this.deps.transcriptStore.readTranscriptChunks(session);
+    const replayBuffer =
+      transcriptChunks.length > 0 ? transcriptChunks : session.outputBuffer.slice(-200);
+
     // Send session info and replay buffer
     sendToWebSocket(wsInfo.ws, {
       type: 'session_joined',
@@ -203,7 +210,7 @@ export class MessageProcessor {
       agent: session.agent,
       lastAgent: session.lastAgent,
       runtimeLabel: session.runtimeLabel,
-      outputBuffer: session.outputBuffer.slice(-200),
+      outputBuffer: replayBuffer,
     });
 
     if (this.deps.dev) {
@@ -595,6 +602,8 @@ export class MessageProcessor {
     if (session.outputBuffer.length > session.maxBufferSize) {
       session.outputBuffer.shift();
     }
+
+    this.deps.transcriptStore.appendOutput(session, data);
   }
 
   private getRuntimeLabel(agentKind: AgentKind, session: SessionRecord | null = null): string {

@@ -25,6 +25,7 @@ import { AgentBridge } from './bridges/agent.js';
 import { TerminalBridge } from './bridges/terminal.js';
 import { AppDatabase } from './services/database.js';
 import { SessionStore } from './services/session-store.js';
+import { TranscriptStore } from './services/transcript-store.js';
 import { AuthService } from './services/auth.js';
 import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
@@ -56,6 +57,7 @@ export class ClaudeCodeWebServer {
 
   private database: AppDatabase;
   private sessionStore: SessionStore;
+  private transcriptStore: TranscriptStore;
   private authService: AuthService;
   private usageReader: UsageReader;
   private usageAnalytics: UsageAnalytics;
@@ -97,6 +99,7 @@ export class ClaudeCodeWebServer {
 
     this.database = new AppDatabase({ dataDir: config.dataDir });
     this.sessionStore = new SessionStore({ database: this.database });
+    this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
     this.authService = new AuthService({
       database: this.database,
       dev: this.dev,
@@ -125,6 +128,7 @@ export class ClaudeCodeWebServer {
       createSessionRecord: (params) => this.createSessionRecord(params),
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
+      transcriptStore: this.transcriptStore,
       usageReader: this.usageReader,
       usageAnalytics: this.usageAnalytics,
     });
@@ -358,6 +362,7 @@ export class ClaudeCodeWebServer {
       createSessionRecord: (params) => this.createSessionRecord(params),
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
+      transcriptStore: this.transcriptStore,
       sessionStore: this.sessionStore,
     });
 
