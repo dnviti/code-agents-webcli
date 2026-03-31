@@ -320,7 +320,7 @@ export class ClaudeCodeWebServer {
 
     this.app.get('/manifest.json', (_req, res) => {
       res.setHeader('Content-Type', 'application/manifest+json');
-      res.sendFile(path.join(publicDir, 'manifest.json'));
+      res.sendFile('manifest.json', { root: publicDir });
     });
 
     this.app.use(express.static(publicDir, { index: false }));
@@ -365,7 +365,7 @@ export class ClaudeCodeWebServer {
       ['/', '/index.html'],
       this.authService.requireAuth(),
       (_req, res) => {
-        res.sendFile(path.join(publicDir, 'index.html'));
+        res.sendFile('index.html', { root: publicDir });
       },
     );
   }
