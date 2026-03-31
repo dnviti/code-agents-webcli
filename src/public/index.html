@@ -140,7 +140,10 @@
                     <p>Connecting to Claude Code...</p>
                 </div>
                 <div class="start-prompt" id="startPrompt" style="display: none;">
-                    <h2>Launch a Runtime</h2>
+                    <div class="start-prompt-header">
+                        <h2>Launch a Runtime</h2>
+                        <button class="close-btn" id="closeStartPromptBtn" title="Cancel new session">&times;</button>
+                    </div>
                     <p>Pick the workflow for this repository. The shell and terminal colors stay in sync with your selected GitHub theme.</p>
                     <div class="start-buttons">
                         <button id="startBtn" class="btn btn-primary">Start Claude</button>
@@ -149,6 +152,9 @@
                         <button id="dangerousCodexBtn" class="btn btn-danger" title="Bypass approvals and sandbox. Use with caution.">Dangerous Codex</button>
                         <button id="startAgentBtn" class="btn btn-primary">Start Cursor</button>
                         <button id="startTerminalBtn" class="btn btn-secondary">Start Terminal</button>
+                    </div>
+                    <div class="start-prompt-actions">
+                        <button id="cancelStartPromptBtn" class="btn btn-secondary">Cancel New Session</button>
                     </div>
                 </div>
                 <div class="error-message" id="errorMessage" style="display: none;">

@@ -1,0 +1,48 @@
+/*
+ * Bundled terminal webfonts.
+ * These mono Nerd Font faces are vendored so patched glyphs render consistently in the browser.
+ */
+
+@font-face {
+    font-family: 'CaskaydiaMono Nerd Font';
+    src:
+        local('CaskaydiaCove Nerd Font Mono'),
+        local('CaskaydiaCoveNerdFontMono-Regular'),
+        url('./fonts/nerd/CaskaydiaCoveNerdFontMono-Regular.ttf') format('truetype');
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+}
+
+@font-face {
+    font-family: 'Hack Nerd Font Mono';
+    src:
+        local('Hack Nerd Font Mono'),
+        local('HackNerdFontMono-Regular'),
+        url('./fonts/nerd/HackNerdFontMono-Regular.ttf') format('truetype');
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+}
+
+@font-face {
+    font-family: 'MesloLGS Nerd Font Mono';
+    src:
+        local('MesloLGS Nerd Font Mono'),
+        local('MesloLGSNerdFontMono-Regular'),
+        url('./fonts/nerd/MesloLGSNerdFontMono-Regular.ttf') format('truetype');
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+}
+
+@font-face {
+    font-family: 'SauceCodePro Nerd Font Mono';
+    src:
+        local('SauceCodePro Nerd Font Mono'),
+        local('SauceCodeProNerdFontMono-Regular'),
+        url('./fonts/nerd/SauceCodeProNerdFontMono-Regular.ttf') format('truetype');
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+}

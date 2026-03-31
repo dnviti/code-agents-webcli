@@ -209,6 +209,8 @@ export class App {
     const dangerousCodexBtn = document.getElementById('dangerousCodexBtn');
     const startAgentBtn = document.getElementById('startAgentBtn');
     const startTerminalBtn = document.getElementById('startTerminalBtn');
+    const closeStartPromptBtn = document.getElementById('closeStartPromptBtn');
+    const cancelStartPromptBtn = document.getElementById('cancelStartPromptBtn');
     const settingsBtn = document.getElementById('settingsBtn');
     const retryBtn = document.getElementById('retryBtn');
     const closeMenuBtn = document.getElementById('closeMenuBtn');
@@ -228,6 +230,16 @@ export class App {
     );
     startAgentBtn?.addEventListener('click', () => this.startAgentSession());
     startTerminalBtn?.addEventListener('click', () => this.showTerminalOptionsModal());
+    const cancelStartPrompt = async () => {
+      if (!this.currentClaudeSessionId) {
+        hideOverlay();
+        return;
+      }
+
+      await this.deleteSession(this.currentClaudeSessionId, { confirm: false });
+    };
+    closeStartPromptBtn?.addEventListener('click', () => void cancelStartPrompt());
+    cancelStartPromptBtn?.addEventListener('click', () => void cancelStartPrompt());
     settingsBtn?.addEventListener('click', () => this.showSettings());
     retryBtn?.addEventListener('click', () => this.wsConnection.reconnect());
 
@@ -374,8 +386,8 @@ export class App {
     sessionsLeaveSession(this);
   }
 
-  deleteSession(sessionId: string): Promise<void> {
-    return sessionsDeleteSession(this, sessionId);
+  deleteSession(sessionId: string, options?: { confirm?: boolean }): Promise<void> {
+    return sessionsDeleteSession(this, sessionId, options);
   }
 
   startClaudeSession(options: RuntimeStartOptions = {}): Promise<void> {

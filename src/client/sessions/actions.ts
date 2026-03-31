@@ -94,8 +94,17 @@ export function leaveSession(app: App): void {
   app.send({ type: 'leave_session' });
 }
 
-export async function deleteSession(app: App, sessionId: string): Promise<void> {
-  if (!confirm('Are you sure you want to delete this session? This will stop any running Claude process.')) {
+export async function deleteSession(
+  app: App,
+  sessionId: string,
+  options: { confirm?: boolean } = {},
+): Promise<void> {
+  const { confirm: requireConfirm = true } = options;
+
+  if (
+    requireConfirm &&
+    !confirm('Are you sure you want to delete this session? This will stop any running Claude process.')
+  ) {
     return;
   }
 

@@ -8,19 +8,44 @@ import type {
   ThemePresetId,
 } from '../types';
 
-const TERMINAL_FONT_FAMILIES: Record<TerminalFontFamilyId, string> = {
-  'jetbrains-mono': '"JetBrains Mono", "Fira Code", Monaco, Consolas, monospace',
-  'fira-code': '"Fira Code", "JetBrains Mono", Monaco, Consolas, monospace',
-  'source-code-pro': '"Source Code Pro", "JetBrains Mono", Monaco, Consolas, monospace',
-  'ibm-plex-mono': '"IBM Plex Mono", "JetBrains Mono", Monaco, Consolas, monospace',
-  'cascadia-code-nf':
-    '"CascadiaCode NF", "CaskaydiaCove Nerd Font", "Cascadia Code", Monaco, Consolas, monospace',
-  'hack-nf':
-    '"Hack Nerd Font", Hack, "JetBrains Mono", Monaco, Consolas, monospace',
-  'meslo-nf':
-    '"MesloLGS NF", "MesloLGM Nerd Font", Menlo, Monaco, Consolas, monospace',
-  'sauce-code-pro-nf':
-    '"SauceCodePro NF", "SauceCodePro Nerd Font", "Source Code Pro", Monaco, Consolas, monospace',
+interface TerminalFontPreset {
+  fontFamily: string;
+  loadFamily?: string;
+}
+
+const TERMINAL_FONT_PRESETS: Record<TerminalFontFamilyId, TerminalFontPreset> = {
+  'jetbrains-mono': {
+    fontFamily: '"JetBrains Mono", "Fira Code", Monaco, Consolas, monospace',
+  },
+  'fira-code': {
+    fontFamily: '"Fira Code", "JetBrains Mono", Monaco, Consolas, monospace',
+  },
+  'source-code-pro': {
+    fontFamily: '"Source Code Pro", "JetBrains Mono", Monaco, Consolas, monospace',
+  },
+  'ibm-plex-mono': {
+    fontFamily: '"IBM Plex Mono", "JetBrains Mono", Monaco, Consolas, monospace',
+  },
+  'cascadia-code-nf': {
+    fontFamily:
+      '"CaskaydiaMono Nerd Font", "CaskaydiaCove Nerd Font Mono", "Cascadia Code", Monaco, Consolas, monospace',
+    loadFamily: '"CaskaydiaMono Nerd Font"',
+  },
+  'hack-nf': {
+    fontFamily:
+      '"Hack Nerd Font Mono", "Hack Nerd Font", Hack, "JetBrains Mono", Monaco, Consolas, monospace',
+    loadFamily: '"Hack Nerd Font Mono"',
+  },
+  'meslo-nf': {
+    fontFamily:
+      '"MesloLGS Nerd Font Mono", "MesloLGS Nerd Font", Menlo, Monaco, Consolas, monospace',
+    loadFamily: '"MesloLGS Nerd Font Mono"',
+  },
+  'sauce-code-pro-nf': {
+    fontFamily:
+      '"SauceCodePro Nerd Font Mono", "SauceCodePro Nerd Font", "Source Code Pro", Monaco, Consolas, monospace',
+    loadFamily: '"SauceCodePro Nerd Font Mono"',
+  },
 };
 
 const TERMINAL_THEMES: Record<ThemePresetId, NonNullable<ITerminalOptions['theme']>> = {
@@ -236,11 +261,24 @@ export function loadSettings(): AppSettings {
       ...DEFAULTS,
       ...parsed,
       theme: normalizedTheme,
+      terminalFontFamily: normalizeTerminalFontFamily(parsed.terminalFontFamily),
     };
   } catch (error) {
     console.error('Failed to load settings:', error);
     return { ...DEFAULTS };
   }
+}
+
+function normalizeTerminalFontFamily(value: unknown): TerminalFontFamilyId {
+  if (typeof value !== 'string') {
+    return DEFAULTS.terminalFontFamily;
+  }
+
+  if (value in TERMINAL_FONT_PRESETS) {
+    return value as TerminalFontFamilyId;
+  }
+
+  return DEFAULTS.terminalFontFamily;
 }
 
 export function saveSettings(app: App): void {
@@ -251,8 +289,7 @@ export function saveSettings(app: App): void {
   const settings: AppSettings = {
     fontSize: parseInt(fontSlider?.value ?? String(DEFAULTS.fontSize), 10),
     theme: normalizeThemePreset(themeSelect?.value) ?? DEFAULTS.theme,
-    terminalFontFamily:
-      (terminalFontSelect?.value as TerminalFontFamilyId) ?? DEFAULTS.terminalFontFamily,
+    terminalFontFamily: normalizeTerminalFontFamily(terminalFontSelect?.value),
   };
 
   try {
@@ -269,26 +306,51 @@ export function applySettings(app: App, settings: AppSettings): void {
   document.documentElement.setAttribute('data-color-mode', getThemeMode(settings.theme));
   updateThemeColor(settings.theme);
 
-  const terminalFontFamily =
-    TERMINAL_FONT_FAMILIES[settings.terminalFontFamily] ||
-    TERMINAL_FONT_FAMILIES[DEFAULTS.terminalFontFamily];
+  const terminalFontPreset =
+    TERMINAL_FONT_PRESETS[settings.terminalFontFamily] ||
+    TERMINAL_FONT_PRESETS[DEFAULTS.terminalFontFamily];
   const terminalTheme =
     TERMINAL_THEMES[settings.theme] ||
     TERMINAL_THEMES[DEFAULTS.theme];
 
   if (app.terminal) {
     app.terminal.options.fontSize = settings.fontSize;
-    app.terminal.options.fontFamily = terminalFontFamily;
+    app.terminal.options.fontFamily = terminalFontPreset.fontFamily;
     app.terminal.options.theme = terminalTheme;
   }
 
   app.terminalController?.restoreViewport();
   app.splitContainer?.applyTerminalAppearance({
     fontSize: settings.fontSize,
-    fontFamily: terminalFontFamily,
+    fontFamily: terminalFontPreset.fontFamily,
     theme: terminalTheme,
   });
   app.fitTerminal();
+  void loadTerminalFont(app, terminalFontPreset, settings.fontSize, terminalTheme);
+}
+
+async function loadTerminalFont(
+  app: App,
+  preset: TerminalFontPreset,
+  fontSize: number,
+  terminalTheme: NonNullable<ITerminalOptions['theme']>,
+): Promise<void> {
+  if (!preset.loadFamily || !document.fonts?.load) {
+    return;
+  }
+
+  try {
+    await document.fonts.load(`${Math.max(fontSize, 12)}px ${preset.loadFamily}`);
+    app.terminalController?.restoreViewport();
+    app.splitContainer?.applyTerminalAppearance({
+      fontSize,
+      fontFamily: preset.fontFamily,
+      theme: terminalTheme,
+    });
+    app.fitTerminal();
+  } catch {
+    // Font loading is best-effort only.
+  }
 }
 
 function normalizeThemePreset(
