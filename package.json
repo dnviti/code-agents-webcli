@@ -4,8 +4,8 @@
   "description": "Multiuser web CLI for Claude Code, Codex, and terminal sessions",
   "main": "dist/server/index.js",
   "bin": {
-    "code-agents-webcli": "./bin/cc-web.js",
-    "cc-web": "./bin/cc-web.js"
+    "code-agents-webcli": "bin/cc-web.js",
+    "cc-web": "bin/cc-web.js"
   },
   "scripts": {
     "build": "node scripts/build.js",

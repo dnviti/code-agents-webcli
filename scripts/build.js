@@ -10,6 +10,9 @@ const isWatch = process.argv.includes('--watch');
 async function build() {
   console.log('Building code-agents-webcli...\n');
 
+  const distDir = path.join(__dirname, '..', 'dist');
+  fs.rmSync(distDir, { recursive: true, force: true });
+
   // 1. Compile server TypeScript
   console.log('[server] Compiling TypeScript...');
   try {
