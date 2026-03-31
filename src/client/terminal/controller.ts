@@ -75,6 +75,7 @@ export function createTerminalController(
   let restoreTimeouts: number[] = [];
   let viewport: HTMLElement | null = null;
   let viewportScrollHandler: (() => void) | null = null;
+  let touchScrollLastY: number | null = null;
   let lastViewportScrollTop = 0;
   let lastViewportWasAtBottom = true;
 
@@ -214,6 +215,50 @@ export function createTerminalController(
     restoreViewport();
   };
 
+  const onTouchStart = (event: TouchEvent): void => {
+    if (event.touches.length !== 1) {
+      touchScrollLastY = null;
+      return;
+    }
+
+    trackViewport();
+    touchScrollLastY = event.touches[0].clientY;
+  };
+
+  const onTouchMove = (event: TouchEvent): void => {
+    if (event.touches.length !== 1 || touchScrollLastY === null) {
+      return;
+    }
+
+    trackViewport();
+    if (!viewport) {
+      touchScrollLastY = event.touches[0].clientY;
+      return;
+    }
+
+    const maxScrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    if (maxScrollTop <= 0) {
+      touchScrollLastY = event.touches[0].clientY;
+      return;
+    }
+
+    const currentY = event.touches[0].clientY;
+    const deltaY = currentY - touchScrollLastY;
+    touchScrollLastY = currentY;
+
+    if (deltaY === 0) {
+      return;
+    }
+
+    viewport.scrollTop = Math.max(0, Math.min(maxScrollTop, viewport.scrollTop - deltaY));
+    rememberViewportState();
+    event.preventDefault();
+  };
+
+  const resetTouchScroll = (): void => {
+    touchScrollLastY = null;
+  };
+
   const open = (target: HTMLElement): void => {
     container = target;
     terminal.open(target);
@@ -226,6 +271,10 @@ export function createTerminalController(
     window.addEventListener('focus', onWindowFocus);
     window.addEventListener('pageshow', onPageShow);
     window.visualViewport?.addEventListener('resize', onViewportResize);
+    target.addEventListener('touchstart', onTouchStart, { passive: true });
+    target.addEventListener('touchmove', onTouchMove, { passive: false });
+    target.addEventListener('touchend', resetTouchScroll);
+    target.addEventListener('touchcancel', resetTouchScroll);
 
     void document.fonts.ready
       .then(() => restoreViewport())
@@ -254,6 +303,10 @@ export function createTerminalController(
     window.removeEventListener('focus', onWindowFocus);
     window.removeEventListener('pageshow', onPageShow);
     window.visualViewport?.removeEventListener('resize', onViewportResize);
+    container?.removeEventListener('touchstart', onTouchStart);
+    container?.removeEventListener('touchmove', onTouchMove);
+    container?.removeEventListener('touchend', resetTouchScroll);
+    container?.removeEventListener('touchcancel', resetTouchScroll);
     if (viewport && viewportScrollHandler) {
       viewport.removeEventListener('scroll', viewportScrollHandler);
     }

@@ -19,6 +19,26 @@ export function detectMobile(): boolean {
 export function disablePullToRefresh(): void {
   let lastY = 0;
 
+  const findScrollableAncestor = (target: EventTarget | null): HTMLElement | null => {
+    let node = target instanceof HTMLElement ? target : null;
+
+    while (node && node !== document.body) {
+      const styles = window.getComputedStyle(node);
+      const overflowY = styles.overflowY;
+      const canScroll =
+        (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay')
+        && node.scrollHeight > node.clientHeight;
+
+      if (canScroll) {
+        return node;
+      }
+
+      node = node.parentElement;
+    }
+
+    return null;
+  };
+
   document.addEventListener(
     'touchstart',
     (e: TouchEvent) => {
@@ -30,14 +50,34 @@ export function disablePullToRefresh(): void {
   document.addEventListener(
     'touchmove',
     (e: TouchEvent) => {
+      if (e.defaultPrevented) {
+        lastY = e.touches[0].clientY;
+        return;
+      }
+
       const y = e.touches[0].clientY;
+      const isPullingDown = y > lastY;
+      const scrollableAncestor = findScrollableAncestor(e.target);
+
+      if (scrollableAncestor) {
+        const maxScrollTop = Math.max(0, scrollableAncestor.scrollHeight - scrollableAncestor.clientHeight);
+        const canUseScrollableAncestor = isPullingDown
+          ? scrollableAncestor.scrollTop > 0
+          : scrollableAncestor.scrollTop < maxScrollTop;
+
+        if (canUseScrollableAncestor) {
+          lastY = y;
+          return;
+        }
+      }
+
       const scrollTop =
         window.pageYOffset ||
         document.documentElement.scrollTop ||
         document.body.scrollTop ||
         0;
 
-      if (scrollTop === 0 && y > lastY) {
+      if (scrollTop === 0 && isPullingDown) {
         e.preventDefault();
       }
 
@@ -45,17 +85,6 @@ export function disablePullToRefresh(): void {
     },
     { passive: false },
   );
-
-  const terminal = document.getElementById('terminal');
-  if (terminal) {
-    terminal.addEventListener(
-      'touchmove',
-      (e: TouchEvent) => {
-        e.stopPropagation();
-      },
-      { passive: false },
-    );
-  }
 }
 
 export function showModeSwitcher(app: App): void {
