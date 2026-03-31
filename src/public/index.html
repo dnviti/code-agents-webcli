@@ -3,16 +3,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Claude Code Web Interface</title>
+    <title>Code Agents Web CLI</title>
     
     <!-- PWA Meta Tags -->
-    <meta name="description" content="Web interface for Claude Code - Run Claude commands directly from your browser">
+    <meta name="description" content="Web interface for Claude Code, Codex, and terminal sessions with GitHub OAuth and SQLite persistence">
     <meta name="theme-color" content="#161b22">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="apple-mobile-web-app-title" content="CC Web">
+    <meta name="apple-mobile-web-app-title" content="Code Agents">
     <meta name="mobile-web-app-capable" content="yes">
-    <meta name="application-name" content="Claude Code Web">
+    <meta name="application-name" content="Code Agents Web CLI">
     <meta name="format-detection" content="telephone=no">
     
     <!-- Web App Manifest -->
@@ -30,29 +30,48 @@
       (function() {
         try {
           const s = JSON.parse(localStorage.getItem('cc-web-settings') || '{}');
-          if (s && s.theme === 'light') {
-            document.documentElement.setAttribute('data-theme', 'light');
-          } else {
-            // Dark is default — ensure no 'light' override is set
-            document.documentElement.removeAttribute('data-theme');
-          }
+          const themeMap = {
+            'github-dark': 'github-dark',
+            'github-dark-dimmed': 'github-dark-dimmed',
+            'github-dark-high-contrast': 'github-dark-high-contrast',
+            'github-light': 'github-light',
+            'github-light-high-contrast': 'github-light-high-contrast',
+            'github-light-soft': 'github-light',
+            dark: 'github-dark',
+            light: 'github-light',
+            dracula: 'github-dark-dimmed',
+            'solarized-dark': 'github-dark-dimmed'
+          };
+          const theme =
+            (s && typeof s.theme === 'string' && themeMap[s.theme]) ||
+            (s && typeof s.terminalTheme === 'string' && themeMap[s.terminalTheme]) ||
+            'github-dark';
+          document.documentElement.setAttribute('data-theme', theme);
+          document.documentElement.setAttribute(
+            'data-color-mode',
+            theme.indexOf('github-light') === 0 ? 'light' : 'dark'
+          );
         } catch (_) { /* ignore */ }
       })();
     </script>
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="css/main.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-    <script src="https://unpkg.com/xterm@5.3.0/lib/xterm.js"></script>
-    <script src="https://unpkg.com/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
-    <script src="https://unpkg.com/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.js"></script>
-    <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css" />
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Source+Code+Pro:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/@xterm/xterm@6.0.0/css/xterm.css" />
 </head>
 <body>
     <div id="app">
         
         <!-- Session Tabs Bar -->
         <div class="session-tabs-bar" id="sessionTabsBar">
+            <div class="shell-brand" aria-label="Code Agents Web CLI">
+                <div class="shell-brand-mark">cc</div>
+                <div class="shell-brand-copy">
+                    <span class="shell-brand-kicker">GitHub Console</span>
+                    <strong>Code Agents Web CLI</strong>
+                </div>
+            </div>
             <div class="tabs-section">
                 <div class="tabs-container" id="tabsContainer">
                     <!-- Tabs will be dynamically added here -->
@@ -79,6 +98,8 @@
                 </div>
             </div>
             <div class="tab-actions">
+                <div class="current-user-badge" id="currentUserBadge" title="Signed-in GitHub user" style="display: none;"></div>
+                <a class="tab-logout" id="logoutLink" href="/auth/logout" title="Sign out" style="display: none;">Logout</a>
                 <button class="tab-settings" id="settingsBtn" title="Settings">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/>
@@ -91,13 +112,13 @@
 
         <div class="mobile-menu" id="mobileMenu">
             <div class="mobile-menu-header">
-                <h2><span class="icon" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 10h.01M16 10h.01M8 16c1.333-1 2.667-1 4 0 1.333 1 2.667 1 4 0"/></svg></span> Claude Code</h2>
+                <h2><span class="icon" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 10h.01M16 10h.01M8 16c1.333-1 2.667-1 4 0 1.333 1 2.667 1 4 0"/></svg></span> Code Agents</h2>
                 <button class="close-menu-btn" id="closeMenuBtn">&times;</button>
             </div>
             <div class="mobile-menu-content">
                 <button id="sessionsBtnMobile" class="mobile-menu-btn">Sessions</button>
-                <button id="closeSessionBtnMobile" class="mobile-menu-btn btn-danger" style="display: none;">Close Session</button>
-                <button id="reconnectBtnMobile" class="mobile-menu-btn" disabled>Reconnect</button>
+                <button id="closeSessionBtnMobile" class="mobile-menu-btn btn-danger">Close Session</button>
+                <button id="reconnectBtnMobile" class="mobile-menu-btn">Reconnect</button>
                 <button id="clearBtnMobile" class="mobile-menu-btn">Clear Terminal</button>
                 <button id="settingsBtnMobile" class="mobile-menu-btn">Settings</button>
             </div>
@@ -119,8 +140,8 @@
                     <p>Connecting to Claude Code...</p>
                 </div>
                 <div class="start-prompt" id="startPrompt" style="display: none;">
-                    <h2>Choose What to Start</h2>
-                    <p>Select an assistant or a terminal for this directory.</p>
+                    <h2>Launch a Runtime</h2>
+                    <p>Pick the workflow for this repository. The shell and terminal colors stay in sync with your selected GitHub theme.</p>
                     <div class="start-buttons">
                         <button id="startBtn" class="btn btn-primary">Start Claude</button>
                         <button id="dangerousSkipBtn" class="btn btn-danger" title="Dangerously skip permissions. Use with caution.">Dangerous Claude</button>
@@ -145,21 +166,34 @@
                     <button class="close-btn" id="closeSettingsBtn">&times;</button>
                 </div>
                 <div class="modal-body">
+                    <p class="modal-description">Choose a GitHub-inspired colorway and terminal typography. The terminal palette follows the selected app theme automatically.</p>
                     <div class="setting-group">
                         <label for="fontSize">Font Size:</label>
                         <input type="range" id="fontSize" min="10" max="24" value="14">
                         <span id="fontSizeValue">14px</span>
                     </div>
                     <div class="setting-group">
-                        <label for="themeSelect">Theme:</label>
+                        <label for="themeSelect">Colorway:</label>
                         <select id="themeSelect">
-                            <option value="dark">Dark</option>
-                            <option value="light">Light</option>
+                            <option value="github-dark">GitHub Dark</option>
+                            <option value="github-dark-dimmed">GitHub Dark Dimmed</option>
+                            <option value="github-dark-high-contrast">GitHub Dark High Contrast</option>
+                            <option value="github-light">GitHub Light</option>
+                            <option value="github-light-high-contrast">GitHub Light High Contrast</option>
                         </select>
                     </div>
                     <div class="setting-group">
-                        <label for="showTokenStats">Show Token Stats:</label>
-                        <input type="checkbox" id="showTokenStats" checked>
+                        <label for="terminalFontFamilySelect">Terminal Font:</label>
+                        <select id="terminalFontFamilySelect">
+                            <option value="jetbrains-mono">JetBrains Mono</option>
+                            <option value="fira-code">Fira Code</option>
+                            <option value="source-code-pro">Source Code Pro</option>
+                            <option value="ibm-plex-mono">IBM Plex Mono</option>
+                            <option value="cascadia-code-nf">Cascadia Code NF</option>
+                            <option value="hack-nf">Hack Nerd Font</option>
+                            <option value="meslo-nf">Meslo Nerd Font</option>
+                            <option value="sauce-code-pro-nf">Sauce Code Pro NF</option>
+                        </select>
                     </div>
                 </div>
                 <div class="modal-footer">
@@ -331,12 +365,7 @@
     </div>
 
 
-    <script src="auth.js"></script>
-    <script src="plan-detector.js"></script>
-    <script src="session-manager.js"></script>
-    <script src="splits.js"></script>
-    <script src="icons.js"></script>
-    <script src="app.js"></script>
+    <script src="app.bundle.js"></script>
     
     <!-- Service Worker Registration -->
     <script>
@@ -357,7 +386,7 @@
                             newWorker.addEventListener('statechange', () => {
                                 if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
                                     // New service worker available, prompt user to refresh
-                                    if (confirm('A new version of Claude Code Web is available. Refresh to update?')) {
+                                    if (confirm('A new version of Code Agents Web CLI is available. Refresh to update?')) {
                                         newWorker.postMessage({ type: 'SKIP_WAITING' });
                                         window.location.reload();
                                     }
@@ -395,7 +424,7 @@
                     border: none;
                     border-radius: 8px;
                     cursor: pointer;
-                    font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, 'JetBrains Mono', monospace;
+                    font-family: 'IBM Plex Sans', 'Segoe UI', sans-serif;
                     font-size: 14px;
                     box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
                     z-index: 1000;

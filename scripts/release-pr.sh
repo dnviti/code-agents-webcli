@@ -62,7 +62,7 @@ main() {
   echo "Opening pull request…"
   gh pr create \
     --title "chore(release): v${version}" \
-    --body "This PR prepares the v${version} release.\n\n- Bump version in package files\n- Update CHANGELOG\n\nMerging to main will trigger the release workflow to tag, create a GitHub release, and publish to npm." \
+    --body "This PR prepares the v${version} release.\n\n- Bump version in package files\n- Update CHANGELOG\n\nMerging to main will trigger the release workflow to publish the npm package via trusted publishing, build and push the GHCR image, and create the GitHub release tag." \
     --base main \
     --head "${branch}" || true
 
@@ -70,4 +70,3 @@ main() {
 }
 
 main "$@"
-

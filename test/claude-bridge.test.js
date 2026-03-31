@@ -1,5 +1,5 @@
 const assert = require('assert');
-const ClaudeBridge = require('../src/claude-bridge');
+const { ClaudeBridge } = require('../dist/server/bridges/claude.js');
 
 describe('ClaudeBridge', function() {
   let bridge;
@@ -15,8 +15,8 @@ describe('ClaudeBridge', function() {
     });
 
     it('should find a claude command on initialization', function() {
-      assert(typeof bridge.claudeCommand === 'string');
-      assert(bridge.claudeCommand.length > 0);
+      assert(typeof bridge.resolvedCommand === 'string');
+      assert(bridge.resolvedCommand.length > 0);
     });
   });
 

@@ -1,0 +1,76 @@
+/*
+ * Light GitHub Variants
+ */
+
+[data-theme="github-light"] {
+    color-scheme: light;
+    --bg-app: #f6f8fa;
+    --bg-primary: #ffffff;
+    --bg-secondary: rgba(255, 255, 255, 0.88);
+    --bg-tertiary: #f6f8fa;
+    --bg-elevated: #ffffff;
+    --bg-soft: rgba(31, 35, 40, 0.04);
+    --text-primary: #1f2328;
+    --text-secondary: #59636e;
+    --text-tertiary: #6e7781;
+    --text-inverse: #ffffff;
+    --accent: #0969da;
+    --accent-strong: #218bff;
+    --accent-soft: rgba(9, 105, 218, 0.12);
+    --success: #1a7f37;
+    --error: #cf222e;
+    --warning: #9a6700;
+    --border: rgba(31, 35, 40, 0.1);
+    --border-strong: #d0d7de;
+    --border-soft: rgba(31, 35, 40, 0.06);
+    --ambient-a: rgba(9, 105, 218, 0.12);
+    --ambient-b: rgba(46, 160, 67, 0.07);
+    --ambient-c: rgba(154, 103, 0, 0.06);
+    --surface-overlay: rgba(246, 248, 250, 0.82);
+    --grid-line: rgba(31, 35, 40, 0.04);
+    --shadow-sm: 0 10px 24px rgba(31, 35, 40, 0.08);
+    --shadow-md: 0 24px 60px rgba(31, 35, 40, 0.12);
+    --shadow-lg: 0 34px 90px rgba(31, 35, 40, 0.16);
+    --terminal-shell: linear-gradient(180deg, rgba(9, 105, 218, 0.02), transparent 24%), #ffffff;
+    --terminal-shell-border: rgba(31, 35, 40, 0.1);
+    --terminal-shell-glow: rgba(9, 105, 218, 0.08);
+    --scrollbar-thumb: rgba(87, 96, 106, 0.36);
+    --scrollbar-thumb-hover: rgba(36, 41, 47, 0.56);
+}
+
+[data-theme="github-light-high-contrast"] {
+    color-scheme: light;
+    --bg-app: #ffffff;
+    --bg-primary: #ffffff;
+    --bg-secondary: rgba(255, 255, 255, 0.94);
+    --bg-tertiary: #f3f4f6;
+    --bg-elevated: #ffffff;
+    --bg-soft: rgba(14, 17, 22, 0.045);
+    --text-primary: #0e1116;
+    --text-secondary: #2e343b;
+    --text-tertiary: #4d5560;
+    --text-inverse: #ffffff;
+    --accent: #0550ae;
+    --accent-strong: #0969da;
+    --accent-soft: rgba(9, 105, 218, 0.16);
+    --success: #116329;
+    --error: #a0111f;
+    --warning: #7d4e00;
+    --border: rgba(14, 17, 22, 0.14);
+    --border-strong: #6e7781;
+    --border-soft: rgba(14, 17, 22, 0.08);
+    --ambient-a: rgba(9, 105, 218, 0.12);
+    --ambient-b: rgba(17, 99, 41, 0.06);
+    --ambient-c: rgba(125, 78, 0, 0.05);
+    --surface-overlay: rgba(255, 255, 255, 0.88);
+    --grid-line: rgba(14, 17, 22, 0.05);
+    --shadow-sm: 0 10px 24px rgba(14, 17, 22, 0.08);
+    --shadow-md: 0 24px 60px rgba(14, 17, 22, 0.12);
+    --shadow-lg: 0 34px 90px rgba(14, 17, 22, 0.15);
+    --terminal-shell: linear-gradient(180deg, rgba(9, 105, 218, 0.03), transparent 24%), #ffffff;
+    --terminal-shell-border: rgba(14, 17, 22, 0.16);
+    --terminal-shell-glow: rgba(9, 105, 218, 0.1);
+    --scrollbar-thumb: rgba(77, 85, 96, 0.42);
+    --scrollbar-thumb-hover: rgba(14, 17, 22, 0.68);
+    --focus-ring: 0 0 0 3px rgba(9, 105, 218, 0.22);
+}

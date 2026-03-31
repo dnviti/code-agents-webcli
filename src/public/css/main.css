@@ -1,0 +1,19 @@
+/*
+ * Main CSS Entry Point
+ * Imports all modular CSS files in the correct order.
+ * Variables must come first so they are available to all other modules.
+ */
+
+@import url('./variables.css');
+@import url('./base.css');
+@import url('./layout.css');
+@import url('./components/tabs.css');
+@import url('./components/terminal.css');
+@import url('./components/overlay.css');
+@import url('./components/buttons.css');
+@import url('./components/modals.css');
+@import url('./components/folder-browser.css');
+@import url('./components/mobile.css');
+@import url('./components/notifications.css');
+@import url('./themes/dark.css');
+@import url('./themes/light.css');

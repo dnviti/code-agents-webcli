@@ -1,0 +1,112 @@
+/*
+ * Button Component
+ * Shared primary, secondary, danger, success, and icon button treatments.
+ */
+
+.btn {
+    min-height: 46px;
+    padding: 0 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    border: 1px solid var(--border-strong);
+    border-radius: 14px;
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 90%),
+        var(--bg-primary);
+    color: var(--text-primary);
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    transition:
+        transform var(--transition-fast),
+        background-color var(--transition-fast),
+        border-color var(--transition-fast),
+        box-shadow var(--transition-fast),
+        color var(--transition-fast);
+}
+
+.btn:hover:not(:disabled) {
+    transform: translateY(-1px);
+    border-color: var(--border-strong);
+    box-shadow: var(--shadow-sm);
+}
+
+.btn:disabled {
+    opacity: 0.52;
+    cursor: not-allowed;
+    box-shadow: none;
+}
+
+.btn-primary {
+    background: linear-gradient(180deg, var(--accent-strong), var(--accent));
+    border-color: var(--accent);
+    color: #ffffff;
+}
+
+.btn-primary:hover:not(:disabled) {
+    border-color: var(--accent-strong);
+    box-shadow: 0 12px 28px rgba(9, 105, 218, 0.26);
+}
+
+.btn-secondary {
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 90%),
+        var(--bg-tertiary);
+}
+
+.btn-danger {
+    background: linear-gradient(180deg, #ff7b72, #cf222e);
+    border-color: #cf222e;
+    color: #ffffff;
+}
+
+.btn-danger:hover:not(:disabled) {
+    box-shadow: 0 12px 28px rgba(207, 34, 46, 0.26);
+}
+
+.btn-success {
+    background: linear-gradient(180deg, #3fb950, #238636);
+    border-color: #238636;
+    color: #ffffff;
+}
+
+.btn-small {
+    min-height: 40px;
+    padding: 0 14px;
+    font-size: 13px;
+}
+
+.btn-icon {
+    width: 40px;
+    height: 40px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 90%),
+        var(--bg-primary);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition:
+        transform var(--transition-fast),
+        border-color var(--transition-fast),
+        background-color var(--transition-fast),
+        color var(--transition-fast);
+}
+
+.btn-icon:hover:not(:disabled) {
+    transform: translateY(-1px);
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+}
+
+.btn-icon:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}

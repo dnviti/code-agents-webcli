@@ -1,0 +1,261 @@
+/*
+ * Modals Component
+ * Shared modal shell, settings/session dialogs, plan modal, and form cards.
+ */
+
+.settings-modal,
+.session-modal,
+.plan-modal {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 32px;
+    background: var(--surface-overlay);
+    backdrop-filter: blur(18px);
+}
+
+.settings-modal,
+.session-modal {
+    z-index: 2200;
+}
+
+.plan-modal {
+    z-index: 10001;
+}
+
+.settings-modal.active,
+.session-modal.active,
+.plan-modal.active {
+    display: flex;
+}
+
+.modal-content {
+    width: min(560px, 100%);
+    max-height: min(88vh, 920px);
+    overflow: auto;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 24%),
+        var(--bg-elevated);
+    box-shadow: var(--shadow-lg);
+}
+
+.plan-modal .modal-content {
+    width: min(880px, 100%);
+}
+
+.folder-browser-content {
+    width: min(980px, 100%);
+    max-height: min(90vh, 960px);
+}
+
+.modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 24px 26px 18px;
+    border-bottom: 1px solid var(--border);
+}
+
+.modal-header h2 {
+    font-family: var(--font-display);
+    font-size: 1.65rem;
+    line-height: 1.1;
+    letter-spacing: -0.03em;
+    color: var(--text-primary);
+}
+
+.close-btn,
+.modal-close {
+    width: 42px;
+    height: 42px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 90%),
+        var(--bg-primary);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 24px;
+    transition:
+        transform var(--transition-fast),
+        color var(--transition-fast),
+        border-color var(--transition-fast),
+        background-color var(--transition-fast);
+}
+
+.close-btn:hover,
+.modal-close:hover {
+    transform: translateY(-1px);
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+}
+
+.modal-body {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    padding: 24px 26px;
+}
+
+.modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+    padding: 18px 26px 24px;
+    border-top: 1px solid var(--border);
+}
+
+.modal-description {
+    color: var(--text-secondary);
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.form-group,
+.setting-group {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 18px;
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    background: var(--bg-soft);
+}
+
+.form-group label,
+.setting-group label {
+    color: var(--text-tertiary);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+}
+
+.form-hint {
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.form-error {
+    color: var(--error);
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+.setting-group input[type="range"] {
+    width: 100%;
+    min-height: 14px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-pill);
+    background: linear-gradient(90deg, var(--accent-soft), rgba(255, 255, 255, 0.02));
+    appearance: none;
+}
+
+.setting-group input[type="range"]::-webkit-slider-thumb {
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border: 2px solid #ffffff;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.24);
+}
+
+.setting-group input[type="range"]::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    border: 2px solid #ffffff;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.24);
+}
+
+#fontSizeValue {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    align-self: flex-start;
+    min-width: 56px;
+    min-height: 32px;
+    padding: 0 12px;
+    border-radius: var(--radius-pill);
+    background: var(--accent-soft);
+    color: var(--accent-strong);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.terminal-shell-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.terminal-shell-btn {
+    min-height: 48px;
+    font-family: var(--font-mono);
+}
+
+.plan-modal .modal-body {
+    max-height: 64vh;
+    overflow: auto;
+}
+
+.plan-status {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    background: var(--bg-soft);
+}
+
+.plan-status-indicator {
+    width: 11px;
+    height: 11px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: var(--success);
+    animation: plan-status-pulse 2s infinite;
+}
+
+@keyframes plan-status-pulse {
+    0%,
+    100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.45;
+    }
+}
+
+.plan-status-text {
+    color: var(--text-secondary);
+    font-size: 14px;
+}
+
+.plan-content {
+    padding: 20px;
+    border: 1px solid var(--border);
+    border-radius: 22px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 14px;
+    line-height: 1.65;
+}

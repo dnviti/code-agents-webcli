@@ -1,0 +1,353 @@
+/*
+ * Mobile Component
+ * Drawer menu, mobile action controls, mode switcher, and responsive shell adjustments.
+ */
+
+.mobile-menu {
+    position: fixed;
+    top: 18px;
+    right: -340px;
+    bottom: 18px;
+    width: min(320px, calc(100vw - 24px));
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border-strong);
+    border-radius: 24px;
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 18%),
+        var(--bg-elevated);
+    box-shadow: var(--shadow-lg);
+    z-index: 3000;
+    transition: right var(--transition-medium);
+}
+
+.mobile-menu.active {
+    right: 12px;
+}
+
+.mobile-menu-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 18px 20px 16px;
+    border-bottom: 1px solid var(--border);
+}
+
+.mobile-menu-header h2 {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--font-display);
+    font-size: 1.35rem;
+}
+
+.close-menu-btn {
+    width: 42px;
+    height: 42px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: var(--bg-primary);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 24px;
+}
+
+.mobile-menu-content {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 18px 20px 20px;
+}
+
+.mobile-menu-btn {
+    min-height: 48px;
+    padding: 0 16px;
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--border-strong);
+    border-radius: 14px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    cursor: pointer;
+    font-weight: 600;
+    text-align: left;
+}
+
+.mobile-menu-btn.btn-danger {
+    background: linear-gradient(180deg, #ff7b72, #cf222e);
+    border-color: #cf222e;
+    color: #ffffff;
+}
+
+.mode-switcher {
+    position: fixed;
+    right: 18px;
+    bottom: 20px;
+    z-index: 1200;
+    display: none;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.mode-switcher-btn,
+.escape-btn {
+    width: 56px;
+    height: 56px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 18px;
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 90%),
+        var(--bg-elevated);
+    box-shadow: var(--shadow-md);
+    cursor: pointer;
+    transition:
+        transform var(--transition-fast),
+        box-shadow var(--transition-fast),
+        border-color var(--transition-fast);
+}
+
+.mode-switcher-btn {
+    border: 1px solid var(--border-strong);
+    color: var(--accent-strong);
+}
+
+.escape-btn {
+    border: 1px solid rgba(248, 81, 73, 0.38);
+    color: var(--error);
+}
+
+.mode-switcher-btn:hover,
+.escape-btn:hover {
+    transform: translateY(-2px);
+}
+
+.mode-switcher-btn[data-mode="chat"] {
+    border-color: rgba(63, 185, 80, 0.42);
+}
+
+.mode-switcher-btn[data-mode="code"] {
+    border-color: rgba(88, 166, 255, 0.42);
+}
+
+.mode-switcher-btn[data-mode="plan"] {
+    border-color: rgba(210, 153, 34, 0.42);
+}
+
+.mode-switcher-btn.switching,
+.escape-btn.pressed {
+    transform: scale(0.96);
+}
+
+@media (max-width: 1024px) and (hover: none) and (pointer: coarse),
+       (max-width: 768px) {
+    .mode-switcher {
+        display: flex;
+    }
+}
+
+@media (max-width: 1024px) {
+    .session-tabs-bar {
+        gap: 14px;
+        min-height: 76px;
+        padding: 12px 16px 10px;
+    }
+
+    .shell-brand {
+        padding: 10px 12px;
+    }
+
+    .shell-brand-mark {
+        width: 38px;
+        height: 38px;
+    }
+
+    .main {
+        padding: 16px;
+    }
+
+    .terminal-wrapper,
+    .split-terminal-wrapper {
+        padding: 16px 16px 12px;
+    }
+}
+
+@media (max-width: 768px) {
+    .desktop-only {
+        display: none !important;
+    }
+
+    .session-tabs-bar {
+        gap: 10px;
+        min-height: 70px;
+        padding: 10px 12px;
+    }
+
+    .shell-brand {
+        min-width: auto;
+        padding: 8px 10px;
+    }
+
+    .shell-brand-copy {
+        display: none;
+    }
+
+    .shell-brand-mark {
+        width: 36px;
+        height: 36px;
+        border-radius: 12px;
+        font-size: 16px;
+    }
+
+    .tabs-section {
+        gap: 8px;
+    }
+
+    .session-tab {
+        min-width: 126px;
+        max-width: 180px;
+        padding: 10px 12px;
+    }
+
+    .tab-new,
+    .tab-settings,
+    .tab-overflow-btn,
+    .tab-tile {
+        width: 40px;
+        height: 40px;
+        border-radius: 14px;
+    }
+
+    .main {
+        padding: 12px;
+    }
+
+    .terminal-wrapper,
+    .split-terminal-wrapper {
+        padding: 12px 12px 10px;
+        border-radius: 22px;
+    }
+
+    .terminal-overlay,
+    .settings-modal,
+    .session-modal,
+    .plan-modal,
+    .folder-browser-modal {
+        padding: 12px;
+        align-items: flex-start;
+    }
+
+    .overlay-content,
+    .modal-content,
+    .folder-browser-content {
+        width: 100%;
+        max-width: none;
+        max-height: calc(100dvh - 24px);
+        margin: 0;
+    }
+
+    .overlay-content {
+        padding: 24px;
+        border-radius: 24px;
+    }
+
+    .start-buttons {
+        grid-template-columns: 1fr;
+    }
+
+    .modal-header,
+    .modal-body,
+    .modal-footer,
+    .folder-browser-body {
+        padding-left: 18px;
+        padding-right: 18px;
+    }
+
+    .modal-header {
+        padding-top: 18px;
+        padding-bottom: 16px;
+    }
+
+    .modal-footer {
+        flex-wrap: wrap;
+    }
+
+    .modal-footer .btn,
+    .folder-browser-buttons .btn {
+        flex: 1 1 180px;
+    }
+
+    .terminal-shell-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .folder-path-bar {
+        grid-template-columns: auto auto auto;
+    }
+
+    .folder-path-input {
+        grid-column: 1 / -1;
+    }
+
+    .folder-create-bar,
+    .folder-browser-footer {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .folder-browser-buttons {
+        width: 100%;
+    }
+
+    .folder-list-container,
+    .session-list {
+        max-height: 42vh;
+    }
+
+    .session-item {
+        flex-direction: column;
+    }
+
+    .session-actions {
+        justify-content: flex-end;
+    }
+}
+
+@media (max-width: 480px) {
+    .session-tabs-bar {
+        padding: 10px;
+    }
+
+    .session-tab {
+        min-width: 112px;
+        max-width: 156px;
+    }
+
+    .tab-name {
+        font-size: 12px;
+    }
+
+    .overlay-content,
+    .modal-content,
+    .folder-browser-content {
+        border-radius: 22px;
+    }
+
+    .overlay-content {
+        padding: 22px 18px;
+    }
+
+    .modal-header h2 {
+        font-size: 1.45rem;
+    }
+
+    .start-prompt h2,
+    .error-message h3 {
+        font-size: 1.8rem;
+    }
+}

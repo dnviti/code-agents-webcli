@@ -1,24 +1,38 @@
 #!/usr/bin/env node
 
 const { Command } = require('commander');
-const path = require('path');
-const open = require('open');
-const crypto = require('crypto');
-const { startServer } = require('../src/server');
+const packageJson = require('../package.json');
+
+let ClaudeCodeWebServer;
+try {
+  ClaudeCodeWebServer = require('../dist/server/index.js').ClaudeCodeWebServer;
+} catch (error) {
+  console.error('Cannot start code-agents-webcli because the compiled server bundle is missing.');
+  console.error('Run `npm run build` first, or reinstall the package if this came from npm.');
+  if (error && error.message) {
+    console.error(`Original error: ${error.message}`);
+  }
+  process.exit(1);
+}
 
 const program = new Command();
 
 program
-  .name('cc-web')
-  .description('Web-based interface for Claude Code CLI')
-  .version('3.4.0')
+  .name('code-agents-webcli')
+  .description('Multiuser web CLI for Claude Code, Codex, and terminal sessions')
+  .version(packageJson.version)
   .option('-p, --port <number>', 'port to run the server on', '32352')
   .option('--no-open', 'do not automatically open browser')
-  .option('--auth <token>', 'authentication token for secure access')
-  .option('--disable-auth', 'disable authentication (not recommended for production)')
   .option('--https', 'enable HTTPS (requires cert files)')
   .option('--cert <path>', 'path to SSL certificate file')
   .option('--key <path>', 'path to SSL private key file')
+  .option('--setup', 'run the interactive installation/setup wizard before starting')
+  .option('--public-base-url <url>', 'public base URL used for GitHub OAuth callbacks')
+  .option('--github-client-id <id>', 'GitHub OAuth client ID')
+  .option('--github-client-secret <secret>', 'GitHub OAuth client secret')
+  .option('--github-app-token <token>', 'GitHub App token stored during installation')
+  .option('--allowed-github-ids <ids>', 'comma-separated GitHub OAuth user IDs allowed to sign in')
+  .option('--data-dir <path>', 'directory for the SQLite database and local state')
   .option('--dev', 'development mode with additional logging')
   .option('--plan <type>', 'subscription plan (pro, max5, max20)', 'max20')
   .option('--claude-alias <name>', 'display alias for Claude (default: env CLAUDE_ALIAS or "Claude")')
@@ -30,13 +44,9 @@ program
 
 const options = program.opts();
 
-function generateRandomToken(length = 10) {
-  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
-  let result = '';
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
+async function openUrl(url) {
+  const { default: open } = await import('open');
+  await open(url);
 }
 
 async function main() {
@@ -48,29 +58,20 @@ async function main() {
       process.exit(1);
     }
 
-    // Handle authentication logic
-    let authToken = null;
-    let noAuth = options.disableAuth === true;
-    
-    if (!noAuth) {
-      if (options.auth) {
-        // Use provided token
-        authToken = options.auth;
-      } else {
-        // Generate random token
-        authToken = generateRandomToken();
-      }
-    }
-
     const serverOptions = {
       port,
-      auth: authToken,
-      noAuth: noAuth,
       https: options.https,
       cert: options.cert,
       key: options.key,
+      setup: options.setup,
       dev: options.dev,
       plan: options.plan,
+      publicBaseUrl: options.publicBaseUrl,
+      githubClientId: options.githubClientId,
+      githubClientSecret: options.githubClientSecret,
+      githubAppToken: options.githubAppToken,
+      allowedGitHubIds: options.allowedGitHubIds,
+      dataDir: options.dataDir,
       // UI aliases for assistants
       claudeAlias: options.claudeAlias || process.env.CLAUDE_ALIAS || 'Claude',
       codexAlias: options.codexAlias || process.env.CODEX_ALIAS || 'Codex',
@@ -78,28 +79,14 @@ async function main() {
       folderMode: true // Always use folder mode
     };
 
-    console.log('Starting Claude Code Web Interface...');
+    console.log('Starting Code Agents Web CLI...');
     console.log(`Port: ${port}`);
     console.log('Mode: Folder selection mode');
     console.log(`Plan: ${options.plan}`);
     console.log(`Aliases: Claude → "${serverOptions.claudeAlias}", Codex → "${serverOptions.codexAlias}", Agent → "${serverOptions.agentAlias}"`);
-    
-    // Display authentication status prominently
-    if (noAuth) {
-      console.log('\n⚠️  AUTHENTICATION DISABLED - Server is accessible without a token');
-      console.log('   (Use without --disable-auth flag for security in production)');
-    } else {
-      console.log('\n🔐 AUTHENTICATION ENABLED');
-      if (options.auth) {
-        console.log('   Using provided authentication token');
-      } else {
-        console.log('   Generated random authentication token:');
-        console.log(`   \x1b[1m\x1b[33m${authToken}\x1b[0m`);
-        console.log('   \x1b[2mSave this token - you\'ll need it to access the interface\x1b[0m');
-      }
-    }
 
-    const server = await startServer(serverOptions);
+    const appServer = new ClaudeCodeWebServer(serverOptions);
+    await appServer.start();
 
     // ngrok setup
     const hasNgrokToken = !!options.ngrokAuthToken;
@@ -115,16 +102,7 @@ async function main() {
     const protocol = options.https ? 'https' : 'http';
     const url = `${protocol}://localhost:${port}`;
     
-    console.log(`\n🚀 Claude Code Web Interface is running at: ${url}`);
-
-    if (!noAuth) {
-      console.log('\n📋 Authentication Required:');
-      if (options.auth) {
-        console.log('   Use your provided authentication token to access the interface');
-      } else {
-        console.log(`   Enter this token when prompted: \x1b[1m\x1b[33m${authToken}\x1b[0m`);
-      }
-    }
+    console.log(`\n🚀 Code Agents Web CLI is running at: ${url}`);
     
     // Start ngrok tunnel if both flags provided
     let publicUrl = null;
@@ -159,7 +137,9 @@ async function main() {
         }
 
         if (options.open && publicUrl) {
-          try { await open(publicUrl); } catch (error) {
+          try {
+            await openUrl(publicUrl);
+          } catch (error) {
             console.warn('Could not automatically open browser:', error.message);
           }
         }
@@ -170,7 +150,7 @@ async function main() {
     } else if (options.open) {
       // Open local URL only when ngrok not used and auto-open enabled
       try {
-        await open(url);
+        await openUrl(url);
       } catch (error) {
         console.warn('Could not automatically open browser:', error.message);
       }
@@ -178,20 +158,25 @@ async function main() {
 
     console.log('\nPress Ctrl+C to stop the server\n');
 
+    let shuttingDown = false;
     const shutdown = async () => {
-      console.log('\nShutting down server...');
+      if (shuttingDown) {
+        return;
+      }
+      shuttingDown = true;
+
       // Close ngrok tunnel first if active
       if (ngrokListener && typeof ngrokListener.close === 'function') {
         try { await ngrokListener.close(); } catch (_) {}
       }
-      server.close(() => {
-        console.log('Server closed');
-        process.exit(0);
-      });
+
+      await appServer.shutdown();
+      console.log('Server closed');
+      process.exit(0);
     };
 
-    process.on('SIGINT', () => { shutdown(); });
-    process.on('SIGTERM', () => { shutdown(); });
+    process.on('SIGINT', () => { void shutdown(); });
+    process.on('SIGTERM', () => { void shutdown(); });
 
   } catch (error) {
     console.error('Error starting server:', error.message);

@@ -1,0 +1,103 @@
+/*
+ * Dark GitHub Variants
+ */
+
+[data-theme="github-dark"] {
+    color-scheme: dark;
+    --bg-app: #0d1117;
+    --bg-primary: #161b22;
+    --bg-secondary: rgba(22, 27, 34, 0.82);
+    --bg-tertiary: #21262d;
+    --bg-elevated: #1c2128;
+    --bg-soft: rgba(240, 246, 252, 0.04);
+    --text-primary: #f0f6fc;
+    --text-secondary: #9ba6b2;
+    --text-tertiary: #7d8590;
+    --text-inverse: #0d1117;
+    --accent: #2f81f7;
+    --accent-strong: #58a6ff;
+    --accent-soft: rgba(88, 166, 255, 0.16);
+    --success: #3fb950;
+    --error: #f85149;
+    --warning: #d29922;
+    --border: rgba(240, 246, 252, 0.1);
+    --border-strong: #30363d;
+    --border-soft: rgba(240, 246, 252, 0.06);
+    --ambient-a: rgba(47, 129, 247, 0.24);
+    --ambient-b: rgba(63, 185, 80, 0.12);
+    --ambient-c: rgba(210, 153, 34, 0.08);
+    --surface-overlay: rgba(13, 17, 23, 0.74);
+    --grid-line: rgba(240, 246, 252, 0.05);
+    --terminal-shell: linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 24%), #0d1117;
+    --terminal-shell-border: rgba(240, 246, 252, 0.08);
+    --terminal-shell-glow: rgba(88, 166, 255, 0.1);
+    --scrollbar-thumb: rgba(110, 118, 129, 0.46);
+    --scrollbar-thumb-hover: rgba(177, 186, 196, 0.72);
+}
+
+[data-theme="github-dark-dimmed"] {
+    color-scheme: dark;
+    --bg-app: #1b1f24;
+    --bg-primary: #22272e;
+    --bg-secondary: rgba(34, 39, 46, 0.84);
+    --bg-tertiary: #2d333b;
+    --bg-elevated: #2f363d;
+    --bg-soft: rgba(205, 217, 229, 0.06);
+    --text-primary: #cdd9e5;
+    --text-secondary: #92a1b1;
+    --text-tertiary: #768390;
+    --text-inverse: #1b1f24;
+    --accent: #316dca;
+    --accent-strong: #539bf5;
+    --accent-soft: rgba(83, 155, 245, 0.17);
+    --success: #57ab5a;
+    --error: #f47067;
+    --warning: #c69026;
+    --border: rgba(205, 217, 229, 0.1);
+    --border-strong: #444c56;
+    --border-soft: rgba(205, 217, 229, 0.06);
+    --ambient-a: rgba(83, 155, 245, 0.18);
+    --ambient-b: rgba(87, 171, 90, 0.1);
+    --ambient-c: rgba(198, 144, 38, 0.09);
+    --surface-overlay: rgba(27, 31, 36, 0.74);
+    --grid-line: rgba(205, 217, 229, 0.04);
+    --terminal-shell: linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 24%), #22272e;
+    --terminal-shell-border: rgba(205, 217, 229, 0.09);
+    --terminal-shell-glow: rgba(83, 155, 245, 0.11);
+    --scrollbar-thumb: rgba(118, 131, 144, 0.48);
+    --scrollbar-thumb-hover: rgba(205, 217, 229, 0.74);
+}
+
+[data-theme="github-dark-high-contrast"] {
+    color-scheme: dark;
+    --bg-app: #010409;
+    --bg-primary: #0a0f16;
+    --bg-secondary: rgba(10, 15, 22, 0.9);
+    --bg-tertiary: #151b23;
+    --bg-elevated: #111824;
+    --bg-soft: rgba(240, 243, 246, 0.06);
+    --text-primary: #f0f3f6;
+    --text-secondary: #d9dee3;
+    --text-tertiary: #9ea7b3;
+    --text-inverse: #010409;
+    --accent: #2f81f7;
+    --accent-strong: #79c0ff;
+    --accent-soft: rgba(121, 192, 255, 0.22);
+    --success: #26cd4d;
+    --error: #ff6a69;
+    --warning: #f0b72f;
+    --border: rgba(240, 243, 246, 0.16);
+    --border-strong: #7a828e;
+    --border-soft: rgba(240, 243, 246, 0.1);
+    --ambient-a: rgba(121, 192, 255, 0.18);
+    --ambient-b: rgba(38, 205, 77, 0.08);
+    --ambient-c: rgba(240, 183, 47, 0.08);
+    --surface-overlay: rgba(1, 4, 9, 0.82);
+    --grid-line: rgba(240, 243, 246, 0.08);
+    --terminal-shell: linear-gradient(180deg, rgba(121, 192, 255, 0.05), transparent 24%), #010409;
+    --terminal-shell-border: rgba(240, 243, 246, 0.16);
+    --terminal-shell-glow: rgba(121, 192, 255, 0.14);
+    --scrollbar-thumb: rgba(158, 167, 179, 0.58);
+    --scrollbar-thumb-hover: rgba(240, 243, 246, 0.82);
+    --focus-ring: 0 0 0 3px rgba(121, 192, 255, 0.28);
+}

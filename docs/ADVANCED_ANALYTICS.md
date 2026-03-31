@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Claude Code Web Interface now includes sophisticated session tracking and token analytics that accurately model Claude's 5-hour rolling session window system.
+Code Agents Web CLI includes sophisticated session tracking and token analytics that accurately model Claude's 5-hour rolling session window system.
 
 ## Key Features
 

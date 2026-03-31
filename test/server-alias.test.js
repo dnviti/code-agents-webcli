@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { ClaudeCodeWebServer } = require('../src/server');
+const { ClaudeCodeWebServer } = require('../dist/server/index.js');
 
 describe('Server Aliases', function() {
   it('should set aliases from options', function() {
@@ -22,4 +22,3 @@ describe('Server Aliases', function() {
     assert.ok(server.aliases.agent && server.aliases.agent.length > 0);
   });
 });
-

@@ -1,6 +1,6 @@
 const assert = require('assert');
 const path = require('path');
-const TerminalBridge = require('../src/terminal-bridge');
+const { TerminalBridge } = require('../dist/server/bridges/terminal.js');
 
 function createFakePty() {
   return {
@@ -34,7 +34,7 @@ function createFakePty() {
     },
     emitExit(code, signal) {
       if (this.onExitHandler) {
-        this.onExitHandler(code, signal);
+        this.onExitHandler({ exitCode: code, signal });
       }
     },
     emitError(error) {
@@ -140,5 +140,22 @@ describe('TerminalBridge', function() {
     await bridge.stopSession('session-5');
 
     assert.deepStrictEqual(ptys[0].killSignals, ['SIGTERM']);
+  });
+
+  it('ignores benign EIO errors during shutdown', async function() {
+    let reportedError = null;
+
+    await bridge.startSession('session-6', {
+      onError(error) {
+        reportedError = error;
+      }
+    });
+
+    await bridge.stopSession('session-6');
+    ptys[0].emitError(Object.assign(new Error('read EIO'), { code: 'EIO' }));
+    ptys[0].emitExit(143, 0);
+
+    assert.strictEqual(reportedError, null);
+    assert.strictEqual(bridge.getSession('session-6'), undefined);
   });
 });

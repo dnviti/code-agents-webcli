@@ -1,0 +1,176 @@
+/*
+ * Base / Reset Styles
+ * Global defaults, typography, selection, form controls, and shared helpers.
+ */
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html,
+body,
+#app {
+    width: 100%;
+    min-height: 100%;
+}
+
+html {
+    overflow-x: hidden;
+    overscroll-behavior: none;
+}
+
+body {
+    font-family: var(--font-ui);
+    background:
+        radial-gradient(circle at top left, var(--ambient-a), transparent 28%),
+        radial-gradient(circle at top right, var(--ambient-b), transparent 26%),
+        radial-gradient(circle at bottom center, var(--ambient-c), transparent 30%),
+        var(--bg-app);
+    color: var(--text-primary);
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
+    overscroll-behavior: none;
+    touch-action: pan-x pan-y;
+    position: relative;
+    line-height: 1.5;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+}
+
+body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+        linear-gradient(var(--grid-line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+    background-size: 36px 36px;
+    opacity: 0.35;
+    pointer-events: none;
+    z-index: -2;
+}
+
+body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: linear-gradient(180deg, transparent 0%, rgba(0, 0, 0, 0.08) 100%);
+    pointer-events: none;
+    z-index: -1;
+}
+
+[data-color-mode="light"] body::after {
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.12) 0%, rgba(31, 35, 40, 0.03) 100%);
+}
+
+body,
+button,
+input,
+select,
+textarea {
+    font: inherit;
+}
+
+button,
+input,
+select,
+textarea {
+    color: inherit;
+}
+
+button {
+    border: 0;
+    background: none;
+}
+
+input,
+select,
+textarea {
+    width: 100%;
+    min-height: 46px;
+    padding: 0 14px;
+    border: 1px solid var(--border-strong);
+    border-radius: 14px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 14px;
+    transition:
+        border-color var(--transition-fast),
+        box-shadow var(--transition-fast),
+        background-color var(--transition-fast);
+}
+
+input::placeholder,
+textarea::placeholder {
+    color: var(--text-tertiary);
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+    outline: none;
+    box-shadow: var(--focus-ring);
+    border-color: var(--accent-strong);
+}
+
+::selection {
+    background: var(--accent-soft);
+    color: var(--text-primary);
+}
+
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: var(--radius-pill);
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--scrollbar-thumb-hover);
+}
+
+.icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 0;
+}
+
+.dot {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background-color: var(--border-strong);
+}
+
+.dot.dot-on {
+    background-color: var(--success);
+}
+
+.dot.dot-idle {
+    background-color: var(--accent-strong);
+}
+
+.dot.dot-error {
+    background-color: var(--error);
+}
+
+pre,
+code {
+    font-family: var(--font-mono);
+    word-wrap: break-word;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+}

@@ -1,0 +1,115 @@
+/*
+ * Overlay and Loading Component
+ * Runtime chooser, loading state, and connection error surface.
+ */
+
+.terminal-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 5000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px;
+    background: var(--surface-overlay);
+    backdrop-filter: blur(18px);
+}
+
+.terminal-overlay::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background:
+        radial-gradient(circle at 18% 18%, var(--ambient-a), transparent 24%),
+        radial-gradient(circle at 82% 22%, var(--ambient-b), transparent 20%),
+        radial-gradient(circle at 50% 86%, var(--ambient-c), transparent 24%);
+    opacity: 0.9;
+    pointer-events: none;
+}
+
+.overlay-content {
+    position: relative;
+    z-index: 1;
+    width: min(760px, 100%);
+    padding: 34px;
+    border: 1px solid var(--border-strong);
+    border-radius: 30px;
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 24%),
+        var(--bg-elevated);
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+}
+
+.overlay-content::before {
+    content: '';
+    position: absolute;
+    inset: auto auto 0 -5%;
+    width: 46%;
+    height: 46%;
+    background: radial-gradient(circle, var(--accent-soft), transparent 68%);
+    opacity: 0.85;
+    pointer-events: none;
+}
+
+.loading-spinner,
+.start-prompt,
+.error-message {
+    position: relative;
+    z-index: 1;
+}
+
+.loading-spinner {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 18px;
+}
+
+.loading-spinner p,
+.start-prompt p,
+.error-message p {
+    max-width: 54ch;
+    color: var(--text-secondary);
+    font-size: 15px;
+    line-height: 1.6;
+}
+
+.spinner {
+    width: 52px;
+    height: 52px;
+    border: 3px solid var(--border);
+    border-top: 3px solid var(--accent-strong);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+.start-prompt h2,
+.error-message h3 {
+    font-family: var(--font-display);
+    font-size: clamp(2rem, 4vw, 2.8rem);
+    line-height: 1.05;
+    letter-spacing: -0.03em;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+}
+
+.error-message h3 {
+    color: var(--error);
+}
+
+.start-buttons {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    margin-top: 26px;
+}
+
+.start-buttons .btn {
+    width: 100%;
+}

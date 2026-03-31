@@ -1,7 +1,7 @@
 {
-  "name": "Claude Code Web",
-  "short_name": "CC Web",
-  "description": "Web interface for Claude Code - Run Claude commands directly from your browser",
+  "name": "Code Agents Web CLI",
+  "short_name": "Agents WebCLI",
+  "description": "Multiuser web CLI for Claude Code, Codex, and terminal sessions",
   "start_url": "/",
   "display": "standalone",
   "display_override": ["standalone", "minimal-ui", "browser"],
@@ -31,7 +31,7 @@
     {
       "name": "New Session",
       "url": "/",
-      "description": "Start a new Claude session"
+      "description": "Start a new authenticated agent session"
     }
   ],
   "screenshots": [
@@ -39,7 +39,7 @@
       "src": "/screenshot-wide.png",
       "sizes": "1280x720",
       "type": "image/png",
-      "label": "Claude Code Web Interface"
+      "label": "Code Agents Web CLI"
     }
   ]
 }

@@ -1,339 +1,192 @@
-# Claude Code Web Interface
+# Code Agents Web CLI
 
-A web-based interface for Claude Code CLI that can be accessed from any browser. This package allows you to run Claude Code in a terminal-like environment through your web browser, with real-time streaming and full interactivity.
+`code-agents-webcli` is a single Node.js web application for running Claude Code, Codex, Cursor Agent, and classic terminal sessions from the browser.
+
+It now supports:
+
+- GitHub OAuth authentication
+- multi-user session isolation keyed by GitHub user IDs
+- SQLite-backed persistence for users, auth sessions, working directories, and runtime sessions
+- xterm.js-based terminals
+- Docker image builds and GitHub Actions release automation
 
 ## Requirements
 
-- Node.js >= 16
-- Claude/Code CLI installed and available on `PATH`
-- Modern browser with WebSocket support
+- Node.js `>= 20`
+- Claude / Codex / Cursor CLI binaries available on the server host `PATH`
+- A GitHub OAuth App for sign-in
+- A modern browser with WebSocket support
 
-## ⚠️ Authentication is now Required by Default
+## Quick Start
 
-**Breaking Change**: Starting with v2.0.0, authentication is enabled by default for security. When you start the server, it will automatically generate a random token that you'll need to access the interface.
+Run without installing:
 
-**Quick Start**: Just run the command and copy the displayed token:
 ```bash
-npx claude-code-web
-# Look for: "Generated random authentication token: Xr9kM2nQ7w"
+npx code-agents-webcli
 ```
 
-**Migration**: If you need the old behavior (no authentication), use `--disable-auth`:
+Or install globally:
+
 ```bash
-npx claude-code-web --disable-auth
+npm install -g code-agents-webcli
+code-agents-webcli
 ```
 
-## Features
+On the first interactive run, the server asks for:
 
-- 🌐 **Web-based terminal** - Access Claude Code, Codex, Cursor Agent, or a classic shell from any browser
-- 🚀 **Real-time streaming** - Live output with WebSocket communication  
-- 🎨 **Terminal emulation** - Full ANSI color support and terminal features
-- 🔐 **Authentication** - Secure by default with automatic token generation
-- 📱 **Responsive design** - Works on desktop and mobile
-- ⚡ **NPX support** - Run anywhere with `npx claude-code-web`
-- 🎛️ **Customizable** - Adjustable font size, themes, and settings
-- 🔄 **Multi-Session Support** - Create and manage multiple persistent sessions for assistants or shells
-- 🌍 **Multi-Browser Access** - Connect to the same session from different browsers/devices
-- 💾 **Session Persistence** - Sessions remain active even when disconnecting
-- 📜 **Output Buffering** - Reconnect and see previous output from your session
-- 🔀 **VS Code-Style Split View** - Drag tabs to create side-by-side terminals for different sessions
+1. the public base URL
+2. the GitHub OAuth client ID
+3. the GitHub OAuth client secret
+4. the allowed GitHub user IDs, if you want an allowlist
+5. the GitHub App token, if your internal setup needs one
 
-## Installation
+Those values are stored in the local SQLite database.
 
-### Global Installation
+## GitHub OAuth Setup
+
+Create a GitHub OAuth App and set the callback URL to:
+
+```text
+https://your-host.example.com/auth/github/callback
+```
+
+For local development, this can be:
+
+```text
+http://localhost:32352/auth/github/callback
+```
+
+After sign-in, each browser user is mapped to an internal user record by GitHub numeric ID. Runtime sessions are filtered by owner, so users only see their own sessions.
+
+## Persistence
+
+By default, local state is stored in:
+
+```text
+~/.code-agents-webcli/app.sqlite
+```
+
+The database contains:
+
+- app settings
+- GitHub users
+- auth sessions
+- runtime sessions
+- per-user selected working directories
+
+Override the storage directory with:
+
 ```bash
-npm install -g claude-code-web
+code-agents-webcli --data-dir /path/to/state
 ```
 
-### NPX (No installation required)
+## Common Commands
+
 ```bash
-npx claude-code-web
+# interactive setup + normal start
+code-agents-webcli --setup
+
+# custom port
+code-agents-webcli --port 8080
+
+# HTTPS
+code-agents-webcli --https --cert /path/to/cert.pem --key /path/to/key.pem
+
+# explicit GitHub OAuth config
+code-agents-webcli \
+  --public-base-url https://agents.example.com \
+  --github-client-id YOUR_CLIENT_ID \
+  --github-client-secret YOUR_CLIENT_SECRET \
+  --allowed-github-ids 12345,67890
+
+# development mode
+npm run dev
 ```
 
-### Local Development (from source)
-```bash
-git clone <repository>
-cd claude-code-web
-npm install
-npm run dev            # starts with debug logging
-```
-
-## Usage
-
-### Basic Usage
-```bash
-# Start with default settings (port 32352, max20 plan, auto-generated auth token)
-npx claude-code-web
-
-# Specify a subscription plan
-npx claude-code-web --plan pro    # 19k tokens, $18 limit
-npx claude-code-web --plan max5   # 88k tokens, $35 limit  
-npx claude-code-web --plan max20  # 220k tokens, $140 limit (default)
-
-# Specify a custom port
-npx claude-code-web --port 8080
-
-# Don't automatically open browser
-npx claude-code-web --no-open
-```
-
-### Authentication Options
-```bash
-# Default: Auto-generates a random 10-character token (RECOMMENDED)
-npx claude-code-web
-# Output will show: "Generated random authentication token: Xr9kM2nQ7w"
-
-# Use a custom authentication token
-npx claude-code-web --auth your-secret-token
-
-# Disable authentication entirely (NOT recommended for production)
-npx claude-code-web --disable-auth
-
-# Access with token in URL: http://localhost:32352/?token=your-token
-```
-
-### HTTPS Support
-```bash
-# Enable HTTPS (requires SSL certificate files)
-npx claude-code-web --https --cert /path/to/cert.pem --key /path/to/key.pem
-```
-
-### Development Mode
-```bash
-# Enable additional logging and debugging
-npx claude-code-web --dev
-
-### Assistant Aliases
-
-You can customize how the assistants are labeled in the UI (for example, to display "Alice" instead of "Claude" or "R2" instead of "Codex").
-
-- Flags:
-  - `--claude-alias <name>`: Set the display name for Claude (default: env `CLAUDE_ALIAS` or "Claude").
-  - `--codex-alias <name>`: Set the display name for Codex (default: env `CODEX_ALIAS` or "Codex").
-  - `--agent-alias <name>`: Set the display name for Cursor Agent (default: env `AGENT_ALIAS` or "Cursor").
-
-Examples:
-
-```
-npx claude-code-web --claude-alias Alice --codex-alias R2
-```
-
-Or via environment variables:
-
-```
-export CLAUDE_ALIAS=Alice
-export CODEX_ALIAS=R2
-npx claude-code-web
-```
-
-These aliases are for display purposes only; they do not change which underlying CLI is launched.
-```
-
-### Running from source
-```bash
-# Start the server with defaults
-npm start            # equivalent to: node bin/cc-web.js
-
-# Start in dev mode with verbose logs
-npm run dev          # equivalent to: node bin/cc-web.js --dev
-
-# Run on a custom port
-node bin/cc-web.js --port 8080
-
-# Provide an auth token
-node bin/cc-web.js --auth YOUR_TOKEN
-```
-
-## Multi-Session Features
-
-### Creating and Managing Sessions
-- **Session Tabs**: Use the tab bar to switch between active sessions
-- **New Session**: Create named sessions with custom working directories
-- **Join Session**: Connect to any existing session from any browser
-- **Shell Sessions**: Start `zsh`, `bash`, `sh`, or a custom command like `htop`, `btop`, or `watch podman ps`
-- **Leave Session**: Disconnect without stopping the running process
-- **Delete Session**: Stop the running process and remove the session
-
-### Session Persistence
-- Sessions remain active even after all browsers disconnect
-- Reconnect from any device using the same server
-- Output history preserved (last 1000 lines)
-- Multiple users can connect to the same session simultaneously
-
-### Use Cases
-- **Remote Work**: Start a session at work, continue from home
-- **Collaboration**: Share a session with team members
-- **Device Switching**: Move between desktop and mobile seamlessly
-- **Recovery**: Never lose work due to connection issues
-
-## Command Line Options
+## CLI Options
 
 | Option | Description | Default |
-|--------|-------------|---------|
-| `-p, --port <number>` | Server port | 32352 |
-| `--no-open` | Don't automatically open browser | false |
-| `--auth <token>` | Custom authentication token | auto-generated |
-| `--disable-auth` | Disable authentication (not recommended) | false |
-| `--https` | Enable HTTPS | false |
-| `--cert <path>` | SSL certificate file path | none |
-| `--key <path>` | SSL private key file path | none |
-| `--dev` | Development mode with extra logging | false |
-| `--plan <type>` | Subscription plan (pro, max5, max20) | max20 |
+| --- | --- | --- |
+| `-p, --port <number>` | HTTP port | `32352` |
+| `--no-open` | Do not auto-open the browser | `false` |
+| `--https` | Enable HTTPS | `false` |
+| `--cert <path>` | TLS certificate path | none |
+| `--key <path>` | TLS private key path | none |
+| `--setup` | Force the interactive setup wizard | `false` |
+| `--public-base-url <url>` | Public base URL for OAuth callbacks | `http://localhost:<port>` |
+| `--github-client-id <id>` | GitHub OAuth client ID | from SQLite / env |
+| `--github-client-secret <secret>` | GitHub OAuth client secret | from SQLite / env |
+| `--github-app-token <token>` | Optional GitHub App token stored during setup | from SQLite / env |
+| `--allowed-github-ids <ids>` | Comma-separated GitHub numeric IDs allowed to sign in | allow all |
+| `--data-dir <path>` | Directory for SQLite and local state | `~/.code-agents-webcli` |
+| `--dev` | Extra logging | `false` |
+| `--plan <type>` | Usage analytics plan (`pro`, `max5`, `max20`) | `max20` |
+| `--claude-alias <name>` | UI label for Claude | `Claude` |
+| `--codex-alias <name>` | UI label for Codex | `Codex` |
+| `--agent-alias <name>` | UI label for Cursor Agent | `Cursor` |
+| `--ngrok-auth-token <token>` | Enable ngrok tunneling | none |
+| `--ngrok-domain <domain>` | Reserved ngrok domain | none |
 
-## How It Works
+## Docker
 
-1. **Claude Code Bridge** - Spawns and manages Claude Code processes using `node-pty`
-2. **WebSocket Communication** - Real-time bidirectional communication between browser and CLI
-3. **Terminal Emulation** - Uses `xterm.js` for full terminal experience with ANSI colors
-4. **Process Management** - Handles multiple sessions, process lifecycle, and cleanup
-5. **Session Persistence** - Automatically saves and restores sessions across server restarts
-6. **Folder Mode** - Browse and select working directories through the web interface
-7. **Security** - Optional authentication and rate limiting for production use
+Build locally:
 
-## API Endpoints
-
-### REST API
-- `GET /` - Web interface
-- `GET /api/health` - Server health status
-- `GET /api/config` - Get server configuration
-- `GET /api/sessions/list` - List all saved sessions
-- `GET /api/sessions/persistence` - Get session persistence info
-- `POST /api/sessions/create` - Create a new session
-- `GET /api/sessions/:sessionId` - Get session details
-- `DELETE /api/sessions/:sessionId` - Delete a session
-- `GET /api/folders` - List available folders (folder mode)
-- `POST /api/folders/select` - Select working directory
-- `POST /api/set-working-dir` - Set working directory
-- `POST /api/create-folder` - Create new folder
-- `POST /api/close-session` - Close a session
-
-### WebSocket Events
-- `create_session` - Create a new session
-- `join_session` - Join an existing session
-- `leave_session` - Leave current session
-- `start_claude` - Start Claude Code in current session
-- `start_codex` - Start Codex in current session
-- `start_agent` - Start Cursor Agent in current session
-- `start_terminal` - Start `zsh`, `bash`, `sh`, or a custom shell command in current session
-- `input` - Send input to the current session process
-- `resize` - Resize terminal
-- `stop` - Stop the current process in the session
-- `ping/pong` - Heartbeat
-
-## Security Considerations
-
-### Authentication (Enabled by Default)
-Claude Code Web now requires authentication by default for security:
-
-**Default Behavior**: Automatically generates a secure 10-character random token
 ```bash
-npx claude-code-web
-# Output: "Generated random authentication token: Xr9kM2nQ7w"
+docker build -t code-agents-webcli .
 ```
 
-**Custom Token**: Specify your own token
+Run:
+
 ```bash
-npx claude-code-web --auth my-secure-token-123
+docker run --rm -it \
+  -p 32352:32352 \
+  -v code-agents-webcli-data:/home/appuser/.code-agents-webcli \
+  -e GITHUB_OAUTH_CLIENT_ID=YOUR_CLIENT_ID \
+  -e GITHUB_OAUTH_CLIENT_SECRET=YOUR_CLIENT_SECRET \
+  -e PUBLIC_BASE_URL=http://localhost:32352 \
+  code-agents-webcli
 ```
 
-**Disable Authentication**: Only for development (not recommended)
-```bash
-npx claude-code-web --disable-auth
-```
+Important:
 
-Clients must provide the token either:
-- In the `Authorization` header: `Bearer your-token`
-- As a query parameter: `?token=your-token`
-- Through the web login prompt when accessing the interface
-
-### Rate Limiting
-Built-in rate limiting prevents abuse:
-- 100 requests per minute per IP by default
-- Configurable limits for production environments
-
-### Production Security Setup
-For production use, combine HTTPS with authentication:
-```bash
-# Recommended: Auto-generated token with HTTPS
-npx claude-code-web --https --cert cert.pem --key key.pem
-
-# Alternative: Custom token with HTTPS
-npx claude-code-web --https --cert cert.pem --key key.pem --auth $(openssl rand -hex 32)
-```
-
-### Security Features
-- **Default Authentication**: Automatic token generation prevents unauthorized access
-- **Secure Token Display**: Generated tokens are highlighted in the console for easy copying
-- **Session Security**: Each session requires proper authentication
-- **WebSocket Protection**: Authentication extends to WebSocket connections
-- **Warning System**: Clear warnings when authentication is disabled
+- the image contains the web server only
+- Claude / Codex / Cursor CLIs are not bundled into the container
+- if you want assistant runtimes inside Docker, extend the image and install those CLIs there
 
 ## Development
 
-### Local Development
-Use the commands above under "Local Development (from source)" and "Running from source". Ensure the Claude CLI is installed and on your `PATH`.
-
-### File Structure
-```
-claude-code-web/
-├── bin/cc-web.js          # CLI entry point
-├── src/
-│   ├── server.js          # Express server + WebSocket
-│   ├── claude-bridge.js   # Claude Code process management  
-│   ├── utils/
-│   │   ├── auth.js        # Authentication utilities
-│   │   └── session-store.js # Session persistence
-│   └── public/            # Web interface files
-│       ├── index.html     # Main HTML
-│       ├── app.js         # Frontend JavaScript
-│       ├── auth.js        # Client-side authentication
-│       ├── session-manager.js # Session management UI
-│       ├── plan-detector.js # Plan mode detection
-│       └── style.css      # Styling
-└── package.json
-```
-
-## Testing
-
-- Framework: Mocha with Node's `assert`
-- Location: tests under `test/*.test.js`
-- Run tests: `npm test`
-- Guidelines: write fast, isolated unit tests; avoid network and real CLI calls—mock process spawns where possible.
-
-## Browser Compatibility
-
-- Chrome/Chromium 90+
-- Firefox 88+
-- Safari 14+
-- Edge 90+
-
-## Troubleshooting
-
-### Claude Code Not Found
-Ensure Claude Code is installed and accessible:
 ```bash
-which claude
-# or
-claude --version
+npm install
+npm run build
+npm run dev
 ```
 
-### Connection Issues
-- Check firewall settings for the specified port
-- Verify Claude Code is properly installed
-- Try running with `--dev` flag for detailed logs
+Other useful commands:
 
-### Permission Issues
-- Ensure the process has permission to spawn child processes
-- Check file system permissions for the working directory
+```bash
+npm run typecheck
+npm test
+```
 
-## License
+## GitHub Actions Release Flow
 
-MIT — see the [LICENSE](LICENSE) file.
+The repository includes:
 
-## Contributing
+- `.github/workflows/ci.yml`: typecheck, test, and Docker build validation
+- `.github/workflows/release-on-main.yml`: publish the npm package and GHCR container image from `main`
 
-Contributions welcome! See [CONTRIBUTING](CONTRIBUTING.md) for guidelines on development, testing, and pull requests.
+The release workflow is designed for npm trusted publishing with GitHub Actions OIDC.
 
-## Support
+## What You Still Need To Configure
 
-For issues and feature requests, please use the GitHub issue tracker.
+Publishing cannot succeed until you complete these external steps:
+
+1. Create the GitHub OAuth App and set the callback URL for your deployment.
+2. Configure npm trusted publishing for `dnviti/code-agents-webcli` against this repository and the release workflow.
+3. If you plan to run the Docker image in production, make sure the required assistant CLIs are installed in the runtime environment or a derived image.
+
+## Repository
+
+- GitHub: `https://github.com/dnviti/code-agents-webcli`
+- npm: `https://www.npmjs.com/package/code-agents-webcli`
+

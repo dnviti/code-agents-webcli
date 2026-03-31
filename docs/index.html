@@ -3,25 +3,29 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Claude Code Web — Web UI for Claude Code CLI</title>
-    <meta name="description" content="Run Claude Code in your browser with a fast, secure, multi-session web interface. Start instantly with npx claude-code-web." />
-    <meta property="og:title" content="Claude Code Web" />
-    <meta property="og:description" content="Run Claude Code in your browser with a fast, secure, multi-session web interface." />
+    <title>Code Agents Web CLI</title>
+    <meta
+      name="description"
+      content="GitHub OAuth protected web UI for Claude Code, Codex, Cursor Agent, and terminal sessions."
+    />
+    <meta property="og:title" content="Code Agents Web CLI" />
+    <meta
+      property="og:description"
+      content="Multi-user browser terminal for Claude Code, Codex, Cursor Agent, and shells with SQLite persistence."
+    />
     <meta property="og:type" content="website" />
-    <meta property="og:url" content="https://github.com/vultuk/claude-code-web" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <meta property="og:url" content="https://github.com/dnviti/code-agents-webcli" />
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <header class="site-header">
       <div class="container nav">
-        <div class="brand">Claude Code Web</div>
+        <div class="brand">Code Agents Web CLI</div>
         <nav>
           <a href="#features">Features</a>
           <a href="#usage">Get Started</a>
-          <a href="#security">Security</a>
-          <a href="#faq">FAQ</a>
-          <a class="btn ghost" href="https://github.com/vultuk/claude-code-web" target="_blank" rel="noopener">GitHub</a>
+          <a href="#deploy">Deploy</a>
+          <a class="btn ghost" href="https://github.com/dnviti/code-agents-webcli" target="_blank" rel="noopener">GitHub</a>
         </nav>
       </div>
     </header>
@@ -30,25 +34,31 @@
       <section class="hero">
         <div class="container hero-inner">
           <div class="hero-copy">
-            <h1>Run Claude Code in your browser</h1>
-            <p class="tagline">A lightweight, real‑time web UI for Claude Code CLI — secure by default, multi‑session, and fast to start.</p>
+            <h1>Run code agents from the browser</h1>
+            <p class="tagline">
+              A single Node.js app with GitHub OAuth, SQLite persistence, multi-user isolation,
+              and terminal sessions powered by xterm.js.
+            </p>
             <div class="cta">
               <a class="btn primary" href="#usage">Get Started</a>
-              <a class="btn" href="https://www.npmjs.com/package/claude-code-web" target="_blank" rel="noopener">View on npm</a>
+              <a class="btn" href="https://www.npmjs.com/package/code-agents-webcli" target="_blank" rel="noopener">View on npm</a>
             </div>
-            <pre class="snippet"><code>npx claude-code-web
-# optional flags:
-# --port 8080 --auth YOUR_TOKEN
-# --ngrok-auth-token NGROK_TOKEN --ngrok-domain your-subdomain</code></pre>
+            <pre class="snippet"><code>npx code-agents-webcli --setup
+
+# first run asks for:
+# - public base URL
+# - GitHub OAuth client ID / secret
+# - allowed GitHub user IDs
+# - optional GitHub App token</code></pre>
           </div>
           <div class="hero-aside">
             <div class="terminal-card">
               <div class="term-bar"><span></span><span></span><span></span></div>
               <div class="term-body">
-                <div>$ npx claude-code-web</div>
-                <div>▶ Server listening on http://localhost:32352</div>
-                <div>🔐 Generated auth token: <em>••••••••••</em></div>
-                <div>🧠 Claude session ready — open your browser!</div>
+                <div>$ npx code-agents-webcli --setup</div>
+                <div>▶ SQLite ready at ~/.code-agents-webcli/app.sqlite</div>
+                <div>🔐 GitHub OAuth enabled</div>
+                <div>🧠 Claude / Codex / Terminal sessions available</div>
               </div>
             </div>
           </div>
@@ -59,93 +69,67 @@
         <div class="container">
           <h2>Features</h2>
           <div class="grid">
-            <div class="card"><h3>🌐 Web‑based</h3><p>Access Claude Code from any modern browser with a responsive UI.</p></div>
-            <div class="card"><h3>🚀 Real‑time</h3><p>Low‑latency streaming via WebSockets with full ANSI terminal emulation.</p></div>
-            <div class="card"><h3>🔐 Secure by default</h3><p>Authentication enabled by default with token-based access.</p></div>
-            <div class="card"><h3>🔄 Multi‑session</h3><p>Create, join, and persist multiple sessions across reconnects.</p></div>
-            <div class="card"><h3>🎛️ Customizable</h3><p>Adjust themes, font size, working directory, and plan options.</p></div>
-            <div class="card"><h3>🌍 Remote access</h3><p>Built‑in ngrok integration for secure public tunnels when needed.</p></div>
+            <div class="card"><h3>GitHub OAuth</h3><p>Users authenticate with GitHub and are identified internally by GitHub numeric ID.</p></div>
+            <div class="card"><h3>SQLite Persistence</h3><p>Runtime sessions, auth sessions, and user settings survive restarts in a local SQLite database.</p></div>
+            <div class="card"><h3>Multi-user Isolation</h3><p>Sessions are owner-scoped so users only see and reconnect to their own work.</p></div>
+            <div class="card"><h3>xterm.js Frontend</h3><p>Modern terminal rendering with theme and font controls from the browser.</p></div>
+            <div class="card"><h3>Docker Ready</h3><p>The repo ships with a Dockerfile and GitHub Actions workflow for container builds.</p></div>
+            <div class="card"><h3>npm + GHCR Release</h3><p>Release automation publishes the package to npm and the image to GitHub Container Registry.</p></div>
           </div>
         </div>
       </section>
 
       <section id="usage" class="section alt">
         <div class="container">
-          <h2>Quick Start</h2>
+          <h2>Get Started</h2>
           <div class="columns">
             <div>
-              <h3>Install or run instantly</h3>
-              <pre class="snippet"><code># Run without installing
-npx claude-code-web
+              <h3>Run locally</h3>
+              <pre class="snippet"><code>npm install -g code-agents-webcli
+code-agents-webcli --setup
 
-# Or install globally
-npm install -g claude-code-web
-cc-web --port 8080
-              </code></pre>
+# or without installing
+npx code-agents-webcli --setup</code></pre>
             </div>
             <div>
-              <h3>Common flags</h3>
-              <pre class="snippet"><code># Development mode (verbose logs)
-cc-web --dev
+              <h3>Configure OAuth callback</h3>
+              <pre class="snippet"><code>https://your-host.example.com/auth/github/callback
 
-# Provide an auth token
-cc-web --auth YOUR_TOKEN
-
-# Public access via ngrok
-cc-web --ngrok-auth-token NGROK_TOKEN --ngrok-domain your-subdomain
-              </code></pre>
+# local development
+http://localhost:32352/auth/github/callback</code></pre>
             </div>
           </div>
 
           <div class="links">
-            <a class="btn primary" href="https://github.com/vultuk/claude-code-web#readme" target="_blank" rel="noopener">Read the README</a>
-            <a class="btn" href="https://github.com/vultuk/claude-code-web" target="_blank" rel="noopener">Browse Source</a>
-            <a class="btn" href="https://github.com/vultuk/claude-code-web/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contribute</a>
+            <a class="btn primary" href="https://github.com/dnviti/code-agents-webcli#readme" target="_blank" rel="noopener">Read the README</a>
+            <a class="btn" href="https://github.com/dnviti/code-agents-webcli" target="_blank" rel="noopener">Browse Source</a>
+            <a class="btn" href="https://github.com/dnviti/code-agents-webcli/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contribute</a>
           </div>
         </div>
       </section>
 
-      <section id="security" class="section">
+      <section id="deploy" class="section">
         <div class="container">
-          <h2>Security</h2>
+          <h2>Deploy</h2>
           <ul class="bullets">
-            <li><strong>Auth required by default</strong> — automatic token generation on startup.</li>
-            <li><strong>Public access via ngrok</strong> — provide <code>--ngrok-auth-token</code> and <code>--ngrok-domain</code> to create a tunnel.</li>
-            <li><strong>Session scope</strong> — authentication covers REST and WebSocket endpoints.</li>
+            <li><strong>Database:</strong> local state is stored in <code>~/.code-agents-webcli/app.sqlite</code> unless overridden with <code>--data-dir</code>.</li>
+            <li><strong>Docker:</strong> the container bundles the web app, but you still need Claude / Codex / Cursor CLIs in the runtime environment.</li>
+            <li><strong>Publishing:</strong> npm trusted publishing must be configured on npm before the GitHub release workflow can publish successfully.</li>
           </ul>
-        </div>
-      </section>
-
-      <section id="faq" class="section alt">
-        <div class="container">
-          <h2>FAQ</h2>
-          <details>
-            <summary>What are the requirements?</summary>
-            <p>Node.js 16+, Claude/Code CLI on PATH, and a modern browser with WebSocket support.</p>
-          </details>
-          <details>
-            <summary>How do I develop locally?</summary>
-            <p>Clone the repo, run <code>npm install</code>, then <code>npm run dev</code>. See the README for full details.</p>
-          </details>
-          <details>
-            <summary>Is it open source?</summary>
-            <p>Yes — MIT licensed. Contributions are welcome!</p>
-          </details>
         </div>
       </section>
     </main>
 
     <footer class="site-footer">
       <div class="container">
-        <div>© <span id="year"></span> Claude Code Web contributors • <a href="https://github.com/vultuk/claude-code-web/blob/main/LICENSE" target="_blank" rel="noopener">MIT</a></div>
+        <div>© <span id="year"></span> Code Agents Web CLI contributors</div>
         <div class="footer-links">
-          <a href="https://github.com/vultuk/claude-code-web" target="_blank" rel="noopener">GitHub</a>
-          <a href="https://www.npmjs.com/package/claude-code-web" target="_blank" rel="noopener">npm</a>
-          <a href="https://github.com/vultuk/claude-code-web#readme" target="_blank" rel="noopener">Docs</a>
+          <a href="https://github.com/dnviti/code-agents-webcli" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://www.npmjs.com/package/code-agents-webcli" target="_blank" rel="noopener">npm</a>
         </div>
       </div>
     </footer>
 
     <script src="script.js"></script>
   </body>
-  </html>
+</html>
