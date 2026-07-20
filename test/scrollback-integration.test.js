@@ -59,7 +59,15 @@ describe('scrollback integration (real PTY)', function () {
         env: { ...process.env, TERM: 'xterm-256color' },
       });
 
-      term.onData((data) => recorder.write(data));
+      let bytes = 0;
+      let chunks = 0;
+      let exitInfo = null;
+      term.onData((data) => {
+        bytes += data.length;
+        chunks += 1;
+        recorder.write(data);
+      });
+      term.onExit((e) => { exitInfo = e; });
 
       let settled = false;
       const finish = async (error) => {
@@ -81,10 +89,17 @@ describe('scrollback integration (real PTY)', function () {
         }
       }, 20);
 
-      const bail = setTimeout(
-        () => void finish(new Error('the sentinel never arrived: PTY output was lost')),
-        25000,
-      );
+      const bail = setTimeout(() => {
+        const screen = recorder.snapshotScreen();
+        void finish(
+          new Error(
+            `the sentinel never arrived. chunks=${chunks} bytes=${bytes} ` +
+              `exit=${JSON.stringify(exitInfo)} screenLines=${screen.length} ` +
+              `lastScreen=${JSON.stringify(screen.slice(-3))} ` +
+              `firstScreen=${JSON.stringify(screen.slice(0, 2))}`,
+          ),
+        );
+      }, 25000);
     });
   }
 
