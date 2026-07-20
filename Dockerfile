@@ -7,10 +7,13 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./
-RUN npm ci
+# --ignore-scripts because `prepare` (needed so `npm i github:...` builds the
+# package) would run scripts/build.js here, before the sources are copied in.
+# It also defers the native builds, which `npm rebuild` performs below.
+RUN npm ci --ignore-scripts
 
 COPY . .
-RUN npm run build && npm prune --omit=dev
+RUN npm rebuild && npm run build && npm prune --omit=dev
 
 FROM node:20-bookworm-slim
 

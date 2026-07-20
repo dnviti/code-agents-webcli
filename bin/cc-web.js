@@ -88,6 +88,15 @@ async function main() {
     console.log(`Aliases: Claude → "${serverOptions.claudeAlias}", Codex → "${serverOptions.codexAlias}", Agent → "${serverOptions.agentAlias}"`);
 
     const appServer = new ClaudeCodeWebServer(serverOptions);
+
+    // Runs the first-time (or --setup) wizard. Returns false when the user
+    // chose to install a background service, in which case systemd now owns
+    // the port and this process must not bind it too.
+    const shouldRunHere = await appServer.runSetupIfNeeded();
+    if (!shouldRunHere) {
+      process.exit(0);
+    }
+
     await appServer.start();
 
     // ngrok setup

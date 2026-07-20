@@ -1,6 +1,6 @@
 import type { IncomingMessage } from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { createInterface } from 'node:readline/promises';
+import { PromptSession } from '../setup/prompts.js';
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import type { AuthContext, AuthenticatedUser } from '../types.js';
 import { AppDatabase } from './database.js';
@@ -99,9 +99,18 @@ export class AuthService {
     return Boolean(this.githubClientId && this.githubClientSecret);
   }
 
-  async ensureConfiguredInteractive(force = false): Promise<void> {
+  /**
+   * Collect and persist the GitHub OAuth configuration.
+   *
+   * The caller owns the PromptSession so that the run-mode wizard can ask its
+   * own questions on the same readline interface afterwards.
+   */
+  async ensureConfiguredInteractive(
+    force = false,
+    session?: PromptSession,
+  ): Promise<boolean> {
     if (!force && this.isConfigured()) {
-      return;
+      return false;
     }
 
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
@@ -110,10 +119,8 @@ export class AuthService {
       );
     }
 
-    const rl = createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
+    const rl = session ?? new PromptSession();
+    const ownsSession = !session;
 
     try {
       const defaultBaseUrl =
@@ -122,33 +129,24 @@ export class AuthService {
       console.log('\nInitial setup for Code Agents Web CLI');
       console.log('This installation uses GitHub OAuth for user authentication.\n');
 
-      const publicBaseUrl = await promptValue(
-        rl,
-        'Public base URL',
-        defaultBaseUrl,
-        true,
-      );
-      const githubClientId = await promptValue(
-        rl,
+      const publicBaseUrl = await rl.value('Public base URL', defaultBaseUrl, true);
+      const githubClientId = await rl.value(
         'GitHub OAuth Client ID',
         this.githubClientId || '',
         true,
       );
-      const githubClientSecret = await promptSecret(
-        rl,
+      const githubClientSecret = await rl.secret(
         'GitHub OAuth Client Secret',
         this.githubClientSecret || '',
       );
       // Required: an empty allow-list now denies every sign-in, so silently
       // accepting a blank answer here would produce an unusable install.
-      const allowedGitHubIds = await promptValue(
-        rl,
+      const allowedGitHubIds = await rl.value(
         'Allowed GitHub user IDs (comma-separated)',
         this.allowedGitHubIds.join(','),
         true,
       );
-      const githubAppToken = await promptSecret(
-        rl,
+      const githubAppToken = await rl.secret(
         'GitHub App token (optional, press Enter to skip)',
         this.githubAppToken || '',
         true,
@@ -163,8 +161,11 @@ export class AuthService {
       });
 
       console.log('\nGitHub authentication setup saved to SQLite.\n');
+      return true;
     } finally {
-      rl.close();
+      if (ownsSession) {
+        rl.close();
+      }
     }
   }
 
@@ -594,83 +595,6 @@ function sanitizeRedirectTarget(next: string): string {
 
 function capitalize(value: string): string {
   return value.charAt(0).toUpperCase() + value.slice(1);
-}
-
-async function promptValue(
-  rl: ReturnType<typeof createInterface>,
-  label: string,
-  defaultValue: string,
-  required: boolean,
-): Promise<string> {
-  while (true) {
-    const prompt = defaultValue ? `${label} [${defaultValue}]: ` : `${label}: `;
-    const response = (await rl.question(prompt)).trim();
-    const value = response || defaultValue;
-    if (!required || value) {
-      return value;
-    }
-  }
-}
-
-async function promptSecret(
-  rl: ReturnType<typeof createInterface>,
-  label: string,
-  defaultValue: string,
-  allowEmpty = false,
-): Promise<string> {
-  while (true) {
-    const prompt = defaultValue ? `${label} [saved]: ` : `${label}: `;
-    const value = (await askMasked(rl, prompt)).trim();
-    if (value) {
-      return value;
-    }
-    if (defaultValue) {
-      return defaultValue;
-    }
-    if (allowEmpty) {
-      return '';
-    }
-  }
-}
-
-/**
- * Like rl.question(), but does not echo what is typed. readline echoes by
- * default, which would leave the OAuth client secret in terminal scrollback,
- * tmux buffers and any session/CI recording.
- */
-async function askMasked(
-  rl: ReturnType<typeof createInterface>,
-  prompt: string,
-): Promise<string> {
-  const target = rl as unknown as {
-    output?: { write: (chunk: string) => void };
-    _writeToOutput?: (chunk: string) => void;
-  };
-
-  const originalWrite = target._writeToOutput;
-  let muted = false;
-
-  target._writeToOutput = function writeMasked(chunk: string) {
-    if (!muted) {
-      originalWrite?.call(this, chunk);
-      return;
-    }
-    // Keep newlines so the cursor still advances on Enter.
-    if (chunk.includes('\n')) {
-      originalWrite?.call(this, '\n');
-    }
-  };
-
-  try {
-    const answer = rl.question(prompt);
-    muted = true;
-    const value = await answer;
-    return value;
-  } finally {
-    muted = false;
-    target._writeToOutput = originalWrite;
-    target.output?.write('\n');
-  }
 }
 
 function renderLoginPage(next: string): string {

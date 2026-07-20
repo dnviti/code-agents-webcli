@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "node scripts/build.js",
+    "prepare": "node scripts/build.js",
     "build:watch": "node scripts/build.js --watch",
     "start": "npm run build && node bin/cc-web.js",
     "dev": "npm run build && node bin/cc-web.js --dev",
