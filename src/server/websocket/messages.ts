@@ -301,7 +301,14 @@ export class MessageProcessor {
 
     // Identifies this particular run, so a late callback from a previous run
     // cannot mark the current one dead and orphan its PTY.
+    //
+    // Claim the id BEFORE starting: the bridge registers the PTY handlers
+    // synchronously, so output or an immediate exit can reach the callbacks
+    // before startSession()'s promise resolves. Assigning afterwards left a
+    // window where they saw runId undefined and dropped the event.
     const runId = randomUUID();
+    const previousRunId = session.runId;
+    session.runId = runId;
 
     try {
       const runtimeSession = (await bridge.startSession(sessionId, {
@@ -367,7 +374,6 @@ export class MessageProcessor {
         },
       })) as RuntimeSession;
 
-      session.runId = runId;
       session.active = true;
       session.agent = agentKind;
       session.lastAgent = agentKind;
@@ -408,6 +414,11 @@ export class MessageProcessor {
       );
     } catch (error: unknown) {
       session.outputBuffer = previousOutputBuffer;
+      // The run never started, so hand the id back rather than leaving the
+      // session tagged with a run that does not exist.
+      if (session.runId === runId) {
+        session.runId = previousRunId;
+      }
 
       const errorMessage = error instanceof Error ? error.message : String(error);
       if (this.deps.dev) {
