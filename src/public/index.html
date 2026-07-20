@@ -54,10 +54,14 @@
         } catch (_) { /* ignore */ }
       })();
     </script>
+    <link rel="stylesheet" href="css/relay/relay.css">
     <link rel="stylesheet" href="css/main.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Source+Code+Pro:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- Geist is the Relay UI face; the rest remain selectable terminal fonts.
+         Loaded here rather than via the @import in Relay's tokens/fonts.css,
+         which would serialise the fetch behind that stylesheet's own parse. -->
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Geist:wght@100..900&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Source+Code+Pro:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="css/vendor/xterm.css" />
 </head>
 <body>
@@ -142,13 +146,25 @@
             <pre class="update-banner__log" id="updateBannerLog" aria-live="off" hidden></pre>
         </div>
 
-        <main class="main">
-            <div class="terminal-container" id="terminalContainer" data-view="single">
-                <div class="terminal-wrapper">
-                    <div id="terminal"></div>
-                </div>
+        <!--
+          The Relay shell mounts here and renders the title bar, tab strip,
+          sidebar and status bar.
+        -->
+        <div id="relayRoot"></div>
+
+        <!--
+          The terminal lives outside the React tree on purpose and is adopted
+          into it by TerminalHost. xterm binds its renderer, viewport and
+          selection to whatever node it was constructed against, so if React
+          created this node, any re-render that unmounted the component would
+          take a live session's scrollback and cursor with it. It is created
+          once here and never re-created.
+        -->
+        <div class="terminal-container" id="terminalContainer" data-view="single">
+            <div class="terminal-wrapper">
+                <div id="terminal"></div>
             </div>
-        </main>
+        </div>
 
         <!-- App-wide overlay (moved out of terminal container to avoid width issues) -->
         <div class="terminal-overlay" id="overlay" style="display: none;">

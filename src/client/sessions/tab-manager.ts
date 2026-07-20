@@ -2,6 +2,7 @@
 
 import type { App } from '../app';
 import type { SessionInfo } from '../types';
+import { shellStore, type ShellTab } from '../shell/store';
 
 export class SessionTabManager {
   app: App;
@@ -162,6 +163,40 @@ export class SessionTabManager {
   // ---------------------------------------------------------------------------
   // Tab ordering helpers
   // ---------------------------------------------------------------------------
+
+  /**
+   * Publish tab state to the React shell.
+   *
+   * Called from the overflow updaters and updateTabStatus, which between them
+   * already run after every mutation that changes what a tab looks like. The
+   * store drops no-op updates, so the duplicate calls that come from a single
+   * logical change (a switch touches order, history and status) collapse into
+   * one render.
+   */
+  syncShell(): void {
+    const tabs: ShellTab[] = this.getOrderedTabIds()
+      .map((id) => {
+        const session = this.activeSessions.get(id);
+        if (!session) return null;
+        return {
+          id,
+          title: session.name,
+          status:
+            session.hasError || session.status === 'error'
+              ? 'error'
+              : session.status === 'active'
+                ? 'running'
+                : 'idle',
+          // Not yet tracked per session; see UNGROUPED in AppShell.
+          kind: '',
+          workingDir: session.workingDir,
+          unread: session.unreadOutput,
+        } satisfies ShellTab;
+      })
+      .filter((tab): tab is ShellTab => tab !== null);
+
+    shellStore.setState({ tabs, activeId: this.activeTabId });
+  }
 
   getOrderedTabIds(): string[] {
     this.tabOrder = this.tabOrder.filter((id) => this.tabs.has(id));
@@ -332,6 +367,7 @@ export class SessionTabManager {
   }
 
   updateTabOverflow(): void {
+    this.syncShell();
     const isMobile = window.innerWidth <= 768;
     const overflowWrapper = document.getElementById('tabOverflowWrapper');
     const overflowCount = document.querySelector('.tab-overflow-count');
@@ -360,6 +396,7 @@ export class SessionTabManager {
   }
 
   updateOverflowMenu(): void {
+    this.syncShell();
     const menu = document.getElementById('tabOverflowMenu');
     if (!menu) return;
 
@@ -818,6 +855,9 @@ export class SessionTabManager {
       session.lastActivity = Date.now();
       if (status !== 'error') session.hasError = false;
     }
+
+    // After the mutation, not before: the shell renders the status dot.
+    this.syncShell();
   }
 
   markSessionActivity(sessionId: string, hasOutput = false, outputData = ''): void {
