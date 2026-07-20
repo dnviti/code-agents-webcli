@@ -68,6 +68,49 @@ describe('PasteStore .gitignore', function () {
     assert.strictEqual(body.split('code-agents-webcli').length - 1, 1);
   });
 
+  it('retries the marker after a failed write instead of memoising the failure', async function () {
+    const container = path.join(workingDir, '.cc-web');
+    fs.mkdirSync(container, { mode: 0o500 });
+
+    try {
+      // Read-only directory: the write fails with EACCES.
+      await store.ensureGitignore(container);
+      assert.ok(
+        !fs.existsSync(path.join(container, '.gitignore')),
+        'the write was expected to fail for this test to mean anything',
+      );
+      // Memoising a failure would leave every later paste into this project
+      // unignored for the rest of the process's life.
+      assert.ok(!store.ignoredDirs.has(container), 'a failed write must not be memoised');
+    } finally {
+      fs.chmodSync(container, 0o700);
+    }
+
+    await store.ensureGitignore(container);
+    assert.ok(fs.existsSync(path.join(container, '.gitignore')), 'the next attempt must retry');
+  });
+
+  it('puts the marker back when the directory cannot be removed', async function () {
+    const container = path.join(workingDir, '.cc-web');
+    await store.save({ id: 'ok', ownerUserId: 1, workingDir }, PNG);
+    fs.rmSync(path.join(container, 'pasted'), { recursive: true, force: true });
+
+    // rmdir needs write permission on the PARENT, so this makes the removal
+    // fail after the marker has already been deleted — the same end state as
+    // another session racing in and re-creating pasted/.
+    fs.chmodSync(workingDir, 0o500);
+    try {
+      await store.removeContainerIfEmpty(container);
+      assert.ok(fs.existsSync(container), 'the directory was expected to survive');
+      assert.ok(
+        fs.existsSync(path.join(container, '.gitignore')),
+        'a directory that survives must keep its ignore marker',
+      );
+    } finally {
+      fs.chmodSync(workingDir, 0o700);
+    }
+  });
+
   it('works the same outside a git repository', async function () {
     await store.save({ id: 'ok', ownerUserId: 1, workingDir }, PNG);
     assert.ok(fs.existsSync(gitignorePath()));

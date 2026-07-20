@@ -271,16 +271,22 @@ export class PasteStore implements PasteStoreLike {
     if (this.ignoredDirs.has(dir)) {
       return;
     }
-    this.ignoredDirs.add(dir);
 
     try {
       // wx: an existing file is left exactly as the user left it.
       await fs.promises.writeFile(path.join(dir, '.gitignore'), GITIGNORE_BODY, { flag: 'wx' });
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST') {
+        // Memoised only on success, so a transient failure — a full disk, a
+        // momentarily read-only directory — is retried on the next paste
+        // rather than leaving every later image in this project unignored.
         console.error('Could not write the paste .gitignore:', error);
+        return;
       }
     }
+
+    this.ignoredDirs.add(dir);
   }
 
   /**
@@ -301,17 +307,24 @@ export class PasteStore implements PasteStoreLike {
       return;
     }
 
+    // The marker has to go before the rmdir, since a directory holding it is
+    // not empty — but another session can create pasted/ in the window between
+    // the readdir above and the rmdir below, so the removal must be reversible.
     await fs.promises.rm(path.join(container, '.gitignore'), { force: true }).catch(() => undefined);
     const removed = await fs.promises
       .rmdir(container)
       .then(() => true)
       .catch(() => false);
 
-    if (removed) {
-      // The memo is what stops ensureGitignore rewriting the file. Without
-      // this, a later paste into the same directory would silently arrive
-      // un-ignored for the rest of the process's life.
-      this.ignoredDirs.delete(container);
+    // The memo is what stops ensureGitignore rewriting the file, so it has to
+    // be dropped either way: on success so a recreated directory is ignored
+    // again, on failure so the restore below is allowed to proceed.
+    this.ignoredDirs.delete(container);
+
+    if (!removed) {
+      // Something raced in, or the directory could not be removed. Put the
+      // marker back rather than leave the images inside it visible to git.
+      await this.ensureGitignore(container);
     }
   }
 
