@@ -207,12 +207,17 @@ export function TabBar({ tabs = [], activeId, onSelect, onClose, onNew, ariaLabe
           />
         ))}
       </div>
-      <button
-        type="button"
-        onClick={onNew} onMouseEnter={() => setHoverNew(true)} onMouseLeave={() => setHoverNew(false)}
-        aria-label="New tab" title="New tab"
-        style={newStyle}
-      >+</button>
+      {/* Rendered only when there is something to do. Without a handler it was
+          still a focusable control announcing itself as "New tab" and doing
+          nothing when activated — the same defect as the sidebar's "+". */}
+      {onNew ? (
+        <button
+          type="button"
+          onClick={onNew} onMouseEnter={() => setHoverNew(true)} onMouseLeave={() => setHoverNew(false)}
+          aria-label="New tab" title="New tab"
+          style={newStyle}
+        >+</button>
+      ) : null}
       <div style={{ flex: 1 }} />
     </div>
   );

@@ -24,10 +24,13 @@ function tabLabel(t: TabsItem): React.ReactNode {
 
 export function Tabs({ tabs = [], value, onChange, style }: TabsProps) {
   const first = tabs[0] !== undefined ? tabValue(tabs[0]) : undefined;
-  const [internal, setInternal] = React.useState<string | undefined>(
-    value != null ? value : first,
-  );
-  const cur = value != null ? value : internal;
+  // Only `undefined` means uncontrolled. `null` is a value the prop type
+  // admits, and it means "controlled, with nothing selected" — treating it as
+  // uncontrolled left a parent no way to clear the selection, because the
+  // component would quietly fall back to its own last choice.
+  const isControlled = value !== undefined;
+  const [internal, setInternal] = React.useState<string | undefined>(first);
+  const cur = isControlled ? value : internal;
   const set = (v: string): void => {
     setInternal(v);
     onChange && onChange(v);

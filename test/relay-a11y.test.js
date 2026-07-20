@@ -24,6 +24,7 @@ before(function () {
     `export { Separator } from ${JSON.stringify(path.join(ROOT, 'src/client/ui/relay/Separator'))};`,
     `export { Dialog } from ${JSON.stringify(path.join(ROOT, 'src/client/ui/relay/Dialog'))};`,
     `export { ProfileSidebar } from ${JSON.stringify(path.join(ROOT, 'src/client/ui/relay/ProfileSidebar'))};`,
+    `export { Tabs } from ${JSON.stringify(path.join(ROOT, 'src/client/ui/relay/Tabs'))};`,
   ].join('\n');
 
   const out = path.join(os.tmpdir(), `relay-a11y-${process.pid}.js`);
@@ -130,6 +131,48 @@ describe('Relay accessibility guards', function () {
     } else {
       assert.ok(/aria-label="/.test(html), 'a dialog must be labelled somehow');
     }
+  });
+
+  it('does not offer a New tab button with nothing behind it', function () {
+    // Same defect as the sidebar "+": a focusable control announcing itself as
+    // "New tab" that does nothing when activated.
+    const { renderToStaticMarkup, React, TabBar } = mod;
+    const withoutHandler = renderToStaticMarkup(
+      React.createElement(TabBar, { tabs: [{ id: 'a', title: 'one' }], activeId: 'a' }),
+    );
+    assert.ok(
+      !/aria-label="New tab"/.test(withoutHandler),
+      'no New tab control should render when there is no onNew handler',
+    );
+
+    const withHandler = renderToStaticMarkup(
+      React.createElement(TabBar, {
+        tabs: [{ id: 'a', title: 'one' }], activeId: 'a', onNew() {},
+      }),
+    );
+    assert.ok(
+      /aria-label="New tab"/.test(withHandler),
+      'the New tab control should render when a handler is supplied',
+    );
+  });
+
+  it('lets a parent control Tabs with no selection', function () {
+    // `value` is typed `string | null`, so null has to mean "controlled, and
+    // nothing selected". Treating it as uncontrolled left the component falling
+    // back to its own last pick, which a parent could not override.
+    const { renderToStaticMarkup, React, Tabs } = mod;
+    const tabs = [{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }];
+
+    const cleared = renderToStaticMarkup(React.createElement(Tabs, { tabs, value: null }));
+    const selected = renderToStaticMarkup(React.createElement(Tabs, { tabs, value: 'b' }));
+    const uncontrolled = renderToStaticMarkup(React.createElement(Tabs, { tabs }));
+
+    assert.notStrictEqual(
+      cleared,
+      uncontrolled,
+      'value={null} must not render the same as an uncontrolled Tabs, which selects the first tab',
+    );
+    assert.notStrictEqual(cleared, selected, 'value={null} must not select a tab');
   });
 
   it('does not render a decorative sidebar + that looks clickable', function () {
