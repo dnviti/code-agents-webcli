@@ -275,10 +275,41 @@ export class MessageProcessor {
     const previousOutputBuffer = [...session.outputBuffer];
     session.outputBuffer = [];
 
+    // Only these keys are accepted from the client. Spreading the raw client
+    // object would let it override onOutput/onExit/onError (non-function values
+    // are then invoked inside node-pty handlers, taking down the process) and
+    // override workingDir, escaping the validated per-session sandbox.
+    const safeOptions: Record<string, unknown> = {};
+    if (options.mode === 'command' || options.mode === 'shell') {
+      safeOptions.mode = options.mode;
+    }
+    if (typeof options.shell === 'string') {
+      safeOptions.shell = options.shell;
+    }
+    if (typeof options.command === 'string') {
+      safeOptions.command = options.command;
+    }
+    if (options.dangerouslySkipPermissions === true) {
+      safeOptions.dangerouslySkipPermissions = true;
+    }
+    if (typeof options.cols === 'number' && Number.isFinite(options.cols)) {
+      safeOptions.cols = options.cols;
+    }
+    if (typeof options.rows === 'number' && Number.isFinite(options.rows)) {
+      safeOptions.rows = options.rows;
+    }
+
+    // Identifies this particular run, so a late callback from a previous run
+    // cannot mark the current one dead and orphan its PTY.
+    const runId = randomUUID();
+
     try {
       const runtimeSession = (await bridge.startSession(sessionId, {
+        ...safeOptions,
         workingDir: session.workingDir,
         onOutput: (data: string) => {
+          const currentSession = this.deps.claudeSessions.get(sessionId);
+          if (!currentSession || currentSession.runId !== runId) return;
           this.appendOutputToSession(sessionId, data);
           broadcastToSession(
             sessionId,
@@ -289,7 +320,7 @@ export class MessageProcessor {
         },
         onExit: (code: number | null, signal: string | null) => {
           const currentSession = this.deps.claudeSessions.get(sessionId);
-          if (!currentSession) return;
+          if (!currentSession || currentSession.runId !== runId) return;
 
           const stopRequested = currentSession.stopRequested;
           currentSession.active = false;
@@ -314,7 +345,7 @@ export class MessageProcessor {
         },
         onError: (error: Error) => {
           const currentSession = this.deps.claudeSessions.get(sessionId);
-          if (!currentSession) return;
+          if (!currentSession || currentSession.runId !== runId) return;
 
           const stopRequested = currentSession.stopRequested;
           currentSession.active = false;
@@ -334,9 +365,9 @@ export class MessageProcessor {
             );
           }
         },
-        ...options,
       })) as RuntimeSession;
 
+      session.runId = runId;
       session.active = true;
       session.agent = agentKind;
       session.lastAgent = agentKind;

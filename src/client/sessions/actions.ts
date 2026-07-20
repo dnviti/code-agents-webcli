@@ -74,6 +74,13 @@ export async function joinSession(app: App, sessionId: string): Promise<void> {
   }
 
   return new Promise<void>((resolve) => {
+    // A second join overwrites the stored resolver, so settle the previous one
+    // first: otherwise its promise (and anything awaiting the tab switch)
+    // hangs forever.
+    if (app.pendingJoinResolve) {
+      app.pendingJoinResolve();
+    }
+
     app.pendingJoinResolve = resolve;
     app.pendingJoinSessionId = sessionId;
 
@@ -81,11 +88,12 @@ export async function joinSession(app: App, sessionId: string): Promise<void> {
     app.requestUsageStats();
 
     setTimeout(() => {
-      if (app.pendingJoinResolve) {
+      // Only clear the slot if it is still ours; always settle this promise.
+      if (app.pendingJoinResolve === resolve) {
         app.pendingJoinResolve = null;
         app.pendingJoinSessionId = null;
-        resolve();
       }
+      resolve();
     }, 2000);
   });
 }

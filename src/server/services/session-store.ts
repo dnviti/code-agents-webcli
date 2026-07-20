@@ -48,7 +48,7 @@ export class SessionStore {
     try {
       const db = this.database.raw;
       const insert = db.prepare(`
-        INSERT INTO runtime_sessions (
+        INSERT OR REPLACE INTO runtime_sessions (
           id,
           owner_user_id,
           name,
@@ -86,11 +86,19 @@ export class SessionStore {
         )
       `);
 
+      // Upsert the current rows, then delete only the ids that are genuinely
+      // gone. The previous DELETE-everything-then-reinsert meant any save with
+      // a partial or empty in-memory map destroyed every other persisted
+      // session.
+      const deleteMissing = db.prepare(
+        'DELETE FROM runtime_sessions WHERE id NOT IN (SELECT value FROM json_each(?))',
+      );
+
       const replaceAll = db.transaction((sessionRows: Array<Record<string, unknown>>) => {
-        db.prepare('DELETE FROM runtime_sessions').run();
         for (const row of sessionRows) {
           insert.run(row);
         }
+        deleteMissing.run(JSON.stringify(sessionRows.map((row) => row.id)));
       });
 
       const rows = Array.from(sessions.values()).map((session) => ({

@@ -91,6 +91,22 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     const { name, workingDir } = req.body;
     const sessionId = randomUUID();
 
+    // The name is bound into a SQLite statement on every autosave. A non-string
+    // makes better-sqlite3 throw inside the replaceAll transaction, which runs
+    // after a DELETE, so one bad value would wipe every user's persisted
+    // sessions on the next save.
+    if (name !== undefined && typeof name !== 'string') {
+      res.status(400).json({ error: 'invalid_name', message: 'Session name must be a string' });
+      return;
+    }
+    if (workingDir !== undefined && workingDir !== null && typeof workingDir !== 'string') {
+      res.status(400).json({
+        error: 'invalid_working_dir',
+        message: 'Working directory must be a string',
+      });
+      return;
+    }
+
     let validWorkingDir = deps.baseFolder;
     if (workingDir) {
       const validation = deps.validatePath(workingDir);

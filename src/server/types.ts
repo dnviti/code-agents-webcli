@@ -21,6 +21,7 @@ export interface ServerOptions {
   githubClientSecret?: string;
   githubAppToken?: string;
   allowedGitHubIds?: string;
+  allowAnyGitHubUser?: boolean;
   dataDir?: string;
 }
 
@@ -42,6 +43,8 @@ export interface SessionRecord {
   runtimeLabel: string | null;
   terminalOptions: TerminalOptions | null;
   stopRequested: boolean;
+  /** Identifies the current PTY run so late callbacks from a previous run are ignored. */
+  runId?: string;
   workingDir: string;
   connections: Set<string>;
   outputBuffer: string[];
@@ -122,6 +125,7 @@ export interface ServerState {
   githubClientSecret: string | null;
   githubAppToken: string | null;
   allowedGitHubIds: string[];
+  allowAnyGitHubUser: boolean;
   dataDir: string | null;
   sessionDurationHours: number;
   aliases: Aliases;

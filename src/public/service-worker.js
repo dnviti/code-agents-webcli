@@ -65,13 +65,22 @@ self.addEventListener('fetch', (event) => {
         }
         return response;
       })
-      .catch(() => caches.match(request).then((response) => {
+      .catch(() => caches.match(request).then(async (response) => {
         if (response) {
           return response;
         }
 
         if (request.mode === 'navigate') {
-          return caches.match('/index.html');
+          // caches.match resolves to undefined on a miss, and respondWith()
+          // with undefined surfaces as a network error rather than the shell.
+          const shell = await caches.match('/index.html');
+          if (shell) {
+            return shell;
+          }
+          return new Response(
+            '<h1>Offline</h1><p>This app is not available offline yet.</p>',
+            { status: 503, headers: { 'Content-Type': 'text/html' } },
+          );
         }
 
         return new Response('Resource not available offline', { status: 404 });

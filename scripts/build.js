@@ -76,7 +76,40 @@ async function build() {
     copyDir(cssSrc, cssDest);
   }
 
+  // Vendor xterm's stylesheet locally. Loading it from unpkg made the terminal
+  // unusable on any network that cannot reach the CDN.
+  const xtermCss = path.join(
+    __dirname, '..', 'node_modules', '@xterm', 'xterm', 'css', 'xterm.css'
+  );
+  if (fs.existsSync(xtermCss)) {
+    fs.mkdirSync(path.join(cssDest, 'vendor'), { recursive: true });
+    fs.copyFileSync(xtermCss, path.join(cssDest, 'vendor', 'xterm.css'));
+  } else {
+    console.warn('[assets] WARNING: @xterm/xterm/css/xterm.css not found; terminal styling will be missing.');
+  }
+
   console.log('[assets] Done.\n');
+
+  if (isWatch) {
+    // esbuild only watches the TS entry graph, so HTML/CSS edits were
+    // invisible until a full rebuild.
+    console.log('[assets] Watching public assets for changes...');
+    fs.watch(publicSrc, { recursive: true }, (_event, filename) => {
+      if (!filename) return;
+      const src = path.join(publicSrc, filename);
+      const dest = path.join(publicDest, filename);
+      try {
+        if (!fs.existsSync(src)) return;
+        if (fs.statSync(src).isDirectory()) return;
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(src, dest);
+        console.log(`[assets] Updated ${filename}`);
+      } catch (error) {
+        console.error(`[assets] Failed to copy ${filename}:`, error.message);
+      }
+    });
+  }
+
   console.log('Build complete!');
 }
 

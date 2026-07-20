@@ -372,8 +372,14 @@ export class SplitContainer {
 
     this.activeSplitIndex = 0;
 
-    if (this.app.currentClaudeSessionId) {
-      setTimeout(() => this.app.connect(), 100);
+    // Reattach the main socket to the session the user was last focused on.
+    // Reconnecting without the id left the socket joined to whichever session
+    // it had before the split, so keystrokes went to the wrong terminal.
+    const resumeSessionId = this.app.currentClaudeSessionId;
+    if (resumeSessionId) {
+      setTimeout(() => {
+        void this.app.connect(resumeSessionId);
+      }, 100);
     }
 
     this.saveState();
@@ -408,6 +414,15 @@ export class SplitContainer {
 
   async onTabSwitch(sessionId: string): Promise<void> {
     if (!this.enabled) return;
+
+    // Showing one session in both panes duplicates its output stream; focus the
+    // pane that already holds it instead.
+    const otherIndex = this.activeSplitIndex === 0 ? 1 : 0;
+    if (this.splits[otherIndex]?.sessionId === sessionId) {
+      this.focusSplit(otherIndex);
+      return;
+    }
+
     const activeSplit = this.splits[this.activeSplitIndex];
     if (activeSplit) await activeSplit.setSession(sessionId);
   }

@@ -32,6 +32,9 @@ export function createConfig(options: ServerOptions): ServerState {
       .split(',')
       .map((value) => value.trim())
       .filter(Boolean),
+    allowAnyGitHubUser:
+      options.allowAnyGitHubUser === true ||
+      process.env.GITHUB_ALLOW_ANY_USER === 'true',
     dataDir: options.dataDir || process.env.CODE_AGENTS_WEBCLI_DATA_DIR || null,
     sessionDurationHours,
     aliases,

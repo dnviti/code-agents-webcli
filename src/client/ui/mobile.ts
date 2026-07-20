@@ -217,16 +217,26 @@ export function renderMobileSessionList(app: App): void {
     const clientsText =
       session.connectedClients === 1 ? '1 client' : `${session.connectedClients} clients`;
 
+    // Session names and working directories are user-controlled and shared
+    // across users, so escape them before they reach innerHTML.
+    const escapeHtml = (value: string): string =>
+      value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+
     const folderIcon = icons.folder(14);
     const workingDirHtml = session.workingDir
-      ? `<div class="session-folder" title="${session.workingDir}"><span class="icon" aria-hidden="true">${folderIcon}</span> ${session.workingDir.split('/').pop() || '/'}</div>`
+      ? `<div class="session-folder" title="${escapeHtml(session.workingDir)}"><span class="icon" aria-hidden="true">${folderIcon}</span> ${escapeHtml(session.workingDir.split('/').pop() || '/')}</div>`
       : '';
 
     sessionItem.innerHTML = `
       <div class="session-info">
         <span class="session-status">${statusIcon}</span>
         <div class="session-details">
-          <div class="session-name">${session.name}</div>
+          <div class="session-name">${escapeHtml(session.name)}</div>
           <div class="session-meta">${clientsText} &bull; ${new Date(session.created).toLocaleTimeString()}</div>
           ${workingDirHtml}
         </div>

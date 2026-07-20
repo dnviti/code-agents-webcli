@@ -3,12 +3,13 @@ import { BaseBridge, StartSessionOptions } from './base.js';
 
 export class ClaudeBridge extends BaseBridge {
   protected getCommandCandidates(): string[] {
+    // The running user's own install must win: a hardcoded foreign home
+    // directory used to be probed first.
     return [
-      '/home/ec2-user/.claude/local/claude',
-      'claude',
-      'claude-code',
       path.join(process.env.HOME || '/', '.claude', 'local', 'claude'),
       path.join(process.env.HOME || '/', '.local', 'bin', 'claude'),
+      'claude',
+      'claude-code',
       '/usr/local/bin/claude',
       '/usr/bin/claude',
     ];

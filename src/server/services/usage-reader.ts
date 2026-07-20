@@ -134,6 +134,16 @@ export class UsageReader {
     overlapEnd: Date;
   }> = [];
 
+  /** Parsed entries per file, invalidated when the file's mtime or size changes. */
+  private fileCache = new Map<
+    string,
+    { mtimeMs: number; size: number; entries: UsageEntry[] }
+  >();
+  private entriesCache: UsageEntry[] | null = null;
+  private entriesCacheTime = 0;
+  private entriesCacheTimeout = 5000;
+  private entriesCachePromise: Promise<UsageEntry[]> | null = null;
+
   constructor(sessionDurationHours: number = 5) {
     this.claudeProjectsPath = path.join(
       process.env.HOME || '',
@@ -141,6 +151,92 @@ export class UsageReader {
       'projects',
     );
     this.sessionDurationHours = sessionDurationHours;
+  }
+
+  /**
+   * Read the whole corpus once and slice by cutoff in memory. Every usage poll
+   * used to trigger four independent full scans that streamed and JSON.parsed
+   * every line of every project transcript.
+   */
+  async getAllEntries(): Promise<UsageEntry[]> {
+    const now = Date.now();
+    if (
+      this.entriesCache &&
+      now - this.entriesCacheTime < this.entriesCacheTimeout
+    ) {
+      return this.entriesCache;
+    }
+    if (this.entriesCachePromise) {
+      return this.entriesCachePromise;
+    }
+
+    this.entriesCachePromise = (async () => {
+      try {
+        const files = await this.findJsonlFiles();
+        const perFile = await Promise.all(
+          files.map((file) => this.readJsonlFileCached(file)),
+        );
+
+        // Deduplicate across the whole corpus: the same message can appear in
+        // more than one transcript, and a per-file set double counts it.
+        const seen = new Set<string>();
+        const entries: UsageEntry[] = [];
+        for (const fileEntries of perFile) {
+          for (const entry of fileEntries) {
+            const hash =
+              entry.messageId && entry.requestId
+                ? `${entry.messageId}:${entry.requestId}`
+                : null;
+            if (hash) {
+              if (seen.has(hash)) continue;
+              seen.add(hash);
+            }
+            entries.push(entry);
+          }
+        }
+
+        entries.sort(
+          (a, b) =>
+            new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+        );
+
+        const live = new Set(files);
+        for (const key of this.fileCache.keys()) {
+          if (!live.has(key)) this.fileCache.delete(key);
+        }
+
+        this.entriesCache = entries;
+        this.entriesCacheTime = Date.now();
+        return entries;
+      } finally {
+        this.entriesCachePromise = null;
+      }
+    })();
+
+    return this.entriesCachePromise;
+  }
+
+  /** Re-parse a transcript only when it actually changed. */
+  private async readJsonlFileCached(filePath: string): Promise<UsageEntry[]> {
+    let stat;
+    try {
+      stat = await fs.stat(filePath);
+    } catch {
+      return [];
+    }
+
+    const cached = this.fileCache.get(filePath);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      return cached.entries;
+    }
+
+    const entries = await this.readJsonlFile(filePath, new Date(0));
+    this.fileCache.set(filePath, {
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      entries,
+    });
+    return entries;
   }
 
   normalizeModelName(model: string | undefined | null): string {
@@ -370,26 +466,12 @@ export class UsageReader {
   }
 
   async readAllEntries(cutoffTime: Date): Promise<UsageEntry[]> {
-    const entries: UsageEntry[] = [];
-
     try {
-      const files = await this.findJsonlFiles();
-
-      for (const file of files) {
-        const fileEntries = await this.readJsonlFile(
-          file,
-          cutoffTime,
-        );
-        entries.push(...fileEntries);
-      }
-
-      entries.sort(
-        (a, b) =>
-          new Date(a.timestamp).getTime() -
-          new Date(b.timestamp).getTime(),
+      const all = await this.getAllEntries();
+      const cutoff = cutoffTime.getTime();
+      return all.filter(
+        (entry) => new Date(entry.timestamp).getTime() >= cutoff,
       );
-
-      return entries;
     } catch (error) {
       console.error('Error reading entries:', error);
       return [];
@@ -399,26 +481,9 @@ export class UsageReader {
   async readRecentEntries(
     cutoffTime: Date,
   ): Promise<UsageEntry[]> {
-    const entries: UsageEntry[] = [];
-
     try {
-      const files = await this.findJsonlFiles(true);
-
-      for (const file of files) {
-        const fileEntries = await this.readJsonlFile(
-          file,
-          cutoffTime,
-        );
-        entries.push(...fileEntries);
-      }
-
-      entries.sort(
-        (a, b) =>
-          new Date(a.timestamp).getTime() -
-          new Date(b.timestamp).getTime(),
-      );
-
-      return entries;
+      // Same corpus and same cache; the cutoff already restricts the range.
+      return await this.readAllEntries(cutoffTime);
     } catch (error) {
       console.error('Error reading recent entries:', error);
       return [];
@@ -480,42 +545,51 @@ export class UsageReader {
   ): Promise<string[]> {
     const files: string[] = [];
 
-    try {
-      const projectDirs = await fs.readdir(
-        this.claudeProjectsPath,
-      );
-
-      for (const projectDir of projectDirs) {
-        const projectPath = path.join(
-          this.claudeProjectsPath,
-          projectDir,
-        );
-        const stat = await fs.stat(projectPath);
-
-        if (stat.isDirectory()) {
-          const projectFiles = await fs.readdir(projectPath);
-          const jsonlFiles = projectFiles.filter((f) =>
-            f.endsWith('.jsonl'),
-          );
-
-          for (const jsonlFile of jsonlFiles) {
-            const filePath = path.join(projectPath, jsonlFile);
-
-            if (onlyRecent) {
-              const fileStat = await fs.stat(filePath);
-              const hoursSinceModified =
-                (Date.now() - fileStat.mtime.getTime()) /
-                (1000 * 60 * 60);
-
-              if (hoursSinceModified <= 24) {
-                files.push(filePath);
-              }
-            } else {
-              files.push(filePath);
-            }
-          }
-        }
+    // Walk the tree: subagent transcripts live in nested directories and a
+    // single-level scan silently excluded them from every usage number.
+    const walk = async (dir: string): Promise<void> => {
+      let dirents;
+      try {
+        dirents = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        // One unreadable directory must not abort the whole scan.
+        return;
       }
+
+      await Promise.all(
+        dirents.map(async (dirent) => {
+          const entryPath = path.join(dir, dirent.name);
+
+          if (dirent.isDirectory()) {
+            await walk(entryPath);
+            return;
+          }
+
+          if (!dirent.isFile() || !dirent.name.endsWith('.jsonl')) {
+            return;
+          }
+
+          if (!onlyRecent) {
+            files.push(entryPath);
+            return;
+          }
+
+          try {
+            const fileStat = await fs.stat(entryPath);
+            const hoursSinceModified =
+              (Date.now() - fileStat.mtime.getTime()) / (1000 * 60 * 60);
+            if (hoursSinceModified <= 24) {
+              files.push(entryPath);
+            }
+          } catch {
+            // Skip files that vanished mid-scan.
+          }
+        }),
+      );
+    };
+
+    try {
+      await walk(this.claudeProjectsPath);
     } catch (error) {
       console.error('Error finding JSONL files:', error);
     }

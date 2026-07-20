@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { PathValidation, SessionRecord, AuthContext, AuthenticatedUser } from '../types.js';
 
@@ -16,7 +17,7 @@ export interface FolderRoutesDeps {
 export function createFolderRoutes(deps: FolderRoutesDeps): Router {
   const router = Router();
 
-  router.post('/api/create-folder', (req: Request, res: Response): void => {
+  router.post('/api/create-folder', async (req: Request, res: Response): Promise<void> => {
     const user = requireUser(res);
     if (!user) {
       res.status(401).json({ error: 'authentication_required' });
@@ -55,12 +56,15 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
     }
 
     try {
-      if (fs.existsSync(fullValidation.path!)) {
+      // Async fs: these handlers share the event loop with every user's live
+      // terminal, so a slow or networked directory would stall all of them.
+      const exists = await fsp.access(fullValidation.path!).then(() => true).catch(() => false);
+      if (exists) {
         res.status(409).json({ message: 'Folder already exists' });
         return;
       }
 
-      fs.mkdirSync(fullValidation.path!, { recursive: true });
+      await fsp.mkdir(fullValidation.path!, { recursive: true });
 
       res.json({
         success: true,
@@ -76,7 +80,7 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
     }
   });
 
-  router.get('/api/folders', (_req: Request, res: Response): void => {
+  router.get('/api/folders', async (_req: Request, res: Response): Promise<void> => {
     const user = requireUser(res);
     if (!user) {
       res.status(401).json({ error: 'authentication_required' });
@@ -101,7 +105,7 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
     const currentPath = validation.path!;
 
     try {
-      const items = fs.readdirSync(currentPath, { withFileTypes: true });
+      const items = await fsp.readdir(currentPath, { withFileTypes: true });
       const folders = items
         .filter((item) => item.isDirectory())
         .filter((item) => !item.name.startsWith('.') || req.query.showHidden === 'true')
@@ -123,15 +127,16 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
         baseFolder: deps.baseFolder,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      // fs errors embed absolute paths and errno detail; keep that server-side.
+      console.error('Cannot access directory:', error);
       res.status(403).json({
         error: 'Cannot access directory',
-        message,
+        message: 'Cannot access directory',
       });
     }
   });
 
-  router.post('/api/set-working-dir', (req: Request, res: Response): void => {
+  router.post('/api/set-working-dir', async (req: Request, res: Response): Promise<void> => {
     const user = requireUser(res);
     if (!user) {
       res.status(401).json({ error: 'authentication_required' });
@@ -155,12 +160,17 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
     const validatedPath = validation.path!;
 
     try {
-      if (!fs.existsSync(validatedPath)) {
-        res.status(404).json({ error: 'Directory does not exist' });
-        return;
+      let stats;
+      try {
+        stats = await fsp.stat(validatedPath);
+      } catch (statError) {
+        if ((statError as NodeJS.ErrnoException).code === 'ENOENT') {
+          res.status(404).json({ error: 'Directory does not exist' });
+          return;
+        }
+        throw statError;
       }
 
-      const stats = fs.statSync(validatedPath);
       if (!stats.isDirectory()) {
         res.status(400).json({ error: 'Path is not a directory' });
         return;
@@ -193,7 +203,7 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
     }
   });
 
-  router.post('/api/folders/select', (req: Request, res: Response): void => {
+  router.post('/api/folders/select', async (req: Request, res: Response): Promise<void> => {
     const user = requireUser(res);
     if (!user) {
       res.status(401).json({ error: 'authentication_required' });
@@ -212,7 +222,8 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
       }
 
       const validatedPath = validation.path!;
-      if (!fs.existsSync(validatedPath) || !fs.statSync(validatedPath).isDirectory()) {
+      const isDir = await fsp.stat(validatedPath).then((s2) => s2.isDirectory()).catch(() => false);
+      if (!isDir) {
         res.status(400).json({ error: 'Invalid directory path' });
         return;
       }

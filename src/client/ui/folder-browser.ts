@@ -115,12 +115,22 @@ export class FolderBrowser {
     data.folders.forEach((folder) => {
       const folderItem = document.createElement('div');
       folderItem.className = 'folder-item';
-      folderItem.innerHTML = `
+
+      // Directory names are attacker-controllable (any signed-in user can
+      // create one) and this is a shared multiuser browser, so the name must
+      // never be parsed as HTML. Only the static icon uses innerHTML.
+      const icon = document.createElement('span');
+      icon.innerHTML = `
         <svg class="folder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
         </svg>
-        <span class="folder-name">${folder.name}</span>
       `;
+
+      const name = document.createElement('span');
+      name.className = 'folder-name';
+      name.textContent = folder.name;
+
+      folderItem.append(icon, name);
       folderItem.addEventListener('click', () => this.loadFolders(folder.path));
       folderList.appendChild(folderItem);
     });

@@ -14,6 +14,8 @@ export class WebSocketConnection {
 
   private readonly heartbeatIntervalMs = 30000;
   private readonly pongTimeoutMs = 10000;
+  /** Retry cadence once the fast exponential backoff budget is spent. */
+  private readonly slowReconnectDelayMs = 30000;
 
   constructor(app: App) {
     this.app = app;
@@ -216,13 +218,18 @@ export class WebSocketConnection {
       return;
     }
 
-    if (this.app.reconnectAttempts >= this.app.maxReconnectAttempts) {
-      showError('Connection lost. Please check your network and try again.');
-      return;
+    // Past the fast-retry budget, keep retrying slowly instead of giving up
+    // forever: a laptop resuming from sleep or a brief server restart should
+    // recover without the user reloading the page.
+    const exhausted = this.app.reconnectAttempts >= this.app.maxReconnectAttempts;
+    if (exhausted) {
+      showError('Connection lost. Retrying in the background...');
     }
 
     const attempt = this.app.reconnectAttempts;
-    const delay = this.app.reconnectDelay * Math.pow(2, attempt);
+    const delay = exhausted
+      ? this.slowReconnectDelayMs
+      : this.app.reconnectDelay * Math.pow(2, attempt);
     this.app.reconnectAttempts++;
 
     console.warn(
