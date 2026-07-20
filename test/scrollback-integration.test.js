@@ -49,7 +49,10 @@ describe('scrollback integration (real PTY)', function () {
         onGap: (dropped) => gaps.push(dropped),
       });
 
-      const term = pty.spawn('/bin/bash', ['-lc', `${command}; echo "${SENTINEL}"`], {
+      // Deliberately not a login shell: `-l` sources the system and user
+      // profiles, which on a CI image pull in version managers and can take
+      // tens of seconds on the first invocation. Nothing here needs them.
+      const term = pty.spawn('/bin/bash', ['-c', `${command}; echo "${SENTINEL}"`], {
         cols,
         rows,
         name: 'xterm-256color',
