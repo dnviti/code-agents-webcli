@@ -238,21 +238,8 @@ export class App {
   // ---------------------------------------------------------------------------
 
   private setupUI(): void {
-    const startBtn = document.getElementById('startBtn');
-    const dangerousSkipBtn = document.getElementById('dangerousSkipBtn');
-    const startCodexBtn = document.getElementById('startCodexBtn');
-    const dangerousCodexBtn = document.getElementById('dangerousCodexBtn');
-    const startAgentBtn = document.getElementById('startAgentBtn');
-    const startPiBtn = document.getElementById('startPiBtn');
-    const startGrokBtn = document.getElementById('startGrokBtn');
-    const dangerousGrokBtn = document.getElementById('dangerousGrokBtn');
-    const startQwenBtn = document.getElementById('startQwenBtn');
-    const dangerousQwenBtn = document.getElementById('dangerousQwenBtn');
-    const startKimiBtn = document.getElementById('startKimiBtn');
-    const dangerousKimiBtn = document.getElementById('dangerousKimiBtn');
-    const startTerminalBtn = document.getElementById('startTerminalBtn');
-    const closeStartPromptBtn = document.getElementById('closeStartPromptBtn');
-    const cancelStartPromptBtn = document.getElementById('cancelStartPromptBtn');
+    // The runtime buttons are gone from the markup: RuntimeLauncher renders
+    // that picker now and calls the same start*Session methods directly.
     const settingsBtn = document.getElementById('settingsBtn');
     const retryBtn = document.getElementById('retryBtn');
     const closeMenuBtn = document.getElementById('closeMenuBtn');
@@ -263,39 +250,6 @@ export class App {
     const clearBtnMobile = document.getElementById('clearBtnMobile');
     const attachImageBtnMobile = document.getElementById('attachImageBtnMobile');
 
-    startBtn?.addEventListener('click', () => this.startClaudeSession());
-    dangerousSkipBtn?.addEventListener('click', () =>
-      this.startClaudeSession({ dangerouslySkipPermissions: true }),
-    );
-    startCodexBtn?.addEventListener('click', () => this.startCodexSession());
-    dangerousCodexBtn?.addEventListener('click', () =>
-      this.startCodexSession({ dangerouslySkipPermissions: true }),
-    );
-    startAgentBtn?.addEventListener('click', () => this.startAgentSession());
-    startPiBtn?.addEventListener('click', () => this.startPiSession());
-    startGrokBtn?.addEventListener('click', () => this.startGrokSession());
-    dangerousGrokBtn?.addEventListener('click', () =>
-      this.startGrokSession({ dangerouslySkipPermissions: true }),
-    );
-    startQwenBtn?.addEventListener('click', () => this.startQwenSession());
-    dangerousQwenBtn?.addEventListener('click', () =>
-      this.startQwenSession({ dangerouslySkipPermissions: true }),
-    );
-    startKimiBtn?.addEventListener('click', () => this.startKimiSession());
-    dangerousKimiBtn?.addEventListener('click', () =>
-      this.startKimiSession({ dangerouslySkipPermissions: true }),
-    );
-    startTerminalBtn?.addEventListener('click', () => this.showTerminalOptionsModal());
-    const cancelStartPrompt = async () => {
-      if (!this.currentClaudeSessionId) {
-        hideOverlay();
-        return;
-      }
-
-      await this.deleteSession(this.currentClaudeSessionId, { confirm: false });
-    };
-    closeStartPromptBtn?.addEventListener('click', () => void cancelStartPrompt());
-    cancelStartPromptBtn?.addEventListener('click', () => void cancelStartPrompt());
     settingsBtn?.addEventListener('click', () => this.showSettings());
     retryBtn?.addEventListener('click', () => this.wsConnection.reconnect());
 
@@ -499,6 +453,22 @@ export class App {
 
   closeSession(): Promise<void> {
     return sessionsCloseSession(this);
+  }
+
+  /**
+   * Back out of the runtime picker.
+   *
+   * Choosing a working directory creates the session before the runtime is
+   * picked, so cancelling has to delete it again — otherwise an empty session
+   * is left behind on the server every time someone changes their mind.
+   */
+  async cancelStartPrompt(): Promise<void> {
+    if (!this.currentClaudeSessionId) {
+      hideOverlay();
+      return;
+    }
+
+    await this.deleteSession(this.currentClaudeSessionId, { confirm: false });
   }
 
   // UI shortcuts

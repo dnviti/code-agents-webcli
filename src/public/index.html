@@ -182,30 +182,14 @@
                     <div class="spinner"></div>
                     <p>Connecting to Claude Code...</p>
                 </div>
+                <!--
+                  The runtime picker is rendered here by RuntimeLauncher. Only
+                  the contents changed: showOverlay('startPrompt') and
+                  hideOverlay() still drive it, so every session-creation path
+                  (folder pick, cancel, reconnect, join) is untouched.
+                -->
                 <div class="start-prompt" id="startPrompt" style="display: none;">
-                    <div class="start-prompt-header">
-                        <h2>Launch a Runtime</h2>
-                        <button class="close-btn" id="closeStartPromptBtn" title="Cancel new session">&times;</button>
-                    </div>
-                    <p>Pick the workflow for this repository. The shell and terminal colors stay in sync with your selected GitHub theme.</p>
-                    <div class="start-buttons">
-                        <button id="startBtn" class="btn btn-primary">Start Claude</button>
-                        <button id="dangerousSkipBtn" class="btn btn-danger" title="Dangerously skip permissions. Use with caution.">Dangerous Claude</button>
-                        <button id="startCodexBtn" class="btn btn-primary">Start Codex</button>
-                        <button id="dangerousCodexBtn" class="btn btn-danger" title="Bypass approvals and sandbox. Use with caution.">Dangerous Codex</button>
-                        <button id="startAgentBtn" class="btn btn-primary">Start Cursor</button>
-                        <button id="startPiBtn" class="btn btn-primary">Start Pi</button>
-                        <button id="startGrokBtn" class="btn btn-primary">Start Grok</button>
-                        <button id="dangerousGrokBtn" class="btn btn-danger" title="Auto-approve every tool execution. Use with caution.">Dangerous Grok</button>
-                        <button id="startQwenBtn" class="btn btn-primary">Start Qwen</button>
-                        <button id="dangerousQwenBtn" class="btn btn-danger" title="Auto-accept every action (YOLO mode). Use with caution.">Dangerous Qwen</button>
-                        <button id="startKimiBtn" class="btn btn-primary">Start Kimi</button>
-                        <button id="dangerousKimiBtn" class="btn btn-danger" title="Automatically approve all actions. Use with caution.">Dangerous Kimi</button>
-                        <button id="startTerminalBtn" class="btn btn-secondary">Start Terminal</button>
-                    </div>
-                    <div class="start-prompt-actions">
-                        <button id="cancelStartPromptBtn" class="btn btn-secondary">Cancel New Session</button>
-                    </div>
+                    <div id="runtimeLauncherRoot"></div>
                 </div>
                 <div class="error-message" id="errorMessage" style="display: none;">
                     <h3>Connection Error</h3>

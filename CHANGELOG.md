@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Changed
+- **The runtime picker is a Relay screen.** The thirteen buttons are now one card per runtime,
+  each showing the command its bridge looks for (`claude`, `cursor-agent`, `qwen`, `kimi`, …) so a
+  CLI that is not installed is diagnosable at a glance. Starting a runtime without approval prompts
+  is a separate control inside the card rather than a second button beside it, so aiming at the card
+  cannot trigger it, and it names what the runtime will actually do — "auto-accepts every action"
+  rather than the word "dangerous". Cursor and pi have no such control, because their CLIs have no
+  tool-approval bypass to offer.
+
 - **The UI now uses the Relay design system**, whose semantic tokens are shadcn's own
   (`--background`, `--foreground`, `--primary`, `--muted`, `--destructive`, `--border`, …). The
   chrome — title bar, tab strip, sessions sidebar, status bar and a Ctrl/Cmd-K command palette — is
