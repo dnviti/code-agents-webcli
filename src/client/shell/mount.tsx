@@ -35,11 +35,15 @@ export function readStoredTheme(): 'dark' | 'light' {
  */
 export function mountShell(app: App): void {
   const mountPoint = document.getElementById('relayRoot');
-  const terminalNode = document.getElementById('terminalContainer');
+  // '.main', not '#terminalContainer': SplitContainer appends its split panes
+  // into '.main' as a sibling of the terminal and toggles between them, so
+  // adopting only the child would strand '.main' outside the shell and make
+  // split view silently unreachable.
+  const terminalNode = document.querySelector<HTMLElement>('.main');
 
   if (!mountPoint || !terminalNode) {
     // Better a working terminal with no chrome than a blank page.
-    console.error('Relay shell not mounted: #relayRoot or #terminalContainer is missing.');
+    console.error('Relay shell not mounted: #relayRoot or .main is missing.');
     return;
   }
 

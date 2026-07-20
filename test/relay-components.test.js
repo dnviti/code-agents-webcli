@@ -46,6 +46,9 @@ const PROPS = {
   // traffic lights and windows caption glyphs would be buttons that do nothing.
   WindowControls: { title: 'relay', os: 'none' },
   Switch: { label: 'Enabled' },
+  // Both need a label: rendered bare they exercise none of the
+  // label-association path, which is where their accessibility bugs were.
+  Checkbox: { label: 'Enabled' },
   Select: { options: [{ value: 'a', label: 'A' }] },
 };
 

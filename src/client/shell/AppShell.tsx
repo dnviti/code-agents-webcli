@@ -195,8 +195,13 @@ export function AppShell({ terminalNode, actions }: AppShellProps): React.JSX.El
   return (
     <div
       style={{
-        position: 'absolute',
-        inset: 0,
+        // In flow rather than `position: absolute; inset: 0`. #app is a column
+        // flex container with `position: relative`, so an absolute shell is
+        // sized against #app and paints over its in-flow siblings — the update
+        // banner sits above the shell in that column and was being covered.
+        flex: 1,
+        minHeight: 0,
+        width: '100%',
         display: 'flex',
         flexDirection: 'column',
         background: 'var(--background)',

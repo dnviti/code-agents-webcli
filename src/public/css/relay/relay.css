@@ -14,6 +14,14 @@
    does it in parallel instead, so the import is deliberately not reproduced
    here. Every stack below falls back to a system font if the fetch fails. */
 
+/* The shell is a flex child of #app, not an overlay, so that in-flow siblings
+   such as the update banner keep their row above it. */
+#relayRoot {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
 /* Transitional. SessionTabManager still builds the old tab strip as its own
    bookkeeping — tabs are `Map<string, HTMLElement>` and several of its methods
    read back from those nodes — while the Relay TabBar renders the visible one

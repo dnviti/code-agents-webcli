@@ -159,12 +159,21 @@
           created this node, any re-render that unmounted the component would
           take a live session's scrollback and cursor with it. It is created
           once here and never re-created.
+
+          <main class="main"> is the element adopted, not #terminalContainer
+          itself: SplitContainer.createSplitElements() looks up '.main' and
+          appends its split panes as a sibling of #terminalContainer, then
+          toggles between the two. Adopting the child alone leaves '.main'
+          outside the shell, and that lookup returns null and silently
+          early-returns — split view simply stops existing, with no error.
         -->
-        <div class="terminal-container" id="terminalContainer" data-view="single">
-            <div class="terminal-wrapper">
-                <div id="terminal"></div>
+        <main class="main">
+            <div class="terminal-container" id="terminalContainer" data-view="single">
+                <div class="terminal-wrapper">
+                    <div id="terminal"></div>
+                </div>
             </div>
-        </div>
+        </main>
 
         <!-- App-wide overlay (moved out of terminal container to avoid width issues) -->
         <div class="terminal-overlay" id="overlay" style="display: none;">

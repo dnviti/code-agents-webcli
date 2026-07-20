@@ -56,6 +56,9 @@ export function TerminalHost({ node, onResize }: TerminalHostProps): React.JSX.E
         flex: 1,
         minWidth: 0,
         minHeight: 0,
+        // The adopted node is `.main`, which is itself `flex: 1`, so this frame
+        // has to be a flex container for it to fill the space.
+        display: 'flex',
         position: 'relative',
         background: 'var(--terminal-bg)',
         overflow: 'hidden',
