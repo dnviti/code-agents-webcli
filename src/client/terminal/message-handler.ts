@@ -3,6 +3,12 @@
 import type { App } from '../app';
 import type { WsMessage } from '../types';
 import { showOverlay, hideOverlay, showError } from '../ui/overlay';
+import {
+  appendUpdateLog,
+  applyUpdateStatus,
+  onUpdateDone,
+  onUpdateRestarting,
+} from '../ui/update-banner';
 import { stripUnsupportedTerminalSequences } from './text';
 
 export class MessageHandler {
@@ -87,6 +93,22 @@ export class MessageHandler {
 
       case 'usage_update':
         // Usage display has been removed from the UI
+        break;
+
+      case 'update_status':
+        applyUpdateStatus(message.status);
+        break;
+
+      case 'update_output':
+        appendUpdateLog(message.data);
+        break;
+
+      case 'update_restarting':
+        onUpdateRestarting();
+        break;
+
+      case 'update_done':
+        onUpdateDone(this.app, message);
         break;
 
       default:

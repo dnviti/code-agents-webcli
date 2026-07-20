@@ -186,6 +186,42 @@ export interface WsUsageUpdateMessage {
   limits: unknown;
 }
 
+// The server and the banner share one definition of these; see src/shared/update.ts.
+export type {
+  UpdateMode,
+  UpdateState,
+  UpdateStatus,
+  UpdateStatusResponse,
+} from '../shared/update';
+import type { UpdateStatus } from '../shared/update';
+
+/** Broadcast to every client; the button is gated per-user by the status route. */
+export interface WsUpdateStatusMessage {
+  type: 'update_status';
+  status: UpdateStatus;
+}
+
+/** Installer's sockets only: npm output carries host paths. */
+export interface WsUpdateOutputMessage {
+  type: 'update_output';
+  stream: 'stdout' | 'stderr';
+  data: string;
+}
+
+export interface WsUpdateDoneMessage {
+  type: 'update_done';
+  ok: boolean;
+  code: number | null;
+  restarting: boolean;
+  restartRequired: boolean;
+  message: string;
+}
+
+/** Broadcast: a restart ends every user's agent sessions, not just the installer's. */
+export interface WsUpdateRestartingMessage {
+  type: 'update_restarting';
+}
+
 export type WsMessage =
   | WsConnectedMessage
   | WsSessionCreatedMessage
@@ -201,4 +237,8 @@ export type WsMessage =
   | WsSessionGoneMessage
   | WsPongMessage
   | WsHistoryChunkMessage
-  | WsUsageUpdateMessage;
+  | WsUsageUpdateMessage
+  | WsUpdateStatusMessage
+  | WsUpdateOutputMessage
+  | WsUpdateDoneMessage
+  | WsUpdateRestartingMessage;

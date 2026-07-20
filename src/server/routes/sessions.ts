@@ -14,6 +14,8 @@ import {
 import { TranscriptStoreLike } from '../services/transcript-store.js';
 import { HistoryStoreLike } from '../services/history-store.js';
 import { SessionTeardownLike } from '../services/session-teardown.js';
+import { stripAnsi } from '../services/ansi.js';
+import { getOwnedSession, requireUser } from './helpers.js';
 
 export interface SessionRoutesDeps {
   claudeSessions: Map<string, SessionRecord>;
@@ -300,7 +302,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         }
       } catch (error) {
         console.error(`Failed to export session ${sessionId}:`, error);
-        res.write('\n[... esportazione interrotta da un errore ...]\n');
+        res.write('\n[... export interrupted by an error ...]\n');
       }
 
       res.write(`${FENCE}\n`);
@@ -315,19 +317,9 @@ const EXPORT_PAGE_LINES = 500;
 /** Long enough that ordinary fenced output inside the transcript cannot close it. */
 const FENCE = '``````````';
 
-// CSI/OSC and the rest of the escape vocabulary a PTY emits. Markdown is plain
-// text, so all of it goes.
-const ANSI_PATTERN =
-  // CSI (colours, cursor moves, including colon-separated and private
-  // parameters), OSC and the other string-terminated escapes with their whole
-  // body, single-character escapes, and stray control bytes. Tab, LF and CR
-  // are deliberately left in.
-  // eslint-disable-next-line no-control-regex
-  /\x1b\[[0-?]*[ -/]*[@-~]|\x1b[P^_X][^\x07\x1b]*(?:\x07|\x1b\\|$)|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|$)|\x1b[ -/]*[0-~]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
-
 function toPlainText(value: string): string {
-  return value
-    .replace(ANSI_PATTERN, '')
+  // Markdown is plain text, so the whole escape vocabulary goes.
+  return stripAnsi(value)
     .replace(/\r\n?/g, '\n')
     // Shorten any run that could close the fence; 9 still renders as backticks.
     .replace(/`{10,}/g, '`````````');
@@ -336,28 +328,7 @@ function toPlainText(value: string): string {
 function exportFileName(session: SessionRecord): string {
   const safe = session.name.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
   const stamp = session.created.toISOString().slice(0, 10);
-  return `${safe || 'sessione'}-${stamp}.md`;
-}
-
-function requireUser(res: Response): AuthenticatedUser | null {
-  const authContext = (res.locals.authContext as AuthContext | undefined) || {
-    user: null,
-    authSessionId: null,
-  };
-  return authContext.user;
-}
-
-function getOwnedSession(
-  sessions: Map<string, SessionRecord>,
-  sessionId: string,
-  user: AuthenticatedUser,
-): SessionRecord | null {
-  const session = sessions.get(sessionId);
-  if (!session || session.ownerUserId !== user.id) {
-    return null;
-  }
-
-  return session;
+  return `${safe || 'session'}-${stamp}.md`;
 }
 
 function countUserSessions(

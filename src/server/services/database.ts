@@ -80,6 +80,32 @@ export class AppDatabase {
     this.db.prepare('DELETE FROM app_settings WHERE key = ?').run(key);
   }
 
+  /**
+   * The installer: the account that completed the very first OAuth callback,
+   * and the only one allowed to apply a self-update.
+   *
+   * `users.id` is AUTOINCREMENT and `upsertGitHubUser` never rewrites it, so
+   * MIN(id) is stable across re-logins. The result is pinned into app_settings
+   * on first resolution: without the pin, deleting the installer's row would
+   * silently promote whoever signed in second.
+   */
+  getInstallerUserId(): number | null {
+    const pinned = this.getSetting('update.installerUserId');
+    if (pinned && /^\d+$/.test(pinned)) {
+      return Number(pinned);
+    }
+
+    const row = this.db.prepare('SELECT id FROM users ORDER BY id ASC LIMIT 1').get() as
+      | { id: number }
+      | undefined;
+    if (!row) {
+      return null;
+    }
+
+    this.setSetting('update.installerUserId', String(row.id));
+    return row.id;
+  }
+
   getUserSetting(userId: number, key: string): string | null {
     return this.getSetting(`user:${userId}:${key}`);
   }

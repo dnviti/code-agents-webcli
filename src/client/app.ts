@@ -58,6 +58,7 @@ import {
   setupMobileSessionsModal,
 } from './ui/mobile';
 import { showNotification, playNotificationSound } from './ui/notifications';
+import { setupUpdateBanner } from './ui/update-banner';
 import { SplitContainer } from './splits/split-container';
 import type { HistoryView, HistoryRange } from './terminal/history-view';
 
@@ -182,6 +183,7 @@ export class App {
     applySettings(this, loadSettings());
     applyAliasesToUI(this);
     disablePullToRefresh();
+    setupUpdateBanner(this);
 
     showOverlay('loadingSpinner');
 

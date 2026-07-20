@@ -1,4 +1,8 @@
-const CACHE_NAME = 'code-agents-webcli-v1';
+// The placeholder below is substituted by scripts/build.js with the commit
+// this bundle was built from. Without it the cache name never changes, so
+// after a self-update the activate handler would go on serving the previous
+// client against the new server.
+const CACHE_NAME = 'code-agents-webcli-__BUILD_ID__';
 const urlsToCache = [
   '/',
   '/index.html',

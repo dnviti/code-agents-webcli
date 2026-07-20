@@ -30,6 +30,13 @@ async function build() {
 
   const distDir = path.join(__dirname, '..', 'dist');
   fs.rmSync(distDir, { recursive: true, force: true });
+  fs.mkdirSync(distDir, { recursive: true });
+  const buildInfo = writeBuildInfo(distDir);
+  // Identifies this bundle to the service-worker cache. Falls back to the
+  // build timestamp so a source build still busts its own cache.
+  const buildId = buildInfo.sha
+    ? `${buildInfo.sha.slice(0, 12)}${buildInfo.dirty ? '-dirty' : ''}`
+    : buildInfo.builtAt.replace(/[^0-9]/g, '');
 
   // 1. Compile server TypeScript
   console.log('[server] Compiling TypeScript...');
@@ -85,7 +92,14 @@ async function build() {
   for (const file of filesToCopy) {
     const src = path.join(publicSrc, file);
     const dest = path.join(publicDest, file);
-    if (fs.existsSync(src)) {
+    if (!fs.existsSync(src)) {
+      continue;
+    }
+    if (file === 'service-worker.js') {
+      // Stamp the cache name with this build, so the worker's activate handler
+      // evicts the previous client instead of serving it against a new server.
+      fs.writeFileSync(dest, fs.readFileSync(src, 'utf8').replace(/__BUILD_ID__/g, buildId));
+    } else {
       fs.copyFileSync(src, dest);
     }
   }
@@ -132,6 +146,87 @@ async function build() {
   }
 
   console.log('Build complete!');
+}
+
+const REPO_ROOT = path.join(__dirname, '..');
+
+function git(args) {
+  // stdio must NOT be 'inherit': without a .git directory git writes
+  // "fatal: not a git repository" straight into the user's install log.
+  return execFileSync('git', args, {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+}
+
+/**
+ * Record which commit this build came from, so the running server can ask
+ * GitHub whether it is behind.
+ *
+ * It has to be a git SHA rather than the package version: installs come from
+ * `github:dnviti/code-agents-webcli`, which resolves to whatever main's HEAD
+ * is, and package.json's version only moves on release.
+ *
+ * The file lands in dist/ because that is what ships — package.json "files"
+ * publishes bin/ and dist/ only, so a generated file anywhere else would be
+ * missing from the installed package.
+ */
+function writeBuildInfo(distDir) {
+  const pkg = require('../package.json');
+  const info = {
+    version: pkg.version,
+    sha: null,
+    commitDate: null,
+    dirty: false,
+    source: 'unknown',
+    builtAt: new Date().toISOString(),
+  };
+
+  const envSha = (process.env.CODE_AGENTS_WEBCLI_BUILD_SHA || '').trim();
+  const envDate = (process.env.CODE_AGENTS_WEBCLI_BUILD_DATE || '').trim();
+
+  if (/^[0-9a-f]{40}$/.test(envSha)) {
+    // Docker and CI: .dockerignore excludes .git, so the SHA has to be passed in.
+    info.sha = envSha;
+    info.commitDate = /^\d{4}-\d{2}-\d{2}T/.test(envDate) ? envDate : null;
+    info.source = 'env';
+  } else {
+    try {
+      const sha = git(['rev-parse', 'HEAD']);
+      if (/^[0-9a-f]{40}$/.test(sha)) {
+        info.sha = sha;
+        info.source = 'git';
+        try {
+          info.commitDate = git(['show', '-s', '--format=%cI', 'HEAD']);
+        } catch {
+          // Shallow clone without the commit object; the SHA alone is enough.
+        }
+        // `dirty` marks a working tree the maintainer has edited, which turns
+        // update checks informational. It must NOT be sampled while npm is
+        // packing a release: prepack runs in the publisher's tree, so their
+        // unrelated local edits would ship as "this build is modified" to
+        // every user of the tarball.
+        const packing = process.env.npm_lifecycle_event === 'prepack';
+        if (!packing) {
+          try {
+            info.dirty = git(['status', '--porcelain']).length > 0;
+          } catch {
+            // Not fatal; assume clean.
+          }
+        }
+      }
+    } catch {
+      // Both "not a git repository" (exit 128) and "git is not installed"
+      // (ENOENT) land here. A build with no commit identity is supported; it
+      // just cannot offer update checks.
+    }
+  }
+
+  fs.writeFileSync(path.join(distDir, 'build-info.json'), JSON.stringify(info, null, 2));
+  const label = info.sha ? info.sha.slice(0, 7) : 'unknown';
+  console.log(`[build-info] ${info.source}: ${label}${info.dirty ? '-dirty' : ''}\n`);
+  return info;
 }
 
 function copyDir(src, dest) {
