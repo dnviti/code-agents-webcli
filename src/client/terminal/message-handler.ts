@@ -39,6 +39,8 @@ export class MessageHandler {
       case 'claude_started':
       case 'codex_started':
       case 'agent_started':
+      case 'pi_started':
+      case 'grok_started':
       case 'terminal_started':
         this.onRuntimeStarted(message);
         break;
@@ -46,6 +48,8 @@ export class MessageHandler {
       case 'claude_stopped':
       case 'codex_stopped':
       case 'agent_stopped':
+      case 'pi_stopped':
+      case 'grok_stopped':
       case 'terminal_stopped':
         this.onRuntimeStopped(message);
         break;

@@ -7,6 +7,7 @@ import WebSocket from 'ws';
 import cors from 'cors';
 
 import {
+  Aliases,
   ServerOptions,
   SessionRecord,
   WebSocketInfo,
@@ -24,6 +25,8 @@ import { runRunModeWizard } from './setup/wizard.js';
 import { ClaudeBridge } from './bridges/claude.js';
 import { CodexBridge } from './bridges/codex.js';
 import { AgentBridge } from './bridges/agent.js';
+import { PiBridge } from './bridges/pi.js';
+import { GrokBridge } from './bridges/grok.js';
 import { TerminalBridge } from './bridges/terminal.js';
 import { AppDatabase } from './services/database.js';
 import { SessionStore } from './services/session-store.js';
@@ -56,7 +59,7 @@ export class ClaudeCodeWebServer {
   private baseFolder: string;
   private publicBaseUrl: string | null;
   private sessionDurationHours: number;
-  private aliases: { claude: string; codex: string; agent: string };
+  private aliases: Aliases;
 
   private startTime: number;
   private isShuttingDown: boolean;
@@ -68,6 +71,8 @@ export class ClaudeCodeWebServer {
   private claudeBridge: BridgeInterface;
   private codexBridge: BridgeInterface;
   private agentBridge: BridgeInterface;
+  private piBridge: BridgeInterface;
+  private grokBridge: BridgeInterface;
   private terminalBridge: BridgeInterface;
 
   private database: AppDatabase;
@@ -117,6 +122,8 @@ export class ClaudeCodeWebServer {
     this.claudeBridge = new ClaudeBridge();
     this.codexBridge = new CodexBridge();
     this.agentBridge = new AgentBridge();
+    this.piBridge = new PiBridge();
+    this.grokBridge = new GrokBridge();
     this.terminalBridge = new TerminalBridge();
 
     this.dataDir = config.dataDir;
@@ -309,6 +316,10 @@ export class ClaudeCodeWebServer {
         return this.codexBridge;
       case 'agent':
         return this.agentBridge;
+      case 'pi':
+        return this.piBridge;
+      case 'grok':
+        return this.grokBridge;
       case 'terminal':
         return this.terminalBridge;
       case 'claude':

@@ -14,6 +14,8 @@ export async function loadConfig(app: App): Promise<void> {
           claude: cfg.aliases.claude || 'Claude',
           codex: cfg.aliases.codex || 'Codex',
           agent: cfg.aliases.agent || 'Cursor',
+          pi: cfg.aliases.pi || 'Pi',
+          grok: cfg.aliases.grok || 'Grok',
           terminal: 'Terminal',
         };
       }
@@ -43,6 +45,8 @@ export function getAlias(app: App, kind: AgentKind | string): string {
   }
   if (kind === 'codex') return 'Codex';
   if (kind === 'agent') return 'Cursor';
+  if (kind === 'pi') return 'Pi';
+  if (kind === 'grok') return 'Grok';
   if (kind === 'terminal') return 'Terminal';
   return 'Claude';
 }
@@ -73,6 +77,16 @@ export function getRuntimeStartMessage(
     return `Starting ${getAlias(app, 'agent')}...`;
   }
 
+  if (kind === 'pi') {
+    return `Starting ${getAlias(app, 'pi')}...`;
+  }
+
+  if (kind === 'grok') {
+    return options.dangerouslySkipPermissions
+      ? `Starting ${getAlias(app, 'grok')} (auto-approving every tool call)...`
+      : `Starting ${getAlias(app, 'grok')}...`;
+  }
+
   if (kind === 'terminal') {
     if (options.mode === 'command') {
       return `Running ${options.command}...`;
@@ -91,6 +105,9 @@ export function applyAliasesToUI(app: App): void {
   const startCodexBtn = document.getElementById('startCodexBtn');
   const dangerousCodexBtn = document.getElementById('dangerousCodexBtn');
   const startAgentBtn = document.getElementById('startAgentBtn');
+  const startPiBtn = document.getElementById('startPiBtn');
+  const startGrokBtn = document.getElementById('startGrokBtn');
+  const dangerousGrokBtn = document.getElementById('dangerousGrokBtn');
   const startTerminalBtn = document.getElementById('startTerminalBtn');
 
   if (startBtn) startBtn.textContent = `Start ${getAlias(app, 'claude')}`;
@@ -98,6 +115,9 @@ export function applyAliasesToUI(app: App): void {
   if (startCodexBtn) startCodexBtn.textContent = `Start ${getAlias(app, 'codex')}`;
   if (dangerousCodexBtn) dangerousCodexBtn.textContent = `Dangerous ${getAlias(app, 'codex')}`;
   if (startAgentBtn) startAgentBtn.textContent = `Start ${getAlias(app, 'agent')}`;
+  if (startPiBtn) startPiBtn.textContent = `Start ${getAlias(app, 'pi')}`;
+  if (startGrokBtn) startGrokBtn.textContent = `Start ${getAlias(app, 'grok')}`;
+  if (dangerousGrokBtn) dangerousGrokBtn.textContent = `Dangerous ${getAlias(app, 'grok')}`;
   if (startTerminalBtn) startTerminalBtn.textContent = `Start ${getAlias(app, 'terminal')}`;
 
   const planTitle = document.querySelector('#planModal .modal-header h2');

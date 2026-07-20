@@ -31,6 +31,8 @@ import {
   startClaudeSession as sessionsStartClaude,
   startCodexSession as sessionsStartCodex,
   startAgentSession as sessionsStartAgent,
+  startPiSession as sessionsStartPi,
+  startGrokSession as sessionsStartGrok,
   startTerminalSession as sessionsStartTerminal,
   closeSession as sessionsCloseSession,
 } from './sessions/actions';
@@ -144,7 +146,14 @@ export class App {
     this.currentFolderPath = null;
     this.selectedWorkingDir = null;
 
-    this.aliases = { claude: 'Claude', codex: 'Codex', agent: 'Cursor', terminal: 'Terminal' };
+    this.aliases = {
+      claude: 'Claude',
+      codex: 'Codex',
+      agent: 'Cursor',
+      pi: 'Pi',
+      grok: 'Grok',
+      terminal: 'Terminal',
+    };
 
     this.isMobile = detectMobile();
     this.currentMode = 'chat';
@@ -224,6 +233,9 @@ export class App {
     const startCodexBtn = document.getElementById('startCodexBtn');
     const dangerousCodexBtn = document.getElementById('dangerousCodexBtn');
     const startAgentBtn = document.getElementById('startAgentBtn');
+    const startPiBtn = document.getElementById('startPiBtn');
+    const startGrokBtn = document.getElementById('startGrokBtn');
+    const dangerousGrokBtn = document.getElementById('dangerousGrokBtn');
     const startTerminalBtn = document.getElementById('startTerminalBtn');
     const closeStartPromptBtn = document.getElementById('closeStartPromptBtn');
     const cancelStartPromptBtn = document.getElementById('cancelStartPromptBtn');
@@ -246,6 +258,11 @@ export class App {
       this.startCodexSession({ dangerouslySkipPermissions: true }),
     );
     startAgentBtn?.addEventListener('click', () => this.startAgentSession());
+    startPiBtn?.addEventListener('click', () => this.startPiSession());
+    startGrokBtn?.addEventListener('click', () => this.startGrokSession());
+    dangerousGrokBtn?.addEventListener('click', () =>
+      this.startGrokSession({ dangerouslySkipPermissions: true }),
+    );
     startTerminalBtn?.addEventListener('click', () => this.showTerminalOptionsModal());
     const cancelStartPrompt = async () => {
       if (!this.currentClaudeSessionId) {
@@ -436,6 +453,14 @@ export class App {
 
   startAgentSession(options: RuntimeStartOptions = {}): Promise<void> {
     return sessionsStartAgent(this, options);
+  }
+
+  startPiSession(options: RuntimeStartOptions = {}): Promise<void> {
+    return sessionsStartPi(this, options);
+  }
+
+  startGrokSession(options: RuntimeStartOptions = {}): Promise<void> {
+    return sessionsStartGrok(this, options);
   }
 
   startTerminalSession(options: RuntimeStartOptions = {}): Promise<void> {

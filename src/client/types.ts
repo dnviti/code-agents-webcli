@@ -40,10 +40,12 @@ export interface Aliases {
   claude: string;
   codex: string;
   agent: string;
+  pi: string;
+  grok: string;
   terminal: string;
 }
 
-export type AgentKind = 'claude' | 'codex' | 'agent' | 'terminal';
+export type AgentKind = 'claude' | 'codex' | 'agent' | 'pi' | 'grok' | 'terminal';
 
 export interface PlanData {
   content: string;
@@ -126,12 +128,24 @@ export interface WsSessionLeftMessage {
 }
 
 export interface WsRuntimeStartedMessage {
-  type: 'claude_started' | 'codex_started' | 'agent_started' | 'terminal_started';
+  type:
+    | 'claude_started'
+    | 'codex_started'
+    | 'agent_started'
+    | 'pi_started'
+    | 'grok_started'
+    | 'terminal_started';
   agent?: AgentKind;
 }
 
 export interface WsRuntimeStoppedMessage {
-  type: 'claude_stopped' | 'codex_stopped' | 'agent_stopped' | 'terminal_stopped';
+  type:
+    | 'claude_stopped'
+    | 'codex_stopped'
+    | 'agent_stopped'
+    | 'pi_stopped'
+    | 'grok_stopped'
+    | 'terminal_stopped';
   agent?: AgentKind;
   runtimeLabel?: string;
 }

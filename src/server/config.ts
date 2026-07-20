@@ -9,6 +9,8 @@ export function createConfig(options: ServerOptions): ServerState {
     claude: options.claudeAlias || process.env.CLAUDE_ALIAS || 'Claude',
     codex: options.codexAlias || process.env.CODEX_ALIAS || 'Codex',
     agent: options.agentAlias || process.env.AGENT_ALIAS || 'Cursor',
+    pi: options.piAlias || process.env.PI_ALIAS || 'Pi',
+    grok: options.grokAlias || process.env.GROK_ALIAS || 'Grok',
   };
 
   return {
