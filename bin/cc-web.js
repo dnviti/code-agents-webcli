@@ -1,36 +1,130 @@
 #!/usr/bin/env node
 
 const { Command } = require('commander');
+const { execFileSync } = require('child_process');
 const packageJson = require('../package.json');
+const {
+  NATIVE_DEPENDENCIES,
+  isGlobalRoot,
+  isNativeModuleFailure,
+  manualInstructions,
+  repairCommands,
+  resolveInstallRoot,
+  resolveNpm,
+} = require('./native-repair.js');
 
-let ClaudeCodeWebServer;
-try {
-  ClaudeCodeWebServer = require('../dist/server/index.js').ClaudeCodeWebServer;
-} catch (error) {
-  const message = (error && error.message) || String(error);
+function printLines(lines) {
+  for (const line of lines) {
+    console.error(line);
+  }
+}
 
-  // Distinguish the two very different causes: a missing build, versus a build
-  // that is present but whose native dependencies were never compiled. The
-  // second is common on npm >= 12, which blocks install scripts by default.
-  const nativeModuleFailed = /pty\.node|better_sqlite3\.node|Failed to load native module|\.node['"]?$/.test(message);
+function askToApprove() {
+  return new Promise((resolve) => {
+    const rl = require('readline').createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    rl.question('Approve these install scripts and build them now? [y/N] ', (answer) => {
+      rl.close();
+      resolve(/^y(es)?$/i.test(String(answer).trim()));
+    });
+  });
+}
 
-  if (nativeModuleFailed) {
-    console.error('Cannot start code-agents-webcli: a native dependency was not compiled.');
-    console.error('');
-    console.error('npm 12 blocks install scripts by default, so the native modules arrived');
-    console.error('uncompiled. Build them with:');
-    console.error('');
-    console.error('  npm rebuild --prefix "$(npm root -g)/code-agents-webcli"');
-    console.error('');
-    console.error('Do not pass --allow-scripts: npm rejects it for this package.');
-    console.error('Building needs a C++ toolchain (python3, make, g++ on Linux).');
-  } else {
-    console.error('Cannot start code-agents-webcli because the compiled server bundle is missing.');
-    console.error('Run `npm run build` first, or reinstall the package if this came from npm.');
+/**
+ * Offer to compile the native dependencies, and report whether to retry.
+ *
+ * Deliberately asks first. npm blocks install scripts as a supply-chain
+ * protection, and approving them runs third-party build code — that is the
+ * user's call, not something to do silently on their behalf because it happens
+ * to be convenient.
+ */
+async function offerNativeRepair(root) {
+  const global = isGlobalRoot(root);
+  const commands = repairCommands(root, { global });
+
+  console.error('Cannot start code-agents-webcli: a native dependency was not compiled.');
+  console.error('');
+  console.error(`These packages need to build native code: ${NATIVE_DEPENDENCIES.join(', ')}`);
+
+  // npm refuses to approve scripts for a global prefix, so there is nothing to
+  // offer here beyond telling the truth about it.
+  if (!commands) {
+    printLines(manualInstructions(root, { global }));
+    return false;
   }
 
-  console.error(`Original error: ${message}`);
-  process.exit(1);
+  console.error(`They would be approved and built in: ${root}`);
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    // Nobody is there to consent, so do not decide for them.
+    printLines(manualInstructions(root, { global }));
+    return false;
+  }
+
+  console.error('');
+  if (!(await askToApprove())) {
+    printLines(manualInstructions(root, { global }));
+    return false;
+  }
+
+  const npm = resolveNpm();
+  for (const args of commands) {
+    console.error(`\n$ npm ${args.join(' ')}`);
+    try {
+      execFileSync(npm, args, { stdio: 'inherit' });
+    } catch {
+      console.error('\nThat step failed, so the build is incomplete.');
+      printLines(manualInstructions(root, { global }));
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function loadServer() {
+  return require('../dist/server/index.js').ClaudeCodeWebServer;
+}
+
+async function loadServerOrRepair() {
+  try {
+    return loadServer();
+  } catch (error) {
+    const message = (error && error.message) || String(error);
+
+    // Two very different causes: a build that never happened, versus a build
+    // that is present but whose native dependencies were never compiled.
+    if (!isNativeModuleFailure(message)) {
+      console.error('Cannot start code-agents-webcli because the compiled server bundle is missing.');
+      console.error('Run `npm run build` first, or reinstall the package if this came from npm.');
+      console.error(`Original error: ${message}`);
+      process.exit(1);
+    }
+
+    const root = resolveInstallRoot();
+    if (!root) {
+      console.error('Cannot start code-agents-webcli: a native dependency was not compiled.');
+      console.error('Run `npm rebuild` in this checkout, or `npm install` if you have not yet.');
+      console.error(`Original error: ${message}`);
+      process.exit(1);
+    }
+
+    if (!(await offerNativeRepair(root))) {
+      console.error(`\nOriginal error: ${message}`);
+      process.exit(1);
+    }
+
+    try {
+      // A throwing require is not cached, so this genuinely re-resolves.
+      return loadServer();
+    } catch (retryError) {
+      console.error('\nThe native modules were built, but the server still failed to load.');
+      console.error(`Original error: ${(retryError && retryError.message) || retryError}`);
+      process.exit(1);
+    }
+  }
 }
 
 const program = new Command();
@@ -102,6 +196,11 @@ async function main() {
       grokAlias: options.grokAlias || process.env.GROK_ALIAS || 'Grok',
       folderMode: true // Always use folder mode
     };
+
+    // Before the banner: repairing an uncompiled native dependency needs to
+    // prompt, and announcing "Starting…" only to fail two lines later reads as
+    // a crash rather than as a question.
+    const ClaudeCodeWebServer = await loadServerOrRepair();
 
     console.log('Starting Code Agents Web CLI...');
     console.log(`Port: ${port}`);

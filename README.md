@@ -34,16 +34,26 @@ Try it without installing:
 npx --allow-git=all github:dnviti/code-agents-webcli
 ```
 
+On npm 12 the first run stops and asks permission to build `node-pty` and
+`better-sqlite3`. npm blocks dependency install scripts by default, and for an npx run there is no
+project file in which to pre-approve them — the root `package.json` is one npm generates itself.
+Answering `y` approves and builds them in the npx cache; answering `n` prints the two commands to run
+by hand. Either way it needs a C++ toolchain.
+
 Install it properly (required if you want the background service):
 
 ```bash
 npm i -g --allow-git=all github:dnviti/code-agents-webcli
-npm rebuild --prefix "$(npm root -g)/code-agents-webcli"
 cc-web
 ```
 
 The install compiles the package, so the first run takes a minute and needs a C++ toolchain for the
 native dependencies (`python3`, `make`, `g++` on Linux).
+
+> **Use npm 11 or newer for the global install.** On npm 10 — the version bundled with Node 20 — a
+> git install fails while preparing the checkout with `Cannot find module 'esbuild'`, because npm 10
+> runs this package's `prepare` script before its dev dependencies are in place. `npm i -g npm@latest`
+> first, or use `npx`, which is unaffected.
 
 <details>
 <summary>Why two commands, and why <code>--allow-git=all</code>?</summary>
@@ -56,7 +66,18 @@ instead of per command with `npm config set allow-git all`. On npm 11 and earlie
 **Install scripts are blocked**, and `node-pty` and `better-sqlite3` are native modules that must be
 compiled. This package permits them through the `allowScripts` field in its `package.json`, which
 covers the build that happens while npm prepares the git checkout — but *not* the dependencies of the
-global install itself, which is why they arrive uncompiled and `npm rebuild` is needed afterwards.
+install itself, which is why they arrive uncompiled.
+
+`npm rebuild` alone does **not** fix that: it reports `rebuilt dependencies successfully` while
+skipping every package whose scripts are blocked. The approval has to come first, and it is written
+into the *root* `package.json` of wherever the install landed:
+
+```bash
+npm install-scripts approve node-pty better-sqlite3 --prefix <install root>
+npm rebuild --prefix <install root>
+```
+
+The server prints those two lines, with the real directory filled in, if it ever hits this.
 
 Do **not** try to solve this by adding `--allow-scripts`: npm forwards it into the project-scoped
 install it runs while preparing the git checkout, and that inner install rejects it outright, so the
@@ -171,11 +192,10 @@ unavailable until they are reinstalled once:
 
 ```bash
 npm i -g --allow-git=all github:dnviti/code-agents-webcli
-npm rebuild --prefix "$(npm root -g)/code-agents-webcli"
 ```
 
-If an update is interrupted — a reboot, an OOM kill — the next start says so. The same two commands
-are the recovery.
+If an update is interrupted — a reboot, an OOM kill — the next start says so, and the same command is
+the recovery.
 
 Building the Docker image yourself? Pass the commit, or the image reports an unknown build:
 
