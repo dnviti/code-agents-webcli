@@ -736,9 +736,9 @@ export class MessageProcessor {
     const recorder = new ScrollbackRecorder({
       onLines: (lines) => this.deps.historyStore.append(ref, lines),
       onGap: (dropped) => {
-        const amount = dropped === null ? 'un numero imprecisato di' : String(dropped);
+        const amount = dropped === null ? 'an unknown number of' : String(dropped);
         this.deps.historyStore.append(ref, [
-          `\x1b[2m[... ${amount} righe non registrate: output troppo rapido ...]\x1b[0m`,
+          `\x1b[2m[... ${amount} lines not recorded: output too fast ...]\x1b[0m`,
         ]);
       },
     });

@@ -13,6 +13,7 @@ import {
 } from '../types.js';
 import { TranscriptStoreLike } from '../services/transcript-store.js';
 import { HistoryStoreLike } from '../services/history-store.js';
+import { SessionTeardownLike } from '../services/session-teardown.js';
 
 export interface SessionRoutesDeps {
   claudeSessions: Map<string, SessionRecord>;
@@ -39,6 +40,11 @@ export interface SessionRoutesDeps {
   sessionStore: {
     getSessionMetadata(): Promise<any>;
   };
+  /**
+   * Optional so the hand-built deps literals in the existing tests keep
+   * compiling; the server always supplies one.
+   */
+  sessionTeardown?: SessionTeardownLike;
 }
 
 export function createSessionRoutes(deps: SessionRoutesDeps): Router {
@@ -225,6 +231,9 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     deps.disposeRecorder(sessionId);
     void deps.transcriptStore.deleteTranscript(session);
     void deps.historyStore.deleteHistory(session);
+    // Subsystems that registered their own cleanup (pasted images, and
+    // whatever comes next) rather than each appending a line here.
+    deps.sessionTeardown?.dispose(session);
     void deps.saveSessionsToDisk();
 
     res.json({ success: true, message: 'Session deleted' });
@@ -262,14 +271,14 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
 
       res.write(`# ${session.name}\n\n`);
       res.write(`- Directory: \`${session.workingDir}\`\n`);
-      res.write(`- Creata: ${session.created.toISOString()}\n`);
-      res.write(`- Ultima attività: ${session.lastActivity.toISOString()}\n\n`);
+      res.write(`- Created: ${session.created.toISOString()}\n`);
+      res.write(`- Last activity: ${session.lastActivity.toISOString()}\n\n`);
       res.write(`${FENCE}\n`);
 
       try {
         const { firstLine, totalLines } = await deps.historyStore.stat(session);
         if (firstLine > 0) {
-          res.write(`[... ${firstLine} righe precedenti non più conservate ...]\n`);
+          res.write(`[... ${firstLine} earlier lines no longer retained ...]\n`);
         }
 
         for (let cursor = firstLine; cursor < totalLines; ) {

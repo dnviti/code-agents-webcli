@@ -29,6 +29,7 @@ import { AppDatabase } from './services/database.js';
 import { SessionStore } from './services/session-store.js';
 import { TranscriptStore } from './services/transcript-store.js';
 import { HistoryStore } from './services/history-store.js';
+import { SessionTeardownRegistry } from './services/session-teardown.js';
 import { AuthService } from './services/auth.js';
 import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
@@ -63,6 +64,7 @@ export class ClaudeCodeWebServer {
   private sessionStore: SessionStore;
   private transcriptStore: TranscriptStore;
   private historyStore: HistoryStore;
+  private sessionTeardown: SessionTeardownRegistry;
   private authService: AuthService;
   private usageReader: UsageReader;
   private usageAnalytics: UsageAnalytics;
@@ -107,6 +109,7 @@ export class ClaudeCodeWebServer {
     this.sessionStore = new SessionStore({ database: this.database });
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
     this.historyStore = new HistoryStore({ storageDir: this.database.storageDir });
+    this.sessionTeardown = new SessionTeardownRegistry();
     this.authService = new AuthService({
       database: this.database,
       dev: this.dev,
@@ -409,6 +412,7 @@ export class ClaudeCodeWebServer {
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
       transcriptStore: this.transcriptStore,
       historyStore: this.historyStore,
+      sessionTeardown: this.sessionTeardown,
       getScreenSnapshot: (sessionId: string) =>
         this.messageProcessor.getScreenSnapshot(sessionId),
       disposeRecorder: (sessionId: string) => this.messageProcessor.disposeRecorder(sessionId),
