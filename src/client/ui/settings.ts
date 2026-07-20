@@ -2,6 +2,7 @@
 
 import type { ITerminalOptions } from '@xterm/xterm';
 import type { App } from '../app';
+import { setThemeMode } from '../shell/theme';
 import type {
   AppSettings,
   TerminalFontFamilyId,
@@ -305,6 +306,11 @@ export function applySettings(app: App, settings: AppSettings): void {
   document.documentElement.setAttribute('data-theme', settings.theme);
   document.documentElement.setAttribute('data-color-mode', getThemeMode(settings.theme));
   updateThemeColor(settings.theme);
+
+  // Keep the Relay shell on the same side of light/dark as the colourway.
+  // The two set different terminal palettes by design, but without this a
+  // github-dark colourway left the chrome light around a dark terminal.
+  setThemeMode(getThemeMode(settings.theme));
 
   const terminalFontPreset =
     TERMINAL_FONT_PRESETS[settings.terminalFontFamily] ||

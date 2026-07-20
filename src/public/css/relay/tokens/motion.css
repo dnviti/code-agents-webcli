@@ -1,0 +1,28 @@
+/* Relay motion — quick, mechanical, no bounce. */
+:root {
+  --duration-instant: 60ms;
+  --duration-fast: 100ms;
+  --duration-base: 150ms;
+  --duration-slow: 240ms;
+
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+}
+
+@keyframes relay-cursor-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+@keyframes relay-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes relay-scale-in {
+  from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes relay-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}

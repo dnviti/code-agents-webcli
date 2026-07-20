@@ -65,6 +65,7 @@ import { showNotification, playNotificationSound } from './ui/notifications';
 import { setupUpdateBanner } from './ui/update-banner';
 import { pickImage, type ImagePasteTarget } from './terminal/paste';
 import { SplitContainer } from './splits/split-container';
+import { mountShell } from './shell/mount';
 import type { HistoryView, HistoryRange } from './terminal/history-view';
 
 export class App {
@@ -206,6 +207,11 @@ export class App {
 
     this.sessionTabManager = new SessionTabManager(this);
     await this.sessionTabManager.init();
+
+    // After setupTerminal and the tab manager, so the terminal node exists and
+    // has xterm attached before TerminalHost adopts it, and so the first render
+    // already has tabs to show.
+    mountShell(this);
 
     this.splitContainer = new SplitContainer(this);
     this.splitContainer.setupDropZones();

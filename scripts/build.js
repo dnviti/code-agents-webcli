@@ -63,6 +63,10 @@ async function build() {
       sourcemap: true,
       minify: !isWatch,
       target: ['es2020'],
+      // The Relay shell is .tsx. 'automatic' matches tsconfig.client.json's
+      // "jsx": "react-jsx", so components do not have to import React just to
+      // use JSX — only to use hooks.
+      jsx: 'automatic',
       define: {
         'process.env.NODE_ENV': isWatch ? '"development"' : '"production"'
       }

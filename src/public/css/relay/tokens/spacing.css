@@ -1,0 +1,43 @@
+/* Relay spacing, radius, borders, elevation, z-index.
+   House style is SHARP: base radius is 0. Only fully-round primitives
+   (status dots, switch knob, avatars) use --radius-full. */
+:root {
+  --space-0: 0px;
+  --space-px: 1px;
+  --space-0-5: 2px;
+  --space-1: 4px;
+  --space-1-5: 6px;
+  --space-2: 8px;
+  --space-2-5: 10px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  --radius: 0px;
+  --radius-sm: 0px;
+  --radius-md: 0px;
+  --radius-lg: 0px;
+  --radius-full: 9999px;
+
+  --border-width: 1px;
+  --border-width-2: 2px;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 14px 40px rgba(0, 0, 0, 0.55);
+  --shadow-popover: 0 10px 34px rgba(0, 0, 0, 0.6);
+  --shadow-focus: 0 0 0 2px var(--background), 0 0 0 4px var(--ring);
+
+  --z-base: 0;
+  --z-sticky: 30;
+  --z-dropdown: 40;
+  --z-overlay: 50;
+  --z-modal: 60;
+  --z-toast: 70;
+  --z-tooltip: 80;
+}
