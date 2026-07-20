@@ -58,9 +58,18 @@ function sidebarGroups(tabs: ShellTab[]): ProfileSidebarGroup[] {
     else byKind.set(tab.kind, [tab]);
   }
 
+  // indexOf returns -1 for a kind that is not in GROUP_LABELS, which would sort
+  // it *ahead* of every known runtime — so the moment a new kind appears, or
+  // while the kind is still the empty placeholder, the unknown group jumps to
+  // the top. Unranked kinds sort last instead, and ties break by label so the
+  // order is stable rather than dependent on insertion.
   const order = Object.keys(GROUP_LABELS);
+  const rank = (kind: string): number => {
+    const i = order.indexOf(kind);
+    return i === -1 ? order.length : i;
+  };
   return [...byKind.entries()]
-    .sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0]))
+    .sort((a, b) => rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]))
     .map(([kind, items]) => ({
       label: GROUP_LABELS[kind] || (kind ? kind : UNGROUPED),
       items: items.map((tab) => ({
@@ -246,6 +255,10 @@ export function AppShell({ terminalNode, actions }: AppShellProps): React.JSX.El
             groups={sidebarGroups(state.tabs)}
             activeId={state.activeId ?? undefined}
             onSelect={actions.selectTab}
+            // Without this the header "+" renders as inert decoration. It reads
+            // as a control, so it should be one.
+            onNew={actions.newTab}
+            newLabel="New session"
           />
         ) : null}
         <TerminalHost node={terminalNode} onResize={actions.fitTerminal} />

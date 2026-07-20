@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Changed
+- **The UI now uses the Relay design system**, whose semantic tokens are shadcn's own
+  (`--background`, `--foreground`, `--primary`, `--muted`, `--destructive`, `--border`, …). The
+  chrome — title bar, tab strip, sessions sidebar, status bar and a Ctrl/Cmd-K command palette — is
+  React; a dark and a light theme come from the token layer. shadcn/ui itself is not installed:
+  Relay's components are plain React with inline styles bound to CSS custom properties, so adopting
+  Tailwind, PostCSS and Radix would have bought identical pixels for an extra toolchain.
+- The terminal is deliberately **not** a React component. xterm binds its renderer, viewport and
+  selection to the node it was constructed against, so the node is created once outside React and
+  adopted into the tree; a re-render can never take a live session's scrollback with it. Relay's own
+  `TerminalPane` renders mock ANSI lines and is a design-system stand-in, not a terminal.
+- React is a devDependency, bundled by esbuild. Relay's reference page loads React and Babel from
+  unpkg; that is not reproduced, because this app is a PWA that ships offline and already vendors
+  xterm's stylesheet locally for the same reason.
+
 ### Added
 - **Qwen Code and Kimi Code** as runtimes, with `--qwen-alias` and `--kimi-alias` to relabel them.
   Both get a Dangerous button wired to `--yolo`. For Kimi that flag is documented (`-y, --yolo
