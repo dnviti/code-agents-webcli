@@ -88,6 +88,8 @@ function mountRuntimeLauncher(app: App): void {
     return;
   }
 
+  const onTerminal = (): void => app.showTerminalOptionsModal();
+
   const start = (kind: AgentKind, options: RuntimeStartOptions = {}): void => {
     switch (kind) {
       case 'claude': void app.startClaudeSession(options); break;
@@ -97,7 +99,11 @@ function mountRuntimeLauncher(app: App): void {
       case 'grok': void app.startGrokSession(options); break;
       case 'qwen': void app.startQwenSession(options); break;
       case 'kimi': void app.startKimiSession(options); break;
-      // 'terminal' goes through its own modal, which asks for a shell first.
+      // The launcher routes the terminal through onTerminal, because it needs a
+      // shell chosen first. Handled here anyway: leaving it to `default` made a
+      // call with 'terminal' a silent no-op, and a later refactor that routed it
+      // through onStart would have produced a button that simply did nothing.
+      case 'terminal': onTerminal(); break;
       default: break;
     }
   };
@@ -106,7 +112,7 @@ function mountRuntimeLauncher(app: App): void {
     <RuntimeLauncher
       aliases={app.aliases}
       onStart={start}
-      onTerminal={() => app.showTerminalOptionsModal()}
+      onTerminal={onTerminal}
       onCancel={() => void app.cancelStartPrompt()}
     />,
   );

@@ -3,6 +3,26 @@ import * as React from 'react';
 import { Icon } from './Icon';
 import { Kbd } from './Kbd';
 
+/**
+ * Whether a keydown should activate the card.
+ *
+ * A keydown on a nested control in `action` bubbles up to the card. Without
+ * this the card activates too, so pressing Enter on a card's secondary action
+ * runs BOTH — on the runtime launcher that meant one session started with the
+ * approval bypass and a second started without it.
+ *
+ * Only the card itself is focusable, so any other target is a nested control by
+ * definition. Clicks are covered separately: the action is expected to
+ * stopPropagation, and a target check cannot stand in for that here because a
+ * click legitimately lands on the inner label.
+ *
+ * Exported so the rule can be tested without a DOM.
+ */
+export function activatesFromKey(key: string, target: unknown, currentTarget: unknown): boolean {
+  if (target !== currentTarget) return false;
+  return key === 'Enter' || key === ' ';
+}
+
 export interface LaunchCardProps {
   icon: string;
   label: string;
@@ -38,10 +58,9 @@ export function LaunchCard({
       tabIndex={0}
       onClick={activate}
       onKeyDown={(e: React.KeyboardEvent<HTMLDivElement>) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          activate();
-        }
+        if (!activatesFromKey(e.key, e.target, e.currentTarget)) return;
+        e.preventDefault();
+        activate();
       }}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}

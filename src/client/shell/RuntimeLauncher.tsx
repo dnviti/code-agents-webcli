@@ -110,11 +110,17 @@ export function RuntimeLauncher({
 
       <SectionLabel>Agents</SectionLabel>
       <div style={{ display: 'grid', gap: 8 }}>
-        {RUNTIMES.map((runtime) => (
+        {RUNTIMES.map((runtime) => {
+          // One fallback, used by both the label and the tooltip. Computed once
+          // so the two cannot drift — the tooltip previously read the alias
+          // straight through and would have said "Start undefined" for a
+          // runtime whose alias was missing while the card still read fine.
+          const label = aliases[runtime.kind] || runtime.kind;
+          return (
           <LaunchCard
             key={runtime.kind}
             icon="cpu"
-            label={aliases[runtime.kind] || runtime.kind}
+            label={label}
             meta={runtime.binary}
             onClick={() => onStart(runtime.kind)}
             action={
@@ -126,7 +132,7 @@ export function RuntimeLauncher({
                   // separate target so the bypass cannot be hit by aiming at
                   // the card. The title states the actual consequence rather
                   // than the word "dangerous", which says nothing.
-                  title={`Start ${aliases[runtime.kind]} in a mode that ${runtime.dangerous}.`}
+                  title={`Start ${label} in a mode that ${runtime.dangerous}.`}
                   onClick={(event: React.MouseEvent<HTMLButtonElement>) => {
                     event.stopPropagation();
                     onStart(runtime.kind, { dangerouslySkipPermissions: true });
@@ -137,7 +143,8 @@ export function RuntimeLauncher({
               ) : null
             }
           />
-        ))}
+          );
+        })}
       </div>
 
       <SectionLabel>Terminal</SectionLabel>

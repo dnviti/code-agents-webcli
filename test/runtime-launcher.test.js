@@ -18,6 +18,7 @@ before(function () {
     `export { renderToStaticMarkup } from 'react-dom/server';`,
     `export * as React from 'react';`,
     `export { RuntimeLauncher } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/RuntimeLauncher'))};`,
+    `export { LaunchCard, activatesFromKey } from ${JSON.stringify(path.join(ROOT, 'src/client/ui/relay/LaunchCard'))};`,
   ].join('\n');
 
   const out = path.join(os.tmpdir(), `runtime-launcher-${process.pid}.js`);
@@ -104,6 +105,34 @@ describe('RuntimeLauncher', function () {
     assert.ok(/auto-accepts every action/.test(html), 'Qwen should say what --yolo does');
     assert.ok(/auto-approves every action/.test(html), 'Kimi should say what --yolo does');
     assert.ok(/skips every permission prompt/.test(html), 'Claude should say what its flag does');
+  });
+
+  it('does not let a keypress on the bypass control also start the runtime safely', function () {
+    // The card is a role=button with its own Enter/Space handling, and the
+    // bypass is a nested <button>. A keydown on the nested button bubbles to
+    // the card, so without this rule Enter on "No prompts" started the runtime
+    // TWICE — once bypassed by the button, once safely by the card.
+    const { activatesFromKey } = mod;
+    const card = { id: 'card' };
+    const nested = { id: 'nested-button' };
+
+    assert.strictEqual(
+      activatesFromKey('Enter', nested, card),
+      false,
+      'Enter on a nested control must not also activate the card',
+    );
+    assert.strictEqual(
+      activatesFromKey(' ', nested, card),
+      false,
+      'Space on a nested control must not also activate the card',
+    );
+
+    // The card itself must stay operable by keyboard.
+    assert.strictEqual(activatesFromKey('Enter', card, card), true);
+    assert.strictEqual(activatesFromKey(' ', card, card), true);
+    // And must not swallow keys it does not handle.
+    assert.strictEqual(activatesFromKey('a', card, card), false);
+    assert.strictEqual(activatesFromKey('Tab', card, card), false);
   });
 
   it('starts a runtime safely by default and only bypasses on the separate control', function () {
