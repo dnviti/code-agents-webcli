@@ -111,17 +111,6 @@ export function sniffImageType(bytes: Buffer): ImageKind | null {
   return null;
 }
 
-/** Formats a byte count for a user-facing message. */
-export function formatBytes(bytes: number): string {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-  if (bytes < 1024 * 1024) {
-    return `${(bytes / 1024).toFixed(1)} kB`;
-  }
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 const SAFE_BARE = /^[A-Za-z0-9_@%+=:,.\/-]+$/;
 
 /**
@@ -294,6 +283,38 @@ export class PasteStore implements PasteStoreLike {
     }
   }
 
+  /**
+   * Remove `.cc-web` once nothing but our own ignore file is left in it.
+   *
+   * The ignore file must not be deleted before that is known. Sessions can
+   * share a working directory, so another session's images may still be
+   * sitting under `.cc-web/pasted` — removing the marker first would leave
+   * those images visible to git, and an agent running `git add -A` would
+   * commit them.
+   */
+  private async removeContainerIfEmpty(container: string): Promise<void> {
+    const remaining = await fs.promises.readdir(container).catch(() => null);
+    if (remaining === null) {
+      return;
+    }
+    if (remaining.length > 0 && !(remaining.length === 1 && remaining[0] === '.gitignore')) {
+      return;
+    }
+
+    await fs.promises.rm(path.join(container, '.gitignore'), { force: true }).catch(() => undefined);
+    const removed = await fs.promises
+      .rmdir(container)
+      .then(() => true)
+      .catch(() => false);
+
+    if (removed) {
+      // The memo is what stops ensureGitignore rewriting the file. Without
+      // this, a later paste into the same directory would silently arrive
+      // un-ignored for the rest of the process's life.
+      this.ignoredDirs.delete(container);
+    }
+  }
+
   async save(session: PasteSessionRef, bytes: Buffer): Promise<PasteResult> {
     if (bytes.length === 0) {
       throw Object.assign(new Error('Empty body'), { code: 'EMPTY_BODY' });
@@ -424,13 +445,8 @@ export class PasteStore implements PasteStoreLike {
         for (const root of roots) {
           // Non-recursive on purpose: a directory that gained the user's own
           // files must survive.
-          await fs.promises.rm(path.join(root, '.gitignore'), { force: true }).catch(() => undefined);
           await fs.promises.rmdir(root).catch(() => undefined);
-          const container = path.dirname(root);
-          await fs.promises
-            .rm(path.join(container, '.gitignore'), { force: true })
-            .catch(() => undefined);
-          await fs.promises.rmdir(container).catch(() => undefined);
+          await this.removeContainerIfEmpty(path.dirname(root));
         }
 
         await fs.promises.rm(manifestFile, { force: true });

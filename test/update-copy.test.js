@@ -5,50 +5,41 @@ const { describeUpdate } = require('../dist/shared/update.js');
 // `npm test` (mocha test/*.test.js) and not the browser checks. Keeping the
 // state -> copy mapping pure and shared is what makes it testable here.
 
+const BASE_STATUS = {
+  state: 'behind',
+  installed: {
+    sha: 'a'.repeat(40),
+    short: 'aaaaaaa',
+    commitDate: null,
+    version: '4.1.0',
+    dirty: false,
+    source: 'git',
+  },
+  remote: { sha: 'b'.repeat(40), short: 'bbbbbbb', commitDate: null, subject: null },
+  behindBy: 4,
+  checkedAt: 1000,
+  nextCheckAllowedAt: 2000,
+  message: null,
+};
+
+const BASE_RESPONSE = {
+  mode: 'systemd',
+  canTrigger: true,
+  isInstaller: true,
+  running: false,
+  runnerState: 'idle',
+  activeSessions: 0,
+  interrupted: null,
+  logTail: [],
+};
+
 function response(overrides = {}) {
   return {
-    status: {
-      state: 'behind',
-      installed: {
-        sha: 'a'.repeat(40),
-        short: 'aaaaaaa',
-        commitDate: null,
-        version: '4.1.0',
-        dirty: false,
-        source: 'git',
-      },
-      remote: { sha: 'b'.repeat(40), short: 'bbbbbbb', commitDate: null, subject: null },
-      behindBy: 4,
-      checkedAt: 1000,
-      nextCheckAllowedAt: 2000,
-      message: null,
-      ...(overrides.status ?? {}),
-    },
-    mode: 'systemd',
-    canTrigger: true,
-    isInstaller: true,
-    running: false,
-    runnerState: 'idle',
-    activeSessions: 0,
-    interrupted: null,
-    logTail: [],
+    ...BASE_RESPONSE,
     ...overrides,
-    status: { ...({
-      state: 'behind',
-      installed: {
-        sha: 'a'.repeat(40),
-        short: 'aaaaaaa',
-        commitDate: null,
-        version: '4.1.0',
-        dirty: false,
-        source: 'git',
-      },
-      remote: { sha: 'b'.repeat(40), short: 'bbbbbbb', commitDate: null, subject: null },
-      behindBy: 4,
-      checkedAt: 1000,
-      nextCheckAllowedAt: 2000,
-      message: null,
-    }), ...(overrides.status ?? {}) },
+    // Merged separately so a test can override one status field without
+    // having to restate the whole object.
+    status: { ...BASE_STATUS, ...(overrides.status ?? {}) },
   };
 }
 

@@ -162,6 +162,12 @@ export class UpdateChecker {
       // A stored status describing a different build is worthless — it is what
       // the *previous* install was comparing.
       if (parsed.installed?.sha !== this.buildInfo.sha) {
+        // The ETag has to go with it. Keeping it would send If-None-Match on
+        // the next check, GitHub would answer 304 ("nothing changed since you
+        // last asked"), and the 304 branch would re-publish this very
+        // never_checked status — leaving the banner stuck immediately after a
+        // successful update, until someone happened to push to main.
+        this.settings.setSetting(SETTING_ETAG, '');
         return fallback;
       }
       return { ...fallback, ...parsed, installed: fallback.installed };
@@ -293,7 +299,8 @@ export class UpdateChecker {
     try {
       head = await this.request(
         `${GITHUB_API}/repos/${REPO_OWNER}/${REPO_NAME}/commits/${BRANCH}`,
-        this.settings.getSetting(SETTING_ETAG),
+        // Only useful when there is a previous verdict for a 304 to reaffirm.
+        this.status.state === 'never_checked' ? null : this.settings.getSetting(SETTING_ETAG),
       );
     } catch (error) {
       return this.publish({

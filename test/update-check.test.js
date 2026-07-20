@@ -364,7 +364,7 @@ describe('UpdateChecker', function () {
     assert.ok(!JSON.stringify(status).includes('evil.example'));
   });
 
-  it('rejects an oversized body without parsing it', async function () {
+  it('rejects an oversized body declared by content-length', async function () {
     const huge = 'x'.repeat(2 * 1024 * 1024);
     const { fetchImpl } = recorder([
       { body: huge, headers: { 'content-length': String(huge.length) } },
@@ -378,6 +378,84 @@ describe('UpdateChecker', function () {
 
     const status = await checker.check(true);
     assert.strictEqual(status.state, 'offline');
+    // Asserting the reason, not just the state: unparseable JSON also yields
+    // 'offline', so without this the test would pass with the cap removed.
+    assert.match(status.message, /larger than the allowed maximum/);
+  });
+
+  it('stops reading an oversized body that declares no length', async function () {
+    // The realistic hostile shape: no content-length, bytes just keep coming.
+    // res.text() would buffer all of it before any check could run.
+    let cancelled = false;
+    let chunksServed = 0;
+    const fetchImpl = async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({}),
+      body: {
+        getReader() {
+          return {
+            async read() {
+              chunksServed += 1;
+              if (chunksServed > 200) {
+                return { done: true, value: undefined };
+              }
+              return { done: false, value: new Uint8Array(64 * 1024) };
+            },
+            async cancel() {
+              cancelled = true;
+            },
+          };
+        },
+      },
+    });
+
+    const checker = new UpdateChecker({
+      buildInfo: buildInfo(),
+      settings: settings(),
+      fetchImpl,
+      now: () => 1000,
+    });
+
+    const status = await checker.check(true);
+    assert.strictEqual(status.state, 'offline');
+    assert.match(status.message, /larger than the allowed maximum/);
+    assert.ok(cancelled, 'the reader must be cancelled rather than drained');
+    assert.ok(chunksServed < 200, 'reading must stop at the cap');
+  });
+
+  it('drops the stored ETag when the installed build changes', async function () {
+    const store = settings();
+    const { calls, fetchImpl } = recorder([
+      { body: commitBody(REMOTE), headers: { etag: 'W/"abc"' } },
+      { body: { status: 'ahead', ahead_by: 3 } },
+      { body: commitBody(REMOTE) },
+      { body: { status: 'identical' } },
+    ]);
+
+    const before = new UpdateChecker({
+      buildInfo: buildInfo(),
+      settings: store,
+      fetchImpl,
+      now: () => 1000,
+    });
+    await before.check(true);
+
+    // The self-update installed what main was pointing at, and the process
+    // restarted onto the new build.
+    const after = new UpdateChecker({
+      buildInfo: buildInfo({ sha: REMOTE }),
+      settings: store,
+      fetchImpl,
+      now: () => 2000,
+    });
+    const status = await after.check(true);
+
+    // Sending the old ETag would earn a 304, and the 304 branch reaffirms the
+    // current status — which the build change had just reset to never_checked.
+    // The banner would then read "not checked yet" forever.
+    assert.strictEqual(calls[2].init.headers['If-None-Match'], undefined);
+    assert.strictEqual(status.state, 'up_to_date');
   });
 
   it('restores a persisted status without spending a request', async function () {

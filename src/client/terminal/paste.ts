@@ -17,6 +17,15 @@ export interface ImagePasteTarget {
   getSessionId(): string | null;
   /** The only thing that differs between the main terminal and a split. */
   sendText(text: string): void;
+  /**
+   * Re-emit clipboard text as a paste.
+   *
+   * Delegates to xterm rather than writing the bytes ourselves, because only
+   * xterm knows whether the attached program has enabled bracketed paste. Sent
+   * raw, a multi-line clipboard would execute line by line in a shell instead
+   * of arriving as one inert block.
+   */
+  pasteText(text: string): void;
   isConnected(): boolean;
 }
 
@@ -182,7 +191,7 @@ async function handleImages(
     // The text half of a mixed paste must not be lost just because the image
     // half was refused.
     if (trailingText) {
-      target.sendText(trailingText);
+      target.pasteText(trailingText);
     }
     return;
   }
@@ -214,8 +223,9 @@ async function handleImages(
     }
 
     if (trailingText && target.getSessionId() === sessionId && target.isConnected()) {
-      // Last, so the caret ends after the user's own words.
-      target.sendText(trailingText);
+      // Last, so the caret ends after the user's own words. Through xterm's
+      // paste path, so it is bracketed exactly as an ordinary paste would be.
+      target.pasteText(trailingText);
     }
   } finally {
     busySessions.delete(sessionId);
@@ -293,6 +303,28 @@ export function attachImageDrop(target: ImagePasteTarget): () => void {
     target.element.removeEventListener('dragleave', onDragLeave);
     target.element.removeEventListener('drop', onDrop);
   };
+}
+
+/**
+ * Swallow file drags that land anywhere outside a terminal.
+ *
+ * Without this the browser navigates to the dropped file, which tears down the
+ * page and every live session with it. It has to be global rather than on
+ * #terminalContainer: that element is hidden entirely in split view, and it
+ * excludes the gutter around it and the header above it.
+ *
+ * The per-terminal handlers call stopPropagation(), so a drop on an actual
+ * terminal never reaches this and still uploads.
+ */
+export function installFileDropGuard(): void {
+  const swallowIfFiles = (event: DragEvent): void => {
+    if (event.dataTransfer?.types.includes('Files')) {
+      event.preventDefault();
+    }
+  };
+
+  window.addEventListener('dragover', swallowIfFiles);
+  window.addEventListener('drop', swallowIfFiles);
 }
 
 /**

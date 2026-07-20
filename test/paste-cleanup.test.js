@@ -142,6 +142,43 @@ describe('PasteStore cleanup', function () {
 
     assert.ok(!fs.existsSync(mine.absolutePath));
     assert.ok(fs.existsSync(theirs.absolutePath), 'sessions sharing a directory must not collide');
+    // The surviving images must stay ignored. Removing the marker while they
+    // are still there would make them plain untracked files, and an agent
+    // running `git add -A` would commit them.
+    assert.ok(
+      fs.existsSync(path.join(workingDir, '.cc-web', '.gitignore')),
+      'the ignore marker must survive while another session still has images',
+    );
+  });
+
+  it('re-ignores a directory that was cleaned up and used again', async function () {
+    await store.save({ id: 'first', ownerUserId: 1, workingDir }, PNG);
+    await store.deletePastes({ id: 'first', ownerUserId: 1 });
+    assert.ok(!fs.existsSync(path.join(workingDir, '.cc-web')));
+
+    await store.save({ id: 'second', ownerUserId: 1, workingDir }, PNG);
+
+    // The store memoises which directories it has already written a .gitignore
+    // into. Without evicting that memo on cleanup, every later paste into this
+    // project would arrive un-ignored until the process restarted.
+    assert.ok(
+      fs.existsSync(path.join(workingDir, '.cc-web', '.gitignore')),
+      'the ignore marker must be rewritten for the new session',
+    );
+  });
+
+  it('keeps the marker when the user has their own files in .cc-web', async function () {
+    await store.save({ id: 'ok', ownerUserId: 1, workingDir }, PNG);
+    const userFile = path.join(workingDir, '.cc-web', 'notes.txt');
+    fs.writeFileSync(userFile, 'mine');
+
+    await store.deletePastes({ id: 'ok', ownerUserId: 1 });
+
+    assert.ok(fs.existsSync(userFile), 'a user file must survive');
+    assert.ok(
+      fs.existsSync(path.join(workingDir, '.cc-web', '.gitignore')),
+      'a surviving directory must stay ignored',
+    );
   });
 
   it('resolves when the working directory is gone', async function () {

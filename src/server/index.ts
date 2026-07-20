@@ -520,7 +520,15 @@ export class ClaudeCodeWebServer {
       selfUpdate: this.selfUpdate,
       getUpdateMode: () => this.getUpdateMode(),
       getInstallerUserId: () => this.database.getInstallerUserId(),
-      getInterruptedUpdate: () => this.interruptedUpdate,
+      getInterruptedUpdate: () => {
+        // Reported once and then forgotten. Left set, it would keep the banner
+        // in its error state — which offers no Update button — for the rest of
+        // the process's life, so the interrupted update could never be
+        // retried from the browser.
+        const interrupted = this.interruptedUpdate;
+        this.interruptedUpdate = null;
+        return interrupted;
+      },
       getScreenSnapshot: (sessionId: string) =>
         this.messageProcessor.getScreenSnapshot(sessionId),
       disposeRecorder: (sessionId: string) => this.messageProcessor.disposeRecorder(sessionId),

@@ -66,6 +66,7 @@ class Split {
       element: terminalDiv,
       getSessionId: () => this.sessionId,
       sendText: (text) => this.socket?.send(JSON.stringify({ type: 'input', data: text })),
+      pasteText: (text) => this.terminal?.paste(text),
       isConnected: () => this.socket?.readyState === WebSocket.OPEN,
     };
     attachImagePaste(pasteTarget);
@@ -506,11 +507,8 @@ export class SplitContainer {
 
     terminalContainer.addEventListener('dragover', (e: DragEvent) => {
       if (e.dataTransfer?.types.includes('Files')) {
-        // An image dragged anywhere over the container — the padding, the
-        // divider, the drop-zone overlay — must not navigate the page away,
-        // which would take every live session with it. The per-terminal
-        // handler does the actual upload; this only refuses the default.
-        e.preventDefault();
+        // Not a session-tab drag, so the split affordance must not appear.
+        // installFileDropGuard() is what stops the browser navigating away.
         dropZone.style.display = 'none';
         return;
       }
@@ -529,9 +527,8 @@ export class SplitContainer {
 
     terminalContainer.addEventListener('drop', async (e: DragEvent) => {
       if (e.dataTransfer?.types.includes('Files')) {
-        // An image dropped outside any terminal. Swallow it: the alternative
-        // is the browser navigating to the file.
-        e.preventDefault();
+        // An image dropped outside any terminal; the global guard has already
+        // refused the browser's default.
         dropZone.style.display = 'none';
         return;
       }
