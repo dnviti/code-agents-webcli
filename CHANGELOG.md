@@ -12,8 +12,6 @@
 - The advice printed on that failure was wrong for every install that is not global: it named
   `$(npm root -g)/code-agents-webcli`, which for an npx run does not exist. It also recommended
   `npm rebuild`, which reports success while silently skipping the blocked packages.
-
-### Fixed
 - **Releases now actually happen.** `release-on-main.yml` published to npm partway through its release
   job, which 404'd on every run because trusted publishing cannot bootstrap a package that has never
   existed on the registry. Because that step sat mid-job, its failure skipped the container build,
