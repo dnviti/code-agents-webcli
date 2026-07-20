@@ -19,28 +19,86 @@ It now supports:
 
 ## Quick Start
 
-Run without installing:
+This package is not published to npm; it installs straight from GitHub.
+
+Before you start, create a [GitHub OAuth App](https://github.com/settings/developers) and set its
+callback URL to `<your base URL>/auth/github/callback` — for a local install that is
+`http://localhost:32352/auth/github/callback`. You will also want your own GitHub numeric user ID,
+which `curl -s https://api.github.com/users/<your-login> | grep '"id"'` will tell you.
+
+Try it without installing:
 
 ```bash
-npx code-agents-webcli
+npx --allow-git=all github:dnviti/code-agents-webcli
 ```
 
-Or install globally:
+Install it properly (required if you want the background service):
 
 ```bash
-npm install -g code-agents-webcli
-code-agents-webcli
+npm i -g --allow-git=all github:dnviti/code-agents-webcli
+npm rebuild --prefix "$(npm root -g)/code-agents-webcli"
+cc-web
 ```
 
-On the first interactive run, the server asks for:
+The install compiles the package, so the first run takes a minute and needs a C++ toolchain for the
+native dependencies (`python3`, `make`, `g++` on Linux).
+
+<details>
+<summary>Why two commands, and why <code>--allow-git=all</code>?</summary>
+
+npm 12 changed two defaults, and a GitHub install trips both.
+
+**`allow-git` now defaults to `none`**, so npm refuses to fetch from a git remote at all. Set it once
+instead of per command with `npm config set allow-git all`. On npm 11 and earlier this is unnecessary.
+
+**Install scripts are blocked**, and `node-pty` and `better-sqlite3` are native modules that must be
+compiled. This package permits them through the `allowScripts` field in its `package.json`, which
+covers the build that happens while npm prepares the git checkout — but *not* the dependencies of the
+global install itself, which is why they arrive uncompiled and `npm rebuild` is needed afterwards.
+
+Do **not** try to solve this by adding `--allow-scripts`: npm forwards it into the project-scoped
+install it runs while preparing the git checkout, and that inner install rejects it outright, so the
+whole install fails:
+
+```
+npm error code EALLOWSCRIPTS
+npm error --allow-scripts is not allowed in project-scoped installs.
+```
+
+Putting `allow-scripts` in `.npmrc` fails the same way.
+
+</details>
+
+On the first run — or any time you pass `--setup` — a wizard asks for:
 
 1. the public base URL
 2. the GitHub OAuth client ID
-3. the GitHub OAuth client secret
-4. the allowed GitHub user IDs, if you want an allowlist
+3. the GitHub OAuth client secret (not echoed as you type)
+4. the allowed GitHub user IDs
 5. the GitHub App token, if your internal setup needs one
+6. whether to run in the foreground or install a background service
 
-Those values are stored in the local SQLite database.
+Those values are stored in the local SQLite database, never in the systemd unit or the command line.
+
+> **The allow-list is not optional.** An empty list denies every sign-in. Anyone you list can sign in
+> and run commands on the host, so list only the accounts you intend to give a shell to.
+
+### Background service
+
+Choosing the service option writes a `systemd --user` unit, enables it at boot and enables lingering
+so it survives logout:
+
+```bash
+systemctl --user status code-agents-webcli.service
+journalctl --user -u code-agents-webcli.service -f
+```
+
+The wizard asks for a working directory, which bounds the file browser in the web UI — only that
+directory and its subdirectories are reachable.
+
+The service option is unavailable when running through `npx`, because npx unpacks into a cache that
+npm can delete at any time; a unit pointing there would break later. Use the global install for that.
+It is also Linux/systemd-only; elsewhere the wizard offers foreground mode only.
 
 ## GitHub OAuth Setup
 

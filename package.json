@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "node scripts/build.js",
+    "prepare": "node scripts/build.js",
     "build:watch": "node scripts/build.js --watch",
     "start": "npm run build && node bin/cc-web.js",
     "dev": "npm run build && node bin/cc-web.js --dev",
@@ -75,5 +76,10 @@
   "overrides": {
     "serialize-javascript": "^7.0.5",
     "diff": "^8.0.3"
+  },
+  "allowScripts": {
+    "node-pty": true,
+    "better-sqlite3": true,
+    "esbuild": true
   }
 }

@@ -18,6 +18,8 @@ import { createConfig, createUsageAnalyticsOptions } from './config.js';
 import { registerRoutes } from './routes/index.js';
 import { WebSocketHandler } from './websocket/handler.js';
 import { MessageProcessor } from './websocket/messages.js';
+import { PromptSession } from './setup/prompts.js';
+import { runRunModeWizard } from './setup/wizard.js';
 
 import { ClaudeBridge } from './bridges/claude.js';
 import { CodexBridge } from './bridges/codex.js';
@@ -37,6 +39,7 @@ export class ClaudeCodeWebServer {
   private certFile: string | undefined;
   private keyFile: string | undefined;
   private setup: boolean;
+  private dataDir: string | null;
   private folderMode: boolean;
   private baseFolder: string;
   private publicBaseUrl: string | null;
@@ -97,6 +100,7 @@ export class ClaudeCodeWebServer {
     this.agentBridge = new AgentBridge();
     this.terminalBridge = new TerminalBridge();
 
+    this.dataDir = config.dataDir;
     this.database = new AppDatabase({ dataDir: config.dataDir });
     this.sessionStore = new SessionStore({ database: this.database });
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
@@ -402,9 +406,43 @@ export class ClaudeCodeWebServer {
 
   }
 
+  /**
+   * Run the interactive setup when needed, and let the caller know whether the
+   * server should still be started in this process.
+   *
+   * Returns false when the user chose to install a background service: the
+   * systemd unit now owns the port, so binding it here too would fail with
+   * EADDRINUSE immediately after a success message.
+   */
+  async runSetupIfNeeded(): Promise<boolean> {
+    const needsAuthSetup = this.setup || !this.authService.isConfigured();
+    if (!needsAuthSetup) {
+      return true;
+    }
+
+    const session = new PromptSession();
+    try {
+      await this.authService.ensureConfiguredInteractive(this.setup, session);
+
+      const action = await runRunModeWizard(
+        {
+          port: this.port,
+          dataDir: this.dataDir,
+          cwd: process.cwd(),
+        },
+        session,
+      );
+      return action === 'run-foreground';
+    } finally {
+      session.close();
+    }
+  }
+
   async start(): Promise<http.Server | https.Server> {
     await this.loadPersistedSessions();
-    await this.authService.ensureConfiguredInteractive(this.setup);
+    // Embedders may call start() directly without going through
+    // runSetupIfNeeded(); this stays as the safety net.
+    await this.authService.ensureConfiguredInteractive(false);
 
     let server: http.Server | https.Server;
     if (this.useHttps) {
