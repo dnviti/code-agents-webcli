@@ -43,7 +43,7 @@
     "express": "^5.2.1",
     "node-pty": "^1.1.0",
     "open": "^11.0.0",
-    "ws": "^8.20.0"
+    "ws": "^8.21.1"
   },
   "engines": {
     "node": ">=20.0.0"
@@ -68,8 +68,12 @@
     "@types/express": "^5.0.6",
     "@types/node": "^25.5.0",
     "@types/ws": "^8.18.1",
-    "esbuild": "^0.27.4",
+    "esbuild": "^0.28.1",
     "mocha": "^11.7.5",
     "typescript": "^6.0.2"
+  },
+  "overrides": {
+    "serialize-javascript": "^7.0.5",
+    "diff": "^8.0.3"
   }
 }
