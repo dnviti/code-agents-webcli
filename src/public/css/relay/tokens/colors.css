@@ -1,0 +1,154 @@
+/* Relay color system.
+   Dark is the primary theme and lives in :root. Light is an opt-in variant
+   under .light. Neutral (true-gray) ramp — the UI accent is white/near-white,
+   shadcn-style. ANSI + terminal chrome tokens are Relay additions. */
+
+:root {
+  /* ---- Neutral ramp (base) ---- */
+  --neutral-950: #0a0a0a;
+  --neutral-925: #0d0d0d;
+  --neutral-900: #0f0f0f;
+  --neutral-875: #141414;
+  --neutral-850: #171717;
+  --neutral-800: #1c1c1c;
+  --neutral-750: #232323;
+  --neutral-700: #262626;
+  --neutral-600: #333333;
+  --neutral-500: #525252;
+  --neutral-400: #737373;
+  --neutral-300: #a3a3a3;
+  --neutral-200: #d4d4d4;
+  --neutral-100: #e5e5e5;
+  --neutral-050: #fafafa;
+
+  /* ---- Semantic (shadcn-compatible names) ---- */
+  --background: #0a0a0a;
+  --foreground: #fafafa;
+  --card: #0f0f0f;
+  --card-foreground: #fafafa;
+  --popover: #141414;
+  --popover-foreground: #fafafa;
+  --primary: #fafafa;
+  --primary-foreground: #0a0a0a;
+  --secondary: #1c1c1c;
+  --secondary-foreground: #fafafa;
+  --muted: #171717;
+  --muted-foreground: #a3a3a3;
+  --accent: #262626;
+  --accent-foreground: #fafafa;
+  --destructive: #ef4444;
+  --destructive-foreground: #fafafa;
+  --success: #4ade80;
+  --success-foreground: #052e16;
+  --warning: #facc15;
+  --warning-foreground: #422006;
+  --info: #60a5fa;
+  --border: #262626;
+  --border-strong: #333333;
+  --input: #1f1f1f;
+  --ring: #d4d4d4;
+  --overlay: rgba(0, 0, 0, 0.66);
+
+  /* ---- App chrome (terminal environment) ---- */
+  --chrome: #0d0d0d;
+  --chrome-foreground: #e5e5e5;
+  --sidebar: #0d0d0d;
+  --sidebar-foreground: #e5e5e5;
+  --sidebar-muted: #737373;
+  --tab-bar: #0d0d0d;
+  --tab-active: #0a0a0a;
+  --tab-active-foreground: #fafafa;
+  --tab-inactive: #141414;
+  --tab-inactive-foreground: #a3a3a3;
+
+  /* ---- Terminal surface ---- */
+  --terminal-bg: #0a0a0a;
+  --terminal-fg: #d4d4d4;
+  --terminal-dim: #737373;
+  --terminal-cursor: #fafafa;
+  --terminal-selection: rgba(212, 212, 212, 0.18);
+  --terminal-prompt: #4ade80;
+
+  /* ---- ANSI 16-color (tuned for dark terminal bg) ---- */
+  --ansi-black: #1a1a1a;
+  --ansi-red: #f87171;
+  --ansi-green: #4ade80;
+  --ansi-yellow: #facc15;
+  --ansi-blue: #60a5fa;
+  --ansi-magenta: #c084fc;
+  --ansi-cyan: #22d3ee;
+  --ansi-white: #d4d4d4;
+  --ansi-bright-black: #525252;
+  --ansi-bright-red: #fca5a5;
+  --ansi-bright-green: #86efac;
+  --ansi-bright-yellow: #fde047;
+  --ansi-bright-blue: #93c5fd;
+  --ansi-bright-magenta: #d8b4fe;
+  --ansi-bright-cyan: #67e8f9;
+  --ansi-bright-white: #fafafa;
+}
+
+/* ---- Light variant ---- */
+.light {
+  --background: #ffffff;
+  --foreground: #0a0a0a;
+  --card: #ffffff;
+  --card-foreground: #0a0a0a;
+  --popover: #ffffff;
+  --popover-foreground: #0a0a0a;
+  --primary: #171717;
+  --primary-foreground: #fafafa;
+  --secondary: #f5f5f5;
+  --secondary-foreground: #171717;
+  --muted: #f5f5f5;
+  --muted-foreground: #737373;
+  --accent: #f0f0f0;
+  --accent-foreground: #171717;
+  --destructive: #dc2626;
+  --destructive-foreground: #fafafa;
+  --success: #16a34a;
+  --success-foreground: #ffffff;
+  --warning: #ca8a04;
+  --warning-foreground: #ffffff;
+  --info: #2563eb;
+  --border: #e5e5e5;
+  --border-strong: #d4d4d4;
+  --input: #e5e5e5;
+  --ring: #0a0a0a;
+  --overlay: rgba(10, 10, 10, 0.32);
+
+  --chrome: #f5f5f5;
+  --chrome-foreground: #171717;
+  --sidebar: #fafafa;
+  --sidebar-foreground: #171717;
+  --sidebar-muted: #737373;
+  --tab-bar: #ececec;
+  --tab-active: #ffffff;
+  --tab-active-foreground: #0a0a0a;
+  --tab-inactive: #e4e4e4;
+  --tab-inactive-foreground: #737373;
+
+  --terminal-bg: #fbfbfb;
+  --terminal-fg: #262626;
+  --terminal-dim: #a3a3a3;
+  --terminal-cursor: #171717;
+  --terminal-selection: rgba(23, 23, 23, 0.12);
+  --terminal-prompt: #16a34a;
+
+  --ansi-black: #171717;
+  --ansi-red: #dc2626;
+  --ansi-green: #16a34a;
+  --ansi-yellow: #ca8a04;
+  --ansi-blue: #2563eb;
+  --ansi-magenta: #9333ea;
+  --ansi-cyan: #0891b2;
+  --ansi-white: #404040;
+  --ansi-bright-black: #737373;
+  --ansi-bright-red: #ef4444;
+  --ansi-bright-green: #22c55e;
+  --ansi-bright-yellow: #eab308;
+  --ansi-bright-blue: #3b82f6;
+  --ansi-bright-magenta: #a855f7;
+  --ansi-bright-cyan: #06b6d4;
+  --ansi-bright-white: #171717;
+}

@@ -1,0 +1,52 @@
+/* Relay design system — entry point.
+   Vendored from the Relay Design System project. The token files are copied
+   verbatim so they can be re-synced; everything Relay-specific that this app
+   adds lives below the imports, not inside them. */
+
+@import "./tokens/colors.css";
+@import "./tokens/typography.css";
+@import "./tokens/spacing.css";
+@import "./tokens/motion.css";
+
+/* Relay's own fonts.css pulls Geist and JetBrains Mono from Google Fonts with a
+   nested @import. Nested @import serialises: the browser has to fetch and parse
+   this file before it even discovers the font request. The <link> in index.html
+   does it in parallel instead, so the import is deliberately not reproduced
+   here. Every stack below falls back to a system font if the fetch fails. */
+
+.ricon svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  stroke-width: 1.75;
+}
+
+/* The design system assumes a full-bleed app shell that owns the viewport. */
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: var(--text-ui);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--neutral-700);
+  border: 2px solid var(--background);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
