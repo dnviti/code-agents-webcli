@@ -75,6 +75,5 @@ npm start
 
 Prerequisites outside the repo:
 
-- the package name must be available on npm
 - GitHub OAuth credentials must be configured for deployed environments
 
