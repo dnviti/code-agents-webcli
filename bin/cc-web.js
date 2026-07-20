@@ -7,11 +7,28 @@ let ClaudeCodeWebServer;
 try {
   ClaudeCodeWebServer = require('../dist/server/index.js').ClaudeCodeWebServer;
 } catch (error) {
-  console.error('Cannot start code-agents-webcli because the compiled server bundle is missing.');
-  console.error('Run `npm run build` first, or reinstall the package if this came from npm.');
-  if (error && error.message) {
-    console.error(`Original error: ${error.message}`);
+  const message = (error && error.message) || String(error);
+
+  // Distinguish the two very different causes: a missing build, versus a build
+  // that is present but whose native dependencies were never compiled. The
+  // second is common on npm >= 12, which blocks install scripts by default.
+  const nativeModuleFailed = /pty\.node|better_sqlite3\.node|Failed to load native module|\.node['"]?$/.test(message);
+
+  if (nativeModuleFailed) {
+    console.error('Cannot start code-agents-webcli: a native dependency was not compiled.');
+    console.error('');
+    console.error('npm 12 blocks install scripts by default. Reinstall allowing them:');
+    console.error('');
+    console.error('  npm i -g --allow-scripts=code-agents-webcli,better-sqlite3,node-pty \\');
+    console.error('    github:dnviti/code-agents-webcli');
+    console.error('');
+    console.error('Building also needs a C++ toolchain (python3, make, g++ on Linux).');
+  } else {
+    console.error('Cannot start code-agents-webcli because the compiled server bundle is missing.');
+    console.error('Run `npm run build` first, or reinstall the package if this came from npm.');
   }
+
+  console.error(`Original error: ${message}`);
   process.exit(1);
 }
 
