@@ -41,6 +41,8 @@ export class MessageHandler {
       case 'agent_started':
       case 'pi_started':
       case 'grok_started':
+      case 'qwen_started':
+      case 'kimi_started':
       case 'terminal_started':
         this.onRuntimeStarted(message);
         break;
@@ -50,6 +52,8 @@ export class MessageHandler {
       case 'agent_stopped':
       case 'pi_stopped':
       case 'grok_stopped':
+      case 'qwen_stopped':
+      case 'kimi_stopped':
       case 'terminal_stopped':
         this.onRuntimeStopped(message);
         break;

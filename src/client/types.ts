@@ -42,10 +42,20 @@ export interface Aliases {
   agent: string;
   pi: string;
   grok: string;
+  qwen: string;
+  kimi: string;
   terminal: string;
 }
 
-export type AgentKind = 'claude' | 'codex' | 'agent' | 'pi' | 'grok' | 'terminal';
+export type AgentKind =
+  | 'claude'
+  | 'codex'
+  | 'agent'
+  | 'pi'
+  | 'grok'
+  | 'qwen'
+  | 'kimi'
+  | 'terminal';
 
 export interface PlanData {
   content: string;
@@ -134,6 +144,8 @@ export interface WsRuntimeStartedMessage {
     | 'agent_started'
     | 'pi_started'
     | 'grok_started'
+    | 'qwen_started'
+    | 'kimi_started'
     | 'terminal_started';
   agent?: AgentKind;
 }
@@ -145,6 +157,8 @@ export interface WsRuntimeStoppedMessage {
     | 'agent_stopped'
     | 'pi_stopped'
     | 'grok_stopped'
+    | 'qwen_stopped'
+    | 'kimi_stopped'
     | 'terminal_stopped';
   agent?: AgentKind;
   runtimeLabel?: string;

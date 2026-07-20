@@ -109,6 +109,14 @@ export class MessageProcessor {
         await this.startRuntime(wsId, 'grok', data.options || {});
         break;
 
+      case 'start_qwen':
+        await this.startRuntime(wsId, 'qwen', data.options || {});
+        break;
+
+      case 'start_kimi':
+        await this.startRuntime(wsId, 'kimi', data.options || {});
+        break;
+
       case 'start_terminal':
         await this.startRuntime(wsId, 'terminal', data.options || {});
         break;
@@ -833,6 +841,10 @@ export class MessageProcessor {
         return this.deps.aliases.pi;
       case 'grok':
         return this.deps.aliases.grok;
+      case 'qwen':
+        return this.deps.aliases.qwen;
+      case 'kimi':
+        return this.deps.aliases.kimi;
       case 'terminal':
         return session?.runtimeLabel || 'Terminal';
       case 'claude':
@@ -851,6 +863,10 @@ export class MessageProcessor {
         return 'Pi';
       case 'grok':
         return 'Grok Build';
+      case 'qwen':
+        return 'Qwen Code';
+      case 'kimi':
+        return 'Kimi Code';
       case 'terminal':
         return 'terminal';
       case 'claude':

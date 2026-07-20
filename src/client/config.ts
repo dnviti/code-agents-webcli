@@ -16,6 +16,8 @@ export async function loadConfig(app: App): Promise<void> {
           agent: cfg.aliases.agent || 'Cursor',
           pi: cfg.aliases.pi || 'Pi',
           grok: cfg.aliases.grok || 'Grok',
+          qwen: cfg.aliases.qwen || 'Qwen',
+          kimi: cfg.aliases.kimi || 'Kimi',
           terminal: 'Terminal',
         };
       }
@@ -47,6 +49,8 @@ export function getAlias(app: App, kind: AgentKind | string): string {
   if (kind === 'agent') return 'Cursor';
   if (kind === 'pi') return 'Pi';
   if (kind === 'grok') return 'Grok';
+  if (kind === 'qwen') return 'Qwen';
+  if (kind === 'kimi') return 'Kimi';
   if (kind === 'terminal') return 'Terminal';
   return 'Claude';
 }
@@ -87,6 +91,18 @@ export function getRuntimeStartMessage(
       : `Starting ${getAlias(app, 'grok')}...`;
   }
 
+  if (kind === 'qwen') {
+    return options.dangerouslySkipPermissions
+      ? `Starting ${getAlias(app, 'qwen')} (auto-accepting every action)...`
+      : `Starting ${getAlias(app, 'qwen')}...`;
+  }
+
+  if (kind === 'kimi') {
+    return options.dangerouslySkipPermissions
+      ? `Starting ${getAlias(app, 'kimi')} (auto-approving every action)...`
+      : `Starting ${getAlias(app, 'kimi')}...`;
+  }
+
   if (kind === 'terminal') {
     if (options.mode === 'command') {
       return `Running ${options.command}...`;
@@ -108,6 +124,10 @@ export function applyAliasesToUI(app: App): void {
   const startPiBtn = document.getElementById('startPiBtn');
   const startGrokBtn = document.getElementById('startGrokBtn');
   const dangerousGrokBtn = document.getElementById('dangerousGrokBtn');
+  const startQwenBtn = document.getElementById('startQwenBtn');
+  const dangerousQwenBtn = document.getElementById('dangerousQwenBtn');
+  const startKimiBtn = document.getElementById('startKimiBtn');
+  const dangerousKimiBtn = document.getElementById('dangerousKimiBtn');
   const startTerminalBtn = document.getElementById('startTerminalBtn');
 
   if (startBtn) startBtn.textContent = `Start ${getAlias(app, 'claude')}`;
@@ -118,6 +138,10 @@ export function applyAliasesToUI(app: App): void {
   if (startPiBtn) startPiBtn.textContent = `Start ${getAlias(app, 'pi')}`;
   if (startGrokBtn) startGrokBtn.textContent = `Start ${getAlias(app, 'grok')}`;
   if (dangerousGrokBtn) dangerousGrokBtn.textContent = `Dangerous ${getAlias(app, 'grok')}`;
+  if (startQwenBtn) startQwenBtn.textContent = `Start ${getAlias(app, 'qwen')}`;
+  if (dangerousQwenBtn) dangerousQwenBtn.textContent = `Dangerous ${getAlias(app, 'qwen')}`;
+  if (startKimiBtn) startKimiBtn.textContent = `Start ${getAlias(app, 'kimi')}`;
+  if (dangerousKimiBtn) dangerousKimiBtn.textContent = `Dangerous ${getAlias(app, 'kimi')}`;
   if (startTerminalBtn) startTerminalBtn.textContent = `Start ${getAlias(app, 'terminal')}`;
 
   const planTitle = document.querySelector('#planModal .modal-header h2');

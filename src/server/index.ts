@@ -27,6 +27,8 @@ import { CodexBridge } from './bridges/codex.js';
 import { AgentBridge } from './bridges/agent.js';
 import { PiBridge } from './bridges/pi.js';
 import { GrokBridge } from './bridges/grok.js';
+import { QwenBridge } from './bridges/qwen.js';
+import { KimiBridge } from './bridges/kimi.js';
 import { TerminalBridge } from './bridges/terminal.js';
 import { AppDatabase } from './services/database.js';
 import { SessionStore } from './services/session-store.js';
@@ -73,6 +75,8 @@ export class ClaudeCodeWebServer {
   private agentBridge: BridgeInterface;
   private piBridge: BridgeInterface;
   private grokBridge: BridgeInterface;
+  private qwenBridge: BridgeInterface;
+  private kimiBridge: BridgeInterface;
   private terminalBridge: BridgeInterface;
 
   private database: AppDatabase;
@@ -124,6 +128,8 @@ export class ClaudeCodeWebServer {
     this.agentBridge = new AgentBridge();
     this.piBridge = new PiBridge();
     this.grokBridge = new GrokBridge();
+    this.qwenBridge = new QwenBridge();
+    this.kimiBridge = new KimiBridge();
     this.terminalBridge = new TerminalBridge();
 
     this.dataDir = config.dataDir;
@@ -320,6 +326,10 @@ export class ClaudeCodeWebServer {
         return this.piBridge;
       case 'grok':
         return this.grokBridge;
+      case 'qwen':
+        return this.qwenBridge;
+      case 'kimi':
+        return this.kimiBridge;
       case 'terminal':
         return this.terminalBridge;
       case 'claude':

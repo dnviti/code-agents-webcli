@@ -1,7 +1,7 @@
 # Code Agents Web CLI
 
 `code-agents-webcli` is a single Node.js web application for running Claude Code, Codex, Cursor
-Agent, pi, Grok Build, and classic terminal sessions from the browser.
+Agent, pi, Grok Build, Qwen Code, Kimi Code, and classic terminal sessions from the browser.
 
 It now supports:
 
@@ -15,7 +15,8 @@ It now supports:
 
 - Node.js `>= 20`
 - The agent CLIs you intend to use on the server host `PATH`: `claude`, `codex`, `cursor-agent`,
-  `pi`, `grok`. Each is optional — a missing one only fails when you press its button.
+  `pi`, `grok`, `qwen`, `kimi`. Each is optional — a missing one only fails when you press its
+  button.
 - A GitHub OAuth App for sign-in
 - A modern browser with WebSocket support
 
@@ -335,6 +336,8 @@ npm run dev
 | `--agent-alias <name>` | UI label for Cursor Agent | `Cursor` |
 | `--pi-alias <name>` | UI label for pi | `Pi` |
 | `--grok-alias <name>` | UI label for Grok Build | `Grok` |
+| `--qwen-alias <name>` | UI label for Qwen Code | `Qwen` |
+| `--kimi-alias <name>` | UI label for Kimi Code | `Kimi` |
 | `--ngrok-auth-token <token>` | Enable ngrok tunneling | none |
 | `--ngrok-domain <domain>` | Reserved ngrok domain | none |
 
@@ -391,7 +394,8 @@ updates — `.dockerignore` excludes `.git`, so the build cannot read the commit
 Important:
 
 - the image contains the web server only
-- the agent CLIs (`claude`, `codex`, `cursor-agent`, `pi`, `grok`) are **not** bundled; only terminal
+- the agent CLIs (`claude`, `codex`, `cursor-agent`, `pi`, `grok`, `qwen`, `kimi`) are **not**
+  bundled; only terminal
   sessions work out of the box
 - to use the assistants in Docker, derive an image and install those CLIs in it
 - the folder browser is bounded by the container's working directory (`/app`), so mount your projects

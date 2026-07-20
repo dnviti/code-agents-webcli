@@ -145,6 +145,8 @@ program
   .option('--agent-alias <name>', 'display alias for Agent (default: env AGENT_ALIAS or "Cursor")')
   .option('--pi-alias <name>', 'display alias for pi (default: env PI_ALIAS or "Pi")')
   .option('--grok-alias <name>', 'display alias for Grok Build (default: env GROK_ALIAS or "Grok")')
+  .option('--qwen-alias <name>', 'display alias for Qwen Code (default: env QWEN_ALIAS or "Qwen")')
+  .option('--kimi-alias <name>', 'display alias for Kimi Code (default: env KIMI_ALIAS or "Kimi")')
   .option('--ngrok-auth-token <token>', 'ngrok auth token to open a public tunnel')
   .option('--ngrok-domain <domain>', 'ngrok reserved domain to use for the tunnel')
   .parse();
@@ -186,6 +188,8 @@ async function main() {
       agentAlias: options.agentAlias || process.env.AGENT_ALIAS || 'Cursor',
       piAlias: options.piAlias || process.env.PI_ALIAS || 'Pi',
       grokAlias: options.grokAlias || process.env.GROK_ALIAS || 'Grok',
+      qwenAlias: options.qwenAlias || process.env.QWEN_ALIAS || 'Qwen',
+      kimiAlias: options.kimiAlias || process.env.KIMI_ALIAS || 'Kimi',
       folderMode: true // Always use folder mode
     };
 
@@ -198,7 +202,21 @@ async function main() {
     console.log(`Port: ${port}`);
     console.log('Mode: Folder selection mode');
     console.log(`Plan: ${options.plan}`);
-    console.log(`Aliases: Claude → "${serverOptions.claudeAlias}", Codex → "${serverOptions.codexAlias}", Agent → "${serverOptions.agentAlias}", pi → "${serverOptions.piAlias}", Grok → "${serverOptions.grokAlias}"`);
+    // Built from a table rather than one template string: the line grew past
+    // terminal width every time a runtime was added, and each addition meant
+    // editing a 200-character literal.
+    const aliasBanner = [
+      ['Claude', serverOptions.claudeAlias],
+      ['Codex', serverOptions.codexAlias],
+      ['Agent', serverOptions.agentAlias],
+      ['pi', serverOptions.piAlias],
+      ['Grok', serverOptions.grokAlias],
+      ['Qwen', serverOptions.qwenAlias],
+      ['Kimi', serverOptions.kimiAlias],
+    ]
+      .map(([name, alias]) => `${name} → "${alias}"`)
+      .join(', ');
+    console.log(`Aliases: ${aliasBanner}`);
 
     const appServer = new ClaudeCodeWebServer(serverOptions);
 

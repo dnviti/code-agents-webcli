@@ -225,6 +225,14 @@ export function startGrokSession(app: App, options: RuntimeStartOptions = {}): P
   return startRuntimeSession(app, 'grok', options);
 }
 
+export function startQwenSession(app: App, options: RuntimeStartOptions = {}): Promise<void> {
+  return startRuntimeSession(app, 'qwen', options);
+}
+
+export function startKimiSession(app: App, options: RuntimeStartOptions = {}): Promise<void> {
+  return startRuntimeSession(app, 'kimi', options);
+}
+
 export function startTerminalSession(app: App, options: RuntimeStartOptions = {}): Promise<void> {
   return startRuntimeSession(app, 'terminal', options);
 }

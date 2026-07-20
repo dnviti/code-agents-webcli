@@ -33,6 +33,8 @@ import {
   startAgentSession as sessionsStartAgent,
   startPiSession as sessionsStartPi,
   startGrokSession as sessionsStartGrok,
+  startQwenSession as sessionsStartQwen,
+  startKimiSession as sessionsStartKimi,
   startTerminalSession as sessionsStartTerminal,
   closeSession as sessionsCloseSession,
 } from './sessions/actions';
@@ -152,6 +154,8 @@ export class App {
       agent: 'Cursor',
       pi: 'Pi',
       grok: 'Grok',
+      qwen: 'Qwen',
+      kimi: 'Kimi',
       terminal: 'Terminal',
     };
 
@@ -236,6 +240,10 @@ export class App {
     const startPiBtn = document.getElementById('startPiBtn');
     const startGrokBtn = document.getElementById('startGrokBtn');
     const dangerousGrokBtn = document.getElementById('dangerousGrokBtn');
+    const startQwenBtn = document.getElementById('startQwenBtn');
+    const dangerousQwenBtn = document.getElementById('dangerousQwenBtn');
+    const startKimiBtn = document.getElementById('startKimiBtn');
+    const dangerousKimiBtn = document.getElementById('dangerousKimiBtn');
     const startTerminalBtn = document.getElementById('startTerminalBtn');
     const closeStartPromptBtn = document.getElementById('closeStartPromptBtn');
     const cancelStartPromptBtn = document.getElementById('cancelStartPromptBtn');
@@ -262,6 +270,14 @@ export class App {
     startGrokBtn?.addEventListener('click', () => this.startGrokSession());
     dangerousGrokBtn?.addEventListener('click', () =>
       this.startGrokSession({ dangerouslySkipPermissions: true }),
+    );
+    startQwenBtn?.addEventListener('click', () => this.startQwenSession());
+    dangerousQwenBtn?.addEventListener('click', () =>
+      this.startQwenSession({ dangerouslySkipPermissions: true }),
+    );
+    startKimiBtn?.addEventListener('click', () => this.startKimiSession());
+    dangerousKimiBtn?.addEventListener('click', () =>
+      this.startKimiSession({ dangerouslySkipPermissions: true }),
     );
     startTerminalBtn?.addEventListener('click', () => this.showTerminalOptionsModal());
     const cancelStartPrompt = async () => {
@@ -461,6 +477,14 @@ export class App {
 
   startGrokSession(options: RuntimeStartOptions = {}): Promise<void> {
     return sessionsStartGrok(this, options);
+  }
+
+  startQwenSession(options: RuntimeStartOptions = {}): Promise<void> {
+    return sessionsStartQwen(this, options);
+  }
+
+  startKimiSession(options: RuntimeStartOptions = {}): Promise<void> {
+    return sessionsStartKimi(this, options);
   }
 
   startTerminalSession(options: RuntimeStartOptions = {}): Promise<void> {
