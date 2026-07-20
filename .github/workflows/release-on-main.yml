@@ -6,10 +6,14 @@ on:
       - main
   workflow_dispatch:
 
+# This project is distributed from git and as a container image, not via npm.
+# Publishing to npm was removed: the package has never existed on the registry,
+# and trusted publishing cannot bootstrap one, so `npm publish` 404'd on every
+# run -- taking the tag, the release and the Docker push down with it, since
+# they are later steps in the same job.
 permissions:
   contents: write
   packages: write
-  id-token: write
 
 concurrency:
   group: release-on-main
@@ -21,7 +25,7 @@ env:
 
 jobs:
   release:
-    name: Publish npm package and Docker image
+    name: Tag, release and publish the Docker image
     runs-on: ubuntu-latest
 
     steps:
@@ -32,14 +36,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
           cache: npm
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Upgrade npm for trusted publishing
-        run: npm install --global npm@latest
 
       - name: Show tool versions
         run: |
@@ -70,19 +70,6 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Check if npm version is already published
-        id: npm-version
-        run: |
-          if npm view "code-agents-webcli@${{ steps.pkg.outputs.version }}" version >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Publish to npm with trusted publishing
-        if: steps.git-tag.outputs.exists == 'false' && steps.npm-version.outputs.exists == 'false'
-        run: npm publish --access public
 
       - name: Log in to GitHub Container Registry
         if: steps.git-tag.outputs.exists == 'false'
@@ -128,5 +115,10 @@ jobs:
             Automated release for v${{ steps.pkg.outputs.version }}.
 
             Published assets:
-            - npm package: `code-agents-webcli`
             - container image: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}`
+
+            Install with:
+            ```
+            npm i -g --allow-git=all github:dnviti/code-agents-webcli
+            npm rebuild --prefix "$(npm root -g)/code-agents-webcli"
+            ```

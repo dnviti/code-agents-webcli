@@ -345,17 +345,19 @@ npm test
 The repository includes:
 
 - `.github/workflows/ci.yml`: typecheck, test, and Docker build validation
-- `.github/workflows/release-on-main.yml`: publish the npm package and GHCR container image from `main`
+- `.github/workflows/release-on-main.yml`: tag `v<version>`, cut a GitHub release, and push the GHCR
+  container image from `main`
 
-The release workflow is designed for npm trusted publishing with GitHub Actions OIDC.
+A release fires when `package.json`'s version changes and no matching tag exists yet. This project is
+not published to npm — it is distributed from git and as a container image — so the workflow needs no
+registry credentials.
 
 ## What You Still Need To Configure
 
-Publishing cannot succeed until you complete these external steps:
+The app cannot serve sign-ins until you complete these external steps:
 
 1. Create the GitHub OAuth App and set the callback URL for your deployment.
-2. Configure npm trusted publishing for `dnviti/code-agents-webcli` against this repository and the release workflow.
-3. If you plan to run the Docker image in production, make sure the required assistant CLIs are installed in the runtime environment or a derived image.
+2. If you plan to run the Docker image in production, make sure the required assistant CLIs are installed in the runtime environment or a derived image.
 
 ## Repository
 

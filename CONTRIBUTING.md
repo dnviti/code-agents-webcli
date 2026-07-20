@@ -71,11 +71,10 @@ npm start
 
 1. Land the version bump on `main`.
 2. GitHub Actions runs `.github/workflows/release-on-main.yml`.
-3. That workflow validates the build, publishes the npm package with trusted publishing, and pushes the Docker image to GHCR.
+3. That workflow validates the build, tags `v<version>`, cuts a GitHub release, and pushes the Docker image to GHCR.
 
 Prerequisites outside the repo:
 
-- npm trusted publishing must be configured for this repository
 - the package name must be available on npm
 - GitHub OAuth credentials must be configured for deployed environments
 
