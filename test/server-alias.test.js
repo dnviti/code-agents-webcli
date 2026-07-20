@@ -60,16 +60,66 @@ describe('Server Aliases', function() {
     }
   });
 
-  it('labels every runtime distinctly rather than falling back to Claude', function() {
-    const server = new ClaudeCodeWebServer({ noAuth: true });
-    // Same trap, on the user-visible side: the alias map is what the tab title
-    // and the "Starting ..." line are built from.
-    const labels = ['claude', 'codex', 'agent', 'pi', 'grok', 'qwen', 'kimi']
-      .map((kind) => server.aliases[kind]);
-    assert.strictEqual(
-      new Set(labels).size,
-      labels.length,
-      `runtime aliases must be distinct, got: ${labels.join(', ')}`,
-    );
+  // The label lookups are where the fall-through actually bites. Both
+  // getRuntimeLabel and getRuntimeErrorLabel end in `case 'claude': default:`,
+  // so a kind that reached the AgentKind union but never got a case compiles,
+  // runs, starts its session — and reports itself as Claude throughout.
+  //
+  // Aliases are passed explicitly for every runtime rather than relying on the
+  // defaults: createConfig resolves each one as
+  // `options.xAlias || process.env.X_ALIAS || 'X'`, so an ambient CLAUDE_ALIAS
+  // or QWEN_ALIAS in the environment could otherwise collide two labels and
+  // fail this run for reasons that have nothing to do with the code.
+  const EXPLICIT = {
+    claude: 'Alias-claude',
+    codex: 'Alias-codex',
+    agent: 'Alias-agent',
+    pi: 'Alias-pi',
+    grok: 'Alias-grok',
+    qwen: 'Alias-qwen',
+    kimi: 'Alias-kimi',
+  };
+
+  function serverWithExplicitAliases() {
+    return new ClaudeCodeWebServer({
+      noAuth: true,
+      claudeAlias: EXPLICIT.claude,
+      codexAlias: EXPLICIT.codex,
+      agentAlias: EXPLICIT.agent,
+      piAlias: EXPLICIT.pi,
+      grokAlias: EXPLICIT.grok,
+      qwenAlias: EXPLICIT.qwen,
+      kimiAlias: EXPLICIT.kimi,
+    });
+  }
+
+  it('getRuntimeLabel returns each runtime own alias, never Claude\'s', function() {
+    const processor = serverWithExplicitAliases().messageProcessor;
+    // `private` in TypeScript is erased at runtime, so this is callable here.
+    for (const [kind, expected] of Object.entries(EXPLICIT)) {
+      assert.strictEqual(
+        processor.getRuntimeLabel(kind),
+        expected,
+        `getRuntimeLabel('${kind}') fell through — it is missing a case`,
+      );
+    }
+  });
+
+  it('getRuntimeErrorLabel names each runtime distinctly', function() {
+    const processor = serverWithExplicitAliases().messageProcessor;
+    // These are product names rather than aliases, so they are checked for
+    // distinctness instead of exact values.
+    const kinds = Object.keys(EXPLICIT);
+    const seen = new Map();
+    for (const kind of kinds) {
+      const label = processor.getRuntimeErrorLabel(kind);
+      assert.ok(label, `getRuntimeErrorLabel('${kind}') returned nothing`);
+      const clash = seen.get(label);
+      assert.ok(
+        !clash,
+        `getRuntimeErrorLabel('${kind}') returned '${label}', same as '${clash}' — a missing case falls through to Claude`,
+      );
+      seen.set(label, kind);
+    }
   });
 });
