@@ -9,6 +9,8 @@ import {
   WebSocketInfo,
 } from '../types.js';
 import { TranscriptStoreLike } from '../services/transcript-store.js';
+import { HistoryStoreLike } from '../services/history-store.js';
+import { ScrollbackRecorder } from '../services/scrollback.js';
 import { sendToWebSocket, broadcastToSession } from './handler.js';
 
 export interface MessageProcessorDeps {
@@ -30,6 +32,7 @@ export interface MessageProcessorDeps {
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
   saveSessionsToDisk(): Promise<void>;
   transcriptStore: TranscriptStoreLike;
+  historyStore: HistoryStoreLike;
   usageReader: {
     getCurrentSessionStats(): Promise<any>;
     calculateBurnRate(minutes: number): Promise<any>;
@@ -55,10 +58,15 @@ interface IncomingMessage {
   cols?: number;
   rows?: number;
   command?: string;
+  fromLine?: number;
+  count?: number;
+  requestId?: string;
 }
 
 export class MessageProcessor {
   private deps: MessageProcessorDeps;
+  /** One scrollback emulator per session, rebuilding history from the PTY stream. */
+  private recorders = new Map<string, ScrollbackRecorder>();
 
   constructor(deps: MessageProcessorDeps) {
     this.deps = deps;
@@ -107,6 +115,10 @@ export class MessageProcessor {
 
       case 'stop':
         await this.handleStop(wsInfo);
+        break;
+
+      case 'history_request':
+        await this.handleHistoryRequest(wsInfo, data);
         break;
 
       case 'ping':
@@ -200,9 +212,17 @@ export class MessageProcessor {
     const replayBuffer =
       transcriptChunks.length > 0 ? transcriptChunks : session.outputBuffer.slice(-200);
 
+    // Tells the client how far back it can page. The replayed tail restores the
+    // live terminal; anything above it is fetched a screen at a time.
+    const history = await this.deps.historyStore.stat(session).catch(() => ({
+      firstLine: 0,
+      totalLines: 0,
+    }));
+
     // Send session info and replay buffer
     sendToWebSocket(wsInfo.ws, {
       type: 'session_joined',
+      history,
       sessionId: claudeSessionId,
       sessionName: session.name,
       workingDir: session.workingDir,
@@ -328,6 +348,12 @@ export class MessageProcessor {
         onExit: (code: number | null, signal: string | null) => {
           const currentSession = this.deps.claudeSessions.get(sessionId);
           if (!currentSession || currentSession.runId !== runId) return;
+
+          // The run is over, so the screen it leaves behind can never be
+          // repainted: freeze it into history and let the emulator go. Keeping
+          // one alive per finished session costs a couple of megabytes each,
+          // for a buffer nothing will ever write to again.
+          this.retireRecorder(currentSession);
 
           const stopRequested = currentSession.stopRequested;
           currentSession.active = false;
@@ -511,6 +537,10 @@ export class MessageProcessor {
     const session = this.deps.claudeSessions.get(wsInfo.claudeSessionId);
     if (!session || !session.connections.has(wsId)) return;
 
+    // Keep the recorder's geometry in step with the PTY, otherwise stored lines
+    // would be wrapped at a width the program never actually rendered at.
+    this.recorders.get(session.id)?.resize(cols, rows);
+
     if (session.active && session.agent) {
       try {
         const bridge = this.deps.getRuntimeBridge(session.agent);
@@ -646,6 +676,131 @@ export class MessageProcessor {
     }
 
     this.deps.transcriptStore.appendOutput(session, data);
+    this.getRecorder(session).write(data);
+  }
+
+  /**
+   * Serve a page of scrollback.
+   *
+   * The ownership check is the important part: session ids are guessable enough
+   * that without it any signed-in user could page through another user's
+   * terminal history, which is exactly the content this app exists to protect.
+   */
+  private async handleHistoryRequest(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const sessionId = data.sessionId || wsInfo.claudeSessionId;
+    if (!sessionId) {
+      return;
+    }
+
+    const session = this.deps.claudeSessions.get(sessionId);
+    if (!session || session.ownerUserId !== wsInfo.userId) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: 'Session not found',
+      });
+      return;
+    }
+
+    try {
+      const page = await this.deps.historyStore.read(
+        session,
+        typeof data.fromLine === 'number' ? data.fromLine : 0,
+        typeof data.count === 'number' ? data.count : 0,
+      );
+
+      sendToWebSocket(wsInfo.ws, {
+        type: 'history_chunk',
+        sessionId,
+        requestId: data.requestId ?? null,
+        ...page,
+      });
+    } catch (error) {
+      console.error(`Failed to read history for session ${sessionId}:`, error);
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: 'Failed to read session history',
+      });
+    }
+  }
+
+  private getRecorder(session: SessionRecord): ScrollbackRecorder {
+    const existing = this.recorders.get(session.id);
+    if (existing) {
+      return existing;
+    }
+
+    const ref = { id: session.id, ownerUserId: session.ownerUserId };
+    const recorder = new ScrollbackRecorder({
+      onLines: (lines) => this.deps.historyStore.append(ref, lines),
+      onGap: (dropped) => {
+        const amount = dropped === null ? 'un numero imprecisato di' : String(dropped);
+        this.deps.historyStore.append(ref, [
+          `\x1b[2m[... ${amount} righe non registrate: output troppo rapido ...]\x1b[0m`,
+        ]);
+      },
+    });
+
+    this.recorders.set(session.id, recorder);
+    return recorder;
+  }
+
+  /**
+   * The lines still on screen for a session, so an export can end where the
+   * session actually ends. Flushes first so nothing sits in limbo between the
+   * emulator and the store.
+   */
+  getScreenSnapshot(sessionId: string): string[] {
+    const recorder = this.recorders.get(sessionId);
+    if (!recorder) {
+      return [];
+    }
+    recorder.flush();
+    return recorder.snapshotScreen();
+  }
+
+  /**
+   * Fold a finished run's last screen into history, then release the emulator.
+   *
+   * The remaining lines never scrolled off, so a plain flush would leave them
+   * out of both the history and the export. They are final now that the
+   * process is gone.
+   */
+  private retireRecorder(session: SessionRecord): void {
+    const recorder = this.recorders.get(session.id);
+    if (!recorder) {
+      return;
+    }
+
+    recorder.flush();
+    const screen = recorder.snapshotScreen();
+    if (screen.length > 0) {
+      this.deps.historyStore.append(
+        { id: session.id, ownerUserId: session.ownerUserId },
+        screen,
+      );
+    }
+
+    recorder.dispose();
+    this.recorders.delete(session.id);
+  }
+
+  /** Drop the emulator for a session that is going away. */
+  disposeRecorder(sessionId: string): void {
+    const recorder = this.recorders.get(sessionId);
+    if (recorder) {
+      recorder.flush();
+      recorder.dispose();
+      this.recorders.delete(sessionId);
+    }
+  }
+
+  disposeAllRecorders(): void {
+    for (const sessionId of Array.from(this.recorders.keys())) {
+      this.disposeRecorder(sessionId);
+    }
   }
 
   private getRuntimeLabel(agentKind: AgentKind, session: SessionRecord | null = null): string {

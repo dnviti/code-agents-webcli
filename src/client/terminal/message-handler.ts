@@ -78,6 +78,10 @@ export class MessageHandler {
         this.onSessionDeleted(message);
         break;
 
+      case 'history_chunk':
+        this.onHistoryChunk(message);
+        break;
+
       case 'pong':
         break;
 
@@ -114,8 +118,11 @@ export class MessageHandler {
     outputBuffer?: string[];
     lastAgent?: string;
     runtimeLabel?: string;
+    history?: { firstLine: number; totalLines: number };
   }): void {
     this.app.currentClaudeSessionId = message.sessionId;
+    this.app.historyRange = message.history ?? { firstLine: 0, totalLines: 0 };
+    this.app.historyView?.setRange(this.app.historyRange);
     this.app.currentClaudeSessionName = message.sessionName;
     this.app.terminal?.reset();
     this.scheduleTerminalRefit();
@@ -138,11 +145,13 @@ export class MessageHandler {
       this.app.pendingJoinSessionId = null;
     }
 
-    // Replay output buffer
+    // Replay output buffer. Joined into a single write: the transcript arrives
+    // pre-split into 64KB chunks purely for transport, and parsing it as one
+    // stream avoids re-entering the write pipeline dozens of times on join.
     if (message.outputBuffer && message.outputBuffer.length > 0 && this.app.terminal) {
-      message.outputBuffer.forEach((data: string) => {
-        this.app.terminal?.write(stripUnsupportedTerminalSequences(data));
-      });
+      this.app.terminal.write(
+        stripUnsupportedTerminalSequences(message.outputBuffer.join('')),
+      );
       this.scheduleTerminalRefit();
     }
 
@@ -227,10 +236,9 @@ export class MessageHandler {
 
   private onOutput(message: { data: string }): void {
     const filteredData = stripUnsupportedTerminalSequences(message.data);
-    this.app.terminal?.write(filteredData);
-    if (document.visibilityState === 'visible') {
-      this.app.terminalController?.refresh();
-    }
+    // Batched to the next frame. Writing (and previously force-refreshing) once
+    // per socket chunk meant a full-screen repaint per streamed token.
+    this.app.terminalController?.write(filteredData);
 
     if (this.app.sessionTabManager && this.app.currentClaudeSessionId) {
       this.app.sessionTabManager.markSessionActivity(
@@ -242,6 +250,33 @@ export class MessageHandler {
 
     if (this.app.planDetector) {
       this.app.planDetector.processOutput(message.data);
+    }
+  }
+
+  /**
+   * Hand the page to whoever asked for it. Replies are matched by id because
+   * fast scrolling leaves several requests in flight and they can come back
+   * out of order.
+   */
+  private onHistoryChunk(message: {
+    requestId?: string | null;
+    lines?: string[];
+    firstLine?: number;
+    totalLines?: number;
+  }): void {
+    if (typeof message.firstLine === 'number' && typeof message.totalLines === 'number') {
+      this.app.historyRange = { firstLine: message.firstLine, totalLines: message.totalLines };
+      this.app.historyView?.setRange(this.app.historyRange);
+    }
+
+    if (!message.requestId) {
+      return;
+    }
+
+    const resolve = this.app.historyRequests.get(message.requestId);
+    if (resolve) {
+      this.app.historyRequests.delete(message.requestId);
+      resolve(message.lines ?? []);
     }
   }
 
@@ -296,34 +331,46 @@ export class MessageHandler {
     this.app.loadSessions();
   }
 
-  private scheduleTerminalRefit(): void {
-    const syncSize = (): void => {
-      if (
-        this.app.socket &&
-        this.app.socket.readyState === WebSocket.OPEN &&
-        this.app.terminal &&
-        this.app.terminal.cols > 0 &&
-        this.app.terminal.rows > 0
-      ) {
-        this.app.send({
-          type: 'resize',
-          cols: this.app.terminal.cols,
-          rows: this.app.terminal.rows,
-        });
-      }
-    };
+  private lastSentCols = 0;
+  private lastSentRows = 0;
 
+  /**
+   * Fit once now and once after layout settles.
+   *
+   * This used to fire three waves (sync, rAF, +32ms) and send a resize each
+   * time. Every wave that changed the size reflowed the whole scrollback and
+   * made the PTY redraw, so joining a session could reflow it several times
+   * over. Sending only on an actual change also stops the server from
+   * re-rendering for a size it already has.
+   */
+  private syncSize(): void {
+    const terminal = this.app.terminal;
+    if (
+      !terminal ||
+      terminal.cols <= 0 ||
+      terminal.rows <= 0 ||
+      !this.app.socket ||
+      this.app.socket.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+
+    if (terminal.cols === this.lastSentCols && terminal.rows === this.lastSentRows) {
+      return;
+    }
+
+    this.lastSentCols = terminal.cols;
+    this.lastSentRows = terminal.rows;
+    this.app.send({ type: 'resize', cols: terminal.cols, rows: terminal.rows });
+  }
+
+  private scheduleTerminalRefit(): void {
     this.app.fitTerminal();
-    syncSize();
+    this.syncSize();
 
     requestAnimationFrame(() => {
       this.app.fitTerminal();
-      syncSize();
+      this.syncSize();
     });
-
-    setTimeout(() => {
-      this.app.fitTerminal();
-      syncSize();
-    }, 32);
   }
 }

@@ -100,6 +100,41 @@ The service option is unavailable when running through `npx`, because npx unpack
 npm can delete at any time; a unit pointing there would break later. Use the global install for that.
 It is also Linux/systemd-only; elsewhere the wizard offers foreground mode only.
 
+## Scrollback and history
+
+Long sessions used to bog the browser down: the terminal held a 20,000-line buffer, reflowed all of
+it on every resize, and forced a full repaint per streamed chunk.
+
+The live terminal now keeps only the recent tail. Everything older is rebuilt server-side and paged
+in a screen at a time, so scrolling back is bounded by the size of your screen rather than by the
+length of the session.
+
+- The server runs a headless copy of the same terminal emulator the browser runs, and freezes each
+  line as it scrolls off. Those lines go to an append-only log with a fixed-width index, so fetching
+  "lines 812,340 to 812,390" is two positioned reads and costs the same whether the session is a
+  minute or a week old.
+- Scroll to the top of the live buffer (or keep scrolling up once you are there) to enter the
+  history viewer. Scroll to the bottom, press Escape, or use **Torna al presente** to come back.
+- Full-screen programs are not recorded: the alternate screen buffer is isolated, so a TUI redrawing
+  itself does not fill your history with frames.
+- **Scarica .md** in the history bar downloads the whole session as Markdown, ANSI stripped and
+  streamed page by page. It is also available at `GET /api/sessions/<id>/export.md`.
+
+History is per user and enforced on every request, the same as sessions themselves.
+
+Known limits:
+
+- History lines are wrapped at the width the PTY was rendering at. Viewing from a window of a
+  different width shows the PTY's wrapping, not your own.
+- Oldest lines are dropped past a per-session cap (200,000 lines by default). Line numbers stay
+  absolute, and the viewer tells you how many were dropped.
+- If a program emits more scrollback in a single burst than the emulator holds, the gap is recorded
+  in the history rather than passed over silently.
+- Text selection inside the history viewer is not supported yet; use the Markdown export to get
+  content out.
+- A scrollback emulator costs roughly 2 MB per session while a runtime is running. It is released
+  when the process exits, the session is deleted, or the server shuts down.
+
 ## GitHub OAuth Setup
 
 Create a GitHub OAuth App and set the callback URL to:

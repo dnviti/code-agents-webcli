@@ -49,6 +49,18 @@ describe('MessageProcessor', function() {
       saveSessionsToDisk() {
         return Promise.resolve();
       },
+      historyStore: {
+        append() {},
+        stat() {
+          return Promise.resolve({ firstLine: 0, totalLines: 0 });
+        },
+        read() {
+          return Promise.resolve({ firstLine: 0, totalLines: 0, fromLine: 0, lines: [] });
+        },
+        deleteHistory() {
+          return Promise.resolve();
+        },
+      },
       transcriptStore: {
         ensureTranscript() {
           return Promise.resolve('/tmp/session-1.md');

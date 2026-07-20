@@ -12,6 +12,7 @@ import {
   AuthenticatedUser,
 } from '../types.js';
 import { TranscriptStoreLike } from '../services/transcript-store.js';
+import { HistoryStoreLike } from '../services/history-store.js';
 
 export interface SessionRoutesDeps {
   claudeSessions: Map<string, SessionRecord>;
@@ -29,6 +30,11 @@ export interface SessionRoutesDeps {
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
   saveSessionsToDisk(): Promise<void>;
   transcriptStore: TranscriptStoreLike;
+  historyStore: HistoryStoreLike;
+  /** Lines still on screen, not yet scrolled into history. */
+  getScreenSnapshot(sessionId: string): string[];
+  /** Tear down the scrollback emulator held for a session. */
+  disposeRecorder(sessionId: string): void;
   getSelectedWorkingDir(userId: number): string | null;
   sessionStore: {
     getSessionMetadata(): Promise<any>;
@@ -214,13 +220,114 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
 
     session.connections.clear();
     deps.claudeSessions.delete(sessionId);
+    // Without this the headless emulator for a deleted session would live for
+    // as long as the process does.
+    deps.disposeRecorder(sessionId);
     void deps.transcriptStore.deleteTranscript(session);
+    void deps.historyStore.deleteHistory(session);
     void deps.saveSessionsToDisk();
 
     res.json({ success: true, message: 'Session deleted' });
   });
 
+  /**
+   * Download the whole session as Markdown.
+   *
+   * Streamed in pages straight from the history index rather than buffered:
+   * a long session is tens of megabytes, and holding all of it in memory to
+   * serve one download would be the same mistake the scrollback paging exists
+   * to avoid.
+   */
+  router.get(
+    '/api/sessions/:sessionId/export.md',
+    async (req: Request, res: Response): Promise<void> => {
+      const user = requireUser(res);
+      if (!user) {
+        res.status(401).json({ error: 'authentication_required' });
+        return;
+      }
+
+      const sessionId = req.params.sessionId as string;
+      const session = getOwnedSession(deps.claudeSessions, sessionId, user);
+      if (!session) {
+        res.status(404).json({ error: 'Session not found' });
+        return;
+      }
+
+      res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${exportFileName(session)}"`,
+      );
+
+      res.write(`# ${session.name}\n\n`);
+      res.write(`- Directory: \`${session.workingDir}\`\n`);
+      res.write(`- Creata: ${session.created.toISOString()}\n`);
+      res.write(`- Ultima attività: ${session.lastActivity.toISOString()}\n\n`);
+      res.write(`${FENCE}\n`);
+
+      try {
+        const { firstLine, totalLines } = await deps.historyStore.stat(session);
+        if (firstLine > 0) {
+          res.write(`[... ${firstLine} righe precedenti non più conservate ...]\n`);
+        }
+
+        for (let cursor = firstLine; cursor < totalLines; ) {
+          const page = await deps.historyStore.read(session, cursor, EXPORT_PAGE_LINES);
+          if (page.lines.length === 0) {
+            break;
+          }
+          res.write(`${page.lines.map(toPlainText).join('\n')}\n`);
+          cursor = page.fromLine + page.lines.length;
+        }
+
+        // The newest lines are still on the emulator's screen and have not
+        // scrolled into history yet. Taking them from the raw output buffer
+        // instead would re-emit whatever of the session that buffer still
+        // holds, duplicating most of the export.
+        const tail = deps.getScreenSnapshot(sessionId);
+        if (tail.length > 0) {
+          res.write(`${tail.map(toPlainText).join('\n')}\n`);
+        }
+      } catch (error) {
+        console.error(`Failed to export session ${sessionId}:`, error);
+        res.write('\n[... esportazione interrotta da un errore ...]\n');
+      }
+
+      res.write(`${FENCE}\n`);
+      res.end();
+    },
+  );
+
   return router;
+}
+
+const EXPORT_PAGE_LINES = 500;
+/** Long enough that ordinary fenced output inside the transcript cannot close it. */
+const FENCE = '``````````';
+
+// CSI/OSC and the rest of the escape vocabulary a PTY emits. Markdown is plain
+// text, so all of it goes.
+const ANSI_PATTERN =
+  // CSI (colours, cursor moves, including colon-separated and private
+  // parameters), OSC and the other string-terminated escapes with their whole
+  // body, single-character escapes, and stray control bytes. Tab, LF and CR
+  // are deliberately left in.
+  // eslint-disable-next-line no-control-regex
+  /\x1b\[[0-?]*[ -/]*[@-~]|\x1b[P^_X][^\x07\x1b]*(?:\x07|\x1b\\|$)|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|$)|\x1b[ -/]*[0-~]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+
+function toPlainText(value: string): string {
+  return value
+    .replace(ANSI_PATTERN, '')
+    .replace(/\r\n?/g, '\n')
+    // Shorten any run that could close the fence; 9 still renders as backticks.
+    .replace(/`{10,}/g, '`````````');
+}
+
+function exportFileName(session: SessionRecord): string {
+  const safe = session.name.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  const stamp = session.created.toISOString().slice(0, 10);
+  return `${safe || 'sessione'}-${stamp}.md`;
 }
 
 function requireUser(res: Response): AuthenticatedUser | null {

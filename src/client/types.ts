@@ -106,6 +106,18 @@ export interface WsSessionJoinedMessage {
   outputBuffer?: string[];
   lastAgent?: AgentKind;
   runtimeLabel?: string;
+  /** How far back the server can page this session's scrollback. */
+  history?: { firstLine: number; totalLines: number };
+}
+
+export interface WsHistoryChunkMessage {
+  type: 'history_chunk';
+  sessionId: string;
+  requestId: string | null;
+  fromLine: number;
+  lines: string[];
+  firstLine: number;
+  totalLines: number;
 }
 
 export interface WsSessionLeftMessage {
@@ -188,4 +200,5 @@ export type WsMessage =
   | WsSessionDeletedMessage
   | WsSessionGoneMessage
   | WsPongMessage
+  | WsHistoryChunkMessage
   | WsUsageUpdateMessage;

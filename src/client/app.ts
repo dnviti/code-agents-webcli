@@ -59,11 +59,18 @@ import {
 } from './ui/mobile';
 import { showNotification, playNotificationSound, injectNotificationStyles } from './ui/notifications';
 import { SplitContainer } from './splits/split-container';
+import type { HistoryView, HistoryRange } from './terminal/history-view';
 
 export class App {
   // Terminal
   terminal: Terminal | null;
   terminalController: TerminalController | null;
+
+  // Server-paged scrollback
+  historyView: HistoryView | null;
+  historyRange: HistoryRange;
+  historyRequests: Map<string, (lines: string[]) => void>;
+  historyRequestSeq: number;
   socket: WebSocket | null;
   connectionId: string | null;
 
@@ -108,6 +115,10 @@ export class App {
   constructor() {
     this.terminal = null;
     this.terminalController = null;
+    this.historyView = null;
+    this.historyRange = { firstLine: 0, totalLines: 0 };
+    this.historyRequests = new Map();
+    this.historyRequestSeq = 0;
     this.socket = null;
     this.connectionId = null;
 
