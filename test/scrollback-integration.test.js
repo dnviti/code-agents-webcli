@@ -29,6 +29,16 @@ describe('scrollback integration (real PTY)', function () {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  const SENTINEL = 'FINE-SENTINELLA';
+
+  /**
+   * Run a command and wait until its output has actually arrived.
+   *
+   * Waiting on the PTY's exit event is not enough: it can fire while output is
+   * still in flight, so on a loaded machine the recorder simply never sees the
+   * tail. The command echoes a sentinel last, and we wait for that to reach the
+   * emulator's screen before reading anything.
+   */
   function runThroughPty(command, cols = 100, rows = 30) {
     return new Promise((resolve, reject) => {
       const gaps = [];
@@ -39,7 +49,7 @@ describe('scrollback integration (real PTY)', function () {
         onGap: (dropped) => gaps.push(dropped),
       });
 
-      const term = pty.spawn('/bin/bash', ['-lc', command], {
+      const term = pty.spawn('/bin/bash', ['-lc', `${command}; echo "${SENTINEL}"`], {
         cols,
         rows,
         name: 'xterm-256color',
@@ -47,16 +57,31 @@ describe('scrollback integration (real PTY)', function () {
       });
 
       term.onData((data) => recorder.write(data));
-      term.onExit(() => {
-        // Wait for the parser rather than for a timeout: on a loaded machine a
-        // fixed delay leaves output still queued, and the counts come out short.
-        void recorder.drain().then(() => {
-          recorder.dispose();
-          resolve({ gaps });
-        });
-      });
 
-      setTimeout(() => reject(new Error('PTY timed out')), 25000);
+      let settled = false;
+      const finish = async (error) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(poll);
+        clearTimeout(bail);
+        await recorder.drain();
+        const screen = recorder.snapshotScreen();
+        recorder.dispose();
+        try { term.kill(); } catch { /* already gone */ }
+        if (error) reject(error);
+        else resolve({ gaps, screen });
+      };
+
+      const poll = setInterval(() => {
+        if (recorder.snapshotScreen().some((line) => line.includes(SENTINEL))) {
+          void finish();
+        }
+      }, 20);
+
+      const bail = setTimeout(
+        () => void finish(new Error('the sentinel never arrived: PTY output was lost')),
+        25000,
+      );
     });
   }
 
@@ -64,10 +89,10 @@ describe('scrollback integration (real PTY)', function () {
     const { gaps } = await runThroughPty('for i in $(seq 1 4000); do echo "riga $i"; done');
     assert.deepStrictEqual(gaps, [], 'no history should have been dropped');
 
-    // 4000 echoed lines, 30 rows on screen: everything above the last screen
-    // is final, the rest is still live and arrives via the normal replay.
+    // The sentinel proves every line was delivered, so the count is exact:
+    // 4000 lines plus the sentinel, minus the screenful still live.
     const stats = await store.stat(SESSION);
-    assert.strictEqual(stats.totalLines, 4000 - 30 + 1);
+    assert.strictEqual(stats.totalLines, 4001 - 30 + 1);
 
     // Walk the whole history in screen-sized pages, exactly as the client does.
     const seen = [];
@@ -80,7 +105,7 @@ describe('scrollback integration (real PTY)', function () {
     }
 
     const numbered = seen.filter((line) => /^riga \d+$/.test(line));
-    assert.strictEqual(numbered.length, 3971);
+    assert.strictEqual(numbered.length, 3972);
     // Every line present exactly once, in order, with no gaps.
     numbered.forEach((line, index) => {
       assert.strictEqual(line, `riga ${index + 1}`);
