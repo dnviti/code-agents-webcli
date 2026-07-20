@@ -11,6 +11,8 @@ export function createConfig(options: ServerOptions): ServerState {
     agent: options.agentAlias || process.env.AGENT_ALIAS || 'Cursor',
     pi: options.piAlias || process.env.PI_ALIAS || 'Pi',
     grok: options.grokAlias || process.env.GROK_ALIAS || 'Grok',
+    qwen: options.qwenAlias || process.env.QWEN_ALIAS || 'Qwen',
+    kimi: options.kimiAlias || process.env.KIMI_ALIAS || 'Kimi',
   };
 
   return {

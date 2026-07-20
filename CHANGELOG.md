@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Qwen Code and Kimi Code** as runtimes, with `--qwen-alias` and `--kimi-alias` to relabel them.
+  Both get a Dangerous button wired to `--yolo`. For Kimi that flag is documented (`-y, --yolo
+  Automatically approve all actions.`); for Qwen it is not — `qwen --help` omits it entirely — but
+  the shipped bundle both registers it (`.option("yolo", { alias: "y", type: "boolean" })`) and acts
+  on it (`else if (argv.yolo) approvalMode = "yolo"`), verified against `@qwen-code/qwen-code`
+  0.20.0. Kimi's `--auto` is deliberately not used: it is a narrower "auto permission mode" that
+  still prompts for what it does not cover, so wiring the Dangerous button to it would promise a
+  bypass the user does not get.
+- The Kimi bridge looks in `~/.kimi-code/bin` before `PATH`, because that is where its installer puts
+  the binary and that directory is often missing from a systemd `--user` PATH — the same reason the
+  Grok bridge leads with `~/.grok/bin`.
+
 ## [4.1.0] - 2026-07-20
 
 ### Fixed
