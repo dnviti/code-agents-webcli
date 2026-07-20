@@ -35,3 +35,103 @@
 .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
     background: var(--scrollbar-thumb-hover);
 }
+
+/* ---------------------------------------------------------------------------
+   History viewer: one screenful of server-paged scrollback.
+
+   The scroller sits on top of the terminal and owns the scrollbar. Its spacer
+   is sized to the whole session, so the scrollbar thumb reflects the real
+   extent of the history while only one screen is ever rendered.
+   --------------------------------------------------------------------------- */
+
+.history-view {
+    position: absolute;
+    inset: 0;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    background: var(--terminal-bg, #0d1117);
+    border-radius: inherit;
+}
+
+.history-view[hidden] {
+    display: none;
+}
+
+.history-view__bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--terminal-shell-border, rgba(240, 246, 252, 0.1));
+    font-size: 12px;
+    color: var(--text-muted, #8b949e);
+    flex: 0 0 auto;
+}
+
+.history-view__status {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.history-view__actions {
+    display: flex;
+    gap: 8px;
+    flex: 0 0 auto;
+}
+
+.history-view__button {
+    padding: 4px 10px;
+    font: inherit;
+    font-size: 12px;
+    color: var(--text-muted, #8b949e);
+    background: transparent;
+    border: 1px solid var(--terminal-shell-border, rgba(240, 246, 252, 0.1));
+    border-radius: var(--radius-pill, 999px);
+    cursor: pointer;
+}
+
+.history-view__button:hover {
+    color: var(--text-primary, #f0f6fc);
+}
+
+.history-view__button--primary {
+    color: #79c0ff;
+    border-color: rgba(121, 192, 255, 0.4);
+}
+
+.history-view__body {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+}
+
+.history-view__terminal {
+    position: absolute;
+    inset: 0;
+}
+
+.history-view__scroller {
+    position: absolute;
+    inset: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb, rgba(240, 246, 252, 0.2)) transparent;
+    touch-action: pan-y;
+}
+
+.history-view__scroller::-webkit-scrollbar {
+    width: 9px;
+}
+
+.history-view__scroller::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb, rgba(240, 246, 252, 0.2));
+    border-radius: var(--radius-pill, 999px);
+}
+
+.history-view__spacer {
+    width: 1px;
+}

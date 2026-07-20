@@ -1,6 +1,8 @@
 import { Terminal, type IDisposable, type ITerminalOptions } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
+import { WebglAddon } from '@xterm/addon-webgl';
+import { createFrameScheduler } from './scheduler';
 
 export interface TerminalController {
   terminal: Terminal;
@@ -10,15 +12,31 @@ export interface TerminalController {
   restoreViewport(): void;
   open(container: HTMLElement): void;
   dispose(): void;
+  /** Queue output for the next frame instead of parsing every socket chunk on its own. */
+  write(data: string): void;
+  /** True when the viewport is pinned to the newest line. */
+  isAtBottom(): boolean;
+  /** Fires when the user scrolls to the very top of the live buffer. */
+  onReachedTop(handler: () => void): IDisposable;
+  /** Which renderer actually took over, for diagnostics. */
+  readonly rendererKind: () => 'webgl' | 'dom';
 }
 
 interface CreateTerminalControllerOptions {
   fontSize?: number;
   fontFamily?: string;
   theme?: ITerminalOptions['theme'];
+  scrollback?: number;
 }
 
-const DEFAULT_THEME: NonNullable<ITerminalOptions['theme']> = {
+/**
+ * The live terminal only holds the recent tail. Everything older is paged in
+ * from the server on demand, so a bigger buffer here would only add reflow cost
+ * (xterm reflows the whole scrollback on every resize) without adding reach.
+ */
+export const LIVE_SCROLLBACK_LINES = 2000;
+
+export const DEFAULT_THEME: NonNullable<ITerminalOptions['theme']> = {
   background: '#0d1117',
   foreground: '#f0f6fc',
   cursor: '#58a6ff',
@@ -59,7 +77,7 @@ export function createTerminalController(
     fastScrollSensitivity: 5,
     minimumContrastRatio: 1,
     rightClickSelectsWord: false,
-    scrollback: 20000,
+    scrollback: options.scrollback ?? LIVE_SCROLLBACK_LINES,
     scrollOnUserInput: true,
     smoothScrollDuration: 0,
   });
@@ -70,54 +88,21 @@ export function createTerminalController(
 
   let container: HTMLElement | null = null;
   let resizeObserver: ResizeObserver | null = null;
-  let fitFrame: number | null = null;
-  let restoreFrame: number | null = null;
-  let restoreTimeouts: number[] = [];
-  let viewport: HTMLElement | null = null;
-  let viewportScrollHandler: (() => void) | null = null;
-  let touchScrollLastY: number | null = null;
-  let lastViewportScrollTop = 0;
-  let lastViewportWasAtBottom = true;
+  const fitScheduler = createFrameScheduler();
+  const writeScheduler = createFrameScheduler();
+  let pending: string[] = [];
+  let renderer: 'webgl' | 'dom' = 'dom';
+  let webglAddon: WebglAddon | null = null;
+  let lastCols = 0;
+  let lastRows = 0;
+  const topHandlers = new Set<() => void>();
 
   terminal.loadAddon(fitAddon);
   terminal.loadAddon(webLinksAddon);
 
-  const getViewport = (): HTMLElement | null => {
-    if (!container) {
-      return null;
-    }
-
-    return container.querySelector('.xterm-viewport') as HTMLElement | null;
-  };
-
-  const rememberViewportState = (): void => {
-    if (!viewport) {
-      return;
-    }
-
-    lastViewportScrollTop = viewport.scrollTop;
-    const distanceFromBottom =
-      viewport.scrollHeight - (viewport.scrollTop + viewport.clientHeight);
-    lastViewportWasAtBottom = distanceFromBottom <= 24;
-  };
-
-  const trackViewport = (): void => {
-    const nextViewport = getViewport();
-    if (!nextViewport) {
-      return;
-    }
-
-    if (nextViewport !== viewport) {
-      if (viewport && viewportScrollHandler) {
-        viewport.removeEventListener('scroll', viewportScrollHandler);
-      }
-
-      viewport = nextViewport;
-      viewportScrollHandler = rememberViewportState;
-      viewport.addEventListener('scroll', viewportScrollHandler, { passive: true });
-    }
-
-    rememberViewportState();
+  const isAtBottom = (): boolean => {
+    const buffer = terminal.buffer.active;
+    return buffer.viewportY >= buffer.baseY;
   };
 
   const refresh = (): void => {
@@ -126,6 +111,17 @@ export function createTerminalController(
     }
   };
 
+  /**
+   * Resize to the container, then re-pin to the bottom if that is where we
+   * already were.
+   *
+   * Everything here goes through xterm's own scroll API. An earlier version
+   * assigned `.xterm-viewport.scrollTop` directly and also called
+   * `scrollToBottom()`, which left xterm's internal `viewportY` disagreeing
+   * with the DOM: rows then render at the wrong offsets (text appears to
+   * interleave) and the scroll clamps against a stale `scrollHeight`, so the
+   * bottom becomes unreachable. Both were reported symptoms.
+   */
   const syncViewport = (): void => {
     if (!container || !container.isConnected) {
       return;
@@ -135,146 +131,126 @@ export function createTerminalController(
       return;
     }
 
-    trackViewport();
+    const stickToBottom = isAtBottom();
 
-    const previousScrollTop = viewport?.scrollTop ?? lastViewportScrollTop;
     fitAddon.fit();
-    refresh();
-    trackViewport();
 
-    if (!viewport) {
-      return;
-    }
+    // Reflow is the expensive part of a resize, so skip the follow-up work
+    // entirely when the geometry did not actually change.
+    const changed = terminal.cols !== lastCols || terminal.rows !== lastRows;
+    lastCols = terminal.cols;
+    lastRows = terminal.rows;
 
-    if (lastViewportWasAtBottom) {
+    if (stickToBottom) {
       terminal.scrollToBottom();
-    } else {
-      const maxScrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
-      viewport.scrollTop = Math.min(previousScrollTop, maxScrollTop);
     }
 
-    lastViewportScrollTop = viewport.scrollTop;
-  };
-
-  const clearRestoreTimers = (): void => {
-    restoreTimeouts.forEach((timeoutId) => window.clearTimeout(timeoutId));
-    restoreTimeouts = [];
+    if (changed) {
+      refresh();
+    }
   };
 
   const fit = (): void => {
-    if (fitFrame !== null) {
-      cancelAnimationFrame(fitFrame);
+    fitScheduler.schedule(syncViewport);
+  };
+
+  /**
+   * Layout can still be settling when this is called (fonts loading, mobile
+   * keyboard animating, a tab becoming visible), so re-check on the next frame
+   * rather than firing a burst of timers that each pay for a full reflow.
+   */
+  const restoreViewport = (): void => {
+    syncViewport();
+    fit();
+  };
+
+  const write = (data: string): void => {
+    if (!data) {
+      return;
     }
 
-    fitFrame = requestAnimationFrame(() => {
-      fitFrame = null;
-      syncViewport();
+    pending.push(data);
+
+    writeScheduler.schedule(() => {
+      if (pending.length === 0) {
+        return;
+      }
+      const batch = pending.length === 1 ? pending[0] : pending.join('');
+      pending = [];
+      terminal.write(batch);
     });
   };
 
-  const restoreViewport = (): void => {
-    if (fitFrame !== null) {
-      cancelAnimationFrame(fitFrame);
-      fitFrame = null;
+  const atTopWithHistory = (): boolean => {
+    const buffer = terminal.buffer.active;
+    return buffer.viewportY === 0 && buffer.baseY > 0;
+  };
+
+  const notifyTop = (): void => {
+    topHandlers.forEach((handler) => handler());
+  };
+
+  /**
+   * Scrolling up while already parked at the top produces no scroll event —
+   * there is nowhere left to go — so the wheel itself has to be the signal.
+   * Without this, the most natural gesture for "show me more" did nothing.
+   */
+  const onWheel = (event: WheelEvent): void => {
+    if (event.deltaY < 0 && atTopWithHistory()) {
+      notifyTop();
     }
-
-    if (restoreFrame !== null) {
-      cancelAnimationFrame(restoreFrame);
-    }
-    clearRestoreTimers();
-
-    syncViewport();
-
-    restoreFrame = requestAnimationFrame(() => {
-      restoreFrame = null;
-      syncViewport();
-    });
-
-    [32, 96, 180].forEach((delay) => {
-      restoreTimeouts.push(window.setTimeout(syncViewport, delay));
-    });
   };
 
   const onVisibilityChange = (): void => {
     if (document.visibilityState === 'visible') {
       restoreViewport();
-    } else {
-      trackViewport();
     }
   };
 
-  const onViewportResize = (): void => {
-    restoreViewport();
-  };
-
-  const onWindowFocus = (): void => {
-    restoreViewport();
-  };
-
-  const onPageShow = (): void => {
-    restoreViewport();
-  };
-
-  const onTouchStart = (event: TouchEvent): void => {
-    if (event.touches.length !== 1) {
-      touchScrollLastY = null;
-      return;
+  const enableWebgl = (): void => {
+    // The DOM renderer repaints a full screen of <span>s per frame, which is
+    // what made long sessions crawl. WebGL is optional: some GPUs, blocklisted
+    // drivers and headless browsers have no context to give us.
+    try {
+      const addon = new WebglAddon();
+      addon.onContextLoss(() => {
+        addon.dispose();
+        webglAddon = null;
+        renderer = 'dom';
+      });
+      terminal.loadAddon(addon);
+      webglAddon = addon;
+      renderer = 'webgl';
+    } catch {
+      renderer = 'dom';
     }
-
-    trackViewport();
-    touchScrollLastY = event.touches[0].clientY;
-  };
-
-  const onTouchMove = (event: TouchEvent): void => {
-    if (event.touches.length !== 1 || touchScrollLastY === null) {
-      return;
-    }
-
-    trackViewport();
-    if (!viewport) {
-      touchScrollLastY = event.touches[0].clientY;
-      return;
-    }
-
-    const maxScrollTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
-    if (maxScrollTop <= 0) {
-      touchScrollLastY = event.touches[0].clientY;
-      return;
-    }
-
-    const currentY = event.touches[0].clientY;
-    const deltaY = currentY - touchScrollLastY;
-    touchScrollLastY = currentY;
-
-    if (deltaY === 0) {
-      return;
-    }
-
-    viewport.scrollTop = Math.max(0, Math.min(maxScrollTop, viewport.scrollTop - deltaY));
-    rememberViewportState();
-    event.preventDefault();
-  };
-
-  const resetTouchScroll = (): void => {
-    touchScrollLastY = null;
   };
 
   const open = (target: HTMLElement): void => {
     container = target;
     terminal.open(target);
-    trackViewport();
+
+    // Must come after open(): the addon needs the canvas the terminal creates.
+    enableWebgl();
+
+    lastCols = terminal.cols;
+    lastRows = terminal.rows;
+
+    disposables.push(
+      terminal.onScroll(() => {
+        if (atTopWithHistory()) {
+          notifyTop();
+        }
+      }),
+    );
 
     resizeObserver = new ResizeObserver(() => fit());
     resizeObserver.observe(target);
 
+    target.addEventListener('wheel', onWheel, { passive: true });
     document.addEventListener('visibilitychange', onVisibilityChange);
-    window.addEventListener('focus', onWindowFocus);
-    window.addEventListener('pageshow', onPageShow);
-    window.visualViewport?.addEventListener('resize', onViewportResize);
-    target.addEventListener('touchstart', onTouchStart, { passive: true });
-    target.addEventListener('touchmove', onTouchMove, { passive: false });
-    target.addEventListener('touchend', resetTouchScroll);
-    target.addEventListener('touchcancel', resetTouchScroll);
+    window.addEventListener('pageshow', restoreViewport);
+    window.visualViewport?.addEventListener('resize', fit);
 
     void document.fonts.ready
       .then(() => restoreViewport())
@@ -286,32 +262,19 @@ export function createTerminalController(
   };
 
   const dispose = (): void => {
-    if (fitFrame !== null) {
-      cancelAnimationFrame(fitFrame);
-      fitFrame = null;
-    }
-
-    if (restoreFrame !== null) {
-      cancelAnimationFrame(restoreFrame);
-      restoreFrame = null;
-    }
-
-    clearRestoreTimers();
+    fitScheduler.cancel();
+    writeScheduler.cancel();
+    pending = [];
+    topHandlers.clear();
 
     resizeObserver?.disconnect();
+    container?.removeEventListener('wheel', onWheel);
     document.removeEventListener('visibilitychange', onVisibilityChange);
-    window.removeEventListener('focus', onWindowFocus);
-    window.removeEventListener('pageshow', onPageShow);
-    window.visualViewport?.removeEventListener('resize', onViewportResize);
-    container?.removeEventListener('touchstart', onTouchStart);
-    container?.removeEventListener('touchmove', onTouchMove);
-    container?.removeEventListener('touchend', resetTouchScroll);
-    container?.removeEventListener('touchcancel', resetTouchScroll);
-    if (viewport && viewportScrollHandler) {
-      viewport.removeEventListener('scroll', viewportScrollHandler);
-    }
+    window.removeEventListener('pageshow', restoreViewport);
+    window.visualViewport?.removeEventListener('resize', fit);
 
     disposables.forEach((disposable) => disposable.dispose());
+    webglAddon?.dispose();
     terminal.dispose();
   };
 
@@ -323,5 +286,12 @@ export function createTerminalController(
     restoreViewport,
     open,
     dispose,
+    write,
+    isAtBottom,
+    onReachedTop: (handler: () => void): IDisposable => {
+      topHandlers.add(handler);
+      return { dispose: () => topHandlers.delete(handler) };
+    },
+    rendererKind: () => renderer,
   };
 }

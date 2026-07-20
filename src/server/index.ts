@@ -28,6 +28,7 @@ import { TerminalBridge } from './bridges/terminal.js';
 import { AppDatabase } from './services/database.js';
 import { SessionStore } from './services/session-store.js';
 import { TranscriptStore } from './services/transcript-store.js';
+import { HistoryStore } from './services/history-store.js';
 import { AuthService } from './services/auth.js';
 import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
@@ -61,6 +62,7 @@ export class ClaudeCodeWebServer {
   private database: AppDatabase;
   private sessionStore: SessionStore;
   private transcriptStore: TranscriptStore;
+  private historyStore: HistoryStore;
   private authService: AuthService;
   private usageReader: UsageReader;
   private usageAnalytics: UsageAnalytics;
@@ -104,6 +106,7 @@ export class ClaudeCodeWebServer {
     this.database = new AppDatabase({ dataDir: config.dataDir });
     this.sessionStore = new SessionStore({ database: this.database });
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
+    this.historyStore = new HistoryStore({ storageDir: this.database.storageDir });
     this.authService = new AuthService({
       database: this.database,
       dev: this.dev,
@@ -134,6 +137,7 @@ export class ClaudeCodeWebServer {
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
       transcriptStore: this.transcriptStore,
+      historyStore: this.historyStore,
       usageReader: this.usageReader,
       usageAnalytics: this.usageAnalytics,
     });
@@ -280,6 +284,9 @@ export class ClaudeCodeWebServer {
 
     console.log('\nGracefully shutting down...');
     await this.saveSessionsToDisk();
+    // Let the emulators finish parsing and flush; a bare flush would miss
+    // whatever is still queued in the parser.
+    await this.messageProcessor.drainAllRecorders();
     if (this.autoSaveInterval) {
       clearInterval(this.autoSaveInterval);
       this.autoSaveInterval = null;
@@ -401,6 +408,10 @@ export class ClaudeCodeWebServer {
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
       transcriptStore: this.transcriptStore,
+      historyStore: this.historyStore,
+      getScreenSnapshot: (sessionId: string) =>
+        this.messageProcessor.getScreenSnapshot(sessionId),
+      disposeRecorder: (sessionId: string) => this.messageProcessor.disposeRecorder(sessionId),
       sessionStore: this.sessionStore,
     });
 

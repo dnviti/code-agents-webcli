@@ -16,3 +16,5 @@ dist/
 *~
 .claude/
 test-*.js
+test/browser/bundle.js
+.work/
