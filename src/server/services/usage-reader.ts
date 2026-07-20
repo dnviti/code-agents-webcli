@@ -3,6 +3,41 @@ import * as path from 'path';
 import * as readline from 'readline';
 import { createReadStream } from 'fs';
 
+/** Max concurrent transcript reads / stats, to stay well under the fd limit. */
+const READ_CONCURRENCY = 16;
+
+/**
+ * Run `worker` over `items` with at most `limit` in flight, preserving order.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) {
+    return [];
+  }
+
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  const runners = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      while (true) {
+        const index = nextIndex++;
+        if (index >= items.length) {
+          return;
+        }
+        results[index] = await worker(items[index]);
+      }
+    },
+  );
+
+  await Promise.all(runners);
+  return results;
+}
+
 export interface UsageEntry {
   timestamp: string;
   model: string;
@@ -173,8 +208,12 @@ export class UsageReader {
     this.entriesCachePromise = (async () => {
       try {
         const files = await this.findJsonlFiles();
-        const perFile = await Promise.all(
-          files.map((file) => this.readJsonlFileCached(file)),
+        // Bounded concurrency: one read stream per file at once would exhaust
+        // file descriptors (EMFILE) on a large corpus and spike latency.
+        const perFile = await mapWithConcurrency(
+          files,
+          READ_CONCURRENCY,
+          (file) => this.readJsonlFileCached(file),
         );
 
         // Deduplicate across the whole corpus: the same message can appear in
@@ -556,36 +595,36 @@ export class UsageReader {
         return;
       }
 
-      await Promise.all(
-        dirents.map(async (dirent) => {
-          const entryPath = path.join(dir, dirent.name);
+      // Bounded concurrency here too: an unbounded recursive fan-out would
+      // issue a stat per file across the whole tree at once.
+      await mapWithConcurrency(dirents, READ_CONCURRENCY, async (dirent) => {
+        const entryPath = path.join(dir, dirent.name);
 
-          if (dirent.isDirectory()) {
-            await walk(entryPath);
-            return;
-          }
+        if (dirent.isDirectory()) {
+          await walk(entryPath);
+          return;
+        }
 
-          if (!dirent.isFile() || !dirent.name.endsWith('.jsonl')) {
-            return;
-          }
+        if (!dirent.isFile() || !dirent.name.endsWith('.jsonl')) {
+          return;
+        }
 
-          if (!onlyRecent) {
+        if (!onlyRecent) {
+          files.push(entryPath);
+          return;
+        }
+
+        try {
+          const fileStat = await fs.stat(entryPath);
+          const hoursSinceModified =
+            (Date.now() - fileStat.mtime.getTime()) / (1000 * 60 * 60);
+          if (hoursSinceModified <= 24) {
             files.push(entryPath);
-            return;
           }
-
-          try {
-            const fileStat = await fs.stat(entryPath);
-            const hoursSinceModified =
-              (Date.now() - fileStat.mtime.getTime()) / (1000 * 60 * 60);
-            if (hoursSinceModified <= 24) {
-              files.push(entryPath);
-            }
-          } catch {
-            // Skip files that vanished mid-scan.
-          }
-        }),
-      );
+        } catch {
+          // Skip files that vanished mid-scan.
+        }
+      });
     };
 
     try {
