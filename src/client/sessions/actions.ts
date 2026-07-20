@@ -217,6 +217,14 @@ export function startAgentSession(app: App, options: RuntimeStartOptions = {}): 
   return startRuntimeSession(app, 'agent', options);
 }
 
+export function startPiSession(app: App, options: RuntimeStartOptions = {}): Promise<void> {
+  return startRuntimeSession(app, 'pi', options);
+}
+
+export function startGrokSession(app: App, options: RuntimeStartOptions = {}): Promise<void> {
+  return startRuntimeSession(app, 'grok', options);
+}
+
 export function startTerminalSession(app: App, options: RuntimeStartOptions = {}): Promise<void> {
   return startRuntimeSession(app, 'terminal', options);
 }

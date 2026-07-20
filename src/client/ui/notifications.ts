@@ -1,23 +1,48 @@
 // Notifications: toast-style messages and audio cues
 
-export function showNotification(message: string): void {
+export type NotificationVariant = 'info' | 'error';
+
+const CONTAINER_ID = 'notificationContainer';
+
+/**
+ * Toasts stack inside one container rather than each pinning itself to the
+ * same fixed coordinates. Four rejected images in a single paste would
+ * otherwise render four toasts exactly on top of each other.
+ */
+function getContainer(): HTMLElement {
+  const existing = document.getElementById(CONTAINER_ID);
+  if (existing) {
+    return existing;
+  }
+
+  const container = document.createElement('div');
+  container.id = CONTAINER_ID;
+  container.className = 'notification-container';
+  document.body.appendChild(container);
+  return container;
+}
+
+export function showNotification(
+  message: string,
+  variant: NotificationVariant = 'info',
+): void {
   const notification = document.createElement('div');
-  notification.className = 'notification';
+  notification.className = `notification notification--${variant}`;
+  // An error is announced immediately because the user has to act on it; a
+  // confirmation waits for a pause so it never cuts a screen reader off
+  // mid-sentence.
+  notification.setAttribute('role', variant === 'error' ? 'alert' : 'status');
+  notification.setAttribute('aria-live', variant === 'error' ? 'assertive' : 'polite');
   notification.textContent = message;
-  notification.style.cssText = `
-    position: fixed; top: 20px; right: 20px;
-    background: var(--accent); color: white;
-    padding: 12px 20px; border-radius: 8px;
-    z-index: 10002;
-    animation: slideIn 0.3s ease;
-  `;
 
-  document.body.appendChild(notification);
+  getContainer().appendChild(notification);
 
+  // Errors carry a path or a limit the user may want to read twice.
+  const visibleFor = variant === 'error' ? 6000 : 3000;
   setTimeout(() => {
-    notification.style.animation = 'slideOut 0.3s ease';
+    notification.classList.add('notification--leaving');
     setTimeout(() => notification.remove(), 300);
-  }, 3000);
+  }, visibleFor);
 }
 
 export function playNotificationSound(): void {
@@ -32,22 +57,4 @@ export function playNotificationSound(): void {
   } catch {
     // Ignore sound errors
   }
-}
-
-/** Inject the slideIn / slideOut keyframes once. */
-export function injectNotificationStyles(): void {
-  if (document.getElementById('notificationKeyframes')) return;
-  const style = document.createElement('style');
-  style.id = 'notificationKeyframes';
-  style.textContent = `
-    @keyframes slideIn {
-      from { transform: translateX(100%); opacity: 0; }
-      to   { transform: translateX(0);    opacity: 1; }
-    }
-    @keyframes slideOut {
-      from { transform: translateX(0);    opacity: 1; }
-      to   { transform: translateX(100%); opacity: 0; }
-    }
-  `;
-  document.head.appendChild(style);
 }

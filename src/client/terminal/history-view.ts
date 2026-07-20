@@ -71,7 +71,7 @@ export class HistoryView {
       const exportBtn = document.createElement('button');
       exportBtn.type = 'button';
       exportBtn.className = 'history-view__button';
-      exportBtn.textContent = 'Scarica .md';
+      exportBtn.textContent = 'Download .md';
       exportBtn.addEventListener('click', () => options.onExport?.());
       actions.appendChild(exportBtn);
     }
@@ -79,7 +79,7 @@ export class HistoryView {
     const exitBtn = document.createElement('button');
     exitBtn.type = 'button';
     exitBtn.className = 'history-view__button history-view__button--primary';
-    exitBtn.textContent = 'Torna al presente';
+    exitBtn.textContent = 'Back to live';
     exitBtn.addEventListener('click', () => this.close());
     actions.appendChild(exitBtn);
 
@@ -282,8 +282,8 @@ export class HistoryView {
 
     const shown = Math.min(from + rows, this.range.totalLines);
     this.status.textContent =
-      `Cronologia — righe ${from + 1}–${shown} di ${this.range.totalLines}` +
-      (this.range.firstLine > 0 ? ` (le prime ${this.range.firstLine} non sono più conservate)` : '');
+      `History — lines ${from + 1}–${shown} of ${this.range.totalLines}` +
+      (this.range.firstLine > 0 ? ` (the first ${this.range.firstLine} are no longer retained)` : '');
   }
 }
 

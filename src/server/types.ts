@@ -1,6 +1,6 @@
 import { WebSocket } from 'ws';
 
-export type AgentKind = 'claude' | 'codex' | 'agent' | 'terminal';
+export type AgentKind = 'claude' | 'codex' | 'agent' | 'pi' | 'grok' | 'terminal';
 
 export interface ServerOptions {
   port?: number;
@@ -16,6 +16,8 @@ export interface ServerOptions {
   claudeAlias?: string;
   codexAlias?: string;
   agentAlias?: string;
+  piAlias?: string;
+  grokAlias?: string;
   publicBaseUrl?: string;
   githubClientId?: string;
   githubClientSecret?: string;
@@ -29,6 +31,8 @@ export interface Aliases {
   claude: string;
   codex: string;
   agent: string;
+  pi: string;
+  grok: string;
 }
 
 export interface SessionRecord {

@@ -5,6 +5,7 @@ import type { Terminal, ITerminalOptions } from '@xterm/xterm';
 import type { TerminalController } from '../terminal/controller';
 import { createTerminalController } from '../terminal/controller';
 import { stripUnsupportedTerminalSequences } from '../terminal/text';
+import { attachImageDrop, attachImagePaste, type ImagePasteTarget } from '../terminal/paste';
 
 // ---------------------------------------------------------------------------
 // Single split pane with its own terminal + WebSocket
@@ -58,6 +59,18 @@ class Split {
     });
     this.terminal = this.controller.terminal;
     this.controller.open(terminalDiv);
+
+    // A split owns its own socket, so it needs its own sender; everything else
+    // about the paste path is shared.
+    const pasteTarget: ImagePasteTarget = {
+      element: terminalDiv,
+      getSessionId: () => this.sessionId,
+      sendText: (text) => this.socket?.send(JSON.stringify({ type: 'input', data: text })),
+      pasteText: (text) => this.terminal?.paste(text),
+      isConnected: () => this.socket?.readyState === WebSocket.OPEN,
+    };
+    attachImagePaste(pasteTarget);
+    attachImageDrop(pasteTarget);
 
     this.terminal.onData((data: string) => {
       if (this.socket && this.socket.readyState === WebSocket.OPEN) {
@@ -493,6 +506,12 @@ export class SplitContainer {
     terminalContainer.appendChild(dropZone);
 
     terminalContainer.addEventListener('dragover', (e: DragEvent) => {
+      if (e.dataTransfer?.types.includes('Files')) {
+        // Not a session-tab drag, so the split affordance must not appear.
+        // installFileDropGuard() is what stops the browser navigating away.
+        dropZone.style.display = 'none';
+        return;
+      }
       if (this.enabled) return;
       e.preventDefault();
       e.dataTransfer!.dropEffect = 'move';
@@ -507,6 +526,13 @@ export class SplitContainer {
     });
 
     terminalContainer.addEventListener('drop', async (e: DragEvent) => {
+      if (e.dataTransfer?.types.includes('Files')) {
+        // An image dropped outside any terminal; the global guard has already
+        // refused the browser's default.
+        dropZone.style.display = 'none';
+        return;
+      }
+
       const sessionId = e.dataTransfer?.getData('application/x-session-id');
       if (!sessionId || sessionId === this.app.currentClaudeSessionId) {
         dropZone.style.display = 'none';

@@ -135,3 +135,30 @@
 .history-view__spacer {
     width: 1px;
 }
+
+/*
+ * Image drop and upload states.
+ *
+ * The outline is not the only signal — errors and confirmations go through the
+ * toast primitive, which is announced to a screen reader.
+ */
+#terminal.terminal-drop-active,
+.split-terminal.terminal-drop-active {
+    outline: 2px dashed var(--accent-strong);
+    outline-offset: -4px;
+    background: var(--accent-soft);
+}
+
+#terminal.terminal-upload-active,
+.split-terminal.terminal-upload-active {
+    /* A 10 MB upload over a tunnel is measurable; say something is happening. */
+    outline: 2px solid var(--accent);
+    outline-offset: -4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #terminal.terminal-upload-active,
+    .split-terminal.terminal-upload-active {
+        transition: none;
+    }
+}

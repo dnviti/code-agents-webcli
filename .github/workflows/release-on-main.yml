@@ -112,6 +112,11 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.docker-meta.outputs.tags }}
           labels: ${{ steps.docker-meta.outputs.labels }}
+          # The image has no .git, so the commit it was built from has to be
+          # passed in or the container cannot report its own version.
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
 
       - name: Create GitHub release
         if: steps.git-tag.outputs.exists == 'false'

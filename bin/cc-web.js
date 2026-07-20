@@ -57,6 +57,8 @@ program
   .option('--claude-alias <name>', 'display alias for Claude (default: env CLAUDE_ALIAS or "Claude")')
   .option('--codex-alias <name>', 'display alias for Codex (default: env CODEX_ALIAS or "Codex")')
   .option('--agent-alias <name>', 'display alias for Agent (default: env AGENT_ALIAS or "Cursor")')
+  .option('--pi-alias <name>', 'display alias for pi (default: env PI_ALIAS or "Pi")')
+  .option('--grok-alias <name>', 'display alias for Grok Build (default: env GROK_ALIAS or "Grok")')
   .option('--ngrok-auth-token <token>', 'ngrok auth token to open a public tunnel')
   .option('--ngrok-domain <domain>', 'ngrok reserved domain to use for the tunnel')
   .parse();
@@ -96,6 +98,8 @@ async function main() {
       claudeAlias: options.claudeAlias || process.env.CLAUDE_ALIAS || 'Claude',
       codexAlias: options.codexAlias || process.env.CODEX_ALIAS || 'Codex',
       agentAlias: options.agentAlias || process.env.AGENT_ALIAS || 'Cursor',
+      piAlias: options.piAlias || process.env.PI_ALIAS || 'Pi',
+      grokAlias: options.grokAlias || process.env.GROK_ALIAS || 'Grok',
       folderMode: true // Always use folder mode
     };
 
@@ -103,7 +107,7 @@ async function main() {
     console.log(`Port: ${port}`);
     console.log('Mode: Folder selection mode');
     console.log(`Plan: ${options.plan}`);
-    console.log(`Aliases: Claude → "${serverOptions.claudeAlias}", Codex → "${serverOptions.codexAlias}", Agent → "${serverOptions.agentAlias}"`);
+    console.log(`Aliases: Claude → "${serverOptions.claudeAlias}", Codex → "${serverOptions.codexAlias}", Agent → "${serverOptions.agentAlias}", pi → "${serverOptions.piAlias}", Grok → "${serverOptions.grokAlias}"`);
 
     const appServer = new ClaudeCodeWebServer(serverOptions);
 

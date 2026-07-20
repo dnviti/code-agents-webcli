@@ -13,12 +13,24 @@ COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts
 
 COPY . .
+
+# .dockerignore excludes .git, so the build cannot read the commit itself.
+# Without these the image reports "commit unknown" and cannot check for
+# updates; pass them from CI (see .github/workflows/release-on-main.yml).
+ARG BUILD_SHA=""
+ARG BUILD_DATE=""
+ENV CODE_AGENTS_WEBCLI_BUILD_SHA=$BUILD_SHA
+ENV CODE_AGENTS_WEBCLI_BUILD_DATE=$BUILD_DATE
+
 RUN npm rebuild && npm run build && npm prune --omit=dev
 
 FROM node:20-bookworm-slim
 
 ENV NODE_ENV=production
 ENV PORT=32352
+# Deliberately not carried into the runtime image: the commit is already baked
+# into dist/build-info.json, and an inherited value here would be picked up by
+# any nested build and misreport it.
 
 WORKDIR /app
 

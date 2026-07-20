@@ -1,5 +1,44 @@
 # Changelog
 
+## [4.1.0] - 2026-07-20
+
+### Added
+- **Update checking against GitHub.** The app compares the commit it was built from against the tip
+  of `main` and shows a banner when it is behind. The commit is baked into `dist/build-info.json`
+  at build time, because installs come from `github:dnviti/code-agents-webcli` and resolve to
+  whatever `main` HEAD is, not to the package version.
+- **One-click self-update**, restricted to the first account that ever signed in. It installs, then
+  runs `npm rebuild`, then verifies the new build loads, and only restarts the service if all three
+  succeed. npx, container, source-checkout and unwritable-prefix installs are each refused with a
+  specific reason rather than offered a button that would silently do nothing.
+- **Image paste and drag-and-drop** into Claude, Codex, Cursor and terminal sessions. The image is
+  written to `<working directory>/.cc-web/pasted/` and its path is typed into the prompt, followed by
+  a space and no newline so you can add your question first. Type is decided by magic bytes; SVG is
+  refused. 10 MB per image, removed when the session is deleted.
+- **pi and Grok Build** as runtimes, with `--pi-alias` and `--grok-alias` to relabel them. Grok gets
+  a Dangerous button wired to `--always-approve`; pi does not, because its `--approve` only trusts
+  project-local files and is not a tool-approval bypass.
+
+### Changed
+- Toasts stack in a container instead of every toast pinning itself to the same corner coordinates,
+  and carry `role`/`aria-live` so screen readers announce errors immediately and confirmations
+  politely.
+- Session teardown is a registry a subsystem registers with, rather than another line appended to the
+  DELETE handler by every new feature.
+- The service-worker cache name is derived from the build, so a new server is never paired with the
+  previously cached client.
+- UI strings the scrollback feature had left in Italian are now English, matching the rest of the UI.
+
+### Security
+- The paste endpoint rejects cross-origin requests. The auth cookie is `SameSite=Lax`, which is
+  site-scoped rather than origin-scoped, so a sibling subdomain would otherwise reach an endpoint
+  that writes a file and injects text into a PTY.
+- Paste directories are created one level at a time and refused if any level is a symlink. `mkdir -p`
+  follows an existing symlink, so a planted `.cc-web` could otherwise have a directory created
+  through it before any later check could refuse.
+- Update output is sent only to the installer's own sockets, never broadcast: npm prints absolute
+  host paths.
+
 ## [3.4.0] - 2025-10-23
 
 ### Added

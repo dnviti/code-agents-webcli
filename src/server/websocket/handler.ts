@@ -154,6 +154,34 @@ export function sendToWebSocket(ws: WebSocket, data: Record<string, unknown>): v
 }
 
 /**
+ * Send a message to every socket belonging to one user.
+ *
+ * Session-agnostic, unlike broadcastToSession: update output is addressed to a
+ * person, not to a terminal, and must not reach anybody else.
+ */
+export function sendToUser(
+  userId: number,
+  data: Record<string, unknown>,
+  webSocketConnections: Map<string, WebSocketInfo>,
+): void {
+  for (const wsInfo of webSocketConnections.values()) {
+    if (wsInfo.userId === userId) {
+      sendToWebSocket(wsInfo.ws, data);
+    }
+  }
+}
+
+/** Send a message to every connected client, whatever session they are in. */
+export function broadcastToAllConnections(
+  data: Record<string, unknown>,
+  webSocketConnections: Map<string, WebSocketInfo>,
+): void {
+  for (const wsInfo of webSocketConnections.values()) {
+    sendToWebSocket(wsInfo.ws, data);
+  }
+}
+
+/**
  * Broadcast a message to all WebSocket connections in a session.
  */
 export function broadcastToSession(

@@ -52,6 +52,10 @@ jobs:
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # No build-args here on purpose. This job only proves the image builds,
+      # and on a pull_request `github.sha` is the ephemeral merge commit, which
+      # is not on main — baking it would produce an image whose update check
+      # asks GitHub about a commit that 404s.
       - name: Build Docker image
         uses: docker/build-push-action@v6
         with:

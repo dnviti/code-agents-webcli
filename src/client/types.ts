@@ -40,10 +40,12 @@ export interface Aliases {
   claude: string;
   codex: string;
   agent: string;
+  pi: string;
+  grok: string;
   terminal: string;
 }
 
-export type AgentKind = 'claude' | 'codex' | 'agent' | 'terminal';
+export type AgentKind = 'claude' | 'codex' | 'agent' | 'pi' | 'grok' | 'terminal';
 
 export interface PlanData {
   content: string;
@@ -126,12 +128,24 @@ export interface WsSessionLeftMessage {
 }
 
 export interface WsRuntimeStartedMessage {
-  type: 'claude_started' | 'codex_started' | 'agent_started' | 'terminal_started';
+  type:
+    | 'claude_started'
+    | 'codex_started'
+    | 'agent_started'
+    | 'pi_started'
+    | 'grok_started'
+    | 'terminal_started';
   agent?: AgentKind;
 }
 
 export interface WsRuntimeStoppedMessage {
-  type: 'claude_stopped' | 'codex_stopped' | 'agent_stopped' | 'terminal_stopped';
+  type:
+    | 'claude_stopped'
+    | 'codex_stopped'
+    | 'agent_stopped'
+    | 'pi_stopped'
+    | 'grok_stopped'
+    | 'terminal_stopped';
   agent?: AgentKind;
   runtimeLabel?: string;
 }
@@ -186,6 +200,42 @@ export interface WsUsageUpdateMessage {
   limits: unknown;
 }
 
+// The server and the banner share one definition of these; see src/shared/update.ts.
+export type {
+  UpdateMode,
+  UpdateState,
+  UpdateStatus,
+  UpdateStatusResponse,
+} from '../shared/update';
+import type { UpdateStatus } from '../shared/update';
+
+/** Broadcast to every client; the button is gated per-user by the status route. */
+export interface WsUpdateStatusMessage {
+  type: 'update_status';
+  status: UpdateStatus;
+}
+
+/** Installer's sockets only: npm output carries host paths. */
+export interface WsUpdateOutputMessage {
+  type: 'update_output';
+  stream: 'stdout' | 'stderr';
+  data: string;
+}
+
+export interface WsUpdateDoneMessage {
+  type: 'update_done';
+  ok: boolean;
+  code: number | null;
+  restarting: boolean;
+  restartRequired: boolean;
+  message: string;
+}
+
+/** Broadcast: a restart ends every user's agent sessions, not just the installer's. */
+export interface WsUpdateRestartingMessage {
+  type: 'update_restarting';
+}
+
 export type WsMessage =
   | WsConnectedMessage
   | WsSessionCreatedMessage
@@ -201,4 +251,8 @@ export type WsMessage =
   | WsSessionGoneMessage
   | WsPongMessage
   | WsHistoryChunkMessage
-  | WsUsageUpdateMessage;
+  | WsUsageUpdateMessage
+  | WsUpdateStatusMessage
+  | WsUpdateOutputMessage
+  | WsUpdateDoneMessage
+  | WsUpdateRestartingMessage;

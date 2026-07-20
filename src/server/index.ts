@@ -7,6 +7,7 @@ import WebSocket from 'ws';
 import cors from 'cors';
 
 import {
+  Aliases,
   ServerOptions,
   SessionRecord,
   WebSocketInfo,
@@ -24,11 +25,24 @@ import { runRunModeWizard } from './setup/wizard.js';
 import { ClaudeBridge } from './bridges/claude.js';
 import { CodexBridge } from './bridges/codex.js';
 import { AgentBridge } from './bridges/agent.js';
+import { PiBridge } from './bridges/pi.js';
+import { GrokBridge } from './bridges/grok.js';
 import { TerminalBridge } from './bridges/terminal.js';
 import { AppDatabase } from './services/database.js';
 import { SessionStore } from './services/session-store.js';
 import { TranscriptStore } from './services/transcript-store.js';
 import { HistoryStore } from './services/history-store.js';
+import { SessionTeardownRegistry } from './services/session-teardown.js';
+import { PasteStore } from './services/paste-store.js';
+import { readBuildInfo } from './services/build-info.js';
+import { UpdateChecker } from './services/update-check.js';
+import {
+  InterruptedUpdate,
+  SelfUpdateRunner,
+  UpdateModeResult,
+  detectUpdateMode,
+} from './services/self-update.js';
+import { broadcastToAllConnections, sendToUser } from './websocket/handler.js';
 import { AuthService } from './services/auth.js';
 import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
@@ -45,7 +59,7 @@ export class ClaudeCodeWebServer {
   private baseFolder: string;
   private publicBaseUrl: string | null;
   private sessionDurationHours: number;
-  private aliases: { claude: string; codex: string; agent: string };
+  private aliases: Aliases;
 
   private startTime: number;
   private isShuttingDown: boolean;
@@ -57,15 +71,23 @@ export class ClaudeCodeWebServer {
   private claudeBridge: BridgeInterface;
   private codexBridge: BridgeInterface;
   private agentBridge: BridgeInterface;
+  private piBridge: BridgeInterface;
+  private grokBridge: BridgeInterface;
   private terminalBridge: BridgeInterface;
 
   private database: AppDatabase;
   private sessionStore: SessionStore;
   private transcriptStore: TranscriptStore;
   private historyStore: HistoryStore;
+  private pasteStore: PasteStore;
+  private sessionTeardown: SessionTeardownRegistry;
   private authService: AuthService;
   private usageReader: UsageReader;
   private usageAnalytics: UsageAnalytics;
+  private updateChecker: UpdateChecker;
+  private selfUpdate: SelfUpdateRunner;
+  private updateMode: UpdateModeResult | null;
+  private interruptedUpdate: InterruptedUpdate | null;
 
   private app: express.Express;
   private server: http.Server | https.Server | null;
@@ -100,6 +122,8 @@ export class ClaudeCodeWebServer {
     this.claudeBridge = new ClaudeBridge();
     this.codexBridge = new CodexBridge();
     this.agentBridge = new AgentBridge();
+    this.piBridge = new PiBridge();
+    this.grokBridge = new GrokBridge();
     this.terminalBridge = new TerminalBridge();
 
     this.dataDir = config.dataDir;
@@ -107,6 +131,12 @@ export class ClaudeCodeWebServer {
     this.sessionStore = new SessionStore({ database: this.database });
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
     this.historyStore = new HistoryStore({ storageDir: this.database.storageDir });
+    this.pasteStore = new PasteStore({ storageDir: this.database.storageDir });
+    this.sessionTeardown = new SessionTeardownRegistry();
+    // Registered rather than appended to the DELETE handler, so the next
+    // feature that needs teardown does not collide on the same line.
+    this.sessionTeardown.register('pasted-images', (session) =>
+      this.pasteStore.deletePastes(session));
     this.authService = new AuthService({
       database: this.database,
       dev: this.dev,
@@ -123,6 +153,65 @@ export class ClaudeCodeWebServer {
     this.usageAnalytics = new UsageAnalytics(
       createUsageAnalyticsOptions(options, this.sessionDurationHours),
     );
+
+    this.updateChecker = new UpdateChecker({
+      buildInfo: readBuildInfo(),
+      settings: {
+        getSetting: (key) => this.database.getSetting(key),
+        setSetting: (key, value) => this.database.setSetting(key, value),
+      },
+      // Everyone is told a newer build exists; only the installer is offered
+      // the button, and that is decided per-user in the status route rather
+      // than baked into this broadcast.
+      onStatus: (status) => {
+        broadcastToAllConnections(
+          { type: 'update_status', status },
+          this.webSocketConnections,
+        );
+      },
+    });
+
+    this.updateMode = null;
+    this.interruptedUpdate = null;
+    this.selfUpdate = new SelfUpdateRunner({
+      settings: {
+        getSetting: (key) => this.database.getSetting(key),
+        setSetting: (key, value) => this.database.setSetting(key, value),
+        deleteSetting: (key) => this.database.deleteSetting(key),
+      },
+      onOutput: (stream, line) => {
+        const installerUserId = this.database.getInstallerUserId();
+        if (installerUserId !== null) {
+          sendToUser(
+            installerUserId,
+            { type: 'update_output', stream, data: line },
+            this.webSocketConnections,
+          );
+        }
+      },
+      onDone: (result) => {
+        const installerUserId = this.database.getInstallerUserId();
+        if (installerUserId !== null) {
+          sendToUser(
+            installerUserId,
+            { type: 'update_done', ...result },
+            this.webSocketConnections,
+          );
+        }
+      },
+      onRestarting: () => {
+        // Everyone loses their agent sessions to this, not just the installer,
+        // so everyone gets told before it happens.
+        broadcastToAllConnections(
+          { type: 'update_restarting' },
+          this.webSocketConnections,
+        );
+      },
+      beforeRestart: async () => {
+        await this.saveSessionsToDisk();
+        await this.messageProcessor.drainAllRecorders();
+      },
+    });
 
     this.messageProcessor = new MessageProcessor({
       dev: this.dev,
@@ -227,6 +316,10 @@ export class ClaudeCodeWebServer {
         return this.codexBridge;
       case 'agent':
         return this.agentBridge;
+      case 'pi':
+        return this.piBridge;
+      case 'grok':
+        return this.grokBridge;
       case 'terminal':
         return this.terminalBridge;
       case 'claude':
@@ -234,6 +327,17 @@ export class ClaudeCodeWebServer {
       default:
         return null;
     }
+  }
+
+  /**
+   * Cached: detection shells out to `npm root -g` and `systemctl is-active`,
+   * and neither answer changes while the process is alive.
+   */
+  private getUpdateMode(): UpdateModeResult {
+    if (!this.updateMode) {
+      this.updateMode = detectUpdateMode();
+    }
+    return this.updateMode;
   }
 
   private getSelectedWorkingDir(userId: number): string | null {
@@ -291,6 +395,7 @@ export class ClaudeCodeWebServer {
       clearInterval(this.autoSaveInterval);
       this.autoSaveInterval = null;
     }
+    this.updateChecker.stop();
 
     if (this.wss) {
       // close() stops accepting new connections but leaves established ones
@@ -409,6 +514,21 @@ export class ClaudeCodeWebServer {
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
       transcriptStore: this.transcriptStore,
       historyStore: this.historyStore,
+      sessionTeardown: this.sessionTeardown,
+      pasteStore: this.pasteStore,
+      updateChecker: this.updateChecker,
+      selfUpdate: this.selfUpdate,
+      getUpdateMode: () => this.getUpdateMode(),
+      getInstallerUserId: () => this.database.getInstallerUserId(),
+      getInterruptedUpdate: () => {
+        // Reported once and then forgotten. Left set, it would keep the banner
+        // in its error state — which offers no Update button — for the rest of
+        // the process's life, so the interrupted update could never be
+        // retried from the browser.
+        const interrupted = this.interruptedUpdate;
+        this.interruptedUpdate = null;
+        return interrupted;
+      },
       getScreenSnapshot: (sessionId: string) =>
         this.messageProcessor.getScreenSnapshot(sessionId),
       disposeRecorder: (sessionId: string) => this.messageProcessor.disposeRecorder(sessionId),
@@ -451,6 +571,27 @@ export class ClaudeCodeWebServer {
 
   async start(): Promise<http.Server | https.Server> {
     await this.loadPersistedSessions();
+
+    // A marker left behind means a previous update was killed part-way — host
+    // reboot, OOM, an outside restart — so the global prefix may be half
+    // written. Surface it instead of letting the banner claim all is well.
+    this.interruptedUpdate = this.selfUpdate.takeInterrupted();
+    if (this.interruptedUpdate) {
+      console.warn(
+        'A previous self-update did not finish. If the server misbehaves, reinstall with:\n'
+        + '  npm i -g --allow-git=all github:dnviti/code-agents-webcli\n'
+        + '  npm rebuild --prefix "$(npm root -g)/code-agents-webcli"',
+      );
+    }
+
+    // Deliberately not awaited, and delayed: a first-run install should reach
+    // "listening" without waiting on GitHub.
+    const firstCheck = setTimeout(() => {
+      void this.updateChecker.check(false).catch(() => undefined);
+    }, 60_000);
+    firstCheck.unref?.();
+    this.updateChecker.start();
+
     // Embedders may call start() directly without going through
     // runSetupIfNeeded(); this stays as the safety net.
     await this.authService.ensureConfiguredInteractive(false);

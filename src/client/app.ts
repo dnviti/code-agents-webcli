@@ -31,6 +31,8 @@ import {
   startClaudeSession as sessionsStartClaude,
   startCodexSession as sessionsStartCodex,
   startAgentSession as sessionsStartAgent,
+  startPiSession as sessionsStartPi,
+  startGrokSession as sessionsStartGrok,
   startTerminalSession as sessionsStartTerminal,
   closeSession as sessionsCloseSession,
 } from './sessions/actions';
@@ -57,7 +59,9 @@ import {
   showMobileSessionsModal,
   setupMobileSessionsModal,
 } from './ui/mobile';
-import { showNotification, playNotificationSound, injectNotificationStyles } from './ui/notifications';
+import { showNotification, playNotificationSound } from './ui/notifications';
+import { setupUpdateBanner } from './ui/update-banner';
+import { pickImage, type ImagePasteTarget } from './terminal/paste';
 import { SplitContainer } from './splits/split-container';
 import type { HistoryView, HistoryRange } from './terminal/history-view';
 
@@ -65,6 +69,8 @@ export class App {
   // Terminal
   terminal: Terminal | null;
   terminalController: TerminalController | null;
+  /** Lets the mobile menu reach the same upload path as paste and drop. */
+  imagePasteTarget: ImagePasteTarget | null;
 
   // Server-paged scrollback
   historyView: HistoryView | null;
@@ -116,6 +122,7 @@ export class App {
     this.terminal = null;
     this.terminalController = null;
     this.historyView = null;
+    this.imagePasteTarget = null;
     this.historyRange = { firstLine: 0, totalLines: 0 };
     this.historyRequests = new Map();
     this.historyRequestSeq = 0;
@@ -139,7 +146,14 @@ export class App {
     this.currentFolderPath = null;
     this.selectedWorkingDir = null;
 
-    this.aliases = { claude: 'Claude', codex: 'Codex', agent: 'Cursor', terminal: 'Terminal' };
+    this.aliases = {
+      claude: 'Claude',
+      codex: 'Codex',
+      agent: 'Cursor',
+      pi: 'Pi',
+      grok: 'Grok',
+      terminal: 'Terminal',
+    };
 
     this.isMobile = detectMobile();
     this.currentMode = 'chat';
@@ -182,7 +196,7 @@ export class App {
     applySettings(this, loadSettings());
     applyAliasesToUI(this);
     disablePullToRefresh();
-    injectNotificationStyles();
+    setupUpdateBanner(this);
 
     showOverlay('loadingSpinner');
 
@@ -219,6 +233,9 @@ export class App {
     const startCodexBtn = document.getElementById('startCodexBtn');
     const dangerousCodexBtn = document.getElementById('dangerousCodexBtn');
     const startAgentBtn = document.getElementById('startAgentBtn');
+    const startPiBtn = document.getElementById('startPiBtn');
+    const startGrokBtn = document.getElementById('startGrokBtn');
+    const dangerousGrokBtn = document.getElementById('dangerousGrokBtn');
     const startTerminalBtn = document.getElementById('startTerminalBtn');
     const closeStartPromptBtn = document.getElementById('closeStartPromptBtn');
     const cancelStartPromptBtn = document.getElementById('cancelStartPromptBtn');
@@ -230,6 +247,7 @@ export class App {
     const closeSessionBtnMobile = document.getElementById('closeSessionBtnMobile');
     const reconnectBtnMobile = document.getElementById('reconnectBtnMobile');
     const clearBtnMobile = document.getElementById('clearBtnMobile');
+    const attachImageBtnMobile = document.getElementById('attachImageBtnMobile');
 
     startBtn?.addEventListener('click', () => this.startClaudeSession());
     dangerousSkipBtn?.addEventListener('click', () =>
@@ -240,6 +258,11 @@ export class App {
       this.startCodexSession({ dangerouslySkipPermissions: true }),
     );
     startAgentBtn?.addEventListener('click', () => this.startAgentSession());
+    startPiBtn?.addEventListener('click', () => this.startPiSession());
+    startGrokBtn?.addEventListener('click', () => this.startGrokSession());
+    dangerousGrokBtn?.addEventListener('click', () =>
+      this.startGrokSession({ dangerouslySkipPermissions: true }),
+    );
     startTerminalBtn?.addEventListener('click', () => this.showTerminalOptionsModal());
     const cancelStartPrompt = async () => {
       if (!this.currentClaudeSessionId) {
@@ -273,6 +296,12 @@ export class App {
     });
     clearBtnMobile?.addEventListener('click', () => {
       this.terminal?.reset();
+      closeMobileMenu();
+    });
+    attachImageBtnMobile?.addEventListener('click', () => {
+      if (this.imagePasteTarget) {
+        pickImage(this.imagePasteTarget);
+      }
       closeMobileMenu();
     });
 
@@ -424,6 +453,14 @@ export class App {
 
   startAgentSession(options: RuntimeStartOptions = {}): Promise<void> {
     return sessionsStartAgent(this, options);
+  }
+
+  startPiSession(options: RuntimeStartOptions = {}): Promise<void> {
+    return sessionsStartPi(this, options);
+  }
+
+  startGrokSession(options: RuntimeStartOptions = {}): Promise<void> {
+    return sessionsStartGrok(this, options);
   }
 
   startTerminalSession(options: RuntimeStartOptions = {}): Promise<void> {

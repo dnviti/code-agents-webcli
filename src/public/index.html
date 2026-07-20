@@ -120,8 +120,26 @@
                 <button id="closeSessionBtnMobile" class="mobile-menu-btn btn-danger">Close Session</button>
                 <button id="reconnectBtnMobile" class="mobile-menu-btn">Reconnect</button>
                 <button id="clearBtnMobile" class="mobile-menu-btn">Clear Terminal</button>
+                <!-- Touch devices have no drag source and paste is unreliable there. -->
+                <button id="attachImageBtnMobile" class="mobile-menu-btn">Attach Image</button>
                 <button id="settingsBtnMobile" class="mobile-menu-btn">Settings</button>
             </div>
+        </div>
+
+        <!--
+          A direct child of #app, which is the column flex container. .main is
+          a ROW flex container that split view appends its own pane to, so a
+          banner placed inside it would render beside the terminal rather than
+          above it.
+        -->
+        <div class="update-banner" id="updateBanner" hidden>
+            <span class="update-banner__dot" id="updateBannerDot" aria-hidden="true"></span>
+            <span class="update-banner__text" id="updateBannerText" role="status" aria-live="polite"></span>
+            <button type="button" class="update-banner__action" id="updateBannerAction" hidden></button>
+            <button type="button" class="update-banner__toggle" id="updateBannerToggle" aria-expanded="false" hidden>Show log</button>
+            <button type="button" class="update-banner__dismiss" id="updateBannerDismiss" aria-label="Hide update notice">&times;</button>
+            <!-- aria-live="off": every streamed npm line would otherwise be announced. -->
+            <pre class="update-banner__log" id="updateBannerLog" aria-live="off" hidden></pre>
         </div>
 
         <main class="main">
@@ -151,6 +169,9 @@
                         <button id="startCodexBtn" class="btn btn-primary">Start Codex</button>
                         <button id="dangerousCodexBtn" class="btn btn-danger" title="Bypass approvals and sandbox. Use with caution.">Dangerous Codex</button>
                         <button id="startAgentBtn" class="btn btn-primary">Start Cursor</button>
+                        <button id="startPiBtn" class="btn btn-primary">Start Pi</button>
+                        <button id="startGrokBtn" class="btn btn-primary">Start Grok</button>
+                        <button id="dangerousGrokBtn" class="btn btn-danger" title="Auto-approve every tool execution. Use with caution.">Dangerous Grok</button>
                         <button id="startTerminalBtn" class="btn btn-secondary">Start Terminal</button>
                     </div>
                     <div class="start-prompt-actions">
