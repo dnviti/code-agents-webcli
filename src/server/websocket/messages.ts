@@ -774,17 +774,20 @@ export class MessageProcessor {
       return;
     }
 
-    recorder.flush();
-    const screen = recorder.snapshotScreen();
-    if (screen.length > 0) {
-      this.deps.historyStore.append(
-        { id: session.id, ownerUserId: session.ownerUserId },
-        screen,
-      );
-    }
-
-    recorder.dispose();
+    // Unregister first: a restart of the same session must get a fresh
+    // recorder rather than write into one that is draining.
     this.recorders.delete(session.id);
+
+    void recorder.drain().then(() => {
+      const screen = recorder.snapshotScreen();
+      if (screen.length > 0) {
+        this.deps.historyStore.append(
+          { id: session.id, ownerUserId: session.ownerUserId },
+          screen,
+        );
+      }
+      recorder.dispose();
+    });
   }
 
   /** Drop the emulator for a session that is going away. */
@@ -797,10 +800,19 @@ export class MessageProcessor {
     }
   }
 
-  disposeAllRecorders(): void {
-    for (const sessionId of Array.from(this.recorders.keys())) {
-      this.disposeRecorder(sessionId);
-    }
+  /** Let every emulator finish parsing before the process goes. */
+  async drainAllRecorders(): Promise<void> {
+    const recorders = Array.from(this.recorders.values());
+    this.recorders.clear();
+    await Promise.all(
+      recorders.map(async (recorder) => {
+        try {
+          await recorder.drain();
+        } finally {
+          recorder.dispose();
+        }
+      }),
+    );
   }
 
   private getRuntimeLabel(agentKind: AgentKind, session: SessionRecord | null = null): string {

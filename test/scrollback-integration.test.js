@@ -48,12 +48,12 @@ describe('scrollback integration (real PTY)', function () {
 
       term.onData((data) => recorder.write(data));
       term.onExit(() => {
-        // Let the emulator drain before taking the final reading.
-        setTimeout(() => {
-          recorder.flush();
+        // Wait for the parser rather than for a timeout: on a loaded machine a
+        // fixed delay leaves output still queued, and the counts come out short.
+        void recorder.drain().then(() => {
           recorder.dispose();
           resolve({ gaps });
-        }, 300);
+        });
       });
 
       setTimeout(() => reject(new Error('PTY timed out')), 25000);

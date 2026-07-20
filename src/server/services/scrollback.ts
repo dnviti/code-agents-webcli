@@ -107,6 +107,28 @@ export class ScrollbackRecorder {
     this.flush();
   }
 
+  /**
+   * Wait for the emulator to finish parsing everything written so far, then
+   * flush.
+   *
+   * `flush()` alone only sees what the parser has already applied — writes are
+   * asynchronous — so calling it at shutdown or when a run ends can miss the
+   * tail of the output entirely. An empty write is enough to get a callback
+   * behind the queued data.
+   */
+  drain(): Promise<void> {
+    return new Promise((resolve) => {
+      if (this.disposed) {
+        resolve();
+        return;
+      }
+      this.terminal.write('', () => {
+        this.flush();
+        resolve();
+      });
+    });
+  }
+
   /** Emit every line that has scrolled off the screen since the last call. */
   flush(): void {
     if (this.disposed) {

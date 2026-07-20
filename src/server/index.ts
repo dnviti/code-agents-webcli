@@ -284,8 +284,9 @@ export class ClaudeCodeWebServer {
 
     console.log('\nGracefully shutting down...');
     await this.saveSessionsToDisk();
-    // Flush any lines still held in the emulators before the process goes.
-    this.messageProcessor.disposeAllRecorders();
+    // Let the emulators finish parsing and flush; a bare flush would miss
+    // whatever is still queued in the parser.
+    await this.messageProcessor.drainAllRecorders();
     if (this.autoSaveInterval) {
       clearInterval(this.autoSaveInterval);
       this.autoSaveInterval = null;
