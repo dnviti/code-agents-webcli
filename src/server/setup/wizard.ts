@@ -60,7 +60,7 @@ export async function runRunModeWizard(
     prompt.note('This copy is running from npm\'s npx cache, which npm can delete at any time.');
     prompt.note('A background service pointing there would break later, so install it durably first:');
     prompt.note('');
-    prompt.note('  npm i -g github:dnviti/code-agents-webcli');
+    prompt.note('  npm i -g --allow-git=all github:dnviti/code-agents-webcli');
     prompt.note('  cc-web --setup');
     prompt.note('');
     prompt.note('Continuing in foreground mode for now.');

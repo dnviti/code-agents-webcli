@@ -35,8 +35,7 @@ npx --allow-git=all github:dnviti/code-agents-webcli
 Install it properly (required if you want the background service):
 
 ```bash
-npm i -g --allow-git=all --allow-scripts=code-agents-webcli,better-sqlite3,node-pty \
-  github:dnviti/code-agents-webcli
+npm i -g --allow-git=all github:dnviti/code-agents-webcli
 cc-web
 ```
 
@@ -44,23 +43,28 @@ Both commands compile the package on install, so the first run takes a minute an
 toolchain for the native dependencies (`python3`, `make`, `g++` on Linux).
 
 <details>
-<summary>Why those flags?</summary>
+<summary>Why <code>--allow-git=all</code>?</summary>
 
-npm 12 tightened two defaults, and a GitHub install trips both:
+npm 12 changed `allow-git` to default to `none`, so npm refuses to fetch a package from a git remote
+at all. On npm 11 and earlier the flag is unnecessary.
 
-- `allow-git` defaults to `none`, so npm refuses to fetch a package from a git remote at all.
-- Install scripts are blocked, and `node-pty` and `better-sqlite3` are native modules that must be
-  compiled. The `allowScripts` field in this package's `package.json` covers project-scoped
-  installs, but a **global** install still needs the flag.
-
-If you would rather set them once instead of per command:
+Set it once instead of per command with:
 
 ```bash
 npm config set allow-git all
-npm config set allow-scripts code-agents-webcli,better-sqlite3,node-pty --location=user
 ```
 
-On npm 11 and earlier neither flag is needed.
+Note that **`--allow-scripts` must not be added** to these commands, even though npm 12 blocks
+install scripts by default. npm forwards the flag into the project-scoped install it runs while
+preparing the git checkout, and that inner install rejects it:
+
+```
+npm error code EALLOWSCRIPTS
+npm error --allow-scripts is not allowed in project-scoped installs.
+```
+
+The native modules are permitted through the `allowScripts` field in this package's `package.json`
+instead, which is why nothing extra is needed on the command line.
 
 </details>
 

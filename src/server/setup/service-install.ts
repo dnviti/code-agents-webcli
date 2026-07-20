@@ -87,6 +87,15 @@ function assertUnitSafe(label: string, value: string): void {
   }
 }
 
+/**
+ * systemd expands `%` specifiers (%h, %i, ...) inside unit values, so a literal
+ * percent in a path has to be doubled or the unit silently means something
+ * else.
+ */
+function escapeUnitValue(value: string): string {
+  return value.replace(/%/g, '%%');
+}
+
 export function renderUnit(request: ServiceInstallRequest): string {
   assertUnitSafe('Working directory', request.workingDirectory);
   assertUnitSafe('Node path', request.target.execPath);
@@ -108,13 +117,13 @@ export function renderUnit(request: ServiceInstallRequest): string {
   }
 
   const args = [
-    JSON.stringify(request.target.scriptPath),
+    JSON.stringify(escapeUnitValue(request.target.scriptPath)),
     '--port',
     String(request.port),
     '--no-open',
   ];
   const dataDirEnv = request.dataDir
-    ? `Environment=CODE_AGENTS_WEBCLI_DATA_DIR=${request.dataDir}\n`
+    ? `Environment=CODE_AGENTS_WEBCLI_DATA_DIR=${escapeUnitValue(request.dataDir)}\n`
     : '';
 
   // Credentials deliberately never appear here: they live in SQLite, written
@@ -130,13 +139,13 @@ Wants=network-online.target
 Type=simple
 # Bounds the folder browser: only this directory and its subdirectories are
 # reachable from the web UI.
-WorkingDirectory=${request.workingDirectory}
-ExecStart=${request.target.execPath} ${args.join(' ')}
+WorkingDirectory=${escapeUnitValue(request.workingDirectory)}
+ExecStart=${escapeUnitValue(request.target.execPath)} ${args.join(' ')}
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=20
 Environment=NODE_ENV=production
-Environment=PATH=${pathEntries.join(path.delimiter)}
+Environment=PATH=${escapeUnitValue(pathEntries.join(path.delimiter))}
 ${dataDirEnv}# Agent CLIs run as PTY children; SIGTERM the main process, then clean up
 # the cgroup after TimeoutStopSec.
 KillMode=mixed

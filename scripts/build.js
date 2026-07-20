@@ -1,11 +1,29 @@
 #!/usr/bin/env node
 
 const esbuild = require('esbuild');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
 const isWatch = process.argv.includes('--watch');
+
+/**
+ * Resolve the TypeScript compiler that is actually installed here.
+ *
+ * Deliberately not `npx tsc`: when the local devDependency is not visible —
+ * which happens inside the temporary clone npm prepares for a git install —
+ * npx silently downloads the unrelated, deprecated `tsc` package from the
+ * registry and runs that instead, which both fails the build and executes code
+ * nobody asked for.
+ */
+function resolveTsc() {
+  const pkg = require.resolve('typescript/package.json');
+  const tscJs = path.join(path.dirname(pkg), 'bin', 'tsc');
+  if (!fs.existsSync(tscJs)) {
+    throw new Error(`TypeScript is installed but ${tscJs} is missing.`);
+  }
+  return tscJs;
+}
 
 async function build() {
   console.log('Building code-agents-webcli...\n');
@@ -16,7 +34,10 @@ async function build() {
   // 1. Compile server TypeScript
   console.log('[server] Compiling TypeScript...');
   try {
-    execSync('npx tsc --project tsconfig.json', { stdio: 'inherit' });
+    execFileSync(process.execPath, [resolveTsc(), '--project', 'tsconfig.json'], {
+      stdio: 'inherit',
+      cwd: path.join(__dirname, '..'),
+    });
     console.log('[server] Done.\n');
   } catch (error) {
     console.error('[server] TypeScript compilation failed');
