@@ -30,6 +30,7 @@ import { SessionStore } from './services/session-store.js';
 import { TranscriptStore } from './services/transcript-store.js';
 import { HistoryStore } from './services/history-store.js';
 import { SessionTeardownRegistry } from './services/session-teardown.js';
+import { PasteStore } from './services/paste-store.js';
 import { readBuildInfo } from './services/build-info.js';
 import { UpdateChecker } from './services/update-check.js';
 import {
@@ -73,6 +74,7 @@ export class ClaudeCodeWebServer {
   private sessionStore: SessionStore;
   private transcriptStore: TranscriptStore;
   private historyStore: HistoryStore;
+  private pasteStore: PasteStore;
   private sessionTeardown: SessionTeardownRegistry;
   private authService: AuthService;
   private usageReader: UsageReader;
@@ -122,7 +124,12 @@ export class ClaudeCodeWebServer {
     this.sessionStore = new SessionStore({ database: this.database });
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
     this.historyStore = new HistoryStore({ storageDir: this.database.storageDir });
+    this.pasteStore = new PasteStore({ storageDir: this.database.storageDir });
     this.sessionTeardown = new SessionTeardownRegistry();
+    // Registered rather than appended to the DELETE handler, so the next
+    // feature that needs teardown does not collide on the same line.
+    this.sessionTeardown.register('pasted-images', (session) =>
+      this.pasteStore.deletePastes(session));
     this.authService = new AuthService({
       database: this.database,
       dev: this.dev,
@@ -497,6 +504,7 @@ export class ClaudeCodeWebServer {
       transcriptStore: this.transcriptStore,
       historyStore: this.historyStore,
       sessionTeardown: this.sessionTeardown,
+      pasteStore: this.pasteStore,
       updateChecker: this.updateChecker,
       selfUpdate: this.selfUpdate,
       getUpdateMode: () => this.getUpdateMode(),

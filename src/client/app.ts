@@ -59,6 +59,7 @@ import {
 } from './ui/mobile';
 import { showNotification, playNotificationSound } from './ui/notifications';
 import { setupUpdateBanner } from './ui/update-banner';
+import { pickImage, type ImagePasteTarget } from './terminal/paste';
 import { SplitContainer } from './splits/split-container';
 import type { HistoryView, HistoryRange } from './terminal/history-view';
 
@@ -66,6 +67,8 @@ export class App {
   // Terminal
   terminal: Terminal | null;
   terminalController: TerminalController | null;
+  /** Lets the mobile menu reach the same upload path as paste and drop. */
+  imagePasteTarget: ImagePasteTarget | null;
 
   // Server-paged scrollback
   historyView: HistoryView | null;
@@ -117,6 +120,7 @@ export class App {
     this.terminal = null;
     this.terminalController = null;
     this.historyView = null;
+    this.imagePasteTarget = null;
     this.historyRange = { firstLine: 0, totalLines: 0 };
     this.historyRequests = new Map();
     this.historyRequestSeq = 0;
@@ -231,6 +235,7 @@ export class App {
     const closeSessionBtnMobile = document.getElementById('closeSessionBtnMobile');
     const reconnectBtnMobile = document.getElementById('reconnectBtnMobile');
     const clearBtnMobile = document.getElementById('clearBtnMobile');
+    const attachImageBtnMobile = document.getElementById('attachImageBtnMobile');
 
     startBtn?.addEventListener('click', () => this.startClaudeSession());
     dangerousSkipBtn?.addEventListener('click', () =>
@@ -274,6 +279,12 @@ export class App {
     });
     clearBtnMobile?.addEventListener('click', () => {
       this.terminal?.reset();
+      closeMobileMenu();
+    });
+    attachImageBtnMobile?.addEventListener('click', () => {
+      if (this.imagePasteTarget) {
+        pickImage(this.imagePasteTarget);
+      }
       closeMobileMenu();
     });
 

@@ -4,6 +4,7 @@ import type { App } from '../app';
 import { createTerminalController, DEFAULT_THEME } from './controller';
 import { HistoryView } from './history-view';
 import { stripUnsupportedTerminalSequences } from './text';
+import { attachImageDrop, attachImagePaste, type ImagePasteTarget } from './paste';
 
 export function setupTerminal(app: App): void {
   const isMobile = app.isMobile;
@@ -14,6 +15,16 @@ export function setupTerminal(app: App): void {
   const terminalEl = document.getElementById('terminal');
   if (terminalEl) {
     app.terminalController.open(terminalEl);
+
+    const pasteTarget: ImagePasteTarget = {
+      element: terminalEl,
+      getSessionId: () => app.currentClaudeSessionId,
+      sendText: (text) => app.send({ type: 'input', data: text }),
+      isConnected: () => app.socket?.readyState === WebSocket.OPEN,
+    };
+    attachImagePaste(pasteTarget);
+    attachImageDrop(pasteTarget);
+    app.imagePasteTarget = pasteTarget;
   }
 
   const historyHost = document.querySelector('.terminal-wrapper') as HTMLElement | null;
