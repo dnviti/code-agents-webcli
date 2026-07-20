@@ -405,7 +405,8 @@ The repository includes:
 
 A release fires when `package.json`'s version changes and no matching tag exists yet. This project is
 not published to npm — it is distributed from git and as a container image — so the workflow needs no
-registry credentials.
+npm account or token. Pushing to GHCR uses the `GITHUB_TOKEN` that Actions provides automatically,
+so there is nothing to configure for a release to work.
 
 ## What You Still Need To Configure
 
@@ -417,5 +418,5 @@ The app cannot serve sign-ins until you complete these external steps:
 ## Repository
 
 - GitHub: `https://github.com/dnviti/code-agents-webcli`
-- npm: `https://www.npmjs.com/package/code-agents-webcli`
+- Container image: `ghcr.io/dnviti/code-agents-webcli`
 
