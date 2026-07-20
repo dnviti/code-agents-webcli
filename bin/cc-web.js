@@ -47,15 +47,7 @@ async function offerNativeRepair(root) {
   console.error('Cannot start code-agents-webcli: a native dependency was not compiled.');
   console.error('');
   console.error(`These packages need to build native code: ${NATIVE_DEPENDENCIES.join(', ')}`);
-
-  // npm refuses to approve scripts for a global prefix, so there is nothing to
-  // offer here beyond telling the truth about it.
-  if (!commands) {
-    printLines(manualInstructions(root, { global }));
-    return false;
-  }
-
-  console.error(`They would be approved and built in: ${root}`);
+  console.error(`They would be built in: ${root}`);
 
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     // Nobody is there to consent, so do not decide for them.

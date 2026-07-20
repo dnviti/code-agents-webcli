@@ -81,10 +81,25 @@ describe('repairCommands', function () {
     }
   });
 
-  it('offers no command sequence for a global install', function () {
-    // `npm install-scripts` refuses to run against a global prefix (EGLOBAL),
-    // so emitting these would be advice that cannot work.
-    assert.strictEqual(repairCommands('/usr/lib', { global: true }), null);
+  // The two mechanisms are exact mirror images: each is refused in the other's
+  // context, so the wrong one is not merely suboptimal, it errors out.
+  it('uses --allow-scripts for a global install', function () {
+    const commands = repairCommands('/usr/lib', { global: true });
+    assert.deepStrictEqual(commands, [
+      ['rebuild', '--global', '--allow-scripts=node-pty,better-sqlite3'],
+    ]);
+  });
+
+  it('never offers install-scripts approve for a global install', function () {
+    // npm refuses it against a global prefix with EGLOBAL.
+    const flat = repairCommands('/usr/lib', { global: true }).flat().join(' ');
+    assert.ok(!flat.includes('install-scripts'));
+  });
+
+  it('never offers --allow-scripts for a project-scoped install', function () {
+    // npm refuses it there with EALLOWSCRIPTS.
+    const flat = repairCommands('/home/u/.npm/_npx/abc').flat().join(' ');
+    assert.ok(!flat.includes('--allow-scripts'));
   });
 });
 
@@ -108,8 +123,10 @@ describe('manualInstructions', function () {
   it('does not tell a global install to run a command npm refuses', function () {
     const text = manualInstructions('/usr/lib', { global: true }).join('\n');
     assert.ok(!text.includes('install-scripts approve'));
-    assert.match(text, /global install/i);
-    assert.match(text, /npx --allow-git=all/);
+    assert.match(text, /npm rebuild --global --allow-scripts=/);
+    // Someone who has hit EALLOWSCRIPTS on an install will assume the flag is
+    // unusable here too, so the difference is spelled out.
+    assert.match(text, /project-scoped install is refused/);
   });
 
   it('always mentions the toolchain requirement', function () {
