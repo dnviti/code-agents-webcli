@@ -34,16 +34,26 @@ Try it without installing:
 npx --allow-git=all github:dnviti/code-agents-webcli
 ```
 
+On npm 12 the first run stops and asks permission to build `node-pty` and
+`better-sqlite3`. npm blocks dependency install scripts by default, and for an npx run there is no
+project file in which to pre-approve them — the root `package.json` is one npm generates itself.
+Answering `y` approves and builds them in the npx cache; answering `n` prints the two commands to run
+by hand. Either way it needs a C++ toolchain.
+
 Install it properly (required if you want the background service):
 
 ```bash
 npm i -g --allow-git=all github:dnviti/code-agents-webcli
-npm rebuild --prefix "$(npm root -g)/code-agents-webcli"
 cc-web
 ```
 
 The install compiles the package, so the first run takes a minute and needs a C++ toolchain for the
 native dependencies (`python3`, `make`, `g++` on Linux).
+
+> **Use npm 11 or newer for the global install.** On npm 10 — the version bundled with Node 20 — a
+> git install fails while preparing the checkout with `Cannot find module 'esbuild'`, because npm 10
+> runs this package's `prepare` script before its dev dependencies are in place. `npm i -g npm@latest`
+> first, or use `npx`, which is unaffected.
 
 <details>
 <summary>Why two commands, and why <code>--allow-git=all</code>?</summary>
@@ -56,7 +66,18 @@ instead of per command with `npm config set allow-git all`. On npm 11 and earlie
 **Install scripts are blocked**, and `node-pty` and `better-sqlite3` are native modules that must be
 compiled. This package permits them through the `allowScripts` field in its `package.json`, which
 covers the build that happens while npm prepares the git checkout — but *not* the dependencies of the
-global install itself, which is why they arrive uncompiled and `npm rebuild` is needed afterwards.
+install itself, which is why they arrive uncompiled.
+
+`npm rebuild` alone does **not** fix that: it reports `rebuilt dependencies successfully` while
+skipping every package whose scripts are blocked. The approval has to come first, and it is written
+into the *root* `package.json` of wherever the install landed:
+
+```bash
+npm install-scripts approve node-pty better-sqlite3 --prefix <install root>
+npm rebuild --prefix <install root>
+```
+
+The server prints those two lines, with the real directory filled in, if it ever hits this.
 
 Do **not** try to solve this by adding `--allow-scripts`: npm forwards it into the project-scoped
 install it runs while preparing the git checkout, and that inner install rejects it outright, so the
@@ -171,11 +192,10 @@ unavailable until they are reinstalled once:
 
 ```bash
 npm i -g --allow-git=all github:dnviti/code-agents-webcli
-npm rebuild --prefix "$(npm root -g)/code-agents-webcli"
 ```
 
-If an update is interrupted — a reboot, an OOM kill — the next start says so. The same two commands
-are the recovery.
+If an update is interrupted — a reboot, an OOM kill — the next start says so, and the same command is
+the recovery.
 
 Building the Docker image yourself? Pass the commit, or the image reports an unknown build:
 
@@ -301,29 +321,64 @@ npm run dev
 
 ## Docker
 
-Build locally:
+Images are published to GHCR on every release, tagged `latest`, `<version>` and `v<version>`:
 
 ```bash
-docker build -t code-agents-webcli .
+docker pull ghcr.io/dnviti/code-agents-webcli:latest
 ```
 
-Run:
+Run it:
 
 ```bash
-docker run --rm -it \
+docker run -d --name code-agents-webcli \
   -p 32352:32352 \
   -v code-agents-webcli-data:/home/appuser/.code-agents-webcli \
   -e GITHUB_OAUTH_CLIENT_ID=YOUR_CLIENT_ID \
   -e GITHUB_OAUTH_CLIENT_SECRET=YOUR_CLIENT_SECRET \
+  -e GITHUB_ALLOWED_USER_IDS=YOUR_NUMERIC_ID \
   -e PUBLIC_BASE_URL=http://localhost:32352 \
-  code-agents-webcli
+  ghcr.io/dnviti/code-agents-webcli:latest
 ```
+
+All four environment variables are needed:
+
+| Variable | Why |
+| --- | --- |
+| `GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET` | Without them the server exits at startup. |
+| `GITHUB_ALLOWED_USER_IDS` | Without it every sign-in is refused. |
+| `PUBLIC_BASE_URL` | The OAuth callback is built from it; a wrong value means sign-in returns to the wrong host. |
+
+They are not optional the way they are for a local install, because the setup wizard needs a terminal
+to ask its questions. A detached container has none — nor does one started by Compose or Kubernetes —
+so the configuration has to arrive as environment variables instead. (Running with `-it` *does* give
+the wizard a TTY, so it can be completed interactively once, but only if the volume below is in place
+to keep the answers.)
+
+The volume matters just as much: the SQLite database holds your users, sessions and settings, and
+without it they are gone the moment the container is replaced.
+
+Build it yourself instead, passing the commit so the image can report its own version:
+
+```bash
+docker build \
+  --build-arg BUILD_SHA="$(git rev-parse HEAD)" \
+  --build-arg BUILD_DATE="$(git show -s --format=%cI HEAD)" \
+  -t code-agents-webcli .
+```
+
+Without those build args the image still runs, but reports an unknown build and cannot check for
+updates — `.dockerignore` excludes `.git`, so the build cannot read the commit on its own.
 
 Important:
 
 - the image contains the web server only
-- Claude / Codex / Cursor CLIs are not bundled into the container
-- if you want assistant runtimes inside Docker, extend the image and install those CLIs there
+- the agent CLIs (`claude`, `codex`, `cursor-agent`, `pi`, `grok`) are **not** bundled; only terminal
+  sessions work out of the box
+- to use the assistants in Docker, derive an image and install those CLIs in it
+- the folder browser is bounded by the container's working directory (`/app`), so mount your projects
+  and point sessions at them
+- the update banner reports "running in a container" and offers no update button, by design: a
+  self-install would write into a layer that the next `docker pull` discards
 
 ## Development
 

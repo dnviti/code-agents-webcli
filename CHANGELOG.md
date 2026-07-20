@@ -2,6 +2,24 @@
 
 ## [4.1.0] - 2026-07-20
 
+### Fixed
+- **`npx github:dnviti/code-agents-webcli` could not start.** npm 12 blocks dependency install
+  scripts unless the *root* package.json approves them, and for an npx run that root is a file npm
+  generates itself — this package has no way to influence it — so node-pty and better-sqlite3 arrived
+  uncompiled. The launcher now detects that, names the actual install directory, and offers to
+  approve and build them. It asks first: npm blocks those scripts as a supply-chain protection, and
+  approving them runs third-party build code.
+- The advice printed on that failure was wrong for every install that is not global: it named
+  `$(npm root -g)/code-agents-webcli`, which for an npx run does not exist. It also recommended
+  `npm rebuild`, which reports success while silently skipping the blocked packages.
+
+### Fixed
+- **Releases now actually happen.** `release-on-main.yml` published to npm partway through its release
+  job, which 404'd on every run because trusted publishing cannot bootstrap a package that has never
+  existed on the registry. Because that step sat mid-job, its failure skipped the container build,
+  the GHCR push and the GitHub release, so the repository had no tags, no releases and no published
+  images. npm publishing is removed; the project is distributed from git and as a container image.
+
 ### Added
 - **Update checking against GitHub.** The app compares the commit it was built from against the tip
   of `main` and shows a banner when it is behind. The commit is baked into `dist/build-info.json`
