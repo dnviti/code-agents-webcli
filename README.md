@@ -330,7 +330,7 @@ docker pull ghcr.io/dnviti/code-agents-webcli:latest
 Run it:
 
 ```bash
-docker run --rm -it \
+docker run -d --name code-agents-webcli \
   -p 32352:32352 \
   -v code-agents-webcli-data:/home/appuser/.code-agents-webcli \
   -e GITHUB_OAUTH_CLIENT_ID=YOUR_CLIENT_ID \
@@ -340,10 +340,22 @@ docker run --rm -it \
   ghcr.io/dnviti/code-agents-webcli:latest
 ```
 
-The three environment variables are not optional. There is no TTY in a container, so the setup wizard
-cannot run: without the OAuth pair the server exits immediately saying so, and without the allow-list
-every sign-in is refused. The volume matters just as much — the SQLite database holds your users,
-sessions and settings, and without it they are gone the moment the container is replaced.
+All four environment variables are needed:
+
+| Variable | Why |
+| --- | --- |
+| `GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET` | Without them the server exits at startup. |
+| `GITHUB_ALLOWED_USER_IDS` | Without it every sign-in is refused. |
+| `PUBLIC_BASE_URL` | The OAuth callback is built from it; a wrong value means sign-in returns to the wrong host. |
+
+They are not optional the way they are for a local install, because the setup wizard needs a terminal
+to ask its questions. A detached container has none — nor does one started by Compose or Kubernetes —
+so the configuration has to arrive as environment variables instead. (Running with `-it` *does* give
+the wizard a TTY, so it can be completed interactively once, but only if the volume below is in place
+to keep the answers.)
+
+The volume matters just as much: the SQLite database holds your users, sessions and settings, and
+without it they are gone the moment the container is replaced.
 
 Build it yourself instead, passing the commit so the image can report its own version:
 

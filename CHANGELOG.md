@@ -14,8 +14,8 @@
   `npm rebuild`, which reports success while silently skipping the blocked packages.
 
 ### Fixed
-- **Releases now actually happen.** `release-on-main.yml` published to npm as its first release step,
-  which 404'd on every run because trusted publishing cannot bootstrap a package that has never
+- **Releases now actually happen.** `release-on-main.yml` published to npm partway through its release
+  job, which 404'd on every run because trusted publishing cannot bootstrap a package that has never
   existed on the registry. Because that step sat mid-job, its failure skipped the container build,
   the GHCR push and the GitHub release, so the repository had no tags, no releases and no published
   images. npm publishing is removed; the project is distributed from git and as a container image.
