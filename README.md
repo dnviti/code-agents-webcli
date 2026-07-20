@@ -44,11 +44,16 @@ Install it properly (required if you want the background service):
 
 ```bash
 npm i -g --allow-git=all github:dnviti/code-agents-webcli
+npm rebuild -g --allow-scripts=node-pty,better-sqlite3
 cc-web
 ```
 
 The install compiles the package, so the first run takes a minute and needs a C++ toolchain for the
 native dependencies (`python3`, `make`, `g++` on Linux).
+
+The second command is what actually builds `node-pty` and `better-sqlite3`. npm 12 blocks dependency
+install scripts, and the first command cannot approve them itself — see below. Skipping it leaves the
+server unable to start; it will tell you so, and print that same command.
 
 > **Use npm 11 or newer for the global install.** On npm 10 — the version bundled with Node 20 — a
 > git install fails while preparing the checkout with `Cannot find module 'esbuild'`, because npm 10
@@ -79,16 +84,30 @@ npm rebuild --prefix <install root>
 
 The server prints those two lines, with the real directory filled in, if it ever hits this.
 
-Do **not** try to solve this by adding `--allow-scripts`: npm forwards it into the project-scoped
-install it runs while preparing the git checkout, and that inner install rejects it outright, so the
-whole install fails:
+Do **not** try to solve this by adding `--allow-scripts` to the *install*: npm forwards it into the
+project-scoped install it runs while preparing the git checkout, and that inner install rejects it
+outright, so the whole install fails:
 
 ```
 npm error code EALLOWSCRIPTS
 npm error --allow-scripts is not allowed in project-scoped installs.
 ```
 
-Putting `allow-scripts` in `.npmrc` fails the same way.
+Putting `allow-scripts` in `.npmrc` fails the same way. The flag does work on `npm rebuild -g`, which
+is why the install is two commands: the first cannot accept it, and the second requires it.
+
+npm's own warning suggests `npm install -g --allow-scripts=… github:…` as a one-liner. That does not
+work for a git spec, for exactly the reason above.
+
+The two approval mechanisms are mirror images, and each is rejected in the other's context:
+
+| Install | Approve with | Rejected |
+| --- | --- | --- |
+| global | `npm rebuild -g --allow-scripts=<pkgs>` | `npm install-scripts` → `EGLOBAL` |
+| project-scoped, incl. `npx` | `npm install-scripts approve <pkgs>` then `npm rebuild` | `--allow-scripts` → `EALLOWSCRIPTS` |
+
+`npm rebuild` without either is never enough: it reports `rebuilt dependencies successfully` while
+skipping every blocked package.
 
 </details>
 

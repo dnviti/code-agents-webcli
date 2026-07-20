@@ -3,6 +3,12 @@
 ## [4.1.0] - 2026-07-20
 
 ### Fixed
+- **A global install could not start, and was told there was no way to fix it.** npm exposes two
+  approval mechanisms that are exact mirror images — `npm install-scripts approve` for project-scoped
+  installs, `--allow-scripts=<pkgs>` for global ones — and each is rejected in the other's context.
+  Having verified that `npm install-scripts` refuses a global prefix, the launcher wrongly concluded
+  no mechanism existed and told users to reinstall or run node-gyp by hand. It now prints
+  `npm rebuild -g --allow-scripts=node-pty,better-sqlite3`, and offers to run it.
 - **`npx github:dnviti/code-agents-webcli` could not start.** npm 12 blocks dependency install
   scripts unless the *root* package.json approves them, and for an npx run that root is a file npm
   generates itself — this package has no way to influence it — so node-pty and better-sqlite3 arrived

@@ -92,17 +92,25 @@ function isGlobalRoot(root, deps = {}) {
 /**
  * The commands that actually unblock and build the native dependencies.
  *
- * `npm rebuild` alone is not one of them: it reports "rebuilt dependencies
- * successfully" while skipping every package whose scripts are blocked, which
- * is why the previous advice looked like it should work and did not.
+ * npm offers two mechanisms for this and they are exact mirror images, which
+ * is why each has to be detected rather than guessed:
  *
- * Returns null for a global install, where there is no such sequence —
- * `npm install-scripts` refuses to run against a global prefix (EGLOBAL).
+ *   project-scoped   `npm install-scripts approve` writes the approval into
+ *                    the root package.json. Passing `--allow-scripts` here is
+ *                    refused outright (EALLOWSCRIPTS).
+ *   global           `--allow-scripts=<list>` is the only way in. Running
+ *                    `npm install-scripts` against a global prefix is refused
+ *                    outright (EGLOBAL).
+ *
+ * `npm rebuild` on its own is never enough: it reports "rebuilt dependencies
+ * successfully" while skipping every package whose scripts are blocked, which
+ * is why advice built around it looks like it should work and does not.
  */
 function repairCommands(root, options = {}) {
   if (options.global) {
-    return null;
+    return [['rebuild', '--global', `--allow-scripts=${NATIVE_DEPENDENCIES.join(',')}`]];
   }
+
   const scope = ['--prefix', root];
   return [
     ['install-scripts', 'approve', ...NATIVE_DEPENDENCIES, ...scope],
@@ -119,28 +127,20 @@ function repairCommands(root, options = {}) {
 function manualInstructions(root, options = {}) {
   const lines = [];
   lines.push('npm 12 blocks dependency install scripts by default, so the native modules');
+  lines.push('arrived uncompiled. Building them fixes it:');
+  lines.push('');
+  for (const args of repairCommands(root, options)) {
+    lines.push(`  npm ${args.join(' ')}`);
+  }
+  lines.push('');
+  lines.push('`npm rebuild` on its own is not enough — it reports success while still');
+  lines.push('skipping the blocked packages.');
 
-  const commands = repairCommands(root, options);
-  if (!commands) {
-    // npm offers no approval mechanism for a global prefix, so the only way
-    // out is an install that is allowed to run scripts in the first place.
-    lines.push('arrived uncompiled, and `npm install-scripts` cannot approve them for a');
-    lines.push('global install. Reinstall somewhere npm can approve them instead:');
-    lines.push('');
-    lines.push('  npx --allow-git=all github:dnviti/code-agents-webcli');
-    lines.push('');
-    lines.push('or build the two packages by hand in the global install directory:');
-    lines.push('');
-    lines.push(`  cd ${path.join(root, 'node_modules')}/<package> && npx node-gyp rebuild`);
-  } else {
-    lines.push('arrived uncompiled. Approving them and rebuilding fixes it:');
-    lines.push('');
-    for (const args of commands) {
-      lines.push(`  npm ${args.join(' ')}`);
-    }
-    lines.push('');
-    lines.push('`npm rebuild` on its own is not enough — it reports success while still');
-    lines.push('skipping the blocked packages.');
+  if (options.global) {
+    // Worth stating, because the flag is refused in the other kind of install
+    // and someone who has met that error will assume it cannot be used here.
+    lines.push('A global install is approved with --allow-scripts; passing that flag to a');
+    lines.push('project-scoped install is refused, which is why the two differ.');
   }
 
   lines.push('');
