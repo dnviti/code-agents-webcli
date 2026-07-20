@@ -76,7 +76,13 @@ function sidebarGroups(tabs: ShellTab[]): ProfileSidebarGroup[] {
         id: tab.id,
         label: tab.title,
         meta: tab.workingDir ? basename(tab.workingDir) : undefined,
-        status: tab.status === 'running' ? 'online' : tab.status === 'error' ? 'error' : 'busy',
+        // Idle deliberately maps to no status rather than to 'busy'. 'busy'
+        // paints var(--warning), so every quiet session was showing a warning
+        // dot, and "busy" came to mean "not running" — the opposite of what it
+        // says. Undefined falls back to the neutral dot; 'busy' stays free for
+        // a real connecting/working state if one is added.
+        status:
+          tab.status === 'running' ? 'online' : tab.status === 'error' ? 'error' : undefined,
       })),
     }));
 }

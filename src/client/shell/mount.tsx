@@ -4,13 +4,29 @@ import { createRoot } from 'react-dom/client';
 import type { App } from '../app';
 import { AppShell, type ShellActions } from './AppShell';
 import { shellStore } from './store';
+import { relayTerminalTheme } from './terminal-theme';
 
 const THEME_STORAGE_KEY = 'cc-web-relay-theme';
+
+/** The live terminal, so a theme change can reach it. Set once at mount. */
+let themedApp: App | null = null;
 
 /** Apply the Relay theme by toggling the `.light` class the tokens key off. */
 export function applyTheme(theme: 'dark' | 'light'): void {
   document.documentElement.classList.toggle('light', theme === 'light');
   shellStore.setState({ theme });
+
+  // xterm renders from a JavaScript theme object, not from CSS, so the class
+  // toggle above reaches every React surface and stops at the terminal. Without
+  // this the chrome goes light and the terminal stays dark.
+  const terminal = themedApp?.terminal;
+  if (terminal) {
+    const next = relayTerminalTheme();
+    // null means the tokens are not in the cascade. Keeping the previous theme
+    // is right: one built from empty strings is black on black.
+    if (next) terminal.options.theme = next;
+  }
+
   try {
     localStorage.setItem(THEME_STORAGE_KEY, theme);
   } catch {
@@ -56,6 +72,8 @@ export function mountShell(app: App): void {
     setTheme: applyTheme,
   };
 
+  // Before applyTheme, so the very first call can already reach the terminal.
+  themedApp = app;
   applyTheme(readStoredTheme());
   createRoot(mountPoint).render(<AppShell terminalNode={terminalNode} actions={actions} />);
 }

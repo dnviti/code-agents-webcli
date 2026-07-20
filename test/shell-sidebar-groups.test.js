@@ -86,6 +86,23 @@ describe('shell sidebar grouping', function () {
     );
   });
 
+  it('does not paint an idle session with the warning dot', function () {
+    // 'busy' resolves to var(--warning) in ProfileSidebar, so mapping idle to
+    // it made every quiet session look like it needed attention, and left
+    // "busy" meaning "not running".
+    const idle = renderWith([tab('a', 'claude')]);
+    assert.ok(
+      !/var\(--warning\)/.test(idle),
+      'an idle session must not render the warning dot',
+    );
+
+    const running = renderWith([{ ...tab('b', 'claude'), status: 'running' }]);
+    assert.ok(
+      /var\(--ansi-green\)/.test(running),
+      'a running session should still render the online dot',
+    );
+  });
+
   it('groups sessions of the same runtime together', function () {
     const html = renderWith([tab('a', 'claude'), tab('b', 'kimi'), tab('c', 'claude')]);
     assert.strictEqual(
