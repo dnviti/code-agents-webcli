@@ -17,12 +17,13 @@ try {
   if (nativeModuleFailed) {
     console.error('Cannot start code-agents-webcli: a native dependency was not compiled.');
     console.error('');
-    console.error('npm 12 blocks install scripts by default. Reinstall allowing them:');
+    console.error('npm 12 blocks install scripts by default, so the native modules arrived');
+    console.error('uncompiled. Build them with:');
     console.error('');
-    console.error('  npm i -g --allow-scripts=code-agents-webcli,better-sqlite3,node-pty \\');
-    console.error('    github:dnviti/code-agents-webcli');
+    console.error('  npm rebuild --prefix "$(npm root -g)/code-agents-webcli"');
     console.error('');
-    console.error('Building also needs a C++ toolchain (python3, make, g++ on Linux).');
+    console.error('Do not pass --allow-scripts: npm rejects it for this package.');
+    console.error('Building needs a C++ toolchain (python3, make, g++ on Linux).');
   } else {
     console.error('Cannot start code-agents-webcli because the compiled server bundle is missing.');
     console.error('Run `npm run build` first, or reinstall the package if this came from npm.');

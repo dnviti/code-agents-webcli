@@ -36,35 +36,36 @@ Install it properly (required if you want the background service):
 
 ```bash
 npm i -g --allow-git=all github:dnviti/code-agents-webcli
+npm rebuild --prefix "$(npm root -g)/code-agents-webcli"
 cc-web
 ```
 
-Both commands compile the package on install, so the first run takes a minute and needs a C++
-toolchain for the native dependencies (`python3`, `make`, `g++` on Linux).
+The install compiles the package, so the first run takes a minute and needs a C++ toolchain for the
+native dependencies (`python3`, `make`, `g++` on Linux).
 
 <details>
-<summary>Why <code>--allow-git=all</code>?</summary>
+<summary>Why two commands, and why <code>--allow-git=all</code>?</summary>
 
-npm 12 changed `allow-git` to default to `none`, so npm refuses to fetch a package from a git remote
-at all. On npm 11 and earlier the flag is unnecessary.
+npm 12 changed two defaults, and a GitHub install trips both.
 
-Set it once instead of per command with:
+**`allow-git` now defaults to `none`**, so npm refuses to fetch from a git remote at all. Set it once
+instead of per command with `npm config set allow-git all`. On npm 11 and earlier this is unnecessary.
 
-```bash
-npm config set allow-git all
-```
+**Install scripts are blocked**, and `node-pty` and `better-sqlite3` are native modules that must be
+compiled. This package permits them through the `allowScripts` field in its `package.json`, which
+covers the build that happens while npm prepares the git checkout — but *not* the dependencies of the
+global install itself, which is why they arrive uncompiled and `npm rebuild` is needed afterwards.
 
-Note that **`--allow-scripts` must not be added** to these commands, even though npm 12 blocks
-install scripts by default. npm forwards the flag into the project-scoped install it runs while
-preparing the git checkout, and that inner install rejects it:
+Do **not** try to solve this by adding `--allow-scripts`: npm forwards it into the project-scoped
+install it runs while preparing the git checkout, and that inner install rejects it outright, so the
+whole install fails:
 
 ```
 npm error code EALLOWSCRIPTS
 npm error --allow-scripts is not allowed in project-scoped installs.
 ```
 
-The native modules are permitted through the `allowScripts` field in this package's `package.json`
-instead, which is why nothing extra is needed on the command line.
+Putting `allow-scripts` in `.npmrc` fails the same way.
 
 </details>
 
