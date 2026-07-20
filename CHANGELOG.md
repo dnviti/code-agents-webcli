@@ -2,6 +2,13 @@
 
 ## [4.1.0] - 2026-07-20
 
+### Fixed
+- **Releases now actually happen.** `release-on-main.yml` published to npm as its first release step,
+  which 404'd on every run because trusted publishing cannot bootstrap a package that has never
+  existed on the registry. Because that step sat mid-job, its failure skipped the container build,
+  the GHCR push and the GitHub release, so the repository had no tags, no releases and no published
+  images. npm publishing is removed; the project is distributed from git and as a container image.
+
 ### Added
 - **Update checking against GitHub.** The app compares the commit it was built from against the tip
   of `main` and shows a banner when it is behind. The commit is baked into `dist/build-info.json`

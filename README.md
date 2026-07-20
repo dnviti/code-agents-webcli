@@ -301,13 +301,13 @@ npm run dev
 
 ## Docker
 
-Build locally:
+Images are published to GHCR on every release, tagged `latest`, `<version>` and `v<version>`:
 
 ```bash
-docker build -t code-agents-webcli .
+docker pull ghcr.io/dnviti/code-agents-webcli:latest
 ```
 
-Run:
+Run it:
 
 ```bash
 docker run --rm -it \
@@ -315,15 +315,38 @@ docker run --rm -it \
   -v code-agents-webcli-data:/home/appuser/.code-agents-webcli \
   -e GITHUB_OAUTH_CLIENT_ID=YOUR_CLIENT_ID \
   -e GITHUB_OAUTH_CLIENT_SECRET=YOUR_CLIENT_SECRET \
+  -e GITHUB_ALLOWED_USER_IDS=YOUR_NUMERIC_ID \
   -e PUBLIC_BASE_URL=http://localhost:32352 \
-  code-agents-webcli
+  ghcr.io/dnviti/code-agents-webcli:latest
 ```
+
+The three environment variables are not optional. There is no TTY in a container, so the setup wizard
+cannot run: without the OAuth pair the server exits immediately saying so, and without the allow-list
+every sign-in is refused. The volume matters just as much — the SQLite database holds your users,
+sessions and settings, and without it they are gone the moment the container is replaced.
+
+Build it yourself instead, passing the commit so the image can report its own version:
+
+```bash
+docker build \
+  --build-arg BUILD_SHA="$(git rev-parse HEAD)" \
+  --build-arg BUILD_DATE="$(git show -s --format=%cI HEAD)" \
+  -t code-agents-webcli .
+```
+
+Without those build args the image still runs, but reports an unknown build and cannot check for
+updates — `.dockerignore` excludes `.git`, so the build cannot read the commit on its own.
 
 Important:
 
 - the image contains the web server only
-- Claude / Codex / Cursor CLIs are not bundled into the container
-- if you want assistant runtimes inside Docker, extend the image and install those CLIs there
+- the agent CLIs (`claude`, `codex`, `cursor-agent`, `pi`, `grok`) are **not** bundled; only terminal
+  sessions work out of the box
+- to use the assistants in Docker, derive an image and install those CLIs in it
+- the folder browser is bounded by the container's working directory (`/app`), so mount your projects
+  and point sessions at them
+- the update banner reports "running in a container" and offers no update button, by design: a
+  self-install would write into a layer that the next `docker pull` discards
 
 ## Development
 
