@@ -21,6 +21,21 @@ export class WebSocketHandler {
   }
 
   handleConnection(ws: WebSocket, req: IncomingMessage): void {
+    try {
+      this.setupConnection(ws, req);
+    } catch (error) {
+      // This runs inside the ws 'connection' listener, where a throw is
+      // uncaught and fatal. Close the socket instead of the process.
+      console.error('Failed to set up WebSocket connection:', error);
+      try {
+        ws.close(1011, 'Internal error');
+      } catch {
+        // Socket already gone.
+      }
+    }
+  }
+
+  private setupConnection(ws: WebSocket, req: IncomingMessage): void {
     const authContext = this.deps.getAuthContext(req);
     if (!authContext.user) {
       ws.close(4401, 'Authentication required');
@@ -83,9 +98,28 @@ export class WebSocketHandler {
       connectionId: wsId,
     });
 
-    // If sessionId provided, auto-join that session
-    if (claudeSessionId && this.deps.claudeSessions.has(claudeSessionId)) {
-      this.messageProcessor.joinSession(wsId, claudeSessionId);
+    // If sessionId provided, auto-join that session. joinSession is async and
+    // reads the transcript from disk: an unhandled rejection here would take
+    // the whole process down.
+    if (claudeSessionId) {
+      if (this.deps.claudeSessions.has(claudeSessionId)) {
+        void this.messageProcessor.joinSession(wsId, claudeSessionId).catch((error) => {
+          console.error(`Failed to auto-join session ${claudeSessionId}:`, error);
+          sendToWebSocket(ws, {
+            type: 'error',
+            message: 'Failed to join session',
+          });
+        });
+      } else {
+        // Tell the client instead of silently leaving it attached to nothing:
+        // after a server restart the reconnect would otherwise look successful
+        // while the terminal stayed dead.
+        sendToWebSocket(ws, {
+          type: 'session_gone',
+          sessionId: claudeSessionId,
+          message: 'This session no longer exists.',
+        });
+      }
     }
   }
 

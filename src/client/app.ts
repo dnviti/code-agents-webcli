@@ -298,7 +298,17 @@ export class App {
     const content = document.getElementById('planContent');
     if (!content || !modal) return;
 
-    let formatted = plan.content
+    // plan.content is raw terminal output: anything the agent prints (a file it
+    // cats, a fetched page, a dependency README) reaches this sink. Escape
+    // first, so only the tags produced below are live HTML.
+    const escaped = plan.content
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+
+    const formatted = escaped
       .replace(/^### (.*?)$/gm, '<h3>$1</h3>')
       .replace(/^## (.*?)$/gm, '<h2>$1</h2>')
       .replace(/^- (.*?)$/gm, '\u2022 $1')
@@ -313,6 +323,9 @@ export class App {
 
   private hidePlanModal(): void {
     document.getElementById('planModal')?.classList.remove('active');
+    // Without this the next output chunk re-detects the same plan and
+    // immediately reopens the modal.
+    this.planDetector.clearBuffer();
   }
 
   private acceptPlan(): void {
@@ -424,13 +437,9 @@ export class App {
   }
 
   requestUsageStats(): void {
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-      this.socket.send(JSON.stringify({ type: 'get_usage' }));
-    }
-
-    if (!this.usageUpdateTimer) {
-      this.usageUpdateTimer = setInterval(() => this.requestUsageStats(), 10000);
-    }
+    // The usage panel was removed from the UI, so every response was discarded
+    // while the 10s interval kept the server rescanning the whole
+    // ~/.claude/projects corpus. Left as a no-op hook for when the UI returns.
   }
 
   startHeartbeat(): void {

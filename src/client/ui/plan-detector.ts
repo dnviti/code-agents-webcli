@@ -2,14 +2,8 @@
 
 import type { PlanData } from '../types';
 
-interface BufferEntry {
-  timestamp: number;
-  data: string;
-}
-
 export class PlanDetector {
   isMonitoring: boolean;
-  outputBuffer: BufferEntry[];
   planModeActive: boolean;
   currentPlan: PlanData | null;
   onPlanDetected: ((plan: PlanData) => void) | null;
@@ -17,11 +11,18 @@ export class PlanDetector {
 
   private readonly planStartMarker = '## Implementation Plan:';
   private readonly planEndMarker = 'User has approved your plan';
-  private readonly maxBufferSize = 10000;
+  private readonly maxChars = 50000;
+
+  /**
+   * A single rolling, already ANSI-stripped string. Keeping the raw chunks and
+   * re-joining plus re-stripping them on every chunk was quadratic in the
+   * amount of output produced.
+   */
+  private text = '';
+  private lastPlanContent: string | null = null;
 
   constructor() {
     this.isMonitoring = false;
-    this.outputBuffer = [];
     this.planModeActive = false;
     this.currentPlan = null;
     this.onPlanDetected = null;
@@ -31,13 +32,15 @@ export class PlanDetector {
   processOutput(data: string): void {
     if (!this.isMonitoring) return;
 
-    this.outputBuffer.push({ timestamp: Date.now(), data });
+    this.text += data
+      .replace(/\x1b\[[0-9;]*m/g, '')
+      .replace(/\x1b\[[0-9]*[A-Za-z]/g, '');
 
-    if (this.outputBuffer.length > this.maxBufferSize) {
-      this.outputBuffer = this.outputBuffer.slice(-this.maxBufferSize / 2);
+    if (this.text.length > this.maxChars) {
+      this.text = this.text.slice(-this.maxChars);
     }
 
-    const recentText = this.getRecentText();
+    const recentText = this.text;
 
     if (!this.planModeActive && this.detectPlanModeStart(recentText)) {
       this.planModeActive = true;
@@ -46,7 +49,11 @@ export class PlanDetector {
 
     if (this.planModeActive && this.detectCompletedPlan(recentText)) {
       const plan = this.extractPlan(recentText);
-      if (plan) {
+      // Fire once per distinct plan: the markers stay inside the window, so an
+      // unguarded callback reopens the modal on every subsequent chunk and the
+      // user can never dismiss it.
+      if (plan && plan.content !== this.lastPlanContent) {
+        this.lastPlanContent = plan.content;
         this.currentPlan = plan;
         this.onPlanDetected?.(plan);
       }
@@ -54,18 +61,16 @@ export class PlanDetector {
 
     if (this.planModeActive && this.detectPlanModeEnd(recentText)) {
       this.planModeActive = false;
+      // Drop the consumed window, otherwise the start markers still in it
+      // immediately re-activate plan mode on the next chunk.
+      this.text = '';
+      this.lastPlanContent = null;
       this.onPlanModeChange?.(false);
     }
   }
 
   getRecentText(maxChars = 50000): string {
-    const text = this.outputBuffer
-      .map((item) => item.data)
-      .join('')
-      .replace(/\x1b\[[0-9;]*m/g, '')
-      .replace(/\x1b\[[0-9]*[A-Za-z]/g, '');
-
-    return text.slice(-maxChars);
+    return this.text.slice(-maxChars);
   }
 
   private detectPlanModeStart(text: string): boolean {
@@ -149,21 +154,24 @@ export class PlanDetector {
 
   startMonitoring(): void {
     this.isMonitoring = true;
-    this.outputBuffer = [];
+    this.text = '';
     this.planModeActive = false;
     this.currentPlan = null;
+    this.lastPlanContent = null;
   }
 
   stopMonitoring(): void {
     this.isMonitoring = false;
-    this.outputBuffer = [];
+    this.text = '';
     this.planModeActive = false;
     this.currentPlan = null;
+    this.lastPlanContent = null;
   }
 
   clearBuffer(): void {
-    this.outputBuffer = [];
+    this.text = '';
     this.currentPlan = null;
+    this.lastPlanContent = null;
   }
 
   getPlanModeStatus(): boolean {

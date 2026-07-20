@@ -19,6 +19,7 @@ interface AuthServiceOptions {
   githubClientSecret: string | null;
   githubAppToken: string | null;
   allowedGitHubIds: string[];
+  allowAnyGitHubUser?: boolean;
 }
 
 interface GitHubAccessTokenResponse {
@@ -52,6 +53,7 @@ export class AuthService {
   private githubClientSecret: string | null;
   private githubAppToken: string | null;
   private allowedGitHubIds: string[];
+  private readonly allowAnyGitHubUser: boolean;
 
   constructor(options: AuthServiceOptions) {
     this.database = options.database;
@@ -63,8 +65,26 @@ export class AuthService {
     this.githubClientSecret = options.githubClientSecret;
     this.githubAppToken = options.githubAppToken;
     this.allowedGitHubIds = options.allowedGitHubIds;
+    this.allowAnyGitHubUser = options.allowAnyGitHubUser === true;
 
     this.loadPersistedSettings();
+
+    if (this.allowedGitHubIds.length === 0) {
+      if (this.allowAnyGitHubUser) {
+        console.warn(
+          '\nWARNING: --allow-any-github-user is set and no allow-list is configured.\n' +
+            '         ANY GitHub account that can reach this server may sign in and run\n' +
+            '         commands on this host. Do not use this on an exposed network.\n',
+        );
+      } else {
+        console.warn(
+          '\nWARNING: no allowed GitHub user IDs are configured, so every sign-in will be\n' +
+            '         refused. Set --allowed-github-ids (or GITHUB_ALLOWED_USER_IDS), or\n' +
+            '         re-run with --setup. Pass --allow-any-github-user to intentionally\n' +
+            '         allow anyone.\n',
+        );
+      }
+    }
   }
 
   get currentAllowedGitHubIds(): string[] {
@@ -119,11 +139,13 @@ export class AuthService {
         'GitHub OAuth Client Secret',
         this.githubClientSecret || '',
       );
+      // Required: an empty allow-list now denies every sign-in, so silently
+      // accepting a blank answer here would produce an unusable install.
       const allowedGitHubIds = await promptValue(
         rl,
-        'Allowed GitHub user IDs (comma-separated, optional)',
+        'Allowed GitHub user IDs (comma-separated)',
         this.allowedGitHubIds.join(','),
-        false,
+        true,
       );
       const githubAppToken = await promptSecret(
         rl,
@@ -323,7 +345,8 @@ export class AuthService {
         }),
       ]);
 
-      res.redirect(redirectTarget || '/');
+      // Re-sanitize: the cookie value is not integrity-protected.
+      res.redirect(sanitizeRedirectTarget(redirectTarget || '/'));
     } catch (error) {
       console.error('GitHub OAuth callback failed:', error);
       res.status(500).send(
@@ -479,7 +502,14 @@ export class AuthService {
   }
 
   private isGitHubUserAllowed(githubId: string): boolean {
-    return this.allowedGitHubIds.length === 0 || this.allowedGitHubIds.includes(githubId);
+    // Fail closed. An empty allow-list used to mean "allow every GitHub account
+    // on earth", and since any signed-in user can spawn PTY processes on the
+    // host, that made an exposed instance equivalent to unauthenticated RCE.
+    // Opening the instance up is now an explicit, loudly logged opt-in.
+    if (this.allowedGitHubIds.length === 0) {
+      return this.allowAnyGitHubUser;
+    }
+    return this.allowedGitHubIds.includes(githubId);
   }
 }
 
@@ -500,7 +530,14 @@ function parseCookies(cookieHeader?: string): Record<string, string> {
 
       const key = pair.slice(0, separatorIndex).trim();
       const value = pair.slice(separatorIndex + 1).trim();
-      acc[key] = decodeURIComponent(value);
+      try {
+        acc[key] = decodeURIComponent(value);
+      } catch {
+        // decodeURIComponent throws URIError on malformed input (e.g. "a=%").
+        // This runs on the unauthenticated WebSocket upgrade path, where an
+        // uncaught throw would take the whole process down.
+        acc[key] = value;
+      }
       return acc;
     }, {});
 }
@@ -540,11 +577,19 @@ function sanitizeRedirectTarget(next: string): string {
     return '/';
   }
 
-  if (next.startsWith('//')) {
+  // Resolve against a placeholder origin and keep the target only if it stayed
+  // same-origin. A leading "//" or "/\" would otherwise escape off-site:
+  // per the URL spec a backslash acts as a slash in special schemes, so
+  // "/\evil.com" resolves to "https://evil.com/".
+  try {
+    const resolved = new URL(next, 'http://placeholder.invalid');
+    if (resolved.origin !== 'http://placeholder.invalid') {
+      return '/';
+    }
+    return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+  } catch {
     return '/';
   }
-
-  return next;
 }
 
 function capitalize(value: string): string {
@@ -575,7 +620,7 @@ async function promptSecret(
 ): Promise<string> {
   while (true) {
     const prompt = defaultValue ? `${label} [saved]: ` : `${label}: `;
-    const value = (await rl.question(prompt)).trim();
+    const value = (await askMasked(rl, prompt)).trim();
     if (value) {
       return value;
     }
@@ -585,6 +630,46 @@ async function promptSecret(
     if (allowEmpty) {
       return '';
     }
+  }
+}
+
+/**
+ * Like rl.question(), but does not echo what is typed. readline echoes by
+ * default, which would leave the OAuth client secret in terminal scrollback,
+ * tmux buffers and any session/CI recording.
+ */
+async function askMasked(
+  rl: ReturnType<typeof createInterface>,
+  prompt: string,
+): Promise<string> {
+  const target = rl as unknown as {
+    output?: { write: (chunk: string) => void };
+    _writeToOutput?: (chunk: string) => void;
+  };
+
+  const originalWrite = target._writeToOutput;
+  let muted = false;
+
+  target._writeToOutput = function writeMasked(chunk: string) {
+    if (!muted) {
+      originalWrite?.call(this, chunk);
+      return;
+    }
+    // Keep newlines so the cursor still advances on Enter.
+    if (chunk.includes('\n')) {
+      originalWrite?.call(this, '\n');
+    }
+  };
+
+  try {
+    const answer = rl.question(prompt);
+    muted = true;
+    const value = await answer;
+    return value;
+  } finally {
+    muted = false;
+    target._writeToOutput = originalWrite;
+    target.output?.write('\n');
   }
 }
 

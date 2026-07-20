@@ -152,6 +152,13 @@ export interface WsSessionDeletedMessage {
   message: string;
 }
 
+/** Sent when a reattach targets a session the server no longer has. */
+export interface WsSessionGoneMessage {
+  type: 'session_gone';
+  sessionId: string;
+  message: string;
+}
+
 export interface WsPongMessage {
   type: 'pong';
 }
@@ -179,5 +186,6 @@ export type WsMessage =
   | WsErrorMessage
   | WsInfoMessage
   | WsSessionDeletedMessage
+  | WsSessionGoneMessage
   | WsPongMessage
   | WsUsageUpdateMessage;

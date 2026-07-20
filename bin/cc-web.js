@@ -32,6 +32,7 @@ program
   .option('--github-client-secret <secret>', 'GitHub OAuth client secret')
   .option('--github-app-token <token>', 'GitHub App token stored during installation')
   .option('--allowed-github-ids <ids>', 'comma-separated GitHub OAuth user IDs allowed to sign in')
+  .option('--allow-any-github-user', 'allow ANY GitHub account to sign in (dangerous: signed-in users can run commands on this host)')
   .option('--data-dir <path>', 'directory for the SQLite database and local state')
   .option('--dev', 'development mode with additional logging')
   .option('--plan <type>', 'subscription plan (pro, max5, max20)', 'max20')
@@ -71,6 +72,7 @@ async function main() {
       githubClientSecret: options.githubClientSecret,
       githubAppToken: options.githubAppToken,
       allowedGitHubIds: options.allowedGitHubIds,
+      allowAnyGitHubUser: options.allowAnyGitHubUser,
       dataDir: options.dataDir,
       // UI aliases for assistants
       claudeAlias: options.claudeAlias || process.env.CLAUDE_ALIAS || 'Claude',

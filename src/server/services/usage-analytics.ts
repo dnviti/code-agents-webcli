@@ -491,7 +491,12 @@ export class UsageAnalytics extends EventEmitter {
   }
 
   getTokenLimit(): number {
+    // An unrecognised --plan / CLAUDE_PLAN value yields undefined here, and
+    // reading .algorithm off it threw on every usage request.
     const plan = this.planLimits[this.currentPlan];
+    if (!plan) {
+      return this.p90Limit || 188026;
+    }
 
     if (plan.algorithm === 'fixed' && plan.tokens !== null) {
       return plan.tokens;

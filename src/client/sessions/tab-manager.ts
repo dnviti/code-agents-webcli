@@ -97,10 +97,16 @@ export class SessionTabManager {
       z-index: 10001; max-width: 90%; text-align: center; cursor: pointer;
       animation: slideDown 0.3s ease-out;
     `;
-    toast.innerHTML = `
-      <div style="font-weight:bold;margin-bottom:4px;">${title}</div>
-      <div style="font-size:14px;opacity:0.9;">${body}</div>
-    `;
+    // `title` embeds the session name, which is user-controlled: set as text.
+    const toastTitle = document.createElement('div');
+    toastTitle.style.cssText = 'font-weight:bold;margin-bottom:4px;';
+    toastTitle.textContent = title;
+
+    const toastBody = document.createElement('div');
+    toastBody.style.cssText = 'font-size:14px;opacity:0.9;';
+    toastBody.textContent = body;
+
+    toast.append(toastTitle, toastBody);
 
     this.injectMobileNotificationStyles();
 
@@ -369,15 +375,23 @@ export class SessionTabManager {
       item.className = 'overflow-tab-item';
       if (sessionId === this.activeTabId) item.classList.add('active');
 
+      // Re-interpolating the tab's textContent into innerHTML would undo the
+      // escaping addTab() applied, so set the name as text here too.
       const nameEl = tabElement.querySelector('.tab-name');
       item.innerHTML = `
-        <span class="overflow-tab-name">${nameEl?.textContent ?? ''}</span>
-        <span class="overflow-tab-close" data-session-id="${sessionId}" title="Close tab">
+        <span class="overflow-tab-name"></span>
+        <span class="overflow-tab-close" title="Close tab">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
           </svg>
         </span>
       `;
+
+      const overflowName = item.querySelector('.overflow-tab-name') as HTMLElement | null;
+      if (overflowName) overflowName.textContent = nameEl?.textContent ?? '';
+
+      const overflowClose = item.querySelector('.overflow-tab-close') as HTMLElement | null;
+      if (overflowClose) overflowClose.dataset.sessionId = sessionId;
 
       item.addEventListener('click', async (e: Event) => {
         if (!(e.target as HTMLElement).classList.contains('overflow-tab-close')) {
@@ -478,10 +492,13 @@ export class SessionTabManager {
     const folderName = workingDir ? workingDir.split('/').pop() || '/' : null;
     const displayName = !isDefaultSessionName ? sessionName : (folderName || sessionName);
 
+    // Session names and working directories are user-controlled and visible to
+    // other users in this multiuser app, so they are set as text, never parsed
+    // as HTML.
     tab.innerHTML = `
       <div class="tab-content">
-        <span class="tab-status ${status}"></span>
-        <span class="tab-name" title="${workingDir || sessionName}">${displayName}</span>
+        <span class="tab-status"></span>
+        <span class="tab-name"></span>
       </div>
       <span class="tab-close" title="Close tab">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -489,6 +506,15 @@ export class SessionTabManager {
         </svg>
       </span>
     `;
+
+    const statusEl = tab.querySelector('.tab-status') as HTMLElement | null;
+    if (statusEl) statusEl.className = `tab-status ${status}`;
+
+    const nameEl = tab.querySelector('.tab-name') as HTMLElement | null;
+    if (nameEl) {
+      nameEl.textContent = displayName;
+      nameEl.title = workingDir || sessionName;
+    }
 
     tab.addEventListener('click', async (e: Event) => {
       if (!(e.target as HTMLElement).closest('.tab-close')) {

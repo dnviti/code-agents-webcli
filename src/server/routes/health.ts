@@ -14,6 +14,18 @@ export function createHealthRoutes(deps: HealthRoutesDeps): Router {
   const router = Router();
 
   router.get('/api/health', (_req: Request, res: Response): void => {
+    const authContext = (res.locals.authContext as AuthContext | undefined) || {
+      user: null,
+      authSessionId: null,
+    };
+
+    // Stay usable as an unauthenticated liveness probe, but only disclose
+    // session and connection counts to a signed-in user.
+    if (!authContext.user) {
+      res.json({ status: 'ok' });
+      return;
+    }
+
     res.json({
       status: 'ok',
       claudeSessions: deps.claudeSessions.size,

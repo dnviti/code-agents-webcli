@@ -72,6 +72,12 @@ export class MessageHandler {
         this.onSessionDeleted(message);
         break;
 
+      // The session we tried to reattach to is gone (e.g. after a server
+      // restart): drop the stale tab rather than leaving a dead terminal.
+      case 'session_gone':
+        this.onSessionDeleted(message);
+        break;
+
       case 'pong':
         break;
 

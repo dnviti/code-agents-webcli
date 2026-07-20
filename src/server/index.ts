@@ -110,6 +110,7 @@ export class ClaudeCodeWebServer {
       githubClientSecret: config.githubClientSecret,
       githubAppToken: config.githubAppToken,
       allowedGitHubIds: config.allowedGitHubIds,
+      allowAnyGitHubUser: config.allowAnyGitHubUser,
     });
     this.usageReader = new UsageReader(this.sessionDurationHours);
     this.usageAnalytics = new UsageAnalytics(
@@ -281,6 +282,15 @@ export class ClaudeCodeWebServer {
     }
 
     if (this.wss) {
+      // close() stops accepting new connections but leaves established ones
+      // open, which keeps the HTTP server from ever closing.
+      for (const client of this.wss.clients) {
+        try {
+          client.terminate();
+        } catch {
+          // Already gone.
+        }
+      }
       this.wss.close();
       this.wss = null;
     }
@@ -299,7 +309,17 @@ export class ClaudeCodeWebServer {
 
     await new Promise<void>((resolve) => {
       if (this.server && this.server.listening) {
-        this.server.close(() => resolve());
+        // server.close() waits for every open connection, and a WebSocket is
+        // never idle, so shutdown would hang forever with any client attached.
+        // Close the WebSocket server (which terminates its sockets) first, and
+        // keep a deadline as a backstop.
+        const timeout = setTimeout(() => resolve(), 5000);
+        timeout.unref?.();
+
+        this.server.close(() => {
+          clearTimeout(timeout);
+          resolve();
+        });
       } else {
         resolve();
       }
@@ -327,11 +347,25 @@ export class ClaudeCodeWebServer {
       res.sendFile('manifest.json', { root: publicDir });
     });
 
+    // Must come before express.static: `index: false` only disables directory
+    // index resolution, so a direct GET /index.html would still be served by
+    // the static middleware and skip requireAuth entirely.
+    this.app.get(
+      ['/', '/index.html'],
+      this.authService.requireAuth(),
+      (_req, res) => {
+        res.sendFile('index.html', { root: publicDir });
+      },
+    );
+
     this.app.use(express.static(publicDir, { index: false }));
 
     const iconSizes = [16, 32, 144, 180, 192, 512];
     iconSizes.forEach((size) => {
-      this.app.get(`/icon-${size}.png`, (_req, res) => {
+      // These are SVG documents, so they are also served at .svg URLs and the
+      // manifest points there: declaring image/png for SVG bytes made the PWA
+      // fail its installability check.
+      this.app.get([`/icon-${size}.svg`, `/icon-${size}.png`], (_req, res) => {
         const svg = `
           <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">
             <rect width="${size}" height="${size}" fill="#0d1117" rx="${size * 0.12}"/>
@@ -366,13 +400,6 @@ export class ClaudeCodeWebServer {
       sessionStore: this.sessionStore,
     });
 
-    this.app.get(
-      ['/', '/index.html'],
-      this.authService.requireAuth(),
-      (_req, res) => {
-        res.sendFile('index.html', { root: publicDir });
-      },
-    );
   }
 
   async start(): Promise<http.Server | https.Server> {

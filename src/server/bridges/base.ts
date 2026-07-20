@@ -269,9 +269,14 @@ export abstract class BaseBridge {
 
         session.killTimeout = setTimeout(() => {
           if (!session.finalized && session.process) {
-            session.process.kill('SIGKILL');
+            try {
+              session.process.kill('SIGKILL');
+            } catch {
+              // Process is already gone.
+            }
           }
         }, 5000);
+        session.killTimeout.unref?.();
       }
     } catch (error: unknown) {
       const message =
@@ -281,6 +286,14 @@ export abstract class BaseBridge {
 
     session.stopRequested = true;
     session.active = false;
+
+    // Free the id now rather than when the PTY finally dies, so restarting the
+    // same session immediately after a stop does not hit "already exists".
+    // The captured `session` object keeps the kill timer and exit handlers
+    // working, and finalizeSession only deletes an entry it still owns.
+    if (this.sessions.get(sessionId) === session) {
+      this.sessions.delete(sessionId);
+    }
   }
 
   getSession(sessionId: string): BridgeSession | undefined {
@@ -321,7 +334,11 @@ export abstract class BaseBridge {
     }
 
     session.active = false;
-    this.sessions.delete(sessionId);
+    // Only drop the map entry if it still belongs to this run: a restart under
+    // the same id must survive the previous run's late exit.
+    if (this.sessions.get(sessionId) === session) {
+      this.sessions.delete(sessionId);
+    }
     return true;
   }
 
