@@ -1,6 +1,7 @@
 # Code Agents Web CLI
 
-`code-agents-webcli` is a single Node.js web application for running Claude Code, Codex, Cursor Agent, and classic terminal sessions from the browser.
+`code-agents-webcli` is a single Node.js web application for running Claude Code, Codex, Cursor
+Agent, pi, Grok Build, and classic terminal sessions from the browser.
 
 It now supports:
 
@@ -13,7 +14,8 @@ It now supports:
 ## Requirements
 
 - Node.js `>= 20`
-- Claude / Codex / Cursor CLI binaries available on the server host `PATH`
+- The agent CLIs you intend to use on the server host `PATH`: `claude`, `codex`, `cursor-agent`,
+  `pi`, `grok`. Each is optional — a missing one only fails when you press its button.
 - A GitHub OAuth App for sign-in
 - A modern browser with WebSocket support
 
@@ -114,10 +116,10 @@ length of the session.
   "lines 812,340 to 812,390" is two positioned reads and costs the same whether the session is a
   minute or a week old.
 - Scroll to the top of the live buffer (or keep scrolling up once you are there) to enter the
-  history viewer. Scroll to the bottom, press Escape, or use **Torna al presente** to come back.
+  history viewer. Scroll to the bottom, press Escape, or use **Back to live** to come back.
 - Full-screen programs are not recorded: the alternate screen buffer is isolated, so a TUI redrawing
   itself does not fill your history with frames.
-- **Scarica .md** in the history bar downloads the whole session as Markdown, ANSI stripped and
+- **Download .md** in the history bar downloads the whole session as Markdown, ANSI stripped and
   streamed page by page. It is also available at `GET /api/sessions/<id>/export.md`.
 
 History is per user and enforced on every request, the same as sessions themselves.
@@ -134,6 +136,81 @@ Known limits:
   content out.
 - A scrollback emulator costs roughly 2 MB per session while a runtime is running. It is released
   when the process exits, the session is deleted, or the server shuts down.
+
+## Updating
+
+The app checks GitHub for newer commits and shows a banner when this build is behind.
+
+Installs come from `github:dnviti/code-agents-webcli`, which resolves to whatever `main` HEAD is, so
+the running build is identified by the commit it was built from rather than by the package version.
+That commit is baked into `dist/build-info.json` during the build.
+
+- Everyone signed in sees the banner. Only the **first account that ever signed in** — the installer
+  — can apply the update, and that identity is pinned, so deleting that account does not promote
+  anyone else.
+- Applying it runs the install, then `npm rebuild`, then a check that the new build actually loads,
+  and only restarts the service if all three succeed. If any step fails, nothing is restarted and the
+  running version is untouched.
+- **A restart ends every user's agent sessions**, not just the installer's. The confirmation names
+  how many are running. Sessions, transcripts and history survive; in-flight conversations do not.
+- GitHub is polled at most every 15 minutes however often anyone presses Check, because the
+  unauthenticated API allows 60 requests an hour per IP. No credentials are ever sent.
+
+Some installs cannot update themselves, and say so instead of offering a button that would do
+nothing:
+
+| Situation | Why, and what to do instead |
+| --- | --- |
+| Running via `npx` | The npx cache is temporary. The next `npx` run already fetches the latest commit; install globally to make it durable. |
+| Running in a container | `docker pull` and recreate the container. |
+| Running from a git clone | A global install would not replace the code that is running. Use `git pull && npm run build`. |
+| Global prefix not writable | A `sudo npm i -g` install is root-owned while the service runs as you. Reinstall from a shell. |
+
+Existing installs made before this release carry no commit identity and report that update checks are
+unavailable until they are reinstalled once:
+
+```bash
+npm i -g --allow-git=all github:dnviti/code-agents-webcli
+npm rebuild --prefix "$(npm root -g)/code-agents-webcli"
+```
+
+If an update is interrupted — a reboot, an OOM kill — the next start says so. The same two commands
+are the recovery.
+
+Building the Docker image yourself? Pass the commit, or the image reports an unknown build:
+
+```bash
+docker build --build-arg BUILD_SHA="$(git rev-parse HEAD)" -t code-agents-webcli .
+```
+
+## Pasting images
+
+Paste an image into a terminal, or drag one onto it, and it is written into the session's working
+directory; the path is then typed into the prompt for the agent to read. On a phone, **Attach Image**
+in the menu opens the picker.
+
+Nothing is submitted for you: the path arrives followed by a single space, so you can say what you
+want done with it before pressing Enter.
+
+- Files land in `<working directory>/.cc-web/pasted/`. That location is deliberate — it is the only
+  place all the agent CLIs read without a permission prompt, since Claude Code asks before reading
+  outside its working directory and a sandboxed Codex can refuse outright.
+- A `.gitignore` is written inside `.cc-web/` so the images never show up in `git status`. Your own
+  `.gitignore` is never touched. If you edit the generated one, your version is kept.
+- Images are deleted when the session is deleted.
+- PNG, JPEG, GIF, WebP and BMP are accepted, decided by content rather than by the name or the type
+  the browser claims. SVG is refused: it has no magic number and can carry script.
+- The cap is 10 MB per image. Behind nginx, `client_max_body_size 10m;` is needed or the upload fails
+  at the proxy.
+
+Known limits:
+
+- iPhone photo libraries hand over HEIC unless the browser converts it; HEIC is refused with a
+  message saying so.
+- Every session on the host runs as the same OS user, so a user who points a session at another
+  user's working directory can read images pasted there. This is the same boundary the rest of the
+  app has — anyone signed in can already open a shell — but it is worth stating.
+- Text pasting is untouched: an event with no image in it is left entirely to the terminal.
 
 ## GitHub OAuth Setup
 
@@ -217,6 +294,8 @@ npm run dev
 | `--claude-alias <name>` | UI label for Claude | `Claude` |
 | `--codex-alias <name>` | UI label for Codex | `Codex` |
 | `--agent-alias <name>` | UI label for Cursor Agent | `Cursor` |
+| `--pi-alias <name>` | UI label for pi | `Pi` |
+| `--grok-alias <name>` | UI label for Grok Build | `Grok` |
 | `--ngrok-auth-token <token>` | Enable ngrok tunneling | none |
 | `--ngrok-domain <domain>` | Reserved ngrok domain | none |
 
