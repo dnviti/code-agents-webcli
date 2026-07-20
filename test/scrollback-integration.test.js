@@ -34,10 +34,16 @@ describe('scrollback integration (real PTY)', function () {
   /**
    * Run a command and wait until its output has actually arrived.
    *
-   * Waiting on the PTY's exit event is not enough: it can fire while output is
-   * still in flight, so on a loaded machine the recorder simply never sees the
-   * tail. The command echoes a sentinel last, and we wait for that to reach the
-   * emulator's screen before reading anything.
+   * Two things make a short-lived command unreliable to observe.
+   *
+   * The exit event fires while output is still in flight, so it says nothing
+   * about delivery. Worse, when the child exits the PTY master is closed and
+   * whatever is still in the kernel buffer is discarded: a CI runner showed
+   * 33,634 of ~44,000 bytes delivered, with the final line cut mid-word.
+   *
+   * So the shell is kept alive after echoing a sentinel, and we wait for that
+   * sentinel to reach the emulator before reading anything. The sleep never
+   * actually elapses — the terminal is killed as soon as the sentinel lands.
    */
   function runThroughPty(command, cols = 100, rows = 30) {
     return new Promise((resolve, reject) => {
@@ -52,7 +58,7 @@ describe('scrollback integration (real PTY)', function () {
       // Deliberately not a login shell: `-l` sources the system and user
       // profiles, which on a CI image pull in version managers and can take
       // tens of seconds on the first invocation. Nothing here needs them.
-      const term = pty.spawn('/bin/bash', ['-c', `${command}; echo "${SENTINEL}"`], {
+      const term = pty.spawn('/bin/bash', ['-c', `${command}; echo "${SENTINEL}"; sleep 60`], {
         cols,
         rows,
         name: 'xterm-256color',
