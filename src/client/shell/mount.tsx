@@ -3,22 +3,25 @@ import { createRoot } from 'react-dom/client';
 
 import type { App } from '../app';
 import { AppShell, type ShellActions } from './AppShell';
-import { shellStore } from './store';
+import { readStoredTheme, setThemeMode, type RelayTheme } from './theme';
 import { relayTerminalTheme } from './terminal-theme';
-
-const THEME_STORAGE_KEY = 'cc-web-relay-theme';
 
 /** The live terminal, so a theme change can reach it. Set once at mount. */
 let themedApp: App | null = null;
 
-/** Apply the Relay theme by toggling the `.light` class the tokens key off. */
-export function applyTheme(theme: 'dark' | 'light'): void {
-  document.documentElement.classList.toggle('light', theme === 'light');
-  shellStore.setState({ theme });
+/**
+ * Switch theme from the shell's own toggle: mode plus the Relay terminal
+ * palette.
+ *
+ * Settings takes the other path — setThemeMode alone — because it applies a
+ * GitHub colourway to the terminal itself and only needs the mode kept in step.
+ */
+export function applyTheme(theme: RelayTheme): void {
+  setThemeMode(theme);
 
   // xterm renders from a JavaScript theme object, not from CSS, so the class
-  // toggle above reaches every React surface and stops at the terminal. Without
-  // this the chrome goes light and the terminal stays dark.
+  // toggle reaches every React surface and stops at the terminal. Without this
+  // the chrome goes light and the terminal stays dark.
   const terminal = themedApp?.terminal;
   if (terminal) {
     const next = relayTerminalTheme();
@@ -26,21 +29,9 @@ export function applyTheme(theme: 'dark' | 'light'): void {
     // is right: one built from empty strings is black on black.
     if (next) terminal.options.theme = next;
   }
-
-  try {
-    localStorage.setItem(THEME_STORAGE_KEY, theme);
-  } catch {
-    // Private-mode storage failures must not stop the app rendering.
-  }
 }
 
-export function readStoredTheme(): 'dark' | 'light' {
-  try {
-    return localStorage.getItem(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
-  } catch {
-    return 'dark';
-  }
-}
+export { readStoredTheme };
 
 /**
  * Mount the Relay shell around the already-constructed terminal.
