@@ -127,9 +127,9 @@ program
   .version(packageJson.version)
   .option('-p, --port <number>', 'port to run the server on', '32352')
   .option('--no-open', 'do not automatically open browser')
-  .option('--https', 'enable HTTPS (requires cert files)')
-  .option('--cert <path>', 'path to SSL certificate file')
-  .option('--key <path>', 'path to SSL private key file')
+  .option('--https', 'accepted and ignored: HTTPS is always on')
+  .option('--cert <path>', 'TLS certificate to use instead of the generated one')
+  .option('--key <path>', 'private key for --cert')
   .option('--setup', 'run the interactive installation/setup wizard before starting')
   .option('--public-base-url <url>', 'public base URL used for GitHub OAuth callbacks')
   .option('--github-client-id <id>', 'GitHub OAuth client ID')
@@ -241,10 +241,16 @@ async function main() {
 
     let ngrokListener = null;
     
-    const protocol = options.https ? 'https' : 'http';
-    const url = `${protocol}://localhost:${port}`;
-    
+    // Always https: the server refuses to serve content over anything else,
+    // because a plain-http origin off localhost is not a secure context and the
+    // browser then withholds the service worker the app needs.
+    const url = `https://localhost:${port}`;
+
     console.log(`\n🚀 Code Agents Web CLI is running at: ${url}`);
+    console.log(
+      'From another device use https://<this-host>:'
+      + `${port} and install the local CA once from https://<this-host>:${port}/ca.crt`,
+    );
     
     // Start ngrok tunnel if both flags provided
     let publicUrl = null;

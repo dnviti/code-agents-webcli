@@ -18,7 +18,9 @@ export function createConfig(options: ServerOptions): ServerState {
   return {
     port: options.port || 32352,
     dev: options.dev || false,
-    useHttps: options.https || false,
+    // Not a choice any more: see the note in start(). `--https` is kept as an
+    // accepted no-op so existing scripts and service units do not fail.
+    useHttps: true,
     certFile: options.cert,
     keyFile: options.key,
     setup: options.setup || false,
