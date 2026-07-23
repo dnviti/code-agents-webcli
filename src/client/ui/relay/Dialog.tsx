@@ -7,6 +7,13 @@ export interface DialogProps {
   footer?: React.ReactNode;
   onClose?: React.MouseEventHandler<HTMLElement>;
   width?: React.CSSProperties['width'];
+  /**
+   * `bottom` anchors the panel to the bottom edge full-width — the sheet a
+   * touch UI expects, where a centred panel puts its controls out of thumb
+   * reach. Everything else about the dialog is unchanged, which is the point:
+   * focus handling, stacked Escape and the labelling all come along.
+   */
+  placement?: 'center' | 'bottom';
   children?: React.ReactNode;
 }
 
@@ -50,6 +57,7 @@ export function Dialog({
   footer,
   onClose,
   width = 440,
+  placement = 'center',
   children,
 }: DialogProps): React.JSX.Element | null {
   // Hooks run on every render, so the `open` bail-out has to come after them.
@@ -117,13 +125,27 @@ export function Dialog({
 
   if (!open) return null;
 
+  const bottom = placement === 'bottom';
   const overlayStyle: React.CSSProperties = {
-    position: 'fixed', inset: 0, zIndex: 'var(--z-modal)' as unknown as number, display: 'flex', alignItems: 'center', justifyContent: 'center',
-    padding: 24, background: 'var(--overlay)', animation: 'relay-fade-in var(--duration-base)',
+    position: 'fixed', inset: 0, zIndex: 'var(--z-modal)' as unknown as number, display: 'flex',
+    alignItems: bottom ? 'flex-end' : 'center', justifyContent: 'center',
+    padding: bottom ? 0 : 24, background: 'var(--overlay)', animation: 'relay-fade-in var(--duration-base)',
   };
   const panelStyle: React.CSSProperties = {
-    width, maxWidth: '100%', background: 'var(--popover)', border: '1px solid var(--border)',
-    boxShadow: 'var(--shadow-lg)', borderRadius: 'var(--radius)', animation: 'relay-scale-in var(--duration-base) var(--ease-out)',
+    width: bottom ? '100%' : width,
+    maxWidth: '100%',
+    maxHeight: bottom ? '85dvh' : undefined,
+    display: bottom ? 'flex' : undefined,
+    flexDirection: bottom ? 'column' : undefined,
+    background: 'var(--popover)',
+    border: '1px solid var(--border)',
+    borderWidth: bottom ? '1px 0 0' : '1px',
+    // Clear of the home indicator on a phone; zero everywhere else.
+    paddingBottom: bottom ? 'env(safe-area-inset-bottom, 0px)' : undefined,
+    boxShadow: 'var(--shadow-lg)', borderRadius: 'var(--radius)',
+    animation: bottom
+      ? 'relay-slide-up var(--duration-base) var(--ease-out)'
+      : 'relay-scale-in var(--duration-base) var(--ease-out)',
     // The panel is only ever focused programmatically, so it should not paint a
     // ring; the controls inside it carry their own.
     outline: 'none',
@@ -137,7 +159,11 @@ export function Dialog({
     boxShadow: closeFocusVisible ? 'var(--shadow-focus)' : undefined,
   };
   const descriptionStyle: React.CSSProperties = { margin: '6px 0 0', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-sm)', color: 'var(--muted-foreground)', lineHeight: 'var(--leading-normal)' };
-  const bodyStyle: React.CSSProperties = { padding: '16px 18px', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-ui)', color: 'var(--foreground)' };
+  const bodyStyle: React.CSSProperties = {
+    padding: '16px 18px', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-ui)', color: 'var(--foreground)',
+    // A sheet is height-capped, so its body is the part that scrolls.
+    ...(bottom ? { flex: 1, minHeight: 0, overflowY: 'auto' as const } : null),
+  };
   const footerStyle: React.CSSProperties = { padding: '12px 18px', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'flex-end', gap: 8 };
 
   return (

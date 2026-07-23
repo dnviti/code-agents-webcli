@@ -16,7 +16,6 @@ import {
   getAlias as configGetAlias,
   getRuntimeLabel as configGetRuntimeLabel,
   getRuntimeStartMessage as configGetRuntimeStartMessage,
-  applyAliasesToUI,
 } from './config';
 import { setupTerminal, fitTerminal } from './terminal/setup';
 import { WebSocketConnection } from './terminal/connection';
@@ -40,31 +39,28 @@ import {
 } from './sessions/actions';
 import { FolderBrowser } from './ui/folder-browser';
 import { PlanDetector } from './ui/plan-detector';
-import { showOverlay, hideOverlay, showError } from './ui/overlay';
+import { showOverlay, hideOverlay } from './ui/overlay';
 import {
-  setupSettingsModal,
   showSettings as settingsShow,
   loadSettings,
   applySettings,
 } from './ui/settings';
 import {
-  setupNewSessionModal,
   showNewSessionModal as modalsShowNewSession,
-  setupTerminalOptionsModal,
   showTerminalOptionsModal as modalsShowTerminalOptions,
 } from './ui/modals';
 import {
   detectMobile,
   disablePullToRefresh,
-  showModeSwitcher,
-  closeMobileMenu,
   showMobileSessionsModal,
-  setupMobileSessionsModal,
+  watchViewport,
 } from './ui/mobile';
 import { showNotification, playNotificationSound } from './ui/notifications';
 import { setupUpdateBanner } from './ui/update-banner';
 import { pickImage, type ImagePasteTarget } from './terminal/paste';
 import { SplitContainer } from './splits/split-container';
+import { shellStore } from './shell/store';
+import { setupInstallPrompt } from './shell/install-prompt';
 import { mountShell } from './shell/mount';
 import type { HistoryView, HistoryRange } from './terminal/history-view';
 
@@ -193,14 +189,22 @@ export class App {
   // ---------------------------------------------------------------------------
 
   private async init(): Promise<void> {
+    // Before anything renders: the shell lays itself out differently on a phone
+    // (bottom bar instead of status bar), and a first paint in the wrong mode
+    // would resize the terminal twice.
+    shellStore.setState({ isMobile: this.isMobile });
+
+    // Before the first await. `beforeinstallprompt` fires once and is not
+    // replayed, so a listener attached after a network round trip is a listener
+    // that can miss it outright.
+    setupInstallPrompt();
+
     await loadConfig(this);
     setupTerminal(this);
-    this.setupUI();
     this.setupPlanDetector();
-    loadSettings(); // side-effect: reads from localStorage
     applySettings(this, loadSettings());
-    applyAliasesToUI(this);
     disablePullToRefresh();
+    watchViewport(this);
     setupUpdateBanner(this);
 
     showOverlay('loadingSpinner');
@@ -216,17 +220,13 @@ export class App {
     this.splitContainer = new SplitContainer(this);
     this.splitContainer.setupDropZones();
 
-    if (this.isMobile) {
-      showModeSwitcher(this);
-    }
-
     if (this.sessionTabManager.tabs.size > 0) {
       const firstTabId = this.sessionTabManager.tabs.keys().next().value;
       await this.sessionTabManager.switchToTab(firstTabId!);
       hideOverlay();
     } else {
       hideOverlay();
-      this.folderBrowser.show();
+      void this.folderBrowser.show();
     }
 
     window.addEventListener('resize', () => this.fitTerminal());
@@ -236,103 +236,6 @@ export class App {
   // ---------------------------------------------------------------------------
   // UI wiring (button clicks -> module functions)
   // ---------------------------------------------------------------------------
-
-  private setupUI(): void {
-    const startBtn = document.getElementById('startBtn');
-    const dangerousSkipBtn = document.getElementById('dangerousSkipBtn');
-    const startCodexBtn = document.getElementById('startCodexBtn');
-    const dangerousCodexBtn = document.getElementById('dangerousCodexBtn');
-    const startAgentBtn = document.getElementById('startAgentBtn');
-    const startPiBtn = document.getElementById('startPiBtn');
-    const startGrokBtn = document.getElementById('startGrokBtn');
-    const dangerousGrokBtn = document.getElementById('dangerousGrokBtn');
-    const startQwenBtn = document.getElementById('startQwenBtn');
-    const dangerousQwenBtn = document.getElementById('dangerousQwenBtn');
-    const startKimiBtn = document.getElementById('startKimiBtn');
-    const dangerousKimiBtn = document.getElementById('dangerousKimiBtn');
-    const startTerminalBtn = document.getElementById('startTerminalBtn');
-    const closeStartPromptBtn = document.getElementById('closeStartPromptBtn');
-    const cancelStartPromptBtn = document.getElementById('cancelStartPromptBtn');
-    const settingsBtn = document.getElementById('settingsBtn');
-    const retryBtn = document.getElementById('retryBtn');
-    const closeMenuBtn = document.getElementById('closeMenuBtn');
-    const settingsBtnMobile = document.getElementById('settingsBtnMobile');
-    const sessionsBtnMobile = document.getElementById('sessionsBtnMobile');
-    const closeSessionBtnMobile = document.getElementById('closeSessionBtnMobile');
-    const reconnectBtnMobile = document.getElementById('reconnectBtnMobile');
-    const clearBtnMobile = document.getElementById('clearBtnMobile');
-    const attachImageBtnMobile = document.getElementById('attachImageBtnMobile');
-
-    startBtn?.addEventListener('click', () => this.startClaudeSession());
-    dangerousSkipBtn?.addEventListener('click', () =>
-      this.startClaudeSession({ dangerouslySkipPermissions: true }),
-    );
-    startCodexBtn?.addEventListener('click', () => this.startCodexSession());
-    dangerousCodexBtn?.addEventListener('click', () =>
-      this.startCodexSession({ dangerouslySkipPermissions: true }),
-    );
-    startAgentBtn?.addEventListener('click', () => this.startAgentSession());
-    startPiBtn?.addEventListener('click', () => this.startPiSession());
-    startGrokBtn?.addEventListener('click', () => this.startGrokSession());
-    dangerousGrokBtn?.addEventListener('click', () =>
-      this.startGrokSession({ dangerouslySkipPermissions: true }),
-    );
-    startQwenBtn?.addEventListener('click', () => this.startQwenSession());
-    dangerousQwenBtn?.addEventListener('click', () =>
-      this.startQwenSession({ dangerouslySkipPermissions: true }),
-    );
-    startKimiBtn?.addEventListener('click', () => this.startKimiSession());
-    dangerousKimiBtn?.addEventListener('click', () =>
-      this.startKimiSession({ dangerouslySkipPermissions: true }),
-    );
-    startTerminalBtn?.addEventListener('click', () => this.showTerminalOptionsModal());
-    const cancelStartPrompt = async () => {
-      if (!this.currentClaudeSessionId) {
-        hideOverlay();
-        return;
-      }
-
-      await this.deleteSession(this.currentClaudeSessionId, { confirm: false });
-    };
-    closeStartPromptBtn?.addEventListener('click', () => void cancelStartPrompt());
-    cancelStartPromptBtn?.addEventListener('click', () => void cancelStartPrompt());
-    settingsBtn?.addEventListener('click', () => this.showSettings());
-    retryBtn?.addEventListener('click', () => this.wsConnection.reconnect());
-
-    closeMenuBtn?.addEventListener('click', () => closeMobileMenu());
-    settingsBtnMobile?.addEventListener('click', () => {
-      this.showSettings();
-      closeMobileMenu();
-    });
-    sessionsBtnMobile?.addEventListener('click', () => {
-      showMobileSessionsModal(this);
-      closeMobileMenu();
-    });
-    closeSessionBtnMobile?.addEventListener('click', async () => {
-      await this.closeSession();
-      closeMobileMenu();
-    });
-    reconnectBtnMobile?.addEventListener('click', () => {
-      this.wsConnection.reconnect();
-      closeMobileMenu();
-    });
-    clearBtnMobile?.addEventListener('click', () => {
-      this.terminal?.reset();
-      closeMobileMenu();
-    });
-    attachImageBtnMobile?.addEventListener('click', () => {
-      if (this.imagePasteTarget) {
-        pickImage(this.imagePasteTarget);
-      }
-      closeMobileMenu();
-    });
-
-    setupSettingsModal(this);
-    this.folderBrowser.setup();
-    setupNewSessionModal(this);
-    setupTerminalOptionsModal(this);
-    setupMobileSessionsModal(this);
-  }
 
   // ---------------------------------------------------------------------------
   // Plan detection
@@ -344,53 +247,26 @@ export class App {
       // Plan mode indicator UI has been removed
     };
 
-    const acceptBtn = document.getElementById('acceptPlanBtn');
-    const rejectBtn = document.getElementById('rejectPlanBtn');
-    const closeBtn = document.getElementById('closePlanBtn');
-
-    acceptBtn?.addEventListener('click', () => this.acceptPlan());
-    rejectBtn?.addEventListener('click', () => this.rejectPlan());
-    closeBtn?.addEventListener('click', () => this.hidePlanModal());
-
     this.planDetector.startMonitoring();
   }
 
   private showPlanModal(plan: PlanData): void {
-    const modal = document.getElementById('planModal');
-    const content = document.getElementById('planContent');
-    if (!content || !modal) return;
-
     // plan.content is raw terminal output: anything the agent prints (a file it
-    // cats, a fetched page, a dependency README) reaches this sink. Escape
-    // first, so only the tags produced below are live HTML.
-    const escaped = plan.content
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-
-    const formatted = escaped
-      .replace(/^### (.*?)$/gm, '<h3>$1</h3>')
-      .replace(/^## (.*?)$/gm, '<h2>$1</h2>')
-      .replace(/^- (.*?)$/gm, '\u2022 $1')
-      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*(.*?)\*/g, '<em>$1</em>')
-      .replace(/`([^`]+)`/g, '<code>$1</code>');
-
-    content.innerHTML = formatted;
-    modal.classList.add('active');
+    // cats, a fetched page, a dependency README) reaches this sink. It used to
+    // be escaped here and then re-parsed as HTML; PlanDialog builds React
+    // elements from it instead, so it can never become markup at all.
+    shellStore.setState({ plan: plan.content });
     playNotificationSound();
   }
 
-  private hidePlanModal(): void {
-    document.getElementById('planModal')?.classList.remove('active');
+  hidePlanModal(): void {
+    shellStore.setState({ plan: null });
     // Without this the next output chunk re-detects the same plan and
     // immediately reopens the modal.
     this.planDetector.clearBuffer();
   }
 
-  private acceptPlan(): void {
+  acceptPlan(): void {
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify({ type: 'input', data: 'y\n' }));
     }
@@ -399,7 +275,7 @@ export class App {
     showNotification('Plan accepted! Claude will begin implementation.');
   }
 
-  private rejectPlan(): void {
+  rejectPlan(): void {
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify({ type: 'input', data: 'n\n' }));
     }
@@ -501,17 +377,52 @@ export class App {
     return sessionsCloseSession(this);
   }
 
+  /**
+   * Back out of the runtime picker.
+   *
+   * Choosing a working directory creates the session before the runtime is
+   * picked, so cancelling has to delete it again — otherwise an empty session
+   * is left behind on the server every time someone changes their mind.
+   */
+  async cancelStartPrompt(): Promise<void> {
+    if (!this.currentClaudeSessionId) {
+      hideOverlay();
+      return;
+    }
+
+    await this.deleteSession(this.currentClaudeSessionId, { confirm: false });
+  }
+
   // UI shortcuts
   showSettings(): void {
-    settingsShow(this);
+    settingsShow();
   }
 
   showNewSessionModal(): void {
-    modalsShowNewSession(this);
+    modalsShowNewSession();
   }
 
   showTerminalOptionsModal(): void {
-    modalsShowTerminalOptions(this);
+    modalsShowTerminalOptions();
+  }
+
+  showSessions(): void {
+    showMobileSessionsModal(this);
+  }
+
+  /** Reachable from the palette, the mobile bar and the connection overlay. */
+  reconnect(): void {
+    this.wsConnection.reconnect();
+  }
+
+  clearTerminal(): void {
+    this.terminal?.reset();
+  }
+
+  attachImage(): void {
+    if (this.imagePasteTarget) {
+      pickImage(this.imagePasteTarget);
+    }
   }
 
   requestUsageStats(): void {

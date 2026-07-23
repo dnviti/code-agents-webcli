@@ -7,6 +7,7 @@ import type {
   WsUpdateDoneMessage,
 } from '../types';
 import { describeUpdate, INSTALL_COMMAND } from '../../shared/update';
+import { shellStore } from '../shell/store';
 import { showNotification } from './notifications';
 
 const DISMISS_KEY = 'cc-web-update-dismissed';
@@ -18,10 +19,16 @@ let current: UpdateStatusResponse | null = null;
 let logLines: string[] = [];
 let logOpen = false;
 let restartPollStartedAt: number | null = null;
-
-function el<T extends HTMLElement>(id: string): T | null {
-  return document.getElementById(id) as T | null;
-}
+/**
+ * Set while the restart poll is narrating, and cleared by the next real render.
+ *
+ * The poll has something to say that no `UpdateStatusResponse` describes — the
+ * server is not answering — so it overrides the derived text rather than trying
+ * to encode "down" as a status.
+ */
+let overrideText: string | null = null;
+/** Set by setupUpdateBanner so the React handlers can reach the app. */
+let bannerApp: App | null = null;
 
 function dismissedSha(): string | null {
   try {
@@ -32,27 +39,29 @@ function dismissedSha(): string | null {
 }
 
 export function setupUpdateBanner(app: App): void {
-  el<HTMLButtonElement>('updateBannerAction')?.addEventListener('click', () => {
-    void onAction(app);
-  });
-
-  el<HTMLButtonElement>('updateBannerToggle')?.addEventListener('click', () => {
-    logOpen = !logOpen;
-    render();
-  });
-
-  el<HTMLButtonElement>('updateBannerDismiss')?.addEventListener('click', () => {
-    const sha = current?.status.remote.sha;
-    try {
-      // Keyed by commit, so a newer one brings the banner back.
-      localStorage.setItem(DISMISS_KEY, sha ?? 'none');
-    } catch {
-      // Private browsing; the banner simply reappears on reload.
-    }
-    render();
-  });
-
+  bannerApp = app;
   void refresh(app);
+}
+
+/** Wired to the banner's action button by the shell. */
+export function onBannerAction(): void {
+  if (bannerApp) void onAction(bannerApp);
+}
+
+export function onBannerToggleLog(): void {
+  logOpen = !logOpen;
+  render();
+}
+
+export function onBannerDismiss(): void {
+  const sha = current?.status.remote.sha;
+  try {
+    // Keyed by commit, so a newer one brings the banner back.
+    localStorage.setItem(DISMISS_KEY, sha ?? 'none');
+  } catch {
+    // Private browsing; the banner simply reappears on reload.
+  }
+  render();
 }
 
 export async function refresh(app: App): Promise<void> {
@@ -63,6 +72,8 @@ export async function refresh(app: App): Promise<void> {
     }
     current = (await res.json()) as UpdateStatusResponse;
     logLines = current.logTail ?? [];
+    // A fresh status supersedes whatever the restart poll was narrating.
+    overrideText = null;
     render();
   } catch {
     // The banner is never worth an error of its own.
@@ -166,10 +177,8 @@ async function clearServiceWorkerCaches(): Promise<void> {
 }
 
 function setBannerText(text: string): void {
-  const textEl = el('updateBannerText');
-  if (textEl) {
-    textEl.textContent = text;
-  }
+  overrideText = text;
+  render();
 }
 
 async function onAction(app: App): Promise<void> {
@@ -244,52 +253,31 @@ async function onAction(app: App): Promise<void> {
 }
 
 function render(): void {
-  const banner = el('updateBanner');
-  if (!banner || !current) {
+  if (!current) {
     return;
   }
 
   const view = describeUpdate(current);
-  const dot = el('updateBannerDot');
-  const textEl = el('updateBannerText');
-  const action = el<HTMLButtonElement>('updateBannerAction');
-  const toggle = el<HTMLButtonElement>('updateBannerToggle');
-  const dismiss = el<HTMLButtonElement>('updateBannerDismiss');
-  const log = el('updateBannerLog');
-
   const remoteSha = current.status.remote.sha ?? 'none';
   const hidden =
     !view.visible || (view.dismissible && dismissedSha() === remoteSha && !current.running);
 
-  banner.hidden = hidden;
   if (hidden) {
+    shellStore.setState({ banner: null });
     return;
   }
 
-  if (dot) {
-    dot.className = `update-banner__dot update-banner__dot--${view.tone}`;
-  }
-  if (textEl) {
-    // textContent, never innerHTML: the commit subject is whatever text landed
-    // on main, and it is not trusted.
-    textEl.textContent = view.text;
-  }
-
-  if (action) {
-    action.hidden = view.action === null;
-    action.textContent = view.actionLabel ?? '';
-  }
-  if (toggle) {
-    toggle.hidden = !view.showLog;
-    toggle.textContent = logOpen ? 'Hide log' : 'Show log';
-    toggle.setAttribute('aria-expanded', String(logOpen));
-  }
-  if (dismiss) {
-    dismiss.hidden = !view.dismissible;
-  }
-  if (log) {
-    log.hidden = !view.showLog || !logOpen;
-    log.textContent = logLines.join('\n');
-    log.scrollTop = log.scrollHeight;
-  }
+  shellStore.setState({
+    banner: {
+      tone: view.tone,
+      // The commit subject is whatever text landed on main and is not trusted;
+      // the view renders it as a React child, never as markup.
+      text: overrideText ?? view.text,
+      actionLabel: view.action === null ? null : view.actionLabel ?? '',
+      showLog: view.showLog,
+      logOpen,
+      dismissible: view.dismissible,
+      log: logLines.join('\n'),
+    },
+  });
 }

@@ -7,7 +7,10 @@
     
     <!-- PWA Meta Tags -->
     <meta name="description" content="Web interface for Claude Code, Codex, and terminal sessions with GitHub OAuth and SQLite persistence">
-    <meta name="theme-color" content="#161b22">
+    <!-- Relay's --background. The inline script below overrides this per
+         colourway once settings have loaded; this is the value that paints the
+         address bar and the PWA splash before then. -->
+    <meta name="theme-color" content="#0a0a0a">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="Code Agents">
@@ -18,12 +21,21 @@
     <!-- Web App Manifest -->
     <link rel="manifest" href="/manifest.json">
     
-    <!-- Icons for various platforms -->
-    <link rel="icon" type="image/svg+xml" sizes="32x32" href="/icon-32.svg">
-    <link rel="icon" type="image/svg+xml" sizes="16x16" href="/icon-16.svg">
-    <link rel="apple-touch-icon" sizes="180x180" href="/icon-180.png">
-    <meta name="msapplication-TileColor" content="#161b22">
-    <meta name="msapplication-TileImage" content="/icon-144.png">
+    <!--
+      Icons. Real files under /icons, rasterised from assets/icon.svg at build
+      time; they used to be one Express route answering every size and both
+      extensions with the same SVG document.
+
+      apple-touch-icon must be a PNG: Safari ignores an SVG here, which is why
+      "Add to Home Screen" produced a blank tile. favicon.ico is listed for the
+      browsers that request it unasked, and the SVG for those that prefer a
+      scalable one.
+    -->
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
+    <link rel="icon" type="image/svg+xml" href="/icons/icon.svg">
+    <link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-180.png">
+    <meta name="msapplication-TileColor" content="#0a0a0a">
+    <meta name="msapplication-TileImage" content="/icons/icon-144.png">
     
     <!-- Apply saved theme early to avoid flash -->
     <script>
@@ -66,89 +78,10 @@
 </head>
 <body>
     <div id="app">
-        
-        <!-- Session Tabs Bar -->
-        <div class="session-tabs-bar" id="sessionTabsBar">
-            <div class="shell-brand" aria-label="Code Agents Web CLI">
-                <div class="shell-brand-mark">cc</div>
-                <div class="shell-brand-copy">
-                    <span class="shell-brand-kicker">GitHub Console</span>
-                    <strong>Code Agents Web CLI</strong>
-                </div>
-            </div>
-            <div class="tabs-section">
-                <div class="tabs-container" id="tabsContainer">
-                    <!-- Tabs will be dynamically added here -->
-                </div>
-                <button class="tab-new" id="tabNewBtn" title="New Session (Ctrl+T)">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="12" y1="5" x2="12" y2="19"/>
-                        <line x1="5" y1="12" x2="19" y2="12"/>
-                    </svg>
-                </button>
-            </div>
-            <!-- Overflow dropdown for mobile - outside tabs-section to prevent scrolling issues -->
-            <div class="tab-overflow-wrapper" id="tabOverflowWrapper" style="display: none;">
-                <button class="tab-overflow-btn" id="tabOverflowBtn" title="More tabs">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <circle cx="12" cy="5" r="1"/>
-                        <circle cx="12" cy="12" r="1"/>
-                        <circle cx="12" cy="19" r="1"/>
-                    </svg>
-                    <span class="tab-overflow-count">0</span>
-                </button>
-                <div class="tab-overflow-menu" id="tabOverflowMenu">
-                    <!-- Overflow tabs will be listed here -->
-                </div>
-            </div>
-            <div class="tab-actions">
-                <div class="current-user-badge" id="currentUserBadge" title="Signed-in GitHub user" style="display: none;"></div>
-                <a class="tab-logout" id="logoutLink" href="/auth/logout" title="Sign out" style="display: none;">Logout</a>
-                <button class="tab-settings" id="settingsBtn" title="Settings">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/>
-                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1Z"/>
-                </svg>
-                </button>
-            </div>
-        </div>
-
-
-        <div class="mobile-menu" id="mobileMenu">
-            <div class="mobile-menu-header">
-                <h2><span class="icon" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 10h.01M16 10h.01M8 16c1.333-1 2.667-1 4 0 1.333 1 2.667 1 4 0"/></svg></span> Code Agents</h2>
-                <button class="close-menu-btn" id="closeMenuBtn">&times;</button>
-            </div>
-            <div class="mobile-menu-content">
-                <button id="sessionsBtnMobile" class="mobile-menu-btn">Sessions</button>
-                <button id="closeSessionBtnMobile" class="mobile-menu-btn btn-danger">Close Session</button>
-                <button id="reconnectBtnMobile" class="mobile-menu-btn">Reconnect</button>
-                <button id="clearBtnMobile" class="mobile-menu-btn">Clear Terminal</button>
-                <!-- Touch devices have no drag source and paste is unreliable there. -->
-                <button id="attachImageBtnMobile" class="mobile-menu-btn">Attach Image</button>
-                <button id="settingsBtnMobile" class="mobile-menu-btn">Settings</button>
-            </div>
-        </div>
-
         <!--
-          A direct child of #app, which is the column flex container. .main is
-          a ROW flex container that split view appends its own pane to, so a
-          banner placed inside it would render beside the terminal rather than
-          above it.
-        -->
-        <div class="update-banner" id="updateBanner" hidden>
-            <span class="update-banner__dot" id="updateBannerDot" aria-hidden="true"></span>
-            <span class="update-banner__text" id="updateBannerText" role="status" aria-live="polite"></span>
-            <button type="button" class="update-banner__action" id="updateBannerAction" hidden></button>
-            <button type="button" class="update-banner__toggle" id="updateBannerToggle" aria-expanded="false" hidden>Show log</button>
-            <button type="button" class="update-banner__dismiss" id="updateBannerDismiss" aria-label="Hide update notice">&times;</button>
-            <!-- aria-live="off": every streamed npm line would otherwise be announced. -->
-            <pre class="update-banner__log" id="updateBannerLog" aria-live="off" hidden></pre>
-        </div>
-
-        <!--
-          The Relay shell mounts here and renders the title bar, tab strip,
-          sidebar and status bar.
+          Every panel, bar, dialog, sheet and toast the app has is rendered by
+          the Relay shell into #relayRoot. What is left in this file is the one
+          thing React must never own.
         -->
         <div id="relayRoot"></div>
 
@@ -174,252 +107,7 @@
                 </div>
             </div>
         </main>
-
-        <!-- App-wide overlay (moved out of terminal container to avoid width issues) -->
-        <div class="terminal-overlay" id="overlay" style="display: none;">
-            <div class="overlay-content">
-                <div class="loading-spinner" id="loadingSpinner">
-                    <div class="spinner"></div>
-                    <p>Connecting to Claude Code...</p>
-                </div>
-                <div class="start-prompt" id="startPrompt" style="display: none;">
-                    <div class="start-prompt-header">
-                        <h2>Launch a Runtime</h2>
-                        <button class="close-btn" id="closeStartPromptBtn" title="Cancel new session">&times;</button>
-                    </div>
-                    <p>Pick the workflow for this repository. The shell and terminal colors stay in sync with your selected GitHub theme.</p>
-                    <div class="start-buttons">
-                        <button id="startBtn" class="btn btn-primary">Start Claude</button>
-                        <button id="dangerousSkipBtn" class="btn btn-danger" title="Dangerously skip permissions. Use with caution.">Dangerous Claude</button>
-                        <button id="startCodexBtn" class="btn btn-primary">Start Codex</button>
-                        <button id="dangerousCodexBtn" class="btn btn-danger" title="Bypass approvals and sandbox. Use with caution.">Dangerous Codex</button>
-                        <button id="startAgentBtn" class="btn btn-primary">Start Cursor</button>
-                        <button id="startPiBtn" class="btn btn-primary">Start Pi</button>
-                        <button id="startGrokBtn" class="btn btn-primary">Start Grok</button>
-                        <button id="dangerousGrokBtn" class="btn btn-danger" title="Auto-approve every tool execution. Use with caution.">Dangerous Grok</button>
-                        <button id="startQwenBtn" class="btn btn-primary">Start Qwen</button>
-                        <button id="dangerousQwenBtn" class="btn btn-danger" title="Auto-accept every action (YOLO mode). Use with caution.">Dangerous Qwen</button>
-                        <button id="startKimiBtn" class="btn btn-primary">Start Kimi</button>
-                        <button id="dangerousKimiBtn" class="btn btn-danger" title="Automatically approve all actions. Use with caution.">Dangerous Kimi</button>
-                        <button id="startTerminalBtn" class="btn btn-secondary">Start Terminal</button>
-                    </div>
-                    <div class="start-prompt-actions">
-                        <button id="cancelStartPromptBtn" class="btn btn-secondary">Cancel New Session</button>
-                    </div>
-                </div>
-                <div class="error-message" id="errorMessage" style="display: none;">
-                    <h3>Connection Error</h3>
-                    <p id="errorText"></p>
-                    <button id="retryBtn" class="btn btn-primary">Retry</button>
-                </div>
-            </div>
-        </div>
-
-        <div class="settings-modal" id="settingsModal">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h2>Settings</h2>
-                    <button class="close-btn" id="closeSettingsBtn">&times;</button>
-                </div>
-                <div class="modal-body">
-                    <p class="modal-description">Choose a GitHub-inspired colorway and terminal typography. The terminal palette follows the selected app theme automatically.</p>
-                    <div class="setting-group">
-                        <label for="fontSize">Font Size:</label>
-                        <input type="range" id="fontSize" min="10" max="24" value="14">
-                        <span id="fontSizeValue">14px</span>
-                    </div>
-                    <div class="setting-group">
-                        <label for="themeSelect">Colorway:</label>
-                        <select id="themeSelect">
-                            <option value="github-dark">GitHub Dark</option>
-                            <option value="github-dark-dimmed">GitHub Dark Dimmed</option>
-                            <option value="github-dark-high-contrast">GitHub Dark High Contrast</option>
-                            <option value="github-light">GitHub Light</option>
-                            <option value="github-light-high-contrast">GitHub Light High Contrast</option>
-                        </select>
-                    </div>
-                    <div class="setting-group">
-                        <label for="terminalFontFamilySelect">Terminal Font:</label>
-                        <select id="terminalFontFamilySelect">
-                            <option value="jetbrains-mono">JetBrains Mono</option>
-                            <option value="fira-code">Fira Code</option>
-                            <option value="source-code-pro">Source Code Pro</option>
-                            <option value="ibm-plex-mono">IBM Plex Mono</option>
-                            <option value="cascadia-code-nf">Cascadia Code NF</option>
-                            <option value="hack-nf">Hack Nerd Font</option>
-                            <option value="meslo-nf">Meslo Nerd Font</option>
-                            <option value="sauce-code-pro-nf">Sauce Code Pro NF</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="modal-footer">
-                    <button class="btn btn-primary" id="saveSettingsBtn">Save Settings</button>
-                </div>
-            </div>
-        </div>
-
-        <div class="plan-modal" id="planModal">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h2>
-                        <span class="icon" aria-hidden="true">
-                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <rect x="4" y="3" width="16" height="18" rx="2"/>
-                                <line x1="8" y1="7" x2="16" y2="7"/>
-                            </svg>
-                        </span>
-                        Claude's Plan
-                    </h2>
-                    <button class="close-btn" id="closePlanBtn" title="Close">&times;</button>
-                </div>
-                <div class="modal-body">
-                    <div class="plan-status" id="planStatus">
-                        <span class="plan-status-indicator"></span>
-                        <span class="plan-status-text">Plan Mode Active</span>
-                    </div>
-                    <div class="plan-content" id="planContent">
-                        <!-- Plan will be inserted here -->
-                    </div>
-                </div>
-                <div class="modal-footer">
-                    <button class="btn btn-success" id="acceptPlanBtn">
-                        <span class="icon" aria-hidden="true">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <polyline points="20 6 9 17 4 12"/>
-                            </svg>
-                        </span>
-                        Accept Plan
-                    </button>
-                    <button class="btn btn-danger" id="rejectPlanBtn">
-                        <span class="icon" aria-hidden="true">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <line x1="18" y1="6" x2="6" y2="18"/>
-                                <line x1="6" y1="6" x2="18" y2="18"/>
-                            </svg>
-                        </span>
-                        Reject Plan
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <div class="session-modal" id="newSessionModal">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h2>Create New Session</h2>
-                    <button class="close-btn" id="closeNewSessionBtn">&times;</button>
-                </div>
-                <div class="modal-body">
-                    <div class="form-group">
-                        <label for="sessionName">Session Name:</label>
-                        <input type="text" id="sessionName" placeholder="Enter session name (optional)">
-                    </div>
-                    <div class="form-group">
-                        <label for="sessionWorkingDir">Working Directory:</label>
-                        <input type="text" id="sessionWorkingDir" placeholder="Leave empty to use current directory">
-                    </div>
-                </div>
-                <div class="modal-footer">
-                    <button class="btn btn-secondary" id="cancelNewSessionBtn">Cancel</button>
-                    <button class="btn btn-primary" id="createSessionBtn">Create Session</button>
-                </div>
-            </div>
-        </div>
-
-        <div class="session-modal" id="terminalOptionsModal">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h2>Start Terminal</h2>
-                    <button class="close-btn" id="closeTerminalOptionsBtn">&times;</button>
-                </div>
-                <div class="modal-body">
-                    <p class="modal-description">Open an interactive shell or run a single command in this session.</p>
-                    <div class="terminal-shell-grid">
-                        <button class="btn btn-primary terminal-shell-btn" data-terminal-shell="zsh">zsh</button>
-                        <button class="btn btn-primary terminal-shell-btn" data-terminal-shell="bash">bash</button>
-                        <button class="btn btn-primary terminal-shell-btn" data-terminal-shell="sh">sh</button>
-                    </div>
-                    <div class="form-group">
-                        <label for="terminalCommandInput">Custom Command:</label>
-                        <input type="text" id="terminalCommandInput" placeholder="Examples: btop, htop, watch podman ps">
-                        <p class="form-hint">Runs through a shell with the session working directory as the current directory.</p>
-                        <p class="form-error" id="terminalCommandError" style="display: none;"></p>
-                    </div>
-                </div>
-                <div class="modal-footer">
-                    <button class="btn btn-secondary" id="cancelTerminalOptionsBtn">Cancel</button>
-                    <button class="btn btn-primary" id="runTerminalCommandBtn">Run Command</button>
-                </div>
-            </div>
-        </div>
-
-        <div class="folder-browser-modal" id="folderBrowserModal">
-            <div class="modal-content folder-browser-content">
-                <div class="modal-header">
-                    <h2>Select Working Directory</h2>
-                </div>
-                <div class="folder-browser-body">
-                    <div class="folder-path-bar">
-                        <button class="btn-icon" id="folderUpBtn" title="Go to parent directory">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M19 12H5M12 19l-7-7 7-7"/>
-                            </svg>
-                        </button>
-                        <button class="btn-icon" id="folderHomeBtn" title="Go to home directory">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
-                            </svg>
-                        </button>
-                        <input type="text" class="folder-path-input" id="currentPathInput" readonly>
-                        <button class="btn-icon" id="createFolderBtn" title="Create new folder">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-                                <line x1="12" y1="11" x2="12" y2="17"/>
-                                <line x1="9" y1="14" x2="15" y2="14"/>
-                            </svg>
-                        </button>
-                    </div>
-                    <div class="folder-create-bar" id="folderCreateBar" style="display: none;">
-                        <input type="text" class="folder-name-input" id="newFolderNameInput" placeholder="Enter folder name...">
-                        <button class="btn btn-primary btn-small" id="confirmCreateFolderBtn">Create</button>
-                        <button class="btn btn-secondary btn-small" id="cancelCreateFolderBtn">Cancel</button>
-                    </div>
-                    <div class="folder-list-container">
-                        <div class="folder-list" id="folderList">
-                            <!-- Folders will be dynamically added here -->
-                        </div>
-                    </div>
-                    <div class="folder-browser-footer">
-                        <label class="checkbox-label">
-                            <input type="checkbox" id="showHiddenFolders">
-                            Show hidden folders
-                        </label>
-                        <div class="folder-browser-buttons">
-                            <button class="btn btn-secondary" id="cancelFolderBtn">Cancel</button>
-                            <button class="btn btn-primary" id="selectFolderBtn">Select This Folder</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
     </div>
-
-    <!-- Mobile Sessions Modal -->
-    <div class="session-modal" id="mobileSessionsModal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>Sessions</h2>
-                <button class="modal-close" id="closeMobileSessionsModal">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div id="mobileSessionList" class="session-list">
-                    <!-- Sessions will be dynamically added here -->
-                </div>
-                <button class="btn btn-primary" id="newSessionBtnMobile" style="width: 100%; margin-top: 10px;">New Session</button>
-            </div>
-        </div>
-    </div>
-
 
     <script src="app.bundle.js"></script>
     
@@ -455,60 +143,6 @@
                     });
             });
         }
-        
-        // Handle app install prompt
-        let deferredPrompt;
-        window.addEventListener('beforeinstallprompt', (e) => {
-            // Prevent Chrome 67 and earlier from automatically showing the prompt
-            e.preventDefault();
-            // Stash the event so it can be triggered later
-            deferredPrompt = e;
-            
-            // Create install button if it doesn't exist
-            if (!document.getElementById('installBtn')) {
-                const installBtn = document.createElement('button');
-                installBtn.id = 'installBtn';
-                installBtn.className = 'install-btn';
-                installBtn.innerHTML = '<span class="icon" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><path d="M8 11l4 4 4-4"/><path d="M5 21h14"/></svg></span> Install App';
-                installBtn.style.cssText = `
-                    position: fixed;
-                    bottom: 20px;
-                    right: 20px;
-                    padding: 12px 20px;
-                    background: var(--accent);
-                    color: white;
-                    border: none;
-                    border-radius: 8px;
-                    cursor: pointer;
-                    font-family: 'IBM Plex Sans', 'Segoe UI', sans-serif;
-                    font-size: 14px;
-                    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
-                    z-index: 1000;
-                    transition: all 0.3s ease;
-                `;
-                
-                installBtn.addEventListener('click', async () => {
-                    if (deferredPrompt) {
-                        deferredPrompt.prompt();
-                        const { outcome } = await deferredPrompt.userChoice;
-                        console.log(`User response to install prompt: ${outcome}`);
-                        deferredPrompt = null;
-                        installBtn.remove();
-                    }
-                });
-                
-                document.body.appendChild(installBtn);
-            }
-        });
-        
-        // Handle successful installation
-        window.addEventListener('appinstalled', () => {
-            console.log('PWA was installed');
-            const installBtn = document.getElementById('installBtn');
-            if (installBtn) {
-                installBtn.remove();
-            }
-        });
     </script>
 </body>
 </html>

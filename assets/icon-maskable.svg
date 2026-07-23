@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Code Agents Web CLI">
+  <!--
+    The maskable variant of icon.svg.
+
+    Android (and any launcher honouring purpose "maskable") crops the icon to a
+    shape of its choosing, and only guarantees that the central circle of 80%
+    diameter survives. Declaring one artwork as both "any" and "maskable" is the
+    standard way to get a mark with its edges shaved off on one device and
+    floating in dead space on another, so this is a separate file.
+
+    The background goes full bleed and the glyph is scaled to 0.74, which puts
+    its bounding box inside the safe circle with room to spare: the artwork
+    spans 284x288, so at 0.74 its half-diagonal is about 150px against a safe
+    radius of 205px.
+  -->
+  <rect width="512" height="512" fill="#0a0a0a"/>
+  <g transform="translate(256 256) scale(0.74) translate(-256 -256)">
+    <path d="M140 140 L268 256 L140 372"
+          fill="none"
+          stroke="#fafafa"
+          stroke-width="56"
+          stroke-linecap="square"
+          stroke-linejoin="miter"/>
+    <rect x="330" y="306" width="66" height="66" fill="#4ade80"/>
+  </g>
+</svg>

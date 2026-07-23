@@ -1,26 +1,45 @@
 {
   "name": "Code Agents Web CLI",
-  "short_name": "Agents WebCLI",
-  "description": "Multiuser web CLI for Claude Code, Codex, and terminal sessions",
+  "short_name": "Code Agents",
+  "description": "Run Claude Code, Codex, Cursor and a terminal from the browser",
+  "id": "/",
   "start_url": "/",
   "display": "standalone",
   "display_override": ["standalone", "minimal-ui", "browser"],
   "scope": "/",
-  "background_color": "#161b22",
-  "theme_color": "#161b22",
+  "background_color": "#0a0a0a",
+  "theme_color": "#0a0a0a",
   "orientation": "any",
   "icons": [
     {
-      "src": "/icon-192.svg",
+      "src": "/icons/icon-192.png",
       "sizes": "192x192",
-      "type": "image/svg+xml",
-      "purpose": "any maskable"
+      "type": "image/png",
+      "purpose": "any"
     },
     {
-      "src": "/icon-512.svg",
+      "src": "/icons/icon-512.png",
       "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-maskable-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
       "type": "image/svg+xml",
-      "purpose": "any maskable"
+      "purpose": "any"
     }
   ],
   "categories": ["developer", "productivity", "utilities"],
@@ -29,17 +48,10 @@
   "prefer_related_applications": false,
   "shortcuts": [
     {
-      "name": "New Session",
+      "name": "New session",
       "url": "/",
-      "description": "Start a new authenticated agent session"
-    }
-  ],
-  "screenshots": [
-    {
-      "src": "/screenshot-wide.png",
-      "sizes": "1280x720",
-      "type": "image/png",
-      "label": "Code Agents Web CLI"
+      "description": "Start a new agent session",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" }]
     }
   ]
 }

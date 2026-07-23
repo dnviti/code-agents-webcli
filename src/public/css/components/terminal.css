@@ -13,7 +13,7 @@
     overscroll-behavior: contain;
     background: transparent !important;
     scrollbar-width: thin;
-    scrollbar-color: var(--scrollbar-thumb) transparent;
+    scrollbar-color: var(--border-strong) transparent;
     -webkit-overflow-scrolling: touch;
     touch-action: pan-y;
 }
@@ -28,12 +28,12 @@
 }
 
 .xterm .xterm-viewport::-webkit-scrollbar-thumb {
-    background: var(--scrollbar-thumb);
-    border-radius: var(--radius-pill);
+    background: var(--border-strong);
+    border-radius: var(--radius-full);
 }
 
 .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
-    background: var(--scrollbar-thumb-hover);
+    background: var(--muted-foreground);
 }
 
 /* ---------------------------------------------------------------------------
@@ -50,7 +50,7 @@
     z-index: 5;
     display: flex;
     flex-direction: column;
-    background: var(--terminal-bg, #0d1117);
+    background: var(--background);
     border-radius: inherit;
 }
 
@@ -64,9 +64,9 @@
     justify-content: space-between;
     gap: 12px;
     padding: 8px 12px;
-    border-bottom: 1px solid var(--terminal-shell-border, rgba(240, 246, 252, 0.1));
+    border-bottom: 1px solid var(--border);
     font-size: 12px;
-    color: var(--text-muted, #8b949e);
+    color: var(--muted-foreground);
     flex: 0 0 auto;
 }
 
@@ -86,20 +86,20 @@
     padding: 4px 10px;
     font: inherit;
     font-size: 12px;
-    color: var(--text-muted, #8b949e);
+    color: var(--muted-foreground);
     background: transparent;
-    border: 1px solid var(--terminal-shell-border, rgba(240, 246, 252, 0.1));
-    border-radius: var(--radius-pill, 999px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
     cursor: pointer;
 }
 
 .history-view__button:hover {
-    color: var(--text-primary, #f0f6fc);
+    color: var(--foreground);
 }
 
 .history-view__button--primary {
-    color: #79c0ff;
-    border-color: rgba(121, 192, 255, 0.4);
+    color: var(--primary);
+    border-color: var(--ring);
 }
 
 .history-view__body {
@@ -119,7 +119,7 @@
     overflow-y: auto;
     overscroll-behavior: contain;
     scrollbar-width: thin;
-    scrollbar-color: var(--scrollbar-thumb, rgba(240, 246, 252, 0.2)) transparent;
+    scrollbar-color: var(--border-strong) transparent;
     touch-action: pan-y;
 }
 
@@ -128,8 +128,8 @@
 }
 
 .history-view__scroller::-webkit-scrollbar-thumb {
-    background: var(--scrollbar-thumb, rgba(240, 246, 252, 0.2));
-    border-radius: var(--radius-pill, 999px);
+    background: var(--border-strong);
+    border-radius: var(--radius-full);
 }
 
 .history-view__spacer {
@@ -144,15 +144,15 @@
  */
 #terminal.terminal-drop-active,
 .split-terminal.terminal-drop-active {
-    outline: 2px dashed var(--accent-strong);
+    outline: 2px dashed var(--ring);
     outline-offset: -4px;
-    background: var(--accent-soft);
+    background: var(--ring);
 }
 
 #terminal.terminal-upload-active,
 .split-terminal.terminal-upload-active {
     /* A 10 MB upload over a tunnel is measurable; say something is happening. */
-    outline: 2px solid var(--accent);
+    outline: 2px solid var(--ring);
     outline-offset: -4px;
 }
 

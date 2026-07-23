@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Code Agents Web CLI">
+  <!--
+    Master icon. Everything else is rasterised from this file by
+    scripts/build-icons.js. Edit here, never the generated PNGs.
+
+    The mark is a shell prompt: a chevron and a block cursor. It follows the
+    Relay design language the app itself uses, so the icon and the first screen
+    agree with each other.
+
+      square, no corner radius. Relay's house style is sharp (radius token is
+      0), and launchers apply their own mask anyway; icon-maskable.svg is the
+      variant for platforms that crop.
+
+      near-black on near-white, the two ends of Relay's neutral ramp
+      (background #0a0a0a, foreground #fafafa).
+
+      the cursor takes ansi-green #4ade80, the same colour the tab strip uses
+      for a session that is running. It is the one warm mark in the UI and the
+      one thing worth spotting at a glance.
+
+    Drawn as geometry rather than a text glyph on purpose: a text element would
+    render against whatever monospace font the rasteriser happened to find, so
+    the icon would differ between machines and CI.
+
+    Note for editors: XML forbids a double hyphen inside a comment, so CSS
+    custom properties are named here without their leading dashes. Writing them
+    in full makes this file unparseable and the icon build fails with a bare
+    "unable to read image data".
+  -->
+  <rect width="512" height="512" fill="#0a0a0a"/>
+  <path d="M140 140 L268 256 L140 372"
+        fill="none"
+        stroke="#fafafa"
+        stroke-width="56"
+        stroke-linecap="square"
+        stroke-linejoin="miter"/>
+  <rect x="330" y="306" width="66" height="66" fill="#4ade80"/>
+</svg>

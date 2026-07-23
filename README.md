@@ -26,7 +26,8 @@ This package is not published to npm; it installs straight from GitHub.
 
 Before you start, create a [GitHub OAuth App](https://github.com/settings/developers) and set its
 callback URL to `<your base URL>/auth/github/callback` — for a local install that is
-`http://localhost:32352/auth/github/callback`. You will also want your own GitHub numeric user ID,
+`https://localhost:32352/auth/github/callback`. The server is HTTPS only, so the callback is
+too. You will also want your own GitHub numeric user ID,
 which `curl -s https://api.github.com/users/<your-login> | grep '"id"'` will tell you.
 
 Try it without installing:
@@ -252,6 +253,44 @@ Known limits:
   app has — anyone signed in can already open a shell — but it is worth stating.
 - Text pasting is untouched: an event with no image in it is left entirely to the terminal.
 
+## HTTPS and the local certificate
+
+The server speaks HTTPS only. This is not about secrecy on a home network: a browser treats a
+plain-http origin that is not `localhost` as an insecure context and withholds the service worker,
+which means no installable app, no offline shell, no clipboard API and no notifications. Those
+features all worked when tested at `http://localhost` and were silently missing for anyone opening
+the same server at `http://192.168.x.x`, which is how it is normally reached.
+
+On first start the server generates a certificate authority and a server certificate in
+`~/.code-agents-webcli/tls/`, covering `localhost`, this machine's hostname, `<hostname>.local` and
+every non-internal IP address it answers on. It reissues automatically when the certificate is
+close to expiry or when the machine's addresses change — a laptop moving between networks gets a
+new certificate rather than a confusing TLS error. The CA itself is reused, so devices do not have
+to be re-trusted.
+
+Because the CA is local, each device has to trust it once. Download it from `/ca.crt` — that route
+is deliberately reachable without signing in, since a device that does not trust the certificate
+cannot get as far as the login page:
+
+```bash
+# Linux, Chrome/Chromium (no root needed)
+curl -k https://<host>:32352/ca.crt -o ca.crt
+certutil -d sql:$HOME/.pki/nssdb -A -t "C,," -n "Code Agents Web CLI local CA" -i ca.crt
+
+# Linux, system-wide
+sudo cp ca.crt /etc/pki/ca-trust/source/anchors/   # Fedora/RHEL
+sudo update-ca-trust
+```
+
+On iOS, open `https://<host>:32352/ca.crt` in Safari, install the downloaded profile, then enable it
+under Settings → General → About → Certificate Trust Settings. On Android, install it under
+Settings → Security → Encryption & credentials → Install a certificate → CA certificate.
+
+To use a real certificate instead, pass `--cert` and `--key`; nothing is generated in that case.
+
+Plain http requests to the port are answered with a 308 redirect to the https URL, so existing
+bookmarks keep working. No content is served over http.
+
 ## GitHub OAuth Setup
 
 Create a GitHub OAuth App and set the callback URL to:
@@ -263,8 +302,10 @@ https://your-host.example.com/auth/github/callback
 For local development, this can be:
 
 ```text
-http://localhost:32352/auth/github/callback
+https://localhost:32352/auth/github/callback
 ```
+
+The scheme is `https` even locally: the server does not serve content over plain http.
 
 After sign-in, each browser user is mapped to an internal user record by GitHub numeric ID. Runtime sessions are filtered by owner, so users only see their own sessions.
 
@@ -299,8 +340,8 @@ code-agents-webcli --setup
 # custom port
 code-agents-webcli --port 8080
 
-# HTTPS
-code-agents-webcli --https --cert /path/to/cert.pem --key /path/to/key.pem
+# HTTPS is always on. To use your own certificate instead of the generated one:
+code-agents-webcli --cert /path/to/cert.pem --key /path/to/key.pem
 
 # explicit GitHub OAuth config
 code-agents-webcli \
@@ -317,13 +358,13 @@ npm run dev
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `-p, --port <number>` | HTTP port | `32352` |
+| `-p, --port <number>` | HTTPS port | `32352` |
 | `--no-open` | Do not auto-open the browser | `false` |
-| `--https` | Enable HTTPS | `false` |
-| `--cert <path>` | TLS certificate path | none |
-| `--key <path>` | TLS private key path | none |
+| `--https` | Accepted and ignored; HTTPS is always on | n/a |
+| `--cert <path>` | TLS certificate to use instead of the generated one | generated |
+| `--key <path>` | Private key for `--cert` | generated |
 | `--setup` | Force the interactive setup wizard | `false` |
-| `--public-base-url <url>` | Public base URL for OAuth callbacks | `http://localhost:<port>` |
+| `--public-base-url <url>` | Public base URL for OAuth callbacks | `https://localhost:<port>` |
 | `--github-client-id <id>` | GitHub OAuth client ID | from SQLite / env |
 | `--github-client-secret <secret>` | GitHub OAuth client secret | from SQLite / env |
 | `--github-app-token <token>` | Optional GitHub App token stored during setup | from SQLite / env |

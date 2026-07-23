@@ -44,12 +44,6 @@ const CONTRACT = [
     required_by: 'src/client/shell/mount.tsx',
     breaks: 'the Relay shell does not mount, leaving the app with no chrome',
   },
-  {
-    selector: '#updateBanner',
-    html: /id="updateBanner"/,
-    required_by: 'src/client/ui/update-banner.ts',
-    breaks: 'update notices are never shown',
-  },
 ];
 
 describe('index.html DOM contract', function () {
@@ -80,16 +74,42 @@ describe('index.html DOM contract', function () {
     );
   });
 
-  it('keeps the update banner outside the shell mount point', function () {
-    // The banner is a sibling of #relayRoot in #app's column. React owns
-    // everything inside #relayRoot and would discard foreign children on
-    // render, so the banner must not be moved in there.
-    const rootIdx = HTML.indexOf('id="relayRoot"');
-    const bannerIdx = HTML.indexOf('id="updateBanner"');
-    assert.ok(rootIdx !== -1 && bannerIdx !== -1);
+  it('still publishes the drag payload split view reads on drop', function () {
+    // The same class of silent failure, one layer up. SplitContainer's drop
+    // handler reads `application/x-session-id` off the dataTransfer and returns
+    // early when it is absent — so a tab strip that stops setting it does not
+    // throw, it just makes drag-to-split quietly impossible. The strip is React
+    // now, and the two ends of this contract live in different files.
+    const shell = fs.readFileSync(
+      path.join(ROOT, 'src', 'client', 'shell', 'AppShell.tsx'), 'utf8',
+    );
+    const splits = fs.readFileSync(
+      path.join(ROOT, 'src', 'client', 'splits', 'split-container.ts'), 'utf8',
+    );
+
+    for (const key of ['application/x-session-id', 'x-source-pane']) {
+      assert.ok(
+        shell.includes(key),
+        `AppShell must publish "${key}" via TabBar's dragPayload; without it a tab drag `
+          + 'carries nothing split view can identify.',
+      );
+    }
     assert.ok(
-      bannerIdx < rootIdx,
-      'the update banner must precede #relayRoot so it keeps its own row above the shell',
+      splits.includes('application/x-session-id'),
+      'split-container must still read the key AppShell publishes',
+    );
+  });
+
+  it('leaves nothing but the terminal for React to collide with', function () {
+    // Everything the app renders now lives inside #relayRoot, and React
+    // discards foreign children of a root it owns. The terminal is the one
+    // exception, and it is deliberately a sibling — never a child.
+    const rootIdx = HTML.indexOf('id="relayRoot"');
+    const mainIdx = HTML.indexOf('class="main"');
+    assert.ok(rootIdx !== -1 && mainIdx !== -1);
+    assert.ok(
+      rootIdx < mainIdx,
+      '#relayRoot must precede <main class="main">, not contain it',
     );
   });
 });

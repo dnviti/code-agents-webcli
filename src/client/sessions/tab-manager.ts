@@ -1,12 +1,27 @@
 // Session tab management: create, switch, reorder, and close tabs
+//
+// The strip is rendered by the Relay `TabBar` from `shellStore`. This class no
+// longer builds or reads any DOM: `tabs` used to be `Map<string, HTMLElement>`
+// and several methods read state back out of those nodes (a tab's name came
+// from its `.tab-name` textContent, unread came from a CSS class). It is a
+// plain record now, and `syncShell()` is the only way any of it reaches the
+// screen.
 
 import type { App } from '../app';
 import type { SessionInfo } from '../types';
 import { shellStore, type ShellTab } from '../shell/store';
+import { playNotificationSound, showNotification } from '../ui/notifications';
+
+/** What the strip needs about a tab that `SessionInfo` does not already say. */
+interface TabRecord {
+  id: string;
+  /** The label shown on the tab, which is not always the session name. */
+  displayName: string;
+}
 
 export class SessionTabManager {
   app: App;
-  tabs: Map<string, HTMLElement>;
+  tabs: Map<string, TabRecord>;
   activeSessions: Map<string, SessionInfo>;
   activeTabId: string | null;
   tabOrder: string[];
@@ -25,7 +40,7 @@ export class SessionTabManager {
   }
 
   getAlias(kind: string): string {
-    return this.app.getAlias(kind as any);
+    return this.app.getAlias(kind as never);
   }
 
   // ---------------------------------------------------------------------------
@@ -66,18 +81,25 @@ export class SessionTabManager {
         setTimeout(() => notification.close(), 5000);
         return;
       } catch {
-        // fall through to mobile fallback
+        // fall through to the in-page fallback
       }
     }
 
-    this.showMobileNotification(title, body, sessionId);
+    this.showInPageNotification(title, body);
   }
 
-  private showMobileNotification(title: string, body: string, sessionId: string): void {
+  /**
+   * Fallback for a device that refuses system notifications.
+   *
+   * It used to build its own fixed-position div with an inline stylesheet and
+   * its own keyframes. It is the app's toast now — one primitive, one place
+   * where the styling and the screen-reader announcement are decided.
+   */
+  private showInPageNotification(title: string, body: string): void {
     const originalTitle = document.title;
     let flashCount = 0;
     const flashInterval = setInterval(() => {
-      document.title = flashCount % 2 === 0 ? `\u2022 ${title}` : originalTitle;
+      document.title = flashCount % 2 === 0 ? `• ${title}` : originalTitle;
       flashCount++;
       if (flashCount > 6) {
         clearInterval(flashInterval);
@@ -89,75 +111,8 @@ export class SessionTabManager {
       try { navigator.vibrate([200, 100, 200]); } catch { /* unsupported */ }
     }
 
-    const toast = document.createElement('div');
-    toast.className = 'mobile-notification';
-    toast.style.cssText = `
-      position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
-      background: #3b82f6; color: white; padding: 12px 20px;
-      border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-      z-index: 10001; max-width: 90%; text-align: center; cursor: pointer;
-      animation: slideDown 0.3s ease-out;
-    `;
-    // `title` embeds the session name, which is user-controlled: set as text.
-    const toastTitle = document.createElement('div');
-    toastTitle.style.cssText = 'font-weight:bold;margin-bottom:4px;';
-    toastTitle.textContent = title;
-
-    const toastBody = document.createElement('div');
-    toastBody.style.cssText = 'font-size:14px;opacity:0.9;';
-    toastBody.textContent = body;
-
-    toast.append(toastTitle, toastBody);
-
-    this.injectMobileNotificationStyles();
-
-    toast.onclick = () => {
-      this.switchToTab(sessionId);
-      toast.style.animation = 'slideUp 0.3s ease-out';
-      setTimeout(() => toast.remove(), 300);
-    };
-
-    document.body.appendChild(toast);
-
-    setTimeout(() => {
-      if (toast.parentNode) {
-        toast.style.animation = 'slideUp 0.3s ease-out';
-        setTimeout(() => toast.remove(), 300);
-      }
-    }, 5000);
-
-    try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.frequency.value = 800;
-      osc.type = 'sine';
-      gain.gain.setValueAtTime(0.3, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.2);
-      osc.start(ctx.currentTime);
-      osc.stop(ctx.currentTime + 0.2);
-    } catch {
-      // audio not available
-    }
-  }
-
-  private injectMobileNotificationStyles(): void {
-    if (document.querySelector('#mobileNotificationStyles')) return;
-    const style = document.createElement('style');
-    style.id = 'mobileNotificationStyles';
-    style.textContent = `
-      @keyframes slideDown {
-        from { transform: translateX(-50%) translateY(-100%); opacity: 0; }
-        to   { transform: translateX(-50%) translateY(0);     opacity: 1; }
-      }
-      @keyframes slideUp {
-        from { transform: translateX(-50%) translateY(0);     opacity: 1; }
-        to   { transform: translateX(-50%) translateY(-100%); opacity: 0; }
-      }
-    `;
-    document.head.appendChild(style);
+    showNotification(`${title} — ${body}`);
+    playNotificationSound();
   }
 
   // ---------------------------------------------------------------------------
@@ -167,27 +122,27 @@ export class SessionTabManager {
   /**
    * Publish tab state to the React shell.
    *
-   * Called from the overflow updaters and updateTabStatus, which between them
-   * already run after every mutation that changes what a tab looks like. The
-   * store drops no-op updates, so the duplicate calls that come from a single
-   * logical change (a switch touches order, history and status) collapse into
-   * one render.
+   * The store drops no-op updates, so the duplicate calls that come from a
+   * single logical change (a switch touches order, history and status) collapse
+   * into one render.
    */
   syncShell(): void {
     const tabs: ShellTab[] = this.getOrderedTabIds()
       .map((id) => {
         const session = this.activeSessions.get(id);
-        if (!session) return null;
+        const record = this.tabs.get(id);
+        if (!session || !record) return null;
         return {
           id,
-          title: session.name,
+          title: record.displayName,
           status:
             session.hasError || session.status === 'error'
               ? 'error'
               : session.status === 'active'
                 ? 'running'
                 : 'idle',
-          // Not yet tracked per session; see UNGROUPED in AppShell.
+          // Not yet tracked per session; the server's SessionRecord.agent would
+          // have to be plumbed through the list endpoint first.
           kind: '',
           workingDir: session.workingDir,
           unread: session.unreadOutput,
@@ -203,34 +158,18 @@ export class SessionTabManager {
     return [...this.tabOrder];
   }
 
-  getOrderedTabElements(): HTMLElement[] {
-    return this.getOrderedTabIds()
-      .map((id) => this.tabs.get(id))
-      .filter(Boolean) as HTMLElement[];
-  }
-
-  syncOrderFromDom(): void {
-    const tabsContainer = document.getElementById('tabsContainer');
-    if (!tabsContainer) return;
-    const ids = Array.from(tabsContainer.querySelectorAll<HTMLElement>('.session-tab'))
-      .map((tab) => tab.dataset.sessionId)
-      .filter(Boolean) as string[];
-    if (ids.length) this.tabOrder = ids;
-  }
-
-  ensureTabVisible(sessionId: string): void {
-    const tab = this.tabs.get(sessionId);
-    if (!tab) return;
-    const scrollContainer = tab.closest('.tabs-section');
-    if (!scrollContainer) return;
-    const tabRect = tab.getBoundingClientRect();
-    const containerRect = scrollContainer.getBoundingClientRect();
-
-    if (tabRect.left < containerRect.left) {
-      scrollContainer.scrollLeft += tabRect.left - containerRect.left - 16;
-    } else if (tabRect.right > containerRect.right) {
-      scrollContainer.scrollLeft += tabRect.right - containerRect.right + 16;
-    }
+  /**
+   * Apply an order the tab strip produced by dragging.
+   *
+   * Ids the strip does not know about are appended rather than dropped: a tab
+   * created while a drag was in flight must not disappear because the dragged
+   * order predates it.
+   */
+  applyOrder(ids: string[]): void {
+    const known = ids.filter((id) => this.tabs.has(id));
+    const missing = this.tabOrder.filter((id) => this.tabs.has(id) && !known.includes(id));
+    this.tabOrder = [...known, ...missing];
+    this.syncShell();
   }
 
   updateTabHistory(sessionId: string): void {
@@ -248,208 +187,9 @@ export class SessionTabManager {
   // ---------------------------------------------------------------------------
 
   async init(): Promise<void> {
-    this.setupTabBar();
     this.setupKeyboardShortcuts();
-    this.setupOverflowDropdown();
     await this.loadSessions();
-    this.updateTabOverflow();
-
-    setTimeout(() => this.checkAndPromptForNotifications(), 2000);
-  }
-
-  private checkAndPromptForNotifications(): void {
-    if (!('Notification' in window) || Notification.permission !== 'default') return;
-
-    const promptDiv = document.createElement('div');
-    promptDiv.style.cssText = `
-      position: fixed; top: 60px; right: 20px;
-      background: #1e293b; border: 1px solid #475569;
-      border-radius: 8px; padding: 12px 16px;
-      color: #e2e8f0; font-size: 14px; z-index: 10000;
-      box-shadow: 0 4px 6px rgba(0,0,0,0.3); max-width: 300px;
-    `;
-    promptDiv.innerHTML = `
-      <div style="margin-bottom:10px;">
-        <strong>Enable Desktop Notifications?</strong><br>
-        Get notified when ${this.getAlias('claude')} completes tasks in background tabs.
-      </div>
-      <div style="display:flex;gap:10px;">
-        <button id="enableNotifications" style="background:#3b82f6;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:13px;">Enable</button>
-        <button id="dismissNotifications" style="background:#475569;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:13px;">Not Now</button>
-      </div>
-    `;
-    document.body.appendChild(promptDiv);
-
-    document.getElementById('enableNotifications')!.onclick = () => {
-      this.requestNotificationPermission();
-      promptDiv.remove();
-    };
-    document.getElementById('dismissNotifications')!.onclick = () => promptDiv.remove();
-
-    setTimeout(() => { if (promptDiv.parentNode) promptDiv.remove(); }, 10000);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Tab bar setup
-  // ---------------------------------------------------------------------------
-
-  setupTabBar(): void {
-    const tabsContainer = document.getElementById('tabsContainer');
-    const newTabBtn = document.getElementById('tabNewBtn');
-
-    newTabBtn?.addEventListener('click', () => this.createNewSession());
-
-    if (!tabsContainer) return;
-
-    tabsContainer.addEventListener('dragstart', (e: DragEvent) => {
-      const target = e.target as HTMLElement;
-      if (!target.classList.contains('session-tab')) return;
-      e.dataTransfer!.effectAllowed = 'copyMove';
-      const sid = target.dataset.sessionId;
-      if (sid) {
-        e.dataTransfer!.setData('text/plain', sid);
-        e.dataTransfer!.setData('application/x-session-id', sid);
-        e.dataTransfer!.setData('x-source-pane', '-1');
-      }
-      target.classList.add('dragging');
-    });
-
-    tabsContainer.addEventListener('dragend', (e: DragEvent) => {
-      const target = e.target as HTMLElement;
-      if (target.classList.contains('session-tab')) {
-        target.classList.remove('dragging');
-        this.syncOrderFromDom();
-        this.updateTabOverflow();
-        this.updateOverflowMenu();
-      }
-    });
-
-    tabsContainer.addEventListener('dragover', (e: DragEvent) => {
-      e.preventDefault();
-      const draggingTab = tabsContainer.querySelector('.dragging');
-      if (!draggingTab) return;
-      const afterElement = this.getDragAfterElement(tabsContainer, e.clientX);
-      if (!afterElement) {
-        tabsContainer.appendChild(draggingTab);
-      } else {
-        tabsContainer.insertBefore(draggingTab, afterElement);
-      }
-    });
-
-    tabsContainer.addEventListener('drop', (e: DragEvent) => {
-      e.preventDefault();
-    });
-  }
-
-  setupOverflowDropdown(): void {
-    const overflowBtn = document.getElementById('tabOverflowBtn');
-    const overflowMenu = document.getElementById('tabOverflowMenu');
-
-    overflowBtn?.addEventListener('click', (e: Event) => {
-      e.stopPropagation();
-      overflowMenu?.classList.toggle('active');
-      this.updateOverflowMenu();
-    });
-
-    document.addEventListener('click', (e: Event) => {
-      if (
-        !overflowMenu?.contains(e.target as Node) &&
-        !overflowBtn?.contains(e.target as Node)
-      ) {
-        overflowMenu?.classList.remove('active');
-      }
-    });
-
-    window.addEventListener('resize', () => {
-      this.updateTabOverflow();
-      this.updateOverflowMenu();
-    });
-  }
-
-  updateTabOverflow(): void {
     this.syncShell();
-    const isMobile = window.innerWidth <= 768;
-    const overflowWrapper = document.getElementById('tabOverflowWrapper');
-    const overflowCount = document.querySelector('.tab-overflow-count');
-
-    if (!isMobile) {
-      this.tabs.forEach((tab) => { tab.style.display = ''; });
-      if (overflowWrapper) overflowWrapper.style.display = 'none';
-      if (overflowCount) overflowCount.textContent = '';
-      return;
-    }
-
-    const tabsArray = this.getOrderedTabElements();
-    tabsArray.forEach((tab, index) => {
-      tab.style.display = index < 2 ? '' : 'none';
-    });
-
-    if (tabsArray.length > 2) {
-      if (overflowWrapper) {
-        overflowWrapper.style.display = 'flex';
-        if (overflowCount) overflowCount.textContent = String(tabsArray.length - 2);
-      }
-    } else {
-      if (overflowWrapper) overflowWrapper.style.display = 'none';
-      if (overflowCount) overflowCount.textContent = '';
-    }
-  }
-
-  updateOverflowMenu(): void {
-    this.syncShell();
-    const menu = document.getElementById('tabOverflowMenu');
-    if (!menu) return;
-
-    const overflowIds = this.getOrderedTabIds().slice(2);
-    menu.innerHTML = '';
-
-    overflowIds.forEach((sessionId) => {
-      const tabElement = this.tabs.get(sessionId);
-      const session = this.activeSessions.get(sessionId);
-      if (!tabElement || !session) return;
-
-      const item = document.createElement('div');
-      item.className = 'overflow-tab-item';
-      if (sessionId === this.activeTabId) item.classList.add('active');
-
-      // Re-interpolating the tab's textContent into innerHTML would undo the
-      // escaping addTab() applied, so set the name as text here too.
-      const nameEl = tabElement.querySelector('.tab-name');
-      item.innerHTML = `
-        <span class="overflow-tab-name"></span>
-        <span class="overflow-tab-close" title="Close tab">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
-        </span>
-      `;
-
-      const overflowName = item.querySelector('.overflow-tab-name') as HTMLElement | null;
-      if (overflowName) overflowName.textContent = nameEl?.textContent ?? '';
-
-      const overflowClose = item.querySelector('.overflow-tab-close') as HTMLElement | null;
-      if (overflowClose) overflowClose.dataset.sessionId = sessionId;
-
-      item.addEventListener('click', async (e: Event) => {
-        if (!(e.target as HTMLElement).classList.contains('overflow-tab-close')) {
-          await this.switchToTab(sessionId);
-          menu.classList.remove('active');
-          setTimeout(() => {
-            this.updateTabOverflow();
-            this.updateOverflowMenu();
-          }, 150);
-        }
-      });
-
-      const closeBtn = item.querySelector('.overflow-tab-close');
-      closeBtn?.addEventListener('click', (e: Event) => {
-        e.stopPropagation();
-        this.closeSession(sessionId);
-        menu.classList.remove('active');
-      });
-
-      menu.appendChild(item);
-    });
   }
 
   setupKeyboardShortcuts(): void {
@@ -481,21 +221,30 @@ export class SessionTabManager {
   // Session loading
   // ---------------------------------------------------------------------------
 
-  async loadSessions(): Promise<any[]> {
+  async loadSessions(): Promise<unknown[]> {
     try {
       const response = await fetch('/api/sessions/list');
       const data = await response.json();
-      const sessions: any[] = data.sessions || [];
+      const sessions: Array<Record<string, never>> = data.sessions || [];
 
-      sessions.forEach((session: any, index: number) => {
-        this.addTab(session.id, session.name, session.active ? 'active' : 'idle', session.workingDir, false);
+      sessions.forEach((raw, index: number) => {
+        const session = raw as unknown as {
+          id: string; name: string; active: boolean; workingDir: string | null;
+        };
+        this.addTab(
+          session.id,
+          session.name,
+          session.active ? 'active' : 'idle',
+          session.workingDir,
+          false,
+        );
         const sessionData = this.activeSessions.get(session.id);
         if (sessionData) {
           sessionData.lastAccessed = Date.now() - (sessions.length - index) * 1000;
         }
       });
 
-      if (window.innerWidth <= 768) {
+      if (this.app.isMobile) {
         this.reorderTabsByLastAccessed();
       }
 
@@ -517,74 +266,13 @@ export class SessionTabManager {
     workingDir: string | null = null,
     autoSwitch = true,
   ): void {
-    const tabsContainer = document.getElementById('tabsContainer');
-    if (!tabsContainer || this.tabs.has(sessionId)) return;
-
-    const tab = document.createElement('div');
-    tab.className = 'session-tab';
-    tab.dataset.sessionId = sessionId;
-    tab.draggable = true;
+    if (this.tabs.has(sessionId)) return;
 
     const isDefaultSessionName = sessionName.startsWith('Session ') && sessionName.includes(':');
     const folderName = workingDir ? workingDir.split('/').pop() || '/' : null;
     const displayName = !isDefaultSessionName ? sessionName : (folderName || sessionName);
 
-    // Session names and working directories are user-controlled and visible to
-    // other users in this multiuser app, so they are set as text, never parsed
-    // as HTML.
-    tab.innerHTML = `
-      <div class="tab-content">
-        <span class="tab-status"></span>
-        <span class="tab-name"></span>
-      </div>
-      <span class="tab-close" title="Close tab">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-        </svg>
-      </span>
-    `;
-
-    const statusEl = tab.querySelector('.tab-status') as HTMLElement | null;
-    if (statusEl) statusEl.className = `tab-status ${status}`;
-
-    const nameEl = tab.querySelector('.tab-name') as HTMLElement | null;
-    if (nameEl) {
-      nameEl.textContent = displayName;
-      nameEl.title = workingDir || sessionName;
-    }
-
-    tab.addEventListener('click', async (e: Event) => {
-      if (!(e.target as HTMLElement).closest('.tab-close')) {
-        await this.switchToTab(sessionId);
-      }
-    });
-
-    tab.querySelector('.tab-close')?.addEventListener('click', (e: Event) => {
-      e.stopPropagation();
-      this.closeSession(sessionId);
-    });
-
-    tab.addEventListener('dblclick', (e: Event) => {
-      if (!(e.target as HTMLElement).closest('.tab-close')) {
-        this.renameTab(sessionId);
-      }
-    });
-
-    tab.addEventListener('auxclick', (e: MouseEvent) => {
-      if (e.button === 1) {
-        e.preventDefault();
-        e.stopPropagation();
-        this.closeSession(sessionId);
-      }
-    });
-
-    tab.addEventListener('contextmenu', (e: MouseEvent) => {
-      e.preventDefault();
-      this.openTabContextMenu(sessionId, e.clientX, e.clientY);
-    });
-
-    tabsContainer.appendChild(tab);
-    this.tabs.set(sessionId, tab);
+    this.tabs.set(sessionId, { id: sessionId, displayName });
     if (!this.tabOrder.includes(sessionId)) {
       this.tabOrder.push(sessionId);
     }
@@ -600,8 +288,7 @@ export class SessionTabManager {
       hasError: false,
     });
 
-    this.updateTabOverflow();
-    this.updateOverflowMenu();
+    this.syncShell();
 
     if (this.tabs.size === 1 && autoSwitch) {
       this.switchToTab(sessionId);
@@ -619,13 +306,7 @@ export class SessionTabManager {
       return;
     }
 
-    this.tabs.forEach((tab) => tab.classList.remove('active'));
-
-    const tab = this.tabs.get(sessionId);
-    if (!tab) return;
-    tab.classList.add('active');
     this.activeTabId = sessionId;
-    this.ensureTabVisible(sessionId);
 
     const session = this.activeSessions.get(sessionId);
     if (session) {
@@ -637,51 +318,37 @@ export class SessionTabManager {
       this.updateTabHistory(sessionId);
     }
 
-    if (window.innerWidth <= 768) {
-      const tabIndex = this.getOrderedTabIds().indexOf(sessionId);
-      if (tabIndex >= 2) this.reorderTabsByLastAccessed();
-    }
-
-    this.updateOverflowMenu();
+    // The strip scrolls the active tab into view itself, so there is no longer
+    // any reason to shuffle the order on a narrow screen — reordering under a
+    // user who just tapped a tab is exactly the thing that made the old mobile
+    // strip feel unpredictable.
+    this.syncShell();
 
     await this.app.joinSession(sessionId);
     this.updateHeaderInfo(sessionId);
   }
 
   reorderTabsByLastAccessed(): void {
-    const tabsContainer = document.getElementById('tabsContainer');
-    if (!tabsContainer) return;
-
-    const sortedIds = this.getOrderedTabIds().sort((a, b) => {
+    this.tabOrder = this.getOrderedTabIds().sort((a, b) => {
       const sa = this.activeSessions.get(a);
       const sb = this.activeSessions.get(b);
       return (sb?.lastAccessed ?? 0) - (sa?.lastAccessed ?? 0);
     });
-
-    sortedIds.forEach((sessionId) => {
-      const el = this.tabs.get(sessionId);
-      if (el) tabsContainer.appendChild(el);
-    });
-
-    this.tabOrder = sortedIds;
-    this.updateTabOverflow();
+    this.syncShell();
   }
 
   closeSession(sessionId: string, { skipServerRequest = false } = {}): void {
-    const tab = this.tabs.get(sessionId);
-    if (!tab) return;
+    if (!this.tabs.has(sessionId)) return;
 
     const orderedIds = this.getOrderedTabIds();
     const closedIndex = orderedIds.indexOf(sessionId);
 
-    tab.remove();
     this.tabs.delete(sessionId);
     this.activeSessions.delete(sessionId);
     this.tabOrder = orderedIds.filter((id) => id !== sessionId);
     this.removeFromHistory(sessionId);
 
-    this.updateTabOverflow();
-    this.updateOverflowMenu();
+    this.syncShell();
 
     if (!skipServerRequest) {
       fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' }).catch(
@@ -698,47 +365,28 @@ export class SessionTabManager {
       }
       if (fallbackId) {
         this.switchToTab(fallbackId);
+      } else {
+        this.syncShell();
       }
     }
   }
 
-  renameTab(sessionId: string): void {
-    const tab = this.tabs.get(sessionId);
-    if (!tab) return;
+  /**
+   * Rename a tab.
+   *
+   * The label used to be edited in place by swapping the span for an input,
+   * which meant the name lived in the DOM and the rename was lost on any
+   * re-render. `RenameDialog` collects the name; this stores it.
+   */
+  renameTab(sessionId: string, newName: string): void {
+    const record = this.tabs.get(sessionId);
+    const name = newName.trim();
+    if (!record || !name) return;
 
-    const nameSpan = tab.querySelector('.tab-name') as HTMLElement | null;
-    if (!nameSpan) return;
-    const currentName = nameSpan.textContent || '';
-
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.value = currentName;
-    input.className = 'tab-name-input';
-    input.style.width = '100%';
-
-    nameSpan.replaceWith(input);
-    input.focus();
-    input.select();
-
-    const saveNewName = () => {
-      const newName = input.value.trim() || currentName;
-      const newNameSpan = document.createElement('span');
-      newNameSpan.className = 'tab-name';
-      newNameSpan.textContent = newName;
-      input.replaceWith(newNameSpan);
-
-      const session = this.activeSessions.get(sessionId);
-      if (session) session.name = newName;
-    };
-
-    input.addEventListener('blur', saveNewName);
-    input.addEventListener('keydown', (e: KeyboardEvent) => {
-      if (e.key === 'Enter') saveNewName();
-      else if (e.key === 'Escape') {
-        input.value = currentName;
-        saveNewName();
-      }
-    });
+    record.displayName = name;
+    const session = this.activeSessions.get(sessionId);
+    if (session) session.name = name;
+    this.syncShell();
   }
 
   closeOthers(sessionId: string): void {
@@ -747,37 +395,9 @@ export class SessionTabManager {
     });
   }
 
-  openTabContextMenu(sessionId: string, clientX: number, clientY: number): void {
-    document.querySelectorAll('.pane-session-menu').forEach((m) => m.remove());
-
-    const menu = document.createElement('div');
-    menu.className = 'pane-session-menu';
-
-    const addItem = (label: string, fn: () => void) => {
-      const el = document.createElement('div');
-      el.className = 'pane-session-item';
-      el.textContent = label;
-      el.onclick = () => { try { fn(); } finally { menu.remove(); } };
-      return el;
-    };
-
-    menu.appendChild(addItem('Close Others', () => this.closeOthers(sessionId)));
-    document.body.appendChild(menu);
-    menu.style.top = `${clientY + 4}px`;
-    menu.style.left = `${clientX + 4}px`;
-
-    const close = (ev: Event) => {
-      if (!menu.contains(ev.target as Node)) {
-        menu.remove();
-        document.removeEventListener('mousedown', close, true);
-      }
-    };
-    setTimeout(() => document.addEventListener('mousedown', close, true), 0);
-  }
-
   createNewSession(): void {
     this.app.isCreatingNewSession = true;
-    this.app.folderBrowser.show();
+    void this.app.folderBrowser.show();
   }
 
   // ---------------------------------------------------------------------------
@@ -813,50 +433,38 @@ export class SessionTabManager {
   // Status updates
   // ---------------------------------------------------------------------------
 
+  /**
+   * Publish the active session's working directory to the status bar.
+   *
+   * It used to write into `#workingDir`, an element that has not existed in the
+   * markup for some time — the lookup was defensive, so the feature had simply
+   * stopped happening without anything failing.
+   */
   updateHeaderInfo(sessionId: string): void {
     const session = this.activeSessions.get(sessionId);
-    if (session) {
-      const workingDirEl = document.getElementById('workingDir');
-      if (workingDirEl && session.workingDir) {
-        workingDirEl.textContent = session.workingDir;
-      }
-    }
+    if (!session) return;
+    const { connection } = shellStore.getSnapshot();
+    shellStore.setState({
+      connection: { ...connection, workingDir: session.workingDir },
+    });
   }
 
   updateTabStatus(sessionId: string, status: SessionInfo['status']): void {
-    const tab = this.tabs.get(sessionId);
-    if (!tab) return;
-
-    const statusEl = tab.querySelector('.tab-status');
-    if (statusEl) {
-      const session = this.activeSessions.get(sessionId);
-      const wasActive = session?.status === 'active';
-      const hasUnread = statusEl.classList.contains('unread');
-
-      statusEl.className = `tab-status ${status}`;
-
-      if (wasActive && status === 'idle' && sessionId !== this.activeTabId) {
-        statusEl.classList.add('unread');
-        if (session) session.unreadOutput = true;
-      } else if (hasUnread) {
-        statusEl.classList.add('unread');
-      }
-
-      if (status === 'active') {
-        statusEl.classList.add('pulse');
-      } else {
-        statusEl.classList.remove('pulse');
-      }
-    }
-
     const session = this.activeSessions.get(sessionId);
-    if (session) {
-      session.status = status;
-      session.lastActivity = Date.now();
-      if (status !== 'error') session.hasError = false;
+    if (!session) return;
+
+    const wasActive = session.status === 'active';
+
+    session.status = status;
+    session.lastActivity = Date.now();
+    if (status !== 'error') session.hasError = false;
+
+    // A session that was working and has gone quiet in the background is the
+    // one signal worth carrying on the tab, so the dot survives the transition.
+    if (wasActive && status === 'idle' && sessionId !== this.activeTabId) {
+      session.unreadOutput = true;
     }
 
-    // After the mutation, not before: the shell renders the status dot.
     this.syncShell();
   }
 
@@ -881,7 +489,6 @@ export class SessionTabManager {
           if (wasActive && sessionId !== this.activeTabId) {
             const sessionName = s.name || 'Session';
             const duration = Date.now() - previousActivity;
-            s.unreadOutput = true;
             this.updateUnreadIndicator(sessionId, true);
             this.sendNotification(
               `${sessionName} -- ${this.getAlias('claude')} appears finished`,
@@ -898,15 +505,11 @@ export class SessionTabManager {
     }
 
     if (hasOutput && outputData) {
-      this.checkForCommandCompletion(sessionId, outputData, previousActivity);
+      this.checkForCommandCompletion(sessionId, outputData);
     }
   }
 
-  private checkForCommandCompletion(
-    sessionId: string,
-    outputData: string,
-    previousActivity: number,
-  ): void {
+  private checkForCommandCompletion(sessionId: string, outputData: string): void {
     const session = this.activeSessions.get(sessionId);
     if (!session) return;
 
@@ -917,7 +520,7 @@ export class SessionTabManager {
       /deployment\s+complete/i,
       /npm\s+install.*completed/i,
       /successfully\s+compiled/i,
-      /\u2713\s+All\s+tests\s+passed/i,
+      /✓\s+All\s+tests\s+passed/i,
       /Done\s+in\s+\d+\.\d+s/i,
     ];
 
@@ -929,27 +532,16 @@ export class SessionTabManager {
       else if (/tests?\s+passed/i.test(outputData)) message = 'All tests passed';
       else if (/deployment\s+complete/i.test(outputData)) message = 'Deployment completed';
 
-      session.unreadOutput = true;
       this.updateUnreadIndicator(sessionId, true);
       this.sendNotification(session.name || 'Session', message, sessionId);
     }
   }
 
   updateUnreadIndicator(sessionId: string, hasUnread: boolean): void {
-    const tab = this.tabs.get(sessionId);
-    if (tab) {
-      const statusEl = tab.querySelector('.tab-status');
-      if (hasUnread) {
-        tab.classList.add('has-unread');
-        statusEl?.classList.add('unread');
-      } else {
-        tab.classList.remove('has-unread');
-        statusEl?.classList.remove('unread');
-      }
-    }
-
     const session = this.activeSessions.get(sessionId);
-    if (session) session.unreadOutput = hasUnread;
+    if (!session || session.unreadOutput === hasUnread) return;
+    session.unreadOutput = hasUnread;
+    this.syncShell();
   }
 
   markSessionError(sessionId: string, hasError = true): void {
@@ -964,24 +556,8 @@ export class SessionTabManager {
         'A command has failed or the session encountered an error',
         sessionId,
       );
+    } else {
+      this.syncShell();
     }
-  }
-
-  getDragAfterElement(container: HTMLElement, x: number): HTMLElement | undefined {
-    const draggableElements = Array.from(
-      container.querySelectorAll<HTMLElement>('.session-tab:not(.dragging)'),
-    );
-
-    return draggableElements.reduce<{ offset: number; element: HTMLElement | undefined }>(
-      (closest, child) => {
-        const box = child.getBoundingClientRect();
-        const offset = x - box.left - box.width / 2;
-        if (offset < 0 && offset > closest.offset) {
-          return { offset, element: child };
-        }
-        return closest;
-      },
-      { offset: Number.NEGATIVE_INFINITY, element: undefined },
-    ).element;
   }
 }

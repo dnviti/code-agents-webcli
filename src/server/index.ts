@@ -1,6 +1,7 @@
 import express from 'express';
 import http from 'http';
 import https from 'https';
+import net from 'net';
 import fs from 'node:fs';
 import path from 'node:path';
 import WebSocket from 'ws';
@@ -38,6 +39,7 @@ import { SessionTeardownRegistry } from './services/session-teardown.js';
 import { PasteStore } from './services/paste-store.js';
 import { readBuildInfo } from './services/build-info.js';
 import { UpdateChecker } from './services/update-check.js';
+import { ensureCertificates, createHttpsOnlyPort, caCertificateHandler } from './services/tls.js';
 import {
   InterruptedUpdate,
   SelfUpdateRunner,
@@ -95,6 +97,14 @@ export class ClaudeCodeWebServer {
 
   private app: express.Express;
   private server: http.Server | https.Server | null;
+  /**
+   * The socket actually bound to the port. It is not the https server: that one
+   * is fed connections by the demultiplexer in createTlsPort(), so it never
+   * listens and closing it alone would leave the port held.
+   */
+  private listener: net.Server | null;
+  /** The local CA, when one was generated; offered at /ca.crt for other devices. */
+  private caFile: string | undefined;
   private wss: WebSocket.Server | null;
 
   private wsHandler: WebSocketHandler;
@@ -118,6 +128,8 @@ export class ClaudeCodeWebServer {
 
     this.autoSaveInterval = null;
     this.server = null;
+    this.listener = null;
+    this.caFile = undefined;
     this.wss = null;
 
     this.claudeSessions = new Map();
@@ -434,15 +446,19 @@ export class ClaudeCodeWebServer {
     this.webSocketConnections.clear();
 
     await new Promise<void>((resolve) => {
-      if (this.server && this.server.listening) {
-        // server.close() waits for every open connection, and a WebSocket is
-        // never idle, so shutdown would hang forever with any client attached.
-        // Close the WebSocket server (which terminates its sockets) first, and
-        // keep a deadline as a backstop.
+      // The port is held by the demultiplexer, not by the https server, so it
+      // is the one that has to be closed; closing the https server would return
+      // immediately and leave the address in use on the next start.
+      const bound = this.listener || this.server;
+      if (bound && bound.listening) {
+        // close() waits for every open connection, and a WebSocket is never
+        // idle, so shutdown would hang forever with any client attached. Close
+        // the WebSocket server (which terminates its sockets) first, and keep a
+        // deadline as a backstop.
         const timeout = setTimeout(() => resolve(), 5000);
         timeout.unref?.();
 
-        this.server.close(() => {
+        bound.close(() => {
           clearTimeout(timeout);
           resolve();
         });
@@ -451,6 +467,7 @@ export class ClaudeCodeWebServer {
       }
     });
 
+    this.listener = null;
     this.server = null;
     this.database.close();
   }
@@ -467,6 +484,12 @@ export class ClaudeCodeWebServer {
     this.app.get('/auth/github/callback', this.authService.handleGitHubCallback);
     this.app.get('/auth/logout', this.authService.handleLogout);
     this.app.get('/api/auth/me', this.authService.handleCurrentUser);
+
+    // The local CA, offered before sign-in on purpose: a device that does not
+    // trust it cannot complete a TLS handshake it would believe, so requiring a
+    // login first would be a lock whose key is behind the lock. It is a public
+    // certificate and carries no private key.
+    this.app.get('/ca.crt', caCertificateHandler(() => this.caFile));
 
     this.app.get('/manifest.json', (_req, res) => {
       res.setHeader('Content-Type', 'application/manifest+json');
@@ -486,26 +509,13 @@ export class ClaudeCodeWebServer {
 
     this.app.use(express.static(publicDir, { index: false }));
 
-    const iconSizes = [16, 32, 144, 180, 192, 512];
-    iconSizes.forEach((size) => {
-      // These are SVG documents, so they are also served at .svg URLs and the
-      // manifest points there: declaring image/png for SVG bytes made the PWA
-      // fail its installability check.
-      this.app.get([`/icon-${size}.svg`, `/icon-${size}.png`], (_req, res) => {
-        const svg = `
-          <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">
-            <rect width="${size}" height="${size}" fill="#0d1117" rx="${size * 0.12}"/>
-            <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle"
-                  font-family="monospace" font-size="${size * 0.36}px" font-weight="bold" fill="#58a6ff">
-              CA
-            </text>
-          </svg>
-        `;
-        res.setHeader('Content-Type', 'image/svg+xml');
-        res.setHeader('Cache-Control', 'public, max-age=31536000');
-        res.send(Buffer.from(svg));
-      });
-    });
+    // The icons used to be generated here: one route answered both /icon-N.svg
+    // and /icon-N.png with the same SVG document. That is why the app could not
+    // be installed on iOS — apple-touch-icon must be a real PNG and Safari
+    // ignores anything else — and why the mark was still the old palette long
+    // after the UI stopped using it. They are designed assets under
+    // src/public/icons now, rasterised from assets/icon.svg at build time and
+    // served by express.static above with the right content types.
 
     registerRoutes(this.app, {
       claudeSessions: this.claudeSessions,
@@ -606,31 +616,52 @@ export class ClaudeCodeWebServer {
     // runSetupIfNeeded(); this stays as the safety net.
     await this.authService.ensureConfiguredInteractive(false);
 
-    let server: http.Server | https.Server;
-    if (this.useHttps) {
-      if (!this.certFile || !this.keyFile) {
-        throw new Error('HTTPS requires both --cert and --key options');
-      }
-      const cert = fs.readFileSync(this.certFile);
-      const key = fs.readFileSync(this.keyFile);
-      server = https.createServer({ cert, key }, this.app);
-    } else {
-      server = http.createServer(this.app);
+    // HTTPS is not optional. A plain-http origin that is not localhost is not a
+    // secure context, and the browser then withholds the service worker — so no
+    // installable app, no offline shell, no clipboard, no notifications. Those
+    // all worked when tested at http://localhost and were missing for anyone
+    // opening the same server at http://192.168.x.x, which is the normal way to
+    // use it. An explicit --cert/--key pair still wins; otherwise a local CA is
+    // generated in the data directory.
+    if (this.certFile && !this.keyFile) {
+      throw new Error('--cert was given without --key; a certificate needs both.');
+    }
+    if (this.keyFile && !this.certFile) {
+      throw new Error('--key was given without --cert; a certificate needs both.');
     }
 
-    this.wss = new WebSocket.Server({ server });
+    if (!this.certFile || !this.keyFile) {
+      const material = ensureCertificates(this.dataDir);
+      this.certFile = material.certFile;
+      this.keyFile = material.keyFile;
+      this.caFile = material.caFile;
+      if (material.issued) {
+        console.log(`Issued a TLS certificate for: ${material.hosts.join(', ')}`);
+      }
+    }
+
+    const secure = https.createServer(
+      { cert: fs.readFileSync(this.certFile), key: fs.readFileSync(this.keyFile) },
+      this.app,
+    );
+
+    this.wss = new WebSocket.Server({ server: secure });
     this.wss.on('connection', (ws: WebSocket, req) => {
       this.wsHandler.handleConnection(ws, req);
     });
 
+    const server = createHttpsOnlyPort(secure);
+
     return await new Promise((resolve, reject) => {
       server.listen(this.port, () => {
-        this.server = server;
-        resolve(server);
+        this.server = secure;
+        this.listener = server;
+        resolve(secure);
       });
       server.on('error', reject);
     });
   }
+
 
   close(): void {
     void this.shutdown();

@@ -1,21 +1,21 @@
 /*
  * Main CSS Entry Point
- * Imports all modular CSS files in the correct order.
- * Variables must come first so they are available to all other modules.
+ *
+ * The component stylesheets are gone: every panel, bar, dialog, sheet and toast
+ * they styled is a Relay component now, and Relay components carry their own
+ * styles inline against the design tokens. What is left is the cascade the
+ * terminal needs: the Nerd Font faces, a small reset, and the layout of the one
+ * element React does not own.
+ *
+ * The legacy token and theme files went with them. They declared twelve names
+ * that Relay also declares — --accent, --border, --radius-sm/md/lg, --shadow-*
+ * — and they loaded *after* relay.css, so the design system's own values were
+ * being silently overridden in every component: --accent resolved to a solid
+ * blue where Relay expects a subtle hover wash, and the sharp 0px radii came
+ * out as 12/18/28px. Relay owns the token layer now, alone.
  */
 
 @import url('./fonts.css');
-@import url('./variables.css');
 @import url('./base.css');
 @import url('./layout.css');
-@import url('./components/tabs.css');
 @import url('./components/terminal.css');
-@import url('./components/overlay.css');
-@import url('./components/buttons.css');
-@import url('./components/modals.css');
-@import url('./components/folder-browser.css');
-@import url('./components/mobile.css');
-@import url('./components/notifications.css');
-@import url('./components/update-banner.css');
-@import url('./themes/dark.css');
-@import url('./themes/light.css');

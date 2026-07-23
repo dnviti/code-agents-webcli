@@ -14,21 +14,52 @@
    does it in parallel instead, so the import is deliberately not reproduced
    here. Every stack below falls back to a system font if the fetch fails. */
 
-/* The shell is a flex child of #app, not an overlay, so that in-flow siblings
-   such as the update banner keep their row above it. */
+/* The shell owns the whole viewport; #app has no other in-flow children. */
 #relayRoot {
   flex: 1;
   min-height: 0;
   display: flex;
 }
 
-/* Transitional. SessionTabManager still builds the old tab strip as its own
-   bookkeeping — tabs are `Map<string, HTMLElement>` and several of its methods
-   read back from those nodes — while the Relay TabBar renders the visible one
-   from the store. Hiding rather than deleting keeps that machinery intact until
-   the tab manager stops owning DOM. Delete this rule and the markup together. */
-#sessionTabsBar {
-  display: none !important;
+:root {
+  /* The terminal's only remaining chrome. One value, one place. */
+  --terminal-padding: 10px 12px;
+  /* Published so the toast stack can sit clear of whichever bar owns the
+     bottom edge. Both must match the components that draw them. */
+  --mobile-bar-height: 56px;
+  --status-bar-height: 24px;
+}
+
+@media (max-width: 480px) {
+  :root {
+    --terminal-padding: 6px 8px;
+  }
+}
+
+@keyframes relay-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes relay-slide-up {
+  from { transform: translateY(12px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The sheet, the toasts and the spinner all animate; none of them carry
+     meaning that survives only in the motion. */
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* The tab strip scrolls horizontally. A scrollbar inside a 38px-tall row would
+   take a third of its height, and every tab is reachable by wheel, touch and
+   the arrow keys without one. */
+.relay-tabstrip::-webkit-scrollbar {
+  display: none;
 }
 
 .ricon svg {
