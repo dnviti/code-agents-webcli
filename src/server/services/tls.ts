@@ -272,3 +272,40 @@ export function createHttpsOnlyPort(secure: https.Server): net.Server {
     socket.on('error', () => socket.destroy());
   });
 }
+
+/**
+ * Serve the local CA so a device can trust this server.
+ *
+ * Deliberately reads the file rather than handing the path to res.sendFile():
+ * express refuses any path containing a dot-segment by default, and the data
+ * directory is `~/.code-agents-webcli`. sendFile() answered every request with
+ * a bare 404 while the file sat there readable — no error, no log, and no way
+ * for anyone to onboard a phone.
+ */
+export function caCertificateHandler(
+  getCaFile: () => string | undefined,
+): (req: unknown, res: CertificateResponse) => void {
+  return (_req, res) => {
+    const caFile = getCaFile();
+    if (!caFile || !fs.existsSync(caFile)) {
+      res.status(404);
+      res.setHeader('Content-Type', 'text/plain');
+      res.send(
+        'This server is using a certificate supplied with --cert, '
+        + 'so there is no local CA to install.\n',
+      );
+      return;
+    }
+
+    res.setHeader('Content-Type', 'application/x-x509-ca-cert');
+    res.setHeader('Content-Disposition', 'attachment; filename="code-agents-webcli-ca.crt"');
+    res.send(fs.readFileSync(caFile));
+  };
+}
+
+/** The slice of an express response this handler needs. */
+export interface CertificateResponse {
+  status(code: number): unknown;
+  setHeader(name: string, value: string): unknown;
+  send(body: string | Buffer): unknown;
+}

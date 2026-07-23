@@ -39,7 +39,7 @@ import { SessionTeardownRegistry } from './services/session-teardown.js';
 import { PasteStore } from './services/paste-store.js';
 import { readBuildInfo } from './services/build-info.js';
 import { UpdateChecker } from './services/update-check.js';
-import { ensureCertificates, createHttpsOnlyPort } from './services/tls.js';
+import { ensureCertificates, createHttpsOnlyPort, caCertificateHandler } from './services/tls.js';
 import {
   InterruptedUpdate,
   SelfUpdateRunner,
@@ -489,17 +489,7 @@ export class ClaudeCodeWebServer {
     // trust it cannot complete a TLS handshake it would believe, so requiring a
     // login first would be a lock whose key is behind the lock. It is a public
     // certificate and carries no private key.
-    this.app.get('/ca.crt', (_req, res) => {
-      if (!this.caFile || !fs.existsSync(this.caFile)) {
-        res.status(404).type('text/plain').send(
-          'This server is using a certificate supplied with --cert, so there is no local CA to install.\n',
-        );
-        return;
-      }
-      res.setHeader('Content-Type', 'application/x-x509-ca-cert');
-      res.setHeader('Content-Disposition', 'attachment; filename="code-agents-webcli-ca.crt"');
-      res.sendFile(this.caFile);
-    });
+    this.app.get('/ca.crt', caCertificateHandler(() => this.caFile));
 
     this.app.get('/manifest.json', (_req, res) => {
       res.setHeader('Content-Type', 'application/manifest+json');

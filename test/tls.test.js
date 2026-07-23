@@ -80,6 +80,63 @@ describeBuilt('TLS material', function () {
   });
 });
 
+// Every device has to fetch /ca.crt before it can trust this server, so the
+// route is the front door to the whole arrangement. It answered 404 for every
+// request while the file sat there readable: express refuses any path with a
+// dot-segment, and the data directory is `~/.code-agents-webcli`. There was no
+// error and no log — just a phone that could not be onboarded.
+describeBuilt('CA certificate route', function () {
+  this.timeout(30000);
+
+  let tls;
+  let dir;
+  let caFile;
+
+  before(function () {
+    tls = require(tlsModule);
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-ca-'));
+    // A dot-directory, because that is what the real data directory is.
+    const dotted = path.join(dir, '.code-agents-webcli');
+    fs.mkdirSync(dotted, { recursive: true });
+    caFile = tls.ensureCertificates(dotted).caFile;
+    assert.ok(caFile.includes('/.code-agents-webcli/'), 'the fixture must use a dot-segment');
+  });
+
+  after(function () {
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function invoke(getCaFile) {
+    const res = {
+      statusCode: 200,
+      headers: {},
+      body: null,
+      status(code) { this.statusCode = code; return this; },
+      setHeader(name, value) { this.headers[name.toLowerCase()] = value; return this; },
+      send(body) { this.body = body; return this; },
+    };
+    tls.caCertificateHandler(getCaFile)({}, res);
+    return res;
+  }
+
+  it('serves the certificate from a dot-directory', function () {
+    const res = invoke(() => caFile);
+    assert.strictEqual(res.statusCode, 200, 'a dot-segment in the path must not 404');
+    assert.ok(
+      res.body.toString().startsWith('-----BEGIN CERTIFICATE-----'),
+      'the body must be the PEM certificate',
+    );
+    assert.strictEqual(res.headers['content-type'], 'application/x-x509-ca-cert');
+    assert.match(res.headers['content-disposition'], /filename="code-agents-webcli-ca\.crt"/);
+  });
+
+  it('explains itself when the deployment brought its own certificate', function () {
+    const res = invoke(() => undefined);
+    assert.strictEqual(res.statusCode, 404);
+    assert.match(res.body.toString(), /--cert/);
+  });
+});
+
 describeBuilt('HTTPS-only port', function () {
   this.timeout(30000);
 
