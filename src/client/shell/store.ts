@@ -4,6 +4,13 @@
 // PTY transport and xterm. React only renders chrome, and reads it from here.
 // Keeping the flow one-directional is what stops a re-render from being able to
 // disturb a live terminal: the shell never owns session state, it mirrors it.
+//
+// Every surface the app has — tab strip, dialogs, overlay, toasts, banner,
+// mobile bar — is now rendered from this one snapshot. The imperative modules
+// that used to call `document.getElementById(...).classList.add('active')` call
+// `shellStore.setState({ ... })` instead and keep the rest of their logic.
+
+import type { SessionListItem } from '../types';
 
 export type ShellTabStatus = 'running' | 'error' | 'idle';
 
@@ -11,7 +18,7 @@ export interface ShellTab {
   id: string;
   title: string;
   status: ShellTabStatus;
-  /** Which runtime this session is, used to group the sidebar. */
+  /** Which runtime this session is. Not yet plumbed through from the server. */
   kind: string;
   workingDir: string | null;
   unread: boolean;
@@ -22,22 +29,157 @@ export interface ShellConnection {
   workingDir: string | null;
 }
 
+/**
+ * Which single-purpose panel the connection overlay is showing.
+ *
+ * `null` is "no overlay". The three views are the same three the old
+ * `#overlay > .overlay-content` switched between, so `showOverlay()` keeps its
+ * meaning and all of its call sites.
+ */
+export type OverlayView = 'loading' | 'start' | 'error' | null;
+
+export interface ShellDialogs {
+  settings: boolean;
+  newSession: boolean;
+  terminalOptions: boolean;
+  /** The session list, reachable from the mobile bar and the palette. */
+  sessions: boolean;
+  /** The mobile "More" sheet. */
+  more: boolean;
+  /** Session id being renamed, or null. Doubles as the open flag. */
+  rename: string | null;
+}
+
+export interface FolderEntry {
+  name: string;
+  path: string;
+}
+
+export interface FolderState {
+  open: boolean;
+  path: string | null;
+  parentPath: string | null;
+  entries: FolderEntry[];
+  showHidden: boolean;
+  loading: boolean;
+  /** True while the inline "new folder" row is open. */
+  creating: boolean;
+}
+
+export type ToastVariant = 'info' | 'error';
+
+export interface ToastItem {
+  id: number;
+  message: string;
+  variant: ToastVariant;
+}
+
+/**
+ * The update banner, flattened to exactly what it paints.
+ *
+ * `update-banner.ts` still owns polling, the apply request and the restart
+ * poll; it derives this and hands it over. `log` is pre-joined so the whole
+ * object stays one level deep, which is all `shallowEqual` below compares.
+ */
+export interface BannerView {
+  tone: string;
+  text: string;
+  actionLabel: string | null;
+  showLog: boolean;
+  logOpen: boolean;
+  dismissible: boolean;
+  log: string;
+}
+
+export type InstallState =
+  | 'installed'
+  | 'available'
+  | 'ios'
+  | 'insecure'
+  | 'blocked'
+  | 'unsupported';
+
 export interface ShellState {
   tabs: ShellTab[];
   activeId: string | null;
   connection: ShellConnection;
-  sidebarOpen: boolean;
   paletteOpen: boolean;
   theme: 'dark' | 'light';
+  /** Set once at boot from `detectMobile()`; drives the bottom bar. */
+  isMobile: boolean;
+  dialogs: ShellDialogs;
+  folder: FolderState;
+  overlay: OverlayView;
+  /** Replaces the loading view's default line; empty means use the default. */
+  overlayMessage: string;
+  errorText: string;
+  /** Formatted plan text, or null when the plan dialog is closed. */
+  plan: string | null;
+  toasts: ToastItem[];
+  /** Backing list for the sessions sheet. */
+  sessionList: SessionListItem[];
+  banner: BannerView | null;
+  /** GitHub login of the signed-in user, when the server reports one. */
+  user: string | null;
+  /** Sign-out URL, when the deployment has auth enabled. */
+  logoutUrl: string | null;
+  /**
+   * Whether this window can become an installed app.
+   *
+   * `available` means a deferred `beforeinstallprompt` is in hand. `ios` means
+   * the browser can install but only through its own share sheet, so the UI has
+   * to explain rather than offer a button.
+   *
+   * `insecure` is the one people actually hit here: this server is normally
+   * reached at http://<host>:32352 from another machine, and a plain-http
+   * origin that is not localhost gets no service worker and no install prompt
+   * however capable the browser is. It is separate from `unsupported` because
+   * the two need opposite advice — one is fixed by changing the URL, the other
+   * cannot be fixed at all.
+   *
+   * `blocked` is the https version of the same trap: the page loads, the scheme
+   * says secure, and the browser still refuses the service worker because it
+   * does not trust the certificate. Nothing about that is visible from the page
+   * except that the worker never becomes ready.
+   */
+  install: InstallState;
 }
+
 
 const INITIAL: ShellState = {
   tabs: [],
   activeId: null,
   connection: { state: 'disconnected', workingDir: null },
-  sidebarOpen: true,
   paletteOpen: false,
   theme: 'dark',
+  isMobile: false,
+  dialogs: {
+    settings: false,
+    newSession: false,
+    terminalOptions: false,
+    sessions: false,
+    more: false,
+    rename: null,
+  },
+  folder: {
+    open: false,
+    path: null,
+    parentPath: null,
+    entries: [],
+    showHidden: false,
+    loading: false,
+    creating: false,
+  },
+  overlay: null,
+  overlayMessage: '',
+  errorText: '',
+  plan: null,
+  toasts: [],
+  sessionList: [],
+  banner: null,
+  user: null,
+  logoutUrl: null,
+  install: 'unsupported',
 };
 
 export class ShellStore {
@@ -72,6 +214,19 @@ export class ShellStore {
     if (!changed) return;
     this.state = next;
     for (const listener of this.listeners) listener();
+  }
+
+  /**
+   * Merge a patch into one nested slice.
+   *
+   * `setState({ dialogs: { settings: true } })` would drop every other dialog
+   * flag, so each caller would otherwise have to spread the current slice by
+   * hand. Doing it here means a caller that only knows about its own field
+   * cannot silently close somebody else's panel.
+   */
+  patchSlice<K extends 'dialogs' | 'folder'>(key: K, patch: Partial<ShellState[K]>): void {
+    const merged = { ...this.state[key], ...patch };
+    this.setState({ [key]: merged } as Partial<ShellState>);
   }
 
   /**

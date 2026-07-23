@@ -1,8 +1,8 @@
 // Configuration: load server config and provide alias helpers
 
 import type { App } from './app';
-import type { AgentKind, Aliases, RuntimeStartOptions } from './types';
-import * as icons from './utils/icons';
+import type { AgentKind, RuntimeStartOptions } from './types';
+import { shellStore } from './shell/store';
 
 export async function loadConfig(app: App): Promise<void> {
   try {
@@ -25,16 +25,10 @@ export async function loadConfig(app: App): Promise<void> {
         app.folderMode = cfg.folderMode;
       }
 
-      const currentUserBadge = document.getElementById('currentUserBadge');
-      const logoutLink = document.getElementById('logoutLink') as HTMLAnchorElement | null;
-      if (cfg?.currentUser && currentUserBadge) {
-        currentUserBadge.textContent = `@${cfg.currentUser.githubLogin}`;
-        currentUserBadge.style.display = 'inline-flex';
-      }
-      if (cfg?.logoutUrl && logoutLink) {
-        logoutLink.href = cfg.logoutUrl;
-        logoutLink.style.display = 'inline-flex';
-      }
+      shellStore.setState({
+        user: cfg?.currentUser?.githubLogin ?? null,
+        logoutUrl: cfg?.logoutUrl ?? null,
+      });
     }
   } catch {
     // best-effort
@@ -113,39 +107,4 @@ export function getRuntimeStartMessage(
   return options.dangerouslySkipPermissions
     ? `Starting ${getAlias(app, 'claude')} (skipping permissions)...`
     : `Starting ${getAlias(app, 'claude')}...`;
-}
-
-export function applyAliasesToUI(app: App): void {
-  const startBtn = document.getElementById('startBtn');
-  const dangerousSkipBtn = document.getElementById('dangerousSkipBtn');
-  const startCodexBtn = document.getElementById('startCodexBtn');
-  const dangerousCodexBtn = document.getElementById('dangerousCodexBtn');
-  const startAgentBtn = document.getElementById('startAgentBtn');
-  const startPiBtn = document.getElementById('startPiBtn');
-  const startGrokBtn = document.getElementById('startGrokBtn');
-  const dangerousGrokBtn = document.getElementById('dangerousGrokBtn');
-  const startQwenBtn = document.getElementById('startQwenBtn');
-  const dangerousQwenBtn = document.getElementById('dangerousQwenBtn');
-  const startKimiBtn = document.getElementById('startKimiBtn');
-  const dangerousKimiBtn = document.getElementById('dangerousKimiBtn');
-  const startTerminalBtn = document.getElementById('startTerminalBtn');
-
-  if (startBtn) startBtn.textContent = `Start ${getAlias(app, 'claude')}`;
-  if (dangerousSkipBtn) dangerousSkipBtn.textContent = `Dangerous ${getAlias(app, 'claude')}`;
-  if (startCodexBtn) startCodexBtn.textContent = `Start ${getAlias(app, 'codex')}`;
-  if (dangerousCodexBtn) dangerousCodexBtn.textContent = `Dangerous ${getAlias(app, 'codex')}`;
-  if (startAgentBtn) startAgentBtn.textContent = `Start ${getAlias(app, 'agent')}`;
-  if (startPiBtn) startPiBtn.textContent = `Start ${getAlias(app, 'pi')}`;
-  if (startGrokBtn) startGrokBtn.textContent = `Start ${getAlias(app, 'grok')}`;
-  if (dangerousGrokBtn) dangerousGrokBtn.textContent = `Dangerous ${getAlias(app, 'grok')}`;
-  if (startQwenBtn) startQwenBtn.textContent = `Start ${getAlias(app, 'qwen')}`;
-  if (dangerousQwenBtn) dangerousQwenBtn.textContent = `Dangerous ${getAlias(app, 'qwen')}`;
-  if (startKimiBtn) startKimiBtn.textContent = `Start ${getAlias(app, 'kimi')}`;
-  if (dangerousKimiBtn) dangerousKimiBtn.textContent = `Dangerous ${getAlias(app, 'kimi')}`;
-  if (startTerminalBtn) startTerminalBtn.textContent = `Start ${getAlias(app, 'terminal')}`;
-
-  const planTitle = document.querySelector('#planModal .modal-header h2');
-  if (planTitle) {
-    planTitle.innerHTML = `<span class="icon" aria-hidden="true">${icons.clipboard(18)}</span> ${getAlias(app, 'claude')}'s Plan`;
-  }
 }

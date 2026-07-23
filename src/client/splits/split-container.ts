@@ -416,11 +416,11 @@ export class SplitContainer {
       this.app.currentClaudeSessionId = split.sessionId;
 
       if (this.app.sessionTabManager) {
-        this.app.sessionTabManager.tabs.forEach((t, id) => {
-          if (id === split.sessionId) t.classList.add('active');
-          else t.classList.remove('active');
-        });
+        // Setting activeTabId is the whole job now. The strip used to be told
+        // separately by toggling an `active` class on each tab node, which meant
+        // focusing a split could leave the id and the highlight disagreeing.
         this.app.sessionTabManager.activeTabId = split.sessionId;
+        this.app.sessionTabManager.syncShell();
       }
     }
   }

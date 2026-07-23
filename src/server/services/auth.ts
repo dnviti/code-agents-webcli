@@ -601,12 +601,10 @@ function renderLoginPage(next: string): string {
   return renderPage(
     'Code Agents Web CLI',
     `
-      <div class="card">
-        <span class="eyebrow">Secure Access</span>
-        <h1>Sign in with GitHub</h1>
-        <p>This installation uses GitHub OAuth identities for all internal users. Your runtime sessions stay isolated per user in the local SQLite database.</p>
-        <a class="button" href="/auth/github/login?next=${encodeURIComponent(next)}">Continue with GitHub</a>
-      </div>
+      <span class="eyebrow">Secure access</span>
+      <h1>Sign in with GitHub</h1>
+      <p>Every user signs in with a GitHub identity. Sessions stay isolated per user in the local database.</p>
+      <a class="button" href="/auth/github/login?next=${encodeURIComponent(next)}">Continue with GitHub</a>
     `,
   );
 }
@@ -615,11 +613,9 @@ function renderSetupRequiredPage(): string {
   return renderPage(
     'Setup Required',
     `
-      <div class="card">
-        <span class="eyebrow">Setup Required</span>
-        <h1>GitHub OAuth is not configured</h1>
-        <p>Run the server once in an interactive terminal so it can ask for the GitHub OAuth client ID, client secret, and the optional GitHub App token.</p>
-      </div>
+      <span class="eyebrow">Setup required</span>
+      <h1>GitHub OAuth is not configured</h1>
+      <p>Run the server once in an interactive terminal, or start it with <code>--setup</code>, so it can ask for the OAuth client ID, the client secret and the optional GitHub App token.</p>
     `,
   );
 }
@@ -628,87 +624,165 @@ function renderAuthErrorPage(message: string): string {
   return renderPage(
     'Authentication Error',
     `
-      <div class="card">
-        <span class="eyebrow">Authentication Error</span>
-        <h1>GitHub sign-in failed</h1>
-        <p>${escapeHtml(message)}</p>
-        <a class="button secondary" href="/login">Back to login</a>
-      </div>
+      <span class="eyebrow">Authentication error</span>
+      <h1>GitHub sign-in failed</h1>
+      <p class="error">${escapeHtml(message)}</p>
+      <a class="button secondary" href="/login">Back to sign in</a>
     `,
   );
 }
 
+/**
+ * The shell for the pages served before a user is signed in.
+ *
+ * These are the first thing anyone sees, and until now they were the last part
+ * of the app still speaking the old visual language: 28px radii, blue
+ * gradients, radial glows over #0d1117 — everything the interface behind them
+ * stopped using.
+ *
+ * They link the real design tokens rather than restating their values. That is
+ * the whole point: a token change reaches the login screen without anyone
+ * remembering this file exists. /css/relay/relay.css is static and sits ahead
+ * of requireAuth, so it is reachable while signed out.
+ */
 function renderPage(title: string, body: string): string {
   return `<!DOCTYPE html>
   <html lang="en">
     <head>
       <meta charset="utf-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
       <title>${escapeHtml(title)}</title>
+      <meta name="theme-color" content="#0a0a0a" />
+      <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+      <link rel="icon" type="image/svg+xml" href="/icons/icon.svg" />
+      <link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-180.png" />
+      <link rel="stylesheet" href="/css/relay/relay.css" />
+      <script>
+        // The app stores its mode under this key and signals light with a class
+        // on <html>. Reading it here stops a dark sign-in page from flashing in
+        // front of a light app. Inline and before paint, so there is no flash
+        // to fix afterwards.
+        (function () {
+          try {
+            if (localStorage.getItem('cc-web-relay-theme') === 'light') {
+              document.documentElement.classList.add('light');
+            }
+          } catch (e) { /* private mode; dark is the default anyway */ }
+        })();
+      </script>
       <style>
-        :root {
-          color-scheme: dark;
-          font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        }
         body {
-          margin: 0;
-          min-height: 100vh;
           display: grid;
           place-items: center;
-          background:
-            radial-gradient(circle at top left, rgba(88, 166, 255, 0.2), transparent 28%),
-            radial-gradient(circle at bottom right, rgba(63, 185, 80, 0.12), transparent 24%),
-            #0d1117;
-          color: #f0f6fc;
+          padding: 24px;
+          /* relay.css hides body overflow for the app shell, which owns the
+             viewport. These pages are a centred card that must be able to
+             scroll on a short window. */
+          overflow: auto;
         }
         .card {
-          width: min(560px, calc(100vw - 32px));
-          padding: 32px;
-          border: 1px solid rgba(240, 246, 252, 0.12);
-          border-radius: 28px;
-          background: rgba(22, 27, 34, 0.86);
-          box-shadow: 0 24px 64px rgba(1, 4, 9, 0.35);
+          width: min(460px, 100%);
+          padding: var(--space-6);
+          border: 1px solid var(--border);
+          border-radius: var(--radius);
+          background: var(--card);
+          box-shadow: var(--shadow-lg);
+        }
+        .mark {
+          display: flex;
+          align-items: center;
+          gap: 9px;
+          margin-bottom: 22px;
+          color: var(--muted-foreground);
+          font-family: var(--font-mono);
+          font-size: var(--text-xs);
+          letter-spacing: var(--tracking-caps);
+          text-transform: uppercase;
+        }
+        .mark img {
+          width: 20px;
+          height: 20px;
+          display: block;
         }
         .eyebrow {
-          display: inline-block;
-          margin-bottom: 12px;
-          color: #7d8590;
-          font-size: 12px;
-          font-weight: 700;
-          letter-spacing: 0.14em;
+          display: block;
+          margin-bottom: 10px;
+          color: var(--muted-foreground);
+          font-family: var(--font-mono);
+          font-size: var(--text-2xs);
+          letter-spacing: var(--tracking-caps);
           text-transform: uppercase;
         }
         h1 {
-          margin: 0 0 12px;
-          font-size: clamp(2rem, 5vw, 2.7rem);
-          line-height: 1.04;
+          margin: 0 0 10px;
+          font-size: var(--text-2xl);
+          font-weight: var(--font-semibold);
+          line-height: var(--leading-tight);
+          color: var(--foreground);
         }
         p {
           margin: 0;
-          color: #9ba6b2;
-          font-size: 15px;
-          line-height: 1.65;
+          color: var(--muted-foreground);
+          font-size: var(--text-ui);
+          line-height: var(--leading-normal);
+        }
+        code {
+          padding: 1px 5px;
+          border: 1px solid var(--border);
+          background: var(--secondary);
+          font-family: var(--font-mono);
+          font-size: var(--text-sm);
+          color: var(--foreground);
         }
         .button {
           display: inline-flex;
           align-items: center;
           justify-content: center;
-          min-height: 48px;
-          margin-top: 24px;
-          padding: 0 18px;
-          border-radius: 14px;
-          background: linear-gradient(180deg, #58a6ff, #2f81f7);
-          color: #fff;
-          font-weight: 700;
+          gap: 8px;
+          /* 40px, not the app's 32px: this is the one control on the page and
+             is routinely tapped on a phone. */
+          min-height: 40px;
+          margin-top: 22px;
+          padding: 0 16px;
+          border: 1px solid var(--primary);
+          border-radius: var(--radius);
+          background: var(--primary);
+          color: var(--primary-foreground);
+          font-family: var(--font-sans);
+          font-size: var(--text-ui);
+          font-weight: var(--font-medium);
           text-decoration: none;
+          transition: filter var(--duration-fast) var(--ease-standard);
         }
+        .button:hover { filter: brightness(0.9); }
+        .button:focus-visible { outline: none; box-shadow: var(--shadow-focus); }
         .button.secondary {
-          background: rgba(240, 246, 252, 0.06);
-          color: #f0f6fc;
+          border-color: var(--border);
+          background: transparent;
+          color: var(--foreground);
+        }
+        .button.secondary:hover { filter: none; background: var(--accent); }
+        .error {
+          margin-top: 14px;
+          padding: 10px 12px;
+          border: 1px solid var(--destructive);
+          background: var(--secondary);
+          color: var(--foreground);
+          font-size: var(--text-sm);
+          line-height: var(--leading-normal);
+          word-break: break-word;
         }
       </style>
     </head>
-    <body>${body}</body>
+    <body>
+      <main class="card">
+        <div class="mark">
+          <img src="/icons/icon.svg" alt="" width="20" height="20" />
+          <span>Code Agents</span>
+        </div>
+        ${body}
+      </main>
+    </body>
   </html>`;
 }
 

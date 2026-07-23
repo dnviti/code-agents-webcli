@@ -194,15 +194,13 @@ export class MessageHandler {
 
       if (isNewSession) {
         if (this.app.pendingRuntimeStart) {
-          showOverlay('loadingSpinner');
-          const spinnerEl = document.getElementById('loadingSpinner');
-          const pEl = spinnerEl?.querySelector('p');
-          if (pEl) {
-            pEl.textContent = this.app.getRuntimeStartMessage(
+          showOverlay(
+            'loadingSpinner',
+            this.app.getRuntimeStartMessage(
               this.app.pendingRuntimeStart.kind,
               this.app.pendingRuntimeStart.options,
-            );
-          }
+            ),
+          );
         } else {
           if (this.app.startPromptRequested) {
             showOverlay('startPrompt');

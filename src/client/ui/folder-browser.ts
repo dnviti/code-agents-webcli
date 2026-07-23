@@ -1,7 +1,12 @@
 // Folder browser: navigate, create, and select working directories
+//
+// `FolderBrowserDialog` paints it. This class kept everything the dialog is not
+// allowed to know about: the folder API, the create-folder call, and the
+// session-creation flow that a directory choice kicks off.
 
 import type { App } from '../app';
 import type { FolderData } from '../types';
+import { shellStore } from '../shell/store';
 import { showError } from './overlay';
 
 export class FolderBrowser {
@@ -11,73 +16,23 @@ export class FolderBrowser {
     this.app = app;
   }
 
-  setup(): void {
-    const modal = document.getElementById('folderBrowserModal');
-    const upBtn = document.getElementById('folderUpBtn');
-    const homeBtn = document.getElementById('folderHomeBtn');
-    const selectBtn = document.getElementById('selectFolderBtn');
-    const cancelBtn = document.getElementById('cancelFolderBtn');
-    const showHiddenCheckbox = document.getElementById('showHiddenFolders') as HTMLInputElement | null;
-    const createFolderBtn = document.getElementById('createFolderBtn');
-    const confirmCreateBtn = document.getElementById('confirmCreateFolderBtn');
-    const cancelCreateBtn = document.getElementById('cancelCreateFolderBtn');
-    const newFolderInput = document.getElementById('newFolderNameInput') as HTMLInputElement | null;
-
-    upBtn?.addEventListener('click', () => this.navigateToParent());
-    homeBtn?.addEventListener('click', () => this.navigateToHome());
-    selectBtn?.addEventListener('click', () => this.selectCurrentFolder());
-    cancelBtn?.addEventListener('click', () => this.close());
-    showHiddenCheckbox?.addEventListener('change', () =>
-      this.loadFolders(this.app.currentFolderPath),
-    );
-    createFolderBtn?.addEventListener('click', () => this.showCreateFolderInput());
-    confirmCreateBtn?.addEventListener('click', () => this.createFolder());
-    cancelCreateBtn?.addEventListener('click', () => this.hideCreateFolderInput());
-
-    newFolderInput?.addEventListener('keypress', (e: KeyboardEvent) => {
-      if (e.key === 'Enter') {
-        this.createFolder();
-      } else if (e.key === 'Escape') {
-        this.hideCreateFolderInput();
-      }
-    });
-
-    modal?.addEventListener('click', (e: Event) => {
-      if (e.target === modal) {
-        this.close();
-      }
-    });
-  }
-
   async show(): Promise<void> {
-    const modal = document.getElementById('folderBrowserModal');
-    if (!modal) return;
-    modal.classList.add('active');
-
-    if (this.app.isMobile) {
-      document.body.style.overflow = 'hidden';
-    }
-
-    await this.loadFolders();
+    shellStore.patchSlice('folder', { open: true, creating: false });
+    await this.loadFolders(this.app.currentFolderPath);
   }
 
   close(): void {
-    const modal = document.getElementById('folderBrowserModal');
-    if (modal) modal.classList.remove('active');
-
-    if (this.app.isMobile) {
-      document.body.style.overflow = '';
-    }
-
+    shellStore.patchSlice('folder', { open: false, creating: false });
     this.app.isCreatingNewSession = false;
   }
 
   async loadFolders(path: string | null = null): Promise<void> {
-    const showHidden = (document.getElementById('showHiddenFolders') as HTMLInputElement | null)
-      ?.checked;
+    const { showHidden } = shellStore.getSnapshot().folder;
     const params = new URLSearchParams();
     if (path) params.append('path', path);
     if (showHidden) params.append('showHidden', 'true');
+
+    shellStore.patchSlice('folder', { loading: true });
 
     try {
       const response = await this.app.authFetch(`/api/folders?${params}`);
@@ -88,58 +43,33 @@ export class FolderBrowser {
 
       const data: FolderData = await response.json();
       this.app.currentFolderPath = data.currentPath;
-      this.renderFolders(data);
+      shellStore.patchSlice('folder', {
+        path: data.currentPath,
+        parentPath: data.parentPath,
+        entries: data.folders,
+        loading: false,
+      });
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
       console.error('Failed to load folders:', error);
+      // Clearing the list matters: leaving the previous directory's entries on
+      // screen under a new path would invite a click that navigates somewhere
+      // the user did not ask for.
+      shellStore.patchSlice('folder', { loading: false, entries: [] });
       showError(`Failed to load folders: ${msg}`);
     }
   }
 
-  renderFolders(data: FolderData): void {
-    const pathInput = document.getElementById('currentPathInput') as HTMLInputElement | null;
-    const folderList = document.getElementById('folderList');
-    const upBtn = document.getElementById('folderUpBtn') as HTMLButtonElement | null;
-
-    if (pathInput) pathInput.value = data.currentPath;
-    if (upBtn) upBtn.disabled = !data.parentPath;
-
-    if (!folderList) return;
-    folderList.innerHTML = '';
-
-    if (data.folders.length === 0) {
-      folderList.innerHTML = '<div class="empty-folder-message">No folders found</div>';
-      return;
-    }
-
-    data.folders.forEach((folder) => {
-      const folderItem = document.createElement('div');
-      folderItem.className = 'folder-item';
-
-      // Directory names are attacker-controllable (any signed-in user can
-      // create one) and this is a shared multiuser browser, so the name must
-      // never be parsed as HTML. Only the static icon uses innerHTML.
-      const icon = document.createElement('span');
-      icon.innerHTML = `
-        <svg class="folder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-        </svg>
-      `;
-
-      const name = document.createElement('span');
-      name.className = 'folder-name';
-      name.textContent = folder.name;
-
-      folderItem.append(icon, name);
-      folderItem.addEventListener('click', () => this.loadFolders(folder.path));
-      folderList.appendChild(folderItem);
-    });
+  async setShowHidden(showHidden: boolean): Promise<void> {
+    shellStore.patchSlice('folder', { showHidden });
+    await this.loadFolders(this.app.currentFolderPath);
   }
 
   async navigateToParent(): Promise<void> {
-    if (this.app.currentFolderPath) {
-      const parentPath =
-        this.app.currentFolderPath.split('/').slice(0, -1).join('/') || '/';
+    const { parentPath } = shellStore.getSnapshot().folder;
+    // The server tells us the parent; deriving it by trimming the last path
+    // segment got `/` wrong and could not represent a mount boundary.
+    if (parentPath) {
       await this.loadFolders(parentPath);
     }
   }
@@ -148,33 +78,25 @@ export class FolderBrowser {
     await this.loadFolders();
   }
 
-  private showCreateFolderInput(): void {
-    const createBar = document.getElementById('folderCreateBar');
-    const input = document.getElementById('newFolderNameInput') as HTMLInputElement | null;
-    if (createBar) createBar.style.display = 'flex';
-    if (input) {
-      input.value = '';
-      input.focus();
-    }
+  showCreateFolderInput(): void {
+    shellStore.patchSlice('folder', { creating: true });
   }
 
-  private hideCreateFolderInput(): void {
-    const createBar = document.getElementById('folderCreateBar');
-    const input = document.getElementById('newFolderNameInput') as HTMLInputElement | null;
-    if (createBar) createBar.style.display = 'none';
-    if (input) input.value = '';
+  hideCreateFolderInput(): void {
+    shellStore.patchSlice('folder', { creating: false });
   }
 
-  async createFolder(): Promise<void> {
-    const input = document.getElementById('newFolderNameInput') as HTMLInputElement | null;
-    const folderName = input?.value.trim();
+  async createFolder(folderName: string): Promise<void> {
+    const name = folderName.trim();
 
-    if (!folderName) {
+    // The dialog refuses both of these before calling, so reaching them means a
+    // different caller. Refusing here too keeps the server contract honest.
+    if (!name) {
       showError('Please enter a folder name');
       return;
     }
 
-    if (folderName.includes('/') || folderName.includes('\\')) {
+    if (name.includes('/') || name.includes('\\')) {
       showError('Folder name cannot contain path separators');
       return;
     }
@@ -185,7 +107,7 @@ export class FolderBrowser {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           parentPath: this.app.currentFolderPath || '/',
-          folderName,
+          folderName: name,
         }),
       });
 

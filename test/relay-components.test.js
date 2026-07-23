@@ -159,3 +159,40 @@ describe('Relay components', function () {
     assert.ok(!/#[0-9a-fA-F]{3,8}/.test(none), 'os="none" must not paint window decoration');
   });
 });
+
+// --------------------------------------------------------------------------
+// Icon.tsx returns null for a name it does not know, so a typo — or a name
+// added to a component before it was added to the set — renders nothing at all.
+// No error, no warning, just a control that quietly loses its glyph. That is
+// how "Install app" shipped without its icon while every row beside it had one.
+// --------------------------------------------------------------------------
+
+describe('Relay icon names', function () {
+  it('defines every icon the client asks for', function () {
+    const iconSrc = fs.readFileSync(path.join(RELAY_DIR, 'Icon.tsx'), 'utf8');
+    const defined = new Set([...iconSrc.matchAll(/^ {2}"([a-z0-9-]+)":/gm)].map((m) => m[1]));
+    assert.ok(defined.size > 0, 'no icons parsed out of Icon.tsx');
+
+    const used = new Map();
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { walk(full); continue; }
+        if (!/\.tsx?$/.test(entry.name) || entry.name.startsWith('Icon.')) continue;
+        const text = fs.readFileSync(full, 'utf8');
+        // Only the two shapes that reach Icon: the JSX prop and the plain
+        // `icon:` field the bars and sheets use to describe their rows.
+        for (const m of text.matchAll(/<Icon\s[^>]*name="([a-z0-9-]+)"/g)) used.set(m[1], full);
+        for (const m of text.matchAll(/\bicon:\s*'([a-z0-9-]+)'/g)) used.set(m[1], full);
+      }
+    };
+    walk(path.join(ROOT, 'src', 'client'));
+
+    const missing = [...used.entries()].filter(([name]) => !defined.has(name));
+    assert.deepStrictEqual(
+      missing.map(([name, file]) => `${name} (${path.relative(ROOT, file)})`),
+      [],
+      'these icon names render as nothing because Icon.tsx does not define them',
+    );
+  });
+});

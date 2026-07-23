@@ -1,7 +1,7 @@
 // WebSocket connection management
 
 import type { App } from '../app';
-import { hideOverlay, showOverlay, showError } from '../ui/overlay';
+import { hideOverlay, isOverlayVisible, showOverlay, showError } from '../ui/overlay';
 
 export class WebSocketConnection {
   private app: App;
@@ -43,9 +43,10 @@ export class WebSocketConnection {
       wsUrl += `?sessionId=${encodeURIComponent(requestedSessionId)}`;
     }
 
-    // Only show loading spinner if overlay is already visible
-    const overlay = document.getElementById('overlay');
-    if (overlay && overlay.style.display !== 'none') {
+    // Only switch to the spinner if an overlay is already covering the
+    // terminal: a background reconnect must not throw a panel over output
+    // somebody is reading.
+    if (isOverlayVisible()) {
       showOverlay('loadingSpinner');
     }
 

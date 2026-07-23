@@ -2,6 +2,7 @@
 
 import type { App } from '../app';
 import type { AgentKind, RuntimeStartOptions } from '../types';
+import { shellStore } from '../shell/store';
 import { hideOverlay, showOverlay, showError } from '../ui/overlay';
 
 async function stabilizeTerminalSize(
@@ -37,6 +38,10 @@ export async function loadSessions(app: App): Promise<void> {
     if (!response.ok) throw new Error('Failed to load sessions');
     const data = await response.json();
     app.claudeSessions = data.sessions;
+    // The sessions dialog reads from the store, so a delete or a create that
+    // refreshes this list is reflected in an already-open dialog rather than
+    // leaving a row behind for a session that is gone.
+    shellStore.setState({ sessionList: data.sessions });
   } catch (error) {
     console.error('Failed to load sessions:', error);
   }
@@ -185,12 +190,7 @@ export async function startRuntimeSession(
     app.pendingRuntimeStart = { kind, options };
     app.terminal?.reset();
     app.fitTerminal();
-    showOverlay('loadingSpinner');
-    const spinnerEl = document.getElementById('loadingSpinner');
-    const pEl = spinnerEl?.querySelector('p');
-    if (pEl) {
-      pEl.textContent = app.getRuntimeStartMessage(kind, options);
-    }
+    showOverlay('loadingSpinner', app.getRuntimeStartMessage(kind, options));
     const terminalSize = await stabilizeTerminalSize(app);
     const payloadOptions = terminalSize
       ? { ...options, ...terminalSize }

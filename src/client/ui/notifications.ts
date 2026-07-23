@@ -1,47 +1,31 @@
 // Notifications: toast-style messages and audio cues
+//
+// The stack is rendered by `Toasts`; this module still owns when a toast
+// appears and how long it lives, which is what every caller depends on.
 
-export type NotificationVariant = 'info' | 'error';
+import { shellStore, type ToastVariant } from '../shell/store';
 
-const CONTAINER_ID = 'notificationContainer';
+export type NotificationVariant = ToastVariant;
 
-/**
- * Toasts stack inside one container rather than each pinning itself to the
- * same fixed coordinates. Four rejected images in a single paste would
- * otherwise render four toasts exactly on top of each other.
- */
-function getContainer(): HTMLElement {
-  const existing = document.getElementById(CONTAINER_ID);
-  if (existing) {
-    return existing;
-  }
-
-  const container = document.createElement('div');
-  container.id = CONTAINER_ID;
-  container.className = 'notification-container';
-  document.body.appendChild(container);
-  return container;
-}
+/** Monotonic so React keys stay stable even for two identical messages. */
+let nextId = 1;
 
 export function showNotification(
   message: string,
   variant: NotificationVariant = 'info',
 ): void {
-  const notification = document.createElement('div');
-  notification.className = `notification notification--${variant}`;
-  // An error is announced immediately because the user has to act on it; a
-  // confirmation waits for a pause so it never cuts a screen reader off
-  // mid-sentence.
-  notification.setAttribute('role', variant === 'error' ? 'alert' : 'status');
-  notification.setAttribute('aria-live', variant === 'error' ? 'assertive' : 'polite');
-  notification.textContent = message;
-
-  getContainer().appendChild(notification);
+  const id = nextId++;
+  const { toasts } = shellStore.getSnapshot();
+  // Four rejected images in a single paste produce four toasts; the stack
+  // renders them in order rather than on top of each other.
+  shellStore.setState({ toasts: [...toasts, { id, message, variant }] });
 
   // Errors carry a path or a limit the user may want to read twice.
   const visibleFor = variant === 'error' ? 6000 : 3000;
   setTimeout(() => {
-    notification.classList.add('notification--leaving');
-    setTimeout(() => notification.remove(), 300);
+    shellStore.setState({
+      toasts: shellStore.getSnapshot().toasts.filter((toast) => toast.id !== id),
+    });
   }, visibleFor);
 }
 

@@ -2,6 +2,7 @@
 
 import type { ITerminalOptions } from '@xterm/xterm';
 import type { App } from '../app';
+import { shellStore } from '../shell/store';
 import { setThemeMode } from '../shell/theme';
 import type {
   AppSettings,
@@ -191,58 +192,12 @@ const THEME_ALIASES: Record<string, ThemePresetId> = {
   'solarized-dark': 'github-dark-dimmed',
 };
 
-export function setupSettingsModal(app: App): void {
-  const modal = document.getElementById('settingsModal');
-  const closeBtn = document.getElementById('closeSettingsBtn');
-  const saveBtn = document.getElementById('saveSettingsBtn');
-  const fontSizeSlider = document.getElementById('fontSize') as HTMLInputElement | null;
-  const fontSizeValue = document.getElementById('fontSizeValue');
-
-  closeBtn?.addEventListener('click', () => hideSettings(app));
-  saveBtn?.addEventListener('click', () => saveSettings(app));
-
-  fontSizeSlider?.addEventListener('input', (e: Event) => {
-    const target = e.target as HTMLInputElement;
-    if (fontSizeValue) {
-      fontSizeValue.textContent = target.value + 'px';
-    }
-  });
-
-  modal?.addEventListener('click', (e: Event) => {
-    if (e.target === modal) {
-      hideSettings(app);
-    }
-  });
+export function showSettings(): void {
+  shellStore.patchSlice('dialogs', { settings: true });
 }
 
-export function showSettings(app: App): void {
-  const modal = document.getElementById('settingsModal');
-  if (!modal) return;
-  modal.classList.add('active');
-
-  if (app.isMobile) {
-    document.body.style.overflow = 'hidden';
-  }
-
-  const settings = loadSettings();
-  const fontSlider = document.getElementById('fontSize') as HTMLInputElement | null;
-  const fontValue = document.getElementById('fontSizeValue');
-  const themeSelect = document.getElementById('themeSelect') as HTMLSelectElement | null;
-  const terminalFontSelect = document.getElementById('terminalFontFamilySelect') as HTMLSelectElement | null;
-
-  if (fontSlider) fontSlider.value = String(settings.fontSize);
-  if (fontValue) fontValue.textContent = settings.fontSize + 'px';
-  if (themeSelect) themeSelect.value = settings.theme;
-  if (terminalFontSelect) terminalFontSelect.value = settings.terminalFontFamily;
-}
-
-export function hideSettings(app: App): void {
-  const modal = document.getElementById('settingsModal');
-  if (modal) modal.classList.remove('active');
-
-  if (app.isMobile) {
-    document.body.style.overflow = '';
-  }
+export function hideSettings(): void {
+  shellStore.patchSlice('dialogs', { settings: false });
 }
 
 export function loadSettings(): AppSettings {
@@ -282,24 +237,37 @@ function normalizeTerminalFontFamily(value: unknown): TerminalFontFamilyId {
   return DEFAULTS.terminalFontFamily;
 }
 
-export function saveSettings(app: App): void {
-  const fontSlider = document.getElementById('fontSize') as HTMLInputElement | null;
-  const themeSelect = document.getElementById('themeSelect') as HTMLSelectElement | null;
-  const terminalFontSelect = document.getElementById('terminalFontFamilySelect') as HTMLSelectElement | null;
-
+/**
+ * Persist and apply.
+ *
+ * The values now arrive from the dialog rather than being read back out of
+ * three inputs, so they are re-normalised here: the dialog is the only caller
+ * today, but this is the function that decides what gets written to storage and
+ * it should not trust its input to be a valid preset id.
+ */
+export function saveSettings(app: App, next: AppSettings): void {
   const settings: AppSettings = {
-    fontSize: parseInt(fontSlider?.value ?? String(DEFAULTS.fontSize), 10),
-    theme: normalizeThemePreset(themeSelect?.value) ?? DEFAULTS.theme,
-    terminalFontFamily: normalizeTerminalFontFamily(terminalFontSelect?.value),
+    fontSize: clampFontSize(next.fontSize),
+    theme: normalizeThemePreset(next.theme),
+    terminalFontFamily: normalizeTerminalFontFamily(next.terminalFontFamily),
   };
 
   try {
     localStorage.setItem('cc-web-settings', JSON.stringify(settings));
-    applySettings(app, settings);
-    hideSettings(app);
   } catch (error) {
+    // Private browsing refuses writes. Applying anyway is right: the change
+    // works for this session, it just will not survive a reload.
     console.error('Failed to save settings:', error);
   }
+
+  applySettings(app, settings);
+  hideSettings();
+}
+
+/** Matches the dialog's slider bounds; a stored value outside them is junk. */
+function clampFontSize(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULTS.fontSize;
+  return Math.min(24, Math.max(10, Math.round(value)));
 }
 
 export function applySettings(app: App, settings: AppSettings): void {

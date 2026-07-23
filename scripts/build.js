@@ -85,14 +85,23 @@ async function build() {
     process.exit(1);
   }
 
-  // 3. Copy public assets
+  // 3. Rasterise the app icons, then copy public assets.
+  //
+  // Before the copy, because it writes into src/public/icons and
+  // src/public/favicon.ico — running it after would ship the previous set.
+  try {
+    require('./build-icons.js');
+  } catch (error) {
+    console.warn('[icons] skipped:', error.message);
+  }
+
   console.log('[assets] Copying public files...');
   const publicSrc = path.join(__dirname, '..', 'src', 'public');
   const publicDest = path.join(__dirname, '..', 'dist', 'public');
 
   fs.mkdirSync(publicDest, { recursive: true });
 
-  const filesToCopy = ['index.html', 'manifest.json', 'service-worker.js'];
+  const filesToCopy = ['index.html', 'manifest.json', 'service-worker.js', 'favicon.ico'];
   for (const file of filesToCopy) {
     const src = path.join(publicSrc, file);
     const dest = path.join(publicDest, file);
@@ -106,6 +115,12 @@ async function build() {
     } else {
       fs.copyFileSync(src, dest);
     }
+  }
+
+  // Copy the icon set
+  const iconSrc = path.join(publicSrc, 'icons');
+  if (fs.existsSync(iconSrc)) {
+    copyDir(iconSrc, path.join(publicDest, 'icons'));
   }
 
   // Copy CSS directory

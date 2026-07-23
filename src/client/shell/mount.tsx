@@ -3,6 +3,10 @@ import { createRoot } from 'react-dom/client';
 
 import type { App } from '../app';
 import type { AgentKind, RuntimeStartOptions } from '../types';
+import { sendEscape, switchMode } from '../ui/mobile';
+import { createNewSession, runTerminalCommand, startTerminalShell } from '../ui/modals';
+import { loadSettings, applySettings, saveSettings } from '../ui/settings';
+import { onBannerAction, onBannerDismiss, onBannerToggleLog } from '../ui/update-banner';
 import { AppShell, type ShellActions } from './AppShell';
 import { RuntimeLauncher } from './RuntimeLauncher';
 import { readStoredTheme, setThemeMode, type RelayTheme } from './theme';
@@ -56,38 +60,27 @@ export function mountShell(app: App): void {
     return;
   }
 
-  const actions: ShellActions = {
-    selectTab: (id) => void app.sessionTabManager.switchToTab(id),
-    closeTab: (id) => app.sessionTabManager.closeSession(id),
-    newTab: () => app.sessionTabManager.createNewSession(),
-    openSettings: () => app.showSettings(),
-    fitTerminal: () => app.fitTerminal(),
-    setTheme: applyTheme,
-  };
-
   // Before applyTheme, so the very first call can already reach the terminal.
   themedApp = app;
   applyTheme(readStoredTheme());
-  createRoot(mountPoint).render(<AppShell terminalNode={terminalNode} actions={actions} />);
-  mountRuntimeLauncher(app);
+
+  createRoot(mountPoint).render(
+    <AppShell
+      terminalNode={terminalNode}
+      actions={buildActions(app)}
+      launcher={buildLauncher(app)}
+    />,
+  );
 }
 
 /**
- * Render the runtime picker into the existing start-prompt slot.
+ * The runtime picker.
  *
- * A separate root rather than part of AppShell: the overlay it lives in is
- * shown and hidden imperatively by the session code (showOverlay('startPrompt')
- * from several places in the message handler), and moving that decision into
- * React state would mean re-deriving when a session is being created — the one
- * piece of flow most likely to break quietly.
+ * Rendered as a child of the shell rather than into its own root: the overlay
+ * that hosts it is store state now, so there is nothing left for a second React
+ * root to decouple it from.
  */
-function mountRuntimeLauncher(app: App): void {
-  const slot = document.getElementById('runtimeLauncherRoot');
-  if (!slot) {
-    console.error('Runtime launcher not mounted: #runtimeLauncherRoot is missing.');
-    return;
-  }
-
+function buildLauncher(app: App): React.ReactNode {
   const onTerminal = (): void => app.showTerminalOptionsModal();
 
   const start = (kind: AgentKind, options: RuntimeStartOptions = {}): void => {
@@ -108,12 +101,85 @@ function mountRuntimeLauncher(app: App): void {
     }
   };
 
-  createRoot(slot).render(
+  return (
     <RuntimeLauncher
       aliases={app.aliases}
       onStart={start}
       onTerminal={onTerminal}
       onCancel={() => void app.cancelStartPrompt()}
-    />,
+    />
   );
+}
+
+/**
+ * The complete list of what the chrome may do to the app.
+ *
+ * Built once and passed down, so the identity is stable across renders and the
+ * effects in AppShell that depend on `actions` do not re-run on every store
+ * update.
+ */
+function buildActions(app: App): ShellActions {
+  return {
+    selectTab: (id) => void app.sessionTabManager.switchToTab(id),
+    closeTab: (id) => app.sessionTabManager.closeSession(id),
+    closeOtherTabs: (id) => app.sessionTabManager.closeOthers(id),
+    renameTab: (id, name) => app.sessionTabManager.renameTab(id, name),
+    reorderTabs: (ids) => app.sessionTabManager.applyOrder(ids),
+    newTab: () => app.sessionTabManager.createNewSession(),
+
+    fitTerminal: () => app.fitTerminal(),
+    clearTerminal: () => app.clearTerminal(),
+    sendEscape: () => sendEscape(app),
+    switchMode: () => switchMode(app),
+    attachImage: () => app.attachImage(),
+    reconnect: () => app.reconnect(),
+    closeCurrentSession: () => void app.closeSession(),
+
+    setTheme: applyTheme,
+    readSettings: () => loadSettings(),
+    // Preview writes straight to xterm without touching localStorage, so
+    // cancelling a settings edit leaves nothing persisted to undo.
+    previewSettings: (next) => applySettings(app, next),
+    saveSettings: (next) => saveSettings(app, next),
+    openSettings: () => app.showSettings(),
+
+    createSession: (name, workingDir) => void createNewSession(app, name, workingDir),
+    startShell: (shell) => startTerminalShell(app, shell),
+    runCommand: (command) => runTerminalCommand(app, command),
+
+    folderNavigate: (path) => void app.folderBrowser.loadFolders(path),
+    folderUp: () => void app.folderBrowser.navigateToParent(),
+    folderHome: () => void app.folderBrowser.navigateToHome(),
+    folderToggleHidden: (next) => void app.folderBrowser.setShowHidden(next),
+    folderStartCreate: () => app.folderBrowser.showCreateFolderInput(),
+    folderCancelCreate: () => app.folderBrowser.hideCreateFolderInput(),
+    folderCreate: (name) => void app.folderBrowser.createFolder(name),
+    folderSelect: () => void app.folderBrowser.selectCurrentFolder(),
+    folderClose: () => app.folderBrowser.close(),
+
+    openSessions: () => app.showSessions(),
+    // The list can contain a session this client has no tab for — another user
+    // created it, or it appeared after the tab strip was populated — and
+    // switchToTab silently returns for an id it does not know.
+    joinSession: (id) => {
+      if (app.sessionTabManager.tabs.has(id)) {
+        void app.sessionTabManager.switchToTab(id);
+      } else {
+        void app.joinSession(id);
+      }
+    },
+    leaveSession: () => app.leaveSession(),
+    // The dialog does not confirm; deleting another user's session in a shared
+    // deployment is not something to do on a single tap.
+    deleteSession: (id) => void app.deleteSession(id),
+
+    acceptPlan: () => app.acceptPlan(),
+    rejectPlan: () => app.rejectPlan(),
+
+    retryConnection: () => app.reconnect(),
+
+    updateAction: () => onBannerAction(),
+    updateToggleLog: () => onBannerToggleLog(),
+    updateDismiss: () => onBannerDismiss(),
+  };
 }
