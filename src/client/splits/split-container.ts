@@ -5,6 +5,7 @@ import type { Terminal, ITerminalOptions } from '@xterm/xterm';
 import type { TerminalController } from '../terminal/controller';
 import { createTerminalController } from '../terminal/controller';
 import { stripUnsupportedTerminalSequences } from '../terminal/text';
+import { withCtrlLatch } from '../ui/mobile';
 import { attachImageDrop, attachImagePaste, type ImagePasteTarget } from '../terminal/paste';
 
 // ---------------------------------------------------------------------------
@@ -74,7 +75,10 @@ class Split {
 
     this.terminal.onData((data: string) => {
       if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-        const filteredData = stripUnsupportedTerminalSequences(data);
+        // The Ctrl latch lives at onData, the one path every input method
+        // reaches (IME composition never produces a usable keydown), and it
+        // has to apply here too or the latch silently dies in split panes.
+        const filteredData = stripUnsupportedTerminalSequences(withCtrlLatch(data));
         if (filteredData) {
           this.socket.send(JSON.stringify({ type: 'input', data: filteredData }));
         }

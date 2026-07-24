@@ -3,10 +3,13 @@
  * xterm sizing and theme-aware viewport scrollbars.
  */
 
+/* Touch gestures on the terminal are owned by terminal/touch-scroll.ts, not
+   the browser: native panning here was the unreliable scroll path, and any
+   native scroll that did start raced the JS scroll for the same gesture. */
 .xterm {
     width: 100% !important;
     height: 100% !important;
-    touch-action: pan-y;
+    touch-action: none;
 }
 
 .xterm .xterm-viewport {
@@ -15,7 +18,11 @@
     scrollbar-width: thin;
     scrollbar-color: var(--border-strong) transparent;
     -webkit-overflow-scrolling: touch;
-    touch-action: pan-y;
+    touch-action: none;
+}
+
+.xterm .xterm-screen {
+    touch-action: none;
 }
 
 .xterm .xterm-viewport::-webkit-scrollbar {

@@ -3,13 +3,14 @@ import { createRoot } from 'react-dom/client';
 
 import type { App } from '../app';
 import type { AgentKind, RuntimeStartOptions } from '../types';
-import { sendEscape, switchMode } from '../ui/mobile';
+import { sendEscape, sendMobileKey, switchMode, toggleCtrlLatch } from '../ui/mobile';
 import { createNewSession, runTerminalCommand, startTerminalShell } from '../ui/modals';
 import { loadSettings, applySettings, saveSettings } from '../ui/settings';
 import { onBannerAction, onBannerDismiss, onBannerToggleLog } from '../ui/update-banner';
 import { AppShell, type ShellActions } from './AppShell';
 import { RuntimeLauncher } from './RuntimeLauncher';
 import { readStoredTheme, setThemeMode, type RelayTheme } from './theme';
+import { shellStore } from './store';
 import { relayTerminalTheme } from './terminal-theme';
 
 /** The live terminal, so a theme change can reach it. Set once at mount. */
@@ -131,6 +132,9 @@ function buildActions(app: App): ShellActions {
     clearTerminal: () => app.clearTerminal(),
     sendEscape: () => sendEscape(app),
     switchMode: () => switchMode(app),
+    sendMobileKey: (key) => sendMobileKey(app, key),
+    toggleCtrl: () => toggleCtrlLatch(),
+    toggleKeys: () => shellStore.setState({ keysVisible: !shellStore.getSnapshot().keysVisible }),
     attachImage: () => app.attachImage(),
     reconnect: () => app.reconnect(),
     closeCurrentSession: () => void app.closeSession(),

@@ -120,6 +120,110 @@ export function sendEscape(app: App): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// On-screen terminal keys (issue #21)
+//
+// A phone's keyboard has no Escape, arrows, Ctrl or Tab. The key strip sends
+// those straight to the socket, bypassing xterm's own key handling entirely —
+// which is also why the on-screen keyboard never pops up for them.
+// ---------------------------------------------------------------------------
+
+/** The keys the mobile strip can send, named rather than wired to bytes. */
+export type MobileKey = 'esc' | 'tab' | 'up' | 'down' | 'left' | 'right';
+
+/**
+ * One-shot Ctrl latch.
+ *
+ * The latch cannot be implemented by intercepting `keydown`: Android keyboards
+ * type through IME composition, which never produces a usable key event. What
+ * every input method does produce is xterm's `onData`, so the transform lives
+ * there — see `withCtrlLatch` and its call site in terminal/setup.ts.
+ */
+export function toggleCtrlLatch(): void {
+  shellStore.setState({ ctrlLatched: !shellStore.getSnapshot().ctrlLatched });
+}
+
+/**
+ * The control character a key becomes under Ctrl, or null when the key has no
+ * standard Ctrl mapping (digits, punctuation). Letters are the case that
+ * matters — Ctrl+C, Ctrl+D, Ctrl+Z, Ctrl+R are what agents ask for.
+ */
+export function controlCodeFor(ch: string): string | null {
+  if (ch.length !== 1) return null;
+  if (ch >= 'a' && ch <= 'z') return String.fromCharCode(ch.charCodeAt(0) - 96);
+  if (ch >= 'A' && ch <= 'Z') return String.fromCharCode(ch.charCodeAt(0) - 64);
+  switch (ch) {
+    case ' ': return '\x00';
+    case '[': return '\x1b';
+    case '\\': return '\x1c';
+    case ']': return '\x1d';
+    case '^': return '\x1e';
+    case '_': return '\x1f';
+    default: return null;
+  }
+}
+
+/**
+ * Apply and consume the Ctrl latch against the next chunk of terminal input.
+ *
+ * One-shot semantics: any input disengages the latch, whether or not it could
+ * be mapped. A single character maps to its control code; anything longer is a
+ * paste, which Ctrl must never mangle, so it passes through untouched.
+ */
+export function withCtrlLatch(data: string): string {
+  if (!shellStore.getSnapshot().ctrlLatched) return data;
+  shellStore.setState({ ctrlLatched: false });
+  const mapped = controlCodeFor(data);
+  return mapped ?? data;
+}
+
+const CURSOR_KEYS: Record<'up' | 'down' | 'left' | 'right', string> = {
+  up: 'A',
+  down: 'B',
+  right: 'C',
+  left: 'D',
+};
+
+/**
+ * Send one strip key to the active session.
+ *
+ * Cursor keys follow the terminal's application-cursor-keys mode: a full-
+ * screen app that switched the mode on expects SS3 (\x1bOA) and ignores or
+ * misreads CSI (\x1b[A), and readline-style prompts expect the reverse. A
+ * latched Ctrl turns the arrow into its modified form (CSI 1;5X) — word jumps
+ * in prompts that bind them.
+ */
+export function sendMobileKey(app: App, key: MobileKey): void {
+  if (!app.socket || app.socket.readyState !== WebSocket.OPEN) return;
+
+  const ctrl = shellStore.getSnapshot().ctrlLatched;
+  let data: string;
+
+  switch (key) {
+    case 'esc':
+      data = '\x1b';
+      break;
+    case 'tab':
+      // Ctrl+Tab has no encoding in a terminal; the latch is still consumed
+      // below so it cannot leak into the next real character.
+      data = '\t';
+      break;
+    default: {
+      const letter = CURSOR_KEYS[key];
+      if (ctrl) {
+        data = `\x1b[1;5${letter}`;
+      } else if (app.terminal?.modes.applicationCursorKeysMode) {
+        data = `\x1bO${letter}`;
+      } else {
+        data = `\x1b[${letter}`;
+      }
+    }
+  }
+
+  if (ctrl) shellStore.setState({ ctrlLatched: false });
+  app.send({ type: 'input', data });
+}
+
 export function switchMode(app: App): void {
   const modes = ['chat', 'code', 'plan'] as const;
   const currentIndex = modes.indexOf(app.currentMode as (typeof modes)[number]);

@@ -88,9 +88,11 @@ function reset(extra) {
       sessionList: [],
       paletteOpen: false,
       install: 'unsupported',
+      keysVisible: true,
+      ctrlLatched: false,
       dialogs: {
         settings: false, newSession: false, terminalOptions: false,
-        sessions: false, more: false, rename: null,
+        sessions: false, tabs: false, more: false, rename: null,
       },
       folder: {
         open: false, path: null, parentPath: null, entries: [],
@@ -134,10 +136,60 @@ describe('shell chrome', function () {
 
     const mobile = render(reset({ tabs: [tab('a')], activeId: 'a', isMobile: true }));
     assert.ok(/aria-label="Session controls"/.test(mobile), 'the bottom bar renders on mobile');
-    // Escape has no key on the iOS keyboard, so the bar is the only way to send
-    // it — losing this button silently is the failure worth catching.
-    assert.ok(/>Esc</.test(mobile), 'the bottom bar must offer Escape');
     assert.ok(/>Sessions</.test(mobile) && /># More|>More</.test(mobile));
+  });
+
+  it('swaps the tab strip for the key strip on mobile (issue #21)', function () {
+    const mobile = render(reset({ tabs: [tab('a'), tab('b')], activeId: 'a', isMobile: true }));
+
+    // The desktop tab strip does not fit a phone: squeezed tabs are
+    // untappable and the row costs vertical space the terminal needs.
+    assert.strictEqual(
+      mobile.split('role="tablist"').length - 1,
+      0,
+      'the desktop tab strip must not render on mobile',
+    );
+
+    // A phone keyboard has no Escape, arrows, Ctrl or Tab — the strip is the
+    // only way to send them, so losing it silently is the failure worth
+    // catching.
+    assert.ok(/aria-label="Terminal keys"/.test(mobile), 'the key strip renders on mobile');
+    assert.ok(/>Esc</.test(mobile), 'the key strip must offer Escape');
+    assert.ok(/>Tab</.test(mobile), 'the key strip must offer Tab');
+    assert.ok(/>Ctrl</.test(mobile), 'the key strip must offer the Ctrl latch');
+    for (const arrow of ['Up', 'Down', 'Left', 'Right']) {
+      assert.ok(
+        mobile.includes(`aria-label="Send ${arrow} arrow"`),
+        `the key strip must offer the ${arrow} arrow`,
+      );
+    }
+
+    // Hidden on purpose: the toggle has to be able to reclaim the room.
+    const keysHidden = render(reset({
+      tabs: [tab('a')], activeId: 'a', isMobile: true, keysVisible: false,
+    }));
+    assert.ok(
+      !/aria-label="Terminal keys"/.test(keysHidden),
+      'keysVisible: false must hide the strip',
+    );
+  });
+
+  it('switches sessions from a touch sheet, not the strip, on mobile', function () {
+    const html = render(reset({
+      tabs: [tab('a'), tab('b', { status: 'running', unread: true })],
+      activeId: 'a',
+      isMobile: true,
+      dialogs: {
+        settings: false, newSession: false, terminalOptions: false,
+        sessions: false, tabs: true, more: false, rename: null,
+      },
+    }));
+
+    assert.ok(html.includes('aria-current="true"'), 'the active session is marked');
+    assert.ok(html.includes('aria-label="Unread output"'), 'unread activity is visible');
+    assert.ok(html.includes('aria-label="Close b"'), 'every session can be closed from the sheet');
+    assert.ok(html.includes('New session'), 'a new session is one tap away');
+    assert.ok(html.includes('All sessions'), 'the server-wide list stays reachable');
   });
 
   it('renders a running session with the online dot and an idle one without a warning', function () {

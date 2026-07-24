@@ -1,6 +1,7 @@
 // Terminal initialization: create xterm instance, addons, and event handlers
 
 import type { App } from '../app';
+import { withCtrlLatch } from '../ui/mobile';
 import { createTerminalController, DEFAULT_THEME } from './controller';
 import { HistoryView } from './history-view';
 import { stripUnsupportedTerminalSequences } from './text';
@@ -66,7 +67,10 @@ export function setupTerminal(app: App): void {
 
   app.terminal.onData((data: string) => {
     if (app.socket && app.socket.readyState === WebSocket.OPEN) {
-      const filteredData = stripUnsupportedTerminalSequences(data);
+      // The mobile key strip's Ctrl latch transforms here, at onData, because
+      // it is the one path every input method reaches — Android keyboards
+      // type through IME composition and never fire a usable keydown.
+      const filteredData = stripUnsupportedTerminalSequences(withCtrlLatch(data));
       if (filteredData) {
         app.send({ type: 'input', data: filteredData });
       }

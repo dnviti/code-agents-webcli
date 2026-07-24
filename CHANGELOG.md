@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added
+- **On-screen terminal keys on mobile** (issue #21): a key strip above the bottom bar with
+  Esc, Tab, a one-shot Ctrl latch, and the four arrow keys — the keys a phone keyboard does
+  not have and agents routinely ask for. Ctrl is a latch, not a chord: tap it, then type the
+  letter on the ordinary keyboard (the transform hooks xterm's `onData`, the one path every
+  input method reaches, including Android IME composition). Arrows honor the terminal's
+  application-cursor-keys mode (SS3 vs CSI), send their modified form (CSI 1;5X) while Ctrl
+  is latched, and repeat while held. The strip can be hidden with the bottom bar's new Keys
+  toggle when the terminal needs the room back.
+- **A mobile tab switcher sheet** replacing the desktop tab strip on phones: full-width,
+  thumb-sized rows with the active session ringed, unread output dotted, per-row close, a
+  New session button, and an All sessions route to the server-wide list. The desktop strip
+  no longer renders at phone widths, returning its vertical space to the terminal.
+- **Deliberate touch scrolling for the terminal**: vertical drags on the live terminal now
+  scroll the buffer through xterm's own scroll API with sub-line precision, owned by the app
+  instead of the browser's incidental native scroll of the xterm viewport. Dragging down
+  while parked at the top hands off to server-paged history, matching the mouse-wheel path,
+  and the gesture can never trigger pull-to-refresh or bounce the surrounding page.
+
 ### Changed
 - **The runtime picker is a Relay screen.** The thirteen buttons are now one card per runtime,
   each showing the command its bridge looks for (`claude`, `cursor-agent`, `qwen`, `kimi`, …) so a

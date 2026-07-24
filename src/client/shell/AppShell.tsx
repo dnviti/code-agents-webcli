@@ -15,6 +15,9 @@ import { SessionsDialog } from './dialogs/SessionsDialog';
 import { SettingsDialog } from './dialogs/SettingsDialog';
 import { TerminalOptionsDialog } from './dialogs/TerminalOptionsDialog';
 import { MobileBar, type MobileBarAction } from './MobileBar';
+import { TabSwitcherSheet } from './TabSwitcherSheet';
+import { KeyStrip, KEY_STRIP_HEIGHT } from './KeyStrip';
+import type { MobileKey } from '../ui/mobile';
 import { MoreSheet } from './MoreSheet';
 import { installHint, promptInstall } from './install-prompt';
 import { OverlayHost } from './OverlayHost';
@@ -45,6 +48,9 @@ export interface ShellActions {
   clearTerminal(): void;
   sendEscape(): void;
   switchMode(): void;
+  sendMobileKey(key: MobileKey): void;
+  toggleCtrl(): void;
+  toggleKeys(): void;
   attachImage(): void;
   reconnect(): void;
   closeCurrentSession(): void;
@@ -148,7 +154,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
   // around it, and xterm only reflows when it is told to.
   React.useEffect(() => {
     actions.fitTerminal();
-  }, [actions, state.isMobile, state.banner !== null]);
+  }, [actions, state.isMobile, state.keysVisible, state.banner !== null]);
 
   const paletteGroups: CommandPaletteGroup[] = [
     {
@@ -265,12 +271,21 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       label: 'Sessions',
       icon: 'layout-list',
       badge: state.tabs.some((t) => t.unread && t.id !== state.activeId),
-      onPress: actions.openSessions,
+      active: state.dialogs.tabs,
+      expands: true,
+      onPress: () => closeDialogs({ tabs: true }),
     },
     { id: 'new', label: 'New', icon: 'plus', onPress: actions.newTab },
-    // Escape is the single most-used key when driving an agent from a phone,
-    // and the on-screen keyboard on iOS does not have one.
-    { id: 'esc', label: 'Esc', icon: 'circle-x', onPress: actions.sendEscape },
+    // The on-screen key strip carries Escape now; this toggles it for the
+    // moments the terminal needs the vertical room back.
+    {
+      id: 'keys',
+      label: 'Keys',
+      icon: 'keyboard',
+      active: state.keysVisible,
+      toggle: true,
+      onPress: actions.toggleKeys,
+    },
     { id: 'image', label: 'Image', icon: 'image', onPress: actions.attachImage },
     {
       id: 'more',
@@ -365,26 +380,33 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       {/* One bar, not two. The title row was a second full-width strip whose
           only unique content was a title the tab already shows, and on a phone
           it cost a tenth of the viewport. */}
-      <TabBar
-        tabs={tabItems(state.tabs)}
-        activeId={state.activeId ?? undefined}
-        ariaLabel="Sessions"
-        onSelect={actions.selectTab}
-        onClose={actions.closeTab}
-        onNew={() => actions.newTab()}
-        onReorder={actions.reorderTabs}
-        // Split view reads this off the drop; see split-container.ts.
-        dragPayload={(id) => ({
-          'application/x-session-id': id,
-          'x-source-pane': '-1',
-        })}
-        onTabDoubleClick={(id) => closeDialogs({ rename: id })}
-        onTabAuxClose={actions.closeTab}
-        onTabContextMenu={(id, x, y) => setMenu({ id, x, y })}
-        leading={brand}
-        trailing={barActions}
-        style={{ height: state.isMobile ? 44 : 38, flex: '0 0 auto' }}
-      />
+      {/* On mobile the strip is gone entirely (issue #21): squeezed tabs are
+          untappable and the row costs vertical space the terminal needs.
+          Sessions are managed from the TabSwitcherSheet instead; everything
+          else the strip's trailing side carried (theme, settings, sign-out)
+          lives in the More sheet on a phone. */}
+      {state.isMobile ? null : (
+        <TabBar
+          tabs={tabItems(state.tabs)}
+          activeId={state.activeId ?? undefined}
+          ariaLabel="Sessions"
+          onSelect={actions.selectTab}
+          onClose={actions.closeTab}
+          onNew={() => actions.newTab()}
+          onReorder={actions.reorderTabs}
+          // Split view reads this off the drop; see split-container.ts.
+          dragPayload={(id) => ({
+            'application/x-session-id': id,
+            'x-source-pane': '-1',
+          })}
+          onTabDoubleClick={(id) => closeDialogs({ rename: id })}
+          onTabAuxClose={actions.closeTab}
+          onTabContextMenu={(id, x, y) => setMenu({ id, x, y })}
+          leading={brand}
+          trailing={barActions}
+          style={{ height: 38, flex: '0 0 auto' }}
+        />
+      )}
 
       <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
         <TerminalHost node={terminalNode} onResize={actions.fitTerminal} />
@@ -396,6 +418,10 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           launcher={launcher}
         />
       </div>
+
+      {state.isMobile && state.keysVisible ? (
+        <KeyStrip ctrlLatched={state.ctrlLatched} onKey={actions.sendMobileKey} onToggleCtrl={actions.toggleCtrl} />
+      ) : null}
 
       {state.isMobile ? <MobileBar actions={mobileActions} /> : <StatusBar left={statusLeft} right={statusRight} />}
 
@@ -467,6 +493,17 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         onClose={() => closeDialogs({ sessions: false })}
       />
 
+      <TabSwitcherSheet
+        open={state.dialogs.tabs}
+        tabs={state.tabs}
+        activeId={state.activeId}
+        onSelect={(id) => { closeDialogs({ tabs: false }); actions.selectTab(id); }}
+        onCloseTab={(id) => actions.closeTab(id)}
+        onNew={() => { closeDialogs({ tabs: false }); actions.newTab(); }}
+        onAllSessions={() => { closeDialogs({ tabs: false }); actions.openSessions(); }}
+        onClose={() => closeDialogs({ tabs: false })}
+      />
+
       <PlanDialog
         open={state.plan !== null}
         content={state.plan ?? ''}
@@ -506,6 +543,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       <Toasts
         toasts={state.toasts}
         isMobile={state.isMobile}
+        bottomOffset={state.isMobile && state.keysVisible ? KEY_STRIP_HEIGHT : 0}
         onDismiss={(id) => {
           shellStore.setState({ toasts: shellStore.getSnapshot().toasts.filter((t) => t.id !== id) });
         }}
