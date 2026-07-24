@@ -129,7 +129,7 @@ export function sendEscape(app: App): void {
 // ---------------------------------------------------------------------------
 
 /** The keys the mobile strip can send, named rather than wired to bytes. */
-export type MobileKey = 'esc' | 'tab' | 'up' | 'down' | 'left' | 'right';
+export type MobileKey = 'esc' | 'tab' | 'enter' | 'up' | 'down' | 'left' | 'right';
 
 /**
  * One-shot Ctrl latch.
@@ -207,6 +207,10 @@ export function sendMobileKey(app: App, key: MobileKey): void {
       // Ctrl+Tab has no encoding in a terminal; the latch is still consumed
       // below so it cannot leak into the next real character.
       data = '\t';
+      break;
+    case 'enter':
+      // Same reasoning as Tab: Ctrl+Enter has no universal encoding.
+      data = '\r';
       break;
     default: {
       const letter = CURSOR_KEYS[key];

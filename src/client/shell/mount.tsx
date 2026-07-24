@@ -4,6 +4,7 @@ import { createRoot } from 'react-dom/client';
 import type { App } from '../app';
 import type { AgentKind, RuntimeStartOptions } from '../types';
 import { sendEscape, sendMobileKey, switchMode, toggleCtrlLatch } from '../ui/mobile';
+import { summonKeyboard } from '../terminal/keyboard';
 import { createNewSession, runTerminalCommand, startTerminalShell } from '../ui/modals';
 import { loadSettings, applySettings, saveSettings } from '../ui/settings';
 import { onBannerAction, onBannerDismiss, onBannerToggleLog } from '../ui/update-banner';
@@ -135,6 +136,7 @@ function buildActions(app: App): ShellActions {
     sendMobileKey: (key) => sendMobileKey(app, key),
     toggleCtrl: () => toggleCtrlLatch(),
     toggleKeys: () => shellStore.setState({ keysVisible: !shellStore.getSnapshot().keysVisible }),
+    showKeyboard: () => summonKeyboard(),
     attachImage: () => app.attachImage(),
     reconnect: () => app.reconnect(),
     closeCurrentSession: () => void app.closeSession(),

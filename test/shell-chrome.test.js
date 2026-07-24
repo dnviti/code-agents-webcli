@@ -157,6 +157,11 @@ describe('shell chrome', function () {
     assert.ok(/>Esc</.test(mobile), 'the key strip must offer Escape');
     assert.ok(/>Tab</.test(mobile), 'the key strip must offer Tab');
     assert.ok(/>Ctrl</.test(mobile), 'the key strip must offer the Ctrl latch');
+    assert.ok(/aria-label="Send Enter"/.test(mobile), 'the key strip must offer Enter');
+    assert.ok(
+      /aria-label="Show on-screen keyboard"/.test(mobile),
+      'summoning the keyboard is an explicit act, never a side effect of a tap',
+    );
     for (const arrow of ['Up', 'Down', 'Left', 'Right']) {
       assert.ok(
         mobile.includes(`aria-label="Send ${arrow} arrow"`),

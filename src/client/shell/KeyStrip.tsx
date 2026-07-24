@@ -11,6 +11,8 @@ export interface KeyStripProps {
   ctrlLatched: boolean;
   onKey(key: MobileKey): void;
   onToggleCtrl(): void;
+  /** Summons the on-screen keyboard; taps on the terminal no longer do. */
+  onShowKeyboard(): void;
 }
 
 interface StripButton {
@@ -43,17 +45,21 @@ const REPEAT_INTERVAL_MS = 65;
  * the letter on the ordinary keyboard. Chording two fingers on glass is the
  * interaction phones are worst at; latching is what Termux converged on too.
  */
-export function KeyStrip({ ctrlLatched, onKey, onToggleCtrl }: KeyStripProps): React.JSX.Element {
+export function KeyStrip({ ctrlLatched, onKey, onToggleCtrl, onShowKeyboard }: KeyStripProps): React.JSX.Element {
   const buttons: StripButton[] = [
     { id: 'ctrl', label: 'Ctrl', ariaLabel: 'Latch Ctrl for the next key', active: ctrlLatched, onPress: onToggleCtrl },
     // Escape is the single most-used agent key and the one iOS keyboards
     // lack entirely, so it sits at the thumb's leading edge, always visible.
     { id: 'esc', label: 'Esc', ariaLabel: 'Send Escape', onPress: () => onKey('esc') },
     { id: 'tab', label: 'Tab', ariaLabel: 'Send Tab', onPress: () => onKey('tab') },
+    { id: 'enter', icon: 'corner-down-left', ariaLabel: 'Send Enter', onPress: () => onKey('enter') },
     { id: 'left', icon: 'arrow-left', ariaLabel: 'Send Left arrow', repeat: true, onPress: () => onKey('left') },
     { id: 'down', icon: 'arrow-down', ariaLabel: 'Send Down arrow', repeat: true, onPress: () => onKey('down') },
     { id: 'up', icon: 'arrow-up', ariaLabel: 'Send Up arrow', repeat: true, onPress: () => onKey('up') },
     { id: 'right', icon: 'arrow-right', ariaLabel: 'Send Right arrow', repeat: true, onPress: () => onKey('right') },
+    // The keyboard no longer appears by itself — every tap focused xterm's
+    // hidden textarea and popped it — so summoning it is an explicit act.
+    { id: 'keyboard', icon: 'keyboard', ariaLabel: 'Show on-screen keyboard', onPress: onShowKeyboard },
   ];
 
   return (

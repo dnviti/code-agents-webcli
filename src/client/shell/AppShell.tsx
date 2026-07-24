@@ -51,6 +51,7 @@ export interface ShellActions {
   sendMobileKey(key: MobileKey): void;
   toggleCtrl(): void;
   toggleKeys(): void;
+  showKeyboard(): void;
   attachImage(): void;
   reconnect(): void;
   closeCurrentSession(): void;
@@ -420,7 +421,12 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       </div>
 
       {state.isMobile && state.keysVisible ? (
-        <KeyStrip ctrlLatched={state.ctrlLatched} onKey={actions.sendMobileKey} onToggleCtrl={actions.toggleCtrl} />
+        <KeyStrip
+          ctrlLatched={state.ctrlLatched}
+          onKey={actions.sendMobileKey}
+          onToggleCtrl={actions.toggleCtrl}
+          onShowKeyboard={actions.showKeyboard}
+        />
       ) : null}
 
       {state.isMobile ? <MobileBar actions={mobileActions} /> : <StatusBar left={statusLeft} right={statusRight} />}

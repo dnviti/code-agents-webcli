@@ -20,6 +20,12 @@
   instead of the browser's incidental native scroll of the xterm viewport. Dragging down
   while parked at the top hands off to server-paged history, matching the mouse-wheel path,
   and the gesture can never trigger pull-to-refresh or bounce the surrounding page.
+- **The on-screen keyboard no longer appears by itself.** Every tap on the terminal focused
+  xterm's hidden textarea and summoned it; the textarea now keeps `inputMode="none"` so taps
+  stay silent, and the keyboard appears only from the key strip's explicit keyboard button
+  (Enter is on the strip too). When it does appear, the app lifts by exactly the keyboard's
+  size — natively on Android Chrome (`interactive-widget=resizes-content`) and via a
+  visualViewport watcher on iOS Safari — instead of being covered.
 
 ### Changed
 - **The runtime picker is a Relay screen.** The thirteen buttons are now one card per runtime,
