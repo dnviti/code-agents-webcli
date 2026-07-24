@@ -45,6 +45,21 @@ async function run(): Promise<void> {
     controller.rendererKind(),
   );
 
+  // Issue #19 (copy from the terminal), asserted at the real layer: the
+  // controller must intercept a right-click when there is a selection to copy,
+  // and leave the native menu alone when there is not. select() makes a
+  // deterministic selection without depending on rendered glyphs or the
+  // Clipboard API (unavailable in a headless file:// context).
+  controller.terminal.select(0, 0, 5);
+  const menuWithSelection = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+  host.dispatchEvent(menuWithSelection);
+  check('right-click with a selection is intercepted for copy', menuWithSelection.defaultPrevented);
+
+  controller.terminal.clearSelection();
+  const menuNoSelection = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+  host.dispatchEvent(menuNoSelection);
+  check('right-click with no selection leaves the native menu', !menuNoSelection.defaultPrevented);
+
   let text = '';
   for (let i = 0; i < 3000; i++) {
     text += `riga ${i}\r\n`;
