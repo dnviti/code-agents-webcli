@@ -3,6 +3,8 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { createFrameScheduler } from './scheduler';
+import { attachClipboard } from './clipboard';
+import { showNotification } from '../ui/notifications';
 
 export interface TerminalController {
   terminal: Terminal;
@@ -93,6 +95,7 @@ export function createTerminalController(
   let pending: string[] = [];
   let renderer: 'webgl' | 'dom' = 'dom';
   let webglAddon: WebglAddon | null = null;
+  let detachClipboard: (() => void) | null = null;
   let lastCols = 0;
   let lastRows = 0;
   const topHandlers = new Set<() => void>();
@@ -233,6 +236,10 @@ export function createTerminalController(
     // Must come after open(): the addon needs the canvas the terminal creates.
     enableWebgl();
 
+    // Copy/paste for this terminal and its container. Wired here so the main
+    // terminal and both split panes get it without duplication.
+    detachClipboard = attachClipboard(terminal, target, { notify: showNotification });
+
     lastCols = terminal.cols;
     lastRows = terminal.rows;
 
@@ -272,6 +279,9 @@ export function createTerminalController(
     document.removeEventListener('visibilitychange', onVisibilityChange);
     window.removeEventListener('pageshow', restoreViewport);
     window.visualViewport?.removeEventListener('resize', fit);
+
+    detachClipboard?.();
+    detachClipboard = null;
 
     disposables.forEach((disposable) => disposable.dispose());
     webglAddon?.dispose();
