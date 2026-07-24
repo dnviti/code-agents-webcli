@@ -55,6 +55,7 @@ import {
   showMobileSessionsModal,
   watchViewport,
 } from './ui/mobile';
+import { watchKeyboardInset } from './terminal/keyboard';
 import { showNotification, playNotificationSound } from './ui/notifications';
 import { setupUpdateBanner } from './ui/update-banner';
 import { pickImage, type ImagePasteTarget } from './terminal/paste';
@@ -205,6 +206,10 @@ export class App {
     applySettings(this, loadSettings());
     disablePullToRefresh();
     watchViewport(this);
+    // The keyboard must lift the app, not cover it: Android Chrome handles
+    // that via the viewport meta, iOS Safari via this visualViewport watcher.
+    const appEl = document.getElementById('app');
+    if (appEl) watchKeyboardInset(appEl, () => this.fitTerminal());
     setupUpdateBanner(this);
 
     showOverlay('loadingSpinner');

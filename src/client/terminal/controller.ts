@@ -4,6 +4,8 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { createFrameScheduler } from './scheduler';
 import { attachClipboard } from './clipboard';
+import { attachTouchScroll } from './touch-scroll';
+import { suppressAutoKeyboard } from './keyboard';
 import { showNotification } from '../ui/notifications';
 
 export interface TerminalController {
@@ -96,6 +98,7 @@ export function createTerminalController(
   let renderer: 'webgl' | 'dom' = 'dom';
   let webglAddon: WebglAddon | null = null;
   let detachClipboard: (() => void) | null = null;
+  let detachTouchScroll: (() => void) | null = null;
   let lastCols = 0;
   let lastRows = 0;
   const topHandlers = new Set<() => void>();
@@ -240,6 +243,16 @@ export function createTerminalController(
     // terminal and both split panes get it without duplication.
     detachClipboard = attachClipboard(terminal, target, { notify: showNotification });
 
+    // Touch scrolling is owned by JS, not the browser: xterm 6 has no touch
+    // handling, and the viewport's incidental native scroll was the unreliable
+    // path issue #21 names. Attached for every terminal, main and split alike.
+    detachTouchScroll = attachTouchScroll(target, { terminal, onReachedTop: notifyTop });
+
+    // xterm focuses its hidden textarea on every tap, and on a phone that
+    // focus summons the keyboard over half the screen. Suppression is
+    // one-shot: summonKeyboard() in the key strip brings it back on demand.
+    suppressAutoKeyboard(target);
+
     lastCols = terminal.cols;
     lastRows = terminal.rows;
 
@@ -282,6 +295,8 @@ export function createTerminalController(
 
     detachClipboard?.();
     detachClipboard = null;
+    detachTouchScroll?.();
+    detachTouchScroll = null;
 
     disposables.forEach((disposable) => disposable.dispose());
     webglAddon?.dispose();

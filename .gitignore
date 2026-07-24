@@ -18,3 +18,4 @@ dist/
 test-*.js
 test/browser/bundle.js
 .work/
+.work/

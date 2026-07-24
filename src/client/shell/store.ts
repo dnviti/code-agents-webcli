@@ -44,6 +44,8 @@ export interface ShellDialogs {
   terminalOptions: boolean;
   /** The session list, reachable from the mobile bar and the palette. */
   sessions: boolean;
+  /** The mobile tab switcher sheet. */
+  tabs: boolean;
   /** The mobile "More" sheet. */
   more: boolean;
   /** Session id being renamed, or null. Doubles as the open flag. */
@@ -107,6 +109,14 @@ export interface ShellState {
   theme: 'dark' | 'light';
   /** Set once at boot from `detectMobile()`; drives the bottom bar. */
   isMobile: boolean;
+  /** Whether the on-screen terminal key strip is showing (mobile only). */
+  keysVisible: boolean;
+  /**
+   * One-shot Ctrl latch for the key strip: the next terminal input is sent
+   * as its control code. In the store so both the strip (paint) and the
+   * terminal's onData path (transform) can reach it.
+   */
+  ctrlLatched: boolean;
   dialogs: ShellDialogs;
   folder: FolderState;
   overlay: OverlayView;
@@ -153,11 +163,14 @@ const INITIAL: ShellState = {
   paletteOpen: false,
   theme: 'dark',
   isMobile: false,
+  keysVisible: true,
+  ctrlLatched: false,
   dialogs: {
     settings: false,
     newSession: false,
     terminalOptions: false,
     sessions: false,
+    tabs: false,
     more: false,
     rename: null,
   },

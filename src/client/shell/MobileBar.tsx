@@ -15,6 +15,12 @@ export interface MobileBarAction {
    * sheet does.
    */
   expands?: boolean;
+  /**
+   * Set when the item toggles something visible rather than opening a panel
+   * (e.g. the key strip). It is announced as pressed/not-pressed — neither a
+   * dialog disclosure nor a current section.
+   */
+  toggle?: boolean;
   /** Draws attention without a count, e.g. background output arrived. */
   badge?: boolean;
   disabled?: boolean;
@@ -59,7 +65,8 @@ export function MobileBar({ actions }: MobileBarProps): React.JSX.Element {
           disabled={action.disabled}
           aria-haspopup={action.expands ? 'dialog' : undefined}
           aria-expanded={action.expands ? Boolean(action.active) : undefined}
-          aria-current={!action.expands && action.active ? 'true' : undefined}
+          aria-pressed={action.toggle ? Boolean(action.active) : undefined}
+          aria-current={!action.expands && !action.toggle && action.active ? 'true' : undefined}
           style={{
             position: 'relative',
             flex: 1,

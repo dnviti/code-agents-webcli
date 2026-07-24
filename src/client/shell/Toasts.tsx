@@ -7,6 +7,8 @@ export interface ToastsProps {
   toasts: ToastItem[];
   /** Lifts the stack clear of the bottom bar. */
   isMobile: boolean;
+  /** Extra clearance, e.g. the key strip's height when it is showing. */
+  bottomOffset?: number;
   onDismiss(id: number): void;
 }
 
@@ -18,7 +20,7 @@ export interface ToastsProps {
  * a pause so it never cuts a screen reader off mid-sentence. `notifications.ts`
  * still owns the lifetime; this only paints.
  */
-export function Toasts({ toasts, isMobile, onDismiss }: ToastsProps): React.JSX.Element | null {
+export function Toasts({ toasts, isMobile, bottomOffset = 0, onDismiss }: ToastsProps): React.JSX.Element | null {
   if (toasts.length === 0) return null;
 
   return (
@@ -31,7 +33,7 @@ export function Toasts({ toasts, isMobile, onDismiss }: ToastsProps): React.JSX.
         // safe-area inset, or the desktop status bar. A toast overlapping either
         // hides the connection state at exactly the moment something failed.
         bottom: isMobile
-          ? 'calc(var(--mobile-bar-height) + env(safe-area-inset-bottom, 0px) + 12px)'
+          ? `calc(var(--mobile-bar-height) + env(safe-area-inset-bottom, 0px) + ${bottomOffset + 12}px)`
           : 'calc(var(--status-bar-height) + 12px)',
         zIndex: 'var(--z-toast)' as unknown as number,
         display: 'flex',
