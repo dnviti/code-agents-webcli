@@ -501,6 +501,10 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
             view={state.chatView}
             onViewChange={actions.setChatView}
             onOpenSettings={() => closeDialogs({ chatSettings: true })}
+            // The chat surface owns the whole viewport, so the tab strip's own
+            // theme button is off-screen while a conversation is showing.
+            theme={state.theme}
+            onToggleTheme={toggleTheme}
           />
         ) : null}
         <OverlayHost

@@ -1,6 +1,6 @@
 {
   "name": "code-agents-webcli",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "description": "Multiuser web CLI for Claude Code, Codex, and terminal sessions",
   "main": "dist/server/index.js",
   "bin": {

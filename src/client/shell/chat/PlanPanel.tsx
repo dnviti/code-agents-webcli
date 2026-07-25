@@ -16,6 +16,13 @@ export interface PlanPanelProps {
   items: PlanItem[];
   /** Tighter spacing for the header/sidebar, where the panel is a summary. */
   compact?: boolean;
+  /**
+   * `rail` drops the card frame and takes the top of the trace rail: a 28px
+   * caps header, a counter and a progress bar. The panel is the region there
+   * rather than an object floating inside one, so a border around it would be a
+   * second edge a few pixels inside the rail's own.
+   */
+  variant?: 'card' | 'rail';
 }
 
 const STATUS_ICON: Record<PlanItem['status'], IconName> = {
@@ -30,13 +37,77 @@ const STATUS_LABEL: Record<PlanItem['status'], string> = {
   completed: 'Completed',
 };
 
-export function PlanPanel({ items, compact = false }: PlanPanelProps) {
+export function PlanPanel({ items, compact = false, variant = 'card' }: PlanPanelProps) {
   // An agent with no plan yet has nothing to show — a panel with a "0 of 0"
   // header would just be chrome around an empty list.
   if (!items || items.length === 0) return null;
 
   const completed = items.filter((item) => item.status === 'completed').length;
   const gap = compact ? 3 : 6;
+
+  if (variant === 'rail') {
+    const pct = Math.round((completed / items.length) * 100);
+    return (
+      <section aria-label="Plan" style={{ flex: '0 0 auto', display: 'flex', flexDirection: 'column' }}>
+        <div
+          style={{
+            flex: '0 0 auto',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            height: 28,
+            padding: '0 12px',
+            borderBottom: '1px solid var(--border)',
+            fontFamily: 'var(--font-mono)',
+            fontSize: 10,
+            color: 'var(--muted-foreground)',
+          }}
+        >
+          <Icon name="list-todo" size={12} />
+          <span style={{ letterSpacing: 'var(--tracking-caps)', textTransform: 'uppercase' }}>plan</span>
+          <span style={{ marginLeft: 'auto' }}>
+            {completed} / {items.length}
+          </span>
+        </div>
+
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 7,
+            padding: '8px 12px 10px',
+            // The list can outgrow the rail; the timeline below it must keep
+            // its own scroller rather than being pushed off the bottom.
+            maxHeight: '38vh',
+            overflowY: 'auto',
+          }}
+        >
+          <div
+            role="progressbar"
+            aria-valuenow={pct}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-label="Plan progress"
+            style={{ height: 3, background: 'var(--muted)', border: '1px solid var(--border)' }}
+          >
+            <div
+              style={{
+                width: `${pct}%`,
+                height: '100%',
+                background: 'var(--success)',
+                transition: 'width var(--duration-base) var(--ease-standard)',
+              }}
+            />
+          </div>
+          <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'grid', gap: 2 }}>
+            {items.map((item, i) => (
+              <PlanRow key={i} item={item} compact />
+            ))}
+          </ul>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <div

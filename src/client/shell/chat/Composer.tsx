@@ -2,9 +2,12 @@ import * as React from 'react';
 import {
   ChatAttachment,
   ChatCapabilities,
+  ChatUsage,
+  ModelChoice,
   QueuedTurn,
   SlashCommand,
 } from '../../../shared/chat-events.js';
+import { compactCount } from '../../chat/tool-meta.js';
 import { mentionAtCaret } from '../../../shared/file-match.js';
 import { classifyPaste, MAX_IMAGES_PER_PASTE, PasteCandidate } from '../../../shared/paste-classify.js';
 import { MAX_IMAGE_BYTES } from '../../terminal/paste.js';
@@ -53,6 +56,33 @@ export interface ComposerProps {
    * arrives.
    */
   onFindFiles?: (query: string) => Promise<string[]>;
+  /**
+   * Bump to replace the draft with `seedDraft`.
+   *
+   * A seed rather than a controlled value: "edit and resend" has to write into
+   * the field once, and making the draft controlled would re-render the whole
+   * chat surface — turn grouping, activity projection and all — on every
+   * keystroke to achieve it.
+   */
+  seedKey?: number;
+  seedDraft?: string;
+  /** Shown on the branch chip; the surface reads it from the workspace API. */
+  branch?: string;
+  /** e.g. "turn 12", for the hint row's right-hand readout. */
+  turnLabel?: string;
+  /** Session totals, for the same readout. */
+  usage?: ChatUsage;
+  /**
+   * The model this session is actually running.
+   *
+   * Distinct from `capabilities.models`, which is the menu. Showing the first
+   * entry of the menu as the current value is right only by accident.
+   */
+  model?: string;
+  /** Drives what the permission chip reports. */
+  bypassPermissions?: boolean;
+  /** Changes what the hint row says about who owns Return. */
+  terminalOpen?: boolean;
 }
 
 interface AttachmentEntry {
@@ -124,6 +154,14 @@ export function Composer({
   queued = [],
   onCancelQueued,
   onFindFiles,
+  seedKey = 0,
+  seedDraft = '',
+  branch,
+  turnLabel,
+  usage,
+  model,
+  bypassPermissions = false,
+  terminalOpen = false,
 }: ComposerProps) {
   const baseId = React.useId();
   const listboxId = `${baseId}-picker`;
@@ -202,6 +240,18 @@ export function Composer({
     el.setSelectionRange(at, at);
     setCaret(at);
   }, [text]);
+
+  // "Edit and resend" writes here, once per bump. Guarded on the key rather
+  // than on the text so resending the same message twice still lands.
+  const lastSeed = React.useRef(seedKey);
+  React.useEffect(() => {
+    if (seedKey === lastSeed.current) return;
+    lastSeed.current = seedKey;
+    if (!seedKey) return;
+    setText(seedDraft);
+    pendingCaret.current = seedDraft.length;
+    textareaRef.current?.focus();
+  }, [seedKey, seedDraft, setText]);
 
   const attachmentsEnabled = capabilities.attachments && Boolean(onUpload);
   const commands = capabilities.commands ?? [];
@@ -657,62 +707,95 @@ export function Composer({
         />
       ) : null}
 
-      {/* The toolbar sits under the field rather than beside it: at one line
-          the two looked like a search box, and at twelve the buttons floated
-          in the middle of a wall of text with nothing to align to. */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-1)' }}>
+      {/* Two rows under the field rather than one beside it. At one line the
+          field and a row of buttons read as a search box; at twelve the buttons
+          floated in the middle of a wall of text with nothing to align to.
+          Actions first, then a line of plain text that says what the keys do
+          and what the conversation has cost. */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
         {attachmentsEnabled ? (
-          <IconButton
-            type="button"
-            size="md"
+          <ChipButton
             label="Attach a file or image"
             onClick={() => fileInputRef.current?.click()}
             disabled={disabled}
           >
-            <Icon name="paperclip" />
-          </IconButton>
+            <Icon name="paperclip" size={12} />
+          </ChipButton>
         ) : null}
 
         {filesEnabled ? (
-          <IconButton type="button" size="md" label="Reference a file from this project" onClick={openFiles}>
-            <Icon name="at-sign" />
-          </IconButton>
+          <ChipButton label="Reference a file from this project" onClick={openFiles}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>@</span>
+          </ChipButton>
         ) : null}
 
         {commands.length > 0 ? (
-          <IconButton
-            type="button"
-            size="md"
+          <ChipButton
             label="Slash commands and skills"
             aria-expanded={pickerOpen && pickerKind === 'commands'}
             onClick={openCommands}
             disabled={disabled}
           >
-            <Icon name="command" />
-          </IconButton>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>/</span>
+          </ChipButton>
         ) : null}
 
         <span
-          aria-hidden="true"
           style={{
-            flex: 1,
+            marginLeft: 'auto',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 7,
             minWidth: 0,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-            paddingLeft: 'var(--space-1)',
-            fontSize: 'var(--text-2xs)',
-            color: 'var(--muted-foreground)',
           }}
         >
-          {roomy ? hintFor({ isMobile, busy, findFailed, filesEnabled }) : null}
+          {branch && roomy ? (
+            <Chip
+              label={`On branch ${branch}`}
+              reason="Switch branches from the terminal or the Changes panel — a checkout under a running agent is not something this control can undo."
+              icon="git-branch"
+            >
+              {branch}
+            </Chip>
+          ) : null}
+
+          <ModelChip
+            current={model}
+            models={capabilities.models}
+            commands={commands}
+            disabled={disabled}
+            onPick={(value) => onSend(`/model ${value}`, [])}
+          />
+
+          <PermissionChip bypassPermissions={bypassPermissions} />
+
+          {busy && !disabled ? (
+            <StopButton onClick={onInterrupt} enabled={capabilities.interrupt} />
+          ) : null}
+
+          <SendButton label={sendLabel} enabled={canSend} queueing={busy} onClick={submit} />
         </span>
+      </div>
 
-        {busy && !disabled ? (
-          <StopButton onClick={onInterrupt} enabled={capabilities.interrupt} />
-        ) : null}
-
-        <SendButton label={sendLabel} enabled={canSend} queueing={busy} onClick={submit} />
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 10,
+          minWidth: 0,
+          fontFamily: 'var(--font-mono)',
+          fontSize: 'var(--text-2xs)',
+          color: 'var(--muted-foreground)',
+        }}
+      >
+        <span
+          style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+        >
+          {roomy ? hintFor({ isMobile, busy, findFailed, filesEnabled, terminalOpen }) : null}
+        </span>
+        <span style={{ marginLeft: 'auto', flex: '0 0 auto', whiteSpace: 'nowrap' }}>
+          {sessionReadout(turnLabel, usage)}
+        </span>
       </div>
     </div>
   );
@@ -803,20 +886,310 @@ function hintFor({
   busy,
   findFailed,
   filesEnabled,
+  terminalOpen,
 }: {
   isMobile: boolean;
   busy: boolean;
   findFailed: boolean;
   filesEnabled: boolean;
+  terminalOpen: boolean;
 }): React.ReactNode {
   if (findFailed) return 'Could not search this project’s files.';
   if (busy) return 'Send anyway — it will go as soon as this turn finishes.';
   if (isMobile) return filesEnabled ? '@ for a file, / for a command' : 'Tap send when you are ready';
   return (
     <>
-      <Kbd>Return</Kbd> to send · <Kbd>Shift</Kbd>+<Kbd>Return</Kbd> for a newline
-      {filesEnabled ? ' · @ for a file' : null}
+      <Kbd>Return</Kbd> sends · <Kbd>Shift</Kbd>+<Kbd>Return</Kbd> newline
+      {filesEnabled ? ' · @ file · / command · drop files anywhere' : null}
+      {/* With a shell on screen, "Return sends" is ambiguous until you know
+          which surface is listening. */}
+      {terminalOpen ? ' · the terminal takes Return while it has focus' : null}
     </>
+  );
+}
+
+/** `turn 12 · 349k tok · $0.4133`, with nothing invented for what is missing. */
+function sessionReadout(turnLabel: string | undefined, usage: ChatUsage | undefined): string {
+  const bits: string[] = [];
+  if (turnLabel) bits.push(turnLabel);
+  if (usage) {
+    const total = usage.totalTokens
+      ?? [usage.inputTokens, usage.outputTokens].reduce<number | undefined>(
+        (sum, value) => (value === undefined ? sum : (sum ?? 0) + value),
+        undefined,
+      );
+    if (total !== undefined) bits.push(`${compactCount(total)} tok`);
+    if (usage.costUsd !== undefined) bits.push(`$${usage.costUsd.toFixed(4)}`);
+  }
+  return bits.join(' · ');
+}
+
+/** A 26px square control on the composer's action row. */
+function ChipButton({
+  label,
+  onClick,
+  disabled,
+  children,
+  ...rest
+}: {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  children: React.ReactNode;
+} & React.ButtonHTMLAttributes<HTMLButtonElement>): React.JSX.Element {
+  const [hover, setHover] = React.useState(false);
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      title={label}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flex: '0 0 auto',
+        width: 26,
+        height: 26,
+        background: hover && !disabled ? 'var(--accent)' : 'transparent',
+        border: '1px solid var(--border)',
+        borderRadius: 'var(--radius)',
+        color: hover && !disabled ? 'var(--foreground)' : 'var(--muted-foreground)',
+        opacity: disabled ? 0.5 : 1,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        transition: 'background var(--duration-fast), color var(--duration-fast)',
+      }}
+      {...rest}
+    >
+      {children}
+    </button>
+  );
+}
+
+/**
+ * A readout the runtime does not let this surface change.
+ *
+ * Rendered and disabled rather than hidden: the value is worth knowing, and a
+ * control that vanishes reads as a bug while one that says why reads as a
+ * property of the runtime — which is what it is.
+ */
+function Chip({
+  label,
+  reason,
+  icon,
+  tone,
+  children,
+}: {
+  label: string;
+  reason: string;
+  icon?: string;
+  tone?: string;
+  children: React.ReactNode;
+}): React.JSX.Element {
+  return (
+    <button
+      type="button"
+      disabled
+      aria-label={label}
+      title={`${label}. ${reason}`}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 5,
+        flex: '0 1 auto',
+        minWidth: 0,
+        height: 26,
+        padding: '0 8px',
+        whiteSpace: 'nowrap',
+        background: 'transparent',
+        border: `1px solid ${tone ? `color-mix(in oklab, ${tone} 38%, transparent)` : 'var(--border)'}`,
+        borderRadius: 'var(--radius)',
+        fontFamily: 'var(--font-mono)',
+        fontSize: 'var(--text-2xs)',
+        color: tone || 'var(--muted-foreground)',
+        cursor: 'default',
+      }}
+    >
+      {icon ? <Icon name={icon} size={10} /> : null}
+      <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>{children}</span>
+    </button>
+  );
+}
+
+/**
+ * The model, and the one honest way to change it.
+ *
+ * There is no protocol message for "switch model" — every runtime that supports
+ * it does so through its own slash command. So the picker is live exactly when
+ * the runtime advertises both a model list and a `/model` command, and sends
+ * that command as an ordinary turn. Anything else would be a control that looks
+ * like it worked.
+ */
+function ModelChip({
+  current,
+  models,
+  commands,
+  disabled,
+  onPick,
+}: {
+  /** What the session reported it is running, when it reported anything. */
+  current: string | undefined;
+  models: ModelChoice[] | undefined;
+  commands: SlashCommand[];
+  disabled: boolean;
+  onPick: (value: string) => void;
+}): React.JSX.Element | null {
+  const [open, setOpen] = React.useState(false);
+  const ref = React.useRef<HTMLDivElement | null>(null);
+  const switchable = Boolean(models && models.length) && commands.some((c) => c.name === 'model');
+  // The session's own model wins. `models` is a menu in whatever order the
+  // runtime listed it, and its first entry is the current one only by accident.
+  const matched = models?.find((m) => m.value === current || m.name === current);
+  const label = matched?.name ?? current ?? models?.[0]?.name;
+
+  React.useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent): void => {
+      if (!ref.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown, true);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown, true);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  // Nothing to report and nothing to offer.
+  if (!label) return null;
+
+  if (!switchable) {
+    return (
+      <Chip
+        label={`Model ${label}`}
+        reason="This runtime does not accept a model change mid-session; start a new session to change it."
+      >
+        {label}
+      </Chip>
+    );
+  }
+
+  return (
+    <div ref={ref} style={{ position: 'relative', flex: '0 0 auto' }}>
+      <button
+        type="button"
+        disabled={disabled}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label="Change model"
+        title="Change model"
+        onClick={() => setOpen((value) => !value)}
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 5,
+          height: 26,
+          padding: '0 8px',
+          whiteSpace: 'nowrap',
+          background: open ? 'var(--accent)' : 'transparent',
+          border: '1px solid var(--border)',
+          borderRadius: 'var(--radius)',
+          fontFamily: 'var(--font-mono)',
+          fontSize: 'var(--text-2xs)',
+          color: 'var(--muted-foreground)',
+          opacity: disabled ? 0.5 : 1,
+          cursor: disabled ? 'not-allowed' : 'pointer',
+        }}
+      >
+        {label}
+        <Icon name="chevron-down" size={9} />
+      </button>
+      {open ? (
+        <div
+          role="listbox"
+          aria-label="Models"
+          style={{
+            position: 'absolute',
+            right: 0,
+            bottom: '100%',
+            marginBottom: 6,
+            minWidth: 180,
+            maxHeight: 220,
+            overflowY: 'auto',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 1,
+            padding: 'var(--space-1)',
+            background: 'var(--popover)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius)',
+            boxShadow: 'var(--shadow-popover)',
+            zIndex: 'var(--z-dropdown)' as unknown as number,
+          }}
+        >
+          {(models ?? []).map((model) => (
+            <button
+              key={model.value}
+              type="button"
+              role="option"
+              aria-selected={false}
+              onClick={() => {
+                setOpen(false);
+                onPick(model.value);
+              }}
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 2,
+                width: '100%',
+                padding: '5px 8px',
+                background: 'transparent',
+                border: 0,
+                borderRadius: 'var(--radius)',
+                color: 'var(--foreground)',
+                font: 'inherit',
+                fontSize: 'var(--text-xs)',
+                textAlign: 'left',
+                cursor: 'pointer',
+              }}
+            >
+              <span style={{ fontFamily: 'var(--font-mono)' }}>{model.name}</span>
+              {model.description ? (
+                <span style={{ color: 'var(--muted-foreground)' }}>{model.description}</span>
+              ) : null}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * What the agent is allowed to do without asking.
+ *
+ * Read-only on purpose. Approvals are a launch decision — the flag lives on the
+ * server's session record and there is no message that changes it underneath a
+ * running process — so this reports the truth and says where the choice is
+ * made. A picker here that silently did nothing would be the worst of the three
+ * options available.
+ */
+function PermissionChip({ bypassPermissions }: { bypassPermissions: boolean }): React.JSX.Element {
+  return (
+    <Chip
+      label={bypassPermissions ? 'Approvals bypassed' : 'Approvals asked for'}
+      reason="Set when the session is launched; start a new session to change it."
+      icon="shield"
+      tone={bypassPermissions ? 'var(--destructive)' : undefined}
+    >
+      {bypassPermissions ? 'bypass' : 'ask first'}
+    </Chip>
   );
 }
 

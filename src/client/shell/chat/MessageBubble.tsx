@@ -6,16 +6,15 @@ import {
   ErrorBlock,
   ImageBlock,
   NoticeBlock,
-  ThinkingBlock,
 } from '../../../shared/chat-events.js';
 import { ChatTranscript } from '../../chat/transcript.js';
+import { compactCount, formatDuration } from '../../chat/tool-meta.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import { Markdown, markdownText } from './Markdown.js';
-import { ToolCallCard } from './ToolCallCard.js';
 import { PlanPanel } from './PlanPanel.js';
 
 /**
- * One message in the transcript.
+ * One message in the transcript — prose, and nothing else.
  *
  * The bubble subscribes to its own message rather than reading whatever the
  * list handed it. A streaming turn fires an event per token against a single
@@ -26,30 +25,43 @@ import { PlanPanel } from './PlanPanel.js';
  * The reducer mutates messages in place, so the `message` prop is a stable
  * object across a whole streaming turn — which is what makes React.memo here
  * actually bite instead of re-rendering on identity churn.
+ *
+ * Reasoning blocks and tool calls are deliberately not rendered here. They are
+ * projected onto the trace rail's timeline instead (chat/activity.ts), where
+ * they can be read as a sequence of work rather than as interruptions in the
+ * middle of a sentence. What is left behind is a work pill: how much happened,
+ * and one click to go and look at it. Moved, never hidden.
  */
 
 export interface MessageBubbleProps {
   message: ChatMessage;
   transcript: ChatTranscript;
   onFork?: (messageId: string) => void;
-  onRetry?: () => void;
-  /** Hide reasoning blocks entirely, per the chat display settings. */
+  /**
+   * Resend the turn this message belongs to.
+   *
+   * Takes the message id. It used to take nothing, which meant the handler had
+   * to guess which turn was meant — and it guessed "whichever one is selected",
+   * so retrying an error you had scrolled back to resent the newest turn.
+   */
+  onRetry?: (messageId: string) => void;
+  /** Open the rail and scroll its timeline to this message's first event. */
+  onShowWork?: (messageId: string) => void;
+  /** Put this turn's text back in the composer, unsent. */
+  onEdit?: (text: string) => void;
+  /** Count reasoning blocks in the work pill, per the chat display settings. */
   showThinking?: boolean;
-  /** Hide tool call cards. A view change only: the tools still run. */
+  /** Count tool calls in the work pill. */
   showToolCalls?: boolean;
 }
-
-const ROLE_META: Record<string, { icon: string; label: string }> = {
-  user: { icon: 'user', label: 'You' },
-  assistant: { icon: 'bot', label: 'Assistant' },
-  system: { icon: 'message-square', label: 'System' },
-};
 
 export const MessageBubble = React.memo(function MessageBubble({
   message,
   transcript,
   onFork,
   onRetry,
+  onShowWork,
+  onEdit,
   showThinking = true,
   showToolCalls = true,
 }: MessageBubbleProps) {
@@ -74,13 +86,21 @@ export const MessageBubble = React.memo(function MessageBubble({
 
   const [copied, setCopied] = React.useState(false);
   const isUser = current.role === 'user';
-  // A marker is not a turn: no bubble, no header, no copy button, and the full
+  // A marker is not a turn: no surface, no glyph, no controls, and the full
   // width of the column — it is a line drawn across the conversation.
   const isMarker =
     current.role === 'system'
     && current.blocks.length > 0
     && current.blocks.every((block) => block.kind === 'notice');
-  const meta = ROLE_META[current.role] || ROLE_META.assistant;
+
+  // Derived from this message's own blocks, not from a list handed down. An
+  // events array as a prop would be a new object identity every render and
+  // would defeat React.memo for the whole transcript on every streamed token.
+  const work = React.useMemo(
+    () => summariseWork(current, showThinking, showToolCalls),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [current, version, showThinking, showToolCalls],
+  );
 
   const copy = React.useCallback(() => {
     // Same contract as CodeBlock: the label only flips once the write actually
@@ -97,182 +117,235 @@ export const MessageBubble = React.memo(function MessageBubble({
       });
   }, [current]);
 
+  // Nothing left to draw: an assistant turn that was only machinery, with both
+  // display toggles off. An empty bordered row is worse than no row — it reads
+  // as a message that failed to render rather than as one the settings hid.
+  if (!isUser && !isMarker && !current.streaming && visibleBlocks(current) === 0 && work.total === 0) {
+    return null;
+  }
+
   if (isMarker) {
     return (
-      <div style={{ display: 'grid', gap: 6, padding: '6px 8px' }}>
+      <div data-message-id={id} style={{ padding: '10px 14px' }}>
         {current.blocks.map((block, i) => (
-          <BlockView
-            key={i}
-            block={block}
-            plain={false}
-            onRetry={onRetry}
-            showThinking={showThinking}
-            showToolCalls={showToolCalls}
-            caret={false}
-          />
+          <NoticeRule key={i} block={block as NoticeBlock} />
         ))}
       </div>
     );
   }
 
   return (
-    // The alignment row. A bubble that is narrower than the column has to be
-    // pushed to one side by something, and giving the article `margin-left:
-    // auto` instead would fight the grid the list lays these out in.
-    <div
+    <article
+      data-message-id={id}
+      aria-label={isUser ? 'Your message' : 'Assistant message'}
       style={{
         display: 'flex',
-        justifyContent: isUser ? 'flex-end' : 'flex-start',
+        gap: 10,
         minWidth: 0,
-        padding: '2px 4px',
+        padding: isUser ? '10px 14px' : '12px 14px',
+        // The user's turn is the only thing in the transcript with a surface
+        // under it. That is what makes an hour of conversation skimmable: the
+        // asks are the landmarks, and everything between two of them is one
+        // answer.
+        background: isUser ? 'var(--muted)' : 'transparent',
+        borderBottom: '1px solid var(--border)',
+        fontFamily: 'var(--font-sans)',
       }}
     >
-      <article
-        aria-label={`${meta.label} message`}
+      <span
+        aria-hidden="true"
         style={{
-          display: 'grid',
-          gap: 6,
-          minWidth: 0,
-          // Asymmetric on purpose. A user's turn is a sentence and reads better
-          // in a narrow column; the assistant's carries code blocks, diffs and
-          // diagrams, and squeezing those to the same width to look tidy would
-          // wrap every line of every listing.
-          maxWidth: isUser ? 'min(78%, 720px)' : '100%',
-          width: isUser ? 'fit-content' : '100%',
-          padding: '10px 12px',
-          // Square, like everything else here: `--radius` is 0 by house style,
-          // so the bubbles are read as bubbles by their edges and their
-          // alignment rather than by rounded corners.
+          flex: '0 0 auto',
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: 18,
+          height: 18,
+          border: `1px solid ${isUser ? 'var(--border-strong)' : 'var(--border)'}`,
           borderRadius: 'var(--radius)',
-          // Role is carried by four independent signals — side, surface, icon
-          // and text label — so it survives a monochrome display, colour
-          // blindness, and a screen reader that sees none of the geometry.
-          background: isUser ? 'var(--card)' : 'transparent',
-          border: isUser ? '1px solid var(--border)' : '1px solid transparent',
-          borderLeft: isUser ? '1px solid var(--border)' : '2px solid var(--border)',
+          color: isUser ? 'var(--foreground)' : 'var(--muted-foreground)',
         }}
       >
-      <header style={{ display: 'flex', alignItems: 'center', gap: 6, minHeight: 20 }}>
-        {/*
-          Only the user's turns are labelled.
+        <Icon name={isUser ? 'user' : 'bot'} size={10} />
+      </span>
 
-          A conversation is overwhelmingly the assistant talking, so "Assistant"
-          on every bubble is a word repeated down the whole page that says
-          nothing the reader did not already know — while "You" marks the far
-          rarer thing, and is worth the row. The user's turn keeps its card
-          background and left border too, so the two are still told apart
-          without reading anything. The <article> label below is unconditional,
-          so a screen reader still hears which is which.
-        */}
-        {isUser ? (
-          <>
-            <span
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                width: 18,
-                height: 18,
-                border: '1px solid var(--border)',
-                color: 'var(--muted-foreground)',
-                borderRadius: 'var(--radius)',
-              }}
-            >
-              <Icon name={meta.icon} size={11} />
-            </span>
-            <span
-              style={{
-                fontSize: 'var(--text-xs)',
-                fontWeight: 'var(--font-semibold)',
-                letterSpacing: 'var(--tracking-wide)',
-                color: 'var(--foreground)',
-              }}
-            >
-              {meta.label}
-            </span>
-          </>
-        ) : null}
-        {current.streaming ? (
-          <span
-            style={{
-              fontFamily: 'var(--font-mono)',
-              fontSize: 'var(--text-2xs)',
-              color: 'var(--muted-foreground)',
-            }}
-          >
-            writing
-          </span>
-        ) : null}
-
-        <span style={{ flex: 1 }} />
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-          {/* Always in the DOM and in the tab order. Hover-only controls put the
-              two power features of this surface out of reach of keyboards and
-              of every touch device, which is most of how this app is used. */}
-          <ActionButton
-            label={copied ? 'Copied' : 'Copy message'}
-            icon={copied ? 'check' : 'copy'}
-            onClick={copy}
-            tone={copied ? 'var(--success)' : undefined}
-          />
-          {onFork ? (
-            <ActionButton
-              label="Branch from here"
-              icon="git-branch"
-              onClick={() => onFork(id)}
-            />
-          ) : null}
-        </div>
-      </header>
-
-      <div style={{ display: 'grid', gap: 8, minWidth: 0 }}>
+      <div
+        className="chat-prose"
+        style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: isUser ? 7 : 10 }}
+      >
         {current.blocks.map((block, i) => (
           <BlockView
             key={i}
             block={block}
             plain={isUser}
-            onRetry={onRetry}
-            showThinking={showThinking}
-            showToolCalls={showToolCalls}
+            onRetry={onRetry ? () => onRetry(id) : undefined}
             caret={Boolean(current.streaming) && i === current.blocks.length - 1}
           />
         ))}
-        {current.streaming && current.blocks.length === 0 ? <Caret /> : null}
+        {current.streaming && visibleBlocks(current) === 0 ? <Caret /> : null}
+
+        {!isUser && work.total > 0 && onShowWork ? (
+          <WorkPill label={work.label} onClick={() => onShowWork(id)} />
+        ) : null}
+
+        {isUser ? null : <Footer model={current.model} usage={current.usage} />}
+      </div>
+
+      <div style={{ flex: '0 0 auto', display: 'flex', alignItems: 'flex-start', gap: 2 }}>
+        <span
+          style={{
+            paddingTop: 3,
+            fontFamily: 'var(--font-mono)',
+            fontSize: 'var(--text-2xs)',
+            color: 'var(--muted-foreground)',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {clockTime(current.ts)}
+        </span>
+        {/* Always in the DOM and in the tab order. Hover-only controls put the
+            power features of this surface out of reach of keyboards and of
+            every touch device, which is most of how this app is used. */}
+        <ActionButton
+          label={copied ? 'Copied' : 'Copy message'}
+          icon={copied ? 'check' : 'copy'}
+          onClick={copy}
+          tone={copied ? 'var(--success)' : undefined}
+        />
+        {isUser && onEdit ? (
+          <ActionButton
+            label="Edit and resend"
+            icon="pencil"
+            onClick={() => onEdit(plainText(current))}
+          />
+        ) : null}
+        {!isUser && onRetry ? (
+          <ActionButton label="Retry this turn" icon="refresh-cw" onClick={() => onRetry(id)} />
+        ) : null}
+        {onFork ? (
+          <ActionButton label="Branch from here" icon="git-branch" onClick={() => onFork(id)} />
+        ) : null}
       </div>
 
       {/* Mounted unconditionally: a live region that appears with its text
           already in it is not an update, and assistive tech announces nothing. */}
-      <span
-        aria-live="polite"
-        style={{ position: 'absolute', width: 1, height: 1, overflow: 'hidden', clip: 'rect(0 0 0 0)' }}
-      >
-        {current.streaming ? `${meta.label} is responding` : ''}
+      <span aria-live="polite" style={SR_ONLY}>
+        {current.streaming ? `${isUser ? 'You are' : 'The assistant is'} responding` : ''}
       </span>
-
-        <Footer model={current.model} usage={current.usage} />
-      </article>
-    </div>
+    </article>
   );
 });
 
 const ZERO = (): number => 0;
+
+const SR_ONLY: React.CSSProperties = {
+  position: 'absolute',
+  width: 1,
+  height: 1,
+  overflow: 'hidden',
+  clip: 'rect(0 0 0 0)',
+};
+
+/** How many blocks this message would actually paint. */
+function visibleBlocks(message: ChatMessage): number {
+  return message.blocks.filter((block) => block.kind !== 'thinking' && block.kind !== 'tool').length;
+}
+
+interface WorkSummary {
+  total: number;
+  label: string;
+}
+
+/**
+ * What the pill says: how much machinery this message carried.
+ *
+ * Duration is summed from the calls that reported one rather than measured
+ * between timestamps — a message's `ts` is when it opened, and the gap to the
+ * next one includes however long the user spent reading.
+ */
+function summariseWork(
+  message: ChatMessage,
+  showThinking: boolean,
+  showToolCalls: boolean,
+): WorkSummary {
+  let tools = 0;
+  let reasoning = 0;
+  let durationMs = 0;
+  for (const block of message.blocks) {
+    if (block.kind === 'tool' && showToolCalls) {
+      tools += 1;
+      if (block.durationMs !== undefined) durationMs += block.durationMs;
+    } else if (block.kind === 'thinking' && showThinking) {
+      reasoning += 1;
+    }
+  }
+
+  const bits: string[] = [];
+  if (tools) bits.push(`${tools} command${tools === 1 ? '' : 's'}`);
+  if (reasoning) bits.push(`${reasoning} reasoning`);
+  if (durationMs > 0) {
+    const formatted = formatDuration(durationMs);
+    if (formatted) bits.push(formatted);
+  }
+
+  return { total: tools + reasoning, label: bits.join(' · ') };
+}
+
+/**
+ * The one thing the transcript keeps of a turn's machinery.
+ *
+ * Not a disclosure: expanding it here would put the wall of tool output back in
+ * the middle of the prose, which is the thing the redesign removed. It is a
+ * pointer — it opens the rail and scrolls the timeline to this message.
+ */
+function WorkPill({ label, onClick }: { label: string; onClick: () => void }): React.JSX.Element {
+  const [hover, setHover] = React.useState(false);
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      onFocus={() => setHover(true)}
+      onBlur={() => setHover(false)}
+      style={{
+        alignSelf: 'flex-start',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 8,
+        maxWidth: '100%',
+        height: 24,
+        padding: '0 8px',
+        background: 'var(--card)',
+        border: `1px solid ${hover ? 'var(--border-strong)' : 'var(--border)'}`,
+        borderRadius: 'var(--radius)',
+        fontFamily: 'var(--font-mono)',
+        fontSize: 10.5,
+        color: hover ? 'var(--foreground)' : 'var(--muted-foreground)',
+        cursor: 'pointer',
+        transition: 'border-color var(--duration-fast), color var(--duration-fast)',
+      }}
+    >
+      <Icon name="terminal" size={10} />
+      <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        {label}
+      </span>
+      <span style={{ flex: '0 0 auto', color: 'var(--foreground)' }}>show work</span>
+    </button>
+  );
+}
 
 function BlockView({
   block,
   plain,
   caret,
   onRetry,
-  showThinking,
-  showToolCalls,
 }: {
   block: ChatBlock;
   /** True for the user's own turn, where text is echoed literally. */
   plain: boolean;
   caret: boolean;
   onRetry?: () => void;
-  showThinking: boolean;
-  showToolCalls: boolean;
 }) {
   switch (block.kind) {
     case 'text':
@@ -280,32 +353,38 @@ function BlockView({
       // input back through a renderer silently rewrites what they wrote.
       if (plain) {
         return (
-          <div
+          <p
             style={{
+              margin: 0,
+              maxWidth: 'var(--chat-prose-width, 74ch)',
               whiteSpace: 'pre-wrap',
               wordBreak: 'break-word',
+              fontSize: 'var(--chat-prose-size, var(--text-ui))',
               lineHeight: 'var(--leading-normal)',
             }}
           >
             {block.text}
             {caret ? <Caret /> : null}
-          </div>
+          </p>
         );
       }
       return (
-        <div style={{ minWidth: 0 }}>
+        // The class goes on the element the renderer's blocks are *direct*
+        // children of. The measure rule uses `>` so that a code block, a table
+        // or a diff — which are not in the selector — keeps the width its
+        // content needs; a descendant selector would have capped them too.
+        <div className="chat-prose" style={{ minWidth: 0 }}>
           <Markdown text={block.text} />
           {caret ? <Caret /> : null}
         </div>
       );
 
+    // Reasoning and tool calls live on the trace timeline now. Returning null
+    // rather than removing the cases: a block kind that silently fell through
+    // to `default` would be indistinguishable from one nobody has handled yet.
     case 'thinking':
-      // Hidden, not collapsed. The card is already collapsed by default, so a
-      // setting that only collapsed it would change nothing.
-      return showThinking ? <Thinking block={block} /> : null;
-
     case 'tool':
-      return showToolCalls ? <ToolCallCard block={block} /> : null;
+      return null;
 
     case 'plan':
       return <PlanPanel items={block.items} />;
@@ -322,76 +401,6 @@ function BlockView({
     default:
       return null;
   }
-}
-
-function Thinking({ block }: { block: ThinkingBlock }) {
-  const [open, setOpen] = React.useState(false);
-  const regionId = React.useId();
-
-  const { lines, tokens } = React.useMemo(() => {
-    const text = block.text || '';
-    return {
-      lines: text ? text.split('\n').length : 0,
-      // Four characters per token is the usual rough ratio; this is a size cue,
-      // not an accounting figure, so an approximation is honest enough.
-      tokens: Math.ceil(text.length / 4),
-    };
-  }, [block.text]);
-
-  return (
-    <div style={{ border: '1px solid var(--border)', background: 'var(--muted)' }}>
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        aria-expanded={open}
-        aria-controls={regionId}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 6,
-          width: '100%',
-          minHeight: 34,
-          padding: '0 8px',
-          background: 'transparent',
-          border: 0,
-          color: 'var(--muted-foreground)',
-          font: 'inherit',
-          fontSize: 'var(--text-xs)',
-          textAlign: 'left',
-          cursor: 'pointer',
-          borderRadius: 'var(--radius)',
-        }}
-      >
-        <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} />
-        <Icon name="brain" size={12} />
-        <span style={{ fontWeight: 'var(--font-medium)' }}>
-          {open ? 'Hide reasoning' : 'Reasoning'}
-        </span>
-        <span
-          style={{
-            marginLeft: 'auto',
-            fontFamily: 'var(--font-mono)',
-            fontSize: 'var(--text-2xs)',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          {lines} {lines === 1 ? 'line' : 'lines'} · ~{compact(tokens)} tok
-        </span>
-      </button>
-      {open ? (
-        <div
-          id={regionId}
-          style={{
-            padding: '2px 10px 8px',
-            color: 'var(--muted-foreground)',
-            fontSize: 'var(--text-sm)',
-          }}
-        >
-          <Markdown text={block.text} dense />
-        </div>
-      ) : null}
-    </div>
-  );
 }
 
 /**
@@ -439,7 +448,7 @@ function ImageView({ block }: { block: ImageBlock }) {
       alt={block.alt || 'Attached image'}
       loading="lazy"
       style={{
-        maxWidth: '100%',
+        maxWidth: 'min(100%, 420px)',
         height: 'auto',
         border: '1px solid var(--border)',
         borderRadius: 'var(--radius)',
@@ -455,6 +464,7 @@ function ErrorCallout({ block, onRetry }: { block: ErrorBlock; onRetry?: () => v
         display: 'flex',
         alignItems: 'flex-start',
         gap: 8,
+        maxWidth: 760,
         padding: '8px 10px',
         border: '1px solid color-mix(in oklab, var(--destructive) 38%, transparent)',
         background: 'color-mix(in oklab, var(--destructive) 8%, transparent)',
@@ -541,9 +551,8 @@ function ActionButton({
         display: 'inline-flex',
         alignItems: 'center',
         justifyContent: 'center',
-        // 34px keeps it a comfortable touch target on the phone layout.
-        width: 34,
-        height: 34,
+        width: 22,
+        height: 22,
         background: hot ? 'var(--accent)' : 'transparent',
         border: '1px solid transparent',
         color: tone || 'var(--muted-foreground)',
@@ -555,7 +564,7 @@ function ActionButton({
         transition: 'opacity var(--duration-fast), background var(--duration-fast)',
       }}
     >
-      <Icon name={icon} size={13} />
+      <Icon name={icon} size={11} />
     </button>
   );
 }
@@ -564,9 +573,9 @@ function Footer({ model, usage }: { model?: string; usage?: ChatUsage }) {
   const bits: string[] = [];
   if (model) bits.push(model);
   if (usage) {
-    if (usage.inputTokens !== undefined) bits.push(`${compact(usage.inputTokens)} in`);
-    if (usage.outputTokens !== undefined) bits.push(`${compact(usage.outputTokens)} out`);
-    if (usage.cacheReadTokens) bits.push(`${compact(usage.cacheReadTokens)} cached`);
+    if (usage.inputTokens !== undefined) bits.push(`${compactCount(usage.inputTokens)} in`);
+    if (usage.outputTokens !== undefined) bits.push(`${compactCount(usage.outputTokens)} out`);
+    if (usage.cacheReadTokens) bits.push(`${compactCount(usage.cacheReadTokens)} cached`);
     if (usage.costUsd !== undefined) bits.push(`$${usage.costUsd.toFixed(4)}`);
   }
   if (!bits.length) return null;
@@ -589,12 +598,20 @@ function Footer({ model, usage }: { model?: string; usage?: ChatUsage }) {
   );
 }
 
-/** Short form for token counts, which routinely run to six figures. */
-function compact(n: number): string {
-  if (!Number.isFinite(n)) return '0';
-  if (n < 1000) return String(Math.round(n));
-  if (n < 10000) return `${(n / 1000).toFixed(1)}k`;
-  return `${Math.round(n / 1000)}k`;
+/** hh:mm of a message's timestamp, in the viewer's locale. */
+function clockTime(ts: number): string {
+  if (!ts) return '';
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return '';
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+/** The literal text of a turn, for seeding the composer with it again. */
+export function plainText(message: ChatMessage): string {
+  return message.blocks
+    .filter((block): block is Extract<ChatBlock, { kind: 'text' }> => block.kind === 'text')
+    .map((block) => block.text)
+    .join('\n\n');
 }
 
 /** Plain text of a whole message, for the copy button. */

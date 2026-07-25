@@ -224,6 +224,7 @@ async function run(): Promise<void> {
   await checkModeQueriesDoNotKillTheTerminal();
   await checkATallDialogStaysOnScreen();
   await checkTheComposerShrinksWithTheWorkspaceRail();
+  await checkTheFixedBarsNeverWrap();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -460,10 +461,13 @@ async function checkTheComposerShrinksWithTheWorkspaceRail(): Promise<void> {
     const inputBox = textarea.getBoundingClientRect();
     const hostBox = host.getBoundingClientRect();
 
+    // The rail sits to the *right* of the conversation since the redesign, so
+    // the test of "neither is drawn over the other" runs the other way: the
+    // composer has to end before the rail begins.
     check(
-      `a ${panelWidth}px rail starts before the composer does`,
-      inputBox.left >= railBox.right,
-      `rail ends ${Math.round(railBox.right)}, composer starts ${Math.round(inputBox.left)}`,
+      `a ${panelWidth}px rail starts after the composer ends`,
+      inputBox.right <= railBox.left + 1,
+      `composer ends ${Math.round(inputBox.right)}, rail starts ${Math.round(railBox.left)}`,
     );
     check(
       `a ${panelWidth}px rail leaves the composer inside the surface`,
@@ -473,6 +477,137 @@ async function checkTheComposerShrinksWithTheWorkspaceRail(): Promise<void> {
   }
 
   root.unmount();
+  host.remove();
+}
+
+/**
+ * The fixed-height bars must never wrap, at any width the app is used at.
+ *
+ * Acceptance criterion §7.5 of the design spec, and the one defect class this
+ * layout is most exposed to: the header, the turn strips and the terminal tab
+ * bar are all a fixed height with a money figure or a token count on the right.
+ * One item that refuses to shrink pushes the row to two lines — which changes
+ * the height of everything below it — or clips the number, which is worse than
+ * not showing it. Static markup renders both as passing; only a layout engine
+ * knows.
+ *
+ * The rule the components implement, asserted here rather than described: the
+ * low-value items shrink (`min-width: 0` + ellipsis) and the numbers do not.
+ */
+async function checkTheFixedBarsNeverWrap(): Promise<void> {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+
+  const controller = new ChatController('bar-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'bar-check',
+    snapshot: {
+      sessionId: 'bar-check',
+      runtime: 'claude',
+      state: 'running',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true, commands: [{ name: 'clear' }],
+      },
+      // Deliberately the widest realistic values: six-figure token counts, a
+      // four-decimal cost, a long branch name and a deep working directory.
+      usage: { totalTokens: 987654, costUsd: 1234.5678, contextWindow: 200000, contextUsed: 190000 },
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'a question long enough to need the whole column for itself' }],
+        },
+        {
+          id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: Date.now(),
+          blocks: [
+            { kind: 'text', text: 'an answer' },
+            { kind: 'thinking', text: 'working' },
+            {
+              kind: 'tool', toolId: 'x1', name: 'bash', toolKind: 'execute',
+              status: 'completed', input: { command: 'npm test' }, durationMs: 754321,
+            },
+          ],
+          usage: { inputTokens: 123456, outputTokens: 98765, costUsd: 1234.5678 },
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
+      live: true, bypassPermissions: true,
+    },
+  } as never);
+
+  // A fresh mount per width rather than one root re-rendered three times: the
+  // surface measures itself with a ResizeObserver to decide which zones fit,
+  // and re-rendering a live tree into a resized box is not the same thing as
+  // opening it at that size — which is what a user actually does.
+  for (const width of [924, 1280, 1600]) {
+    host.style.cssText = `width:${width}px;height:760px;position:absolute;top:0;left:0;display:flex`;
+    const root = createRoot(host);
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/home/dev/projects/a-rather-deeply-nested-working-directory',
+        branch: 'feature/a-long-enough-branch-name-to-crowd-the-bar',
+        view: { ...DEFAULT_CHAT_VIEW, terminalOpen: true },
+        onViewChange: () => {},
+      } as never),
+    );
+    await wait(400);
+
+    const bars: Array<[string, HTMLElement | null]> = [
+      ['session header', host.querySelector('header')],
+      ['turn strip', host.querySelector('[data-turn-id]')],
+      ['turn index header', host.querySelector('nav[aria-label="Turns"] div')],
+      ['activity filter row', host.querySelector('[aria-label="Activity"] [role="tablist"]')],
+      ['terminal tab bar', host.querySelector('[role="tablist"][aria-label="Terminals"]')],
+    ];
+
+    for (const [name, bar] of bars) {
+      if (!bar) {
+        // The turn index is a rail only above 1024px; below that it is a sheet
+        // and its header legitimately is not on screen.
+        if (name === 'turn index header' && width < 1024) continue;
+        check(
+          `${name} renders at ${width}px`,
+          false,
+          `not found; navs=${host.querySelectorAll('nav').length} tablists=${host.querySelectorAll('[role="tablist"]').length}`,
+        );
+        continue;
+      }
+      // One line, not two: a wrapped bar is taller than the box it was given.
+      check(
+        `the ${name} does not wrap at ${width}px`,
+        bar.scrollHeight <= bar.clientHeight + 1,
+        `scrollHeight=${bar.scrollHeight} clientHeight=${bar.clientHeight}`,
+      );
+    }
+
+    // And the figures people came to read are inside their bar, not clipped
+    // off its right edge.
+    const header = host.querySelector('header') as HTMLElement | null;
+    if (header) {
+      const headerBox = header.getBoundingClientRect();
+      const overflowing = Array.from(header.querySelectorAll('*')).filter((node) => {
+        const box = (node as HTMLElement).getBoundingClientRect();
+        return box.width > 0 && box.right > headerBox.right + 1;
+      });
+      check(
+        `nothing in the header is clipped at ${width}px`,
+        overflowing.length === 0,
+        overflowing.length
+          ? overflowing
+              .map((n) => `${n.tagName.toLowerCase()}:${(n.textContent || '').trim().slice(0, 18) || (n as HTMLElement).getAttribute('aria-label') || '?'}`)
+              .join(' | ')
+          : '0 overflowing',
+      );
+    }
+
+    root.unmount();
+  }
+
   host.remove();
 }
 
