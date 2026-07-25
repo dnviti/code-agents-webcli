@@ -7,10 +7,13 @@ import { Icon } from '../ui/relay/Icon';
 import { IconButton } from '../ui/relay/IconButton';
 import { StatusBar, type StatusBarSegment } from '../ui/relay/StatusBar';
 import { TabBar, type TabItem } from '../ui/relay/TabBar';
+import { resolveConfirm } from '../ui/confirm';
+import { ConfirmDialog } from './dialogs/ConfirmDialog';
 import { FolderBrowserDialog } from './dialogs/FolderBrowserDialog';
 import { NewSessionDialog } from './dialogs/NewSessionDialog';
 import { PlanDialog } from './dialogs/PlanDialog';
 import { RenameDialog } from './dialogs/RenameDialog';
+import { RuntimeProfilesDialog } from './dialogs/RuntimeProfilesDialog';
 import { SessionsDialog } from './dialogs/SessionsDialog';
 import { SettingsDialog } from './dialogs/SettingsDialog';
 import { TerminalOptionsDialog } from './dialogs/TerminalOptionsDialog';
@@ -23,6 +26,8 @@ import { installHint, promptInstall } from './install-prompt';
 import { OverlayHost } from './OverlayHost';
 import { TabContextMenu } from './TabContextMenu';
 import { TerminalHost } from './TerminalHost';
+import { ChatView } from './chat/ChatView';
+import type { ChatController } from '../chat/controller';
 import { Toasts } from './Toasts';
 import { UpdateBannerView } from './UpdateBannerView';
 import { shellStore, type ShellState, type ShellTab } from './store';
@@ -127,6 +132,12 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
   );
 
   const active = state.tabs.find((t) => t.id === state.activeId) || null;
+
+  // The chat surface is decided by the server and published into the store; the
+  // controller is carried as an opaque handle because its transcript mutates
+  // per token and must not live in shell state.
+  const chatActive = state.chat.active;
+  const chatController = state.chat.controller as ChatController | null;
   const [menu, setMenu] = React.useState<{ id: string; x: number; y: number } | null>(null);
 
   const closePalette = React.useCallback(() => {
@@ -410,7 +421,33 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       )}
 
       <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
-        <TerminalHost node={terminalNode} onResize={actions.fitTerminal} />
+        {/*
+          The terminal stays mounted even while the chat surface is showing.
+          xterm is imperative and owns a live DOM node; unmounting it to swap
+          surfaces would throw away the buffer, and re-parenting it is the one
+          thing this shell has always refused to do. Hiding costs nothing.
+        */}
+        <div
+          style={{
+            flex: 1,
+            display: chatActive ? 'none' : 'flex',
+            minHeight: 0,
+            minWidth: 0,
+          }}
+        >
+          <TerminalHost node={terminalNode} onResize={actions.fitTerminal} />
+        </div>
+        {chatActive && chatController ? (
+          <ChatView
+            controller={chatController}
+            runtime={state.chat.runtime}
+            runtimeLabel={state.chat.runtimeLabel || state.chat.runtime}
+            workingDir={state.chat.workingDir || active?.workingDir || ''}
+            isMobile={state.isMobile}
+            bypassPermissions={state.chat.bypassPermissions}
+            onOpenSettings={() => closeDialogs({ settings: true })}
+          />
+        ) : null}
         <OverlayHost
           view={state.overlay}
           message={state.overlayMessage}
@@ -443,6 +480,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         settings={actions.readSettings()}
         install={state.install}
         onInstall={() => void installHint()}
+        onOpenRuntimeProfiles={() => closeDialogs({ settings: false, runtimeProfiles: true })}
         onPreview={actions.previewSettings}
         onSave={(next) => { actions.saveSettings(next); closeDialogs({ settings: false }); }}
         onClose={() => {
@@ -453,6 +491,11 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           actions.previewSettings(actions.readSettings());
           closeDialogs({ settings: false });
         }}
+      />
+
+      <RuntimeProfilesDialog
+        open={state.dialogs.runtimeProfiles}
+        onClose={() => closeDialogs({ runtimeProfiles: false })}
       />
 
       <NewSessionDialog
@@ -528,6 +571,8 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         }}
         onClose={() => closeDialogs({ rename: null })}
       />
+
+      <ConfirmDialog request={state.confirm} onAnswer={resolveConfirm} />
 
       <MoreSheet
         open={state.dialogs.more}

@@ -1,0 +1,13 @@
+{"t":"session","seq":1,"ts":1000,"nativeSessionId":"native-1","model":"vendor/model-x","cwd":"/home/tizio/progetto","capabilities":{"streaming":true,"thinking":false,"toolCalls":true,"diffs":true,"permissions":true,"interrupt":true,"resume":true,"fork":false,"attachments":false,"usage":true,"cost":true,"plan":false}}
+{"t":"msg_start","seq":2,"ts":1001,"id":"m1","role":"user","turnId":"turn-1"}
+{"t":"block_start","seq":3,"ts":1002,"msgId":"m1","index":0,"block":{"kind":"text","text":"Fix the login bug please"}}
+{"t":"msg_end","seq":4,"ts":1003,"msgId":"m1","stopReason":"end_turn"}
+{"t":"msg_start","seq":5,"ts":1004,"id":"m2","role":"assistant","turnId":"turn-1","model":"vendor/model-x"}
+{"t":"block_start","seq":6,"ts":1005,"msgId":"m2","index":0,"block":{"kind":"text","text":""}}
+{"t":"block_delta","seq":7,"ts":1006,"msgId":"m2","index":0,"text":"Looking "}
+{"t":"block_delta","seq":8,"ts":1007,"msgId":"m2","index":0,"text":"at the code now."}
+{"t":"block_end","seq":9,"ts":1008,"msgId":"m2","index":0}
+{"t":"block_start","seq":10,"ts":1009,"msgId":"m2","index":1,"block":{"kind":"tool","toolId":"t1","name":"bash","toolKind":"execute","status":"running"}}
+{"t":"tool","seq":11,"ts":1010,"toolId":"t1","patch":{"status":"completed","output":"login bug fixed"}}
+{"t":"msg_end","seq":12,"ts":1011,"msgId":"m2","stopReason":"end_turn","usage":{"inputTokens":120,"outputTokens":45}}
+{"t":"turn_end","seq":13,"ts":1012,"turnId":"turn-1","stopReason":"end_turn"}

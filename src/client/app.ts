@@ -20,6 +20,8 @@ import {
 import { setupTerminal, fitTerminal } from './terminal/setup';
 import { WebSocketConnection } from './terminal/connection';
 import { MessageHandler } from './terminal/message-handler';
+import { ChatController } from './chat/controller';
+import { syncChatSurface } from './chat/surface';
 import { SessionTabManager } from './sessions/tab-manager';
 import {
   loadSessions as sessionsLoadSessions,
@@ -34,6 +36,7 @@ import {
   startGrokSession as sessionsStartGrok,
   startQwenSession as sessionsStartQwen,
   startKimiSession as sessionsStartKimi,
+  startOmpSession as sessionsStartOmp,
   startTerminalSession as sessionsStartTerminal,
   closeSession as sessionsCloseSession,
 } from './sessions/actions';
@@ -87,6 +90,16 @@ export class App {
   isCreatingNewSession: boolean;
   startPromptRequested: boolean;
   pendingRuntimeStart: { kind: AgentKind; options: RuntimeStartOptions } | null;
+  /**
+   * Watchdog for a launch the server never answers.
+   *
+   * A start request is fire-and-forget over the socket, so a server that does
+   * not understand it drops it and the spinner covers the screen forever with
+   * nothing to click. That is not hypothetical: the server loads its code once
+   * at boot, so a long-running process paired with a freshly built page is
+   * exactly a client that speaks a message the server has never heard of.
+   */
+  runtimeStartTimer: ReturnType<typeof setTimeout> | null;
   pendingJoinResolve: (() => void) | null;
   pendingJoinSessionId: string | null;
 
@@ -110,6 +123,14 @@ export class App {
   // Modules
   wsConnection: WebSocketConnection;
   messageHandler: MessageHandler;
+  /**
+   * The chat surface's controller.
+   *
+   * Always present, even for terminal sessions: it costs nothing idle, and a
+   * lazily-created one would have to be threaded through every place a message
+   * can arrive before the surface is known.
+   */
+  chat: ChatController;
   sessionTabManager!: SessionTabManager;
   folderBrowser: FolderBrowser;
   planDetector: PlanDetector;
@@ -135,6 +156,7 @@ export class App {
     this.isCreatingNewSession = false;
     this.startPromptRequested = false;
     this.pendingRuntimeStart = null;
+    this.runtimeStartTimer = null;
     this.pendingJoinResolve = null;
     this.pendingJoinSessionId = null;
 
@@ -154,6 +176,7 @@ export class App {
       grok: 'Grok',
       qwen: 'Qwen',
       kimi: 'Kimi',
+      omp: 'Oh My Pi',
       terminal: 'Terminal',
     };
 
@@ -162,6 +185,10 @@ export class App {
 
     this.wsConnection = new WebSocketConnection(this);
     this.messageHandler = new MessageHandler(this);
+    this.chat = new ChatController({
+      send: (message) => this.send(message),
+      onChange: () => syncChatSurface(this),
+    });
     this.folderBrowser = new FolderBrowser(this);
     this.planDetector = new PlanDetector();
     this.splitContainer = null;
@@ -372,6 +399,10 @@ export class App {
 
   startKimiSession(options: RuntimeStartOptions = {}): Promise<void> {
     return sessionsStartKimi(this, options);
+  }
+
+  startOmpSession(options: RuntimeStartOptions = {}): Promise<void> {
+    return sessionsStartOmp(this, options);
   }
 
   startTerminalSession(options: RuntimeStartOptions = {}): Promise<void> {

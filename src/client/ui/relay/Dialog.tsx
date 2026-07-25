@@ -134,9 +134,16 @@ export function Dialog({
   const panelStyle: React.CSSProperties = {
     width: bottom ? '100%' : width,
     maxWidth: '100%',
-    maxHeight: bottom ? '85dvh' : undefined,
-    display: bottom ? 'flex' : undefined,
-    flexDirection: bottom ? 'column' : undefined,
+    // Every panel is height-capped, centred ones included. Without a cap a tall
+    // dialog simply grows past the viewport, and because the overlay centres it
+    // the overflow goes off *both* edges — so the top of the content, title row
+    // included, ends up above the window with nothing able to scroll to it. The
+    // overlay is `position: fixed`, so the page behind cannot reach it either.
+    // `- 48px` is the overlay's own 24px padding on each side.
+    maxHeight: bottom ? '85dvh' : 'calc(100dvh - 48px)',
+    // Header and footer keep their height, the body takes the rest and scrolls.
+    display: 'flex',
+    flexDirection: 'column',
     background: 'var(--popover)',
     border: '1px solid var(--border)',
     borderWidth: bottom ? '1px 0 0' : '1px',
@@ -150,7 +157,10 @@ export function Dialog({
     // ring; the controls inside it carry their own.
     outline: 'none',
   };
-  const headerStyle: React.CSSProperties = { padding: '16px 18px', borderBottom: '1px solid var(--border)' };
+  // A flex item's default `min-height: auto` refuses to shrink below its
+  // content, which would push the header and footer off a capped panel instead
+  // of letting the body scroll. `flexShrink: 0` keeps them whole.
+  const headerStyle: React.CSSProperties = { padding: '16px 18px', borderBottom: '1px solid var(--border)', flexShrink: 0 };
   const headerRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 };
   const titleStyle: React.CSSProperties = { margin: 0, fontFamily: 'var(--font-sans)', fontSize: 'var(--text-body)', fontWeight: 'var(--font-semibold)' as React.CSSProperties['fontWeight'], color: 'var(--foreground)' };
   const closeStyle: React.CSSProperties = {
@@ -161,10 +171,20 @@ export function Dialog({
   const descriptionStyle: React.CSSProperties = { margin: '6px 0 0', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-sm)', color: 'var(--muted-foreground)', lineHeight: 'var(--leading-normal)' };
   const bodyStyle: React.CSSProperties = {
     padding: '16px 18px', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-ui)', color: 'var(--foreground)',
-    // A sheet is height-capped, so its body is the part that scrolls.
-    ...(bottom ? { flex: 1, minHeight: 0, overflowY: 'auto' as const } : null),
+    // The body is the part that scrolls, in every placement. `minHeight: 0` is
+    // what actually allows it: without it the item cannot shrink below its
+    // content, so the panel would overflow its own cap and nothing would scroll.
+    flex: 1,
+    minHeight: 0,
+    overflowY: 'auto',
+    // Wide content — a long argument string, an env value — scrolls sideways in
+    // here rather than stretching the panel past the window.
+    overflowX: 'auto',
+    // Anchoring keeps a growing list from dragging the viewport around as rows
+    // are added or removed above the scroll position.
+    overflowAnchor: 'auto',
   };
-  const footerStyle: React.CSSProperties = { padding: '12px 18px', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'flex-end', gap: 8 };
+  const footerStyle: React.CSSProperties = { padding: '12px 18px', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'flex-end', gap: 8, flexShrink: 0 };
 
   return (
     <div onClick={onClose} style={overlayStyle}>

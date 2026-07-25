@@ -94,6 +94,7 @@ function buildLauncher(app: App): React.ReactNode {
       case 'grok': void app.startGrokSession(options); break;
       case 'qwen': void app.startQwenSession(options); break;
       case 'kimi': void app.startKimiSession(options); break;
+      case 'omp': void app.startOmpSession(options); break;
       // The launcher routes the terminal through onTerminal, because it needs a
       // shell chosen first. Handled here anyway: leaving it to `default` made a
       // call with 'terminal' a silent no-op, and a later refactor that routed it
@@ -103,14 +104,28 @@ function buildLauncher(app: App): React.ReactNode {
     }
   };
 
-  return (
-    <RuntimeLauncher
-      aliases={app.aliases}
-      onStart={start}
-      onTerminal={onTerminal}
-      onCancel={() => void app.cancelStartPrompt()}
-    />
-  );
+  // Wrapped in a component rather than returned directly so the launcher can
+  // follow the viewport: `buildLauncher` runs once, but whether the buttons
+  // have room for their labels changes every time the window is resized or the
+  // phone is rotated.
+  function LauncherHost(): React.JSX.Element {
+    const state = React.useSyncExternalStore(
+      shellStore.subscribe,
+      shellStore.getSnapshot,
+      shellStore.getSnapshot,
+    );
+    return (
+      <RuntimeLauncher
+        aliases={app.aliases}
+        onStart={start}
+        onTerminal={onTerminal}
+        onCancel={() => void app.cancelStartPrompt()}
+        compact={state.isMobile}
+      />
+    );
+  }
+
+  return <LauncherHost />;
 }
 
 /**

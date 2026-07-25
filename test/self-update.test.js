@@ -207,8 +207,8 @@ function runner(overrides, options = {}) {
 }
 
 describe('SelfUpdateRunner', function () {
-  it('runs install, then rebuild, then a load check, then restarts', async function () {
-    const { calls, spawn } = spawnRecorder([0, 0, 0]);
+  it('runs install, then a load check, then restarts', async function () {
+    const { calls, spawn } = spawnRecorder([0, 0]);
     const execFileCalls = [];
     const { instance, restarts } = runner({
       spawn,
@@ -221,15 +221,16 @@ describe('SelfUpdateRunner', function () {
 
     await instance.apply('systemd', '/opt/pkg', 'b'.repeat(40));
 
-    assert.strictEqual(calls.length, 3, 'install, rebuild and smoke check must all run');
+    assert.strictEqual(calls.length, 2, 'install and smoke check must both run');
     assert.deepStrictEqual(calls[0].args, [
       'install', '-g', '--allow-git=all', 'github:dnviti/code-agents-webcli',
     ]);
-    // npm >= 12 blocks dependency install scripts, so a global install arrives
-    // with node-pty and better-sqlite3 uncompiled. Skipping this step puts the
-    // service into a crash loop recoverable only from a shell.
-    assert.deepStrictEqual(calls[1].args, ['rebuild', '--prefix', '/opt/pkg']);
-    assert.ok(calls[2].args.includes('require(process.argv[1])'));
+    // There is deliberately no `npm rebuild` between the two any more: nothing
+    // in the dependency tree compiles, so there is nothing to rebuild. If a
+    // package with an install script is ever reintroduced, this test keeps
+    // passing while the service breaks — which is why the real guard against
+    // that is test/install-surface.test.js, not this assertion.
+    assert.ok(calls[1].args.includes('require(process.argv[1])'));
 
     assert.strictEqual(restarts.length, 1);
     assert.deepStrictEqual(execFileCalls[0].args, [
@@ -251,14 +252,13 @@ describe('SelfUpdateRunner', function () {
       assert.strictEqual(call.options.shell, false);
     }
 
-    // The two npm invocations must stay free of anything a shell would treat
-    // as syntax, since only the package directory varies.
+    // The npm invocation must stay free of anything a shell would treat as
+    // syntax, since only the install spec varies.
     assert.doesNotMatch(calls[0].args.join(' '), /[;&|`$()<>]/);
-    assert.doesNotMatch(calls[1].args.join(' '), /[;&|`$()<>]/);
 
     // The load check is a frozen literal plus a path passed as its own argv
     // entry, so the parentheses never reach a shell.
-    assert.deepStrictEqual(calls[2].args, [
+    assert.deepStrictEqual(calls[1].args, [
       '-e',
       'require(process.argv[1])',
       '/opt/pkg/dist/server/index.js',
@@ -301,7 +301,7 @@ describe('SelfUpdateRunner', function () {
     assert.strictEqual(done[0].restarting, false);
   });
 
-  it('does not restart when the native rebuild fails', async function () {
+  it('does not restart when the new build fails to load', async function () {
     const { calls, spawn } = spawnRecorder([0, 1]);
     const execFileCalls = [];
     const { instance, done } = runner({
@@ -316,30 +316,11 @@ describe('SelfUpdateRunner', function () {
 
     assert.strictEqual(calls.length, 2);
     assert.strictEqual(execFileCalls.length, 0);
-    assert.strictEqual(done[0].ok, false);
-    assert.match(done[0].message, /native modules/i);
-  });
-
-  it('does not restart when the new build fails to load', async function () {
-    const { calls, spawn } = spawnRecorder([0, 0, 1]);
-    const execFileCalls = [];
-    const { instance, done } = runner({
-      spawn,
-      execFile: (file, args, cb) => {
-        execFileCalls.push({ file, args });
-        cb(null, '', '');
-      },
-    });
-
-    await instance.apply('systemd', '/opt/pkg', null);
-
-    assert.strictEqual(calls.length, 3);
-    assert.strictEqual(execFileCalls.length, 0);
     assert.match(done[0].message, /failed to load/i);
   });
 
   it('installs but does not exit in foreground mode', async function () {
-    const { spawn } = spawnRecorder([0, 0, 0]);
+    const { spawn } = spawnRecorder([0, 0]);
     const execFileCalls = [];
     const { instance, done } = runner({
       spawn,
@@ -371,7 +352,7 @@ describe('SelfUpdateRunner', function () {
     const second = instance.apply('systemd', '/opt/pkg', 'b'.repeat(40));
     await Promise.all([first, second]);
 
-    assert.strictEqual(calls.length, 3, 'the second call must not spawn anything');
+    assert.strictEqual(calls.length, 2, 'the second call must not spawn anything');
   });
 
   it('recovers from a restart that could not be queued', async function () {
@@ -406,7 +387,7 @@ describe('SelfUpdateRunner', function () {
     await pending;
 
     assert.strictEqual(settings.store['update.inProgress'], undefined);
-    assert.strictEqual(calls.length, 3);
+    assert.strictEqual(calls.length, 2);
 
     const fresh = runner({ spawn }, { settings: settingsDouble() });
     fresh.settings.setSetting(

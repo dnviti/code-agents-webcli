@@ -18,10 +18,13 @@ import {
 } from './types.js';
 import { createConfig, createUsageAnalyticsOptions } from './config.js';
 import { registerRoutes } from './routes/index.js';
+import { RuntimeProfileStore } from './services/runtime-profiles.js';
+import { TierWriterContext, applyTiers, defaultTierContext } from './services/tier-writer.js';
 import { WebSocketHandler } from './websocket/handler.js';
 import { MessageProcessor } from './websocket/messages.js';
 import { PromptSession } from './setup/prompts.js';
 import { runRunModeWizard } from './setup/wizard.js';
+import { INSTALL_COMMAND } from '../shared/update.js';
 
 import { ClaudeBridge } from './bridges/claude.js';
 import { CodexBridge } from './bridges/codex.js';
@@ -30,6 +33,7 @@ import { PiBridge } from './bridges/pi.js';
 import { GrokBridge } from './bridges/grok.js';
 import { QwenBridge } from './bridges/qwen.js';
 import { KimiBridge } from './bridges/kimi.js';
+import { OmpBridge } from './bridges/omp.js';
 import { TerminalBridge } from './bridges/terminal.js';
 import { AppDatabase } from './services/database.js';
 import { SessionStore } from './services/session-store.js';
@@ -46,7 +50,9 @@ import {
   UpdateModeResult,
   detectUpdateMode,
 } from './services/self-update.js';
-import { broadcastToAllConnections, sendToUser } from './websocket/handler.js';
+import { broadcastToAllConnections, broadcastToSession, sendToUser } from './websocket/handler.js';
+import { ChatStore } from './chat/store.js';
+import { ChatSessionManager } from './chat/manager.js';
 import { AuthService } from './services/auth.js';
 import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
@@ -79,13 +85,18 @@ export class ClaudeCodeWebServer {
   private grokBridge: BridgeInterface;
   private qwenBridge: BridgeInterface;
   private kimiBridge: BridgeInterface;
+  private ompBridge: BridgeInterface;
   private terminalBridge: BridgeInterface;
 
   private database: AppDatabase;
   private sessionStore: SessionStore;
   private transcriptStore: TranscriptStore;
+  private chatStore: ChatStore;
+  private chatManager: ChatSessionManager;
   private historyStore: HistoryStore;
   private pasteStore: PasteStore;
+  private runtimeProfiles: RuntimeProfileStore;
+  private tierContext: TierWriterContext;
   private sessionTeardown: SessionTeardownRegistry;
   private authService: AuthService;
   private usageReader: UsageReader;
@@ -142,6 +153,7 @@ export class ClaudeCodeWebServer {
     this.grokBridge = new GrokBridge();
     this.qwenBridge = new QwenBridge();
     this.kimiBridge = new KimiBridge();
+    this.ompBridge = new OmpBridge();
     this.terminalBridge = new TerminalBridge();
 
     this.dataDir = config.dataDir;
@@ -150,6 +162,28 @@ export class ClaudeCodeWebServer {
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
     this.historyStore = new HistoryStore({ storageDir: this.database.storageDir });
     this.pasteStore = new PasteStore({ storageDir: this.database.storageDir });
+    this.chatStore = new ChatStore({ storageDir: this.database.storageDir });
+    this.chatManager = new ChatSessionManager({
+      store: this.chatStore,
+      storageDir: this.database.storageDir,
+      broadcast: (sessionId, message) =>
+        broadcastToSession(
+          sessionId,
+          message,
+          this.claudeSessions,
+          this.webSocketConnections,
+        ),
+      // Chat mode spawns the same binary the terminal mode would; the bridges
+      // already own that lookup and it must not be duplicated here, where it
+      // would drift the first time a CLI moved.
+      resolveCommand: (runtime) => {
+        const bridge = this.getRuntimeBridge(runtime as AgentKind);
+        const resolved = (bridge as unknown as { command?: string })?.command;
+        return resolved || runtime;
+      },
+    });
+    this.runtimeProfiles = new RuntimeProfileStore({ database: this.database });
+    this.tierContext = defaultTierContext(this.database.storageDir);
     this.sessionTeardown = new SessionTeardownRegistry();
     // Registered rather than appended to the DELETE handler, so the next
     // feature that needs teardown does not collide on the same line.
@@ -167,6 +201,12 @@ export class ClaudeCodeWebServer {
       allowedGitHubIds: config.allowedGitHubIds,
       allowAnyGitHubUser: config.allowAnyGitHubUser,
     });
+    // Installer rights follow the allow-list: a stored account that can no
+    // longer sign in must not hold them, or the installer-only screens are
+    // read-only for everybody.
+    this.database.setInstallerEligibility((githubId) =>
+      this.authService.isGitHubUserAllowed(githubId),
+    );
     this.usageReader = new UsageReader(this.sessionDurationHours);
     this.usageAnalytics = new UsageAnalytics(
       createUsageAnalyticsOptions(options, this.sessionDurationHours),
@@ -243,8 +283,11 @@ export class ClaudeCodeWebServer {
       createSessionRecord: (params) => this.createSessionRecord(params),
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
+      resolveRuntimeProfile: (agentKind: AgentKind, workingDir: string) =>
+        this.resolveRuntimeProfile(agentKind, workingDir),
       transcriptStore: this.transcriptStore,
       historyStore: this.historyStore,
+      chatManager: this.chatManager,
       usageReader: this.usageReader,
       usageAnalytics: this.usageAnalytics,
     });
@@ -344,6 +387,8 @@ export class ClaudeCodeWebServer {
         return this.qwenBridge;
       case 'kimi':
         return this.kimiBridge;
+      case 'omp':
+        return this.ompBridge;
       case 'terminal':
         return this.terminalBridge;
       case 'claude':
@@ -351,6 +396,42 @@ export class ClaudeCodeWebServer {
       default:
         return null;
     }
+  }
+
+  /**
+   * Resolve the active profile for a runtime into launch parameters.
+   *
+   * Tiers are written through here as well as on save: the generated file has
+   * to exist on disk before the process starts, and a profile saved by an
+   * earlier build (or a data directory restored from backup) may never have
+   * been through the save path at all.
+   */
+  private resolveRuntimeProfile(agentKind: AgentKind, workingDir: string): {
+    profileName: string;
+    model?: string;
+    extraArgs?: string[];
+    env?: Record<string, string>;
+  } | null {
+    const profile = this.runtimeProfiles.activeFor(agentKind);
+    if (!profile) return null;
+
+    // The session's directory is where pi's tier agents go, so it is part of
+    // the context rather than something the writer could guess.
+    const tierResult = applyTiers(profile, { ...this.tierContext, workingDir });
+    for (const skipped of tierResult.skipped) {
+      console.warn(
+        `Runtime profile "${profile.name}": left ${skipped.file} alone (${skipped.reason})`,
+      );
+    }
+
+    const extraArgs = [...tierResult.args, ...(profile.args || [])];
+
+    return {
+      profileName: profile.name,
+      model: profile.model,
+      extraArgs: extraArgs.length ? extraArgs : undefined,
+      env: profile.env,
+    };
   }
 
   /**
@@ -538,6 +619,8 @@ export class ClaudeCodeWebServer {
       historyStore: this.historyStore,
       sessionTeardown: this.sessionTeardown,
       pasteStore: this.pasteStore,
+      runtimeProfiles: this.runtimeProfiles,
+      tierContext: this.tierContext,
       updateChecker: this.updateChecker,
       selfUpdate: this.selfUpdate,
       getUpdateMode: () => this.getUpdateMode(),
@@ -601,8 +684,7 @@ export class ClaudeCodeWebServer {
     if (this.interruptedUpdate) {
       console.warn(
         'A previous self-update did not finish. If the server misbehaves, reinstall with:\n'
-        + '  npm i -g --allow-git=all github:dnviti/code-agents-webcli\n'
-        + '  npm rebuild --prefix "$(npm root -g)/code-agents-webcli"',
+        + `  ${INSTALL_COMMAND}`,
       );
     }
 

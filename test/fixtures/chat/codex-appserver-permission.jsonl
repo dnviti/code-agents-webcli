@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":10,"method":"execCommandApproval","params":{"conversationId":"th_123","callId":"item_c2","approvalId":null,"command":["rm","-rf","tmp"],"cwd":"/work","reason":"cleanup","parsedCmd":[]}}
+{"jsonrpc":"2.0","id":11,"method":"applyPatchApproval","params":{"conversationId":"th_123","callId":"item_f2","fileChanges":{"hello.txt":{"type":"update","unified_diff":"@@ -1,1 +1,1 @@\n-old\n+new","move_path":null}},"reason":null,"grantRoot":null}}

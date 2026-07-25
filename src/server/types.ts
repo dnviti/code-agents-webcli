@@ -8,6 +8,7 @@ export type AgentKind =
   | 'grok'
   | 'qwen'
   | 'kimi'
+  | 'omp'
   | 'terminal';
 
 export interface ServerOptions {
@@ -28,6 +29,7 @@ export interface ServerOptions {
   grokAlias?: string;
   qwenAlias?: string;
   kimiAlias?: string;
+  ompAlias?: string;
   publicBaseUrl?: string;
   githubClientId?: string;
   githubClientSecret?: string;
@@ -45,6 +47,7 @@ export interface Aliases {
   grok: string;
   qwen: string;
   kimi: string;
+  omp: string;
 }
 
 export interface SessionRecord {
@@ -57,6 +60,14 @@ export interface SessionRecord {
   agent: AgentKind | null;
   lastAgent: AgentKind | null;
   runtimeLabel: string | null;
+  /**
+   * Which surface this session runs on, fixed when the runtime is started.
+   *
+   * Absent on every session created before chat mode existed, and on every
+   * terminal session since, so `undefined` reads as 'terminal' everywhere
+   * rather than needing a migration to backfill.
+   */
+  surface?: 'terminal' | 'chat';
   terminalOptions: TerminalOptions | null;
   stopRequested: boolean;
   /** Identifies the current PTY run so late callbacks from a previous run are ignored. */

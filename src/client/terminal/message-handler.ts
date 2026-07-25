@@ -10,6 +10,8 @@ import {
   onUpdateRestarting,
 } from '../ui/update-banner';
 import { stripUnsupportedTerminalSequences } from './text';
+import { clearChatSurface, setChatSurface } from '../chat/surface';
+import { settleRuntimeStart } from '../sessions/actions';
 
 export class MessageHandler {
   private app: App;
@@ -19,6 +21,44 @@ export class MessageHandler {
   }
 
   handle(message: WsMessage): void {
+    // The surface a session runs on is the server's decision, and it arrives
+    // on exactly these two messages. Read before dispatching, because the chat
+    // handler below consumes chat_started and the terminal path never sees it.
+    if (message.type === 'chat_started') {
+      // Settled here for the same reason onRuntimeStarted settles the terminal
+      // path: this message *is* the answer to the launch. Left pending, the
+      // next join would read it as a start still in flight and cover the live
+      // conversation with a spinner that had nothing left to wait for.
+      settleRuntimeStart(this.app);
+      this.app.startPromptRequested = false;
+      setChatSurface(this.app, {
+        active: true,
+        runtime: message.agent || '',
+        runtimeLabel: message.runtimeLabel || '',
+        bypassPermissions: message.bypassPermissions === true,
+      });
+      hideOverlay();
+    } else if (message.type === 'session_joined') {
+      if (message.surface === 'chat') {
+        setChatSurface(this.app, {
+          active: true,
+          runtime: message.agent || '',
+          runtimeLabel: message.runtimeLabel || '',
+          workingDir: message.workingDir || '',
+        });
+      } else {
+        clearChatSurface(this.app);
+      }
+    }
+
+    // The chat surface owns its own message family. Offered them first so this
+    // switch does not have to grow a case per chat event, and so an unknown
+    // chat message stays inside the chat layer rather than reaching a terminal
+    // handler that has no idea what to do with it.
+    if (this.app.chat?.handle(message as unknown as Record<string, unknown>)) {
+      return;
+    }
+
     switch (message.type) {
       case 'connected':
         this.app.connectionId = message.connectionId;
@@ -43,6 +83,7 @@ export class MessageHandler {
       case 'grok_started':
       case 'qwen_started':
       case 'kimi_started':
+      case 'omp_started':
       case 'terminal_started':
         this.onRuntimeStarted(message);
         break;
@@ -54,6 +95,7 @@ export class MessageHandler {
       case 'grok_stopped':
       case 'qwen_stopped':
       case 'kimi_stopped':
+      case 'omp_stopped':
       case 'terminal_stopped':
         this.onRuntimeStopped(message);
         break;
@@ -236,7 +278,7 @@ export class MessageHandler {
   }
 
   private onRuntimeStarted(message: { agent?: string }): void {
-    this.app.pendingRuntimeStart = null;
+    settleRuntimeStart(this.app);
     this.app.startPromptRequested = false;
     hideOverlay();
     this.scheduleTerminalRefit();
@@ -327,7 +369,7 @@ export class MessageHandler {
   }
 
   private onError(message: { message: string }): void {
-    this.app.pendingRuntimeStart = null;
+    settleRuntimeStart(this.app);
     showError(message.message);
 
     if (this.app.sessionTabManager && this.app.currentClaudeSessionId) {
@@ -350,7 +392,7 @@ export class MessageHandler {
     ) {
       this.app.currentClaudeSessionId = null;
       this.app.currentClaudeSessionName = null;
-      this.app.pendingRuntimeStart = null;
+      settleRuntimeStart(this.app);
       this.app.startPromptRequested = false;
       this.app.terminal?.reset();
       hideOverlay();

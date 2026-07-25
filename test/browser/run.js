@@ -21,12 +21,19 @@ if (!fs.existsSync(path.join(dir, '..', '..', 'dist', 'public', 'css', 'componen
 }
 
 // The esbuild `bin` entry is a native executable, not a script: use the API.
+//
+// Minified, at the shipped target: the settings are half of what is under test.
+// Built unminified at a laxer target, these checks passed while the real bundle
+// carried a `ReferenceError` that blanked the terminal on the first mode query
+// — the defect lived in the minifier's output, so nothing that skipped
+// minification could see it.
 require('esbuild').buildSync({
   entryPoints: [path.join(dir, 'checks.ts')],
   bundle: true,
   outfile: path.join(dir, 'bundle.js'),
   format: 'iife',
-  target: ['es2020'],
+  minify: true,
+  target: require('../../scripts/client-bundle.js').CLIENT_TARGET,
 });
 
 const out = execFileSync(

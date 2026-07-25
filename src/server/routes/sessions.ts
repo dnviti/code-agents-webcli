@@ -105,10 +105,12 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     const { name, workingDir } = req.body;
     const sessionId = randomUUID();
 
-    // The name is bound into a SQLite statement on every autosave. A non-string
-    // makes better-sqlite3 throw inside the replaceAll transaction, which runs
-    // after a DELETE, so one bad value would wipe every user's persisted
-    // sessions on the next save.
+    // The name is bound into a SQLite statement on every autosave, and SQLite
+    // refuses to bind anything that is not a string, number, null, bigint or
+    // buffer. One bad value therefore throws inside the replaceAll transaction
+    // and aborts the save — for every user's sessions, not just this one, since
+    // they are all written in that single transaction. Rejecting it here keeps
+    // the failure at the request that caused it.
     if (name !== undefined && typeof name !== 'string') {
       res.status(400).json({ error: 'invalid_name', message: 'Session name must be a string' });
       return;

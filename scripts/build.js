@@ -4,6 +4,7 @@ const esbuild = require('esbuild');
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { CLIENT_TARGET } = require('./client-bundle.js');
 
 const isWatch = process.argv.includes('--watch');
 
@@ -34,9 +35,18 @@ async function build() {
   const buildInfo = writeBuildInfo(distDir);
   // Identifies this bundle to the service-worker cache. Falls back to the
   // build timestamp so a source build still busts its own cache.
-  const buildId = buildInfo.sha
-    ? `${buildInfo.sha.slice(0, 12)}${buildInfo.dirty ? '-dirty' : ''}`
-    : buildInfo.builtAt.replace(/[^0-9]/g, '');
+  // A commit identifies a released build exactly, but says nothing about a
+  // working tree: every build from uncommitted changes produced the *same*
+  // `<sha>-dirty` id, so the service worker kept serving the client it had
+  // already cached however many times the bundle was rebuilt. A fix could be
+  // built, shipped and reloaded, and the browser would still run the broken
+  // bundle — which is precisely how it behaves when you most need it not to.
+  //
+  // Only the working-tree case needs the extra entropy; a clean build stays
+  // reproducible and keeps its commit as the id.
+  const buildId = buildInfo.sha && !buildInfo.dirty
+    ? buildInfo.sha.slice(0, 12)
+    : `${buildInfo.sha ? `${buildInfo.sha.slice(0, 12)}-` : ''}${buildInfo.builtAt.replace(/[^0-9]/g, '')}`;
 
   // 1. Compile server TypeScript
   console.log('[server] Compiling TypeScript...');
@@ -62,7 +72,8 @@ async function build() {
       globalName: 'ClaudeCodeWeb',
       sourcemap: true,
       minify: !isWatch,
-      target: ['es2020'],
+      // Shared with the browser checks so they test what actually ships.
+      target: CLIENT_TARGET,
       // The Relay shell is .tsx. 'automatic' matches tsconfig.client.json's
       // "jsx": "react-jsx", so components do not have to import React just to
       // use JSX — only to use hooks.
@@ -82,6 +93,49 @@ async function build() {
     }
   } catch (error) {
     console.error('[client] Bundle failed:', error.message);
+    process.exit(1);
+  }
+
+  // 2b. Bundle Mermaid as its own chunk.
+  //
+  // Kept out of the main bundle deliberately: Mermaid is larger than everything
+  // else the client ships put together, and it is only reachable when a message
+  // actually contains a ```mermaid fence. Loading it on demand keeps the cost
+  // off every other session. It is bundled rather than pulled from a CDN
+  // because this app is routinely run on a LAN with no outbound internet, and a
+  // diagram that only renders when GitHub is reachable is not a feature.
+  console.log('[mermaid] Bundling diagram renderer...');
+  try {
+    const mermaidCtx = await esbuild.context({
+      entryPoints: ['src/client/chat/mermaid-entry.ts'],
+      bundle: true,
+      outfile: 'dist/public/mermaid.bundle.js',
+      format: 'iife',
+      globalName: 'ClaudeCodeWebMermaid',
+      // Only in watch mode. This map is 12.7 MB — on its own, more than a third
+      // of everything the package ships — and every byte of it describes
+      // vendored third-party rendering code, not this app. Dropping it from
+      // release builds is the single largest saving available to an install,
+      // and costs nothing: with sourcemap off esbuild omits the
+      // sourceMappingURL comment too, so the browser never asks for it.
+      // app.bundle.js keeps its map, because that one is our code.
+      sourcemap: isWatch,
+      minify: !isWatch,
+      target: CLIENT_TARGET,
+      define: {
+        'process.env.NODE_ENV': isWatch ? '"development"' : '"production"'
+      }
+    });
+
+    if (isWatch) {
+      await mermaidCtx.watch();
+    } else {
+      await mermaidCtx.rebuild();
+      await mermaidCtx.dispose();
+    }
+    console.log('[mermaid] Done.\n');
+  } catch (error) {
+    console.error('[mermaid] Bundle failed:', error.message);
     process.exit(1);
   }
 

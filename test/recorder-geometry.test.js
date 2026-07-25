@@ -68,6 +68,8 @@ describe('session terminal geometry', function () {
       createSessionRecord: () => session,
       getRuntimeBridge: () => bridge ?? null,
       saveSessionsToDisk: () => Promise.resolve(),
+      // No runtime profile configured: the default, unmodified launch.
+      resolveRuntimeProfile: () => null,
       historyStore: {
         append() {},
         stat: () => Promise.resolve({ firstLine: 0, totalLines: 0 }),

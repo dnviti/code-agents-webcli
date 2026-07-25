@@ -271,4 +271,59 @@ describe('installer identity', function () {
     assert.strictEqual(database.getInstallerUserId(), first.id);
     assert.notStrictEqual(database.getInstallerUserId(), second.id);
   });
+
+  it('skips a stored account that is not allowed to sign in', function () {
+    // A row left behind by a test run or a restored backup sorts ahead of the
+    // real installer on id alone. Handing it the installer rights makes every
+    // installer-only screen — runtime profiles, the update button — read-only
+    // for everyone, forever, because nobody can ever sign in as it.
+    const stray = addUser('g1', 'userA');
+    const real = addUser('8649488', 'dnviti');
+    database.setInstallerEligibility((githubId) => githubId === '8649488');
+
+    const installer = database.getInstallerUserId();
+    assert.strictEqual(installer, real.id);
+    assert.notStrictEqual(installer, stray.id);
+  });
+
+  it('re-pins away from an installer that has lost access', function () {
+    const stray = addUser('g1', 'userA');
+    const real = addUser('8649488', 'dnviti');
+
+    // Pinned while everything was still allowed, which is how an install that
+    // predates the fix arrives here.
+    assert.strictEqual(database.getInstallerUserId(), stray.id);
+
+    database.setInstallerEligibility((githubId) => githubId === '8649488');
+    assert.strictEqual(database.getInstallerUserId(), real.id);
+    // ...and the correction is written through, not recomputed every call.
+    assert.strictEqual(database.getSetting('update.installerUserId'), String(real.id));
+  });
+
+  it('still refuses to promote anyone when the pinned row is merely gone', function () {
+    // A deleted row and a revoked account are different: only the second means
+    // the pin can never be exercised. Deleting must keep its old behaviour.
+    const first = addUser('1000', 'primo');
+    const second = addUser('2000', 'secondo');
+    database.setInstallerEligibility(() => true);
+    assert.strictEqual(database.getInstallerUserId(), first.id);
+
+    database.raw.prepare('DELETE FROM users WHERE id = ?').run(first.id);
+    assert.strictEqual(database.getInstallerUserId(), first.id);
+    assert.notStrictEqual(database.getInstallerUserId(), second.id);
+  });
+
+  it('has no installer when nobody stored may sign in', function () {
+    addUser('g1', 'userA');
+    database.setInstallerEligibility(() => false);
+    assert.strictEqual(database.getInstallerUserId(), null);
+  });
+
+  it('behaves exactly as before with no eligibility wired', function () {
+    // The hook is optional: every other consumer of AppDatabase (tests, the
+    // session store) constructs it bare and must keep the original answer.
+    const first = addUser('1000', 'primo');
+    addUser('2000', 'secondo');
+    assert.strictEqual(database.getInstallerUserId(), first.id);
+  });
 });

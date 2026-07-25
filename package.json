@@ -17,7 +17,8 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.client.json",
     "prepack": "npm run build",
     "release:pr": "bash scripts/release-pr.sh",
-    "test:browser": "npm run build && node test/browser/run.js"
+    "test:browser": "npm run build && node test/browser/run.js",
+    "verify:install": "bash scripts/verify-install.sh"
   },
   "keywords": [
     "claude",
@@ -34,22 +35,17 @@
   "author": "Daniele Viti",
   "license": "MIT",
   "dependencies": {
+    "@lydell/node-pty": "1.2.0-beta.14",
     "@ngrok/ngrok": "^1.7.0",
-    "@xterm/addon-fit": "^0.11.0",
-    "@xterm/addon-web-links": "^0.12.0",
-    "@xterm/addon-webgl": "^0.19.0",
     "@xterm/headless": "^6.0.0",
-    "@xterm/xterm": "^6.0.0",
-    "better-sqlite3": "^12.8.0",
     "commander": "^14.0.3",
     "cors": "^2.8.6",
     "express": "^5.2.1",
-    "node-pty": "^1.1.0",
     "open": "^11.0.0",
     "ws": "^8.21.1"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.13.0"
   },
   "repository": {
     "type": "git",
@@ -66,14 +62,18 @@
     "LICENSE"
   ],
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^25.5.0",
     "@types/react": "^18.3.31",
     "@types/react-dom": "^18.3.7",
     "@types/ws": "^8.18.1",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/addon-webgl": "^0.19.0",
+    "@xterm/xterm": "^6.0.0",
     "esbuild": "^0.28.1",
+    "mermaid": "^11.16.0",
     "mocha": "^11.7.5",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
@@ -82,10 +82,5 @@
   "overrides": {
     "serialize-javascript": "^7.0.5",
     "diff": "^8.0.3"
-  },
-  "allowScripts": {
-    "node-pty": true,
-    "better-sqlite3": true,
-    "esbuild": true
   }
 }

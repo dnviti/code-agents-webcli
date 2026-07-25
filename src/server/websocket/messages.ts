@@ -12,6 +12,7 @@ import { TranscriptStoreLike } from '../services/transcript-store.js';
 import { HistoryStoreLike } from '../services/history-store.js';
 import { ScrollbackRecorder } from '../services/scrollback.js';
 import { sendToWebSocket, broadcastToSession } from './handler.js';
+import { chatUnavailableReason, isChatRuntime } from '../../shared/chat-runtimes.js';
 
 export interface MessageProcessorDeps {
   dev: boolean;
@@ -31,8 +32,27 @@ export interface MessageProcessorDeps {
   }): SessionRecord;
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
   saveSessionsToDisk(): Promise<void>;
+  /**
+   * Launch configuration for this runtime, already resolved from the active
+   * profile: model, extra args and environment. Returns null when no profile
+   * is active, which is the default and must stay a plain unmodified launch.
+   */
+  resolveRuntimeProfile(agentKind: AgentKind, workingDir: string): {
+    profileName: string;
+    model?: string;
+    extraArgs?: string[];
+    env?: Record<string, string>;
+  } | null;
   transcriptStore: TranscriptStoreLike;
   historyStore: HistoryStoreLike;
+  /**
+   * Live chat sessions, when chat mode is available.
+   *
+   * Optional so a server built without it — and every existing test that
+   * constructs a MessageProcessor — keeps working unchanged; chat messages
+   * then answer with a plain "unavailable" rather than throwing.
+   */
+  chatManager?: ChatManagerLike;
   usageReader: {
     getCurrentSessionStats(): Promise<any>;
     calculateBurnRate(minutes: number): Promise<any>;
@@ -48,6 +68,32 @@ export interface MessageProcessorDeps {
   };
 }
 
+/** What the message processor needs from the chat manager, and nothing more. */
+export interface ChatManagerLike {
+  has(sessionId: string): boolean;
+  start(
+    record: SessionRecord,
+    options: {
+      runtime: string;
+      workingDir: string;
+      model?: string;
+      extraArgs?: string[];
+      env?: Record<string, string>;
+      bypassPermissions?: boolean;
+    },
+  ): Promise<{ runtimeKind: string; currentCapabilities: unknown; bypassing: boolean }>;
+  snapshot(record: SessionRecord): Promise<unknown>;
+  send(sessionId: string, turn: { text: string; attachments?: unknown[] }): Promise<void>;
+  interrupt(sessionId: string): Promise<void>;
+  respondPermission(sessionId: string, requestId: string, optionId: string): boolean;
+  stop(sessionId: string): Promise<void>;
+  readPage(
+    record: SessionRecord,
+    fromSeq: number,
+    count: number,
+  ): Promise<{ events: unknown[]; firstSeq: number; cursor: number }>;
+}
+
 interface IncomingMessage {
   type: string;
   name?: string;
@@ -61,6 +107,11 @@ interface IncomingMessage {
   fromLine?: number;
   count?: number;
   requestId?: string;
+  text?: string;
+  attachments?: unknown[];
+  optionId?: string;
+  fromSeq?: number;
+  agentKind?: string;
 }
 
 export class MessageProcessor {
@@ -117,8 +168,32 @@ export class MessageProcessor {
         await this.startRuntime(wsId, 'kimi', data.options || {});
         break;
 
+      case 'start_omp':
+        await this.startRuntime(wsId, 'omp', data.options || {});
+        break;
+
       case 'start_terminal':
         await this.startRuntime(wsId, 'terminal', data.options || {});
+        break;
+
+      case 'start_chat':
+        await this.startChat(wsId, String(data.agentKind || ''), data.options || {});
+        break;
+
+      case 'chat_send':
+        await this.handleChatSend(wsInfo, data);
+        break;
+
+      case 'chat_interrupt':
+        await this.handleChatInterrupt(wsInfo);
+        break;
+
+      case 'chat_permission_response':
+        this.handleChatPermission(wsInfo, data);
+        break;
+
+      case 'chat_history_request':
+        await this.handleChatHistory(wsInfo, data);
         break;
 
       case 'input':
@@ -145,10 +220,27 @@ export class MessageProcessor {
         await this.handleGetUsage(wsInfo);
         break;
 
+      // Closing is done over HTTP; the socket message is the client's older
+      // half of that call and still arrives. Named explicitly so it stays a
+      // no-op rather than being reported as unknown below.
+      case 'close_session':
+        break;
+
       default:
         if (this.deps.dev) {
           console.log(`Unknown message type: ${data.type}`);
         }
+        // Answered rather than dropped. A request this server has never heard
+        // of is almost always a page built against newer code than the running
+        // process — which loads its own code once, at boot. Silence left the
+        // browser waiting on a reply that was never coming; saying so turns an
+        // indefinite spinner into a sentence naming the fix.
+        sendToWebSocket(wsInfo.ws, {
+          type: 'error',
+          message:
+            `This server does not understand "${data.type}". It is probably running ` +
+            'an older version than this page — restart the server and reload.',
+        });
     }
   }
 
@@ -246,8 +338,30 @@ export class MessageProcessor {
       agent: session.agent,
       lastAgent: session.lastAgent,
       runtimeLabel: session.runtimeLabel,
+      surface: session.surface || 'terminal',
       outputBuffer: replayBuffer,
     });
+
+    // A chat session's transcript is not in the PTY replay above — it is a
+    // separate event log — so it is sent as its own snapshot. Sent after
+    // session_joined so the client has already switched surfaces and has
+    // somewhere to put it.
+    if (session.surface === 'chat' && this.deps.chatManager) {
+      try {
+        const snapshot = await this.deps.chatManager.snapshot(session);
+        sendToWebSocket(wsInfo.ws, {
+          type: 'chat_snapshot',
+          sessionId: claudeSessionId,
+          snapshot,
+        });
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        sendToWebSocket(wsInfo.ws, {
+          type: 'error',
+          message: `Could not load the conversation: ${message}`,
+        });
+      }
+    }
 
     if (this.deps.dev) {
       console.log(`WebSocket ${wsId} joined Claude session ${claudeSessionId}`);
@@ -333,6 +447,21 @@ export class MessageProcessor {
     }
     if (typeof options.rows === 'number' && Number.isFinite(options.rows)) {
       safeOptions.rows = options.rows;
+    }
+
+    // The active profile is resolved here rather than in the bridge: the bridge
+    // is a spawn wrapper with no view of settings, and resolving once per start
+    // keeps a mid-session settings change from applying to a running process.
+    //
+    // Profile values are deliberately *not* read from `options`: everything in
+    // safeOptions came from the browser, and the whole point of the profile is
+    // that it is server-side configuration the client cannot forge.
+    const profile = this.deps.resolveRuntimeProfile(agentKind, session.workingDir);
+    if (profile) {
+      if (profile.model) safeOptions.model = profile.model;
+      if (profile.extraArgs?.length) safeOptions.extraArgs = profile.extraArgs;
+      if (profile.env && Object.keys(profile.env).length) safeOptions.env = profile.env;
+      console.log(`Applying runtime profile "${profile.profileName}" to ${agentKind}`);
     }
 
     // The scrollback recorder is born on the first output byte, before any
@@ -720,6 +849,193 @@ export class MessageProcessor {
    * that without it any signed-in user could page through another user's
    * terminal history, which is exactly the content this app exists to protect.
    */
+
+  // ----------------------------------------------------------------- chat mode
+
+  /**
+   * Open this session as a chat instead of a terminal.
+   *
+   * The surface is fixed on the session record here and never changes: the two
+   * modes run the runtime as different processes — a TUI in a PTY versus a
+   * headless protocol stream — so there is nothing meaningful to switch between
+   * afterwards. A session that already ran as a terminal is refused rather than
+   * converted, because its scrollback and a chat log are not the same history.
+   */
+  async startChat(
+    wsId: string,
+    agentKind: string,
+    options: Record<string, unknown> = {},
+  ): Promise<void> {
+    const wsInfo = this.deps.webSocketConnections.get(wsId);
+    if (!wsInfo || !wsInfo.claudeSessionId) {
+      if (wsInfo?.ws) {
+        sendToWebSocket(wsInfo.ws, { type: 'error', message: 'No session joined' });
+      }
+      return;
+    }
+
+    const manager = this.deps.chatManager;
+    if (!manager) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: 'Chat mode is not available on this server',
+      });
+      return;
+    }
+
+    const session = this.deps.claudeSessions.get(wsInfo.claudeSessionId);
+    if (!session || session.ownerUserId !== wsInfo.userId) return;
+
+    if (!isChatRuntime(agentKind)) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message:
+          chatUnavailableReason(agentKind) || `${agentKind} cannot be opened as a chat`,
+      });
+      return;
+    }
+
+    if (session.active) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: 'A process is already running in this session',
+      });
+      return;
+    }
+
+    // Only the bypass flag is taken from the browser. Everything else that
+    // shapes the launch — model, arguments, environment — comes from the
+    // server-side profile below, for the same reason it does on the terminal
+    // path: the client must not be able to forge a launch configuration.
+    const bypassPermissions = options.dangerouslySkipPermissions === true;
+
+    const profile = this.deps.resolveRuntimeProfile(
+      agentKind as AgentKind,
+      session.workingDir,
+    );
+
+    session.surface = 'chat';
+    session.agent = agentKind as AgentKind;
+    session.lastAgent = agentKind as AgentKind;
+    session.runtimeLabel = this.getRuntimeLabel(agentKind as AgentKind, session);
+    session.lastActivity = new Date();
+
+    try {
+      const chat = await manager.start(session, {
+        runtime: agentKind,
+        workingDir: session.workingDir,
+        model: profile?.model,
+        extraArgs: profile?.extraArgs,
+        env: profile?.env,
+        bypassPermissions,
+      });
+
+      session.active = true;
+      session.stopRequested = false;
+      session.sessionStartTime = session.sessionStartTime || new Date();
+
+      broadcastToSession(
+        wsInfo.claudeSessionId,
+        {
+          type: 'chat_started',
+          sessionId: wsInfo.claudeSessionId,
+          agent: agentKind,
+          runtimeLabel: session.runtimeLabel,
+          capabilities: chat.currentCapabilities,
+          bypassPermissions: chat.bypassing,
+        },
+        this.deps.claudeSessions,
+        this.deps.webSocketConnections,
+      );
+
+      await this.deps.saveSessionsToDisk();
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      session.active = false;
+      // Left on 'chat' deliberately: the conversation log for this session is
+      // a chat log, and flipping the surface back would show the user an empty
+      // terminal as the explanation for a failed chat launch.
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: `Could not start ${agentKind}: ${message}`,
+      });
+    }
+  }
+
+  private chatSessionFor(wsInfo: WebSocketInfo): SessionRecord | null {
+    if (!wsInfo.claudeSessionId) return null;
+    const session = this.deps.claudeSessions.get(wsInfo.claudeSessionId);
+    if (!session || session.ownerUserId !== wsInfo.userId) return null;
+    return session;
+  }
+
+  private async handleChatSend(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo);
+    if (!manager || !session) return;
+
+    const text = typeof data.text === 'string' ? data.text : '';
+    if (!text.trim() && !(data.attachments || []).length) return;
+
+    try {
+      await manager.send(session.id, {
+        text,
+        attachments: Array.isArray(data.attachments) ? data.attachments : undefined,
+      });
+      session.lastActivity = new Date();
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendToWebSocket(wsInfo.ws, { type: 'error', message });
+    }
+  }
+
+  private async handleChatInterrupt(wsInfo: WebSocketInfo): Promise<void> {
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo);
+    if (!manager || !session) return;
+    await manager.interrupt(session.id).catch(() => undefined);
+  }
+
+  private handleChatPermission(wsInfo: WebSocketInfo, data: IncomingMessage): void {
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo);
+    if (!manager || !session) return;
+
+    const requestId = typeof data.requestId === 'string' ? data.requestId : '';
+    const optionId = typeof data.optionId === 'string' ? data.optionId : '';
+    if (!requestId || !optionId) return;
+
+    manager.respondPermission(session.id, requestId, optionId);
+  }
+
+  private async handleChatHistory(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo);
+    if (!manager || !session) return;
+
+    const fromSeq = Math.max(0, Math.floor(Number(data.fromSeq) || 0));
+    const count = Math.max(1, Math.floor(Number(data.count) || 200));
+
+    try {
+      const page = await manager.readPage(session, fromSeq, count);
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_page',
+        sessionId: session.id,
+        requestId: data.requestId || null,
+        ...page,
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendToWebSocket(wsInfo.ws, { type: 'error', message });
+    }
+  }
+
   private async handleHistoryRequest(
     wsInfo: WebSocketInfo,
     data: IncomingMessage,
@@ -865,6 +1181,8 @@ export class MessageProcessor {
         return this.deps.aliases.qwen;
       case 'kimi':
         return this.deps.aliases.kimi;
+      case 'omp':
+        return this.deps.aliases.omp;
       case 'terminal':
         return session?.runtimeLabel || 'Terminal';
       case 'claude':
@@ -887,6 +1205,8 @@ export class MessageProcessor {
         return 'Qwen Code';
       case 'kimi':
         return 'Kimi Code';
+      case 'omp':
+        return 'Oh My Pi';
       case 'terminal':
         return 'terminal';
       case 'claude':

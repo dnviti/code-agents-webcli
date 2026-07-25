@@ -6,12 +6,12 @@
     <title>Code Agents Web CLI</title>
     <meta
       name="description"
-      content="GitHub OAuth protected web UI for Claude Code, Codex, Cursor Agent, and terminal sessions."
+      content="Run Claude Code, Codex, Cursor Agent, pi, Grok, Qwen, Kimi and Oh My Pi from your browser. One command, no compiler, GitHub sign-in."
     />
     <meta property="og:title" content="Code Agents Web CLI" />
     <meta
       property="og:description"
-      content="Multi-user browser terminal for Claude Code, Codex, Cursor Agent, and shells with SQLite persistence."
+      content="Run your coding agents from any browser — phone, tablet, another machine. Real terminals, GitHub OAuth, sessions that survive a reload."
     />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://github.com/dnviti/code-agents-webcli" />
@@ -36,29 +36,29 @@
           <div class="hero-copy">
             <h1>Run code agents from the browser</h1>
             <p class="tagline">
-              A single Node.js app with GitHub OAuth, SQLite persistence, multi-user isolation,
-              and terminal sessions powered by xterm.js.
+              Claude Code, Codex, Cursor Agent, pi, Grok, Qwen, Kimi, Oh My Pi and plain shells —
+              on your phone, on a tablet, from anywhere on your network. Real terminals,
+              GitHub sign-in, sessions that survive a reload.
             </p>
             <div class="cta">
               <a class="btn primary" href="#usage">Get Started</a>
-              <a class="btn" href="https://www.npmjs.com/package/code-agents-webcli" target="_blank" rel="noopener">View on npm</a>
+              <a class="btn" href="https://github.com/dnviti/code-agents-webcli/blob/main/docs/README.md" target="_blank" rel="noopener">Documentation</a>
             </div>
-            <pre class="snippet"><code>npx code-agents-webcli --setup
-
-# first run asks for:
-# - public base URL
-# - GitHub OAuth client ID / secret
-# - allowed GitHub user IDs
-# - optional GitHub App token</code></pre>
+            <pre class="snippet"><code>npx --allow-git=all github:dnviti/code-agents-webcli</code></pre>
+            <p class="tagline">
+              That is the whole install. Nothing compiles, no C++ toolchain, no second command.
+              Needs Node 22.13+ and a GitHub OAuth App.
+            </p>
           </div>
           <div class="hero-aside">
             <div class="terminal-card">
               <div class="term-bar"><span></span><span></span><span></span></div>
               <div class="term-body">
-                <div>$ npx code-agents-webcli --setup</div>
+                <div>$ npx --allow-git=all github:dnviti/code-agents-webcli</div>
                 <div>▶ SQLite ready at ~/.code-agents-webcli/app.sqlite</div>
                 <div>🔐 GitHub OAuth enabled</div>
-                <div>🧠 Claude / Codex / Terminal sessions available</div>
+                <div>🔒 https://localhost:32352</div>
+                <div>🧠 Claude · Codex · Cursor · pi · Grok · Qwen · Kimi · omp</div>
               </div>
             </div>
           </div>
@@ -69,12 +69,12 @@
         <div class="container">
           <h2>Features</h2>
           <div class="grid">
-            <div class="card"><h3>GitHub OAuth</h3><p>Users authenticate with GitHub and are identified internally by GitHub numeric ID.</p></div>
-            <div class="card"><h3>SQLite Persistence</h3><p>Runtime sessions, auth sessions, and user settings survive restarts in a local SQLite database.</p></div>
-            <div class="card"><h3>Multi-user Isolation</h3><p>Sessions are owner-scoped so users only see and reconnect to their own work.</p></div>
-            <div class="card"><h3>xterm.js Frontend</h3><p>Modern terminal rendering with theme and font controls from the browser.</p></div>
-            <div class="card"><h3>Docker Ready</h3><p>The repo ships with a Dockerfile and GitHub Actions workflow for container builds.</p></div>
-            <div class="card"><h3>npm + GHCR Release</h3><p>Release automation publishes the package to npm and the image to GitHub Container Registry.</p></div>
+            <div class="card"><h3>Real terminals</h3><p>Full pseudo-terminals over WebSocket with xterm.js — TUIs, colours, Ctrl-C, the lot. Not a chat box pretending to be a shell.</p></div>
+            <div class="card"><h3>Eight agent CLIs</h3><p>Whatever you already use. Each is optional; the app only runs what is on the host&rsquo;s PATH, and plain shell sessions always work.</p></div>
+            <div class="card"><h3>Multi-user isolation</h3><p>GitHub OAuth with an explicit allow-list. Sessions are owner-scoped, so users only see and reconnect to their own work.</p></div>
+            <div class="card"><h3>Scrollback that scales</h3><p>The recent tail stays live; everything older is paged in from the server a screen at a time — and exports as Markdown.</p></div>
+            <div class="card"><h3>Built for the phone</h3><p>On-screen terminal keys, owned touch scrolling, a tab sheet, image attach, and an installable PWA.</p></div>
+            <div class="card"><h3>Nothing to compile</h3><p>No native dependencies: the terminal ships as a prebuilt binary and SQLite comes from Node itself. CI proves it on every commit.</p></div>
           </div>
         </div>
       </section>
@@ -84,24 +84,26 @@
           <h2>Get Started</h2>
           <div class="columns">
             <div>
-              <h3>Run locally</h3>
-              <pre class="snippet"><code>npm install -g code-agents-webcli
-code-agents-webcli --setup
+              <h3>Run it</h3>
+              <pre class="snippet"><code># try it, nothing installed permanently
+npx --allow-git=all github:dnviti/code-agents-webcli
 
-# or without installing
-npx code-agents-webcli --setup</code></pre>
+# or install it properly
+npm i -g --allow-git=all github:dnviti/code-agents-webcli
+cc-web</code></pre>
             </div>
             <div>
-              <h3>Configure OAuth callback</h3>
+              <h3>Configure the OAuth callback</h3>
               <pre class="snippet"><code>https://your-host.example.com/auth/github/callback
 
-# local development
-http://localhost:32352/auth/github/callback</code></pre>
+# local install
+https://localhost:32352/auth/github/callback</code></pre>
             </div>
           </div>
 
           <div class="links">
-            <a class="btn primary" href="https://github.com/dnviti/code-agents-webcli#readme" target="_blank" rel="noopener">Read the README</a>
+            <a class="btn primary" href="https://github.com/dnviti/code-agents-webcli/blob/main/docs/installation.md" target="_blank" rel="noopener">Installation guide</a>
+            <a class="btn" href="https://github.com/dnviti/code-agents-webcli/blob/main/docs/README.md" target="_blank" rel="noopener">All documentation</a>
             <a class="btn" href="https://github.com/dnviti/code-agents-webcli" target="_blank" rel="noopener">Browse Source</a>
             <a class="btn" href="https://github.com/dnviti/code-agents-webcli/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contribute</a>
           </div>
@@ -112,9 +114,11 @@ http://localhost:32352/auth/github/callback</code></pre>
         <div class="container">
           <h2>Deploy</h2>
           <ul class="bullets">
-            <li><strong>Database:</strong> local state is stored in <code>~/.code-agents-webcli/app.sqlite</code> unless overridden with <code>--data-dir</code>.</li>
-            <li><strong>Docker:</strong> the container bundles the web app, but you still need Claude / Codex / Cursor CLIs in the runtime environment.</li>
-            <li><strong>Publishing:</strong> npm trusted publishing must be configured on npm before the GitHub release workflow can publish successfully.</li>
+            <li><strong>Requirements:</strong> Node 22.13 or newer, <code>openssl</code> on PATH, and a GitHub OAuth App. Nothing else.</li>
+            <li><strong>HTTPS only:</strong> the server generates its own certificate authority on first start; trust it once per device from <code>/ca.crt</code>. A plain-http origin costs you the service worker, the clipboard and the installable app.</li>
+            <li><strong>Background service:</strong> the setup wizard can install a <code>systemd --user</code> unit that starts at boot and survives logout.</li>
+            <li><strong>Docker:</strong> <code>ghcr.io/dnviti/code-agents-webcli</code> ships the web server only — derive an image to add the agent CLIs, and mount a volume or your users and sessions vanish with the container.</li>
+            <li><strong>Security:</strong> anyone on the allow-list gets a shell on the host as the user running the server. List only accounts you would give SSH to.</li>
           </ul>
         </div>
       </section>
@@ -125,7 +129,8 @@ http://localhost:32352/auth/github/callback</code></pre>
         <div>© <span id="year"></span> Code Agents Web CLI contributors</div>
         <div class="footer-links">
           <a href="https://github.com/dnviti/code-agents-webcli" target="_blank" rel="noopener">GitHub</a>
-          <a href="https://www.npmjs.com/package/code-agents-webcli" target="_blank" rel="noopener">npm</a>
+          <a href="https://github.com/dnviti/code-agents-webcli/blob/main/docs/README.md" target="_blank" rel="noopener">Docs</a>
+          <a href="https://github.com/dnviti/code-agents-webcli/pkgs/container/code-agents-webcli" target="_blank" rel="noopener">Container image</a>
         </div>
       </div>
     </footer>

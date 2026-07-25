@@ -358,13 +358,17 @@ export class SelfUpdateRunner {
   }
 
   /**
-   * Install, rebuild, verify, and only then restart.
+   * Install, verify, and only then restart.
    *
-   * The rebuild step is not optional: npm >= 12 blocks dependency lifecycle
-   * scripts, so node-pty and better-sqlite3 arrive uncompiled from a global
-   * install. Restarting without it would put the service into a crash loop
-   * whose only recovery is a shell — the one thing this feature exists to
-   * avoid needing.
+   * There used to be an `npm rebuild` between the two: npm >= 12 blocks
+   * dependency lifecycle scripts, so node-pty and better-sqlite3 arrived
+   * uncompiled from a global install and restarting without rebuilding them put
+   * the service into a crash loop. Both are gone — the pty is a prebuilt binary
+   * and SQLite is Node's own — so there is nothing left to compile, and the
+   * install is a plain file copy.
+   *
+   * The smoke check stays. It is cheap, and it is the only thing standing
+   * between a half-written install and a service that will not come back up.
    */
   async apply(mode: UpdateMode, packageDir: string | null, targetSha: string | null): Promise<void> {
     if (this.state !== 'idle') {
@@ -405,28 +409,9 @@ export class SelfUpdateRunner {
       return;
     }
 
-    this.note(`$ ${npm} rebuild --prefix ${packageDir}`);
-    const rebuildCode = await this.runStep(
-      npm,
-      ['rebuild', '--prefix', packageDir],
-      INSTALL_TIMEOUT_MS,
-    );
-    if (rebuildCode !== 0) {
-      this.finish({
-        ok: false,
-        code: rebuildCode,
-        restarting: false,
-        restartRequired: false,
-        message:
-          'The native modules failed to rebuild, so the new build would not start. '
-          + 'Nothing was restarted; the running version is unchanged.',
-      });
-      return;
-    }
-
     // Prove the new tree actually loads before handing it the port. Requiring
-    // the server entry pulls in node-pty and better-sqlite3, which is exactly
-    // what an unbuilt install gets wrong.
+    // the server entry pulls in the pty binding and opens the SQLite module,
+    // which is what a half-written install gets wrong.
     const entry = path.join(packageDir, 'dist', 'server', 'index.js');
     this.note(`$ node -e "require(...)" ${entry}`);
     const smokeCode = await this.runStep(

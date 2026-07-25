@@ -1,4 +1,4 @@
-import { spawn as spawnPty, IPty } from 'node-pty';
+import { spawn as spawnPty, IPty } from '../services/pty.js';
 import * as path from 'path';
 import * as fs from 'fs';
 import { execFileSync } from 'child_process';
@@ -23,6 +23,15 @@ export interface SessionInfo {
 export interface StartSessionOptions {
   workingDir?: string;
   dangerouslySkipPermissions?: boolean;
+  /**
+   * Free-text model id from the active runtime profile. Passed via the
+   * bridge's model flag, or ignored when the CLI has none.
+   */
+  model?: string;
+  /** Extra CLI arguments from the active runtime profile, appended last. */
+  extraArgs?: string[];
+  /** Environment variables from the active runtime profile. */
+  env?: Record<string, string>;
   onOutput?: (data: string) => void;
   onExit?: (exitCode: number, signal: number) => void;
   onError?: (error: Error) => void;
@@ -49,6 +58,41 @@ export abstract class BaseBridge {
 
   /** Build the argument list for spawning the process. */
   protected abstract getArgs(options: StartSessionOptions): string[];
+
+  /**
+   * The flag this CLI uses to pin a model, or null when it has none.
+   *
+   * Only ever a flag *name*: the value is whatever the user typed, so this
+   * stays provider-agnostic. Bridges that return null still honour a profile's
+   * `args`, which is the escape hatch for a CLI that spells it differently.
+   */
+  protected getModelFlag(): string | null {
+    return null;
+  }
+
+  /**
+   * Full argument list: the bridge's own arguments, then the profile's model,
+   * then the profile's extra arguments.
+   *
+   * Profile arguments come last so they can override an earlier flag on CLIs
+   * that take last-one-wins, and so the bridge's safety-relevant choices (the
+   * approval-bypass flag above all) are never silently displaced by a value
+   * typed into Settings.
+   */
+  protected buildArgs(options: StartSessionOptions): string[] {
+    const args = [...this.getArgs(options)];
+
+    const modelFlag = this.getModelFlag();
+    if (options.model && modelFlag) {
+      args.push(modelFlag, options.model);
+    }
+
+    if (options.extraArgs?.length) {
+      args.push(...options.extraArgs);
+    }
+
+    return args;
+  }
 
   /**
    * Hook called on every chunk of process output.
@@ -107,6 +151,7 @@ export abstract class BaseBridge {
       onError = () => {},
       cols = 80,
       rows = 24,
+      env: profileEnv,
     } = options;
 
     try {
@@ -123,12 +168,24 @@ export abstract class BaseBridge {
         );
       }
 
-      const args = this.getArgs(options);
+      // Built from the *resolved* options: `workingDir` defaults above, and a
+      // bridge that reasons about the directory it is launched in (omp does)
+      // must see the directory the PTY will actually get, not `undefined`.
+      const args = this.buildArgs({ ...options, workingDir });
+
+      if (args.length) {
+        console.log(`Args: ${args.join(' ')}`);
+      }
 
       const ptyProcess = spawnPty(this.resolvedCommand, args, {
         cwd: workingDir,
         env: {
           ...process.env,
+          // Profile variables sit between the inherited environment and the
+          // terminal settings: they may override an inherited value (that is
+          // the point) but never TERM/COLORTERM, which describe this PTY rather
+          // than the user's preference and would corrupt rendering if changed.
+          ...(profileEnv || {}),
           TERM: 'xterm-256color',
           FORCE_COLOR: '1',
           COLORTERM: 'truecolor',
@@ -294,6 +351,17 @@ export abstract class BaseBridge {
     if (this.sessions.get(sessionId) === session) {
       this.sessions.delete(sessionId);
     }
+  }
+
+  /**
+   * The executable this bridge resolved at construction.
+   *
+   * Exposed so chat mode can spawn the same binary the terminal mode would.
+   * The lookup walks a runtime-specific candidate list and is not something to
+   * repeat in a second place, where it would drift the first time a CLI moves.
+   */
+  get command(): string {
+    return this.resolvedCommand;
   }
 
   getSession(sessionId: string): BridgeSession | undefined {

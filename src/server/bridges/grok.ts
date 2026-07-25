@@ -31,6 +31,11 @@ export class GrokBridge extends BaseBridge {
     // analogue of Claude's --dangerously-skip-permissions.
     return options.dangerouslySkipPermissions ? ['--always-approve'] : [];
   }
+
+  protected getModelFlag(): string | null {
+    // `--model <model>` — verified against the installed CLI's --help.
+    return '--model';
+  }
 }
 
 export default GrokBridge;
