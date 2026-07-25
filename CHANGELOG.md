@@ -3,6 +3,58 @@
 ## [Unreleased]
 
 ### Added
+- **The chat area is three zones you can each switch off.** The turn index on
+  the left, the conversation in the middle with a shell split under it, and the
+  trace rail on the right. What drives the rest is that reasoning blocks and
+  tool calls leave the transcript: inlining them put a disclosure and a tool
+  card between every two paragraphs, which made a five-line answer eight screens
+  tall and the prose impossible to read as prose. They move to the rail — a
+  relocation, never a hiding. Every block is still on screen and still expands
+  to the same card, with its arguments, its clamped output and its diff hunks.
+- **A trace rail holding the plan and everything the agent did about it.** One
+  ordered timeline of every reasoning block and tool call in the conversation,
+  filterable to tools, reasoning or file changes, each row expandable in place.
+  A call that is still running updates on the timeline as it goes rather than
+  freezing at whatever its arguments looked like when the row was drawn, and a
+  row you opened stays open when the next token arrives. It is the rail's first
+  tab and it opens by default, since it is now where the agent's working is.
+- **A turn index for jumping back through a long conversation.** A long session
+  is a scrollbar with no landmarks, and "the twelfth thing I asked" is a unit
+  the user thinks in that a flat message list has no name for. Every turn gets a
+  number, an outcome glyph and the first line of what was asked; the arrow keys
+  move the selection and Enter jumps to it. Below 1280px it collapses to an icon
+  rail rather than taking width the conversation needs.
+- **Each turn is headed by what it cost.** A slim strip carrying the turn's
+  duration, token count and price, sticky for the turn you are reading so
+  scrolling back through an hour of conversation always leaves a header on
+  screen saying which turn the text under it belongs to.
+- **A working line above the composer, with the stop button on it.** While a
+  turn runs it says what the agent is doing now. The header's state chip is a
+  spot of colour at the top of a tall surface, so with the transcript scrolled
+  up or the terminal open, "is it still working, and on what" was a question the
+  screen could not answer without going to look. Stop lives here for the same
+  reason approvals do: the thing you need when a turn goes wrong must not be
+  somewhere you have to find.
+- **A shell at the bottom of the conversation, in its working directory.** You
+  can read what the agent said it did and check it without leaving the
+  conversation, losing your scroll position or switching tabs. Tabbed, with a
+  draggable divider, and each pane is a real session — so its scrollback is
+  stored, its history is pageable and it survives the browser going away.
+  Ctrl+` opens it, and gets you back out of it.
+- **⌘F finds something in the conversation you are in.** Instant, over the
+  transcript the browser already holds, and explicit that this is what it
+  covers — paging further back is what "Load earlier messages" is for. The
+  ranked search across every session is unchanged.
+- **Keyboard shortcuts for the surface**: Ctrl+` for the terminal, Escape to
+  interrupt, ⌘F to search, ⌘B for the rail, ⌘J for the latest turn and ⌘↑/⌘↓
+  between turns. Escape inside the terminal stays a byte the shell wants, so
+  `vi` still works in a pane you opened in order to use it.
+- **Reading width and density are yours to set.** A measure of about 74
+  characters or the full column, at 13px or 14px. Code, tables and diffs ignore
+  it and take the room they need, because their width is part of what they say.
+- **The app opens in the theme the operating system asks for**, until you pick a
+  side — after which your choice wins and the machine going light at sunset no
+  longer flips the app out from under you.
 - **Pick up a past conversation when you open a folder.** The web counterpart of
   `claude --resume`: choose a directory, and the launcher lists the
   conversations that happened in it before offering to start a new one — because
@@ -186,6 +238,16 @@
   come back as an error toast, and falls back to the behaviour that server can deliver.
 
 ### Changed
+- **The composer shows the model the session is actually running**, rather than
+  the first entry of the list of models it could run — which was right only by
+  accident. Switching is offered only where the runtime genuinely supports it,
+  and approval mode is shown as the read-only fact it is: it is fixed when the
+  session is launched, so a picker there would have been a control that looked
+  like it worked.
+- **The transcript stays pinned to the bottom when the window changes shape,**
+  not only when the text grows. Opening the terminal, resizing the window or the
+  on-screen keyboard arriving used to leave a transcript that was following
+  along short by exactly the height the viewport had lost.
 - **The transcript is chat bubbles** — the user's turns on the right in a card,
   the agent's on the left with the full width its code blocks and diffs need.
   Square corners, like everything else here.
