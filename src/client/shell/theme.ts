@@ -4,12 +4,60 @@ export type RelayTheme = 'dark' | 'light';
 
 const THEME_STORAGE_KEY = 'cc-web-relay-theme';
 
+/**
+ * The theme to open in.
+ *
+ * A stored choice wins outright — it is the user saying so. With nothing
+ * stored, the operating system's preference is the next best evidence, and
+ * defaulting to dark against a machine set to light is the app disagreeing with
+ * its own environment on first run for no reason. Dark remains the fallback
+ * when nothing can be read, which is the house style.
+ */
 export function readStoredTheme(): RelayTheme {
   try {
-    return localStorage.getItem(THEME_STORAGE_KEY) === 'light' ? 'light' : 'dark';
+    const stored = localStorage.getItem(THEME_STORAGE_KEY);
+    if (stored === 'light' || stored === 'dark') return stored;
+  } catch {
+    // Private-mode storage refuses reads; fall through to the OS preference.
+  }
+  return systemTheme();
+}
+
+/** What the OS is asking for, or dark where it cannot be asked. */
+export function systemTheme(): RelayTheme {
+  try {
+    return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
   } catch {
     return 'dark';
   }
+}
+
+/**
+ * Follow the OS while the user has expressed no preference of their own.
+ *
+ * Stops as soon as anything is stored — flipping the app out from under someone
+ * who chose dark, because their machine went light at sunset, would be the app
+ * overruling them.
+ */
+export function watchSystemTheme(apply: (theme: RelayTheme) => void): () => void {
+  let query: MediaQueryList;
+  try {
+    query = window.matchMedia('(prefers-color-scheme: light)');
+  } catch {
+    return () => {};
+  }
+
+  const onChange = (): void => {
+    try {
+      if (localStorage.getItem(THEME_STORAGE_KEY)) return;
+    } catch {
+      // Unreadable storage means no stored choice to respect.
+    }
+    apply(systemTheme());
+  };
+
+  query.addEventListener('change', onChange);
+  return () => query.removeEventListener('change', onChange);
 }
 
 /**

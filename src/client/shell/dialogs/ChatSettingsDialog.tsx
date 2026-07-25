@@ -4,10 +4,13 @@ import {
   CHAT_PANEL_IDS,
   CHAT_PANEL_LABELS,
   type ChatViewSettings,
+  type ProseDensity,
+  type ProseWidth,
 } from '../../chat/view-settings';
 import { Button } from '../../ui/relay/Button';
 import { Dialog } from '../../ui/relay/Dialog';
 import { Icon } from '../../ui/relay/Icon';
+import { Select } from '../../ui/relay/Select';
 import { SettingRow } from '../../ui/relay/SettingRow';
 import { Switch } from '../../ui/relay/Switch';
 
@@ -27,6 +30,7 @@ import { Switch } from '../../ui/relay/Switch';
  */
 
 const PANEL_DESCRIPTIONS: Record<string, string> = {
+  trace: 'The plan, and every reasoning block and tool call as an inspectable timeline.',
   files: 'Browse the session\'s working directory.',
   changes: 'Uncommitted changes, with a diff per file.',
   github: 'Open pull requests and issues, via the `gh` CLI on the server.',
@@ -73,31 +77,83 @@ export function ChatSettingsDialog({
         </Button>
       }
     >
+      <Section>Chat area</Section>
+
       <SettingRow
-        label="Workspace panel"
-        description="The rail beside the conversation, with files, changes and repository details."
+        label="Trace rail"
+        description="The rail on the right. It holds the plan and the agent's working — with it closed, the transcript is prose only."
       >
         <Switch
           checked={settings.panelOpen}
-          ariaLabel="Show the workspace panel"
+          ariaLabel="Show the trace rail"
           onChange={(checked) => update({ panelOpen: checked })}
         />
       </SettingRow>
 
-      <div
-        style={{
-          padding: '14px 0 4px',
-          fontFamily: 'var(--font-sans)',
-          fontSize: 'var(--text-2xs)',
-          textTransform: 'uppercase',
-          letterSpacing: 'var(--tracking-caps)',
-          color: 'var(--muted-foreground)',
-        }}
+      <SettingRow
+        label="Turn index"
+        description="The list of turns down the left-hand side, for jumping back through a long conversation."
       >
-        Panels
-      </div>
+        <Switch
+          checked={settings.indexOpen}
+          ariaLabel="Show the turn index"
+          onChange={(checked) => update({ indexOpen: checked })}
+        />
+      </SettingRow>
 
-      {CHAT_PANEL_IDS.map((id) => (
+      <SettingRow
+        label="Terminal"
+        description="A shell in the session's working directory, split below the conversation. Ctrl+` toggles it."
+      >
+        <Switch
+          checked={settings.terminalOpen}
+          ariaLabel="Show the terminal split"
+          onChange={(checked) => update({ terminalOpen: checked })}
+        />
+      </SettingRow>
+
+      <SettingRow
+        label="Reading width"
+        description="A measure of about 74 characters, or the full width of the column. Code, tables and diffs ignore this and take the room they need."
+      >
+        <div style={{ width: 170 }}>
+          <Select
+            size="sm"
+            aria-label="Reading width"
+            value={settings.proseWidth}
+            onChange={(e) => update({ proseWidth: e.target.value as ProseWidth })}
+            options={[
+              { value: 'column', label: 'Column (74ch)' },
+              { value: 'full', label: 'Full width' },
+            ]}
+          />
+        </div>
+      </SettingRow>
+
+      <SettingRow
+        label="Density"
+        description="Compact fits more of the conversation on screen; comfortable is easier over a long read."
+      >
+        <div style={{ width: 170 }}>
+          <Select
+            size="sm"
+            aria-label="Density"
+            value={settings.density}
+            onChange={(e) => update({ density: e.target.value as ProseDensity })}
+            options={[
+              { value: 'compact', label: 'Compact' },
+              { value: 'comfortable', label: 'Comfortable' },
+            ]}
+          />
+        </div>
+      </SettingRow>
+
+      <Section>Panels</Section>
+
+      {/* Trace is deliberately absent: it is the only home of the reasoning and
+          the tool calls now, so a switch that hid it would hide them from the
+          whole app. The rail's own open/closed state is above. */}
+      {CHAT_PANEL_IDS.filter((id) => id !== 'trace').map((id) => (
         <SettingRow
           key={id}
           label={CHAT_PANEL_LABELS[id]}
@@ -111,22 +167,11 @@ export function ChatSettingsDialog({
         </SettingRow>
       ))}
 
-      <div
-        style={{
-          padding: '14px 0 4px',
-          fontFamily: 'var(--font-sans)',
-          fontSize: 'var(--text-2xs)',
-          textTransform: 'uppercase',
-          letterSpacing: 'var(--tracking-caps)',
-          color: 'var(--muted-foreground)',
-        }}
-      >
-        Transcript
-      </div>
+      <Section>Transcript</Section>
 
       <SettingRow
         label="Reasoning"
-        description="Show the model's own working, collapsed, above its answer."
+        description="Keep the model's own working in the trace timeline. Off removes it from the rail as well."
       >
         <Switch
           checked={settings.showThinking}
@@ -137,7 +182,7 @@ export function ChatSettingsDialog({
 
       <SettingRow
         label="Tool calls"
-        description="Show a card for each tool the agent runs. Hiding them changes the view only — the tools still run, and approvals still appear."
+        description="Keep a row on the trace timeline for each tool the agent runs. Hiding them changes the view only — the tools still run, and approvals still appear."
       >
         <Switch
           checked={settings.showToolCalls}
@@ -146,7 +191,7 @@ export function ChatSettingsDialog({
         />
       </SettingRow>
 
-      <SettingRow label="Plan" description="The agent's to-do list, beside the conversation.">
+      <SettingRow label="Plan" description="The agent's to-do list, at the top of the trace rail.">
         <Switch
           checked={settings.showPlan}
           ariaLabel="Show the plan panel"
@@ -169,5 +214,23 @@ export function ChatSettingsDialog({
         </div>
       </SettingRow>
     </Dialog>
+  );
+}
+
+/** A rule and a caps label, between groups of rows. */
+function Section({ children }: { children: React.ReactNode }): React.JSX.Element {
+  return (
+    <div
+      style={{
+        padding: '14px 0 4px',
+        fontFamily: 'var(--font-sans)',
+        fontSize: 'var(--text-2xs)',
+        textTransform: 'uppercase',
+        letterSpacing: 'var(--tracking-caps)',
+        color: 'var(--muted-foreground)',
+      }}
+    >
+      {children}
+    </div>
   );
 }

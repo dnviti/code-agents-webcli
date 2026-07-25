@@ -12,7 +12,7 @@ import { onBannerAction, onBannerDismiss, onBannerToggleLog } from '../ui/update
 import { hideOverlay, showError } from '../ui/overlay';
 import { AppShell, type ShellActions } from './AppShell';
 import { RuntimeLauncher, type ResumableConversation } from './RuntimeLauncher';
-import { readStoredTheme, setThemeMode, type RelayTheme } from './theme';
+import { readStoredTheme, setThemeMode, watchSystemTheme, type RelayTheme } from './theme';
 import { shellStore } from './store';
 import { relayTerminalTheme } from './terminal-theme';
 
@@ -67,6 +67,9 @@ export function mountShell(app: App): void {
   // Before applyTheme, so the very first call can already reach the terminal.
   themedApp = app;
   applyTheme(readStoredTheme());
+  // Keeps following the OS until the user picks a side, at which point the
+  // stored choice wins and this stops changing anything.
+  watchSystemTheme(applyTheme);
 
   // Published before the first render so the chat surface opens with the rail
   // the user left it with, rather than flashing the default and then correcting.

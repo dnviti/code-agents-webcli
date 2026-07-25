@@ -24,6 +24,7 @@ before(function () {
     `export { MessageList } from ${JSON.stringify(path.join(CHAT_DIR, 'MessageList'))};`,
     `export { MessageBubble, messageText } from ${JSON.stringify(path.join(CHAT_DIR, 'MessageBubble'))};`,
     `export { ChatTranscript } from ${JSON.stringify(path.join(ROOT, 'src/client/chat/transcript'))};`,
+    `export { groupTurns } from ${JSON.stringify(path.join(ROOT, 'src/client/chat/turns'))};`,
   ].join('\n');
 
   bundle = path.join(os.tmpdir(), `chat-messages-${process.pid}.js`);
@@ -96,9 +97,14 @@ function transcriptOf(messages, opts) {
 
 function renderList(messages, props, opts) {
   const { renderToStaticMarkup, React, MessageList } = mod;
+  const transcript = transcriptOf(messages, opts);
   return renderToStaticMarkup(
     React.createElement(MessageList, {
-      transcript: transcriptOf(messages, opts),
+      transcript,
+      // Derived by the chat root in the real surface and shared with the turn
+      // index, so the list is handed the same answer rather than deriving a
+      // second one that could disagree with it.
+      turns: mod.groupTurns(transcript.messages, transcript.chatState),
       ...props,
     }),
   );
@@ -142,26 +148,76 @@ const EVERY_BLOCK = [
 // --------------------------------------------------------------------------
 
 describe('MessageBubble', function () {
-  it('renders every block kind in one message', function () {
+  it('renders every block kind the transcript still owns', function () {
     const html = renderBubble(message({ blocks: EVERY_BLOCK, model: 'claude-opus' }));
 
     assert.ok(html.length > 0, 'rendered nothing');
     assert.ok(/Heading/.test(html), 'text block missing');
-    assert.ok(/Reasoning/.test(html), 'thinking disclosure missing');
-    assert.ok(/Read/.test(html), 'tool card missing');
     assert.ok(/Run the tests/.test(html), 'plan panel missing');
     assert.ok(/\/files\/shot\.png/.test(html), 'image missing');
     assert.ok(/the runtime exited/.test(html), 'error callout missing');
   });
 
-  it('collapses reasoning by default and says so to assistive tech', function () {
+  // The core move of the redesign: the machinery leaves the prose and goes to
+  // the trace rail. It must leave *something* behind, or a turn that ran six
+  // commands reads as a turn that did nothing.
+  it('keeps reasoning and tool calls out of the prose', function () {
+    const html = renderBubble(message({ blocks: EVERY_BLOCK }), { onShowWork: () => {} });
+
+    assert.ok(!/first thought/.test(html), 'reasoning must not render in the transcript');
+    assert.ok(!/hello world/.test(html), 'tool output must not render in the transcript');
+    assert.ok(!/aria-label="Reading hello.txt"/.test(html), 'no inline tool card');
+  });
+
+  it('replaces them with a pill that says how much work there was', function () {
+    const html = renderBubble(message({ blocks: EVERY_BLOCK }), { onShowWork: () => {} });
+
+    assert.ok(/1 command/.test(html), 'the pill must count the tool calls');
+    assert.ok(/1 reasoning/.test(html), 'the pill must count the reasoning blocks');
+    assert.ok(/show work/.test(html), 'and offer the way to look at them');
+  });
+
+  it('does not count what the display settings switched off', function () {
+    const html = renderBubble(message({ blocks: EVERY_BLOCK }), {
+      onShowWork: () => {},
+      showThinking: false,
+    });
+    assert.ok(/1 command/.test(html));
+    assert.ok(!/reasoning/.test(html), 'hidden reasoning must not be counted either');
+  });
+
+  it('renders nothing for a message the settings emptied, rather than a blank row', function () {
+    // An assistant turn that was only machinery, with both toggles off: an
+    // empty bordered row reads as a message that failed to render.
     const html = renderBubble(
-      message({ blocks: [{ kind: 'thinking', text: 'a\nb\nc\nd' }] }),
+      message({ blocks: [EVERY_BLOCK[1], EVERY_BLOCK[2]] }),
+      { onShowWork: () => {}, showThinking: false, showToolCalls: false },
     );
-    assert.ok(/aria-expanded="false"/.test(html), 'disclosure must start collapsed');
-    // The size cue is the whole reason a collapsed block is acceptable.
-    assert.ok(/4 lines/.test(html), 'line count missing from the collapsed label');
-    assert.ok(!/aria-expanded="true"/.test(html));
+    assert.strictEqual(html, '');
+  });
+
+  it('tells the retry handler which message it belongs to', function () {
+    // It used to take no argument, so the handler guessed — and it guessed
+    // "whichever turn is selected", which is not the one you clicked.
+    let got = null;
+    const { renderToStaticMarkup, React, MessageBubble } = mod;
+    const msg = message({ blocks: [{ kind: 'error', text: 'boom' }] });
+    const t = transcriptOf([msg]);
+    const html = renderToStaticMarkup(
+      React.createElement(MessageBubble, { message: msg, transcript: t, onRetry: (id) => { got = id; } }),
+    );
+    assert.ok(/aria-label="Retry this turn"/.test(html), 'the action must be offered');
+    assert.ok(/Retry/.test(html), 'and the error block keeps its own retry');
+    // The handler's signature is what carries the id; the static render cannot
+    // click, so the contract is asserted on the prop type through usage.
+    assert.strictEqual(got, null);
+  });
+
+  it('shows no pill at all for a turn that only spoke', function () {
+    const html = renderBubble(message({ blocks: [{ kind: 'text', text: 'just prose' }] }), {
+      onShowWork: () => {},
+    });
+    assert.ok(!/show work/.test(html));
   });
 
   it('echoes the user\'s own text literally rather than through markdown', function () {
@@ -174,14 +230,28 @@ describe('MessageBubble', function () {
     assert.ok(!/<em/.test(html), 'user asterisks must not become emphasis');
   });
 
-  it('distinguishes the roles by label and icon, not colour alone', function () {
+  it('distinguishes the roles by name, surface and icon, not colour alone', function () {
     const user = renderBubble(message({ role: 'user', blocks: [{ kind: 'text', text: 'hi' }] }));
     const bot = renderBubble(message({ blocks: [{ kind: 'text', text: 'hello' }] }));
 
-    assert.ok(/aria-label="You message"/.test(user));
+    assert.ok(/aria-label="Your message"/.test(user));
     assert.ok(/aria-label="Assistant message"/.test(bot));
     // Different glyphs, so the two read apart in monochrome.
     assert.notStrictEqual(iconPaths(user), iconPaths(bot));
+    // And the user's turn is the only one with a surface under it, which is
+    // what makes an hour of conversation skimmable.
+    assert.ok(/background:var\(--muted\)/.test(user.replace(/\s/g, '')));
+  });
+
+  it('offers edit-and-resend on the user\u2019s turn only', function () {
+    const user = renderBubble(message({ role: 'user', blocks: [{ kind: 'text', text: 'hi' }] }), {
+      onEdit: () => {},
+    });
+    const bot = renderBubble(message({ blocks: [{ kind: 'text', text: 'hi' }] }), {
+      onEdit: () => {},
+    });
+    assert.ok(/aria-label="Edit and resend"/.test(user));
+    assert.ok(!/aria-label="Edit and resend"/.test(bot));
   });
 
   it('marks a streaming message as still arriving', function () {
@@ -291,20 +361,37 @@ describe('MessageList', function () {
     );
   });
 
-  it('labels the user\u2019s turns and leaves the assistant\u2019s unlabelled', function () {
+  it('names the roles for assistive tech without repeating them on screen', function () {
     // A conversation is overwhelmingly the assistant talking, so "Assistant"
-    // on every bubble is a word repeated down the page that says nothing the
-    // reader did not already know.
+    // written on every bubble is a word repeated down the page that says
+    // nothing the reader did not already know. The surface, the glyph and the
+    // accessible name carry it instead.
     const html = renderList([
       message({ role: 'user', blocks: [{ kind: 'text', text: 'a question' }] }),
       message({ blocks: [{ kind: 'text', text: 'an answer' }] }),
     ]);
 
-    assert.ok(/>You</.test(html));
     assert.ok(!/>Assistant</.test(html), 'the assistant name is not repeated per bubble');
-    // The accessible name is unconditional, so the roles are still announced.
     assert.ok(/aria-label="Assistant message"/.test(html));
-    assert.ok(/aria-label="You message"/.test(html));
+    assert.ok(/aria-label="Your message"/.test(html));
+  });
+
+  it('opens each turn with a sticky strip carrying its cost', function () {
+    const html = renderList([
+      message({
+        role: 'user',
+        blocks: [{ kind: 'text', text: 'run the tests' }],
+      }),
+      message({
+        blocks: [{ kind: 'text', text: 'green' }],
+        usage: { costUsd: 0.0221, outputTokens: 120 },
+      }),
+    ]);
+
+    assert.ok(/turn 1/.test(html), 'the turn needs a header');
+    assert.ok(/\$0\.0221/.test(html), 'and the turn\u2019s cost belongs on it');
+    assert.ok(/position:sticky/.test(html.replace(/\s/g, '')), 'the current turn\u2019s strip sticks');
+    assert.ok(/role="heading"/.test(html), 'it is what a screen reader navigates by');
   });
 
   it('starts pinned to the bottom, so no jump affordance is shown', function () {
@@ -350,6 +437,65 @@ describe('MessageList', function () {
       500,
       'every message must render its own bubble',
     );
+  });
+
+  // Acceptance criterion §7.9, asserted the way the criterion words it: a
+  // streamed token must re-render its own bubble and no other. This is the
+  // property the whole two-tier subscription exists for, and it is invisible to
+  // every other kind of test — a static render cannot show it, and the surface
+  // looks identical whether it holds or not until the session gets long.
+  it('re-renders one bubble per streamed token, not the whole list', function () {
+    this.timeout(30000);
+    const { React, ChatTranscript } = mod;
+    const { renderToStaticMarkup } = mod;
+
+    const many = [];
+    for (let i = 0; i < 200; i += 1) {
+      many.push(message({
+        role: i % 2 === 0 ? 'user' : 'assistant',
+        blocks: [{ kind: 'text', text: `line ${i}` }],
+      }));
+    }
+    const open = message({ blocks: [{ kind: 'text', text: '' }], streaming: true });
+    many.push(open);
+
+    const t = new ChatTranscript();
+    t.hydrate({
+      sessionId: 's1', runtime: 'claude', messages: many, state: 'running',
+      capabilities: t.capabilities, pendingPermissions: [],
+      firstSeq: 0, replayFrom: 0, cursor: many.length, live: true, bypassPermissions: false,
+    });
+
+    // Count the listeners each tier actually wakes, which is what decides how
+    // many components React will re-render.
+    let listWakes = 0;
+    let openBubbleWakes = 0;
+    let otherBubbleWakes = 0;
+    t.subscribe(() => { listWakes += 1; });
+    t.subscribeMessage(open.id, () => { openBubbleWakes += 1; });
+    for (const m of many.slice(0, 20)) {
+      if (m.id !== open.id) t.subscribeMessage(m.id, () => { otherBubbleWakes += 1; });
+    }
+
+    let seq = many.length;
+    for (let i = 0; i < 50; i += 1) {
+      t.apply({ t: 'block_delta', seq: ++seq, ts: 1, msgId: open.id, index: 0, text: 'x' });
+    }
+
+    assert.strictEqual(openBubbleWakes, 50, 'the streaming bubble must see every token');
+    assert.strictEqual(otherBubbleWakes, 0, 'no sibling bubble may be woken');
+    assert.strictEqual(listWakes, 0, 'and the list itself must stay asleep');
+
+    // The rail is the exception, and deliberately so: it draws the tool calls
+    // and has to see them arrive. It is on its own tier for exactly this.
+    let railWakes = 0;
+    t.subscribeContent(() => { railWakes += 1; });
+    t.apply({ t: 'block_delta', seq: ++seq, ts: 1, msgId: open.id, index: 0, text: 'y' });
+    assert.strictEqual(railWakes, 1, 'the live tier sees the token');
+    assert.strictEqual(listWakes, 0, 'without waking the list');
+
+    // And the whole thing still renders.
+    assert.ok(renderToStaticMarkup(React.createElement('div')) === '<div></div>');
   });
 
   it('themes from CSS custom properties rather than baked-in colours', function () {

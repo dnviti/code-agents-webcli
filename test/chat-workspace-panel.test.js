@@ -132,7 +132,19 @@ describe('chat view settings', function () {
         status: false,
       },
     });
-    assert.deepStrictEqual(mod.viewSettings.enabledPanels(settings), ['files', 'github', 'links']);
+    assert.deepStrictEqual(
+      mod.viewSettings.enabledPanels(settings),
+      ['trace', 'files', 'github', 'links'],
+    );
+  });
+
+  it('refuses to switch the trace panel off', function () {
+    // It is the only surface in the app that shows reasoning and tool calls
+    // since they left the transcript. A switch that hid it would hide them
+    // everywhere, with nothing on screen to say where they went.
+    const settings = mod.viewSettings.normalizeChatView({ panels: { trace: false } });
+    assert.strictEqual(settings.panels.trace, true);
+    assert.ok(mod.viewSettings.enabledPanels(settings).includes('trace'));
   });
 });
 
@@ -224,7 +236,10 @@ describe('WorkspacePanel', function () {
     });
     // NaN would render `width: NaNpx`, which the browser drops entirely — the
     // rail would have no width at all.
-    assert.ok(/aria-valuenow="320"/.test(broken));
+    assert.ok(
+      new RegExp(`aria-valuenow="${mod.viewSettings.PANEL_DEFAULT_WIDTH}"`).test(broken),
+      'a broken width falls back to the default',
+    );
     assert.ok(!/NaN/.test(broken));
   });
 
@@ -390,9 +405,22 @@ describe('ChatSettingsDialog', function () {
       onClose() {},
     });
 
-    for (const label of ['Workspace panel', 'Files', 'Changes', 'GitHub', 'Agents', 'Links', 'Reasoning', 'Tool calls', 'Plan', 'Usage']) {
+    const labels = [
+      // The three zones of the redesigned surface…
+      'Trace rail', 'Turn index', 'Terminal', 'Reading width', 'Density',
+      // …the rail's optional tabs…
+      'Files', 'Changes', 'GitHub', 'Agents', 'Links',
+      // …and what the transcript renders.
+      'Reasoning', 'Tool calls', 'Plan', 'Usage',
+    ];
+    for (const label of labels) {
       assert.ok(html.includes(label), `missing "${label}"`);
     }
+
+    // Trace has no switch: it is not optional, and offering one that had to be
+    // ignored would be a control that lies.
+    const switches = html.match(/aria-label="Show the ([^"]+) panel"/g) || [];
+    assert.ok(!switches.some((s) => /Trace panel/.test(s)), 'the trace panel must have no switch');
 
     // The app-wide dialog's controls must not have followed it here.
     for (const stray of ['Font size', 'Colorway', 'Terminal font', 'Runtime profiles', 'Install app']) {

@@ -49,6 +49,25 @@ export class ChatTranscript {
   private messageVersions = new Map<string, number>();
 
   /**
+   * Bumped on *every* applied change, including the per-message ones.
+   *
+   * The two-tier split above exists so a streaming turn re-renders one bubble
+   * rather than the whole list — and it works because a bubble is the only
+   * thing that needs to see a token arrive. The trace rail broke that
+   * assumption: it draws every tool call in the conversation, so it has to see
+   * `block_start`, `block_delta` and `tool` patches, none of which reach
+   * `subscribe`. Hanging the rail off `subscribe` meant a forty-second command
+   * did not appear on the timeline until something unrelated happened to fire.
+   *
+   * A third tier rather than a coarser first one: this is the *live* tier, and
+   * only the surfaces that are genuinely live subscribe to it. The chat root
+   * stays on `subscribe`, so the header, the index and the composer are not
+   * re-rendered per token.
+   */
+  private contentVersion = 0;
+  private contentListeners = new Set<Listener>();
+
+  /**
    * Lowest seq this client actually holds.
    *
    * Distinct from `state.firstSeq`, which is the lowest seq the *server* still
@@ -222,12 +241,19 @@ export class ChatTranscript {
     if (listeners) {
       for (const listener of listeners) listener();
     }
+    this.bumpContent();
+  }
+
+  private bumpContent(): void {
+    this.contentVersion++;
+    for (const listener of this.contentListeners) listener();
   }
 
   /** Something session-level moved; the list re-reads, bubbles do not. */
   private notify(): void {
     this.version++;
     for (const listener of this.listeners) listener();
+    this.bumpContent();
   }
 
   private bumpAll(): void {
@@ -237,6 +263,7 @@ export class ChatTranscript {
       this.messageVersions.set(id, (this.messageVersions.get(id) || 0) + 1);
       for (const listener of listeners) listener();
     }
+    this.bumpContent();
   }
 
   subscribe = (listener: Listener): (() => void) => {
@@ -258,6 +285,22 @@ export class ChatTranscript {
       if (set!.size === 0) this.messageListeners.delete(id);
     };
   };
+
+  /**
+   * Anything at all changed, including one token of one message.
+   *
+   * For surfaces that redraw the *contents* of the conversation rather than its
+   * shape — the trace timeline and the working ribbon. Everything else should
+   * use `subscribe`, which is quiet during a streaming turn.
+   */
+  subscribeContent = (listener: Listener): (() => void) => {
+    this.contentListeners.add(listener);
+    return () => {
+      this.contentListeners.delete(listener);
+    };
+  };
+
+  getContentVersion = (): number => this.contentVersion;
 
   getVersion = (): number => this.version;
 
@@ -303,6 +346,16 @@ export class ChatTranscript {
   /** Lowest seq held here; where the next page request starts counting back from. */
   get oldestSeq(): number {
     return this.oldest;
+  }
+
+  /**
+   * The model the runtime reported for this conversation.
+   *
+   * From the `session` event, so it is what the process was started with rather
+   * than the first entry of whatever list it happens to advertise.
+   */
+  get model(): string | undefined {
+    return this.state.model;
   }
 
   get lastError(): string | undefined {

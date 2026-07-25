@@ -118,11 +118,10 @@ describe('ChatView', function () {
 
     assert.ok(html.includes('Nothing here yet'), 'empty transcript needs its invitation');
     assert.ok(html.includes('Claude Code'), 'header must name the runtime');
-    assert.ok(html.includes('Beta'), 'the surface is still beta and must say so');
     // Basename in the chrome, full path still reachable by assistive tech.
     assert.ok(html.includes('webcli'), 'working directory leaf missing');
     assert.ok(html.includes('/home/dev/projects/webcli'), 'full path must stay announced');
-    assert.ok(html.includes('Ready'), 'idle state indicator missing');
+    assert.ok(html.includes('ready'), 'idle state indicator missing');
     assert.ok(html.includes('aria-live="polite"'), 'state indicator must be announced');
     assert.ok(!html.includes('Pending approvals'), 'nothing is pending here');
     assert.ok(html.includes('Message Claude Code'), 'composer placeholder missing');
@@ -140,7 +139,7 @@ describe('ChatView', function () {
 
     const html = render({ controller });
 
-    assert.ok(html.includes('Thinking'), 'thinking state must reach the header');
+    assert.ok(html.includes('thinking'), 'thinking state must reach the header');
     assert.ok(html.includes('refactor the parser'), 'user turn missing');
     assert.ok(html.includes('Reading the parser now'), 'streamed assistant text missing');
     assert.ok(!html.includes('Nothing here yet'), 'the transcript is not empty');
@@ -170,7 +169,7 @@ describe('ChatView', function () {
     assert.ok(html.includes('aria-live="assertive"'), 'a blocked agent must interrupt');
     assert.ok(html.includes('Run npm test'), 'approval title missing');
     assert.ok(html.includes('Allow once') && html.includes('Deny'), 'approval options missing');
-    assert.ok(html.includes('Waiting for you'), 'header must show the session is blocked');
+    assert.ok(html.includes('waiting for you'), 'header must show the session is blocked');
     // The composer stays live. Answering the approval is what unblocks the
     // agent, but the moment it is waiting on you is exactly when the follow-up
     // is worth typing — it is accepted and queued rather than refused.
@@ -181,20 +180,21 @@ describe('ChatView', function () {
   it('keeps the composer inside the conversation column, not across the whole surface', function () {
     // The composer used to be a sibling of the row that holds the workspace
     // rail, so it ran the full width of the surface: the rail was drawn over
-    // the left end of the input, and widening the rail covered more of it.
+    // the end of the input, and widening the rail covered more of it. The rail
+    // now sits to the *right* of the column, so the order is reversed — what
+    // has not changed is that the two are siblings in one flex row and neither
+    // is drawn over the other.
     const html = render({
       controller: controllerWith({}),
       view: { ...mod.viewSettings.DEFAULT_CHAT_VIEW, panelOpen: true, panelTab: 'files' },
     });
 
-    const rail = html.indexOf('aria-label="Workspace"');
     const composer = html.indexOf('aria-label="Message"');
+    const rail = html.indexOf('aria-label="Workspace"');
     assert.ok(rail !== -1 && composer !== -1, 'both the rail and the composer should render');
-
-    // The rail closes before the conversation column opens, so the composer is
-    // inside a box the rail's width has already taken its share of.
-    const railEnd = html.indexOf('</aside>', rail);
-    assert.ok(railEnd !== -1 && railEnd < composer, 'the composer must come after the rail closes, inside the column');
+    assert.ok(composer < rail, 'the composer belongs to the column that precedes the rail');
+    // And the column has closed before the rail opens.
+    assert.ok(html.lastIndexOf('</div>', rail) < rail);
   });
 
   it('carries the queue and its withdraw control down to the composer', function () {
@@ -210,7 +210,7 @@ describe('ChatView', function () {
     assert.ok(html.includes('aria-label="Remove queued message 1"'), 'and must be withdrawable from here');
   });
 
-  it('puts the plan in a right rail on desktop', function () {
+  it('puts the plan at the top of the trace rail on desktop', function () {
     const controller = controllerWith({
       plan: [
         { text: 'Read the reducer', status: 'completed' },
@@ -220,9 +220,50 @@ describe('ChatView', function () {
 
     const html = render({ controller });
 
-    assert.ok(html.includes('aria-label="Plan"'), 'plan rail missing');
+    assert.ok(html.includes('aria-label="Plan"'), 'plan panel missing');
     assert.ok(html.includes('Wire the view'), 'plan item missing');
-    assert.ok(html.includes('1 of 2'), 'plan progress missing');
+    assert.ok(html.includes('1 / 2'), 'plan progress missing');
+    // And the timeline underneath it, which is the rest of the tab.
+    assert.ok(html.includes('aria-label="Activity"'), 'the trace timeline belongs below it');
+  });
+
+  it('moves reasoning and tool calls to the rail rather than dropping them', function () {
+    const controller = controllerWith({
+      messages: [
+        message('m1', 1, 'user', 'run the tests'),
+        {
+          id: 'm2',
+          seq: 2,
+          turnId: 't1',
+          role: 'assistant',
+          ts: 2,
+          blocks: [
+            { kind: 'text', text: 'all green' },
+            { kind: 'thinking', text: 'checking the suite' },
+            {
+              kind: 'tool',
+              toolId: 'x1',
+              name: 'bash',
+              toolKind: 'execute',
+              status: 'completed',
+              input: { command: 'npm test' },
+              output: '68 passing',
+            },
+          ],
+        },
+      ],
+      cursor: 2,
+    });
+
+    const html = render({ controller });
+
+    // On the timeline…
+    assert.ok(html.includes('npm test'), 'the tool call belongs on the rail');
+    assert.ok(html.includes('reasoning'), 'and so does the reasoning');
+    // …and not in the prose, which keeps its answer.
+    assert.ok(html.includes('all green'));
+    assert.ok(!html.includes('68 passing'), 'tool output must not be back in the transcript');
+    assert.ok(html.includes('show work'), 'the transcript keeps a pointer to it');
   });
 
   it('states plainly that an exited session is over', function () {
@@ -233,7 +274,7 @@ describe('ChatView', function () {
 
     assert.ok(html.includes('has exited'), 'exit must be stated');
     assert.ok(html.includes('read-only'), 'the transcript is read-only after an exit');
-    assert.ok(html.includes('Exited'), 'header indicator must follow the state');
+    assert.ok(html.includes('exited'), 'header indicator must follow the state');
     assert.ok(/<textarea[^>]*disabled/.test(html), 'a dead process cannot take input');
     for (const word of ['Resume this conversation', 'Start a new chat']) {
       assert.ok(!html.includes(word), `${word} promises something there is nothing to do it to`);
@@ -280,8 +321,8 @@ describe('ChatView', function () {
       const controller = controllerWith({ ...DEAD, nativeSessionId: 'native-7' });
       const html = render({ controller });
 
-      assert.ok(html.includes('Exited'), 'the header must follow the process');
-      assert.ok(!html.includes('>Ready<'), 'a dead session is not ready for anything');
+      assert.ok(html.includes('exited'), 'the header must follow the process');
+      assert.ok(!/>\s*ready\s*</.test(html), 'a dead session is not ready for anything');
     });
 
     it('does not offer a resume it cannot deliver', function () {
@@ -393,7 +434,7 @@ describe('ChatView', function () {
 
     assert.ok(html.includes('stdio closed unexpectedly'), 'lastError must be shown verbatim');
     assert.ok(html.includes('role="alert"'), 'a fatal error must be announced immediately');
-    assert.ok(html.includes('Error'), 'header indicator must follow the state');
+    assert.ok(html.includes('>error<'), 'header indicator must follow the state');
   });
 
   it('collapses the rails and keeps touch targets on mobile', function () {
@@ -403,12 +444,68 @@ describe('ChatView', function () {
 
     const html = render({ controller, isMobile: true });
 
-    assert.ok(!html.includes('aria-label="Plan"'), 'the side rail must not survive on a phone');
+    assert.ok(!html.includes('aria-label="Workspace"'), 'the rail must not open itself on a phone');
     assert.ok(html.includes('aria-expanded="false"'), 'plan collapses to a disclosure');
     assert.ok(html.includes('0 of 1'), 'the collapsed summary still reports progress');
     assert.ok(html.includes('env(safe-area-inset-bottom'), 'composer must clear the home bar');
     // Every control in this pane has to be thumb-sized; 34 is the app's floor.
     assert.ok(html.includes('min-height:34px'), 'disclosure below the touch-target floor');
+  });
+
+  // Acceptance criterion §7.6: a blocked agent must stay answerable with the
+  // rail closed, the terminal open, and on a phone. The phone was the case that
+  // broke — the rail took over the whole column, approvals and composer with it.
+  it('keeps a pending approval answerable on a phone with the rail open', function () {
+    const controller = controllerWith({
+      state: 'awaiting_permission',
+      pendingPermissions: [
+        {
+          requestId: 'p1',
+          title: 'Remove the build directory',
+          toolKind: 'delete',
+          input: { path: 'dist' },
+          options: [
+            { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+            { optionId: 'reject_once', name: 'Deny', kind: 'reject_once' },
+          ],
+          ts: 1,
+        },
+      ],
+    });
+
+    const html = render({
+      controller,
+      isMobile: true,
+      view: { ...mod.viewSettings.DEFAULT_CHAT_VIEW, panelOpen: true, panelTab: 'trace' },
+    });
+
+    assert.ok(html.includes('Remove the build directory'), 'the approval must stay on screen');
+    assert.ok(html.includes('Allow once') && html.includes('Deny'), 'and must stay answerable');
+    assert.ok(html.includes('aria-label="Message"'), 'and the composer must survive with it');
+  });
+
+  it('keeps a pending approval answerable with the terminal open', function () {
+    const controller = controllerWith({
+      state: 'awaiting_permission',
+      pendingPermissions: [
+        {
+          requestId: 'p1',
+          title: 'Run npm test',
+          toolKind: 'execute',
+          options: [{ optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' }],
+          ts: 1,
+        },
+      ],
+    });
+
+    const html = render({
+      controller,
+      view: { ...mod.viewSettings.DEFAULT_CHAT_VIEW, terminalOpen: true },
+    });
+
+    assert.ok(html.includes('Run npm test'));
+    assert.ok(html.includes('Allow once'));
+    assert.ok(html.includes('aria-label="Resize the terminal"'), 'with the split actually open');
   });
 
   it('keeps an active permission bypass on screen for the whole session', function () {

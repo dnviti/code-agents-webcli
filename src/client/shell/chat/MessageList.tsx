@@ -1,11 +1,14 @@
 import * as React from 'react';
 import { ChatTranscript } from '../../chat/transcript.js';
+import { createStick, BOTTOM_SLACK, type StickHandle } from '../../chat/stick.js';
+import type { TurnSummary } from '../../chat/turns.js';
 import { Button } from '../../ui/relay/Button.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import { MessageBubble } from './MessageBubble.js';
+import { TurnStrip } from './TurnStrip.js';
 
 /**
- * The scrolling transcript.
+ * The scrolling transcript, grouped into turns.
  *
  * Two subscriptions, deliberately split. This component watches the transcript
  * version, which tells it only that the set of messages may have moved; each
@@ -13,17 +16,36 @@ import { MessageBubble } from './MessageBubble.js';
  * against one message, and if the list re-rendered every bubble for each of
  * them the surface would stall at a few hundred messages. See MessageBubble.
  *
- * Scroll behaviour mirrors the terminal side (src/client/terminal/controller.ts):
- * "am I at the bottom" is sampled from the live geometry, and new output only
- * follows the viewport down when that was already true. The user scrolling up
- * is an instruction, and it outranks anything the agent is emitting.
+ * Staying pinned to the bottom is delegated to `createStick`, which samples live
+ * geometry rather than React state and re-pins on all four of the things that
+ * move a scroller's bottom edge — a commit, the content growing, the *viewport*
+ * shrinking (the terminal split opening is exactly this), and late async layout.
+ * The user scrolling up is an instruction, and it outranks anything the agent is
+ * emitting.
  */
+
+export interface MessageListHandle {
+  /** Put a turn's strip at the top of the viewport. */
+  scrollToTurn(turnId: string): void;
+  /** Bring a single message into view, e.g. from the trace timeline. */
+  scrollToMessage(messageId: string): void;
+  /** Force the scroller back to the bottom. */
+  pin(): void;
+}
 
 export interface MessageListProps {
   transcript: ChatTranscript;
+  /** Derived once by the chat root and shared with the turn index. */
+  turns: TurnSummary[];
   onLoadMore?: () => void;
   onFork?: (messageId: string) => void;
-  onRetry?: () => void;
+  onRetry?: (messageId: string) => void;
+  onShowWork?: (messageId: string) => void;
+  onEditTurn?: (text: string) => void;
+  onCopyTurn?: (turnId: string) => void;
+  onForkTurn?: (turnId: string) => void;
+  /** Which turn the index has selected; its strip is the sticky one. */
+  currentTurnId?: string;
   /**
    * Passed down as primitives, not as a settings object.
    *
@@ -35,8 +57,7 @@ export interface MessageListProps {
   showToolCalls?: boolean;
 }
 
-/** How close to an edge still counts as being at it, in px. */
-const BOTTOM_SLACK = 24;
+/** How close to the top still counts as asking for the previous page. */
 const TOP_SLACK = 48;
 
 // Scroll correction has to land before the browser paints or the transcript
@@ -46,223 +67,344 @@ const TOP_SLACK = 48;
 const useScrollEffect =
   typeof window === 'undefined' ? React.useEffect : React.useLayoutEffect;
 
-export function MessageList({
-  transcript,
-  onLoadMore,
-  onFork,
-  onRetry,
-  showThinking = true,
-  showToolCalls = true,
-}: MessageListProps) {
-  const version = React.useSyncExternalStore(transcript.subscribe, transcript.getVersion, ZERO);
-  const messages = React.useMemo(
-    () => transcript.messages,
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [transcript, version],
-  );
+export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>(
+  function MessageList(
+    {
+      transcript,
+      turns,
+      onLoadMore,
+      onFork,
+      onRetry,
+      onShowWork,
+      onEditTurn,
+      onCopyTurn,
+      onForkTurn,
+      currentTurnId,
+      showThinking = true,
+      showToolCalls = true,
+    },
+    handle,
+  ) {
+    const version = React.useSyncExternalStore(transcript.subscribe, transcript.getVersion, ZERO);
+    const messages = React.useMemo(
+      () => transcript.messages,
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [transcript, version],
+    );
 
-  const scroller = React.useRef<HTMLDivElement | null>(null);
-  const [stuck, setStuck] = React.useState(true);
+    const scroller = React.useRef<HTMLDivElement | null>(null);
+    const content = React.useRef<HTMLDivElement | null>(null);
+    const [stuck, setStuck] = React.useState(true);
 
-  // Read off the transcript rather than tracked here. This used to be local
-  // state cleared only when a page actually prepended a message — so a page
-  // that legitimately came back with none (or never came back at all) left
-  // "Loading earlier messages" on screen for the rest of the session. The
-  // controller owns the request's lifetime and settles it however it ends.
-  const loadingMore = transcript.loadingMore;
+    // Read off the transcript rather than tracked here. This used to be local
+    // state cleared only when a page actually prepended a message — so a page
+    // that legitimately came back with none (or never came back at all) left
+    // "Loading earlier messages" on screen for the rest of the session. The
+    // controller owns the request's lifetime and settles it however it ends.
+    const loadingMore = transcript.loadingMore;
 
-  // Read inside layout effects and scroll handlers, where a state value would
-  // be a render behind the geometry it is describing.
-  const stuckRef = React.useRef(true);
-  const firstIdRef = React.useRef<string | undefined>(undefined);
-  const heightRef = React.useRef(0);
+    const firstIdRef = React.useRef<string | undefined>(undefined);
+    const heightRef = React.useRef(0);
 
-  // Kept in refs so a caller passing fresh closures every render does not
-  // defeat React.memo on every bubble in the list.
-  const forkRef = React.useRef(onFork);
-  const retryRef = React.useRef(onRetry);
-  const loadRef = React.useRef(onLoadMore);
-  React.useEffect(() => {
-    forkRef.current = onFork;
-    retryRef.current = onRetry;
-    loadRef.current = onLoadMore;
-  }, [onFork, onRetry, onLoadMore]);
+    // One handle for the life of the component; React attaches and detaches the
+    // elements through the callback refs below.
+    const stickRef = React.useRef<StickHandle | null>(null);
+    if (stickRef.current === null) stickRef.current = createStick(BOTTOM_SLACK);
+    const stick = stickRef.current;
+    React.useEffect(() => () => stick.dispose(), [stick]);
 
-  const fork = React.useMemo(
-    () => (onFork ? (messageId: string) => forkRef.current?.(messageId) : undefined),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [Boolean(onFork)],
-  );
-  const retry = React.useMemo(
-    () => (onRetry ? () => retryRef.current?.() : undefined),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [Boolean(onRetry)],
-  );
+    // Kept in refs so a caller passing fresh closures every render does not
+    // defeat React.memo on every bubble in the list.
+    const forkRef = React.useRef(onFork);
+    const retryRef = React.useRef(onRetry);
+    const loadRef = React.useRef(onLoadMore);
+    const workRef = React.useRef(onShowWork);
+    const editRef = React.useRef(onEditTurn);
+    React.useEffect(() => {
+      forkRef.current = onFork;
+      retryRef.current = onRetry;
+      loadRef.current = onLoadMore;
+      workRef.current = onShowWork;
+      editRef.current = onEditTurn;
+    }, [onFork, onRetry, onLoadMore, onShowWork, onEditTurn]);
 
-  // The controller de-duplicates concurrent requests, so this only has to
-  // avoid asking for something that does not exist.
-  const requestMore = React.useCallback(() => {
-    if (!loadRef.current || transcript.loadingMore || !transcript.hasMore) return;
-    loadRef.current();
-  }, [transcript]);
+    const fork = React.useMemo(
+      () => (onFork ? (messageId: string) => forkRef.current?.(messageId) : undefined),
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [Boolean(onFork)],
+    );
+    const retry = React.useMemo(
+      () => (onRetry ? (messageId: string) => retryRef.current?.(messageId) : undefined),
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [Boolean(onRetry)],
+    );
+    const showWork = React.useMemo(
+      () => (onShowWork ? (messageId: string) => workRef.current?.(messageId) : undefined),
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [Boolean(onShowWork)],
+    );
+    const edit = React.useMemo(
+      () => (onEditTurn ? (text: string) => editRef.current?.(text) : undefined),
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [Boolean(onEditTurn)],
+    );
 
-  const setStick = React.useCallback((next: boolean) => {
-    if (stuckRef.current === next) return;
-    stuckRef.current = next;
-    setStuck(next);
-  }, []);
+    // The controller de-duplicates concurrent requests, so this only has to
+    // avoid asking for something that does not exist.
+    const requestMore = React.useCallback(() => {
+      if (!loadRef.current || transcript.loadingMore || !transcript.hasMore) return;
+      loadRef.current();
+    }, [transcript]);
 
-  const onScroll = React.useCallback(() => {
-    const el = scroller.current;
-    if (!el) return;
-    setStick(el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK);
-    if (el.scrollTop <= TOP_SLACK) requestMore();
-  }, [requestMore, setStick]);
+    const attachScroller = React.useCallback(
+      (node: HTMLDivElement | null) => {
+        scroller.current = node;
+        stick.attachScroller(node);
+      },
+      [stick],
+    );
 
-  const jumpToLatest = React.useCallback(() => {
-    const el = scroller.current;
-    if (!el) return;
-    setStick(true);
-    el.scrollTop = el.scrollHeight;
-  }, [setStick]);
+    const attachContent = React.useCallback(
+      (node: HTMLDivElement | null) => {
+        content.current = node;
+        stick.attachContent(node);
+      },
+      [stick],
+    );
 
-  useScrollEffect(() => {
-    const el = scroller.current;
-    if (!el) return;
+    const onScroll = React.useCallback(() => {
+      const el = scroller.current;
+      if (!el) return;
+      stick.sample();
+      const atBottom = stick.isStuck();
+      setStuck((was) => (was === atBottom ? was : atBottom));
+      if (el.scrollTop <= TOP_SLACK) requestMore();
+    }, [requestMore, stick]);
 
-    const firstId = messages.length ? messages[0].id : undefined;
-    const prepended = firstIdRef.current !== undefined && firstId !== firstIdRef.current;
+    const scrollToId = React.useCallback((selector: string) => {
+      const el = scroller.current;
+      if (!el) return;
+      const target = el.querySelector(selector) as HTMLElement | null;
+      if (!target) return;
+      // `scrollTo` on this scroller, never `scrollIntoView`: the latter scrolls
+      // every ancestor too and can drag the whole app shell sideways to bring a
+      // wide code block into view.
+      el.scrollTo({ top: Math.max(0, target.offsetTop - el.offsetTop) });
+    }, []);
 
-    if (stuckRef.current) {
-      el.scrollTop = el.scrollHeight;
-    } else if (prepended) {
-      // The classic defect on this surface: older messages land above the
-      // viewport and everything the user was reading jumps down the page.
-      // Adding back exactly what the document grew by keeps it still.
-      el.scrollTop += el.scrollHeight - heightRef.current;
-    }
+    React.useImperativeHandle(
+      handle,
+      () => ({
+        scrollToTurn: (turnId: string) => scrollToId(`[data-turn-id="${cssEscape(turnId)}"]`),
+        scrollToMessage: (messageId: string) =>
+          scrollToId(`[data-message-id="${cssEscape(messageId)}"]`),
+        pin: () => {
+          stick.pin(true);
+          setStuck(true);
+        },
+      }),
+      [scrollToId, stick],
+    );
 
-    firstIdRef.current = firstId;
-    heightRef.current = el.scrollHeight;
+    useScrollEffect(() => {
+      const el = scroller.current;
+      if (!el) return;
 
-    // A transcript shorter than its viewport never fires a scroll event, so the
-    // top would never be reached and paging would never start. requestMore is
-    // idempotent while a page is in flight, so this cannot spin.
-    if (el.scrollHeight <= el.clientHeight) requestMore();
-  }, [version, messages, requestMore]);
+      const firstId = messages.length ? messages[0].id : undefined;
+      const prepended = firstIdRef.current !== undefined && firstId !== firstIdRef.current;
 
-  return (
-    <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', minHeight: 0, flex: 1 }}>
-      <div
-        ref={scroller}
-        onScroll={onScroll}
-        role="log"
-        aria-label="Conversation"
-        // Focusable so the transcript can be scrolled from the keyboard; a
-        // scroll container that only responds to a pointer strands anyone
-        // without one.
-        tabIndex={0}
-        style={{
-          flex: 1,
-          minHeight: 0,
-          overflowY: 'auto',
-          overflowX: 'hidden',
-          overscrollBehavior: 'contain',
-          WebkitOverflowScrolling: 'touch',
-          padding: '8px 0 16px',
-        }}
-      >
-        {transcript.hasMore && onLoadMore ? (
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              gap: 6,
-              minHeight: 34,
-              fontSize: 'var(--text-xs)',
-              color: 'var(--muted-foreground)',
-            }}
-          >
-            {loadingMore ? (
-              <>
-                <span style={{ animation: 'relay-pulse 1.2s var(--ease-standard) infinite' }}>
-                  <Icon name="loader-circle" size={12} />
-                </span>
-                <span aria-live="polite">Loading earlier messages</span>
-              </>
-            ) : (
-              <button
-                type="button"
-                onClick={requestMore}
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 6,
-                  minHeight: 34,
-                  padding: '0 10px',
-                  background: 'transparent',
-                  border: '1px solid var(--border)',
-                  color: 'var(--muted-foreground)',
-                  font: 'inherit',
-                  fontSize: 'var(--text-xs)',
-                  cursor: 'pointer',
-                  borderRadius: 'var(--radius)',
-                }}
-              >
-                <Icon name="arrow-up" size={11} />
-                Load earlier messages
-              </button>
-            )}
-          </div>
-        ) : null}
+      if (stick.isStuck()) {
+        stick.pin(true);
+      } else if (prepended) {
+        // The classic defect on this surface: older messages land above the
+        // viewport and everything the user was reading jumps down the page.
+        // Adding back exactly what the document grew by keeps it still.
+        el.scrollTop += el.scrollHeight - heightRef.current;
+      }
 
-        {messages.length === 0 ? (
-          <EmptyState />
-        ) : (
-          messages.map((message) => (
-            <MessageBubble
-              key={message.id}
-              message={message}
-              transcript={transcript}
-              onFork={fork}
-              onRetry={retry}
-              showThinking={showThinking}
-              showToolCalls={showToolCalls}
-            />
-          ))
-        )}
-      </div>
+      firstIdRef.current = firstId;
+      heightRef.current = el.scrollHeight;
 
-      {!stuck && messages.length > 0 ? (
+      // A transcript shorter than its viewport never fires a scroll event, so the
+      // top would never be reached and paging would never start. requestMore is
+      // idempotent while a page is in flight, so this cannot spin.
+      if (el.scrollHeight <= el.clientHeight) requestMore();
+    }, [version, messages, requestMore, stick]);
+
+    const jumpToLatest = React.useCallback(() => {
+      stick.pin(true);
+      setStuck(true);
+    }, [stick]);
+
+    // Which message opens which turn, so the strips can be interleaved in one
+    // pass instead of searching the turn list per message.
+    const stripFor = React.useMemo(() => {
+      const map = new Map<string, TurnSummary>();
+      for (const turn of turns) {
+        if (turn.messageIds.length) map.set(turn.messageIds[0], turn);
+      }
+      return map;
+    }, [turns]);
+
+    const lastTurnId = turns.length ? turns[turns.length - 1].id : undefined;
+
+    // Which strip has just acknowledged a copy. The prop existed and nothing
+    // ever set it, so the glyph never flipped and the click had no feedback.
+    const [copiedTurn, setCopiedTurn] = React.useState<string | null>(null);
+    const copyTurn = React.useCallback(
+      (turnId: string) => {
+        onCopyTurn?.(turnId);
+        setCopiedTurn(turnId);
+        window.setTimeout(() => setCopiedTurn((current) => (current === turnId ? null : current)), 1400);
+      },
+      [onCopyTurn],
+    );
+
+    return (
+      <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', minHeight: 0, flex: 1 }}>
         <div
+          ref={attachScroller}
+          onScroll={onScroll}
+          role="log"
+          aria-label="Conversation"
+          // Focusable so the transcript can be scrolled from the keyboard; a
+          // scroll container that only responds to a pointer strands anyone
+          // without one.
+          tabIndex={0}
           style={{
-            position: 'absolute',
-            left: 0,
-            right: 0,
-            bottom: 12,
-            display: 'flex',
-            justifyContent: 'center',
-            // The overlay must not swallow clicks aimed at the message under it.
-            pointerEvents: 'none',
+            flex: 1,
+            // A normal block scroller. Never `justify-content: flex-end` to fake
+            // bottom alignment — that makes the scrollback unreachable.
+            minHeight: 160,
+            overflowY: 'auto',
+            overflowX: 'hidden',
+            overscrollBehavior: 'contain',
+            WebkitOverflowScrolling: 'touch',
           }}
         >
-          <Button
-            size="sm"
-            variant="secondary"
-            onClick={jumpToLatest}
-            iconLeft={<Icon name="arrow-down" size={12} />}
-            style={{ pointerEvents: 'auto', height: 34, boxShadow: 'var(--shadow-md)' }}
-          >
-            Jump to latest
-          </Button>
+          <div ref={attachContent} style={{ display: 'flex', flexDirection: 'column' }}>
+            {transcript.hasMore && onLoadMore ? (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 6,
+                  minHeight: 34,
+                  fontSize: 'var(--text-xs)',
+                  color: 'var(--muted-foreground)',
+                }}
+              >
+                {loadingMore ? (
+                  <>
+                    <span style={{ animation: 'relay-pulse 1.2s var(--ease-standard) infinite' }}>
+                      <Icon name="loader-circle" size={12} />
+                    </span>
+                    <span aria-live="polite">Loading earlier messages</span>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={requestMore}
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      minHeight: 34,
+                      padding: '0 10px',
+                      background: 'transparent',
+                      border: '1px solid var(--border)',
+                      color: 'var(--muted-foreground)',
+                      font: 'inherit',
+                      fontSize: 'var(--text-xs)',
+                      cursor: 'pointer',
+                      borderRadius: 'var(--radius)',
+                    }}
+                  >
+                    <Icon name="arrow-up" size={11} />
+                    Load earlier messages
+                  </button>
+                )}
+              </div>
+            ) : null}
+
+            {messages.length === 0 ? <EmptyState /> : null}
+
+            {messages.map((message) => {
+              const turn = stripFor.get(message.id);
+              return (
+                <React.Fragment key={message.id}>
+                  {turn ? (
+                    <TurnStrip
+                      turn={turn}
+                      anchorId={turn.id}
+                      // Sticky for the turn you are in, static above it. The
+                      // selected turn wins over "the last one" so that jumping
+                      // back through the index leaves a header on screen.
+                      variant={turn.id === (currentTurnId || lastTurnId) ? 'current' : 'past'}
+                      copied={copiedTurn === turn.id}
+                      onCopy={() => copyTurn(turn.id)}
+                      onBranch={onForkTurn ? () => onForkTurn(turn.id) : undefined}
+                    />
+                  ) : null}
+                  <MessageBubble
+                    message={message}
+                    transcript={transcript}
+                    onFork={fork}
+                    onRetry={retry}
+                    onShowWork={showWork}
+                    onEdit={edit}
+                    showThinking={showThinking}
+                    showToolCalls={showToolCalls}
+                  />
+                </React.Fragment>
+              );
+            })}
+          </div>
         </div>
-      ) : null}
-    </div>
-  );
-}
+
+        {!stuck && messages.length > 0 ? (
+          <div
+            style={{
+              position: 'absolute',
+              left: 0,
+              right: 0,
+              bottom: 12,
+              display: 'flex',
+              justifyContent: 'center',
+              // The overlay must not swallow clicks aimed at the message under it.
+              pointerEvents: 'none',
+            }}
+          >
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={jumpToLatest}
+              iconLeft={<Icon name="arrow-down" size={12} />}
+              style={{ pointerEvents: 'auto', height: 34, boxShadow: 'var(--shadow-md)' }}
+            >
+              Jump to latest
+            </Button>
+          </div>
+        ) : null}
+      </div>
+    );
+  },
+);
 
 const ZERO = (): number => 0;
+
+/**
+ * Escape an id for use inside an attribute selector.
+ *
+ * Message and turn ids are server-generated UUIDs today, but they are also
+ * replayed from disk and carried across versions, and a selector built by
+ * concatenation is one odd id away from throwing inside a scroll handler.
+ */
+function cssEscape(value: string): string {
+  const escape = (globalThis as { CSS?: { escape?: (v: string) => string } }).CSS?.escape;
+  return escape ? escape(value) : value.replace(/["\\]/g, '\\$&');
+}
 
 function EmptyState() {
   return (

@@ -77,6 +77,30 @@
   display: none;
 }
 
+/* The reading measure, published onto the chat root by the layout settings
+   (see chat/view-settings.ts). A class rather than an inline style because it
+   has to reach the elements the Markdown renderer generates, and because the
+   exemptions are the point: code blocks, tables and diffs carry information
+   whose width *is* part of the information, and a 74ch cap would wrap every
+   line of every listing. They are simply not in the selector. */
+.chat-prose {
+  font-size: var(--chat-prose-size, var(--text-ui));
+  line-height: var(--chat-prose-leading, 1.55);
+}
+
+.chat-prose > p,
+.chat-prose > h1,
+.chat-prose > h2,
+.chat-prose > h3,
+.chat-prose > h4,
+.chat-prose > h5,
+.chat-prose > h6,
+.chat-prose > ul,
+.chat-prose > ol,
+.chat-prose > blockquote {
+  max-width: var(--chat-prose-width, 74ch);
+}
+
 .ricon svg {
   width: 100%;
   height: 100%;

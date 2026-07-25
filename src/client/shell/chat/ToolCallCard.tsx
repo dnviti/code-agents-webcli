@@ -1,7 +1,22 @@
 import * as React from 'react';
-import { FileDiff, ToolBlock, ToolKind, ToolStatus } from '../../../shared/chat-events.js';
-import { Badge, BadgeVariant } from '../../ui/relay/Badge.js';
+import { FileDiff, ToolBlock } from '../../../shared/chat-events.js';
+import { Badge } from '../../ui/relay/Badge.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import {
+  COMMAND_KEYS,
+  INPUT_CHARS,
+  KIND_ICON,
+  LINE_CHARS,
+  OUTPUT_LINES,
+  TOOL_STATUS,
+  asRecord,
+  clip,
+  firstString,
+  formatDuration,
+  omit,
+  stringify,
+  summarize,
+} from '../../chat/tool-meta.js';
 import { CodeBlock } from './Markdown.js';
 import { DiffView } from './DiffView.js';
 
@@ -26,44 +41,6 @@ export interface ToolCallCardProps {
   onRevertHunk?: (diff: FileDiff, hunkIndex: number) => void;
 }
 
-/** Output lines shown before the block clamps itself. */
-const OUTPUT_LINES = 20;
-/** Hard ceiling on one rendered line, so a minified bundle cannot become a row. */
-const LINE_CHARS = 2000;
-/** Hard ceiling on pretty-printed arguments. */
-const INPUT_CHARS = 20000;
-
-const KIND_ICON: Record<ToolKind, string> = {
-  read: 'file-text',
-  edit: 'pencil',
-  delete: 'trash-2',
-  move: 'arrow-right',
-  search: 'search',
-  execute: 'terminal',
-  think: 'brain',
-  fetch: 'download',
-  task: 'cpu',
-  todo: 'list-todo',
-  other: 'wrench',
-};
-
-interface StatusStyle {
-  icon: string;
-  label: string;
-  color: string;
-  spin?: boolean;
-  badge?: BadgeVariant;
-}
-
-const STATUS: Record<ToolStatus, StatusStyle> = {
-  pending: { icon: 'loader-circle', label: 'Pending', color: 'var(--muted-foreground)', spin: true },
-  running: { icon: 'loader-circle', label: 'Running', color: 'var(--info)', spin: true },
-  completed: { icon: 'check', label: 'Completed', color: 'var(--success)' },
-  failed: { icon: 'circle-x', label: 'Failed', color: 'var(--destructive)', badge: 'destructive' },
-  denied: { icon: 'shield', label: 'Denied', color: 'var(--warning)', badge: 'warning' },
-  canceled: { icon: 'x', label: 'Canceled', color: 'var(--muted-foreground)', badge: 'outline' },
-};
-
 export function ToolCallCard({
   block,
   defaultOpen,
@@ -73,7 +50,7 @@ export function ToolCallCard({
   const [open, setOpen] = React.useState(Boolean(defaultOpen));
   const bodyId = React.useId();
 
-  const status = STATUS[block.status] || STATUS.pending;
+  const status = TOOL_STATUS[block.status] || TOOL_STATUS.pending;
   const active = block.status === 'pending' || block.status === 'running';
   const summary = React.useMemo(() => summarize(block), [block]);
   const hasDiffs = Boolean(block.diffs && block.diffs.length);
@@ -374,146 +351,6 @@ function Output({ text }: { text: string }) {
       ) : null}
     </div>
   );
-}
-
-// --------------------------------------------------------------------------
-// Target extraction.
-//
-// Every runtime names its arguments differently, so the closed row asks each
-// kind for the field that identifies what it acted on and takes the first one
-// present. An unmapped shape falls back to any string field, then to the
-// locations the adapter reported — a row with no target at all is the last
-// resort, not the first.
-// --------------------------------------------------------------------------
-
-const PATH_KEYS = ['file_path', 'filePath', 'path', 'file', 'filename', 'abs_path', 'target_file'];
-const COMMAND_KEYS = ['command', 'cmd', 'script', 'shell_command', 'commandLine'];
-
-const SUMMARY_KEYS: Record<ToolKind, string[]> = {
-  read: PATH_KEYS,
-  edit: PATH_KEYS,
-  delete: PATH_KEYS,
-  move: ['destination', 'dest', 'new_path', 'newPath', ...PATH_KEYS],
-  search: ['pattern', 'query', 'q', 'regex', 'glob', 'search', ...PATH_KEYS],
-  execute: COMMAND_KEYS,
-  think: ['thought', 'text', 'reasoning'],
-  fetch: ['url', 'uri', 'href', 'link'],
-  task: ['description', 'prompt', 'task', 'subagent_type'],
-  todo: ['todos', 'items', 'plan'],
-  other: [...PATH_KEYS, ...COMMAND_KEYS, 'url', 'query', 'description'],
-};
-
-function summarize(block: ToolBlock): string {
-  const direct = summarizeInput(block);
-  if (direct) return shorten(direct, 140);
-  const location = block.locations && block.locations[0];
-  return location ? shorten(location, 140) : '';
-}
-
-function summarizeInput(block: ToolBlock): string {
-  if (block.input === undefined) {
-    return block.inputPartial === undefined ? '' : partialTarget(block.inputPartial);
-  }
-  if (typeof block.input === 'string') return oneLine(block.input);
-
-  const record = asRecord(block.input);
-  if (!record) return '';
-
-  if (block.toolKind === 'move') {
-    const from = firstString(record, ['source', 'src', 'old_path', 'oldPath', 'from', ...PATH_KEYS]);
-    const to = firstString(record, ['destination', 'dest', 'new_path', 'newPath', 'to']);
-    if (from && to) return `${from} → ${to}`;
-  }
-
-  if (block.toolKind === 'todo') {
-    const list = record.todos || record.items || record.plan;
-    if (Array.isArray(list)) return `${list.length} item${list.length === 1 ? '' : 's'}`;
-  }
-
-  const preferred = firstString(record, SUMMARY_KEYS[block.toolKind] || []);
-  if (preferred) return oneLine(preferred);
-
-  // Nothing recognised: any string argument still says more than the tool name.
-  for (const value of Object.values(record)) {
-    if (typeof value === 'string' && value.trim()) return oneLine(value);
-  }
-  return '';
-}
-
-/**
- * Pull a target out of half-arrived JSON.
- *
- * Matches a completed `"key": "value"` pair textually rather than parsing,
- * because the fragment is by definition not valid JSON yet. When even that is
- * not there the row says the arguments are still arriving, which is true and is
- * what the user needs to know.
- */
-function partialTarget(partial: string): string {
-  const keys = [...COMMAND_KEYS, ...PATH_KEYS, 'url', 'pattern', 'query', 'description', 'prompt'];
-  for (const key of keys) {
-    const match = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(partial);
-    if (match) return oneLine(match[1].replace(/\\(["\\/])/g, '$1'));
-  }
-  return 'receiving arguments…';
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
-function firstString(record: Record<string, unknown>, keys: string[]): string {
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === 'string' && value.trim()) return value;
-    if (Array.isArray(value) && value.every((v) => typeof v === 'string') && value.length) {
-      return value.join(' ');
-    }
-  }
-  return '';
-}
-
-function omit(record: Record<string, unknown>, keys: string[]): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(record)) {
-    if (!keys.includes(key)) out[key] = value;
-  }
-  return out;
-}
-
-function stringify(value: unknown): string {
-  try {
-    return JSON.stringify(value, null, 2) ?? String(value);
-  } catch {
-    // Arguments arrive as JSON, so a cycle should be impossible — but a card
-    // that throws would take the whole transcript down with it.
-    return String(value);
-  }
-}
-
-function oneLine(text: string): string {
-  return text.replace(/\s+/g, ' ').trim();
-}
-
-function clip(text: string, max: number): string {
-  return text.length > max ? `${text.slice(0, max)}…` : text;
-}
-
-/** Keep the tail of a path and the head of prose: both hold the meaning. */
-function shorten(text: string, max: number): string {
-  if (text.length <= max) return text;
-  if (text.includes('/') && !text.includes(' ')) return `…${text.slice(text.length - max + 1)}`;
-  return `${text.slice(0, max - 1)}…`;
-}
-
-function formatDuration(ms: number): string {
-  if (!Number.isFinite(ms) || ms < 0) return '';
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-  const minutes = Math.floor(ms / 60000);
-  const seconds = Math.round((ms % 60000) / 1000);
-  return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
 }
 
 const srOnly: React.CSSProperties = {

@@ -47,6 +47,15 @@ export interface WorkspacePanelProps {
   onResize?: (width: number) => void;
   /** Full-width sheet instead of a fixed rail. */
   isMobile?: boolean;
+  /**
+   * The `trace` tab's contents, built by the caller.
+   *
+   * Passed in rather than composed here: the plan and the activity projection
+   * are derived from the transcript the chat root already holds, and rebuilding
+   * them inside the rail would mean two components deriving the same list from
+   * the same version counter on every token of a streaming turn.
+   */
+  trace?: React.ReactNode;
 }
 
 export function WorkspacePanel({
@@ -58,6 +67,7 @@ export function WorkspacePanel({
   onClose,
   onResize,
   isMobile = false,
+  trace,
 }: WorkspacePanelProps): React.JSX.Element | null {
   const tabs = enabledPanels(settings);
   const active = tabs.includes(settings.panelTab) ? settings.panelTab : tabs[0];
@@ -108,6 +118,13 @@ export function WorkspacePanel({
     <Rail isMobile={isMobile} width={width} onResize={onResize} onDragWidth={setDragWidth}>
       <RailHeader tabs={tabs} active={active} onSelectTab={onSelectTab} onClose={onClose} />
       <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+        {active === 'trace' ? (
+          trace ?? (
+            <PanelNote icon="list-todo">
+              Reasoning and tool calls appear here as the agent works.
+            </PanelNote>
+          )
+        ) : null}
         {active === 'files' ? (
           <FilesTab sessionId={sessionId} root={workingDir} onOpenFile={setEditing} />
         ) : null}
@@ -168,7 +185,7 @@ function Rail({
         minHeight: 0,
         display: 'flex',
         flexDirection: 'column',
-        borderRight: isMobile ? 'none' : '1px solid var(--border)',
+        borderLeft: isMobile ? 'none' : '1px solid var(--border)',
         background: 'var(--sidebar)',
         position: 'relative',
       }}
@@ -214,7 +231,7 @@ function useAvailableWidth(ref: React.RefObject<HTMLElement | null>): number {
 }
 
 /**
- * The rail's right edge, draggable.
+ * The rail's left edge, draggable.
  *
  * Pointer events rather than mouse events: one code path then covers a mouse, a
  * trackpad, a pen and a touch, and `setPointerCapture` keeps the drag attached
@@ -277,7 +294,9 @@ function ResizeHandle({
     // strip used to rewrite the origin, so releasing committed a width that was
     // never on screen.
     if (!active || active.id !== event.pointerId) return;
-    onDragWidth(clamp(active.width + (event.clientX - active.x)));
+    // The rail is on the right, so dragging *left* makes it wider — the
+    // delta is subtracted, not added.
+    onDragWidth(clamp(active.width - (event.clientX - active.x)));
   };
 
   const finish = (event: React.PointerEvent<HTMLDivElement>): void => {
@@ -291,7 +310,7 @@ function ResizeHandle({
     }
 
     onDragWidth(null);
-    const next = clamp(active.width + (event.clientX - active.x));
+    const next = clamp(active.width - (event.clientX - active.x));
     // Compared against the width this drag *started* from, not the current
     // prop: during a drag the prop already carries the live width, so `next`
     // always equalled it and the commit never fired — the rail followed the
@@ -309,8 +328,11 @@ function ResizeHandle({
 
     const step = event.shiftKey ? 64 : 16;
     let next: number | null = null;
-    if (event.key === 'ArrowLeft') next = width - step;
-    else if (event.key === 'ArrowRight') next = width + step;
+    // The key moves the separator, not the width: on a right-hand rail those
+    // are opposite, and an arrow that widened the panel it is pointing away
+    // from would be the wrong way round for everyone who watched it move.
+    if (event.key === 'ArrowLeft') next = width + step;
+    else if (event.key === 'ArrowRight') next = width - step;
     else if (event.key === 'Home') next = PANEL_MIN_WIDTH;
     else if (event.key === 'End') next = max;
     else if (event.key === 'Enter' || event.key === ' ') next = PANEL_DEFAULT_WIDTH;
@@ -361,7 +383,7 @@ function ResizeHandle({
         bottom: 0,
         // Straddles the border, but only just: every pixel of overhang is a
         // pixel of the transcript that swallows clicks and text selection.
-        right: -3,
+        left: -3,
         width: 7,
         cursor: 'col-resize',
         // Without this a drag selects the text it passes over, and the pointer
