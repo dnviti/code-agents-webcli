@@ -23,6 +23,7 @@ before(function () {
     `export * as React from 'react';`,
     `export { ChatView } from ${JSON.stringify(path.join(CHAT_DIR, 'ChatView'))};`,
     `export { ChatController } from ${JSON.stringify(path.join(ROOT, 'src', 'client', 'chat', 'controller'))};`,
+    `export * as viewSettings from ${JSON.stringify(path.join(ROOT, 'src', 'client', 'chat', 'view-settings'))};`,
   ].join('\n');
 
   bundle = path.join(os.tmpdir(), `chat-view-${process.pid}.js`);
@@ -80,7 +81,7 @@ function snapshot(overrides) {
 /** A controller hydrated the way the socket hydrates one, so the real path runs. */
 function controllerWith(overrides, events = []) {
   const sent = [];
-  const controller = new mod.ChatController({ send: (m) => sent.push(m) });
+  const controller = new mod.ChatController('s1', { send: (m) => sent.push(m) });
   controller.handle({ type: 'chat_snapshot', sessionId: 's1', snapshot: snapshot(overrides) });
   for (const event of events) controller.transcript.apply(event);
   controller.sent = sent;
@@ -170,8 +171,43 @@ describe('ChatView', function () {
     assert.ok(html.includes('Run npm test'), 'approval title missing');
     assert.ok(html.includes('Allow once') && html.includes('Deny'), 'approval options missing');
     assert.ok(html.includes('Waiting for you'), 'header must show the session is blocked');
-    // The composer cannot move this forward, so it must not pretend it can.
-    assert.ok(/<textarea[^>]*disabled/.test(html), 'composer stays disabled while blocked');
+    // The composer stays live. Answering the approval is what unblocks the
+    // agent, but the moment it is waiting on you is exactly when the follow-up
+    // is worth typing — it is accepted and queued rather than refused.
+    assert.ok(!/<textarea[^>]*disabled/.test(html), 'composer keeps accepting type-ahead while blocked');
+    assert.ok(html.includes('Answer above'), 'the placeholder says what happens rather than forbidding it');
+  });
+
+  it('keeps the composer inside the conversation column, not across the whole surface', function () {
+    // The composer used to be a sibling of the row that holds the workspace
+    // rail, so it ran the full width of the surface: the rail was drawn over
+    // the left end of the input, and widening the rail covered more of it.
+    const html = render({
+      controller: controllerWith({}),
+      view: { ...mod.viewSettings.DEFAULT_CHAT_VIEW, panelOpen: true, panelTab: 'files' },
+    });
+
+    const rail = html.indexOf('aria-label="Workspace"');
+    const composer = html.indexOf('aria-label="Message"');
+    assert.ok(rail !== -1 && composer !== -1, 'both the rail and the composer should render');
+
+    // The rail closes before the conversation column opens, so the composer is
+    // inside a box the rail's width has already taken its share of.
+    const railEnd = html.indexOf('</aside>', rail);
+    assert.ok(railEnd !== -1 && railEnd < composer, 'the composer must come after the rail closes, inside the column');
+  });
+
+  it('carries the queue and its withdraw control down to the composer', function () {
+    const controller = controllerWith({ state: 'thinking' });
+    controller.handle({
+      type: 'chat_queue',
+      sessionId: 's1',
+      queued: [{ id: 'q1', text: 'and then run the tests', ts: 2 }],
+    });
+
+    const html = render({ controller });
+    assert.ok(html.includes('and then run the tests'), 'a waiting turn belongs on screen');
+    assert.ok(html.includes('aria-label="Remove queued message 1"'), 'and must be withdrawable from here');
   });
 
   it('puts the plan in a right rail on desktop', function () {
@@ -189,7 +225,9 @@ describe('ChatView', function () {
     assert.ok(html.includes('1 of 2'), 'plan progress missing');
   });
 
-  it('states plainly that an exited session is over and offers nothing it cannot do', function () {
+  it('states plainly that an exited session is over', function () {
+    // An empty transcript is the discriminator: there is no conversation to
+    // offer to resume, so this is the plain statement and nothing else.
     const controller = controllerWith({ state: 'exited', live: false });
     const html = render({ controller });
 
@@ -197,9 +235,153 @@ describe('ChatView', function () {
     assert.ok(html.includes('read-only'), 'the transcript is read-only after an exit');
     assert.ok(html.includes('Exited'), 'header indicator must follow the state');
     assert.ok(/<textarea[^>]*disabled/.test(html), 'a dead process cannot take input');
-    for (const word of ['Restart', 'Resume', 'Reconnect', 'Try again']) {
-      assert.ok(!html.includes(word), `${word} promises something this pane cannot do`);
+    for (const word of ['Resume this conversation', 'Start a new chat']) {
+      assert.ok(!html.includes(word), `${word} promises something there is nothing to do it to`);
     }
+  });
+
+  // The server keeps chat sessions in memory and transcripts on disk, so a
+  // restart leaves exactly this: a conversation on screen with nothing running
+  // it. What the user used to get was the app-wide "Connection error" panel and
+  // a Retry that reconnected a socket which had never been the problem.
+  describe('a conversation whose process is gone', function () {
+    const DEAD = {
+      live: false,
+      state: 'idle',
+      messages: [message('m1', 1, 'user', 'where were we?')],
+      firstSeq: 1,
+      cursor: 1,
+    };
+
+    it('offers to resume it or to start again, in the same tab', function () {
+      const controller = controllerWith({ ...DEAD, nativeSessionId: 'native-7' });
+      const html = render({ controller });
+
+      assert.ok(html.includes('is no longer running'), 'the user must be told');
+      assert.ok(html.includes('Resume this conversation'), 'resume must be offered');
+      assert.ok(html.includes('Start a new chat'), 'starting over must be offered');
+      assert.ok(html.includes('role="alert"'), 'this interrupts what the user was doing');
+      assert.ok(
+        /<textarea[^>]*disabled/.test(html),
+        'typing would only produce the same failure again',
+      );
+    });
+
+    it('names the runtime it knows rather than calling it "the agent"', function () {
+      const controller = controllerWith({ ...DEAD, nativeSessionId: 'native-7' });
+      const html = render({ controller });
+
+      assert.ok(html.includes('Claude Code is no longer running'), 'the pane knows the name');
+    });
+
+    it('does not go on reporting Ready above a notice saying it is not', function () {
+      // The log replays to `idle` on its own — a conversation that ended on a
+      // finished turn reads as Ready — so the process state has to win.
+      const controller = controllerWith({ ...DEAD, nativeSessionId: 'native-7' });
+      const html = render({ controller });
+
+      assert.ok(html.includes('Exited'), 'the header must follow the process');
+      assert.ok(!html.includes('>Ready<'), 'a dead session is not ready for anything');
+    });
+
+    it('does not offer a resume it cannot deliver', function () {
+      // No native id recorded: the agent cannot be handed its own context back,
+      // and a Resume that quietly produced a stranger would be the expensive
+      // kind of wrong — it looks like it worked.
+      const controller = controllerWith(DEAD);
+      const html = render({ controller });
+
+      assert.ok(html.includes('Start a new chat'), 'starting over is always possible');
+      assert.ok(!html.includes('Resume this conversation'), 'resume must not be offered');
+      assert.ok(html.includes('cannot be given its context back'), 'and the reason must be said');
+    });
+
+    it('asks the server to resume this session, not to open another', function () {
+      const controller = controllerWith({ ...DEAD, nativeSessionId: 'native-7' });
+      controller.relaunch('claude', { resume: true });
+
+      const start = controller.sent.find((m) => m.type === 'start_chat');
+      assert.ok(start, 'a relaunch must be requested');
+      assert.strictEqual(start.sessionId, 's1', 'the same session, so the transcript stays');
+      assert.strictEqual(start.options.resume, true);
+    });
+
+    it('starting again is a different request from resuming', function () {
+      const controller = controllerWith({ ...DEAD, nativeSessionId: 'native-7' });
+      controller.relaunch('claude', { resume: false });
+
+      const start = controller.sent.find((m) => m.type === 'start_chat');
+      assert.strictEqual(start.options.resume, false, 'the server clears the window on this');
+    });
+
+    it('takes the offer down on chat_started alone, with no new snapshot', function () {
+      // The server announces a relaunch and sends no transcript with it —
+      // rightly, since the browser already has this conversation. Clearing only
+      // the stored reason left the derived one reporting the same thing from
+      // `transcript.live`, so the offer sat over a session that was already
+      // running and nothing changed until the page was reloaded.
+      const controller = controllerWith({ ...DEAD, nativeSessionId: 'native-7' });
+      assert.ok(controller.unavailableReason, 'the offer starts up');
+
+      controller.handle({ type: 'chat_started', sessionId: 's1' });
+
+      assert.strictEqual(controller.unavailableReason, null, 'and comes straight down');
+      assert.strictEqual(controller.transcript.live, true, 'the transcript knows it is alive');
+    });
+
+    it('lets the composer come back, rather than staying disabled until a reload', function () {
+      const controller = controllerWith({ ...DEAD, state: 'exited', nativeSessionId: 'native-7' });
+      assert.ok(/<textarea[^>]*disabled/.test(render({ controller })), 'disabled to begin with');
+
+      controller.handle({ type: 'chat_started', sessionId: 's1' });
+      // What the relaunched session emits first.
+      controller.transcript.apply({ t: 'state', seq: 41, ts: 1, state: 'idle' });
+
+      const html = render({ controller });
+      assert.ok(!/<textarea[^>]*disabled/.test(html), 'a running session takes input');
+      assert.ok(!html.includes('is no longer running'));
+    });
+
+    it('offers it for a cleared conversation too, which has no messages left', function () {
+      // `/clear` and "start a new chat" both empty the window while leaving the
+      // log — and the runtime behind it can still be gone. Gating the offer on
+      // having messages put this case back into the failure it exists to fix.
+      const controller = controllerWith({
+        live: false,
+        state: 'idle',
+        messages: [],
+        firstSeq: 40,
+        cursor: 40,
+        nativeSessionId: 'native-7',
+      });
+
+      assert.ok(controller.unavailableReason, 'an empty window is not an empty session');
+      assert.ok(render({ controller }).includes('is no longer running'));
+    });
+
+    it('says nothing at all about a session where chat never started', function () {
+      // Same shape from the store — no process, no messages — and the right
+      // answer is the opposite one: there is nothing here to resume.
+      const controller = controllerWith({ live: false, state: 'idle', messages: [], firstSeq: 1, cursor: 0 });
+
+      assert.strictEqual(controller.unavailableReason, null);
+      assert.ok(!render({ controller }).includes('is no longer running'));
+    });
+
+    it('reports a send that found nothing to send to as this, not as an error', function () {
+      const controller = controllerWith({ live: true, state: 'idle' });
+      const claimed = controller.handle({
+        type: 'chat_unavailable',
+        sessionId: 's1',
+        runtimeLabel: 'Claude',
+        canResume: true,
+        message: 'this chat session is not running',
+      });
+
+      assert.ok(claimed, 'the chat surface owns this message');
+      assert.strictEqual(controller.unavailableReason.runtimeLabel, 'Claude');
+      assert.strictEqual(controller.unavailableReason.canResume, true);
+    });
   });
 
   it('surfaces the transcript error rather than an empty error state', function () {

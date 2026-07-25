@@ -11,6 +11,20 @@ export interface WebSocketHandlerDeps {
   getAuthContext(message: IncomingMessage): AuthContext;
 }
 
+/**
+ * Optional protocol extensions this build understands.
+ *
+ * Add a name here when a client would otherwise have to guess whether a message
+ * is supported. Names are permanent once shipped: a client checks for the
+ * string, so renaming one silently turns the feature off for every page that
+ * has not been reloaded.
+ */
+export const SERVER_FEATURES = [
+  // Watch several chat sessions on one socket, so a background conversation
+  // keeps streaming while the user is looking at a different tab.
+  'chat_subscribe',
+] as const;
+
 export class WebSocketHandler {
   private deps: WebSocketHandlerDeps;
   private messageProcessor: MessageProcessor;
@@ -59,6 +73,7 @@ export class WebSocketHandler {
       userId: authContext.user.id,
       githubLogin: authContext.user.githubLogin,
       claudeSessionId: null,
+      chatSessionIds: new Set<string>(),
       created: new Date(),
     };
     this.deps.webSocketConnections.set(wsId, wsInfo);
@@ -92,10 +107,19 @@ export class WebSocketHandler {
       this.cleanupConnection(wsId);
     });
 
-    // Send initial connection message
+    // Send initial connection message.
+    //
+    // `features` is what lets a page newer than the server it is talking to
+    // stay quiet about it. The server answers an unrecognised message with a
+    // visible error — deliberately, because silence used to leave the browser
+    // waiting forever — so a client that simply sent every message it knew
+    // about would turn a routine version gap into an error toast per chat tab.
+    // Advertised rather than inferred: the client asks for nothing it has not
+    // been told is there.
     sendToWebSocket(ws, {
       type: 'connected',
       connectionId: wsId,
+      features: SERVER_FEATURES,
     });
 
     // If sessionId provided, auto-join that session. joinSession is async and
@@ -126,6 +150,8 @@ export class WebSocketHandler {
   cleanupConnection(wsId: string): void {
     const wsInfo = this.deps.webSocketConnections.get(wsId);
     if (!wsInfo) return;
+
+    wsInfo.chatSessionIds.clear();
 
     // Remove from session if joined
     if (wsInfo.claudeSessionId) {
@@ -177,6 +203,37 @@ export function broadcastToAllConnections(
   webSocketConnections: Map<string, WebSocketInfo>,
 ): void {
   for (const wsInfo of webSocketConnections.values()) {
+    sendToWebSocket(wsInfo.ws, data);
+  }
+}
+
+/**
+ * Deliver a chat message to every socket watching that conversation.
+ *
+ * Deliberately not routed through `session.connections`: that set records who
+ * is *driving* the session, and a browser with three chat tabs open is driving
+ * at most one of them. Chat events are session-tagged and land in a per-session
+ * transcript on the client, so anyone who asked to watch can safely receive
+ * them — which is the whole of what makes a background tab keep up rather than
+ * going quiet until it is focused again.
+ *
+ * Ownership is still enforced: a socket only ever gets into `chatSessionIds`
+ * for a session it owns (see MessageProcessor.subscribeChat), and the check is
+ * repeated here so a stale entry cannot outlive the ownership that put it there.
+ */
+export function broadcastChat(
+  claudeSessionId: string,
+  data: Record<string, unknown>,
+  claudeSessions: Map<string, SessionRecord>,
+  webSocketConnections: Map<string, WebSocketInfo>,
+): void {
+  const session = claudeSessions.get(claudeSessionId);
+
+  for (const wsInfo of webSocketConnections.values()) {
+    const watching =
+      wsInfo.chatSessionIds.has(claudeSessionId) || wsInfo.claudeSessionId === claudeSessionId;
+    if (!watching) continue;
+    if (session && session.ownerUserId !== wsInfo.userId) continue;
     sendToWebSocket(wsInfo.ws, data);
   }
 }

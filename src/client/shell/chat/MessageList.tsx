@@ -24,6 +24,15 @@ export interface MessageListProps {
   onLoadMore?: () => void;
   onFork?: (messageId: string) => void;
   onRetry?: () => void;
+  /**
+   * Passed down as primitives, not as a settings object.
+   *
+   * Every bubble is `React.memo`'d against a message that never changes
+   * identity, and a fresh options object per render would defeat that for the
+   * whole list on every token of a streaming turn.
+   */
+  showThinking?: boolean;
+  showToolCalls?: boolean;
 }
 
 /** How close to an edge still counts as being at it, in px. */
@@ -37,7 +46,14 @@ const TOP_SLACK = 48;
 const useScrollEffect =
   typeof window === 'undefined' ? React.useEffect : React.useLayoutEffect;
 
-export function MessageList({ transcript, onLoadMore, onFork, onRetry }: MessageListProps) {
+export function MessageList({
+  transcript,
+  onLoadMore,
+  onFork,
+  onRetry,
+  showThinking = true,
+  showToolCalls = true,
+}: MessageListProps) {
   const version = React.useSyncExternalStore(transcript.subscribe, transcript.getVersion, ZERO);
   const messages = React.useMemo(
     () => transcript.messages,
@@ -47,7 +63,13 @@ export function MessageList({ transcript, onLoadMore, onFork, onRetry }: Message
 
   const scroller = React.useRef<HTMLDivElement | null>(null);
   const [stuck, setStuck] = React.useState(true);
-  const [loadingMore, setLoadingMore] = React.useState(false);
+
+  // Read off the transcript rather than tracked here. This used to be local
+  // state cleared only when a page actually prepended a message — so a page
+  // that legitimately came back with none (or never came back at all) left
+  // "Loading earlier messages" on screen for the rest of the session. The
+  // controller owns the request's lifetime and settles it however it ends.
+  const loadingMore = transcript.loadingMore;
 
   // Read inside layout effects and scroll handlers, where a state value would
   // be a render behind the geometry it is describing.
@@ -77,13 +99,10 @@ export function MessageList({ transcript, onLoadMore, onFork, onRetry }: Message
     [Boolean(onRetry)],
   );
 
-  // A ref rather than the state value: this fires from a scroll handler and
-  // from a layout effect, and a state read there is a render behind.
-  const loadingRef = React.useRef(false);
+  // The controller de-duplicates concurrent requests, so this only has to
+  // avoid asking for something that does not exist.
   const requestMore = React.useCallback(() => {
-    if (loadingRef.current || !loadRef.current || !transcript.hasMore) return;
-    loadingRef.current = true;
-    setLoadingMore(true);
+    if (!loadRef.current || transcript.loadingMore || !transcript.hasMore) return;
     loadRef.current();
   }, [transcript]);
 
@@ -121,11 +140,6 @@ export function MessageList({ transcript, onLoadMore, onFork, onRetry }: Message
       // viewport and everything the user was reading jumps down the page.
       // Adding back exactly what the document grew by keeps it still.
       el.scrollTop += el.scrollHeight - heightRef.current;
-    }
-
-    if (prepended) {
-      loadingRef.current = false;
-      setLoadingMore(false);
     }
 
     firstIdRef.current = firstId;
@@ -213,6 +227,8 @@ export function MessageList({ transcript, onLoadMore, onFork, onRetry }: Message
               transcript={transcript}
               onFork={fork}
               onRetry={retry}
+              showThinking={showThinking}
+              showToolCalls={showToolCalls}
             />
           ))
         )}

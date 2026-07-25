@@ -9,6 +9,7 @@
 
 import type { App } from '../app';
 import type { SessionInfo } from '../types';
+import { clearChatSurface } from '../chat/surface';
 import { shellStore, type ShellTab } from '../shell/store';
 import { playNotificationSound, showNotification } from '../ui/notifications';
 
@@ -17,6 +18,15 @@ interface TabRecord {
   id: string;
   /** The label shown on the tab, which is not always the session name. */
   displayName: string;
+  /**
+   * Which surface the session runs on, as far as this client knows.
+   *
+   * Learned from the session list at boot and from `session_joined` /
+   * `chat_started` afterwards. It decides whether the browser subscribes to the
+   * conversation's event stream, which is what keeps a chat tab live while the
+   * user is looking at a different one.
+   */
+  surface: 'terminal' | 'chat';
 }
 
 export class SessionTabManager {
@@ -135,6 +145,7 @@ export class SessionTabManager {
         return {
           id,
           title: record.displayName,
+          surface: record.surface,
           status:
             session.hasError || session.status === 'error'
               ? 'error'
@@ -230,6 +241,7 @@ export class SessionTabManager {
       sessions.forEach((raw, index: number) => {
         const session = raw as unknown as {
           id: string; name: string; active: boolean; workingDir: string | null;
+          surface?: 'terminal' | 'chat';
         };
         this.addTab(
           session.id,
@@ -238,6 +250,9 @@ export class SessionTabManager {
           session.workingDir,
           false,
         );
+        if (session.surface === 'chat') {
+          this.setTabSurface(session.id, 'chat');
+        }
         const sessionData = this.activeSessions.get(session.id);
         if (sessionData) {
           sessionData.lastAccessed = Date.now() - (sessions.length - index) * 1000;
@@ -272,7 +287,7 @@ export class SessionTabManager {
     const folderName = workingDir ? workingDir.split('/').pop() || '/' : null;
     const displayName = !isDefaultSessionName ? sessionName : (folderName || sessionName);
 
-    this.tabs.set(sessionId, { id: sessionId, displayName });
+    this.tabs.set(sessionId, { id: sessionId, displayName, surface: 'terminal' });
     if (!this.tabOrder.includes(sessionId)) {
       this.tabOrder.push(sessionId);
     }
@@ -292,6 +307,35 @@ export class SessionTabManager {
 
     if (this.tabs.size === 1 && autoSwitch) {
       this.switchToTab(sessionId);
+    }
+  }
+
+  /**
+   * Record that a session runs on the chat surface, and start watching it.
+   *
+   * Subscribing here rather than on tab switch is the whole point: a browser
+   * follows every conversation it has a tab for, so the one it is not looking
+   * at still streams, still moves its tab, and is still there — complete — when
+   * the user comes back to it. Idempotent, because the same fact arrives from
+   * the session list, from `session_joined` and from `chat_started`.
+   */
+  setTabSurface(sessionId: string, surface: 'terminal' | 'chat'): void {
+    const record = this.tabs.get(sessionId);
+    if (!record || record.surface === surface) return;
+
+    record.surface = surface;
+    if (surface === 'chat') {
+      this.app.chats.subscribe(sessionId);
+    }
+    this.syncShell();
+  }
+
+  /** Re-establish every chat subscription, e.g. after the socket reconnected. */
+  resubscribeChats(): void {
+    for (const record of this.tabs.values()) {
+      if (record.surface === 'chat') {
+        this.app.chats.subscribe(record.id);
+      }
     }
   }
 
@@ -347,6 +391,19 @@ export class SessionTabManager {
     this.activeSessions.delete(sessionId);
     this.tabOrder = orderedIds.filter((id) => id !== sessionId);
     this.removeFromHistory(sessionId);
+    // Closing the tab is the client saying it no longer wants this
+    // conversation's events; without this the socket keeps receiving them for
+    // a transcript nothing will ever render.
+    this.app.chats.drop(sessionId);
+
+    // And take it off the screen. The surface is only ever *replaced* by
+    // joining another session, so closing the last tab — or closing a chat
+    // while the fallback is another chat that has not joined yet — left the
+    // dead conversation sitting there, complete with a composer that could
+    // not send anything.
+    if (shellStore.getSnapshot().chat.sessionId === sessionId) {
+      clearChatSurface();
+    }
 
     this.syncShell();
 

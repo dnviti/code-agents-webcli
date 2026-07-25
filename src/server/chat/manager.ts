@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ChatSnapshot, UserTurn } from '../../shared/chat-events.js';
 import { SessionRecord } from '../types.js';
-import { ChatSession, ChatSessionStartOptions } from './session.js';
+import { ChatNotRunningError, ChatSession, ChatSessionStartOptions } from './session.js';
 import { ChatStore } from './store.js';
 
 /**
@@ -20,6 +20,11 @@ export interface ChatManagerDeps {
   storageDir: string;
   broadcast: (sessionId: string, message: Record<string, unknown>) => void;
   resolveCommand: (runtime: string) => string;
+  /** Passed through to every session; see ChatSessionDeps.onLifecycle. */
+  onLifecycle?: (
+    sessionId: string,
+    change: { nativeSessionId?: string; exited?: boolean },
+  ) => void;
 }
 
 export class ChatSessionManager {
@@ -69,13 +74,14 @@ export class ChatSessionManager {
       { id: record.id, ownerUserId: record.ownerUserId },
       {
         store: this.deps.store,
-        socketDir: path.join(this.deps.storageDir, 'chat-sockets'),
+        socketDir: path.join(this.deps.storageDir, 'cs'),
         hookScript: this.hookScript,
         broadcast: this.deps.broadcast,
         resolveCommand: this.deps.resolveCommand,
         readFile: (sessionId, filePath) => this.readFile(sessionId, filePath),
         writeFile: (sessionId, filePath, contents) =>
           this.writeFile(sessionId, filePath, contents),
+        onLifecycle: this.deps.onLifecycle,
       },
     );
 
@@ -135,12 +141,39 @@ export class ChatSessionManager {
     return resolved;
   }
 
-  snapshot(record: SessionRecord): Promise<ChatSnapshot> {
+  async snapshot(record: SessionRecord): Promise<ChatSnapshot> {
     const session = this.sessions.get(record.id);
     if (session) return session.snapshot();
     // No live session: the log is still the truth, so a browser rejoining a
     // finished conversation reads it exactly as it was left.
-    return this.deps.store.snapshot({ id: record.id, ownerUserId: record.ownerUserId });
+    const snapshot = await this.deps.store.snapshot({
+      id: record.id,
+      ownerUserId: record.ownerUserId,
+    });
+    // The record, not the replayed log: a snapshot replays only the tail, and
+    // the id is recorded once at the very top of a conversation. Telling the
+    // browser "this cannot be resumed" because the fact scrolled out of the
+    // window would be a wrong answer given confidently.
+    //
+    // The head-scan is the backfill for conversations that were recorded before
+    // the id was kept on the record — without it every chat a user already has
+    // would come back offering only to start over.
+    let nativeSessionId = record.nativeChatSessionId;
+    if (!nativeSessionId) {
+      nativeSessionId =
+        (await this.deps.store
+          .nativeSessionId({ id: record.id, ownerUserId: record.ownerUserId })
+          .catch(() => null)) || undefined;
+      if (nativeSessionId) {
+        this.deps.onLifecycle?.(record.id, { nativeSessionId });
+      }
+    }
+
+    return {
+      ...snapshot,
+      runtime: snapshot.runtime || record.lastAgent || '',
+      nativeSessionId,
+    };
   }
 
   /** One page of older events, for a browser scrolling back through a long chat. */
@@ -148,12 +181,13 @@ export class ChatSessionManager {
     record: SessionRecord,
     fromSeq: number,
     count: number,
-  ): Promise<{ events: unknown[]; firstSeq: number; cursor: number }> {
+  ): Promise<{ events: unknown[]; firstSeq: number; from: number; cursor: number }> {
     return this.deps.store
       .read({ id: record.id, ownerUserId: record.ownerUserId }, fromSeq, count)
       .then((page) => ({
         events: page.events,
         firstSeq: page.firstSeq,
+        from: page.from,
         cursor: page.cursor,
       }));
   }
@@ -165,6 +199,11 @@ export class ChatSessionManager {
 
   async interrupt(sessionId: string): Promise<void> {
     await this.sessions.get(sessionId)?.interrupt();
+  }
+
+  /** Drop a turn that was typed ahead and has not run yet. */
+  cancelQueued(sessionId: string, queuedId: string): boolean {
+    return this.sessions.get(sessionId)?.cancelQueued(queuedId) ?? false;
   }
 
   respondPermission(sessionId: string, requestId: string, optionId: string): boolean {
@@ -185,7 +224,7 @@ export class ChatSessionManager {
 
   private require(sessionId: string): ChatSession {
     const session = this.sessions.get(sessionId);
-    if (!session) throw new Error('this chat session is not running');
+    if (!session) throw new ChatNotRunningError();
     return session;
   }
 }

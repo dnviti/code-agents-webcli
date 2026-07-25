@@ -24,44 +24,66 @@ export class MessageHandler {
     // The surface a session runs on is the server's decision, and it arrives
     // on exactly these two messages. Read before dispatching, because the chat
     // handler below consumes chat_started and the terminal path never sees it.
+    //
+    // Both are now conditional on the message naming the session the shell is
+    // actually showing. A browser watching three conversations receives
+    // `chat_started` for any of them, and swapping the visible pane because a
+    // background agent launched is exactly the behaviour that made tabs feel
+    // like they were taking the screen from one another.
     if (message.type === 'chat_started') {
-      // Settled here for the same reason onRuntimeStarted settles the terminal
-      // path: this message *is* the answer to the launch. Left pending, the
-      // next join would read it as a start still in flight and cover the live
-      // conversation with a spinner that had nothing left to wait for.
-      settleRuntimeStart(this.app);
-      this.app.startPromptRequested = false;
-      setChatSurface(this.app, {
-        active: true,
-        runtime: message.agent || '',
-        runtimeLabel: message.runtimeLabel || '',
-        bypassPermissions: message.bypassPermissions === true,
-      });
-      hideOverlay();
-    } else if (message.type === 'session_joined') {
-      if (message.surface === 'chat') {
+      const startedId = message.sessionId || '';
+      if (startedId) this.app.sessionTabManager?.setTabSurface(startedId, 'chat');
+
+      if (!startedId || startedId === this.app.currentClaudeSessionId) {
+        // Settled here for the same reason onRuntimeStarted settles the
+        // terminal path: this message *is* the answer to the launch. Left
+        // pending, the next join would read it as a start still in flight and
+        // cover the live conversation with a spinner that had nothing left to
+        // wait for.
+        settleRuntimeStart(this.app);
+        this.app.startPromptRequested = false;
         setChatSurface(this.app, {
           active: true,
+          sessionId: startedId,
           runtime: message.agent || '',
+          runtimeLabel: message.runtimeLabel || '',
+          workingDir: message.workingDir || '',
+          bypassPermissions: message.bypassPermissions === true,
+        });
+        hideOverlay();
+      }
+    } else if (message.type === 'session_joined') {
+      if (message.surface === 'chat') {
+        this.app.sessionTabManager?.setTabSurface(message.sessionId, 'chat');
+        setChatSurface(this.app, {
+          active: true,
+          sessionId: message.sessionId,
+          runtime: message.agent || message.lastAgent || '',
           runtimeLabel: message.runtimeLabel || '',
           workingDir: message.workingDir || '',
         });
       } else {
-        clearChatSurface(this.app);
+        clearChatSurface();
       }
+    } else if (message.type === 'chat_event') {
+      this.reflectChatActivity(message);
     }
 
     // The chat surface owns its own message family. Offered them first so this
     // switch does not have to grow a case per chat event, and so an unknown
     // chat message stays inside the chat layer rather than reaching a terminal
     // handler that has no idea what to do with it.
-    if (this.app.chat?.handle(message as unknown as Record<string, unknown>)) {
+    if (this.app.chats.handle(message as unknown as Record<string, unknown>)) {
       return;
     }
 
     switch (message.type) {
       case 'connected':
         this.app.connectionId = message.connectionId;
+        // Before anything can ask for an optional message: the handshake is
+        // the first thing the server sends, and the alternative is a client
+        // that has to guess what the other end understands.
+        this.app.chats.setFeatures(message.features);
         break;
 
       case 'session_created':
@@ -163,6 +185,60 @@ export class MessageHandler {
 
       default:
         break;
+    }
+  }
+
+  /**
+   * Let a conversation the user is not looking at move its own tab.
+   *
+   * A chat session emits no PTY output, so none of the terminal path's activity
+   * tracking ever fires for it and a background agent could work, finish, or
+   * stop and ask for approval with nothing on the tab strip to say so. Only the
+   * events that mean something at that distance are used: what the session is
+   * doing, and whether it is waiting on a person.
+   */
+  private reflectChatActivity(message: { sessionId?: string; event?: unknown }): void {
+    const tabs = this.app.sessionTabManager;
+    const sessionId = message.sessionId;
+    if (!tabs || !sessionId) return;
+
+    const event = message.event as { t?: string; state?: string } | undefined;
+    if (!event) return;
+
+    const background = sessionId !== this.app.currentClaudeSessionId;
+
+    if (event.t === 'permission') {
+      // The one event that is genuinely blocking: the agent has stopped and
+      // will not move again until somebody answers.
+      tabs.updateTabStatus(sessionId, 'idle');
+      if (background) tabs.updateUnreadIndicator(sessionId, true);
+      return;
+    }
+
+    if (event.t !== 'state') return;
+
+    switch (event.state) {
+      case 'thinking':
+      case 'running':
+      case 'starting':
+        tabs.updateTabStatus(sessionId, 'active');
+        return;
+      case 'awaiting_permission':
+        tabs.updateTabStatus(sessionId, 'idle');
+        if (background) tabs.updateUnreadIndicator(sessionId, true);
+        return;
+      case 'error':
+        tabs.markSessionError(sessionId, true);
+        return;
+      case 'idle':
+      case 'exited':
+        // updateTabStatus already raises the unread dot for a background
+        // session that was working and has gone quiet, which is the signal
+        // worth carrying here.
+        tabs.updateTabStatus(sessionId, 'idle');
+        return;
+      default:
+        return;
     }
   }
 
@@ -380,6 +456,11 @@ export class MessageHandler {
   private onSessionDeleted(message: { sessionId: string; message: string }): void {
     const deletedSessionId = message.sessionId;
     const wasCurrentSession = deletedSessionId === this.app.currentClaudeSessionId;
+
+    // The conversation is gone with the session; keeping its controller would
+    // leak a transcript and a subscription for a session id that no longer
+    // resolves anywhere.
+    if (deletedSessionId) this.app.chats.drop(deletedSessionId);
 
     if (this.app.sessionTabManager && deletedSessionId) {
       this.app.sessionTabManager.closeSession(deletedSessionId, { skipServerRequest: true });

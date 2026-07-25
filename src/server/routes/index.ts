@@ -4,7 +4,9 @@ import { createSessionRoutes, SessionRoutesDeps } from './sessions.js';
 import { createFolderRoutes, FolderRoutesDeps } from './folders.js';
 import { createUpdateRoutes, UpdateRoutesDeps } from './update.js';
 import { createPasteRoutes, PasteRoutesDeps } from './paste.js';
+import { createChatAttachmentRoutes, ChatAttachmentRoutesDeps } from './chat-attachments.js';
 import { createProfileRoutes, ProfileRoutesDeps } from './profiles.js';
+import { createWorkspaceRoutes, WorkspaceRoutesDeps } from './workspace.js';
 
 export interface RegisterRoutesDeps
   extends HealthRoutesDeps,
@@ -12,7 +14,9 @@ export interface RegisterRoutesDeps
     FolderRoutesDeps,
     UpdateRoutesDeps,
     PasteRoutesDeps,
-    ProfileRoutesDeps {}
+    ChatAttachmentRoutesDeps,
+    ProfileRoutesDeps,
+    WorkspaceRoutesDeps {}
 
 export function registerRoutes(app: Express, deps: RegisterRoutesDeps): void {
   app.use(createHealthRoutes(deps));
@@ -20,5 +24,7 @@ export function registerRoutes(app: Express, deps: RegisterRoutesDeps): void {
   app.use(createFolderRoutes(deps));
   app.use(createUpdateRoutes(deps));
   app.use(createPasteRoutes(deps));
+  app.use(createChatAttachmentRoutes(deps));
   app.use(createProfileRoutes(deps));
+  app.use(createWorkspaceRoutes(deps));
 }

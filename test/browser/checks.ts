@@ -15,7 +15,10 @@
 import * as React from 'react';
 import { createRoot } from 'react-dom/client';
 
-import { createTerminalController } from '../../src/client/terminal/controller';
+import { ChatController } from '../../src/client/chat/controller';
+import { ChatView } from '../../src/client/shell/chat/ChatView';
+import { DEFAULT_CHAT_VIEW } from '../../src/client/chat/view-settings';
+import { createTerminalController, LIVE_SCROLLBACK_LINES } from '../../src/client/terminal/controller';
 import { HistoryView } from '../../src/client/terminal/history-view';
 import { Dialog } from '../../src/client/ui/relay/Dialog';
 
@@ -73,8 +76,38 @@ async function run(): Promise<void> {
 
   const buffer = controller.terminal.buffer.active;
   check('output written through the batching path arrives', buffer.baseY > 0, `baseY=${buffer.baseY}`);
-  check('the live scrollback stays bounded', buffer.baseY <= 2000, `baseY=${buffer.baseY}`);
   check('the viewport stays pinned to the newest output', controller.isAtBottom());
+
+  // The live buffer must be *bounded*, because everything older is the server's
+  // job to page back in. Asserting that against the real 20k limit would need
+  // 20k lines of output to say anything, so it is asserted against a small
+  // explicit limit on a throwaway terminal — the limit is a parameter, and what
+  // is under test is that the parameter is honoured — plus one assertion that
+  // the default is the constant the rest of the app reasons about.
+  const boundedHost = document.createElement('div');
+  boundedHost.style.cssText = 'width:800px;height:400px;position:absolute;top:0;left:0';
+  document.body.appendChild(boundedHost);
+  const bounded = createTerminalController({ fontSize: 14, scrollback: 500 });
+  bounded.open(boundedHost);
+  let overflow = '';
+  for (let i = 0; i < 1500; i++) {
+    overflow += `riga ${i}\r\n`;
+  }
+  bounded.write(overflow);
+  await wait(400);
+  const boundedBuffer = bounded.terminal.buffer.active;
+  check(
+    'the live scrollback stays bounded',
+    boundedBuffer.baseY === 500,
+    `baseY=${boundedBuffer.baseY} after 1500 lines into a 500-line buffer`,
+  );
+  check(
+    'and the default bound is the one the app pages against',
+    LIVE_SCROLLBACK_LINES === 20000,
+    `LIVE_SCROLLBACK_LINES=${LIVE_SCROLLBACK_LINES}`,
+  );
+  bounded.dispose();
+  boundedHost.remove();
 
   let reachedTop = 0;
   controller.onReachedTop(() => {
@@ -150,10 +183,13 @@ async function run(): Promise<void> {
   check('the fetched page lands in the terminal', firstRow === `storia ${requested[0].from}`, String(firstRow));
 
   const status = historyHost.querySelector('.history-view__status') as HTMLElement;
+  const statusText = status.textContent || '';
   check(
     'the status line reports the real position',
-    /di 100000/.test(status.textContent || ''),
-    JSON.stringify(status.textContent),
+    // The whole session, not the page: a viewer that says "1–19 of 19" tells
+    // the user they have reached the end of a 100k-line history.
+    statusText.includes(`of ${TOTAL}`) && statusText.includes(String(requested[0].from + 1)),
+    JSON.stringify(statusText),
   );
 
   const spacer = historyHost.querySelector('.history-view__spacer') as HTMLElement;
@@ -187,6 +223,7 @@ async function run(): Promise<void> {
 
   await checkModeQueriesDoNotKillTheTerminal();
   await checkATallDialogStaysOnScreen();
+  await checkTheComposerShrinksWithTheWorkspaceRail();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -343,6 +380,99 @@ async function checkATallDialogStaysOnScreen(): Promise<void> {
     check('the body scrolls to the end', body.scrollTop > 0, `scrollTop=${body.scrollTop}`);
   }
 
+  host.remove();
+}
+
+
+/**
+ * The composer belongs to the conversation column, and must shrink with it.
+ *
+ * Two defects in one check, both of which static markup renders as passing:
+ *
+ *   1. The composer used to be a sibling of the row holding the workspace rail,
+ *      so it ran the full width of the surface and the rail was simply drawn on
+ *      top of its left end.
+ *   2. Moving it into the column was not enough. The region holding it is a CSS
+ *      grid, and a grid item has `min-width: auto` exactly the way a flex item
+ *      does — so the implicit track refused to go below the composer's
+ *      min-content width and a wide rail pushed it off the right edge instead.
+ *      Only a layout engine can tell those apart from a correct layout, which
+ *      is why this check lives here.
+ */
+async function checkTheComposerShrinksWithTheWorkspaceRail(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:360px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('browser-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check',
+      runtime: 'claude',
+      state: 'thinking',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true, commands: [{ name: 'clear' }],
+      },
+      messages: [],
+      pendingPermissions: [],
+      queued: [{ id: 'q1', text: 'a message waiting its turn', ts: 1 }],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 1,
+      live: true,
+      bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  const paint = (panelWidth: number): void => {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/tmp/project',
+        view: { ...DEFAULT_CHAT_VIEW, panelOpen: true, panelTab: 'files', panelWidth },
+        onViewChange: () => {},
+      } as never),
+    );
+  };
+
+  // Wide enough that the rail takes most of the surface, which is the case that
+  // broke: at the default 320 the column had room to spare and both defects
+  // looked fine.
+  for (const panelWidth of [320, 560]) {
+    paint(panelWidth);
+    await wait(250);
+
+    const rail = host.querySelector('aside[aria-label="Workspace"]') as HTMLElement | null;
+    const textarea = host.querySelector('textarea') as HTMLElement | null;
+    if (!rail || !textarea) {
+      check(`the composer renders beside a ${panelWidth}px rail`, false);
+      continue;
+    }
+
+    const railBox = rail.getBoundingClientRect();
+    const inputBox = textarea.getBoundingClientRect();
+    const hostBox = host.getBoundingClientRect();
+
+    check(
+      `a ${panelWidth}px rail starts before the composer does`,
+      inputBox.left >= railBox.right,
+      `rail ends ${Math.round(railBox.right)}, composer starts ${Math.round(inputBox.left)}`,
+    );
+    check(
+      `a ${panelWidth}px rail leaves the composer inside the surface`,
+      inputBox.right <= hostBox.right + 1,
+      `composer ends ${Math.round(inputBox.right)}, surface ends ${Math.round(hostBox.right)}`,
+    );
+  }
+
+  root.unmount();
   host.remove();
 }
 

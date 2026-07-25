@@ -212,6 +212,9 @@ function describeUnmappedItem(item: Record<string, unknown>): string {
     case 'exitedReviewMode':
       return `[exited review mode: ${str(item.review) || ''}]`;
     case 'contextCompaction':
+      // Kept as text for the summary path below; the adapter also emits a
+      // `marker` so the transcript draws the line rather than printing a
+      // sentence that reads like something the agent said.
       return '[context compacted]';
     default:
       return `[unhandled codex item: ${str(item.type) || 'unknown'}]`;

@@ -44,6 +44,38 @@ const TRIM_CHUNK_BYTES = 1024 * 1024;
 /** Same character class history-store enforces, plus the same two named exceptions. */
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 
+/**
+ * How a conversation's opening is read: in chunks, up to a ceiling.
+ *
+ * The two facts wanted are at very different depths. The runtime's session id
+ * is in the first event; the first thing the *user* said can be a long way
+ * down, because some runtimes open by announcing everything they can do — Oh
+ * My Pi's first event is 48 kB of command list, and a `capabilities` event
+ * after it another 44 kB, which puts the opening message past 90 kB in a
+ * perfectly ordinary conversation. A single small read found the id and
+ * silently missed the message, and the list then had nothing to label a
+ * conversation with but its timestamp.
+ *
+ * So: read a chunk at a time and stop the moment both are found, which for
+ * most logs is the first one. The ceiling is what keeps a pathological file
+ * from being read in full to answer a question about its first line.
+ */
+const HEAD_SCAN_CHUNK = 64 * 1024;
+const HEAD_SCAN_LIMIT = 1024 * 1024;
+
+/**
+ * Events that belong to one message, and are meaningless without the
+ * `msg_start` that opened it. Everything not listed here describes the session
+ * rather than a message, and is replayed however far back it was emitted.
+ */
+const MESSAGE_SCOPED: ReadonlySet<string> = new Set([
+  'msg_start',
+  'block_start',
+  'block_delta',
+  'block_end',
+  'msg_end',
+]);
+
 export interface ChatStoreOptions {
   storageDir: string;
   /** Retained events per session before the oldest are dropped. */
@@ -52,8 +84,12 @@ export interface ChatStoreOptions {
   trimChunkEvents?: number;
   /** Upper bound on events served in one read(). */
   maxPageEvents?: number;
-  /** How far back snapshot() replays before leaving the rest to paging. */
+  /** Chunk size used while walking back for a message boundary. */
   snapshotReplayEvents?: number;
+  /** Messages a freshly opened conversation shows before it has to page. */
+  snapshotMinMessages?: number;
+  /** Hard cap on how far back the boundary search will read. */
+  snapshotMaxScanEvents?: number;
 }
 
 export interface ChatStats {
@@ -68,6 +104,13 @@ export interface ChatStats {
 
 export interface ChatPage extends ChatStats {
   events: ChatEvent[];
+  /**
+   * Lowest seq this page covers, after clamping the request to what is on
+   * disk. The client folds it into its own paging floor; without it a client
+   * cannot tell a page that reached the head of the log from one that did not,
+   * and keeps asking for the same range.
+   */
+  from: number;
 }
 
 export interface ChatSnapshotOptions {
@@ -79,6 +122,14 @@ export interface ChatSnapshotOptions {
 }
 
 export type ChatSessionRef = Pick<SessionRecord, 'id' | 'ownerUserId'>;
+
+/** What a conversation can be listed and resumed by, read from its first lines. */
+export interface ChatDescription {
+  /** The runtime's own id, or null when it never reported one. */
+  nativeSessionId: string | null;
+  /** How the conversation opened, so a list of them can be read. */
+  firstMessage: string | null;
+}
 
 interface SessionState {
   firstSeq: number;
@@ -101,6 +152,8 @@ export class ChatStore implements ChatStoreLike {
   readonly trimChunkEvents: number;
   readonly maxPageEvents: number;
   readonly snapshotReplayEvents: number;
+  readonly snapshotMinMessages: number;
+  readonly snapshotMaxScanEvents: number;
 
   private readonly states = new Map<string, SessionState>();
   private readonly queues = new Map<string, Promise<unknown>>();
@@ -111,6 +164,10 @@ export class ChatStore implements ChatStoreLike {
     this.trimChunkEvents = options.trimChunkEvents ?? 5_000;
     this.maxPageEvents = options.maxPageEvents ?? 500;
     this.snapshotReplayEvents = options.snapshotReplayEvents ?? 1_000;
+    // Enough to fill a tall window and leave something to scroll, without
+    // making a rejoin pay for a whole conversation.
+    this.snapshotMinMessages = options.snapshotMinMessages ?? 40;
+    this.snapshotMaxScanEvents = options.snapshotMaxScanEvents ?? 40_000;
   }
 
   /**
@@ -135,6 +192,95 @@ export class ChatStore implements ChatStoreLike {
     return path.join(this.storageDir, String(session.ownerUserId), id);
   }
 
+  /**
+   * The runtime's own id for a conversation, read from the head of its log.
+   *
+   * Backfill for sessions recorded before the id was kept on the session row.
+   * Bounded on purpose: a runtime names its conversation in the first thing it
+   * says, so the answer is in the first few lines — and these logs reach tens
+   * of megabytes, which is a size worth never reading to learn one field.
+   *
+   * Returns null for "not in the head", which the caller reads as "cannot be
+   * resumed". That is the safe direction to be wrong in: it offers a fresh
+   * start rather than a resume that would silently produce a stranger.
+   */
+  async nativeSessionId(session: ChatSessionRef): Promise<string | null> {
+    return (await this.describe(session)).nativeSessionId;
+  }
+
+  /**
+   * Enough about a conversation to list it: what it can be resumed as, and how
+   * it opened.
+   *
+   * Both facts are in the first few lines, so one bounded read answers both.
+   * The opening line is what makes a list of past conversations usable at all:
+   * a column of "Session 25/07/2026, 21:35" tells a person nothing about which
+   * one they were looking for, and the question they asked tells them
+   * immediately.
+   */
+  async describe(session: ChatSessionRef): Promise<ChatDescription> {
+    const found: ChatDescription = { nativeSessionId: null, firstMessage: null };
+    const base = this.basePath(session);
+    const handle = await fs.promises.open(`${base}.jsonl`, 'r').catch(() => null);
+    if (!handle) return found;
+
+    // The id of the message the *user* opened with, so a block belonging to the
+    // agent's reply is never mistaken for the question.
+    let firstUserMessage: string | null = null;
+    let remainder = '';
+    let offset = 0;
+
+    const take = (line: string): void => {
+      let event: Record<string, unknown>;
+      try {
+        event = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        // A line this cannot parse is not a reason to abandon the read.
+        return;
+      }
+
+      if (event.t === 'session' && typeof event.nativeSessionId === 'string') {
+        found.nativeSessionId ??= event.nativeSessionId;
+      }
+      if (event.t === 'msg_start' && event.role === 'user' && !firstUserMessage) {
+        firstUserMessage = String(event.id || '');
+      }
+      if (
+        event.t === 'block_start'
+        && firstUserMessage
+        && event.msgId === firstUserMessage
+        && !found.firstMessage
+      ) {
+        const block = event.block as { kind?: string; text?: unknown } | undefined;
+        if (block?.kind === 'text' && typeof block.text === 'string' && block.text.trim()) {
+          found.firstMessage = block.text.trim().slice(0, 300);
+        }
+      }
+    };
+
+    try {
+      const buffer = Buffer.alloc(HEAD_SCAN_CHUNK);
+      while (offset < HEAD_SCAN_LIMIT && !(found.nativeSessionId && found.firstMessage)) {
+        const { bytesRead } = await handle.read(buffer, 0, HEAD_SCAN_CHUNK, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+
+        const lines = (remainder + buffer.subarray(0, bytesRead).toString('utf8')).split('\n');
+        // The last piece is whatever the chunk cut in half; it is carried into
+        // the next read rather than parsed, because half an event is not one.
+        remainder = lines.pop() ?? '';
+        for (const line of lines) {
+          if (line) take(line);
+          if (found.nativeSessionId && found.firstMessage) break;
+        }
+      }
+
+      return found;
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+
   /** Serialise every operation per session: a reader must not see a half-written index. */
   private enqueue<T>(key: string, task: () => Promise<T>): Promise<T> {
     const previous = this.queues.get(key) ?? Promise.resolve();
@@ -155,8 +301,16 @@ export class ChatStore implements ChatStoreLike {
     // 1 rather than 0: chat-reducer treats cursor 0 as "nothing applied yet",
     // so an empty store reporting firstSeq 1 / cursor 0 reads the same way a
     // freshly created transcript does.
-    let state: SessionState = { firstSeq: 1, count: 0, logSize: 0 };
+    const state: SessionState = { firstSeq: 1, count: 0, logSize: 0 };
 
+    // Sized before the index is read, and unconditionally: it is what tells
+    // repairIndex there is a log to rebuild from when the index cannot be
+    // trusted. Reading it only inside the happy path is what made a bad index
+    // hide the entire conversation instead of triggering a repair.
+    const logStat = await fs.promises.stat(`${base}.jsonl`).catch(() => null);
+    state.logSize = logStat ? logStat.size : 0;
+
+    let usable = false;
     try {
       const header = Buffer.alloc(HEADER_BYTES);
       const handle = await fs.promises.open(`${base}.idx`, 'r');
@@ -165,12 +319,9 @@ export class ChatStore implements ChatStoreLike {
         if (size >= HEADER_BYTES) {
           await handle.read(header, 0, HEADER_BYTES, 0);
           if (header.readUInt32BE(0) === MAGIC && header.readUInt16BE(4) === FORMAT_VERSION) {
-            const logStat = await fs.promises.stat(`${base}.jsonl`).catch(() => ({ size: 0 }));
-            state = {
-              firstSeq: Number(header.readBigUInt64BE(8)),
-              count: Math.floor((size - HEADER_BYTES) / ENTRY_BYTES),
-              logSize: logStat.size,
-            };
+            state.firstSeq = Number(header.readBigUInt64BE(8));
+            state.count = Math.floor((size - HEADER_BYTES) / ENTRY_BYTES);
+            usable = true;
           }
         }
       } finally {
@@ -180,6 +331,19 @@ export class ChatStore implements ChatStoreLike {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         console.error(`Failed to read chat index ${base}.idx:`, error);
       }
+    }
+
+    if (!usable && state.logSize > 0) {
+      // An index that does not start with our header cannot be read at all:
+      // every offset lookup is measured from HEADER_BYTES, so a header-less
+      // file silently returns the wrong records. The log is the durable
+      // artefact and it is intact, so the index is thrown away and rebuilt
+      // from it — which is also the recovery path for any session written by
+      // the build that never wrote a header in the first place.
+      console.warn(`Chat index ${base}.idx is unreadable; rebuilding it from the log.`);
+      state.firstSeq = (await firstSeqInLog(base)) ?? 1;
+      state.count = 0;
+      await fs.promises.writeFile(`${base}.idx`, headerBuffer(state.firstSeq));
     }
 
     await this.repairIndex(base, state);
@@ -307,10 +471,17 @@ export class ChatStore implements ChatStoreLike {
   private async appendNow(base: string, events: ChatEvent[]): Promise<void> {
     await fs.promises.mkdir(path.dirname(base), { recursive: true });
 
-    const existed = this.states.has(base);
     const state = await this.loadState(base);
 
-    if (!existed && state.count === 0 && state.logSize === 0) {
+    // "Is this log empty?" is a question about the log, not about whether this
+    // process happens to have a cached state for it. It used to be the latter
+    // — and `ChatSession.start()` calls `stat()` before the first append, so
+    // the cache was *always* warm by then and the header was *never* written.
+    // Every index this store had ever produced was therefore header-less, and
+    // since every offset lookup is measured from HEADER_BYTES, rejoining a
+    // conversation silently dropped its first few events and a restart lost
+    // the whole thing.
+    if (state.count === 0 && state.logSize === 0) {
       // The session assigns seq, not this store; a brand-new log adopts
       // wherever the caller started numbering rather than assuming 1, so the
       // store is never coupled to a convention that lives one layer up.
@@ -451,11 +622,11 @@ export class ChatStore implements ChatStoreLike {
       const end = Math.min(stats.cursor + 1, start + wanted);
 
       if (wanted === 0 || end <= start) {
-        return { ...stats, events: [] };
+        return { ...stats, events: [], from: start };
       }
 
       const events = await this.readSlice(base, state, start, end);
-      return { ...stats, events };
+      return { ...stats, events, from: start };
     });
   }
 
@@ -535,7 +706,88 @@ export class ChatStore implements ChatStoreLike {
   }
 
   /**
-   * Replay of a session, capped to its most recent events.
+   * The tail of a session, cut at a message boundary rather than an event count.
+   *
+   * A fixed event window is the obvious implementation and it is wrong for
+   * exactly the sessions that need it most. Streaming turns emit an event per
+   * token, so in a long conversation the last thousand events are routinely all
+   * `block_delta`s belonging to one message whose `msg_start` fell outside the
+   * window — and the reducer, correctly, has nowhere to put them. A 42,000-event
+   * transcript opened completely blank.
+   *
+   * So the search walks backwards in chunks until it has seen enough *messages*,
+   * and replays from the `msg_start` of the oldest one it wants. Bounded twice
+   * over: it stops at the head of the log, and it stops after
+   * `snapshotMaxScanEvents` however few messages it has found, so a pathological
+   * log cannot turn opening a session into a full replay.
+   */
+  private async replayTail(
+    base: string,
+    state: SessionState,
+    stats: ChatStats,
+  ): Promise<{ from: number; events: ChatEvent[] }> {
+    const floor = state.firstSeq;
+    if (stats.cursor < floor) {
+      return { from: floor, events: [] };
+    }
+
+    const chunkSize = Math.max(this.snapshotReplayEvents, 1);
+    const chunks: ChatEvent[][] = [];
+    let starts: number[] = [];
+    let scanned = 0;
+    let end = stats.cursor + 1;
+
+    while (end > floor && scanned < this.snapshotMaxScanEvents) {
+      const start = Math.max(floor, end - chunkSize);
+      const events = await this.readSlice(base, state, start, end);
+      chunks.unshift(events);
+      scanned += end - start;
+
+      const found: number[] = [];
+      for (const event of events) {
+        if ((event as { t?: string }).t === 'msg_start') found.push(event.seq);
+      }
+      starts = found.concat(starts);
+
+      end = start;
+      if (starts.length >= this.snapshotMinMessages) break;
+    }
+
+    const all = chunks.flat();
+    if (all.length === 0) {
+      return { from: floor, events: [] };
+    }
+
+    // The whole log is in hand and it is shorter than the cap: replay all of
+    // it, and say so, or the client would be told there is older history to
+    // page for a conversation it already holds in full.
+    const reachedHead = end <= floor;
+    if (reachedHead && starts.length < this.snapshotMinMessages) {
+      return { from: floor, events: all };
+    }
+
+    // No message boundary within reach — a single enormous message, or a log
+    // of nothing but session-level events. Replaying what was read is still
+    // better than nothing: it carries the state, plan and pending approvals.
+    const from =
+      starts.length > 0
+        ? starts[Math.max(0, starts.length - this.snapshotMinMessages)]
+        : all[0].seq;
+
+    // Only *message* events are cut at the boundary. Everything else in the
+    // scanned window is session-level — the capabilities a runtime reported,
+    // the plan, the running usage, an unanswered approval — and it lives at
+    // whatever seq it happened to be emitted at, which is routinely older than
+    // the newest forty messages. Dropping those alongside the messages is how
+    // a rejoin came back with no slash commands and a blank state.
+    return {
+      from,
+      events: all.filter((event) => event.seq >= from || !MESSAGE_SCOPED.has(event.t)),
+    };
+  }
+
+  /**
+   * Replay of a session, capped to its most recent messages.
    *
    * A month-long session must not cost a full replay on every browser join,
    * so this only walks the tail; a client that scrolls past what comes back
@@ -550,9 +802,7 @@ export class ChatStore implements ChatStoreLike {
       const state = await this.loadState(base);
       const stats = this.statsOf(state);
 
-      const windowStart = Math.max(state.firstSeq, stats.cursor - this.snapshotReplayEvents + 1);
-      const events =
-        stats.cursor >= windowStart ? await this.readSlice(base, state, windowStart, stats.cursor + 1) : [];
+      const { from: windowStart, events } = await this.replayTail(base, state, stats);
 
       const transcript = createTranscript(NO_CHAT_CAPABILITIES);
       applyAll(transcript, events);
@@ -567,6 +817,7 @@ export class ChatStore implements ChatStoreLike {
         plan: transcript.plan,
         pendingPermissions: transcript.pendingPermissions,
         firstSeq: stats.firstSeq,
+        replayFrom: windowStart,
         cursor: stats.cursor,
         live: options.live ?? false,
         bypassPermissions: options.bypassPermissions ?? false,
@@ -624,6 +875,39 @@ export class ChatStore implements ChatStoreLike {
       );
     });
     this.queues.delete(base);
+  }
+}
+
+/**
+ * The seq of the first record in a log, so a rebuilt index can restore the
+ * numbering the session actually used rather than assuming it started at 1.
+ *
+ * Reads a bounded prefix: the first line is all that is wanted, and a log whose
+ * first record is enormous must not be pulled into memory to find its number.
+ */
+async function firstSeqInLog(base: string): Promise<number | null> {
+  const buffer = Buffer.alloc(64 * 1024);
+  let read = 0;
+  try {
+    const handle = await fs.promises.open(`${base}.jsonl`, 'r');
+    try {
+      ({ bytesRead: read } = await handle.read(buffer, 0, buffer.length, 0));
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return null;
+  }
+
+  const text = buffer.subarray(0, read).toString('utf8');
+  const newline = text.indexOf('\n');
+  if (newline < 0) return null;
+
+  try {
+    const seq = (JSON.parse(text.slice(0, newline)) as { seq?: unknown }).seq;
+    return typeof seq === 'number' && Number.isSafeInteger(seq) && seq >= 0 ? seq : null;
+  } catch {
+    return null;
   }
 }
 

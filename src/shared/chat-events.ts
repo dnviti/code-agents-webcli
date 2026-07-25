@@ -171,13 +171,32 @@ export interface ErrorBlock {
   text: string;
 }
 
+/**
+ * A line across the conversation marking something that happened *to* it.
+ *
+ * Not something anyone said, which is why it is its own block kind rather than
+ * a system message with prose in it: compaction rewrote the context the agent
+ * is working from, and everything above the line is no longer what it can see.
+ * That is a fact about the conversation, and it has to be visible in the
+ * conversation — an agent that quietly forgets the first hour and gives a
+ * different answer for it is a confusing agent.
+ */
+export interface NoticeBlock {
+  kind: 'notice';
+  notice: 'compacted' | 'cleared';
+  text: string;
+  /** Optional detail — how much was reclaimed, what the summary covers. */
+  detail?: string;
+}
+
 export type ChatBlock =
   | TextBlock
   | ThinkingBlock
   | ToolBlock
   | ImageBlock
   | PlanBlock
-  | ErrorBlock;
+  | ErrorBlock
+  | NoticeBlock;
 
 /**
  * Token and cost accounting for a message, turn or session.
@@ -369,7 +388,23 @@ export type ChatEvent =
       durationMs?: number;
     }
   /** The runtime revised what it can do — new slash commands, a model switch. */
-  | { t: 'capabilities'; seq: number; ts: number; capabilities: Partial<ChatCapabilities> };
+  | { t: 'capabilities'; seq: number; ts: number; capabilities: Partial<ChatCapabilities> }
+  /**
+   * Something happened to the conversation itself.
+   *
+   * `compacted` leaves a marker in place and keeps the transcript: what was
+   * said still happened and is still worth scrolling back to, even though the
+   * agent can no longer see it. `cleared` empties the transcript, because that
+   * is what the user asked for — `/clear` means "start again", and a window
+   * still full of the previous conversation would be the opposite of that.
+   */
+  | {
+      t: 'marker';
+      seq: number;
+      ts: number;
+      kind: 'compacted' | 'cleared';
+      detail?: string;
+    };
 
 /** An attachment on an outgoing user turn. */
 export interface ChatAttachment {
@@ -389,6 +424,31 @@ export interface UserTurn {
 }
 
 /**
+ * A turn typed while the agent was still working, waiting its place in line.
+ *
+ * Deliberately not a transcript event. The log is the record of what happened,
+ * and a queued turn has not happened yet — it can still be cancelled, and if
+ * the server goes down it is gone along with the process it was queued for.
+ * It rides on the snapshot and on its own broadcast instead, which is what
+ * lets a second browser (or the same one after a reload) see the same line.
+ */
+export interface QueuedTurn {
+  id: string;
+  text: string;
+  attachments?: ChatAttachment[];
+  ts: number;
+}
+
+/**
+ * How many turns may wait at once.
+ *
+ * A ceiling rather than a policy: the queue is held in memory on behalf of a
+ * browser that may never come back, and "type as much as you like" is not a
+ * promise this server should make with someone else's RAM.
+ */
+export const MAX_QUEUED_TURNS = 20;
+
+/**
  * The rolling view a client holds.
  *
  * `cursor` is the highest seq the client has applied, so a reconnect asks for
@@ -403,12 +463,40 @@ export interface ChatSnapshot {
   usage?: ChatUsage;
   plan?: PlanItem[];
   pendingPermissions: PermissionRequest[];
+  /**
+   * Turns typed ahead, still waiting. Optional so a snapshot replayed from the
+   * store — which knows nothing about a live process — is not obliged to
+   * invent one; the session fills it in.
+   */
+  queued?: QueuedTurn[];
   /** Lowest seq still on disk; below this the log has been trimmed. */
   firstSeq: number;
+  /**
+   * Lowest seq actually folded into `messages`.
+   *
+   * A snapshot replays only the tail of a long session, so `firstSeq` alone
+   * cannot tell a client whether there is anything above what it was given —
+   * and comparing it against zero says "yes" for every session ever created,
+   * because seq numbering starts at one. This is the honest floor: there is
+   * more to page in exactly when `firstSeq < replayFrom`.
+   *
+   * Optional so a client can tell a server that predates it apart from one
+   * reporting a fully-replayed session, and default to offering no paging.
+   */
+  replayFrom?: number;
   /** Highest seq written. */
   cursor: number;
   /** True when the runtime process is alive. */
   live: boolean;
+  /**
+   * The runtime's own id for this conversation, when one was recorded.
+   *
+   * Only interesting alongside `live: false`, where it is the difference
+   * between offering to *continue* the conversation on screen and offering
+   * only to start over: with it the agent comes back knowing what was said,
+   * without it a restart is a stranger reading someone else's transcript.
+   */
+  nativeSessionId?: string;
   bypassPermissions: boolean;
 }
 

@@ -172,7 +172,13 @@ describe('a launch nothing answers', function () {
       // null on purpose: stabilizeTerminalSize returns early without a
       // terminal, which keeps this clear of document/RAF.
       terminal: null,
-      chat: null,
+      // The registry the message handler routes chat traffic through. Only the
+      // three methods that path reaches are needed here.
+      chats: {
+        ensure: () => ({ transcript: null, sessionId: 'session-1' }),
+        handle: () => false,
+        drop() {},
+      },
       sessionTabManager: null,
       splitContainer: null,
       historyView: null,

@@ -35,6 +35,14 @@ function fakeApp() {
     joinSession: async (id) => { joined.push(id); },
     folderBrowser: { show() {} },
     isCreatingNewSession: false,
+    // The manager subscribes a chat tab when it learns its surface, and drops
+    // the conversation when the tab closes.
+    chats: {
+      subscribed: [],
+      dropped: [],
+      subscribe(id) { this.subscribed.push(id); },
+      drop(id) { this.dropped.push(id); },
+    },
   };
 }
 
@@ -177,6 +185,69 @@ describe('session tab state', function () {
     m.closeSession('only', { skipServerRequest: true });
     assert.strictEqual(m.activeTabId, null);
     assert.deepStrictEqual(mod.shellStore.getSnapshot().tabs, [], 'the strip empties');
+  });
+
+  it('takes the conversation off screen when its tab is closed', function () {
+    const { m } = manager();
+    m.addTab('s1', 'One', 'idle', '/tmp/one', false);
+    m.setTabSurface('s1', 'chat');
+
+    // What the shell would be showing for that tab.
+    mod.shellStore.setState({
+      chat: {
+        active: true,
+        sessionId: 's1',
+        controller: {},
+        runtime: 'claude',
+        runtimeLabel: 'Claude',
+        workingDir: '/tmp/one',
+        bypassPermissions: false,
+      },
+    });
+
+    m.closeSession('s1', { skipServerRequest: true });
+
+    // The surface used to be replaced only by *joining* something else, so
+    // closing the last tab left a dead conversation on screen with a composer
+    // that could not send anything.
+    const chat = mod.shellStore.getSnapshot().chat;
+    assert.strictEqual(chat.active, false);
+    assert.strictEqual(chat.sessionId, '');
+    assert.strictEqual(chat.controller, null);
+  });
+
+  it('leaves another conversation on screen when a different tab closes', function () {
+    const { m } = manager();
+    m.addTab('keep', 'Keep', 'idle', '/tmp/keep', false);
+    m.addTab('go', 'Go', 'idle', '/tmp/go', false);
+    mod.shellStore.setState({
+      chat: {
+        active: true,
+        sessionId: 'keep',
+        controller: {},
+        runtime: 'claude',
+        runtimeLabel: 'Claude',
+        workingDir: '/tmp/keep',
+        bypassPermissions: false,
+      },
+    });
+
+    m.closeSession('go', { skipServerRequest: true });
+
+    assert.strictEqual(mod.shellStore.getSnapshot().chat.sessionId, 'keep');
+  });
+
+  it('subscribes to a session once it learns the session is a chat', function () {
+    const { m, app } = manager();
+    m.addTab('s1', 'One', 'idle', '/tmp/one', false);
+
+    m.setTabSurface('s1', 'chat');
+    m.setTabSurface('s1', 'chat');
+
+    // Idempotent: the same fact arrives from the session list, from
+    // session_joined and from chat_started.
+    assert.deepStrictEqual(app.chats.subscribed, ['s1']);
+    assert.strictEqual(shellTab('s1').surface, 'chat');
   });
 
   it('applies a dragged order and keeps a tab that arrived mid-drag', function () {

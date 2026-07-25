@@ -41,6 +41,7 @@ import { TranscriptStore } from './services/transcript-store.js';
 import { HistoryStore } from './services/history-store.js';
 import { SessionTeardownRegistry } from './services/session-teardown.js';
 import { PasteStore } from './services/paste-store.js';
+import { AttachmentStore } from './services/attachment-store.js';
 import { readBuildInfo } from './services/build-info.js';
 import { UpdateChecker } from './services/update-check.js';
 import { ensureCertificates, createHttpsOnlyPort, caCertificateHandler } from './services/tls.js';
@@ -50,7 +51,7 @@ import {
   UpdateModeResult,
   detectUpdateMode,
 } from './services/self-update.js';
-import { broadcastToAllConnections, broadcastToSession, sendToUser } from './websocket/handler.js';
+import { broadcastChat, broadcastToAllConnections, sendToUser } from './websocket/handler.js';
 import { ChatStore } from './chat/store.js';
 import { ChatSessionManager } from './chat/manager.js';
 import { AuthService } from './services/auth.js';
@@ -95,6 +96,7 @@ export class ClaudeCodeWebServer {
   private chatManager: ChatSessionManager;
   private historyStore: HistoryStore;
   private pasteStore: PasteStore;
+  private attachmentStore: AttachmentStore;
   private runtimeProfiles: RuntimeProfileStore;
   private tierContext: TierWriterContext;
   private sessionTeardown: SessionTeardownRegistry;
@@ -162,12 +164,16 @@ export class ClaudeCodeWebServer {
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
     this.historyStore = new HistoryStore({ storageDir: this.database.storageDir });
     this.pasteStore = new PasteStore({ storageDir: this.database.storageDir });
+    // No storageDir: unlike a paste, an attachment is never swept up when the
+    // session ends — a transcript still points at it — so there is no manifest
+    // to keep. See services/attachment-store.ts.
+    this.attachmentStore = new AttachmentStore();
     this.chatStore = new ChatStore({ storageDir: this.database.storageDir });
     this.chatManager = new ChatSessionManager({
       store: this.chatStore,
       storageDir: this.database.storageDir,
       broadcast: (sessionId, message) =>
-        broadcastToSession(
+        broadcastChat(
           sessionId,
           message,
           this.claudeSessions,
@@ -180,6 +186,21 @@ export class ClaudeCodeWebServer {
         const bridge = this.getRuntimeBridge(runtime as AgentKind);
         const resolved = (bridge as unknown as { command?: string })?.command;
         return resolved || runtime;
+      },
+      // The chat subsystem does not know about session records, and should not:
+      // this is the one seam where a fact it learns has to outlive its process.
+      onLifecycle: (sessionId, change) => {
+        const record = this.claudeSessions.get(sessionId);
+        if (!record) return;
+        if (change.nativeSessionId) {
+          record.nativeChatSessionId = change.nativeSessionId;
+        }
+        if (change.exited) {
+          // Frees the session for a relaunch in the same tab. Without it the
+          // record still claims a process that is gone, and `start_chat`
+          // refuses with "A process is already running in this session".
+          record.active = false;
+        }
       },
     });
     this.runtimeProfiles = new RuntimeProfileStore({ database: this.database });
@@ -619,6 +640,7 @@ export class ClaudeCodeWebServer {
       historyStore: this.historyStore,
       sessionTeardown: this.sessionTeardown,
       pasteStore: this.pasteStore,
+      attachmentStore: this.attachmentStore,
       runtimeProfiles: this.runtimeProfiles,
       tierContext: this.tierContext,
       updateChecker: this.updateChecker,
@@ -638,6 +660,13 @@ export class ClaudeCodeWebServer {
         this.messageProcessor.getScreenSnapshot(sessionId),
       disposeRecorder: (sessionId: string) => this.messageProcessor.disposeRecorder(sessionId),
       sessionStore: this.sessionStore,
+      // For listing past conversations in a folder.
+      chatStore: this.chatStore,
+      // For the status panel. Passed rather than reached for so a build that
+      // does not track usage simply has no plan section, instead of a section
+      // full of zeros that reads as "nothing left".
+      usageAnalytics: this.usageAnalytics,
+      usageReader: this.usageReader,
     });
 
   }

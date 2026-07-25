@@ -293,6 +293,73 @@ describe('ChatStore', function () {
       );
     });
 
+    it('opens a long streaming conversation at a message boundary, not an event count', async function () {
+      // The shape that broke it: one assistant turn whose token deltas fill the
+      // whole tail window. Cutting at a fixed event count started the replay
+      // inside that message, the reducer had nowhere to put the deltas, and a
+      // 42,000-event transcript opened completely blank.
+      const session = { id: 'long', ownerUserId: 1 };
+      const events = [];
+      let seq = 1;
+
+      const message = (id, text, deltas) => {
+        events.push({ t: 'msg_start', seq: seq++, ts: 1, id, role: 'assistant', turnId: 't' });
+        events.push({ t: 'block_start', seq: seq++, ts: 1, msgId: id, index: 0, block: { kind: 'text', text: '' } });
+        for (let i = 0; i < deltas; i++) {
+          events.push({ t: 'block_delta', seq: seq++, ts: 1, msgId: id, index: 0, text });
+        }
+        events.push({ t: 'msg_end', seq: seq++, ts: 1, msgId: id });
+      };
+
+      for (let i = 0; i < 5; i++) message(`m${i}`, 'x', 20);
+      // The last turn alone is longer than the replay chunk.
+      message('final', 'y', 4000);
+
+      store.append(session, events);
+      const snapshot = await store.snapshot(session);
+
+      assert.ok(snapshot.messages.length > 0, 'a long conversation must not open empty');
+      const last = snapshot.messages[snapshot.messages.length - 1];
+      assert.strictEqual(last.id, 'final');
+      assert.strictEqual(last.blocks[0].text.length, 4000, 'the streamed message must be whole');
+      // And the replay floor is reported honestly, so the client knows to page.
+      assert.ok(snapshot.replayFrom >= snapshot.firstSeq);
+      assert.ok(snapshot.replayFrom <= snapshot.cursor);
+    });
+
+    it('gives back the newest messages, capped, on a conversation of many turns', async function () {
+      const capped = new ChatStore({ storageDir: dir, snapshotMinMessages: 4 });
+      const session = { id: 'many', ownerUserId: 1 };
+      const events = [];
+      let seq = 1;
+      for (let i = 0; i < 30; i++) {
+        events.push({ t: 'msg_start', seq: seq++, ts: 1, id: `m${i}`, role: 'assistant', turnId: 't' });
+        events.push({ t: 'block_start', seq: seq++, ts: 1, msgId: `m${i}`, index: 0, block: { kind: 'text', text: String(i) } });
+        events.push({ t: 'msg_end', seq: seq++, ts: 1, msgId: `m${i}` });
+      }
+      capped.append(session, events);
+
+      const snapshot = await capped.snapshot(session);
+      assert.strictEqual(snapshot.messages.length, 4);
+      assert.deepStrictEqual(snapshot.messages.map((m) => m.id), ['m26', 'm27', 'm28', 'm29']);
+      assert.ok(snapshot.replayFrom > snapshot.firstSeq, 'there is older history to page');
+    });
+
+    it('stops walking back rather than replaying a log with no message boundaries', async function () {
+      const capped = new ChatStore({
+        storageDir: dir,
+        snapshotReplayEvents: 10,
+        snapshotMaxScanEvents: 30,
+      });
+      const session = { id: 'stateonly', ownerUserId: 1 };
+      capped.append(session, makeEvents(1, 500));
+
+      const snapshot = await capped.snapshot(session);
+      assert.deepStrictEqual(snapshot.messages, []);
+      // Bounded: it did not walk the whole log looking for a boundary.
+      assert.ok(snapshot.replayFrom > 400, `walked back too far: ${snapshot.replayFrom}`);
+    });
+
     it('returns a usable empty snapshot for a session with no events yet', async function () {
       const snapshot = await store.snapshot({ id: 'blank', ownerUserId: 1 });
       assert.deepStrictEqual(snapshot.messages, []);

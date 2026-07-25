@@ -1,7 +1,12 @@
 import * as React from 'react';
 import { ChatAttachment, ChatState } from '../../../shared/chat-events.js';
-import { ChatController } from '../../chat/controller.js';
+import { uploadAttachment } from '../../chat/attachments-api.js';
+import { ChatController, type ChatUnavailable } from '../../chat/controller.js';
+import { findFiles } from '../../chat/workspace-api.js';
+import type { ChatPanelId, ChatViewSettings } from '../../chat/view-settings.js';
+import { DEFAULT_CHAT_VIEW, enabledPanels } from '../../chat/view-settings.js';
 import { Badge } from '../../ui/relay/Badge.js';
+import { Button } from '../../ui/relay/Button.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
 import { Tooltip } from '../../ui/relay/Tooltip.js';
@@ -10,6 +15,7 @@ import { MessageList } from './MessageList.js';
 import { PermissionCard } from './PermissionCard.js';
 import { PlanPanel } from './PlanPanel.js';
 import { UsageMeter } from './UsageMeter.js';
+import { WorkspacePanel } from './WorkspacePanel.js';
 
 /**
  * The chat surface, assembled.
@@ -35,7 +41,18 @@ export interface ChatViewProps {
   runtimeLabel: string;
   workingDir: string;
   isMobile?: boolean;
+  /**
+   * Opens the chat's own display settings — not the app's.
+   *
+   * The two were the same dialog, which meant the gear inside a conversation
+   * offered font size, terminal typeface and install: a page of controls that
+   * could not change anything on the surface they were reached from.
+   */
   onOpenSettings?: () => void;
+  /** What this surface shows. Panels, reasoning, tool cards, plan, usage. */
+  view?: ChatViewSettings;
+  /** Persist a change made from inside the surface, e.g. closing the rail. */
+  onViewChange?: (next: ChatViewSettings) => void;
   /**
    * Whether this session was launched with tool approvals bypassed.
    *
@@ -86,6 +103,8 @@ export function ChatView({
   isMobile = false,
   onOpenSettings,
   bypassPermissions = false,
+  view = DEFAULT_CHAT_VIEW,
+  onViewChange,
 }: ChatViewProps) {
   const transcript = controller.transcript;
 
@@ -97,11 +116,22 @@ export function ChatView({
   React.useSyncExternalStore(transcript.subscribe, transcript.getVersion, ZERO);
 
   const chatState = transcript.chatState;
-  const meta = STATE_META[chatState] || STATE_META.idle;
   const plan = transcript.plan;
   const pending = transcript.pendingPermissions;
   const exited = chatState === 'exited';
-  const awaiting = chatState === 'awaiting_permission';
+
+  const unavailable = controller.unavailableReason;
+
+  // The log replays to `idle` on its own — a conversation that ended on a
+  // finished turn reads as Ready — so a session whose process is gone showed a
+  // green "Ready" pill above a notice saying it was not running. The state of
+  // the *process* wins over the state of the transcript.
+  const meta = unavailable ? STATE_META.exited : STATE_META[chatState] || STATE_META.idle;
+
+  const relaunch = React.useCallback(
+    (resume: boolean) => controller.relaunch(runtime, { resume, bypassPermissions }),
+    [controller, runtime, bypassPermissions],
+  );
 
   const [planOpen, setPlanOpen] = React.useState(false);
   const keyboardInset = useKeyboardInset(isMobile);
@@ -116,9 +146,39 @@ export function ChatView({
     (requestId: string, optionId: string) => controller.respondPermission(requestId, optionId),
     [controller],
   );
+  const cancelQueued = React.useCallback(
+    (queuedId: string) => controller.cancelQueued(queuedId),
+    [controller],
+  );
+  const upload = React.useCallback(
+    (file: File) => uploadAttachment(controller.sessionId, file),
+    [controller],
+  );
+  const findProjectFiles = React.useCallback(
+    (query: string) => findFiles(controller.sessionId, query).then((result) => result.matches),
+    [controller],
+  );
 
-  const showRail = !isMobile && plan.length > 0;
-  const showPlanSheet = isMobile && plan.length > 0;
+  const showRail = !isMobile && view.showPlan && plan.length > 0;
+  const showPlanSheet = isMobile && view.showPlan && plan.length > 0;
+
+  const panelsAvailable = enabledPanels(view).length > 0;
+  const workspaceOpen = view.panelOpen && panelsAvailable;
+
+  const setView = React.useCallback(
+    (patch: Partial<ChatViewSettings>) => onViewChange?.({ ...view, ...patch }),
+    [onViewChange, view],
+  );
+
+  const selectPanel = React.useCallback(
+    (panelTab: ChatPanelId) => setView({ panelTab }),
+    [setView],
+  );
+  const closePanel = React.useCallback(() => setView({ panelOpen: false }), [setView]);
+
+  // On a phone the rail replaces the conversation rather than sitting beside
+  // it: 320px of panel next to a 390px viewport leaves neither usable.
+  const workspaceTakesOver = isMobile && workspaceOpen;
 
   return (
     <section
@@ -129,6 +189,11 @@ export function ChatView({
         flexDirection: 'column',
         flex: 1,
         minHeight: 0,
+        // A flex item defaults to `min-width: auto`, which means it refuses to
+        // shrink below its content — so one long file path in the rail, or one
+        // long line in the transcript, pushed the whole surface wider than the
+        // phone and cut off the right-hand edge of everything on it.
+        minWidth: 0,
         height: '100%',
         background: 'var(--background)',
         color: 'var(--foreground)',
@@ -205,7 +270,9 @@ export function ChatView({
           {/* UsageMeter renders nothing at all when the runtime has reported no
               numbers, which is exactly the "when there is usage to show" rule —
               deciding it twice is how the two answers drift apart. */}
-          <UsageMeter usage={transcript.usage} capabilities={transcript.capabilities} compact />
+          {view.showUsage ? (
+            <UsageMeter usage={transcript.usage} capabilities={transcript.capabilities} compact />
+          ) : null}
 
           <div
             role="status"
@@ -226,11 +293,24 @@ export function ChatView({
             </span>
           </div>
 
+          {panelsAvailable && onViewChange ? (
+            <IconButton
+              type="button"
+              size={isMobile ? 'lg' : 'md'}
+              label={workspaceOpen ? 'Hide workspace panel' : 'Show workspace panel'}
+              aria-pressed={workspaceOpen}
+              onClick={() => setView({ panelOpen: !workspaceOpen })}
+              style={workspaceOpen ? { color: 'var(--foreground)' } : undefined}
+            >
+              <Icon name="panel-left" />
+            </IconButton>
+          ) : null}
+
           {onOpenSettings ? (
             <IconButton
               type="button"
               size={isMobile ? 'lg' : 'md'}
-              label="Settings"
+              label="Chat display settings"
               onClick={onOpenSettings}
             >
               <Icon name="settings" />
@@ -240,13 +320,164 @@ export function ChatView({
       </header>
 
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-        <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        {/* Ahead of the transcript in the DOM as well as on screen: the rail
+            is a sibling navigation surface, and a keyboard user reaching it
+            after the whole conversation would have to tab past every message
+            in it. */}
+        {workspaceOpen ? (
+          <WorkspacePanel
+            sessionId={controller.sessionId}
+            workingDir={workingDir}
+            transcript={transcript}
+            settings={view}
+            onSelectTab={selectPanel}
+            onClose={closePanel}
+            onResize={(panelWidth) => setView({ panelWidth })}
+            isMobile={isMobile}
+          />
+        ) : null}
+
+        {/* The conversation column: the transcript and, below it, everything
+            that must never scroll away. The composer used to sit outside this
+            row entirely, which made it the full width of the surface — so the
+            workspace rail was drawn over the left end of the input, and
+            dragging the rail wider covered more of it. It belongs to this
+            column, and is bounded by the same two rails the transcript is. */}
+        <div
+          style={{
+            flex: 1,
+            minWidth: 0,
+            // Hidden rather than unmounted on a phone: the scroll position of a
+            // long conversation is worth more than the few nodes this saves.
+            display: workspaceTakesOver ? 'none' : 'flex',
+            flexDirection: 'column',
+            minHeight: 0,
+          }}
+        >
           {/* An empty transcript is MessageList's own quiet prompt to start.
               Duplicating it here would put two invitations on one screen. */}
-          <MessageList transcript={transcript} onLoadMore={loadMore} />
+          <MessageList
+            transcript={transcript}
+            onLoadMore={loadMore}
+            showThinking={view.showThinking}
+            showToolCalls={view.showToolCalls}
+          />
+
+          <div
+            style={{
+              flex: '0 0 auto',
+              display: 'grid',
+              // `minmax(0, 1fr)`, not the implicit `auto` track. A grid item
+              // has `min-width: auto` exactly the way a flex item does, so the
+              // implicit track refuses to go below the composer's min-content
+              // width — and once the composer lived in this column rather than
+              // across the whole surface, dragging the workspace rail wide
+              // pushed it straight off the right-hand edge instead of shrinking
+              // it. `minWidth: 0` on the container alone does not fix this; the
+              // track is what has to be allowed to shrink.
+              gridTemplateColumns: 'minmax(0, 1fr)',
+              minWidth: 0,
+              gap: 'var(--space-2)',
+              padding: 'var(--space-2) var(--space-3) var(--space-3)',
+              borderTop: '1px solid var(--border)',
+              background: 'var(--background)',
+              // iOS does not shrink the layout viewport for the on-screen
+              // keyboard, and the shell's existing lift (terminal/keyboard.ts)
+              // only fires for the xterm textarea, so the composer would sit
+              // under the keyboard. Margin rather than padding: it has to take
+              // height away from the flex column, which is what pushes the
+              // composer back into view.
+              marginBottom: keyboardInset || undefined,
+              paddingBottom: isMobile ? 'env(safe-area-inset-bottom, 0px)' : undefined,
+            }}
+          >
+            {unavailable ? (
+              <UnavailableNotice
+                reason={unavailable}
+                runtimeLabel={runtimeLabel}
+                onResume={() => relaunch(true)}
+                onFresh={() => relaunch(false)}
+              />
+            ) : (
+              <StateNotice state={chatState} runtimeLabel={runtimeLabel} error={transcript.lastError} />
+            )}
+
+            {showPlanSheet ? (
+              <div>
+                <button
+                  type="button"
+                  aria-expanded={planOpen}
+                  onClick={() => setPlanOpen((open) => !open)}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    width: '100%',
+                    minHeight: TOUCH,
+                    padding: '0 var(--space-2)',
+                    background: 'var(--card)',
+                    border: '1px solid var(--border)',
+                    borderRadius: 'var(--radius)',
+                    color: 'var(--foreground)',
+                    font: 'inherit',
+                    fontSize: 'var(--text-sm)',
+                    textAlign: 'left',
+                    cursor: 'pointer',
+                  }}
+                >
+                  <Icon name={planOpen ? 'chevron-down' : 'chevron-right'} size={12} />
+                  <Icon name="list-todo" size={12} />
+                  Plan
+                  <span style={{ marginLeft: 'auto', color: 'var(--muted-foreground)' }}>
+                    {plan.filter((item) => item.status === 'completed').length} of {plan.length}
+                  </span>
+                </button>
+                {planOpen ? (
+                  <div style={{ marginTop: 'var(--space-1)', maxHeight: '30vh', overflowY: 'auto' }}>
+                    <PlanPanel items={plan} compact />
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            {pending.length > 0 ? (
+              // assertive, not polite: nothing else the user does will move the
+              // session forward until one of these is answered.
+              <div
+                role="region"
+                aria-label="Pending approvals"
+                aria-live="assertive"
+                style={{ display: 'grid', gap: 'var(--space-2)', maxHeight: '50vh', overflowY: 'auto' }}
+              >
+                {pending.map((request) => (
+                  <PermissionCard key={request.requestId} request={request} onRespond={respond} />
+                ))}
+              </div>
+            ) : null}
+
+            <Composer
+              onSend={send}
+              onInterrupt={interrupt}
+              busy={transcript.busy}
+              capabilities={transcript.capabilities}
+              // Only a dead session takes the input away. An approval on screen
+              // used to disable it too, which meant the one moment you most
+              // want to type the follow-up — while the agent waits on you — was
+              // the one moment you could not. It queues instead.
+              // Also while the recovery offer is up: a message typed into a
+              // session with no process would come straight back as the same
+              // failure, and the choice above is what has to happen first.
+              disabled={exited || Boolean(unavailable)}
+              placeholder={placeholderFor(chatState, runtimeLabel)}
+              queued={transcript.queuedTurns}
+              onCancelQueued={cancelQueued}
+              onFindFiles={findProjectFiles}
+              onUpload={upload}
+            />
+          </div>
         </div>
 
-        {showRail ? (
+        {showRail && !workspaceOpen ? (
           <aside
             aria-label="Plan"
             style={{
@@ -263,88 +494,6 @@ export function ChatView({
           </aside>
         ) : null}
       </div>
-
-      <div
-        style={{
-          flex: '0 0 auto',
-          display: 'grid',
-          gap: 'var(--space-2)',
-          padding: 'var(--space-2) var(--space-3) var(--space-3)',
-          borderTop: '1px solid var(--border)',
-          background: 'var(--background)',
-          // iOS does not shrink the layout viewport for the on-screen keyboard,
-          // and the shell's existing lift (terminal/keyboard.ts) only fires for
-          // the xterm textarea, so the composer would sit under the keyboard.
-          // Margin rather than padding: it has to take height away from the
-          // flex column, which is what pushes the composer back into view.
-          marginBottom: keyboardInset || undefined,
-          paddingBottom: isMobile ? 'env(safe-area-inset-bottom, 0px)' : undefined,
-        }}
-      >
-        <StateNotice state={chatState} runtimeLabel={runtimeLabel} error={transcript.lastError} />
-
-        {showPlanSheet ? (
-          <div>
-            <button
-              type="button"
-              aria-expanded={planOpen}
-              onClick={() => setPlanOpen((open) => !open)}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 6,
-                width: '100%',
-                minHeight: TOUCH,
-                padding: '0 var(--space-2)',
-                background: 'var(--card)',
-                border: '1px solid var(--border)',
-                borderRadius: 'var(--radius)',
-                color: 'var(--foreground)',
-                font: 'inherit',
-                fontSize: 'var(--text-sm)',
-                textAlign: 'left',
-                cursor: 'pointer',
-              }}
-            >
-              <Icon name={planOpen ? 'chevron-down' : 'chevron-right'} size={12} />
-              <Icon name="list-todo" size={12} />
-              Plan
-              <span style={{ marginLeft: 'auto', color: 'var(--muted-foreground)' }}>
-                {plan.filter((item) => item.status === 'completed').length} of {plan.length}
-              </span>
-            </button>
-            {planOpen ? (
-              <div style={{ marginTop: 'var(--space-1)', maxHeight: '30vh', overflowY: 'auto' }}>
-                <PlanPanel items={plan} compact />
-              </div>
-            ) : null}
-          </div>
-        ) : null}
-
-        {pending.length > 0 ? (
-          // assertive, not polite: nothing else the user does will move the
-          // session forward until one of these is answered.
-          <div
-            role="region"
-            aria-label="Pending approvals"
-            aria-live="assertive"
-            style={{ display: 'grid', gap: 'var(--space-2)', maxHeight: '50vh', overflowY: 'auto' }}
-          >
-            {pending.map((request) => (
-              <PermissionCard key={request.requestId} request={request} onRespond={respond} />
-            ))}
-          </div>
-        ) : null}
-
-        <Composer
-          onSend={send}
-          onInterrupt={interrupt}
-          busy={transcript.busy}
-          capabilities={transcript.capabilities}
-          disabled={exited || awaiting}
-          placeholder={placeholderFor(chatState, runtimeLabel)}
-        />
-      </div>
     </section>
   );
 }
@@ -353,16 +502,87 @@ const ZERO = (): number => 0;
 
 function placeholderFor(state: ChatState, runtimeLabel: string): string {
   if (state === 'exited') return 'This session has ended';
-  if (state === 'awaiting_permission') return 'Answer the approval above to continue';
+  // No longer 'answer this before you can type': the composer stays live and
+  // queues, so the sentence has to describe what happens rather than forbid it.
+  if (state === 'awaiting_permission') return 'Answer above — or type the next message';
   return `Message ${runtimeLabel}…`;
+}
+
+/**
+ * A conversation with nothing running it, and the two ways out.
+ *
+ * The ordinary way to get here is the server restarting: chat sessions live in
+ * its memory and transcripts live on disk, so the conversation outlives the
+ * process that was having it. What the user saw before was the app-wide
+ * "Connection error" panel — covering the transcript, blaming the network, and
+ * offering a Retry that reconnected a socket that had never been the problem.
+ *
+ * Both buttons act on *this* session in *this* tab, which is the point: the
+ * conversation is what the user came back for, and sending them to a new tab
+ * to escape the error would leave it behind.
+ */
+function UnavailableNotice({
+  reason,
+  runtimeLabel,
+  onResume,
+  onFresh,
+}: {
+  reason: ChatUnavailable;
+  /** What this pane calls the runtime, used when the server named none. */
+  runtimeLabel: string;
+  onResume: () => void;
+  onFresh: () => void;
+}) {
+  const label = reason.runtimeLabel || runtimeLabel || 'The agent';
+  return (
+    <div
+      role="alert"
+      style={{
+        display: 'grid',
+        gap: 'var(--space-2)',
+        padding: 'var(--space-3)',
+        border: '1px solid var(--border)',
+        borderRadius: 'var(--radius)',
+        background: 'var(--card)',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+        <span aria-hidden="true" style={{ color: 'var(--warning)', display: 'inline-flex' }}>
+          <Icon name="plug" size={16} />
+        </span>
+        <strong style={{ fontSize: 'var(--text-body)' }}>
+          {`${label} is no longer running`}
+        </strong>
+      </div>
+
+      <p style={{ margin: 0, fontSize: 'var(--text-sm)', color: 'var(--muted-foreground)' }}>
+        {reason.canResume
+          ? 'This conversation is safe — it is stored on disk. Pick it up where it left off, or start a new one in this tab.'
+          : 'This conversation is safe — it is stored on disk. Nothing recorded which conversation the agent had, so it cannot be given its context back; a new one starts with this transcript closed.'}
+      </p>
+
+      <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
+        {/* Offered only when it can actually deliver. A "Resume" that quietly
+            produced an agent with no memory of the transcript above it would be
+            the most expensive kind of wrong: it looks like it worked. */}
+        {reason.canResume ? (
+          <Button variant="primary" onClick={onResume}>
+            Resume this conversation
+          </Button>
+        ) : null}
+        <Button variant={reason.canResume ? 'ghost' : 'primary'} onClick={onFresh}>
+          Start a new chat
+        </Button>
+      </div>
+    </div>
+  );
 }
 
 /**
  * The three states that owe the user a sentence.
  *
- * `exited` deliberately carries no button: nothing in this pane can restart a
- * dead process, and an affordance that cannot deliver is worse than the plain
- * statement that the session is over.
+ * `exited` carries no button of its own: the recovery offer above is where
+ * that choice lives, and it appears on the same condition with more to say.
  */
 function StateNotice({
   state,

@@ -14,6 +14,6 @@
     "sourceMap": true,
     "jsx": "react-jsx"
   },
-  "include": ["src/client/**/*.ts", "src/client/**/*.tsx", "src/shared/**/*.ts"],
+  "include": ["src/client/**/*.ts", "src/client/**/*.tsx", "src/client/**/*.d.ts", "src/shared/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

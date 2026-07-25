@@ -20,7 +20,7 @@ import {
 import { setupTerminal, fitTerminal } from './terminal/setup';
 import { WebSocketConnection } from './terminal/connection';
 import { MessageHandler } from './terminal/message-handler';
-import { ChatController } from './chat/controller';
+import { ChatRegistry } from './chat/registry';
 import { syncChatSurface } from './chat/surface';
 import { SessionTabManager } from './sessions/tab-manager';
 import {
@@ -59,6 +59,7 @@ import {
   watchViewport,
 } from './ui/mobile';
 import { watchKeyboardInset } from './terminal/keyboard';
+import { installBrowserShortcutGuard } from './ui/browser-shortcuts';
 import { showNotification, playNotificationSound } from './ui/notifications';
 import { setupUpdateBanner } from './ui/update-banner';
 import { pickImage, type ImagePasteTarget } from './terminal/paste';
@@ -124,13 +125,14 @@ export class App {
   wsConnection: WebSocketConnection;
   messageHandler: MessageHandler;
   /**
-   * The chat surface's controller.
+   * Every chat conversation this page is watching, keyed by session id.
    *
-   * Always present, even for terminal sessions: it costs nothing idle, and a
-   * lazily-created one would have to be threaded through every place a message
-   * can arrive before the surface is known.
+   * A registry rather than a single controller: the browser can hold a tab per
+   * conversation and each one keeps its own transcript and its own live
+   * subscription, so switching tabs shows a different conversation instead of
+   * overwriting the one that was there.
    */
-  chat: ChatController;
+  chats: ChatRegistry;
   sessionTabManager!: SessionTabManager;
   folderBrowser: FolderBrowser;
   planDetector: PlanDetector;
@@ -185,7 +187,7 @@ export class App {
 
     this.wsConnection = new WebSocketConnection(this);
     this.messageHandler = new MessageHandler(this);
-    this.chat = new ChatController({
+    this.chats = new ChatRegistry({
       send: (message) => this.send(message),
       onChange: () => syncChatSurface(this),
     });
@@ -229,6 +231,10 @@ export class App {
 
     await loadConfig(this);
     setupTerminal(this);
+    // One listener for the page. Which surfaces it applies to is decided by
+    // the `data-claims-shortcuts` attribute, not by this call — the composer,
+    // the dialogs and every ordinary text field keep the browser's defaults.
+    installBrowserShortcutGuard();
     this.setupPlanDetector();
     applySettings(this, loadSettings());
     disablePullToRefresh();

@@ -5,6 +5,7 @@ import {
   ChatUsage,
   ErrorBlock,
   ImageBlock,
+  NoticeBlock,
   ThinkingBlock,
 } from '../../../shared/chat-events.js';
 import { ChatTranscript } from '../../chat/transcript.js';
@@ -32,6 +33,10 @@ export interface MessageBubbleProps {
   transcript: ChatTranscript;
   onFork?: (messageId: string) => void;
   onRetry?: () => void;
+  /** Hide reasoning blocks entirely, per the chat display settings. */
+  showThinking?: boolean;
+  /** Hide tool call cards. A view change only: the tools still run. */
+  showToolCalls?: boolean;
 }
 
 const ROLE_META: Record<string, { icon: string; label: string }> = {
@@ -45,6 +50,8 @@ export const MessageBubble = React.memo(function MessageBubble({
   transcript,
   onFork,
   onRetry,
+  showThinking = true,
+  showToolCalls = true,
 }: MessageBubbleProps) {
   const id = message.id;
 
@@ -67,6 +74,12 @@ export const MessageBubble = React.memo(function MessageBubble({
 
   const [copied, setCopied] = React.useState(false);
   const isUser = current.role === 'user';
+  // A marker is not a turn: no bubble, no header, no copy button, and the full
+  // width of the column — it is a line drawn across the conversation.
+  const isMarker =
+    current.role === 'system'
+    && current.blocks.length > 0
+    && current.blocks.every((block) => block.kind === 'notice');
   const meta = ROLE_META[current.role] || ROLE_META.assistant;
 
   const copy = React.useCallback(() => {
@@ -84,44 +97,101 @@ export const MessageBubble = React.memo(function MessageBubble({
       });
   }, [current]);
 
+  if (isMarker) {
+    return (
+      <div style={{ display: 'grid', gap: 6, padding: '6px 8px' }}>
+        {current.blocks.map((block, i) => (
+          <BlockView
+            key={i}
+            block={block}
+            plain={false}
+            onRetry={onRetry}
+            showThinking={showThinking}
+            showToolCalls={showToolCalls}
+            caret={false}
+          />
+        ))}
+      </div>
+    );
+  }
+
   return (
-    <article
-      aria-label={`${meta.label} message`}
+    // The alignment row. A bubble that is narrower than the column has to be
+    // pushed to one side by something, and giving the article `margin-left:
+    // auto` instead would fight the grid the list lays these out in.
+    <div
       style={{
-        display: 'grid',
-        gap: 6,
-        padding: '10px 12px',
-        // Role is carried by three independent signals — icon, text label and
-        // this surface — so it survives a monochrome display or colour blindness.
-        background: isUser ? 'var(--card)' : 'transparent',
-        borderLeft: isUser ? '2px solid var(--border-strong)' : '2px solid transparent',
+        display: 'flex',
+        justifyContent: isUser ? 'flex-end' : 'flex-start',
+        minWidth: 0,
+        padding: '2px 4px',
       }}
     >
+      <article
+        aria-label={`${meta.label} message`}
+        style={{
+          display: 'grid',
+          gap: 6,
+          minWidth: 0,
+          // Asymmetric on purpose. A user's turn is a sentence and reads better
+          // in a narrow column; the assistant's carries code blocks, diffs and
+          // diagrams, and squeezing those to the same width to look tidy would
+          // wrap every line of every listing.
+          maxWidth: isUser ? 'min(78%, 720px)' : '100%',
+          width: isUser ? 'fit-content' : '100%',
+          padding: '10px 12px',
+          // Square, like everything else here: `--radius` is 0 by house style,
+          // so the bubbles are read as bubbles by their edges and their
+          // alignment rather than by rounded corners.
+          borderRadius: 'var(--radius)',
+          // Role is carried by four independent signals — side, surface, icon
+          // and text label — so it survives a monochrome display, colour
+          // blindness, and a screen reader that sees none of the geometry.
+          background: isUser ? 'var(--card)' : 'transparent',
+          border: isUser ? '1px solid var(--border)' : '1px solid transparent',
+          borderLeft: isUser ? '1px solid var(--border)' : '2px solid var(--border)',
+        }}
+      >
       <header style={{ display: 'flex', alignItems: 'center', gap: 6, minHeight: 20 }}>
-        <span
-          style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            width: 18,
-            height: 18,
-            border: '1px solid var(--border)',
-            color: 'var(--muted-foreground)',
-            borderRadius: 'var(--radius)',
-          }}
-        >
-          <Icon name={meta.icon} size={11} />
-        </span>
-        <span
-          style={{
-            fontSize: 'var(--text-xs)',
-            fontWeight: 'var(--font-semibold)',
-            letterSpacing: 'var(--tracking-wide)',
-            color: 'var(--foreground)',
-          }}
-        >
-          {meta.label}
-        </span>
+        {/*
+          Only the user's turns are labelled.
+
+          A conversation is overwhelmingly the assistant talking, so "Assistant"
+          on every bubble is a word repeated down the whole page that says
+          nothing the reader did not already know — while "You" marks the far
+          rarer thing, and is worth the row. The user's turn keeps its card
+          background and left border too, so the two are still told apart
+          without reading anything. The <article> label below is unconditional,
+          so a screen reader still hears which is which.
+        */}
+        {isUser ? (
+          <>
+            <span
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: 18,
+                height: 18,
+                border: '1px solid var(--border)',
+                color: 'var(--muted-foreground)',
+                borderRadius: 'var(--radius)',
+              }}
+            >
+              <Icon name={meta.icon} size={11} />
+            </span>
+            <span
+              style={{
+                fontSize: 'var(--text-xs)',
+                fontWeight: 'var(--font-semibold)',
+                letterSpacing: 'var(--tracking-wide)',
+                color: 'var(--foreground)',
+              }}
+            >
+              {meta.label}
+            </span>
+          </>
+        ) : null}
         {current.streaming ? (
           <span
             style={{
@@ -163,6 +233,8 @@ export const MessageBubble = React.memo(function MessageBubble({
             block={block}
             plain={isUser}
             onRetry={onRetry}
+            showThinking={showThinking}
+            showToolCalls={showToolCalls}
             caret={Boolean(current.streaming) && i === current.blocks.length - 1}
           />
         ))}
@@ -178,8 +250,9 @@ export const MessageBubble = React.memo(function MessageBubble({
         {current.streaming ? `${meta.label} is responding` : ''}
       </span>
 
-      <Footer model={current.model} usage={current.usage} />
-    </article>
+        <Footer model={current.model} usage={current.usage} />
+      </article>
+    </div>
   );
 });
 
@@ -190,12 +263,16 @@ function BlockView({
   plain,
   caret,
   onRetry,
+  showThinking,
+  showToolCalls,
 }: {
   block: ChatBlock;
   /** True for the user's own turn, where text is echoed literally. */
   plain: boolean;
   caret: boolean;
   onRetry?: () => void;
+  showThinking: boolean;
+  showToolCalls: boolean;
 }) {
   switch (block.kind) {
     case 'text':
@@ -223,16 +300,21 @@ function BlockView({
       );
 
     case 'thinking':
-      return <Thinking block={block} />;
+      // Hidden, not collapsed. The card is already collapsed by default, so a
+      // setting that only collapsed it would change nothing.
+      return showThinking ? <Thinking block={block} /> : null;
 
     case 'tool':
-      return <ToolCallCard block={block} />;
+      return showToolCalls ? <ToolCallCard block={block} /> : null;
 
     case 'plan':
       return <PlanPanel items={block.items} />;
 
     case 'image':
       return <ImageView block={block} />;
+
+    case 'notice':
+      return <NoticeRule block={block} />;
 
     case 'error':
       return <ErrorCallout block={block} onRetry={onRetry} />;
@@ -308,6 +390,44 @@ function Thinking({ block }: { block: ThinkingBlock }) {
           <Markdown text={block.text} dense />
         </div>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * A rule across the conversation, marking something that happened to it.
+ *
+ * A line rather than a message, because nobody said it. Compaction is the case
+ * that matters: everything above the rule is still on screen and still worth
+ * reading, and is no longer in the agent's context — so an answer that
+ * contradicts something from earlier is explained rather than baffling.
+ */
+function NoticeRule({ block }: { block: NoticeBlock }): React.JSX.Element {
+  return (
+    <div
+      role="separator"
+      aria-label={block.detail ? `${block.text} — ${block.detail}` : block.text}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        width: '100%',
+        padding: '2px 0',
+        color: 'var(--muted-foreground)',
+        fontFamily: 'var(--font-sans)',
+        fontSize: 'var(--text-2xs)',
+        letterSpacing: 'var(--tracking-wide)',
+      }}
+    >
+      <span aria-hidden="true" style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
+        <Icon name="fold-vertical" size={11} />
+        {block.text}
+        {block.detail ? (
+          <span style={{ fontFamily: 'var(--font-mono)', opacity: 0.75 }}>{block.detail}</span>
+        ) : null}
+      </span>
+      <span aria-hidden="true" style={{ flex: 1, height: 1, background: 'var(--border)' }} />
     </div>
   );
 }

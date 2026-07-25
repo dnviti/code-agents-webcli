@@ -1,4 +1,5 @@
 // Terminal initialization: create xterm instance, addons, and event handlers
+import { CLAIM_ATTRIBUTE } from '../ui/browser-shortcuts';
 
 import type { App } from '../app';
 import { withCtrlLatch } from '../ui/mobile';
@@ -22,6 +23,10 @@ export function setupTerminal(app: App): void {
   const terminalEl = document.getElementById('terminal');
   if (terminalEl) {
     app.terminalController.open(terminalEl);
+    // Ctrl+R is reverse history search, Ctrl+U kills the line, Ctrl+P walks
+    // back through it. Without this the byte reached the shell *and* the
+    // browser reloaded the page, viewed the source or opened the print dialog.
+    terminalEl.setAttribute(CLAIM_ATTRIBUTE, 'terminal');
 
     const pasteTarget: ImagePasteTarget = {
       element: terminalEl,

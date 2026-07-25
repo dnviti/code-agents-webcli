@@ -358,6 +358,36 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires_at
         ON auth_sessions(expires_at);
     `);
+
+    // Which surface a session runs on. Added after the fact, so it is nullable
+    // and a null reads as 'terminal' — every row that predates chat mode is a
+    // terminal session, which makes the backfill a no-op rather than a guess.
+    this.addColumnIfMissing('runtime_sessions', 'surface', 'TEXT');
+
+    // The runtime's own id for the conversation, so a chat can be resumed with
+    // its context after the server restarts. It lives on the record rather than
+    // being read back out of the event log because the log is replayed from its
+    // tail: in a long conversation the `session` event that carries the id is
+    // thousands of events above the window, and a fact needed to *start* a
+    // session should not require replaying the session to learn.
+    this.addColumnIfMissing('runtime_sessions', 'native_chat_session_id', 'TEXT');
+  }
+
+  /**
+   * Additive schema change that is safe to run on every boot.
+   *
+   * SQLite has no `ADD COLUMN IF NOT EXISTS`, and `ALTER TABLE` on an existing
+   * column is an error rather than a no-op, so the table is asked what it has
+   * first. Additive-and-nullable is the only shape allowed here: it leaves an
+   * older build able to read the same file, which matters because a downgrade
+   * is a normal part of how this app is updated.
+   */
+  private addColumnIfMissing(table: string, column: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (columns.some((existing) => existing.name === column)) {
+      return;
+    }
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 }
 
