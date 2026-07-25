@@ -315,6 +315,8 @@ export class ClaudeCodeWebServer {
       workingDir: params.workingDir,
       connections: new Set(params.connections || []),
       outputBuffer: [],
+      termCols: 80,
+      termRows: 24,
       sessionStartTime: null,
       sessionUsage: {
         requests: 0,

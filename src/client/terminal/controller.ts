@@ -34,11 +34,12 @@ interface CreateTerminalControllerOptions {
 }
 
 /**
- * The live terminal only holds the recent tail. Everything older is paged in
- * from the server on demand, so a bigger buffer here would only add reflow cost
- * (xterm reflows the whole scrollback on every resize) without adding reach.
+ * How far back the live terminal scrolls on its own. Everything older is paged
+ * in from the server on demand; the trade-off of a bigger buffer is reflow
+ * cost (xterm reflows the whole scrollback on every resize), accepted here so
+ * an ordinary scroll-up covers a whole agent reply without hitting the wire.
  */
-export const LIVE_SCROLLBACK_LINES = 2000;
+export const LIVE_SCROLLBACK_LINES = 20000;
 
 export const DEFAULT_THEME: NonNullable<ITerminalOptions['theme']> = {
   background: '#0d1117',

@@ -186,6 +186,10 @@ export class SessionStore {
           workingDir: row.working_dir,
           connections: new Set(),
           outputBuffer: parseJson<string[]>(row.output_buffer_json, []),
+          // Geometry is runtime state, not persisted: the next client resize
+          // re-establishes it before the recorder sees any output.
+          termCols: 80,
+          termRows: 24,
           sessionStartTime: row.session_start_time ? new Date(row.session_start_time) : null,
           sessionUsage: parseJson(row.session_usage_json, {
             requests: 0,
