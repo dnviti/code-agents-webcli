@@ -132,17 +132,21 @@ export class ScrollbackRecorder {
       return;
     }
 
-    // Cheap pre-scan of the raw chunk: the emulator settles the buffer but
-    // says nothing about how it got there, and the flush below needs to know
-    // whether the lines it is about to freeze came from an in-place repaint.
-    if (REDRAW_SIGNAL.test(rawData)) {
-      this.redrawSeen = true;
-    }
-
     // See ERASE_SCROLLBACK: a scrollback wipe has no meaning for a recorder.
     const data = rawData.replace(ERASE_SCROLLBACK, '');
     if (!data) {
       return;
+    }
+
+    // Cheap pre-scan of the chunk: the emulator settles the buffer but says
+    // nothing about how it got there, and the flush below needs to know
+    // whether the lines it is about to freeze came from an in-place repaint.
+    // Scan after the ED 3 strip and never on an emptied chunk: the flag is
+    // consumed by the next flush whatever produced it, so letting a fully
+    // stripped write set it would gate — and wrongly collapse — unrelated
+    // output that arrives later.
+    if (REDRAW_SIGNAL.test(data)) {
+      this.redrawSeen = true;
     }
 
     // The parser runs asynchronously, so the buffer is only settled once the

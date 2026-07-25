@@ -337,9 +337,15 @@ export class MessageProcessor {
 
     // The scrollback recorder is born on the first output byte, before any
     // resize message can arrive, so the geometry the run starts at has to be
-    // known here — otherwise the splash is recorded wrapped at 80x24.
-    session.termCols = Math.max(1, Math.floor((safeOptions.cols as number) || 80));
-    session.termRows = Math.max(1, Math.floor((safeOptions.rows as number) || 24));
+    // known here — otherwise the splash is recorded wrapped at 80x24. Only
+    // the payload overrides what the session already knows: a restart without
+    // geometry must not clobber the size an earlier resize established.
+    if (typeof safeOptions.cols === 'number') {
+      session.termCols = Math.max(1, Math.floor(safeOptions.cols));
+    }
+    if (typeof safeOptions.rows === 'number') {
+      session.termRows = Math.max(1, Math.floor(safeOptions.rows));
+    }
 
     // Identifies this particular run, so a late callback from a previous run
     // cannot mark the current one dead and orphan its PTY.
@@ -558,6 +564,10 @@ export class MessageProcessor {
 
     const session = this.deps.claudeSessions.get(wsInfo.claudeSessionId);
     if (!session || !session.connections.has(wsId)) return;
+
+    // cols/rows come straight off the socket: Math.max(1, Math.floor(NaN))
+    // is NaN, and a NaN geometry would reach the emulator and the PTY.
+    if (!Number.isFinite(cols) || !Number.isFinite(rows)) return;
 
     // Keep the recorder's geometry in step with the PTY, otherwise stored lines
     // would be wrapped at a width the program never actually rendered at.

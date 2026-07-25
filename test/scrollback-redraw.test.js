@@ -206,6 +206,36 @@ describe('ScrollbackRecorder with repainting programs', function () {
     recorder.dispose();
   });
 
+  it('does not leak the redraw gate out of a write that was only an ED 3', async function () {
+    const { recorder, lines, gaps } = makeRecorder({ rows: 5 });
+    recorder.write('primo blocco\r\n');
+    for (let i = 0; i < 8; i++) {
+      recorder.write(`pad ${i}\r\n`);
+    }
+    await settle();
+
+    // A write that contains nothing but the wipe: stripped to empty, it must
+    // not arm the collapse gate for whatever flushes next.
+    recorder.write('\x1b[3J');
+    await settle();
+
+    // A plain program genuinely prints the same line again — no repaint
+    // sequences anywhere. Both copies must survive.
+    recorder.write('primo blocco\r\n');
+    for (let i = 0; i < 8; i++) {
+      recorder.write(`coda ${i}\r\n`);
+    }
+    await settle();
+
+    assert.deepStrictEqual(gaps, []);
+    assert.strictEqual(
+      lines.filter((line) => line === 'primo blocco').length,
+      2,
+      'a genuine repeat after an emptied write must not be collapsed',
+    );
+    recorder.dispose();
+  });
+
   it('collapses splash re-renders even across chunked writes', async function () {
     const { recorder, lines } = makeRecorder();
     const frame = Array.from({ length: 10 }, (_, i) => `splash ${i}`);
