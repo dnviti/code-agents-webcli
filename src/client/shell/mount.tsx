@@ -7,9 +7,11 @@ import { sendEscape, sendMobileKey, switchMode, toggleCtrlLatch } from '../ui/mo
 import { summonKeyboard } from '../terminal/keyboard';
 import { createNewSession, runTerminalCommand, startTerminalShell } from '../ui/modals';
 import { loadSettings, applySettings, saveSettings } from '../ui/settings';
+import { loadChatView, saveChatView, type ChatViewSettings } from '../chat/view-settings';
 import { onBannerAction, onBannerDismiss, onBannerToggleLog } from '../ui/update-banner';
+import { hideOverlay, showError } from '../ui/overlay';
 import { AppShell, type ShellActions } from './AppShell';
-import { RuntimeLauncher } from './RuntimeLauncher';
+import { RuntimeLauncher, type ResumableConversation } from './RuntimeLauncher';
 import { readStoredTheme, setThemeMode, type RelayTheme } from './theme';
 import { shellStore } from './store';
 import { relayTerminalTheme } from './terminal-theme';
@@ -66,6 +68,10 @@ export function mountShell(app: App): void {
   themedApp = app;
   applyTheme(readStoredTheme());
 
+  // Published before the first render so the chat surface opens with the rail
+  // the user left it with, rather than flashing the default and then correcting.
+  shellStore.setState({ chatView: loadChatView() });
+
   createRoot(mountPoint).render(
     <AppShell
       terminalNode={terminalNode}
@@ -73,6 +79,74 @@ export function mountShell(app: App): void {
       launcher={buildLauncher(app)}
     />,
   );
+}
+
+/** Past conversations in a folder, for the launcher's resume list. */
+async function fetchResumable(app: App, workingDir: string): Promise<ResumableConversation[]> {
+  const response = await app.authFetch(
+    `/api/sessions/resumable?dir=${encodeURIComponent(workingDir)}`,
+  );
+  if (!response.ok) return [];
+  const data = (await response.json()) as { conversations?: ResumableConversation[] };
+  return Array.isArray(data.conversations) ? data.conversations : [];
+}
+
+/**
+ * Pick up a past conversation instead of starting a new one.
+ *
+ * The tab the user is looking at was created a moment ago by choosing a folder,
+ * and it is not the one they want: the conversation they picked has its own
+ * session, with its own transcript. So this switches the tab to that session
+ * and then throws the empty one away — leaving it behind would put a session
+ * that never held anything into the session list, once per resume.
+ *
+ * `resume: true` is what makes it a resume rather than a re-open: the runtime
+ * is handed back its own conversation, so it remembers what is on screen. A
+ * conversation that never recorded one still opens — the transcript is intact
+ * either way — with an agent reading it for the first time, which the list
+ * marks as "transcript only" so the choice is made knowingly.
+ */
+async function resumeConversation(app: App, conversation: ResumableConversation): Promise<void> {
+  const abandoned = app.currentClaudeSessionId;
+  const runtime = (conversation.runtime || 'claude') as AgentKind;
+
+  try {
+    if (app.sessionTabManager) {
+      app.sessionTabManager.addTab(
+        conversation.id,
+        conversation.name,
+        'idle',
+        undefined,
+        false,
+      );
+      await app.sessionTabManager.switchToTab(conversation.id);
+    } else {
+      await app.joinSession(conversation.id);
+    }
+
+    app.startPromptRequested = false;
+    hideOverlay();
+
+    // Already running: it has a live process and a live transcript, and the
+    // join above is the whole of what "open it" means. Starting it again would
+    // be refused, and rightly.
+    if (!conversation.running) {
+      app.send({
+        type: 'start_chat',
+        agentKind: runtime,
+        sessionId: conversation.id,
+        options: { resume: true },
+      });
+    }
+
+    // Last, and only once the destination is open: deleting first would leave
+    // the user on a tab that no longer exists if the join then failed.
+    if (abandoned && abandoned !== conversation.id) {
+      await app.deleteSession(abandoned, { confirm: false });
+    }
+  } catch (error: unknown) {
+    showError(error instanceof Error ? error.message : 'That conversation could not be opened');
+  }
 }
 
 /**
@@ -114,6 +188,38 @@ function buildLauncher(app: App): React.ReactNode {
       shellStore.getSnapshot,
       shellStore.getSnapshot,
     );
+
+    const workingDir = app.selectedWorkingDir || app.currentFolderPath || '';
+    const [conversations, setConversations] = React.useState<ResumableConversation[]>([]);
+    const [loading, setLoading] = React.useState(false);
+
+    // Asked each time the launcher opens on a folder, not cached: an agent may
+    // have been running in another tab since the last time, and a stale list
+    // would offer a conversation to resume that is already going.
+    React.useEffect(() => {
+      if (!workingDir) {
+        setConversations([]);
+        return;
+      }
+      let cancelled = false;
+      setLoading(true);
+      fetchResumable(app, workingDir)
+        .then((list) => {
+          if (!cancelled) setConversations(list);
+        })
+        .catch(() => {
+          // A folder with no past conversations and a server that could not
+          // answer look the same from here, and both mean "just launch".
+          if (!cancelled) setConversations([]);
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }, [workingDir]);
+
     return (
       <RuntimeLauncher
         aliases={app.aliases}
@@ -121,6 +227,10 @@ function buildLauncher(app: App): React.ReactNode {
         onTerminal={onTerminal}
         onCancel={() => void app.cancelStartPrompt()}
         compact={state.isMobile}
+        chatBypass={state.chatBypassPermissions}
+        conversations={conversations}
+        conversationsLoading={loading}
+        onResume={(conversation) => void resumeConversation(app, conversation)}
       />
     );
   }
@@ -155,6 +265,12 @@ function buildActions(app: App): ShellActions {
     attachImage: () => app.attachImage(),
     reconnect: () => app.reconnect(),
     closeCurrentSession: () => void app.closeSession(),
+
+    setChatView: (next: ChatViewSettings) => {
+      // Normalised on the way to storage and published from the same value, so
+      // the store can never hold a setting that would not survive a reload.
+      shellStore.setState({ chatView: saveChatView(next) });
+    },
 
     setTheme: applyTheme,
     readSettings: () => loadSettings(),

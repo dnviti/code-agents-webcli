@@ -45,6 +45,21 @@
   to { transform: translateY(0); opacity: 1; }
 }
 
+/* The composer's "the agent is working" signal: a highlight travelling along
+   the top edge of the input. On the edge rather than over the text because the
+   field stays usable while it runs — you can type the next message into it. */
+@keyframes relay-composer-sweep {
+  from { background-position: -60% 0; }
+  to { background-position: 160% 0; }
+}
+
+/* Attachment and queued-turn chips, arriving. Short and small: several can
+   appear at once and anything longer reads as the row rearranging itself. */
+@keyframes relay-chip-in {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   /* The sheet, the toasts and the spinner all animate; none of them carry
      meaning that survives only in the motion. */

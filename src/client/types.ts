@@ -4,6 +4,15 @@ export interface AppSettings {
   fontSize: number;
   theme: ThemePresetId;
   terminalFontFamily: TerminalFontFamilyId;
+  /**
+   * Launch web chats with tool approvals bypassed.
+   *
+   * A launch-time property of the session, not a live switch: the runtime is
+   * told once, on the command line, and a session that started asking keeps
+   * asking. Stored here so the choice survives a reload rather than having to
+   * be re-made for every conversation.
+   */
+  chatBypassPermissions: boolean;
 }
 
 export type ThemePresetId =
@@ -96,6 +105,8 @@ export interface SessionListItem {
   workingDir: string;
   connectedClients: number;
   created: string;
+  /** Absent means terminal, so a server that predates chat mode still reads. */
+  surface?: 'terminal' | 'chat';
 }
 
 export interface FolderData {
@@ -111,6 +122,13 @@ export interface FolderData {
 export interface WsConnectedMessage {
   type: 'connected';
   connectionId: string;
+  /**
+   * Optional protocol extensions this server understands.
+   *
+   * Absent on a server that predates the handshake, which is exactly the case
+   * the list exists for: the client then asks for nothing optional.
+   */
+  features?: string[];
 }
 
 export interface WsSessionCreatedMessage {
@@ -152,6 +170,7 @@ export interface WsChatStartedMessage {
   sessionId: string;
   agent: AgentKind;
   runtimeLabel: string;
+  workingDir?: string;
   capabilities?: unknown;
   bypassPermissions?: boolean;
 }
@@ -174,7 +193,17 @@ export interface WsChatPageMessage {
   requestId: string | null;
   events: unknown[];
   firstSeq: number;
+  /** Lowest seq this page covers once the server clamped the request. */
+  from?: number;
   cursor: number;
+}
+
+/** A page read that failed server-side, so the requesting tab stops waiting. */
+export interface WsChatPageFailedMessage {
+  type: 'chat_page_failed';
+  sessionId: string;
+  requestId: string | null;
+  message: string;
 }
 
 export interface WsHistoryChunkMessage {
@@ -330,4 +359,5 @@ export type WsMessage =
   | WsChatStartedMessage
   | WsChatSnapshotMessage
   | WsChatEventMessage
-  | WsChatPageMessage;
+  | WsChatPageMessage
+  | WsChatPageFailedMessage;

@@ -1,7 +1,22 @@
 // WebSocket connection management
 
 import type { App } from '../app';
+import { shellStore } from '../shell/store';
 import { hideOverlay, isOverlayVisible, showOverlay, showError } from '../ui/overlay';
+
+/**
+ * Publish the socket's state to the status bar.
+ *
+ * Nothing wrote this, so the indicator sat on `disconnected` — its initial
+ * value — for the whole life of a perfectly healthy session, and the one thing
+ * on screen that is supposed to tell you the connection dropped could never say
+ * anything else.
+ */
+function publishConnection(state: 'connected' | 'connecting' | 'disconnected'): void {
+  const { connection } = shellStore.getSnapshot();
+  if (connection.state === state) return;
+  shellStore.setState({ connection: { ...connection, state } });
+}
 
 export class WebSocketConnection {
   private app: App;
@@ -52,6 +67,7 @@ export class WebSocketConnection {
 
     this.clearReconnectTimer();
     this.manuallyClosed = false;
+    publishConnection('connecting');
 
     const socketVersion = ++this.socketVersion;
 
@@ -82,9 +98,14 @@ export class WebSocketConnection {
           }
 
           this.app.reconnectAttempts = 0;
+          publishConnection('connected');
           this.startHeartbeat();
           this.clearPongTimeout();
           void this.app.loadSessions();
+          // Subscriptions live on the server's socket record, so a reconnect
+          // starts with none. Without this every background conversation goes
+          // quiet after a dropped connection and only the joined one recovers.
+          this.app.sessionTabManager?.resubscribeChats();
 
           if (
             !this.app.currentClaudeSessionId &&
@@ -120,6 +141,7 @@ export class WebSocketConnection {
           this.stopHeartbeat();
           this.clearPongTimeout();
           this.app.socket = null;
+          publishConnection('disconnected');
 
           if (!settled) {
             fail(new Error('WebSocket closed before connection was established'));
@@ -204,6 +226,7 @@ export class WebSocketConnection {
     const socket = this.app.socket;
     this.app.socket = null;
     this.connectPromise = null;
+    publishConnection('disconnected');
 
     if (socket) {
       try {

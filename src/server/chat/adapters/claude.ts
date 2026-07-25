@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { BaseChatAdapter } from '../adapter.js';
+import { describeSlashCommand } from '../../../shared/slash-commands.js';
 import {
   ChatAttachment,
   ChatBlock,
@@ -177,6 +178,23 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       this.handleStatus(raw);
       return;
     }
+    if (subtype === 'compact_boundary') {
+      // The one system event that is genuinely about the conversation rather
+      // than about the plumbing: everything before this point is no longer in
+      // the model's context, and the transcript has to say so.
+      const meta = raw.compact_metadata as Record<string, unknown> | undefined;
+      const trigger = str(meta?.trigger);
+      const before = Number(meta?.pre_tokens);
+      this.emit({
+        t: 'marker',
+        kind: 'compacted',
+        detail: [
+          trigger === 'auto' ? 'ran automatically' : trigger === 'manual' ? 'requested' : '',
+          Number.isFinite(before) && before > 0 ? `${Math.round(before / 1000)}k tokens summarised` : '',
+        ].filter(Boolean).join(' · ') || undefined,
+      });
+      return;
+    }
     // hook_started / hook_response / anything else is session-internal
     // plumbing a transcript viewer has no use for.
   }
@@ -185,10 +203,21 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     const sessionId = str(raw.session_id) ?? this.freshSessionId ?? this.options.resumeSessionId;
     this.nativeSessionId = sessionId;
 
+    // Claude reports its commands as bare names. The picker has a column for a
+    // description and would otherwise show a list of indistinguishable slashes,
+    // so the built-ins are described from the shared table; anything this
+    // runtime supplies for itself, or a project command with its own
+    // frontmatter, is left exactly as it arrived.
     const slashCommands = Array.isArray(raw.slash_commands) ? (raw.slash_commands as unknown[]) : [];
     const commands = slashCommands
-      .map((name) => (typeof name === 'string' ? { name } : null))
-      .filter((c): c is { name: string } => c !== null);
+      .map((entry) => {
+        if (typeof entry === 'string') {
+          const description = describeSlashCommand(entry);
+          return description ? { name: entry, description } : { name: entry };
+        }
+        return null;
+      })
+      .filter((c): c is { name: string; description?: string } => c !== null);
 
     this.emit({
       t: 'session',

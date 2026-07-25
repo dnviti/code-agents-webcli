@@ -77,7 +77,7 @@ describe('Composer', function () {
     assert.ok(html.includes('aria-label="Send message"'), 'idle state should offer a send control');
     assert.ok(!html.includes('aria-label="Stop"'), 'not busy: no stop control');
     assert.ok(!html.includes('cannot be interrupted'), 'not busy: no interrupt explainer either');
-    assert.ok(!html.includes('aria-label="Attach a file"'), 'attachments capability is off');
+    assert.ok(!html.includes('aria-label="Attach a file or image"'), 'attachments capability is off');
     assert.ok(!html.includes('role="listbox"'), 'no commands were advertised');
     assert.ok(!html.includes('role="combobox"'), 'combobox role is not worn when there are no commands to complete');
   });
@@ -88,8 +88,14 @@ describe('Composer', function () {
 
     const busyWithInterrupt = render({ busy: true, capabilities: caps({ interrupt: true }) });
     assert.ok(busyWithInterrupt.includes('aria-label="Stop"'), 'busy + interrupt: Stop must appear');
-    assert.ok(!busyWithInterrupt.includes('aria-label="Send message"'), 'Stop replaces Send, it does not sit beside it');
-    assert.ok(!busyWithInterrupt.includes('disabled'), 'a working Stop control must not be disabled');
+    // Stop no longer *replaces* Send: a turn typed while the agent works is
+    // queued rather than refused, so both controls have a job at the same time.
+    assert.ok(!busyWithInterrupt.includes('aria-label="Send message"'), 'while busy, sending is queueing and says so');
+    assert.ok(busyWithInterrupt.includes('aria-label="Queue this message"'), 'the send control stays, relabelled');
+    assert.ok(
+      /aria-label="Stop" title="Stop"(?![^>]*disabled)/.test(busyWithInterrupt),
+      'a working Stop control must not be disabled',
+    );
 
     const busyWithoutInterrupt = render({ busy: true, capabilities: caps({ interrupt: false }) });
     assert.ok(!busyWithoutInterrupt.includes('aria-label="Stop"'), 'no bare "Stop" label when the runtime cannot honour it');
@@ -101,16 +107,16 @@ describe('Composer', function () {
 
   it('renders the attach affordance only when both the capability and an upload handler are present', function () {
     const noCapability = render({ capabilities: caps({ attachments: true }) }); // no onUpload
-    assert.ok(!noCapability.includes('aria-label="Attach a file"'), 'attachments advertised but nothing to do the uploading');
+    assert.ok(!noCapability.includes('aria-label="Attach a file or image"'), 'attachments advertised but nothing to do the uploading');
 
     const noFlag = render({ capabilities: caps({ attachments: false }), onUpload: async () => ({ url: '/x', mime: 'image/png', name: 'x', size: 1 }) });
-    assert.ok(!noFlag.includes('aria-label="Attach a file"'), 'onUpload alone is not the capability');
+    assert.ok(!noFlag.includes('aria-label="Attach a file or image"'), 'onUpload alone is not the capability');
 
     const both = render({
       capabilities: caps({ attachments: true }),
       onUpload: async () => ({ url: '/x', mime: 'image/png', name: 'x', size: 1 }),
     });
-    assert.ok(both.includes('aria-label="Attach a file"'), 'capability + handler: the paperclip must appear');
+    assert.ok(both.includes('aria-label="Attach a file or image"'), 'capability + handler: the paperclip must appear');
     assert.ok(both.includes('type="file"'), 'a real file input backs the button');
   });
 
@@ -126,6 +132,7 @@ describe('Composer', function () {
 
     const notSlash = render({ capabilities: caps({ commands }), draft: 'hello' });
     assert.ok(!notSlash.includes('role="listbox"'), 'commands exist but the draft is not a slash command');
+    assert.ok(notSlash.includes('aria-label="Slash commands and skills"'), 'a button reaches the list without typing "/"');
     assert.ok(notSlash.includes('role="combobox"'), 'the textarea still advertises the capability structurally');
     assert.ok(notSlash.includes('aria-expanded="false"'), 'closed combobox reports aria-expanded=false');
 
@@ -139,6 +146,57 @@ describe('Composer', function () {
 
     const filtered = render({ capabilities: caps({ commands }), draft: '/comp' });
     assert.ok(filtered.includes('/compact') && !filtered.includes('/clear'), 'typing narrows the match list');
+  });
+
+  it('keeps sending available while the agent is busy, because a turn queues', function () {
+    const busy = render({ busy: true, draft: 'the next thing', capabilities: caps({ interrupt: true }) });
+    assert.ok(
+      /aria-label="Queue this message"(?![^>]*disabled)/.test(busy),
+      'a drafted message must be sendable mid-run — the server queues it',
+    );
+    assert.ok(busy.includes('will go as soon as this turn finishes'), 'and the composer says what will happen to it');
+  });
+
+  it('lists what is waiting, in order, each one withdrawable', function () {
+    const html = render({
+      busy: true,
+      capabilities: caps({ interrupt: true }),
+      queued: [
+        { id: 'q1', text: 'first in line', ts: 1 },
+        { id: 'q2', text: 'second in line', ts: 2, attachments: [{ url: '/a', mime: 'image/png', name: 'a.png', size: 3 }] },
+      ],
+      onCancelQueued() {},
+    });
+
+    assert.ok(html.includes('aria-label="Messages waiting to be sent"'), 'the line is a labelled region');
+    assert.ok(html.indexOf('first in line') < html.indexOf('second in line'), 'oldest first');
+    assert.ok(html.includes('aria-label="Remove queued message 1"'), 'each waiting turn can be withdrawn');
+    assert.ok(html.includes('aria-label="Remove queued message 2"'));
+  });
+
+  it('offers no withdraw control when nothing can act on it', function () {
+    const html = render({ queued: [{ id: 'q1', text: 'waiting', ts: 1 }] });
+    assert.ok(html.includes('waiting'), 'the turn is still shown');
+    assert.ok(!html.includes('aria-label="Remove queued message 1"'), 'but not a button that would do nothing');
+  });
+
+  it('renders nothing extra when the queue is empty', function () {
+    assert.ok(!render({}).includes('Messages waiting to be sent'));
+  });
+
+  it('offers the file picker only when something can search for files', function () {
+    const without = render({});
+    assert.ok(!without.includes('aria-label="Reference a file from this project"'));
+    assert.ok(!without.includes('role="combobox"'), 'nothing completes, so it is not a combobox');
+
+    const with_ = render({ onFindFiles: async () => [] });
+    assert.ok(with_.includes('aria-label="Reference a file from this project"'), 'the @ button needs no typing to find');
+    assert.ok(with_.includes('role="combobox"'), 'the field completes, so it says so throughout');
+  });
+
+  it('does not offer the file picker on a dead session', function () {
+    const html = render({ disabled: true, onFindFiles: async () => [] });
+    assert.ok(!html.includes('aria-label="Reference a file from this project"'));
   });
 
   it('disables the whole composer via the disabled prop', function () {

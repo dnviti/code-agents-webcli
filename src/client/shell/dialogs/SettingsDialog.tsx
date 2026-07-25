@@ -7,6 +7,7 @@ import { Dialog } from '../../ui/relay/Dialog';
 import { Select } from '../../ui/relay/Select';
 import { Icon } from '../../ui/relay/Icon';
 import { SettingRow } from '../../ui/relay/SettingRow';
+import { Switch } from '../../ui/relay/Switch';
 
 const FONT_SIZE_MIN = 10;
 const FONT_SIZE_MAX = 24;
@@ -201,6 +202,39 @@ export function SettingsDialog({
           onChange={(event) => update({ terminalFontFamily: event.target.value as TerminalFontFamilyId })}
           style={{ minWidth: 220 }}
         />
+      </SettingRow>
+
+      <SettingRow
+        label="Web chat approvals"
+        description={
+          draft.chatBypassPermissions
+            ? 'New web chats will run every tool without asking — including shell commands and file writes. Conversations already running keep the setting they started with.'
+            : 'New web chats ask before each tool call. Turn this off to let them read, write and run commands unattended.'
+        }
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {draft.chatBypassPermissions ? (
+            <span
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                fontFamily: 'var(--font-sans)',
+                fontSize: 'var(--text-sm)',
+                color: 'var(--warning)',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              <Icon name="circle-alert" size={13} />
+              Bypassed
+            </span>
+          ) : null}
+          <Switch
+            checked={draft.chatBypassPermissions}
+            ariaLabel="Bypass tool approvals in new web chats"
+            onChange={(checked) => update({ chatBypassPermissions: checked })}
+          />
+        </div>
       </SettingRow>
 
       <SettingRow

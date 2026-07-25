@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import type { AgentKind, Aliases, RuntimeStartOptions } from '../types';
+import { Badge } from '../ui/relay/Badge';
 import { Button } from '../ui/relay/Button';
 import { Icon } from '../ui/relay/Icon';
 import { LaunchCard } from '../ui/relay/LaunchCard';
@@ -20,6 +21,41 @@ export interface RuntimeLauncherProps {
    * something shorter and friendlier than it is.
    */
   compact?: boolean;
+  /**
+   * Whether a web chat launched now would skip tool approvals.
+   *
+   * Passed in rather than read from storage here so the button's label and the
+   * flag it actually sends come from one value. The setting itself lives in the
+   * app Settings dialog, where a choice with this much consequence belongs.
+   */
+  chatBypass?: boolean;
+  /**
+   * Past conversations in this working directory, newest first.
+   *
+   * The web counterpart of `claude --resume`: having chosen a folder, the next
+   * question is usually "carry on with the one from this morning", not "start
+   * over". Absent or empty simply means there are none to offer, and the
+   * launcher is what it always was.
+   */
+  conversations?: ResumableConversation[];
+  /** True while that list is still being fetched. */
+  conversationsLoading?: boolean;
+  onResume?(conversation: ResumableConversation): void;
+}
+
+export interface ResumableConversation {
+  id: string;
+  name: string;
+  runtime: string | null;
+  runtimeLabel: string | null;
+  lastActivity: string;
+  events: number;
+  /** How the conversation opened — what makes the list readable. */
+  firstMessage: string | null;
+  /** False when nothing recorded which conversation the runtime was having. */
+  canResume: boolean;
+  /** Already running: joining it is right, resuming it is not. */
+  running: boolean;
 }
 
 interface RuntimeEntry {
@@ -62,11 +98,13 @@ function ChatLaunchButton({
   label,
   kind,
   compact,
+  bypass,
   onStart,
 }: {
   label: string;
   kind: AgentKind;
   compact?: boolean;
+  bypass?: boolean;
   onStart(kind: AgentKind, options?: RuntimeStartOptions): void;
 }): React.JSX.Element {
   const unavailable = chatUnavailableReason(kind);
@@ -92,13 +130,20 @@ function ChatLaunchButton({
       title={
         unavailable
           ? `${CHAT_LAUNCH_LABEL} is unavailable for ${label}. ${unavailable}`
-          : `Open ${label} as a chat in the browser instead of a terminal. This surface is in beta.`
+          : bypass
+            ? `Open ${label} as a chat in the browser. Tool approvals are bypassed for new chats `
+              + '(change that in Settings). This surface is in beta.'
+            : `Open ${label} as a chat in the browser instead of a terminal. This surface is in beta.`
       }
-      aria-label={compact ? `Open ${label} as a web chat (beta)` : undefined}
+      aria-label={
+        compact
+          ? `Open ${label} as a web chat (beta)${bypass ? ', approvals bypassed' : ''}`
+          : undefined
+      }
       onClick={(event: React.MouseEvent<HTMLButtonElement>) => {
         event.stopPropagation();
         if (unavailable) return;
-        onStart(kind, { surface: 'chat' });
+        onStart(kind, { surface: 'chat', dangerouslySkipPermissions: bypass === true });
       }}
     >
       {compact ? (
@@ -106,6 +151,14 @@ function ChatLaunchButton({
       ) : (
         CHAT_LAUNCH_LABEL
       )}
+      {/* Stated on the control that carries it, not only in a dialog the user
+          may never open: the difference between asking and not asking is the
+          single most consequential thing about the session being started. */}
+      {!compact && bypass ? (
+        <span style={{ marginLeft: 6, opacity: 0.85 }} aria-hidden="true">
+          · no prompts
+        </span>
+      ) : null}
     </Button>
   );
 }
@@ -128,13 +181,101 @@ function SectionLabel({ children }: { children: React.ReactNode }): React.JSX.El
   );
 }
 
+/**
+ * One past conversation, offered by what was said in it.
+ *
+ * The opening message is the label and the date is the detail, not the other
+ * way round: "che file ho caricato?" identifies a conversation instantly, where
+ * "Session 25/07/2026, 21:35" identifies nothing — which is the whole reason a
+ * list of timestamps is not worth showing.
+ */
+function ConversationCard({
+  conversation,
+  onSelect,
+}: {
+  conversation: ResumableConversation;
+  onSelect: () => void;
+}): React.JSX.Element {
+  const [hover, setHover] = React.useState(false);
+  const title = conversation.firstMessage || conversation.name;
+
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      title={title}
+      style={{
+        display: 'grid',
+        gap: 3,
+        width: '100%',
+        padding: '8px 10px',
+        textAlign: 'left',
+        font: 'inherit',
+        color: 'var(--foreground)',
+        background: hover ? 'var(--accent)' : 'transparent',
+        border: '1px solid var(--border)',
+        borderRadius: 'var(--radius)',
+        cursor: 'pointer',
+      }}
+    >
+      <span
+        style={{
+          display: 'block',
+          fontSize: 'var(--text-ui)',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {title}
+      </span>
+      <span
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          flexWrap: 'wrap',
+          fontSize: 'var(--text-2xs)',
+          color: 'var(--muted-foreground)',
+        }}
+      >
+        <span>{conversation.runtimeLabel || conversation.runtime || 'chat'}</span>
+        <span>{formatWhen(conversation.lastActivity)}</span>
+        {conversation.running ? <Badge variant="success">running</Badge> : null}
+        {/* Said here rather than discovered on arrival: the transcript comes
+            back either way, and this is the difference between an agent that
+            remembers it and one reading it for the first time. */}
+        {!conversation.running && !conversation.canResume ? (
+          <Badge variant="outline">transcript only</Badge>
+        ) : null}
+      </span>
+    </button>
+  );
+}
+
+/** A date a person reads, in their own locale. */
+function formatWhen(iso: string): string {
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return iso;
+  const today = new Date();
+  const sameDay = at.toDateString() === today.toDateString();
+  return sameDay ? at.toLocaleTimeString() : at.toLocaleString();
+}
+
 export function RuntimeLauncher({
   aliases,
   onStart,
   onTerminal,
   onCancel,
   compact,
+  chatBypass,
+  conversations,
+  conversationsLoading = false,
+  onResume,
 }: RuntimeLauncherProps): React.JSX.Element {
+  const resumable = onResume ? conversations || [] : [];
   return (
     <div
       style={{
@@ -180,10 +321,37 @@ export function RuntimeLauncher({
           fontSize: 'var(--text-body)',
         }}
       >
-        Pick a runtime for this working directory.
+        {resumable.length > 0
+          ? 'Carry on with a conversation, or start a new one.'
+          : 'Pick a runtime for this working directory.'}
       </div>
 
-      <SectionLabel>Agents</SectionLabel>
+      {/* Above the runtimes, because when there is one it is usually the
+          answer: someone who opened this folder yesterday is here to continue,
+          and making them scroll past six identical launch cards to find that
+          out is the wrong order. */}
+      {conversationsLoading || resumable.length > 0 ? (
+        <>
+          <SectionLabel>Resume a conversation</SectionLabel>
+          {conversationsLoading && resumable.length === 0 ? (
+            <div style={{ color: 'var(--muted-foreground)', fontSize: 'var(--text-sm)' }}>
+              Looking for past conversations…
+            </div>
+          ) : (
+            <div style={{ display: 'grid', gap: 6, maxHeight: 260, overflowY: 'auto' }}>
+              {resumable.map((conversation) => (
+                <ConversationCard
+                  key={conversation.id}
+                  conversation={conversation}
+                  onSelect={() => onResume?.(conversation)}
+                />
+              ))}
+            </div>
+          )}
+        </>
+      ) : null}
+
+      <SectionLabel>{resumable.length > 0 ? 'Or start something new' : 'Agents'}</SectionLabel>
       <div style={{ display: 'grid', gap: 8 }}>
         {RUNTIMES.map((runtime) => {
           // One fallback, used by both the label and the tooltip. Computed once
@@ -204,6 +372,7 @@ export function RuntimeLauncher({
                   label={label}
                   kind={runtime.kind}
                   compact={compact}
+                  bypass={chatBypass}
                   onStart={onStart}
                 />
                 {runtime.dangerous ? (

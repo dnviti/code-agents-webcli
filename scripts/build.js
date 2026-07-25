@@ -139,6 +139,88 @@ async function build() {
     process.exit(1);
   }
 
+  // 2c. Bundle Monaco as its own chunk, plus its worker.
+  //
+  // Same bargain as Mermaid above, at a larger scale: the code editor is around
+  // 3 MB and opens from one row of one panel, so it is fetched the first time
+  // someone opens a file and never otherwise. And bundled rather than loaded
+  // from a CDN — Monaco's usual AMD loader wants exactly that — because this
+  // app is routinely run on a LAN with no outbound route, where an editor that
+  // needs jsdelivr is not an editor.
+  //
+  // Two outputs beside the script:
+  //
+  //   - the stylesheet, because Monaco imports CSS from inside its own modules.
+  //     esbuild emits it next to the bundle and chat/monaco.ts injects it.
+  //   - the worker, as a separate top-level bundle. A worker cannot be part of
+  //     an IIFE that is loaded with a <script> tag; it is a second entry point
+  //     to a second file, which is what `MonacoEnvironment.getWorker` fetches.
+  //
+  // The codicon font is inlined as a data URI rather than emitted: it is 70 kB,
+  // it is referenced from inside vendored CSS, and inlining removes an asset
+  // whose relative path would otherwise have to survive the copy step below.
+  console.log('[monaco] Bundling code editor...');
+  try {
+    // Resolved here, not written as a path in the source. Monaco's `exports`
+    // map rewrites every subpath to `./esm/vs/*.js`, so its stylesheets are
+    // unreachable by package name — and a relative `../../node_modules/...`
+    // in the entry file is a guess about hoisting that breaks the first time
+    // this is installed as a dependency of something else.
+    //
+    // Resolved through a module rather than through `package.json`: that map
+    // catches `./package.json` too and rewrites it to `package.json.js`, which
+    // does not exist. `editor.api` is a real file, and the codicon directory
+    // sits at a fixed place relative to it inside the package.
+    const editorApi = require.resolve('monaco-editor/editor/editor.api');
+    const codicons = path.resolve(
+      path.dirname(editorApi),
+      '../base/browser/ui/codicons/codicon',
+    );
+
+    const monacoOptions = {
+      alias: {
+        'monaco-codicons/codicon.css': path.join(codicons, 'codicon.css'),
+        'monaco-codicons/codicon-modifiers.css': path.join(codicons, 'codicon-modifiers.css'),
+      },
+      bundle: true,
+      format: 'iife',
+      // Monaco's own maps are tens of megabytes of vendored editor internals —
+      // the same reasoning as the Mermaid map above, and the same answer.
+      sourcemap: isWatch,
+      minify: !isWatch,
+      target: CLIENT_TARGET,
+      loader: { '.ttf': 'dataurl' },
+    };
+
+    const monacoCtx = await esbuild.context({
+      ...monacoOptions,
+      entryPoints: ['src/client/chat/monaco-entry.ts'],
+      outfile: 'dist/public/monaco.bundle.js',
+      globalName: 'ClaudeCodeWebMonaco',
+    });
+
+    // No globalName: nothing imports this, the browser runs it as a worker.
+    const monacoWorkerCtx = await esbuild.context({
+      ...monacoOptions,
+      entryPoints: ['node_modules/monaco-editor/esm/vs/editor/editor.worker.js'],
+      outfile: 'dist/public/monaco-editor.worker.js',
+    });
+
+    if (isWatch) {
+      await monacoCtx.watch();
+      await monacoWorkerCtx.watch();
+    } else {
+      await monacoCtx.rebuild();
+      await monacoCtx.dispose();
+      await monacoWorkerCtx.rebuild();
+      await monacoWorkerCtx.dispose();
+    }
+    console.log('[monaco] Done.\n');
+  } catch (error) {
+    console.error('[monaco] Bundle failed:', error.message);
+    process.exit(1);
+  }
+
   // 3. Rasterise the app icons, then copy public assets.
   //
   // Before the copy, because it writes into src/public/icons and

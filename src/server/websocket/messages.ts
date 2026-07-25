@@ -11,8 +11,9 @@ import {
 import { TranscriptStoreLike } from '../services/transcript-store.js';
 import { HistoryStoreLike } from '../services/history-store.js';
 import { ScrollbackRecorder } from '../services/scrollback.js';
-import { sendToWebSocket, broadcastToSession } from './handler.js';
+import { sendToWebSocket, broadcastChat, broadcastToSession } from './handler.js';
 import { chatUnavailableReason, isChatRuntime } from '../../shared/chat-runtimes.js';
+import { ChatNotRunningError } from '../chat/session.js';
 
 export interface MessageProcessorDeps {
   dev: boolean;
@@ -80,18 +81,21 @@ export interface ChatManagerLike {
       extraArgs?: string[];
       env?: Record<string, string>;
       bypassPermissions?: boolean;
+      resumeSessionId?: string;
+      startFresh?: boolean;
     },
   ): Promise<{ runtimeKind: string; currentCapabilities: unknown; bypassing: boolean }>;
   snapshot(record: SessionRecord): Promise<unknown>;
   send(sessionId: string, turn: { text: string; attachments?: unknown[] }): Promise<void>;
   interrupt(sessionId: string): Promise<void>;
+  cancelQueued(sessionId: string, queuedId: string): boolean;
   respondPermission(sessionId: string, requestId: string, optionId: string): boolean;
   stop(sessionId: string): Promise<void>;
   readPage(
     record: SessionRecord,
     fromSeq: number,
     count: number,
-  ): Promise<{ events: unknown[]; firstSeq: number; cursor: number }>;
+  ): Promise<{ events: unknown[]; firstSeq: number; from?: number; cursor: number }>;
 }
 
 interface IncomingMessage {
@@ -112,6 +116,8 @@ interface IncomingMessage {
   optionId?: string;
   fromSeq?: number;
   agentKind?: string;
+  /** Identifies one turn waiting in the send-ahead queue. */
+  queuedId?: string;
 }
 
 export class MessageProcessor {
@@ -177,7 +183,12 @@ export class MessageProcessor {
         break;
 
       case 'start_chat':
-        await this.startChat(wsId, String(data.agentKind || ''), data.options || {});
+        await this.startChat(
+          wsId,
+          String(data.agentKind || ''),
+          data.options || {},
+          typeof data.sessionId === 'string' ? data.sessionId : undefined,
+        );
         break;
 
       case 'chat_send':
@@ -185,7 +196,11 @@ export class MessageProcessor {
         break;
 
       case 'chat_interrupt':
-        await this.handleChatInterrupt(wsInfo);
+        await this.handleChatInterrupt(wsInfo, data);
+        break;
+
+      case 'chat_queue_cancel':
+        this.handleChatQueueCancel(wsInfo, data);
         break;
 
       case 'chat_permission_response':
@@ -194,6 +209,14 @@ export class MessageProcessor {
 
       case 'chat_history_request':
         await this.handleChatHistory(wsInfo, data);
+        break;
+
+      case 'chat_subscribe':
+        await this.subscribeChat(wsInfo, data.sessionId || '');
+        break;
+
+      case 'chat_unsubscribe':
+        if (data.sessionId) wsInfo.chatSessionIds.delete(data.sessionId);
         break;
 
       case 'input':
@@ -345,22 +368,10 @@ export class MessageProcessor {
     // A chat session's transcript is not in the PTY replay above — it is a
     // separate event log — so it is sent as its own snapshot. Sent after
     // session_joined so the client has already switched surfaces and has
-    // somewhere to put it.
-    if (session.surface === 'chat' && this.deps.chatManager) {
-      try {
-        const snapshot = await this.deps.chatManager.snapshot(session);
-        sendToWebSocket(wsInfo.ws, {
-          type: 'chat_snapshot',
-          sessionId: claudeSessionId,
-          snapshot,
-        });
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        sendToWebSocket(wsInfo.ws, {
-          type: 'error',
-          message: `Could not load the conversation: ${message}`,
-        });
-      }
+    // somewhere to put it. Subscribing here as well as sending the snapshot is
+    // what keeps the conversation live once the user moves to another tab.
+    if (session.surface === 'chat') {
+      await this.subscribeChat(wsInfo, claudeSessionId);
     }
 
     if (this.deps.dev) {
@@ -865,6 +876,15 @@ export class MessageProcessor {
     wsId: string,
     agentKind: string,
     options: Record<string, unknown> = {},
+    /**
+     * Which conversation to (re)launch, when the browser names one.
+     *
+     * A relaunch is issued from the pane of a specific chat, and a socket can
+     * be watching several — so falling back to "whichever session this socket
+     * joined" would restart the wrong conversation. Absent for a first launch,
+     * where the joined session is the only candidate.
+     */
+    targetSessionId?: string,
   ): Promise<void> {
     const wsInfo = this.deps.webSocketConnections.get(wsId);
     if (!wsInfo || !wsInfo.claudeSessionId) {
@@ -883,7 +903,12 @@ export class MessageProcessor {
       return;
     }
 
-    const session = this.deps.claudeSessions.get(wsInfo.claudeSessionId);
+    // Same ownership rule either way: `chatSessionFor` refuses an id this
+    // socket has neither joined nor subscribed to, so naming a session cannot
+    // be used to reach one that is not this browser's to reach.
+    const session = targetSessionId
+      ? this.chatSessionFor(wsInfo, targetSessionId)
+      : this.deps.claudeSessions.get(wsInfo.claudeSessionId);
     if (!session || session.ownerUserId !== wsInfo.userId) return;
 
     if (!isChatRuntime(agentKind)) {
@@ -909,6 +934,15 @@ export class MessageProcessor {
     // path: the client must not be able to forge a launch configuration.
     const bypassPermissions = options.dangerouslySkipPermissions === true;
 
+    // Two ways to relaunch a chat whose process is gone, and the difference is
+    // the whole point of the choice the user is offered: resume hands the agent
+    // back its own context, so the conversation on screen is one it remembers;
+    // without it the transcript stays but the agent is new to it.
+    const resumeSessionId =
+      options.resume === true ? session.nativeChatSessionId : undefined;
+    // Only when the browser said so: see ChatSessionStartOptions.startFresh.
+    const startFresh = options.resume === false;
+
     const profile = this.deps.resolveRuntimeProfile(
       agentKind as AgentKind,
       session.workingDir,
@@ -928,19 +962,29 @@ export class MessageProcessor {
         extraArgs: profile?.extraArgs,
         env: profile?.env,
         bypassPermissions,
+        resumeSessionId,
+        startFresh,
       });
 
       session.active = true;
       session.stopRequested = false;
       session.sessionStartTime = session.sessionStartTime || new Date();
 
-      broadcastToSession(
-        wsInfo.claudeSessionId,
+      // Before the broadcast, so the socket that asked for the launch is
+      // already a watcher when the very first event goes out.
+      wsInfo.chatSessionIds.add(session.id);
+
+      // `session.id`, not the socket's joined id: a relaunch names its own
+      // conversation, and announcing it under the joined one would tell every
+      // watcher the wrong chat had come back.
+      broadcastChat(
+        session.id,
         {
           type: 'chat_started',
-          sessionId: wsInfo.claudeSessionId,
+          sessionId: session.id,
           agent: agentKind,
           runtimeLabel: session.runtimeLabel,
+          workingDir: session.workingDir,
           capabilities: chat.currentCapabilities,
           bypassPermissions: chat.bypassing,
         },
@@ -962,9 +1006,57 @@ export class MessageProcessor {
     }
   }
 
-  private chatSessionFor(wsInfo: WebSocketInfo): SessionRecord | null {
-    if (!wsInfo.claudeSessionId) return null;
-    const session = this.deps.claudeSessions.get(wsInfo.claudeSessionId);
+  /**
+   * Start watching a chat session's event stream, and hand over its transcript.
+   *
+   * The reply is a full `chat_snapshot` rather than "subscribed": a tab that has
+   * just been told it may watch has nothing to watch *from*, and asking it to
+   * make a second round trip for the transcript would leave a window in which
+   * live events arrive for a conversation the client cannot place them in.
+   */
+  async subscribeChat(wsInfo: WebSocketInfo, sessionId: string): Promise<void> {
+    const manager = this.deps.chatManager;
+    if (!manager || !sessionId) return;
+
+    const session = this.deps.claudeSessions.get(sessionId);
+    if (!session || session.ownerUserId !== wsInfo.userId) {
+      sendToWebSocket(wsInfo.ws, { type: 'error', message: 'Session not found' });
+      return;
+    }
+    if (session.surface !== 'chat') return;
+
+    wsInfo.chatSessionIds.add(sessionId);
+
+    try {
+      const snapshot = await manager.snapshot(session);
+      sendToWebSocket(wsInfo.ws, { type: 'chat_snapshot', sessionId, snapshot });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: `Could not load the conversation: ${message}`,
+      });
+    }
+  }
+
+  /**
+   * The chat session a message is aimed at.
+   *
+   * Explicit `sessionId` wins, because a browser with several chat tabs open is
+   * watching more than the one it happens to be driving; the joined session is
+   * the fallback so a client that predates per-tab addressing still works.
+   */
+  private chatSessionFor(
+    wsInfo: WebSocketInfo,
+    sessionId?: string,
+  ): SessionRecord | null {
+    const target = sessionId || wsInfo.claudeSessionId;
+    if (!target) return null;
+    // A socket may only address a chat it is driving or has subscribed to.
+    if (target !== wsInfo.claudeSessionId && !wsInfo.chatSessionIds.has(target)) {
+      return null;
+    }
+    const session = this.deps.claudeSessions.get(target);
     if (!session || session.ownerUserId !== wsInfo.userId) return null;
     return session;
   }
@@ -974,7 +1066,7 @@ export class MessageProcessor {
     data: IncomingMessage,
   ): Promise<void> {
     const manager = this.deps.chatManager;
-    const session = this.chatSessionFor(wsInfo);
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) return;
 
     const text = typeof data.text === 'string' ? data.text : '';
@@ -988,20 +1080,59 @@ export class MessageProcessor {
       session.lastActivity = new Date();
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
+
+      // Not a connection failure, and not the whole app's problem: this one
+      // session's process is gone, its transcript is intact, and there is
+      // something the user can do about it. Reported as its own message so the
+      // pane can say so and offer the choice, instead of the generic error
+      // overlay covering a conversation with a Retry that cannot work.
+      if (error instanceof ChatNotRunningError) {
+        sendToWebSocket(wsInfo.ws, {
+          type: 'chat_unavailable',
+          sessionId: session.id,
+          runtime: session.lastAgent || '',
+          runtimeLabel: session.runtimeLabel || '',
+          canResume: Boolean(session.nativeChatSessionId),
+          message,
+        });
+        return;
+      }
+
       sendToWebSocket(wsInfo.ws, { type: 'error', message });
     }
   }
 
-  private async handleChatInterrupt(wsInfo: WebSocketInfo): Promise<void> {
+  private async handleChatInterrupt(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
     const manager = this.deps.chatManager;
-    const session = this.chatSessionFor(wsInfo);
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) return;
     await manager.interrupt(session.id).catch(() => undefined);
   }
 
+  /**
+   * Withdraw a turn the user typed ahead.
+   *
+   * Silent when the id is unknown: by the time a click arrives the turn may
+   * already have started running, and the session's own `chat_queue` broadcast
+   * has told every browser so. An error for that would be noise about a race
+   * the user cannot lose in any way that matters.
+   */
+  private handleChatQueueCancel(wsInfo: WebSocketInfo, data: IncomingMessage): void {
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!manager || !session) return;
+
+    const queuedId = typeof data.queuedId === 'string' ? data.queuedId : '';
+    if (!queuedId) return;
+    manager.cancelQueued(session.id, queuedId);
+  }
+
   private handleChatPermission(wsInfo: WebSocketInfo, data: IncomingMessage): void {
     const manager = this.deps.chatManager;
-    const session = this.chatSessionFor(wsInfo);
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) return;
 
     const requestId = typeof data.requestId === 'string' ? data.requestId : '';
@@ -1016,7 +1147,7 @@ export class MessageProcessor {
     data: IncomingMessage,
   ): Promise<void> {
     const manager = this.deps.chatManager;
-    const session = this.chatSessionFor(wsInfo);
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) return;
 
     const fromSeq = Math.max(0, Math.floor(Number(data.fromSeq) || 0));
@@ -1032,6 +1163,15 @@ export class MessageProcessor {
       });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
+      // Answered on the chat channel too. A bare `error` leaves the requesting
+      // tab's "loading earlier messages" spinner running against a reply that
+      // is never coming, which is precisely the state it was stuck in.
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_page_failed',
+        sessionId: session.id,
+        requestId: data.requestId || null,
+        message,
+      });
       sendToWebSocket(wsInfo.ws, { type: 'error', message });
     }
   }

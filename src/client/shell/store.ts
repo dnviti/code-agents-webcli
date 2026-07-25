@@ -12,6 +12,7 @@
 
 import type { SessionListItem } from '../types';
 import type { ConfirmRequest } from '../ui/confirm';
+import { DEFAULT_CHAT_VIEW, type ChatViewSettings } from '../chat/view-settings';
 
 export type ShellTabStatus = 'running' | 'error' | 'idle';
 
@@ -26,10 +27,10 @@ export interface ShellTab {
   /**
    * Which surface this session runs on, fixed when it was started.
    *
-   * Absent means terminal, so every tab that predates chat mode keeps its
-   * behaviour without a migration.
+   * Defaults to terminal until the server says otherwise, which it does from
+   * the session list, from `session_joined` and from `chat_started`.
    */
-  surface?: 'terminal' | 'chat';
+  surface: 'terminal' | 'chat';
 }
 
 /**
@@ -43,6 +44,8 @@ export interface ShellTab {
 export interface ShellChat {
   /** True when the session in focus runs on the chat surface. */
   active: boolean;
+  /** Which conversation is on screen. Empty when the terminal is showing. */
+  sessionId: string;
   controller: unknown | null;
   runtime: string;
   runtimeLabel: string;
@@ -79,6 +82,8 @@ export interface ShellDialogs {
   more: boolean;
   /** Session id being renamed, or null. Doubles as the open flag. */
   rename: string | null;
+  /** The chat surface's own presentation settings. */
+  chatSettings: boolean;
 }
 
 export interface FolderEntry {
@@ -191,6 +196,16 @@ export interface ShellState {
    * except that the worker never becomes ready.
    */
   install: InstallState;
+  /**
+   * Whether a web chat launched now would skip tool approvals.
+   *
+   * Mirrored out of AppSettings so the launcher can label the button that acts
+   * on it. Reading storage separately in both places is how a control ends up
+   * promising something other than what it does.
+   */
+  chatBypassPermissions: boolean;
+  /** Which chat panels are shown, and what the transcript renders. */
+  chatView: ChatViewSettings;
 }
 
 
@@ -212,6 +227,7 @@ const INITIAL: ShellState = {
     tabs: false,
     more: false,
     rename: null,
+    chatSettings: false,
   },
   folder: {
     open: false,
@@ -227,6 +243,7 @@ const INITIAL: ShellState = {
   errorText: '',
   chat: {
     active: false,
+    sessionId: '',
     controller: null,
     runtime: '',
     runtimeLabel: '',
@@ -241,6 +258,8 @@ const INITIAL: ShellState = {
   user: null,
   logoutUrl: null,
   install: 'unsupported',
+  chatBypassPermissions: false,
+  chatView: DEFAULT_CHAT_VIEW,
 };
 
 export class ShellStore {

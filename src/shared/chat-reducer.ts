@@ -330,6 +330,51 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
+    case 'marker': {
+      if (event.kind === 'cleared') {
+        // Emptied, not annotated. `/clear` means "start again", and a window
+        // still holding the previous conversation is the opposite of that —
+        // and worse, it would show a history the agent can no longer see.
+        state.messages = [];
+        state.index = {};
+        state.plan = [];
+        state.lastError = undefined;
+        // And no paging back past it. The log still holds what was said — this
+        // is a view, not a delete — but offering "load earlier messages" right
+        // after someone asked for a clean window would undo the thing they
+        // just asked for, one scroll at a time.
+        state.firstSeq = event.seq;
+        return { messageIndex: null, structural: true, meta: true, applied: true };
+      }
+
+      // Compaction keeps the transcript and draws a line across it. What was
+      // said still happened and is still worth scrolling back to; the marker
+      // is there because everything above it is no longer in the agent's
+      // context, and an agent that quietly forgets the first hour is a
+      // confusing one.
+      const message: ChatMessage = {
+        id: `marker-${event.seq}`,
+        seq: event.seq,
+        turnId: state.currentTurnId ?? `marker-${event.seq}`,
+        role: 'system',
+        ts: event.ts,
+        blocks: [{
+          kind: 'notice',
+          notice: 'compacted',
+          text: 'Context compacted',
+          detail: event.detail,
+        }],
+      };
+      state.messages.push(message);
+      state.index[message.id] = state.messages.length - 1;
+      return {
+        messageIndex: state.messages.length - 1,
+        structural: true,
+        meta: true,
+        applied: true,
+      };
+    }
+
     case 'turn_end': {
       state.currentTurnId = null;
       if (state.state !== 'error' && state.state !== 'exited') {

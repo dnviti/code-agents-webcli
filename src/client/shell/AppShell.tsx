@@ -15,6 +15,7 @@ import { PlanDialog } from './dialogs/PlanDialog';
 import { RenameDialog } from './dialogs/RenameDialog';
 import { RuntimeProfilesDialog } from './dialogs/RuntimeProfilesDialog';
 import { SessionsDialog } from './dialogs/SessionsDialog';
+import { ChatSettingsDialog } from './dialogs/ChatSettingsDialog';
 import { SettingsDialog } from './dialogs/SettingsDialog';
 import { TerminalOptionsDialog } from './dialogs/TerminalOptionsDialog';
 import { MobileBar, type MobileBarAction } from './MobileBar';
@@ -24,10 +25,15 @@ import type { MobileKey } from '../ui/mobile';
 import { MoreSheet } from './MoreSheet';
 import { installHint, promptInstall } from './install-prompt';
 import { OverlayHost } from './OverlayHost';
+import { AppContextMenu } from './AppContextMenu.js';
+import { downloadFile, uploadIntoWorkspace } from '../chat/workspace-api';
+import { showConfirm } from '../ui/confirm';
+import { showError } from '../ui/overlay';
 import { TabContextMenu } from './TabContextMenu';
 import { TerminalHost } from './TerminalHost';
 import { ChatView } from './chat/ChatView';
 import type { ChatController } from '../chat/controller';
+import type { ChatViewSettings } from '../chat/view-settings';
 import { Toasts } from './Toasts';
 import { UpdateBannerView } from './UpdateBannerView';
 import { shellStore, type ShellState, type ShellTab } from './store';
@@ -97,6 +103,10 @@ export interface ShellActions {
   // Connection overlay
   retryConnection(): void;
 
+  // Chat surface
+  /** Persist and publish a change to the chat's display settings. */
+  setChatView(next: ChatViewSettings): void;
+
   // Update banner
   updateAction(): void;
   updateToggleLog(): void;
@@ -139,6 +149,28 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
   const chatActive = state.chat.active;
   const chatController = state.chat.controller as ChatController | null;
   const [menu, setMenu] = React.useState<{ id: string; x: number; y: number } | null>(null);
+
+  /**
+   * The right-click menu's file actions, present only when there is a project.
+   *
+   * Composed here rather than added to ShellActions because both halves need
+   * the session the user is looking at, and that is state this component
+   * already holds — threading it down to build the same closure elsewhere would
+   * be the same code with one more hop.
+   */
+  const chatSessionId = chatActive ? state.chat.sessionId : null;
+  const menuActions = React.useMemo(
+    () => ({
+      ...actions,
+      workspace: chatSessionId
+        ? {
+            download: (filePath: string) => downloadFile(chatSessionId, filePath),
+            upload: (directory: string) => void pickAndUpload(chatSessionId, directory),
+          }
+        : undefined,
+    }),
+    [actions, chatSessionId],
+  );
 
   const closePalette = React.useCallback(() => {
     shellStore.setState({ paletteOpen: false });
@@ -288,16 +320,32 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       onPress: () => closeDialogs({ tabs: true }),
     },
     { id: 'new', label: 'New', icon: 'plus', onPress: actions.newTab },
-    // The on-screen key strip carries Escape now; this toggles it for the
-    // moments the terminal needs the vertical room back.
-    {
-      id: 'keys',
-      label: 'Keys',
-      icon: 'keyboard',
-      active: state.keysVisible,
-      toggle: true,
-      onPress: actions.toggleKeys,
-    },
+    // One slot, two jobs, decided by what is on screen.
+    //
+    // The key strip sends terminal control codes, which a conversation has no
+    // use for; the workspace panel is meaningless without one. Giving each its
+    // own slot would put six items on a 390px bar with one of them always
+    // inert. This shows whichever the current surface can actually use.
+    chatActive
+      ? {
+          id: 'workspace',
+          label: 'Panel',
+          icon: 'panel-left',
+          active: state.chatView.panelOpen,
+          toggle: true,
+          onPress: () =>
+            actions.setChatView({ ...state.chatView, panelOpen: !state.chatView.panelOpen }),
+        }
+      : {
+          // The on-screen key strip carries Escape now; this toggles it for the
+          // moments the terminal needs the vertical room back.
+          id: 'keys',
+          label: 'Keys',
+          icon: 'keyboard',
+          active: state.keysVisible,
+          toggle: true,
+          onPress: actions.toggleKeys,
+        },
     { id: 'image', label: 'Image', icon: 'image', onPress: actions.attachImage },
     {
       id: 'more',
@@ -439,13 +487,20 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         </div>
         {chatActive && chatController ? (
           <ChatView
+            // Keyed by session so switching tabs remounts the surface: the
+            // scroller, the composer draft and every panel's fetch belong to
+            // one conversation, and carrying them across would show the new
+            // chat scrolled to the old one's position.
+            key={chatController.sessionId}
             controller={chatController}
             runtime={state.chat.runtime}
             runtimeLabel={state.chat.runtimeLabel || state.chat.runtime}
             workingDir={state.chat.workingDir || active?.workingDir || ''}
             isMobile={state.isMobile}
             bypassPermissions={state.chat.bypassPermissions}
-            onOpenSettings={() => closeDialogs({ settings: true })}
+            view={state.chatView}
+            onViewChange={actions.setChatView}
+            onOpenSettings={() => closeDialogs({ chatSettings: true })}
           />
         ) : null}
         <OverlayHost
@@ -457,7 +512,11 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         />
       </div>
 
-      {state.isMobile && state.keysVisible ? (
+      {/* Not over a conversation: the strip sends terminal control codes, and
+          the chat surface has its own composer. Now that its toggle gives up
+          the mobile-bar slot to the workspace panel in chat mode, leaving the
+          strip rendered would also leave it with no way to be dismissed. */}
+      {state.isMobile && state.keysVisible && !chatActive ? (
         <KeyStrip
           ctrlLatched={state.ctrlLatched}
           onKey={actions.sendMobileKey}
@@ -496,6 +555,13 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       <RuntimeProfilesDialog
         open={state.dialogs.runtimeProfiles}
         onClose={() => closeDialogs({ runtimeProfiles: false })}
+      />
+
+      <ChatSettingsDialog
+        open={state.dialogs.chatSettings}
+        settings={state.chatView}
+        onChange={actions.setChatView}
+        onClose={() => closeDialogs({ chatSettings: false })}
       />
 
       <NewSessionDialog
@@ -616,6 +682,82 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           onClose={() => setMenu(null)}
         />
       ) : null}
+
+      {/* Last, so it sits above everything and its own `contextmenu` listener
+          is the final one to see an event no surface claimed. */}
+      <AppContextMenu
+        actions={menuActions}
+        theme={state.theme}
+        hasTerminal={state.tabs.some((tab) => tab.id === state.activeId && tab.surface !== 'chat')}
+      />
     </div>
   );
+}
+
+/**
+ * Ask for files and put them in a folder of the project.
+ *
+ * A file input created on demand rather than a hidden one kept in the tree: it
+ * is used from a menu item that only exists while a project is open, and a
+ * permanently-mounted input would be one more thing for the shortcut guard and
+ * the focus order to step around for the sake of a gesture used occasionally.
+ */
+async function pickAndUpload(sessionId: string, directory: string): Promise<void> {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.multiple = true;
+  input.style.display = 'none';
+  document.body.appendChild(input);
+
+  const files = await new Promise<File[]>((resolve) => {
+    // `cancel` is not universally supported, so the promise must not be the
+    // only thing keeping the input alive — `change` settles it where it fires,
+    // and the removal below runs either way.
+    input.addEventListener('cancel', () => resolve([]), { once: true });
+    input.addEventListener(
+      'change',
+      () => resolve(Array.from(input.files || [])),
+      { once: true },
+    );
+    input.click();
+  });
+  input.remove();
+  if (!files.length) return;
+
+  let wrote = 0;
+  for (const file of files) {
+    try {
+      await uploadIntoWorkspace(sessionId, directory, file);
+      wrote += 1;
+    } catch (error) {
+      const status = (error as Error & { status?: number }).status;
+      if (status === 409) {
+        // The one outcome that cannot be undone from here, so it is asked
+        // rather than assumed — per file, because "replace all" on a multi-file
+        // drop is a different promise than the one the user made.
+        const replace = await showConfirm({
+          title: `Replace ${file.name}?`,
+          description: `A file called ${file.name} is already in that folder. Replacing it cannot be undone from here.`,
+          confirmLabel: 'Replace',
+          tone: 'danger',
+        });
+        if (!replace) continue;
+        try {
+          await uploadIntoWorkspace(sessionId, directory, file, { overwrite: true });
+          wrote += 1;
+          continue;
+        } catch (retryError) {
+          showError(retryError instanceof Error ? retryError.message : 'That file could not be uploaded');
+          continue;
+        }
+      }
+      showError(error instanceof Error ? error.message : 'That file could not be uploaded');
+    }
+  }
+
+  // The tree is the thing that just became wrong. Announced rather than called,
+  // because the panel that has to re-read is not in this component's tree.
+  if (wrote > 0) {
+    window.dispatchEvent(new CustomEvent('ccweb:workspace-changed', { detail: { directory } }));
+  }
 }

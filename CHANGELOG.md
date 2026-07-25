@@ -3,6 +3,315 @@
 ## [Unreleased]
 
 ### Added
+- **Pick up a past conversation when you open a folder.** The web counterpart of
+  `claude --resume`: choose a directory, and the launcher lists the
+  conversations that happened in it before offering to start a new one — because
+  when there is one, it is usually the answer. Each is listed by what was said
+  in it rather than by when it happened, since a column of
+  "Session 25/07/2026, 21:35" identifies nothing. One already running is marked
+  as such, and one whose runtime never named itself is marked "transcript only",
+  so the difference between an agent that remembers the conversation and one
+  reading it for the first time is known before choosing rather than after.
+- **HTML files open as a page.** An `.html` file gets the same Preview/Code
+  toggle markdown has, rendered in a sandboxed frame with an opaque origin: the
+  page runs its own scripts and can do nothing to this app — no reading the auth
+  cookie, no reaching into the surrounding DOM. Its relative `./style.css` and
+  images load too, through a path-shaped asset route, so a preview looks like
+  the page rather than like its markup.
+- **A chat whose process is gone offers to resume it or start again, in the same
+  tab.** Chat sessions live in the server's memory and transcripts live on disk,
+  so restarting the server left a conversation on screen that no longer had
+  anything running it — and the first message came back as an app-wide
+  "Connection error" with a Retry that reconnected a socket which had never been
+  the problem. The pane now says which agent stopped and offers the two ways
+  forward. *Resume* hands the runtime its own conversation back, so it remembers
+  what is on screen; *start a new chat* keeps the transcript on disk and draws a
+  line under it. Resume is only offered when it can actually deliver — a
+  conversation whose runtime never named itself says so rather than producing a
+  stranger that looks like it worked.
+- **Cut, Copy and Paste in the right-click menu, and Download / Upload on a
+  file.** Right-clicking a file in the workspace tree saves it out; right-clicking
+  anywhere in the tree uploads into that folder, one file or several, asking
+  before it replaces anything.
+- **Issues and pull requests open in the app.** The GitHub panel used to hand
+  them to a new browser window, which on a phone means finding your way back.
+  They now open in a panel that renders the body and the discussion with the
+  same markdown renderer the transcript uses, with a link out for the things
+  only GitHub can do.
+- **The file viewer is a window.** Drag it by its title bar, resize it from the
+  bottom-right corner, or fill the screen with the button beside Close — so a
+  file can sit open beside the conversation instead of on top of it.
+- **A Status panel: what is left of the context window, the plan, and the
+  branch.** The three things worth knowing before deciding whether to keep
+  going. Every number is one something actually reported — a runtime that does
+  not publish its context window gets a sentence saying so rather than a meter
+  reading zero, which is indistinguishable from having nothing left.
+- **Markdown files open rendered, with a toggle back to the source.** A README is
+  written to be read, so it opens as a document — headings, links, tables, and
+  mermaid diagrams through the same renderer the chat already uses. Two buttons
+  switch between that and the editor, and the preview shows the *draft*, so
+  edits appear as you make them.
+- **Images, video, audio and PDFs open in the viewer instead of "this file is
+  binary".** A screenshot is shown, a screen recording plays with a working seek
+  bar, a voice note plays, a PDF gets the browser's own viewer. Range requests
+  are answered, which is not a nicety — Safari will not start a video at all
+  without them, and seeking depends on them everywhere else.
+
+  A file is never served back under a type its *name* claimed: the bytes decide,
+  and anything unrecognised is an opaque download. SVG — the one image format
+  that is also an executable document — is served under a `sandbox` policy.
+- **A right-click menu that belongs to the app.** The browser's menu offers Back,
+  View Source and Save As on top of an application where none of them is what
+  was meant. In its place: the current selection, a paste into whatever field is
+  focused, sessions, settings, theme and reload. Surfaces with a better menu of
+  their own keep it — the editor, and the terminal's right-click-to-copy — by
+  claiming the event, so nothing had to be hardcoded here.
+- **A line across the conversation when the context is compacted**, saying what
+  triggered it and how much was summarised. Everything above it is still on
+  screen and still worth reading, and is no longer something the agent can see;
+  an answer that contradicts an earlier one is explained rather than baffling.
+- **`/clear`, `/new` and `/reset` empty the chat window.** They already cleared
+  the runtime's context, and the window went on showing an hour of conversation
+  the agent could no longer see.
+- **The slash command list says what each command does.** Claude reports its
+  commands as bare names, so the picker was a column of indistinguishable
+  slashes; the built-ins are described, and anything a runtime describes for
+  itself is left alone.
+
+- **The browser stops stealing keys from the terminal and the editor.** `Ctrl+R`
+  is reverse history search in every shell anyone uses; until now the byte
+  reached the shell *and* the page reloaded, losing the scrollback. `Ctrl+U`
+  kills the line rather than viewing the source, `Ctrl+P` walks back through
+  history rather than printing, and `Ctrl+F` is the editor's find. Nineteen
+  chords in total, claimed only inside the terminal and the editor — the
+  composer, the dialogs and every ordinary text field keep the browser's
+  defaults, because there taking them away would be the bug.
+
+  Copy, paste, cut, select-all, undo and redo are never touched: for those the
+  browser's default *is* the mechanism. `AltGr` is not mistaken for `Ctrl+Alt`,
+  so an Italian or German keyboard can still type `@` and `[`. `F5` and
+  `Ctrl+Shift+R` are deliberately left alone so reload stays reachable — every
+  other claimed chord means something in a shell or an editor, and that one does
+  not. `Ctrl+T`, `Ctrl+W` and `Ctrl+N` are reserved by the browser and never
+  reach a page at all.
+- **The file editor is Monaco**, the editor from VS Code. Around ninety
+  languages instead of eleven, plus everything the hand-rolled one never had:
+  find and replace, folding, multi-cursor, bracket matching, a minimap, a
+  command palette and a real undo stack. It is themed from the same CSS custom
+  properties the terminal and the chat's own highlighter use, so one file looks
+  the same in all three.
+
+  It is fetched the first time you open a file and never otherwise — 4.6 MB in
+  its own chunk, with the main bundle unchanged at around 950 kB — and it is
+  bundled and served by this app rather than pulled from a CDN, because this app
+  is routinely run on a LAN with no route out. Until it lands, and for good if it
+  cannot be fetched at all, the previous editor is what fills the panel: the file
+  is readable and editable either way.
+
+  The language *services* are deliberately switched off. Monaco's TypeScript
+  service only ever sees the single open buffer, so it cannot resolve one import
+  in a real project and would underline most of every source file in red — 6.7 MB
+  spent making the editor confidently wrong. Syntax highlighting comes from the
+  grammars, which cost nothing extra.
+- **Type ahead while the agent is working.** The composer no longer goes inert mid-turn:
+  a message sent while a turn is running is accepted and queued, and goes over the moment
+  that turn ends. The queue lives on the server, not in the tab — this app's whole premise
+  is that the agent keeps working after you close the browser, and a queue that died with
+  the tab would contradict it. Waiting messages are listed above the input, oldest first,
+  each withdrawable until the moment it starts; a second browser watching the same
+  conversation sees the same line. Pressing Stop discards it, because a stop that then
+  fires three more prompts is not a stop.
+
+  It also queues while an approval is on screen. That moment — the agent waiting on you —
+  is exactly when the follow-up is worth typing, and it was the one moment you could not.
+- **Attach files and images to a chat turn.** The composer had the whole attachment
+  interface already — chips, drag and drop, the image-paste classifier — and no way to
+  reach it, because nothing ever gave it an upload handler and there was no endpoint to
+  upload to. Now there is: drag a file onto the composer, paste a screenshot, or use the
+  paperclip. Images preview as themselves rather than as a grey rectangle labelled "image",
+  and land in the transcript as pictures.
+
+  Files are stored inside the session's own working directory, which is the only place
+  every agent CLI can read without asking first. Nothing is ever served back under a
+  content type the uploader chose: a file whose bytes really are an image comes back as
+  that image, and everything else is an opaque download.
+- **`@` to reference a file from the project.** Typing `@` opens a picker over the whole
+  working tree — `git ls-files`, so it knows what `.gitignore` says, with a bounded walk
+  for a directory that is not a repository. Ranked on the assumption that people type the
+  filename, so `session` finds `session.ts` rather than everything under `chat/`; `@` with
+  a slash in it is read as a path fragment, and initials still work as a fallback.
+- **Buttons for the things that used to need a keystroke you had to already know about.**
+  `@` for files and `/` for the runtime's slash commands and skills are now also a click,
+  next to the paperclip. Reaching a feature by typing a character nobody told you about is
+  not discoverability.
+- **The workspace panel's tabs stay reachable when the rail is narrow.** The tab strip
+  scrolls, with the scrollbar hidden — so narrowing the rail moved tabs out of view with
+  nothing on screen to say they were still there. A chevron now appears exactly when they
+  overflow, listing every panel.
+- **The workspace panel can be resized**, by dragging its edge or from the keyboard — the
+  handle is a real `separator` with arrow keys, Home/End, Enter to reset and double-click to
+  reset. The width is clamped to 220–760px, never takes more than 70% of the window, and is
+  kept across reloads.
+- **Clicking a file opens it in an editor.** A modal with syntax highlighting, line numbers,
+  Tab indent (including whole-selection indent and outdent) and ⌘/Ctrl+S to save — built on
+  the highlighter the chat already uses for code blocks, so it follows the terminal palette
+  and adds no dependency. Reachable from the Files tree and from a per-row button in
+  Changes. Binary and oversized files open read-only and say which limit applies.
+
+  Saving carries the version the file was opened at, and the server refuses a stale one:
+  an agent is editing the same tree while the panel is open, and overwriting its work with
+  a copy read two minutes ago is the one outcome nobody would ask for. Unsaved edits are
+  never discarded without asking. Files inside `.git` are not writable.
+- **The web chat's own display settings.** The gear inside a conversation opened the
+  app-wide Settings dialog — font size, colourway, terminal typeface, install — none of
+  which changes anything you can see in a chat. It now opens a chat dialog: which workspace
+  panels exist, and whether the transcript shows reasoning, tool cards, the plan and the
+  usage readout. Presentation only; nothing there changes what an agent may do.
+- **A workspace panel beside the conversation**, with five tabs you can switch off
+  individually. *Files* browses the session's working directory. *Changes* lists the
+  uncommitted work from `git status` and fetches a diff per file only when you open it.
+  *GitHub* shows open pull requests and issues through the `gh` CLI on the server — and
+  says which of "not installed", "not signed in" or "not a GitHub repository" applies,
+  because an empty list looks identical to a repository with no open work. *Agents* lists
+  the subagents and workflows this conversation has started, running ones first, derived
+  from the transcript rather than from a registry that could disagree with it. *Links*
+  turns local server addresses the agent printed into links you can open — re-pointed at
+  the host the page was served from, so a `localhost:5173` printed on the server is
+  reachable from the phone looking at it.
+- **Bypass tool approvals for web chats**, as a setting in the app Settings dialog. Only
+  the terminal launcher could start a runtime with approvals off; a chat could not, even
+  though the server already accepted the flag. The chat launch button states when it is on.
+- **A capability handshake on connect.** The server advertises the optional messages it
+  understands, so a page newer than the server it is talking to asks for nothing that would
+  come back as an error toast, and falls back to the behaviour that server can deliver.
+
+### Changed
+- **The transcript is chat bubbles** — the user's turns on the right in a card,
+  the agent's on the left with the full width its code blocks and diffs need.
+  Square corners, like everything else here.
+- **The font chosen for the terminal is now the app's monospace font.** It set
+  exactly one thing before, so the same snippet was one typeface in the terminal
+  and another in the transcript quoting it. It now drives the chat's code blocks,
+  the file editor and the diff view too.
+
+### Fixed
+- **Resuming a conversation changes what is on screen.** Clearing the recovery
+  offer was not enough: the transcript still recorded the session as dead, so
+  the derived offer came straight back and the pane sat unchanged — composer
+  disabled, notice up — over a session that was already running, until the page
+  was reloaded.
+- **The file window's contents follow its height.** The editor and the preview
+  were sized in viewport units, so dragging the window bigger left the content
+  exactly as it was, with empty panel underneath. They now fill the panel and
+  track it to the pixel in both directions.
+- **A window can no longer be resized past the bottom of the screen**, which put
+  its own resize grip out of reach and left no way to make it smaller again.
+- **Monaco colours large files.** Its large-file optimisation silently drops
+  syntax highlighting, and "large" is much smaller than it sounds; long lines
+  stopped being tokenised at 20,000 characters. Both limits are lifted — the
+  language services that optimisation protects are switched off here anyway, so
+  tokenising is nearly all this editor does.
+- **Copy in the right-click menu now sees text selected in a field.** A form
+  control keeps its own selection and `document.getSelection()` cannot see into
+  it, so the menu offered nothing in the one place people select text most — the
+  composer.
+- **A chat pane no longer reports "Ready" for a process that is gone.** The event
+  log replays to idle on its own, so a conversation that ended on a finished turn
+  came back looking live, with a working composer, until the first message failed.
+- **A chat session's runtime is freed when it exits.** The session record went on
+  claiming a process that had died, so relaunching in the same tab was refused
+  with "A process is already running in this session" — escapable only by opening
+  a new tab and leaving the conversation behind.
+- **Both Monaco themes are re-derived when the app theme changes.** They were
+  defined once from whichever palette happened to be live, so switching to light
+  produced a light editor still wearing dark token colours.
+- **The `@` and `/` pickers behave like menus.** Arrowing past the fold scrolls
+  the list instead of walking the highlight off the bottom of it, clicking
+  outside closes them rather than leaving Escape as the only way out, and moving
+  the pointer over a row selects it.
+- **The editor follows the app's theme.** Both themes were derived once, from
+  whichever palette happened to be live at the time, so switching to light gave
+  a light editor still wearing the dark palette's token colours.
+- **The workspace rail no longer sits on top of the composer.** The input was a sibling of
+  the row that holds the rail, so it ran the full width of the surface and the rail was
+  simply drawn over its left end — and dragging the rail wider covered more of it. It
+  belongs to the conversation column now, bounded by the same rails the transcript is.
+
+  Moving it was not sufficient on its own: the region holding it is a CSS grid, and a grid
+  item has `min-width: auto` exactly the way a flex item does, so the track refused to
+  shrink below the composer's min-content width and a wide rail pushed it off the
+  right-hand edge instead. Both are pinned by a browser check that measures the geometry;
+  neither is visible to a test that only renders markup.
+- **The prompt field says where your typing goes.** A lit ring and a top edge that draws
+  itself in on focus, a highlight travelling along that edge while the agent works, press
+  feedback on send, and room around the text instead of six pixels. On a narrow rail the
+  keyboard hint drops out rather than truncating to "Send anyway — it …", which is not a
+  shorter sentence but a worse one.
+- **Opening a second web chat no longer clears the first.** A browser held one transcript
+  and the server bound each socket to one session, so a second conversation overwrote the
+  first and its tab went blank while its agent carried on working. Chat sessions are
+  addressed by id now: the browser keeps a transcript per conversation, the server delivers
+  each conversation's events to every socket watching it, and a background chat keeps
+  streaming — moving its own tab's status and unread dot while you are elsewhere.
+- **Chat transcripts were being silently truncated, and lost entirely on restart.** The
+  event index was written without its header whenever `stat()` had been called before the
+  first append — which `ChatSession.start()` always does — so every index this store had
+  ever produced was header-less. Since offsets are measured from the header, rejoining a
+  conversation dropped its first few events and a server restart made the whole log
+  unreadable. New logs are written correctly and existing ones are repaired in place on
+  first read.
+- **`Could not start claude: listen EINVAL`.** The approval socket lived at
+  `<data-dir>/chat-sockets/<session-uuid>/perm-<24 hex>.sock`, which for a default install
+  is 118 bytes — past the 108-byte limit on `sockaddr_un.sun_path`, which the kernel reports
+  as `EINVAL` rather than as a length error. The per-session directory is gone (the random
+  filename already made the path unguessable) and a private temp directory is used as a
+  fallback when the data directory is too deep to fit.
+- **"Loading earlier messages" no longer spins forever.** Two defects: the "is there older
+  history" test was `firstSeq > 0`, and seq numbering starts at 1, so every session ever
+  created claimed to have more; and a page that came back with no messages never notified
+  the list, so the spinner it raised was never taken down. Snapshots now report how far back
+  their replay reached, an empty or failed page settles the control, and a request that goes
+  unanswered gives the button back.
+- **A Claude chat no longer hangs on every tool approval.** Emitting the approval event
+  replaced the pending entry and threw away the resolver the hook was blocked on, so
+  answering in the browser went nowhere: the tool never ran, the turn never ended, and the
+  surface kept its stop button and its "Working" indicator indefinitely. Every chat that
+  touched a tool was affected.
+- **Slash commands now work for every runtime that has them, not just Oh My Pi.** A launch
+  reports its command list before the conversation is announced, and the browser was
+  dropping every event that arrived in that window; the list is also kept on the session so
+  it survives a rejoin instead of being replaced by the adapter's static declaration.
+- **Rejoining a finished chat no longer reports "Thinking" forever.** The session's state
+  only moved on an explicit `state` event, and Claude ends a turn with `turn_end`.
+- **Closing a chat tab closes the conversation with it.** The surface was only ever
+  replaced by joining another session, so closing the last tab left a dead conversation on
+  screen with a composer that could not send anything.
+- **The chat surface no longer pushes itself wider than the window.** It is a flex item and
+  had no `min-width: 0`, so one long file path in the panel or one long line in the
+  transcript cut off the right-hand edge of everything on a phone.
+- **The connection indicator now reflects the connection.** Nothing ever wrote to it, so it
+  read "disconnected" for the whole life of a healthy session.
+- **The Changes panel works for a session opened inside a subdirectory of a repository.**
+  `git status --porcelain` reports paths relative to the repository root whatever directory
+  it ran in, so those paths were being resolved against the session directory and pointed at
+  files that do not exist — and the listing showed changes from outside the session as well.
+  It is now scoped to the session's own directory and reports paths relative to it.
+- **Workspace paths are confined after following symlinks.** A lexical path check passes a
+  link inside the working tree that points at `/etc`, and an agent's working tree is exactly
+  the sort of place a symlink turns up.
+
+### Changed
+- **Node 22.13 or newer is required** (was 20). This is the breaking change behind 5.0.0.
+- The workspace panel sits to the left of the conversation, and on a phone it takes the
+  mobile bar slot the key strip had — the strip sends terminal control codes, which a
+  conversation has no use for, and it is still there for terminal sessions.
+- Assistant messages are no longer labelled "Assistant". A conversation is overwhelmingly
+  the assistant talking; the user's turns keep their label, their card and their rule. The
+  accessible name is unchanged, so both roles are still announced.
+- A session's surface (terminal or chat) is persisted, so a restart reopens a conversation
+  as a conversation instead of as an empty terminal.
+
+### Added
 - **On-screen terminal keys on mobile** (issue #21): a key strip above the bottom bar with
   Esc, Tab, a one-shot Ctrl latch, and the four arrow keys — the keys a phone keyboard does
   not have and agents routinely ask for. Ctrl is a latch, not a chord: tap it, then type the

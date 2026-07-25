@@ -1,4 +1,5 @@
 import * as React from 'react';
+import { Icon } from './Icon';
 
 export interface DialogProps {
   open?: boolean;
@@ -14,7 +15,68 @@ export interface DialogProps {
    * focus handling, stacked Escape and the labelling all come along.
    */
   placement?: 'center' | 'bottom';
+  /**
+   * Let the user move, resize and maximise the panel.
+   *
+   * Off by default, and deliberately so: a dialog that asks one question wants
+   * to be where it was put. This is for the panels a user *works* in — a file
+   * they are reading beside the conversation, an issue they are checking
+   * against the code — where being able to shove it aside is the difference
+   * between a dialog and a window.
+   *
+   * Ignored for `bottom` placement: a sheet is already the full width of a
+   * phone, and dragging it around a screen it already fills is nothing.
+   */
+  movable?: boolean;
+  /**
+   * A definite height for the panel, before the user resizes it.
+   *
+   * Needed by any dialog whose content should *fill* it rather than size it: a
+   * percentage resolves against nothing when the panel's own height is `auto`,
+   * which is why an editor inside one had to be sized in viewport units — and
+   * then stayed that size no matter how large the window was dragged.
+   */
+  height?: React.CSSProperties['height'];
+  /**
+   * Make the body a flex column, so a child with `flex: 1` fills it.
+   *
+   * Opt-in: the ordinary dialog body is a block that scrolls, and turning every
+   * one of them into a flex container would quietly restyle content that was
+   * laid out as prose.
+   */
+  bodyFill?: boolean;
+  /** Extra controls for the title row, left of maximise and close. */
+  headerActions?: React.ReactNode;
   children?: React.ReactNode;
+}
+
+interface PanelBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** Keeps a moved panel reachable: its title row may never leave the viewport. */
+const KEEP_ON_SCREEN = 48;
+const MIN_PANEL = { width: 320, height: 200 };
+
+/** The minimum wins over the maximum: a tiny viewport must still be usable. */
+function clampSpan(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(value, max));
+}
+
+function clampBox(box: PanelBox): PanelBox {
+  const maxX = Math.max(0, window.innerWidth - KEEP_ON_SCREEN);
+  const maxY = Math.max(0, window.innerHeight - KEEP_ON_SCREEN);
+  return {
+    ...box,
+    // Negative x is allowed up to a point — dragging a wide panel left so its
+    // right-hand side is readable is a normal thing to want — but never so far
+    // that the header it is dragged by is gone.
+    x: Math.min(Math.max(box.x, KEEP_ON_SCREEN - box.width), maxX),
+    y: Math.min(Math.max(box.y, 0), maxY),
+  };
 }
 
 // `matches(':focus-visible')` throws a SyntaxError on engines that do not know the
@@ -58,6 +120,10 @@ export function Dialog({
   onClose,
   width = 440,
   placement = 'center',
+  movable = false,
+  height,
+  bodyFill = false,
+  headerActions,
   children,
 }: DialogProps): React.JSX.Element | null {
   // Hooks run on every render, so the `open` bail-out has to come after them.
@@ -68,6 +134,70 @@ export function Dialog({
   const panelRef = React.useRef<HTMLDivElement | null>(null);
   const closeRef = React.useRef<HTMLButtonElement | null>(null);
   const [closeFocusVisible, setCloseFocusVisible] = React.useState(false);
+
+  // Null until the user moves or resizes it: the panel stays centred by the
+  // overlay's flex until then, so the ordinary case involves no measurement and
+  // no layout the browser was not already doing.
+  const [box, setBox] = React.useState<PanelBox | null>(null);
+  const [maximised, setMaximised] = React.useState(false);
+
+  const startGesture = React.useCallback(
+    (event: React.PointerEvent, mode: 'move' | 'resize') => {
+      const panel = panelRef.current;
+      // Primary button only: a right-click on the title bar belongs to the app
+      // menu, and a middle-click drag is not a gesture anyone means.
+      if (!panel || event.button !== 0) return;
+      event.preventDefault();
+
+      const rect = panel.getBoundingClientRect();
+      const from = { x: event.clientX, y: event.clientY };
+      // Measured once, here: reading the rect on every pointermove would make
+      // the drag depend on the layout it is itself changing.
+      const origin: PanelBox = { x: rect.left, y: rect.top, width: rect.width, height: rect.height };
+      setMaximised(false);
+      setBox(origin);
+
+      const onMove = (move: PointerEvent): void => {
+        const dx = move.clientX - from.x;
+        const dy = move.clientY - from.y;
+        setBox(
+          mode === 'move'
+            ? clampBox({ ...origin, x: origin.x + dx, y: origin.y + dy })
+            : {
+                ...origin,
+                // Capped at the viewport edge, not merely floored at a minimum.
+                // A panel dragged taller than the window puts its own resize
+                // grip below the bottom of the screen, and there is then no way
+                // to make it smaller again — the one state a resize handle must
+                // never be able to reach.
+                width: clampSpan(origin.width + dx, MIN_PANEL.width, window.innerWidth - origin.x),
+                height: clampSpan(origin.height + dy, MIN_PANEL.height, window.innerHeight - origin.y),
+              },
+        );
+      };
+      const onUp = (): void => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('pointercancel', onUp);
+      };
+      // On the window, not the handle: a fast drag outpaces the pointer and
+      // leaves the element behind, and a listener on the handle would stop
+      // getting moves exactly when the gesture is going fastest.
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      window.addEventListener('pointercancel', onUp);
+    },
+    [],
+  );
+
+  // A window that was dragged to the right of a screen that then got narrower
+  // is a window the user cannot reach.
+  React.useEffect(() => {
+    if (!box) return;
+    const onResize = (): void => setBox((current) => (current ? clampBox(current) : current));
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [box !== null]);
 
   // Focus moves into the panel on open and back out on close. The panel itself
   // takes focus (tabIndex={-1}) rather than the first focusable child, so a
@@ -126,6 +256,10 @@ export function Dialog({
   if (!open) return null;
 
   const bottom = placement === 'bottom';
+  const windowed = movable && !bottom;
+  // Placed only once the user has actually moved or maximised it. Until then
+  // the overlay's flex centring is left alone.
+  const placed = windowed && (maximised || box !== null);
   const overlayStyle: React.CSSProperties = {
     position: 'fixed', inset: 0, zIndex: 'var(--z-modal)' as unknown as number, display: 'flex',
     alignItems: bottom ? 'flex-end' : 'center', justifyContent: 'center',
@@ -134,6 +268,10 @@ export function Dialog({
   const panelStyle: React.CSSProperties = {
     width: bottom ? '100%' : width,
     maxWidth: '100%',
+    // Before any drag. A panel with a definite height is what lets its body
+    // hand a definite height to the content inside it; `maxHeight` alone
+    // cannot, because a cap is not a size.
+    height: bottom ? undefined : height,
     // Every panel is height-capped, centred ones included. Without a cap a tall
     // dialog simply grows past the viewport, and because the overlay centres it
     // the overflow goes off *both* edges — so the top of the content, title row
@@ -156,6 +294,25 @@ export function Dialog({
     // The panel is only ever focused programmatically, so it should not paint a
     // ring; the controls inside it carry their own.
     outline: 'none',
+    // The containing block for the resize grip. Harmless for every other
+    // dialog, which has none.
+    position: 'relative',
+    ...(placed
+      ? {
+          position: 'fixed' as const,
+          left: maximised ? 8 : box?.x,
+          top: maximised ? 8 : box?.y,
+          width: maximised ? 'calc(100vw - 16px)' : box?.width,
+          height: maximised ? 'calc(100dvh - 16px)' : box?.height,
+          // The cap is what centring needed; a placed panel has an explicit
+          // height and the cap would fight it.
+          maxHeight: 'none',
+          maxWidth: 'none',
+          // A drag should feel immediate, and the open animation has long since
+          // finished by the time one starts.
+          animation: 'none',
+        }
+      : null),
   };
   // A flex item's default `min-height: auto` refuses to shrink below its
   // content, which would push the header and footer off a capped panel instead
@@ -176,7 +333,12 @@ export function Dialog({
     // content, so the panel would overflow its own cap and nothing would scroll.
     flex: 1,
     minHeight: 0,
-    overflowY: 'auto',
+    // A filling body does not scroll itself: whatever fills it owns its own
+    // overflow, and a scrollbar on both is a scrollbar inside a scrollbar.
+    ...(bodyFill
+      ? { display: 'flex', flexDirection: 'column' as const, overflowY: 'hidden' as const }
+      : null),
+    overflowY: bodyFill ? 'hidden' : 'auto',
     // Wide content — a long argument string, an env value — scrolls sideways in
     // here rather than stretching the panel past the window.
     overflowX: 'auto',
@@ -198,27 +360,82 @@ export function Dialog({
         onClick={(e) => e.stopPropagation()}
         style={panelStyle}
       >
-        <div style={headerStyle}>
+        <div
+          style={{
+            ...headerStyle,
+            // The whole title row is the handle, which is the convention every
+            // window manager uses; the buttons inside it stop the gesture
+            // themselves so a click on Close is a click, not a one-pixel drag.
+            cursor: windowed ? (maximised ? 'default' : 'move') : undefined,
+            touchAction: windowed ? 'none' : undefined,
+          }}
+          onPointerDown={windowed && !maximised ? (e) => startGesture(e, 'move') : undefined}
+        >
           <div style={headerRowStyle}>
             <h2 id={titleId} style={titleStyle}>{title}</h2>
-            {onClose ? (
-              <button
-                ref={closeRef}
-                type="button"
-                onClick={onClose}
-                onFocus={(e) => setCloseFocusVisible(matchesFocusVisible(e.currentTarget))}
-                onBlur={() => setCloseFocusVisible(false)}
-                aria-label="Close"
-                style={closeStyle}
-              >
-                ✕
-              </button>
-            ) : null}
+            <div
+              style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              {headerActions}
+              {windowed ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    // Restoring drops the box as well: a panel that was
+                    // maximised from centred should go back to centred, not to
+                    // wherever it happened to be measured on the way in.
+                    setMaximised((current) => !current);
+                    if (maximised) setBox(null);
+                  }}
+                  aria-pressed={maximised}
+                  aria-label={maximised ? 'Restore size' : 'Fill the window'}
+                  title={maximised ? 'Restore size' : 'Fill the window'}
+                  style={closeStyle}
+                >
+                  <Icon name={maximised ? 'minimize-2' : 'maximize-2'} size={13} />
+                </button>
+              ) : null}
+              {onClose ? (
+                <button
+                  ref={closeRef}
+                  type="button"
+                  onClick={onClose}
+                  onFocus={(e) => setCloseFocusVisible(matchesFocusVisible(e.currentTarget))}
+                  onBlur={() => setCloseFocusVisible(false)}
+                  aria-label="Close"
+                  style={closeStyle}
+                >
+                  ✕
+                </button>
+              ) : null}
+            </div>
           </div>
           {description ? <p id={descriptionId} style={descriptionStyle}>{description}</p> : null}
         </div>
         {children ? <div style={bodyStyle}>{children}</div> : null}
         {footer ? <div style={footerStyle}>{footer}</div> : null}
+        {windowed && !maximised ? (
+          <div
+            role="presentation"
+            aria-hidden="true"
+            onPointerDown={(e) => startGesture(e, 'resize')}
+            title="Drag to resize"
+            style={{
+              position: 'absolute',
+              right: 0,
+              bottom: 0,
+              width: 18,
+              height: 18,
+              cursor: 'nwse-resize',
+              touchAction: 'none',
+              // Two hairlines rather than an icon: it reads as a grip at any
+              // size and costs nothing to paint.
+              background:
+                'linear-gradient(135deg, transparent 0 45%, var(--border) 45% 55%, transparent 55% 70%, var(--border) 70% 80%, transparent 80%)',
+            }}
+          />
+        ) : null}
       </div>
     </div>
   );

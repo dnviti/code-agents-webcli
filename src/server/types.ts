@@ -68,6 +68,14 @@ export interface SessionRecord {
    * rather than needing a migration to backfill.
    */
   surface?: 'terminal' | 'chat';
+  /**
+   * The runtime's own id for this conversation, when it reported one.
+   *
+   * Kept so a chat can be resumed *with its context* after the server restarts:
+   * the transcript survives on disk regardless, but without this the agent that
+   * reads it back would be a stranger to it.
+   */
+  nativeChatSessionId?: string;
   terminalOptions: TerminalOptions | null;
   stopRequested: boolean;
   /** Identifies the current PTY run so late callbacks from a previous run are ignored. */
@@ -108,7 +116,22 @@ export interface WebSocketInfo {
   ws: WebSocket;
   userId: number;
   githubLogin: string;
+  /**
+   * The session this socket is *driving*: where input, resize and start go.
+   * One at a time, because there is one terminal on the page.
+   */
   claudeSessionId: string | null;
+  /**
+   * Chat sessions this socket is *watching*.
+   *
+   * Separate from `claudeSessionId` because a chat surface has no shared
+   * device to contend for: its events are session-tagged and land in a
+   * per-session transcript, so a browser can follow every chat it has a tab
+   * for while driving only one. Without this a second chat tab silently
+   * unsubscribed the first, and its conversation went blank while its agent
+   * carried on working.
+   */
+  chatSessionIds: Set<string>;
   created: Date;
 }
 
@@ -123,6 +146,8 @@ export interface SessionListItem {
   workingDir: string;
   connectedClients: number;
   lastActivity: Date;
+  /** Absent means terminal; the client needs it to watch chat sessions it is not driving. */
+  surface?: 'terminal' | 'chat';
 }
 
 export interface BridgeInterface {

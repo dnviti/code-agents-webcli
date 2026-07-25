@@ -37,7 +37,7 @@ function createSessionRecord(params = {}) {
 
 /** A chat manager that records what it was asked to do. */
 function createChatManager(overrides = {}) {
-  const calls = { start: [], send: [], interrupt: [], permission: [], page: [] };
+  const calls = { start: [], send: [], interrupt: [], permission: [], page: [], cancelQueued: [] };
   return {
     calls,
     has: () => false,
@@ -68,6 +68,10 @@ function createChatManager(overrides = {}) {
     },
     async interrupt(sessionId) {
       calls.interrupt.push(sessionId);
+    },
+    cancelQueued(sessionId, queuedId) {
+      calls.cancelQueued.push({ sessionId, queuedId });
+      return true;
     },
     respondPermission(sessionId, requestId, optionId) {
       calls.permission.push({ sessionId, requestId, optionId });
@@ -102,6 +106,9 @@ function build(sessionOverrides = {}, managerOverrides = {}) {
         userId: 7,
         githubLogin: 'tester',
         claudeSessionId: session.id,
+        // Chat events reach a socket that has *subscribed*, not one that
+        // merely joined, so a fixture without this set receives nothing.
+        chatSessionIds: new Set(),
         created: new Date(),
       },
     ],
@@ -240,6 +247,27 @@ describe('chat wiring', function () {
       const { processor, chatManager } = build({ surface: 'chat' });
       await processor.handleMessage('ws-1', { type: 'chat_interrupt' });
       assert.deepStrictEqual(chatManager.calls.interrupt, ['session-1']);
+    });
+
+    it('forwards a withdrawal of a queued turn', async function () {
+      const { processor, chatManager } = build({ surface: 'chat' });
+      await processor.handleMessage('ws-1', { type: 'chat_queue_cancel', queuedId: 'queued-9' });
+      assert.deepStrictEqual(chatManager.calls.cancelQueued[0], {
+        sessionId: 'session-1',
+        queuedId: 'queued-9',
+      });
+    });
+
+    it('ignores a withdrawal with no id rather than clearing the whole line', async function () {
+      const { processor, chatManager } = build({ surface: 'chat' });
+      await processor.handleMessage('ws-1', { type: 'chat_queue_cancel' });
+      assert.strictEqual(chatManager.calls.cancelQueued.length, 0);
+    });
+
+    it('will not let one socket withdraw from another user\u2019s queue', async function () {
+      const { processor, chatManager } = build({ surface: 'chat', ownerUserId: 999 });
+      await processor.handleMessage('ws-1', { type: 'chat_queue_cancel', queuedId: 'queued-9' });
+      assert.strictEqual(chatManager.calls.cancelQueued.length, 0);
     });
 
     it('forwards a permission decision', async function () {

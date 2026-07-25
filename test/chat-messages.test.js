@@ -66,10 +66,18 @@ function message(over) {
   };
 }
 
-/** A transcript holding exactly the messages given, with no server history. */
+/**
+ * A transcript holding exactly the messages given.
+ *
+ * `firstSeq` is the lowest seq the *server* still has and `replayFrom` is the
+ * lowest one this snapshot actually carried; older history exists exactly when
+ * they differ. Defaulting replayFrom to firstSeq is the "fully replayed" case,
+ * where there is nothing above what the client already holds.
+ */
 function transcriptOf(messages, opts) {
   const { ChatTranscript } = mod;
   const t = new ChatTranscript();
+  const firstSeq = opts && opts.firstSeq !== undefined ? opts.firstSeq : 0;
   t.hydrate({
     sessionId: 's1',
     runtime: 'claude',
@@ -77,7 +85,8 @@ function transcriptOf(messages, opts) {
     state: (opts && opts.state) || 'idle',
     capabilities: t.capabilities,
     pendingPermissions: [],
-    firstSeq: opts && opts.firstSeq !== undefined ? opts.firstSeq : 0,
+    firstSeq,
+    replayFrom: opts && opts.replayFrom !== undefined ? opts.replayFrom : firstSeq,
     cursor: messages.length,
     live: true,
     bypassPermissions: false,
@@ -266,12 +275,36 @@ describe('MessageList', function () {
 
   it('offers to page older history only when it exists and can be fetched', function () {
     const msgs = [message({ blocks: [{ kind: 'text', text: 'hi' }] })];
+    const load = { onLoadMore: () => {} };
 
-    assert.ok(!/earlier messages/.test(renderList(msgs, {}, { firstSeq: 0 })));
-    assert.ok(!/earlier messages/.test(renderList(msgs, {}, { firstSeq: 40 })));
+    // Nothing above what we hold: the replay reached the head of the log.
+    assert.ok(!/earlier messages/.test(renderList(msgs, load, { firstSeq: 0, replayFrom: 0 })));
+    // The regression this guards: seq numbering starts at 1, so a session with
+    // one message and nothing above it reports firstSeq 1. Reading that as
+    // "there is more" offered a control that could never finish, and the
+    // spinner it raised never came down.
+    assert.ok(!/earlier messages/.test(renderList(msgs, load, { firstSeq: 1, replayFrom: 1 })));
+    // Genuinely trimmed: the log starts at 40 and the replay only reached 900.
+    assert.ok(!/earlier messages/.test(renderList(msgs, {}, { firstSeq: 40, replayFrom: 900 })));
     assert.ok(
-      /earlier messages/.test(renderList(msgs, { onLoadMore: () => {} }, { firstSeq: 40 })),
+      /earlier messages/.test(renderList(msgs, load, { firstSeq: 40, replayFrom: 900 })),
     );
+  });
+
+  it('labels the user\u2019s turns and leaves the assistant\u2019s unlabelled', function () {
+    // A conversation is overwhelmingly the assistant talking, so "Assistant"
+    // on every bubble is a word repeated down the page that says nothing the
+    // reader did not already know.
+    const html = renderList([
+      message({ role: 'user', blocks: [{ kind: 'text', text: 'a question' }] }),
+      message({ blocks: [{ kind: 'text', text: 'an answer' }] }),
+    ]);
+
+    assert.ok(/>You</.test(html));
+    assert.ok(!/>Assistant</.test(html), 'the assistant name is not repeated per bubble');
+    // The accessible name is unconditional, so the roles are still announced.
+    assert.ok(/aria-label="Assistant message"/.test(html));
+    assert.ok(/aria-label="You message"/.test(html));
   });
 
   it('starts pinned to the bottom, so no jump affordance is shown', function () {
@@ -305,7 +338,11 @@ describe('MessageList', function () {
       );
     }
 
-    const html = renderList(many, { onFork: () => {}, onRetry: () => {} }, { firstSeq: 900 });
+    const html = renderList(
+      many,
+      { onFork: () => {}, onRetry: () => {} },
+      { firstSeq: 900, replayFrom: 1400 },
+    );
     assert.ok(/question 0/.test(html), 'first message missing');
     assert.ok(/answer 499/.test(html), 'last message missing');
     assert.strictEqual(

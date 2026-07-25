@@ -17,6 +17,14 @@ import { SessionTeardownLike } from '../services/session-teardown.js';
 import { stripAnsi } from '../services/ansi.js';
 import { getOwnedSession, requireUser } from './helpers.js';
 
+/**
+ * How many past conversations one folder offers.
+ *
+ * A list to choose from, not an archive to browse: past this many the useful
+ * one is not findable by scrolling anyway, and every entry costs a read.
+ */
+const MAX_RESUMABLE = 25;
+
 export interface SessionRoutesDeps {
   claudeSessions: Map<string, SessionRecord>;
   webSocketConnections: Map<string, WebSocketInfo>;
@@ -47,6 +55,20 @@ export interface SessionRoutesDeps {
    * compiling; the server always supplies one.
    */
   sessionTeardown?: SessionTeardownLike;
+  /**
+   * The chat log, for listing past conversations in a folder.
+   *
+   * Optional for the same reason as `sessionTeardown` — the hand-built deps in
+   * the tests predate it — and a server without one simply has nothing to
+   * resume, which the route reports as an empty list rather than an error.
+   */
+  chatStore?: {
+    stat(session: { id: string; ownerUserId: number }): Promise<{ firstSeq: number; cursor: number }>;
+    describe(session: { id: string; ownerUserId: number }): Promise<{
+      nativeSessionId: string | null;
+      firstMessage: string | null;
+    }>;
+  };
 }
 
 export function createSessionRoutes(deps: SessionRoutesDeps): Router {
@@ -70,6 +92,81 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     });
   });
 
+  /**
+   * Past conversations in a folder, to pick up instead of starting over.
+   *
+   * The web counterpart of `claude --resume`: choose a directory, then choose a
+   * conversation. Scoped to one directory on purpose — a conversation is about
+   * a project, and a list mixing every folder a person has ever opened is a
+   * list nobody reads.
+   *
+   * Only sessions this user owns, and only ones that actually have a chat log:
+   * a session record with an empty transcript is a folder someone opened and
+   * walked away from, and offering to "resume" it would resume nothing.
+   */
+  router.get('/api/sessions/resumable', async (req: Request, res: Response): Promise<void> => {
+    const user = requireUser(res);
+    if (!user) {
+      res.status(401).json({ error: 'authentication_required' });
+      return;
+    }
+
+    const requested = typeof req.query.dir === 'string' ? req.query.dir : '';
+    if (!requested) {
+      res.status(400).json({ error: 'No folder was named' });
+      return;
+    }
+
+    // The same check every other path in this app goes through. A directory
+    // that fails it cannot have had a session in it anyway, so this is about
+    // refusing to answer questions about the rest of the disk.
+    const validation = deps.validatePath(requested);
+    if (!validation.valid || !validation.path) {
+      res.status(403).json({ error: 'That folder is outside the allowed base' });
+      return;
+    }
+
+    const candidates = Array.from(deps.claudeSessions.values())
+      .filter((session) => session.ownerUserId === user.id)
+      .filter((session) => session.surface === 'chat')
+      .filter((session) => session.workingDir === validation.path)
+      .sort((a, b) => b.lastActivity.getTime() - a.lastActivity.getTime())
+      .slice(0, MAX_RESUMABLE);
+
+    const store = deps.chatStore;
+    const conversations = await Promise.all(
+      candidates.map(async (session) => {
+        const ref = { id: session.id, ownerUserId: session.ownerUserId };
+        const [stats, description] = await Promise.all([
+          store?.stat(ref).catch(() => null) ?? null,
+          store?.describe(ref).catch(() => null) ?? null,
+        ]);
+
+        return {
+          id: session.id,
+          name: session.name,
+          runtime: session.lastAgent,
+          runtimeLabel: session.runtimeLabel,
+          lastActivity: session.lastActivity.toISOString(),
+          workingDir: session.workingDir,
+          events: stats?.cursor ?? 0,
+          firstMessage: description?.firstMessage ?? null,
+          // The record first, then the log: the record is authoritative and the
+          // head scan is the backfill for conversations that predate it.
+          canResume: Boolean(session.nativeChatSessionId || description?.nativeSessionId),
+          // A conversation that is already running is not one to resume; the
+          // list says so rather than offering an action that would be refused.
+          running: session.active === true,
+        };
+      }),
+    );
+
+    res.json({
+      dir: validation.path,
+      conversations: conversations.filter((entry) => entry.events > 0),
+    });
+  });
+
   router.get('/api/sessions/list', (_req: Request, res: Response): void => {
     const user = requireUser(res);
     if (!user) {
@@ -90,6 +187,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         workingDir: session.workingDir,
         connectedClients: session.connections.size,
         lastActivity: session.lastActivity,
+        surface: session.surface || 'terminal',
       }));
 
     res.json({ sessions: sessionList });

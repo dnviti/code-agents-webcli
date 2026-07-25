@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as net from 'net';
+import * as os from 'os';
 import * as path from 'path';
 
 /**
@@ -37,9 +38,27 @@ export interface PermissionAnswer {
 
 type Decider = (ask: PermissionAsk) => Promise<PermissionAnswer>;
 
+/**
+ * How long a unix socket path may actually be.
+ *
+ * `bind()` copies the path into `sockaddr_un.sun_path`, a fixed array of 108
+ * bytes on Linux and 104 on macOS and the BSDs — one of which is the trailing
+ * NUL. Exceed it and the kernel rejects the address; Node reports that as
+ * `EINVAL`, which reads like a malformed argument rather than a length limit
+ * and is exactly why it was mistaken for one. 103 is the portable floor, so a
+ * path that fits here fits everywhere this server runs.
+ */
+const MAX_SOCKET_PATH_BYTES = 103;
+
+function socketPathFits(candidate: string): boolean {
+  return Buffer.byteLength(candidate, 'utf8') <= MAX_SOCKET_PATH_BYTES;
+}
+
 export class PermissionBroker {
   private server: net.Server | null = null;
   private socketPath = '';
+  /** Set only when the socket had to be placed outside `socketDir`. */
+  private tempDir: string | null = null;
   private decide: Decider | null = null;
   private readonly open = new Set<net.Socket>();
 
@@ -65,14 +84,7 @@ export class PermissionBroker {
     if (this.server) return this.socketPath;
 
     this.decide = decide;
-    fs.mkdirSync(this.socketDir, { recursive: true, mode: 0o700 });
-    // mkdir's mode is subject to umask, so it is set explicitly afterwards.
-    fs.chmodSync(this.socketDir, 0o700);
-
-    this.socketPath = path.join(
-      this.socketDir,
-      `perm-${crypto.randomBytes(12).toString('hex')}.sock`,
-    );
+    this.socketPath = this.reservePath();
 
     const server = net.createServer((socket) => this.accept(socket));
     this.server = server;
@@ -92,6 +104,51 @@ export class PermissionBroker {
     });
 
     return this.socketPath;
+  }
+
+  /**
+   * Choose a path the kernel will actually accept, and create its directory.
+   *
+   * The data directory is wherever the user pointed `--data-dir`, and it can be
+   * arbitrarily deep — deep enough on its own to blow the 103-byte budget above
+   * before this adds a single character. So the preferred location is tried
+   * first and a private `mkdtemp` under the OS temp directory is the fallback:
+   * still 0700, still unguessable, and short by construction. Falling back is
+   * strictly better than the alternative, which is the session refusing to
+   * start at all with a message about an invalid argument.
+   */
+  private reservePath(): string {
+    // 8 random bytes rather than the session id: the id is knowable by anyone
+    // who can list the user's sessions, and while the directory mode already
+    // stops another account from connecting, there is no reason to make the
+    // path guessable by whatever else runs as this user.
+    const name = `p${crypto.randomBytes(8).toString('hex')}.sock`;
+
+    const preferred = path.join(this.socketDir, name);
+    if (socketPathFits(preferred)) {
+      fs.mkdirSync(this.socketDir, { recursive: true, mode: 0o700 });
+      // mkdir's mode is subject to umask, so it is set explicitly afterwards.
+      fs.chmodSync(this.socketDir, 0o700);
+      return preferred;
+    }
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccweb-'));
+    fs.chmodSync(dir, 0o700);
+    this.tempDir = dir;
+
+    const fallback = path.join(dir, name);
+    if (!socketPathFits(fallback)) {
+      // Only reachable if TMPDIR itself is pathological. Say so plainly rather
+      // than letting bind() answer with EINVAL again.
+      fs.rmSync(dir, { recursive: true, force: true });
+      this.tempDir = null;
+      throw new Error(
+        `no room for an approval socket: even ${fallback} exceeds the ` +
+          `${MAX_SOCKET_PATH_BYTES}-byte unix socket path limit. Set TMPDIR to a shorter path.`,
+      );
+    }
+
+    return fallback;
   }
 
   private accept(socket: net.Socket): void {
@@ -163,6 +220,15 @@ export class PermissionBroker {
         // Already gone, or never created.
       }
       this.socketPath = '';
+    }
+
+    if (this.tempDir) {
+      try {
+        fs.rmSync(this.tempDir, { recursive: true, force: true });
+      } catch {
+        // A leftover empty directory in the temp dir is not worth reporting.
+      }
+      this.tempDir = null;
     }
   }
 }

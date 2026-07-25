@@ -198,6 +198,42 @@ describe('chat permission broker', function () {
       assert.strictEqual(fs.existsSync(socketPath), false);
     });
 
+    it('listens even when the data directory is too deep for a socket path', async function () {
+      // The reported failure, reproduced by arithmetic rather than by guessing:
+      // sockaddr_un.sun_path is 108 bytes on Linux and 104 on macOS, and the
+      // old layout spent 37 of them on a directory named after the session
+      // UUID. bind() rejects the address, and Node reports that as EINVAL —
+      // which reads like a bad argument, not a length limit.
+      const deep = path.join(root, 'x'.repeat(80), 'chat-sockets');
+      broker = new PermissionBroker(deep);
+
+      const socketPath = await broker.listen(async () => ({ allow: true }));
+
+      assert.ok(
+        Buffer.byteLength(socketPath, 'utf8') <= 103,
+        `socket path is ${Buffer.byteLength(socketPath, 'utf8')} bytes: ${socketPath}`,
+      );
+      // Still usable, not merely short: the fallback location has to be one the
+      // hook can actually dial.
+      const { decision } = await runHook(socketPath);
+      assert.strictEqual(decision.permissionDecision, 'allow');
+
+      const dir = path.dirname(socketPath);
+      assert.strictEqual(fs.statSync(dir).mode & 0o777, 0o700);
+      assert.strictEqual(fs.statSync(socketPath).mode & 0o777, 0o600);
+
+      broker.close();
+      broker = null;
+      // The fallback directory is this broker's alone, so it goes with it.
+      assert.strictEqual(fs.existsSync(dir), false);
+    });
+
+    it('keeps the preferred directory when the path does fit', async function () {
+      broker = new PermissionBroker(path.join(root, 'sockets'));
+      const socketPath = await broker.listen(async () => ({ allow: true }));
+      assert.strictEqual(path.dirname(socketPath), path.join(root, 'sockets'));
+    });
+
     it('does not put the session id in the socket name', async function () {
       broker = new PermissionBroker(path.join(root, 'sockets'));
       const socketPath = await broker.listen(async () => ({ allow: true }));

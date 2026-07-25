@@ -177,6 +177,9 @@ const DEFAULTS: AppSettings = {
   fontSize: 14,
   theme: 'github-dark',
   terminalFontFamily: 'jetbrains-mono',
+  // Off. Every other default in this file is a matter of taste; this one
+  // decides whether an agent can act on this machine without being asked.
+  chatBypassPermissions: false,
 };
 
 const THEME_ALIASES: Record<string, ThemePresetId> = {
@@ -218,6 +221,9 @@ export function loadSettings(): AppSettings {
       ...parsed,
       theme: normalizedTheme,
       terminalFontFamily: normalizeTerminalFontFamily(parsed.terminalFontFamily),
+      // Strict equality, not truthiness: anything in storage that is not
+      // literally `true` leaves approvals on.
+      chatBypassPermissions: parsed.chatBypassPermissions === true,
     };
   } catch (error) {
     console.error('Failed to load settings:', error);
@@ -250,6 +256,7 @@ export function saveSettings(app: App, next: AppSettings): void {
     fontSize: clampFontSize(next.fontSize),
     theme: normalizeThemePreset(next.theme),
     terminalFontFamily: normalizeTerminalFontFamily(next.terminalFontFamily),
+    chatBypassPermissions: next.chatBypassPermissions === true,
   };
 
   try {
@@ -271,6 +278,11 @@ function clampFontSize(value: number): number {
 }
 
 export function applySettings(app: App, settings: AppSettings): void {
+  // Published so the runtime launcher can show the current choice on the
+  // button that acts on it, instead of the two reading storage separately and
+  // disagreeing about what is about to happen.
+  shellStore.setState({ chatBypassPermissions: settings.chatBypassPermissions === true });
+
   document.documentElement.setAttribute('data-theme', settings.theme);
   document.documentElement.setAttribute('data-color-mode', getThemeMode(settings.theme));
   updateThemeColor(settings.theme);
@@ -286,6 +298,19 @@ export function applySettings(app: App, settings: AppSettings): void {
   const terminalTheme =
     TERMINAL_THEMES[settings.theme] ||
     TERMINAL_THEMES[DEFAULTS.theme];
+
+  // Published as the app-wide monospace family, not just handed to xterm.
+  // Everything that shows code already reads `--font-mono` — the chat's code
+  // blocks and inline spans, the file editor, the diff view, the `@` picker —
+  // and before this the setting labelled "terminal font" changed exactly one
+  // of them, so the same snippet was one typeface in the terminal and another
+  // in the transcript quoting it.
+  try {
+    document.documentElement.style.setProperty('--font-mono', terminalFontPreset.fontFamily);
+  } catch {
+    // A document that refuses a custom property is one where the rest of this
+    // will not work either; the terminal below is still worth applying.
+  }
 
   if (app.terminal) {
     app.terminal.options.fontSize = settings.fontSize;

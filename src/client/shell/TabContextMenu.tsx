@@ -1,10 +1,15 @@
 import * as React from 'react';
+import { Icon } from '../ui/relay/Icon.js';
 
 export interface TabMenuItem {
   label: string;
   onSelect(): void;
   destructive?: boolean;
   disabled?: boolean;
+  /** Optional leading icon, for menus where the items are not all one kind. */
+  icon?: string;
+  /** A rule above this item, grouping what follows. Not focusable. */
+  separated?: boolean;
 }
 
 export interface TabContextMenuProps {
@@ -12,6 +17,8 @@ export interface TabContextMenuProps {
   y: number;
   items: TabMenuItem[];
   onClose(): void;
+  /** What the menu is for. Announced, so it cannot be left as the default. */
+  label?: string;
 }
 
 /**
@@ -28,7 +35,9 @@ export interface TabContextMenuProps {
  * half off-screen, which is where it is most likely to be opened from on a
  * narrow window.
  */
-export function TabContextMenu({ x, y, items, onClose }: TabContextMenuProps): React.JSX.Element {
+export function TabContextMenu({
+  x, y, items, onClose, label = 'Session actions',
+}: TabContextMenuProps): React.JSX.Element {
   const ref = React.useRef<HTMLDivElement | null>(null);
   const itemRefs = React.useRef<Array<HTMLButtonElement | null>>([]);
   const [pos, setPos] = React.useState({ left: x, top: y });
@@ -125,7 +134,7 @@ export function TabContextMenu({ x, y, items, onClose }: TabContextMenuProps): R
     <div
       ref={ref}
       role="menu"
-      aria-label="Session actions"
+      aria-label={label}
       onKeyDown={onKeyDown}
       style={{
         position: 'fixed',
@@ -163,6 +172,13 @@ function MenuItem({
 }): React.JSX.Element {
   const [hover, setHover] = React.useState(false);
   return (
+    <>
+      {item.separated ? (
+        <div
+          role="separator"
+          style={{ height: 1, margin: '4px 2px', background: 'var(--border)' }}
+        />
+      ) : null}
     <button
       ref={registerRef}
       type="button"
@@ -189,7 +205,15 @@ function MenuItem({
         font: 'inherit',
       }}
     >
-      {item.label}
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+        {item.icon ? (
+          <span style={{ display: 'inline-flex', flex: '0 0 auto', color: 'var(--muted-foreground)' }}>
+            <Icon name={item.icon} size={12} />
+          </span>
+        ) : null}
+        {item.label}
+      </span>
     </button>
+    </>
   );
 }

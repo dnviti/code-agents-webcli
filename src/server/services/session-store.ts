@@ -31,6 +31,8 @@ interface RuntimeSessionRow {
   session_usage_json: string;
   max_buffer_size: number;
   last_accessed: number;
+  surface: string | null;
+  native_chat_session_id: string | null;
 }
 
 export class SessionStore {
@@ -64,7 +66,9 @@ export class SessionStore {
           session_start_time,
           session_usage_json,
           max_buffer_size,
-          last_accessed
+          last_accessed,
+          surface,
+          native_chat_session_id
         )
         VALUES (
           @id,
@@ -82,7 +86,9 @@ export class SessionStore {
           @session_start_time,
           @session_usage_json,
           @max_buffer_size,
-          @last_accessed
+          @last_accessed,
+          @surface,
+          @native_chat_session_id
         )
       `);
 
@@ -131,6 +137,13 @@ export class SessionStore {
         ),
         max_buffer_size: session.maxBufferSize || 1000,
         last_accessed: session.lastAccessed || Date.now(),
+        // Persisted so a restart does not show an empty terminal as the whole
+        // history of what was a conversation.
+        surface: session.surface || null,
+        // Without this a restart can still show the conversation but not
+        // continue it: the agent would come back with no memory of a transcript
+        // the user is looking at.
+        native_chat_session_id: session.nativeChatSessionId || null,
       }));
 
       replaceAll(rows);
@@ -163,7 +176,9 @@ export class SessionStore {
             session_start_time,
             session_usage_json,
             max_buffer_size,
-            last_accessed
+            last_accessed,
+            surface,
+            native_chat_session_id
           FROM runtime_sessions
           ORDER BY created_at ASC
         `)
@@ -201,6 +216,8 @@ export class SessionStore {
           }),
           maxBufferSize: row.max_buffer_size || 1000,
           lastAccessed: row.last_accessed || Date.now(),
+          surface: row.surface === 'chat' ? 'chat' : undefined,
+          nativeChatSessionId: row.native_chat_session_id || undefined,
         });
       }
 
