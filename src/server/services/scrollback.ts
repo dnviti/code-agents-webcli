@@ -17,17 +17,64 @@ import type { IBufferCell, IBufferLine, IMarker } from '@xterm/headless';
  * history.
  */
 
-const DEFAULT_EMULATOR_SCROLLBACK = 5000;
+/**
+ * Lines the emulator holds between flushes. This only has to absorb the
+ * output that scrolls by in one inter-flush window — bounded by PTY chunking
+ * (measured: ~7.5KB per chunk, ~2.5k short lines realistic, ~7.5k for an
+ * adversarial all-newline chunk) — not a whole session, because flushes ride
+ * every write callback. 20k is a 2.5x margin over the worst single chunk at
+ * ~45MB worst-case per long-lived session; 50k would be safer still but costs
+ * ~120MB resident per session once filled, which a multi-session self-hosted
+ * server cannot afford.
+ */
+const DEFAULT_EMULATOR_SCROLLBACK = 20_000;
+
+/**
+ * How many already-emitted lines are kept for overlap collapsing. An Ink-style
+ * re-render scrolls the whole previous frame again, so the window has to cover
+ * the tallest frame a program can plausibly draw, not just a screenful.
+ */
+const DEFAULT_OVERLAP_WINDOW_LINES = 10_000;
+
+/** Hard cap on the characters held by the overlap window, so giant lines cannot blow it up. */
+const OVERLAP_WINDOW_MAX_CHARS = 4 * 1024 * 1024;
+
+/**
+ * CSI finals that only a program repainting in place emits: cursor up (A),
+ * cursor preceding line (F), cursor position (H/f), erase in display (J).
+ * Plain streaming output never uses them, and neither does readline-style
+ * editing (that is \r plus erase-in-line), which is what makes them a safe
+ * gate: collapsing only runs for output produced alongside a repaint, so a
+ * genuine repeated block in a normal stream is never eaten.
+ */
+const REDRAW_SIGNAL = /\x1b\[[0-9;]*[AFHfJ]/;
+
+/**
+ * ED 3 wipes the scrollback itself — the program declaring its own history
+ * void. The recorder's whole purpose is that history, so the sequence is
+ * stripped before the emulator sees it: the store keeps the transcript
+ * (exactly as it already does across `clear`, whose ED 2 never touched
+ * scrollback either), the anchor markers are never left pointing at lines
+ * that no longer exist, and a program requesting the wipe is never mistaken
+ * for a recording gap.
+ */
+const ERASE_SCROLLBACK = /\x1b\[0*3J/g;
 
 export interface ScrollbackRecorderOptions {
   cols?: number;
   rows?: number;
   /**
    * How many scrolled-off lines the emulator may hold between flushes. Lines
-   * are flushed on every write, so this only needs to absorb the largest single
-   * burst; beyond it the emulator drops the oldest lines and we record a gap.
+   * are flushed on every write callback, so this only needs to absorb the
+   * largest single burst; beyond it the emulator drops the oldest lines and
+   * we record a gap.
    */
   emulatorScrollback?: number;
+  /**
+   * Lines of already-emitted history retained for overlap collapsing (see
+   * {@link ScrollbackRecorder.flush}).
+   */
+  overlapWindowLines?: number;
   onLines: (lines: string[]) => void;
   /** `null` when lines were lost but the count could not be determined. */
   onGap?: (droppedLines: number | null) => void;
@@ -44,26 +91,57 @@ export class ScrollbackRecorder {
   private absoluteBase = 0;
   private marker: IMarker | undefined;
   private markerAbsolute = 0;
+  /**
+   * Second anchor parked at buffer line 0. Erase-in-display disposes markers
+   * whose line it blanks — and repaint programs erase on every frame — but ED
+   * never touches the scrollback, so once line 0 is above the viewport this
+   * marker dies only to a genuine trim. It is how a flush tells "anchor
+   * erased" (nothing lost) apart from "anchor evicted" (history lost).
+   */
+  private sentry: IMarker | undefined;
   private flushScheduled = false;
   private disposed = false;
+
+  private readonly overlapWindowLines: number;
+  /** Tail of what has already been handed to `onLines`, for frame collapsing. */
+  private emittedTail: string[] = [];
+  private emittedTailChars = 0;
+  /** A repaint sequence was seen in output not yet flushed. */
+  private redrawSeen = false;
 
   constructor(options: ScrollbackRecorderOptions) {
     this.onLines = options.onLines;
     this.onGap = options.onGap ?? (() => {});
+    // Geometry ultimately comes from the client; a negative or fractional
+    // value would break the emulator, so clamp rather than trust.
     this.terminal = new Terminal({
-      cols: options.cols ?? 80,
-      rows: options.rows ?? 24,
+      cols: Math.max(1, Math.floor(options.cols ?? 80)),
+      rows: Math.max(1, Math.floor(options.rows ?? 24)),
       scrollback: options.emulatorScrollback ?? DEFAULT_EMULATOR_SCROLLBACK,
       allowProposedApi: true,
     });
+    this.overlapWindowLines = options.overlapWindowLines ?? DEFAULT_OVERLAP_WINDOW_LINES;
 
     // Anchor before any output arrives, so the very first flush can already
     // tell "nothing was evicted" apart from "the anchor is gone".
     this.anchorMarker();
   }
 
-  write(data: string): void {
-    if (this.disposed || !data) {
+  write(rawData: string): void {
+    if (this.disposed || !rawData) {
+      return;
+    }
+
+    // Cheap pre-scan of the raw chunk: the emulator settles the buffer but
+    // says nothing about how it got there, and the flush below needs to know
+    // whether the lines it is about to freeze came from an in-place repaint.
+    if (REDRAW_SIGNAL.test(rawData)) {
+      this.redrawSeen = true;
+    }
+
+    // See ERASE_SCROLLBACK: a scrollback wipe has no meaning for a recorder.
+    const data = rawData.replace(ERASE_SCROLLBACK, '');
+    if (!data) {
       return;
     }
 
@@ -160,6 +238,21 @@ export class ScrollbackRecorder {
         this.persisted = this.absoluteBase;
         start = 0;
       }
+    } else if (this.sentry && !this.sentry.isDisposed) {
+      // The cursor anchor is dead but line 0 is intact, and trims remove from
+      // line 0 upward — so no line was evicted. The anchor was blanked by an
+      // erase-in-display, which repaint programs emit on every frame; the
+      // un-emitted lines are all still in the buffer and the numbering is
+      // still exact. Reporting a gap here — and worse, renumbering — was what
+      // interleaved "lines not recorded" markers through healthy history and
+      // re-emitted the whole scrollback after every repaint.
+      start = Math.max(0, this.persisted - this.absoluteBase);
+    } else if (buffer.length < (this.terminal.options.scrollback ?? 0) + this.terminal.rows) {
+      // Both anchors died without the buffer ever filling. Trimming is the
+      // only thing that removes lines from the top and it can only happen at
+      // capacity, so this, too, was an erase — possible only while line 0 was
+      // still a screen line (early output, or right after an ED 3 wipe).
+      start = Math.max(0, this.persisted - this.absoluteBase);
     } else {
       // The anchor itself was evicted, so the eviction count is unknowable —
       // `absoluteBase` is stale and would make `start` look valid, quietly
@@ -176,7 +269,7 @@ export class ScrollbackRecorder {
     // append them a second time, so the log physically contains duplicates.
     const target = this.absoluteBase + buffer.baseY;
 
-    const lines: string[] = [];
+    let lines: string[] = [];
     if (target > this.persisted) {
       for (let index = start; index < buffer.baseY; index++) {
         const line = buffer.getLine(index);
@@ -186,6 +279,17 @@ export class ScrollbackRecorder {
       }
       this.persisted = target;
     }
+
+    // A repaint program (Ink-style: cursor up, erase, rewrite the whole frame)
+    // scrolls the top of the previous frame into history again on every frame.
+    // The genuinely new lines are exactly what follows the largest prefix of
+    // this batch that repeats a suffix of what is already recorded — drop only
+    // that prefix. Without the redraw gate this would be unsafe: a plain
+    // stream may legitimately print the same block twice.
+    if (lines.length > 0 && this.redrawSeen) {
+      lines = this.collapseOverlap(lines);
+    }
+    this.redrawSeen = false;
 
     // registerMarker() attaches to whichever buffer is active, so re-anchoring
     // during a full-screen program would put the anchor in the alternate
@@ -197,6 +301,59 @@ export class ScrollbackRecorder {
 
     if (lines.length > 0) {
       this.onLines(lines);
+      this.rememberEmitted(lines);
+    }
+  }
+
+  /**
+   * Drop the largest prefix of `lines` that duplicates a suffix of the emitted
+   * tail. Candidates are anchored by the batch's first line, so the common
+   * no-overlap case costs one scan of the window and no full comparisons.
+   */
+  private collapseOverlap(lines: string[]): string[] {
+    const tail = this.emittedTail;
+    const max = Math.min(lines.length, tail.length);
+    const first = lines[0];
+
+    for (let k = max; k > 0; k--) {
+      if (tail[tail.length - k] !== first) {
+        continue;
+      }
+      let matches = true;
+      for (let index = 1; index < k; index++) {
+        if (lines[index] !== tail[tail.length - k + index]) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) {
+        return k === lines.length ? [] : lines.slice(k);
+      }
+    }
+    return lines;
+  }
+
+  /** Keep a bounded tail of emitted lines for the next collapse comparison. */
+  private rememberEmitted(lines: string[]): void {
+    for (const line of lines) {
+      this.emittedTail.push(line);
+      this.emittedTailChars += line.length;
+    }
+
+    // One splice for the whole trim: shifting line-by-line would be quadratic
+    // on a full window.
+    let drop = 0;
+    let dropChars = 0;
+    let excessChars = this.emittedTailChars - OVERLAP_WINDOW_MAX_CHARS;
+    const excessLines = this.emittedTail.length - this.overlapWindowLines;
+    while (drop < this.emittedTail.length && (drop < excessLines || excessChars > 0)) {
+      dropChars += this.emittedTail[drop].length;
+      excessChars -= this.emittedTail[drop].length;
+      drop++;
+    }
+    if (drop > 0) {
+      this.emittedTail.splice(0, drop);
+      this.emittedTailChars -= dropChars;
     }
   }
 
@@ -234,6 +391,13 @@ export class ScrollbackRecorder {
     this.marker?.dispose();
     this.marker = this.terminal.registerMarker(0);
     this.markerAbsolute = this.absoluteBase + buffer.baseY + buffer.cursorY;
+
+    // registerMarker() is cursor-relative, so parking the sentry at buffer
+    // line 0 means offsetting by the whole cursor position. Line 0 sits in the
+    // scrollback as soon as anything has scrolled, where erase-in-display —
+    // the repaint program's per-frame operation — can never blank it.
+    this.sentry?.dispose();
+    this.sentry = this.terminal.registerMarker(-(buffer.baseY + buffer.cursorY));
   }
 
   dispose(): void {
@@ -243,6 +407,8 @@ export class ScrollbackRecorder {
     this.disposed = true;
     this.marker?.dispose();
     this.marker = undefined;
+    this.sentry?.dispose();
+    this.sentry = undefined;
     this.terminal.dispose();
   }
 }

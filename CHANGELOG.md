@@ -63,6 +63,36 @@
   the binary and that directory is often missing from a systemd `--user` PATH — the same reason the
   Grok bridge leads with `~/.grok/bin`.
 
+### Changed
+- **The live terminal's own scrollback is 10x deeper** (2,000 → 20,000 lines), so scrolling up
+  through a whole agent reply no longer hands off to server-paged history mid-gesture. Older output
+  still pages in from the server at the top exactly as before; the trade-off is xterm's reflow cost
+  on resize, which scales with the buffer.
+
+### Fixed
+- **Scrollback history is a clean transcript again** (issue #22). Three defects compounded into the
+  garbled scroll-up view. First, the server-side recorder anchored its eviction marker at the
+  cursor, and erase-in-display — which repaint-style agent CLIs emit on every single frame —
+  disposes markers on the lines it blanks; each dead anchor was misread as "output outran the
+  recorder", so gap markers were interleaved through healthy history and, worse, the recovery path
+  re-emitted the entire scrollback, which is where the duplicated splash screens and repeated blocks
+  came from. The recorder now parks a second marker at buffer line 0, which erase sequences can
+  never reach (only a genuine trim removes line 0), so an erased anchor is no longer confused for
+  lost output. Second, repaint frames themselves: a redraw taller than the screen scrolls the
+  previous frame's top into history on every keystroke. When — and only when — the output carries
+  in-place repaint sequences (cursor up / cursor position / erase, never plain streaming), the
+  recorder drops the prefix of each new batch that exactly repeats the recorded tail, so a frame is
+  stored once and only the lines that genuinely scrolled for the first time are kept. Third, the
+  recorder was born at a default 80x24 and only caught up with the terminal's real size on the next
+  resize message, wrapping early output at a width the program never had; the session's geometry is
+  now tracked server-side from the start payload onward and the emulator is created at it. A
+  program erasing its own scrollback (ED 3) no longer disturbs any of this either: the sequence is
+  neutralized before the emulator sees it, so the transcript survives a wipe request intact and the
+  request is never mistaken for a recording gap. Genuinely repeated blocks in a plain output stream are never collapsed, and the gap path
+  stays honest for the one case that remains (a single burst outrunning the emulator, whose buffer
+  also grew 5,000 → 20,000 lines, sized from measured PTY chunking rather than guesswork). Session
+  export reads the same store, so exports get the same clean record.
+
 ## [4.1.0] - 2026-07-20
 
 ### Fixed

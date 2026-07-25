@@ -335,6 +335,12 @@ export class MessageProcessor {
       safeOptions.rows = options.rows;
     }
 
+    // The scrollback recorder is born on the first output byte, before any
+    // resize message can arrive, so the geometry the run starts at has to be
+    // known here — otherwise the splash is recorded wrapped at 80x24.
+    session.termCols = Math.max(1, Math.floor((safeOptions.cols as number) || 80));
+    session.termRows = Math.max(1, Math.floor((safeOptions.rows as number) || 24));
+
     // Identifies this particular run, so a late callback from a previous run
     // cannot mark the current one dead and orphan its PTY.
     //
@@ -555,13 +561,15 @@ export class MessageProcessor {
 
     // Keep the recorder's geometry in step with the PTY, otherwise stored lines
     // would be wrapped at a width the program never actually rendered at.
-    this.recorders.get(session.id)?.resize(cols, rows);
+    session.termCols = Math.max(1, Math.floor(cols));
+    session.termRows = Math.max(1, Math.floor(rows));
+    this.recorders.get(session.id)?.resize(session.termCols, session.termRows);
 
     if (session.active && session.agent) {
       try {
         const bridge = this.deps.getRuntimeBridge(session.agent);
         if (bridge) {
-          await bridge.resize(wsInfo.claudeSessionId, cols, rows);
+          await bridge.resize(wsInfo.claudeSessionId, session.termCols, session.termRows);
         }
       } catch (error) {
         if (this.deps.dev) {
@@ -750,6 +758,8 @@ export class MessageProcessor {
 
     const ref = { id: session.id, ownerUserId: session.ownerUserId };
     const recorder = new ScrollbackRecorder({
+      cols: session.termCols || 80,
+      rows: session.termRows || 24,
       onLines: (lines) => this.deps.historyStore.append(ref, lines),
       onGap: (dropped) => {
         const amount = dropped === null ? 'an unknown number of' : String(dropped);

@@ -64,6 +64,13 @@ export interface SessionRecord {
   workingDir: string;
   connections: Set<string>;
   outputBuffer: string[];
+  /**
+   * Geometry the session's PTY is (or was last) running at. The scrollback
+   * recorder must emulate at exactly this size or stored lines are wrapped at
+   * a width the program never rendered.
+   */
+  termCols: number;
+  termRows: number;
   sessionStartTime: Date | null;
   sessionUsage: SessionUsage;
   maxBufferSize: number;
