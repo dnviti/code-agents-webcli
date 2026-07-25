@@ -1,0 +1,152 @@
+import {
+  ChatCapabilities,
+  NO_CHAT_CAPABILITIES,
+} from '../../shared/chat-events.js';
+import { ChatAdapter, ChatAdapterOptions } from './adapter.js';
+import { AcpChatAdapter } from './adapters/acp.js';
+import { ClaudeChatAdapter } from './adapters/claude.js';
+import { CodexChatAdapter } from './adapters/codex.js';
+import { GrokChatAdapter } from './adapters/grok.js';
+import { PiChatAdapter } from './adapters/pi.js';
+
+/**
+ * Which runtimes can be driven as a chat, and by which adapter.
+ *
+ * Four adapter families cover them, and the ACP one covers three CLIs by itself
+ * because they all speak the Agent Client Protocol — adding a fourth ACP agent
+ * is a row in this table, not a new adapter.
+ *
+ * A runtime absent from this table is terminal-only, and the launcher says so
+ * rather than offering a Chat option that would fail on click. That is the rule
+ * this whole feature is built on: never advertise a capability the runtime does
+ * not have. Two runtimes sit in that position deliberately —
+ *
+ *   qwen         — not installed here, so its protocol was never captured.
+ *   agent        — cursor-agent's structured mode was likewise never verified.
+ *
+ * Both are one probe away from a row here; neither gets a guessed adapter,
+ * because an adapter written against an imagined schema fails at the worst
+ * possible moment, in front of a user, mid-turn.
+ */
+
+export type ChatAdapterFactory = (options: ChatAdapterOptions) => ChatAdapter;
+
+interface RuntimeChatEntry {
+  factory: ChatAdapterFactory;
+  /** What the launcher shows before a session exists. */
+  advertised: Partial<ChatCapabilities>;
+}
+
+/**
+ * ACP agents differ only in the argv that starts their protocol server.
+ *
+ * The real capabilities arrive from the handshake, so what is listed here is
+ * only what the launcher shows beforehand; the session replaces it the moment
+ * the agent introduces itself.
+ */
+function acp(runtime: string, acpArgs: string[]): RuntimeChatEntry {
+  return {
+    factory: (options) => new AcpChatAdapter({ ...options, runtime, acpArgs }),
+    advertised: {
+      streaming: true,
+      thinking: true,
+      toolCalls: true,
+      permissions: true,
+      interrupt: true,
+      usage: true,
+      cost: true,
+    },
+  };
+}
+
+const RUNTIMES: Record<string, RuntimeChatEntry> = {
+  claude: {
+    factory: (options) => new ClaudeChatAdapter(options),
+    advertised: {
+      streaming: true,
+      thinking: true,
+      toolCalls: true,
+      permissions: true,
+      interrupt: true,
+      resume: true,
+      attachments: true,
+      usage: true,
+      cost: true,
+    },
+  },
+  codex: {
+    factory: (options) => new CodexChatAdapter(options),
+    advertised: {
+      streaming: true,
+      thinking: true,
+      toolCalls: true,
+      diffs: true,
+      permissions: true,
+      interrupt: true,
+      resume: true,
+      usage: true,
+    },
+  },
+  grok: {
+    factory: (options) => new GrokChatAdapter(options),
+    advertised: { streaming: true, toolCalls: true, usage: true },
+  },
+  pi: {
+    factory: (options) => new PiChatAdapter(options),
+    advertised: {
+      streaming: true,
+      thinking: true,
+      toolCalls: true,
+      usage: true,
+      cost: true,
+    },
+  },
+  kimi: acp('kimi', ['acp']),
+  omp: acp('omp', ['acp']),
+};
+
+/** Whether this runtime can be driven as a chat at all. */
+export function supportsChat(runtime: string): boolean {
+  return runtime in RUNTIMES;
+}
+
+export function chatCapableRuntimes(): string[] {
+  return Object.keys(RUNTIMES);
+}
+
+/**
+ * What the launcher should show for a runtime before anything is running.
+ *
+ * Provisional by nature: several of these CLIs only reveal what they can do
+ * during their handshake, so a live session's capabilities always win over
+ * this. It exists so the launcher can grey out a Chat button honestly rather
+ * than starting a process to find out.
+ */
+export function advertisedChatCapabilities(runtime: string): ChatCapabilities {
+  const entry = RUNTIMES[runtime];
+  if (!entry) return { ...NO_CHAT_CAPABILITIES };
+  return { ...NO_CHAT_CAPABILITIES, ...entry.advertised };
+}
+
+export function createChatAdapter(
+  runtime: string,
+  options: ChatAdapterOptions,
+): ChatAdapter | null {
+  const entry = RUNTIMES[runtime];
+  if (!entry) return null;
+  return entry.factory(options);
+}
+
+/**
+ * Why a runtime has no chat mode, phrased for a person.
+ *
+ * Returns null when it does. The launcher shows this in a tooltip, so "Chat is
+ * unavailable" is never left unexplained.
+ */
+export function chatUnavailableReason(runtime: string): string | null {
+  if (supportsChat(runtime)) return null;
+  if (runtime === 'terminal') {
+    return 'A shell has no conversation to show — this is a terminal session.';
+  }
+  return 'This runtime has no verified structured mode yet, so it runs in the terminal only.';
+}

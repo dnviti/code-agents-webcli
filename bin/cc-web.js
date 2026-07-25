@@ -1,123 +1,55 @@
 #!/usr/bin/env node
 
 const { Command } = require('commander');
-const { execFileSync } = require('child_process');
 const packageJson = require('../package.json');
-const {
-  NATIVE_DEPENDENCIES,
-  isGlobalRoot,
-  isNativeModuleFailure,
-  manualInstructions,
-  repairCommands,
-  resolveInstallRoot,
-  resolveNpm,
-} = require('./native-repair.js');
 
-function printLines(lines) {
-  for (const line of lines) {
-    console.error(line);
+const MIN_NODE_MAJOR = 22;
+const MIN_NODE_MINOR = 13;
+
+/**
+ * Refuse a Node too old for the built-in SQLite, before anything else runs.
+ *
+ * `engines` in package.json is advisory — npm prints a warning and installs
+ * anyway — so without this check the first symptom of an unsupported Node is a
+ * bare `Cannot find module 'node:sqlite'` from three frames deep inside the
+ * server.
+ */
+function checkNodeVersion() {
+  const [major, minor] = process.versions.node.split('.').map(Number);
+  if (major > MIN_NODE_MAJOR || (major === MIN_NODE_MAJOR && minor >= MIN_NODE_MINOR)) {
+    return;
   }
-}
-
-function askToApprove() {
-  return new Promise((resolve) => {
-    const rl = require('readline').createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-    rl.question('Approve these install scripts and build them now? [y/N] ', (answer) => {
-      rl.close();
-      resolve(/^y(es)?$/i.test(String(answer).trim()));
-    });
-  });
+  console.error(
+    `code-agents-webcli needs Node ${MIN_NODE_MAJOR}.${MIN_NODE_MINOR} or newer `
+    + `(it uses Node's built-in SQLite), but this is ${process.version}.`,
+  );
+  console.error('Upgrade Node from https://nodejs.org and run it again.');
+  process.exit(1);
 }
 
 /**
- * Offer to compile the native dependencies, and report whether to retry.
+ * Load the compiled server.
  *
- * Deliberately asks first. npm blocks install scripts as a supply-chain
- * protection, and approving them runs third-party build code — that is the
- * user's call, not something to do silently on their behalf because it happens
- * to be convenient.
+ * There used to be a whole recovery path here that offered to compile
+ * `node-pty` and `better-sqlite3` when they arrived uncompiled from a global
+ * install. Neither package is a dependency any more — the pty ships as a
+ * prebuilt binary and SQLite comes from Node itself — so nothing in the tree
+ * has an install script left to be blocked, and the only remaining way this
+ * fails is a package whose build never ran at all.
  */
-async function offerNativeRepair(root) {
-  const global = isGlobalRoot(root);
-  const commands = repairCommands(root, { global });
-
-  console.error('Cannot start code-agents-webcli: a native dependency was not compiled.');
-  console.error('');
-  console.error(`These packages need to build native code: ${NATIVE_DEPENDENCIES.join(', ')}`);
-  console.error(`They would be built in: ${root}`);
-
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    // Nobody is there to consent, so do not decide for them.
-    printLines(manualInstructions(root, { global }));
-    return false;
-  }
-
-  console.error('');
-  if (!(await askToApprove())) {
-    printLines(manualInstructions(root, { global }));
-    return false;
-  }
-
-  const npm = resolveNpm();
-  for (const args of commands) {
-    console.error(`\n$ npm ${args.join(' ')}`);
-    try {
-      execFileSync(npm, args, { stdio: 'inherit' });
-    } catch {
-      console.error('\nThat step failed, so the build is incomplete.');
-      printLines(manualInstructions(root, { global }));
-      return false;
-    }
-  }
-
-  return true;
-}
-
 function loadServer() {
-  return require('../dist/server/index.js').ClaudeCodeWebServer;
-}
-
-async function loadServerOrRepair() {
   try {
-    return loadServer();
+    return require('../dist/server/index.js').ClaudeCodeWebServer;
   } catch (error) {
     const message = (error && error.message) || String(error);
-
-    // Two very different causes: a build that never happened, versus a build
-    // that is present but whose native dependencies were never compiled.
-    if (!isNativeModuleFailure(message)) {
-      console.error('Cannot start code-agents-webcli because the compiled server bundle is missing.');
-      console.error('Run `npm run build` first, or reinstall the package if this came from npm.');
-      console.error(`Original error: ${message}`);
-      process.exit(1);
-    }
-
-    const root = resolveInstallRoot();
-    if (!root) {
-      console.error('Cannot start code-agents-webcli: a native dependency was not compiled.');
-      console.error('Run `npm rebuild` in this checkout, or `npm install` if you have not yet.');
-      console.error(`Original error: ${message}`);
-      process.exit(1);
-    }
-
-    if (!(await offerNativeRepair(root))) {
-      console.error(`\nOriginal error: ${message}`);
-      process.exit(1);
-    }
-
-    try {
-      // A throwing require is not cached, so this genuinely re-resolves.
-      return loadServer();
-    } catch (retryError) {
-      console.error('\nThe native modules were built, but the server still failed to load.');
-      console.error(`Original error: ${(retryError && retryError.message) || retryError}`);
-      process.exit(1);
-    }
+    console.error('Cannot start code-agents-webcli because the compiled server bundle is missing.');
+    console.error('Run `npm run build` in this checkout, or reinstall the package.');
+    console.error(`Original error: ${message}`);
+    process.exit(1);
   }
 }
+
+checkNodeVersion();
 
 const program = new Command();
 
@@ -147,6 +79,7 @@ program
   .option('--grok-alias <name>', 'display alias for Grok Build (default: env GROK_ALIAS or "Grok")')
   .option('--qwen-alias <name>', 'display alias for Qwen Code (default: env QWEN_ALIAS or "Qwen")')
   .option('--kimi-alias <name>', 'display alias for Kimi Code (default: env KIMI_ALIAS or "Kimi")')
+  .option('--omp-alias <name>', 'display alias for Oh My Pi (default: env OMP_ALIAS or "Oh My Pi")')
   .option('--ngrok-auth-token <token>', 'ngrok auth token to open a public tunnel')
   .option('--ngrok-domain <domain>', 'ngrok reserved domain to use for the tunnel')
   .parse();
@@ -179,8 +112,14 @@ async function main() {
       githubClientId: options.githubClientId,
       githubClientSecret: options.githubClientSecret,
       githubAppToken: options.githubAppToken,
-      allowedGitHubIds: options.allowedGitHubIds,
-      allowAnyGitHubUser: options.allowAnyGitHubUser,
+      // commander derives the property name mechanically — `--allowed-github-ids`
+      // becomes `allowedGithubIds`, with a lower-case `h`. Reading the
+      // `GitHub`-cased spelling the rest of the codebase uses silently yielded
+      // `undefined`, so both of these flags did nothing at all: the allow-list
+      // fell through to the environment (usually empty, refusing every sign-in)
+      // and the deliberate "let anyone in" opt-in could not be expressed.
+      allowedGitHubIds: options.allowedGithubIds,
+      allowAnyGitHubUser: options.allowAnyGithubUser,
       dataDir: options.dataDir,
       // UI aliases for assistants
       claudeAlias: options.claudeAlias || process.env.CLAUDE_ALIAS || 'Claude',
@@ -190,13 +129,13 @@ async function main() {
       grokAlias: options.grokAlias || process.env.GROK_ALIAS || 'Grok',
       qwenAlias: options.qwenAlias || process.env.QWEN_ALIAS || 'Qwen',
       kimiAlias: options.kimiAlias || process.env.KIMI_ALIAS || 'Kimi',
+      ompAlias: options.ompAlias || process.env.OMP_ALIAS || 'Oh My Pi',
       folderMode: true // Always use folder mode
     };
 
-    // Before the banner: repairing an uncompiled native dependency needs to
-    // prompt, and announcing "Starting…" only to fail two lines later reads as
-    // a crash rather than as a question.
-    const ClaudeCodeWebServer = await loadServerOrRepair();
+    // Before the banner: announcing "Starting…" only to fail two lines later
+    // reads as a crash rather than as a missing build.
+    const ClaudeCodeWebServer = loadServer();
 
     console.log('Starting Code Agents Web CLI...');
     console.log(`Port: ${port}`);
@@ -213,6 +152,7 @@ async function main() {
       ['Grok', serverOptions.grokAlias],
       ['Qwen', serverOptions.qwenAlias],
       ['Kimi', serverOptions.kimiAlias],
+      ['Oh My Pi', serverOptions.ompAlias],
     ]
       .map(([name, alias]) => `${name} → "${alias}"`)
       .join(', ');

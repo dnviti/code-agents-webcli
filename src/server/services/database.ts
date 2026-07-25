@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import Database from 'better-sqlite3';
+import { openDatabase, SqliteDatabase } from './sqlite.js';
 import { AuthenticatedUser } from '../types.js';
 
 export interface DatabaseOptions {
@@ -33,7 +33,8 @@ interface AuthSessionRow extends UserRow {
 export class AppDatabase {
   readonly storageDir: string;
   readonly dbPath: string;
-  private readonly db: Database.Database;
+  private readonly db: SqliteDatabase;
+  private isEligibleInstaller: ((githubId: string) => boolean) | null = null;
 
   constructor(options: DatabaseOptions = {}) {
     this.storageDir = options.dataDir
@@ -42,7 +43,7 @@ export class AppDatabase {
     this.dbPath = path.join(this.storageDir, 'app.sqlite');
 
     this.initializeStorage();
-    this.db = new Database(this.dbPath);
+    this.db = openDatabase(this.dbPath);
     this.hardenDatabaseFile();
     this.configureDatabase();
     this.runMigrations();
@@ -52,7 +53,7 @@ export class AppDatabase {
     this.db.close();
   }
 
-  get raw(): Database.Database {
+  get raw(): SqliteDatabase {
     return this.db;
   }
 
@@ -81,29 +82,66 @@ export class AppDatabase {
   }
 
   /**
+   * Teach the installer lookup which accounts are still able to sign in.
+   *
+   * Wired from the auth service rather than read out of app_settings here: the
+   * allow-list can change while the server runs (`--setup`, the settings
+   * route), and a copy taken at boot would keep vouching for an account that
+   * has since been revoked.
+   */
+  setInstallerEligibility(isEligible: ((githubId: string) => boolean) | null): void {
+    this.isEligibleInstaller = isEligible;
+  }
+
+  /**
    * The installer: the account that completed the very first OAuth callback,
-   * and the only one allowed to apply a self-update.
+   * and the only one allowed to apply a self-update or change runtime profiles.
    *
    * `users.id` is AUTOINCREMENT and `upsertGitHubUser` never rewrites it, so
-   * MIN(id) is stable across re-logins. The result is pinned into app_settings
-   * on first resolution: without the pin, deleting the installer's row would
-   * silently promote whoever signed in second.
+   * the earliest id is stable across re-logins. The result is pinned into
+   * app_settings on first resolution: without the pin, deleting the installer's
+   * row would silently promote whoever signed in second, so a pin whose user
+   * row is simply gone is still honoured.
+   *
+   * The one thing that does invalidate a pin is the account behind it no longer
+   * being allowed to sign in. Such a pin can never be exercised by anybody, and
+   * every installer-only screen is then read-only for everyone forever — which
+   * is what a stray row left by a test run or a restored backup produces, since
+   * it sorts ahead of the real installer on id alone.
    */
   getInstallerUserId(): number | null {
     const pinned = this.getSetting('update.installerUserId');
-    if (pinned && /^\d+$/.test(pinned)) {
+    if (pinned && /^\d+$/.test(pinned) && this.isPinnableInstaller(Number(pinned))) {
       return Number(pinned);
     }
 
-    const row = this.db.prepare('SELECT id FROM users ORDER BY id ASC LIMIT 1').get() as
-      | { id: number }
-      | undefined;
-    if (!row) {
+    const rows = this.db.prepare('SELECT id, github_id FROM users ORDER BY id ASC').all() as {
+      id: number;
+      github_id: string;
+    }[];
+    const installer = rows.find((row) => this.canSignIn(row.github_id));
+    if (!installer) {
       return null;
     }
 
-    this.setSetting('update.installerUserId', String(row.id));
-    return row.id;
+    this.setSetting('update.installerUserId', String(installer.id));
+    return installer.id;
+  }
+
+  /**
+   * Whether a pinned id still stands. A missing user row keeps the pin (see
+   * above); only an account that exists and cannot sign in loses it.
+   */
+  private isPinnableInstaller(userId: number): boolean {
+    const row = this.db.prepare('SELECT github_id FROM users WHERE id = ?').get(userId) as
+      | { github_id: string }
+      | undefined;
+    return !row || this.canSignIn(row.github_id);
+  }
+
+  /** With no eligibility hook wired, every stored account counts — the old behaviour. */
+  private canSignIn(githubId: string): boolean {
+    return this.isEligibleInstaller ? this.isEligibleInstaller(githubId) : true;
   }
 
   getUserSetting(userId: number, key: string): string | null {

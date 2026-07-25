@@ -502,7 +502,14 @@ export class AuthService {
     };
   }
 
-  private isGitHubUserAllowed(githubId: string): boolean {
+  /**
+   * Whether this GitHub account may sign in right now.
+   *
+   * Public because the installer lookup needs the same answer: an account that
+   * cannot sign in cannot be the installer either, and reading the allow-list
+   * out of settings a second time would let the two drift apart.
+   */
+  isGitHubUserAllowed(githubId: string): boolean {
     // Fail closed. An empty allow-list used to mean "allow every GitHub account
     // on earth", and since any signed-in user can spawn PTY processes on the
     // host, that made an exposed instance equivalent to unauthenticated RCE.

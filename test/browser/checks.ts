@@ -12,8 +12,12 @@
  * truth for what gets displayed — not against DOM text.
  */
 
+import * as React from 'react';
+import { createRoot } from 'react-dom/client';
+
 import { createTerminalController } from '../../src/client/terminal/controller';
 import { HistoryView } from '../../src/client/terminal/history-view';
+import { Dialog } from '../../src/client/ui/relay/Dialog';
 
 const results: string[] = [];
 const check = (name: string, ok: boolean, detail = ''): void => {
@@ -181,10 +185,165 @@ async function run(): Promise<void> {
   await wait(200);
   check('scrolling past the newest line returns to live', exited > 0 && !view.isOpen, `exited=${exited}`);
 
+  await checkModeQueriesDoNotKillTheTerminal();
+  await checkATallDialogStaysOnScreen();
+
   const pre = document.createElement('pre');
   pre.id = 'results';
   pre.textContent = results.join('\n');
   document.body.appendChild(pre);
+}
+
+/**
+ * A program that asks the terminal what it supports must not be able to stop it
+ * rendering.
+ *
+ * DECRQM (`CSI ? <mode> $p`) is how a modern TUI probes for synchronized
+ * output, in-band resize and friends before it draws anything. xterm answers it
+ * from a handler that runs inside the write loop, so an exception there does
+ * not just drop the reply: it tears down the loop, and every later write — from
+ * this program or any other sharing the terminal — is silently discarded. The
+ * screen simply stops at whatever was on it, which for a program that probes
+ * before its first frame is nothing at all.
+ *
+ * That is not hypothetical; it is what shipped. The build settings turned
+ * xterm's reply-code enum into an assignment to an undeclared name, which
+ * throws in a strict-mode bundle. This check is written against the behaviour
+ * rather than the sequence so it keeps its meaning if the cause ever changes.
+ */
+async function checkModeQueriesDoNotKillTheTerminal(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:800px;height:400px;position:absolute;top:0;left:600px';
+  document.body.appendChild(host);
+
+  const controller = createTerminalController({ fontSize: 14 });
+  controller.open(host);
+  await wait(200);
+
+  const replies: string[] = [];
+  controller.terminal.onData((data) => replies.push(data));
+
+  const errors: string[] = [];
+  const onError = (event: ErrorEvent): void => { errors.push(event.message); };
+  window.addEventListener('error', onError);
+
+  // The five modes a real agent CLI probes at startup, each followed by the
+  // primary-device-attributes query it uses to detect "no answer".
+  const queries = [2026, 2048, 2031, 1010, 1011]
+    .map((mode) => `\x1b[?${mode}$p\x1b[c`)
+    .join('');
+  controller.terminal.write(queries);
+  await wait(200);
+
+  check(
+    'a mode query is answered',
+    replies.some((reply) => reply.includes('$y')),
+    JSON.stringify(replies.slice(0, 6)),
+  );
+  check('a mode query throws nothing', errors.length === 0, errors.join(' | '));
+
+  // The real damage was here: everything written afterwards vanished.
+  const marker = 'still-alive-after-mode-query';
+  controller.terminal.write(`\r\n${marker}\r\n`);
+  await wait(200);
+
+  const buffer = controller.terminal.buffer.active;
+  let rendered = false;
+  for (let row = 0; row < buffer.length; row++) {
+    if (buffer.getLine(row)?.translateToString(true).includes(marker)) {
+      rendered = true;
+      break;
+    }
+  }
+  check('the terminal still renders after a mode query', rendered);
+
+  window.removeEventListener('error', onError);
+  controller.dispose();
+  host.remove();
+}
+
+/**
+ * A dialog with more content than fits must scroll, not overflow the window.
+ *
+ * The overlay centres the panel, so an uncapped panel that outgrows the
+ * viewport hangs off *both* edges — the title row ends up above the top of the
+ * window, and since the overlay is `position: fixed` there is nothing to scroll
+ * to reach it. The runtime-profiles dialog hit this as soon as it had more than
+ * a couple of profiles in it.
+ *
+ * Only a real layout engine can answer this, which is why it lives here rather
+ * than in the jsdom suite: it is entirely about measured geometry.
+ */
+async function checkATallDialogStaysOnScreen(): Promise<void> {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+
+  const rows = Array.from({ length: 60 }, (_, index) =>
+    React.createElement('p', { key: index, style: { height: 48, margin: 0 } }, `row ${index}`),
+  );
+  createRoot(host).render(
+    React.createElement(
+      Dialog,
+      {
+        open: true,
+        title: 'Tall dialog',
+        description: 'More content than the window can hold',
+        footer: React.createElement('button', { type: 'button' }, 'Save'),
+        onClose: () => {},
+        width: 720,
+      },
+      React.createElement('div', null, ...rows),
+    ),
+  );
+  await wait(250);
+
+  const panel = document.querySelector('[role="dialog"]') as HTMLElement | null;
+  if (!panel) {
+    check('a tall dialog renders', false);
+    return;
+  }
+
+  const box = panel.getBoundingClientRect();
+  check(
+    'a tall dialog fits inside the window',
+    box.height <= window.innerHeight,
+    `panel ${Math.round(box.height)}px vs viewport ${window.innerHeight}px`,
+  );
+  // The failure that actually bites: content centred past the top edge is
+  // unreachable, so the title and the close button are simply gone.
+  check('its title stays reachable', box.top >= 0, `top=${Math.round(box.top)}px`);
+  check(
+    'its footer stays reachable',
+    box.bottom <= window.innerHeight,
+    `bottom=${Math.round(box.bottom)}px of ${window.innerHeight}px`,
+  );
+
+  // Header, body, footer — the body is the middle one and the only scroller.
+  const body = panel.children[1] as HTMLElement | undefined;
+  check(
+    'the overflow moves into the body',
+    !!body && body.scrollHeight > body.clientHeight,
+    body ? `scrollHeight=${body.scrollHeight} clientHeight=${body.clientHeight}` : 'no body',
+  );
+
+  // Header and footer must keep their own height rather than being squeezed
+  // away to make room — that is what flex would do to them by default.
+  const header = panel.children[0] as HTMLElement | undefined;
+  const footer = panel.children[2] as HTMLElement | undefined;
+  check(
+    'the header and footer are not squeezed',
+    !!header && header.clientHeight > 20 && !!footer && footer.clientHeight > 20,
+    `header=${header?.clientHeight} footer=${footer?.clientHeight}`,
+  );
+
+  // And scrolling the body actually moves it.
+  if (body) {
+    body.scrollTop = body.scrollHeight;
+    await wait(50);
+    check('the body scrolls to the end', body.scrollTop > 0, `scrollTop=${body.scrollTop}`);
+  }
+
+  host.remove();
 }
 
 run().catch((error: unknown) => {

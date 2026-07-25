@@ -147,4 +147,22 @@ describe('build identity packaging', function () {
     // update, because the activate handler only evicts caches it does not know.
     assert.match(sw, /const CACHE_NAME = 'code-agents-webcli-.+'/);
   });
+
+  it('gives a working-tree build a cache name of its own', function () {
+    // `<sha>-dirty` was the same string for every build from the same commit,
+    // so rebuilding a fix and reloading kept serving the cached broken client:
+    // the cache could not be busted exactly when it most needed to be. A dirty
+    // build now carries the build timestamp; a clean one still gets only its
+    // commit, so released builds stay reproducible.
+    const info = JSON.parse(fs.readFileSync(path.join(root, 'dist', 'build-info.json'), 'utf8'));
+    const sw = fs.readFileSync(path.join(root, 'dist', 'public', 'service-worker.js'), 'utf8');
+    const name = sw.match(/const CACHE_NAME = '([^']+)'/)[1];
+
+    assert.doesNotMatch(name, /-dirty$/, 'a fixed suffix cannot bust a cache');
+    if (info.dirty || !info.sha) {
+      assert.match(name, /\d{12,}$/, `expected a build stamp in ${name}`);
+    } else {
+      assert.strictEqual(name, `code-agents-webcli-${info.sha.slice(0, 12)}`);
+    }
+  });
 });

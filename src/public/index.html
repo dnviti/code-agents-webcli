@@ -109,40 +109,12 @@
         </main>
     </div>
 
+    <!--
+      The service worker is registered from the bundle (src/client/ui/service-worker.ts),
+      not from an inline script here. It has to ask before reloading, and only
+      code inside the bundle can reach the app's own dialog — an inline script's
+      only option is window.confirm, which renders in the browser's chrome.
+    -->
     <script src="app.bundle.js"></script>
-    
-    <!-- Service Worker Registration -->
-    <script>
-        if ('serviceWorker' in navigator) {
-            window.addEventListener('load', () => {
-                navigator.serviceWorker.register('/service-worker.js')
-                    .then(registration => {
-                        console.log('ServiceWorker registration successful:', registration.scope);
-                        
-                        // Check for updates periodically
-                        setInterval(() => {
-                            registration.update();
-                        }, 60000); // Check every minute
-                        
-                        // Handle updates
-                        registration.addEventListener('updatefound', () => {
-                            const newWorker = registration.installing;
-                            newWorker.addEventListener('statechange', () => {
-                                if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                                    // New service worker available, prompt user to refresh
-                                    if (confirm('A new version of Code Agents Web CLI is available. Refresh to update?')) {
-                                        newWorker.postMessage({ type: 'SKIP_WAITING' });
-                                        window.location.reload();
-                                    }
-                                }
-                            });
-                        });
-                    })
-                    .catch(err => {
-                        console.log('ServiceWorker registration failed:', err);
-                    });
-            });
-        }
-    </script>
 </body>
 </html>

@@ -1,0 +1,13 @@
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"th_123","turn":{"id":"turn_2","items":[],"status":"inProgress","error":null,"startedAt":2000,"completedAt":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"th_123","turnId":"turn_2","item":{"type":"reasoning","id":"item_r1","summary":[],"content":[]}}}
+{"jsonrpc":"2.0","method":"item/reasoning/textDelta","params":{"threadId":"th_123","turnId":"turn_2","itemId":"item_r1","delta":"Let me check the file","contentIndex":0}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"th_123","turnId":"turn_2","item":{"type":"reasoning","id":"item_r1","summary":[],"content":["Let me check the file"]}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"th_123","turnId":"turn_2","item":{"type":"commandExecution","id":"item_c1","command":"ls -la","cwd":"/work","processId":null,"source":"agent","status":"inProgress","commandActions":[],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"th_123","turnId":"turn_2","item":{"type":"commandExecution","id":"item_c1","command":"ls -la","cwd":"/work","processId":null,"source":"agent","status":"completed","commandActions":[],"aggregatedOutput":"file1\nfile2","exitCode":0,"durationMs":42}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"th_123","turnId":"turn_2","item":{"type":"fileChange","id":"item_f1","changes":[{"path":"hello.txt","kind":{"type":"update","move_path":null},"diff":"@@ -1,1 +1,1 @@\n-old\n+new"}],"status":"inProgress"}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"th_123","turnId":"turn_2","item":{"type":"fileChange","id":"item_f1","changes":[{"path":"hello.txt","kind":{"type":"update","move_path":null},"diff":"@@ -1,1 +1,1 @@\n-old\n+new"}],"status":"completed"}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"th_123","turnId":"turn_2","item":{"type":"plan","id":"item_p1","text":""}}}
+{"jsonrpc":"2.0","method":"item/plan/delta","params":{"threadId":"th_123","turnId":"turn_2","itemId":"item_p1","delta":"Step 1: read\n"}}
+{"jsonrpc":"2.0","method":"item/plan/delta","params":{"threadId":"th_123","turnId":"turn_2","itemId":"item_p1","delta":"Step 2: edit"}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"th_123","turnId":"turn_2","item":{"type":"plan","id":"item_p1","text":"Step 1: read\nStep 2: edit"}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th_123","turn":{"id":"turn_2","items":[],"status":"completed","error":null,"startedAt":2000,"completedAt":2500,"durationMs":500}}}

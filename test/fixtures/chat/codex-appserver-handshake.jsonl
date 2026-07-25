@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex-cli/0.1.0","codexHome":"/home/user/.codex","platformFamily":"unix","platformOs":"linux"}}
+{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"th_123"},"model":"gpt-5-codex","cwd":"/work"}}

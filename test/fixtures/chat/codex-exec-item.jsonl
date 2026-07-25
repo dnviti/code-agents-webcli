@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"019f994d-0000-7000-8000-000000000000"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agentMessage","id":"item_1","text":"abacus","phase":null,"memoryCitation":null}}
+{"type":"turn.completed"}

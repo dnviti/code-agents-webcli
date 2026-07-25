@@ -1,15 +1,13 @@
-FROM node:20-bookworm-slim AS build
+# Node 22.13+ is required for the built-in node:sqlite this app runs on; 24 is
+# the current LTS. The python3/make/g++ layer that used to be here is gone with
+# the last compiled dependency — nothing in the tree builds native code now.
+FROM node:24-bookworm-slim AS build
 
 WORKDIR /app
-
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 make g++ \
-  && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./
 # --ignore-scripts because `prepare` (needed so `npm i github:...` builds the
 # package) would run scripts/build.js here, before the sources are copied in.
-# It also defers the native builds, which `npm rebuild` performs below.
 RUN npm ci --ignore-scripts
 
 COPY . .
@@ -22,9 +20,9 @@ ARG BUILD_DATE=""
 ENV CODE_AGENTS_WEBCLI_BUILD_SHA=$BUILD_SHA
 ENV CODE_AGENTS_WEBCLI_BUILD_DATE=$BUILD_DATE
 
-RUN npm rebuild && npm run build && npm prune --omit=dev
+RUN npm run build && npm prune --omit=dev
 
-FROM node:20-bookworm-slim
+FROM node:24-bookworm-slim
 
 ENV NODE_ENV=production
 ENV PORT=32352

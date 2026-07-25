@@ -26,6 +26,11 @@ export class CodexBridge extends BaseBridge {
       ? ['--dangerously-bypass-approvals-and-sandbox']
       : [];
   }
+
+  protected getModelFlag(): string | null {
+    // `--model <model>` — verified against the installed CLI's --help.
+    return '--model';
+  }
 }
 
 export default CodexBridge;

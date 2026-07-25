@@ -68,7 +68,6 @@ export interface UpdateStatusResponse {
 }
 
 export const INSTALL_COMMAND = 'npm i -g --allow-git=all github:dnviti/code-agents-webcli';
-export const REBUILD_COMMAND = 'npm rebuild --prefix "$(npm root -g)/code-agents-webcli"';
 export const UNIT_RESTART_COMMAND = 'systemctl --user restart code-agents-webcli.service';
 
 /** What the banner should look like right now. */
@@ -159,7 +158,7 @@ export function describeUpdate(
       tone: 'error',
       text:
         'A previous update did not finish, so this installation may be incomplete. '
-        + `Reinstall from a shell: ${INSTALL_COMMAND} then ${REBUILD_COMMAND}`,
+        + `Reinstall from a shell: ${INSTALL_COMMAND}`,
       action: null,
       actionLabel: null,
       dismissible: true,

@@ -36,6 +36,11 @@ export class KimiBridge extends BaseBridge {
     // it would promise a bypass the user does not actually get.
     return options.dangerouslySkipPermissions ? ['--yolo'] : [];
   }
+
+  protected getModelFlag(): string | null {
+    // `--model <model>` — verified against the installed CLI's --help.
+    return '--model';
+  }
 }
 
 export default KimiBridge;

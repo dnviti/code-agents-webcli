@@ -1,0 +1,4 @@
+{"type":"text","data":"Here's"}
+{"type":"text","data":" a summary"}
+{"type":"thought","data":"Analyzing the directory structure..."}
+{"type":"end","stopReason":"EndTurn","sessionId":"abc123","requestId":"xyz789","num_turns":7,"usage":{"input_tokens":7210,"cache_read_input_tokens":41000,"output_tokens":1893,"reasoning_tokens":412,"total_tokens":50103},"total_cost_usd":0.01268905}

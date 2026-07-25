@@ -44,6 +44,7 @@ export interface Aliases {
   grok: string;
   qwen: string;
   kimi: string;
+  omp: string;
   terminal: string;
 }
 
@@ -55,6 +56,7 @@ export type AgentKind =
   | 'grok'
   | 'qwen'
   | 'kimi'
+  | 'omp'
   | 'terminal';
 
 export interface PlanData {
@@ -68,6 +70,15 @@ export interface RuntimeStartOptions {
   mode?: 'shell' | 'command';
   shell?: string;
   command?: string;
+  /**
+   * Which surface to open the session on.
+   *
+   * Absent means terminal, so every existing caller keeps its behaviour. Set
+   * once at launch and never changed: the two surfaces run the runtime as
+   * different processes — a TUI in a PTY versus a headless protocol stream —
+   * so there is nothing to switch between afterwards.
+   */
+  surface?: 'terminal' | 'chat';
 }
 
 export interface SessionCreateResponse {
@@ -118,8 +129,52 @@ export interface WsSessionJoinedMessage {
   outputBuffer?: string[];
   lastAgent?: AgentKind;
   runtimeLabel?: string;
+  agent?: AgentKind;
+  /**
+   * Which surface this session runs on. Absent means terminal, so a server
+   * that predates chat mode still reads correctly.
+   */
+  surface?: 'terminal' | 'chat';
   /** How far back the server can page this session's scrollback. */
   history?: { firstLine: number; totalLines: number };
+}
+
+/**
+ * The chat surface's message family.
+ *
+ * Typed loosely on purpose at this boundary: the payloads are ChatEvent and
+ * ChatSnapshot from src/shared, and the chat controller is the only thing that
+ * looks inside them. Restating those shapes here would create a second
+ * definition to keep in step with the shared one.
+ */
+export interface WsChatStartedMessage {
+  type: 'chat_started';
+  sessionId: string;
+  agent: AgentKind;
+  runtimeLabel: string;
+  capabilities?: unknown;
+  bypassPermissions?: boolean;
+}
+
+export interface WsChatSnapshotMessage {
+  type: 'chat_snapshot';
+  sessionId: string;
+  snapshot: unknown;
+}
+
+export interface WsChatEventMessage {
+  type: 'chat_event';
+  sessionId: string;
+  event: unknown;
+}
+
+export interface WsChatPageMessage {
+  type: 'chat_page';
+  sessionId: string;
+  requestId: string | null;
+  events: unknown[];
+  firstSeq: number;
+  cursor: number;
 }
 
 export interface WsHistoryChunkMessage {
@@ -146,6 +201,7 @@ export interface WsRuntimeStartedMessage {
     | 'grok_started'
     | 'qwen_started'
     | 'kimi_started'
+    | 'omp_started'
     | 'terminal_started';
   agent?: AgentKind;
 }
@@ -159,6 +215,7 @@ export interface WsRuntimeStoppedMessage {
     | 'grok_stopped'
     | 'qwen_stopped'
     | 'kimi_stopped'
+    | 'omp_stopped'
     | 'terminal_stopped';
   agent?: AgentKind;
   runtimeLabel?: string;
@@ -269,4 +326,8 @@ export type WsMessage =
   | WsUpdateStatusMessage
   | WsUpdateOutputMessage
   | WsUpdateDoneMessage
-  | WsUpdateRestartingMessage;
+  | WsUpdateRestartingMessage
+  | WsChatStartedMessage
+  | WsChatSnapshotMessage
+  | WsChatEventMessage
+  | WsChatPageMessage;

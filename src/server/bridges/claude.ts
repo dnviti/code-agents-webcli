@@ -61,6 +61,11 @@ export class ClaudeBridge extends BaseBridge {
       }, 500);
     }
   }
+
+  protected getModelFlag(): string | null {
+    // `--model <model>` — verified against the installed CLI's --help.
+    return '--model';
+  }
 }
 
 export default ClaudeBridge;

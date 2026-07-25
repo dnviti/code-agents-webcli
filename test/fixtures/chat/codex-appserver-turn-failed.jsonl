@@ -1,0 +1,3 @@
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"th_123","turn":{"id":"turn_3","items":[],"status":"inProgress","error":null,"startedAt":3000,"completedAt":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"error","params":{"error":{"message":"boom","codexErrorInfo":null,"additionalDetails":null},"willRetry":false,"threadId":"th_123","turnId":"turn_3"}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th_123","turn":{"id":"turn_3","items":[],"status":"failed","error":{"message":"boom","codexErrorInfo":null,"additionalDetails":null},"startedAt":3000,"completedAt":3100,"durationMs":100}}}

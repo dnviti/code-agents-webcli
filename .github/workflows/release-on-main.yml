@@ -35,7 +35,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: npm
 
       - name: Setup Docker Buildx
@@ -117,8 +117,17 @@ jobs:
             Published assets:
             - container image: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}`
 
-            Install with:
+            Run it without installing:
+            ```
+            npx --allow-git=all github:dnviti/code-agents-webcli
+            ```
+
+            Or install it:
             ```
             npm i -g --allow-git=all github:dnviti/code-agents-webcli
-            npm rebuild --prefix "$(npm root -g)/code-agents-webcli"
+            cc-web
             ```
+
+            Needs Node 22.13 or newer. Nothing is compiled and there is no
+            second command: the `npm rebuild` step that used to be here went
+            away with the last native dependency.

@@ -17,9 +17,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # 22 is the floor the package declares (the first release with an
+        # unflagged node:sqlite); 24 is current LTS.
         node:
-          - 20
           - 22
+          - 24
 
     steps:
       - name: Checkout
@@ -39,6 +41,28 @@ jobs:
 
       - name: Test
         run: npm test
+
+  install:
+    name: Verify the documented install
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # Deliberately runs on a clean runner with no node_modules and no
+      # pre-approved install scripts, which is the only place the promise in the
+      # README can actually be falsified. It installs the working tree by git
+      # URL into an empty prefix and starts the result. A dependency that needs
+      # to compile, or a `prepare` that only works inside a checkout, fails
+      # here and nowhere else.
+      - name: Install from a git URL into an empty prefix
+        run: bash scripts/verify-install.sh
 
   docker-build:
     name: Validate Docker build

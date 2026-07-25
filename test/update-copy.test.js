@@ -166,7 +166,12 @@ describe('describeUpdate', function () {
     }));
     assert.strictEqual(view.tone, 'error');
     assert.match(view.text, /did not finish/);
-    assert.match(view.text, /npm rebuild --prefix/);
+    // A single reinstall is the whole recovery. It used to be followed by an
+    // `npm rebuild`, which went away with the last native dependency — telling
+    // someone to run a command that no longer does anything is worse than
+    // saying nothing.
+    assert.match(view.text, /npm i -g --allow-git=all github:dnviti\/code-agents-webcli/);
+    assert.doesNotMatch(view.text, /npm rebuild/);
   });
 
   it('says the build is off main when the distance is unknown', function () {

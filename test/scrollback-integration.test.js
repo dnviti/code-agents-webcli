@@ -2,7 +2,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const pty = require('node-pty');
+const pty = require('@lydell/node-pty');
 const { ScrollbackRecorder } = require('../dist/server/services/scrollback.js');
 const { HistoryStore } = require('../dist/server/services/history-store.js');
 

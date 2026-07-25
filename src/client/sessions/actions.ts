@@ -181,12 +181,38 @@ export async function ensureSessionForStart(app: App): Promise<string> {
   return data.sessionId;
 }
 
+/**
+ * How long a launch may go unanswered before the spinner gives up.
+ *
+ * Every runtime announces itself as soon as its process is spawned, not when
+ * the model first replies, so a healthy start lands in well under a second on
+ * either surface. This is therefore not a latency budget — it is the point past
+ * which the only remaining explanation is that nothing is coming.
+ */
+const RUNTIME_START_TIMEOUT_MS = 25000;
+
+/**
+ * A launch has been answered — by a start, an error, or by giving up.
+ *
+ * The pending start and its watchdog are cleared together, from one place,
+ * because they are two halves of one fact. Clearing only the first is what let
+ * a finished chat launch re-raise its own "Starting…" overlay on the next join.
+ */
+export function settleRuntimeStart(app: App): void {
+  if (app.runtimeStartTimer !== null) {
+    clearTimeout(app.runtimeStartTimer);
+    app.runtimeStartTimer = null;
+  }
+  app.pendingRuntimeStart = null;
+}
+
 export async function startRuntimeSession(
   app: App,
   kind: AgentKind,
   options: RuntimeStartOptions = {},
 ): Promise<void> {
   try {
+    settleRuntimeStart(app);
     app.pendingRuntimeStart = { kind, options };
     app.terminal?.reset();
     app.fitTerminal();
@@ -196,9 +222,30 @@ export async function startRuntimeSession(
       ? { ...options, ...terminalSize }
       : { ...options };
     await ensureSessionForStart(app);
-    app.send({ type: `start_${kind}`, options: payloadOptions });
+
+    // Chat mode is a different server path, not a flag on the terminal one:
+    // the runtime is spawned headless over a protocol stream rather than into
+    // a PTY, so there is no geometry to negotiate and no terminal to attach.
+    if (options.surface === 'chat') {
+      app.send({ type: 'start_chat', agentKind: kind, options: payloadOptions });
+    } else {
+      app.send({ type: `start_${kind}`, options: payloadOptions });
+    }
+
+    // Armed only once the request is actually on the wire, so the window covers
+    // the server's silence rather than the time spent measuring the terminal.
+    app.runtimeStartTimer = setTimeout(() => {
+      app.runtimeStartTimer = null;
+      if (!app.pendingRuntimeStart) return;
+      app.pendingRuntimeStart = null;
+      const label = app.getRuntimeLabel(kind, undefined, 'the runtime');
+      showError(
+        `The server never answered the request to start ${label}. ` +
+          'It may be running an older version than this page — restart the server and reload.',
+      );
+    }, RUNTIME_START_TIMEOUT_MS);
   } catch (error: unknown) {
-    app.pendingRuntimeStart = null;
+    settleRuntimeStart(app);
     const msg = error instanceof Error ? error.message : String(error);
     console.error(`Failed to start ${kind}:`, error);
     showError(msg || `Failed to start ${app.getRuntimeLabel(kind, undefined, 'session')}`);
@@ -231,6 +278,10 @@ export function startQwenSession(app: App, options: RuntimeStartOptions = {}): P
 
 export function startKimiSession(app: App, options: RuntimeStartOptions = {}): Promise<void> {
   return startRuntimeSession(app, 'kimi', options);
+}
+
+export function startOmpSession(app: App, options: RuntimeStartOptions = {}): Promise<void> {
+  return startRuntimeSession(app, 'omp', options);
 }
 
 export function startTerminalSession(app: App, options: RuntimeStartOptions = {}): Promise<void> {

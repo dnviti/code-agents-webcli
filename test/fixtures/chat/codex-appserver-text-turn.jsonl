@@ -1,0 +1,7 @@
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"th_123","turn":{"id":"turn_1","items":[],"status":"inProgress","error":null,"startedAt":1000,"completedAt":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"th_123","turnId":"turn_1","item":{"type":"agentMessage","id":"item_1","text":"","phase":null,"memoryCitation":null}}}
+{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"th_123","turnId":"turn_1","itemId":"item_1","delta":"Hello"}}
+{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"th_123","turnId":"turn_1","itemId":"item_1","delta":", world"}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"th_123","turnId":"turn_1","item":{"type":"agentMessage","id":"item_1","text":"Hello, world","phase":null,"memoryCitation":null}}}
+{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"th_123","turnId":"turn_1","tokenUsage":{"total":{"totalTokens":150,"inputTokens":100,"cachedInputTokens":10,"outputTokens":50,"reasoningOutputTokens":0},"last":{"totalTokens":150,"inputTokens":100,"cachedInputTokens":10,"outputTokens":50,"reasoningOutputTokens":0},"modelContextWindow":128000}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th_123","turn":{"id":"turn_1","items":[],"status":"completed","error":null,"startedAt":1000,"completedAt":1200,"durationMs":1200}}}

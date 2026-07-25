@@ -45,6 +45,8 @@ export interface SettingsDialogProps {
   /** Whether this window can become an installed app. */
   install: InstallState;
   onInstall(): void;
+  /** Open the runtime profile editor, which is its own dialog. */
+  onOpenRuntimeProfiles(): void;
 }
 
 /**
@@ -102,6 +104,7 @@ export function SettingsDialog({
   onClose,
   install,
   onInstall,
+  onOpenRuntimeProfiles,
 }: SettingsDialogProps): React.JSX.Element | null {
   const [draft, setDraft] = React.useState<AppSettings>(settings);
 
@@ -198,6 +201,15 @@ export function SettingsDialog({
           onChange={(event) => update({ terminalFontFamily: event.target.value as TerminalFontFamilyId })}
           style={{ minWidth: 220 }}
         />
+      </SettingRow>
+
+      <SettingRow
+        label="Runtime profiles"
+        description="Pin a model, pass extra arguments, set environment variables, or define capability tiers for each agent. Works with any provider."
+      >
+        <Button variant="secondary" onClick={onOpenRuntimeProfiles}>
+          Configure
+        </Button>
       </SettingRow>
 
       <SettingRow

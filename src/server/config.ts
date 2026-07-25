@@ -13,6 +13,7 @@ export function createConfig(options: ServerOptions): ServerState {
     grok: options.grokAlias || process.env.GROK_ALIAS || 'Grok',
     qwen: options.qwenAlias || process.env.QWEN_ALIAS || 'Qwen',
     kimi: options.kimiAlias || process.env.KIMI_ALIAS || 'Kimi',
+    omp: options.ompAlias || process.env.OMP_ALIAS || 'Oh My Pi',
   };
 
   return {

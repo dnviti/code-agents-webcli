@@ -1,4 +1,4 @@
-import { spawn as defaultSpawnPty, IPty } from 'node-pty';
+import { spawn as defaultSpawnPty, IPty } from '../services/pty.js';
 import * as path from 'path';
 import * as fs from 'fs';
 import { execFileSync as defaultExecFileSync } from 'child_process';

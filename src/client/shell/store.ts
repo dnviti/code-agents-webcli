@@ -11,6 +11,7 @@
 // `shellStore.setState({ ... })` instead and keep the rest of their logic.
 
 import type { SessionListItem } from '../types';
+import type { ConfirmRequest } from '../ui/confirm';
 
 export type ShellTabStatus = 'running' | 'error' | 'idle';
 
@@ -22,6 +23,32 @@ export interface ShellTab {
   kind: string;
   workingDir: string | null;
   unread: boolean;
+  /**
+   * Which surface this session runs on, fixed when it was started.
+   *
+   * Absent means terminal, so every tab that predates chat mode keeps its
+   * behaviour without a migration.
+   */
+  surface?: 'terminal' | 'chat';
+}
+
+/**
+ * The chat surface's slice.
+ *
+ * Holds a live controller object rather than plain data, which is unusual for
+ * this store but correct here: the transcript is mutated thousands of times per
+ * turn and has its own subscription, so putting its contents in the shell state
+ * would re-render the whole shell per token. The store carries only the handle.
+ */
+export interface ShellChat {
+  /** True when the session in focus runs on the chat surface. */
+  active: boolean;
+  controller: unknown | null;
+  runtime: string;
+  runtimeLabel: string;
+  workingDir: string;
+  /** True while the session is acting without asking; shown for its whole life. */
+  bypassPermissions: boolean;
 }
 
 export interface ShellConnection {
@@ -40,6 +67,8 @@ export type OverlayView = 'loading' | 'start' | 'error' | null;
 
 export interface ShellDialogs {
   settings: boolean;
+  /** Per-runtime launch configuration: model, args, env, tiers. */
+  runtimeProfiles: boolean;
   newSession: boolean;
   terminalOptions: boolean;
   /** The session list, reachable from the mobile bar and the palette. */
@@ -123,11 +152,20 @@ export interface ShellState {
   /** Replaces the loading view's default line; empty means use the default. */
   overlayMessage: string;
   errorText: string;
+  chat: ShellChat;
   /** Formatted plan text, or null when the plan dialog is closed. */
   plan: string | null;
   toasts: ToastItem[];
   /** Backing list for the sessions sheet. */
   sessionList: SessionListItem[];
+  /**
+   * The open yes/no question, or null.
+   *
+   * Held here rather than owned by whoever asked, because the code that needs
+   * to ask is largely not React — a service-worker callback, the update banner
+   * — and the store is how every other imperative module reaches the shell.
+   */
+  confirm: ConfirmRequest | null;
   banner: BannerView | null;
   /** GitHub login of the signed-in user, when the server reports one. */
   user: string | null;
@@ -167,6 +205,7 @@ const INITIAL: ShellState = {
   ctrlLatched: false,
   dialogs: {
     settings: false,
+    runtimeProfiles: false,
     newSession: false,
     terminalOptions: false,
     sessions: false,
@@ -186,9 +225,18 @@ const INITIAL: ShellState = {
   overlay: null,
   overlayMessage: '',
   errorText: '',
+  chat: {
+    active: false,
+    controller: null,
+    runtime: '',
+    runtimeLabel: '',
+    workingDir: '',
+    bypassPermissions: false,
+  },
   plan: null,
   toasts: [],
   sessionList: [],
+  confirm: null,
   banner: null,
   user: null,
   logoutUrl: null,

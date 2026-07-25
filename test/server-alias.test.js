@@ -11,6 +11,7 @@ describe('Server Aliases', function() {
       grokAlias: 'Xai',
       qwenAlias: 'Tongyi',
       kimiAlias: 'Moonshot',
+      ompAlias: 'OhMy',
       noAuth: true // avoid auth middleware complexity
     });
 
@@ -21,11 +22,12 @@ describe('Server Aliases', function() {
     assert.strictEqual(server.aliases.grok, 'Xai');
     assert.strictEqual(server.aliases.qwen, 'Tongyi');
     assert.strictEqual(server.aliases.kimi, 'Moonshot');
+    assert.strictEqual(server.aliases.omp, 'OhMy');
   });
 
   it('should default aliases when not provided', function() {
     const server = new ClaudeCodeWebServer({ noAuth: true });
-    for (const kind of ['claude', 'codex', 'agent', 'pi', 'grok', 'qwen', 'kimi']) {
+    for (const kind of ['claude', 'codex', 'agent', 'pi', 'grok', 'qwen', 'kimi', 'omp']) {
       assert.ok(
         server.aliases[kind] && server.aliases[kind].length > 0,
         `${kind} must have a default alias`,

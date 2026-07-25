@@ -33,6 +33,11 @@ export class PiBridge extends BaseBridge {
     // the "dangerous" button would mislabel what the user is agreeing to.
     return [];
   }
+
+  protected getModelFlag(): string | null {
+    // `--model <model>` — verified against the installed CLI's --help.
+    return '--model';
+  }
 }
 
 export default PiBridge;
