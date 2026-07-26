@@ -70,16 +70,6 @@ export interface ChatViewProps {
   view?: ChatViewSettings;
   /** Persist a change made from inside the surface, e.g. closing the rail. */
   onViewChange?: (next: ChatViewSettings) => void;
-  /**
-   * Whether this session was launched with tool approvals bypassed.
-   *
-   * Passed in rather than read off the transcript because the flag lives on the
-   * server snapshot (`ChatSnapshot.bypassPermissions`) and ChatController does
-   * not retain it. The badge it drives is not a launch-time notice: as long as
-   * this is true the session acts without asking, and that has to stay on
-   * screen for the whole session rather than scrolling away with a toast.
-   */
-  bypassPermissions?: boolean;
   theme?: 'dark' | 'light';
   onToggleTheme?: () => void;
 }
@@ -108,7 +98,6 @@ export function ChatView({
   workingDir,
   isMobile = false,
   onOpenSettings,
-  bypassPermissions = false,
   view = DEFAULT_CHAT_VIEW,
   onViewChange,
   theme,
@@ -124,6 +113,16 @@ export function ChatView({
   const version = React.useSyncExternalStore(transcript.subscribe, transcript.getVersion, ZERO);
 
   const chatState = transcript.chatState;
+  /**
+   * Read off the transcript, so it is this conversation's mode and not the
+   * shell's last one.
+   *
+   * The badge is not a launch-time notice: as long as this is true the session
+   * acts without asking, so it has to stay on screen for the conversation's
+   * whole life — including while nothing is running it, which is exactly the
+   * case a shared shell-level flag got wrong.
+   */
+  const bypassPermissions = transcript.bypassing;
   const plan = transcript.plan;
   const pending = transcript.pendingPermissions;
   const exited = chatState === 'exited';
@@ -348,9 +347,11 @@ export function ChatView({
     }, 0);
   }, [setView, view.terminalOpen]);
 
+  // No mode is passed: the server restores the one recorded against this
+  // conversation. See ChatController.relaunch.
   const relaunch = React.useCallback(
-    (resume: boolean) => controller.relaunch(runtime, { resume, bypassPermissions }),
-    [controller, runtime, bypassPermissions],
+    (resume: boolean) => controller.relaunch(runtime, { resume }),
+    [controller, runtime],
   );
 
   // ------------------------------------------------------------- shortcuts

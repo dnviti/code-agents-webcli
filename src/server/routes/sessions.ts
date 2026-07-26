@@ -155,6 +155,10 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
           // The record first, then the log: the record is authoritative and the
           // head scan is the backfill for conversations that predate it.
           canResume: Boolean(session.nativeChatSessionId || description?.nativeSessionId),
+          // Reported so the row can say which approval mode picking it will put
+          // back. A restored bypass is a standing permission, and one that
+          // arrives silently is no better than one that is silently dropped.
+          bypassPermissions: session.chatBypassPermissions === true,
           // A conversation that is already running is not one to resume; the
           // list says so rather than offering an action that would be refused.
           running: session.active === true,

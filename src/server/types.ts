@@ -90,6 +90,21 @@ export interface SessionRecord {
    * reads it back would be a stranger to it.
    */
   nativeChatSessionId?: string;
+  /**
+   * Whether this conversation runs with tool approvals bypassed.
+   *
+   * Part of how the user set the conversation up, not a property of the process
+   * that happens to be serving it: a chat started in bypass mode and then
+   * brought back — after a reconnect, a restart, or a resume from the launcher —
+   * has to come back in the mode it was in, and the header has to be able to
+   * say so while nothing is running at all.
+   *
+   * Absent on every session that predates this and on every terminal session,
+   * so `undefined` reads as "asks first" — the safe direction — without a
+   * backfill. Only ever set from an explicit choice made for *this* record, so a
+   * standing permission can never be inherited by another conversation.
+   */
+  chatBypassPermissions?: boolean;
   terminalOptions: TerminalOptions | null;
   stopRequested: boolean;
   /** Identifies the current PTY run so late callbacks from a previous run are ignored. */

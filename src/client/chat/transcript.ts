@@ -103,6 +103,19 @@ export class ChatTranscript {
   private alive = true;
   private resumeId: string | undefined;
 
+  /**
+   * Whether this conversation acts without asking.
+   *
+   * Held per conversation rather than once for the shell, which is what it used
+   * to be: a browser watching several chats has one badge per pane, and a single
+   * shared flag showed whichever chat launched most recently — so switching to a
+   * manual conversation could leave "Approvals bypassed" on screen over it. It
+   * belongs here because this is the object that is hydrated from the server's
+   * snapshot, so the answer survives a reconnect the same way the transcript
+   * does.
+   */
+  private bypass = false;
+
   constructor(capabilities: ChatCapabilities = NO_CHAT_CAPABILITIES) {
     this.state = createTranscript(capabilities);
   }
@@ -120,6 +133,24 @@ export class ChatTranscript {
    */
   get canResume(): boolean {
     return Boolean(this.resumeId);
+  }
+
+  /**
+   * True when this conversation runs with tool approvals bypassed.
+   *
+   * The server is the only authority on it — the mode is recorded against the
+   * conversation there — so this is only ever set from what the server said, and
+   * never guessed from a launch the browser asked for.
+   */
+  get bypassing(): boolean {
+    return this.bypass;
+  }
+
+  /** Take the mode from a `chat_started`, which announces the launch's own. */
+  setBypassing(bypassing: boolean): void {
+    if (this.bypass === bypassing) return;
+    this.bypass = bypassing;
+    this.notify();
   }
 
   /** Replace everything with a server snapshot, e.g. on join or reconnect. */
@@ -140,6 +171,11 @@ export class ChatTranscript {
     this.loading = false;
     this.alive = snapshot.live;
     this.resumeId = snapshot.nativeSessionId;
+    // The snapshot is the answer for an offline conversation too: the server
+    // reads the mode off the conversation's record, so a chat whose process died
+    // still comes back saying which mode it is in rather than defaulting to the
+    // one it is not.
+    this.bypass = snapshot.bypassPermissions === true;
     this.queued = snapshot.queued ? [...snapshot.queued] : [];
     reindexTranscript(this.state);
     this.messageVersions.clear();

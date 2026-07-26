@@ -28,11 +28,15 @@ function memoryStore() {
     async read() {
       return { events: [], firstSeq: 1, from: 1, cursor: events.length };
     },
-    async snapshot() {
+    // Honours `options` the way the real store does: the log knows neither the
+    // runtime nor the approval mode, so whatever the caller passes is the only
+    // answer there is.
+    async snapshot(_ref, options = {}) {
       return {
-        sessionId: 's1', runtime: '', messages: [], state: 'idle',
+        sessionId: 's1', runtime: options.runtime ?? '', messages: [], state: 'idle',
         capabilities: {}, pendingPermissions: [], firstSeq: 1, replayFrom: 1,
-        cursor: events.length, live: false, bypassPermissions: false,
+        cursor: events.length, live: options.live ?? false,
+        bypassPermissions: options.bypassPermissions ?? false,
       };
     },
   };
@@ -183,6 +187,29 @@ describe('resuming a conversation', function () {
 
       assert.strictEqual(snapshot.nativeSessionId, 'native-7');
       assert.strictEqual(snapshot.live, false, 'nothing is running it');
+    });
+
+    it('reports the approval mode of a conversation with nothing running it', async function () {
+      // The mode is a standing permission the user chose for this conversation,
+      // and the log holds what was said rather than how the conversation was set
+      // up. Left to the store's default, every chat whose process was gone came
+      // back to a header claiming it would ask before acting — over an agent
+      // that, once relaunched, would not.
+      const snapshot = await manager().snapshot(
+        record({ chatBypassPermissions: true }),
+      );
+
+      assert.strictEqual(snapshot.bypassPermissions, true);
+      assert.strictEqual(snapshot.live, false, 'nothing is running it');
+    });
+
+    it('never invents a bypass for a conversation that did not record one', async function () {
+      const manual = await manager().snapshot(record());
+      assert.strictEqual(manual.bypassPermissions, false);
+
+      // The shape a session written before the mode was persisted comes back in.
+      const legacy = await manager().snapshot(record({ chatBypassPermissions: undefined }));
+      assert.strictEqual(legacy.bypassPermissions, false);
     });
 
     it('says so plainly when there is no id to resume with', async function () {

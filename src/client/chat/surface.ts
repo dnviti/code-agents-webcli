@@ -23,7 +23,6 @@ export interface ChatSurfaceInfo {
   runtime?: string;
   runtimeLabel?: string;
   workingDir?: string;
-  bypassPermissions?: boolean;
 }
 
 export function setChatSurface(app: App, info: ChatSurfaceInfo): void {
@@ -40,7 +39,6 @@ export function setChatSurface(app: App, info: ChatSurfaceInfo): void {
       runtime: info.runtime ?? previous.runtime,
       runtimeLabel: info.runtimeLabel ?? previous.runtimeLabel,
       workingDir: info.workingDir ?? previous.workingDir,
-      bypassPermissions: info.bypassPermissions ?? previous.bypassPermissions,
     },
   });
 }
@@ -66,7 +64,6 @@ export function clearChatSurface(): void {
       runtime: '',
       runtimeLabel: '',
       workingDir: '',
-      bypassPermissions: false,
     },
   });
 }
