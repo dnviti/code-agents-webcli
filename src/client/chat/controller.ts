@@ -44,6 +44,18 @@ export interface ChatUnavailable {
 }
 
 /**
+ * What actually happened when this browser last asked to change the model.
+ *
+ * Mirrors the server's own honesty about it: a typed model name is never
+ * validated ahead of time, so this reports what was actually possible rather
+ * than assuming the best case.
+ */
+export interface ModelSwitchResult {
+  applied: 'live' | 'sent' | 'pending' | 'cleared';
+  message: string;
+}
+
+/**
  * How long a page request may go unanswered before the control comes back.
  *
  * Not a latency budget — a page is a positioned read of a local file and comes
@@ -65,6 +77,20 @@ export class ChatController {
 
   /** Set while the conversation is readable but has nothing running it. */
   private unavailable: ChatUnavailable | null = null;
+
+  /**
+   * The model override this conversation is carrying, independent of what the
+   * runtime itself reports through the transcript.
+   *
+   * Null means "no override" — the surface then falls back to whatever the
+   * transcript's own `model` says, which is the runtime's default or the
+   * active profile. Kept here rather than folded into the transcript because
+   * it is a fact about the *session record*, not something any adapter emits
+   * as an event.
+   */
+  private modelOverride: string | null = null;
+  /** What the server reported happened to the last model change requested. */
+  private modelResult: ModelSwitchResult | null = null;
 
   constructor(
     readonly sessionId: string,
@@ -91,6 +117,8 @@ export class ChatController {
         if (!snapshot) return true;
         this.settlePage();
         this.transcript.hydrate(snapshot);
+        this.modelOverride =
+          typeof message.modelOverride === 'string' ? message.modelOverride : null;
         this.options.onChange?.();
         return true;
       }
@@ -111,6 +139,25 @@ export class ChatController {
         // message rather than assumed, so the badge cannot claim a mode the
         // process is not running in.
         this.transcript.setBypassing(message.bypassPermissions === true);
+        this.modelOverride =
+          typeof message.modelOverride === 'string' ? message.modelOverride : null;
+        this.options.onChange?.();
+        return true;
+      }
+
+      case 'chat_model_result': {
+        const applied = (message.applied as ModelSwitchResult['applied']) || 'pending';
+        // Only 'live'/'cleared' mean the session is actually running this model now.
+        // 'sent'/'pending' are best-effort or deferred-to-next-launch — adopting the
+        // label for those would claim a model is active when it is not yet, or may
+        // never be without a relaunch.
+        if (applied === 'live' || applied === 'cleared') {
+          this.modelOverride = typeof message.model === 'string' ? message.model : null;
+        }
+        this.modelResult = {
+          applied,
+          message: String(message.message || ''),
+        };
         this.options.onChange?.();
         return true;
       }
@@ -266,6 +313,28 @@ export class ChatController {
     this.send({ type: 'chat_permission_response', requestId, optionId });
   }
 
+  /** The model override in force for this conversation, or null if there is none. */
+  get modelOverrideValue(): string | null {
+    return this.modelOverride;
+  }
+
+  /** What happened the last time this browser asked to change the model. */
+  get modelFeedback(): ModelSwitchResult | null {
+    return this.modelResult;
+  }
+
+  /**
+   * Ask the server to switch this conversation's model, or clear the override
+   * with an empty string.
+   *
+   * Never validated here: the composer sends whatever was typed, and the
+   * server's reply — live, sent, or saved-for-next-time — is what actually
+   * tells the user what happened.
+   */
+  setModel(model: string): void {
+    this.send({ type: 'chat_set_model', model });
+  }
+
   /** Tell the server this browser wants this conversation's live events. */
   subscribe(): void {
     this.send({ type: 'chat_subscribe' });
@@ -332,6 +401,11 @@ export class ChatController {
   /** Drop everything, e.g. when the session is being restarted. */
   reset(): void {
     this.settlePage();
+    // Not a claim either way: the next snapshot or chat_started carries the
+    // record's real override, and showing a stale one in the meantime would
+    // be worse than showing nothing.
+    this.modelOverride = null;
+    this.modelResult = null;
     // `hydrate` clears the queue from the (absent) snapshot field, so the line
     // does not survive into a session that never accepted it.
     this.transcript.hydrate({

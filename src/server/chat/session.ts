@@ -643,6 +643,21 @@ export class ChatSession {
     });
   }
 
+  /**
+   * Switch the live process to a different model, for the adapters that can.
+   *
+   * Only Grok exposes this today — its model is a per-invocation flag it can
+   * rewrite for the next turn without a restart. Every other adapter's model
+   * is fixed at spawn, so this reports it could not and the caller falls back
+   * to the runtime's own `/model` command (best-effort) or to persisting the
+   * choice for the next session.
+   */
+  async setModel(model: string): Promise<boolean> {
+    if (!this.adapter?.alive || !this.adapter.setModel) return false;
+    await this.adapter.setModel(model);
+    return true;
+  }
+
   snapshot(): Promise<ChatSnapshot> {
     return this.deps.store.snapshot(this.ref).then((snapshot) => ({
       ...snapshot,

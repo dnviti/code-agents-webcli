@@ -38,10 +38,14 @@ function createSessionRecord(params = {}) {
 
 /** A chat manager that records what it was asked to do. */
 function createChatManager(overrides = {}) {
-  const calls = { start: [], send: [], interrupt: [], permission: [], page: [], cancelQueued: [] };
+  const calls = { start: [], send: [], interrupt: [], permission: [], page: [], cancelQueued: [], setModel: [] };
   return {
     calls,
     has: () => false,
+    async setModel(sessionId, model) {
+      calls.setModel.push({ sessionId, model });
+      return false;
+    },
     async start(record, options) {
       calls.start.push({ record, options });
       return {
@@ -231,6 +235,27 @@ describe('chat wiring', function () {
     });
   });
 
+  describe('startRuntime (PTY)', function () {
+    it('lets a saved model override outrank the profile default on this launch too', async function () {
+      const { processor, session } = build({ surface: undefined });
+      session.chatModelOverride = 'saved-override';
+      processor.deps.resolveRuntimeProfile = () => ({ profileName: 'p', model: 'profile-default' });
+
+      const startCalls = [];
+      processor.deps.getRuntimeBridge = () => ({
+        startSession: async (sessionId, options) => {
+          startCalls.push(options);
+          return { pid: 1 };
+        },
+      });
+
+      await processor.startRuntime('ws-1', 'claude', {});
+
+      assert.strictEqual(startCalls.length, 1, 'the bridge was not asked to start');
+      assert.strictEqual(startCalls[0].model, 'saved-override');
+    });
+  });
+
   // The approval mode is part of how the user set a conversation up, so it has
   // to outlive the process serving it. It used to live only on the live
   // ChatSession: reconnecting to a conversation whose agent had gone, restarting
@@ -401,6 +426,121 @@ describe('chat wiring', function () {
       });
       assert.deepStrictEqual(chatManager.calls.page[0], { id: 'session-1', fromSeq: 40, count: 20 });
       assert.strictEqual(lastOfType(sent, 'chat_page').requestId, 'p1');
+    });
+  });
+
+  describe('chat_set_model', function () {
+    it('applies live when the adapter can switch without a restart', async function () {
+      const { processor, chatManager, session, sent } = build(
+        { surface: 'chat' },
+        { setModel: async (sessionId, model) => { chatManager.calls.setModel.push({ sessionId, model }); return true; } },
+      );
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_model', model: 'grok-3-fast' });
+
+      assert.deepStrictEqual(chatManager.calls.setModel[0], { sessionId: 'session-1', model: 'grok-3-fast' });
+      assert.strictEqual(session.chatModelOverride, 'grok-3-fast', 'the override is persisted regardless of how it applied');
+      const result = lastOfType(sent, 'chat_model_result');
+      assert.strictEqual(result.applied, 'live');
+      assert.strictEqual(result.model, 'grok-3-fast');
+    });
+
+    it('falls back to a best-effort slash command when the runtime advertises /model but cannot switch live', async function () {
+      const { processor, chatManager, session, sent } = build(
+        { surface: 'chat' },
+        {
+          async snapshot(record) {
+            return {
+              sessionId: record.id,
+              runtime: 'claude',
+              messages: [],
+              state: 'idle',
+              capabilities: { commands: [{ name: 'model' }] },
+              pendingPermissions: [],
+              firstSeq: 0,
+              cursor: 0,
+              live: true,
+              bypassPermissions: false,
+            };
+          },
+        },
+      );
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_model', model: 'claude-opus' });
+
+      assert.strictEqual(chatManager.calls.send.length, 1, 'the slash command must be sent as a turn');
+      assert.strictEqual(chatManager.calls.send[0].turn.text, '/model claude-opus');
+      assert.strictEqual(session.chatModelOverride, 'claude-opus');
+      const result = lastOfType(sent, 'chat_model_result');
+      assert.strictEqual(result.applied, 'sent');
+    });
+
+    it('saves for the next session when nothing live can take the change', async function () {
+      const { processor, session, sent } = build({ surface: 'chat' });
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_model', model: 'some-custom-model' });
+
+      assert.strictEqual(session.chatModelOverride, 'some-custom-model', 'still persisted for next launch');
+      const result = lastOfType(sent, 'chat_model_result');
+      assert.strictEqual(result.applied, 'pending');
+      assert.match(result.message, /next time/i);
+    });
+
+    it('clears the override rather than treating an empty string as a model', async function () {
+      const { processor, session, sent } = build({ surface: 'chat' });
+      session.chatModelOverride = 'previously-set';
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_model', model: '' });
+
+      assert.strictEqual(session.chatModelOverride, undefined);
+      const result = lastOfType(sent, 'chat_model_result');
+      assert.strictEqual(result.applied, 'cleared');
+      assert.strictEqual(result.model, null);
+    });
+
+    it('lets a saved override outrank the profile default on the next launch', async function () {
+      const { processor, chatManager, session } = build(
+        { surface: 'chat' },
+        {},
+      );
+      session.chatModelOverride = 'saved-override';
+      processor.deps.resolveRuntimeProfile = () => ({ profileName: 'p', model: 'profile-default' });
+
+      await processor.startChat('ws-1', 'claude', {});
+
+      assert.strictEqual(chatManager.calls.start[0].options.model, 'saved-override');
+    });
+
+    it('will not set a model override for a session belonging to another user', async function () {
+      const { processor, chatManager, session } = build({ surface: 'chat', ownerUserId: 999 });
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_model', model: 'sneaky-model' });
+
+      assert.strictEqual(chatManager.calls.setModel.length, 0);
+      assert.strictEqual(session.chatModelOverride, undefined);
+    });
+
+    it('reports pending rather than live when the adapter’s live switch throws', async function () {
+      const { processor, session, sent } = build(
+        { surface: 'chat' },
+        { setModel: async () => { throw new Error('adapter rejected the switch'); } },
+      );
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_model', model: 'grok-3-fast' });
+
+      assert.strictEqual(session.chatModelOverride, 'grok-3-fast', 'still saved for next launch despite the failed live attempt');
+      const result = lastOfType(sent, 'chat_model_result');
+      assert.strictEqual(result.applied, 'pending');
+      assert.match(result.message, /adapter rejected the switch|next time/i);
+    });
+
+    it('falls back to the profile default on the next launch when no override was ever saved', async function () {
+      const { processor, chatManager } = build({ surface: 'chat' }, {});
+      processor.deps.resolveRuntimeProfile = () => ({ profileName: 'p', model: 'profile-default' });
+
+      await processor.startChat('ws-1', 'claude', {});
+
+      assert.strictEqual(chatManager.calls.start[0].options.model, 'profile-default');
     });
   });
 

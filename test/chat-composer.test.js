@@ -205,6 +205,53 @@ describe('Composer', function () {
     assert.ok(/<textarea[^>]*disabled=""/.test(html), 'the textarea itself must go inert');
   });
 
+  // ModelChip's own open/closed state is a plain click-toggled useState, unlike
+  // the slash-command popup above (whose "open" is derived from the draft, so
+  // static markup can render it open). A static render can only ever show it
+  // closed, so these assert what is true of every runtime regardless of
+  // whether it has a model list, a live switch, or neither — the always-on
+  // control and its labelling — rather than the popup's own contents.
+  describe('the model control', function () {
+    it('is always present and never disabled, even when the whole composer is', function () {
+      const html = render({ disabled: true, capabilities: caps({}) });
+      assert.ok(html.includes('aria-label="Change model"'), 'a runtime with no model list or /model command still gets a control');
+      assert.ok(
+        !/aria-label="Change model"[^>]*disabled/.test(html),
+        'the model control must not be disabled by the composer being disabled — that is exactly the case where it saves for next session',
+      );
+    });
+
+    it('labels the conversation’s own model over the menu’s first entry', function () {
+      const models = [
+        { value: 'a', name: 'Model A' },
+        { value: 'b', name: 'Model B' },
+      ];
+      const html = render({ model: 'b', capabilities: caps({ models }) });
+      assert.ok(html.includes('>Model B<'), 'the session’s actual model is shown, not the first item in the menu');
+    });
+
+    it('falls back to whatever was typed when it matches nothing in the menu', function () {
+      const html = render({ model: 'a-custom-name', capabilities: caps({}) });
+      assert.ok(html.includes('>a-custom-name<'), 'a free-typed override with no matching menu entry is still the label');
+    });
+
+    it('surfaces the server’s feedback after a pick, in each of the three shapes', function () {
+      const live = render({ model: 'grok-3-fast', modelFeedback: { applied: 'live', message: 'Switched to grok-3-fast for this conversation.' } });
+      assert.ok(live.includes('Switched to grok-3-fast for this conversation.'));
+
+      const sent = render({ model: 'claude-opus', modelFeedback: { applied: 'sent', message: 'Sent "/model claude-opus" to the session — check the transcript to confirm it took.' } });
+      assert.ok(sent.includes('check the transcript to confirm it took'));
+
+      const pending = render({ model: 'some-model', modelFeedback: { applied: 'pending', message: 'Saved. some-model will be used the next time a new session starts for this conversation.' } });
+      assert.ok(pending.includes('will be used the next time a new session starts'));
+    });
+
+    it('shows nothing extra when there is no feedback yet', function () {
+      const html = render({ capabilities: caps({}) });
+      assert.ok(!html.includes('role="status"'), 'no stray feedback region before anything has been picked');
+    });
+  });
+
   it('survives an empty draft and a very long one', function () {
     const empty = render({ draft: '' });
     assert.ok(empty.length > 0);
