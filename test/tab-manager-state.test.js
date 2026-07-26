@@ -21,8 +21,35 @@ const ROOT = path.join(__dirname, '..');
 
 let mod;
 
-const STUBBED = ['window', 'document', 'navigator', 'fetch'];
+const STUBBED = ['window', 'document', 'navigator', 'fetch', 'localStorage', 'sessionStorage'];
+
+/** Renames and the remembered tab both go out over the network / to storage. */
+let requests;
+let respondTo;
+/** The browser-wide store, and this window's own. */
+let stored;
+let perWindow;
 const originals = {};
+
+function installStubs() {
+  global.window = { innerWidth: 1280 };
+  global.document = { addEventListener() {}, visibilityState: 'visible', title: 'test' };
+  global.navigator = { maxTouchPoints: 0, userAgent: 'node' };
+  global.fetch = async (url, init) => {
+    requests.push({ url, init });
+    return respondTo(url, init);
+  };
+  global.localStorage = storage(stored);
+  global.sessionStorage = storage(perWindow);
+}
+
+function storage(map) {
+  return {
+    getItem: (key) => (map.has(key) ? map.get(key) : null),
+    setItem: (key, value) => { map.set(key, String(value)); },
+    removeItem: (key) => { map.delete(key); },
+  };
+}
 
 /** The narrowest App the manager actually reaches for. */
 function fakeApp() {
@@ -70,10 +97,11 @@ describe('session tab state', function () {
     // this file first took the whole update-routes suite down with it.
     for (const name of STUBBED) originals[name] = global[name];
 
-    global.window = { innerWidth: 1280 };
-    global.document = { addEventListener() {}, visibilityState: 'visible', title: 'test' };
-    global.navigator = { maxTouchPoints: 0, userAgent: 'node' };
-    global.fetch = async () => ({ ok: true, json: async () => ({ sessions: [] }) });
+    requests = [];
+    respondTo = () => ({ ok: true, json: async () => ({ sessions: [] }) });
+    stored = new Map();
+    perWindow = new Map();
+    installStubs();
 
     const contents = [
       `export { SessionTabManager } from ${JSON.stringify(path.join(ROOT, 'src/client/sessions/tab-manager'))};`,
@@ -102,6 +130,17 @@ describe('session tab state', function () {
       if (originals[name] === undefined) delete global[name];
       else global[name] = originals[name];
     }
+  });
+
+  // Re-stubbed per test, not just once: another suite in this run deletes
+  // `document`, `navigator` and `localStorage` in a ROOT afterEach, which runs
+  // after every test in the whole process — including these.
+  beforeEach(function () {
+    requests = [];
+    stored.clear();
+    perWindow.clear();
+    respondTo = () => ({ ok: true, json: async () => ({ sessions: [] }) });
+    installStubs();
   });
 
   it('keeps the label out of the DOM and renames in place', function () {
@@ -273,5 +312,153 @@ describe('session tab state', function () {
       ['a', 'b', 'c'],
       'an id for a session that no longer exists is ignored',
     );
+  });
+
+  // A rename that only lives in the page that typed it is the bug in #54: the
+  // name is gone on the next reload, and a second window never hears about it.
+  describe('renaming outlives the page', function () {
+    it('tells the server, without waiting for it to answer', function () {
+      const { m } = manager();
+      m.addTab('s1', 'One', 'idle', '/repos/one', false);
+
+      m.renameTab('s1', '  the good one  ');
+
+      assert.strictEqual(shellTab('s1').title, 'the good one', 'the label moves immediately');
+      assert.strictEqual(requests.length, 1);
+      assert.strictEqual(requests[0].url, '/api/sessions/s1/name');
+      assert.strictEqual(requests[0].init.method, 'PATCH');
+      assert.deepStrictEqual(JSON.parse(requests[0].init.body), { name: 'the good one' });
+    });
+
+    it('settles on the name the server actually stored', async function () {
+      const { m } = manager();
+      m.addTab('s1', 'One', 'idle', null, false);
+
+      // The server caps a very long name. A strip still showing the uncapped
+      // one would disagree with every other window the user has open.
+      respondTo = () => ({ ok: true, json: async () => ({ success: true, name: 'x'.repeat(200) }) });
+      m.renameTab('s1', 'x'.repeat(5000));
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.strictEqual(shellTab('s1').title.length, 200);
+    });
+
+    it('does not ask the server to store a blank name', function () {
+      const { m } = manager();
+      m.addTab('s1', 'One', 'idle', null, false);
+
+      m.renameTab('s1', '   ');
+
+      assert.strictEqual(shellTab('s1').title, 'One');
+      assert.strictEqual(requests.length, 0, 'a name that is only whitespace never leaves the page');
+    });
+
+    it('puts the old label back when the server refuses', async function () {
+      const { m } = manager();
+      m.addTab('s1', 'Session 7/23/2026, 10:26:39 AM', 'idle', '/repos/thing', false);
+      assert.strictEqual(shellTab('s1').title, 'thing');
+
+      respondTo = () => ({ ok: false, status: 404, json: async () => ({}) });
+      m.renameTab('s1', 'gone');
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.strictEqual(
+        shellTab('s1').title,
+        'thing',
+        'a name the server would not store is not left on the strip',
+      );
+    });
+
+    it('keeps the new label when the request never gets out', async function () {
+      const { m } = manager();
+      m.addTab('s1', 'One', 'idle', null, false);
+
+      respondTo = () => { throw new Error('offline'); };
+      m.renameTab('s1', 'still mine');
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.strictEqual(shellTab('s1').title, 'still mine');
+    });
+
+    it('takes a rename that happened in another window', function () {
+      const { m } = manager();
+      m.addTab('s1', 'One', 'idle', null, false);
+
+      m.applyRemoteName('s1', '  from next door  ');
+
+      assert.strictEqual(shellTab('s1').title, 'from next door');
+      assert.strictEqual(requests.length, 0, 'hearing about a rename does not echo it back');
+
+      m.applyRemoteName('unknown', 'nobody');
+      m.applyRemoteName('s1', '   ');
+      assert.strictEqual(shellTab('s1').title, 'from next door');
+    });
+
+    it('shows the stored name for a session that was renamed before this page loaded', function () {
+      const { m } = manager();
+      // What `/api/sessions/list` reports for a renamed session: the created
+      // name it still has, plus the name the user gave it.
+      m.addTab('s1', 'Session 7/23/2026, 10:26:39 AM', 'idle', '/repos/thing', false, 'the good one');
+
+      assert.strictEqual(
+        shellTab('s1').title,
+        'the good one',
+        'a chosen name is not run through the generated-name rules',
+      );
+
+      const { m: m2 } = manager();
+      m2.addTab('s2', 'Session 7/23/2026, 10:26:39 AM', 'idle', '/repos/thing', false);
+      assert.strictEqual(
+        m2.tabs.get('s2').customName,
+        undefined,
+        'a session nobody renamed carries no chosen name',
+      );
+    });
+  });
+
+  describe('the selected tab outlives the page', function () {
+    it('remembers the tab that was switched to', async function () {
+      const { m } = manager();
+      m.addTab('a', 'a', 'idle', null, false);
+      m.addTab('b', 'b', 'idle', null, false);
+
+      await m.switchToTab('b');
+
+      assert.strictEqual(perWindow.get('cc-web-active-tab'), 'b', 'this window remembers it');
+      assert.strictEqual(stored.get('cc-web-active-tab'), 'b', 'and so does the browser, for the next new window');
+    });
+
+    it('does not let a second window drag this one off its tab', async function () {
+      const { m } = manager();
+      m.addTab('a', 'a', 'idle', null, false);
+      m.addTab('b', 'b', 'idle', null, false);
+      await m.switchToTab('b');
+
+      // Another window of the same browser: its own sessionStorage, the same
+      // localStorage. It settles on 'a', which must not move this window.
+      stored.set('cc-web-active-tab', 'a');
+
+      assert.strictEqual(
+        m.initialTabId(),
+        'b',
+        'this window\'s own memory wins over the browser-wide one',
+      );
+    });
+
+    it('opens on the remembered tab, and on the first one when it is gone', function () {
+      const { m } = manager();
+      m.addTab('a', 'a', 'idle', null, false);
+      m.addTab('b', 'b', 'idle', null, false);
+
+      stored.set('cc-web-active-tab', 'b');
+      assert.strictEqual(m.initialTabId(), 'b');
+
+      // The remembered session was closed elsewhere, or ended with the server.
+      stored.set('cc-web-active-tab', 'ghost');
+      assert.strictEqual(m.initialTabId(), 'a', 'a stale id falls back, it does not blank the app');
+
+      stored.delete('cc-web-active-tab');
+      assert.strictEqual(m.initialTabId(), 'a', 'a first visit behaves as it always did');
+    });
   });
 });
