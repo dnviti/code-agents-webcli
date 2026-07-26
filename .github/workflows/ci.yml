@@ -42,6 +42,13 @@ jobs:
       - name: Test
         run: npm test
 
+      # Whole classes of defect here are invisible to the unit suite because
+      # only a layout engine can answer them: whether a bar wraps, whether an
+      # answer actually reaches the screen while it streams. The runner image
+      # ships Chrome, and the runner refuses to skip when CI is set.
+      - name: Browser checks
+        run: npm run test:browser
+
   install:
     name: Verify the documented install
     runs-on: ubuntu-latest

@@ -38,13 +38,19 @@ function createSessionRecord(params = {}) {
 
 /** A chat manager that records what it was asked to do. */
 function createChatManager(overrides = {}) {
-  const calls = { start: [], send: [], interrupt: [], permission: [], page: [], cancelQueued: [], setModel: [] };
+  const calls = {
+    start: [], send: [], interrupt: [], permission: [], page: [], cancelQueued: [],
+    setModel: [], rememberModel: [],
+  };
   return {
     calls,
     has: () => false,
     async setModel(sessionId, model) {
       calls.setModel.push({ sessionId, model });
       return false;
+    },
+    rememberModel(sessionId, model) {
+      calls.rememberModel.push({ sessionId, model });
     },
     async start(record, options) {
       calls.start.push({ record, options });
@@ -496,6 +502,75 @@ describe('chat wiring', function () {
       const result = lastOfType(sent, 'chat_model_result');
       assert.strictEqual(result.applied, 'cleared');
       assert.strictEqual(result.model, null);
+    });
+
+    // A live session holds the options `/clear` will relaunch from, and the
+    // model is the only one this handler can change. Without carrying it over,
+    // the next `/clear` reinstated the model the conversation opened with.
+    it('carries the new model into the options a /clear restart replays', async function () {
+      const { processor, chatManager } = build({ surface: 'chat' });
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_model', model: 'some-custom-model' });
+
+      assert.deepStrictEqual(chatManager.calls.rememberModel[0], {
+        sessionId: 'session-1',
+        model: 'some-custom-model',
+      });
+    });
+
+    it('carries the profile default across when the override is cleared', async function () {
+      const { processor, chatManager } = build({ surface: 'chat' });
+      processor.deps.resolveRuntimeProfile = () => ({ profileName: 'p', model: 'profile-default' });
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_model', model: '' });
+
+      // The value itself, not just that something was carried: clearing has to
+      // land where a fresh launch would land, which is the profile's model and
+      // not the runtime's own default.
+      assert.deepStrictEqual(chatManager.calls.rememberModel[0], {
+        sessionId: 'session-1',
+        model: 'profile-default',
+      });
+    });
+
+    // The same choice by the other door. Forwarding it untouched left the
+    // record unaware, so the next /clear restarted on the original model.
+    it('records a /model typed straight into the composer, and still forwards it', async function () {
+      const { processor, chatManager, session } = build({ surface: 'chat' });
+
+      await processor.handleMessage('ws-1', { type: 'chat_send', text: '/model haiku-3' });
+
+      assert.strictEqual(session.chatModelOverride, 'haiku-3');
+      assert.deepStrictEqual(chatManager.calls.rememberModel[0], {
+        sessionId: 'session-1',
+        model: 'haiku-3',
+      });
+      assert.strictEqual(
+        chatManager.calls.send[0].turn.text,
+        '/model haiku-3',
+        'the runtime still has to receive its own command',
+      );
+    });
+
+    it('leaves an ordinary message that merely mentions /model alone', async function () {
+      const { processor, chatManager, session } = build({ surface: 'chat' });
+
+      await processor.handleMessage('ws-1', { type: 'chat_send', text: 'what does /model do?' });
+
+      assert.strictEqual(session.chatModelOverride, undefined);
+      assert.strictEqual(chatManager.calls.rememberModel.length, 0);
+    });
+
+    it('strips control characters and caps the length of a typed model name', async function () {
+      const { processor, session } = build({ surface: 'chat' });
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_set_model',
+        model: `sneaky\nrm -rf /${'x'.repeat(400)}`,
+      });
+
+      assert.ok(!session.chatModelOverride.includes('\n'), 'a newline would become a second line of the /model turn');
+      assert.ok(session.chatModelOverride.length <= 200, `stored ${session.chatModelOverride.length} characters`);
     });
 
     it('lets a saved override outrank the profile default on the next launch', async function () {

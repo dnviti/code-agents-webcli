@@ -248,11 +248,18 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
     // Looked up by id rather than iterated in transcript order: a turn's own
     // messages are already listed on it, and rendering turn-by-turn (below) is
     // what lets a collapsed turn hide its whole body as one unit.
+    //
+    // Keyed on `version`, not on `messages`: the transcript appends to its
+    // array in place, so its identity never changes and a `[messages]` map
+    // would be built once at mount and then never see another message. Every
+    // later id would miss and render nothing — a turn whose body stays empty
+    // while its strip keeps counting.
     const messageById = React.useMemo(() => {
       const map = new Map<string, (typeof messages)[number]>();
       for (const message of messages) map.set(message.id, message);
       return map;
-    }, [messages]);
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [messages, version]);
 
     const lastTurnId = turns.length ? turns[turns.length - 1].id : undefined;
 

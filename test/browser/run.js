@@ -11,6 +11,14 @@ const chrome = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-b
 });
 
 if (!chrome) {
+  // Skipping is a convenience for a machine that happens to have no browser,
+  // never for CI: these checks are the only thing covering defects that a
+  // layout engine has to be running to see, and a silent skip there would
+  // report a green build for a suite that never ran.
+  if (process.env.CI) {
+    console.error('No Chrome/Chromium on PATH. CI must run the browser checks, not skip them.');
+    process.exit(1);
+  }
   console.log('Skipping browser checks: no Chrome/Chromium on PATH.');
   process.exit(0);
 }

@@ -15,6 +15,29 @@ import { sendToWebSocket, broadcastChat, broadcastToSession } from './handler.js
 import { chatUnavailableReason, isChatRuntime } from '../../shared/chat-runtimes.js';
 import { ChatNotRunningError } from '../chat/session.js';
 
+/**
+ * The longest model name worth storing. Real ones are far shorter; this only
+ * has to stop an unbounded string from being persisted and then handed to a
+ * spawn on every future launch of the conversation.
+ */
+const MAX_MODEL_NAME = 200;
+
+/**
+ * Tidy a typed model name into something safe to keep.
+ *
+ * Names are never validated against a list — a runtime knows its own models
+ * and new ones appear without us — so this only removes what can't belong in
+ * one: control characters, which would otherwise ride into the best-effort
+ * `/model <name>` turn as extra lines, and unbounded length.
+ */
+function normaliseModelName(raw: string): string | undefined {
+  const stripped = raw.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').trim();
+  // Sliced by code point, not by code unit: cutting mid-character would store
+  // half a surrogate pair.
+  const cleaned = [...stripped].slice(0, MAX_MODEL_NAME).join('').trim();
+  return cleaned || undefined;
+}
+
 export interface MessageProcessorDeps {
   dev: boolean;
   claudeSessions: Map<string, SessionRecord>;
@@ -90,6 +113,8 @@ export interface ChatManagerLike {
   interrupt(sessionId: string): Promise<void>;
   /** Switch a live session's model. False when nothing is running, or the adapter cannot. */
   setModel(sessionId: string, model: string): Promise<boolean>;
+  /** Carry a new model into the options an in-place `/clear` restart replays. */
+  rememberModel(sessionId: string, model: string | undefined): void;
   cancelQueued(sessionId: string, queuedId: string): boolean;
   respondPermission(sessionId: string, requestId: string, optionId: string): boolean;
   stop(sessionId: string): Promise<void>;
@@ -1121,6 +1146,23 @@ export class MessageProcessor {
     const text = typeof data.text === 'string' ? data.text : '';
     if (!text.trim() && !(data.attachments || []).length) return;
 
+    // The runtime's own `/model` reaches the same decision by the other door,
+    // so it has to leave the same trace. Without this the command is forwarded
+    // untouched, the conversation really does change model, and then the next
+    // `/clear` restarts it on the model it opened with — the same silent
+    // reversion the model picker was fixed for. Recorded, then forwarded
+    // unchanged: the runtime still runs its own command, and whether it
+    // accepted the name is still its answer to give, not ours.
+    const typedModel = /^\/model[ \t]+(\S.*)$/.exec(text.trim());
+    if (typedModel) {
+      const model = normaliseModelName(typedModel[1]);
+      if (model) {
+        session.chatModelOverride = model;
+        await this.deps.saveSessionsToDisk();
+        manager.rememberModel(session.id, model);
+      }
+    }
+
     try {
       await manager.send(session.id, {
         text,
@@ -1180,9 +1222,21 @@ export class MessageProcessor {
     if (!session) return;
 
     const raw = typeof data.model === 'string' ? data.model.trim() : '';
-    const model = raw || undefined;
+    const model = raw ? normaliseModelName(raw) : undefined;
     session.chatModelOverride = model;
     await this.deps.saveSessionsToDisk();
+
+    // A live session keeps the options it was launched with so that `/clear`
+    // can restart the process in place. The model is the one thing in there
+    // this handler can change, so it has to be carried across too — otherwise
+    // the next `/clear` reinstates the model the conversation opened with,
+    // after the browser has already been told the switch was applied. Resolved
+    // the way a launch resolves it, so clearing lands on the profile default.
+    const profile = this.deps.resolveRuntimeProfile(
+      session.agent as AgentKind,
+      session.workingDir,
+    );
+    this.deps.chatManager?.rememberModel(session.id, model || profile?.model);
 
     if (!model) {
       sendToWebSocket(wsInfo.ws, {

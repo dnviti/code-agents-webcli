@@ -1231,6 +1231,34 @@ function ModelChip({
               This runtime hasn&apos;t listed models — type one above.
             </div>
           ) : null}
+
+          {/* The way back. Picking a model is one click; without this, undoing
+              that choice was impossible — the text field refuses to submit
+              empty and every entry above carries a name — so a conversation
+              could be moved off its profile default but never returned to it,
+              and a typo stayed in force for every later launch. */}
+          <button
+            type="button"
+            role="option"
+            aria-selected={false}
+            onClick={() => pick('')}
+            style={{
+              width: '100%',
+              marginTop: 2,
+              padding: '5px 8px',
+              background: 'transparent',
+              border: 0,
+              borderTop: '1px solid var(--border)',
+              borderRadius: 0,
+              color: 'var(--muted-foreground)',
+              font: 'inherit',
+              fontSize: 'var(--text-xs)',
+              textAlign: 'left',
+              cursor: 'pointer',
+            }}
+          >
+            Use the default for this runtime
+          </button>
         </div>
       ) : null}
 

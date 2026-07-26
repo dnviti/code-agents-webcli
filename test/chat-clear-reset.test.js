@@ -158,4 +158,51 @@ describe('/clear and /new actually reset the conversation', function () {
     assert.strictEqual(sendCalls.length, 1);
     assert.strictEqual(sendCalls[0].text, 'clear the table, please');
   });
+
+  // The restart replays the options the session was launched with, and the
+  // model is the one thing in them that can change while the session is alive.
+  // Both features shipped in 5.1.2 and each one's own tests passed: the
+  // override was lost only where they met.
+  it('restarts with the model the conversation was moved to, not the one it opened with', async function () {
+    const { s } = session();
+    s.lastStartOptions = { runtime: 'claude', workingDir: '/tmp', model: 'opened-with' };
+
+    // What `chat_set_model` does once the choice is persisted, whether or not
+    // the live adapter could take it.
+    s.rememberModel('moved-to');
+
+    let startedWith = null;
+    s.start = async (options) => {
+      startedWith = options;
+      s.adapter = fakeAdapter([]);
+      s.state = 'idle';
+    };
+
+    await s.send({ text: '/clear' });
+
+    assert.strictEqual(
+      startedWith.model,
+      'moved-to',
+      'the fresh process must run the model the browser was told was applied',
+    );
+  });
+
+  it('restarts on the profile default once the override is cleared', async function () {
+    const { s } = session();
+    s.lastStartOptions = { runtime: 'claude', workingDir: '/tmp', model: 'an-override' };
+
+    // Clearing resolves to the profile default, so that is what arrives here.
+    s.rememberModel('profile-default');
+
+    let startedWith = null;
+    s.start = async (options) => {
+      startedWith = options;
+      s.adapter = fakeAdapter([]);
+      s.state = 'idle';
+    };
+
+    await s.send({ text: '/clear' });
+
+    assert.strictEqual(startedWith.model, 'profile-default');
+  });
 });

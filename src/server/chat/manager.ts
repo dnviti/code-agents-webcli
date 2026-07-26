@@ -214,6 +214,11 @@ export class ChatSessionManager {
     return session.setModel(model);
   }
 
+  /** Carry a new model into the options an in-place `/clear` restart replays. */
+  rememberModel(sessionId: string, model: string | undefined): void {
+    this.sessions.get(sessionId)?.rememberModel(model);
+  }
+
   /** Drop a turn that was typed ahead and has not run yet. */
   cancelQueued(sessionId: string, queuedId: string): boolean {
     return this.sessions.get(sessionId)?.cancelQueued(queuedId) ?? false;
