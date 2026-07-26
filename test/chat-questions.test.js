@@ -594,6 +594,18 @@ describe('asking the user a choice-based question', function () {
       assert.ok(!isAskQuestionTool(undefined));
     });
 
+    it('does not mistake a runtime’s own ask-the-user tool for this one', function () {
+      // kimi ships a native `AskUserQuestion`, and in a headless ACP session it
+      // answers itself with "user dismissed" without anyone being asked. It must
+      // not be matched here: this app can neither auto-approve it (that rule
+      // exists because *our* tool is unanswerable behind an approval) nor draw a
+      // card for it (there is no pending question to answer, so the card would
+      // render as already-answered with no answer in it).
+      assert.ok(!isAskQuestionTool('AskUserQuestion'));
+      assert.ok(!looksLikeAskCall('AskUserQuestion', { questions: [{ question: 'Tabs or spaces?' }] }));
+      assert.strictEqual(askedQuestionFrom({ questions: [{ question: 'Tabs or spaces?' }] }), null);
+    });
+
     it('recognises a call an ACP agent renamed past recognition', function () {
       // ACP has no tool-name field: the adapter uses the agent's own title for
       // the block, so the name is prose. The real name turns up in the

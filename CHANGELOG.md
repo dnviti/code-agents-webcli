@@ -24,9 +24,12 @@
   Questions are asked even in sessions running with approvals bypassed: not being
   asked before it acts has never meant having your questions answered for you.
 
-  Works with Claude and with the ACP agents (kimi, omp), each through its own
-  handshake. Codex, pi and grok report the capability as unavailable rather than
-  offering a button that would do nothing.
+  Works with Claude and with omp, each through its own handshake. kimi can reach
+  it too, but often prefers its own built-in question tool, which answers itself
+  without asking anyone — so questions there are hit and miss, and that is kimi's
+  behaviour rather than something this app can steer. Codex, pi and grok report
+  the capability as unavailable rather than offering a button that would do
+  nothing.
 - **You can open what the agent handed off and watch it work.** A delegation
   used to be one line in the agents list: a name, a status badge, a duration.
   Whether it was a sub-agent reading three files or a workflow running a dozen

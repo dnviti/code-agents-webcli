@@ -40,6 +40,16 @@ export type ChatAdapterFactory = (options: ChatAdapterOptions) => ChatAdapter;
  * Absent means the runtime has no verified way to accept one, and it simply
  * reports `questions: false` rather than being handed a flag nobody has watched
  * it parse.
+ *
+ * A wired channel is not a promise the model will use it. kimi accepts the
+ * server, spawns it and exposes the tool — verified — but ships a native
+ * `AskUserQuestion` of its own that it often reaches for first, and that one
+ * answers itself with "the user dismissed this" without anybody being asked.
+ * Nothing here can redirect it: refusing the native call through the permission
+ * channel just ends the turn, because ACP carries no reason back to the model.
+ * Wiring it anyway is still strictly better than not — when the model does pick
+ * this tool the question reaches a person, and when it does not, the outcome is
+ * the one kimi would have produced regardless.
  */
 export type AskChannel = 'cli' | 'protocol';
 
