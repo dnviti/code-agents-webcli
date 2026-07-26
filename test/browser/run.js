@@ -58,7 +58,11 @@ const out = execFileSync(
     // `elementFromPoint` returns null off-screen, which reads as "nothing is
     // covering this control" for a control that is not on screen at all.
     '--window-size=1600,1000',
-    '--virtual-time-budget=20000',
+    // Virtual milliseconds, so this costs wall-clock only while something is
+    // actually waiting. It is a deadline for the whole suite, and a suite that
+    // outgrows it does not report failures — it dumps a page with no results
+    // at all, which is why this has room over what the checks currently need.
+    '--virtual-time-budget=40000',
     '--dump-dom',
     `file://${path.join(dir, 'page.html')}`,
   ],

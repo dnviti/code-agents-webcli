@@ -235,6 +235,7 @@ async function run(): Promise<void> {
   await checkTheComposerShrinksWithTheWorkspaceRail();
   await checkTheFixedBarsNeverWrap();
   await checkALiveAnswerAppearsAsItStreams();
+  await checkSilentStepsLeaveNoRowButKeepTheirTrace();
   await checkThePhoneLayoutIsUsable();
   await checkThePhoneShellSurfacesAreUsable();
 
@@ -1048,6 +1049,159 @@ async function checkALiveAnswerAppearsAsItStreams(): Promise<void> {
     'the transcript itself holds the streamed message',
     controller.transcript.messages.some((m: { id: string }) => m.id === 'a2'),
     `ids=${controller.transcript.messages.map((m: { id: string }) => m.id).join(',')}`,
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * Issue #46 — a step that only ran commands leaves no row, and the next reply
+ * speaks for it.
+ *
+ * A static render can count rows but cannot click, and the half of this that
+ * matters is the click: the pill on the reply has to open the trace *at the
+ * start* of the stretch it counts, not at its own first call. That is a real
+ * event handler feeding real state into the rail, so it needs a real browser.
+ */
+async function checkSilentStepsLeaveNoRowButKeepTheirTrace(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1280px;height:760px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const tool = (id: string, command: string, output: string): unknown => ({
+    kind: 'tool', toolId: id, name: 'bash', toolKind: 'execute',
+    status: 'completed', input: { command }, output, durationMs: 1200,
+  });
+
+  const controller = new ChatController('silent-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'silent-check',
+    snapshot: {
+      sessionId: 'silent-check', runtime: 'claude', state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true, commands: [],
+      },
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'run the tests' }],
+        },
+        // Two steps that said nothing at all — the rows #46 removes.
+        {
+          id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: Date.now(),
+          blocks: [tool('x1', 'npm run lint', 'THE-FIRST-SILENT-STEP')],
+        },
+        {
+          id: 'a2', seq: 3, turnId: 't1', role: 'assistant', ts: Date.now(),
+          blocks: [tool('x2', 'npm run typecheck', 'THE-SECOND-SILENT-STEP')],
+        },
+        // …and the reply that finally arrives, which has to speak for them.
+        {
+          id: 'a3', seq: 4, turnId: 't1', role: 'assistant', ts: Date.now(),
+          blocks: [
+            { kind: 'text', text: 'all green' },
+            tool('x3', 'npm test', 'ITS-OWN-STEP'),
+          ],
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 4,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/home/dev/project',
+      branch: 'main',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  const rows = (): HTMLElement[] =>
+    Array.from(host.querySelectorAll<HTMLElement>('[aria-label="Assistant message"]'));
+
+  check(
+    'a step that only ran commands gets no row of its own',
+    rows().length === 1,
+    `${rows().length} assistant rows: ${rows().map((r) => (r.textContent || '').slice(0, 24)).join(' | ')}`,
+  );
+
+  const reply = rows()[0];
+  const replyText = reply ? reply.textContent || '' : '';
+  check(
+    'the reply that follows them counts the whole stretch',
+    replyText.includes('all green') && replyText.includes('3 commands'),
+    replyText.slice(0, 160),
+  );
+
+  // The trace never lost any of it — the rail is the record, and it is open.
+  const railText = (): string => host.textContent || '';
+  check(
+    'every silent step is still on the trace',
+    railText().includes('npm run lint') && railText().includes('npm run typecheck'),
+    'looked for both suppressed commands on the rail',
+  );
+
+  const pill = Array.from(host.querySelectorAll<HTMLElement>('button'))
+    .find((node) => (node.textContent || '').includes('show work'));
+  check('the reply carries a way into the trace', Boolean(pill), pill ? 'work pill found' : 'no work pill on the reply');
+  pill?.click();
+  await wait(300);
+
+  // Focusing a row expands it, so the first silent step's output is the proof
+  // that the pill landed at the start of the stretch rather than on its own call.
+  check(
+    'it opens the trace at the first silent step, not at the reply’s own call',
+    railText().includes('THE-FIRST-SILENT-STEP'),
+    railText().includes('THE-FIRST-SILENT-STEP')
+      ? 'the first silent step is expanded'
+      : railText().includes('ITS-OWN-STEP')
+        ? 'the pill focused the reply’s own call'
+        : 'nothing was expanded',
+  );
+
+  // And live: a silent step arriving mid-stream must not add a row either.
+  const event = (payload: unknown): void =>
+    controller.handle({ type: 'chat_event', sessionId: 'silent-check', event: payload } as never);
+  event({ t: 'msg_start', id: 'u2', seq: 5, turnId: 't2', role: 'user', ts: Date.now() });
+  event({ t: 'block_start', msgId: 'u2', index: 0, block: { kind: 'text', text: 'and again' } });
+  event({ t: 'msg_end', msgId: 'u2' });
+  event({ t: 'msg_start', id: 'a4', seq: 6, turnId: 't2', role: 'assistant', ts: Date.now() });
+  event({
+    t: 'block_start',
+    msgId: 'a4',
+    index: 0,
+    block: tool('x4', 'npm run build', 'A-LIVE-SILENT-STEP'),
+  });
+  await wait(300);
+
+  check(
+    'a silent step arriving live adds no row while it runs',
+    rows().length === 1,
+    `${rows().length} assistant row(s) while the second turn is only tools`,
+  );
+
+  event({ t: 'msg_end', msgId: 'a4' });
+  event({ t: 'msg_start', id: 'a5', seq: 7, turnId: 't2', role: 'assistant', ts: Date.now() });
+  event({ t: 'block_start', msgId: 'a5', index: 0, block: { kind: 'text', text: 'built' } });
+  await wait(300);
+
+  const live = rows()[1];
+  const liveText = live ? live.textContent || '' : '';
+  check(
+    'the reply appears with the live step already counted on it',
+    liveText.includes('built') && liveText.includes('1 command'),
+    liveText.slice(0, 160) || 'the streamed reply never rendered',
   );
 
   root.unmount();

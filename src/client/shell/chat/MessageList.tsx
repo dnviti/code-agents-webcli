@@ -1,11 +1,12 @@
 import * as React from 'react';
+import type { ChatMessage } from '../../../shared/chat-events.js';
 import { ChatTranscript } from '../../chat/transcript.js';
 import { createStick, BOTTOM_SLACK, type StickHandle } from '../../chat/stick.js';
 import type { TurnSummary } from '../../chat/turns.js';
 import { Button } from '../../ui/relay/Button.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import { usePhone } from '../../ui/touch.js';
-import { MessageBubble } from './MessageBubble.js';
+import { MessageBubble, hasVisibleContent } from './MessageBubble.js';
 import { TurnStrip } from './TurnStrip.js';
 
 /**
@@ -380,23 +381,20 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
                       re-expanding it is instant and cannot desync from a turn
                       that kept running underneath. */}
                   <div id={bodyId} hidden={!open} style={{ display: open ? 'flex' : 'none', flexDirection: 'column' }}>
-                    {turn.messageIds.map((messageId) => {
-                      const message = messageById.get(messageId);
-                      if (!message) return null;
-                      return (
-                        <MessageBubble
-                          key={message.id}
-                          message={message}
-                          transcript={transcript}
-                          onFork={fork}
-                          onRetry={retry}
-                          onShowWork={showWork}
-                          onEdit={edit}
-                          showThinking={showThinking}
-                          showToolCalls={showToolCalls}
-                        />
-                      );
-                    })}
+                    {rowsOf(turn.messageIds, messageById).map(({ message, carriedIds }) => (
+                      <MessageBubble
+                        key={message.id}
+                        message={message}
+                        transcript={transcript}
+                        onFork={fork}
+                        onRetry={retry}
+                        onShowWork={showWork}
+                        onEdit={edit}
+                        carriedIds={carriedIds}
+                        showThinking={showThinking}
+                        showToolCalls={showToolCalls}
+                      />
+                    ))}
                   </div>
                 </React.Fragment>
               );
@@ -444,6 +442,41 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
 );
 
 const ZERO = (): number => 0;
+
+interface Row {
+  message: ChatMessage;
+  /** The silent steps this row speaks for, oldest first, comma-joined. */
+  carriedIds: string;
+}
+
+/**
+ * The rows a turn actually draws, and which silent steps each one carries.
+ *
+ * A step that produced only tool calls and reasoning has no row (see
+ * MessageBubble). Its id is held here until a message that does speak comes
+ * along, and handed to that message so its pill counts the whole stretch and
+ * opens the trace at the start of it.
+ *
+ * Silent steps still pending at the end of a turn are simply dropped: there is
+ * no reply to hang them on, and inventing a row for them is the thing this
+ * removes. Nothing is lost — the turn strip still counts them and the rail
+ * still holds every event.
+ */
+function rowsOf(messageIds: string[], byId: Map<string, ChatMessage>): Row[] {
+  const rows: Row[] = [];
+  let silent: string[] = [];
+  for (const messageId of messageIds) {
+    const message = byId.get(messageId);
+    if (!message) continue;
+    if (!hasVisibleContent(message)) {
+      silent.push(message.id);
+      continue;
+    }
+    rows.push({ message, carriedIds: silent.join(',') });
+    silent = [];
+  }
+  return rows;
+}
 
 /**
  * Escape an id for use inside an attribute selector.
