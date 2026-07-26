@@ -47,8 +47,6 @@ export const PHONE_TEXT = {
   input: 16,
   /** Standing context that is true all session and glanced at, not read. */
   meta: 13,
-  /** The floor. Decoration only — never a word somebody has to act on. */
-  micro: 12,
 } as const;
 
 /**
@@ -74,47 +72,9 @@ export const TOUCH_GAP = 8;
 export const PHONE_SPACE = {
   /** Inside a control, between its icon and its label. */
   inline: 8,
-  /** Between rows of a stacked layout. */
-  row: 10,
   /** A surface's own edge padding. */
   edge: 12,
 } as const;
-
-/**
- * A control's hit area on a phone, without forcing its ink to grow.
- *
- * `minWidth`/`minHeight` rather than `width`/`height`: a labelled control is
- * wider than the floor and must stay wider, and a control that wraps to two
- * lines must stay taller. Both are minimums exactly because the content, not
- * this file, knows the real size.
- */
-export function touchTarget(isMobile: boolean): React.CSSProperties {
-  if (!isMobile) return {};
-  return { minWidth: TOUCH_TARGET, minHeight: TOUCH_TARGET };
-}
-
-/**
- * A row of controls, spaced for fingers.
- *
- * Wraps rather than shrinks: a phone has width to spend downwards and none to
- * spend sideways, and the alternative — squeezing the row — is what produced
- * the truncated labels this issue is about.
- */
-export function touchRow(isMobile: boolean): React.CSSProperties {
-  if (!isMobile) return {};
-  return { display: 'flex', flexWrap: 'wrap', gap: TOUCH_GAP, alignItems: 'center' };
-}
-
-/**
- * Pick between the desktop value and the phone value.
- *
- * Reads at the call site as "on a phone this, otherwise that", which is the
- * only shape these edits take, and keeps the ternaries from spreading a second
- * copy of the scale through the components.
- */
-export function phone<T>(isMobile: boolean, onPhone: T, otherwise: T): T {
-  return isMobile ? onPhone : otherwise;
-}
 
 /**
  * Whether this subtree is being drawn on a phone.

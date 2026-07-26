@@ -21,8 +21,11 @@ import { DEFAULT_CHAT_VIEW } from '../../src/client/chat/view-settings';
 import { createTerminalController, LIVE_SCROLLBACK_LINES } from '../../src/client/terminal/controller';
 import { HistoryView } from '../../src/client/terminal/history-view';
 import { Dialog } from '../../src/client/ui/relay/Dialog';
+import { PhoneContext } from '../../src/client/ui/touch';
 import { MobileBar } from '../../src/client/shell/MobileBar';
 import { MoreSheet } from '../../src/client/shell/MoreSheet';
+import { ChatSettingsDialog } from '../../src/client/shell/dialogs/ChatSettingsDialog';
+import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
 import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
 
 const results: string[] = [];
@@ -788,6 +791,19 @@ function paintedControls(root: HTMLElement): HTMLElement[] {
   return all.filter((node) => !all.some((other) => other !== node && other.contains(node)));
 }
 
+/**
+ * A control's laid-out size, ignoring transforms.
+ *
+ * `getBoundingClientRect()` reports the painted box, which a dialog's entrance
+ * animation scales — so a 44px button measures 43.12px for as long as the
+ * animation is mid-flight, and headless Chrome does not always finish one. How
+ * big a control *is* is a layout question; where it is on screen is the one the
+ * rect answers, and that is what the spacing and overflow checks use.
+ */
+function laidOutSize(node: HTMLElement): { width: number; height: number } {
+  return { width: node.offsetWidth, height: node.offsetHeight };
+}
+
 /** Whether any ancestor up to the host deliberately scrolls this node sideways. */
 function scrollsSideways(node: Element): boolean {
   for (let at: Element | null = node.parentElement; at; at = at.parentElement) {
@@ -856,8 +872,8 @@ function assertPhoneSurface(host: HTMLElement, where: string): void {
   // 1. Every control a finger is meant to hit.
   const controls = paintedControls(host);
   const small = controls.filter((node) => {
-    const box = node.getBoundingClientRect();
-    return box.width < PHONE_TARGET - 0.5 || box.height < PHONE_TARGET - 0.5;
+    const box = laidOutSize(node);
+    return box.width < PHONE_TARGET || box.height < PHONE_TARGET;
   });
   check(
     `every control is at least ${PHONE_TARGET}px in ${where}`,
@@ -866,8 +882,8 @@ function assertPhoneSurface(host: HTMLElement, where: string): void {
       ? small
           .slice(0, 8)
           .map((n) => {
-            const b = n.getBoundingClientRect();
-            return `${describe(n)}=${Math.round(b.width)}x${Math.round(b.height)}`;
+            const b = laidOutSize(n);
+            return `${describe(n)}=${b.width}x${b.height}`;
           })
           .join(' | ')
       : `${controls.length} controls`,
@@ -1206,6 +1222,19 @@ async function checkThePhoneShellSurfacesAreUsable(): Promise<void> {
         onSwitchMode: noop, onCloseSession: noop, onOpenSettings: noop,
         onToggleTheme: noop, onRename: noop,
       } as never)],
+    ['the chat settings dialog', () =>
+      React.createElement(ChatSettingsDialog, {
+        open: true, settings: DEFAULT_CHAT_VIEW, onChange: noop, onClose: noop,
+      } as never)],
+    ['the sessions dialog', () =>
+      React.createElement(SessionsDialog, {
+        open: true,
+        sessions: [
+          { id: 's1', title: 'a session with a fairly long name', runtime: 'claude', workingDir: '/tmp/a' },
+          { id: 's2', title: 'another one', runtime: 'codex', workingDir: '/tmp/b' },
+        ],
+        activeId: 's1', onJoin: noop, onLeave: noop, onDelete: noop, onNew: noop, onClose: noop,
+      } as never)],
     ['the tab switcher', () =>
       React.createElement(TabSwitcherSheet, {
         open: true,
@@ -1242,7 +1271,11 @@ async function checkThePhoneShellSurfacesAreUsable(): Promise<void> {
 
     const host = doc.body;
     const root = createRoot(host);
-    root.render(render());
+    // Inside a provider, because two of these are the app's ordinary dialogs
+    // rather than phone-only surfaces: they take their sizing from the shell's
+    // `isMobile`, the same way every other component below AppShell does, and
+    // outside one they would correctly render at desktop sizes.
+    root.render(React.createElement(PhoneContext.Provider, { value: true }, render()));
     await wait(300);
 
     const target = host;
@@ -1255,16 +1288,16 @@ async function checkThePhoneShellSurfacesAreUsable(): Promise<void> {
     }
 
     const small = controls.filter((node) => {
-      const box = node.getBoundingClientRect();
-      return box.width < PHONE_TARGET - 0.5 || box.height < PHONE_TARGET - 0.5;
+      const box = laidOutSize(node);
+      return box.width < PHONE_TARGET || box.height < PHONE_TARGET;
     });
     check(
       `every control in ${name} is at least ${PHONE_TARGET}px`,
       small.length === 0,
       small.length
         ? small.slice(0, 8).map((n) => {
-            const b = n.getBoundingClientRect();
-            return `${describe(n)}=${Math.round(b.width)}x${Math.round(b.height)}`;
+            const b = laidOutSize(n);
+            return `${describe(n)}=${b.width}x${b.height}`;
           }).join(' | ')
         : `${controls.length} controls`,
     );

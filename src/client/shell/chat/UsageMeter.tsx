@@ -78,6 +78,9 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
         // Named, because it is one of the readouts a phone layout has to keep
         // legible and there is otherwise no way to ask for it — by role it is
         // an anonymous div, and by text it is whatever this session has cost.
+        // The role is what makes the name land: `aria-label` on a plain div is
+        // ignored by most screen readers.
+        role="group"
         aria-label="Session usage"
         style={{
           display: 'flex',

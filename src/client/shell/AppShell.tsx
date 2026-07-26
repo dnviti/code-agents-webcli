@@ -4,6 +4,7 @@ import type { AppSettings } from '../types';
 import { Badge } from '../ui/relay/Badge';
 import { CommandPalette, type CommandPaletteGroup } from '../ui/relay/CommandPalette';
 import { Icon } from '../ui/relay/Icon';
+import { PhoneContext } from '../ui/touch';
 import { IconButton } from '../ui/relay/IconButton';
 import { StatusBar, type StatusBarSegment } from '../ui/relay/StatusBar';
 import { TabBar, type TabItem } from '../ui/relay/TabBar';
@@ -414,6 +415,12 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
   );
 
   return (
+    // The shell's phone answer, published to everything under it — including
+    // the dialogs, which render here rather than inside any conversation and
+    // would otherwise be the one part of a phone still drawn at desktop sizes.
+    // ChatView publishes its own for the same value; a conversation rendered
+    // outside this shell still has to know. See ui/touch.ts.
+    <PhoneContext.Provider value={state.isMobile}>
     <div
       style={{
         // In flow rather than `position: absolute; inset: 0`. #app is a column
@@ -694,6 +701,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         hasTerminal={state.tabs.some((tab) => tab.id === state.activeId && tab.surface !== 'chat')}
       />
     </div>
+    </PhoneContext.Provider>
   );
 }
 

@@ -1,6 +1,6 @@
 import * as React from 'react';
 
-import { TOUCH_TARGET } from '../touch.js';
+import { TOUCH_TARGET, usePhone } from '../touch.js';
 import { Icon } from './Icon';
 
 export interface DialogProps {
@@ -258,6 +258,7 @@ export function Dialog({
   if (!open) return null;
 
   const bottom = placement === 'bottom';
+  const isPhone = usePhone();
   const windowed = movable && !bottom;
   // Placed only once the user has actually moved or maximised it. Until then
   // the overlay's flex centring is left alone.
@@ -323,13 +324,14 @@ export function Dialog({
   const headerRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 };
   const titleStyle: React.CSSProperties = { margin: 0, fontFamily: 'var(--font-sans)', fontSize: 'var(--text-body)', fontWeight: 'var(--font-semibold)' as React.CSSProperties['fontWeight'], color: 'var(--foreground)' };
   const closeStyle: React.CSSProperties = {
-    border: 'none', background: 'transparent', color: 'var(--muted-foreground)', cursor: 'pointer', fontSize: bottom ? 20 : 15, lineHeight: 1, padding: 2,
+    border: 'none', background: 'transparent', color: 'var(--muted-foreground)', cursor: 'pointer', fontSize: bottom || isPhone ? 20 : 15, lineHeight: 1, padding: 2,
     borderRadius: 'var(--radius)',
-    // A bottom sheet is the phone form of this dialog — see `placement` — so
-    // its one control is sized for a thumb rather than a cursor. 17x19px of
+    // A bottom sheet is always the phone form of this dialog — see `placement`
+    // — and a centred one is too when the app says it is on a phone. Either
+    // way its one control is sized for a thumb rather than a cursor: 17x19px of
     // glyph is what a finger has to find otherwise, in the corner of the
     // screen, next to nothing that would forgive a miss.
-    ...(bottom ? { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: TOUCH_TARGET, height: TOUCH_TARGET, marginRight: -10 } : null),
+    ...(bottom || isPhone ? { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: TOUCH_TARGET, height: TOUCH_TARGET, marginRight: -10 } : null),
     boxShadow: closeFocusVisible ? 'var(--shadow-focus)' : undefined,
   };
   const descriptionStyle: React.CSSProperties = { margin: '6px 0 0', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-sm)', color: 'var(--muted-foreground)', lineHeight: 'var(--leading-normal)' };
