@@ -162,6 +162,42 @@ describe('SessionStore', function() {
       assert.strictEqual(loaded.get('default').chatModelOverride, undefined);
     });
 
+    it('remembers the name the user gave a session', async function () {
+      // The one moment a chosen name matters most is coming back to a set of
+      // long-running sessions after a restart, which is exactly the moment it
+      // has to survive. A session nobody renamed reads as "never renamed", not
+      // as an empty name.
+      await sessionStore.saveSessions(new Map([
+        ['named', createSessionRecord({ id: 'named', ownerUserId, customName: 'the good one' })],
+        ['plain', createSessionRecord({ id: 'plain', ownerUserId })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('named').customName, 'the good one');
+      assert.strictEqual(loaded.get('plain').customName, undefined);
+      assert.strictEqual(
+        loaded.get('named').name,
+        createSessionRecord({ id: 'named', ownerUserId }).name,
+        'the created name is kept alongside the chosen one',
+      );
+    });
+
+    it('adds the custom-name column to a database that predates it', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['old', createSessionRecord({ id: 'old', ownerUserId })],
+      ]));
+      sessionStore.database.raw.exec('ALTER TABLE runtime_sessions DROP COLUMN custom_name');
+      sessionStore.database.close();
+
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      const loaded = await sessionStore.loadSessions();
+
+      assert.strictEqual(loaded.size, 1, 'the upgrade must not cost the user their sessions');
+      assert.strictEqual(loaded.get('old').customName, undefined);
+    });
+
     it('adds the model-override column to a database that predates it', async function () {
       await sessionStore.saveSessions(new Map([
         ['old', createSessionRecord({ id: 'old', ownerUserId, surface: 'chat' })],

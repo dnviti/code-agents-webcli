@@ -75,7 +75,7 @@ function SessionCard({
             whiteSpace: 'nowrap',
           }}
         >
-          {session.name}
+          {session.customName || session.name}
         </div>
         <div
           style={{

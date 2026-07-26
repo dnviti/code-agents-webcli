@@ -20,6 +20,15 @@ interface TabRecord {
   /** The label shown on the tab, which is not always the session name. */
   displayName: string;
   /**
+   * The label the user chose, if they chose one.
+   *
+   * Kept apart from `displayName` so a rename that the server refuses can be
+   * put back the way it was, and so a session the user never renamed still goes
+   * through the generated-name rules rather than being pinned to whatever the
+   * strip happened to be showing.
+   */
+  customName?: string;
+  /**
    * Which surface the session runs on, as far as this client knows.
    *
    * Learned from the session list at boot and from `session_joined` /
@@ -28,6 +37,56 @@ interface TabRecord {
    * user is looking at a different one.
    */
   surface: 'terminal' | 'chat';
+}
+
+/**
+ * Where this browser remembers the tab it was last on.
+ *
+ * In the browser and not on the server, because which tab you are looking at is
+ * a property of the window you are looking at it in — a shared answer would have
+ * a second window dragging the first one around.
+ *
+ * Written to both stores and read from sessionStorage first. sessionStorage is
+ * per window, which is what lets two windows sit on different sessions and each
+ * come back to its own after a reload. localStorage is the fallback for a window
+ * that has no session storage to read yet — a newly opened one, or a browser
+ * started fresh — which would otherwise always land on the first tab.
+ */
+const ACTIVE_TAB_KEY = 'cc-web-active-tab';
+
+function rememberActiveTab(sessionId: string): void {
+  for (const store of storages()) {
+    try {
+      store.setItem(ACTIVE_TAB_KEY, sessionId);
+    } catch {
+      // Private mode, a full quota, storage switched off. Losing the memory of
+      // which tab was open is not a reason to fail a tab switch.
+    }
+  }
+}
+
+function recallActiveTab(): string | null {
+  for (const store of storages()) {
+    try {
+      const stored = store.getItem(ACTIVE_TAB_KEY);
+      if (stored) return stored;
+    } catch {
+      // Same as above, and the next store still gets its turn.
+    }
+  }
+  return null;
+}
+
+/** This window's memory first, then the browser-wide one. */
+function storages(): Storage[] {
+  const found: Storage[] = [];
+  try {
+    if (typeof sessionStorage !== 'undefined') found.push(sessionStorage);
+  } catch { /* blocked */ }
+  try {
+    if (typeof localStorage !== 'undefined') found.push(localStorage);
+  } catch { /* blocked */ }
+  return found;
 }
 
 export class SessionTabManager {
@@ -242,7 +301,7 @@ export class SessionTabManager {
       sessions.forEach((raw, index: number) => {
         const session = raw as unknown as {
           id: string; name: string; active: boolean; workingDir: string | null;
-          surface?: 'terminal' | 'chat';
+          surface?: 'terminal' | 'chat'; customName?: string;
         };
         this.addTab(
           session.id,
@@ -250,6 +309,7 @@ export class SessionTabManager {
           session.active ? 'active' : 'idle',
           session.workingDir,
           false,
+          session.customName,
         );
         if (session.surface === 'chat') {
           this.setTabSurface(session.id, 'chat');
@@ -281,21 +341,27 @@ export class SessionTabManager {
     status: SessionInfo['status'] = 'idle',
     workingDir: string | null = null,
     autoSwitch = true,
+    customName?: string,
   ): void {
     if (this.tabs.has(sessionId)) return;
 
     const isDefaultSessionName = sessionName.startsWith('Session ') && sessionName.includes(':');
     const folderName = workingDir ? workingDir.split('/').pop() || '/' : null;
-    const displayName = !isDefaultSessionName ? sessionName : (folderName || sessionName);
+    const generated = !isDefaultSessionName ? sessionName : (folderName || sessionName);
+    // A chosen name wins outright: it is the one thing about a tab the user said
+    // out loud, so it is not run through the generated-name rules.
+    const displayName = customName || generated;
 
-    this.tabs.set(sessionId, { id: sessionId, displayName, surface: 'terminal' });
+    this.tabs.set(sessionId, { id: sessionId, displayName, customName, surface: 'terminal' });
     if (!this.tabOrder.includes(sessionId)) {
       this.tabOrder.push(sessionId);
     }
 
     this.activeSessions.set(sessionId, {
       id: sessionId,
-      name: sessionName,
+      // What a notification calls this session, which is the user's name for it
+      // when they have given one.
+      name: customName || sessionName,
       status,
       workingDir,
       lastAccessed: Date.now(),
@@ -352,6 +418,7 @@ export class SessionTabManager {
     }
 
     this.activeTabId = sessionId;
+    rememberActiveTab(sessionId);
 
     const session = this.activeSessions.get(sessionId);
     if (session) {
@@ -446,9 +513,67 @@ export class SessionTabManager {
     const name = newName.trim();
     if (!record || !name) return;
 
-    record.displayName = name;
+    const previous = { displayName: record.displayName, customName: record.customName };
+    this.applyName(sessionId, name, name);
+
+    // The label moves now and the server is told afterwards: a rename is the
+    // user restating something they already know, and making them watch a round
+    // trip for it would be the slowest part of the interaction. If the server
+    // refuses — a session that has since been deleted, a name it will not take —
+    // the old label goes back, so the strip never keeps a name that was not
+    // stored.
+    void fetch(`/api/sessions/${sessionId}/name`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          this.applyName(sessionId, previous.displayName, previous.customName);
+          showNotification('That name could not be saved');
+          return;
+        }
+        // What was stored, which is not always what was typed: the server caps
+        // a very long name, and the strip showing one thing while every other
+        // window shows another is the disagreement this whole change is about.
+        const stored = await response.json().catch(() => null);
+        if (stored && typeof stored.name === 'string') {
+          this.applyRemoteName(sessionId, stored.name);
+        }
+      })
+      .catch(() => {
+        // Offline or mid-reconnect. The tab keeps the new name for this page —
+        // reverting a rename because the network blinked is the more annoying
+        // failure — and a reload shows what was actually stored.
+      });
+  }
+
+  /**
+   * Take a rename that happened somewhere else: another window, another device.
+   *
+   * Same store the local rename writes to, so two windows on the same sessions
+   * cannot end up disagreeing about what a tab is called.
+   */
+  applyRemoteName(sessionId: string, name: string): void {
+    const trimmed = name.trim();
+    const record = this.tabs.get(sessionId);
+    if (!record || !trimmed || record.displayName === trimmed) return;
+    this.applyName(sessionId, trimmed, trimmed);
+  }
+
+  /** Write a label into the tab, the session and the strip. */
+  private applyName(
+    sessionId: string,
+    displayName: string,
+    customName: string | undefined,
+  ): void {
+    const record = this.tabs.get(sessionId);
+    if (!record) return;
+
+    record.displayName = displayName;
+    record.customName = customName;
     const session = this.activeSessions.get(sessionId);
-    if (session) session.name = name;
+    if (session) session.name = displayName;
     this.syncShell();
   }
 
@@ -490,6 +615,21 @@ export class SessionTabManager {
   switchToTabByIndex(index: number): void {
     const tabIds = this.getOrderedTabIds();
     if (index < tabIds.length) this.switchToTab(tabIds[index]);
+  }
+
+  /**
+   * The tab a freshly loaded page should open on.
+   *
+   * The one this browser was last on, if it is still there — coming back to a
+   * set of long-running sessions and having to find the one you were in again
+   * is the whole complaint. A remembered id that names a session which has since
+   * been closed, or ended on another device, falls back to the first tab, which
+   * is what the app has always done.
+   */
+  initialTabId(): string | null {
+    const remembered = recallActiveTab();
+    if (remembered && this.tabs.has(remembered)) return remembered;
+    return this.getOrderedTabIds()[0] ?? this.tabs.keys().next().value ?? null;
   }
 
   // ---------------------------------------------------------------------------

@@ -36,6 +36,7 @@ interface RuntimeSessionRow {
   owner_session_id: string | null;
   chat_bypass_permissions: number | null;
   chat_model_override: string | null;
+  custom_name: string | null;
 }
 
 export class SessionStore {
@@ -74,7 +75,8 @@ export class SessionStore {
           native_chat_session_id,
           owner_session_id,
           chat_bypass_permissions,
-          chat_model_override
+          chat_model_override,
+          custom_name
         )
         VALUES (
           @id,
@@ -97,7 +99,8 @@ export class SessionStore {
           @native_chat_session_id,
           @owner_session_id,
           @chat_bypass_permissions,
-          @chat_model_override
+          @chat_model_override,
+          @custom_name
         )
       `);
 
@@ -164,6 +167,10 @@ export class SessionStore {
         // Persisted so a restart still prefers it over the profile default the
         // next time a session starts for this conversation.
         chat_model_override: session.chatModelOverride || null,
+        // The label the user chose. Without this a restart brings a session back
+        // under the name it was created with, which is the one thing the user
+        // renamed it to get away from.
+        custom_name: session.customName || null,
       }));
 
       replaceAll(rows);
@@ -201,7 +208,8 @@ export class SessionStore {
             native_chat_session_id,
             owner_session_id,
             chat_bypass_permissions,
-            chat_model_override
+            chat_model_override,
+            custom_name
           FROM runtime_sessions
           ORDER BY created_at ASC
         `)
@@ -251,6 +259,9 @@ export class SessionStore {
           // override" rather than a call to switch to nothing is the safe
           // direction regardless.
           chatModelOverride: row.chat_model_override || undefined,
+          // An empty string reads as "never renamed" for the same reason: the
+          // write side only ever stores a trimmed non-empty name or null.
+          customName: row.custom_name || undefined,
         });
       }
 

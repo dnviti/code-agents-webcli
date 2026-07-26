@@ -107,6 +107,8 @@ export interface SessionListItem {
   created: string;
   /** Absent means terminal, so a server that predates chat mode still reads. */
   surface?: 'terminal' | 'chat';
+  /** The user's chosen label, when there is one. Absent means "never renamed". */
+  customName?: string;
 }
 
 export interface FolderData {
@@ -278,6 +280,16 @@ export interface WsSessionDeletedMessage {
   message: string;
 }
 
+/**
+ * Sent to every one of the user's sockets when a session is renamed, including
+ * the one that asked, so a second window follows the new label without a reload.
+ */
+export interface WsSessionRenamedMessage {
+  type: 'session_renamed';
+  sessionId: string;
+  name: string;
+}
+
 /** Sent when a reattach targets a session the server no longer has. */
 export interface WsSessionGoneMessage {
   type: 'session_gone';
@@ -348,6 +360,7 @@ export type WsMessage =
   | WsErrorMessage
   | WsInfoMessage
   | WsSessionDeletedMessage
+  | WsSessionRenamedMessage
   | WsSessionGoneMessage
   | WsPongMessage
   | WsHistoryChunkMessage

@@ -25,6 +25,9 @@ import { getOwnedSession, requireUser } from './helpers.js';
  */
 const MAX_RESUMABLE = 25;
 
+/** Long enough for any label worth reading on a tab, short enough to store freely. */
+const MAX_NAME_LENGTH = 200;
+
 export interface SessionRoutesDeps {
   claudeSessions: Map<string, SessionRecord>;
   webSocketConnections: Map<string, WebSocketInfo>;
@@ -145,7 +148,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
 
         return {
           id: session.id,
-          name: session.name,
+          name: displayName(session),
           runtime: session.lastAgent,
           runtimeLabel: session.runtimeLabel,
           lastActivity: session.lastActivity.toISOString(),
@@ -204,9 +207,64 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         connectedClients: session.connections.size,
         lastActivity: session.lastActivity,
         surface: session.surface || 'terminal',
+        customName: session.customName,
       }));
 
     res.json({ sessions: sessionList });
+  });
+
+  /**
+   * Rename a session.
+   *
+   * The chosen label is stored beside the created name rather than over it, so
+   * a session that was never renamed keeps the name — and the folder-name
+   * substitution — it has today.
+   *
+   * Every one of this user's sockets is told, not just the one that asked: two
+   * windows open on the same sessions disagreeing about what a tab is called
+   * until somebody reloads is the same complaint as losing the name entirely.
+   */
+  router.patch('/api/sessions/:sessionId/name', (req: Request, res: Response): void => {
+    const user = requireUser(res);
+    if (!user) {
+      res.status(401).json({ error: 'authentication_required' });
+      return;
+    }
+
+    const session = getOwnedSession(deps.claudeSessions, req.params.sessionId as string, user);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const { name } = req.body ?? {};
+    if (typeof name !== 'string') {
+      res.status(400).json({ error: 'invalid_name', message: 'Session name must be a string' });
+      return;
+    }
+
+    // A name is what the user typed with the whitespace taken off, and a name
+    // that is nothing but whitespace is not a name. Capped because this label is
+    // rendered in a fixed-width strip and stored on every autosave, and neither
+    // has any use for a paragraph.
+    const trimmed = name.trim().slice(0, MAX_NAME_LENGTH);
+    if (!trimmed) {
+      res.status(400).json({ error: 'empty_name', message: 'Session name cannot be empty' });
+      return;
+    }
+
+    session.customName = trimmed;
+    void deps.saveSessionsToDisk();
+
+    for (const wsInfo of deps.webSocketConnections.values()) {
+      if (wsInfo.userId !== user.id) continue;
+      if (wsInfo.ws.readyState !== WebSocket.OPEN) continue;
+      wsInfo.ws.send(
+        JSON.stringify({ type: 'session_renamed', sessionId: session.id, name: trimmed }),
+      );
+    }
+
+    res.json({ success: true, name: trimmed });
   });
 
   router.post('/api/sessions/create', (req: Request, res: Response): void => {
@@ -322,6 +380,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     res.json({
       id: session.id,
       name: session.name,
+      customName: session.customName,
       created: session.created,
       active: session.active,
       agent: session.agent,
@@ -392,7 +451,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         `attachment; filename="${exportFileName(session)}"`,
       );
 
-      res.write(`# ${session.name}\n\n`);
+      res.write(`# ${displayName(session)}\n\n`);
       res.write(`- Directory: \`${session.workingDir}\`\n`);
       res.write(`- Created: ${session.created.toISOString()}\n`);
       res.write(`- Last activity: ${session.lastActivity.toISOString()}\n\n`);
@@ -491,8 +550,13 @@ function toPlainText(value: string): string {
     .replace(/`{10,}/g, '`````````');
 }
 
+/** What to call a session in front of the user: their name for it if they gave one. */
+function displayName(session: SessionRecord): string {
+  return session.customName || session.name;
+}
+
 function exportFileName(session: SessionRecord): string {
-  const safe = session.name.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  const safe = displayName(session).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
   const stamp = session.created.toISOString().slice(0, 10);
   return `${safe || 'session'}-${stamp}.md`;
 }
