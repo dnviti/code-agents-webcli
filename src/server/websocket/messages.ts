@@ -117,6 +117,12 @@ export interface ChatManagerLike {
   rememberModel(sessionId: string, model: string | undefined): void;
   cancelQueued(sessionId: string, queuedId: string): boolean;
   respondPermission(sessionId: string, requestId: string, optionId: string): boolean;
+  answerQuestion(
+    sessionId: string,
+    requestId: string,
+    optionIds: string[],
+    skipped?: boolean,
+  ): boolean;
   stop(sessionId: string): Promise<void>;
   readPage(
     record: SessionRecord,
@@ -141,6 +147,10 @@ interface IncomingMessage {
   text?: string;
   attachments?: unknown[];
   optionId?: string;
+  /** Every option picked for a multiple-choice question the model asked. */
+  optionIds?: unknown[];
+  /** True when the user chose to answer a question with nothing. */
+  skipped?: boolean;
   fromSeq?: number;
   agentKind?: string;
   /** Identifies one turn waiting in the send-ahead queue. */
@@ -238,6 +248,10 @@ export class MessageProcessor {
 
       case 'chat_permission_response':
         this.handleChatPermission(wsInfo, data);
+        break;
+
+      case 'chat_question_answer':
+        this.handleChatQuestion(wsInfo, data);
         break;
 
       case 'chat_history_request':
@@ -1348,6 +1362,28 @@ export class MessageProcessor {
     if (!requestId || !optionId) return;
 
     manager.respondPermission(session.id, requestId, optionId);
+  }
+
+  /**
+   * Answer a multiple-choice question the model asked.
+   *
+   * Separate from the approval route rather than reusing it with a list: an
+   * approval is one decision out of a set this app defines, and a question is an
+   * arbitrary selection out of a set the model wrote. Routing both through one
+   * handler would mean a browser could answer a question with an approval id.
+   */
+  private handleChatQuestion(wsInfo: WebSocketInfo, data: IncomingMessage): void {
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!manager || !session) return;
+
+    const requestId = typeof data.requestId === 'string' ? data.requestId : '';
+    if (!requestId) return;
+
+    const optionIds = Array.isArray(data.optionIds)
+      ? data.optionIds.filter((id): id is string => typeof id === 'string')
+      : [];
+    manager.answerQuestion(session.id, requestId, optionIds, data.skipped === true);
   }
 
   private async handleChatHistory(

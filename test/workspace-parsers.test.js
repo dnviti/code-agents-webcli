@@ -21,7 +21,7 @@ before(function () {
   const contents = [
     `export { parseGitStatus, parseUnifiedDiff } from ${JSON.stringify(path.join(ROOT, 'src/shared/git-status'))};`,
     `export { detectServerLinks, rewriteForBrowser } from ${JSON.stringify(path.join(ROOT, 'src/shared/detect-links'))};`,
-    `export { collectAgentActivity, countRunning } from ${JSON.stringify(path.join(ROOT, 'src/shared/agent-activity'))};`,
+    `export { collectAgentActivity, countRunning, findToolBlock, parseWorkflowLog } from ${JSON.stringify(path.join(ROOT, 'src/shared/agent-activity'))};`,
     `export { languageForFile, basename } from ${JSON.stringify(path.join(ROOT, 'src/shared/file-language'))};`,
   ].join('\n');
 
@@ -390,6 +390,64 @@ describe('collectAgentActivity', function () {
     ]);
     assert.ok(entry.description.length <= 140);
     assert.ok(entry.description.endsWith('...'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// workflow popup: finding the live block, reading its log
+// ---------------------------------------------------------------------------
+
+describe('findToolBlock', function () {
+  const toolMessage = (ts, ...tools) => ({
+    id: `m${ts}`,
+    seq: ts,
+    turnId: 't',
+    role: 'assistant',
+    ts,
+    blocks: tools.map((tool) => ({ kind: 'tool', toolKind: 'task', ...tool })),
+  });
+
+  it('finds the block by id, wherever it sits', function () {
+    const second = toolMessage(2, { toolId: 'w1', name: 'Workflow', status: 'running' });
+    const block = mod.findToolBlock(
+      [toolMessage(1, { toolId: 'other', name: 'Bash', status: 'completed' }), second],
+      'w1',
+    );
+    assert.strictEqual(block, second.blocks[0]);
+  });
+
+  it('returns null for an id the transcript never held', function () {
+    const block = mod.findToolBlock([toolMessage(1, { toolId: 'a', name: 'Bash', status: 'completed' })], 'missing');
+    assert.strictEqual(block, null);
+  });
+});
+
+describe('parseWorkflowLog', function () {
+  it('reads narrator headings into sections', function () {
+    const sections = mod.parseWorkflowLog('▸ Review\nchecking file a\nchecking file b\n▸ Verify\nall clear');
+    assert.deepStrictEqual(sections, [
+      { title: 'Review', lines: ['checking file a', 'checking file b'] },
+      { title: 'Verify', lines: ['all clear'] },
+    ]);
+  });
+
+  it('keeps a preamble before the first heading, title null', function () {
+    const sections = mod.parseWorkflowLog('starting up\n▸ Review\nlooking around');
+    assert.strictEqual(sections[0].title, null);
+    assert.deepStrictEqual(sections[0].lines, ['starting up']);
+    assert.strictEqual(sections[1].title, 'Review');
+  });
+
+  it('falls back to one flat section when nothing looks like a heading', function () {
+    const sections = mod.parseWorkflowLog('just some plain output\nmore of the same');
+    assert.strictEqual(sections.length, 1);
+    assert.strictEqual(sections[0].title, null);
+    assert.deepStrictEqual(sections[0].lines, ['just some plain output', 'more of the same']);
+  });
+
+  it('returns nothing for output that never arrived', function () {
+    assert.deepStrictEqual(mod.parseWorkflowLog(undefined), []);
+    assert.deepStrictEqual(mod.parseWorkflowLog(''), []);
   });
 });
 

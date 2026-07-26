@@ -12,6 +12,7 @@ import { Dialog } from '../../ui/relay/Dialog';
 import { Icon } from '../../ui/relay/Icon';
 import { Select } from '../../ui/relay/Select';
 import { SettingRow } from '../../ui/relay/SettingRow';
+import { PHONE_TEXT, usePhone } from '../../ui/touch';
 import { Switch } from '../../ui/relay/Switch';
 
 /**
@@ -219,12 +220,13 @@ export function ChatSettingsDialog({
 
 /** A rule and a caps label, between groups of rows. */
 function Section({ children }: { children: React.ReactNode }): React.JSX.Element {
+  const isPhone = usePhone();
   return (
     <div
       style={{
         padding: '14px 0 4px',
         fontFamily: 'var(--font-sans)',
-        fontSize: 'var(--text-2xs)',
+        fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
         textTransform: 'uppercase',
         letterSpacing: 'var(--tracking-caps)',
         color: 'var(--muted-foreground)',

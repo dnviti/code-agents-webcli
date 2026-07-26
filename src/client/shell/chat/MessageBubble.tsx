@@ -6,12 +6,17 @@ import {
   ErrorBlock,
   ImageBlock,
   NoticeBlock,
+  ToolBlock,
+  askedQuestionFrom,
+  looksLikeAskCall,
 } from '../../../shared/chat-events.js';
 import { ChatTranscript } from '../../chat/transcript.js';
 import { compactCount, formatDuration } from '../../chat/tool-meta.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { Markdown, markdownText } from './Markdown.js';
 import { PlanPanel } from './PlanPanel.js';
+import { QuestionCard } from './QuestionCard.js';
 
 /**
  * One message in the transcript — prose, and nothing else.
@@ -31,6 +36,13 @@ import { PlanPanel } from './PlanPanel.js';
  * they can be read as a sequence of work rather than as interruptions in the
  * middle of a sentence. What is left behind is a work pill: how much happened,
  * and one click to go and look at it. Moved, never hidden.
+ *
+ * A step that was *only* machinery therefore has nothing left to say, and gets
+ * no row at all — a glyph, a clock and a pill with no sentence beside them is a
+ * row the eye has to stop on to learn that nothing was said. Its work is not
+ * lost: the list hands those ids to the next message that does speak (see
+ * `carriedIds`), whose pill counts them and whose "show work" lands on the
+ * first of them. The rail keeps every event either way.
  */
 
 export interface MessageBubbleProps {
@@ -47,12 +59,27 @@ export interface MessageBubbleProps {
   onRetry?: (messageId: string) => void;
   /** Open the rail and scroll its timeline to this message's first event. */
   onShowWork?: (messageId: string) => void;
+  /**
+   * Ids of the silent steps this message speaks for, oldest first, comma-joined.
+   *
+   * A string rather than an array because it is a prop of a `React.memo`
+   * component: a fresh array per render would compare unequal every time and
+   * re-render the whole transcript on every streamed token.
+   */
+  carriedIds?: string;
   /** Put this turn's text back in the composer, unsent. */
   onEdit?: (text: string) => void;
   /** Count reasoning blocks in the work pill, per the chat display settings. */
   showThinking?: boolean;
   /** Count tool calls in the work pill. */
   showToolCalls?: boolean;
+  /**
+   * Answer a question the model asked from its card in the conversation.
+   *
+   * Must be referentially stable — this component is memoised, and a fresh
+   * closure per render would re-render the whole transcript on every token.
+   */
+  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
 }
 
 export const MessageBubble = React.memo(function MessageBubble({
@@ -62,16 +89,33 @@ export const MessageBubble = React.memo(function MessageBubble({
   onRetry,
   onShowWork,
   onEdit,
+  carriedIds = '',
   showThinking = true,
   showToolCalls = true,
+  onAnswerQuestion,
 }: MessageBubbleProps) {
   const id = message.id;
 
+  // This message, plus the silent steps it speaks for — a tool call can report
+  // how long it took after the message it belongs to has closed and the next
+  // one has opened, and a pill that inherited that call has to hear about it.
+  // Still one bubble per event rather than the whole list: nothing here widens
+  // to the transcript.
+  const watched = React.useMemo(() => [id, ...splitIds(carriedIds)], [id, carriedIds]);
+
   const subscribe = React.useCallback(
-    (listener: () => void) => transcript.subscribeMessage(id, listener),
-    [transcript, id],
+    (listener: () => void) => {
+      const offs = watched.map((each) => transcript.subscribeMessage(each, listener));
+      return () => {
+        for (const off of offs) off();
+      };
+    },
+    [transcript, watched],
   );
-  const getVersion = React.useCallback(() => transcript.getMessageVersion(id), [transcript, id]);
+  const getVersion = React.useCallback(
+    () => watched.reduce((sum, each) => sum + transcript.getMessageVersion(each), 0),
+    [transcript, watched],
+  );
   // Static rendering has no subscription to read from, so the server snapshot
   // is a constant; the third argument is required or React throws there.
   const version = React.useSyncExternalStore(subscribe, getVersion, ZERO);
@@ -85,6 +129,7 @@ export const MessageBubble = React.memo(function MessageBubble({
   );
 
   const [copied, setCopied] = React.useState(false);
+  const isPhone = usePhone();
   const isUser = current.role === 'user';
   // A marker is not a turn: no surface, no glyph, no controls, and the full
   // width of the column — it is a line drawn across the conversation.
@@ -93,13 +138,23 @@ export const MessageBubble = React.memo(function MessageBubble({
     && current.blocks.length > 0
     && current.blocks.every((block) => block.kind === 'notice');
 
-  // Derived from this message's own blocks, not from a list handed down. An
-  // events array as a prop would be a new object identity every render and
-  // would defeat React.memo for the whole transcript on every streamed token.
+  // Derived from blocks, not from a list handed down. An events array as a prop
+  // would be a new object identity every render and would defeat React.memo for
+  // the whole transcript on every streamed token — which is also why the silent
+  // steps this message speaks for arrive as a joined string of ids.
+  //
+  // Those steps are resolved through the transcript rather than subscribed to:
+  // a step only becomes silent-and-carried once the message after it has opened,
+  // by which time nothing is still streaming into it.
   const work = React.useMemo(
-    () => summariseWork(current, showThinking, showToolCalls),
+    () => {
+      const carried = splitIds(carriedIds)
+        .map((carriedId) => transcript.message(carriedId))
+        .filter((message): message is ChatMessage => Boolean(message));
+      return summariseWork([...carried, current], showThinking, showToolCalls);
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [current, version, showThinking, showToolCalls],
+    [transcript, current, version, carriedIds, showThinking, showToolCalls],
   );
 
   const copy = React.useCallback(() => {
@@ -117,12 +172,22 @@ export const MessageBubble = React.memo(function MessageBubble({
       });
   }, [current]);
 
-  // Nothing left to draw: an assistant turn that was only machinery, with both
-  // display toggles off. An empty bordered row is worse than no row — it reads
-  // as a message that failed to render rather than as one the settings hid.
-  if (!isUser && !isMarker && !current.streaming && visibleBlocks(current) === 0 && work.total === 0) {
-    return null;
-  }
+  // Nothing to say: a step that was only machinery. Its tool calls and its
+  // reasoning are on the rail, and its count is carried onto the next message
+  // that does speak, so the row itself would be an empty bordered strip with a
+  // clock on it — indistinguishable from a message that failed to render.
+  //
+  // Independent of the display settings, and independent of `streaming`: a step
+  // that has so far produced only tool calls is exactly the case this is about,
+  // and the live ribbon is what says the agent is working while it does.
+  //
+  // The one row kept: a message that has opened and produced *nothing* yet,
+  // while streaming. That is the caret between sending and the first block
+  // arriving, and it is a reply about to happen rather than machinery.
+  //
+  // The rule itself lives in `hasVisibleContent` because the list decides which
+  // ids to carry with it, and the two answers must be the same one.
+  if (!hasVisibleContent(current)) return null;
 
   if (isMarker) {
     return (
@@ -140,6 +205,11 @@ export const MessageBubble = React.memo(function MessageBubble({
       aria-label={isUser ? 'Your message' : 'Assistant message'}
       style={{
         display: 'flex',
+        // On a phone the controls drop to a line of their own below the
+        // message — see the action column. Beside it they were a 44px-wide
+        // column of stacked buttons that made a two-line message four lines
+        // tall and took a sixth of the width off the text.
+        flexWrap: isPhone ? 'wrap' : 'nowrap',
         gap: 10,
         minWidth: 0,
         padding: isUser ? '10px 14px' : '12px 14px',
@@ -178,6 +248,8 @@ export const MessageBubble = React.memo(function MessageBubble({
             key={i}
             block={block}
             plain={isUser}
+            transcript={transcript}
+            onAnswerQuestion={onAnswerQuestion}
             onRetry={onRetry ? () => onRetry(id) : undefined}
             caret={Boolean(current.streaming) && i === current.blocks.length - 1}
           />
@@ -185,18 +257,35 @@ export const MessageBubble = React.memo(function MessageBubble({
         {current.streaming && visibleBlocks(current) === 0 ? <Caret /> : null}
 
         {!isUser && work.total > 0 && onShowWork ? (
-          <WorkPill label={work.label} onClick={() => onShowWork(id)} />
+          // Aimed at the earliest step it counts, not at this message: the point
+          // of the pill on a reply that follows silent work is to open the trace
+          // at the *start* of that stretch.
+          <WorkPill label={work.label} onClick={() => onShowWork(work.firstId || id)} />
         ) : null}
 
         {isUser ? null : <Footer model={current.model} usage={current.usage} />}
       </div>
 
-      <div style={{ flex: '0 0 auto', display: 'flex', alignItems: 'flex-start', gap: 2 }}>
+      <div
+        style={{
+          // Its own full-width line on a phone, so the buttons can be a row of
+          // proper targets without taking that width from the message.
+          flex: isPhone ? '1 0 100%' : '0 0 auto',
+          display: 'flex',
+          // Centred only on a phone, where this is a row of its own under the
+          // message. Beside the message it stays top-aligned, level with the
+          // first line — which is where it has always been.
+          alignItems: isPhone ? 'center' : 'flex-start',
+          justifyContent: isPhone ? 'flex-end' : undefined,
+          gap: isPhone ? TOUCH_GAP : 2,
+        }}
+      >
         <span
           style={{
-            paddingTop: 3,
+            paddingTop: isPhone ? 0 : 3,
+            marginRight: isPhone ? 'auto' : 0,
             fontFamily: 'var(--font-mono)',
-            fontSize: 'var(--text-2xs)',
+            fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
             color: 'var(--muted-foreground)',
             whiteSpace: 'nowrap',
           }}
@@ -246,37 +335,90 @@ const SR_ONLY: React.CSSProperties = {
   clip: 'rect(0 0 0 0)',
 };
 
-/** How many blocks this message would actually paint. */
+/**
+ * How many blocks this message would actually paint.
+ *
+ * Tool calls are machinery and live on the trace rail — with one exception. A
+ * question the model asked is a tool call only in the mechanical sense; what it
+ * actually is, is the agent talking to the user, and burying it on the rail
+ * would hide the one card the turn is blocked behind.
+ */
 function visibleBlocks(message: ChatMessage): number {
-  return message.blocks.filter((block) => block.kind !== 'thinking' && block.kind !== 'tool').length;
+  return message.blocks.filter(
+    (block) =>
+      block.kind !== 'thinking'
+      && (block.kind !== 'tool' || looksLikeAskCall(block.name, block.input)),
+  ).length;
+}
+
+/**
+ * Whether this message gets a row of its own in the transcript.
+ *
+ * The list needs the same answer the bubble reaches, because it is what decides
+ * which ids are carried onto the next message that speaks. Exported rather than
+ * duplicated: two copies of this rule drifting apart would silently either
+ * double-count a step or drop it from every pill.
+ */
+export function hasVisibleContent(message: ChatMessage): boolean {
+  if (message.role === 'user') return true;
+  if (visibleBlocks(message) > 0) return true;
+  // Opened and still empty: the caret. See the early return in the bubble.
+  return message.blocks.length === 0 && Boolean(message.streaming);
+}
+
+/** Split a carried-ids prop back into ids. */
+function splitIds(joined: string): string[] {
+  return joined ? joined.split(',') : [];
 }
 
 interface WorkSummary {
   total: number;
   label: string;
+  /** The earliest message that contributed, so the pill can point there. */
+  firstId?: string;
 }
 
 /**
- * What the pill says: how much machinery this message carried.
+ * What the pill says: how much machinery these messages carried.
+ *
+ * Takes a list rather than one message because a reply speaks for the silent
+ * steps before it as well as for itself — "3 commands" on a sentence that ran
+ * one of them and inherited two is the honest figure, and a pill per step is
+ * exactly the clutter that was removed.
  *
  * Duration is summed from the calls that reported one rather than measured
  * between timestamps — a message's `ts` is when it opened, and the gap to the
  * next one includes however long the user spent reading.
  */
 function summariseWork(
-  message: ChatMessage,
+  messages: ChatMessage[],
   showThinking: boolean,
   showToolCalls: boolean,
 ): WorkSummary {
   let tools = 0;
   let reasoning = 0;
   let durationMs = 0;
-  for (const block of message.blocks) {
-    if (block.kind === 'tool' && showToolCalls) {
-      tools += 1;
-      if (block.durationMs !== undefined) durationMs += block.durationMs;
-    } else if (block.kind === 'thinking' && showThinking) {
-      reasoning += 1;
+  let firstId: string | undefined;
+  for (const message of messages) {
+    for (const block of message.blocks) {
+      // The question card is rendered in the conversation, so counting it here
+      // as well would put "1 command" on a turn whose only machinery is the
+      // question already on screen.
+      if (block.kind === 'tool' && looksLikeAskCall(block.name, block.input)) {
+        continue;
+      }
+      if (block.kind === 'tool' && showToolCalls) {
+        tools += 1;
+        if (block.durationMs !== undefined) durationMs += block.durationMs;
+      } else if (block.kind === 'thinking' && showThinking) {
+        reasoning += 1;
+      } else {
+        continue;
+      }
+      // The first *counted* block, not the first carried id: a step whose only
+      // activity the display settings dropped has nothing on the timeline to
+      // land on, and focusing it would open the rail on nothing.
+      if (firstId === undefined) firstId = message.id;
     }
   }
 
@@ -288,7 +430,7 @@ function summariseWork(
     if (formatted) bits.push(formatted);
   }
 
-  return { total: tools + reasoning, label: bits.join(' · ') };
+  return { total: tools + reasoning, label: bits.join(' · '), firstId };
 }
 
 /**
@@ -299,6 +441,7 @@ function summariseWork(
  * pointer — it opens the rail and scrolls the timeline to this message.
  */
 function WorkPill({ label, onClick }: { label: string; onClick: () => void }): React.JSX.Element {
+  const isPhone = usePhone();
   const [hover, setHover] = React.useState(false);
   return (
     <button
@@ -314,19 +457,19 @@ function WorkPill({ label, onClick }: { label: string; onClick: () => void }): R
         alignItems: 'center',
         gap: 8,
         maxWidth: '100%',
-        height: 24,
-        padding: '0 8px',
+        height: isPhone ? TOUCH_TARGET : 24,
+        padding: isPhone ? '0 12px' : '0 8px',
         background: 'var(--card)',
         border: `1px solid ${hover ? 'var(--border-strong)' : 'var(--border)'}`,
         borderRadius: 'var(--radius)',
         fontFamily: 'var(--font-mono)',
-        fontSize: 10.5,
+        fontSize: isPhone ? PHONE_TEXT.body : 10.5,
         color: hover ? 'var(--foreground)' : 'var(--muted-foreground)',
         cursor: 'pointer',
         transition: 'border-color var(--duration-fast), color var(--duration-fast)',
       }}
     >
-      <Icon name="terminal" size={10} />
+      <Icon name="terminal" size={isPhone ? 16 : 10} />
       <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {label}
       </span>
@@ -339,12 +482,16 @@ function BlockView({
   block,
   plain,
   caret,
+  transcript,
+  onAnswerQuestion,
   onRetry,
 }: {
   block: ChatBlock;
   /** True for the user's own turn, where text is echoed literally. */
   plain: boolean;
   caret: boolean;
+  transcript: ChatTranscript;
+  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
   onRetry?: () => void;
 }) {
   switch (block.kind) {
@@ -383,7 +530,21 @@ function BlockView({
     // rather than removing the cases: a block kind that silently fell through
     // to `default` would be indistinguishable from one nobody has handled yet.
     case 'thinking':
+      return null;
+
     case 'tool':
+      // The one tool call that belongs in the conversation rather than on the
+      // rail: it *is* the agent addressing the user. Everything else about a
+      // tool call is machinery.
+      if (looksLikeAskCall(block.name, block.input)) {
+        return (
+          <QuestionBlock
+            block={block}
+            transcript={transcript}
+            onAnswerQuestion={onAnswerQuestion}
+          />
+        );
+      }
       return null;
 
     case 'plan':
@@ -401,6 +562,49 @@ function BlockView({
     default:
       return null;
   }
+}
+
+/**
+ * A question the model asked, drawn from the call that asked it.
+ *
+ * The tool block is the durable record — the arguments *are* the question, and
+ * they are persisted and replayed like any other block — so this needs no side
+ * table to render from and survives a reload, a rejoin and a server restart.
+ * The transcript is consulted only for the two things the block cannot know:
+ * whether the question is still waiting, and which options were picked.
+ */
+function QuestionBlock({
+  block,
+  transcript,
+  onAnswerQuestion,
+}: {
+  block: ToolBlock;
+  transcript: ChatTranscript;
+  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
+}): React.JSX.Element | null {
+  const asked = askedQuestionFrom(block.input);
+  // Still streaming its arguments in, or malformed. Nothing to draw yet — and
+  // an empty bordered card would read as a question with no answers.
+  if (!asked) return null;
+
+  const request = transcript.questionFor(block.toolId);
+  const answered = request ? undefined : transcript.answerFor(block.toolId);
+
+  return (
+    <QuestionCard
+      request={request}
+      question={asked.question}
+      header={asked.header}
+      multiSelect={asked.multiSelect}
+      options={asked.options}
+      answered={answered}
+      // The fallback for a card rebuilt from a snapshot, where the resolution
+      // event was folded away before this browser ever saw it: the tool result
+      // is the model's own copy of the answer and is still in the block.
+      answerText={!request && !answered ? block.output : undefined}
+      onAnswer={onAnswerQuestion}
+    />
+  );
 }
 
 /**
@@ -537,6 +741,7 @@ function ActionButton({
   tone?: string;
 }) {
   const [hot, setHot] = React.useState(false);
+  const isPhone = usePhone();
   return (
     <button
       type="button"
@@ -551,8 +756,8 @@ function ActionButton({
         display: 'inline-flex',
         alignItems: 'center',
         justifyContent: 'center',
-        width: 22,
-        height: 22,
+        width: isPhone ? TOUCH_TARGET : 22,
+        height: isPhone ? TOUCH_TARGET : 22,
         background: hot ? 'var(--accent)' : 'transparent',
         border: '1px solid transparent',
         color: tone || 'var(--muted-foreground)',
@@ -564,12 +769,13 @@ function ActionButton({
         transition: 'opacity var(--duration-fast), background var(--duration-fast)',
       }}
     >
-      <Icon name={icon} size={11} />
+      <Icon name={icon} size={isPhone ? 18 : 11} />
     </button>
   );
 }
 
 function Footer({ model, usage }: { model?: string; usage?: ChatUsage }) {
+  const isPhone = usePhone();
   const bits: string[] = [];
   if (model) bits.push(model);
   if (usage) {
@@ -587,7 +793,9 @@ function Footer({ model, usage }: { model?: string; usage?: ChatUsage }) {
         flexWrap: 'wrap',
         gap: 8,
         fontFamily: 'var(--font-mono)',
-        fontSize: 'var(--text-2xs)',
+        // The model this answer ran on, and what it cost: the same figures the
+        // header carries, so the same rule applies to them here.
+        fontSize: isPhone ? PHONE_TEXT.label : 'var(--text-2xs)',
         color: 'var(--muted-foreground)',
       }}
     >

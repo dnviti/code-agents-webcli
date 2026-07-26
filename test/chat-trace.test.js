@@ -155,20 +155,39 @@ describe('SessionHeader', function () {
     }
   });
 
-  it('drops the desktop-only chrome on a phone but keeps the state and the search', function () {
+  it('is a strip on a phone: what it is doing, what it has cost, and nothing else', function () {
+    // The controls moved to the floating menu and the detail behind a
+    // disclosure. What stays is the pair that changes while you watch.
     const html = render('SessionHeader', { ...HEADER, isMobile: true, branch: 'main' });
-    assert.ok(!/Search transcript/.test(html), 'the wide trigger has no room');
-    assert.ok(/aria-label="Search this conversation"/.test(html), 'but search stays reachable');
+    assert.ok(/\$0\.4210|\$[0-9]/.test(html), 'the cost is on the strip');
+    assert.ok(/aria-live="polite"/.test(html), 'and so is what it is doing');
+
+    assert.ok(!/Search transcript/.test(html), 'the wide search trigger has no room');
+    assert.ok(!/aria-label="Search this conversation"/.test(html), 'search is in the menu now');
     assert.ok(!/\^`/.test(html), 'a phone has no Ctrl+`');
+    assert.ok(!/Beta/.test(html), 'the badge says nothing about this session');
+
+    // The detail is not merely absent — it is behind a control that says so.
+    assert.ok(/aria-expanded="false"/.test(html), 'the strip reports itself collapsed');
+    assert.ok(
+      /aria-label="Show the session details"/.test(html),
+      'and names what opening it gives you',
+    );
   });
 
-  it('keeps the money and the context meter on a phone, by wrapping', function () {
-    // Dropping them was a straight loss against the surface this replaced —
-    // the cost of a session is worth a second row on a 390px bar.
-    const html = render('SessionHeader', { ...HEADER, isMobile: true });
-    assert.ok(/349k tok/.test(html), 'the token total belongs on a phone too');
-    assert.ok(/aria-valuenow="62"/.test(html), 'and so does the context meter');
-    assert.ok(/flex-wrap:wrap/.test(html.replace(/\s/g, '')), 'which means the bar has to wrap');
+  it('gives the money, the meter and the approvals state back when asked', function () {
+    // Collapsing is allowed to hide these; it is not allowed to lose them.
+    // Rendered statically the strip is shut, so this asserts the shut contract
+    // and the browser checks drive the disclosure — see `assertPhoneSurface`,
+    // which walks the open state at three phone viewports.
+    const shut = render('SessionHeader', { ...HEADER, isMobile: true });
+    assert.ok(!/349k tok/.test(shut), 'the token total is not on the strip');
+    assert.ok(!/aria-valuenow="62"/.test(shut), 'nor is the context meter');
+
+    // On a desktop none of it was ever hidden, and that must not have changed.
+    const desktop = render('SessionHeader', HEADER);
+    assert.ok(/349k tok/.test(desktop), 'the desktop bar still carries the total');
+    assert.ok(/aria-valuenow="62"/.test(desktop), 'and the context meter');
   });
 
   it('still says the surface is beta', function () {

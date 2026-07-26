@@ -149,6 +149,13 @@ export class MessageHandler {
         this.onSessionDeleted(message);
         break;
 
+      // Someone renamed this session — in another window, on another device, or
+      // in this one, since the server tells every socket rather than assuming
+      // the asker already knows.
+      case 'session_renamed':
+        this.app.sessionTabManager?.applyRemoteName(message.sessionId, message.name);
+        break;
+
       // The session we tried to reattach to is gone (e.g. after a server
       // restart): drop the stale tab rather than leaving a dead terminal.
       case 'session_gone':
@@ -223,6 +230,7 @@ export class MessageHandler {
         tabs.updateTabStatus(sessionId, 'active');
         return;
       case 'awaiting_permission':
+      case 'awaiting_answer':
         tabs.updateTabStatus(sessionId, 'idle');
         if (background) tabs.updateUnreadIndicator(sessionId, true);
         return;

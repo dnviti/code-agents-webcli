@@ -1,10 +1,12 @@
 import * as React from 'react';
+import type { ChatMessage } from '../../../shared/chat-events.js';
 import { ChatTranscript } from '../../chat/transcript.js';
 import { createStick, BOTTOM_SLACK, type StickHandle } from '../../chat/stick.js';
 import type { TurnSummary } from '../../chat/turns.js';
 import { Button } from '../../ui/relay/Button.js';
 import { Icon } from '../../ui/relay/Icon.js';
-import { MessageBubble } from './MessageBubble.js';
+import { usePhone } from '../../ui/touch.js';
+import { MessageBubble, hasVisibleContent } from './MessageBubble.js';
 import { TurnStrip } from './TurnStrip.js';
 
 /**
@@ -62,6 +64,8 @@ export interface MessageListProps {
    */
   showThinking?: boolean;
   showToolCalls?: boolean;
+  /** Answer a question the model asked, from its card in the conversation. */
+  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
 }
 
 /** How close to the top still counts as asking for the previous page. */
@@ -91,6 +95,7 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
       onToggleTurn,
       showThinking = true,
       showToolCalls = true,
+      onAnswerQuestion,
     },
     handle,
   ) {
@@ -104,6 +109,7 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
     const scroller = React.useRef<HTMLDivElement | null>(null);
     const content = React.useRef<HTMLDivElement | null>(null);
     const [stuck, setStuck] = React.useState(true);
+    const isPhone = usePhone();
 
     // Read off the transcript rather than tracked here. This used to be local
     // state cleared only when a page actually prepended a message — so a page
@@ -290,7 +296,16 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
             flex: 1,
             // A normal block scroller. Never `justify-content: flex-end` to fake
             // bottom alignment — that makes the scrollback unreachable.
-            minHeight: 160,
+            //
+            // `0`, not a 160px floor. A flex item cannot shrink below its
+            // min-height, so a floor taller than the space available does not
+            // reserve room — it overflows the column, and the transcript gets
+            // painted over the live ribbon and the composer beneath it. A phone
+            // in landscape has about 160px for the whole conversation once the
+            // header, the ribbon and the composer have taken theirs, so this
+            // was the shape it broke in first. Flex already gives the scroller
+            // every pixel the column can spare, which is what the floor was for.
+            minHeight: 0,
             overflowY: 'auto',
             overflowX: 'hidden',
             overscrollBehavior: 'contain',
@@ -369,23 +384,21 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
                       re-expanding it is instant and cannot desync from a turn
                       that kept running underneath. */}
                   <div id={bodyId} hidden={!open} style={{ display: open ? 'flex' : 'none', flexDirection: 'column' }}>
-                    {turn.messageIds.map((messageId) => {
-                      const message = messageById.get(messageId);
-                      if (!message) return null;
-                      return (
-                        <MessageBubble
-                          key={message.id}
-                          message={message}
-                          transcript={transcript}
-                          onFork={fork}
-                          onRetry={retry}
-                          onShowWork={showWork}
-                          onEdit={edit}
-                          showThinking={showThinking}
-                          showToolCalls={showToolCalls}
-                        />
-                      );
-                    })}
+                    {rowsOf(turn.messageIds, messageById).map(({ message, carriedIds }) => (
+                      <MessageBubble
+                        key={message.id}
+                        message={message}
+                        transcript={transcript}
+                        onFork={fork}
+                        onRetry={retry}
+                        onShowWork={showWork}
+                        onEdit={edit}
+                        carriedIds={carriedIds}
+                        showThinking={showThinking}
+                        showToolCalls={showToolCalls}
+                        onAnswerQuestion={onAnswerQuestion}
+                      />
+                    ))}
                   </div>
                 </React.Fragment>
               );
@@ -411,7 +424,17 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
               variant="secondary"
               onClick={jumpToLatest}
               iconLeft={<Icon name="arrow-down" size={12} />}
-              style={{ pointerEvents: 'auto', height: 34, boxShadow: 'var(--shadow-md)' }}
+              // The key is omitted on a phone, not set to `undefined`: the
+              // style object is spread over the primitive's own, so a present
+              // key wins whatever its value is — `height: undefined` deleted
+              // the touch floor as thoroughly as `height: 34` overrode it, and
+              // left the pill 17px tall. 34 is a desktop choice: `sm` is 26px
+              // and this floats over the transcript, where it has to be found.
+              style={{
+                pointerEvents: 'auto',
+                ...(isPhone ? null : { height: 34 }),
+                boxShadow: 'var(--shadow-md)',
+              }}
             >
               Jump to latest
             </Button>
@@ -423,6 +446,41 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
 );
 
 const ZERO = (): number => 0;
+
+interface Row {
+  message: ChatMessage;
+  /** The silent steps this row speaks for, oldest first, comma-joined. */
+  carriedIds: string;
+}
+
+/**
+ * The rows a turn actually draws, and which silent steps each one carries.
+ *
+ * A step that produced only tool calls and reasoning has no row (see
+ * MessageBubble). Its id is held here until a message that does speak comes
+ * along, and handed to that message so its pill counts the whole stretch and
+ * opens the trace at the start of it.
+ *
+ * Silent steps still pending at the end of a turn are simply dropped: there is
+ * no reply to hang them on, and inventing a row for them is the thing this
+ * removes. Nothing is lost — the turn strip still counts them and the rail
+ * still holds every event.
+ */
+function rowsOf(messageIds: string[], byId: Map<string, ChatMessage>): Row[] {
+  const rows: Row[] = [];
+  let silent: string[] = [];
+  for (const messageId of messageIds) {
+    const message = byId.get(messageId);
+    if (!message) continue;
+    if (!hasVisibleContent(message)) {
+      silent.push(message.id);
+      continue;
+    }
+    rows.push({ message, carriedIds: silent.join(',') });
+    silent = [];
+  }
+  return rows;
+}
 
 /**
  * Escape an id for use inside an attribute selector.

@@ -5,6 +5,7 @@ import { Icon } from '../../ui/relay/Icon.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
 import { Kbd } from '../../ui/relay/Kbd.js';
 import { Tooltip } from '../../ui/relay/Tooltip.js';
+import { PHONE_SPACE, PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET } from '../../ui/touch.js';
 import { UsageMeter } from './UsageMeter.js';
 
 /**
@@ -85,6 +86,14 @@ const STATE_META: Record<ChatState, StateMeta> = {
     tint: 'var(--warning)',
     pulse: true,
   },
+  // Its own word, not the approval one: "waiting for you" over a question about
+  // which of three approaches to take reads as though something needs allowing.
+  awaiting_answer: {
+    label: 'asked you a question',
+    color: 'var(--info)',
+    tint: 'var(--info)',
+    pulse: true,
+  },
   exited: { label: 'exited', color: 'var(--muted-foreground)' },
   error: { label: 'error', color: 'var(--destructive)', tint: 'var(--destructive)' },
 };
@@ -97,9 +106,6 @@ const SR_ONLY: React.CSSProperties = {
   overflow: 'hidden',
   clip: 'rect(0,0,0,0)',
 };
-
-/** Touch-target floor for this app's phone layout; matches IconButton size="lg". */
-const TOUCH = 34;
 
 export function SessionHeader({
   runtimeLabel,
@@ -126,7 +132,22 @@ export function SessionHeader({
 }: SessionHeaderProps): React.JSX.Element {
   const meta = exited ? STATE_META.exited : STATE_META[state] || STATE_META.idle;
   // A phone is always the tightest case.
-  const tight = compact || isMobile;
+  const tight = compact;
+
+  if (isMobile) {
+    return (
+      <PhoneHeader
+        runtimeLabel={runtimeLabel}
+        workingDir={workingDir}
+        branch={branch}
+        usage={usage}
+        capabilities={capabilities}
+        meta={meta}
+        bypassPermissions={bypassPermissions}
+        showUsage={showUsage}
+      />
+    );
+  }
 
   return (
     <header
@@ -134,15 +155,10 @@ export function SessionHeader({
         flex: '0 0 auto',
         display: 'flex',
         alignItems: 'center',
-        gap: isMobile ? 6 : 10,
+        gap: 10,
         minWidth: 0,
-        // A phone's header wraps rather than dropping what is on it: the money
-        // and the context meter are worth a second row, and a fixed height
-        // would have to throw one of them away to keep the bar to one line.
-        flexWrap: isMobile ? 'wrap' : 'nowrap',
-        height: isMobile ? undefined : 34,
-        minHeight: isMobile ? TOUCH + 6 : undefined,
-        padding: isMobile ? '3px 10px' : '0 10px',
+        height: 34,
+        padding: '0 10px',
         background: 'var(--chrome)',
         borderBottom: '1px solid var(--border)',
         color: 'var(--chrome-foreground)',
@@ -168,7 +184,7 @@ export function SessionHeader({
             alignItems: 'center',
             gap: 5,
             minWidth: 0,
-            maxWidth: isMobile ? 120 : 220,
+            maxWidth: 220,
             fontFamily: 'var(--font-mono)',
             fontSize: 10.5,
             color: 'var(--muted-foreground)',
@@ -205,7 +221,7 @@ export function SessionHeader({
         </span>
       ) : null}
 
-      {compact && !isMobile ? null : <Badge variant="outline">Beta</Badge>}
+      {compact ? null : <Badge variant="outline">Beta</Badge>}
 
       {tight ? null : <SearchTrigger onClick={onOpenSearch} />}
 
@@ -216,7 +232,7 @@ export function SessionHeader({
           flex: '0 0 auto',
           display: 'flex',
           alignItems: 'center',
-          gap: isMobile ? 4 : 10,
+          gap: 10,
         }}
       >
         {showUsage ? (
@@ -265,7 +281,7 @@ export function SessionHeader({
           <Badge variant="warning" style={{ flex: '0 0 auto' }}>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
               <Icon name="shield" size={10} />
-              {isMobile ? 'bypassed' : 'Approvals bypassed'}
+              Approvals bypassed
             </span>
           </Badge>
         ) : null}
@@ -303,7 +319,7 @@ export function SessionHeader({
         {tight ? (
           <IconButton
             type="button"
-            size={isMobile ? 'lg' : 'md'}
+            size="md"
             label="Search this conversation"
             onClick={onOpenSearch}
           >
@@ -314,7 +330,7 @@ export function SessionHeader({
         {onToggleTheme ? (
           <IconButton
             type="button"
-            size={isMobile ? 'lg' : 'md'}
+            size="md"
             label={theme === 'light' ? 'Switch to the dark theme' : 'Switch to the light theme'}
             onClick={onToggleTheme}
           >
@@ -324,7 +340,7 @@ export function SessionHeader({
 
         <IconButton
           type="button"
-          size={isMobile ? 'lg' : 'md'}
+          size="md"
           label={indexOpen ? 'Hide the turn index' : 'Show the turn index'}
           aria-pressed={indexOpen}
           active={indexOpen}
@@ -335,7 +351,7 @@ export function SessionHeader({
 
         <IconButton
           type="button"
-          size={isMobile ? 'lg' : 'md'}
+          size="md"
           label={railOpen ? 'Hide the trace rail' : 'Show the trace rail'}
           aria-pressed={railOpen}
           active={railOpen}
@@ -346,13 +362,234 @@ export function SessionHeader({
 
         <IconButton
           type="button"
-          size={isMobile ? 'lg' : 'md'}
+          size="md"
           label="Chat display settings"
           onClick={onOpenSettings}
         >
           <Icon name="settings" />
         </IconButton>
       </span>
+    </header>
+  );
+}
+
+/**
+ * The same bar, laid out for a phone — and mostly not laid out at all.
+ *
+ * A separate component rather than a dozen `isMobile ?` ternaries, because the
+ * answer is not "the same row, smaller". The two layouts disagree about their
+ * shape, and now about how much of themselves they show:
+ *
+ *   - The desktop bar is one fixed 34px line that must never wrap, and sheds
+ *     items to stay on it.
+ *   - The phone bar is a strip saying what the session is doing and what it has
+ *     cost, and nothing else until it is asked. Tapping it opens the rest — the
+ *     runtime, the folder, the branch, the tokens, the context meter, the
+ *     approvals state — at a size worth reading, and tapping it again gives the
+ *     room back to the conversation.
+ *
+ * Collapsed by default because the conversation is what a phone is for. The two
+ * figures that stay are the two that change while you watch: what it is doing,
+ * and what that has cost so far.
+ *
+ * The controls that used to sit here are gone from the bar entirely — they are
+ * in the floating menu now, published by ChatView. A row of them here was a row
+ * of chrome the transcript never got back.
+ */
+function PhoneHeader({
+  runtimeLabel,
+  workingDir,
+  branch,
+  usage,
+  capabilities,
+  meta,
+  bypassPermissions,
+  showUsage,
+}: {
+  runtimeLabel: string;
+  workingDir: string;
+  branch?: string;
+  usage: ChatUsage;
+  capabilities: ChatCapabilities;
+  meta: StateMeta;
+  bypassPermissions: boolean;
+  showUsage: boolean;
+}): React.JSX.Element {
+  const [open, setOpen] = React.useState(false);
+  const detailId = React.useId();
+
+  return (
+    <header
+      style={{
+        flex: '0 0 auto',
+        display: 'flex',
+        flexDirection: 'column',
+        minWidth: 0,
+        background: 'var(--chrome)',
+        borderBottom: '1px solid var(--border)',
+        color: 'var(--chrome-foreground)',
+        fontFamily: 'var(--font-sans)',
+      }}
+    >
+      {/* The whole strip is the control. A 44px button in the corner of it
+          would be a second thing to aim at on a bar one line tall; the bar
+          itself is a far bigger target than any button on it. */}
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={detailId}
+        aria-label={open ? 'Hide the session details' : 'Show the session details'}
+        onClick={() => setOpen((value) => !value)}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: PHONE_SPACE.inline,
+          width: '100%',
+          // The floor, like every other control. A full-width strip is an easy
+          // thing to hit at any height, but "easy" is not the rule and 10px is
+          // not what the conversation was short of.
+          minHeight: TOUCH_TARGET,
+          padding: `2px ${PHONE_SPACE.edge}px`,
+          background: 'transparent',
+          border: 0,
+          color: 'inherit',
+          font: 'inherit',
+          textAlign: 'left',
+          cursor: 'pointer',
+          WebkitTapHighlightColor: 'transparent',
+        }}
+      >
+        <span
+          role="status"
+          aria-live="polite"
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            flex: '0 0 auto',
+            minWidth: 0,
+            whiteSpace: 'nowrap',
+            fontFamily: 'var(--font-mono)',
+            fontSize: PHONE_TEXT.label,
+            color: meta.color,
+          }}
+        >
+          <span
+            aria-hidden="true"
+            style={{
+              width: 7,
+              height: 7,
+              flex: '0 0 auto',
+              borderRadius: 'var(--radius-full)',
+              background: 'currentColor',
+              animation: meta.pulse ? 'relay-pulse 1.4s var(--ease-standard) infinite' : undefined,
+            }}
+          />
+          {meta.label}
+        </span>
+
+        {/* Collapsed, the cost is the one figure worth the width. The rest of
+            the meter is below, where there is room for it. */}
+        <span style={{ marginLeft: 'auto', flex: '0 0 auto', display: 'inline-flex', alignItems: 'center', gap: PHONE_SPACE.inline }}>
+          {showUsage && !open ? (
+            <UsageMeter usage={usage} capabilities={capabilities} compact phone costOnly />
+          ) : null}
+
+          {bypassPermissions && !open ? (
+            <Icon name="shield" size={14} style={{ color: 'var(--warning)' }} />
+          ) : null}
+
+          <Icon
+            name={open ? 'chevron-up' : 'chevron-down'}
+            size={16}
+            style={{ color: 'var(--muted-foreground)' }}
+          />
+        </span>
+      </button>
+
+      {open ? (
+        <div
+          id={detailId}
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            alignItems: 'center',
+            columnGap: PHONE_SPACE.inline,
+            rowGap: 4,
+            minWidth: 0,
+            padding: `0 ${PHONE_SPACE.edge}px 8px`,
+          }}
+        >
+          <span
+            style={{
+              fontSize: PHONE_TEXT.meta,
+              fontWeight: 'var(--font-semibold)' as React.CSSProperties['fontWeight'],
+              letterSpacing: 'var(--tracking-tight)',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {runtimeLabel}
+          </span>
+
+          <span
+            title={workingDir}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              minWidth: 0,
+              maxWidth: 150,
+              fontFamily: 'var(--font-mono)',
+              fontSize: PHONE_TEXT.meta,
+              color: 'var(--muted-foreground)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            <Icon name="folder" size={12} />
+            {basename(workingDir)}
+            <span style={SR_ONLY}>{workingDir}</span>
+          </span>
+
+          {branch ? (
+            <span
+              title={`On branch ${branch}`}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                minWidth: 0,
+                maxWidth: 150,
+                fontFamily: 'var(--font-mono)',
+                fontSize: PHONE_TEXT.meta,
+                color: 'var(--ansi-cyan)',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              <Icon name="git-branch" size={12} />
+              {branch}
+            </span>
+          ) : null}
+
+          {showUsage ? <UsageMeter usage={usage} capabilities={capabilities} compact phone /> : null}
+
+          {bypassPermissions ? (
+            <Badge
+              variant="warning"
+              aria-label="Approvals bypassed"
+              style={{ flex: '0 0 auto', height: 'auto', padding: '1px 8px', fontSize: PHONE_TEXT.label }}
+            >
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <Icon name="shield" size={12} />
+                Approvals bypassed
+              </span>
+            </Badge>
+          ) : null}
+        </div>
+      ) : null}
     </header>
   );
 }

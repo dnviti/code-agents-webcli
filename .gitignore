@@ -19,3 +19,8 @@ test-*.js
 test/browser/bundle.js
 .work/
 .work/
+
+# The app's own runtime directory: attachments uploaded through a conversation,
+# written into whatever project it is running against. A screenshot sent to the
+# agent is data, not source, and one reached this repo before this line did.
+.cc-web/

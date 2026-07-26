@@ -1,5 +1,7 @@
 import * as React from 'react';
 
+import { TOUCH_TARGET, usePhone } from '../touch.js';
+
 export type IconButtonSize = 'sm' | 'md' | 'lg';
 export type IconButtonVariant = 'ghost' | 'outline';
 
@@ -27,7 +29,10 @@ export function IconButton({
   ...rest
 }: IconButtonProps) {
   const [hover, setHover] = React.useState(false);
-  const dim = SIZES[size] || SIZES.md;
+  const isPhone = usePhone();
+  // Same rule as Button: on a phone the smallest size is the touch floor,
+  // decided once here instead of at forty call sites.
+  const dim = isPhone ? TOUCH_TARGET : SIZES[size] || SIZES.md;
   const outlined = variant === 'outline';
   return (
     <button

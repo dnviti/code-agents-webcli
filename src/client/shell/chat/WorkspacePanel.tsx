@@ -14,11 +14,15 @@ import type { ChatTranscript } from '../../chat/transcript.js';
 import { fetchFiles, type WorkspaceFiles } from '../../chat/workspace-api.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
+import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { AgentsPanel } from './AgentsPanel.js';
+import type { AgentActivityKind } from '../../../shared/agent-activity.js';
 import { FileTreePanel, type FileTreeEntry } from './FileTreePanel.js';
 import { GitChangesPanel } from './GitChangesPanel.js';
 import { GitHubPanel } from './GitHubPanel.js';
 import { FileEditorDialog } from './FileEditorDialog.js';
+import { WorkflowPopup } from './WorkflowPopup.js';
+import { AgentPopup } from './AgentPopup.js';
 import { LinksPanel } from './LinksPanel.js';
 import { StatusPanel } from './StatusPanel.js';
 import { PanelNote, useWorkspaceData } from './PanelShell.js';
@@ -76,6 +80,16 @@ export function WorkspacePanel({
   // Files tab so a file opened from Changes uses the same dialog — one editor,
   // one place that knows whether it has unsaved work.
   const [editing, setEditing] = React.useState<string | null>(null);
+  /**
+   * The delegation whose detail popup is open, and which kind it is.
+   *
+   * One slot, not two: a workflow and a sub-agent are different views of the
+   * same list, and opening one while the other is up would stack two dialogs
+   * over each other.
+   */
+  const [openDelegation, setOpenDelegation] = React.useState<
+    { toolId: string; kind: AgentActivityKind } | null
+  >(null);
 
   // Live during a drag, committed on release. Dragging straight into the
   // persisted settings would write localStorage on every pointer move and
@@ -88,6 +102,30 @@ export function WorkspacePanel({
   // `git status` is worth re-reading. Polling on a timer instead would either
   // lag behind the agent or run `git status` forever on an idle session.
   const revision = useIdleRevision(transcript);
+
+  // Both popups are mounted here rather than inside the tab that opens them,
+  // so that selecting another tab leaves them where they were. A workflow you
+  // opened to watch should survive a glance at the file tree.
+  const delegation =
+    openDelegation?.kind === 'workflow' ? (
+      <WorkflowPopup
+        key={openDelegation.toolId}
+        open
+        transcript={transcript}
+        toolId={openDelegation.toolId}
+        onClose={() => setOpenDelegation(null)}
+        isMobile={isMobile}
+      />
+    ) : openDelegation ? (
+      <AgentPopup
+        key={openDelegation.toolId}
+        open
+        transcript={transcript}
+        toolId={openDelegation.toolId}
+        onClose={() => setOpenDelegation(null)}
+        isMobile={isMobile}
+      />
+    ) : null;
 
   const editor = (
     <FileEditorDialog
@@ -132,13 +170,19 @@ export function WorkspacePanel({
           <GitChangesPanel sessionId={sessionId} revision={revision} onOpenFile={setEditing} />
         ) : null}
         {active === 'github' ? <GitHubPanel sessionId={sessionId} /> : null}
-        {active === 'agents' ? <AgentsPanel transcript={transcript} /> : null}
+        {active === 'agents' ? (
+          <AgentsPanel
+            transcript={transcript}
+            onOpenDelegation={(toolId, kind) => setOpenDelegation({ toolId, kind })}
+          />
+        ) : null}
         {active === 'links' ? <LinksPanel transcript={transcript} /> : null}
         {active === 'status' ? (
           <StatusPanel sessionId={sessionId} transcript={transcript} revision={revision} />
         ) : null}
       </div>
       {editor}
+      {delegation}
     </Rail>
   );
 }
@@ -441,6 +485,7 @@ function RailHeader({
   const scroller = React.useRef<HTMLDivElement | null>(null);
   const overflowing = useOverflowing(scroller, [tabs.join(' ')]);
   const [menuOpen, setMenuOpen] = React.useState(false);
+  const isPhone = usePhone();
 
   // A rail dragged back out until every tab fits again must not leave a menu
   // hanging under a button that is no longer there.
@@ -453,7 +498,7 @@ function RailHeader({
       style={{
         display: 'flex',
         alignItems: 'center',
-        minHeight: 34,
+        minHeight: isPhone ? TOUCH_TARGET + 8 : 34,
         borderBottom: '1px solid var(--border)',
         flex: '0 0 auto',
       }}
@@ -470,8 +515,8 @@ function RailHeader({
           minWidth: 0,
           display: 'flex',
           alignItems: 'center',
-          gap: 2,
-          padding: '0 2px 0 4px',
+          gap: isPhone ? TOUCH_GAP : 2,
+          padding: isPhone ? '0 4px 0 8px' : '0 2px 0 4px',
           overflowX: 'auto',
           scrollbarWidth: 'none',
         }}
@@ -491,10 +536,11 @@ function RailHeader({
           screen that says so, and a tab you cannot see and cannot scroll to is
           simply gone. This is the way back. */}
       {overflowing ? (
-        <div style={{ flex: '0 0 auto', position: 'relative' }}>
+        <div style={{ flex: '0 0 auto', position: 'relative', marginLeft: isPhone ? TOUCH_GAP : 0 }}>
           <IconButton
             label="All workspace panels"
-            size="sm"
+            size={isPhone ? 'lg' : 'sm'}
+            style={isPhone ? { width: TOUCH_TARGET, height: TOUCH_TARGET } : undefined}
             aria-haspopup="menu"
             aria-expanded={menuOpen}
             active={menuOpen}
@@ -516,8 +562,19 @@ function RailHeader({
         </div>
       ) : null}
 
-      <div style={{ flex: '0 0 auto', padding: '0 4px' }}>
-        <IconButton label="Close workspace panel" size="sm" onClick={onClose}>
+      <div
+        style={{
+          flex: '0 0 auto',
+          padding: isPhone ? '0 6px' : '0 4px',
+          marginLeft: isPhone ? TOUCH_GAP : 0,
+        }}
+      >
+        <IconButton
+          label="Close workspace panel"
+          size={isPhone ? 'lg' : 'sm'}
+          style={isPhone ? { width: TOUCH_TARGET, height: TOUCH_TARGET } : undefined}
+          onClick={onClose}
+        >
           <Icon name="x" />
         </IconButton>
       </div>
@@ -670,6 +727,7 @@ function TabButton({
   onSelect: () => void;
 }): React.JSX.Element {
   const ref = React.useRef<HTMLButtonElement | null>(null);
+  const isPhone = usePhone();
 
   // Five tabs do not fit 320px, so the row scrolls — and a selection restored
   // from storage could sit outside it, leaving the panel showing content whose
@@ -691,15 +749,15 @@ function TabButton({
         display: 'inline-flex',
         alignItems: 'center',
         gap: 5,
-        height: 28,
-        padding: '0 8px',
+        height: isPhone ? TOUCH_TARGET : 28,
+        padding: isPhone ? '0 12px' : '0 8px',
         background: 'transparent',
         border: 0,
         borderRadius: 'var(--radius)',
         color: selected ? 'var(--foreground)' : 'var(--muted-foreground)',
         boxShadow: selected ? 'inset 0 -2px 0 var(--foreground)' : 'none',
         font: 'inherit',
-        fontSize: 'var(--text-xs)',
+        fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
         fontWeight: selected
           ? ('var(--font-medium)' as React.CSSProperties['fontWeight'])
           : undefined,
@@ -707,7 +765,7 @@ function TabButton({
         whiteSpace: 'nowrap',
       }}
     >
-      <Icon name={CHAT_PANEL_ICONS[id]} size={12} />
+      <Icon name={CHAT_PANEL_ICONS[id]} size={isPhone ? 16 : 12} />
       {CHAT_PANEL_LABELS[id]}
     </button>
   );

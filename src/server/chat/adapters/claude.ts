@@ -7,6 +7,7 @@ import {
   ChatBlock,
   ChatCapabilities,
   ChatUsage,
+  ToolStatus,
   UserTurn,
   classifyTool,
 } from '../../../shared/chat-events.js';
@@ -66,6 +67,13 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
   private pendingUsage?: ChatUsage;
   /** Indices of open tool_use blocks in the current message, cleared per message. */
   private readonly openToolIndices = new Set<number>();
+  /**
+   * `task_id` → the `tool_use_id` of the call that started it.
+   *
+   * `task_updated` identifies the run only by `task_id`, so the pairing seen on
+   * `task_started` is what lets its closing status reach the right delegation.
+   */
+  private readonly tasksByTaskId = new Map<string, string>();
 
   protected buildArgs(): string[] {
     const args = [
@@ -200,8 +208,57 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       });
       return;
     }
+    if (subtype === 'task_started' || subtype === 'task_progress' || subtype === 'task_updated') {
+      this.handleTask(subtype, raw);
+      return;
+    }
     // hook_started / hook_response / anything else is session-internal
     // plumbing a transcript viewer has no use for.
+  }
+
+  /**
+   * What a delegated agent is doing, reported beside the call that started it.
+   *
+   * `task_started` and `task_progress` carry `tool_use_id` directly;
+   * `task_updated` carries only its own `task_id`, so the id seen at start is
+   * remembered to route the closing patch. Without that the run would never be
+   * marked finished and its detail view would claim it was still working.
+   */
+  private handleTask(subtype: string, raw: Record<string, unknown>): void {
+    const taskId = str(raw.task_id);
+    const direct = str(raw.tool_use_id);
+    if (direct && taskId) this.tasksByTaskId.set(taskId, direct);
+    const parentToolId = direct ?? (taskId ? this.tasksByTaskId.get(taskId) : undefined);
+    if (!parentToolId) return;
+
+    if (subtype === 'task_updated') {
+      const patch = record(raw.patch);
+      const status = str(patch?.status);
+      this.emit({
+        t: 'agent_progress',
+        parentToolId,
+        patch: { status: status ? toolStatus(status) : undefined, error: str(patch?.error) },
+      });
+      return;
+    }
+
+    const usage = record(raw.usage);
+    this.emit({
+      t: 'agent_progress',
+      parentToolId,
+      patch: {
+        // `description` is the agent's own phrasing of the moment ("Reading
+        // hello.txt"), which is the whole point of the progress channel.
+        activity: str(raw.description),
+        lastTool: str(raw.last_tool_name),
+        subagentType: str(raw.subagent_type),
+        prompt: subtype === 'task_started' ? str(raw.prompt) : undefined,
+        toolUses: num(usage?.tool_uses),
+        totalTokens: num(usage?.total_tokens),
+        durationMs: num(usage?.duration_ms),
+        status: subtype === 'task_started' ? 'running' : undefined,
+      },
+    });
   }
 
   private handleInit(raw: Record<string, unknown>): void {
@@ -250,6 +307,12 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
   private handleStreamEvent(raw: Record<string, unknown>): void {
     const event = record(raw.event);
     if (!event) return;
+    // A partial belonging to a sub-agent, if the runtime ever streams one.
+    // These carry the sub-agent's own message and block indices, so letting
+    // them through would open blocks in — and interleave tokens into — the
+    // main conversation as though the top-level agent had said them. The
+    // delegation's own steps come from the snapshots instead.
+    if (str(raw.parent_tool_use_id)) return;
 
     switch (str(event.type)) {
       case 'message_start':
@@ -404,11 +467,32 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
   private handleAssistantSnapshot(raw: Record<string, unknown>): void {
     const message = record(raw.message);
     const content = message && Array.isArray(message.content) ? (message.content as unknown[]) : [];
+    const parent = str(raw.parent_tool_use_id);
     for (const entry of content) {
       const block = record(entry);
       if (!block || str(block.type) !== 'tool_use') continue;
       const toolId = str(block.id);
       if (!toolId) continue;
+
+      // A sub-agent's own call. Its id belongs to the sub-agent's namespace,
+      // not this transcript's, so it becomes a step on the delegation rather
+      // than a `tool` patch — which is what used to happen, and which the
+      // reducer could only file away as an orphan nobody ever rendered.
+      if (parent) {
+        this.emit({
+          t: 'agent_step',
+          parentToolId: parent,
+          step: {
+            id: toolId,
+            name: str(block.name) ?? 'tool',
+            toolKind: classifyTool(str(block.name) ?? ''),
+            status: 'running',
+            input: block.input,
+            ts: Date.now(),
+          },
+        });
+        continue;
+      }
       // This snapshot arrives before content_block_stop (verified against
       // the fixture), so the reducer's own inputPartial cleanup -- which
       // only runs when `input` is still unset at block_end -- never fires.
@@ -422,6 +506,7 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
   private handleUserEcho(raw: Record<string, unknown>): void {
     const message = record(raw.message);
     const content = message && Array.isArray(message.content) ? (message.content as unknown[]) : [];
+    const parent = str(raw.parent_tool_use_id);
     for (const entry of content) {
       const block = record(entry);
       if (!block || str(block.type) !== 'tool_result') continue;
@@ -430,6 +515,24 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
 
       const failed = block.is_error === true;
       const output = toolResultText(block.content);
+
+      // The result of a step inside a delegation, closing the row its
+      // `tool_use` opened. `is_error` here is the *step* failing, which the
+      // detail view shows without the run itself having failed.
+      if (parent) {
+        this.emit({
+          t: 'agent_step',
+          parentToolId: parent,
+          step: {
+            id: toolId,
+            status: failed ? 'failed' : 'completed',
+            output,
+            error: failed ? output : undefined,
+          },
+        });
+        continue;
+      }
+
       this.emit({
         t: 'tool',
         toolId,
@@ -474,6 +577,35 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     });
     this.activeTurnId = null;
     this.currentMsgId = null;
+  }
+}
+
+/**
+ * A task's own status word, mapped onto the transcript's tool statuses.
+ *
+ * Anything unrecognised becomes `running` rather than a guess at a terminal
+ * state: showing a finished agent as still working is a cosmetic lag the next
+ * event corrects, while showing a working agent as finished stops its detail
+ * view updating for good.
+ */
+function toolStatus(value: string): ToolStatus {
+  switch (value) {
+    case 'completed':
+    case 'success':
+      return 'completed';
+    case 'failed':
+    case 'error':
+      return 'failed';
+    case 'canceled':
+    case 'cancelled':
+      return 'canceled';
+    case 'denied':
+      return 'denied';
+    case 'pending':
+    case 'queued':
+      return 'pending';
+    default:
+      return 'running';
   }
 }
 

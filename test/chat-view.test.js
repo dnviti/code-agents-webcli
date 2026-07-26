@@ -21,7 +21,7 @@ before(function () {
   const contents = [
     `export { renderToStaticMarkup } from 'react-dom/server';`,
     `export * as React from 'react';`,
-    `export { ChatView } from ${JSON.stringify(path.join(CHAT_DIR, 'ChatView'))};`,
+    `export { ChatView, rowFor } from ${JSON.stringify(path.join(CHAT_DIR, 'ChatView'))};`,
     `export { ChatController } from ${JSON.stringify(path.join(ROOT, 'src', 'client', 'chat', 'controller'))};`,
     `export * as viewSettings from ${JSON.stringify(path.join(ROOT, 'src', 'client', 'chat', 'view-settings'))};`,
   ].join('\n');
@@ -473,9 +473,17 @@ describe('ChatView', function () {
       plan: [{ text: 'Wire the view', status: 'in_progress' }],
     });
 
-    const html = render({ controller, isMobile: true });
+    // Told to show the conversation, which is what a phone is given: whether
+    // the rail is open is the shell's answer now, not a stored preference this
+    // component reads — see AppShell's `phonePanel`, and the shell test that
+    // asserts a phone never opens onto a panel.
+    const html = render({
+      controller,
+      isMobile: true,
+      view: { ...mod.viewSettings.DEFAULT_CHAT_VIEW, panelOpen: false },
+    });
 
-    assert.ok(!html.includes('aria-label="Workspace"'), 'the rail must not open itself on a phone');
+    assert.ok(!html.includes('aria-label="Workspace"'), 'the conversation is what is showing');
     assert.ok(html.includes('aria-expanded="false"'), 'plan collapses to a disclosure');
     assert.ok(html.includes('0 of 1'), 'the collapsed summary still reports progress');
     assert.ok(html.includes('env(safe-area-inset-bottom'), 'composer must clear the home bar');
@@ -602,6 +610,46 @@ describe('ChatView', function () {
     const withoutSvg = html.replace(/<svg[\s\S]*?<\/svg>/g, '');
     const hex = withoutSvg.match(/(?:color|background|border|fill)[^;"']*#[0-9a-fA-F]{3,8}/g);
     assert.deepStrictEqual(hex, null, `hardcoded colours found: ${hex && hex.join(', ')}`);
+  });
+
+  // Issue #46: a step that only ran commands has no row, so a trace row or a
+  // search hit pointing at one has to land on the reply that speaks for it —
+  // otherwise clicking it scrolls to an element that is not in the document,
+  // which looks exactly like a control that does nothing.
+  it('resolves a silent step to the row that carries its work', function () {
+    const tool = {
+      kind: 'tool', toolId: 'x1', name: 'bash', toolKind: 'execute',
+      status: 'completed', input: { command: 'npm test' },
+    };
+    const controller = controllerWith({
+      messages: [
+        message('u1', 1, 'user', 'run the tests'),
+        { ...message('a1', 2, 'assistant', ''), blocks: [tool] },
+        { ...message('a2', 3, 'assistant', ''), blocks: [tool] },
+        message('a3', 4, 'assistant', 'all green'),
+      ],
+      cursor: 4,
+    });
+    const turn = { messageIds: ['u1', 'a1', 'a2', 'a3'] };
+    const { rowFor } = mod;
+
+    assert.strictEqual(rowFor('a1', turn, controller.transcript), 'a3', 'forward to the reply');
+    assert.strictEqual(rowFor('a3', turn, controller.transcript), 'a3', 'a row stands for itself');
+
+    // A turn whose tail is all machinery has no reply to fall forward to, so it
+    // lands on the last row above rather than nowhere at all.
+    const trailing = controllerWith({
+      messages: [
+        message('u1', 1, 'user', 'go'),
+        message('a1', 2, 'assistant', 'starting'),
+        { ...message('a2', 3, 'assistant', ''), blocks: [tool] },
+      ],
+      cursor: 3,
+    });
+    assert.strictEqual(
+      rowFor('a2', { messageIds: ['u1', 'a1', 'a2'] }, trailing.transcript),
+      'a1',
+    );
   });
 
   it('wires the composer and the approval buttons to the controller', function () {

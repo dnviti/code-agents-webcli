@@ -1,5 +1,7 @@
 import * as React from 'react';
 
+import { PHONE_TEXT, TOUCH_TARGET, usePhone } from '../touch.js';
+
 export type ButtonVariant = 'primary' | 'secondary' | 'outline' | 'ghost' | 'destructive';
 export type ButtonSize = 'sm' | 'md' | 'lg';
 
@@ -38,6 +40,10 @@ export function Button({ variant = 'primary', size = 'md', disabled = false, ico
   const [active, setActive] = React.useState(false);
   const v = VARIANTS[variant] || VARIANTS.primary;
   const s = SIZES[size] || SIZES.md;
+  // On a phone every size steps up to the touch floor. Doing it here rather
+  // than at each call site is the point of a design system: a dialog reached
+  // from the bottom bar gets it without knowing it is on a phone.
+  const isPhone = usePhone();
   return (
     <button
       disabled={disabled}
@@ -47,7 +53,10 @@ export function Button({ variant = 'primary', size = 'md', disabled = false, ico
       onMouseUp={() => setActive(false)}
       style={{
         display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: s.gap,
-        height: s.height, padding: s.padding, fontSize: s.fontSize, fontFamily: 'var(--font-sans)',
+        height: isPhone ? TOUCH_TARGET : s.height,
+        padding: s.padding,
+        fontSize: isPhone ? PHONE_TEXT.body : s.fontSize,
+        fontFamily: 'var(--font-sans)',
         fontWeight: 'var(--font-medium)' as React.CSSProperties['fontWeight'], lineHeight: 1, letterSpacing: '0.01em', whiteSpace: 'nowrap',
         borderRadius: 'var(--radius)', cursor: disabled ? 'not-allowed' : 'pointer', userSelect: 'none',
         transition: 'background var(--duration-fast) var(--ease-standard), filter var(--duration-fast)',

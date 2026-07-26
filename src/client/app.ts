@@ -259,8 +259,11 @@ export class App {
     this.splitContainer.setupDropZones();
 
     if (this.sessionTabManager.tabs.size > 0) {
-      const firstTabId = this.sessionTabManager.tabs.keys().next().value;
-      await this.sessionTabManager.switchToTab(firstTabId!);
+      // The tab this browser was last on, or the first one if that session is
+      // gone — not always the first one, which sent every reload back to the
+      // start of the strip.
+      const initialTabId = this.sessionTabManager.initialTabId();
+      if (initialTabId) await this.sessionTabManager.switchToTab(initialTabId);
       hideOverlay();
     } else {
       hideOverlay();

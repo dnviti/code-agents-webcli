@@ -151,6 +151,65 @@ export interface ToolBlock {
   /** Set when status is `failed`. */
   error?: string;
   durationMs?: number;
+  /** Set on a delegation: what the agent behind this call did. See `AgentRun`. */
+  agent?: AgentRun;
+}
+
+/**
+ * One action a delegated agent took inside its own work.
+ *
+ * Deliberately not a `ToolBlock`: a step is keyed by the *inner* tool id, which
+ * lives in the sub-agent's own namespace and must never be reachable through
+ * the transcript's `toolIndex` — a patch aimed at the parent conversation and
+ * one aimed at a step would otherwise collide on the same key.
+ */
+export interface AgentStep {
+  /** The inner call's own id, so its result can find the step it belongs to. */
+  id: string;
+  name: string;
+  toolKind: ToolKind;
+  status: ToolStatus;
+  input?: unknown;
+  output?: string;
+  /** Set when the step itself failed, which is not the same as the run failing. */
+  error?: string;
+  ts: number;
+}
+
+/**
+ * A step as it arrives on the wire: always identified, otherwise partial.
+ *
+ * A step is reported twice — once when the agent calls the tool and once when
+ * the result comes back — and the second report knows only the id, the outcome
+ * and the output. Sending a whole `AgentStep` both times would mean the closing
+ * half overwriting the tool's name with a placeholder, so only what is actually
+ * known is sent and the reducer merges it.
+ */
+export type AgentStepPatch = Partial<AgentStep> & { id: string };
+
+/**
+ * What a delegated agent is doing inside a single delegation.
+ *
+ * The runtime reports this out of band from the tool call that started it
+ * (`task_started` / `task_progress` / `task_updated` alongside messages tagged
+ * with a `parent_tool_use_id`), so it hangs off the tool block rather than
+ * being folded into its `output` — which only ever holds the final summary.
+ */
+export interface AgentRun {
+  steps: AgentStep[];
+  /** The agent's own description of what it is doing right now. */
+  activity?: string;
+  /** Name of the most recent tool it reached for. */
+  lastTool?: string;
+  toolUses?: number;
+  totalTokens?: number;
+  durationMs?: number;
+  /** The run's own outcome, which can fail while individual steps succeeded. */
+  status?: ToolStatus;
+  error?: string;
+  /** What it was asked to do. */
+  prompt?: string;
+  subagentType?: string;
 }
 
 export interface ImageBlock {
@@ -265,6 +324,52 @@ export interface PermissionRequest {
   ts: number;
 }
 
+/**
+ * One selectable answer to a question the model asked.
+ *
+ * `optionId` is minted by this app rather than taken from the model, which only
+ * ever supplies a label: two options can legitimately carry the same words
+ * ("Yes, and stop" / "Yes, and stop") and an id derived from the text would make
+ * them the same button.
+ */
+export interface QuestionOption {
+  optionId: string;
+  label: string;
+  /** The model's own gloss on what picking this means. */
+  description?: string;
+}
+
+/**
+ * A question the model asked, waiting on a person.
+ *
+ * Deliberately *not* a `PermissionRequest`. An approval is the app gating the
+ * agent — the options are always some arrangement of allow and deny, and the
+ * answer's meaning is known before it is given. A question is the agent asking
+ * the user something the app has no opinion about, the options are whatever the
+ * model wrote, and the answer is content rather than a decision. Folding the two
+ * together would mean either teaching the approval card to render arbitrary
+ * options or teaching `isAllowOption` to answer for text it cannot interpret.
+ */
+export interface QuestionRequest {
+  requestId: string;
+  /**
+   * The tool call that asked, when it could be identified.
+   *
+   * Present so the card can be drawn where the question was actually asked
+   * rather than in a tray at the bottom. Optional because correlation is
+   * best-effort and an uncorrelated question must still be answerable — an
+   * agent blocked on a question with no button anywhere is a hung session.
+   */
+  toolId?: string;
+  question: string;
+  /** A short label for the question, when the model supplied one. */
+  header?: string;
+  /** True when more than one option may be picked before confirming. */
+  multiSelect: boolean;
+  options: QuestionOption[];
+  ts: number;
+}
+
 /** What a chat session is doing right now, for the header indicator. */
 export type ChatState =
   | 'starting'
@@ -272,6 +377,8 @@ export type ChatState =
   | 'thinking'
   | 'running'
   | 'awaiting_permission'
+  /** Blocked on a question the model asked, which only a person can answer. */
+  | 'awaiting_answer'
   | 'exited'
   | 'error';
 
@@ -293,6 +400,13 @@ export interface ChatCapabilities {
   diffs: boolean;
   /** The runtime can ask before acting, and honour a refusal. */
   permissions: boolean;
+  /**
+   * The model can put a multiple-choice question to the user and wait for it.
+   *
+   * Optional rather than required so a stored snapshot written before this
+   * existed still parses; absent reads as false everywhere it is consulted.
+   */
+  questions?: boolean;
   interrupt: boolean;
   /** A session can be resumed after the process is gone. */
   resume: boolean;
@@ -362,6 +476,23 @@ export type ChatEvent =
    * that opened the call has already closed — so they cannot be a block_delta.
    */
   | { t: 'tool'; seq: number; ts: number; toolId: string; patch: Partial<ToolBlock> }
+  /**
+   * One step a delegated agent took, addressed to the delegation that owns it.
+   *
+   * Separate from `tool` because it is keyed twice over: `parentToolId` finds
+   * the delegation's block, and `step.id` finds (or creates) the step inside
+   * it. Routing this through `tool` would put sub-agent tool ids into the
+   * transcript's own index, where a later top-level patch could hit them.
+   */
+  | { t: 'agent_step'; seq: number; ts: number; parentToolId: string; step: AgentStepPatch }
+  /** Progress for the run as a whole, merged over whatever is already known. */
+  | {
+      t: 'agent_progress';
+      seq: number;
+      ts: number;
+      parentToolId: string;
+      patch: Partial<Omit<AgentRun, 'steps'>>;
+    }
   | { t: 'plan'; seq: number; ts: number; items: PlanItem[] }
   | { t: 'usage'; seq: number; ts: number; usage: ChatUsage }
   | { t: 'permission'; seq: number; ts: number; request: PermissionRequest }
@@ -375,6 +506,30 @@ export type ChatEvent =
       allowed: boolean;
       /** Set when the decision came from the bypass setting, not a person. */
       automatic?: boolean;
+    }
+  | { t: 'question'; seq: number; ts: number; request: QuestionRequest }
+  | {
+      t: 'question_resolved';
+      seq: number;
+      ts: number;
+      requestId: string;
+      /**
+       * The tool call that asked, repeated from the request.
+       *
+       * Carried on the resolution as well so a card rebuilt from the log alone
+       * can find its own answer: the request is dropped from the pending list
+       * the moment it resolves, and the id would otherwise go with it.
+       */
+      toolId?: string;
+      /** Every option the user picked, in the order the question offered them. */
+      optionIds: string[];
+      /**
+       * True when the user chose to answer nothing.
+       *
+       * The model is still told — it is blocked and something has to come back —
+       * but the transcript says "skipped" rather than inventing a selection.
+       */
+      skipped?: boolean;
     }
   | { t: 'state'; seq: number; ts: number; state: ChatState }
   | { t: 'error'; seq: number; ts: number; message: string; fatal?: boolean }
@@ -464,6 +619,13 @@ export interface ChatSnapshot {
   plan?: PlanItem[];
   pendingPermissions: PermissionRequest[];
   /**
+   * Questions still waiting on an answer.
+   *
+   * Optional for the same reason `queued` is: a snapshot replayed by a server
+   * that predates this should read as "none pending", not as malformed.
+   */
+  pendingQuestions?: QuestionRequest[];
+  /**
    * Turns typed ahead, still waiting. Optional so a snapshot replayed from the
    * store — which knows nothing about a live process — is not obliged to
    * invent one; the session fills it in.
@@ -514,7 +676,163 @@ export const NO_CHAT_CAPABILITIES: ChatCapabilities = {
   usage: false,
   cost: false,
   plan: false,
+  questions: false,
 };
+
+/** The MCP server this app exposes to the runtimes it launches. */
+export const ASK_MCP_SERVER = 'ccweb';
+
+/** The one tool that server offers: put a multiple-choice question to the user. */
+export const ASK_QUESTION_TOOL = 'ask_user_question';
+
+/**
+ * What the tool is called once a runtime has namespaced it.
+ *
+ * Claude prefixes MCP tools as `mcp__<server>__<tool>`, and that prefixed name
+ * is what shows up in the transcript — so this is the string the UI matches on
+ * to draw a question card instead of a generic tool row.
+ */
+export const ASK_QUESTION_TOOL_NAME = `mcp__${ASK_MCP_SERVER}__${ASK_QUESTION_TOOL}`;
+
+/**
+ * Whether a tool name refers to this app's question tool.
+ *
+ * Suffix rather than equality: runtimes namespace MCP tools differently (and
+ * have changed the separator before), so the bare name is the part that can be
+ * relied on. Nothing else in the transcript is called this.
+ */
+/**
+ * Turn whatever a model passed as `options` into answerable choices.
+ *
+ * Shared rather than implemented on each side, and that is the whole point: the
+ * server mints the ids it will later be answered with, and the browser mints the
+ * same ids again when it rebuilds a card from the tool call in a replayed
+ * transcript. Two copies of this that drifted by one dropped entry would put the
+ * tick on the wrong option, which is a lie about what the user chose.
+ *
+ * Ids are positional rather than derived from the labels: two options may
+ * legitimately read the same, and a label-derived id would collapse them into
+ * one button that answers for both. Anything unusable is dropped instead of
+ * rendered as an empty choice, and a bare string is accepted as its own label
+ * because that is what a model reaches for when the schema slips its mind.
+ */
+export function normalizeQuestionOptions(raw: unknown): QuestionOption[] {
+  if (!Array.isArray(raw)) return [];
+  const options: QuestionOption[] = [];
+  for (const entry of raw) {
+    let label = '';
+    let description: string | undefined;
+    if (typeof entry === 'string') {
+      label = entry.trim();
+    } else if (entry && typeof entry === 'object') {
+      const object = entry as Record<string, unknown>;
+      const text = object.label ?? object.name ?? object.value ?? object.title;
+      if (typeof text === 'string') label = text.trim();
+      if (typeof object.description === 'string' && object.description.trim()) {
+        description = object.description.trim();
+      }
+    }
+    if (!label) continue;
+    options.push({ optionId: `opt-${options.length}`, label, description });
+  }
+  return options;
+}
+
+export function isAskQuestionTool(name: string | undefined): boolean {
+  if (!name) return false;
+  // Suffix match on a separator of either width. Claude namespaces MCP tools as
+  // `mcp__<server>__<tool>`; omp reports the same tool as
+  // `mcp__ccweb_ask_user_question`, with one underscore. Both were observed —
+  // an exact-name table would have silently failed for one of them.
+  return name === ASK_QUESTION_TOOL || /(^|_)ask_user_question$/.test(name);
+}
+
+/**
+ * Whether a tool block is this app's question tool, however the runtime named it.
+ *
+ * The name alone is not enough. ACP has no separate tool-name field at all: the
+ * adapter uses the agent's own title for the block ("Asking tabs vs spaces
+ * preference"), and the real tool name turns up inside the arguments instead
+ * (omp puts it in `rawInput.path`). So the arguments are consulted too.
+ */
+export function looksLikeAskCall(name: string | undefined, input: unknown): boolean {
+  if (isAskQuestionTool(name)) return true;
+  if (input === undefined || input === null) return false;
+  try {
+    return JSON.stringify(input).includes(ASK_QUESTION_TOOL);
+  } catch {
+    return false;
+  }
+}
+
+/** A question as it can be read back out of the call that asked it. */
+export interface AskedQuestion {
+  question: string;
+  header?: string;
+  multiSelect: boolean;
+  options: QuestionOption[];
+}
+
+/**
+ * Read a question back out of a tool call's arguments.
+ *
+ * Shared between the session — which pairs an incoming question with the call
+ * that asked it — and the browser, which rebuilds the card from a replayed
+ * transcript. Two implementations that disagreed about which options survive
+ * would put the tick on an option the user did not choose.
+ *
+ * Two shapes are accepted because two were observed: the arguments themselves,
+ * and an envelope carrying them as a JSON string (omp reports the call as
+ * `{ path: 'xd://mcp__ccweb_ask_user_question', content: '{...}' }`). Tolerant
+ * by contract — `input` is `unknown` everywhere else in this file for good
+ * reason, and a malformed call should render as nothing rather than throw.
+ */
+export function askedQuestionFrom(input: unknown): AskedQuestion | null {
+  const object = asRecord(input);
+  if (!object) return null;
+
+  const direct = readQuestion(object);
+  if (direct) return direct;
+
+  // An envelope. `content` is the field omp uses; the others cost nothing to
+  // accept and save a second round of probing if another agent picks one.
+  for (const key of ['content', 'arguments', 'input', 'params']) {
+    const inner = object[key];
+    if (typeof inner === 'string') {
+      try {
+        const parsed = readQuestion(asRecord(JSON.parse(inner)));
+        if (parsed) return parsed;
+      } catch {
+        // Not JSON, so not a question. Keep looking.
+      }
+    } else if (inner && typeof inner === 'object') {
+      const parsed = readQuestion(asRecord(inner));
+      if (parsed) return parsed;
+    }
+  }
+  return null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function readQuestion(object: Record<string, unknown> | undefined): AskedQuestion | null {
+  if (!object) return null;
+  const question = typeof object.question === 'string' ? object.question.trim() : '';
+  if (!question) return null;
+  const options = normalizeQuestionOptions(object.options);
+  if (options.length === 0) return null;
+  return {
+    question,
+    header:
+      typeof object.header === 'string' && object.header.trim() ? object.header.trim() : undefined,
+    multiSelect: object.multiSelect === true,
+    options,
+  };
+}
 
 /**
  * Tool-name → kind mapping shared by every adapter.

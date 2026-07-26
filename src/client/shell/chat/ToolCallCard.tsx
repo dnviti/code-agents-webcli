@@ -2,6 +2,7 @@ import * as React from 'react';
 import { FileDiff, ToolBlock } from '../../../shared/chat-events.js';
 import { Badge } from '../../ui/relay/Badge.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { PHONE_TEXT, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import {
   COMMAND_KEYS,
   INPUT_CHARS,
@@ -48,6 +49,7 @@ export function ToolCallCard({
   onRevertHunk,
 }: ToolCallCardProps) {
   const [open, setOpen] = React.useState(Boolean(defaultOpen));
+  const isPhone = usePhone();
   const bodyId = React.useId();
 
   const status = TOOL_STATUS[block.status] || TOOL_STATUS.pending;
@@ -73,14 +75,14 @@ export function ToolCallCard({
           alignItems: 'center',
           gap: 8,
           width: '100%',
-          minHeight: 34,
-          padding: '4px 8px',
+          minHeight: isPhone ? TOUCH_TARGET : 34,
+          padding: isPhone ? '6px 10px' : '4px 8px',
           background: 'transparent',
           border: 0,
           color: 'var(--foreground)',
           font: 'inherit',
           fontFamily: 'var(--font-sans)',
-          fontSize: 'var(--text-sm)',
+          fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-sm)',
           textAlign: 'left',
           cursor: 'pointer',
         }}
@@ -128,7 +130,7 @@ export function ToolCallCard({
               flex: '1 1 auto',
               minWidth: 0,
               fontFamily: 'var(--font-mono)',
-              fontSize: 'var(--text-xs)',
+              fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-xs)',
               color: 'var(--muted-foreground)',
               overflow: 'hidden',
               textOverflow: 'ellipsis',
@@ -150,7 +152,7 @@ export function ToolCallCard({
             style={{
               flex: '0 0 auto',
               fontFamily: 'var(--font-mono)',
-              fontSize: 'var(--text-2xs)',
+              fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
               color: 'var(--muted-foreground)',
             }}
           >

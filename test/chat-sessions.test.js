@@ -48,7 +48,12 @@ after(function () {
 // ChatSessionSidebar
 // ---------------------------------------------------------------------------
 
-const NOW = Date.now();
+// Midday today, not `Date.now()`. The sidebar groups by calendar day, so a
+// fixture anchored to the real clock puts "five minutes ago" and "two hours
+// ago" on *yesterday* whenever the suite runs shortly after midnight — and the
+// Today group the assertions below look for is then legitimately empty. Midday
+// keeps every offset on the day it was written to mean, whatever time it runs.
+const NOW = new Date().setHours(12, 0, 0, 0);
 const HOUR = 3_600_000;
 const DAY = 86_400_000;
 

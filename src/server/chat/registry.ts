@@ -31,10 +31,33 @@ import { PiChatAdapter } from './adapters/pi.js';
 
 export type ChatAdapterFactory = (options: ChatAdapterOptions) => ChatAdapter;
 
+/**
+ * How a runtime is handed the MCP server that asks the user questions.
+ *
+ * `cli` — as a `--mcp-config` argument at spawn (claude).
+ * `protocol` — in the handshake, as part of `session/new` (ACP agents).
+ *
+ * Absent means the runtime has no verified way to accept one, and it simply
+ * reports `questions: false` rather than being handed a flag nobody has watched
+ * it parse.
+ *
+ * A wired channel is not a promise the model will use it. kimi accepts the
+ * server, spawns it and exposes the tool — verified — but ships a native
+ * `AskUserQuestion` of its own that it often reaches for first, and that one
+ * answers itself with "the user dismissed this" without anybody being asked.
+ * Nothing here can redirect it: refusing the native call through the permission
+ * channel just ends the turn, because ACP carries no reason back to the model.
+ * Wiring it anyway is still strictly better than not — when the model does pick
+ * this tool the question reaches a person, and when it does not, the outcome is
+ * the one kimi would have produced regardless.
+ */
+export type AskChannel = 'cli' | 'protocol';
+
 interface RuntimeChatEntry {
   factory: ChatAdapterFactory;
   /** What the launcher shows before a session exists. */
   advertised: Partial<ChatCapabilities>;
+  askChannel?: AskChannel;
 }
 
 /**
@@ -47,6 +70,7 @@ interface RuntimeChatEntry {
 function acp(runtime: string, acpArgs: string[]): RuntimeChatEntry {
   return {
     factory: (options) => new AcpChatAdapter({ ...options, runtime, acpArgs }),
+    askChannel: 'protocol',
     advertised: {
       streaming: true,
       thinking: true,
@@ -62,6 +86,7 @@ function acp(runtime: string, acpArgs: string[]): RuntimeChatEntry {
 const RUNTIMES: Record<string, RuntimeChatEntry> = {
   claude: {
     factory: (options) => new ClaudeChatAdapter(options),
+    askChannel: 'cli',
     advertised: {
       streaming: true,
       thinking: true,
@@ -104,6 +129,17 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
   kimi: acp('kimi', ['acp']),
   omp: acp('omp', ['acp']),
 };
+
+/**
+ * How this runtime takes the question server, or undefined if it does not.
+ *
+ * Only the runtimes it has actually been watched working on: claude and the ACP
+ * agents. Codex, pi and grok are one probe away, and get `questions: false`
+ * until someone runs it.
+ */
+export function askChannelFor(runtime: string): AskChannel | undefined {
+  return RUNTIMES[runtime]?.askChannel;
+}
 
 /** Whether this runtime can be driven as a chat at all. */
 export function supportsChat(runtime: string): boolean {

@@ -45,11 +45,18 @@ export interface ChatSessionSidebarProps {
 }
 
 /** States where the agent is actively doing something, as opposed to waiting. */
-const BUSY_STATES: ReadonlySet<ChatState> = new Set(['starting', 'thinking', 'running', 'awaiting_permission']);
+const BUSY_STATES: ReadonlySet<ChatState> = new Set([
+  'starting',
+  'thinking',
+  'running',
+  'awaiting_permission',
+  'awaiting_answer',
+]);
 
 function stateDotColor(state: ChatState | undefined): string {
   if (state === 'error') return 'var(--destructive)';
   if (state === 'awaiting_permission') return 'var(--warning)';
+  if (state === 'awaiting_answer') return 'var(--info)';
   if (state && BUSY_STATES.has(state)) return 'var(--ansi-green)';
   return 'var(--muted-foreground)';
 }
@@ -64,6 +71,7 @@ function stateDotColor(state: ChatState | undefined): string {
 function stateLabel(state: ChatState | undefined): string | undefined {
   switch (state) {
     case 'awaiting_permission': return 'needs approval';
+    case 'awaiting_answer': return 'asked you something';
     case 'error': return 'error';
     case 'running': return 'running';
     case 'thinking': return 'thinking';
@@ -321,7 +329,13 @@ function SessionRow({
           </Tooltip>
           {label ? (
             <Badge
-              variant={session.state === 'error' ? 'destructive' : session.state === 'awaiting_permission' ? 'warning' : 'neutral'}
+              variant={
+                session.state === 'error'
+                  ? 'destructive'
+                  : session.state === 'awaiting_permission'
+                    ? 'warning'
+                    : 'neutral'
+              }
               style={{ height: 16, padding: '0 5px', fontSize: 'var(--text-2xs)', flex: '0 0 auto' }}
             >
               {label}

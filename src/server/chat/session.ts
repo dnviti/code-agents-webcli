@@ -10,16 +10,32 @@ import {
   PermissionOption,
   PermissionRequest,
   QueuedTurn,
+  QuestionOption,
+  QuestionRequest,
   UserTurn,
   classifyTool,
   defaultPermissionOptions,
   isAllowOption,
+  isAskQuestionTool,
+  looksLikeAskCall,
+  askedQuestionFrom,
+  normalizeQuestionOptions,
+  ASK_MCP_SERVER,
+  ASK_QUESTION_TOOL_NAME,
 } from '../../shared/chat-events.js';
 import { isClearingCommand } from '../../shared/slash-commands.js';
-import { AdapterEvent, ChatAdapter } from './adapter.js';
-import { PermissionAsk, PermissionAnswer, PermissionBroker, permissionHookSettings } from './permission-broker.js';
+import { AdapterEvent, ChatAdapter, ChatAdapterOptions } from './adapter.js';
+import {
+  PermissionAsk,
+  PermissionAnswer,
+  PermissionBroker,
+  QuestionAsk,
+  QuestionReply,
+  permissionHookSettings,
+} from './permission-broker.js';
+import { ASK_SOCKET_ENV, askMcpConfig } from './ask-mcp.js';
 import { ChatStoreLike, ChatSessionRef } from './store.js';
-import { createChatAdapter, supportsChat } from './registry.js';
+import { askChannelFor, createChatAdapter, supportsChat } from './registry.js';
 
 /**
  * One chat conversation, owned by the server.
@@ -44,6 +60,13 @@ export interface ChatSessionDeps {
   socketDir: string;
   /** Absolute path to the compiled permission hook script. */
   hookScript: string;
+  /**
+   * Absolute path to the compiled MCP server that asks the user questions.
+   *
+   * Optional so a deployment that has not built it (or does not want the
+   * capability) simply runs without it, rather than failing to start a session.
+   */
+  askScript?: string;
   /** Push an event to every browser watching this session. */
   broadcast: (sessionId: string, message: Record<string, unknown>) => void;
   /** Resolve the executable for a runtime, from the existing bridge lookup. */
@@ -90,6 +113,12 @@ interface PendingApproval {
   request: PermissionRequest;
   /** Set when the question came over the hook broker rather than the adapter. */
   resolve?: (answer: PermissionAnswer) => void;
+}
+
+/** A question put to the browser, and the tool call waiting on the answer. */
+interface PendingQuestion {
+  request: QuestionRequest;
+  resolve: (reply: QuestionReply) => void;
 }
 
 /**
@@ -145,6 +174,28 @@ export class ChatSession {
   private state: ChatState = 'starting';
   private capabilities: ChatCapabilities | null = null;
   private readonly pending = new Map<string, PendingApproval>();
+  private readonly questions = new Map<string, PendingQuestion>();
+  /**
+   * Question tool calls the transcript has opened and nothing has claimed yet.
+   *
+   * The MCP server that carries a question has no way to know the tool_use id of
+   * the call it is serving — it only ever sees the arguments — so the pairing is
+   * made here instead, from the block the adapter already reported.
+   *
+   * Matched on the question text first, and only then on announcement order.
+   * Order alone is not enough, which omp demonstrated: its model got the option
+   * schema wrong, the call was rejected before it ever reached the MCP server,
+   * and it retried. That leaves *two* announced calls for one question, and
+   * claiming the oldest pinned the card to the attempt that failed. Newest match
+   * first is the answer, because a retry is the later of the two.
+   *
+   * An unclaimed entry left by a call that never reached the server would
+   * mispair a later question, so the list is emptied at the end of every turn —
+   * by which point nothing can still be waiting to claim one.
+   */
+  private askCalls: Array<{ toolId: string; question?: string }> = [];
+  /** True once this session actually handed a runtime the question tool. */
+  private questionsEnabled = false;
   private runtime = '';
   private bypass = false;
   private nativeSessionId: string | null = null;
@@ -241,18 +292,57 @@ export class ChatSession {
     const env = { ...(options.env || {}) };
     const extraArgs = [...(options.extraArgs || [])];
 
-    // Claude gates tools through a PreToolUse hook rather than a protocol
-    // message, so its approval channel is a socket the hook dials back into.
-    // Skipped entirely when bypassing: there is nothing to ask.
-    if (!this.bypass && options.runtime === 'claude' && fs.existsSync(this.deps.hookScript)) {
+    // Claude reaches the browser over a unix socket for two different reasons:
+    // a PreToolUse hook asking whether a tool may run, and an MCP server asking
+    // the user a question. Both dial the same socket, so it is opened whenever
+    // either of them will be installed.
+    //
+    // The hook is skipped when bypassing — there is nothing to approve — but the
+    // question channel is not. Bypassing approvals means "stop asking me before
+    // you act"; it has never meant "answer my questions on my behalf", and a
+    // model that asks which of three approaches to take still needs a person.
+    const wantsHook = !this.bypass && options.runtime === 'claude' && fs.existsSync(this.deps.hookScript);
+    const askScript = this.deps.askScript;
+    const askChannel = askChannelFor(options.runtime);
+    const wantsAsk = Boolean(askChannel) && Boolean(askScript) && fs.existsSync(askScript!);
+    let askMcpServer: ChatAdapterOptions['askMcpServer'];
+
+    if (wantsHook || wantsAsk) {
       // One shared directory, not one per session. A directory named after the
       // session id cost 37 bytes of a 103-byte path budget, which is what put
       // the socket over the kernel's limit; the random socket filename already
       // carries the unguessability that directory was standing in for.
       this.broker = new PermissionBroker(this.deps.socketDir);
-      const socketPath = await this.broker.listen((ask) => this.askUser(ask));
-      extraArgs.push('--settings', permissionHookSettings(this.deps.hookScript, socketPath));
-      env.CCWEB_PERMISSION_SOCKET = socketPath;
+      const socketPath = await this.broker.listen({
+        permission: (ask) => this.askUser(ask),
+        question: (ask) => this.askQuestion(ask),
+      });
+
+      if (wantsHook) {
+        extraArgs.push('--settings', permissionHookSettings(this.deps.hookScript, socketPath));
+        env.CCWEB_PERMISSION_SOCKET = socketPath;
+      }
+      if (wantsAsk && askChannel === 'cli') {
+        extraArgs.push('--mcp-config', askMcpConfig(askScript!, socketPath));
+        // Named explicitly rather than relying on the hook to wave it through:
+        // with approvals bypassed there is no hook at all, and without this the
+        // one tool whose whole purpose is to ask the user something would be the
+        // one tool the runtime refused to run.
+        extraArgs.push('--allowedTools', ASK_QUESTION_TOOL_NAME);
+        this.questionsEnabled = true;
+      }
+      if (wantsAsk && askChannel === 'protocol') {
+        // ACP agents take their MCP servers in the handshake rather than on the
+        // command line, so this goes to the adapter and is sent with
+        // `session/new`. Same script, same socket, same tool.
+        askMcpServer = {
+          name: ASK_MCP_SERVER,
+          command: process.execPath,
+          args: [askScript!],
+          env: { [ASK_SOCKET_ENV]: socketPath },
+        };
+        this.questionsEnabled = true;
+      }
     }
 
     const adapter = createChatAdapter(options.runtime, {
@@ -264,6 +354,7 @@ export class ChatSession {
       env,
       bypassPermissions: this.bypass,
       resumeSessionId: options.resumeSessionId,
+      askMcpServer,
       emit: (event) => this.ingest(event),
       readFile: this.deps.readFile
         ? (filePath) => this.deps.readFile!(this.ref.id, filePath)
@@ -304,6 +395,14 @@ export class ChatSession {
     if (!this.capabilities) {
       this.capabilities = adapter.capabilities;
     }
+    // Not an adapter capability: whether the model can ask a question is a fact
+    // about what this session wired up, not about what the runtime can parse.
+    // The same adapter has it or does not depending on whether the MCP server
+    // was built and found.
+    if (this.questionsEnabled && this.capabilities) {
+      this.capabilities = { ...this.capabilities, questions: true };
+      this.ingest({ t: 'capabilities', capabilities: { questions: true } });
+    }
     this.setState('idle');
   }
 
@@ -331,6 +430,16 @@ export class ChatSession {
     } as ChatEvent;
 
     if (stamped.t === 'session') {
+      // Patched on the event itself, not just on the copy kept here. Every
+      // reader of this log — this session, the browser's reducer, a snapshot
+      // replayed tomorrow — takes `session.capabilities` as a wholesale
+      // replacement, so a flag re-applied only locally would be true on the
+      // server and false in every browser. Whether the model can ask a question
+      // is a fact about what this session wired up; the runtime introducing
+      // itself knows nothing about it and must not be able to unset it.
+      if (this.questionsEnabled && !stamped.capabilities.questions) {
+        stamped.capabilities = { ...stamped.capabilities, questions: true };
+      }
       if (stamped.nativeSessionId) {
         this.nativeSessionId = stamped.nativeSessionId;
         this.deps.onLifecycle?.(this.ref.id, { nativeSessionId: stamped.nativeSessionId });
@@ -362,6 +471,35 @@ export class ChatSession {
     }
     if (stamped.t === 'capabilities' && this.capabilities) {
       this.capabilities = { ...this.capabilities, ...stamped.capabilities };
+    }
+    // A question tool call opening is the only chance to learn its id: by the
+    // time the MCP server relays the question itself, the arguments are all it
+    // knows. `block_start` carries the name, `tool` patches carry only the id,
+    // so this is the one event that can make the pairing.
+    if (stamped.t === 'block_start' && stamped.block.kind === 'tool') {
+      this.noteAskCall(stamped.block.toolId, stamped.block.name, stamped.block.input);
+    }
+    // Claude streams its arguments in as JSON fragments, so a question tool call
+    // is announced before anything says what it asks. The parsed input lands
+    // later as a patch, which is the first point the text is knowable.
+    if (stamped.t === 'tool' && stamped.patch.input !== undefined) {
+      this.noteAskCall(stamped.toolId, stamped.patch.name, stamped.patch.input);
+    }
+    if (stamped.t === 'turn_end') {
+      this.askCalls = [];
+    }
+    if (stamped.t === 'question') {
+      const existing = this.questions.get(stamped.request.requestId);
+      if (existing) {
+        // Same merge-don't-replace rule the approval path learned the hard way:
+        // `askQuestion` records the resolver before it emits this event, and
+        // overwriting the entry here would throw away the only thing that can
+        // unblock the waiting tool call.
+        this.questions.set(stamped.request.requestId, { request: stamped.request, resolve: existing.resolve });
+      }
+    }
+    if (stamped.t === 'question_resolved') {
+      this.questions.delete(stamped.requestId);
     }
     if (stamped.t === 'permission') {
       // Merged, never replaced. `askUser` records the resolver *before* it
@@ -597,6 +735,19 @@ export class ChatSession {
       this.ingest({ t: 'permission_resolved', requestId, optionId: 'reject_once', allowed: false });
     }
     this.pending.clear();
+    // A question is moot once the turn it belongs to is cancelled, and a card
+    // left on screen would invite an answer with nothing left to receive it.
+    for (const [requestId, entry] of this.questions) {
+      entry.resolve({ labels: [], error: 'the turn was interrupted' });
+      this.ingest({
+        t: 'question_resolved',
+        requestId,
+        toolId: entry.request.toolId,
+        optionIds: [],
+        skipped: true,
+      });
+    }
+    this.questions.clear();
     if (dropped) {
       this.ingest({
         t: 'error',
@@ -643,6 +794,13 @@ export class ChatSession {
    * rather than running the tool and apologising afterwards.
    */
   private askUser(ask: PermissionAsk): Promise<PermissionAnswer> {
+    // The one tool that must never be gated. Asking someone to approve being
+    // asked a question is two prompts for one decision, and the second of them
+    // is unanswerable in any useful sense — refusing it just blocks the model
+    // from talking to the person sitting in front of it.
+    if (isAskQuestionTool(ask.toolName)) {
+      return Promise.resolve({ allow: true, reason: 'the user is being asked directly' });
+    }
     if (this.bypass) {
       return Promise.resolve({ allow: true, reason: 'permissions are bypassed for this session' });
     }
@@ -664,6 +822,118 @@ export class ChatSession {
       this.ingest({ t: 'permission', request });
       this.setState('awaiting_permission');
     });
+  }
+
+  /**
+   * Remember a tool call that might be a question, or fill in what it asks.
+   *
+   * Called for every tool block, so the cheap name check comes first. A call
+   * already known is updated rather than duplicated: the same id is reported
+   * twice — once on announcement and again when its arguments finish arriving.
+   */
+  private noteAskCall(toolId: string, name: string | undefined, input: unknown): void {
+    const existing = this.askCalls.find((call) => call.toolId === toolId);
+    if (!existing && !looksLikeAskCall(name, input)) return;
+
+    const question = askedQuestionFrom(input)?.question;
+    if (existing) {
+      if (question) existing.question = question;
+      return;
+    }
+    this.askCalls.push({ toolId, question });
+  }
+
+  /**
+   * Which announced call a question belongs to, if any.
+   *
+   * Claimed as it is answered, so a second question cannot attach itself to the
+   * same block — two cards in one place, one of them unanswerable, is worse than
+   * one card in the pinned fallback.
+   */
+  private claimAskCall(question: string): string | undefined {
+    // Newest text match wins; see the note on `askCalls` for why a retry makes
+    // that the right end to start from.
+    for (let at = this.askCalls.length - 1; at >= 0; at -= 1) {
+      if (this.askCalls[at].question === question) {
+        return this.askCalls.splice(at, 1)[0].toolId;
+      }
+    }
+    // Nothing matched on text — a runtime that reports no arguments, or reports
+    // them in a shape nothing here parses. Order is the fallback, oldest first.
+    return this.askCalls.shift()?.toolId;
+  }
+
+  /**
+   * A question from the model, on its way to a person.
+   *
+   * The promise is the tool call: it resolves when someone clicks, and the MCP
+   * server does not answer the runtime until it does. Everything here is
+   * defensive about shape because the payload is whatever the model wrote — a
+   * question with no options is a question nobody can answer, and coming back
+   * with an error the model can read is better than putting an empty card on
+   * screen and blocking the turn behind it.
+   */
+  private askQuestion(ask: QuestionAsk): Promise<QuestionReply> {
+    const question = typeof ask.question === 'string' ? ask.question.trim() : '';
+    const options = normalizeQuestionOptions(ask.options);
+
+    if (!question || options.length === 0) {
+      return Promise.resolve({
+        labels: [],
+        error: 'the question needs a question and at least one option',
+      });
+    }
+
+    return new Promise<QuestionReply>((resolve) => {
+      const requestId = `ask-${crypto.randomUUID()}`;
+      const request: QuestionRequest = {
+        requestId,
+        // Claimed, not merely read: a second question must not attach itself to
+        // the same tool block, which would draw two cards in one place and
+        // leave the later one unanswerable.
+        toolId: this.claimAskCall(question),
+        question,
+        header: typeof ask.header === 'string' && ask.header.trim() ? ask.header.trim() : undefined,
+        multiSelect: ask.multiSelect === true,
+        options,
+        ts: Date.now(),
+      };
+      this.questions.set(requestId, { request, resolve });
+      this.ingest({ t: 'question', request });
+      this.setState('awaiting_answer');
+    });
+  }
+
+  /**
+   * Record the answer a browser sent, and hand it to the waiting tool call.
+   *
+   * Returns false for a question this session does not have, which is what a
+   * second browser answering one that has already been answered looks like.
+   */
+  answerQuestion(requestId: string, optionIds: string[], skipped = false): boolean {
+    const entry = this.questions.get(requestId);
+    if (!entry) return false;
+
+    // Filtered against the offered options rather than trusted: the ids come
+    // from a browser, and the labels they resolve to are about to be handed
+    // straight to the model as fact.
+    const picked = entry.request.options.filter((option) => optionIds.includes(option.optionId));
+    const answered = !skipped && picked.length > 0;
+
+    entry.resolve({
+      labels: picked.map((option) => option.label),
+      skipped: !answered,
+    });
+
+    this.questions.delete(requestId);
+    this.ingest({
+      t: 'question_resolved',
+      requestId,
+      toolId: entry.request.toolId,
+      optionIds: picked.map((option) => option.optionId),
+      skipped: !answered,
+    });
+    return true;
   }
 
   /**
@@ -715,6 +985,7 @@ export class ChatSession {
       state: this.live ? snapshot.state : 'exited',
       capabilities: this.capabilities || snapshot.capabilities,
       pendingPermissions: Array.from(this.pending.values()).map((entry) => entry.request),
+      pendingQuestions: Array.from(this.questions.values()).map((entry) => entry.request),
       queued: this.queuedTurns,
       live: this.live,
       nativeSessionId: this.nativeSessionId || undefined,
@@ -727,6 +998,14 @@ export class ChatSession {
       approval.resolve?.({ allow: false, reason: 'the session was stopped' });
     }
     this.pending.clear();
+    // The MCP server's socket is about to go with the process, but it is the
+    // one waiting on these promises: resolving them here is what turns a
+    // shutdown into a tool result rather than a connection that simply stops
+    // answering.
+    for (const [, entry] of this.questions) {
+      entry.resolve({ labels: [], error: 'the session was stopped' });
+    }
+    this.questions.clear();
     this.clearQueue();
 
     const adapter = this.adapter;

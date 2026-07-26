@@ -15,6 +15,8 @@
  */
 
 import {
+  AgentRun,
+  AgentStep,
   ChatBlock,
   ChatCapabilities,
   ChatEvent,
@@ -23,6 +25,7 @@ import {
   ChatUsage,
   PermissionRequest,
   PlanItem,
+  QuestionRequest,
   TextBlock,
   ThinkingBlock,
   ToolBlock,
@@ -48,6 +51,26 @@ export interface TranscriptState {
   usage: ChatUsage;
   plan: PlanItem[];
   pendingPermissions: PermissionRequest[];
+  /**
+   * Questions the model asked that nobody has answered yet.
+   *
+   * Held beside the transcript rather than inside a message because a question
+   * outlives the block that asked it: the agent stays blocked across a reload,
+   * and this is what a rejoining browser reads to know there is still a card to
+   * draw. The record of what was *asked and answered* lives in the tool block,
+   * which is where scrolling back finds it.
+   */
+  pendingQuestions: QuestionRequest[];
+  /**
+   * Answers already given, keyed by the tool call that asked.
+   *
+   * Keyed on `toolId` rather than `requestId` because the card that needs it is
+   * drawn from a tool block, and by the time it asks, the request — the only
+   * thing that knew both ids — has been dropped from the pending list. Falls
+   * back to the request id for a question that could not be correlated to a
+   * call, which is answered from the pinned card instead.
+   */
+  answeredQuestions: Record<string, string[]>;
   /** Lowest seq present. Non-zero once the log head has been trimmed. */
   firstSeq: number;
   /** Highest seq applied. Events at or below this are ignored as replays. */
@@ -91,6 +114,8 @@ export function createTranscript(
     usage: {},
     plan: [],
     pendingPermissions: [],
+    pendingQuestions: [],
+    answeredQuestions: {},
     firstSeq: 0,
     cursor: 0,
     currentTurnId: null,
@@ -115,6 +140,51 @@ export function reindexTranscript(state: TranscriptState): void {
 function messageFor(state: TranscriptState, msgId: string): number | null {
   const at = state.index[msgId];
   return at === undefined ? null : at;
+}
+
+/**
+ * Merge only the keys that carry a value.
+ *
+ * A progress report names one thing at a time — the activity now, the tool
+ * name now — and a plain `Object.assign` would write the absent keys back as
+ * `undefined`, erasing what the previous report established. That reads as an
+ * agent whose detail view keeps blanking out mid-run.
+ */
+function assignDefined<T extends object>(target: T, patch: Partial<T>): void {
+  for (const [key, value] of Object.entries(patch)) {
+    if (value !== undefined) (target as Record<string, unknown>)[key] = value;
+  }
+}
+
+function omitUndefined<T extends object>(value: T): Partial<T> {
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry !== undefined) out[key] = entry;
+  }
+  return out as Partial<T>;
+}
+
+/**
+ * The `AgentRun` hanging off a delegation's tool block, created on first use.
+ *
+ * Nothing is buffered when the block is missing, unlike `orphanToolPatches`:
+ * the runtime opens the delegation's own tool call long before it reports
+ * anything happening inside it, so a step with no parent means the parent was
+ * never in this transcript — a replay that started mid-run, say — and inventing
+ * a block to hang it on would put a delegation in the list that the
+ * conversation never made.
+ */
+function locateAgentRun(
+  state: TranscriptState,
+  parentToolId: string,
+): [number, AgentRun] | null {
+  const located = state.toolIndex[parentToolId];
+  if (!located) return null;
+  const [messageIndex, blockIndex] = located;
+  const block = state.messages[messageIndex]?.blocks[blockIndex];
+  if (!block || block.kind !== 'tool') return null;
+  if (!block.agent) block.agent = { steps: [] };
+  return [messageIndex, block.agent];
 }
 
 /**
@@ -274,6 +344,36 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       return { messageIndex, structural: false, meta: false, applied: true };
     }
 
+    case 'agent_step': {
+      const found = locateAgentRun(state, event.parentToolId);
+      if (!found) return NO_CHANGE;
+      const [messageIndex, run] = found;
+      // Upserted by id: a step is opened when the agent calls the tool and
+      // completed by a result that arrives later, and the two have to land on
+      // the same row rather than showing the same call twice.
+      const existing = run.steps.findIndex((step) => step.id === event.step.id);
+      if (existing >= 0) {
+        assignDefined(run.steps[existing], event.step);
+      } else {
+        run.steps.push({
+          name: 'tool',
+          toolKind: 'other',
+          status: 'running',
+          ts: event.ts,
+          ...omitUndefined(event.step),
+        } as AgentStep);
+      }
+      return { messageIndex, structural: false, meta: false, applied: true };
+    }
+
+    case 'agent_progress': {
+      const found = locateAgentRun(state, event.parentToolId);
+      if (!found) return NO_CHANGE;
+      const [messageIndex, run] = found;
+      assignDefined(run, event.patch);
+      return { messageIndex, structural: false, meta: false, applied: true };
+    }
+
     case 'plan': {
       state.plan = event.items;
       return { messageIndex: null, structural: false, meta: true, applied: true };
@@ -302,6 +402,37 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         (pending) => pending.requestId !== event.requestId,
       );
       if (state.state === 'awaiting_permission' && state.pendingPermissions.length === 0) {
+        state.state = 'running';
+      }
+      return { messageIndex: null, structural: false, meta: true, applied: true };
+    }
+
+    case 'question': {
+      const already = state.pendingQuestions.some(
+        (pending) => pending.requestId === event.request.requestId,
+      );
+      if (!already) {
+        state.pendingQuestions.push(event.request);
+      }
+      // Not folded into `awaiting_permission`: the composer, the header and the
+      // stop button all read this, and "waiting for approval" over a question
+      // about which of three approaches to take is simply the wrong sentence.
+      state.state = 'awaiting_answer';
+      return { messageIndex: null, structural: false, meta: true, applied: true };
+    }
+
+    case 'question_resolved': {
+      const asked = state.pendingQuestions.find((pending) => pending.requestId === event.requestId);
+      state.pendingQuestions = state.pendingQuestions.filter(
+        (pending) => pending.requestId !== event.requestId,
+      );
+      // Kept after the fact so the card keeps showing what was picked once the
+      // request itself is gone, without waiting for the runtime to echo a tool
+      // result back.
+      state.answeredQuestions[event.toolId ?? asked?.toolId ?? event.requestId] = event.skipped
+        ? []
+        : [...event.optionIds];
+      if (state.state === 'awaiting_answer' && state.pendingQuestions.length === 0) {
         state.state = 'running';
       }
       return { messageIndex: null, structural: false, meta: true, applied: true };
@@ -339,6 +470,12 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         state.index = {};
         state.plan = [];
         state.lastError = undefined;
+        // The cards go with the conversation they were asked in. A question
+        // card left behind would be drawn against a tool block that is no
+        // longer on screen, and answering it would reach a turn that no longer
+        // exists — the session resolves them at the same moment on its side.
+        state.pendingQuestions = [];
+        state.answeredQuestions = {};
         // And no paging back past it. The log still holds what was said — this
         // is a view, not a delete — but offering "load earlier messages" right
         // after someone asked for a clean window would undo the thing they

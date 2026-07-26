@@ -3,6 +3,7 @@ import * as React from 'react';
 import { Button } from '../ui/relay/Button';
 import { Dialog } from '../ui/relay/Dialog';
 import { Icon } from '../ui/relay/Icon';
+import { TOUCH_TARGET } from '../ui/touch';
 import { IconButton } from '../ui/relay/IconButton';
 import type { ShellTab } from './store';
 
@@ -80,6 +81,9 @@ function TabRow({
           flexDirection: 'column',
           justifyContent: 'center',
           gap: 3,
+          // Stretching to the row was not enough on its own: a row of one short
+          // line is 38px tall, which is under what a thumb reliably hits.
+          minHeight: TOUCH_TARGET,
           border: 'none',
           background: 'transparent',
           color: 'var(--foreground)',
@@ -134,8 +138,12 @@ function TabRow({
           </span>
         ) : null}
       </button>
-      <IconButton label={`Close ${tab.title}`} onClick={onCloseTab}>
-        <Icon name="x" size={15} />
+      <IconButton
+        label={`Close ${tab.title}`}
+        onClick={onCloseTab}
+        style={{ width: TOUCH_TARGET, height: TOUCH_TARGET, flex: '0 0 auto' }}
+      >
+        <Icon name="x" size={18} />
       </IconButton>
     </div>
   );
@@ -171,10 +179,24 @@ export function TabSwitcherSheet({
       onClose={onClose}
       footer={
         <div style={{ display: 'flex', gap: 8, width: '100%' }}>
-          <Button variant="primary" iconLeft={<Icon name="plus" size={14} />} onClick={onNew}>
+          {/* `lg` is 38px, which is still short of a thumb, so the height is
+              stated outright — this sheet only ever appears on a phone. */}
+          <Button
+            variant="primary"
+            size="lg"
+            style={{ height: TOUCH_TARGET }}
+            iconLeft={<Icon name="plus" size={16} />}
+            onClick={onNew}
+          >
             New session
           </Button>
-          <Button variant="secondary" iconLeft={<Icon name="server" size={14} />} onClick={onAllSessions}>
+          <Button
+            variant="secondary"
+            size="lg"
+            style={{ height: TOUCH_TARGET }}
+            iconLeft={<Icon name="server" size={16} />}
+            onClick={onAllSessions}
+          >
             All sessions
           </Button>
         </div>

@@ -329,4 +329,114 @@ describe('claude chat adapter', function () {
       assert.ok(adapter.capabilities.commands.length > 0);
     });
   });
+
+  // ------------------------------------------------------------------
+  // issue #44: what a delegated agent did inside its own work
+  // ------------------------------------------------------------------
+
+  describe('a delegated agent, replayed from a real subagent run', function () {
+    // fixtures/chat/claude-subagent.jsonl is captured traffic, not hand-written:
+    // `claude -p "...use the Task tool..." --output-format stream-json --verbose
+    // --include-partial-messages`. The sub-agent read a file and reported back.
+    const AGENT_TOOL_ID = 'toolu_01VkR42cA7oE6ZFBiBjJJ4j4';
+
+    function replaySubagentRun() {
+      const { adapter, events } = makeAdapter();
+      for (const message of loadFixture('claude-subagent.jsonl')) {
+        adapter.handleMessage(message);
+      }
+      const state = applyAll(events);
+      const [messageIndex, blockIndex] = state.toolIndex[AGENT_TOOL_ID];
+      return { state, events, block: state.messages[messageIndex].blocks[blockIndex] };
+    }
+
+    it('hangs the run off the delegation that started it', function () {
+      const { block } = replaySubagentRun();
+      assert.strictEqual(block.name, 'Agent');
+      assert.ok(block.agent, 'the delegation carries an agent run');
+      assert.strictEqual(block.agent.subagentType, 'general-purpose');
+      assert.ok(block.agent.prompt.includes('hello.txt'));
+    });
+
+    it('records the step the agent actually took, with its input and its result', function () {
+      const { block } = replaySubagentRun();
+      assert.strictEqual(block.agent.steps.length, 1);
+      const [step] = block.agent.steps;
+      assert.strictEqual(step.name, 'Read');
+      assert.strictEqual(step.status, 'completed');
+      assert.ok(step.input.file_path.endsWith('hello.txt'));
+      assert.ok(step.output.includes('BANANAPHONE'));
+    });
+
+    it('keeps the tool name from the opening half rather than the closing one', function () {
+      // The tool_result that completes a step carries no tool name. An earlier
+      // draft sent a whole step both times and the second overwrote `Read`
+      // with a placeholder.
+      const { block } = replaySubagentRun();
+      assert.strictEqual(block.agent.steps[0].name, 'Read');
+      assert.notStrictEqual(block.agent.steps[0].toolKind, 'other');
+    });
+
+    it('reports progress inside the run, not just running vs done', function () {
+      const { block } = replaySubagentRun();
+      assert.strictEqual(block.agent.activity, 'Reading hello.txt');
+      assert.strictEqual(block.agent.lastTool, 'Read');
+      assert.strictEqual(block.agent.toolUses, 1);
+      assert.ok(block.agent.totalTokens > 0);
+    });
+
+    it('marks the run finished when task_updated closes it, which names only a task_id', function () {
+      const { block } = replaySubagentRun();
+      assert.strictEqual(block.agent.status, 'completed');
+    });
+
+    it('leaves no orphan patches: the inner call never reaches the transcript index', function () {
+      // Before this change the sub-agent's own tool_use/tool_result were
+      // emitted as `tool` patches keyed by the inner id, which no block owns,
+      // so they piled up in orphanToolPatches and were never rendered.
+      const { state } = replaySubagentRun();
+      assert.deepStrictEqual(state.orphanToolPatches, {});
+      assert.strictEqual(state.toolIndex['toolu_01RL4bYrSerH1tTitSjPmG7u'], undefined);
+    });
+
+    it('does not add the sub-agent\'s own messages to the conversation', function () {
+      // The agent said things to itself; the transcript shows the delegation,
+      // not a second voice in the main thread.
+      const { state, events } = replaySubagentRun();
+      assert.ok(!events.some((e) => e.t === 'msg_start' && e.role === 'user'));
+      const texts = state.messages.flatMap((m) =>
+        m.blocks.filter((b) => b.kind === 'text').map((b) => b.text),
+      );
+      assert.ok(!texts.some((t) => t.includes('report the magic word it contains')));
+    });
+
+    it('does not blank an earlier progress report with a later, quieter one', function () {
+      // task_progress names one thing at a time. The adapter emits the keys it
+      // has nothing to say about as undefined, so the reducer has to merge only
+      // what is actually set or the detail view blanks out mid-run.
+      const { adapter, events } = makeAdapter();
+      for (const message of loadFixture('claude-subagent.jsonl')) {
+        adapter.handleMessage(message);
+      }
+      adapter.handleMessage({
+        type: 'system',
+        subtype: 'task_progress',
+        task_id: 'a9255a128333cff79',
+        tool_use_id: AGENT_TOOL_ID,
+        usage: { total_tokens: 30000 },
+      });
+      const state = applyAll(events);
+      const [messageIndex, blockIndex] = state.toolIndex[AGENT_TOOL_ID];
+      const { agent } = state.messages[messageIndex].blocks[blockIndex];
+      assert.strictEqual(agent.activity, 'Reading hello.txt');
+      assert.strictEqual(agent.lastTool, 'Read');
+      assert.strictEqual(agent.totalTokens, 30000);
+    });
+
+    it('still delivers the delegation\'s own final result', function () {
+      const { block } = replaySubagentRun();
+      assert.strictEqual(block.status, 'completed');
+      assert.ok(block.output.includes('BANANAPHONE'));
+    });
+  });
 });
