@@ -3,6 +3,22 @@
 ## [5.2.0] - Unreleased
 
 ### Added
+- **A tab you renamed stays renamed, and a reload brings you back to it.** The
+  name you gave a session used to live only in the page you typed it in: reload
+  the browser, or open the app in a second window, and every tab was back to the
+  name it was created with. A chosen name now belongs to the session. It comes
+  back after a reload, it is the same name in every window and on every device,
+  it reaches windows that are already open without them reloading, and it
+  survives the app being restarted and the session being recovered. Sessions
+  nobody renamed are unchanged — they still show their generated name, with the
+  folder name standing in for it.
+
+  The same reload also used to lose your place, dropping you on the first tab
+  whichever one you had been working in. It now returns you to the tab you were
+  last on, remembered per window, so two windows can each sit on their own
+  session. If that session is gone by the time you come back, the app falls back
+  to the first tab rather than showing you nothing.
+
 - **The agent can ask you a question and wait for the answer.** Until now the
   only thing it could put in front of you was an approval — allow or deny a tool
   it was about to run. Anything else it needed to know, it had to ask in prose,

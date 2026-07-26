@@ -119,6 +119,20 @@ export interface SessionRecord {
    * like every row written before this existed.
    */
   chatModelOverride?: string;
+  /**
+   * The label the user chose for this session, when they have chosen one.
+   *
+   * Deliberately not `name`: `name` is the name the session was *created* with,
+   * and the tab strip turns a generated one into the folder name. Keeping the
+   * chosen label in its own field is what lets a renamed tab be renamed
+   * everywhere while a never-renamed one keeps behaving exactly as before —
+   * including when someone renames a tab to something that happens to look like
+   * a generated name.
+   *
+   * Absent means "never renamed", which is what every row written before this
+   * existed carries.
+   */
+  customName?: string;
   terminalOptions: TerminalOptions | null;
   stopRequested: boolean;
   /** Identifies the current PTY run so late callbacks from a previous run are ignored. */
@@ -191,6 +205,8 @@ export interface SessionListItem {
   lastActivity: Date;
   /** Absent means terminal; the client needs it to watch chat sessions it is not driving. */
   surface?: 'terminal' | 'chat';
+  /** The user's chosen label, when there is one. Absent means "never renamed". */
+  customName?: string;
 }
 
 export interface BridgeInterface {

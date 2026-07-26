@@ -28,6 +28,7 @@ import { MoreSheet } from '../../src/client/shell/MoreSheet';
 import { ChatSettingsDialog } from '../../src/client/shell/dialogs/ChatSettingsDialog';
 import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
 import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
+import { TabBar } from '../../src/client/ui/relay/TabBar';
 
 const results: string[] = [];
 const check = (name: string, ok: boolean, detail = ''): void => {
@@ -239,6 +240,7 @@ async function run(): Promise<void> {
   await checkAQuestionIsAnsweredByClicking();
   await checkThePhoneLayoutIsUsable();
   await checkThePhoneShellSurfacesAreUsable();
+  await checkALongTabNameStaysInsideTheStrip();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -2272,6 +2274,114 @@ async function checkThePhoneShellSurfacesAreUsable(): Promise<void> {
     root.unmount();
     frame.remove();
   }
+}
+
+/**
+ * A name the user chose can be any length (issue #54).
+ *
+ * Names used to live only in the page that typed them, so nothing longer than
+ * a session id ever survived to be looked at twice. Now a name is stored and
+ * comes back on every page load, on every device — including the 300-character
+ * one somebody pasted in — so the strip has to keep it inside its own row
+ * instead of stretching until the tabs beside it are unreachable.
+ */
+async function checkALongTabNameStaysInsideTheStrip(): Promise<void> {
+  const LONG = 'a session name that somebody pasted in from a commit message and never shortened, '
+    + 'complete with a path /home/dev/projects/deeply/nested/thing and a ticket reference #54';
+
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;position:absolute;top:0;left:0';
+  document.body.appendChild(host);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(TabBar, {
+      tabs: [
+        { id: 't1', title: LONG, status: 'running' },
+        { id: 't2', title: 'short', status: 'idle' },
+        { id: 't3', title: 'also short', status: 'idle' },
+      ],
+      activeId: 't1',
+      onSelect: () => {},
+      onClose: () => {},
+      onNew: () => {},
+      ariaLabel: 'Sessions',
+    } as never),
+  );
+  await wait(200);
+
+  const strip = host.querySelector('[role="tablist"][aria-label="Sessions"]') as HTMLElement;
+  const tabs = Array.from(strip.querySelectorAll<HTMLElement>('[role="tab"]'));
+  const stripBox = strip.getBoundingClientRect();
+
+  check(
+    'a very long tab name does not widen its tab past the strip’s limit',
+    tabs[0].getBoundingClientRect().width <= 209,
+    `${Math.round(tabs[0].getBoundingClientRect().width)}px`,
+  );
+  check(
+    'the tabs beside it are still on screen',
+    tabs.length === 3 && tabs[2].getBoundingClientRect().right <= stripBox.right + 1,
+    `${tabs.length} tabs, last right=${Math.round(tabs[2]?.getBoundingClientRect().right ?? -1)} strip right=${Math.round(stripBox.right)}`,
+  );
+  check(
+    'the strip is still one row tall',
+    host.getBoundingClientRect().height <= 37,
+    `${Math.round(host.getBoundingClientRect().height)}px`,
+  );
+
+  root.unmount();
+  host.remove();
+
+  // And the same name in the phone's tab switcher, where the row is the whole
+  // width of the screen and there is nowhere for an overflow to hide.
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const sheetRoot = createRoot(doc.body);
+  sheetRoot.render(
+    React.createElement(
+      PhoneContext.Provider,
+      { value: true },
+      React.createElement(TabSwitcherSheet, {
+        open: true,
+        tabs: [
+          { id: 't1', title: LONG, kind: 'chat' },
+          { id: 't2', title: 'short', kind: 'terminal' },
+        ],
+        activeId: 't1',
+        onSelect: () => {}, onCloseTab: () => {}, onNew: () => {},
+        onAllSessions: () => {}, onClose: () => {},
+      } as never),
+    ),
+  );
+  await wait(300);
+  settle(doc);
+
+  const spilling = Array.from(doc.body.querySelectorAll<HTMLElement>('*')).filter((node) => {
+    if (!isPainted(node) || scrollsSideways(node)) return false;
+    const box = node.getBoundingClientRect();
+    return box.right > 391 || box.left < -1;
+  });
+  check(
+    'a very long tab name does not push the phone tab switcher off the side',
+    spilling.length === 0,
+    spilling.length ? spilling.slice(0, 6).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
+  );
+
+  sheetRoot.unmount();
+  frame.remove();
 }
 
 /** The floating menu with its own button already pressed. */
