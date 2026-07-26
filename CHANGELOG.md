@@ -1,6 +1,6 @@
 # Changelog
 
-## [5.2.0] - Unreleased
+## [5.2.0] - 2026-07-27
 
 ### Added
 - **A tab you renamed stays renamed, and a reload brings you back to it.** The
