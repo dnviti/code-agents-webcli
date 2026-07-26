@@ -3,25 +3,30 @@
 ## [5.2.0] - Unreleased
 
 ### Changed
-- **A phone gets a layout built around the conversation.** The chrome is one
-  slim strip above and one row below; everything else is behind a square button
-  floating in the bottom right, or behind a tap on the strip that opens the
-  session's details. The conversation itself now has about four fifths of the
-  screen, where it had under half. The bottom bar is gone — five permanent slots
-  along the bottom edge of a surface whose whole point is what is above them —
-  and everything it held is in the floating menu, together with the controls
-  that used to be a row of buttons in the header.
-- **A phone gets a layout meant for a phone.** The chat surface was the desktop
-  layout at the same size, so the figures you actually read mid-session — the
-  cost, the model, the state, whether approvals are bypassed — were set smaller
-  than the body text, and the controls sat close enough together that hitting
-  the intended one was luck. The header now spends a second line rather than
-  shrinking its type or hiding what is on it; every control a finger is meant
-  to hit is at least 44px with real space around it; and the controls above the
-  composer and in the header say what they are instead of being a bare glyph
-  with a tooltip no touch screen can show. The same treatment reaches the trace
-  rail, the turn index, the model list, the bottom bar, its more sheet and the
-  tab switcher. The desktop and tablet layouts are unchanged.
+- **A phone gets a layout built around the conversation.** It used to be the
+  desktop layout at the same size: the figures you read mid-session — the cost,
+  the model, the state, whether approvals are bypassed — were set smaller than
+  the body text, the controls sat close enough together that hitting the
+  intended one was luck, and more than half the screen went to chrome.
+
+  Now the chat surface is one slim strip above the conversation and one row
+  below it. The strip says what the session is doing and what it has cost;
+  tapping it opens the runtime, the folder, the branch, the tokens, the context
+  meter and the approvals state. The row below is the message field and send,
+  with the attachments, the pickers, the model and the approvals readout behind
+  a *More*. Everything else — search, the turn index, the trace rail, the
+  terminal, the display settings, and every session-level control — is behind a
+  square button floating in the bottom right. The bottom bar is gone with it:
+  five permanent slots along the bottom edge of a surface whose whole point is
+  what is above them.
+
+  The conversation now has about four fifths of a phone screen, where it had
+  under half. Everything a finger is meant to hit is at least 44px with real
+  space around it, nothing carrying live information is smaller than the body
+  text, and every control says what it is rather than being a bare glyph with a
+  tooltip no touch screen can show. The same treatment reaches the trace rail,
+  the turn index, the model list, the more sheet, the tab switcher and the
+  dialogs. The desktop and tablet layouts are unchanged.
 
 ### Fixed
 - **The conversation no longer spills over the live ribbon and the composer on
@@ -31,13 +36,23 @@
 
 ### Internal
 - The automated browser checks run at phone viewports (portrait, keyboard-open
-  and landscape), with each of the phone's own sheets open in turn, and assert
-  the geometry rather than the intent: target size, the space between
-  neighbours, type size, that the named live figures are legible, that every
-  control can be identified without pressing it, and that no region is drawn
-  over another. They also load the app's own stylesheets, without which every
-  `var(--text-2xs)` resolved to nothing and a check measuring type size would
-  have read 16px for text that ships at 10.
+  and landscape), with each of the phone's own disclosures and its menu open in
+  turn, and assert the geometry rather than the intent: target size, the space
+  between neighbours, type size, that the named live figures are legible and
+  reachable, that every control can be identified without pressing it, that no
+  region is drawn over another, and that the chrome takes no more than 170px
+  from the conversation — nothing else would have noticed that drifting back,
+  since every other rule is about the chrome being big enough.
+
+  Three defects in the checks themselves came out of it. They ran in an 800x600
+  window while mounting a 390x740 fixture, so a third of it was off-viewport
+  and anything that asks the viewport a question got the wrong answer. They
+  loaded none of the app's own stylesheets, without which every
+  `var(--text-2xs)` resolved to nothing and a type-size check read 16px for
+  text that ships at 10. And a panel animating in from `opacity: 0` was skipped
+  as invisible in headless Chrome, so a whole state was reported clean without
+  measuring anything — the menu rises without fading now, which also means it
+  is there under reduced motion and on a dropped first frame.
 
 ## [5.1.2] - 2026-07-26
 
