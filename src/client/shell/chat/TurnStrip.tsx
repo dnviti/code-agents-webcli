@@ -147,7 +147,7 @@ export function TurnStrip({
           >
             <Icon name={glyph.icon} size={11} />
           </span>
-          <Shrinkable>{turn.label}</Shrinkable>
+          <Shrinkable fontSize="var(--text-xs)">{turn.label}</Shrinkable>
         </>
       ) : null}
 
@@ -188,8 +188,21 @@ export function TurnStrip({
   );
 }
 
-/** A meta item that gives up its own width before the row wraps. */
-function Shrinkable({ children }: { children: React.ReactNode }): React.JSX.Element {
+/**
+ * Text that gives up its width before anything else in the bar does.
+ *
+ * `nowrap` is what makes the ellipsis work at all: without it the text wraps
+ * instead of being cut, and since the bar is a fixed height the second line
+ * simply leaves it. The other users of this sit inside a span that already
+ * sets both that and a size; the turn label does not, so it says so itself.
+ */
+function Shrinkable({
+  children,
+  fontSize,
+}: {
+  children: React.ReactNode;
+  fontSize?: string | number;
+}): React.JSX.Element {
   return (
     <span
       style={{
@@ -197,6 +210,8 @@ function Shrinkable({ children }: { children: React.ReactNode }): React.JSX.Elem
         minWidth: 0,
         overflow: 'hidden',
         textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+        fontSize,
       }}
     >
       {children}

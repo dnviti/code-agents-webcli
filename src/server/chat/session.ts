@@ -681,6 +681,25 @@ export class ChatSession {
     return true;
   }
 
+  /**
+   * Record the model an in-place restart must launch with.
+   *
+   * `restart()` replays the options this session was last started with, and
+   * those were resolved once, at launch. Everything in them is fixed for the
+   * life of the conversation except the model, which `chat_set_model` can
+   * change underneath them — so without this a `/clear` would quietly
+   * reinstate the model the conversation happened to open with, discarding a
+   * choice the browser has already been told was applied.
+   *
+   * Takes the effective model rather than the override, so clearing an
+   * override lands on the profile default here exactly as it would on a fresh
+   * launch.
+   */
+  rememberModel(model: string | undefined): void {
+    if (!this.lastStartOptions) return;
+    this.lastStartOptions = { ...this.lastStartOptions, model };
+  }
+
   snapshot(): Promise<ChatSnapshot> {
     return this.deps.store.snapshot(this.ref).then((snapshot) => ({
       ...snapshot,
