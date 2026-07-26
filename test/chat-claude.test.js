@@ -295,7 +295,8 @@ describe('claude chat adapter', function () {
   describe('capabilities', function () {
     it('advertises streaming/thinking/toolCalls/resume/interrupt/attachments but not diffs or permissions', function () {
       const { adapter } = makeAdapter();
-      assert.deepStrictEqual(adapter.capabilities, {
+      const { commands, ...rest } = adapter.capabilities;
+      assert.deepStrictEqual(rest, {
         streaming: true,
         thinking: true,
         toolCalls: true,
@@ -309,6 +310,23 @@ describe('claude chat adapter', function () {
         cost: true,
         plan: false,
       });
+    });
+
+    it('advertises a baseline command list before the runtime has said anything', function () {
+      const { adapter } = makeAdapter();
+      assert.ok(adapter.capabilities.commands.length > 0);
+      assert.ok(adapter.capabilities.commands.some((c) => c.name === 'resume'));
+      assert.ok(adapter.capabilities.commands.every((c) => c.description));
+    });
+  });
+
+  describe('before the first turn', function () {
+    it('a freshly constructed adapter already has a non-empty command list, so the menu never starts empty', function () {
+      const { adapter } = makeAdapter();
+      // No handleMessage call at all here: this is the state the session sees
+      // the instant the process is spawned, before Claude has said a word.
+      assert.ok(Array.isArray(adapter.capabilities.commands));
+      assert.ok(adapter.capabilities.commands.length > 0);
     });
   });
 });

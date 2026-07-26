@@ -49,6 +49,21 @@ export function describeSlashCommand(name: string): string | undefined {
 }
 
 /**
+ * The built-ins, as a menu the picker can show before a runtime has said
+ * anything about itself.
+ *
+ * Claude does not report `slash_commands` until it has processed a first
+ * turn (see claude.ts), which used to mean a brand-new session showed no
+ * command menu at all until one message had already been sent. This table is
+ * this app's own knowledge of what a fresh Claude session accepts, not
+ * something Claude told it — a project or plugin command still only appears
+ * once the real `init` arrives and replaces this list outright.
+ */
+export function defaultSlashCommands(): { name: string; description: string }[] {
+  return Object.entries(BUILT_IN).map(([name, description]) => ({ name, description }));
+}
+
+/**
  * Commands that empty the conversation.
  *
  * The runtime clears its own context when it sees one of these; the transcript
