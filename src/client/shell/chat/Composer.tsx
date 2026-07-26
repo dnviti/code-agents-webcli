@@ -1144,7 +1144,16 @@ function ModelChip({
   };
 
   return (
-    <div ref={ref} style={{ position: 'relative', flex: '0 0 auto' }}>
+    <div
+      ref={ref}
+      style={{
+        // Static on a phone so the list below resolves against the composer
+        // rather than this chip: anchored to a chip sitting near the right
+        // edge of a 390px screen, a 200px-wide list hangs off it.
+        position: isPhone ? 'static' : 'relative',
+        flex: '0 0 auto',
+      }}
+    >
       <button
         type="button"
         aria-haspopup="listbox"
@@ -1177,11 +1186,14 @@ function ModelChip({
           aria-label="Models"
           style={{
             position: 'absolute',
+            // On a phone this resolves against the composer (see above), so
+            // pinning both edges gives the list the composer's own width.
             right: 0,
+            left: isPhone ? 0 : undefined,
             bottom: '100%',
             marginBottom: 6,
-            minWidth: 200,
-            maxHeight: 260,
+            minWidth: isPhone ? 0 : 200,
+            maxHeight: isPhone ? '50vh' : 260,
             overflowY: 'auto',
             display: 'flex',
             flexDirection: 'column',
@@ -1194,7 +1206,7 @@ function ModelChip({
             zIndex: 'var(--z-dropdown)' as unknown as number,
           }}
         >
-          <div style={{ display: 'flex', gap: 4, padding: '2px 2px 6px' }}>
+          <div style={{ display: 'flex', gap: isPhone ? TOUCH_GAP : 4, padding: '2px 2px 6px' }}>
             <input
               ref={inputRef}
               value={customValue}
@@ -1210,14 +1222,16 @@ function ModelChip({
               style={{
                 flex: 1,
                 minWidth: 0,
-                height: 24,
-                padding: '0 6px',
+                height: isPhone ? TOUCH_TARGET : 24,
+                padding: isPhone ? '0 10px' : '0 6px',
                 background: 'var(--background)',
                 border: '1px solid var(--border)',
                 borderRadius: 'var(--radius)',
                 color: 'var(--foreground)',
                 font: 'inherit',
-                fontSize: 'var(--text-xs)',
+                // `input`, not `body`: see PHONE_TEXT — anything smaller and
+                // iOS Safari zooms the page the moment this takes focus.
+                fontSize: isPhone ? PHONE_TEXT.input : 'var(--text-xs)',
               }}
             />
             <button
@@ -1227,13 +1241,13 @@ function ModelChip({
               aria-label="Use this model"
               style={{
                 flex: '0 0 auto',
-                height: 24,
-                padding: '0 8px',
+                height: isPhone ? TOUCH_TARGET : 24,
+                padding: isPhone ? '0 14px' : '0 8px',
                 background: 'transparent',
                 border: '1px solid var(--border)',
                 borderRadius: 'var(--radius)',
                 color: 'var(--foreground)',
-                fontSize: 'var(--text-2xs)',
+                fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-2xs)',
                 cursor: customValue.trim() ? 'pointer' : 'not-allowed',
                 opacity: customValue.trim() ? 1 : 0.5,
               }}
@@ -1254,13 +1268,14 @@ function ModelChip({
                 flexDirection: 'column',
                 gap: 2,
                 width: '100%',
-                padding: '5px 8px',
+                minHeight: isPhone ? TOUCH_TARGET : undefined,
+                padding: isPhone ? '8px 12px' : '5px 8px',
                 background: 'transparent',
                 border: 0,
                 borderRadius: 'var(--radius)',
                 color: 'var(--foreground)',
                 font: 'inherit',
-                fontSize: 'var(--text-xs)',
+                fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
                 textAlign: 'left',
                 cursor: 'pointer',
               }}
@@ -1277,7 +1292,7 @@ function ModelChip({
               style={{
                 padding: '4px 8px 2px',
                 color: 'var(--muted-foreground)',
-                fontSize: 'var(--text-2xs)',
+                fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-2xs)',
               }}
             >
               This runtime hasn&apos;t listed models — type one above.
@@ -1297,14 +1312,15 @@ function ModelChip({
             style={{
               width: '100%',
               marginTop: 2,
-              padding: '5px 8px',
+              minHeight: isPhone ? TOUCH_TARGET : undefined,
+              padding: isPhone ? '8px 12px' : '5px 8px',
               background: 'transparent',
               border: 0,
               borderTop: '1px solid var(--border)',
               borderRadius: 0,
               color: 'var(--muted-foreground)',
               font: 'inherit',
-              fontSize: 'var(--text-xs)',
+              fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
               textAlign: 'left',
               cursor: 'pointer',
             }}
@@ -1331,7 +1347,7 @@ function ModelChip({
               feedback.applied === 'live'
                 ? 'var(--foreground)'
                 : 'var(--muted-foreground)',
-            fontSize: 'var(--text-2xs)',
+            fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-2xs)',
             zIndex: 'var(--z-dropdown)' as unknown as number,
           }}
         >

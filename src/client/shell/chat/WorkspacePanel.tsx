@@ -14,6 +14,7 @@ import type { ChatTranscript } from '../../chat/transcript.js';
 import { fetchFiles, type WorkspaceFiles } from '../../chat/workspace-api.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
+import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { AgentsPanel } from './AgentsPanel.js';
 import { FileTreePanel, type FileTreeEntry } from './FileTreePanel.js';
 import { GitChangesPanel } from './GitChangesPanel.js';
@@ -441,6 +442,7 @@ function RailHeader({
   const scroller = React.useRef<HTMLDivElement | null>(null);
   const overflowing = useOverflowing(scroller, [tabs.join(' ')]);
   const [menuOpen, setMenuOpen] = React.useState(false);
+  const isPhone = usePhone();
 
   // A rail dragged back out until every tab fits again must not leave a menu
   // hanging under a button that is no longer there.
@@ -453,7 +455,7 @@ function RailHeader({
       style={{
         display: 'flex',
         alignItems: 'center',
-        minHeight: 34,
+        minHeight: isPhone ? TOUCH_TARGET + 8 : 34,
         borderBottom: '1px solid var(--border)',
         flex: '0 0 auto',
       }}
@@ -470,8 +472,8 @@ function RailHeader({
           minWidth: 0,
           display: 'flex',
           alignItems: 'center',
-          gap: 2,
-          padding: '0 2px 0 4px',
+          gap: isPhone ? TOUCH_GAP : 2,
+          padding: isPhone ? '0 4px 0 8px' : '0 2px 0 4px',
           overflowX: 'auto',
           scrollbarWidth: 'none',
         }}
@@ -491,10 +493,11 @@ function RailHeader({
           screen that says so, and a tab you cannot see and cannot scroll to is
           simply gone. This is the way back. */}
       {overflowing ? (
-        <div style={{ flex: '0 0 auto', position: 'relative' }}>
+        <div style={{ flex: '0 0 auto', position: 'relative', marginLeft: isPhone ? TOUCH_GAP : 0 }}>
           <IconButton
             label="All workspace panels"
-            size="sm"
+            size={isPhone ? 'lg' : 'sm'}
+            style={isPhone ? { width: TOUCH_TARGET, height: TOUCH_TARGET } : undefined}
             aria-haspopup="menu"
             aria-expanded={menuOpen}
             active={menuOpen}
@@ -516,8 +519,19 @@ function RailHeader({
         </div>
       ) : null}
 
-      <div style={{ flex: '0 0 auto', padding: '0 4px' }}>
-        <IconButton label="Close workspace panel" size="sm" onClick={onClose}>
+      <div
+        style={{
+          flex: '0 0 auto',
+          padding: isPhone ? '0 6px' : '0 4px',
+          marginLeft: isPhone ? TOUCH_GAP : 0,
+        }}
+      >
+        <IconButton
+          label="Close workspace panel"
+          size={isPhone ? 'lg' : 'sm'}
+          style={isPhone ? { width: TOUCH_TARGET, height: TOUCH_TARGET } : undefined}
+          onClick={onClose}
+        >
           <Icon name="x" />
         </IconButton>
       </div>
@@ -670,6 +684,7 @@ function TabButton({
   onSelect: () => void;
 }): React.JSX.Element {
   const ref = React.useRef<HTMLButtonElement | null>(null);
+  const isPhone = usePhone();
 
   // Five tabs do not fit 320px, so the row scrolls — and a selection restored
   // from storage could sit outside it, leaving the panel showing content whose
@@ -691,15 +706,15 @@ function TabButton({
         display: 'inline-flex',
         alignItems: 'center',
         gap: 5,
-        height: 28,
-        padding: '0 8px',
+        height: isPhone ? TOUCH_TARGET : 28,
+        padding: isPhone ? '0 12px' : '0 8px',
         background: 'transparent',
         border: 0,
         borderRadius: 'var(--radius)',
         color: selected ? 'var(--foreground)' : 'var(--muted-foreground)',
         boxShadow: selected ? 'inset 0 -2px 0 var(--foreground)' : 'none',
         font: 'inherit',
-        fontSize: 'var(--text-xs)',
+        fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
         fontWeight: selected
           ? ('var(--font-medium)' as React.CSSProperties['fontWeight'])
           : undefined,
@@ -707,7 +722,7 @@ function TabButton({
         whiteSpace: 'nowrap',
       }}
     >
-      <Icon name={CHAT_PANEL_ICONS[id]} size={12} />
+      <Icon name={CHAT_PANEL_ICONS[id]} size={isPhone ? 16 : 12} />
       {CHAT_PANEL_LABELS[id]}
     </button>
   );

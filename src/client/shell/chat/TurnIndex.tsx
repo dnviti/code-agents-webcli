@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { Icon } from '../../ui/relay/Icon.js';
+import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { STATUS_GLYPH, type TurnSummary } from '../../chat/turns.js';
 
 /**
@@ -41,6 +42,7 @@ export function TurnIndex({
   onCollapseAll,
 }: TurnIndexProps): React.JSX.Element {
   const listRef = React.useRef<HTMLDivElement | null>(null);
+  const isPhone = usePhone();
 
   const move = React.useCallback(
     (delta: number) => {
@@ -87,12 +89,13 @@ export function TurnIndex({
           flex: '0 0 auto',
           display: 'flex',
           alignItems: 'center',
-          gap: 8,
-          height: 28,
-          padding: collapsed ? '0 6px' : '0 10px',
+          gap: isPhone ? TOUCH_GAP : 8,
+          height: isPhone ? undefined : 28,
+          minHeight: isPhone ? TOUCH_TARGET + 8 : undefined,
+          padding: collapsed ? '0 6px' : isPhone ? '4px 12px' : '0 10px',
           borderBottom: '1px solid var(--border)',
           fontFamily: 'var(--font-mono)',
-          fontSize: 10,
+          fontSize: isPhone ? PHONE_TEXT.meta : 10,
           color: 'var(--muted-foreground)',
         }}
       >
@@ -105,7 +108,7 @@ export function TurnIndex({
         {/* Icon-rail width has no room for these — the row is already tight
             around the count at 44px. */}
         {!collapsed && (onExpandAll || onCollapseAll) ? (
-          <span style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: isPhone ? TOUCH_GAP : 2 }}>
             {onExpandAll ? (
               <FoldAllButton label="Expand every turn" icon="maximize-2" onClick={onExpandAll} />
             ) : null}
@@ -160,18 +163,18 @@ export function TurnIndex({
           alignItems: 'center',
           justifyContent: collapsed ? 'center' : 'flex-start',
           gap: 6,
-          height: 30,
-          padding: collapsed ? 0 : '0 10px',
+          height: isPhone ? TOUCH_TARGET : 30,
+          padding: collapsed ? 0 : isPhone ? '0 12px' : '0 10px',
           background: 'transparent',
           border: 0,
           borderTop: '1px solid var(--border)',
           fontFamily: 'var(--font-mono)',
-          fontSize: 10,
+          fontSize: isPhone ? PHONE_TEXT.body : 10,
           color: 'var(--muted-foreground)',
           cursor: 'pointer',
         }}
       >
-        <Icon name="arrow-down" size={10} />
+        <Icon name="arrow-down" size={isPhone ? 16 : 10} />
         {collapsed ? null : 'jump to latest'}
       </button>
     </nav>
@@ -192,6 +195,7 @@ function FoldAllButton({
   onClick: () => void;
 }): React.JSX.Element {
   const [hover, setHover] = React.useState(false);
+  const isPhone = usePhone();
   return (
     <button
       type="button"
@@ -207,8 +211,8 @@ function FoldAllButton({
         alignItems: 'center',
         justifyContent: 'center',
         flex: '0 0 auto',
-        width: 18,
-        height: 18,
+        width: isPhone ? TOUCH_TARGET : 18,
+        height: isPhone ? TOUCH_TARGET : 18,
         padding: 0,
         background: hover ? 'var(--accent)' : 'transparent',
         border: 0,
@@ -217,7 +221,7 @@ function FoldAllButton({
         cursor: 'pointer',
       }}
     >
-      <Icon name={icon} size={11} />
+      <Icon name={icon} size={isPhone ? 18 : 11} />
     </button>
   );
 }
@@ -234,6 +238,7 @@ function TurnRow({
   onSelect: () => void;
 }): React.JSX.Element {
   const [hover, setHover] = React.useState(false);
+  const isPhone = usePhone();
   const glyph = STATUS_GLYPH[turn.status] || STATUS_GLYPH.done;
   const number = String(turn.index).padStart(2, '0');
 
@@ -255,7 +260,8 @@ function TurnRow({
         alignItems: 'center',
         gap: 7,
         flex: '0 0 auto',
-        padding: collapsed ? '6px 4px' : '6px 10px',
+        minHeight: isPhone ? TOUCH_TARGET : undefined,
+        padding: collapsed ? '6px 4px' : isPhone ? '8px 12px' : '6px 10px',
         textAlign: 'left',
         background: active ? 'var(--accent)' : hover ? 'var(--accent)' : 'transparent',
         border: 0,
@@ -271,9 +277,9 @@ function TurnRow({
       <span
         style={{
           flex: '0 0 auto',
-          width: 14,
+          width: isPhone ? 20 : 14,
           fontFamily: 'var(--font-mono)',
-          fontSize: 10,
+          fontSize: isPhone ? PHONE_TEXT.meta : 10,
           color: active ? 'var(--foreground)' : 'var(--muted-foreground)',
         }}
       >
@@ -288,14 +294,14 @@ function TurnRow({
           animation: glyph.spin ? 'relay-spin 900ms linear infinite' : undefined,
         }}
       >
-        <Icon name={glyph.icon} size={10} />
+        <Icon name={glyph.icon} size={isPhone ? 14 : 10} />
       </span>
       {collapsed ? null : (
         <span
           style={{
             flex: 1,
             minWidth: 0,
-            fontSize: 'var(--text-xs)',
+            fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
             fontWeight: active ? 'var(--font-medium)' : 'var(--font-normal)',
             overflow: 'hidden',
             textOverflow: 'ellipsis',

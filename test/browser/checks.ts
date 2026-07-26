@@ -764,10 +764,28 @@ function isPainted(node: Element): boolean {
  * own icon every time.
  */
 function paintedControls(root: HTMLElement): HTMLElement[] {
+  const rootBox = root.getBoundingClientRect();
   const all = Array.from(
     root.querySelectorAll<HTMLElement>('button, input, select, textarea, [role="tab"], [role="option"], a[href]'),
-  ).filter(isPainted);
+  ).filter(isPainted).filter((node) => {
+    // A sheet's scrim is a control by markup and a gesture by intent: it is the
+    // empty half of the screen you tap to dismiss, so it abuts the sheet on
+    // purpose and has no size of its own to meet. Recognised by what it is —
+    // an empty element covering most of the surface — rather than by a name.
+    const box = node.getBoundingClientRect();
+    const empty = !(node.textContent || '').trim() && node.childElementCount === 0;
+    return !(empty && box.width * box.height > rootBox.width * rootBox.height * 0.2);
+  });
   return all.filter((node) => !all.some((other) => other !== node && other.contains(node)));
+}
+
+/** Whether any ancestor up to the host deliberately scrolls this node sideways. */
+function scrollsSideways(node: Element): boolean {
+  for (let at: Element | null = node.parentElement; at; at = at.parentElement) {
+    const overflowX = window.getComputedStyle(at).overflowX;
+    if (overflowX === 'auto' || overflowX === 'scroll') return true;
+  }
+  return false;
 }
 
 /** Elements that render a word of their own, with the size that word is set at. */
@@ -786,8 +804,10 @@ function paintedText(root: HTMLElement): Array<{ node: HTMLElement; size: number
 }
 
 function describe(node: HTMLElement, text?: string): string {
-  const label = text || node.getAttribute('aria-label') || (node.textContent || '').trim();
-  return `${node.tagName.toLowerCase()}${label ? `:${label.slice(0, 20)}` : ''}`;
+  const label = (text || node.getAttribute('aria-label') || node.textContent || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return `${node.tagName.toLowerCase()}${label ? `:${label.slice(0, 24)}` : ''}`;
 }
 
 /**
@@ -799,6 +819,136 @@ function describe(node: HTMLElement, text?: string): string {
  * does the composer survive losing the height — is the same either way), and
  * landscape is where a row that only wrapped by luck stops wrapping.
  */
+/**
+ * Every phone rule, against whatever is currently on screen.
+ *
+ * Separate from the mount so it can be run again with a sheet open — see the
+ * loop in the caller. `where` names the state, so a failure says which one.
+ */
+function assertPhoneSurface(host: HTMLElement, where: string): void {
+  const hostBox = host.getBoundingClientRect();
+
+  // 1. Every control a finger is meant to hit.
+  const controls = paintedControls(host);
+  const small = controls.filter((node) => {
+    const box = node.getBoundingClientRect();
+    return box.width < PHONE_TARGET - 0.5 || box.height < PHONE_TARGET - 0.5;
+  });
+  check(
+    `every control is at least ${PHONE_TARGET}px in ${where}`,
+    small.length === 0,
+    small.length
+      ? small
+          .slice(0, 8)
+          .map((n) => {
+            const b = n.getBoundingClientRect();
+            return `${describe(n)}=${Math.round(b.width)}x${Math.round(b.height)}`;
+          })
+          .join(' | ')
+      : `${controls.length} controls`,
+  );
+
+  // 2. And far enough from the one next to it. Only pairs that actually sit
+  //    side by side on the same line can be mistapped for each other.
+  const byLeft = [...controls].sort(
+    (a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left,
+  );
+  const crowded: string[] = [];
+  for (let i = 0; i < byLeft.length; i++) {
+    const a = byLeft[i].getBoundingClientRect();
+    for (let j = i + 1; j < byLeft.length; j++) {
+      const b = byLeft[j].getBoundingClientRect();
+      const sameLine = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > Math.min(a.height, b.height) / 2;
+      if (!sameLine) continue;
+      // A control clipped by a sideways scroller has a box that no longer says
+      // where it is on screen, so measuring it against one outside the scroller
+      // reports a gap that is not there.
+      if (scrollsSideways(byLeft[i]) !== scrollsSideways(byLeft[j])) continue;
+      const gap = b.left - a.right;
+      // Only the nearest neighbour to the right matters; anything further is
+      // separated by that one.
+      if (gap < -0.5) continue;
+      if (gap < PHONE_GAP - 0.5) {
+        crowded.push(`${describe(byLeft[i])}↔${describe(byLeft[j])}=${Math.round(gap)}px`);
+      }
+      break;
+    }
+  }
+  check(
+    `neighbouring controls are at least ${PHONE_GAP}px apart in ${where}`,
+    crowded.length === 0,
+    crowded.length ? crowded.slice(0, 8).join(' | ') : 'no crowded pairs',
+  );
+
+  // 3. Nothing is set in text too small to read.
+  const texts = paintedText(host);
+  const tiny = texts.filter((t) => t.size < PHONE_MIN_TEXT - 0.01);
+  check(
+    `no text is smaller than ${PHONE_MIN_TEXT}px in ${where}`,
+    tiny.length === 0,
+    tiny.length
+      ? tiny.slice(0, 8).map((t) => `${describe(t.node, t.text)}@${t.size}px`).join(' | ')
+      : `${texts.length} text nodes`,
+  );
+
+  // 4. The live session figures specifically — the ones somebody reads
+  //    mid-session and the issue names one by one.
+  const live: Array<[string, HTMLElement | null]> = [
+    ['the state', host.querySelector('header [role="status"]')],
+    ['the cost and tokens', host.querySelector('[aria-label="Session usage"]')],
+    ['the approvals state', host.querySelector('[aria-label="Approvals bypassed"]')],
+    ['the model', host.querySelector('[aria-label="Change model"]')],
+  ];
+  for (const [label, node] of live) {
+    if (!node) {
+      check(`${label} is on screen in ${where}`, false, 'not found');
+      continue;
+    }
+    const size = parseFloat(window.getComputedStyle(node).fontSize) || 0;
+    check(
+      `${label} is at least ${PHONE_LIVE_TEXT}px in ${where}`,
+      size >= PHONE_LIVE_TEXT - 0.01,
+      `${size}px`,
+    );
+  }
+
+  // 5. Nothing is pushed off the side. Vertical overflow inside the
+  //    conversation is scrolling and expected; horizontal overflow is a row
+  //    that refused to wrap, which is the defect.
+  const offscreen = Array.from(host.querySelectorAll<HTMLElement>('*')).filter((node) => {
+    if (!isPainted(node)) return false;
+    // Popovers and sheets are allowed to be positioned relative to the
+    // viewport rather than this host.
+    if (window.getComputedStyle(node).position === 'fixed') return false;
+    // Nor is a row that deliberately scrolls sideways off-screen: the workspace
+    // tab strip is a scroller with a way back to what it is hiding. What this
+    // is looking for is content pushed out of a box that does not scroll.
+    if (scrollsSideways(node)) return false;
+    const box = node.getBoundingClientRect();
+    return box.right > hostBox.right + 1 || box.left < hostBox.left - 1;
+  });
+  check(
+    `nothing is pushed off the side in ${where}`,
+    offscreen.length === 0,
+    offscreen.length ? offscreen.slice(0, 8).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
+  );
+
+  // 6. The composer is the one thing that must survive every viewport: a
+  //    phone with no way to type is not a degraded layout, it is a dead app.
+  const textarea = host.querySelector('textarea') as HTMLElement | null;
+  if (!textarea) {
+    check(`the composer is reachable in ${where}`, false, 'no textarea');
+  } else {
+    const box = textarea.getBoundingClientRect();
+    check(
+      `the composer is fully on screen in ${where}`,
+      box.top >= hostBox.top - 1 && box.bottom <= hostBox.bottom + 1 && box.height > 0,
+      `composer ${Math.round(box.top)}–${Math.round(box.bottom)}, surface ${Math.round(hostBox.top)}–${Math.round(hostBox.bottom)}`,
+    );
+  }
+
+}
+
 async function checkThePhoneLayoutIsUsable(): Promise<void> {
   const host = document.createElement('div');
   document.body.appendChild(host);
@@ -850,139 +1000,57 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
     ['landscape', 740, 390],
   ];
 
+  /**
+   * The base surface, and the same surface with each of the phone's own
+   * overlays open.
+   *
+   * A check only ever covers what its fixture reaches. The trace rail, the turn
+   * index and the model list are all sheets on a phone, and asserting the
+   * closed state alone is how a layout ends up correct in the chrome and
+   * untouched everywhere behind it.
+   */
+  const states: Array<[string, string | null]> = [
+    ['', null],
+    ['with the trace rail open', '[aria-label="Show the trace rail"]'],
+    ['with the turn index open', '[aria-label="Show the turn index"]'],
+    ['with the model list open', '[aria-label="Change model"]'],
+  ];
+
   for (const [name, width, height] of viewports) {
-    // A fresh mount per viewport: the surface measures itself to decide which
-    // zones fit, and re-rendering a live tree into a resized box is not the
-    // same thing as opening it at that size.
-    host.style.cssText = `width:${width}px;height:${height}px;position:absolute;top:0;left:0;display:flex;overflow:hidden`;
-    const root = createRoot(host);
-    root.render(
-      React.createElement(ChatView, {
-        controller,
-        runtime: 'claude',
-        runtimeLabel: 'Claude Code',
-        workingDir: '/home/dev/projects/a-rather-deeply-nested-working-directory',
-        isMobile: true,
-        view: { ...DEFAULT_CHAT_VIEW },
-        onViewChange: () => {},
-      } as never),
-    );
-    await wait(400);
+    for (const [state, opens] of states) {
+      // A fresh mount per state, not a toggle: closing a sheet is its own
+      // control, and a second click on the opener left the previous sheet up
+      // and reported its offences against every state after it.
+      host.style.cssText = `width:${width}px;height:${height}px;position:absolute;top:0;left:0;display:flex;overflow:hidden`;
+      const root = createRoot(host);
+      root.render(
+        React.createElement(ChatView, {
+          controller,
+          runtime: 'claude',
+          runtimeLabel: 'Claude Code',
+          workingDir: '/home/dev/projects/a-rather-deeply-nested-working-directory',
+          isMobile: true,
+          view: { ...DEFAULT_CHAT_VIEW },
+          onViewChange: () => {},
+        } as never),
+      );
+      await wait(400);
 
-    const hostBox = host.getBoundingClientRect();
-
-    // 1. Every control a finger is meant to hit.
-    const controls = paintedControls(host);
-    const small = controls.filter((node) => {
-      const box = node.getBoundingClientRect();
-      return box.width < PHONE_TARGET - 0.5 || box.height < PHONE_TARGET - 0.5;
-    });
-    check(
-      `every control is at least ${PHONE_TARGET}px in ${name}`,
-      small.length === 0,
-      small.length
-        ? small
-            .slice(0, 8)
-            .map((n) => {
-              const b = n.getBoundingClientRect();
-              return `${describe(n)}=${Math.round(b.width)}x${Math.round(b.height)}`;
-            })
-            .join(' | ')
-        : `${controls.length} controls`,
-    );
-
-    // 2. And far enough from the one next to it. Only pairs that actually sit
-    //    side by side on the same line can be mistapped for each other.
-    const byLeft = [...controls].sort(
-      (a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left,
-    );
-    const crowded: string[] = [];
-    for (let i = 0; i < byLeft.length; i++) {
-      const a = byLeft[i].getBoundingClientRect();
-      for (let j = i + 1; j < byLeft.length; j++) {
-        const b = byLeft[j].getBoundingClientRect();
-        const sameLine = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > Math.min(a.height, b.height) / 2;
-        if (!sameLine) continue;
-        const gap = b.left - a.right;
-        // Only the nearest neighbour to the right matters; anything further is
-        // separated by that one.
-        if (gap < -0.5) continue;
-        if (gap < PHONE_GAP - 0.5) {
-          crowded.push(`${describe(byLeft[i])}↔${describe(byLeft[j])}=${Math.round(gap)}px`);
+      const where = state ? `${name} ${state}` : name;
+      if (opens) {
+        const opener = host.querySelector(opens) as HTMLElement | null;
+        if (!opener) {
+          check(`the phone surface can open the sheet ${state} in ${name}`, false, `no ${opens}`);
+          root.unmount();
+          continue;
         }
-        break;
+        opener.click();
+        await wait(300);
       }
+
+      assertPhoneSurface(host, where);
+      root.unmount();
     }
-    check(
-      `neighbouring controls are at least ${PHONE_GAP}px apart in ${name}`,
-      crowded.length === 0,
-      crowded.length ? crowded.slice(0, 8).join(' | ') : 'no crowded pairs',
-    );
-
-    // 3. Nothing is set in text too small to read.
-    const texts = paintedText(host);
-    const tiny = texts.filter((t) => t.size < PHONE_MIN_TEXT - 0.01);
-    check(
-      `no text is smaller than ${PHONE_MIN_TEXT}px in ${name}`,
-      tiny.length === 0,
-      tiny.length
-        ? tiny.slice(0, 8).map((t) => `${describe(t.node, t.text)}@${t.size}px`).join(' | ')
-        : `${texts.length} text nodes`,
-    );
-
-    // 4. The live session figures specifically — the ones somebody reads
-    //    mid-session and the issue names one by one.
-    const live: Array<[string, HTMLElement | null]> = [
-      ['the state', host.querySelector('header [role="status"]')],
-      ['the cost and tokens', host.querySelector('[aria-label="Session usage"]')],
-      ['the approvals state', host.querySelector('[aria-label="Approvals bypassed"]')],
-      ['the model', host.querySelector('[aria-label="Change model"]')],
-    ];
-    for (const [label, node] of live) {
-      if (!node) {
-        check(`${label} is on screen in ${name}`, false, 'not found');
-        continue;
-      }
-      const size = parseFloat(window.getComputedStyle(node).fontSize) || 0;
-      check(
-        `${label} is at least ${PHONE_LIVE_TEXT}px in ${name}`,
-        size >= PHONE_LIVE_TEXT - 0.01,
-        `${size}px`,
-      );
-    }
-
-    // 5. Nothing is pushed off the side. Vertical overflow inside the
-    //    conversation is scrolling and expected; horizontal overflow is a row
-    //    that refused to wrap, which is the defect.
-    const offscreen = Array.from(host.querySelectorAll<HTMLElement>('*')).filter((node) => {
-      if (!isPainted(node)) return false;
-      // Popovers and sheets are allowed to be positioned relative to the
-      // viewport rather than this host.
-      if (window.getComputedStyle(node).position === 'fixed') return false;
-      const box = node.getBoundingClientRect();
-      return box.right > hostBox.right + 1 || box.left < hostBox.left - 1;
-    });
-    check(
-      `nothing is pushed off the side in ${name}`,
-      offscreen.length === 0,
-      offscreen.length ? offscreen.slice(0, 8).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
-    );
-
-    // 6. The composer is the one thing that must survive every viewport: a
-    //    phone with no way to type is not a degraded layout, it is a dead app.
-    const textarea = host.querySelector('textarea') as HTMLElement | null;
-    if (!textarea) {
-      check(`the composer is reachable in ${name}`, false, 'no textarea');
-    } else {
-      const box = textarea.getBoundingClientRect();
-      check(
-        `the composer is fully on screen in ${name}`,
-        box.top >= hostBox.top - 1 && box.bottom <= hostBox.bottom + 1 && box.height > 0,
-        `composer ${Math.round(box.top)}–${Math.round(box.bottom)}, surface ${Math.round(hostBox.top)}–${Math.round(hostBox.bottom)}`,
-      );
-    }
-
-    root.unmount();
   }
 
   host.remove();

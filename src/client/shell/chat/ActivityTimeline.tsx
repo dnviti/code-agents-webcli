@@ -9,6 +9,7 @@ import {
 import type { ActivityFilterId } from '../../chat/view-settings.js';
 import { KIND_ICON, TOOL_STATUS } from '../../chat/tool-meta.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { Markdown } from './Markdown.js';
 import { ToolCallCard } from './ToolCallCard.js';
 
@@ -59,6 +60,7 @@ export function ActivityTimeline({
   const [expanded, setExpanded] = React.useState<ReadonlySet<string>>(() => new Set<string>());
   const scroller = React.useRef<HTMLDivElement | null>(null);
   const rows = React.useRef(new Map<string, HTMLDivElement>());
+  const isPhone = usePhone();
 
   const filtered = React.useMemo(() => filterActivity(events, filter), [events, filter]);
 
@@ -122,9 +124,11 @@ export function ActivityTimeline({
           flex: '0 0 auto',
           display: 'flex',
           alignItems: 'center',
-          gap: 4,
-          height: 28,
-          padding: '0 12px',
+          flexWrap: isPhone ? 'wrap' : 'nowrap',
+          gap: isPhone ? TOUCH_GAP : 4,
+          height: isPhone ? undefined : 28,
+          minHeight: isPhone ? TOUCH_TARGET + 8 : undefined,
+          padding: isPhone ? '4px 12px' : '0 12px',
           borderBottom: '1px solid var(--border)',
         }}
       >
@@ -141,7 +145,7 @@ export function ActivityTimeline({
             marginLeft: 'auto',
             flex: '0 0 auto',
             fontFamily: 'var(--font-mono)',
-            fontSize: 10,
+            fontSize: isPhone ? PHONE_TEXT.meta : 10,
             color: 'var(--muted-foreground)',
             whiteSpace: 'nowrap',
           }}
@@ -197,12 +201,13 @@ export function ActivityTimeline({
                 style={{
                   alignSelf: 'flex-start',
                   marginBottom: 4,
-                  padding: '2px 6px',
+                  minHeight: isPhone ? TOUCH_TARGET : undefined,
+                  padding: isPhone ? '0 12px' : '2px 6px',
                   background: 'transparent',
                   border: '1px solid var(--border)',
                   borderRadius: 'var(--radius)',
                   fontFamily: 'var(--font-mono)',
-                  fontSize: 10,
+                  fontSize: isPhone ? PHONE_TEXT.body : 10,
                   color: 'var(--muted-foreground)',
                   cursor: 'pointer',
                 }}
@@ -246,6 +251,7 @@ function FilterChip({
   onClick: () => void;
 }): React.JSX.Element {
   const [hover, setHover] = React.useState(false);
+  const isPhone = usePhone();
   return (
     <button
       type="button"
@@ -257,13 +263,13 @@ function FilterChip({
       style={{
         display: 'inline-flex',
         alignItems: 'center',
-        height: 18,
-        padding: '0 6px',
+        height: isPhone ? TOUCH_TARGET : 18,
+        padding: isPhone ? '0 12px' : '0 6px',
         background: active || hover ? 'var(--accent)' : 'transparent',
         border: 0,
         borderRadius: 'var(--radius)',
         fontFamily: 'var(--font-mono)',
-        fontSize: 10,
+        fontSize: isPhone ? PHONE_TEXT.body : 10,
         color: active ? 'var(--foreground)' : 'var(--muted-foreground)',
         cursor: 'pointer',
       }}
@@ -300,6 +306,7 @@ const ActivityRow = React.memo(function ActivityRow({
   register: (id: string, node: HTMLDivElement | null) => void;
 }): React.JSX.Element {
   const [hover, setHover] = React.useState(false);
+  const isPhone = usePhone();
   const bodyId = React.useId();
   const reasoning = event.kind === 'reasoning';
   const status = TOOL_STATUS[event.status] || TOOL_STATUS.completed;
@@ -359,8 +366,8 @@ const ActivityRow = React.memo(function ActivityRow({
           gap: 8,
           width: '100%',
           minWidth: 0,
-          minHeight: 24,
-          padding: 0,
+          minHeight: isPhone ? TOUCH_TARGET : 24,
+          padding: isPhone ? '4px 0' : 0,
           textAlign: 'left',
           background: hover ? 'var(--accent)' : 'transparent',
           border: 0,
@@ -372,7 +379,7 @@ const ActivityRow = React.memo(function ActivityRow({
         {reasoning ? null : (
           <Icon
             name={KIND_ICON[event.toolKind || 'other'] || 'wrench'}
-            size={10}
+            size={isPhone ? 15 : 10}
             style={{ color: 'var(--muted-foreground)', flex: '0 0 auto' }}
           />
         )}
@@ -380,7 +387,7 @@ const ActivityRow = React.memo(function ActivityRow({
           style={{
             flex: '0 0 auto',
             fontFamily: 'var(--font-mono)',
-            fontSize: 10.5,
+            fontSize: isPhone ? PHONE_TEXT.meta : 10.5,
             color: reasoning
               ? 'var(--muted-foreground)'
               : failed
@@ -395,7 +402,7 @@ const ActivityRow = React.memo(function ActivityRow({
             flex: 1,
             minWidth: 0,
             fontFamily: 'var(--font-mono)',
-            fontSize: 10.5,
+            fontSize: isPhone ? PHONE_TEXT.meta : 10.5,
             color: 'var(--muted-foreground)',
             overflow: 'hidden',
             textOverflow: 'ellipsis',
@@ -409,7 +416,7 @@ const ActivityRow = React.memo(function ActivityRow({
             style={{
               flex: '0 0 auto',
               fontFamily: 'var(--font-mono)',
-              fontSize: 10,
+              fontSize: isPhone ? PHONE_TEXT.meta : 10,
               color: running ? 'var(--info)' : 'var(--muted-foreground)',
             }}
           >
@@ -463,18 +470,18 @@ const ActivityRow = React.memo(function ActivityRow({
                 display: 'inline-flex',
                 alignItems: 'center',
                 gap: 5,
-                height: 20,
-                padding: '0 6px',
+                height: isPhone ? TOUCH_TARGET : 20,
+                padding: isPhone ? '0 12px' : '0 6px',
                 background: 'transparent',
                 border: '1px solid var(--border)',
                 borderRadius: 'var(--radius)',
                 fontFamily: 'var(--font-mono)',
-                fontSize: 10,
+                fontSize: isPhone ? PHONE_TEXT.body : 10,
                 color: 'var(--muted-foreground)',
                 cursor: 'pointer',
               }}
             >
-              <Icon name="corner-up-left" size={10} />
+              <Icon name="corner-up-left" size={isPhone ? 16 : 10} />
               show in transcript
             </button>
           ) : null}
