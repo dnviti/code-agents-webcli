@@ -15,6 +15,8 @@
  */
 
 import {
+  AgentRun,
+  AgentStep,
   ChatBlock,
   ChatCapabilities,
   ChatEvent,
@@ -115,6 +117,51 @@ export function reindexTranscript(state: TranscriptState): void {
 function messageFor(state: TranscriptState, msgId: string): number | null {
   const at = state.index[msgId];
   return at === undefined ? null : at;
+}
+
+/**
+ * Merge only the keys that carry a value.
+ *
+ * A progress report names one thing at a time — the activity now, the tool
+ * name now — and a plain `Object.assign` would write the absent keys back as
+ * `undefined`, erasing what the previous report established. That reads as an
+ * agent whose detail view keeps blanking out mid-run.
+ */
+function assignDefined<T extends object>(target: T, patch: Partial<T>): void {
+  for (const [key, value] of Object.entries(patch)) {
+    if (value !== undefined) (target as Record<string, unknown>)[key] = value;
+  }
+}
+
+function omitUndefined<T extends object>(value: T): Partial<T> {
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry !== undefined) out[key] = entry;
+  }
+  return out as Partial<T>;
+}
+
+/**
+ * The `AgentRun` hanging off a delegation's tool block, created on first use.
+ *
+ * Nothing is buffered when the block is missing, unlike `orphanToolPatches`:
+ * the runtime opens the delegation's own tool call long before it reports
+ * anything happening inside it, so a step with no parent means the parent was
+ * never in this transcript — a replay that started mid-run, say — and inventing
+ * a block to hang it on would put a delegation in the list that the
+ * conversation never made.
+ */
+function locateAgentRun(
+  state: TranscriptState,
+  parentToolId: string,
+): [number, AgentRun] | null {
+  const located = state.toolIndex[parentToolId];
+  if (!located) return null;
+  const [messageIndex, blockIndex] = located;
+  const block = state.messages[messageIndex]?.blocks[blockIndex];
+  if (!block || block.kind !== 'tool') return null;
+  if (!block.agent) block.agent = { steps: [] };
+  return [messageIndex, block.agent];
 }
 
 /**
@@ -271,6 +318,36 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       const block = state.messages[messageIndex]?.blocks[blockIndex];
       if (!block || block.kind !== 'tool') return NO_CHANGE;
       Object.assign(block, event.patch);
+      return { messageIndex, structural: false, meta: false, applied: true };
+    }
+
+    case 'agent_step': {
+      const found = locateAgentRun(state, event.parentToolId);
+      if (!found) return NO_CHANGE;
+      const [messageIndex, run] = found;
+      // Upserted by id: a step is opened when the agent calls the tool and
+      // completed by a result that arrives later, and the two have to land on
+      // the same row rather than showing the same call twice.
+      const existing = run.steps.findIndex((step) => step.id === event.step.id);
+      if (existing >= 0) {
+        assignDefined(run.steps[existing], event.step);
+      } else {
+        run.steps.push({
+          name: 'tool',
+          toolKind: 'other',
+          status: 'running',
+          ts: event.ts,
+          ...omitUndefined(event.step),
+        } as AgentStep);
+      }
+      return { messageIndex, structural: false, meta: false, applied: true };
+    }
+
+    case 'agent_progress': {
+      const found = locateAgentRun(state, event.parentToolId);
+      if (!found) return NO_CHANGE;
+      const [messageIndex, run] = found;
+      assignDefined(run, event.patch);
       return { messageIndex, structural: false, meta: false, applied: true };
     }
 

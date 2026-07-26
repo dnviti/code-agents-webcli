@@ -16,10 +16,13 @@ import { Icon } from '../../ui/relay/Icon.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
 import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { AgentsPanel } from './AgentsPanel.js';
+import type { AgentActivityKind } from '../../../shared/agent-activity.js';
 import { FileTreePanel, type FileTreeEntry } from './FileTreePanel.js';
 import { GitChangesPanel } from './GitChangesPanel.js';
 import { GitHubPanel } from './GitHubPanel.js';
 import { FileEditorDialog } from './FileEditorDialog.js';
+import { WorkflowPopup } from './WorkflowPopup.js';
+import { AgentPopup } from './AgentPopup.js';
 import { LinksPanel } from './LinksPanel.js';
 import { StatusPanel } from './StatusPanel.js';
 import { PanelNote, useWorkspaceData } from './PanelShell.js';
@@ -77,6 +80,16 @@ export function WorkspacePanel({
   // Files tab so a file opened from Changes uses the same dialog — one editor,
   // one place that knows whether it has unsaved work.
   const [editing, setEditing] = React.useState<string | null>(null);
+  /**
+   * The delegation whose detail popup is open, and which kind it is.
+   *
+   * One slot, not two: a workflow and a sub-agent are different views of the
+   * same list, and opening one while the other is up would stack two dialogs
+   * over each other.
+   */
+  const [openDelegation, setOpenDelegation] = React.useState<
+    { toolId: string; kind: AgentActivityKind } | null
+  >(null);
 
   // Live during a drag, committed on release. Dragging straight into the
   // persisted settings would write localStorage on every pointer move and
@@ -89,6 +102,30 @@ export function WorkspacePanel({
   // `git status` is worth re-reading. Polling on a timer instead would either
   // lag behind the agent or run `git status` forever on an idle session.
   const revision = useIdleRevision(transcript);
+
+  // Both popups are mounted here rather than inside the tab that opens them,
+  // so that selecting another tab leaves them where they were. A workflow you
+  // opened to watch should survive a glance at the file tree.
+  const delegation =
+    openDelegation?.kind === 'workflow' ? (
+      <WorkflowPopup
+        key={openDelegation.toolId}
+        open
+        transcript={transcript}
+        toolId={openDelegation.toolId}
+        onClose={() => setOpenDelegation(null)}
+        isMobile={isMobile}
+      />
+    ) : openDelegation ? (
+      <AgentPopup
+        key={openDelegation.toolId}
+        open
+        transcript={transcript}
+        toolId={openDelegation.toolId}
+        onClose={() => setOpenDelegation(null)}
+        isMobile={isMobile}
+      />
+    ) : null;
 
   const editor = (
     <FileEditorDialog
@@ -133,13 +170,19 @@ export function WorkspacePanel({
           <GitChangesPanel sessionId={sessionId} revision={revision} onOpenFile={setEditing} />
         ) : null}
         {active === 'github' ? <GitHubPanel sessionId={sessionId} /> : null}
-        {active === 'agents' ? <AgentsPanel transcript={transcript} /> : null}
+        {active === 'agents' ? (
+          <AgentsPanel
+            transcript={transcript}
+            onOpenDelegation={(toolId, kind) => setOpenDelegation({ toolId, kind })}
+          />
+        ) : null}
         {active === 'links' ? <LinksPanel transcript={transcript} /> : null}
         {active === 'status' ? (
           <StatusPanel sessionId={sessionId} transcript={transcript} revision={revision} />
         ) : null}
       </div>
       {editor}
+      {delegation}
     </Rail>
   );
 }

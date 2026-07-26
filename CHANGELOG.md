@@ -2,6 +2,32 @@
 
 ## [5.2.0] - Unreleased
 
+### Added
+- **You can open what the agent handed off and watch it work.** A delegation
+  used to be one line in the agents list: a name, a status badge, a duration.
+  Whether it was a sub-agent reading three files or a workflow running a dozen
+  agents across four stages, you got the same single row and waited.
+
+  Now any entry in that list opens. A sub-agent shows its own work — the step it
+  is on in its own words ("Reading hello.txt"), every tool it reached for, what
+  each one gave back, and how many tools and tokens it has spent. It fills in
+  live while the agent works and stays there afterwards for reading back. A
+  workflow opens the same way and shows the stages it narrates as it goes.
+
+  Failures inside that work are now legible. When a step an agent took fails,
+  the popup shows the message it failed with, rather than the whole delegation
+  turning into a red badge that says only that something went wrong somewhere.
+
+  Both popups behave like the file editor — movable, resizable, expandable to
+  fill the window — and both stay open while you look at another panel.
+
+### Fixed
+- **A sub-agent's own steps are no longer thrown away.** The runtime has been
+  reporting them all along, tagged with the delegation they belong to. Nothing
+  read that tag, so every tool call an agent made inside its own work was filed
+  against an id no part of the conversation owned and silently dropped. They now
+  reach the delegation that made them.
+
 ### Changed
 - **A phone gets a layout built around the conversation.** It used to be the
   desktop layout at the same size: the figures you read mid-session — the cost,

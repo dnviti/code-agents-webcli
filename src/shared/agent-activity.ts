@@ -16,6 +16,13 @@
 
 import type { ChatMessage, ToolBlock, ToolStatus } from './chat-events.js';
 
+/** One heading and the lines under it, as best a workflow's log can be read. */
+export interface WorkflowLogSection {
+  /** Null for whatever the workflow printed before its first heading. */
+  title: string | null;
+  lines: string[];
+}
+
 export type AgentActivityKind = 'agent' | 'workflow';
 
 export interface AgentActivity {
@@ -132,4 +139,54 @@ export function collectAgentActivity(messages: ChatMessage[]): AgentActivity[] {
 /** How many are still going, for the panel's badge. */
 export function countRunning(activity: AgentActivity[]): number {
   return activity.reduce((total, entry) => total + (entry.running ? 1 : 0), 0);
+}
+
+/**
+ * The live block behind a delegation, by its tool id.
+ *
+ * The reducer mutates a tool block in place as patches arrive (see the note
+ * above `collectAgentActivity`), so the first match found is never stale —
+ * there is only ever one object for a given `toolId`, and this is it.
+ */
+export function findToolBlock(messages: ChatMessage[], toolId: string): ToolBlock | null {
+  for (const message of messages) {
+    for (const block of message.blocks) {
+      if (block.kind === 'tool' && block.toolId === toolId) return block;
+    }
+  }
+  return null;
+}
+
+/**
+ * Lines that look like a heading, in whatever narrator style a workflow
+ * script happens to use: a leading tree-drawing glyph, or the word "phase"
+ * or "stage" spelled out.
+ */
+const HEADING = /^\s*(?:[▸▶►→•·#]+\s+|(?:phase|stage)\s*:?\s+)(.+)$/i;
+
+/**
+ * A workflow's streamed output, split into the sections its own headings
+ * mark — or, failing that, one section holding the whole log.
+ *
+ * There is no structured progress channel: a workflow tool call reports the
+ * same way any other one does, a growing string of output. This is a best
+ * effort at the same phase/agent structure the run itself narrates, and it
+ * degrades to a flat log rather than guessing at structure that is not there.
+ */
+export function parseWorkflowLog(output: string | undefined): WorkflowLogSection[] {
+  const sections: WorkflowLogSection[] = [];
+  let current: WorkflowLogSection = { title: null, lines: [] };
+
+  for (const raw of (output || '').split('\n')) {
+    const line = raw.trimEnd();
+    const heading = HEADING.exec(line);
+    if (heading) {
+      if (current.title !== null || current.lines.length > 0) sections.push(current);
+      current = { title: heading[1].trim(), lines: [] };
+    } else if (line.trim()) {
+      current.lines.push(line);
+    }
+  }
+  if (current.title !== null || current.lines.length > 0) sections.push(current);
+  return sections;
 }

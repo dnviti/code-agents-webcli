@@ -1,6 +1,10 @@
 import * as React from 'react';
 import type { ToolStatus } from '../../../shared/chat-events.js';
-import { collectAgentActivity, type AgentActivity } from '../../../shared/agent-activity.js';
+import {
+  collectAgentActivity,
+  type AgentActivity,
+  type AgentActivityKind,
+} from '../../../shared/agent-activity.js';
 import type { ChatTranscript } from '../../chat/transcript.js';
 import { Badge, type BadgeVariant } from '../../ui/relay/Badge.js';
 import { Icon } from '../../ui/relay/Icon.js';
@@ -19,7 +23,7 @@ import { PanelBody, PanelHeader, PanelNote } from './PanelShell.js';
  * exists to avoid.
  */
 
-const STATUS_META: Record<ToolStatus, { label: string; variant: BadgeVariant; pulse?: boolean }> = {
+export const STATUS_META: Record<ToolStatus, { label: string; variant: BadgeVariant; pulse?: boolean }> = {
   pending: { label: 'queued', variant: 'outline' },
   running: { label: 'running', variant: 'warning', pulse: true },
   completed: { label: 'done', variant: 'success' },
@@ -30,9 +34,18 @@ const STATUS_META: Record<ToolStatus, { label: string; variant: BadgeVariant; pu
 
 export interface AgentsPanelProps {
   transcript: ChatTranscript;
+  /**
+   * Open a delegation's detail popup, by tool id and by what it is.
+   *
+   * The popups themselves are mounted by the workspace rail, not here: this
+   * panel is unmounted the moment another tab is selected, and a popup that
+   * dies when you glance at the file tree is not the file popup's behaviour,
+   * which is what issue #45 asked it to match.
+   */
+  onOpenDelegation: (toolId: string, kind: AgentActivityKind) => void;
 }
 
-export function AgentsPanel({ transcript }: AgentsPanelProps): React.JSX.Element {
+export function AgentsPanel({ transcript, onOpenDelegation }: AgentsPanelProps): React.JSX.Element {
   const version = React.useSyncExternalStore(
     transcript.subscribe,
     transcript.getVersion,
@@ -65,7 +78,7 @@ export function AgentsPanel({ transcript }: AgentsPanelProps): React.JSX.Element
           </PanelNote>
         ) : null}
         {running.map((entry) => (
-          <ActivityRow key={entry.toolId} entry={entry} />
+          <ActivityRow key={entry.toolId} entry={entry} onOpen={onOpenDelegation} />
         ))}
         {finished.length > 0 && running.length > 0 ? (
           <div
@@ -82,7 +95,7 @@ export function AgentsPanel({ transcript }: AgentsPanelProps): React.JSX.Element
           </div>
         ) : null}
         {finished.map((entry) => (
-          <ActivityRow key={entry.toolId} entry={entry} />
+          <ActivityRow key={entry.toolId} entry={entry} onOpen={onOpenDelegation} />
         ))}
       </PanelBody>
     </>
@@ -91,11 +104,31 @@ export function AgentsPanel({ transcript }: AgentsPanelProps): React.JSX.Element
 
 const ZERO = (): number => 0;
 
-function ActivityRow({ entry }: { entry: AgentActivity }): React.JSX.Element {
+function ActivityRow({
+  entry,
+  onOpen,
+}: {
+  entry: AgentActivity;
+  onOpen: (toolId: string, kind: AgentActivityKind) => void;
+}): React.JSX.Element {
   const meta = STATUS_META[entry.status] || STATUS_META.pending;
+  // Every delegation opens, workflows and sub-agents alike. The steps a
+  // sub-agent reports come from events the runtime already sends for all of
+  // them, so there is nothing to save by withholding the view from short ones
+  // — which was issue #44's open question.
+  const open = (): void => onOpen(entry.toolId, entry.kind);
 
   return (
     <div
+      role="button"
+      tabIndex={0}
+      onClick={open}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          open();
+        }
+      }}
       style={{
         display: 'flex',
         alignItems: 'flex-start',
@@ -103,6 +136,7 @@ function ActivityRow({ entry }: { entry: AgentActivity }): React.JSX.Element {
         padding: '7px 10px',
         borderBottom: '1px solid var(--border)',
         opacity: entry.running ? 1 : 0.75,
+        cursor: 'pointer',
       }}
     >
       <span

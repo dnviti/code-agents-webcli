@@ -229,6 +229,8 @@ async function run(): Promise<void> {
   check('scrolling past the newest line returns to live', exited > 0 && !view.isOpen, `exited=${exited}`);
 
   await checkModeQueriesDoNotKillTheTerminal();
+  await checkAWorkflowPopupBehavesLikeTheFilePopup();
+  await checkAnAgentPopupShowsWhatTheAgentIsDoing();
   await checkATallDialogStaysOnScreen();
   await checkTheComposerShrinksWithTheWorkspaceRail();
   await checkTheFixedBarsNeverWrap();
@@ -307,6 +309,323 @@ async function checkModeQueriesDoNotKillTheTerminal(): Promise<void> {
 
   window.removeEventListener('error', onError);
   controller.dispose();
+  host.remove();
+}
+
+/**
+ * Issue #45: a running workflow opens in a popup that behaves like the file
+ * editor's — movable and expandable — and keeps showing its log live and
+ * after the run ends.
+ *
+ * Driven through the whole `ChatView`, not a bare `AgentsPanel`. Two of the
+ * things asked for here only exist in the composition: that a `tool` patch
+ * (which never reaches the panel's own `subscribe` tier) still reaches the
+ * popup — true only if the popup really is on `subscribeContent` — and that
+ * selecting another rail tab does not take the popup down with the panel that
+ * opened it. Rendering the panel alone passed both while the second was false.
+ */
+async function checkAWorkflowPopupBehavesLikeTheFilePopup(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1100px;height:600px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('workflow-check', { send: () => {} });
+  const transcript = controller.transcript;
+  transcript.apply({ t: 'msg_start', seq: 1, ts: 1, id: 'm1', role: 'assistant', turnId: 't1' });
+  transcript.apply({
+    t: 'block_start',
+    seq: 2,
+    ts: 2,
+    msgId: 'm1',
+    index: 0,
+    block: {
+      kind: 'tool',
+      toolId: 'wf1',
+      name: 'Workflow',
+      toolKind: 'task',
+      status: 'running',
+      input: { name: 'review-changes' },
+      output: '▸ Review\nchecking file a',
+    },
+  });
+
+  const root = createRoot(host);
+  const paint = (panelTab: string): void => {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/tmp/project',
+        view: { ...DEFAULT_CHAT_VIEW, panelOpen: true, panelTab, panelWidth: 420 },
+        onViewChange: () => {},
+      } as never),
+    );
+  };
+
+  paint('agents');
+  await wait(200);
+
+  const rail = host.querySelector('aside[aria-label="Workspace"]') as HTMLElement | null;
+  const row = rail?.querySelector('[role="button"]') as HTMLElement | null;
+  check('a workflow row is clickable', !!row);
+  row?.click();
+  await wait(50);
+
+  const panel = host.querySelector('[role="dialog"]') as HTMLElement | null;
+  check('clicking the workflow row opens a popup', !!panel);
+  if (!panel) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  check('the popup names the workflow', !!panel.textContent?.includes('review-changes'));
+  check('the popup shows the running stage so far', !!panel.textContent?.includes('checking file a'));
+
+  // Movable, like the file popup: a resize grip is present and dragging it
+  // changes the panel's own size rather than the content scrolling instead.
+  const grip = panel.querySelector('[title="Drag to resize"]') as HTMLElement | null;
+  check('the popup has a resize grip', !!grip);
+  const before = panel.getBoundingClientRect();
+  if (grip) {
+    grip.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: before.right, clientY: before.bottom }));
+    window.dispatchEvent(new PointerEvent('pointermove', { clientX: before.right + 120, clientY: before.bottom + 120 }));
+    window.dispatchEvent(new PointerEvent('pointerup', {}));
+    await wait(50);
+  }
+  const afterResize = panel.getBoundingClientRect();
+  check(
+    'dragging the grip resizes the popup',
+    afterResize.width > before.width && afterResize.height > before.height,
+    `${Math.round(before.width)}x${Math.round(before.height)} -> ${Math.round(afterResize.width)}x${Math.round(afterResize.height)}`,
+  );
+
+  const maximise = panel.querySelector('[aria-label="Fill the window"]') as HTMLElement | null;
+  check('the popup can be expanded to fill the screen', !!maximise);
+  maximise?.click();
+  await wait(50);
+  const maximised = panel.getBoundingClientRect();
+  check(
+    'expanding it fills most of the viewport',
+    maximised.width > window.innerWidth - 40,
+    `${Math.round(maximised.width)}px vs viewport ${window.innerWidth}px`,
+  );
+
+  // Live: a `tool` patch is the wire event a running workflow actually gets
+  // patched with (see chat-reducer.ts), and it must reach this popup even
+  // though it never reaches the panel's own `subscribe` tier.
+  transcript.apply({
+    t: 'block_delta',
+    seq: 3,
+    ts: 3,
+    msgId: 'm1',
+    index: 0,
+    text: '\n▸ Verify\nall clear',
+  });
+  await wait(50);
+  check(
+    'new output streamed into the workflow appears live',
+    !!panel.textContent?.includes('all clear'),
+  );
+
+  // And it survives completion, for review afterward.
+  transcript.apply({ t: 'tool', seq: 4, ts: 4, toolId: 'wf1', patch: { status: 'completed' } });
+  await wait(50);
+  check('the popup still shows the log once the workflow finishes', !!panel.textContent?.includes('all clear'));
+  check('the popup reflects the finished status', !!panel.textContent?.toLowerCase().includes('done'));
+
+  // The file popup is mounted by the rail, not by the tab that opened it, so
+  // it outlives a tab change. The workflow popup has to do the same, or a
+  // workflow you opened to watch disappears the moment you look at anything
+  // else — and "still there for review afterward" only holds if you never
+  // touched the rail in between.
+  paint('links');
+  await wait(200);
+  const afterSwitch = host.querySelector('[role="dialog"]') as HTMLElement | null;
+  check(
+    'the popup survives selecting another rail tab',
+    !!afterSwitch && !!afterSwitch.textContent?.includes('all clear'),
+    afterSwitch ? 'still open' : 'unmounted with the agents tab',
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * Issue #44: opening a delegated agent shows its own steps — live while it
+ * works, still there once it is done, and with a failure inside its work
+ * spelled out rather than reduced to a badge.
+ *
+ * The events replayed here are the ones the claude adapter emits for real
+ * sub-agent traffic (see test/chat-claude.test.js, which replays a captured
+ * run through the adapter to prove that shape). This check starts where that
+ * one stops: given those events, what does someone actually see?
+ */
+async function checkAnAgentPopupShowsWhatTheAgentIsDoing(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1100px;height:600px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('agent-check', { send: () => {} });
+  const transcript = controller.transcript;
+  transcript.apply({ t: 'msg_start', seq: 1, ts: 1, id: 'm1', role: 'assistant', turnId: 't1' });
+  transcript.apply({
+    t: 'block_start',
+    seq: 2,
+    ts: 2,
+    msgId: 'm1',
+    index: 0,
+    block: {
+      kind: 'tool',
+      toolId: 'ag1',
+      name: 'Agent',
+      toolKind: 'task',
+      status: 'running',
+      input: { subagent_type: 'general-purpose', description: 'Find the magic word' },
+    },
+  });
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW, panelOpen: true, panelTab: 'agents', panelWidth: 420 },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(200);
+
+  const rail = host.querySelector('aside[aria-label="Workspace"]') as HTMLElement | null;
+  const row = rail?.querySelector('[role="button"]') as HTMLElement | null;
+  check('a sub-agent row is clickable, not just a workflow', !!row);
+  row?.click();
+  await wait(50);
+
+  const panel = host.querySelector('[role="dialog"]') as HTMLElement | null;
+  check('clicking a sub-agent row opens its detail view', !!panel);
+  if (!panel) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  // Nothing reported yet: the view has to say so rather than look broken.
+  check(
+    'an agent with nothing reported yet says it is waiting',
+    !!panel.textContent?.toLowerCase().includes('waiting'),
+  );
+
+  // Progress within its own work — the thing a status badge cannot say.
+  transcript.apply({
+    t: 'agent_progress',
+    seq: 3,
+    ts: 3,
+    parentToolId: 'ag1',
+    patch: { activity: 'Reading hello.txt', lastTool: 'Read', toolUses: 1, totalTokens: 21853 },
+  });
+  await wait(50);
+  check(
+    'the detail view shows what the agent is doing right now',
+    !!panel.textContent?.includes('Reading hello.txt'),
+  );
+
+  // A step it took, live, with no refresh.
+  transcript.apply({
+    t: 'agent_step',
+    seq: 4,
+    ts: 4,
+    parentToolId: 'ag1',
+    step: {
+      id: 's1',
+      name: 'Read',
+      toolKind: 'read',
+      status: 'running',
+      input: { file_path: '/tmp/project/hello.txt' },
+      ts: 4,
+    },
+  });
+  await wait(50);
+  check(
+    "a step appears in the running agent's view without a refresh",
+    !!panel.textContent?.includes('Read') && !!panel.textContent?.includes('hello.txt'),
+  );
+
+  // The closing half must not overwrite the tool's name with a placeholder —
+  // the reducer merges only what a patch actually carries.
+  transcript.apply({
+    t: 'agent_step',
+    seq: 5,
+    ts: 5,
+    parentToolId: 'ag1',
+    step: { id: 's1', status: 'completed', output: 'The magic word is BANANAPHONE.' },
+  });
+  await wait(50);
+  check(
+    'completing a step keeps the tool name it was opened with',
+    !!panel.textContent?.includes('Read'),
+  );
+
+  // A failure *inside* the agent's work, which the row's badge cannot show.
+  transcript.apply({
+    t: 'agent_step',
+    seq: 6,
+    ts: 6,
+    parentToolId: 'ag1',
+    step: {
+      id: 's2',
+      name: 'Bash',
+      toolKind: 'execute',
+      status: 'failed',
+      error: 'grep: missing.txt: No such file or directory',
+      ts: 6,
+    },
+  });
+  await wait(50);
+  check(
+    'a failure inside the agent shows its actual message',
+    !!panel.textContent?.includes('No such file or directory'),
+  );
+
+  // And the whole sequence survives the run finishing, for review.
+  transcript.apply({
+    t: 'agent_progress',
+    seq: 7,
+    ts: 7,
+    parentToolId: 'ag1',
+    // Shaped the way the adapter really emits it: the keys it has nothing to
+    // say about are present and undefined, not absent. A merge that assigns
+    // blindly erases them, which a patch with the keys simply omitted would
+    // never have caught.
+    patch: { status: 'completed', durationMs: 3921, activity: undefined, lastTool: undefined },
+  });
+  transcript.apply({
+    t: 'tool',
+    seq: 8,
+    ts: 8,
+    toolId: 'ag1',
+    patch: { status: 'completed', output: 'The magic word is BANANAPHONE.' },
+  });
+  await wait(50);
+  const text = panel.textContent || '';
+  check(
+    'the finished agent still lists every step it took',
+    text.includes('Read') && text.includes('Bash') && text.includes('No such file or directory'),
+  );
+  check('the finished agent shows what it reported back', text.includes('BANANAPHONE'));
+  // That last progress report named only a status and a duration. A merge that
+  // wrote absent keys back as undefined would have blanked the activity line
+  // the report before it established.
+  check(
+    'a later progress report does not erase what an earlier one said',
+    text.includes('Reading hello.txt'),
+  );
+
+  root.unmount();
   host.remove();
 }
 
@@ -793,12 +1112,41 @@ function viewOf(node: Element): Window {
   return node.ownerDocument?.defaultView ?? window;
 }
 
+/**
+ * Jump every entrance animation to its end state.
+ *
+ * Headless Chrome does not advance animation frames here, so a sheet that
+ * arrives from `opacity: 0` stays at 0 for as long as the fixture lives. It
+ * still lays out, which is why the geometry rules read it happily while the
+ * panel was, by the browser's own account, not on screen. Finishing the
+ * animations makes the measured frame the settled one instead of the first.
+ * An infinite animation (the spinner, the composer sweep) cannot finish and
+ * throws — those have no end state to wait for, so leaving them running is
+ * the right answer.
+ */
+function settle(doc: Document): void {
+  for (const animation of doc.getAnimations()) {
+    try {
+      animation.finish();
+    } catch {
+      /* infinite: no end to jump to */
+    }
+  }
+}
+
 function isPainted(node: Element): boolean {
   const box = node.getBoundingClientRect();
   if (box.width <= 2 || box.height <= 2) return false;
   if (node.closest('[aria-hidden="true"]')) return false;
-  const styles = viewOf(node).getComputedStyle(node);
-  return styles.visibility !== 'hidden' && styles.display !== 'none' && styles.opacity !== '0';
+  const view = viewOf(node);
+  const styles = view.getComputedStyle(node);
+  if (styles.visibility === 'hidden' || styles.display === 'none') return false;
+  // opacity does not inherit, so a faded-out ancestor still computes to 1 here.
+  // A sheet mid-transition would otherwise be measured as if it were on screen.
+  for (let el: Element | null = node; el; el = el.parentElement) {
+    if (view.getComputedStyle(el).opacity === '0') return false;
+  }
+  return true;
 }
 
 /**
@@ -1328,6 +1676,7 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
         }
         opener.click();
         await wait(250);
+        settle(host.ownerDocument);
       }
       if (!reached) {
         root.unmount();
@@ -1525,6 +1874,7 @@ async function checkThePhoneShellSurfacesAreUsable(): Promise<void> {
     // outside one they would correctly render at desktop sizes.
     root.render(React.createElement(PhoneContext.Provider, { value: true }, render()));
     await wait(300);
+    settle(doc);
 
     const target = host;
     const controls = paintedControls(target);

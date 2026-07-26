@@ -151,6 +151,65 @@ export interface ToolBlock {
   /** Set when status is `failed`. */
   error?: string;
   durationMs?: number;
+  /** Set on a delegation: what the agent behind this call did. See `AgentRun`. */
+  agent?: AgentRun;
+}
+
+/**
+ * One action a delegated agent took inside its own work.
+ *
+ * Deliberately not a `ToolBlock`: a step is keyed by the *inner* tool id, which
+ * lives in the sub-agent's own namespace and must never be reachable through
+ * the transcript's `toolIndex` — a patch aimed at the parent conversation and
+ * one aimed at a step would otherwise collide on the same key.
+ */
+export interface AgentStep {
+  /** The inner call's own id, so its result can find the step it belongs to. */
+  id: string;
+  name: string;
+  toolKind: ToolKind;
+  status: ToolStatus;
+  input?: unknown;
+  output?: string;
+  /** Set when the step itself failed, which is not the same as the run failing. */
+  error?: string;
+  ts: number;
+}
+
+/**
+ * A step as it arrives on the wire: always identified, otherwise partial.
+ *
+ * A step is reported twice — once when the agent calls the tool and once when
+ * the result comes back — and the second report knows only the id, the outcome
+ * and the output. Sending a whole `AgentStep` both times would mean the closing
+ * half overwriting the tool's name with a placeholder, so only what is actually
+ * known is sent and the reducer merges it.
+ */
+export type AgentStepPatch = Partial<AgentStep> & { id: string };
+
+/**
+ * What a delegated agent is doing inside a single delegation.
+ *
+ * The runtime reports this out of band from the tool call that started it
+ * (`task_started` / `task_progress` / `task_updated` alongside messages tagged
+ * with a `parent_tool_use_id`), so it hangs off the tool block rather than
+ * being folded into its `output` — which only ever holds the final summary.
+ */
+export interface AgentRun {
+  steps: AgentStep[];
+  /** The agent's own description of what it is doing right now. */
+  activity?: string;
+  /** Name of the most recent tool it reached for. */
+  lastTool?: string;
+  toolUses?: number;
+  totalTokens?: number;
+  durationMs?: number;
+  /** The run's own outcome, which can fail while individual steps succeeded. */
+  status?: ToolStatus;
+  error?: string;
+  /** What it was asked to do. */
+  prompt?: string;
+  subagentType?: string;
 }
 
 export interface ImageBlock {
@@ -362,6 +421,23 @@ export type ChatEvent =
    * that opened the call has already closed — so they cannot be a block_delta.
    */
   | { t: 'tool'; seq: number; ts: number; toolId: string; patch: Partial<ToolBlock> }
+  /**
+   * One step a delegated agent took, addressed to the delegation that owns it.
+   *
+   * Separate from `tool` because it is keyed twice over: `parentToolId` finds
+   * the delegation's block, and `step.id` finds (or creates) the step inside
+   * it. Routing this through `tool` would put sub-agent tool ids into the
+   * transcript's own index, where a later top-level patch could hit them.
+   */
+  | { t: 'agent_step'; seq: number; ts: number; parentToolId: string; step: AgentStepPatch }
+  /** Progress for the run as a whole, merged over whatever is already known. */
+  | {
+      t: 'agent_progress';
+      seq: number;
+      ts: number;
+      parentToolId: string;
+      patch: Partial<Omit<AgentRun, 'steps'>>;
+    }
   | { t: 'plan'; seq: number; ts: number; items: PlanItem[] }
   | { t: 'usage'; seq: number; ts: number; usage: ChatUsage }
   | { t: 'permission'; seq: number; ts: number; request: PermissionRequest }
