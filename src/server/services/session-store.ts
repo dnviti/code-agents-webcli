@@ -33,6 +33,7 @@ interface RuntimeSessionRow {
   last_accessed: number;
   surface: string | null;
   native_chat_session_id: string | null;
+  owner_session_id: string | null;
 }
 
 export class SessionStore {
@@ -68,7 +69,8 @@ export class SessionStore {
           max_buffer_size,
           last_accessed,
           surface,
-          native_chat_session_id
+          native_chat_session_id,
+          owner_session_id
         )
         VALUES (
           @id,
@@ -88,7 +90,8 @@ export class SessionStore {
           @max_buffer_size,
           @last_accessed,
           @surface,
-          @native_chat_session_id
+          @native_chat_session_id,
+          @owner_session_id
         )
       `);
 
@@ -144,6 +147,9 @@ export class SessionStore {
         // continue it: the agent would come back with no memory of a transcript
         // the user is looking at.
         native_chat_session_id: session.nativeChatSessionId || null,
+        // Which conversation owns this shell, so a restart can tell a session
+        // the user can reach from one nothing on screen refers to any more.
+        owner_session_id: session.ownerSessionId || null,
       }));
 
       replaceAll(rows);
@@ -178,7 +184,8 @@ export class SessionStore {
             max_buffer_size,
             last_accessed,
             surface,
-            native_chat_session_id
+            native_chat_session_id,
+            owner_session_id
           FROM runtime_sessions
           ORDER BY created_at ASC
         `)
@@ -218,6 +225,7 @@ export class SessionStore {
           lastAccessed: row.last_accessed || Date.now(),
           surface: row.surface === 'chat' ? 'chat' : undefined,
           nativeChatSessionId: row.native_chat_session_id || undefined,
+          ownerSessionId: row.owner_session_id || undefined,
         });
       }
 

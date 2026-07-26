@@ -10,6 +10,7 @@
 import type { App } from '../app';
 import type { SessionInfo } from '../types';
 import { clearChatSurface } from '../chat/surface';
+import { forgetTerminals } from '../chat/chat-terminal';
 import { shellStore, type ShellTab } from '../shell/store';
 import { playNotificationSound, showNotification } from '../ui/notifications';
 
@@ -395,6 +396,11 @@ export class SessionTabManager {
     // conversation's events; without this the socket keeps receiving them for
     // a transcript nothing will ever render.
     this.app.chats.drop(sessionId);
+    // A conversation owns the shells opened inside it, and the server ends them
+    // with it. What is left here is this page's half of them — live xterms, open
+    // sockets, and a note that would have a reopened split trying to rejoin ptys
+    // that no longer exist. A session with no shells is a no-op.
+    forgetTerminals(sessionId);
 
     // And take it off the screen. The surface is only ever *replaced* by
     // joining another session, so closing the last tab — or closing a chat

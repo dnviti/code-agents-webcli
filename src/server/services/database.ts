@@ -371,6 +371,12 @@ export class AppDatabase {
     // thousands of events above the window, and a fact needed to *start* a
     // session should not require replaying the session to learn.
     this.addColumnIfMissing('runtime_sessions', 'native_chat_session_id', 'TEXT');
+
+    // The conversation a shell belongs to, when it is not a session of its own.
+    // Nullable and null-by-default: every row written before conversations could
+    // open their own terminal is a standalone session, which is exactly what a
+    // null means here.
+    this.addColumnIfMissing('runtime_sessions', 'owner_session_id', 'TEXT');
   }
 
   /**

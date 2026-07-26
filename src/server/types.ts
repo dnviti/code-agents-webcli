@@ -69,6 +69,20 @@ export interface SessionRecord {
    */
   surface?: 'terminal' | 'chat';
   /**
+   * The conversation this session belongs to, when it is not a session of its
+   * own.
+   *
+   * A shell opened inside a conversation is a real session with a real pty —
+   * that is how it gets scrollback, history and a working directory — but it is
+   * not a *standalone* one: it is reached through the conversation that opened
+   * it and through nothing else. Set here, it is the one fact that lets the
+   * listing leave it out and the teardown take it with the conversation.
+   *
+   * Absent on every ordinary session, so `undefined` reads as "standalone"
+   * without a backfill.
+   */
+  ownerSessionId?: string;
+  /**
    * The runtime's own id for this conversation, when it reported one.
    *
    * Kept so a chat can be resumed *with its context* after the server restarts:

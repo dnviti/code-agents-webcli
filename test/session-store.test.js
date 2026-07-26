@@ -98,6 +98,23 @@ describe('SessionStore', function() {
         command: 'watch podman ps'
       });
     });
+
+    it('remembers which conversation a shell belonged to', async function() {
+      // The one fact that keeps a conversation's terminal out of every tab
+      // strip. Lost across a restart, the shell would come back looking like a
+      // standalone session on every device the user has open.
+      await sessionStore.saveSessions(new Map([
+        ['chat', createSessionRecord({ id: 'chat', ownerUserId, surface: 'chat' })],
+        ['shell', createSessionRecord({ id: 'shell', ownerUserId, ownerSessionId: 'chat' })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('shell').ownerSessionId, 'chat');
+      // Absent, not empty-string: `undefined` is what reads as "standalone".
+      assert.strictEqual(loaded.get('chat').ownerSessionId, undefined);
+    });
   });
 });
 
