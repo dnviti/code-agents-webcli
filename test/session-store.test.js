@@ -140,6 +140,48 @@ describe('SessionStore', function() {
       assert.strictEqual(loaded.get('manual').chatBypassPermissions, undefined);
     });
 
+    it('remembers a conversation-scoped model override', async function () {
+      // The override is per conversation, not a new default: a restart must
+      // bring back exactly the choice made for this record and nothing for
+      // any other, and a record that never set one must read as "no override"
+      // rather than an empty string.
+      await sessionStore.saveSessions(new Map([
+        ['custom', createSessionRecord({
+          id: 'custom',
+          ownerUserId,
+          surface: 'chat',
+          chatModelOverride: 'grok-3-fast',
+        })],
+        ['default', createSessionRecord({ id: 'default', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('custom').chatModelOverride, 'grok-3-fast');
+      assert.strictEqual(loaded.get('default').chatModelOverride, undefined);
+    });
+
+    it('adds the model-override column to a database that predates it', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['old', createSessionRecord({ id: 'old', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.raw.exec(
+        'ALTER TABLE runtime_sessions DROP COLUMN chat_model_override',
+      );
+      sessionStore.database.close();
+
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      const loaded = await sessionStore.loadSessions();
+
+      assert.strictEqual(loaded.size, 1, 'the upgrade must not cost the user their sessions');
+      assert.strictEqual(loaded.get('old').chatModelOverride, undefined);
+
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      assert.strictEqual((await sessionStore.loadSessions()).size, 1);
+    });
+
     it('adds the approval-mode column to a database that predates it', async function () {
       // Every install being upgraded has a session table written by an older
       // build. The column is added on boot rather than by a migration file, so

@@ -239,6 +239,10 @@ export function ChatView({
     (queuedId: string) => controller.cancelQueued(queuedId),
     [controller],
   );
+  const setModel = React.useCallback(
+    (model: string) => controller.setModel(model),
+    [controller],
+  );
   const upload = React.useCallback(
     (file: File) => uploadAttachment(controller.sessionId, file),
     [controller],
@@ -710,7 +714,14 @@ export function ChatView({
               branch={branch}
               turnLabel={currentTurn ? `turn ${currentTurn.index}` : undefined}
               usage={transcript.usage}
-              model={transcript.model}
+              // The conversation's own override wins over whatever the
+              // runtime last reported, once it is confirmed live (or cleared).
+              // A pending/sent switch is not yet running and is surfaced via
+              // modelFeedback instead, so this label never claims a model the
+              // session isn't actually on.
+              model={controller.modelOverrideValue ?? transcript.model}
+              onSetModel={setModel}
+              modelFeedback={controller.modelFeedback}
               bypassPermissions={bypassPermissions}
               terminalOpen={terminalOpen}
             />

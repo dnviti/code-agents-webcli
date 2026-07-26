@@ -207,6 +207,13 @@ export class ChatSessionManager {
     await this.sessions.get(sessionId)?.interrupt();
   }
 
+  /** Switch a live session's model. False when nothing is running, or the adapter cannot. */
+  async setModel(sessionId: string, model: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    return session.setModel(model);
+  }
+
   /** Drop a turn that was typed ahead and has not run yet. */
   cancelQueued(sessionId: string, queuedId: string): boolean {
     return this.sessions.get(sessionId)?.cancelQueued(queuedId) ?? false;
