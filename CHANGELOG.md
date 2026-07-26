@@ -1,5 +1,10 @@
 # Changelog
 
+## [5.1.2] - 2026-07-26
+
+### Notes
+- Version bump only; no functional changes.
+
 ## [5.1.1] - 2026-07-26
 
 ### Fixed
