@@ -1281,8 +1281,14 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
    * closed state alone is how a layout ends up correct in the chrome and
    * untouched everywhere behind it.
    */
-  const states: Array<[string, string[]]> = [
+  const states: Array<[string, string[], boolean?]> = [
     ['', []],
+    // Scrolled back, because a control only exists in that state: the
+    // "Jump to latest" pill floats over the transcript when it is not pinned.
+    // It shipped at 34px — a hardcoded height overriding the touch floor its
+    // own primitive applies — and every run that happened to leave the
+    // transcript pinned reported the phone clean.
+    ['scrolled back through the conversation', [], true],
     // Each is now reached through the floating menu: open it, then press the
     // row. Driving it the way a thumb does is the only way to know the route
     // still exists — the controls left the header when the menu arrived.
@@ -1292,7 +1298,7 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
   ];
 
   for (const [name, width, height] of viewports) {
-    for (const [state, opens] of states) {
+    for (const [state, opens, scrollBack] of states) {
       // A fresh mount per state, not a toggle: closing a sheet is its own
       // control, and a second click on the opener left the previous sheet up
       // and reported its offences against every state after it.
@@ -1302,6 +1308,16 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
       await wait(400);
 
       const where = state ? `${name} ${state}` : name;
+
+      if (scrollBack) {
+        const scroller = host.querySelector('[data-message-id]')?.closest('[style*="overflow"]') as HTMLElement | null;
+        if (scroller) {
+          scroller.scrollTop = 0;
+          scroller.dispatchEvent(new Event('scroll'));
+          await wait(250);
+        }
+      }
+
       let reached = true;
       for (const selector of opens) {
         const opener = host.querySelector(selector) as HTMLElement | null;
