@@ -195,6 +195,23 @@ describe('listing conversations to resume', function () {
     assert.deepStrictEqual(got.body.conversations, []);
   });
 
+  it('says which approval mode picking one will put back', async function () {
+    // Resuming restores the mode the conversation was running in, and a bypass
+    // is a standing permission: it has to be visible in the offer rather than
+    // discovered when the agent stops asking.
+    sessions.set('yolo', record('yolo', { chatBypassPermissions: true }));
+    sessions.set('careful', record('careful'));
+    await writeChat('yolo', opened('senza chiedere', 'n1'));
+    await writeChat('careful', opened('chiedendo', 'n2'));
+
+    const got = await list('/projects/alpha');
+    const modes = Object.fromEntries(
+      got.body.conversations.map((c) => [c.id, c.bypassPermissions]),
+    );
+    assert.strictEqual(modes.yolo, true);
+    assert.strictEqual(modes.careful, false, 'a manual conversation must never look bypassed');
+  });
+
   it('marks one that is already running, because that is a join and not a resume', async function () {
     sessions.set('live', record('live', { active: true }));
     await writeChat('live', opened('in corso', 'n1'));

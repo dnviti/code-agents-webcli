@@ -146,10 +146,16 @@ export class ChatSessionManager {
     if (session) return session.snapshot();
     // No live session: the log is still the truth, so a browser rejoining a
     // finished conversation reads it exactly as it was left.
-    const snapshot = await this.deps.store.snapshot({
-      id: record.id,
-      ownerUserId: record.ownerUserId,
-    });
+    const snapshot = await this.deps.store.snapshot(
+      { id: record.id, ownerUserId: record.ownerUserId },
+      {
+        // The mode comes from the record because nothing else here remembers it:
+        // the log holds what was said, not how the conversation was set up. Left
+        // to the store's default, every conversation whose process is gone came
+        // back claiming to ask for approvals — including the ones that do not.
+        bypassPermissions: record.chatBypassPermissions === true,
+      },
+    );
     // The record, not the replayed log: a snapshot replays only the tail, and
     // the id is recorded once at the very top of a conversation. Telling the
     // browser "this cannot be resumed" because the fact scrolled out of the

@@ -932,8 +932,7 @@ export class MessageProcessor {
     // shapes the launch — model, arguments, environment — comes from the
     // server-side profile below, for the same reason it does on the terminal
     // path: the client must not be able to forge a launch configuration.
-    const bypassPermissions = options.dangerouslySkipPermissions === true;
-
+    //
     // Two ways to relaunch a chat whose process is gone, and the difference is
     // the whole point of the choice the user is offered: resume hands the agent
     // back its own context, so the conversation on screen is one it remembers;
@@ -942,6 +941,24 @@ export class MessageProcessor {
       options.resume === true ? session.nativeChatSessionId : undefined;
     // Only when the browser said so: see ChatSessionStartOptions.startFresh.
     const startFresh = options.resume === false;
+
+    // Absent means "whatever this conversation was already running in", which is
+    // what makes a relaunch or a resume from the launcher come back in the mode
+    // the user left it in instead of quietly dropping to manual. The fallback
+    // reads the record — this conversation's own, already checked to belong to
+    // this user — so it can restore a mode but never widen or borrow one.
+    //
+    // Not for a fresh start, though: that deliberately leaves the conversation
+    // behind, and a bypass is a standing permission granted to the conversation
+    // that asked for it rather than to the session it was held in. Inheriting it
+    // would let one choice carry into every later conversation in the same tab,
+    // which is the one direction it must not travel. The browser can still ask
+    // for a bypass outright, and the header states whichever mode is in force.
+    const requestedBypass = options.dangerouslySkipPermissions;
+    const bypassPermissions =
+      typeof requestedBypass === 'boolean'
+        ? requestedBypass
+        : !startFresh && session.chatBypassPermissions === true;
 
     const profile = this.deps.resolveRuntimeProfile(
       agentKind as AgentKind,
@@ -969,6 +986,14 @@ export class MessageProcessor {
       session.active = true;
       session.stopRequested = false;
       session.sessionStartTime = session.sessionStartTime || new Date();
+      // Recorded on the record, not just handed to the process: the process is
+      // the thing that will be gone when this has to be answered again. After
+      // the launch rather than before it, so a bypass that never actually ran
+      // does not become the standing answer for the next attempt — persisting a
+      // permission has to follow from a conversation that really started in it.
+      // Absent rather than false so the whole stack has one representation of
+      // "asks first" and a manual relaunch cannot read as a recorded choice.
+      session.chatBypassPermissions = chat.bypassing ? true : undefined;
 
       // Before the broadcast, so the socket that asked for the launch is
       // already a watcher when the very first event goes out.

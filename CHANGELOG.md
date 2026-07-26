@@ -3,6 +3,22 @@
 ## [5.1.1] - 2026-07-26
 
 ### Fixed
+- **The approval mode you started a conversation in survives having to bring it
+  back.** A chat started with approvals bypassed used to come back asking for them
+  — after the browser reconnected to a conversation whose agent was gone, after
+  the server restarted, or when the conversation was resumed from the launcher —
+  and it came back that way without saying so. The mode is now remembered against
+  the conversation itself, so reconnecting, restarting and resuming all restore it,
+  and relaunching carries it forward instead of quietly falling back to manual.
+
+  The badge in the conversation header is now the conversation's own rather than
+  the shell's most recent, which also fixes it showing the wrong mode after
+  switching between two chats; it states the mode even while a conversation is
+  offline and only its transcript is on screen, and the launcher's resume list
+  says which mode picking a conversation will put back. A conversation that asked
+  first is never restored into a bypass, a remembered bypass belongs to one
+  conversation and one user and is never inherited by another, and starting a
+  fresh conversation in the same tab starts it asking again.
 - **A terminal opened in a conversation stays in that conversation.** It used to
   become a session like any other, so the same shell appeared twice — once in the
   conversation where it belonged and once as a loose terminal tab beside it — and

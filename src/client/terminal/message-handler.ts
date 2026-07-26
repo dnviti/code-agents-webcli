@@ -48,7 +48,6 @@ export class MessageHandler {
           runtime: message.agent || '',
           runtimeLabel: message.runtimeLabel || '',
           workingDir: message.workingDir || '',
-          bypassPermissions: message.bypassPermissions === true,
         });
         hideOverlay();
       }

@@ -56,6 +56,14 @@ export interface ResumableConversation {
   canResume: boolean;
   /** Already running: joining it is right, resuming it is not. */
   running: boolean;
+  /**
+   * The approval mode this conversation was last running in, which opening it
+   * will put back.
+   *
+   * Shown rather than merely restored: bypass is a standing permission, and one
+   * that comes back without saying so is as bad as one that is silently dropped.
+   */
+  bypassPermissions?: boolean;
 }
 
 interface RuntimeEntry {
@@ -249,6 +257,12 @@ function ConversationCard({
             remembers it and one reading it for the first time. */}
         {!conversation.running && !conversation.canResume ? (
           <Badge variant="outline">transcript only</Badge>
+        ) : null}
+        {/* The mode this conversation comes back in. Only the bypass is called
+            out: "asks first" is what every other row already means, and a badge
+            on all of them would make the one that matters harder to see. */}
+        {conversation.bypassPermissions ? (
+          <Badge variant="destructive">approvals bypassed</Badge>
         ) : null}
       </span>
     </button>

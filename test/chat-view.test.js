@@ -509,11 +509,53 @@ describe('ChatView', function () {
   });
 
   it('keeps an active permission bypass on screen for the whole session', function () {
-    const html = render({ controller: controllerWith({}), bypassPermissions: true });
+    // Read off the snapshot rather than handed in as a prop: the server records
+    // the mode against the conversation, and this is the path that has to answer
+    // for a chat rejoined after its agent — or the whole server — has gone.
+    const html = render({ controller: controllerWith({ bypassPermissions: true }) });
     assert.ok(html.includes('Approvals bypassed'), 'an active bypass must stay visible');
 
     const off = render({ controller: controllerWith({}) });
     assert.ok(!off.includes('Approvals bypassed'), 'no warning when nothing is bypassed');
+  });
+
+  it('states the mode of a conversation with nothing running it', function () {
+    // The case the fix exists for. The process is gone and only the transcript is
+    // on screen; the badge still has to say which mode a relaunch comes back in,
+    // because a silently restored bypass is as bad as a silently dropped one.
+    const html = render({
+      controller: controllerWith({ bypassPermissions: true, live: false, cursor: 4 }),
+    });
+
+    assert.ok(html.includes('Approvals bypassed'), 'an offline chat still has a mode');
+  });
+
+  it('takes a relaunch mode from the server rather than asking for one', function () {
+    // A browser's copy of the mode is exactly the thing that used to be wrong
+    // after a restart, so a relaunch names none and the server restores the one
+    // recorded against the conversation.
+    const controller = controllerWith({ bypassPermissions: true, live: false, cursor: 4 });
+    controller.relaunch('claude', { resume: true });
+
+    const launch = controller.sent.filter((m) => m.type === 'start_chat').pop();
+    assert.ok(launch, 'the relaunch must reach the server');
+    assert.strictEqual(launch.options.resume, true);
+    assert.ok(
+      !('dangerouslySkipPermissions' in launch.options),
+      'the client must not ask for a standing permission',
+    );
+  });
+
+  it('follows the mode the launch reports, not the one it asked for', function () {
+    const controller = controllerWith({});
+    assert.strictEqual(controller.transcript.bypassing, false);
+
+    controller.handle({ type: 'chat_started', sessionId: 's1', bypassPermissions: true });
+    assert.strictEqual(controller.transcript.bypassing, true);
+    assert.ok(
+      render({ controller }).includes('Approvals bypassed'),
+      'the restored mode has to be stated when the conversation comes back',
+    );
   });
 
   it('themes from CSS custom properties rather than baked-in colours', function () {

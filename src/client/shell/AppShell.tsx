@@ -497,7 +497,6 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
             runtimeLabel={state.chat.runtimeLabel || state.chat.runtime}
             workingDir={state.chat.workingDir || active?.workingDir || ''}
             isMobile={state.isMobile}
-            bypassPermissions={state.chat.bypassPermissions}
             view={state.chatView}
             onViewChange={actions.setChatView}
             onOpenSettings={() => closeDialogs({ chatSettings: true })}

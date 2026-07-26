@@ -105,6 +105,12 @@ export class ChatController {
         // it. The transcript is where "is anything behind this" actually lives.
         this.unavailable = null;
         this.transcript.setLive(true);
+        // The launch announces the mode it actually started in, which is not
+        // necessarily the one this browser asked for: a relaunch names no mode
+        // at all and the server restores the conversation's own. Taken from the
+        // message rather than assumed, so the badge cannot claim a mode the
+        // process is not running in.
+        this.transcript.setBypassing(message.bypassPermissions === true);
         this.options.onChange?.();
         return true;
       }
@@ -217,18 +223,21 @@ export class ChatController {
    * back and knows what is on screen; without it the transcript stays as a
    * record and the agent starts fresh. Either way it is this session, in this
    * tab — a new one would leave the conversation behind.
+   *
+   * Deliberately says nothing about the approval mode. The server has the
+   * conversation's own recorded against it and restores that, which is both the
+   * right answer and the safe one: a relaunch that carried a mode would be a
+   * browser asking for a standing permission, and this browser's copy of it is
+   * exactly the thing that used to be wrong after a restart.
    */
-  relaunch(agentKind: string, options: { resume: boolean; bypassPermissions?: boolean }): void {
+  relaunch(agentKind: string, options: { resume: boolean }): void {
     this.unavailable = null;
     this.options.onChange?.();
     this.options.send({
       type: 'start_chat',
       agentKind,
       sessionId: this.sessionId,
-      options: {
-        resume: options.resume,
-        dangerouslySkipPermissions: options.bypassPermissions === true,
-      },
+      options: { resume: options.resume },
     });
   }
 
@@ -336,6 +345,9 @@ export class ChatController {
       replayFrom: 0,
       cursor: 0,
       live: false,
+      // Not a claim about the session: this is a wipe, and the next snapshot or
+      // `chat_started` carries the real mode. Manual is the direction to be
+      // wrong in for the moment in between.
       bypassPermissions: false,
     });
     this.options.onChange?.();

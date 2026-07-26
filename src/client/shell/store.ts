@@ -50,9 +50,18 @@ export interface ShellChat {
   runtime: string;
   runtimeLabel: string;
   workingDir: string;
-  /** True while the session is acting without asking; shown for its whole life. */
-  bypassPermissions: boolean;
 }
+
+/*
+ * The approval mode is deliberately absent here.
+ *
+ * It used to be one field on this store, set when a chat launched — so a browser
+ * with several conversations open showed whichever one launched last, and a
+ * `session_joined` for a different chat left the previous chat's answer in place.
+ * It lives on each conversation's transcript now, hydrated from the server
+ * snapshot, which is the only thing that knows the mode of a conversation whose
+ * process is gone. See ChatTranscript.bypassing.
+ */
 
 export interface ShellConnection {
   state: 'connected' | 'connecting' | 'disconnected';
@@ -248,7 +257,6 @@ const INITIAL: ShellState = {
     runtime: '',
     runtimeLabel: '',
     workingDir: '',
-    bypassPermissions: false,
   },
   plan: null,
   toasts: [],

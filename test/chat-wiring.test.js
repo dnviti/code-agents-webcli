@@ -22,6 +22,7 @@ function createSessionRecord(params = {}) {
     lastAgent: null,
     runtimeLabel: null,
     surface: params.surface,
+    chatBypassPermissions: params.chatBypassPermissions,
     terminalOptions: null,
     stopRequested: false,
     workingDir: params.workingDir || '/tmp/project',
@@ -227,6 +228,106 @@ describe('chat wiring', function () {
 
       assert.strictEqual(session.active, false);
       assert.match(lastOfType(sent, 'error').message, /not installed/);
+    });
+  });
+
+  // The approval mode is part of how the user set a conversation up, so it has
+  // to outlive the process serving it. It used to live only on the live
+  // ChatSession: reconnecting to a conversation whose agent had gone, restarting
+  // the server, or resuming from the launcher all brought it back in manual mode
+  // without saying so — and the user was then interrupted by prompts they had
+  // opted out of, or trusted prompts that were no longer coming.
+  describe('the approval mode', function () {
+    it('records the chosen mode on the session, where a restart can find it', async function () {
+      const { processor, session } = build();
+
+      await processor.startChat('ws-1', 'claude', { dangerouslySkipPermissions: true });
+
+      assert.strictEqual(session.chatBypassPermissions, true);
+    });
+
+    it('restores the remembered mode when the browser names none', async function () {
+      // Both a relaunch of a dead conversation and a resume from the launcher
+      // arrive here without a mode. Falling back to manual is what silently
+      // dropped the bypass.
+      const { processor, chatManager, sent } = build({ chatBypassPermissions: true });
+
+      await processor.startChat('ws-1', 'claude', { resume: true });
+
+      assert.strictEqual(chatManager.calls.start[0].options.bypassPermissions, true);
+      assert.strictEqual(
+        lastOfType(sent, 'chat_started').bypassPermissions,
+        true,
+        'the browser has to be told the mode it came back in',
+      );
+    });
+
+    it('never restores a conversation that asked first into a bypass', async function () {
+      const { processor, chatManager, session, sent } = build();
+
+      await processor.startChat('ws-1', 'claude', { resume: true });
+
+      assert.strictEqual(chatManager.calls.start[0].options.bypassPermissions, false);
+      assert.strictEqual(session.chatBypassPermissions, undefined);
+      assert.strictEqual(lastOfType(sent, 'chat_started').bypassPermissions, false);
+    });
+
+    it('does not carry a bypass into a conversation started fresh', async function () {
+      // "Start again" leaves the old conversation behind. The bypass was granted
+      // to that conversation, and letting it cross would make one choice the
+      // standing answer for every later conversation in the same tab.
+      const { processor, chatManager, session, sent } = build({ chatBypassPermissions: true });
+
+      await processor.startChat('ws-1', 'claude', { resume: false });
+
+      assert.strictEqual(chatManager.calls.start[0].options.bypassPermissions, false);
+      assert.strictEqual(session.chatBypassPermissions, undefined);
+      assert.strictEqual(
+        lastOfType(sent, 'chat_started').bypassPermissions,
+        false,
+        'and the header has to say the mode actually changed',
+      );
+    });
+
+    it('lets an explicit choice turn the bypass back off', async function () {
+      // The remembered mode is a default for a launch that names none, not an
+      // override: a mode the user is standing in front of choosing wins.
+      const { processor, chatManager, session } = build({ chatBypassPermissions: true });
+
+      await processor.startChat('ws-1', 'claude', { dangerouslySkipPermissions: false });
+
+      assert.strictEqual(chatManager.calls.start[0].options.bypassPermissions, false);
+      assert.strictEqual(session.chatBypassPermissions, undefined);
+    });
+
+    it('does not remember a bypass from a launch that never ran', async function () {
+      // Persisting a standing permission has to follow from a conversation that
+      // really started in it, not from an attempt that failed.
+      const { processor, session } = build(
+        {},
+        { start: () => Promise.reject(new Error('claude is not installed')) },
+      );
+
+      await processor.startChat('ws-1', 'claude', { dangerouslySkipPermissions: true });
+
+      assert.strictEqual(session.chatBypassPermissions, undefined);
+    });
+
+    it('takes the mode from the session that was named, not the one joined', async function () {
+      // A browser watching several conversations relaunches a specific one. The
+      // remembered mode has to be read off that record, or a bypass could be
+      // carried into a conversation that never chose it.
+      const { processor, chatManager, session } = build({ chatBypassPermissions: true });
+
+      const other = createSessionRecord({ id: 'session-2' });
+      processor.deps.claudeSessions.set(other.id, other);
+      processor.deps.webSocketConnections.get('ws-1').chatSessionIds.add(other.id);
+
+      await processor.startChat('ws-1', 'claude', {}, other.id);
+
+      assert.strictEqual(chatManager.calls.start[0].options.bypassPermissions, false);
+      assert.strictEqual(other.chatBypassPermissions, undefined);
+      assert.strictEqual(session.chatBypassPermissions, true, 'the other record is untouched');
     });
   });
 
