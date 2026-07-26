@@ -16,6 +16,7 @@ import { Button } from '../../ui/relay/Button.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
 import { showNotification } from '../../ui/notifications.js';
+import { PhoneContext } from '../../ui/touch.js';
 import { Composer } from './Composer.js';
 import { MessageList, type MessageListHandle } from './MessageList.js';
 import { messageText } from './MessageBubble.js';
@@ -494,6 +495,11 @@ export function ChatView({
   );
 
   return (
+    // The phone answer, published once for the whole surface. Everything below
+    // — down to a copy button inside a tool call — reads it from here rather
+    // than from a prop threaded through five components, any one of which could
+    // drop it and leave that corner at desktop sizes. See ui/touch.ts.
+    <PhoneContext.Provider value={isMobile}>
     <section
       ref={root as React.RefObject<HTMLElement>}
       aria-label={`${runtimeLabel} chat`}
@@ -845,6 +851,7 @@ export function ChatView({
 
       </div>
     </section>
+    </PhoneContext.Provider>
   );
 }
 

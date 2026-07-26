@@ -5,6 +5,7 @@ import { Icon } from '../../ui/relay/Icon.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
 import { Kbd } from '../../ui/relay/Kbd.js';
 import { Tooltip } from '../../ui/relay/Tooltip.js';
+import { PHONE_SPACE, PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET } from '../../ui/touch.js';
 import { UsageMeter } from './UsageMeter.js';
 
 /**
@@ -98,9 +99,6 @@ const SR_ONLY: React.CSSProperties = {
   clip: 'rect(0,0,0,0)',
 };
 
-/** Touch-target floor for this app's phone layout; matches IconButton size="lg". */
-const TOUCH = 34;
-
 export function SessionHeader({
   runtimeLabel,
   workingDir,
@@ -126,7 +124,28 @@ export function SessionHeader({
 }: SessionHeaderProps): React.JSX.Element {
   const meta = exited ? STATE_META.exited : STATE_META[state] || STATE_META.idle;
   // A phone is always the tightest case.
-  const tight = compact || isMobile;
+  const tight = compact;
+
+  if (isMobile) {
+    return (
+      <PhoneHeader
+        runtimeLabel={runtimeLabel}
+        workingDir={workingDir}
+        branch={branch}
+        usage={usage}
+        capabilities={capabilities}
+        meta={meta}
+        bypassPermissions={bypassPermissions}
+        showUsage={showUsage}
+        railOpen={railOpen}
+        indexOpen={indexOpen}
+        onToggleRail={onToggleRail}
+        onToggleIndex={onToggleIndex}
+        onOpenSearch={onOpenSearch}
+        onOpenSettings={onOpenSettings}
+      />
+    );
+  }
 
   return (
     <header
@@ -134,15 +153,10 @@ export function SessionHeader({
         flex: '0 0 auto',
         display: 'flex',
         alignItems: 'center',
-        gap: isMobile ? 6 : 10,
+        gap: 10,
         minWidth: 0,
-        // A phone's header wraps rather than dropping what is on it: the money
-        // and the context meter are worth a second row, and a fixed height
-        // would have to throw one of them away to keep the bar to one line.
-        flexWrap: isMobile ? 'wrap' : 'nowrap',
-        height: isMobile ? undefined : 34,
-        minHeight: isMobile ? TOUCH + 6 : undefined,
-        padding: isMobile ? '3px 10px' : '0 10px',
+        height: 34,
+        padding: '0 10px',
         background: 'var(--chrome)',
         borderBottom: '1px solid var(--border)',
         color: 'var(--chrome-foreground)',
@@ -168,7 +182,7 @@ export function SessionHeader({
             alignItems: 'center',
             gap: 5,
             minWidth: 0,
-            maxWidth: isMobile ? 120 : 220,
+            maxWidth: 220,
             fontFamily: 'var(--font-mono)',
             fontSize: 10.5,
             color: 'var(--muted-foreground)',
@@ -205,7 +219,7 @@ export function SessionHeader({
         </span>
       ) : null}
 
-      {compact && !isMobile ? null : <Badge variant="outline">Beta</Badge>}
+      {compact ? null : <Badge variant="outline">Beta</Badge>}
 
       {tight ? null : <SearchTrigger onClick={onOpenSearch} />}
 
@@ -216,7 +230,7 @@ export function SessionHeader({
           flex: '0 0 auto',
           display: 'flex',
           alignItems: 'center',
-          gap: isMobile ? 4 : 10,
+          gap: 10,
         }}
       >
         {showUsage ? (
@@ -265,7 +279,7 @@ export function SessionHeader({
           <Badge variant="warning" style={{ flex: '0 0 auto' }}>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
               <Icon name="shield" size={10} />
-              {isMobile ? 'bypassed' : 'Approvals bypassed'}
+              Approvals bypassed
             </span>
           </Badge>
         ) : null}
@@ -303,7 +317,7 @@ export function SessionHeader({
         {tight ? (
           <IconButton
             type="button"
-            size={isMobile ? 'lg' : 'md'}
+            size="md"
             label="Search this conversation"
             onClick={onOpenSearch}
           >
@@ -314,7 +328,7 @@ export function SessionHeader({
         {onToggleTheme ? (
           <IconButton
             type="button"
-            size={isMobile ? 'lg' : 'md'}
+            size="md"
             label={theme === 'light' ? 'Switch to the dark theme' : 'Switch to the light theme'}
             onClick={onToggleTheme}
           >
@@ -324,7 +338,7 @@ export function SessionHeader({
 
         <IconButton
           type="button"
-          size={isMobile ? 'lg' : 'md'}
+          size="md"
           label={indexOpen ? 'Hide the turn index' : 'Show the turn index'}
           aria-pressed={indexOpen}
           active={indexOpen}
@@ -335,7 +349,7 @@ export function SessionHeader({
 
         <IconButton
           type="button"
-          size={isMobile ? 'lg' : 'md'}
+          size="md"
           label={railOpen ? 'Hide the trace rail' : 'Show the trace rail'}
           aria-pressed={railOpen}
           active={railOpen}
@@ -346,7 +360,7 @@ export function SessionHeader({
 
         <IconButton
           type="button"
-          size={isMobile ? 'lg' : 'md'}
+          size="md"
           label="Chat display settings"
           onClick={onOpenSettings}
         >
@@ -354,6 +368,251 @@ export function SessionHeader({
         </IconButton>
       </span>
     </header>
+  );
+}
+
+/**
+ * The same bar, laid out for a phone (issue #51).
+ *
+ * A separate component rather than a dozen `isMobile ?` ternaries, because the
+ * answer is not "the same row, smaller" — that is what shipped and what this
+ * issue is about. The two layouts disagree about their shape:
+ *
+ *   - The desktop bar is one fixed 34px line that must never wrap, and sheds
+ *     items to stay on it. A phone has no width to shed *into*: shedding is how
+ *     the branch, the search field and every label became invisible.
+ *   - So the phone bar spends height instead, which it has. One wrapping row of
+ *     information at a readable size, one row of controls at a size a finger can
+ *     hit. Nothing is dropped for want of room.
+ *
+ * What is dropped, deliberately: the Beta badge (it says nothing about this
+ * session), the terminal toggle and the theme toggle (both are in the bottom
+ * bar's more sheet, so nothing becomes unreachable — see MoreSheet).
+ */
+function PhoneHeader({
+  runtimeLabel,
+  workingDir,
+  branch,
+  usage,
+  capabilities,
+  meta,
+  bypassPermissions,
+  showUsage,
+  railOpen,
+  indexOpen,
+  onToggleRail,
+  onToggleIndex,
+  onOpenSearch,
+  onOpenSettings,
+}: {
+  runtimeLabel: string;
+  workingDir: string;
+  branch?: string;
+  usage: ChatUsage;
+  capabilities: ChatCapabilities;
+  meta: StateMeta;
+  bypassPermissions: boolean;
+  showUsage: boolean;
+  railOpen: boolean;
+  indexOpen: boolean;
+  onToggleRail(): void;
+  onToggleIndex(): void;
+  onOpenSearch(): void;
+  onOpenSettings(): void;
+}): React.JSX.Element {
+  return (
+    <header
+      style={{
+        flex: '0 0 auto',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 2,
+        minWidth: 0,
+        padding: `4px ${PHONE_SPACE.edge}px`,
+        background: 'var(--chrome)',
+        borderBottom: '1px solid var(--border)',
+        color: 'var(--chrome-foreground)',
+        fontFamily: 'var(--font-sans)',
+      }}
+    >
+      {/* The readout. Wraps to as many lines as it needs — a second line costs
+          a phone very little and is the only way every figure stays legible. */}
+      <div
+        style={{
+          display: 'flex',
+          flexWrap: 'wrap',
+          alignItems: 'center',
+          columnGap: PHONE_SPACE.inline,
+          rowGap: 2,
+          minWidth: 0,
+        }}
+      >
+        <span
+          style={{
+            fontSize: PHONE_TEXT.meta,
+            fontWeight: 'var(--font-semibold)' as React.CSSProperties['fontWeight'],
+            letterSpacing: 'var(--tracking-tight)',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {runtimeLabel}
+        </span>
+
+        <span
+          title={workingDir}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 4,
+            minWidth: 0,
+            // Enough for a real directory name at 13px, and it ellipsises
+            // rather than pushing the state word onto its own line.
+            maxWidth: 150,
+            fontFamily: 'var(--font-mono)',
+            fontSize: PHONE_TEXT.meta,
+            color: 'var(--muted-foreground)',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          <Icon name="folder" size={12} />
+          {basename(workingDir)}
+          <span style={SR_ONLY}>{workingDir}</span>
+        </span>
+
+        {/* The branch stays on a phone. On the desktop bar it is shed because
+            the composer row carries it too — but the composer row is exactly
+            what a phone's keyboard covers. */}
+        {branch ? (
+          <span
+            title={`On branch ${branch}`}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              minWidth: 0,
+              maxWidth: 150,
+              fontFamily: 'var(--font-mono)',
+              fontSize: PHONE_TEXT.meta,
+              color: 'var(--ansi-cyan)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            <Icon name="git-branch" size={12} />
+            {branch}
+          </span>
+        ) : null}
+
+        <span
+          role="status"
+          aria-live="polite"
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            flex: '0 0 auto',
+            padding: '1px 8px',
+            whiteSpace: 'nowrap',
+            fontFamily: 'var(--font-mono)',
+            fontSize: PHONE_TEXT.label,
+            background: meta.tint
+              ? `color-mix(in oklab, ${meta.tint} 12%, transparent)`
+              : 'transparent',
+            border: `1px solid ${
+              meta.tint ? `color-mix(in oklab, ${meta.tint} 40%, transparent)` : 'var(--border)'
+            }`,
+            color: meta.color,
+          }}
+        >
+          <span
+            aria-hidden="true"
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: 'var(--radius-full)',
+              background: 'currentColor',
+              animation: meta.pulse ? 'relay-pulse 1.4s var(--ease-standard) infinite' : undefined,
+            }}
+          />
+          {meta.label}
+        </span>
+
+        {showUsage ? <UsageMeter usage={usage} capabilities={capabilities} compact phone /> : null}
+
+        {bypassPermissions ? (
+          <Badge
+            variant="warning"
+            aria-label="Approvals bypassed"
+            style={{ flex: '0 0 auto', height: 'auto', padding: '1px 8px', fontSize: PHONE_TEXT.label }}
+          >
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <Icon name="shield" size={12} />
+              Approvals bypassed
+            </span>
+          </Badge>
+        ) : null}
+      </div>
+
+      {/* The controls, at a size and a spacing a finger can use. Each keeps its
+          own icon; the accessible name is what a long-press reads out, and none
+          of them is now sharing an edge with its neighbour. */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          gap: TOUCH_GAP,
+          // Pulled left so the row's own left edge lines up with the text
+          // above it: an IconButton centres its glyph in its hit area.
+          marginLeft: -((TOUCH_TARGET - 20) / 2),
+        }}
+      >
+        <PhoneControl label="Search this conversation" icon="search" onClick={onOpenSearch} />
+        <PhoneControl
+          label={indexOpen ? 'Hide the turn index' : 'Show the turn index'}
+          icon="panel-left"
+          active={indexOpen}
+          onClick={onToggleIndex}
+        />
+        <PhoneControl
+          label={railOpen ? 'Hide the trace rail' : 'Show the trace rail'}
+          icon="panel-right"
+          active={railOpen}
+          onClick={onToggleRail}
+        />
+        <PhoneControl label="Chat display settings" icon="settings" onClick={onOpenSettings} />
+      </div>
+    </header>
+  );
+}
+
+/** One header control on a phone: a 20px glyph in a target a finger can hit. */
+function PhoneControl({
+  label,
+  icon,
+  active = false,
+  onClick,
+}: {
+  label: string;
+  icon: string;
+  active?: boolean;
+  onClick(): void;
+}): React.JSX.Element {
+  return (
+    <IconButton
+      type="button"
+      size="lg"
+      label={label}
+      aria-pressed={active || undefined}
+      active={active}
+      onClick={onClick}
+      style={{ width: TOUCH_TARGET, height: TOUCH_TARGET }}
+    >
+      <Icon name={icon} size={20} />
+    </IconButton>
   );
 }
 

@@ -12,6 +12,7 @@ import { mentionAtCaret } from '../../../shared/file-match.js';
 import { classifyPaste, MAX_IMAGES_PER_PASTE, PasteCandidate } from '../../../shared/paste-classify.js';
 import { MAX_IMAGE_BYTES } from '../../terminal/paste.js';
 import { detectMobile } from '../../ui/mobile.js';
+import { PHONE_TEXT, PhoneContext, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { showNotification } from '../../ui/notifications.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
@@ -185,7 +186,22 @@ export function Composer({
   /** Where to put the caret after a completion rewrites the draft. */
   const pendingCaret = React.useRef<number | null>(null);
 
-  const [isMobile, setIsMobile] = React.useState(safeDetectMobile);
+  /**
+   * The surface's answer wins over this component's own.
+   *
+   * The composer used to decide "am I on a phone?" by calling `detectMobile()`
+   * itself, which made it the app's second source for that answer and put it
+   * out of reach of anything that renders the surface deliberately — a check at
+   * a phone viewport in headless Chrome has no touch points, so the real
+   * composer could never be examined at the size it actually ships at.
+   *
+   * The local detection stays as the fallback: `Composer` is also rendered on
+   * its own, outside any `PhoneContext`, and Enter's two jobs (send versus
+   * newline) still have to be decided correctly there.
+   */
+  const surfaceIsPhone = usePhone();
+  const [detectedMobile, setIsMobile] = React.useState(safeDetectMobile);
+  const isMobile = surfaceIsPhone || detectedMobile;
   const [uncontrolledText, setUncontrolledText] = React.useState('');
   const [entries, setEntries] = React.useState<AttachmentEntry[]>([]);
   const [dragActive, setDragActive] = React.useState(false);
@@ -612,6 +628,12 @@ export function Composer({
   const sendLabel = busy ? 'Queue this message' : 'Send message';
 
   return (
+    // Re-published rather than merely consumed: `isMobile` here is the surface's
+    // answer *or* this component's own detection, and every control below —
+    // the chips, the model picker, send and stop — has to size itself from the
+    // same one. Composer mounted on its own on a real phone would otherwise
+    // send with Enter like a phone and draw its buttons like a desktop.
+    <PhoneContext.Provider value={isMobile}>
     <div ref={shellRef} style={outerStyle} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}>
       <TopEdge lit={lit} busy={busy && !disabled} />
 
@@ -694,12 +716,19 @@ export function Composer({
           background: 'transparent',
           color: 'var(--foreground)',
           fontFamily: 'var(--font-sans)',
-          fontSize: 'var(--text-ui)',
+          // `input`, not `body` — the extra pixel is what keeps iOS Safari from
+          // zooming the page when the field takes focus. See PHONE_TEXT.
+          fontSize: isMobile ? PHONE_TEXT.input : 'var(--text-ui)',
           lineHeight: 'var(--leading-normal)',
           // Room to breathe above and below one line of text, which the old
           // 6px did not give it: the field is the thing everything else on this
           // surface is arranged around.
           padding: 'var(--space-1) 0 var(--space-2)',
+          // The autosize effect writes `height` directly from `scrollHeight`,
+          // so the floor has to be a `min-height` it cannot undercut: one line
+          // of 13px text is a 32px box, which on a phone is a smaller thing to
+          // aim at than any button around it.
+          minHeight: isMobile ? TOUCH_TARGET : undefined,
           maxHeight: '40vh',
           overflowY: 'auto',
         }}
@@ -722,7 +751,19 @@ export function Composer({
           floated in the middle of a wall of text with nothing to align to.
           Actions first, then a line of plain text that says what the keys do
           and what the conversation has cost. */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          // On a phone the row wraps rather than squeezing: six controls at a
+          // size a finger can hit do not fit across 390px, and the alternative
+          // — the one that shipped — was six controls that do fit and cannot be
+          // hit apart.
+          flexWrap: isMobile ? 'wrap' : 'nowrap',
+          gap: isMobile ? TOUCH_GAP : 7,
+          minWidth: 0,
+        }}
+      >
         {attachmentsEnabled ? (
           <ChipButton
             label="Attach a file or image"
@@ -755,7 +796,9 @@ export function Composer({
             marginLeft: 'auto',
             display: 'flex',
             alignItems: 'center',
-            gap: 7,
+            flexWrap: isMobile ? 'wrap' : 'nowrap',
+            justifyContent: 'flex-end',
+            gap: isMobile ? TOUCH_GAP : 7,
             minWidth: 0,
           }}
         >
@@ -790,10 +833,14 @@ export function Composer({
         style={{
           display: 'flex',
           alignItems: 'center',
+          flexWrap: isMobile ? 'wrap' : 'nowrap',
           gap: 10,
           minWidth: 0,
           fontFamily: 'var(--font-mono)',
-          fontSize: 'var(--text-2xs)',
+          // The right-hand half of this row is the turn number, the token count
+          // and the cost — live session figures, so on a phone they are set at
+          // the body size like every other one.
+          fontSize: isMobile ? PHONE_TEXT.label : 'var(--text-2xs)',
           color: 'var(--muted-foreground)',
         }}
       >
@@ -807,6 +854,7 @@ export function Composer({
         </span>
       </div>
     </div>
+    </PhoneContext.Provider>
   );
 }
 
@@ -933,7 +981,7 @@ function sessionReadout(turnLabel: string | undefined, usage: ChatUsage | undefi
   return bits.join(' · ');
 }
 
-/** A 26px square control on the composer's action row. */
+/** A square control on the composer's action row: 26px, or a finger on a phone. */
 function ChipButton({
   label,
   onClick,
@@ -947,6 +995,8 @@ function ChipButton({
   children: React.ReactNode;
 } & React.ButtonHTMLAttributes<HTMLButtonElement>): React.JSX.Element {
   const [hover, setHover] = React.useState(false);
+  const isPhone = usePhone();
+  const side = isPhone ? TOUCH_TARGET : 26;
   return (
     <button
       type="button"
@@ -961,8 +1011,8 @@ function ChipButton({
         alignItems: 'center',
         justifyContent: 'center',
         flex: '0 0 auto',
-        width: 26,
-        height: 26,
+        width: side,
+        height: side,
         background: hover && !disabled ? 'var(--accent)' : 'transparent',
         border: '1px solid var(--border)',
         borderRadius: 'var(--radius)',
@@ -998,6 +1048,7 @@ function Chip({
   tone?: string;
   children: React.ReactNode;
 }): React.JSX.Element {
+  const isPhone = usePhone();
   return (
     <button
       type="button"
@@ -1010,14 +1061,14 @@ function Chip({
         gap: 5,
         flex: '0 1 auto',
         minWidth: 0,
-        height: 26,
-        padding: '0 8px',
+        height: isPhone ? TOUCH_TARGET : 26,
+        padding: isPhone ? '0 10px' : '0 8px',
         whiteSpace: 'nowrap',
         background: 'transparent',
         border: `1px solid ${tone ? `color-mix(in oklab, ${tone} 38%, transparent)` : 'var(--border)'}`,
         borderRadius: 'var(--radius)',
         fontFamily: 'var(--font-mono)',
-        fontSize: 'var(--text-2xs)',
+        fontSize: isPhone ? PHONE_TEXT.label : 'var(--text-2xs)',
         color: tone || 'var(--muted-foreground)',
         cursor: 'default',
       }}
@@ -1057,6 +1108,7 @@ function ModelChip({
   const [customValue, setCustomValue] = React.useState('');
   const ref = React.useRef<HTMLDivElement | null>(null);
   const inputRef = React.useRef<HTMLInputElement | null>(null);
+  const isPhone = usePhone();
   // The session's own model wins. `models` is a menu in whatever order the
   // runtime listed it, and its first entry is the current one only by accident.
   const matched = models?.find((m) => m.value === current || m.name === current);
@@ -1104,14 +1156,14 @@ function ModelChip({
           display: 'inline-flex',
           alignItems: 'center',
           gap: 5,
-          height: 26,
-          padding: '0 8px',
+          height: isPhone ? TOUCH_TARGET : 26,
+          padding: isPhone ? '0 10px' : '0 8px',
           whiteSpace: 'nowrap',
           background: open ? 'var(--accent)' : 'transparent',
           border: '1px solid var(--border)',
           borderRadius: 'var(--radius)',
           fontFamily: 'var(--font-mono)',
-          fontSize: 'var(--text-2xs)',
+          fontSize: isPhone ? PHONE_TEXT.label : 'var(--text-2xs)',
           color: 'var(--muted-foreground)',
           cursor: 'pointer',
         }}
@@ -1332,6 +1384,7 @@ function SendButton({
 }): React.JSX.Element {
   const [hover, setHover] = React.useState(false);
   const [pressed, setPressed] = React.useState(false);
+  const isPhone = usePhone();
 
   return (
     <button
@@ -1352,8 +1405,8 @@ function SendButton({
         alignItems: 'center',
         justifyContent: 'center',
         flex: '0 0 auto',
-        width: 34,
-        height: 30,
+        width: isPhone ? TOUCH_TARGET : 34,
+        height: isPhone ? TOUCH_TARGET : 30,
         borderRadius: 'var(--radius)',
         border: '1px solid transparent',
         background: enabled ? 'var(--primary)' : 'var(--muted)',
@@ -1370,7 +1423,7 @@ function SendButton({
           + ' opacity var(--duration-fast) var(--ease-standard)',
       }}
     >
-      <Icon name={queueing ? 'corner-down-left' : 'arrow-up'} size={14} />
+      <Icon name={queueing ? 'corner-down-left' : 'arrow-up'} size={isPhone ? 20 : 14} />
     </button>
   );
 }
@@ -1384,6 +1437,8 @@ function SendButton({
  */
 function StopButton({ onClick, enabled }: { onClick: () => void; enabled: boolean }): React.JSX.Element {
   const label = enabled ? 'Stop' : 'This runtime cannot be interrupted';
+  const isPhone = usePhone();
+  const tone = enabled ? { color: 'var(--destructive)', borderColor: 'var(--destructive)' } : undefined;
   return (
     <IconButton
       type="button"
@@ -1392,9 +1447,9 @@ function StopButton({ onClick, enabled }: { onClick: () => void; enabled: boolea
       label={label}
       disabled={!enabled}
       onClick={enabled ? onClick : undefined}
-      style={enabled ? { color: 'var(--destructive)', borderColor: 'var(--destructive)' } : undefined}
+      style={isPhone ? { ...tone, width: TOUCH_TARGET, height: TOUCH_TARGET } : tone}
     >
-      <Icon name="square" size={11} />
+      <Icon name="square" size={isPhone ? 16 : 11} />
     </IconButton>
   );
 }

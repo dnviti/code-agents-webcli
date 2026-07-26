@@ -226,6 +226,7 @@ async function run(): Promise<void> {
   await checkTheComposerShrinksWithTheWorkspaceRail();
   await checkTheFixedBarsNeverWrap();
   await checkALiveAnswerAppearsAsItStreams();
+  await checkThePhoneLayoutIsUsable();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -723,6 +724,267 @@ async function checkALiveAnswerAppearsAsItStreams(): Promise<void> {
   );
 
   root.unmount();
+  host.remove();
+}
+
+/* -------------------------------------------------------------------------
+ * The phone (issue #51)
+ *
+ * Every check above runs at a desktop width, which is how the phone layout
+ * shipped for four minor versions as a shrunken desktop: nothing that ran had
+ * a viewport small enough to see it. These thresholds are written out here
+ * rather than imported from `src/client/ui/touch.ts` on purpose — a check that
+ * imports the app's own constants proves the app agrees with itself, not that
+ * a finger can hit the button or that an eye can read the label.
+ * ------------------------------------------------------------------------- */
+
+/** The floor for anything rendered as text on a phone. */
+const PHONE_MIN_TEXT = 12;
+/** Live session information is never set below the body text. */
+const PHONE_LIVE_TEXT = 15;
+/** Hit area, not ink: a 20px glyph in a 44px button passes. */
+const PHONE_TARGET = 44;
+/** Clear space between two neighbouring targets. */
+const PHONE_GAP = 8;
+
+/** Visible, non-decorative, and not a screen-reader-only clone. */
+function isPainted(node: Element): boolean {
+  const box = node.getBoundingClientRect();
+  if (box.width <= 2 || box.height <= 2) return false;
+  if (node.closest('[aria-hidden="true"]')) return false;
+  const styles = window.getComputedStyle(node);
+  return styles.visibility !== 'hidden' && styles.display !== 'none' && styles.opacity !== '0';
+}
+
+/**
+ * The controls, and only the controls.
+ *
+ * A control nested inside another control is dropped: the outer one is what a
+ * finger aims at, and counting both reports a 0px gap between a chip and its
+ * own icon every time.
+ */
+function paintedControls(root: HTMLElement): HTMLElement[] {
+  const all = Array.from(
+    root.querySelectorAll<HTMLElement>('button, input, select, textarea, [role="tab"], [role="option"], a[href]'),
+  ).filter(isPainted);
+  return all.filter((node) => !all.some((other) => other !== node && other.contains(node)));
+}
+
+/** Elements that render a word of their own, with the size that word is set at. */
+function paintedText(root: HTMLElement): Array<{ node: HTMLElement; size: number; text: string }> {
+  const out: Array<{ node: HTMLElement; size: number; text: string }> = [];
+  for (const node of Array.from(root.querySelectorAll<HTMLElement>('*'))) {
+    const own = Array.from(node.childNodes)
+      .filter((child) => child.nodeType === Node.TEXT_NODE)
+      .map((child) => (child.textContent || '').trim())
+      .join(' ')
+      .trim();
+    if (!own || !isPainted(node)) continue;
+    out.push({ node, size: parseFloat(window.getComputedStyle(node).fontSize) || 0, text: own });
+  }
+  return out;
+}
+
+function describe(node: HTMLElement, text?: string): string {
+  const label = text || node.getAttribute('aria-label') || (node.textContent || '').trim();
+  return `${node.tagName.toLowerCase()}${label ? `:${label.slice(0, 20)}` : ''}`;
+}
+
+/**
+ * A phone is not a narrow desktop.
+ *
+ * Three viewports, because the failures differ: portrait is the ordinary case,
+ * the short one stands in for the on-screen keyboard eating half the screen
+ * (headless Chrome has no `visualViewport` to resize, and the layout question —
+ * does the composer survive losing the height — is the same either way), and
+ * landscape is where a row that only wrapped by luck stops wrapping.
+ */
+async function checkThePhoneLayoutIsUsable(): Promise<void> {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+
+  const controller = new ChatController('phone-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'phone-check',
+    snapshot: {
+      sessionId: 'phone-check',
+      runtime: 'claude',
+      state: 'running',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true, commands: [{ name: 'clear' }],
+        models: [{ name: 'claude-opus-4-6', value: 'claude-opus-4-6' }],
+      },
+      usage: { totalTokens: 987654, costUsd: 12.3456, contextWindow: 200000, contextUsed: 150000 },
+      // On the snapshot, not as a prop: the model and the branch reach the
+      // composer through the transcript and a workspace fetch respectively,
+      // and a prop named `model` on ChatView would be quietly ignored.
+      model: 'claude-opus-4-6',
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'rework the mobile layout so the controls are reachable' }],
+        },
+        {
+          id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: Date.now(),
+          blocks: [
+            { kind: 'text', text: 'here is what I changed' },
+            {
+              kind: 'tool', toolId: 'x1', name: 'bash', toolKind: 'execute',
+              status: 'completed', input: { command: 'npm test' }, durationMs: 4321,
+            },
+          ],
+          usage: { inputTokens: 12345, outputTokens: 6789, costUsd: 0.4321 },
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
+      live: true, bypassPermissions: true,
+    },
+  } as never);
+
+  const viewports: Array<[string, number, number]> = [
+    ['portrait', 390, 740],
+    ['with the keyboard open', 390, 380],
+    ['landscape', 740, 390],
+  ];
+
+  for (const [name, width, height] of viewports) {
+    // A fresh mount per viewport: the surface measures itself to decide which
+    // zones fit, and re-rendering a live tree into a resized box is not the
+    // same thing as opening it at that size.
+    host.style.cssText = `width:${width}px;height:${height}px;position:absolute;top:0;left:0;display:flex;overflow:hidden`;
+    const root = createRoot(host);
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/home/dev/projects/a-rather-deeply-nested-working-directory',
+        isMobile: true,
+        view: { ...DEFAULT_CHAT_VIEW },
+        onViewChange: () => {},
+      } as never),
+    );
+    await wait(400);
+
+    const hostBox = host.getBoundingClientRect();
+
+    // 1. Every control a finger is meant to hit.
+    const controls = paintedControls(host);
+    const small = controls.filter((node) => {
+      const box = node.getBoundingClientRect();
+      return box.width < PHONE_TARGET - 0.5 || box.height < PHONE_TARGET - 0.5;
+    });
+    check(
+      `every control is at least ${PHONE_TARGET}px in ${name}`,
+      small.length === 0,
+      small.length
+        ? small
+            .slice(0, 8)
+            .map((n) => {
+              const b = n.getBoundingClientRect();
+              return `${describe(n)}=${Math.round(b.width)}x${Math.round(b.height)}`;
+            })
+            .join(' | ')
+        : `${controls.length} controls`,
+    );
+
+    // 2. And far enough from the one next to it. Only pairs that actually sit
+    //    side by side on the same line can be mistapped for each other.
+    const byLeft = [...controls].sort(
+      (a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left,
+    );
+    const crowded: string[] = [];
+    for (let i = 0; i < byLeft.length; i++) {
+      const a = byLeft[i].getBoundingClientRect();
+      for (let j = i + 1; j < byLeft.length; j++) {
+        const b = byLeft[j].getBoundingClientRect();
+        const sameLine = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > Math.min(a.height, b.height) / 2;
+        if (!sameLine) continue;
+        const gap = b.left - a.right;
+        // Only the nearest neighbour to the right matters; anything further is
+        // separated by that one.
+        if (gap < -0.5) continue;
+        if (gap < PHONE_GAP - 0.5) {
+          crowded.push(`${describe(byLeft[i])}↔${describe(byLeft[j])}=${Math.round(gap)}px`);
+        }
+        break;
+      }
+    }
+    check(
+      `neighbouring controls are at least ${PHONE_GAP}px apart in ${name}`,
+      crowded.length === 0,
+      crowded.length ? crowded.slice(0, 8).join(' | ') : 'no crowded pairs',
+    );
+
+    // 3. Nothing is set in text too small to read.
+    const texts = paintedText(host);
+    const tiny = texts.filter((t) => t.size < PHONE_MIN_TEXT - 0.01);
+    check(
+      `no text is smaller than ${PHONE_MIN_TEXT}px in ${name}`,
+      tiny.length === 0,
+      tiny.length
+        ? tiny.slice(0, 8).map((t) => `${describe(t.node, t.text)}@${t.size}px`).join(' | ')
+        : `${texts.length} text nodes`,
+    );
+
+    // 4. The live session figures specifically — the ones somebody reads
+    //    mid-session and the issue names one by one.
+    const live: Array<[string, HTMLElement | null]> = [
+      ['the state', host.querySelector('header [role="status"]')],
+      ['the cost and tokens', host.querySelector('[aria-label="Session usage"]')],
+      ['the approvals state', host.querySelector('[aria-label="Approvals bypassed"]')],
+      ['the model', host.querySelector('[aria-label="Change model"]')],
+    ];
+    for (const [label, node] of live) {
+      if (!node) {
+        check(`${label} is on screen in ${name}`, false, 'not found');
+        continue;
+      }
+      const size = parseFloat(window.getComputedStyle(node).fontSize) || 0;
+      check(
+        `${label} is at least ${PHONE_LIVE_TEXT}px in ${name}`,
+        size >= PHONE_LIVE_TEXT - 0.01,
+        `${size}px`,
+      );
+    }
+
+    // 5. Nothing is pushed off the side. Vertical overflow inside the
+    //    conversation is scrolling and expected; horizontal overflow is a row
+    //    that refused to wrap, which is the defect.
+    const offscreen = Array.from(host.querySelectorAll<HTMLElement>('*')).filter((node) => {
+      if (!isPainted(node)) return false;
+      // Popovers and sheets are allowed to be positioned relative to the
+      // viewport rather than this host.
+      if (window.getComputedStyle(node).position === 'fixed') return false;
+      const box = node.getBoundingClientRect();
+      return box.right > hostBox.right + 1 || box.left < hostBox.left - 1;
+    });
+    check(
+      `nothing is pushed off the side in ${name}`,
+      offscreen.length === 0,
+      offscreen.length ? offscreen.slice(0, 8).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
+    );
+
+    // 6. The composer is the one thing that must survive every viewport: a
+    //    phone with no way to type is not a degraded layout, it is a dead app.
+    const textarea = host.querySelector('textarea') as HTMLElement | null;
+    if (!textarea) {
+      check(`the composer is reachable in ${name}`, false, 'no textarea');
+    } else {
+      const box = textarea.getBoundingClientRect();
+      check(
+        `the composer is fully on screen in ${name}`,
+        box.top >= hostBox.top - 1 && box.bottom <= hostBox.bottom + 1 && box.height > 0,
+        `composer ${Math.round(box.top)}–${Math.round(box.bottom)}, surface ${Math.round(hostBox.top)}–${Math.round(hostBox.bottom)}`,
+      );
+    }
+
+    root.unmount();
+  }
+
   host.remove();
 }
 

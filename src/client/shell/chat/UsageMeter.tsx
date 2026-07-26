@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { ChatCapabilities, ChatUsage } from '../../../shared/chat-events.js';
+import { PHONE_TEXT } from '../../ui/touch.js';
 
 /**
  * Tokens and money for a message, turn or session.
@@ -15,6 +16,15 @@ export interface UsageMeterProps {
   usage: ChatUsage;
   capabilities: ChatCapabilities;
   compact?: boolean;
+  /**
+   * Size the figures for a phone.
+   *
+   * Separate from `compact`, which says how much is written (one line versus
+   * the full breakdown) rather than how large it is set. On a phone the compact
+   * form is still the right *content* — and it is the one carrying the cost,
+   * the single number issue #51 names as too small to read.
+   */
+  phone?: boolean;
 }
 
 interface TokenField {
@@ -22,7 +32,7 @@ interface TokenField {
   value: number;
 }
 
-export function UsageMeter({ usage, capabilities, compact = false }: UsageMeterProps) {
+export function UsageMeter({ usage, capabilities, compact = false, phone = false }: UsageMeterProps) {
   // A runtime that advertised no usage/cost reporting can still leave a stale
   // field behind on a reused object; the capability is what says the number is
   // meant to be trusted, not merely present.
@@ -52,7 +62,7 @@ export function UsageMeter({ usage, capabilities, compact = false }: UsageMeterP
     : 0;
   const barColor = contextPct >= 90 ? 'var(--destructive)' : contextPct >= 70 ? 'var(--warning)' : 'var(--success)';
 
-  const fontSize = compact ? 'var(--text-2xs)' : 'var(--text-xs)';
+  const fontSize = phone ? PHONE_TEXT.label : compact ? 'var(--text-2xs)' : 'var(--text-xs)';
 
   if (compact) {
     const parts: string[] = [];
@@ -65,10 +75,15 @@ export function UsageMeter({ usage, capabilities, compact = false }: UsageMeterP
 
     return (
       <div
+        // Named, because it is one of the readouts a phone layout has to keep
+        // legible and there is otherwise no way to ask for it — by role it is
+        // an anonymous div, and by text it is whatever this session has cost.
+        aria-label="Session usage"
         style={{
           display: 'flex',
           alignItems: 'center',
           gap: 8,
+          minWidth: 0,
           fontFamily: 'var(--font-mono)',
           fontSize,
           color: 'var(--muted-foreground)',
@@ -77,7 +92,7 @@ export function UsageMeter({ usage, capabilities, compact = false }: UsageMeterP
         {parts.length ? <span>{parts.join(' · ')}</span> : null}
         {hasContext ? (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-            <ContextBar pct={contextPct} color={barColor} width={40} height={4} />
+            <ContextBar pct={contextPct} color={barColor} width={40} height={phone ? 6 : 4} />
             {Math.round(contextPct)}%
           </span>
         ) : null}

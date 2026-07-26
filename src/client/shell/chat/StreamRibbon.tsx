@@ -5,6 +5,7 @@ import type { ChatTranscript } from '../../chat/transcript.js';
 import type { TurnSummary } from '../../chat/turns.js';
 import { compactCount, formatDuration } from '../../chat/tool-meta.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { useActivity } from './use-activity.js';
 
 /**
@@ -48,6 +49,7 @@ export function StreamRibbon({
   canInterrupt,
   onInterrupt,
 }: StreamRibbonProps): React.JSX.Element {
+  const isPhone = usePhone();
   const tone: Tone =
     state === 'error' ? 'error' : state === 'awaiting_permission' ? 'waiting' : 'working';
   const colour = TONE[tone];
@@ -79,10 +81,14 @@ export function StreamRibbon({
         flex: '0 0 auto',
         display: 'flex',
         alignItems: 'center',
-        gap: 10,
+        // What the agent is doing right now, and the one control that stops it.
+        // Neither may be squeezed onto a 390px line to keep the ribbon 34px.
+        flexWrap: isPhone ? 'wrap' : 'nowrap',
+        gap: isPhone ? TOUCH_GAP : 10,
         minWidth: 0,
-        height: 34,
-        padding: '0 14px',
+        height: isPhone ? undefined : 34,
+        minHeight: isPhone ? TOUCH_TARGET + 8 : undefined,
+        padding: isPhone ? '4px 12px' : '0 14px',
         background: `color-mix(in oklab, ${colour} 10%, transparent)`,
         borderTop: `1px solid color-mix(in oklab, ${colour} 32%, transparent)`,
         fontFamily: 'var(--font-sans)',
@@ -97,14 +103,17 @@ export function StreamRibbon({
           animation: working ? 'relay-spin 900ms linear infinite' : undefined,
         }}
       >
-        <Icon name={working ? 'loader-circle' : tone === 'waiting' ? 'shield' : 'circle-alert'} size={12} />
+        <Icon
+          name={working ? 'loader-circle' : tone === 'waiting' ? 'shield' : 'circle-alert'}
+          size={isPhone ? 16 : 12}
+        />
       </span>
 
       <span
         style={{
           flex: 1,
           minWidth: 0,
-          fontSize: 11.5,
+          fontSize: isPhone ? PHONE_TEXT.body : 11.5,
           color: colour,
           overflow: 'hidden',
           textOverflow: 'ellipsis',
@@ -119,7 +128,7 @@ export function StreamRibbon({
           style={{
             flex: '0 0 auto',
             fontFamily: 'var(--font-mono)',
-            fontSize: 10,
+            fontSize: isPhone ? PHONE_TEXT.label : 10,
             color: 'var(--muted-foreground)',
             whiteSpace: 'nowrap',
           }}
@@ -147,6 +156,7 @@ function StopButton({
   onClick: () => void;
 }): React.JSX.Element {
   const [hover, setHover] = React.useState(false);
+  const isPhone = usePhone();
   const label = canInterrupt ? 'Stop this turn' : 'This runtime cannot be interrupted';
   return (
     <button
@@ -162,20 +172,21 @@ function StopButton({
         display: 'inline-flex',
         alignItems: 'center',
         gap: 6,
-        height: 22,
-        padding: '0 9px',
+        height: isPhone ? TOUCH_TARGET : 22,
+        padding: isPhone ? '0 14px' : '0 9px',
         background: hover && canInterrupt ? 'var(--accent)' : 'var(--secondary)',
         border: '1px solid var(--border-strong)',
         borderRadius: 'var(--radius)',
         fontFamily: 'var(--font-mono)',
-        fontSize: 10,
+        fontSize: isPhone ? PHONE_TEXT.label : 10,
         color: 'var(--foreground)',
         opacity: canInterrupt ? 1 : 0.5,
         cursor: canInterrupt ? 'pointer' : 'not-allowed',
       }}
     >
-      <Icon name="square" size={9} />
-      stop · esc
+      <Icon name="square" size={isPhone ? 14 : 9} />
+      {/* A phone has no Escape key to name. */}
+      {isPhone ? 'stop' : 'stop · esc'}
     </button>
   );
 }

@@ -10,6 +10,7 @@ import {
 import { ChatTranscript } from '../../chat/transcript.js';
 import { compactCount, formatDuration } from '../../chat/tool-meta.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { Markdown, markdownText } from './Markdown.js';
 import { PlanPanel } from './PlanPanel.js';
 
@@ -85,6 +86,7 @@ export const MessageBubble = React.memo(function MessageBubble({
   );
 
   const [copied, setCopied] = React.useState(false);
+  const isPhone = usePhone();
   const isUser = current.role === 'user';
   // A marker is not a turn: no surface, no glyph, no controls, and the full
   // width of the column — it is a line drawn across the conversation.
@@ -191,12 +193,22 @@ export const MessageBubble = React.memo(function MessageBubble({
         {isUser ? null : <Footer model={current.model} usage={current.usage} />}
       </div>
 
-      <div style={{ flex: '0 0 auto', display: 'flex', alignItems: 'flex-start', gap: 2 }}>
+      <div
+        style={{
+          flex: '0 0 auto',
+          display: 'flex',
+          alignItems: 'flex-start',
+          // A phone stacks these instead of putting three 22px buttons in a row
+          // two pixels apart, which is one fingertip covering all three.
+          flexDirection: isPhone ? 'column' : 'row',
+          gap: isPhone ? TOUCH_GAP : 2,
+        }}
+      >
         <span
           style={{
             paddingTop: 3,
             fontFamily: 'var(--font-mono)',
-            fontSize: 'var(--text-2xs)',
+            fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
             color: 'var(--muted-foreground)',
             whiteSpace: 'nowrap',
           }}
@@ -299,6 +311,7 @@ function summariseWork(
  * pointer — it opens the rail and scrolls the timeline to this message.
  */
 function WorkPill({ label, onClick }: { label: string; onClick: () => void }): React.JSX.Element {
+  const isPhone = usePhone();
   const [hover, setHover] = React.useState(false);
   return (
     <button
@@ -314,19 +327,19 @@ function WorkPill({ label, onClick }: { label: string; onClick: () => void }): R
         alignItems: 'center',
         gap: 8,
         maxWidth: '100%',
-        height: 24,
-        padding: '0 8px',
+        height: isPhone ? TOUCH_TARGET : 24,
+        padding: isPhone ? '0 12px' : '0 8px',
         background: 'var(--card)',
         border: `1px solid ${hover ? 'var(--border-strong)' : 'var(--border)'}`,
         borderRadius: 'var(--radius)',
         fontFamily: 'var(--font-mono)',
-        fontSize: 10.5,
+        fontSize: isPhone ? PHONE_TEXT.body : 10.5,
         color: hover ? 'var(--foreground)' : 'var(--muted-foreground)',
         cursor: 'pointer',
         transition: 'border-color var(--duration-fast), color var(--duration-fast)',
       }}
     >
-      <Icon name="terminal" size={10} />
+      <Icon name="terminal" size={isPhone ? 16 : 10} />
       <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {label}
       </span>
@@ -537,6 +550,7 @@ function ActionButton({
   tone?: string;
 }) {
   const [hot, setHot] = React.useState(false);
+  const isPhone = usePhone();
   return (
     <button
       type="button"
@@ -551,8 +565,8 @@ function ActionButton({
         display: 'inline-flex',
         alignItems: 'center',
         justifyContent: 'center',
-        width: 22,
-        height: 22,
+        width: isPhone ? TOUCH_TARGET : 22,
+        height: isPhone ? TOUCH_TARGET : 22,
         background: hot ? 'var(--accent)' : 'transparent',
         border: '1px solid transparent',
         color: tone || 'var(--muted-foreground)',
@@ -564,12 +578,13 @@ function ActionButton({
         transition: 'opacity var(--duration-fast), background var(--duration-fast)',
       }}
     >
-      <Icon name={icon} size={11} />
+      <Icon name={icon} size={isPhone ? 18 : 11} />
     </button>
   );
 }
 
 function Footer({ model, usage }: { model?: string; usage?: ChatUsage }) {
+  const isPhone = usePhone();
   const bits: string[] = [];
   if (model) bits.push(model);
   if (usage) {
@@ -587,7 +602,9 @@ function Footer({ model, usage }: { model?: string; usage?: ChatUsage }) {
         flexWrap: 'wrap',
         gap: 8,
         fontFamily: 'var(--font-mono)',
-        fontSize: 'var(--text-2xs)',
+        // The model this answer ran on, and what it cost: the same figures the
+        // header carries, so the same rule applies to them here.
+        fontSize: isPhone ? PHONE_TEXT.label : 'var(--text-2xs)',
         color: 'var(--muted-foreground)',
       }}
     >

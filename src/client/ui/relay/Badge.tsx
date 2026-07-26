@@ -22,13 +22,21 @@ export interface BadgeProps {
   dot?: boolean;
   children?: React.ReactNode;
   style?: React.CSSProperties;
+  /**
+   * A stable name for a badge whose text is written for the space available.
+   *
+   * "Approvals bypassed" and "bypassed" are the same fact at two widths; only
+   * an explicit name lets a screen reader — or a check asserting that the fact
+   * is legible — ask for it without knowing which width was drawn.
+   */
+  'aria-label'?: string;
 }
 
-export function Badge({ variant = 'neutral', dot = false, children, style }: BadgeProps) {
+export function Badge({ variant = 'neutral', dot = false, children, style, ...rest }: BadgeProps) {
   // Fall back to `neutral` so an out-of-range variant still renders a valid badge.
   const v = V[variant] || V.neutral;
   return (
-    <span style={{
+    <span {...rest} style={{
       display: 'inline-flex', alignItems: 'center', gap: 5, height: 18, padding: '0 7px',
       fontFamily: 'var(--font-mono)', fontSize: 'var(--text-2xs)', fontWeight: 'var(--font-medium)',
       letterSpacing: '0.02em', borderRadius: 'var(--radius)', lineHeight: 1, ...v, ...style,
