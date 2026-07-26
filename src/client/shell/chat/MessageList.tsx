@@ -290,7 +290,16 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
             flex: 1,
             // A normal block scroller. Never `justify-content: flex-end` to fake
             // bottom alignment — that makes the scrollback unreachable.
-            minHeight: 160,
+            //
+            // `0`, not a 160px floor. A flex item cannot shrink below its
+            // min-height, so a floor taller than the space available does not
+            // reserve room — it overflows the column, and the transcript gets
+            // painted over the live ribbon and the composer beneath it. A phone
+            // in landscape has about 160px for the whole conversation once the
+            // header, the ribbon and the composer have taken theirs, so this
+            // was the shape it broke in first. Flex already gives the scroller
+            // every pixel the column can spare, which is what the floor was for.
+            minHeight: 0,
             overflowY: 'auto',
             overflowX: 'hidden',
             overscrollBehavior: 'contain',

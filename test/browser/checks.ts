@@ -797,6 +797,22 @@ function scrollsSideways(node: Element): boolean {
   return false;
 }
 
+/**
+ * The nearest ancestor that scrolls this node, if any.
+ *
+ * Two controls in different scroll containers have no fixed distance from each
+ * other — one of them moves when its container is scrolled, and either can be
+ * clipped to a sliver at the boundary. Measuring the space between them says
+ * nothing about whether they can be mistapped for each other.
+ */
+function scrollBoxOf(node: Element): Element | null {
+  for (let at: Element | null = node.parentElement; at; at = at.parentElement) {
+    const styles = viewOf(at).getComputedStyle(at);
+    if (/(auto|scroll)/.test(styles.overflowY) || /(auto|scroll)/.test(styles.overflowX)) return at;
+  }
+  return null;
+}
+
 /** Elements that render a word of their own, with the size that word is set at. */
 function paintedText(root: HTMLElement): Array<{ node: HTMLElement; size: number; text: string }> {
   const out: Array<{ node: HTMLElement; size: number; text: string }> = [];
@@ -869,10 +885,9 @@ function assertPhoneSurface(host: HTMLElement, where: string): void {
       const b = byLeft[j].getBoundingClientRect();
       const sameLine = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > Math.min(a.height, b.height) / 2;
       if (!sameLine) continue;
-      // A control clipped by a sideways scroller has a box that no longer says
-      // where it is on screen, so measuring it against one outside the scroller
-      // reports a gap that is not there.
-      if (scrollsSideways(byLeft[i]) !== scrollsSideways(byLeft[j])) continue;
+      // Only controls that share a scroll container have a fixed distance from
+      // each other — see scrollBoxOf.
+      if (scrollBoxOf(byLeft[i]) !== scrollBoxOf(byLeft[j])) continue;
       const gap = b.left - a.right;
       // Only the nearest neighbour to the right matters; anything further is
       // separated by that one.
@@ -921,7 +936,47 @@ function assertPhoneSurface(host: HTMLElement, where: string): void {
     );
   }
 
-  // 5. Nothing is pushed off the side. Vertical overflow inside the
+  // And the model control shows the model, not the word "model".
+  //
+  // Asserted because the size check above cannot tell the difference: the chip
+  // falls back to a placeholder when nothing reported a model, and a fixture
+  // that fails to deliver one measures the placeholder and passes.
+  const modelChip = host.querySelector('[aria-label="Change model"]') as HTMLElement | null;
+  if (modelChip) {
+    check(
+      `the model control names the model in ${where}`,
+      (modelChip.textContent || '').includes('claude-opus-4-6'),
+      (modelChip.textContent || '').trim() || 'empty',
+    );
+  }
+
+  // 5. And each of them says which control it is.
+  //
+  //    The issue's wording is "identified without pressing" — on a touch screen
+  //    there is no hover, so `title` reveals nothing and `aria-label` is only
+  //    read aloud to somebody who has turned a screen reader on. A drawn word
+  //    is the only thing that answers the question for everybody.
+  const header = host.querySelector('header') as HTMLElement | null;
+  const composer = (host.querySelector('textarea')?.parentElement ?? null) as HTMLElement | null;
+  for (const [region, box] of [['the header', header], ['the composer row', composer]] as Array<
+    [string, HTMLElement | null]
+  >) {
+    if (!box) continue;
+    const mute = paintedControls(box).filter((node) => {
+      if (node.tagName === 'TEXTAREA') return false;
+      // A field's placeholder is drawn text saying what the field is for, which
+      // is the same answer a button's label gives.
+      if (node.tagName === 'INPUT' && (node as HTMLInputElement).placeholder.trim()) return false;
+      return !(node.textContent || '').trim();
+    });
+    check(
+      `every control in ${region} is identifiable without pressing it in ${where}`,
+      mute.length === 0,
+      mute.length ? mute.slice(0, 8).map((n) => describe(n)).join(' | ') : 'all labelled',
+    );
+  }
+
+  // 6. Nothing is pushed off the side. Vertical overflow inside the
   //    conversation is scrolling and expected; horizontal overflow is a row
   //    that refused to wrap, which is the defect.
   const offscreen = Array.from(host.querySelectorAll<HTMLElement>('*')).filter((node) => {
@@ -942,7 +997,34 @@ function assertPhoneSurface(host: HTMLElement, where: string): void {
     offscreen.length ? offscreen.slice(0, 8).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
   );
 
-  // 6. The composer is the one thing that must survive every viewport: a
+  // 7. The regions do not overlap.
+  //
+  //    Every rule above is satisfiable by a layout whose bands sit on top of
+  //    each other: a control can be the right size, in the right type, inside
+  //    the surface, and still be underneath the ribbon.
+  //
+  //    Asserted between the *regions*, not their contents. The conversation is
+  //    a scroller, so it clips its own children — a turn scrolled half out of
+  //    view has a box that extends above the scroller and is painted nowhere
+  //    near there, and comparing that box to the header reports an overlap that
+  //    does not exist on screen.
+  const conversation = host.querySelector('[data-message-id]')?.closest('[style*="overflow"]') as HTMLElement | null;
+  const bands: Array<[string, HTMLElement | null]> = [
+    ['the header', host.querySelector('header')],
+    ['the status ribbon', host.querySelector('[role="status"][aria-live="polite"]:not(header *)')],
+  ];
+  for (const [label, band] of bands) {
+    if (!band || !conversation || band.contains(conversation) || conversation.contains(band)) continue;
+    const bandBox = band.getBoundingClientRect();
+    const box = conversation.getBoundingClientRect();
+    check(
+      `the conversation and ${label} do not overlap in ${where}`,
+      box.top >= bandBox.bottom - 1 || box.bottom <= bandBox.top + 1,
+      `conversation ${Math.round(box.top)}-${Math.round(box.bottom)}, ${label} ${Math.round(bandBox.top)}-${Math.round(bandBox.bottom)}`,
+    );
+  }
+
+  // 8. The composer is the one thing that must survive every viewport: a
   //    phone with no way to type is not a degraded layout, it is a dead app.
   const textarea = host.querySelector('textarea') as HTMLElement | null;
   if (!textarea) {
@@ -977,10 +1059,6 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
         models: [{ name: 'claude-opus-4-6', value: 'claude-opus-4-6' }],
       },
       usage: { totalTokens: 987654, costUsd: 12.3456, contextWindow: 200000, contextUsed: 150000 },
-      // On the snapshot, not as a prop: the model and the branch reach the
-      // composer through the transcript and a workspace fetch respectively,
-      // and a prop named `model` on ChatView would be quietly ignored.
-      model: 'claude-opus-4-6',
       messages: [
         {
           id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: Date.now(),
@@ -1000,6 +1078,29 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
       ],
       pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
       live: true, bypassPermissions: true,
+    },
+  } as never);
+
+  // The model reaches the composer through a `session` event, not through the
+  // snapshot and not through a prop — a `model` field on either is quietly
+  // ignored, which is how a fixture ends up asserting the size of the word
+  // "model" instead of the size of a model name.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'phone-check',
+    event: {
+      // seq 3, not 0: the reducer drops anything at or below the cursor the
+      // snapshot left behind, so a seq-0 session event is silently a no-op.
+      t: 'session', seq: 3, ts: Date.now(), model: 'claude-opus-4-6',
+      // Repeated in full: a `session` event replaces the capabilities rather
+      // than merging into them, so a short one here would quietly take the
+      // model list and the interrupt away from everything below.
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true, commands: [{ name: 'clear' }],
+        models: [{ name: 'claude-opus-4-6', value: 'claude-opus-4-6' }],
+      },
     },
   } as never);
 

@@ -2,7 +2,34 @@
 
 ## [5.2.0] - Unreleased
 
-Nothing yet — this section collects the work merged onto the 5.2.0 branch.
+### Changed
+- **A phone gets a layout meant for a phone.** The chat surface was the desktop
+  layout at the same size, so the figures you actually read mid-session — the
+  cost, the model, the state, whether approvals are bypassed — were set smaller
+  than the body text, and the controls sat close enough together that hitting
+  the intended one was luck. The header now spends a second line rather than
+  shrinking its type or hiding what is on it; every control a finger is meant
+  to hit is at least 44px with real space around it; and the controls above the
+  composer and in the header say what they are instead of being a bare glyph
+  with a tooltip no touch screen can show. The same treatment reaches the trace
+  rail, the turn index, the model list, the bottom bar, its more sheet and the
+  tab switcher. The desktop and tablet layouts are unchanged.
+
+### Fixed
+- **The conversation no longer spills over the live ribbon and the composer on
+  a short screen.** The transcript kept a fixed minimum height it could not
+  give up, so on a phone in landscape — or any window short enough — it grew
+  past the space it had and was painted over the two things below it.
+
+### Internal
+- The automated browser checks run at phone viewports (portrait, keyboard-open
+  and landscape), with each of the phone's own sheets open in turn, and assert
+  the geometry rather than the intent: target size, the space between
+  neighbours, type size, that the named live figures are legible, that every
+  control can be identified without pressing it, and that no region is drawn
+  over another. They also load the app's own stylesheets, without which every
+  `var(--text-2xs)` resolved to nothing and a check measuring type size would
+  have read 16px for text that ships at 10.
 
 ## [5.1.2] - 2026-07-26
 

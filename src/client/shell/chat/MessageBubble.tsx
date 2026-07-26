@@ -142,6 +142,11 @@ export const MessageBubble = React.memo(function MessageBubble({
       aria-label={isUser ? 'Your message' : 'Assistant message'}
       style={{
         display: 'flex',
+        // On a phone the controls drop to a line of their own below the
+        // message — see the action column. Beside it they were a 44px-wide
+        // column of stacked buttons that made a two-line message four lines
+        // tall and took a sixth of the width off the text.
+        flexWrap: isPhone ? 'wrap' : 'nowrap',
         gap: 10,
         minWidth: 0,
         padding: isUser ? '10px 14px' : '12px 14px',
@@ -195,18 +200,22 @@ export const MessageBubble = React.memo(function MessageBubble({
 
       <div
         style={{
-          flex: '0 0 auto',
+          // Its own full-width line on a phone, so the buttons can be a row of
+          // proper targets without taking that width from the message.
+          flex: isPhone ? '1 0 100%' : '0 0 auto',
           display: 'flex',
-          alignItems: 'flex-start',
-          // A phone stacks these instead of putting three 22px buttons in a row
-          // two pixels apart, which is one fingertip covering all three.
-          flexDirection: isPhone ? 'column' : 'row',
+          // Centred only on a phone, where this is a row of its own under the
+          // message. Beside the message it stays top-aligned, level with the
+          // first line — which is where it has always been.
+          alignItems: isPhone ? 'center' : 'flex-start',
+          justifyContent: isPhone ? 'flex-end' : undefined,
           gap: isPhone ? TOUCH_GAP : 2,
         }}
       >
         <span
           style={{
-            paddingTop: 3,
+            paddingTop: isPhone ? 0 : 3,
+            marginRight: isPhone ? 'auto' : 0,
             fontFamily: 'var(--font-mono)',
             fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
             color: 'var(--muted-foreground)',

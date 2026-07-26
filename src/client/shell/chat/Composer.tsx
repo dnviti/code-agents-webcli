@@ -764,43 +764,56 @@ export function Composer({
           minWidth: 0,
         }}
       >
+        {/* On a phone each of these says what it is. A paperclip is a
+            convention and `@` and `/` are the characters they type, but on a
+            touch screen there is no hover to confirm any of that — the only way
+            to find out what a bare glyph does is to press it and see. */}
         {attachmentsEnabled ? (
           <ChipButton
             label="Attach a file or image"
+            text="Attach"
             onClick={() => fileInputRef.current?.click()}
             disabled={disabled}
           >
-            <Icon name="paperclip" size={12} />
+            <Icon name="paperclip" size={isMobile ? 16 : 12} />
           </ChipButton>
         ) : null}
 
         {filesEnabled ? (
-          <ChipButton label="Reference a file from this project" onClick={openFiles}>
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>@</span>
+          <ChipButton label="Reference a file from this project" text="File" onClick={openFiles}>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: isMobile ? 15 : 12 }}>@</span>
           </ChipButton>
         ) : null}
 
         {commands.length > 0 ? (
           <ChipButton
             label="Slash commands and skills"
+            text="Command"
             aria-expanded={pickerOpen && pickerKind === 'commands'}
             onClick={openCommands}
             disabled={disabled}
           >
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>/</span>
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: isMobile ? 15 : 12 }}>/</span>
           </ChipButton>
         ) : null}
 
+        {/* `display: contents` on a phone: the right-hand group stops being a
+            group at all and its controls join the row above, so they wrap into
+            whatever space is left instead of starting a line of their own —
+            which is what left Send sitting alone on a line by itself. */}
         <span
-          style={{
-            marginLeft: 'auto',
-            display: 'flex',
-            alignItems: 'center',
-            flexWrap: isMobile ? 'wrap' : 'nowrap',
-            justifyContent: 'flex-end',
-            gap: isMobile ? TOUCH_GAP : 7,
-            minWidth: 0,
-          }}
+          style={
+            isMobile
+              ? { display: 'contents' }
+              : {
+                  marginLeft: 'auto',
+                  display: 'flex',
+                  alignItems: 'center',
+                  flexWrap: 'nowrap',
+                  gap: 7,
+                  minWidth: 0,
+                }
+          }
         >
           {branch && roomy ? (
             <Chip
@@ -847,7 +860,13 @@ export function Composer({
         <span
           style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
         >
-          {roomy ? hintFor({ isMobile, busy, findFailed, filesEnabled, terminalOpen }) : null}
+          {/* Dropped on a phone. At the phone type size the sentence does not
+              fit the row and truncates to half of itself, and what it was
+              telling you — that `@` picks a file and `/` picks a command — is
+              now written on the two buttons above it. */}
+          {roomy && !isMobile
+            ? hintFor({ isMobile, busy, findFailed, filesEnabled, terminalOpen })
+            : null}
         </span>
         <span style={{ marginLeft: 'auto', flex: '0 0 auto', whiteSpace: 'nowrap' }}>
           {sessionReadout(turnLabel, usage)}
@@ -981,21 +1000,32 @@ function sessionReadout(turnLabel: string | undefined, usage: ChatUsage | undefi
   return bits.join(' · ');
 }
 
-/** A square control on the composer's action row: 26px, or a finger on a phone. */
+/**
+ * A control on the composer's action row: a 26px square, or a labelled target
+ * on a phone.
+ *
+ * `text` is drawn only on a phone. On the desktop row the glyph plus a hover
+ * tooltip is enough and three labelled chips would crowd out the field; on a
+ * phone there is no hover, so the label is the only thing that answers "what
+ * does this do" without pressing it.
+ */
 function ChipButton({
   label,
+  text,
   onClick,
   disabled,
   children,
   ...rest
 }: {
   label: string;
+  text?: string;
   onClick: () => void;
   disabled?: boolean;
   children: React.ReactNode;
 } & React.ButtonHTMLAttributes<HTMLButtonElement>): React.JSX.Element {
   const [hover, setHover] = React.useState(false);
   const isPhone = usePhone();
+  const labelled = isPhone && Boolean(text);
   const side = isPhone ? TOUCH_TARGET : 26;
   return (
     <button
@@ -1011,8 +1041,13 @@ function ChipButton({
         alignItems: 'center',
         justifyContent: 'center',
         flex: '0 0 auto',
-        width: side,
+        gap: labelled ? 6 : 0,
+        width: labelled ? undefined : side,
+        minWidth: side,
         height: side,
+        padding: labelled ? '0 12px' : 0,
+        fontFamily: 'var(--font-sans)',
+        fontSize: labelled ? PHONE_TEXT.body : undefined,
         background: hover && !disabled ? 'var(--accent)' : 'transparent',
         border: '1px solid var(--border)',
         borderRadius: 'var(--radius)',
@@ -1024,6 +1059,7 @@ function ChipButton({
       {...rest}
     >
       {children}
+      {labelled ? <span>{text}</span> : null}
     </button>
   );
 }
@@ -1421,8 +1457,13 @@ function SendButton({
         alignItems: 'center',
         justifyContent: 'center',
         flex: '0 0 auto',
-        width: isPhone ? TOUCH_TARGET : 34,
+        gap: isPhone ? 6 : 0,
+        width: isPhone ? undefined : 34,
+        minWidth: TOUCH_TARGET,
         height: isPhone ? TOUCH_TARGET : 30,
+        padding: isPhone ? '0 14px' : 0,
+        fontFamily: 'var(--font-sans)',
+        fontSize: isPhone ? PHONE_TEXT.body : undefined,
         borderRadius: 'var(--radius)',
         border: '1px solid transparent',
         background: enabled ? 'var(--primary)' : 'var(--muted)',
@@ -1439,7 +1480,8 @@ function SendButton({
           + ' opacity var(--duration-fast) var(--ease-standard)',
       }}
     >
-      <Icon name={queueing ? 'corner-down-left' : 'arrow-up'} size={isPhone ? 20 : 14} />
+      <Icon name={queueing ? 'corner-down-left' : 'arrow-up'} size={isPhone ? 18 : 14} />
+      {isPhone ? <span>{queueing ? 'Queue' : 'Send'}</span> : null}
     </button>
   );
 }
@@ -1463,9 +1505,24 @@ function StopButton({ onClick, enabled }: { onClick: () => void; enabled: boolea
       label={label}
       disabled={!enabled}
       onClick={enabled ? onClick : undefined}
-      style={isPhone ? { ...tone, width: TOUCH_TARGET, height: TOUCH_TARGET } : tone}
+      style={
+        isPhone
+          ? {
+              ...tone,
+              width: undefined,
+              minWidth: TOUCH_TARGET,
+              height: TOUCH_TARGET,
+              gap: 6,
+              padding: '0 12px',
+              fontFamily: 'var(--font-sans)',
+              fontSize: PHONE_TEXT.body,
+            }
+          : tone
+      }
     >
-      <Icon name="square" size={isPhone ? 16 : 11} />
+      <Icon name="square" size={isPhone ? 15 : 11} />
+      {/* A bare square is not "stop" to anybody who has not been told. */}
+      {isPhone ? <span>Stop</span> : null}
     </IconButton>
   );
 }

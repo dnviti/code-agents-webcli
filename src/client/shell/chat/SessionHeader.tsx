@@ -556,47 +556,65 @@ function PhoneHeader({
         ) : null}
       </div>
 
-      {/* The controls, at a size and a spacing a finger can use. Each keeps its
-          own icon; the accessible name is what a long-press reads out, and none
-          of them is now sharing an edge with its neighbour. */}
+      {/* The controls, at a size and a spacing a finger can use — and each
+          says what it is. A `panel-left` glyph does not mean "turn index" to
+          anybody, and on a touch screen there is no hover to reveal the title
+          that said so: pressing it and watching what happens was the only way
+          to find out. */}
       <div
         style={{
           display: 'flex',
           alignItems: 'center',
           flexWrap: 'wrap',
           gap: TOUCH_GAP,
-          // Pulled left so the row's own left edge lines up with the text
-          // above it: an IconButton centres its glyph in its hit area.
-          marginLeft: -((TOUCH_TARGET - 20) / 2),
+          rowGap: TOUCH_GAP,
+          marginLeft: -10,
         }}
       >
-        <PhoneControl label="Search this conversation" icon="search" onClick={onOpenSearch} />
+        <PhoneControl label="Search this conversation" text="Search" icon="search" onClick={onOpenSearch} />
         <PhoneControl
           label={indexOpen ? 'Hide the turn index' : 'Show the turn index'}
+          text="Turns"
           icon="panel-left"
           active={indexOpen}
           onClick={onToggleIndex}
         />
         <PhoneControl
           label={railOpen ? 'Hide the trace rail' : 'Show the trace rail'}
+          text="Trace"
           icon="panel-right"
           active={railOpen}
           onClick={onToggleRail}
         />
-        <PhoneControl label="Chat display settings" icon="settings" onClick={onOpenSettings} />
+        <PhoneControl
+          label="Chat display settings"
+          text="Display"
+          icon="settings"
+          onClick={onOpenSettings}
+        />
       </div>
     </header>
   );
 }
 
-/** One header control on a phone: a 20px glyph in a target a finger can hit. */
+/**
+ * One header control on a phone: a glyph, its name, and a target a finger can
+ * hit.
+ *
+ * `label` is still the accessible name and stays the full sentence — "Hide the
+ * turn index" — while `text` is the one word there is room to paint. They are
+ * deliberately different lengths for the same control: the drawn word says
+ * which control this is, the accessible name says what pressing it will do.
+ */
 function PhoneControl({
   label,
+  text,
   icon,
   active = false,
   onClick,
 }: {
   label: string;
+  text: string;
   icon: string;
   active?: boolean;
   onClick(): void;
@@ -609,9 +627,18 @@ function PhoneControl({
       aria-pressed={active || undefined}
       active={active}
       onClick={onClick}
-      style={{ width: TOUCH_TARGET, height: TOUCH_TARGET }}
+      style={{
+        width: undefined,
+        minWidth: TOUCH_TARGET,
+        height: TOUCH_TARGET,
+        gap: 6,
+        padding: '0 10px',
+        fontFamily: 'var(--font-sans)',
+        fontSize: PHONE_TEXT.meta,
+      }}
     >
-      <Icon name={icon} size={20} />
+      <Icon name={icon} size={18} />
+      <span>{text}</span>
     </IconButton>
   );
 }
