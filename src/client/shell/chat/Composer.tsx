@@ -220,6 +220,15 @@ export function Composer({
    * draft — it opens the list and lets the completion do the rewriting.
    */
   const [commandsForced, setCommandsForced] = React.useState(false);
+  /**
+   * Whether the phone's secondary controls are showing.
+   *
+   * Attach, the two pickers, the model and the approvals readout are five
+   * controls that a phone has no room for beside the field and no reason to
+   * show while you are typing — the two that matter mid-sentence are send and
+   * stop. Shut by default, and the room goes to the conversation.
+   */
+  const [toolsOpen, setToolsOpen] = React.useState(false);
 
   // A tablet rotated into portrait, or a touch laptop window resized, changes
   // which of Enter's two jobs (send vs newline) is correct — see mobile.ts.
@@ -626,6 +635,13 @@ export function Composer({
   };
 
   const sendLabel = busy ? 'Queue this message' : 'Send message';
+  /**
+   * The phone's resting shape: the field and its buttons on one line.
+   *
+   * Only while the extra controls are shut. Open, they are five more chips that
+   * have nowhere to go on a shared line, so the column comes back.
+   */
+  const phoneCollapsed = isMobile && !toolsOpen;
 
   return (
     // Re-published rather than merely consumed: `isMobile` here is the surface's
@@ -677,6 +693,19 @@ export function Composer({
         </div>
       ) : null}
 
+      {/* One line, not two, while the extra controls are shut.
+          `display: contents` everywhere else, so the desktop keeps the column
+          it has: the field over its own row of actions, which is what stops the
+          buttons floating in the middle of a twelve-line draft. On a phone
+          collapsed there is no twelve-line draft to float in and the second row
+          was 52px the conversation could have had. */}
+      <div
+        style={
+          phoneCollapsed
+            ? { display: 'flex', alignItems: 'flex-end', gap: TOUCH_GAP, minWidth: 0 }
+            : { display: 'contents' }
+        }
+      >
       <textarea
         ref={textareaRef}
         value={text}
@@ -731,6 +760,9 @@ export function Composer({
           minHeight: isMobile ? TOUCH_TARGET : undefined,
           maxHeight: '40vh',
           overflowY: 'auto',
+          // On the shared row it is the part that gives, so the buttons beside
+          // it keep their size. A flex item's `min-width: auto` would refuse.
+          ...(phoneCollapsed ? { flex: 1, minWidth: 0, width: undefined } : null),
         }}
       />
 
@@ -750,7 +782,10 @@ export function Composer({
           field and a row of buttons read as a search box; at twelve the buttons
           floated in the middle of a wall of text with nothing to align to.
           Actions first, then a line of plain text that says what the keys do
-          and what the conversation has cost. */}
+          and what the conversation has cost.
+
+          On a phone the first row is send and stop, and everything else is
+          behind the disclosure at its left. */}
       <div
         style={{
           display: 'flex',
@@ -762,13 +797,29 @@ export function Composer({
           flexWrap: isMobile ? 'wrap' : 'nowrap',
           gap: isMobile ? TOUCH_GAP : 7,
           minWidth: 0,
+          // Beside the field rather than under it, and only as wide as its
+          // buttons.
+          ...(phoneCollapsed ? { flex: '0 0 auto' } : null),
         }}
       >
         {/* On a phone each of these says what it is. A paperclip is a
             convention and `@` and `/` are the characters they type, but on a
             touch screen there is no hover to confirm any of that — the only way
             to find out what a bare glyph does is to press it and see. */}
-        {attachmentsEnabled ? (
+        {isMobile ? (
+          <ChipButton
+            label={toolsOpen ? 'Hide the other controls' : 'Show the other controls'}
+            // Labelled like everything else on this row: a bare `+` says
+            // "attach" to most people, which is the control next to it.
+            text={toolsOpen ? 'Less' : 'More'}
+            aria-expanded={toolsOpen}
+            onClick={() => setToolsOpen((value) => !value)}
+          >
+            <Icon name={toolsOpen ? 'chevron-down' : 'chevron-up'} size={18} />
+          </ChipButton>
+        ) : null}
+
+        {attachmentsEnabled && (!isMobile || toolsOpen) ? (
           <ChipButton
             label="Attach a file or image"
             text="Attach"
@@ -779,13 +830,13 @@ export function Composer({
           </ChipButton>
         ) : null}
 
-        {filesEnabled ? (
+        {filesEnabled && (!isMobile || toolsOpen) ? (
           <ChipButton label="Reference a file from this project" text="File" onClick={openFiles}>
             <span style={{ fontFamily: 'var(--font-mono)', fontSize: isMobile ? 15 : 12 }}>@</span>
           </ChipButton>
         ) : null}
 
-        {commands.length > 0 ? (
+        {commands.length > 0 && (!isMobile || toolsOpen) ? (
           <ChipButton
             label="Slash commands and skills"
             text="Command"
@@ -815,7 +866,7 @@ export function Composer({
                 }
           }
         >
-          {branch && roomy ? (
+          {branch && roomy && (!isMobile || toolsOpen) ? (
             <Chip
               label={`On branch ${branch}`}
               reason="Switch branches from the terminal or the Changes panel — a checkout under a running agent is not something this control can undo."
@@ -825,26 +876,39 @@ export function Composer({
             </Chip>
           ) : null}
 
-          <ModelChip
-            current={model}
-            models={capabilities.models}
-            feedback={modelFeedback}
-            onPick={(value) => onSetModel?.(value)}
-          />
+          {!isMobile || toolsOpen ? (
+            <>
+              <ModelChip
+                current={model}
+                models={capabilities.models}
+                feedback={modelFeedback}
+                onPick={(value) => onSetModel?.(value)}
+              />
 
-          <PermissionChip bypassPermissions={bypassPermissions} />
+              <PermissionChip bypassPermissions={bypassPermissions} />
+            </>
+          ) : null}
 
-          {busy && !disabled ? (
+          {/* Not on a phone's resting row. Stopping is possible exactly while
+              the live ribbon is on screen, and the ribbon carries a labelled
+              stop of its own directly above this — a second one here costs the
+              field about a third of its width to say the same thing twice, and
+              the field is what the row is for. */}
+          {busy && !disabled && !phoneCollapsed ? (
             <StopButton onClick={onInterrupt} enabled={capabilities.interrupt} />
           ) : null}
 
           <SendButton label={sendLabel} enabled={canSend} queueing={busy} onClick={submit} />
         </span>
       </div>
+      </div>
 
+      {/* Hidden on a phone until the other controls are, because the session
+          header already carries the cost and this row is otherwise a line of
+          chrome under the one thing you are trying to type into. */}
       <div
         style={{
-          display: 'flex',
+          display: isMobile && !toolsOpen ? 'none' : 'flex',
           alignItems: 'center',
           flexWrap: isMobile ? 'wrap' : 'nowrap',
           gap: 10,

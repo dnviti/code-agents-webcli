@@ -137,12 +137,6 @@ export function SessionHeader({
         meta={meta}
         bypassPermissions={bypassPermissions}
         showUsage={showUsage}
-        railOpen={railOpen}
-        indexOpen={indexOpen}
-        onToggleRail={onToggleRail}
-        onToggleIndex={onToggleIndex}
-        onOpenSearch={onOpenSearch}
-        onOpenSettings={onOpenSettings}
       />
     );
   }
@@ -372,22 +366,27 @@ export function SessionHeader({
 }
 
 /**
- * The same bar, laid out for a phone (issue #51).
+ * The same bar, laid out for a phone — and mostly not laid out at all.
  *
  * A separate component rather than a dozen `isMobile ?` ternaries, because the
- * answer is not "the same row, smaller" — that is what shipped and what this
- * issue is about. The two layouts disagree about their shape:
+ * answer is not "the same row, smaller". The two layouts disagree about their
+ * shape, and now about how much of themselves they show:
  *
  *   - The desktop bar is one fixed 34px line that must never wrap, and sheds
- *     items to stay on it. A phone has no width to shed *into*: shedding is how
- *     the branch, the search field and every label became invisible.
- *   - So the phone bar spends height instead, which it has. One wrapping row of
- *     information at a readable size, one row of controls at a size a finger can
- *     hit. Nothing is dropped for want of room.
+ *     items to stay on it.
+ *   - The phone bar is a strip saying what the session is doing and what it has
+ *     cost, and nothing else until it is asked. Tapping it opens the rest — the
+ *     runtime, the folder, the branch, the tokens, the context meter, the
+ *     approvals state — at a size worth reading, and tapping it again gives the
+ *     room back to the conversation.
  *
- * What is dropped, deliberately: the Beta badge (it says nothing about this
- * session), the terminal toggle and the theme toggle (both are in the bottom
- * bar's more sheet, so nothing becomes unreachable — see MoreSheet).
+ * Collapsed by default because the conversation is what a phone is for. The two
+ * figures that stay are the two that change while you watch: what it is doing,
+ * and what that has cost so far.
+ *
+ * The controls that used to sit here are gone from the bar entirely — they are
+ * in the floating menu now, published by ChatView. A row of them here was a row
+ * of chrome the transcript never got back.
  */
 function PhoneHeader({
   runtimeLabel,
@@ -398,12 +397,6 @@ function PhoneHeader({
   meta,
   bypassPermissions,
   showUsage,
-  railOpen,
-  indexOpen,
-  onToggleRail,
-  onToggleIndex,
-  onOpenSearch,
-  onOpenSettings,
 }: {
   runtimeLabel: string;
   workingDir: string;
@@ -413,99 +406,51 @@ function PhoneHeader({
   meta: StateMeta;
   bypassPermissions: boolean;
   showUsage: boolean;
-  railOpen: boolean;
-  indexOpen: boolean;
-  onToggleRail(): void;
-  onToggleIndex(): void;
-  onOpenSearch(): void;
-  onOpenSettings(): void;
 }): React.JSX.Element {
+  const [open, setOpen] = React.useState(false);
+  const detailId = React.useId();
+
   return (
     <header
       style={{
         flex: '0 0 auto',
         display: 'flex',
         flexDirection: 'column',
-        gap: 2,
         minWidth: 0,
-        padding: `4px ${PHONE_SPACE.edge}px`,
         background: 'var(--chrome)',
         borderBottom: '1px solid var(--border)',
         color: 'var(--chrome-foreground)',
         fontFamily: 'var(--font-sans)',
       }}
     >
-      {/* The readout. Wraps to as many lines as it needs — a second line costs
-          a phone very little and is the only way every figure stays legible. */}
-      <div
+      {/* The whole strip is the control. A 44px button in the corner of it
+          would be a second thing to aim at on a bar one line tall; the bar
+          itself is a far bigger target than any button on it. */}
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={detailId}
+        aria-label={open ? 'Hide the session details' : 'Show the session details'}
+        onClick={() => setOpen((value) => !value)}
         style={{
           display: 'flex',
-          flexWrap: 'wrap',
           alignItems: 'center',
-          columnGap: PHONE_SPACE.inline,
-          rowGap: 2,
-          minWidth: 0,
+          gap: PHONE_SPACE.inline,
+          width: '100%',
+          // The floor, like every other control. A full-width strip is an easy
+          // thing to hit at any height, but "easy" is not the rule and 10px is
+          // not what the conversation was short of.
+          minHeight: TOUCH_TARGET,
+          padding: `2px ${PHONE_SPACE.edge}px`,
+          background: 'transparent',
+          border: 0,
+          color: 'inherit',
+          font: 'inherit',
+          textAlign: 'left',
+          cursor: 'pointer',
+          WebkitTapHighlightColor: 'transparent',
         }}
       >
-        <span
-          style={{
-            fontSize: PHONE_TEXT.meta,
-            fontWeight: 'var(--font-semibold)' as React.CSSProperties['fontWeight'],
-            letterSpacing: 'var(--tracking-tight)',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          {runtimeLabel}
-        </span>
-
-        <span
-          title={workingDir}
-          style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 4,
-            minWidth: 0,
-            // Enough for a real directory name at 13px, and it ellipsises
-            // rather than pushing the state word onto its own line.
-            maxWidth: 150,
-            fontFamily: 'var(--font-mono)',
-            fontSize: PHONE_TEXT.meta,
-            color: 'var(--muted-foreground)',
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          <Icon name="folder" size={12} />
-          {basename(workingDir)}
-          <span style={SR_ONLY}>{workingDir}</span>
-        </span>
-
-        {/* The branch stays on a phone. On the desktop bar it is shed because
-            the composer row carries it too — but the composer row is exactly
-            what a phone's keyboard covers. */}
-        {branch ? (
-          <span
-            title={`On branch ${branch}`}
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 4,
-              minWidth: 0,
-              maxWidth: 150,
-              fontFamily: 'var(--font-mono)',
-              fontSize: PHONE_TEXT.meta,
-              color: 'var(--ansi-cyan)',
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            }}
-          >
-            <Icon name="git-branch" size={12} />
-            {branch}
-          </span>
-        ) : null}
-
         <span
           role="status"
           aria-live="polite"
@@ -514,24 +459,19 @@ function PhoneHeader({
             alignItems: 'center',
             gap: 6,
             flex: '0 0 auto',
-            padding: '1px 8px',
+            minWidth: 0,
             whiteSpace: 'nowrap',
             fontFamily: 'var(--font-mono)',
             fontSize: PHONE_TEXT.label,
-            background: meta.tint
-              ? `color-mix(in oklab, ${meta.tint} 12%, transparent)`
-              : 'transparent',
-            border: `1px solid ${
-              meta.tint ? `color-mix(in oklab, ${meta.tint} 40%, transparent)` : 'var(--border)'
-            }`,
             color: meta.color,
           }}
         >
           <span
             aria-hidden="true"
             style={{
-              width: 6,
-              height: 6,
+              width: 7,
+              height: 7,
+              flex: '0 0 auto',
               borderRadius: 'var(--radius-full)',
               background: 'currentColor',
               animation: meta.pulse ? 'relay-pulse 1.4s var(--ease-standard) infinite' : undefined,
@@ -540,106 +480,109 @@ function PhoneHeader({
           {meta.label}
         </span>
 
-        {showUsage ? <UsageMeter usage={usage} capabilities={capabilities} compact phone /> : null}
+        {/* Collapsed, the cost is the one figure worth the width. The rest of
+            the meter is below, where there is room for it. */}
+        <span style={{ marginLeft: 'auto', flex: '0 0 auto', display: 'inline-flex', alignItems: 'center', gap: PHONE_SPACE.inline }}>
+          {showUsage && !open ? (
+            <UsageMeter usage={usage} capabilities={capabilities} compact phone costOnly />
+          ) : null}
 
-        {bypassPermissions ? (
-          <Badge
-            variant="warning"
-            aria-label="Approvals bypassed"
-            style={{ flex: '0 0 auto', height: 'auto', padding: '1px 8px', fontSize: PHONE_TEXT.label }}
+          {bypassPermissions && !open ? (
+            <Icon name="shield" size={14} style={{ color: 'var(--warning)' }} />
+          ) : null}
+
+          <Icon
+            name={open ? 'chevron-up' : 'chevron-down'}
+            size={16}
+            style={{ color: 'var(--muted-foreground)' }}
+          />
+        </span>
+      </button>
+
+      {open ? (
+        <div
+          id={detailId}
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            alignItems: 'center',
+            columnGap: PHONE_SPACE.inline,
+            rowGap: 4,
+            minWidth: 0,
+            padding: `0 ${PHONE_SPACE.edge}px 8px`,
+          }}
+        >
+          <span
+            style={{
+              fontSize: PHONE_TEXT.meta,
+              fontWeight: 'var(--font-semibold)' as React.CSSProperties['fontWeight'],
+              letterSpacing: 'var(--tracking-tight)',
+              whiteSpace: 'nowrap',
+            }}
           >
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <Icon name="shield" size={12} />
-              Approvals bypassed
+            {runtimeLabel}
+          </span>
+
+          <span
+            title={workingDir}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              minWidth: 0,
+              maxWidth: 150,
+              fontFamily: 'var(--font-mono)',
+              fontSize: PHONE_TEXT.meta,
+              color: 'var(--muted-foreground)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            <Icon name="folder" size={12} />
+            {basename(workingDir)}
+            <span style={SR_ONLY}>{workingDir}</span>
+          </span>
+
+          {branch ? (
+            <span
+              title={`On branch ${branch}`}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                minWidth: 0,
+                maxWidth: 150,
+                fontFamily: 'var(--font-mono)',
+                fontSize: PHONE_TEXT.meta,
+                color: 'var(--ansi-cyan)',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              <Icon name="git-branch" size={12} />
+              {branch}
             </span>
-          </Badge>
-        ) : null}
-      </div>
+          ) : null}
 
-      {/* The controls, at a size and a spacing a finger can use — and each
-          says what it is. A `panel-left` glyph does not mean "turn index" to
-          anybody, and on a touch screen there is no hover to reveal the title
-          that said so: pressing it and watching what happens was the only way
-          to find out. */}
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          flexWrap: 'wrap',
-          gap: TOUCH_GAP,
-          rowGap: TOUCH_GAP,
-          marginLeft: -10,
-        }}
-      >
-        <PhoneControl label="Search this conversation" text="Search" icon="search" onClick={onOpenSearch} />
-        <PhoneControl
-          label={indexOpen ? 'Hide the turn index' : 'Show the turn index'}
-          text="Turns"
-          icon="panel-left"
-          active={indexOpen}
-          onClick={onToggleIndex}
-        />
-        <PhoneControl
-          label={railOpen ? 'Hide the trace rail' : 'Show the trace rail'}
-          text="Trace"
-          icon="panel-right"
-          active={railOpen}
-          onClick={onToggleRail}
-        />
-        <PhoneControl
-          label="Chat display settings"
-          text="Display"
-          icon="settings"
-          onClick={onOpenSettings}
-        />
-      </div>
+          {showUsage ? <UsageMeter usage={usage} capabilities={capabilities} compact phone /> : null}
+
+          {bypassPermissions ? (
+            <Badge
+              variant="warning"
+              aria-label="Approvals bypassed"
+              style={{ flex: '0 0 auto', height: 'auto', padding: '1px 8px', fontSize: PHONE_TEXT.label }}
+            >
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <Icon name="shield" size={12} />
+                Approvals bypassed
+              </span>
+            </Badge>
+          ) : null}
+        </div>
+      ) : null}
     </header>
-  );
-}
-
-/**
- * One header control on a phone: a glyph, its name, and a target a finger can
- * hit.
- *
- * `label` is still the accessible name and stays the full sentence — "Hide the
- * turn index" — while `text` is the one word there is room to paint. They are
- * deliberately different lengths for the same control: the drawn word says
- * which control this is, the accessible name says what pressing it will do.
- */
-function PhoneControl({
-  label,
-  text,
-  icon,
-  active = false,
-  onClick,
-}: {
-  label: string;
-  text: string;
-  icon: string;
-  active?: boolean;
-  onClick(): void;
-}): React.JSX.Element {
-  return (
-    <IconButton
-      type="button"
-      size="lg"
-      label={label}
-      aria-pressed={active || undefined}
-      active={active}
-      onClick={onClick}
-      style={{
-        width: undefined,
-        minWidth: TOUCH_TARGET,
-        height: TOUCH_TARGET,
-        gap: 6,
-        padding: '0 10px',
-        fontFamily: 'var(--font-sans)',
-        fontSize: PHONE_TEXT.meta,
-      }}
-    >
-      <Icon name={icon} size={18} />
-      <span>{text}</span>
-    </IconButton>
   );
 }
 

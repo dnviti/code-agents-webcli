@@ -3,6 +3,14 @@
 ## [5.2.0] - Unreleased
 
 ### Changed
+- **A phone gets a layout built around the conversation.** The chrome is one
+  slim strip above and one row below; everything else is behind a square button
+  floating in the bottom right, or behind a tap on the strip that opens the
+  session's details. The conversation itself now has about four fifths of the
+  screen, where it had under half. The bottom bar is gone — five permanent slots
+  along the bottom edge of a surface whose whole point is what is above them —
+  and everything it held is in the floating menu, together with the controls
+  that used to be a row of buttons in the header.
 - **A phone gets a layout meant for a phone.** The chat surface was the desktop
   layout at the same size, so the figures you actually read mid-session — the
   cost, the model, the state, whether approvals are bypassed — were set smaller

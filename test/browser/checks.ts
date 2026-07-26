@@ -22,7 +22,7 @@ import { createTerminalController, LIVE_SCROLLBACK_LINES } from '../../src/clien
 import { HistoryView } from '../../src/client/terminal/history-view';
 import { Dialog } from '../../src/client/ui/relay/Dialog';
 import { PhoneContext } from '../../src/client/ui/touch';
-import { MobileBar } from '../../src/client/shell/MobileBar';
+import { FloatingMenu, type FloatingMenuAction } from '../../src/client/shell/FloatingMenu';
 import { MoreSheet } from '../../src/client/shell/MoreSheet';
 import { ChatSettingsDialog } from '../../src/client/shell/dialogs/ChatSettingsDialog';
 import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
@@ -753,6 +753,22 @@ const PHONE_LIVE_TEXT = 15;
 const PHONE_TARGET = 44;
 /** Clear space between two neighbouring targets. */
 const PHONE_GAP = 8;
+/**
+ * The most vertical room the chrome may take from the conversation, at rest.
+ *
+ * The point of the floating menu and the collapsing header and composer is that
+ * the transcript gets the screen. Nothing else here would notice a redesign
+ * that quietly gave the chrome its room back — every other rule is about the
+ * chrome being *big enough*, which pushes the other way.
+ *
+ * A pixel budget rather than a share of the screen: the chrome is a fixed
+ * number of pixels, so its share grows as the screen shortens, and a share
+ * would fail in landscape for a layout that had given up nothing at all.
+ *
+ * The budget covers the header strip, the live ribbon and the collapsed
+ * composer together. It does not cover the floating menu, which floats.
+ */
+const PHONE_CHAT_CHROME = 170;
 
 /** Visible, non-decorative, and not a screen-reader-only clone. */
 /** The view a node actually lives in — this page's, or an iframe's. */
@@ -804,6 +820,14 @@ function laidOutSize(node: HTMLElement): { width: number; height: number } {
   return { width: node.offsetWidth, height: node.offsetHeight };
 }
 
+/**
+ * Which of the named live figures has been seen on screen at all.
+ *
+ * A collapsed layout is allowed to hide a figure; it is not allowed to make it
+ * unreachable. Filled as the states are walked, asserted once at the end.
+ */
+const seenLive = new Set<string>();
+
 /** Whether any ancestor up to the host deliberately scrolls this node sideways. */
 function scrollsSideways(node: Element): boolean {
   for (let at: Element | null = node.parentElement; at; at = at.parentElement) {
@@ -852,6 +876,31 @@ function describe(node: HTMLElement, text?: string): string {
 }
 
 /**
+ * The chat surface as a phone actually composes it.
+ *
+ * The menu is inside `ChatView` on a phone — it has to be, because it is
+ * anchored above the composer and the shell does not know where that ends — so
+ * this only has to supply what the shell would contribute to it.
+ */
+function PhoneSurface({ controller }: { controller: ChatController }): React.ReactElement {
+  return React.createElement(ChatView, {
+    controller,
+    runtime: 'claude',
+    runtimeLabel: 'Claude Code',
+    workingDir: '/home/dev/projects/a-rather-deeply-nested-working-directory',
+    isMobile: true,
+    view: { ...DEFAULT_CHAT_VIEW },
+    onViewChange: () => {},
+    // What the shell contributes. The surface's own entries are added inside.
+    menuActions: [
+      { id: 'sessions', label: 'Sessions', icon: 'layout-list', expands: true, onPress: () => {} },
+      { id: 'new', label: 'New', icon: 'plus', onPress: () => {} },
+      { id: 'more', label: 'More', icon: 'ellipsis', expands: true, onPress: () => {} },
+    ],
+  } as never);
+}
+
+/**
  * A phone is not a narrow desktop.
  *
  * Three viewports, because the failures differ: portrait is the ordinary case,
@@ -866,7 +915,7 @@ function describe(node: HTMLElement, text?: string): string {
  * Separate from the mount so it can be run again with a sheet open — see the
  * loop in the caller. `where` names the state, so a failure says which one.
  */
-function assertPhoneSurface(host: HTMLElement, where: string): void {
+function assertPhoneSurface(host: HTMLElement, where: string, atRest = false): void {
   const hostBox = host.getBoundingClientRect();
 
   // 1. Every control a finger is meant to hit.
@@ -931,8 +980,12 @@ function assertPhoneSurface(host: HTMLElement, where: string): void {
       : `${texts.length} text nodes`,
   );
 
-  // 4. The live session figures specifically — the ones somebody reads
-  //    mid-session and the issue names one by one.
+  // 4. The live session figures — whichever of them this state is showing.
+  //
+  //    Not "all of them, always": the header and the composer collapse now, so
+  //    most of these sit behind a disclosure. What has to hold is that when one
+  //    is on screen it is legible, and that every one of them is reachable in
+  //    *some* state — asserted once at the end, against `seenLive`.
   const live: Array<[string, HTMLElement | null]> = [
     ['the state', host.querySelector('header [role="status"]')],
     ['the cost and tokens', host.querySelector('[aria-label="Session usage"]')],
@@ -940,10 +993,8 @@ function assertPhoneSurface(host: HTMLElement, where: string): void {
     ['the model', host.querySelector('[aria-label="Change model"]')],
   ];
   for (const [label, node] of live) {
-    if (!node) {
-      check(`${label} is on screen in ${where}`, false, 'not found');
-      continue;
-    }
+    if (!node) continue;
+    seenLive.add(label);
     const size = parseFloat(viewOf(node).getComputedStyle(node).fontSize) || 0;
     check(
       `${label} is at least ${PHONE_LIVE_TEXT}px in ${where}`,
@@ -1013,7 +1064,26 @@ function assertPhoneSurface(host: HTMLElement, where: string): void {
     offscreen.length ? offscreen.slice(0, 8).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
   );
 
-  // 7. The regions do not overlap.
+  // 7. And the conversation has most of the screen.
+  //
+  //    Only in the resting state: opening the details or the composer's other
+  //    controls is the user asking for that room, and taking it back the moment
+  //    they do would make the disclosure useless.
+  if (atRest) {
+    const scroller = host.querySelector('[data-message-id]')?.closest('[style*="overflow"]') as HTMLElement | null;
+    const surface = host.getBoundingClientRect();
+    if (scroller && surface.height > 0) {
+      const chrome = surface.height - scroller.getBoundingClientRect().height;
+      check(
+        `the chrome takes no more than ${PHONE_CHAT_CHROME}px from the conversation in ${where}`,
+        chrome <= PHONE_CHAT_CHROME,
+        `${Math.round(chrome)}px of ${Math.round(surface.height)}px`
+          + ` (${Math.round((1 - chrome / surface.height) * 100)}% left to the conversation)`,
+      );
+    }
+  }
+
+  // 8. The regions do not overlap.
   //
   //    Every rule above is satisfiable by a layout whose bands sit on top of
   //    each other: a control can be the right size, in the right type, inside
@@ -1040,7 +1110,7 @@ function assertPhoneSurface(host: HTMLElement, where: string): void {
     );
   }
 
-  // 8. The composer is the one thing that must survive every viewport: a
+  // 9. The composer is the one thing that must survive every viewport: a
   //    phone with no way to type is not a degraded layout, it is a dead app.
   const textarea = host.querySelector('textarea') as HTMLElement | null;
   if (!textarea) {
@@ -1135,11 +1205,14 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
    * closed state alone is how a layout ends up correct in the chrome and
    * untouched everywhere behind it.
    */
-  const states: Array<[string, string | null]> = [
-    ['', null],
-    ['with the trace rail open', '[aria-label="Show the trace rail"]'],
-    ['with the turn index open', '[aria-label="Show the turn index"]'],
-    ['with the model list open', '[aria-label="Change model"]'],
+  const states: Array<[string, string[]]> = [
+    ['', []],
+    // Each is now reached through the floating menu: open it, then press the
+    // row. Driving it the way a thumb does is the only way to know the route
+    // still exists — the controls left the header when the menu arrived.
+    ['with the session details open', ['[aria-label="Show the session details"]']],
+    ['with the other composer controls open', ['[aria-label="Show the other controls"]']],
+    ['with the menu open', ['[aria-label="Open the menu"]']],
   ];
 
   for (const [name, width, height] of viewports) {
@@ -1149,34 +1222,67 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
       // and reported its offences against every state after it.
       host.style.cssText = `width:${width}px;height:${height}px;position:absolute;top:0;left:0;display:flex;overflow:hidden`;
       const root = createRoot(host);
-      root.render(
-        React.createElement(ChatView, {
-          controller,
-          runtime: 'claude',
-          runtimeLabel: 'Claude Code',
-          workingDir: '/home/dev/projects/a-rather-deeply-nested-working-directory',
-          isMobile: true,
-          view: { ...DEFAULT_CHAT_VIEW },
-          onViewChange: () => {},
-        } as never),
-      );
+      root.render(React.createElement(PhoneSurface, { controller }));
       await wait(400);
 
       const where = state ? `${name} ${state}` : name;
-      if (opens) {
-        const opener = host.querySelector(opens) as HTMLElement | null;
+      let reached = true;
+      for (const selector of opens) {
+        const opener = host.querySelector(selector) as HTMLElement | null;
         if (!opener) {
-          check(`the phone surface can open the sheet ${state} in ${name}`, false, `no ${opens}`);
-          root.unmount();
-          continue;
+          check(`the phone surface can open ${state} in ${name}`, false, `no ${selector}`);
+          reached = false;
+          break;
         }
         opener.click();
-        await wait(300);
+        await wait(250);
+      }
+      if (!reached) {
+        root.unmount();
+        continue;
       }
 
-      assertPhoneSurface(host, where);
+      // The menu has to be *legible*, not merely present. It was animating in
+      // from `opacity: 0` and headless Chrome never advanced the frame, so
+      // every rule below skipped the panel as invisible and reported the state
+      // as clean — a check that covered the menu by name and nothing by fact.
+      if (state.includes('menu')) {
+        const panel = host.querySelector('[role="menu"]') as HTMLElement | null;
+        const styles = panel ? viewOf(panel).getComputedStyle(panel) : null;
+        check(
+          `the menu is actually on screen in ${name}`,
+          Boolean(panel) && styles!.opacity === '1' && !/rgba\(.*,\s*0\)/.test(styles!.backgroundColor),
+          panel ? `opacity=${styles!.opacity} background=${styles!.backgroundColor}` : 'no panel',
+        );
+
+        // And the button that dismisses it is still the thing under the finger.
+        // Its scrim and it were on the same layer, so which one a tap reached
+        // was decided by document order.
+        const button = host.querySelector('[aria-label="Close the menu"][aria-haspopup="menu"]') as HTMLElement | null;
+        const box = button?.getBoundingClientRect();
+        const hit = box
+          ? host.ownerDocument.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2)
+          : null;
+        check(
+          `the menu button is not covered by its own scrim in ${name}`,
+          Boolean(button) && Boolean(hit) && button!.contains(hit as Node),
+          hit ? `${(hit as HTMLElement).tagName.toLowerCase()}:${(hit as HTMLElement).getAttribute('aria-label') || '?'}` : 'nothing there',
+        );
+      }
+      assertPhoneSurface(host, where, opens.length === 0);
       root.unmount();
     }
+  }
+
+  // Reachable, not merely legible wherever it happened to be drawn. Collapsing
+  // the header and the composer is what this asserts the price of: every figure
+  // the issue names by hand still has a state that shows it.
+  for (const label of ['the state', 'the cost and tokens', 'the approvals state', 'the model']) {
+    check(
+      `${label} is reachable somewhere on a phone`,
+      seenLive.has(label),
+      seenLive.has(label) ? 'shown' : 'never on screen in any state',
+    );
   }
 
   host.remove();
@@ -1197,6 +1303,9 @@ run().catch((error: unknown) => {
  * ChatView fixture, so they need their own mount or they go the way the phone
  * layout went: untested and therefore unchanged.
  *
+ * The floating menu is mounted *open*, because shut it is one button and the
+ * question is whether the list behind it can be read and hit.
+ *
  * The terminal's key strip is deliberately not here. It is the terminal's own
  * on-screen controls, which issue #51 lists as a non-goal — they were sized
  * for a thumb when they were added, under their own issue.
@@ -1204,14 +1313,14 @@ run().catch((error: unknown) => {
 async function checkThePhoneShellSurfacesAreUsable(): Promise<void> {
   const noop = (): void => {};
   const surfaces: Array<[string, () => React.ReactElement]> = [
-    ['the bottom bar', () =>
-      React.createElement(MobileBar, {
+    ['the floating menu', () =>
+      React.createElement(OpenFloatingMenu, {
         actions: [
-          { id: 'sessions', label: 'Sessions', icon: 'layers', onPress: noop, expands: true },
-          { id: 'keys', label: 'Keys', icon: 'keyboard', onPress: noop, toggle: true },
-          { id: 'chat', label: 'Chat', icon: 'message-square', onPress: noop, active: true },
-          { id: 'esc', label: 'Esc', icon: 'corner-up-left', onPress: noop },
-          { id: 'more', label: 'More', icon: 'ellipsis', onPress: noop, expands: true },
+          { id: 'search', label: 'Search this conversation', icon: 'search', onPress: noop, expands: true, group: 'surface' },
+          { id: 'trace', label: 'Trace rail', icon: 'panel-right', onPress: noop, toggle: true, active: true, group: 'surface' },
+          { id: 'sessions', label: 'Sessions', icon: 'layout-list', onPress: noop, expands: true, group: 'session' },
+          { id: 'new', label: 'New', icon: 'plus', onPress: noop, group: 'session' },
+          { id: 'more', label: 'More', icon: 'ellipsis', onPress: noop, expands: true, group: 'session' },
         ],
       } as never)],
     ['the more sheet', () =>
@@ -1325,4 +1434,17 @@ async function checkThePhoneShellSurfacesAreUsable(): Promise<void> {
     root.unmount();
     frame.remove();
   }
+}
+
+/** The floating menu with its own button already pressed. */
+function OpenFloatingMenu({ actions }: { actions: FloatingMenuAction[] }): React.ReactElement {
+  const ref = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    (ref.current?.querySelector('[aria-label="Open the menu"]') as HTMLElement | null)?.click();
+  }, []);
+  return React.createElement(
+    'div',
+    { ref, style: { position: 'relative', width: '100%', height: '100%' } },
+    React.createElement(FloatingMenu, { actions } as never),
+  );
 }

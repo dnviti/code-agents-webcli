@@ -45,6 +45,18 @@
   to { transform: translateY(0); opacity: 1; }
 }
 
+/* The same arrival without the fade.
+   For anything that must be legible the instant it exists rather than one
+   frame later: a menu whose opacity starts at 0 is a menu that is not there
+   at all if the animation never runs — which is the case under reduced
+   motion, in a browser that drops the first frame, and in the headless
+   Chrome the browser checks use, where it silently measured an invisible
+   panel and reported it as fine. */
+@keyframes relay-rise {
+  from { transform: translateY(8px); }
+  to { transform: translateY(0); }
+}
+
 /* The composer's "the agent is working" signal: a highlight travelling along
    the top edge of the input. On the edge rather than over the text because the
    field stays usable while it runs — you can type the next message into it. */

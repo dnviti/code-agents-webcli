@@ -81,14 +81,17 @@ export function StreamRibbon({
         flex: '0 0 auto',
         display: 'flex',
         alignItems: 'center',
-        // What the agent is doing right now, and the one control that stops it.
-        // Neither may be squeezed onto a 390px line to keep the ribbon 34px.
-        flexWrap: isPhone ? 'wrap' : 'nowrap',
+        // One line on a phone too. What earns the width is what it is doing
+        // and the control that stops it; the elapsed time and the token count
+        // are dropped below rather than wrapped, because a ribbon that wraps is
+        // 40px the conversation does not get and neither figure is one you act
+        // on.
+        flexWrap: 'nowrap',
         gap: isPhone ? TOUCH_GAP : 10,
         minWidth: 0,
         height: isPhone ? undefined : 34,
-        minHeight: isPhone ? TOUCH_TARGET + 8 : undefined,
-        padding: isPhone ? '4px 12px' : '0 14px',
+        minHeight: isPhone ? TOUCH_TARGET + 4 : undefined,
+        padding: isPhone ? '2px 12px' : '0 14px',
         background: `color-mix(in oklab, ${colour} 10%, transparent)`,
         borderTop: `1px solid color-mix(in oklab, ${colour} 32%, transparent)`,
         fontFamily: 'var(--font-sans)',
@@ -123,7 +126,7 @@ export function StreamRibbon({
         {text}
       </span>
 
-      {meta.length ? (
+      {meta.length && !isPhone ? (
         <span
           style={{
             flex: '0 0 auto',

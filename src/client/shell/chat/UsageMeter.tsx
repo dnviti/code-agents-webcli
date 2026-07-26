@@ -25,6 +25,15 @@ export interface UsageMeterProps {
    * the single number issue #51 names as too small to read.
    */
   phone?: boolean;
+  /**
+   * The money only.
+   *
+   * For the phone's collapsed header strip, which has room for one figure. The
+   * cost is the one that earns it: the token count and the context percentage
+   * are both readable off it approximately, and neither is what somebody
+   * glances down at mid-session.
+   */
+  costOnly?: boolean;
 }
 
 interface TokenField {
@@ -32,7 +41,7 @@ interface TokenField {
   value: number;
 }
 
-export function UsageMeter({ usage, capabilities, compact = false, phone = false }: UsageMeterProps) {
+export function UsageMeter({ usage, capabilities, compact = false, phone = false, costOnly = false }: UsageMeterProps) {
   // A runtime that advertised no usage/cost reporting can still leave a stale
   // field behind on a reused object; the capability is what says the number is
   // meant to be trusted, not merely present.
@@ -92,8 +101,8 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
           color: 'var(--muted-foreground)',
         }}
       >
-        {parts.length ? <span>{parts.join(' · ')}</span> : null}
-        {hasContext ? (
+        {parts.length ? <span>{costOnly && hasCost ? formatCost(usage.costUsd!) : parts.join(' · ')}</span> : null}
+        {hasContext && !costOnly ? (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
             <ContextBar pct={contextPct} color={barColor} width={40} height={phone ? 6 : 4} />
             {Math.round(contextPct)}%

@@ -50,6 +50,14 @@ const out = execFileSync(
     '--headless=new',
     '--no-sandbox',
     '--disable-dev-shm-usage',
+    // Big enough for every fixture to fit inside the viewport.
+    //
+    // The default is 800x600, and the phone checks mount a 390x740 surface —
+    // so a third of it was below the window. Layout is unaffected (the host is
+    // absolutely sized), but anything that asks the *viewport* a question is:
+    // `elementFromPoint` returns null off-screen, which reads as "nothing is
+    // covering this control" for a control that is not on screen at all.
+    '--window-size=1600,1000',
     '--virtual-time-budget=20000',
     '--dump-dom',
     `file://${path.join(dir, 'page.html')}`,

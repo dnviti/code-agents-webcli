@@ -17,6 +17,7 @@ import { Icon } from '../../ui/relay/Icon.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
 import { showNotification } from '../../ui/notifications.js';
 import { PhoneContext } from '../../ui/touch.js';
+import { FloatingMenu } from '../FloatingMenu.js';
 import { Composer } from './Composer.js';
 import { MessageList, type MessageListHandle } from './MessageList.js';
 import { messageText } from './MessageBubble.js';
@@ -73,6 +74,29 @@ export interface ChatViewProps {
   onViewChange?: (next: ChatViewSettings) => void;
   theme?: 'dark' | 'light';
   onToggleTheme?: () => void;
+  /**
+   * The shell's own menu entries — sessions, new, more.
+   *
+   * Passed down rather than this surface's being passed up, because the menu
+   * has to be positioned by whoever knows where the composer is. Anchored to
+   * the shell it sat exactly on top of the send button; anchored to the
+   * transcript it floats over the conversation and clears everything.
+   */
+  menuActions?: SurfaceAction[];
+}
+
+/** One control on the phone's floating menu. */
+export interface SurfaceAction {
+  id: string;
+  label: string;
+  icon: string;
+  onPress(): void;
+  active?: boolean;
+  expands?: boolean;
+  toggle?: boolean;
+  badge?: boolean;
+  disabled?: boolean;
+  group?: string;
 }
 
 /**
@@ -103,6 +127,7 @@ export function ChatView({
   onViewChange,
   theme,
   onToggleTheme,
+  menuActions,
 }: ChatViewProps) {
   const transcript = controller.transcript;
 
@@ -494,6 +519,29 @@ export function ChatView({
     />
   );
 
+  const openIndex = React.useCallback(() => {
+    // One control, two jobs, decided by whether the index has room to be a rail
+    // at all. Below 1024px — and on every phone — there is no rail to toggle,
+    // so the same control opens the sheet instead of writing a setting whose
+    // effect nothing on screen would show.
+    if (indexVisible || !(isMobile || narrow)) setView({ indexOpen: !view.indexOpen });
+    else setIndexSheet(true);
+  }, [indexVisible, isMobile, narrow, setView, view.indexOpen]);
+
+  // This surface's own controls, then the shell's. The ones somebody opened the
+  // menu mid-conversation for come first, nearest the button they pressed.
+  const phoneMenu: SurfaceAction[] = React.useMemo(
+    () => [
+      { id: 'chat-search', label: 'Search this conversation', icon: 'search', expands: true, group: 'surface', onPress: () => setSearchOpen(true) },
+      { id: 'chat-turns', label: 'Turn index', icon: 'panel-left', active: indexVisible || indexSheet, toggle: true, group: 'surface', onPress: openIndex },
+      { id: 'chat-trace', label: 'Trace rail', icon: 'panel-right', active: railOpen, toggle: true, group: 'surface', onPress: toggleRail },
+      { id: 'chat-terminal', label: 'Terminal', icon: 'terminal', active: terminalOpen, toggle: true, group: 'surface', onPress: toggleTerminal },
+      { id: 'chat-display', label: 'Display settings', icon: 'settings', expands: true, group: 'surface', onPress: () => onOpenSettings?.() },
+      ...(menuActions ?? []).map((action) => ({ ...action, group: 'session' })),
+    ],
+    [indexVisible, indexSheet, railOpen, terminalOpen, openIndex, toggleRail, toggleTerminal, onOpenSettings, menuActions],
+  );
+
   return (
     // The phone answer, published once for the whole surface. Everything below
     // — down to a copy button inside a tool call — reads it from here rather
@@ -543,11 +591,7 @@ export function ChatView({
         // rail at all. Below 1024px — and on every phone — there is no rail to
         // toggle, so the same button opens the sheet instead of writing a
         // setting whose effect nothing on screen would show.
-        onToggleIndex={
-          indexVisible || !(isMobile || narrow)
-            ? () => setView({ indexOpen: !view.indexOpen })
-            : () => setIndexSheet(true)
-        }
+        onToggleIndex={openIndex}
         onOpenSearch={() => setSearchOpen(true)}
         onOpenSettings={() => onOpenSettings?.()}
         onToggleTheme={onToggleTheme}
@@ -597,6 +641,11 @@ export function ChatView({
               position: 'relative',
             }}
           >
+          {/* Over the conversation, clear of everything else. Anchored to the
+              transcript rather than to the shell: at the shell's bottom right
+              it sat exactly on the send button. */}
+          {isMobile ? <FloatingMenu actions={phoneMenu} /> : null}
+
           {searchOpen ? (
             <TranscriptSearch
               messages={messages}
@@ -773,7 +822,7 @@ export function ChatView({
               // want to type the follow-up — while the agent waits on you — was
               // the one moment you could not. It queues instead.
               disabled={exited || Boolean(unavailable)}
-              placeholder={placeholderFor(chatState, runtimeLabel)}
+              placeholder={placeholderFor(chatState, runtimeLabel, isMobile)}
               queued={transcript.queuedTurns}
               onCancelQueued={cancelQueued}
               onFindFiles={findProjectFiles}
@@ -861,15 +910,20 @@ function viewportHeight(): number {
   return typeof window === 'undefined' ? 900 : window.innerHeight;
 }
 
-function placeholderFor(state: ChatState, runtimeLabel: string): string {
+function placeholderFor(state: ChatState, runtimeLabel: string, isPhone = false): string {
   if (state === 'exited') return 'This session has ended';
   // No longer 'answer this before you can type': the composer stays live and
   // queues, so the sentence has to describe what happens rather than forbid it.
-  if (state === 'awaiting_permission') return 'Answer above — or type the next message';
-  if (state === 'thinking' || state === 'running') {
-    return `Queue a follow-up while ${runtimeLabel} works…`;
+  if (state === 'awaiting_permission') {
+    return isPhone ? 'Answer above, or type' : 'Answer above — or type the next message';
   }
-  return `Message ${runtimeLabel}…`;
+  if (state === 'thinking' || state === 'running') {
+    // Short enough for the one line a phone's field is. The long form wrapped
+    // to two, which grew the composer by 26px for a sentence saying what the
+    // ribbon directly above it already says.
+    return isPhone ? 'Queue a follow-up…' : `Queue a follow-up while ${runtimeLabel} works…`;
+  }
+  return isPhone ? 'Message…' : `Message ${runtimeLabel}…`;
 }
 
 /**

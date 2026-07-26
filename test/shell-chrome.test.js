@@ -130,13 +130,19 @@ describe('shell chrome', function () {
     );
   });
 
-  it('shows the status bar on desktop and the bottom bar on mobile', function () {
+  it('shows the status bar on desktop and the floating menu on mobile', function () {
     const desktop = render(reset({ tabs: [tab('a')], activeId: 'a' }));
-    assert.ok(!/aria-label="Session controls"/.test(desktop), 'no bottom bar on desktop');
+    assert.ok(!/aria-haspopup="menu"/.test(desktop), 'no floating menu on desktop');
 
+    // The bottom bar is gone: five slots of permanent chrome along the bottom
+    // edge, on a surface whose whole point is what is above it. What replaced
+    // it is one square button, and everything the bar held is behind it.
     const mobile = render(reset({ tabs: [tab('a')], activeId: 'a', isMobile: true }));
-    assert.ok(/aria-label="Session controls"/.test(mobile), 'the bottom bar renders on mobile');
-    assert.ok(/>Sessions</.test(mobile) && /># More|>More</.test(mobile));
+    assert.ok(!/aria-label="Session controls"/.test(mobile), 'the bottom bar is gone');
+    assert.ok(/aria-label="Open the menu"/.test(mobile), 'the floating menu button is there');
+    assert.ok(/aria-haspopup="menu"/.test(mobile), 'and says what it opens');
+    // Shut, so nothing behind it is announced as being on screen.
+    assert.ok(!/>Sessions</.test(mobile), 'its rows are not rendered while shut');
   });
 
   it('swaps the tab strip for the key strip on mobile (issue #21)', function () {

@@ -19,7 +19,7 @@ import { SessionsDialog } from './dialogs/SessionsDialog';
 import { ChatSettingsDialog } from './dialogs/ChatSettingsDialog';
 import { SettingsDialog } from './dialogs/SettingsDialog';
 import { TerminalOptionsDialog } from './dialogs/TerminalOptionsDialog';
-import { MobileBar, type MobileBarAction } from './MobileBar';
+import { FloatingMenu, type FloatingMenuAction } from './FloatingMenu';
 import { TabSwitcherSheet } from './TabSwitcherSheet';
 import { KeyStrip, KEY_STRIP_HEIGHT } from './KeyStrip';
 import type { MobileKey } from '../ui/mobile';
@@ -310,7 +310,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
     { children: state.theme === 'dark' ? 'Dark' : 'Light' },
   ];
 
-  const mobileActions: MobileBarAction[] = [
+  const sessionActions: FloatingMenuAction[] = [
     {
       id: 'sessions',
       label: 'Sessions',
@@ -357,6 +357,8 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       onPress: () => closeDialogs({ more: true }),
     },
   ];
+
+
 
   // No brand on a phone. It cost about a third of a 390px tab strip to say
   // something the user already knows, and the working directory that stood
@@ -431,6 +433,8 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         width: '100%',
         display: 'flex',
         flexDirection: 'column',
+        // The box the floating menu and its scrim are positioned against.
+        position: 'relative',
         background: 'var(--background)',
         color: 'var(--foreground)',
         fontFamily: 'var(--font-sans)',
@@ -507,6 +511,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
             view={state.chatView}
             onViewChange={actions.setChatView}
             onOpenSettings={() => closeDialogs({ chatSettings: true })}
+            menuActions={sessionActions}
             // The chat surface owns the whole viewport, so the tab strip's own
             // theme button is off-screen while a conversation is showing.
             theme={state.theme}
@@ -535,7 +540,23 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         />
       ) : null}
 
-      {state.isMobile ? <MobileBar actions={mobileActions} /> : <StatusBar left={statusLeft} right={statusRight} />}
+      {/* The phone's only permanent chrome. A bar along the bottom edge cost
+          56px plus the safe-area inset of a screen whose whole point is the
+          conversation; this costs the corner it covers. */}
+      {/* Over a conversation the menu belongs to the chat surface, which is
+          the only thing that knows where its composer ends — see ChatView. Out
+          here it covers the terminal, which has no bottom-right control of its
+          own to collide with. */}
+      {state.isMobile ? (
+        chatActive ? null : (
+          <FloatingMenu
+            actions={sessionActions}
+            bottomOffset={state.keysVisible ? KEY_STRIP_HEIGHT : 0}
+          />
+        )
+      ) : (
+        <StatusBar left={statusLeft} right={statusRight} />
+      )}
 
       <CommandPalette
         open={state.paletteOpen}
