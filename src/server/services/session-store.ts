@@ -148,7 +148,7 @@ export class SessionStore {
         // the user is looking at.
         native_chat_session_id: session.nativeChatSessionId || null,
         // Which conversation owns this shell, so a restart can tell a session
-        // the user can reach from one nothing on screen refers to any more.
+        // the user can reach from one that nothing on screen refers to any more.
         owner_session_id: session.ownerSessionId || null,
       }));
 
