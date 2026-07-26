@@ -221,6 +221,22 @@ describe('turnOf', function () {
   });
 });
 
+describe('isTurnOpen', function () {
+  it('reads an untouched turn as open exactly when it is the newest', function () {
+    const overrides = new Map();
+    assert.strictEqual(mod.isTurnOpen('t2', 't2', overrides), true);
+    assert.strictEqual(mod.isTurnOpen('t1', 't2', overrides), false);
+  });
+
+  it('lets an explicit override win regardless of which turn is newest', function () {
+    // A turn the user deliberately opened must not be slammed shut by the
+    // next turn starting, and one they closed must not spring back open.
+    const overrides = new Map([['t1', true], ['t2', false]]);
+    assert.strictEqual(mod.isTurnOpen('t1', 't2', overrides), true);
+    assert.strictEqual(mod.isTurnOpen('t2', 't2', overrides), false);
+  });
+});
+
 describe('formatTurnMeta', function () {
   it('says nothing rather than zero for a turn that did nothing', function () {
     const messages = [msg('user', [text('hello')]), msg('assistant', [text('hi')])];

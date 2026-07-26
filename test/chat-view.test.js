@@ -145,6 +145,37 @@ describe('ChatView', function () {
     assert.ok(!html.includes('Nothing here yet'), 'the transcript is not empty');
   });
 
+  it('folds every turn but the newest, and keeps its ask readable while folded', function () {
+    const controller = controllerWith({
+      messages: [
+        message('m1', 1, 'user', 'run the tests'),
+        message('m2', 2, 'assistant', 'all green'),
+        message('m3', 3, 'user', 'now deploy'),
+        message('m4', 4, 'assistant', 'deployed'),
+      ],
+      cursor: 4,
+    });
+
+    const html = render({ controller });
+
+    // Turn 1's disclosure reads closed and its body is hidden, without either
+    // its ask or its outcome leaving the strip — folding history must not
+    // mean losing the map of it.
+    const closedToggle = /aria-label="Expand turn 1"[^>]*aria-expanded="false"|aria-expanded="false"[^>]*aria-label="Expand turn 1"/;
+    assert.ok(closedToggle.test(html), 'turn 1 must read as collapsed');
+    assert.ok(/id="turn-body-m1"[^>]*hidden=""/.test(html), 'turn 1 body must be hidden');
+    assert.ok(html.includes('run the tests'), 'a collapsed turn must still show what was asked');
+
+    // The newest turn opens by default and its body is not hidden.
+    const openToggle = /aria-label="Collapse turn 2"[^>]*aria-expanded="true"|aria-expanded="true"[^>]*aria-label="Collapse turn 2"/;
+    assert.ok(openToggle.test(html), 'turn 2 must read as open');
+    assert.ok(!/id="turn-body-m3"[^>]*hidden=""/.test(html), 'the current turn must not be hidden');
+    assert.ok(html.includes('deployed'), 'the open turn must show its content');
+
+    // The strip stays mounted — and its actions reachable — for a folded turn.
+    assert.ok(/aria-label="Copy this turn as Markdown"/.test(html), 'copy control must survive folding');
+  });
+
   it('pins a pending approval outside the scroller and announces it', function () {
     const controller = controllerWith({
       state: 'awaiting_permission',

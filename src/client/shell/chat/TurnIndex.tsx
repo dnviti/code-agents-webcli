@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { Icon } from '../../ui/relay/Icon.js';
-import type { TurnStatus, TurnSummary } from '../../chat/turns.js';
+import { STATUS_GLYPH, type TurnSummary } from '../../chat/turns.js';
 
 /**
  * Every turn in the conversation, as a list you can jump around.
@@ -23,14 +23,10 @@ export interface TurnIndexProps {
   onJumpLatest(): void;
   /** Below 1280px the labels go and the numbers stay. */
   collapsed?: boolean;
+  /** Open or close every turn's body at once. Omitted, the row shows neither. */
+  onExpandAll?: () => void;
+  onCollapseAll?: () => void;
 }
-
-const STATUS_GLYPH: Record<TurnStatus, { icon: string; color: string; spin?: boolean; word: string }> = {
-  done: { icon: 'check', color: 'var(--success)', word: 'done' },
-  failed: { icon: 'circle-x', color: 'var(--destructive)', word: 'failed' },
-  waiting: { icon: 'shield', color: 'var(--warning)', word: 'waiting for you' },
-  running: { icon: 'loader-circle', color: 'var(--info)', spin: true, word: 'running' },
-};
 
 export const TURN_INDEX_WIDTH = 196;
 export const TURN_INDEX_COLLAPSED_WIDTH = 44;
@@ -41,6 +37,8 @@ export function TurnIndex({
   onSelect,
   onJumpLatest,
   collapsed = false,
+  onExpandAll,
+  onCollapseAll,
 }: TurnIndexProps): React.JSX.Element {
   const listRef = React.useRef<HTMLDivElement | null>(null);
 
@@ -104,6 +102,18 @@ export function TurnIndex({
           </span>
         )}
         <span style={{ marginLeft: collapsed ? 0 : 'auto' }}>{turns.length}</span>
+        {/* Icon-rail width has no room for these — the row is already tight
+            around the count at 44px. */}
+        {!collapsed && (onExpandAll || onCollapseAll) ? (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            {onExpandAll ? (
+              <FoldAllButton label="Expand every turn" icon="maximize-2" onClick={onExpandAll} />
+            ) : null}
+            {onCollapseAll ? (
+              <FoldAllButton label="Collapse every turn" icon="fold-vertical" onClick={onCollapseAll} />
+            ) : null}
+          </span>
+        ) : null}
       </div>
 
       <div
@@ -170,6 +180,46 @@ export function TurnIndex({
 
 function rowId(turnId: string): string {
   return `turn-index-${turnId}`;
+}
+
+function FoldAllButton({
+  label,
+  icon,
+  onClick,
+}: {
+  label: string;
+  icon: string;
+  onClick: () => void;
+}): React.JSX.Element {
+  const [hover, setHover] = React.useState(false);
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={label}
+      title={label}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      onFocus={() => setHover(true)}
+      onBlur={() => setHover(false)}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flex: '0 0 auto',
+        width: 18,
+        height: 18,
+        padding: 0,
+        background: hover ? 'var(--accent)' : 'transparent',
+        border: 0,
+        borderRadius: 'var(--radius)',
+        color: hover ? 'var(--foreground)' : 'var(--muted-foreground)',
+        cursor: 'pointer',
+      }}
+    >
+      <Icon name={icon} size={11} />
+    </button>
+  );
 }
 
 function TurnRow({
