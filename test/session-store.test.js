@@ -98,6 +98,73 @@ describe('SessionStore', function() {
         command: 'watch podman ps'
       });
     });
+
+    it('remembers which conversation a shell belonged to', async function() {
+      // The one fact that keeps a conversation's terminal out of every tab
+      // strip. Lost across a restart, the shell would come back looking like a
+      // standalone session on every device the user has open.
+      await sessionStore.saveSessions(new Map([
+        ['chat', createSessionRecord({ id: 'chat', ownerUserId, surface: 'chat' })],
+        ['shell', createSessionRecord({ id: 'shell', ownerUserId, ownerSessionId: 'chat' })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('shell').ownerSessionId, 'chat');
+      // Absent, not empty-string: `undefined` is what reads as "standalone".
+      assert.strictEqual(loaded.get('chat').ownerSessionId, undefined);
+    });
+
+    it('remembers the approval mode a conversation was running in', async function() {
+      // The mode is part of how the user set the conversation up. Lost across a
+      // restart, a chat started with approvals bypassed comes back asking for
+      // them — and the header says nothing about the change.
+      await sessionStore.saveSessions(new Map([
+        ['bypass', createSessionRecord({
+          id: 'bypass',
+          ownerUserId,
+          surface: 'chat',
+          chatBypassPermissions: true,
+        })],
+        ['manual', createSessionRecord({ id: 'manual', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('bypass').chatBypassPermissions, true);
+      // Absent rather than false: a conversation that never chose the bypass
+      // must never be restored into it, and `undefined` is what reads as
+      // "asks first" everywhere downstream.
+      assert.strictEqual(loaded.get('manual').chatBypassPermissions, undefined);
+    });
+
+    it('adds the approval-mode column to a database that predates it', async function () {
+      // Every install being upgraded has a session table written by an older
+      // build. The column is added on boot rather than by a migration file, so
+      // the thing worth proving is that the boot path finds a table without it,
+      // adds it, and leaves the rows that were already there alone.
+      await sessionStore.saveSessions(new Map([
+        ['old', createSessionRecord({ id: 'old', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.raw.exec(
+        'ALTER TABLE runtime_sessions DROP COLUMN chat_bypass_permissions',
+      );
+      sessionStore.database.close();
+
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      const loaded = await sessionStore.loadSessions();
+
+      assert.strictEqual(loaded.size, 1, 'the upgrade must not cost the user their sessions');
+      assert.strictEqual(loaded.get('old').chatBypassPermissions, undefined);
+
+      // And again on the next boot: the column is there now, and asking for it
+      // twice is an error rather than a no-op in SQLite.
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      assert.strictEqual((await sessionStore.loadSessions()).size, 1);
+    });
   });
 });
 

@@ -37,6 +37,7 @@ export interface SessionRoutesDeps {
     name?: string;
     workingDir: string;
     connections?: string[];
+    ownerSessionId?: string;
   }): SessionRecord;
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
   saveSessionsToDisk(): Promise<void>;
@@ -154,6 +155,10 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
           // The record first, then the log: the record is authoritative and the
           // head scan is the backfill for conversations that predate it.
           canResume: Boolean(session.nativeChatSessionId || description?.nativeSessionId),
+          // Reported so the row can say which approval mode picking it will put
+          // back. A restored bypass is a standing permission, and one that
+          // arrives silently is no better than one that is silently dropped.
+          bypassPermissions: session.chatBypassPermissions === true,
           // A conversation that is already running is not one to resume; the
           // list says so rather than offering an action that would be refused.
           running: session.active === true,
@@ -167,6 +172,16 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     });
   });
 
+  /**
+   * The user's standalone sessions — everything the tab strip and the session
+   * dialogs are built from.
+   *
+   * A shell that belongs to a conversation is deliberately not here. It is a
+   * real session, but it is reached through its conversation and only there;
+   * listing it would put a top-level tab and a session row in front of every
+   * client the user has open, including ones with no relation to the
+   * conversation that opened it.
+   */
   router.get('/api/sessions/list', (_req: Request, res: Response): void => {
     const user = requireUser(res);
     if (!user) {
@@ -176,6 +191,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
 
     const sessionList: SessionListItem[] = Array.from(deps.claudeSessions.entries())
       .filter(([, session]) => session.ownerUserId === user.id)
+      .filter(([, session]) => !session.ownerSessionId)
       .map(([id, session]) => ({
         id,
         name: session.name,
@@ -200,7 +216,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       return;
     }
 
-    const { name, workingDir } = req.body;
+    const { name, workingDir, ownerSessionId } = req.body;
     const sessionId = randomUUID();
 
     // The name is bound into a SQLite statement on every autosave, and SQLite
@@ -219,6 +235,31 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         message: 'Working directory must be a string',
       });
       return;
+    }
+
+    // A session can declare that it belongs to a conversation, which is what
+    // keeps it out of the listings and ties its lifetime to that conversation's.
+    // Only a conversation this user owns will do: accepting an arbitrary id
+    // would let one request hide a session from its own owner's tab strip, or
+    // attach it to somebody else's teardown.
+    let owner: string | undefined;
+    if (ownerSessionId !== undefined && ownerSessionId !== null) {
+      if (typeof ownerSessionId !== 'string') {
+        res.status(400).json({
+          error: 'invalid_owner_session',
+          message: 'Owner session id must be a string',
+        });
+        return;
+      }
+      const parent = getOwnedSession(deps.claudeSessions, ownerSessionId, user);
+      if (!parent || parent.surface !== 'chat') {
+        res.status(400).json({
+          error: 'unknown_owner_session',
+          message: 'That conversation does not exist',
+        });
+        return;
+      }
+      owner = parent.id;
     }
 
     let validWorkingDir = deps.baseFolder;
@@ -241,6 +282,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       ownerUserId: user.id,
       name,
       workingDir: validWorkingDir,
+      ownerSessionId: owner,
     });
 
     deps.claudeSessions.set(sessionId, session);
@@ -305,37 +347,16 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       return;
     }
 
-    if (session.active && session.agent) {
-      const bridge = deps.getRuntimeBridge(session.agent);
-      if (bridge) {
-        void bridge.stopSession(sessionId);
+    // The conversation's own shells go with it. They are only reachable through
+    // it, so a conversation deleted without them would leave ptys running that
+    // nothing in the app — no tab, no listing, no pane — can ever reach again.
+    for (const owned of deps.claudeSessions.values()) {
+      if (owned.ownerSessionId === sessionId) {
+        destroySession(deps, owned);
       }
     }
 
-    session.connections.forEach((wsId) => {
-      const wsInfo = deps.webSocketConnections.get(wsId);
-      if (wsInfo && wsInfo.ws.readyState === WebSocket.OPEN) {
-        wsInfo.claudeSessionId = null;
-        wsInfo.ws.send(
-          JSON.stringify({
-            type: 'session_deleted',
-            sessionId,
-            message: 'Session has been deleted',
-          }),
-        );
-      }
-    });
-
-    session.connections.clear();
-    deps.claudeSessions.delete(sessionId);
-    // Without this the headless emulator for a deleted session would live for
-    // as long as the process does.
-    deps.disposeRecorder(sessionId);
-    void deps.transcriptStore.deleteTranscript(session);
-    void deps.historyStore.deleteHistory(session);
-    // Subsystems that registered their own cleanup (pasted images, and
-    // whatever comes next) rather than each appending a line here.
-    deps.sessionTeardown?.dispose(session);
+    destroySession(deps, session);
     void deps.saveSessionsToDisk();
 
     res.json({ success: true, message: 'Session deleted' });
@@ -411,6 +432,51 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
   );
 
   return router;
+}
+
+/**
+ * End one session: its process, its sockets, its record and everything stored
+ * for it.
+ *
+ * Its own function because a delete is no longer one session — a conversation
+ * takes the shells opened inside it with it — and doing that inline would mean
+ * two copies of a teardown where a missed line leaks a pty.
+ *
+ * Not responsible for persisting the map: the caller saves once for the whole
+ * cascade rather than once per session torn down.
+ */
+function destroySession(deps: SessionRoutesDeps, session: SessionRecord): void {
+  if (session.active && session.agent) {
+    const bridge = deps.getRuntimeBridge(session.agent);
+    if (bridge) {
+      void bridge.stopSession(session.id);
+    }
+  }
+
+  session.connections.forEach((wsId) => {
+    const wsInfo = deps.webSocketConnections.get(wsId);
+    if (wsInfo && wsInfo.ws.readyState === WebSocket.OPEN) {
+      wsInfo.claudeSessionId = null;
+      wsInfo.ws.send(
+        JSON.stringify({
+          type: 'session_deleted',
+          sessionId: session.id,
+          message: 'Session has been deleted',
+        }),
+      );
+    }
+  });
+
+  session.connections.clear();
+  deps.claudeSessions.delete(session.id);
+  // Without this the headless emulator for a deleted session would live for
+  // as long as the process does.
+  deps.disposeRecorder(session.id);
+  void deps.transcriptStore.deleteTranscript(session);
+  void deps.historyStore.deleteHistory(session);
+  // Subsystems that registered their own cleanup (pasted images, and
+  // whatever comes next) rather than each appending a line here.
+  deps.sessionTeardown?.dispose(session);
 }
 
 const EXPORT_PAGE_LINES = 500;

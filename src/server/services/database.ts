@@ -371,6 +371,19 @@ export class AppDatabase {
     // thousands of events above the window, and a fact needed to *start* a
     // session should not require replaying the session to learn.
     this.addColumnIfMissing('runtime_sessions', 'native_chat_session_id', 'TEXT');
+
+    // The conversation a shell belongs to, when it is not a session of its own.
+    // Nullable and null-by-default: every row written before conversations could
+    // open their own terminal is a standalone session, which is exactly what a
+    // null means here.
+    this.addColumnIfMissing('runtime_sessions', 'owner_session_id', 'TEXT');
+
+    // Whether the conversation runs with tool approvals bypassed. Nullable, and
+    // a null reads as "asks first": the only mode a row written before this
+    // column existed could have *recorded* is none, and defaulting a standing
+    // permission on because a column was absent is not a mistake to leave
+    // available. INTEGER because SQLite has no boolean.
+    this.addColumnIfMissing('runtime_sessions', 'chat_bypass_permissions', 'INTEGER');
   }
 
   /**

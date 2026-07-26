@@ -69,6 +69,20 @@ export interface SessionRecord {
    */
   surface?: 'terminal' | 'chat';
   /**
+   * The conversation this session belongs to, when it is not a session of its
+   * own.
+   *
+   * A shell opened inside a conversation is a real session with a real pty —
+   * that is how it gets scrollback, history and a working directory — but it is
+   * not a *standalone* one: it is reached through the conversation that opened
+   * it and through nothing else. Set here, it is the one fact that lets the
+   * listing leave it out and the teardown take it with the conversation.
+   *
+   * Absent on every ordinary session, so `undefined` reads as "standalone"
+   * without a backfill.
+   */
+  ownerSessionId?: string;
+  /**
    * The runtime's own id for this conversation, when it reported one.
    *
    * Kept so a chat can be resumed *with its context* after the server restarts:
@@ -76,6 +90,21 @@ export interface SessionRecord {
    * reads it back would be a stranger to it.
    */
   nativeChatSessionId?: string;
+  /**
+   * Whether this conversation runs with tool approvals bypassed.
+   *
+   * Part of how the user set the conversation up, not a property of the process
+   * that happens to be serving it: a chat started in bypass mode and then
+   * brought back — after a reconnect, a restart, or a resume from the launcher —
+   * has to come back in the mode it was in, and the header has to be able to
+   * say so while nothing is running at all.
+   *
+   * Absent on every session that predates this and on every terminal session,
+   * so `undefined` reads as "asks first" — the safe direction — without a
+   * backfill. Only ever set from an explicit choice made for *this* record, so a
+   * standing permission can never be inherited by another conversation.
+   */
+  chatBypassPermissions?: boolean;
   terminalOptions: TerminalOptions | null;
   stopRequested: boolean;
   /** Identifies the current PTY run so late callbacks from a previous run are ignored. */

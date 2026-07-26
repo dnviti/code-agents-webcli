@@ -14,6 +14,12 @@
  * than a second process inside the chat's: the chat session's slot is occupied
  * by the agent, and the server refuses a second process in one session.
  *
+ * Its own session, but not a *standalone* one. It is created naming the
+ * conversation that owns it, which keeps it out of the session listing the tab
+ * strips are built from: the shell belongs to the conversation it was opened
+ * in, is reached only from there, and is not something another browser or
+ * another device has any business showing as a loose terminal tab.
+ *
  * DOM-owning and imperative, like the rest of the terminal layer. React mounts
  * the element this creates; it never re-parents it.
  */
@@ -27,6 +33,16 @@ import { relayTerminalTheme } from '../shell/terminal-theme.js';
 export type ChatTerminalPhase = 'starting' | 'live' | 'exited' | 'error';
 
 export interface ChatTerminalInit {
+  /**
+   * The conversation this shell belongs to.
+   *
+   * Sent to the server when the session is created, and the whole reason this
+   * shell stays where it was opened: a session that names its conversation is
+   * left out of the session listing every tab strip is built from, so it no
+   * longer appears as a loose terminal tab here or in any other open instance
+   * of the app.
+   */
+  chatSessionId: string;
   workingDir: string;
   /** Shown on the tab. */
   label: string;
@@ -52,7 +68,10 @@ export class ChatTerminal {
   private controller: TerminalController | null = null;
   private socket: WebSocket | null = null;
   private closing = false;
+  /** Whether this pane has already replaced a session that turned out to be gone. */
+  private restarted = false;
   private readonly workingDir: string;
+  private readonly chatSessionId: string;
   /**
    * Mutable, not readonly.
    *
@@ -67,6 +86,7 @@ export class ChatTerminal {
   constructor(init: ChatTerminalInit) {
     this.label = init.label;
     this.workingDir = init.workingDir;
+    this.chatSessionId = init.chatSessionId;
     this.onChange = init.onChange;
 
     this.element = document.createElement('div');
@@ -137,7 +157,11 @@ export class ChatTerminal {
       const response = await fetch('/api/sessions/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: this.label, workingDir: this.workingDir }),
+        body: JSON.stringify({
+          name: this.label,
+          workingDir: this.workingDir,
+          ownerSessionId: this.chatSessionId,
+        }),
       });
       if (!response.ok) {
         throw new Error(await describe(response));
@@ -217,6 +241,28 @@ export class ChatTerminal {
         break;
       }
 
+      case 'session_gone': {
+        // The session this pane tried to rejoin is not there any more — the
+        // server restarted, which takes every pty with it. Only `attachExisting`
+        // can fail this way, and the split's contract is that there is a shell
+        // here, so open a new one rather than leaving an empty box behind.
+        //
+        // Once. A create that also comes back gone is something to report.
+        if (this.restarted) {
+          this.fail('This terminal’s session no longer exists.');
+          break;
+        }
+        this.restarted = true;
+        this.discardSocket();
+        this.sessionId = null;
+        this.phase = 'starting';
+        this.error = null;
+        this.controller?.terminal.reset();
+        this.onChange();
+        void this.start();
+        break;
+      }
+
       case 'exit':
         this.controller?.write('\r\n\x1b[2m[process exited]\x1b[0m\r\n');
         this.phase = 'exited';
@@ -236,6 +282,28 @@ export class ChatTerminal {
           this.onChange();
         }
         break;
+    }
+  }
+
+  /**
+   * Drop the current socket without its handlers firing.
+   *
+   * `onclose` reads a closing socket as the shell having exited, which is true
+   * when the pty ends and wrong when this pane is deliberately letting go of one
+   * connection to make another.
+   */
+  private discardSocket(): void {
+    const dead = this.socket;
+    this.socket = null;
+    if (!dead) return;
+    dead.onclose = null;
+    dead.onerror = null;
+    dead.onmessage = null;
+    dead.onopen = null;
+    try {
+      dead.close();
+    } catch {
+      // Already closing; there is nothing left to release on this side.
     }
   }
 
@@ -273,9 +341,9 @@ export class ChatTerminal {
   /**
    * Let go of the browser's half.
    *
-   * The session on the server stays: it is a real session with a real pty, it
-   * appears in the tab strip like any other, and a long-running process in it
-   * must not die because a panel was collapsed. `close()` is the other verb.
+   * The session on the server stays: it is a real session with a real pty, and
+   * a long-running process in it must not die because a panel was collapsed —
+   * reopening the split rejoins it. `close()` is the other verb.
    */
   dispose(): void {
     this.closing = true;
@@ -317,8 +385,8 @@ export class ChatTerminal {
  *
  * Bounded, because each pane holds an xterm (with a WebGL context) and an open
  * socket: past `MAX_CHATS` conversations the least recently touched one has its
- * browser-side panes released. The *sessions* stay — they are ordinary tabs and
- * reopening the split rejoins them — so nothing the user started is killed by
+ * browser-side panes released. The *sessions* stay — reopening that
+ * conversation's split rejoins them — so nothing the user started is killed by
  * the cap; only this page's copy of the terminal is let go.
  */
 const BY_CHAT = new Map<string, ChatTerminal[]>();
@@ -382,6 +450,21 @@ export function terminalsFor(chatSessionId: string): ChatTerminal[] {
   }
 
   return panes;
+}
+
+/**
+ * Let go of a conversation's shells, because the conversation itself is gone.
+ *
+ * Called on `session_deleted`, where the server has already ended the sessions
+ * these panes were attached to — deleting a conversation takes the shells opened
+ * inside it. So this is the browser's half only: release the xterms and the
+ * sockets, and forget the note that would otherwise have a reopened split trying
+ * to rejoin ptys that no longer exist.
+ */
+export function forgetTerminals(chatSessionId: string): void {
+  for (const pane of BY_CHAT.get(chatSessionId) ?? []) pane.dispose();
+  BY_CHAT.delete(chatSessionId);
+  rememberTerminals(chatSessionId, []);
 }
 
 /** Drop a pane from its conversation's list, ending the session behind it. */

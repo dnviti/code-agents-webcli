@@ -81,7 +81,7 @@ export function TerminalSplit({
 
   const open = React.useCallback(
     (label: string, existing?: string) => {
-      const pane = new ChatTerminal({ workingDir, label, onChange: force });
+      const pane = new ChatTerminal({ chatSessionId, workingDir, label, onChange: force });
       panes.push(pane);
       setActiveId(pane.id);
       // Reattach where there is something to reattach to; otherwise create.
@@ -90,7 +90,7 @@ export function TerminalSplit({
       force();
       return pane;
     },
-    [panes, workingDir],
+    [panes, workingDir, chatSessionId],
   );
 
   // One pane the first time the split is opened for this conversation, and the

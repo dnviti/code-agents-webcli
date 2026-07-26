@@ -45,7 +45,7 @@ const ALIASES = {
   grok: 'Grok', qwen: 'Qwen', kimi: 'Kimi', omp: 'Oh My Pi', terminal: 'Terminal',
 };
 
-function render(onStart) {
+function render(onStart, props = {}) {
   const { renderToStaticMarkup, React, RuntimeLauncher } = mod;
   return renderToStaticMarkup(
     React.createElement(RuntimeLauncher, {
@@ -53,8 +53,24 @@ function render(onStart) {
       onStart: onStart || function () {},
       onTerminal() {},
       onCancel() {},
+      ...props,
     }),
   );
+}
+
+function conversation(over = {}) {
+  return {
+    id: 'c1',
+    name: 'Session c1',
+    runtime: 'claude',
+    runtimeLabel: 'Claude',
+    lastActivity: new Date('2026-07-01T10:00:00Z').toISOString(),
+    events: 12,
+    firstMessage: 'dove sono i test?',
+    canResume: true,
+    running: false,
+    ...over,
+  };
 }
 
 describe('RuntimeLauncher', function () {
@@ -98,6 +114,26 @@ describe('RuntimeLauncher', function () {
       withBypass.sort(),
       ['Claude', 'Codex', 'Grok', 'Kimi', 'Oh My Pi', 'Qwen'],
       'exactly the runtimes with a real bypass flag may offer one',
+    );
+  });
+
+  it('says when resuming a conversation will restore a bypass', function () {
+    // Resuming puts the conversation back in the mode it was running in. A
+    // standing permission arriving without being mentioned is the failure this
+    // guards: the user picks a row expecting to be asked before anything runs.
+    const bypassed = render(undefined, {
+      conversations: [conversation({ bypassPermissions: true })],
+      onResume() {},
+    });
+    assert.ok(/approvals bypassed/i.test(bypassed), 'the restored bypass must be stated');
+
+    const manual = render(undefined, {
+      conversations: [conversation()],
+      onResume() {},
+    });
+    assert.ok(
+      !/approvals bypassed/i.test(manual),
+      'a conversation that asks first must not be labelled as bypassed',
     );
   });
 

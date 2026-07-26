@@ -33,6 +33,8 @@ interface RuntimeSessionRow {
   last_accessed: number;
   surface: string | null;
   native_chat_session_id: string | null;
+  owner_session_id: string | null;
+  chat_bypass_permissions: number | null;
 }
 
 export class SessionStore {
@@ -68,7 +70,9 @@ export class SessionStore {
           max_buffer_size,
           last_accessed,
           surface,
-          native_chat_session_id
+          native_chat_session_id,
+          owner_session_id,
+          chat_bypass_permissions
         )
         VALUES (
           @id,
@@ -88,7 +92,9 @@ export class SessionStore {
           @max_buffer_size,
           @last_accessed,
           @surface,
-          @native_chat_session_id
+          @native_chat_session_id,
+          @owner_session_id,
+          @chat_bypass_permissions
         )
       `);
 
@@ -144,6 +150,13 @@ export class SessionStore {
         // continue it: the agent would come back with no memory of a transcript
         // the user is looking at.
         native_chat_session_id: session.nativeChatSessionId || null,
+        // Which conversation owns this shell, so a restart can tell a session
+        // the user can reach from one that nothing on screen refers to any more.
+        owner_session_id: session.ownerSessionId || null,
+        // The approval mode the user chose for this conversation. Persisted so a
+        // restart brings it back rather than quietly dropping to manual — and so
+        // the header can state the mode of a conversation with nothing running.
+        chat_bypass_permissions: session.chatBypassPermissions === true ? 1 : null,
       }));
 
       replaceAll(rows);
@@ -178,7 +191,9 @@ export class SessionStore {
             max_buffer_size,
             last_accessed,
             surface,
-            native_chat_session_id
+            native_chat_session_id,
+            owner_session_id,
+            chat_bypass_permissions
           FROM runtime_sessions
           ORDER BY created_at ASC
         `)
@@ -218,6 +233,11 @@ export class SessionStore {
           lastAccessed: row.last_accessed || Date.now(),
           surface: row.surface === 'chat' ? 'chat' : undefined,
           nativeChatSessionId: row.native_chat_session_id || undefined,
+          ownerSessionId: row.owner_session_id || undefined,
+          // Only a stored 1 restores the bypass. A null — the value every row
+          // written before this column existed carries — reads as "asks first",
+          // so a missing answer can never grant a standing permission.
+          chatBypassPermissions: row.chat_bypass_permissions === 1 ? true : undefined,
         });
       }
 

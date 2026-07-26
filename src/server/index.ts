@@ -363,9 +363,11 @@ export class ClaudeCodeWebServer {
     name?: string;
     workingDir: string;
     connections?: string[];
+    ownerSessionId?: string;
   }): SessionRecord {
     return {
       id: params.id,
+      ownerSessionId: params.ownerSessionId,
       ownerUserId: params.ownerUserId,
       name: params.name || `Session ${new Date().toLocaleString()}`,
       created: new Date(),
@@ -482,11 +484,28 @@ export class ClaudeCodeWebServer {
     try {
       const sessions = await this.sessionStore.loadSessions();
       this.claudeSessions.clear();
+      let discarded = 0;
       for (const [id, session] of sessions) {
+        // A shell that belonged to a conversation is not restored. Its pty died
+        // with the previous process, and nothing lists it: the only thing that
+        // ever pointed at it was one browser's note of which session its pane
+        // was attached to, which is no longer true. Keeping the record would
+        // leave a row nobody can reach and a transcript nobody will read.
+        if (session.ownerSessionId) {
+          discarded++;
+          void this.transcriptStore.deleteTranscript(session);
+          void this.historyStore.deleteHistory(session);
+          this.sessionTeardown.dispose(session);
+          continue;
+        }
         this.claudeSessions.set(id, session);
       }
-      if (sessions.size > 0) {
-        console.log(`Loaded ${sessions.size} persisted sessions`);
+      if (this.claudeSessions.size > 0) {
+        console.log(`Loaded ${this.claudeSessions.size} persisted sessions`);
+      }
+      if (discarded > 0) {
+        // The rows go on the next autosave, which prunes anything not in the map.
+        void this.saveSessionsToDisk();
       }
     } catch (error) {
       console.error('Failed to load persisted sessions:', error);
