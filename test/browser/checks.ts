@@ -21,6 +21,13 @@ import { DEFAULT_CHAT_VIEW } from '../../src/client/chat/view-settings';
 import { createTerminalController, LIVE_SCROLLBACK_LINES } from '../../src/client/terminal/controller';
 import { HistoryView } from '../../src/client/terminal/history-view';
 import { Dialog } from '../../src/client/ui/relay/Dialog';
+import { PhoneContext } from '../../src/client/ui/touch';
+import { FloatingMenu, type FloatingMenuAction } from '../../src/client/shell/FloatingMenu';
+import { BottomNav } from '../../src/client/shell/BottomNav';
+import { MoreSheet } from '../../src/client/shell/MoreSheet';
+import { ChatSettingsDialog } from '../../src/client/shell/dialogs/ChatSettingsDialog';
+import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
+import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
 
 const results: string[] = [];
 const check = (name: string, ok: boolean, detail = ''): void => {
@@ -226,6 +233,8 @@ async function run(): Promise<void> {
   await checkTheComposerShrinksWithTheWorkspaceRail();
   await checkTheFixedBarsNeverWrap();
   await checkALiveAnswerAppearsAsItStreams();
+  await checkThePhoneLayoutIsUsable();
+  await checkThePhoneShellSurfacesAreUsable();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -726,9 +735,855 @@ async function checkALiveAnswerAppearsAsItStreams(): Promise<void> {
   host.remove();
 }
 
+/* -------------------------------------------------------------------------
+ * The phone (issue #51)
+ *
+ * Every check above runs at a desktop width, which is how the phone layout
+ * shipped for four minor versions as a shrunken desktop: nothing that ran had
+ * a viewport small enough to see it. These thresholds are written out here
+ * rather than imported from `src/client/ui/touch.ts` on purpose — a check that
+ * imports the app's own constants proves the app agrees with itself, not that
+ * a finger can hit the button or that an eye can read the label.
+ * ------------------------------------------------------------------------- */
+
+/** The floor for anything rendered as text on a phone. */
+const PHONE_MIN_TEXT = 12;
+/** Live session information is never set below the body text. */
+const PHONE_LIVE_TEXT = 15;
+/** Hit area, not ink: a 20px glyph in a 44px button passes. */
+const PHONE_TARGET = 44;
+/** Clear space between two neighbouring targets. */
+const PHONE_GAP = 8;
+/**
+ * Above this size on the axis they touch, two neighbours need no gap.
+ *
+ * The gap exists so the seam between two targets is findable. That is a real
+ * problem at the floor — two 44px buttons touching present one 88px strip with
+ * an invisible join — and not one above it: a bottom bar's segments are 78px
+ * wide with a label in the middle of each, which is how every phone in the
+ * world draws a tab bar, and inserting gaps into one would make it read as five
+ * loose buttons rather than one bar.
+ */
+const PHONE_GAP_EXEMPT_AT = PHONE_TARGET * 1.5;
+/**
+ * The most vertical room the chrome may take from the conversation, at rest.
+ *
+ * The point of the floating menu and the collapsing header and composer is that
+ * the transcript gets the screen. Nothing else here would notice a redesign
+ * that quietly gave the chrome its room back — every other rule is about the
+ * chrome being *big enough*, which pushes the other way.
+ *
+ * A pixel budget rather than a share of the screen: the chrome is a fixed
+ * number of pixels, so its share grows as the screen shortens, and a share
+ * would fail in landscape for a layout that had given up nothing at all.
+ *
+ * The budget covers the header strip, the live ribbon, the collapsed composer
+ * and the bottom bar together — about 160px of surface plus the bar's 57. It
+ * does not cover the floating menu, which floats.
+ *
+ * The bar is not counted out for the keyboard-open viewport even though the app
+ * hides it there: that hiding is driven by `visualViewport`, which a fixture in
+ * a sized div cannot move. So this measures the harder case in that one.
+ */
+const PHONE_CHAT_CHROME = 220;
+
+/** Visible, non-decorative, and not a screen-reader-only clone. */
+/** The view a node actually lives in — this page's, or an iframe's. */
+function viewOf(node: Element): Window {
+  return node.ownerDocument?.defaultView ?? window;
+}
+
+function isPainted(node: Element): boolean {
+  const box = node.getBoundingClientRect();
+  if (box.width <= 2 || box.height <= 2) return false;
+  if (node.closest('[aria-hidden="true"]')) return false;
+  const styles = viewOf(node).getComputedStyle(node);
+  return styles.visibility !== 'hidden' && styles.display !== 'none' && styles.opacity !== '0';
+}
+
+/**
+ * The controls, and only the controls.
+ *
+ * A control nested inside another control is dropped: the outer one is what a
+ * finger aims at, and counting both reports a 0px gap between a chip and its
+ * own icon every time.
+ */
+function paintedControls(root: HTMLElement): HTMLElement[] {
+  const rootBox = root.getBoundingClientRect();
+  const all = Array.from(
+    root.querySelectorAll<HTMLElement>('button, input, select, textarea, [role="tab"], [role="option"], a[href]'),
+  ).filter(isPainted).filter((node) => {
+    // A sheet's scrim is a control by markup and a gesture by intent: it is the
+    // empty half of the screen you tap to dismiss, so it abuts the sheet on
+    // purpose and has no size of its own to meet. Recognised by what it is —
+    // an empty element covering most of the surface — rather than by a name.
+    const box = node.getBoundingClientRect();
+    const empty = !(node.textContent || '').trim() && node.childElementCount === 0;
+    return !(empty && box.width * box.height > rootBox.width * rootBox.height * 0.2);
+  });
+  return all.filter((node) => !all.some((other) => other !== node && other.contains(node)));
+}
+
+/**
+ * A control's laid-out size, ignoring transforms.
+ *
+ * `getBoundingClientRect()` reports the painted box, which a dialog's entrance
+ * animation scales — so a 44px button measures 43.12px for as long as the
+ * animation is mid-flight, and headless Chrome does not always finish one. How
+ * big a control *is* is a layout question; where it is on screen is the one the
+ * rect answers, and that is what the spacing and overflow checks use.
+ */
+function laidOutSize(node: HTMLElement): { width: number; height: number } {
+  return { width: node.offsetWidth, height: node.offsetHeight };
+}
+
+/**
+ * Which of the named live figures has been seen on screen at all.
+ *
+ * A collapsed layout is allowed to hide a figure; it is not allowed to make it
+ * unreachable. Filled as the states are walked, asserted once at the end.
+ */
+const seenLive = new Set<string>();
+
+/** Whether any ancestor up to the host deliberately scrolls this node sideways. */
+function scrollsSideways(node: Element): boolean {
+  for (let at: Element | null = node.parentElement; at; at = at.parentElement) {
+    const overflowX = viewOf(at).getComputedStyle(at).overflowX;
+    if (overflowX === 'auto' || overflowX === 'scroll') return true;
+  }
+  return false;
+}
+
+/**
+ * The nearest ancestor that scrolls this node, if any.
+ *
+ * Two controls in different scroll containers have no fixed distance from each
+ * other — one of them moves when its container is scrolled, and either can be
+ * clipped to a sliver at the boundary. Measuring the space between them says
+ * nothing about whether they can be mistapped for each other.
+ */
+function scrollBoxOf(node: Element): Element | null {
+  for (let at: Element | null = node.parentElement; at; at = at.parentElement) {
+    const styles = viewOf(at).getComputedStyle(at);
+    if (/(auto|scroll)/.test(styles.overflowY) || /(auto|scroll)/.test(styles.overflowX)) return at;
+  }
+  return null;
+}
+
+/** Elements that render a word of their own, with the size that word is set at. */
+function paintedText(root: HTMLElement): Array<{ node: HTMLElement; size: number; text: string }> {
+  const out: Array<{ node: HTMLElement; size: number; text: string }> = [];
+  for (const node of Array.from(root.querySelectorAll<HTMLElement>('*'))) {
+    const own = Array.from(node.childNodes)
+      .filter((child) => child.nodeType === Node.TEXT_NODE)
+      .map((child) => (child.textContent || '').trim())
+      .join(' ')
+      .trim();
+    if (!own || !isPainted(node)) continue;
+    out.push({ node, size: parseFloat(viewOf(node).getComputedStyle(node).fontSize) || 0, text: own });
+  }
+  return out;
+}
+
+function describe(node: HTMLElement, text?: string): string {
+  const label = (text || node.getAttribute('aria-label') || node.textContent || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return `${node.tagName.toLowerCase()}${label ? `:${label.slice(0, 24)}` : ''}`;
+}
+
+/**
+ * The chat surface as a phone actually composes it.
+ *
+ * The menu is inside `ChatView` on a phone — it has to be, because it is
+ * anchored above the composer and the shell does not know where that ends — so
+ * this only has to supply what the shell would contribute to it.
+ */
+function PhoneSurface({ controller }: { controller: ChatController }): React.ReactElement {
+  // Real view state, not a frozen object with a no-op setter.
+  //
+  // `DEFAULT_CHAT_VIEW.panelOpen` is true — a desktop preference — and on a
+  // phone the rail *replaces* the transcript, so a fixture that cannot write
+  // the setting back renders a surface with no conversation in it at all and
+  // every measurement below is of the panel. The app clears it on mount; a
+  // fixture that swallows the write never sees that happen.
+  // Seeded shut, which is what the shell hands a phone: `panelOpen` is a
+  // desktop preference and on a phone the rail replaces the conversation, so
+  // AppShell keeps its own session-scoped answer and starts it false. A fixture
+  // that passes the stored default straight through renders the panel and
+  // measures that instead of the conversation.
+  const [view, setView] = React.useState({ ...DEFAULT_CHAT_VIEW, panelOpen: false });
+  const onViewChange = React.useCallback((next: typeof DEFAULT_CHAT_VIEW) => setView(next), []);
+  const go = React.useCallback(
+    (next: Partial<typeof DEFAULT_CHAT_VIEW>) => setView((current) => ({ ...current, ...next })),
+    [],
+  );
+
+  // Both bands: the budget below is about what the chrome costs the
+  // conversation, and the bar is chrome.
+  return React.createElement(
+    'div',
+    { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' } },
+    // The surface in a box that can shrink, exactly as AppShell holds it. Given
+    // the column directly, `height: 100%` on the surface takes the bar's 56px
+    // as well and the transcript is squeezed to nothing.
+    React.createElement(
+      'div',
+      { style: { flex: 1, minHeight: 0, display: 'flex' } },
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/home/dev/projects/a-rather-deeply-nested-working-directory',
+        isMobile: true,
+        view,
+        onViewChange,
+        // What the shell contributes. The surface adds its own inside.
+        menuActions: [
+          { id: 'new', label: 'New session', icon: 'plus', onPress: () => {} },
+          { id: 'more', label: 'More…', icon: 'ellipsis', expands: true, onPress: () => {} },
+        ],
+      } as never),
+    ),
+    React.createElement(BottomNav, {
+      destinations: [
+        {
+          id: 'chat', label: 'Chat', icon: 'message-square',
+          current: !view.panelOpen && !view.terminalOpen,
+          onGo: () => go({ panelOpen: false, terminalOpen: false }),
+        },
+        {
+          id: 'trace', label: 'Trace', icon: 'list-todo',
+          current: view.panelOpen && view.panelTab === 'trace',
+          onGo: () => go({ panelOpen: true, panelTab: 'trace', terminalOpen: false }),
+        },
+        {
+          id: 'files', label: 'Files', icon: 'hard-drive',
+          current: view.panelOpen && view.panelTab !== 'trace',
+          onGo: () => go({ panelOpen: true, panelTab: 'files', terminalOpen: false }),
+        },
+        {
+          id: 'terminal', label: 'Shell', icon: 'terminal',
+          current: view.terminalOpen,
+          onGo: () => go({ panelOpen: false, terminalOpen: true }),
+        },
+        { id: 'sessions', label: 'Sessions', icon: 'layout-list', onGo: () => {} },
+      ],
+    } as never),
+  );
+}
+
+/**
+ * A phone is not a narrow desktop.
+ *
+ * Three viewports, because the failures differ: portrait is the ordinary case,
+ * the short one stands in for the on-screen keyboard eating half the screen
+ * (headless Chrome has no `visualViewport` to resize, and the layout question —
+ * does the composer survive losing the height — is the same either way), and
+ * landscape is where a row that only wrapped by luck stops wrapping.
+ */
+/**
+ * Every phone rule, against whatever is currently on screen.
+ *
+ * Separate from the mount so it can be run again with a sheet open — see the
+ * loop in the caller. `where` names the state, so a failure says which one.
+ */
+function assertPhoneSurface(host: HTMLElement, where: string, atRest = false): void {
+  const hostBox = host.getBoundingClientRect();
+
+  // 1. Every control a finger is meant to hit.
+  const controls = paintedControls(host);
+  const small = controls.filter((node) => {
+    const box = laidOutSize(node);
+    return box.width < PHONE_TARGET || box.height < PHONE_TARGET;
+  });
+  check(
+    `every control is at least ${PHONE_TARGET}px in ${where}`,
+    small.length === 0,
+    small.length
+      ? small
+          .slice(0, 8)
+          .map((n) => {
+            const b = laidOutSize(n);
+            return `${describe(n)}=${b.width}x${b.height}`;
+          })
+          .join(' | ')
+      : `${controls.length} controls`,
+  );
+
+  // 2. And far enough from the one next to it. Only pairs that actually sit
+  //    side by side on the same line can be mistapped for each other.
+  const byLeft = [...controls].sort(
+    (a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left,
+  );
+  const crowded: string[] = [];
+  for (let i = 0; i < byLeft.length; i++) {
+    const a = byLeft[i].getBoundingClientRect();
+    for (let j = i + 1; j < byLeft.length; j++) {
+      const b = byLeft[j].getBoundingClientRect();
+      const sameLine = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > Math.min(a.height, b.height) / 2;
+      if (!sameLine) continue;
+      // Only controls that share a scroll container have a fixed distance from
+      // each other — see scrollBoxOf.
+      if (scrollBoxOf(byLeft[i]) !== scrollBoxOf(byLeft[j])) continue;
+      // Both comfortably over the floor on the axis they meet on — see
+      // PHONE_GAP_EXEMPT_AT.
+      if (a.width >= PHONE_GAP_EXEMPT_AT && b.width >= PHONE_GAP_EXEMPT_AT) continue;
+      const gap = b.left - a.right;
+      // Only the nearest neighbour to the right matters; anything further is
+      // separated by that one.
+      if (gap < -0.5) continue;
+      if (gap < PHONE_GAP - 0.5) {
+        crowded.push(`${describe(byLeft[i])}↔${describe(byLeft[j])}=${Math.round(gap)}px`);
+      }
+      break;
+    }
+  }
+  check(
+    `neighbouring controls are at least ${PHONE_GAP}px apart in ${where}`,
+    crowded.length === 0,
+    crowded.length ? crowded.slice(0, 8).join(' | ') : 'no crowded pairs',
+  );
+
+  // 3. Nothing is set in text too small to read.
+  const texts = paintedText(host);
+  const tiny = texts.filter((t) => t.size < PHONE_MIN_TEXT - 0.01);
+  check(
+    `no text is smaller than ${PHONE_MIN_TEXT}px in ${where}`,
+    tiny.length === 0,
+    tiny.length
+      ? tiny.slice(0, 8).map((t) => `${describe(t.node, t.text)}@${t.size}px`).join(' | ')
+      : `${texts.length} text nodes`,
+  );
+
+  // 4. The live session figures — whichever of them this state is showing.
+  //
+  //    Not "all of them, always": the header and the composer collapse now, so
+  //    most of these sit behind a disclosure. What has to hold is that when one
+  //    is on screen it is legible, and that every one of them is reachable in
+  //    *some* state — asserted once at the end, against `seenLive`.
+  const live: Array<[string, HTMLElement | null]> = [
+    ['the state', host.querySelector('header [role="status"]')],
+    ['the cost and tokens', host.querySelector('[aria-label="Session usage"]')],
+    ['the approvals state', host.querySelector('[aria-label="Approvals bypassed"]')],
+    ['the model', host.querySelector('[aria-label="Change model"]')],
+  ];
+  for (const [label, node] of live) {
+    if (!node) continue;
+    seenLive.add(label);
+    const size = parseFloat(viewOf(node).getComputedStyle(node).fontSize) || 0;
+    check(
+      `${label} is at least ${PHONE_LIVE_TEXT}px in ${where}`,
+      size >= PHONE_LIVE_TEXT - 0.01,
+      `${size}px`,
+    );
+  }
+
+  // And the model control shows the model, not the word "model".
+  //
+  // Asserted because the size check above cannot tell the difference: the chip
+  // falls back to a placeholder when nothing reported a model, and a fixture
+  // that fails to deliver one measures the placeholder and passes.
+  const modelChip = host.querySelector('[aria-label="Change model"]') as HTMLElement | null;
+  if (modelChip) {
+    check(
+      `the model control names the model in ${where}`,
+      (modelChip.textContent || '').includes('claude-opus-4-6'),
+      (modelChip.textContent || '').trim() || 'empty',
+    );
+  }
+
+  // 5. And each of them says which control it is.
+  //
+  //    The issue's wording is "identified without pressing" — on a touch screen
+  //    there is no hover, so `title` reveals nothing and `aria-label` is only
+  //    read aloud to somebody who has turned a screen reader on. A drawn word
+  //    is the only thing that answers the question for everybody.
+  const header = host.querySelector('header') as HTMLElement | null;
+  const composer = (host.querySelector('textarea')?.parentElement ?? null) as HTMLElement | null;
+  for (const [region, box] of [['the header', header], ['the composer row', composer]] as Array<
+    [string, HTMLElement | null]
+  >) {
+    if (!box) continue;
+    const mute = paintedControls(box).filter((node) => {
+      if (node.tagName === 'TEXTAREA') return false;
+      // A field's placeholder is drawn text saying what the field is for, which
+      // is the same answer a button's label gives.
+      if (node.tagName === 'INPUT' && (node as HTMLInputElement).placeholder.trim()) return false;
+      return !(node.textContent || '').trim();
+    });
+    check(
+      `every control in ${region} is identifiable without pressing it in ${where}`,
+      mute.length === 0,
+      mute.length ? mute.slice(0, 8).map((n) => describe(n)).join(' | ') : 'all labelled',
+    );
+  }
+
+  // 6. Nothing is pushed off the side. Vertical overflow inside the
+  //    conversation is scrolling and expected; horizontal overflow is a row
+  //    that refused to wrap, which is the defect.
+  const offscreen = Array.from(host.querySelectorAll<HTMLElement>('*')).filter((node) => {
+    if (!isPainted(node)) return false;
+    // Popovers and sheets are allowed to be positioned relative to the
+    // viewport rather than this host.
+    if (viewOf(node).getComputedStyle(node).position === 'fixed') return false;
+    // Nor is a row that deliberately scrolls sideways off-screen: the workspace
+    // tab strip is a scroller with a way back to what it is hiding. What this
+    // is looking for is content pushed out of a box that does not scroll.
+    if (scrollsSideways(node)) return false;
+    const box = node.getBoundingClientRect();
+    return box.right > hostBox.right + 1 || box.left < hostBox.left - 1;
+  });
+  check(
+    `nothing is pushed off the side in ${where}`,
+    offscreen.length === 0,
+    offscreen.length ? offscreen.slice(0, 8).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
+  );
+
+  // 7. And the conversation has most of the screen.
+  //
+  //    Only in the resting state: opening the details or the composer's other
+  //    controls is the user asking for that room, and taking it back the moment
+  //    they do would make the disclosure useless.
+  if (atRest) {
+    const scroller = host.querySelector('[data-message-id]')?.closest('[style*="overflow"]') as HTMLElement | null;
+    const surface = host.getBoundingClientRect();
+    if (scroller && surface.height > 0) {
+      const chrome = surface.height - scroller.getBoundingClientRect().height;
+      check(
+        `the chrome takes no more than ${PHONE_CHAT_CHROME}px from the conversation in ${where}`,
+        chrome <= PHONE_CHAT_CHROME,
+        `${Math.round(chrome)}px of ${Math.round(surface.height)}px`
+          + ` (${Math.round((1 - chrome / surface.height) * 100)}% left to the conversation)`,
+      );
+    }
+  }
+
+  // 8. The regions do not overlap.
+  //
+  //    Every rule above is satisfiable by a layout whose bands sit on top of
+  //    each other: a control can be the right size, in the right type, inside
+  //    the surface, and still be underneath the ribbon.
+  //
+  //    Asserted between the *regions*, not their contents. The conversation is
+  //    a scroller, so it clips its own children — a turn scrolled half out of
+  //    view has a box that extends above the scroller and is painted nowhere
+  //    near there, and comparing that box to the header reports an overlap that
+  //    does not exist on screen.
+  const conversation = host.querySelector('[data-message-id]')?.closest('[style*="overflow"]') as HTMLElement | null;
+  const bands: Array<[string, HTMLElement | null]> = [
+    ['the header', host.querySelector('header')],
+    ['the status ribbon', host.querySelector('[role="status"][aria-live="polite"]:not(header *)')],
+  ];
+  for (const [label, band] of bands) {
+    if (!band || !conversation || band.contains(conversation) || conversation.contains(band)) continue;
+    const bandBox = band.getBoundingClientRect();
+    const box = conversation.getBoundingClientRect();
+    check(
+      `the conversation and ${label} do not overlap in ${where}`,
+      box.top >= bandBox.bottom - 1 || box.bottom <= bandBox.top + 1,
+      `conversation ${Math.round(box.top)}-${Math.round(box.bottom)}, ${label} ${Math.round(bandBox.top)}-${Math.round(bandBox.bottom)}`,
+    );
+  }
+
+  // 9. The composer is the one thing that must survive every viewport: a
+  //    phone with no way to type is not a degraded layout, it is a dead app.
+  const textarea = host.querySelector('textarea') as HTMLElement | null;
+  if (!textarea) {
+    check(`the composer is reachable in ${where}`, false, 'no textarea');
+  } else {
+    const box = textarea.getBoundingClientRect();
+    check(
+      `the composer is fully on screen in ${where}`,
+      box.top >= hostBox.top - 1 && box.bottom <= hostBox.bottom + 1 && box.height > 0,
+      `composer ${Math.round(box.top)}–${Math.round(box.bottom)}, surface ${Math.round(hostBox.top)}–${Math.round(hostBox.bottom)}`,
+    );
+  }
+
+}
+
+async function checkThePhoneLayoutIsUsable(): Promise<void> {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+
+  const controller = new ChatController('phone-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'phone-check',
+    snapshot: {
+      sessionId: 'phone-check',
+      runtime: 'claude',
+      state: 'running',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true, commands: [{ name: 'clear' }],
+        models: [{ name: 'claude-opus-4-6', value: 'claude-opus-4-6' }],
+      },
+      usage: { totalTokens: 987654, costUsd: 12.3456, contextWindow: 200000, contextUsed: 150000 },
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'rework the mobile layout so the controls are reachable' }],
+        },
+        {
+          id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: Date.now(),
+          blocks: [
+            { kind: 'text', text: 'here is what I changed' },
+            {
+              kind: 'tool', toolId: 'x1', name: 'bash', toolKind: 'execute',
+              status: 'completed', input: { command: 'npm test' }, durationMs: 4321,
+            },
+          ],
+          usage: { inputTokens: 12345, outputTokens: 6789, costUsd: 0.4321 },
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
+      live: true, bypassPermissions: true,
+    },
+  } as never);
+
+  // The model reaches the composer through a `session` event, not through the
+  // snapshot and not through a prop — a `model` field on either is quietly
+  // ignored, which is how a fixture ends up asserting the size of the word
+  // "model" instead of the size of a model name.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'phone-check',
+    event: {
+      // seq 3, not 0: the reducer drops anything at or below the cursor the
+      // snapshot left behind, so a seq-0 session event is silently a no-op.
+      t: 'session', seq: 3, ts: Date.now(), model: 'claude-opus-4-6',
+      // Repeated in full: a `session` event replaces the capabilities rather
+      // than merging into them, so a short one here would quietly take the
+      // model list and the interrupt away from everything below.
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true, commands: [{ name: 'clear' }],
+        models: [{ name: 'claude-opus-4-6', value: 'claude-opus-4-6' }],
+      },
+    },
+  } as never);
+
+  const viewports: Array<[string, number, number]> = [
+    ['portrait', 390, 740],
+    ['with the keyboard open', 390, 380],
+    ['landscape', 740, 390],
+  ];
+
+  /**
+   * The base surface, and the same surface with each of the phone's own
+   * overlays open.
+   *
+   * A check only ever covers what its fixture reaches. The trace rail, the turn
+   * index and the model list are all sheets on a phone, and asserting the
+   * closed state alone is how a layout ends up correct in the chrome and
+   * untouched everywhere behind it.
+   */
+  const states: Array<[string, string[], boolean?]> = [
+    ['', []],
+    // Scrolled back, because a control only exists in that state: the
+    // "Jump to latest" pill floats over the transcript when it is not pinned.
+    // It shipped at 34px — a hardcoded height overriding the touch floor its
+    // own primitive applies — and every run that happened to leave the
+    // transcript pinned reported the phone clean.
+    ['scrolled back through the conversation', [], true],
+    // Each is now reached through the floating menu: open it, then press the
+    // row. Driving it the way a thumb does is the only way to know the route
+    // still exists — the controls left the header when the menu arrived.
+    ['with the session details open', ['[aria-label="Show the session details"]']],
+    ['with the other composer controls open', ['[aria-label="Show the other controls"]']],
+    ['with the menu open', ['[aria-label="Open the menu"]']],
+  ];
+
+  for (const [name, width, height] of viewports) {
+    for (const [state, opens, scrollBack] of states) {
+      // A fresh mount per state, not a toggle: closing a sheet is its own
+      // control, and a second click on the opener left the previous sheet up
+      // and reported its offences against every state after it.
+      host.style.cssText = `width:${width}px;height:${height}px;position:absolute;top:0;left:0;display:flex;overflow:hidden`;
+      const root = createRoot(host);
+      root.render(React.createElement(PhoneSurface, { controller }));
+      await wait(400);
+
+      const where = state ? `${name} ${state}` : name;
+
+      if (scrollBack) {
+        const scroller = host.querySelector('[data-message-id]')?.closest('[style*="overflow"]') as HTMLElement | null;
+        if (scroller) {
+          scroller.scrollTop = 0;
+          scroller.dispatchEvent(new Event('scroll'));
+          await wait(250);
+        }
+      }
+
+      let reached = true;
+      for (const selector of opens) {
+        const opener = host.querySelector(selector) as HTMLElement | null;
+        if (!opener) {
+          check(`the phone surface can open ${state} in ${name}`, false, `no ${selector}`);
+          reached = false;
+          break;
+        }
+        opener.click();
+        await wait(250);
+      }
+      if (!reached) {
+        root.unmount();
+        continue;
+      }
+
+      // The menu has to be *legible*, not merely present. It was animating in
+      // from `opacity: 0` and headless Chrome never advanced the frame, so
+      // every rule below skipped the panel as invisible and reported the state
+      // as clean — a check that covered the menu by name and nothing by fact.
+      if (state.includes('menu')) {
+        const panel = host.querySelector('[role="menu"]') as HTMLElement | null;
+        const styles = panel ? viewOf(panel).getComputedStyle(panel) : null;
+        check(
+          `the menu is actually on screen in ${name}`,
+          Boolean(panel) && styles!.opacity === '1' && !/rgba\(.*,\s*0\)/.test(styles!.backgroundColor),
+          panel ? `opacity=${styles!.opacity} background=${styles!.backgroundColor}` : 'no panel',
+        );
+
+        // And the button that dismisses it is still the thing under the finger.
+        // Its scrim and it were on the same layer, so which one a tap reached
+        // was decided by document order.
+        const button = host.querySelector('[aria-label="Close the menu"][aria-haspopup="menu"]') as HTMLElement | null;
+        const box = button?.getBoundingClientRect();
+        const hit = box
+          ? host.ownerDocument.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2)
+          : null;
+        check(
+          `the menu button is not covered by its own scrim in ${name}`,
+          Boolean(button) && Boolean(hit) && button!.contains(hit as Node),
+          hit ? `${(hit as HTMLElement).tagName.toLowerCase()}:${(hit as HTMLElement).getAttribute('aria-label') || '?'}` : 'nothing there',
+        );
+      }
+      assertPhoneSurface(host, where, opens.length === 0);
+      root.unmount();
+    }
+  }
+
+  // The bar is a set of destinations, and pressing one has to go there.
+  //
+  // Asserted by driving it, because the parts that could be wrong are all on
+  // the far side of a press: which item paints as current, and whether the
+  // surface actually changed. Static markup shows a bar that looks right and
+  // navigates nowhere.
+  {
+    host.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;display:flex;overflow:hidden';
+    const root = createRoot(host);
+    root.render(React.createElement(PhoneSurface, { controller }));
+    await wait(400);
+
+    const bar = host.querySelector('nav[aria-label="Go to"]') as HTMLElement | null;
+    const current = (): string =>
+      (bar?.querySelector('[aria-current="page"]')?.textContent || '').trim();
+
+    check('the bar starts on the conversation', current() === 'Chat', current() || 'nothing current');
+
+    for (const [label, expect] of [
+      ['Trace', 'a rail'],
+      ['Files', 'a rail'],
+      ['Chat', 'the transcript'],
+    ] as Array<[string, string]>) {
+      const item = Array.from(bar?.querySelectorAll('button') ?? []).find(
+        (node) => (node.textContent || '').trim() === label,
+      ) as HTMLElement | undefined;
+      if (!item) {
+        check(`the bar offers ${label}`, false, 'not found');
+        continue;
+      }
+      item.click();
+      await wait(300);
+
+      check(`pressing ${label} marks it as where you are`, current() === label, current() || 'nothing current');
+
+      const showsRail = Boolean(host.querySelector('aside[aria-label="Workspace"]'));
+      const showsTranscript = Boolean(host.querySelector('[data-message-id]'));
+      check(
+        `pressing ${label} actually shows ${expect}`,
+        expect === 'a rail' ? showsRail : showsTranscript && !showsRail,
+        `rail=${showsRail} transcript=${showsTranscript}`,
+      );
+    }
+
+    root.unmount();
+  }
+
+  // Reachable, not merely legible wherever it happened to be drawn. Collapsing
+  // the header and the composer is what this asserts the price of: every figure
+  // the issue names by hand still has a state that shows it.
+  for (const label of ['the state', 'the cost and tokens', 'the approvals state', 'the model']) {
+    check(
+      `${label} is reachable somewhere on a phone`,
+      seenLive.has(label),
+      seenLive.has(label) ? 'shown' : 'never on screen in any state',
+    );
+  }
+
+  host.remove();
+}
+
 run().catch((error: unknown) => {
   const pre = document.createElement('pre');
   pre.id = 'results';
   pre.textContent = `FAIL :: threw :: ${error instanceof Error ? error.stack : String(error)}`;
   document.body.appendChild(pre);
 });
+
+/**
+ * The chat surface is not the whole phone (issue #51).
+ *
+ * The bottom bar, its more sheet and the tab switcher live in the app shell,
+ * above and beside every conversation — none of them is reachable from a
+ * ChatView fixture, so they need their own mount or they go the way the phone
+ * layout went: untested and therefore unchanged.
+ *
+ * The floating menu is mounted *open*, because shut it is one button and the
+ * question is whether the list behind it can be read and hit.
+ *
+ * The terminal's key strip is deliberately not here. It is the terminal's own
+ * on-screen controls, which issue #51 lists as a non-goal — they were sized
+ * for a thumb when they were added, under their own issue.
+ */
+async function checkThePhoneShellSurfacesAreUsable(): Promise<void> {
+  const noop = (): void => {};
+  const surfaces: Array<[string, () => React.ReactElement]> = [
+    ['the floating menu', () =>
+      React.createElement(OpenFloatingMenu, {
+        actions: [
+          { id: 'search', label: 'Search this conversation', icon: 'search', onPress: noop, expands: true, group: 'surface' },
+          { id: 'trace', label: 'Trace rail', icon: 'panel-right', onPress: noop, toggle: true, active: true, group: 'surface' },
+          { id: 'sessions', label: 'Sessions', icon: 'layout-list', onPress: noop, expands: true, group: 'session' },
+          { id: 'new', label: 'New', icon: 'plus', onPress: noop, group: 'session' },
+          { id: 'more', label: 'More', icon: 'ellipsis', onPress: noop, expands: true, group: 'session' },
+        ],
+      } as never)],
+    ['the more sheet', () =>
+      React.createElement(MoreSheet, {
+        open: true, theme: 'dark', logoutUrl: '/logout', canCloseSession: true,
+        install: { supported: true, reason: null } as never,
+        onInstall: noop, onClose: noop, onReconnect: noop, onClearTerminal: noop,
+        onSwitchMode: noop, onCloseSession: noop, onOpenSettings: noop,
+        onToggleTheme: noop, onRename: noop,
+      } as never)],
+    ['the chat settings dialog', () =>
+      React.createElement(ChatSettingsDialog, {
+        open: true, settings: DEFAULT_CHAT_VIEW, onChange: noop, onClose: noop,
+      } as never)],
+    ['the sessions dialog', () =>
+      React.createElement(SessionsDialog, {
+        open: true,
+        sessions: [
+          { id: 's1', title: 'a session with a fairly long name', runtime: 'claude', workingDir: '/tmp/a' },
+          { id: 's2', title: 'another one', runtime: 'codex', workingDir: '/tmp/b' },
+        ],
+        activeId: 's1', onJoin: noop, onLeave: noop, onDelete: noop, onNew: noop, onClose: noop,
+      } as never)],
+    ['the tab switcher', () =>
+      React.createElement(TabSwitcherSheet, {
+        open: true,
+        tabs: [
+          { id: 't1', title: 'a session with a fairly long name', kind: 'terminal' },
+          { id: 't2', title: 'another one', kind: 'chat' },
+        ],
+        activeId: 't1',
+        onSelect: noop, onCloseTab: noop, onNew: noop, onAllSessions: noop, onClose: noop,
+      } as never)],
+  ];
+
+  for (const [name, render] of surfaces) {
+    // An iframe, not a sized div.
+    //
+    // Two of these four surfaces are `Dialog`s, and a Dialog portals to
+    // `document.body` and positions itself against the *viewport*. Measured
+    // inside this page it would be 800px wide whatever the host div says — so
+    // the one thing being asked ("does it fit a phone?") would be answered
+    // about a desktop. An iframe has a viewport of its own.
+    const frame = document.createElement('iframe');
+    frame.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;border:0';
+    document.body.appendChild(frame);
+    const doc = frame.contentDocument as Document;
+    doc.open();
+    doc.write(
+      '<!doctype html><html><head>'
+      + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
+      + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+      + '</head><body style="margin:0"></body></html>',
+    );
+    doc.close();
+    await wait(150);
+
+    const host = doc.body;
+    const root = createRoot(host);
+    // Inside a provider, because two of these are the app's ordinary dialogs
+    // rather than phone-only surfaces: they take their sizing from the shell's
+    // `isMobile`, the same way every other component below AppShell does, and
+    // outside one they would correctly render at desktop sizes.
+    root.render(React.createElement(PhoneContext.Provider, { value: true }, render()));
+    await wait(300);
+
+    const target = host;
+    const controls = paintedControls(target);
+    if (controls.length === 0) {
+      check(`${name} renders on a phone`, false, 'no controls found');
+      root.unmount();
+      frame.remove();
+      continue;
+    }
+
+    const small = controls.filter((node) => {
+      const box = laidOutSize(node);
+      return box.width < PHONE_TARGET || box.height < PHONE_TARGET;
+    });
+    check(
+      `every control in ${name} is at least ${PHONE_TARGET}px`,
+      small.length === 0,
+      small.length
+        ? small.slice(0, 8).map((n) => {
+            const b = laidOutSize(n);
+            return `${describe(n)}=${b.width}x${b.height}`;
+          }).join(' | ')
+        : `${controls.length} controls`,
+    );
+
+    const tiny = paintedText(target).filter((t) => t.size < PHONE_MIN_TEXT - 0.01);
+    check(
+      `no text in ${name} is smaller than ${PHONE_MIN_TEXT}px`,
+      tiny.length === 0,
+      tiny.length
+        ? tiny.slice(0, 8).map((t) => `${describe(t.node, t.text)}@${t.size}px`).join(' | ')
+        : 'all legible',
+    );
+
+    const offscreen = Array.from(target.querySelectorAll<HTMLElement>('*')).filter((node) => {
+      if (!isPainted(node) || scrollsSideways(node)) return false;
+      const box = node.getBoundingClientRect();
+      return box.right > 391 || box.left < -1;
+    });
+    check(
+      `nothing in ${name} is pushed off the side`,
+      offscreen.length === 0,
+      offscreen.length ? offscreen.slice(0, 6).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
+    );
+
+    root.unmount();
+    frame.remove();
+  }
+}
+
+/** The floating menu with its own button already pressed. */
+function OpenFloatingMenu({ actions }: { actions: FloatingMenuAction[] }): React.ReactElement {
+  const ref = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    (ref.current?.querySelector('[aria-label="Open the menu"]') as HTMLElement | null)?.click();
+  }, []);
+  return React.createElement(
+    'div',
+    { ref, style: { position: 'relative', width: '100%', height: '100%' } },
+    React.createElement(FloatingMenu, { actions } as never),
+  );
+}

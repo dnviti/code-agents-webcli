@@ -10,6 +10,7 @@ import {
 import { ChatTranscript } from '../../chat/transcript.js';
 import { compactCount, formatDuration } from '../../chat/tool-meta.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { Markdown, markdownText } from './Markdown.js';
 import { PlanPanel } from './PlanPanel.js';
 
@@ -85,6 +86,7 @@ export const MessageBubble = React.memo(function MessageBubble({
   );
 
   const [copied, setCopied] = React.useState(false);
+  const isPhone = usePhone();
   const isUser = current.role === 'user';
   // A marker is not a turn: no surface, no glyph, no controls, and the full
   // width of the column — it is a line drawn across the conversation.
@@ -140,6 +142,11 @@ export const MessageBubble = React.memo(function MessageBubble({
       aria-label={isUser ? 'Your message' : 'Assistant message'}
       style={{
         display: 'flex',
+        // On a phone the controls drop to a line of their own below the
+        // message — see the action column. Beside it they were a 44px-wide
+        // column of stacked buttons that made a two-line message four lines
+        // tall and took a sixth of the width off the text.
+        flexWrap: isPhone ? 'wrap' : 'nowrap',
         gap: 10,
         minWidth: 0,
         padding: isUser ? '10px 14px' : '12px 14px',
@@ -191,12 +198,26 @@ export const MessageBubble = React.memo(function MessageBubble({
         {isUser ? null : <Footer model={current.model} usage={current.usage} />}
       </div>
 
-      <div style={{ flex: '0 0 auto', display: 'flex', alignItems: 'flex-start', gap: 2 }}>
+      <div
+        style={{
+          // Its own full-width line on a phone, so the buttons can be a row of
+          // proper targets without taking that width from the message.
+          flex: isPhone ? '1 0 100%' : '0 0 auto',
+          display: 'flex',
+          // Centred only on a phone, where this is a row of its own under the
+          // message. Beside the message it stays top-aligned, level with the
+          // first line — which is where it has always been.
+          alignItems: isPhone ? 'center' : 'flex-start',
+          justifyContent: isPhone ? 'flex-end' : undefined,
+          gap: isPhone ? TOUCH_GAP : 2,
+        }}
+      >
         <span
           style={{
-            paddingTop: 3,
+            paddingTop: isPhone ? 0 : 3,
+            marginRight: isPhone ? 'auto' : 0,
             fontFamily: 'var(--font-mono)',
-            fontSize: 'var(--text-2xs)',
+            fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
             color: 'var(--muted-foreground)',
             whiteSpace: 'nowrap',
           }}
@@ -299,6 +320,7 @@ function summariseWork(
  * pointer — it opens the rail and scrolls the timeline to this message.
  */
 function WorkPill({ label, onClick }: { label: string; onClick: () => void }): React.JSX.Element {
+  const isPhone = usePhone();
   const [hover, setHover] = React.useState(false);
   return (
     <button
@@ -314,19 +336,19 @@ function WorkPill({ label, onClick }: { label: string; onClick: () => void }): R
         alignItems: 'center',
         gap: 8,
         maxWidth: '100%',
-        height: 24,
-        padding: '0 8px',
+        height: isPhone ? TOUCH_TARGET : 24,
+        padding: isPhone ? '0 12px' : '0 8px',
         background: 'var(--card)',
         border: `1px solid ${hover ? 'var(--border-strong)' : 'var(--border)'}`,
         borderRadius: 'var(--radius)',
         fontFamily: 'var(--font-mono)',
-        fontSize: 10.5,
+        fontSize: isPhone ? PHONE_TEXT.body : 10.5,
         color: hover ? 'var(--foreground)' : 'var(--muted-foreground)',
         cursor: 'pointer',
         transition: 'border-color var(--duration-fast), color var(--duration-fast)',
       }}
     >
-      <Icon name="terminal" size={10} />
+      <Icon name="terminal" size={isPhone ? 16 : 10} />
       <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {label}
       </span>
@@ -537,6 +559,7 @@ function ActionButton({
   tone?: string;
 }) {
   const [hot, setHot] = React.useState(false);
+  const isPhone = usePhone();
   return (
     <button
       type="button"
@@ -551,8 +574,8 @@ function ActionButton({
         display: 'inline-flex',
         alignItems: 'center',
         justifyContent: 'center',
-        width: 22,
-        height: 22,
+        width: isPhone ? TOUCH_TARGET : 22,
+        height: isPhone ? TOUCH_TARGET : 22,
         background: hot ? 'var(--accent)' : 'transparent',
         border: '1px solid transparent',
         color: tone || 'var(--muted-foreground)',
@@ -564,12 +587,13 @@ function ActionButton({
         transition: 'opacity var(--duration-fast), background var(--duration-fast)',
       }}
     >
-      <Icon name={icon} size={11} />
+      <Icon name={icon} size={isPhone ? 18 : 11} />
     </button>
   );
 }
 
 function Footer({ model, usage }: { model?: string; usage?: ChatUsage }) {
+  const isPhone = usePhone();
   const bits: string[] = [];
   if (model) bits.push(model);
   if (usage) {
@@ -587,7 +611,9 @@ function Footer({ model, usage }: { model?: string; usage?: ChatUsage }) {
         flexWrap: 'wrap',
         gap: 8,
         fontFamily: 'var(--font-mono)',
-        fontSize: 'var(--text-2xs)',
+        // The model this answer ran on, and what it cost: the same figures the
+        // header carries, so the same rule applies to them here.
+        fontSize: isPhone ? PHONE_TEXT.label : 'var(--text-2xs)',
         color: 'var(--muted-foreground)',
       }}
     >

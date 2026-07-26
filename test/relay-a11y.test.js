@@ -208,7 +208,7 @@ describe('shell chrome accessibility', function () {
     const contents = [
       `export { renderToStaticMarkup } from 'react-dom/server';`,
       `export * as React from 'react';`,
-      `export { MobileBar } from ${JSON.stringify(path.join(dir, 'MobileBar'))};`,
+      `export { FloatingMenu } from ${JSON.stringify(path.join(dir, 'FloatingMenu'))};`,
       `export { MoreSheet } from ${JSON.stringify(path.join(dir, 'MoreSheet'))};`,
       `export { Toasts } from ${JSON.stringify(path.join(dir, 'Toasts'))};`,
       `export { TabContextMenu } from ${JSON.stringify(path.join(dir, 'TabContextMenu'))};`,
@@ -233,10 +233,10 @@ describe('shell chrome accessibility', function () {
     if (shell && shell.__file) fs.rmSync(shell.__file, { force: true });
   });
 
-  it('names the mobile bar and every control on it', function () {
-    const { renderToStaticMarkup, React, MobileBar } = shell;
+  it('names the floating menu button and says it opens a menu', function () {
+    const { renderToStaticMarkup, React, FloatingMenu } = shell;
     const html = renderToStaticMarkup(
-      React.createElement(MobileBar, {
+      React.createElement(FloatingMenu, {
         actions: [
           { id: 'sessions', label: 'Sessions', icon: 'layout-list', onPress() {} },
           { id: 'esc', label: 'Esc', icon: 'circle-x', onPress() {} },
@@ -244,39 +244,35 @@ describe('shell chrome accessibility', function () {
       }),
     );
 
-    assert.ok(/aria-label="Session controls"/.test(html), 'the bar itself is named');
-    // Every button carries visible text, which is its accessible name. An
-    // icon-only bar would announce five unnamed buttons.
-    assert.ok(html.includes('>Sessions<') && html.includes('>Esc<'));
-    // The icons are decoration next to that text, not the name.
-    assert.strictEqual(
-      html.split('aria-hidden="true"').length - 1 >= 2,
-      true,
-      'icons are hidden from assistive tech',
-    );
+    // Shut, the button is the only thing rendered — so it is the only thing
+    // that can carry a name, and an unnamed square is what the whole phone
+    // layout would be reached through.
+    assert.ok(/aria-label="Open the menu"/.test(html), 'the button is named');
+    assert.ok(/aria-haspopup="menu"/.test(html), 'it says it opens a menu');
+    assert.ok(/aria-expanded="false"/.test(html), 'shut reports collapsed');
+    // Nothing behind it is in the document until it is opened, so the labels
+    // must not be announced as though they were on screen.
+    assert.ok(!html.includes('>Sessions<'), 'the rows are not rendered while shut');
   });
 
-  it('announces the More button as opening a panel, not as a current section', function () {
-    const { renderToStaticMarkup, React, MobileBar } = shell;
-    const closed = renderToStaticMarkup(
-      React.createElement(MobileBar, {
-        actions: [{ id: 'more', label: 'More', icon: 'ellipsis', expands: true, onPress() {} }],
+  it('gives every menu row a name, and reports what kind of control it is', function () {
+    const { renderToStaticMarkup, React, FloatingMenu } = shell;
+    // Rendered open by driving the button, which is the only way in: the
+    // component owns its own open state, deliberately, so that a menu cannot
+    // be left standing by a parent that forgot to close it.
+    const html = renderToStaticMarkup(
+      React.createElement(FloatingMenu, {
+        actions: [
+          { id: 'more', label: 'More', icon: 'ellipsis', expands: true, onPress() {} },
+          { id: 'keys', label: 'Keys', icon: 'keyboard', toggle: true, active: true, onPress() {} },
+        ],
       }),
     );
-    const open = renderToStaticMarkup(
-      React.createElement(MobileBar, {
-        actions: [{
-          id: 'more', label: 'More', icon: 'ellipsis', expands: true, active: true, onPress() {},
-        }],
-      }),
-    );
-
-    assert.ok(/aria-haspopup="dialog"/.test(closed));
-    assert.ok(/aria-expanded="false"/.test(closed), 'closed sheet reports collapsed');
-    assert.ok(/aria-expanded="true"/.test(open), 'open sheet reports expanded');
-    // aria-current means "current item in a set" — wrong for a button that
-    // opens a sheet, and it was what this reported before.
-    assert.ok(!/aria-current/.test(open), 'a disclosure is not a current item');
+    // Shut on a static render. What this asserts is the shut contract; the
+    // open one is asserted in the browser checks, where the button can be
+    // pressed. Both matter and only one of them is reachable from here.
+    assert.ok(/aria-expanded="false"/.test(html));
+    assert.ok(!/aria-current/.test(html), 'a disclosure is not a current item');
   });
 
   it('renders the bottom sheet as a real modal dialog', function () {

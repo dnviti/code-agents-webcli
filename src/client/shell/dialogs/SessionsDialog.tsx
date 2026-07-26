@@ -4,6 +4,7 @@ import type { SessionListItem } from '../../types';
 import { Button } from '../../ui/relay/Button';
 import { Dialog } from '../../ui/relay/Dialog';
 import { Icon } from '../../ui/relay/Icon';
+import { PHONE_TEXT, usePhone } from '../../ui/touch';
 import { IconButton } from '../../ui/relay/IconButton';
 
 export interface SessionsDialogProps {
@@ -49,6 +50,7 @@ function SessionCard({
   onLeave(): void;
   onDelete(id: string): void;
 }): React.JSX.Element {
+  const isPhone = usePhone();
   return (
     <div style={{ ...cardStyle, borderColor: isActive ? 'var(--ring)' : 'var(--border)' }}>
       <span
@@ -75,7 +77,13 @@ function SessionCard({
         >
           {session.name}
         </div>
-        <div style={{ marginTop: 2, fontSize: 'var(--text-xs)', color: 'var(--muted-foreground)' }}>
+        <div
+          style={{
+            marginTop: 2,
+            fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-xs)',
+            color: 'var(--muted-foreground)',
+          }}
+        >
           {clientsLabel(session.connectedClients)} · {new Date(session.created).toLocaleTimeString()}
         </div>
         {session.workingDir ? (
@@ -92,7 +100,7 @@ function SessionCard({
               border: '1px solid var(--border)',
               borderRadius: 'var(--radius-full)',
               fontFamily: 'var(--font-mono)',
-              fontSize: 'var(--text-2xs)',
+              fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
               color: 'var(--muted-foreground)',
             }}
           >

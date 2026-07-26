@@ -4,6 +4,7 @@ import { createStick, BOTTOM_SLACK, type StickHandle } from '../../chat/stick.js
 import type { TurnSummary } from '../../chat/turns.js';
 import { Button } from '../../ui/relay/Button.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { usePhone } from '../../ui/touch.js';
 import { MessageBubble } from './MessageBubble.js';
 import { TurnStrip } from './TurnStrip.js';
 
@@ -104,6 +105,7 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
     const scroller = React.useRef<HTMLDivElement | null>(null);
     const content = React.useRef<HTMLDivElement | null>(null);
     const [stuck, setStuck] = React.useState(true);
+    const isPhone = usePhone();
 
     // Read off the transcript rather than tracked here. This used to be local
     // state cleared only when a page actually prepended a message — so a page
@@ -290,7 +292,16 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
             flex: 1,
             // A normal block scroller. Never `justify-content: flex-end` to fake
             // bottom alignment — that makes the scrollback unreachable.
-            minHeight: 160,
+            //
+            // `0`, not a 160px floor. A flex item cannot shrink below its
+            // min-height, so a floor taller than the space available does not
+            // reserve room — it overflows the column, and the transcript gets
+            // painted over the live ribbon and the composer beneath it. A phone
+            // in landscape has about 160px for the whole conversation once the
+            // header, the ribbon and the composer have taken theirs, so this
+            // was the shape it broke in first. Flex already gives the scroller
+            // every pixel the column can spare, which is what the floor was for.
+            minHeight: 0,
             overflowY: 'auto',
             overflowX: 'hidden',
             overscrollBehavior: 'contain',
@@ -411,7 +422,17 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
               variant="secondary"
               onClick={jumpToLatest}
               iconLeft={<Icon name="arrow-down" size={12} />}
-              style={{ pointerEvents: 'auto', height: 34, boxShadow: 'var(--shadow-md)' }}
+              // The key is omitted on a phone, not set to `undefined`: the
+              // style object is spread over the primitive's own, so a present
+              // key wins whatever its value is — `height: undefined` deleted
+              // the touch floor as thoroughly as `height: 34` overrode it, and
+              // left the pill 17px tall. 34 is a desktop choice: `sm` is 26px
+              // and this floats over the transcript, where it has to be found.
+              style={{
+                pointerEvents: 'auto',
+                ...(isPhone ? null : { height: 34 }),
+                boxShadow: 'var(--shadow-md)',
+              }}
             >
               Jump to latest
             </Button>

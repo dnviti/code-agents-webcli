@@ -4,6 +4,7 @@ import type { AppSettings } from '../types';
 import { Badge } from '../ui/relay/Badge';
 import { CommandPalette, type CommandPaletteGroup } from '../ui/relay/CommandPalette';
 import { Icon } from '../ui/relay/Icon';
+import { PhoneContext } from '../ui/touch';
 import { IconButton } from '../ui/relay/IconButton';
 import { StatusBar, type StatusBarSegment } from '../ui/relay/StatusBar';
 import { TabBar, type TabItem } from '../ui/relay/TabBar';
@@ -18,7 +19,8 @@ import { SessionsDialog } from './dialogs/SessionsDialog';
 import { ChatSettingsDialog } from './dialogs/ChatSettingsDialog';
 import { SettingsDialog } from './dialogs/SettingsDialog';
 import { TerminalOptionsDialog } from './dialogs/TerminalOptionsDialog';
-import { MobileBar, type MobileBarAction } from './MobileBar';
+import { BottomNav, type BottomNavDestination } from './BottomNav';
+import { FloatingMenu, type FloatingMenuAction } from './FloatingMenu';
 import { TabSwitcherSheet } from './TabSwitcherSheet';
 import { KeyStrip, KEY_STRIP_HEIGHT } from './KeyStrip';
 import type { MobileKey } from '../ui/mobile';
@@ -33,7 +35,7 @@ import { TabContextMenu } from './TabContextMenu';
 import { TerminalHost } from './TerminalHost';
 import { ChatView } from './chat/ChatView';
 import type { ChatController } from '../chat/controller';
-import type { ChatViewSettings } from '../chat/view-settings';
+import { CHAT_PANEL_ICONS, type ChatPanelId, type ChatViewSettings } from '../chat/view-settings';
 import { Toasts } from './Toasts';
 import { UpdateBannerView } from './UpdateBannerView';
 import { shellStore, type ShellState, type ShellTab } from './store';
@@ -147,6 +149,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
   // controller is carried as an opaque handle because its transcript mutates
   // per token and must not live in shell state.
   const chatActive = state.chat.active;
+  const keyboardUp = useKeyboardUp(state.isMobile);
   const chatController = state.chat.controller as ChatController | null;
   const [menu, setMenu] = React.useState<{ id: string; x: number; y: number } | null>(null);
 
@@ -309,53 +312,127 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
     { children: state.theme === 'dark' ? 'Dark' : 'Light' },
   ];
 
-  const mobileActions: MobileBarAction[] = [
-    {
-      id: 'sessions',
-      label: 'Sessions',
-      icon: 'layout-list',
-      badge: state.tabs.some((t) => t.unread && t.id !== state.activeId),
-      active: state.dialogs.tabs,
-      expands: true,
-      onPress: () => closeDialogs({ tabs: true }),
+  /**
+   * Where a phone can be, and where it is.
+   *
+   * Inside a conversation the app has four places worth being — the
+   * conversation, what the agent did, the files it did it to, and a shell in
+   * the same directory — plus the other sessions. Outside one there is the
+   * terminal and its keys. Every one of these *replaces* what fills the screen,
+   * which is what makes them destinations rather than toggles.
+   */
+  /**
+   * On a phone, which panel is open is where you are — not a preference.
+   *
+   * The rail replaces the conversation there rather than sitting beside it, so
+   * a stored `panelOpen: true` would open every conversation onto a panel with
+   * the conversation behind it. And writing the phone's answer back would
+   * clobber the desktop's: the setting is shared, so one session on a phone
+   * would silently close the rail on the machine it was set open on.
+   *
+   * So on a phone it lives here, for the life of the tab, and the persisted
+   * settings never hear about it.
+   */
+  const [phonePanel, setPhonePanel] = React.useState<{ open: boolean; tab: ChatPanelId }>(() => ({
+    open: false,
+    tab: state.chatView.panelTab,
+  }));
+  const view: ChatViewSettings = state.isMobile
+    ? { ...state.chatView, panelOpen: phonePanel.open, panelTab: phonePanel.tab }
+    : state.chatView;
+  const setView = React.useCallback(
+    (next: ChatViewSettings): void => {
+      if (!shellStore.getSnapshot().isMobile) {
+        actions.setChatView(next);
+        return;
+      }
+      setPhonePanel({ open: next.panelOpen, tab: next.panelTab });
+      // Everything else is still a preference and still persists; only the two
+      // fields that mean "where am I" are held back.
+      const stored = shellStore.getSnapshot().chatView;
+      actions.setChatView({ ...next, panelOpen: stored.panelOpen, panelTab: stored.panelTab });
     },
-    { id: 'new', label: 'New', icon: 'plus', onPress: actions.newTab },
-    // One slot, two jobs, decided by what is on screen.
-    //
-    // The key strip sends terminal control codes, which a conversation has no
-    // use for; the workspace panel is meaningless without one. Giving each its
-    // own slot would put six items on a 390px bar with one of them always
-    // inert. This shows whichever the current surface can actually use.
-    chatActive
-      ? {
-          id: 'workspace',
-          label: 'Panel',
-          icon: 'panel-left',
-          active: state.chatView.panelOpen,
-          toggle: true,
-          onPress: () =>
-            actions.setChatView({ ...state.chatView, panelOpen: !state.chatView.panelOpen }),
-        }
-      : {
-          // The on-screen key strip carries Escape now; this toggles it for the
-          // moments the terminal needs the vertical room back.
+    [actions],
+  );
+
+  const goChat = (): void => setView({ ...view, panelOpen: false, terminalOpen: false });
+  const goPanel = (panelTab: ChatPanelId): void =>
+    setView({ ...view, panelOpen: true, panelTab, terminalOpen: false });
+
+  const destinations: BottomNavDestination[] = chatActive
+    ? [
+        {
+          id: 'chat',
+          label: 'Chat',
+          icon: 'message-square',
+          current: !view.panelOpen && !view.terminalOpen,
+          onGo: goChat,
+        },
+        {
+          id: 'trace',
+          label: 'Trace',
+          icon: CHAT_PANEL_ICONS.trace,
+          current: view.panelOpen && view.panelTab === 'trace',
+          onGo: () => goPanel('trace'),
+        },
+        {
+          id: 'files',
+          label: 'Files',
+          icon: CHAT_PANEL_ICONS.files,
+          current: view.panelOpen && view.panelTab !== 'trace',
+          onGo: () => goPanel('files'),
+        },
+        {
+          id: 'terminal',
+          label: 'Shell',
+          icon: 'terminal',
+          current: view.terminalOpen,
+          onGo: () => setView({ ...view, panelOpen: false, terminalOpen: true }),
+        },
+        {
+          id: 'sessions',
+          label: 'Sessions',
+          icon: 'layout-list',
+          badge: state.tabs.some((t) => t.unread && t.id !== state.activeId),
+          onGo: () => closeDialogs({ tabs: true }),
+        },
+      ]
+    : [
+        { id: 'terminal', label: 'Shell', icon: 'terminal', current: true, onGo: () => {} },
+        {
           id: 'keys',
           label: 'Keys',
           icon: 'keyboard',
-          active: state.keysVisible,
-          toggle: true,
-          onPress: actions.toggleKeys,
+          current: state.keysVisible,
+          onGo: actions.toggleKeys,
         },
-    { id: 'image', label: 'Image', icon: 'image', onPress: actions.attachImage },
+        {
+          id: 'sessions',
+          label: 'Sessions',
+          icon: 'layout-list',
+          badge: state.tabs.some((t) => t.unread && t.id !== state.activeId),
+          onGo: () => closeDialogs({ tabs: true }),
+        },
+      ];
+
+  // Verbs, not places — see BottomNav. These are what the floating button is
+  // for, and what a destination bar has no business holding.
+  const sessionActions: FloatingMenuAction[] = [
+    { id: 'new', label: 'New session', icon: 'plus', onPress: actions.newTab },
+    { id: 'image', label: 'Attach an image', icon: 'image', onPress: actions.attachImage },
+    { id: 'rename', label: 'Rename this session', icon: 'pencil', disabled: !active, onPress: () => active && closeDialogs({ rename: active.id }) },
+    { id: 'reconnect', label: 'Reconnect', icon: 'rotate-cw', onPress: actions.reconnect },
     {
       id: 'more',
-      label: 'More',
+      label: 'More…',
       icon: 'ellipsis',
       active: state.dialogs.more,
       expands: true,
       onPress: () => closeDialogs({ more: true }),
     },
   ];
+
+
 
   // No brand on a phone. It cost about a third of a 390px tab strip to say
   // something the user already knows, and the working directory that stood
@@ -414,6 +491,12 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
   );
 
   return (
+    // The shell's phone answer, published to everything under it — including
+    // the dialogs, which render here rather than inside any conversation and
+    // would otherwise be the one part of a phone still drawn at desktop sizes.
+    // ChatView publishes its own for the same value; a conversation rendered
+    // outside this shell still has to know. See ui/touch.ts.
+    <PhoneContext.Provider value={state.isMobile}>
     <div
       style={{
         // In flow rather than `position: absolute; inset: 0`. #app is a column
@@ -424,6 +507,8 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         width: '100%',
         display: 'flex',
         flexDirection: 'column',
+        // The box the floating menu and its scrim are positioned against.
+        position: 'relative',
         background: 'var(--background)',
         color: 'var(--foreground)',
         fontFamily: 'var(--font-sans)',
@@ -497,9 +582,10 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
             runtimeLabel={state.chat.runtimeLabel || state.chat.runtime}
             workingDir={state.chat.workingDir || active?.workingDir || ''}
             isMobile={state.isMobile}
-            view={state.chatView}
-            onViewChange={actions.setChatView}
+            view={view}
+            onViewChange={setView}
             onOpenSettings={() => closeDialogs({ chatSettings: true })}
+            menuActions={sessionActions}
             // The chat surface owns the whole viewport, so the tab strip's own
             // theme button is off-screen while a conversation is showing.
             theme={state.theme}
@@ -528,7 +614,25 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         />
       ) : null}
 
-      {state.isMobile ? <MobileBar actions={mobileActions} /> : <StatusBar left={statusLeft} right={statusRight} />}
+      {/* The phone's only permanent chrome. A bar along the bottom edge cost
+          56px plus the safe-area inset of a screen whose whole point is the
+          conversation; this costs the corner it covers. */}
+      {/* Over a conversation the menu belongs to the chat surface, which is
+          the only thing that knows where its composer ends — see ChatView. Out
+          here it covers the terminal, which has no bottom-right control of its
+          own to collide with. */}
+      {state.isMobile && !chatActive ? (
+        <FloatingMenu
+          actions={sessionActions}
+          bottomOffset={(state.keysVisible ? KEY_STRIP_HEIGHT : 0) + MOBILE_BAR_HEIGHT}
+        />
+      ) : null}
+
+      {state.isMobile ? (
+        <BottomNav destinations={destinations} hidden={keyboardUp} />
+      ) : (
+        <StatusBar left={statusLeft} right={statusRight} />
+      )}
 
       <CommandPalette
         open={state.paletteOpen}
@@ -694,6 +798,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         hasTerminal={state.tabs.some((tab) => tab.id === state.activeId && tab.surface !== 'chat')}
       />
     </div>
+    </PhoneContext.Provider>
   );
 }
 
@@ -763,4 +868,38 @@ async function pickAndUpload(sessionId: string, directory: string): Promise<void
   if (wrote > 0) {
     window.dispatchEvent(new CustomEvent('ccweb:workspace-changed', { detail: { directory } }));
   }
+}
+
+
+/** The height the bar reserves, matching `--mobile-bar-height`. */
+const MOBILE_BAR_HEIGHT = 56;
+
+/**
+ * Whether the on-screen keyboard is up.
+ *
+ * `visualViewport` is the only thing that reports it: a phone keyboard does not
+ * resize the layout viewport, it covers it. The bar goes away while it is up —
+ * the keyboard takes half the screen and the half it leaves is the half being
+ * typed into, which is the one moment nobody is navigating.
+ *
+ * The threshold is generous on purpose. A browser's own collapsing address bar
+ * moves the visual viewport by 60-90px and is not a keyboard; every phone
+ * keyboard is far taller than that.
+ */
+function useKeyboardUp(isMobile: boolean): boolean {
+  const [up, setUp] = React.useState(false);
+
+  React.useEffect(() => {
+    const viewport = typeof window === 'undefined' ? null : window.visualViewport;
+    if (!isMobile || !viewport) {
+      setUp(false);
+      return;
+    }
+    const measure = (): void => setUp(window.innerHeight - viewport.height > 160);
+    measure();
+    viewport.addEventListener('resize', measure);
+    return () => viewport.removeEventListener('resize', measure);
+  }, [isMobile]);
+
+  return up;
 }

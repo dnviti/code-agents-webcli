@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { Icon } from '../../ui/relay/Icon.js';
+import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { formatTurnMeta, turnTime, STATUS_GLYPH, type TurnSummary } from '../../chat/turns.js';
 
 /**
@@ -44,6 +45,7 @@ export function TurnStrip({
   bodyId,
 }: TurnStripProps): React.JSX.Element {
   const past = variant === 'past';
+  const isPhone = usePhone();
   const meta = formatTurnMeta(turn);
   const time = turnTime(turn);
   const glyph = STATUS_GLYPH[turn.status] || STATUS_GLYPH.done;
@@ -68,10 +70,16 @@ export function TurnStrip({
         zIndex: 2,
         display: 'flex',
         alignItems: 'center',
-        gap: 10,
+        // On a phone the bar wraps and grows instead of holding 28px: it
+        // carries a turn number, a time, a duration and a cost, and the only
+        // way all four fit on one 390px line is at a size none of them can be
+        // read at. The desktop bar is still a fixed rule that never wraps.
+        flexWrap: isPhone ? 'wrap' : 'nowrap',
+        gap: isPhone ? TOUCH_GAP : 10,
         minWidth: 0,
-        height: 28,
-        padding: '0 14px',
+        height: isPhone ? undefined : 28,
+        minHeight: isPhone ? TOUCH_TARGET : undefined,
+        padding: isPhone ? '4px 12px' : '0 14px',
         // Opaque, deliberately: see the note above.
         background: past ? 'var(--muted)' : 'var(--secondary)',
         borderBottom: '1px solid var(--border)',
@@ -90,24 +98,24 @@ export function TurnStrip({
           display: 'inline-flex',
           alignItems: 'center',
           justifyContent: 'center',
-          width: 16,
-          height: 16,
+          width: isPhone ? TOUCH_TARGET : 16,
+          height: isPhone ? TOUCH_TARGET : 16,
           padding: 0,
-          margin: '0 -2px 0 -4px',
+          margin: isPhone ? '0 0 0 -12px' : '0 -2px 0 -4px',
           background: 'transparent',
           border: 0,
           color: 'var(--muted-foreground)',
           cursor: 'pointer',
         }}
       >
-        <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} />
+        <Icon name={open ? 'chevron-down' : 'chevron-right'} size={isPhone ? 18 : 12} />
       </button>
 
       <span
         style={{
           flex: '0 0 auto',
           fontFamily: 'var(--font-mono)',
-          fontSize: 10,
+          fontSize: isPhone ? PHONE_TEXT.meta : 10,
           letterSpacing: '0.06em',
           textTransform: 'uppercase',
           whiteSpace: 'nowrap',
@@ -122,7 +130,7 @@ export function TurnStrip({
           style={{
             flex: '0 0 auto',
             fontFamily: 'var(--font-mono)',
-            fontSize: 10,
+            fontSize: isPhone ? PHONE_TEXT.meta : 10,
             whiteSpace: 'nowrap',
             color: 'var(--muted-foreground)',
           }}
@@ -145,9 +153,9 @@ export function TurnStrip({
               animation: glyph.spin ? 'relay-spin 900ms linear infinite' : undefined,
             }}
           >
-            <Icon name={glyph.icon} size={11} />
+            <Icon name={glyph.icon} size={isPhone ? 14 : 11} />
           </span>
-          <Shrinkable fontSize="var(--text-xs)">{turn.label}</Shrinkable>
+          <Shrinkable fontSize={isPhone ? PHONE_TEXT.body : 'var(--text-xs)'}>{turn.label}</Shrinkable>
         </>
       ) : null}
 
@@ -161,7 +169,9 @@ export function TurnStrip({
           overflow: 'hidden',
           whiteSpace: 'nowrap',
           fontFamily: 'var(--font-mono)',
-          fontSize: 10,
+          // The duration and the cost are in here — session figures, so they
+          // follow the same rule as the ones in the header.
+          fontSize: isPhone ? PHONE_TEXT.label : 10,
           color: 'var(--muted-foreground)',
         }}
       >
@@ -231,6 +241,7 @@ function StripButton({
   tone?: string;
 }): React.JSX.Element {
   const [hover, setHover] = React.useState(false);
+  const isPhone = usePhone();
   return (
     <button
       type="button"
@@ -246,8 +257,8 @@ function StripButton({
         alignItems: 'center',
         justifyContent: 'center',
         flex: '0 0 auto',
-        width: 20,
-        height: 20,
+        width: isPhone ? TOUCH_TARGET : 20,
+        height: isPhone ? TOUCH_TARGET : 20,
         padding: 0,
         background: hover ? 'var(--accent)' : 'transparent',
         border: 0,
@@ -257,7 +268,7 @@ function StripButton({
         transition: 'background var(--duration-fast), color var(--duration-fast)',
       }}
     >
-      <Icon name={icon} size={12} />
+      <Icon name={icon} size={isPhone ? 18 : 12} />
     </button>
   );
 }

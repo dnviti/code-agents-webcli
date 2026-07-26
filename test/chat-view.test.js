@@ -473,9 +473,17 @@ describe('ChatView', function () {
       plan: [{ text: 'Wire the view', status: 'in_progress' }],
     });
 
-    const html = render({ controller, isMobile: true });
+    // Told to show the conversation, which is what a phone is given: whether
+    // the rail is open is the shell's answer now, not a stored preference this
+    // component reads — see AppShell's `phonePanel`, and the shell test that
+    // asserts a phone never opens onto a panel.
+    const html = render({
+      controller,
+      isMobile: true,
+      view: { ...mod.viewSettings.DEFAULT_CHAT_VIEW, panelOpen: false },
+    });
 
-    assert.ok(!html.includes('aria-label="Workspace"'), 'the rail must not open itself on a phone');
+    assert.ok(!html.includes('aria-label="Workspace"'), 'the conversation is what is showing');
     assert.ok(html.includes('aria-expanded="false"'), 'plan collapses to a disclosure');
     assert.ok(html.includes('0 of 1'), 'the collapsed summary still reports progress');
     assert.ok(html.includes('env(safe-area-inset-bottom'), 'composer must clear the home bar');

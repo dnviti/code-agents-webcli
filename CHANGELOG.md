@@ -2,7 +2,74 @@
 
 ## [5.2.0] - Unreleased
 
-Nothing yet — this section collects the work merged onto the 5.2.0 branch.
+### Changed
+- **A phone gets a layout built around the conversation.** It used to be the
+  desktop layout at the same size: the figures you read mid-session — the cost,
+  the model, the state, whether approvals are bypassed — were set smaller than
+  the body text, the controls sat close enough together that hitting the
+  intended one was luck, and more than half the screen went to chrome.
+
+  Now the chat surface is one slim strip above the conversation and one row
+  below it. The strip says what the session is doing and what it has cost;
+  tapping it opens the runtime, the folder, the branch, the tokens, the context
+  meter and the approvals state. The row below is the message field and send,
+  with the attachments, the pickers, the model and the approvals readout behind
+  a *More*.
+
+  The bottom bar is now a set of destinations rather than a drawer of commands.
+  What this app does is run agent sessions, and inside one there are four places
+  worth being — the conversation, what the agent did about it, the files it did
+  that to, and a shell in the same directory — plus the other sessions. Those
+  are the five, it says which one you are on, and pressing one goes there. What
+  used to sit in those slots mixed a place to go, a thing to make, a panel to
+  toggle, a file to attach and a sheet of everything left over.
+
+  The verbs moved to a square button floating in the bottom right: search this
+  conversation, jump to a turn, display settings, new session, attach an image,
+  rename, reconnect, and the rest behind *More*. A control that changes where
+  you are and a control that does something to where you are no longer share a
+  row.
+
+  The conversation now has about seven tenths of a phone screen, where it had
+  under half, and the bar gets out of the way entirely while the on-screen
+  keyboard is up. Everything a finger is meant to hit is at least 44px with real
+  space around it, nothing carrying live information is smaller than the body
+  text, and every control says what it is rather than being a bare glyph with a
+  tooltip no touch screen can show. The same treatment reaches the trace rail,
+  the turn index, the model list, the more sheet, the tab switcher and the
+  dialogs. The desktop and tablet layouts are unchanged.
+
+### Fixed
+- **A phone no longer opens a conversation onto a panel.** Which panel is open
+  is a desktop preference — there the rail sits beside the transcript — but on a
+  phone it replaces it, so the stored setting put every conversation behind a
+  panel. It is session state on a phone now, and the shared preference is left
+  alone rather than overwritten, which would have closed the rail on the desktop
+  that set it open.
+- **The conversation no longer spills over the live ribbon and the composer on
+  a short screen.** The transcript kept a fixed minimum height it could not
+  give up, so on a phone in landscape — or any window short enough — it grew
+  past the space it had and was painted over the two things below it.
+
+### Internal
+- The automated browser checks run at phone viewports (portrait, keyboard-open
+  and landscape), with each of the phone's own disclosures and its menu open in
+  turn, and assert the geometry rather than the intent: target size, the space
+  between neighbours, type size, that the named live figures are legible and
+  reachable, that every control can be identified without pressing it, that no
+  region is drawn over another, and that the chrome takes no more than 170px
+  from the conversation — nothing else would have noticed that drifting back,
+  since every other rule is about the chrome being big enough.
+
+  Three defects in the checks themselves came out of it. They ran in an 800x600
+  window while mounting a 390x740 fixture, so a third of it was off-viewport
+  and anything that asks the viewport a question got the wrong answer. They
+  loaded none of the app's own stylesheets, without which every
+  `var(--text-2xs)` resolved to nothing and a type-size check read 16px for
+  text that ships at 10. And a panel animating in from `opacity: 0` was skipped
+  as invisible in headless Chrome, so a whole state was reported clean without
+  measuring anything — the menu rises without fading now, which also means it
+  is there under reduced motion and on a dropped first frame.
 
 ## [5.1.2] - 2026-07-26
 
