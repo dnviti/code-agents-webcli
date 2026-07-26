@@ -23,6 +23,7 @@ before(function () {
     `export * as React from 'react';`,
     `export { AppShell } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/AppShell'))};`,
     `export { shellStore } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/store'))};`,
+    `export { DEFAULT_CHAT_VIEW } from ${JSON.stringify(path.join(ROOT, 'src/client/chat/view-settings'))};`,
   ].join('\n');
 
   const out = path.join(os.tmpdir(), `shell-chrome-${process.pid}.js`);
@@ -38,6 +39,7 @@ before(function () {
   });
   mod = require(out);
   mod.__file = out;
+  DEFAULTS.chatView = mod.DEFAULT_CHAT_VIEW;
 });
 
 after(function () {
@@ -45,6 +47,9 @@ after(function () {
 });
 
 const SETTINGS = { fontSize: 14, theme: 'github-dark', terminalFontFamily: 'jetbrains-mono' };
+
+/** Filled in `before`, once the bundle exists. */
+const DEFAULTS = {};
 
 /** Every action is a no-op; the assertions are about what renders, not what runs. */
 function actions() {
@@ -79,6 +84,15 @@ function reset(extra) {
       tabs: [],
       activeId: null,
       isMobile: false,
+      // Reset explicitly: the store is shared between these tests, so a case
+      // that puts a conversation on screen leaves one there for every case
+      // after it — which is how the key-strip test started failing for a
+      // reason that had nothing to do with the key strip.
+      chat: {
+        active: false, sessionId: '', controller: null,
+        runtime: '', runtimeLabel: '', workingDir: '',
+      },
+      chatView: DEFAULTS.chatView,
       overlay: null,
       overlayMessage: '',
       errorText: '',
@@ -141,8 +155,34 @@ describe('shell chrome', function () {
     assert.ok(!/aria-label="Session controls"/.test(mobile), 'the bottom bar is gone');
     assert.ok(/aria-label="Open the menu"/.test(mobile), 'the floating menu button is there');
     assert.ok(/aria-haspopup="menu"/.test(mobile), 'and says what it opens');
-    // Shut, so nothing behind it is announced as being on screen.
-    assert.ok(!/>Sessions</.test(mobile), 'its rows are not rendered while shut');
+    // Shut, so nothing behind it is announced as being on screen. Scoped to
+    // the menu: "Sessions" is also a destination on the bar, where it is
+    // supposed to be visible.
+    const menu = mobile.slice(mobile.indexOf('aria-haspopup="menu"'));
+    assert.ok(!/role="menuitem"/.test(menu), 'its rows are not rendered while shut');
+  });
+
+  it('never opens a phone onto a panel, whatever the stored preference says', function () {
+    // The rail replaces the conversation on a phone, so a stored `panelOpen`
+    // — a desktop preference, where the rail sits *beside* the transcript —
+    // would put every conversation behind a panel. It is session state on a
+    // phone, held by the shell, and the persisted setting is left alone rather
+    // than overwritten, which would close the rail on the desktop that set it.
+    const mobile = render(reset({
+      tabs: [tab('a')], activeId: 'a', isMobile: true,
+      chat: {
+        active: true, sessionId: 'a', controller: null,
+        runtime: 'claude', runtimeLabel: 'Claude', workingDir: '/tmp',
+      },
+      chatView: { ...mod.DEFAULT_CHAT_VIEW, panelOpen: true, panelTab: 'files' },
+    }));
+
+    // Read off the bar, which says where you are without needing the surface
+    // itself mounted: Chat is current, not Files.
+    const at = mobile.indexOf('aria-current="page"');
+    assert.notStrictEqual(at, -1, 'the bar marks a destination');
+    const marked = mobile.slice(at, mobile.indexOf('</button>', at));
+    assert.ok(/>Chat</.test(marked), `the marked destination is the conversation, got: ${marked.slice(-80)}`);
   });
 
   it('swaps the tab strip for the key strip on mobile (issue #21)', function () {

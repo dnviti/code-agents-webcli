@@ -23,6 +23,7 @@ import { HistoryView } from '../../src/client/terminal/history-view';
 import { Dialog } from '../../src/client/ui/relay/Dialog';
 import { PhoneContext } from '../../src/client/ui/touch';
 import { FloatingMenu, type FloatingMenuAction } from '../../src/client/shell/FloatingMenu';
+import { BottomNav } from '../../src/client/shell/BottomNav';
 import { MoreSheet } from '../../src/client/shell/MoreSheet';
 import { ChatSettingsDialog } from '../../src/client/shell/dialogs/ChatSettingsDialog';
 import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
@@ -754,6 +755,17 @@ const PHONE_TARGET = 44;
 /** Clear space between two neighbouring targets. */
 const PHONE_GAP = 8;
 /**
+ * Above this size on the axis they touch, two neighbours need no gap.
+ *
+ * The gap exists so the seam between two targets is findable. That is a real
+ * problem at the floor — two 44px buttons touching present one 88px strip with
+ * an invisible join — and not one above it: a bottom bar's segments are 78px
+ * wide with a label in the middle of each, which is how every phone in the
+ * world draws a tab bar, and inserting gaps into one would make it read as five
+ * loose buttons rather than one bar.
+ */
+const PHONE_GAP_EXEMPT_AT = PHONE_TARGET * 1.5;
+/**
  * The most vertical room the chrome may take from the conversation, at rest.
  *
  * The point of the floating menu and the collapsing header and composer is that
@@ -765,10 +777,15 @@ const PHONE_GAP = 8;
  * number of pixels, so its share grows as the screen shortens, and a share
  * would fail in landscape for a layout that had given up nothing at all.
  *
- * The budget covers the header strip, the live ribbon and the collapsed
- * composer together. It does not cover the floating menu, which floats.
+ * The budget covers the header strip, the live ribbon, the collapsed composer
+ * and the bottom bar together — about 160px of surface plus the bar's 57. It
+ * does not cover the floating menu, which floats.
+ *
+ * The bar is not counted out for the keyboard-open viewport even though the app
+ * hides it there: that hiding is driven by `visualViewport`, which a fixture in
+ * a sized div cannot move. So this measures the harder case in that one.
  */
-const PHONE_CHAT_CHROME = 170;
+const PHONE_CHAT_CHROME = 220;
 
 /** Visible, non-decorative, and not a screen-reader-only clone. */
 /** The view a node actually lives in — this page's, or an iframe's. */
@@ -883,21 +900,77 @@ function describe(node: HTMLElement, text?: string): string {
  * this only has to supply what the shell would contribute to it.
  */
 function PhoneSurface({ controller }: { controller: ChatController }): React.ReactElement {
-  return React.createElement(ChatView, {
-    controller,
-    runtime: 'claude',
-    runtimeLabel: 'Claude Code',
-    workingDir: '/home/dev/projects/a-rather-deeply-nested-working-directory',
-    isMobile: true,
-    view: { ...DEFAULT_CHAT_VIEW },
-    onViewChange: () => {},
-    // What the shell contributes. The surface's own entries are added inside.
-    menuActions: [
-      { id: 'sessions', label: 'Sessions', icon: 'layout-list', expands: true, onPress: () => {} },
-      { id: 'new', label: 'New', icon: 'plus', onPress: () => {} },
-      { id: 'more', label: 'More', icon: 'ellipsis', expands: true, onPress: () => {} },
-    ],
-  } as never);
+  // Real view state, not a frozen object with a no-op setter.
+  //
+  // `DEFAULT_CHAT_VIEW.panelOpen` is true — a desktop preference — and on a
+  // phone the rail *replaces* the transcript, so a fixture that cannot write
+  // the setting back renders a surface with no conversation in it at all and
+  // every measurement below is of the panel. The app clears it on mount; a
+  // fixture that swallows the write never sees that happen.
+  // Seeded shut, which is what the shell hands a phone: `panelOpen` is a
+  // desktop preference and on a phone the rail replaces the conversation, so
+  // AppShell keeps its own session-scoped answer and starts it false. A fixture
+  // that passes the stored default straight through renders the panel and
+  // measures that instead of the conversation.
+  const [view, setView] = React.useState({ ...DEFAULT_CHAT_VIEW, panelOpen: false });
+  const onViewChange = React.useCallback((next: typeof DEFAULT_CHAT_VIEW) => setView(next), []);
+  const go = React.useCallback(
+    (next: Partial<typeof DEFAULT_CHAT_VIEW>) => setView((current) => ({ ...current, ...next })),
+    [],
+  );
+
+  // Both bands: the budget below is about what the chrome costs the
+  // conversation, and the bar is chrome.
+  return React.createElement(
+    'div',
+    { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' } },
+    // The surface in a box that can shrink, exactly as AppShell holds it. Given
+    // the column directly, `height: 100%` on the surface takes the bar's 56px
+    // as well and the transcript is squeezed to nothing.
+    React.createElement(
+      'div',
+      { style: { flex: 1, minHeight: 0, display: 'flex' } },
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/home/dev/projects/a-rather-deeply-nested-working-directory',
+        isMobile: true,
+        view,
+        onViewChange,
+        // What the shell contributes. The surface adds its own inside.
+        menuActions: [
+          { id: 'new', label: 'New session', icon: 'plus', onPress: () => {} },
+          { id: 'more', label: 'More…', icon: 'ellipsis', expands: true, onPress: () => {} },
+        ],
+      } as never),
+    ),
+    React.createElement(BottomNav, {
+      destinations: [
+        {
+          id: 'chat', label: 'Chat', icon: 'message-square',
+          current: !view.panelOpen && !view.terminalOpen,
+          onGo: () => go({ panelOpen: false, terminalOpen: false }),
+        },
+        {
+          id: 'trace', label: 'Trace', icon: 'list-todo',
+          current: view.panelOpen && view.panelTab === 'trace',
+          onGo: () => go({ panelOpen: true, panelTab: 'trace', terminalOpen: false }),
+        },
+        {
+          id: 'files', label: 'Files', icon: 'hard-drive',
+          current: view.panelOpen && view.panelTab !== 'trace',
+          onGo: () => go({ panelOpen: true, panelTab: 'files', terminalOpen: false }),
+        },
+        {
+          id: 'terminal', label: 'Shell', icon: 'terminal',
+          current: view.terminalOpen,
+          onGo: () => go({ panelOpen: false, terminalOpen: true }),
+        },
+        { id: 'sessions', label: 'Sessions', icon: 'layout-list', onGo: () => {} },
+      ],
+    } as never),
+  );
 }
 
 /**
@@ -953,6 +1026,9 @@ function assertPhoneSurface(host: HTMLElement, where: string, atRest = false): v
       // Only controls that share a scroll container have a fixed distance from
       // each other — see scrollBoxOf.
       if (scrollBoxOf(byLeft[i]) !== scrollBoxOf(byLeft[j])) continue;
+      // Both comfortably over the floor on the axis they meet on — see
+      // PHONE_GAP_EXEMPT_AT.
+      if (a.width >= PHONE_GAP_EXEMPT_AT && b.width >= PHONE_GAP_EXEMPT_AT) continue;
       const gap = b.left - a.right;
       // Only the nearest neighbour to the right matters; anything further is
       // separated by that one.
@@ -1272,6 +1348,53 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
       assertPhoneSurface(host, where, opens.length === 0);
       root.unmount();
     }
+  }
+
+  // The bar is a set of destinations, and pressing one has to go there.
+  //
+  // Asserted by driving it, because the parts that could be wrong are all on
+  // the far side of a press: which item paints as current, and whether the
+  // surface actually changed. Static markup shows a bar that looks right and
+  // navigates nowhere.
+  {
+    host.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;display:flex;overflow:hidden';
+    const root = createRoot(host);
+    root.render(React.createElement(PhoneSurface, { controller }));
+    await wait(400);
+
+    const bar = host.querySelector('nav[aria-label="Go to"]') as HTMLElement | null;
+    const current = (): string =>
+      (bar?.querySelector('[aria-current="page"]')?.textContent || '').trim();
+
+    check('the bar starts on the conversation', current() === 'Chat', current() || 'nothing current');
+
+    for (const [label, expect] of [
+      ['Trace', 'a rail'],
+      ['Files', 'a rail'],
+      ['Chat', 'the transcript'],
+    ] as Array<[string, string]>) {
+      const item = Array.from(bar?.querySelectorAll('button') ?? []).find(
+        (node) => (node.textContent || '').trim() === label,
+      ) as HTMLElement | undefined;
+      if (!item) {
+        check(`the bar offers ${label}`, false, 'not found');
+        continue;
+      }
+      item.click();
+      await wait(300);
+
+      check(`pressing ${label} marks it as where you are`, current() === label, current() || 'nothing current');
+
+      const showsRail = Boolean(host.querySelector('aside[aria-label="Workspace"]'));
+      const showsTranscript = Boolean(host.querySelector('[data-message-id]'));
+      check(
+        `pressing ${label} actually shows ${expect}`,
+        expect === 'a rail' ? showsRail : showsTranscript && !showsRail,
+        `rail=${showsRail} transcript=${showsTranscript}`,
+      );
+    }
+
+    root.unmount();
   }
 
   // Reachable, not merely legible wherever it happened to be drawn. Collapsing
