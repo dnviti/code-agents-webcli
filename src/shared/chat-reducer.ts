@@ -25,6 +25,7 @@ import {
   ChatUsage,
   PermissionRequest,
   PlanItem,
+  QuestionRequest,
   TextBlock,
   ThinkingBlock,
   ToolBlock,
@@ -50,6 +51,26 @@ export interface TranscriptState {
   usage: ChatUsage;
   plan: PlanItem[];
   pendingPermissions: PermissionRequest[];
+  /**
+   * Questions the model asked that nobody has answered yet.
+   *
+   * Held beside the transcript rather than inside a message because a question
+   * outlives the block that asked it: the agent stays blocked across a reload,
+   * and this is what a rejoining browser reads to know there is still a card to
+   * draw. The record of what was *asked and answered* lives in the tool block,
+   * which is where scrolling back finds it.
+   */
+  pendingQuestions: QuestionRequest[];
+  /**
+   * Answers already given, keyed by the tool call that asked.
+   *
+   * Keyed on `toolId` rather than `requestId` because the card that needs it is
+   * drawn from a tool block, and by the time it asks, the request — the only
+   * thing that knew both ids — has been dropped from the pending list. Falls
+   * back to the request id for a question that could not be correlated to a
+   * call, which is answered from the pinned card instead.
+   */
+  answeredQuestions: Record<string, string[]>;
   /** Lowest seq present. Non-zero once the log head has been trimmed. */
   firstSeq: number;
   /** Highest seq applied. Events at or below this are ignored as replays. */
@@ -93,6 +114,8 @@ export function createTranscript(
     usage: {},
     plan: [],
     pendingPermissions: [],
+    pendingQuestions: [],
+    answeredQuestions: {},
     firstSeq: 0,
     cursor: 0,
     currentTurnId: null,
@@ -384,6 +407,37 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
+    case 'question': {
+      const already = state.pendingQuestions.some(
+        (pending) => pending.requestId === event.request.requestId,
+      );
+      if (!already) {
+        state.pendingQuestions.push(event.request);
+      }
+      // Not folded into `awaiting_permission`: the composer, the header and the
+      // stop button all read this, and "waiting for approval" over a question
+      // about which of three approaches to take is simply the wrong sentence.
+      state.state = 'awaiting_answer';
+      return { messageIndex: null, structural: false, meta: true, applied: true };
+    }
+
+    case 'question_resolved': {
+      const asked = state.pendingQuestions.find((pending) => pending.requestId === event.requestId);
+      state.pendingQuestions = state.pendingQuestions.filter(
+        (pending) => pending.requestId !== event.requestId,
+      );
+      // Kept after the fact so the card keeps showing what was picked once the
+      // request itself is gone, without waiting for the runtime to echo a tool
+      // result back.
+      state.answeredQuestions[event.toolId ?? asked?.toolId ?? event.requestId] = event.skipped
+        ? []
+        : [...event.optionIds];
+      if (state.state === 'awaiting_answer' && state.pendingQuestions.length === 0) {
+        state.state = 'running';
+      }
+      return { messageIndex: null, structural: false, meta: true, applied: true };
+    }
+
     case 'state': {
       state.state = event.state;
       return { messageIndex: null, structural: false, meta: true, applied: true };
@@ -416,6 +470,12 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         state.index = {};
         state.plan = [];
         state.lastError = undefined;
+        // The cards go with the conversation they were asked in. A question
+        // card left behind would be drawn against a tool block that is no
+        // longer on screen, and answering it would reach a turn that no longer
+        // exists — the session resolves them at the same moment on its side.
+        state.pendingQuestions = [];
+        state.answeredQuestions = {};
         // And no paging back past it. The log still holds what was said — this
         // is a view, not a delete — but offering "load earlier messages" right
         // after someone asked for a clean window would undo the thing they

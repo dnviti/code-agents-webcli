@@ -309,6 +309,17 @@ export class ChatController {
     this.send({ type: 'chat_queue_cancel', queuedId });
   }
 
+  /**
+   * Answer a multiple-choice question the model asked.
+   *
+   * `skipped` is explicit rather than inferred from an empty list: "I picked
+   * none of these" and "I do not want to answer" reach the model as different
+   * sentences, and the agent is blocked either way until one of them arrives.
+   */
+  answerQuestion(requestId: string, optionIds: string[], skipped = false): void {
+    this.send({ type: 'chat_question_answer', requestId, optionIds, skipped });
+  }
+
   respondPermission(requestId: string, optionId: string): void {
     this.send({ type: 'chat_permission_response', requestId, optionId });
   }
@@ -415,6 +426,7 @@ export class ChatController {
       state: 'starting',
       capabilities: NO_CHAT_CAPABILITIES,
       pendingPermissions: [],
+      pendingQuestions: [],
       firstSeq: 0,
       replayFrom: 0,
       cursor: 0,

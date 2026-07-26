@@ -28,6 +28,7 @@ import {
   PermissionRequest,
   PlanItem,
   QueuedTurn,
+  QuestionRequest,
   NO_CHAT_CAPABILITIES,
 } from '../../shared/chat-events.js';
 import {
@@ -161,6 +162,7 @@ export class ChatTranscript {
       usage: snapshot.usage || {},
       plan: snapshot.plan || [],
       pendingPermissions: snapshot.pendingPermissions || [],
+      pendingQuestions: snapshot.pendingQuestions || [],
       firstSeq: snapshot.firstSeq,
       cursor: snapshot.cursor,
     });
@@ -369,6 +371,27 @@ export class ChatTranscript {
 
   get pendingPermissions(): PermissionRequest[] {
     return this.state.pendingPermissions;
+  }
+
+  /** Questions the model asked that nobody has answered yet. */
+  get pendingQuestions(): QuestionRequest[] {
+    return this.state.pendingQuestions;
+  }
+
+  /**
+   * The question waiting on the given tool call, if that call is the one asking.
+   *
+   * How a card drawn from a tool block finds out it is still live: the block is
+   * in the transcript either way, and this is the difference between a set of
+   * buttons and a record of what was already decided.
+   */
+  questionFor(toolId: string): QuestionRequest | undefined {
+    return this.state.pendingQuestions.find((pending) => pending.toolId === toolId);
+  }
+
+  /** Which options were picked for the question that call asked, once answered. */
+  answerFor(toolId: string): string[] | undefined {
+    return this.state.answeredQuestions[toolId];
   }
 
   get cursor(): number {

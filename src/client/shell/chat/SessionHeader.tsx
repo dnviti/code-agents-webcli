@@ -86,6 +86,14 @@ const STATE_META: Record<ChatState, StateMeta> = {
     tint: 'var(--warning)',
     pulse: true,
   },
+  // Its own word, not the approval one: "waiting for you" over a question about
+  // which of three approaches to take reads as though something needs allowing.
+  awaiting_answer: {
+    label: 'asked you a question',
+    color: 'var(--info)',
+    tint: 'var(--info)',
+    pulse: true,
+  },
   exited: { label: 'exited', color: 'var(--muted-foreground)' },
   error: { label: 'error', color: 'var(--destructive)', tint: 'var(--destructive)' },
 };

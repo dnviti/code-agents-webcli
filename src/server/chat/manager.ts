@@ -30,12 +30,14 @@ export interface ChatManagerDeps {
 export class ChatSessionManager {
   private readonly sessions = new Map<string, ChatSession>();
   private readonly hookScript: string;
+  private readonly askScript: string;
 
   constructor(private readonly deps: ChatManagerDeps) {
     // Resolved from this module's own location rather than cwd: the server is
     // routinely started from whatever directory the user happened to be in,
     // and the hook has to be found from the agent's working directory too.
     this.hookScript = path.join(__dirname, 'permission-hook.js');
+    this.askScript = path.join(__dirname, 'ask-mcp.js');
   }
 
   get store(): ChatStore {
@@ -76,6 +78,7 @@ export class ChatSessionManager {
         store: this.deps.store,
         socketDir: path.join(this.deps.storageDir, 'cs'),
         hookScript: this.hookScript,
+        askScript: this.askScript,
         broadcast: this.deps.broadcast,
         resolveCommand: this.deps.resolveCommand,
         readFile: (sessionId, filePath) => this.readFile(sessionId, filePath),
@@ -226,6 +229,15 @@ export class ChatSessionManager {
 
   respondPermission(sessionId: string, requestId: string, optionId: string): boolean {
     return this.sessions.get(sessionId)?.respondPermission(requestId, optionId) ?? false;
+  }
+
+  answerQuestion(
+    sessionId: string,
+    requestId: string,
+    optionIds: string[],
+    skipped = false,
+  ): boolean {
+    return this.sessions.get(sessionId)?.answerQuestion(requestId, optionIds, skipped) ?? false;
   }
 
   async stop(sessionId: string): Promise<void> {

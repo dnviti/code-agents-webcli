@@ -324,6 +324,52 @@ export interface PermissionRequest {
   ts: number;
 }
 
+/**
+ * One selectable answer to a question the model asked.
+ *
+ * `optionId` is minted by this app rather than taken from the model, which only
+ * ever supplies a label: two options can legitimately carry the same words
+ * ("Yes, and stop" / "Yes, and stop") and an id derived from the text would make
+ * them the same button.
+ */
+export interface QuestionOption {
+  optionId: string;
+  label: string;
+  /** The model's own gloss on what picking this means. */
+  description?: string;
+}
+
+/**
+ * A question the model asked, waiting on a person.
+ *
+ * Deliberately *not* a `PermissionRequest`. An approval is the app gating the
+ * agent — the options are always some arrangement of allow and deny, and the
+ * answer's meaning is known before it is given. A question is the agent asking
+ * the user something the app has no opinion about, the options are whatever the
+ * model wrote, and the answer is content rather than a decision. Folding the two
+ * together would mean either teaching the approval card to render arbitrary
+ * options or teaching `isAllowOption` to answer for text it cannot interpret.
+ */
+export interface QuestionRequest {
+  requestId: string;
+  /**
+   * The tool call that asked, when it could be identified.
+   *
+   * Present so the card can be drawn where the question was actually asked
+   * rather than in a tray at the bottom. Optional because correlation is
+   * best-effort and an uncorrelated question must still be answerable — an
+   * agent blocked on a question with no button anywhere is a hung session.
+   */
+  toolId?: string;
+  question: string;
+  /** A short label for the question, when the model supplied one. */
+  header?: string;
+  /** True when more than one option may be picked before confirming. */
+  multiSelect: boolean;
+  options: QuestionOption[];
+  ts: number;
+}
+
 /** What a chat session is doing right now, for the header indicator. */
 export type ChatState =
   | 'starting'
@@ -331,6 +377,8 @@ export type ChatState =
   | 'thinking'
   | 'running'
   | 'awaiting_permission'
+  /** Blocked on a question the model asked, which only a person can answer. */
+  | 'awaiting_answer'
   | 'exited'
   | 'error';
 
@@ -352,6 +400,13 @@ export interface ChatCapabilities {
   diffs: boolean;
   /** The runtime can ask before acting, and honour a refusal. */
   permissions: boolean;
+  /**
+   * The model can put a multiple-choice question to the user and wait for it.
+   *
+   * Optional rather than required so a stored snapshot written before this
+   * existed still parses; absent reads as false everywhere it is consulted.
+   */
+  questions?: boolean;
   interrupt: boolean;
   /** A session can be resumed after the process is gone. */
   resume: boolean;
@@ -452,6 +507,30 @@ export type ChatEvent =
       /** Set when the decision came from the bypass setting, not a person. */
       automatic?: boolean;
     }
+  | { t: 'question'; seq: number; ts: number; request: QuestionRequest }
+  | {
+      t: 'question_resolved';
+      seq: number;
+      ts: number;
+      requestId: string;
+      /**
+       * The tool call that asked, repeated from the request.
+       *
+       * Carried on the resolution as well so a card rebuilt from the log alone
+       * can find its own answer: the request is dropped from the pending list
+       * the moment it resolves, and the id would otherwise go with it.
+       */
+      toolId?: string;
+      /** Every option the user picked, in the order the question offered them. */
+      optionIds: string[];
+      /**
+       * True when the user chose to answer nothing.
+       *
+       * The model is still told — it is blocked and something has to come back —
+       * but the transcript says "skipped" rather than inventing a selection.
+       */
+      skipped?: boolean;
+    }
   | { t: 'state'; seq: number; ts: number; state: ChatState }
   | { t: 'error'; seq: number; ts: number; message: string; fatal?: boolean }
   | {
@@ -540,6 +619,13 @@ export interface ChatSnapshot {
   plan?: PlanItem[];
   pendingPermissions: PermissionRequest[];
   /**
+   * Questions still waiting on an answer.
+   *
+   * Optional for the same reason `queued` is: a snapshot replayed by a server
+   * that predates this should read as "none pending", not as malformed.
+   */
+  pendingQuestions?: QuestionRequest[];
+  /**
    * Turns typed ahead, still waiting. Optional so a snapshot replayed from the
    * store — which knows nothing about a live process — is not obliged to
    * invent one; the session fills it in.
@@ -590,7 +676,72 @@ export const NO_CHAT_CAPABILITIES: ChatCapabilities = {
   usage: false,
   cost: false,
   plan: false,
+  questions: false,
 };
+
+/** The MCP server this app exposes to the runtimes it launches. */
+export const ASK_MCP_SERVER = 'ccweb';
+
+/** The one tool that server offers: put a multiple-choice question to the user. */
+export const ASK_QUESTION_TOOL = 'ask_user_question';
+
+/**
+ * What the tool is called once a runtime has namespaced it.
+ *
+ * Claude prefixes MCP tools as `mcp__<server>__<tool>`, and that prefixed name
+ * is what shows up in the transcript — so this is the string the UI matches on
+ * to draw a question card instead of a generic tool row.
+ */
+export const ASK_QUESTION_TOOL_NAME = `mcp__${ASK_MCP_SERVER}__${ASK_QUESTION_TOOL}`;
+
+/**
+ * Whether a tool name refers to this app's question tool.
+ *
+ * Suffix rather than equality: runtimes namespace MCP tools differently (and
+ * have changed the separator before), so the bare name is the part that can be
+ * relied on. Nothing else in the transcript is called this.
+ */
+/**
+ * Turn whatever a model passed as `options` into answerable choices.
+ *
+ * Shared rather than implemented on each side, and that is the whole point: the
+ * server mints the ids it will later be answered with, and the browser mints the
+ * same ids again when it rebuilds a card from the tool call in a replayed
+ * transcript. Two copies of this that drifted by one dropped entry would put the
+ * tick on the wrong option, which is a lie about what the user chose.
+ *
+ * Ids are positional rather than derived from the labels: two options may
+ * legitimately read the same, and a label-derived id would collapse them into
+ * one button that answers for both. Anything unusable is dropped instead of
+ * rendered as an empty choice, and a bare string is accepted as its own label
+ * because that is what a model reaches for when the schema slips its mind.
+ */
+export function normalizeQuestionOptions(raw: unknown): QuestionOption[] {
+  if (!Array.isArray(raw)) return [];
+  const options: QuestionOption[] = [];
+  for (const entry of raw) {
+    let label = '';
+    let description: string | undefined;
+    if (typeof entry === 'string') {
+      label = entry.trim();
+    } else if (entry && typeof entry === 'object') {
+      const object = entry as Record<string, unknown>;
+      const text = object.label ?? object.name ?? object.value ?? object.title;
+      if (typeof text === 'string') label = text.trim();
+      if (typeof object.description === 'string' && object.description.trim()) {
+        description = object.description.trim();
+      }
+    }
+    if (!label) continue;
+    options.push({ optionId: `opt-${options.length}`, label, description });
+  }
+  return options;
+}
+
+export function isAskQuestionTool(name: string | undefined): boolean {
+  if (!name) return false;
+  return name === ASK_QUESTION_TOOL || name.endsWith(`__${ASK_QUESTION_TOOL}`);
+}
 
 /**
  * Tool-name → kind mapping shared by every adapter.

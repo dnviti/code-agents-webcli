@@ -109,7 +109,8 @@ function summarise(
     }
   }
 
-  const status: TurnStatus = isLast && chatState === 'awaiting_permission'
+  const status: TurnStatus = isLast
+    && (chatState === 'awaiting_permission' || chatState === 'awaiting_answer')
     ? 'waiting'
     : isLast && (streaming || chatState === 'thinking' || chatState === 'running' || chatState === 'starting')
       ? 'running'

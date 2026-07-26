@@ -6,6 +6,8 @@ import {
   ErrorBlock,
   ImageBlock,
   NoticeBlock,
+  ToolBlock,
+  isAskQuestionTool,
 } from '../../../shared/chat-events.js';
 import { ChatTranscript } from '../../chat/transcript.js';
 import { compactCount, formatDuration } from '../../chat/tool-meta.js';
@@ -13,6 +15,7 @@ import { Icon } from '../../ui/relay/Icon.js';
 import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { Markdown, markdownText } from './Markdown.js';
 import { PlanPanel } from './PlanPanel.js';
+import { QuestionCard, questionFromToolInput } from './QuestionCard.js';
 
 /**
  * One message in the transcript — prose, and nothing else.
@@ -69,6 +72,13 @@ export interface MessageBubbleProps {
   showThinking?: boolean;
   /** Count tool calls in the work pill. */
   showToolCalls?: boolean;
+  /**
+   * Answer a question the model asked from its card in the conversation.
+   *
+   * Must be referentially stable — this component is memoised, and a fresh
+   * closure per render would re-render the whole transcript on every token.
+   */
+  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
 }
 
 export const MessageBubble = React.memo(function MessageBubble({
@@ -81,6 +91,7 @@ export const MessageBubble = React.memo(function MessageBubble({
   carriedIds = '',
   showThinking = true,
   showToolCalls = true,
+  onAnswerQuestion,
 }: MessageBubbleProps) {
   const id = message.id;
 
@@ -236,6 +247,8 @@ export const MessageBubble = React.memo(function MessageBubble({
             key={i}
             block={block}
             plain={isUser}
+            transcript={transcript}
+            onAnswerQuestion={onAnswerQuestion}
             onRetry={onRetry ? () => onRetry(id) : undefined}
             caret={Boolean(current.streaming) && i === current.blocks.length - 1}
           />
@@ -321,9 +334,20 @@ const SR_ONLY: React.CSSProperties = {
   clip: 'rect(0 0 0 0)',
 };
 
-/** How many blocks this message would actually paint. */
+/**
+ * How many blocks this message would actually paint.
+ *
+ * Tool calls are machinery and live on the trace rail — with one exception. A
+ * question the model asked is a tool call only in the mechanical sense; what it
+ * actually is, is the agent talking to the user, and burying it on the rail
+ * would hide the one card the turn is blocked behind.
+ */
 function visibleBlocks(message: ChatMessage): number {
-  return message.blocks.filter((block) => block.kind !== 'thinking' && block.kind !== 'tool').length;
+  return message.blocks.filter(
+    (block) =>
+      block.kind !== 'thinking'
+      && (block.kind !== 'tool' || isAskQuestionTool(block.name)),
+  ).length;
 }
 
 /**
@@ -376,6 +400,12 @@ function summariseWork(
   let firstId: string | undefined;
   for (const message of messages) {
     for (const block of message.blocks) {
+      // The question card is rendered in the conversation, so counting it here
+      // as well would put "1 command" on a turn whose only machinery is the
+      // question already on screen.
+      if (block.kind === 'tool' && isAskQuestionTool(block.name)) {
+        continue;
+      }
       if (block.kind === 'tool' && showToolCalls) {
         tools += 1;
         if (block.durationMs !== undefined) durationMs += block.durationMs;
@@ -451,12 +481,16 @@ function BlockView({
   block,
   plain,
   caret,
+  transcript,
+  onAnswerQuestion,
   onRetry,
 }: {
   block: ChatBlock;
   /** True for the user's own turn, where text is echoed literally. */
   plain: boolean;
   caret: boolean;
+  transcript: ChatTranscript;
+  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
   onRetry?: () => void;
 }) {
   switch (block.kind) {
@@ -495,7 +529,21 @@ function BlockView({
     // rather than removing the cases: a block kind that silently fell through
     // to `default` would be indistinguishable from one nobody has handled yet.
     case 'thinking':
+      return null;
+
     case 'tool':
+      // The one tool call that belongs in the conversation rather than on the
+      // rail: it *is* the agent addressing the user. Everything else about a
+      // tool call is machinery.
+      if (isAskQuestionTool(block.name)) {
+        return (
+          <QuestionBlock
+            block={block}
+            transcript={transcript}
+            onAnswerQuestion={onAnswerQuestion}
+          />
+        );
+      }
       return null;
 
     case 'plan':
@@ -513,6 +561,49 @@ function BlockView({
     default:
       return null;
   }
+}
+
+/**
+ * A question the model asked, drawn from the call that asked it.
+ *
+ * The tool block is the durable record — the arguments *are* the question, and
+ * they are persisted and replayed like any other block — so this needs no side
+ * table to render from and survives a reload, a rejoin and a server restart.
+ * The transcript is consulted only for the two things the block cannot know:
+ * whether the question is still waiting, and which options were picked.
+ */
+function QuestionBlock({
+  block,
+  transcript,
+  onAnswerQuestion,
+}: {
+  block: ToolBlock;
+  transcript: ChatTranscript;
+  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
+}): React.JSX.Element | null {
+  const asked = questionFromToolInput(block.input);
+  // Still streaming its arguments in, or malformed. Nothing to draw yet — and
+  // an empty bordered card would read as a question with no answers.
+  if (!asked) return null;
+
+  const request = transcript.questionFor(block.toolId);
+  const answered = request ? undefined : transcript.answerFor(block.toolId);
+
+  return (
+    <QuestionCard
+      request={request}
+      question={asked.question}
+      header={asked.header}
+      multiSelect={asked.multiSelect}
+      options={asked.options}
+      answered={answered}
+      // The fallback for a card rebuilt from a snapshot, where the resolution
+      // event was folded away before this browser ever saw it: the tool result
+      // is the model's own copy of the answer and is still in the block.
+      answerText={!request && !answered ? block.output : undefined}
+      onAnswer={onAnswerQuestion}
+    />
+  );
 }
 
 /**

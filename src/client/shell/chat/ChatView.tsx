@@ -23,6 +23,7 @@ import { Composer } from './Composer.js';
 import { MessageList, type MessageListHandle } from './MessageList.js';
 import { hasVisibleContent, messageText } from './MessageBubble.js';
 import { PermissionCard } from './PermissionCard.js';
+import { QuestionCard } from './QuestionCard.js';
 import { PlanPanel } from './PlanPanel.js';
 import { SessionHeader } from './SessionHeader.js';
 import { LiveStreamRibbon } from './StreamRibbon.js';
@@ -152,6 +153,19 @@ export function ChatView({
   const bypassPermissions = transcript.bypassing;
   const plan = transcript.plan;
   const pending = transcript.pendingPermissions;
+  // Only the questions that have nowhere else to be drawn. A question that
+  // names the call that asked it renders inside the conversation at that call,
+  // which is where it was asked; this is the safety net for one that could not
+  // be correlated, and without it that question would have no button anywhere
+  // and the turn behind it would never move.
+  const strayQuestions = React.useMemo(
+    () =>
+      transcript.pendingQuestions.filter(
+        (request) => !request.toolId || !transcript.message(messageIdOfTool(transcript, request.toolId)),
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [transcript, version],
+  );
   const exited = chatState === 'exited';
   const unavailable = controller.unavailableReason;
   const busy = transcript.busy;
@@ -302,6 +316,11 @@ export function ChatView({
   const loadMore = React.useCallback(() => controller.loadMore(), [controller]);
   const respond = React.useCallback(
     (requestId: string, optionId: string) => controller.respondPermission(requestId, optionId),
+    [controller],
+  );
+  const answerQuestion = React.useCallback(
+    (requestId: string, optionIds: string[], skipped: boolean) =>
+      controller.answerQuestion(requestId, optionIds, skipped),
     [controller],
   );
   const cancelQueued = React.useCallback(
@@ -673,6 +692,7 @@ export function ChatView({
             onRetry={retryTurn}
             showThinking={view.showThinking}
             showToolCalls={view.showToolCalls}
+            onAnswerQuestion={answerQuestion}
           />
 
           {terminalOpen ? (
@@ -706,7 +726,7 @@ export function ChatView({
             />
           ) : null}
 
-          {busy || chatState === 'awaiting_permission' || chatState === 'error' ? (
+          {busy || chatState === 'awaiting_permission' || chatState === 'awaiting_answer' || chatState === 'error' ? (
             <LiveStreamRibbon
               transcript={transcript}
               turn={currentTurn}
@@ -798,6 +818,27 @@ export function ChatView({
                     <PlanPanel items={plan} compact />
                   </div>
                 ) : null}
+              </div>
+            ) : null}
+
+            {strayQuestions.length > 0 ? (
+              <div
+                role="region"
+                aria-label="Questions from the assistant"
+                aria-live="assertive"
+                style={{ display: 'grid', gap: 'var(--space-2)', maxHeight: '50vh', overflowY: 'auto' }}
+              >
+                {strayQuestions.map((request) => (
+                  <QuestionCard
+                    key={request.requestId}
+                    request={request}
+                    question={request.question}
+                    header={request.header}
+                    multiSelect={request.multiSelect}
+                    options={request.options}
+                    onAnswer={answerQuestion}
+                  />
+                ))}
               </div>
             ) : null}
 
@@ -952,7 +993,7 @@ function placeholderFor(state: ChatState, runtimeLabel: string, isPhone = false)
   if (state === 'exited') return 'This session has ended';
   // No longer 'answer this before you can type': the composer stays live and
   // queues, so the sentence has to describe what happens rather than forbid it.
-  if (state === 'awaiting_permission') {
+  if (state === 'awaiting_permission' || state === 'awaiting_answer') {
     return isPhone ? 'Answer above, or type' : 'Answer above — or type the next message';
   }
   if (state === 'thinking' || state === 'running') {
@@ -1263,3 +1304,19 @@ function mobileBarHeight(): number {
   return Number.isFinite(parsed) ? parsed : MOBILE_BAR_FALLBACK_PX;
 }
 
+/**
+ * Which message holds a given tool call, or '' when the transcript has none.
+ *
+ * Used only to decide whether a pending question already has a card inside the
+ * conversation. A question whose call is above the loaded window — or whose call
+ * never arrived — needs the pinned card instead, and asking the transcript is
+ * the only way to tell those apart from one that is on screen.
+ */
+function messageIdOfTool(transcript: ChatTranscript, toolId: string): string {
+  for (const message of transcript.messages) {
+    for (const block of message.blocks) {
+      if (block.kind === 'tool' && block.toolId === toolId) return message.id;
+    }
+  }
+  return '';
+}
