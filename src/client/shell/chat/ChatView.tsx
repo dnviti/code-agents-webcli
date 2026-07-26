@@ -4,7 +4,7 @@ import { uploadAttachment } from '../../chat/attachments-api.js';
 import { ChatController, type ChatUnavailable } from '../../chat/controller.js';
 import { fetchStatus, findFiles } from '../../chat/workspace-api.js';
 import { activityEvents } from '../../chat/activity.js';
-import { groupTurns, turnOf, type TurnSummary } from '../../chat/turns.js';
+import { groupTurns, isTurnOpen, turnOf, type TurnSummary } from '../../chat/turns.js';
 import type { ChatPanelId, ChatViewSettings } from '../../chat/view-settings.js';
 import {
   DEFAULT_CHAT_VIEW,
@@ -153,6 +153,51 @@ export function ChatView({
       ? selectedTurnId
       : lastTurnId;
 
+  // A turn's fold state, once the user has set it explicitly. Unset, a turn
+  // reads as open exactly when it is the newest one — see isTurnOpen — which
+  // is what makes a fresh turn open itself and everything before it fold
+  // without this ever growing an entry for turns nobody has touched.
+  const [openOverrides, setOpenOverrides] = React.useState<Map<string, boolean>>(new Map());
+  const openTurnIds = React.useMemo(() => {
+    const ids = new Set<string>();
+    for (const turn of turns) {
+      if (isTurnOpen(turn.id, lastTurnId, openOverrides)) ids.add(turn.id);
+    }
+    return ids;
+  }, [turns, lastTurnId, openOverrides]);
+
+  const toggleTurn = React.useCallback(
+    (turnId: string) => {
+      setOpenOverrides((prev) => {
+        const next = new Map(prev);
+        next.set(turnId, !isTurnOpen(turnId, lastTurnId, prev));
+        return next;
+      });
+    },
+    [lastTurnId],
+  );
+
+  // Idempotent, so a jump into an already-open turn does not thrash the map.
+  const openTurn = React.useCallback(
+    (turnId: string) => {
+      setOpenOverrides((prev) => {
+        if (isTurnOpen(turnId, lastTurnId, prev)) return prev;
+        const next = new Map(prev);
+        next.set(turnId, true);
+        return next;
+      });
+    },
+    [lastTurnId],
+  );
+
+  const expandAllTurns = React.useCallback(() => {
+    setOpenOverrides(() => new Map(turns.map((turn) => [turn.id, true])));
+  }, [turns]);
+
+  const collapseAllTurns = React.useCallback(() => {
+    setOpenOverrides(() => new Map(turns.map((turn) => [turn.id, false])));
+  }, [turns]);
+
   const [searchOpen, setSearchOpen] = React.useState(false);
   // Paired with a counter, not held as a bare id: clicking the same work pill
   // twice has to scroll the rail twice, and a string that did not change would
@@ -252,10 +297,17 @@ export function ChatView({
     [controller],
   );
 
-  const selectTurn = React.useCallback((id: string) => {
-    setSelectedTurnId(id);
-    list.current?.scrollToTurn(id);
-  }, []);
+  const selectTurn = React.useCallback(
+    (id: string) => {
+      setSelectedTurnId(id);
+      // The strip itself is always mounted, open or not, so this can scroll
+      // immediately — only a jump *inside* a turn's body needs to wait for it
+      // to open first. See revealMessage.
+      openTurn(id);
+      list.current?.scrollToTurn(id);
+    },
+    [openTurn],
+  );
 
   const jumpLatest = React.useCallback(() => {
     setSelectedTurnId(null);
@@ -288,9 +340,18 @@ export function ChatView({
     [openRail, transcript, view.showThinking, view.showToolCalls],
   );
 
-  const revealMessage = React.useCallback((messageId: string) => {
-    list.current?.scrollToMessage(messageId);
-  }, []);
+  const revealMessage = React.useCallback(
+    (messageId: string) => {
+      const turn = turnOf(messageId, turns);
+      if (turn) openTurn(turn.id);
+      // A turn that was just opened has not painted yet — its bubbles have no
+      // layout box to scroll to until the next tick. A turn already open
+      // scrolls one tick later than it strictly needs to, which nothing on
+      // screen can tell apart from immediate.
+      window.setTimeout(() => list.current?.scrollToMessage(messageId), 0);
+    },
+    [turns, openTurn],
+  );
 
   const copyTurn = React.useCallback(
     (turnId: string) => {
@@ -497,6 +558,8 @@ export function ChatView({
             onSelect={selectTurn}
             onJumpLatest={jumpLatest}
             collapsed={indexCollapsed}
+            onExpandAll={expandAllTurns}
+            onCollapseAll={collapseAllTurns}
           />
         ) : null}
 
@@ -542,6 +605,8 @@ export function ChatView({
             transcript={transcript}
             turns={turns}
             currentTurnId={currentTurnId}
+            openTurnIds={openTurnIds}
+            onToggleTurn={toggleTurn}
             onLoadMore={loadMore}
             onShowWork={showWork}
             onEditTurn={seedDraft}
@@ -765,6 +830,8 @@ export function ChatView({
                   setIndexSheet(false);
                   jumpLatest();
                 }}
+                onExpandAll={expandAllTurns}
+                onCollapseAll={collapseAllTurns}
               />
             </div>
             <button

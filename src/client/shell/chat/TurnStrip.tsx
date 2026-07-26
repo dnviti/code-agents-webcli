@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { Icon } from '../../ui/relay/Icon.js';
-import { formatTurnMeta, turnTime, type TurnSummary } from '../../chat/turns.js';
+import { formatTurnMeta, turnTime, STATUS_GLYPH, type TurnSummary } from '../../chat/turns.js';
 
 /**
  * The 28px rule that opens a turn, and everything that turn cost.
@@ -25,6 +25,11 @@ export interface TurnStripProps {
   onBranch?: () => void;
   /** Set while the copy has just landed, so the glyph can acknowledge it. */
   copied?: boolean;
+  /** Whether the turn's body is shown below this strip. */
+  open: boolean;
+  onToggleOpen(): void;
+  /** Id of the element this strip discloses, for `aria-controls`. */
+  bodyId?: string;
 }
 
 export function TurnStrip({
@@ -34,10 +39,14 @@ export function TurnStrip({
   onCopy,
   onBranch,
   copied = false,
+  open,
+  onToggleOpen,
+  bodyId,
 }: TurnStripProps): React.JSX.Element {
   const past = variant === 'past';
   const meta = formatTurnMeta(turn);
   const time = turnTime(turn);
+  const glyph = STATUS_GLYPH[turn.status] || STATUS_GLYPH.done;
 
   return (
     <div
@@ -69,6 +78,31 @@ export function TurnStrip({
         fontFamily: 'var(--font-sans)',
       }}
     >
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={bodyId}
+        aria-label={`${open ? 'Collapse' : 'Expand'} turn ${turn.index}`}
+        title={open ? 'Collapse this turn' : 'Expand this turn'}
+        onClick={onToggleOpen}
+        style={{
+          flex: '0 0 auto',
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          width: 16,
+          height: 16,
+          padding: 0,
+          margin: '0 -2px 0 -4px',
+          background: 'transparent',
+          border: 0,
+          color: 'var(--muted-foreground)',
+          cursor: 'pointer',
+        }}
+      >
+        <Icon name={open ? 'chevron-down' : 'chevron-right'} size={12} />
+      </button>
+
       <span
         style={{
           flex: '0 0 auto',
@@ -95,6 +129,26 @@ export function TurnStrip({
         >
           {time}
         </span>
+      ) : null}
+
+      {/* Only shown while the body it names is hidden — this is the entire
+          reason a collapsed strip is still worth reading rather than just a
+          number. */}
+      {!open ? (
+        <>
+          <span
+            aria-hidden="true"
+            style={{
+              flex: '0 0 auto',
+              display: 'inline-flex',
+              color: glyph.color,
+              animation: glyph.spin ? 'relay-spin 900ms linear infinite' : undefined,
+            }}
+          >
+            <Icon name={glyph.icon} size={11} />
+          </span>
+          <Shrinkable>{turn.label}</Shrinkable>
+        </>
       ) : null}
 
       <span
