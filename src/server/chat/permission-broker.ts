@@ -36,7 +36,40 @@ export interface PermissionAnswer {
   reason?: string;
 }
 
-type Decider = (ask: PermissionAsk) => Promise<PermissionAnswer>;
+/**
+ * A question the model asked, as it arrives off the socket.
+ *
+ * `unknown` on purpose at this layer: the shape is whatever the model passed to
+ * the MCP tool, and validating it is the session's job — the broker only routes.
+ */
+export interface QuestionAsk {
+  question?: unknown;
+  header?: unknown;
+  multiSelect?: unknown;
+  options?: unknown;
+}
+
+/** What the browser answered, on its way back to the waiting tool call. */
+export interface QuestionReply {
+  labels: string[];
+  skipped?: boolean;
+  error?: string;
+}
+
+/**
+ * The two things that dial into a session's socket.
+ *
+ * One socket, two kinds of caller: the PreToolUse hook asking whether a tool may
+ * run, and the MCP server asking the user a question. They are kept apart here
+ * rather than being squeezed into one decider because the answers have nothing
+ * in common — a boolean with a reason versus a list of chosen labels — and a
+ * union that had to be narrowed at every call site would be worse than two
+ * fields.
+ */
+export interface BrokerHandlers {
+  permission: (ask: PermissionAsk) => Promise<PermissionAnswer>;
+  question: (ask: QuestionAsk) => Promise<QuestionReply>;
+}
 
 /**
  * How long a unix socket path may actually be.
@@ -50,6 +83,10 @@ type Decider = (ask: PermissionAsk) => Promise<PermissionAnswer>;
  */
 const MAX_SOCKET_PATH_BYTES = 103;
 
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function socketPathFits(candidate: string): boolean {
   return Buffer.byteLength(candidate, 'utf8') <= MAX_SOCKET_PATH_BYTES;
 }
@@ -59,7 +96,7 @@ export class PermissionBroker {
   private socketPath = '';
   /** Set only when the socket had to be placed outside `socketDir`. */
   private tempDir: string | null = null;
-  private decide: Decider | null = null;
+  private handlers: BrokerHandlers | null = null;
   private readonly open = new Set<net.Socket>();
 
   constructor(private readonly socketDir: string) {}
@@ -80,10 +117,10 @@ export class PermissionBroker {
    * directory mode already stops another account from connecting, there is no
    * reason to make the path guessable by whatever else runs as this user.
    */
-  async listen(decide: Decider): Promise<string> {
+  async listen(handlers: BrokerHandlers): Promise<string> {
     if (this.server) return this.socketPath;
 
-    this.decide = decide;
+    this.handlers = handlers;
     this.socketPath = this.reservePath();
 
     const server = net.createServer((socket) => this.accept(socket));
@@ -171,7 +208,7 @@ export class PermissionBroker {
   }
 
   private handle(socket: net.Socket, line: string): void {
-    let payload: { id?: string; ask?: PermissionAsk };
+    let payload: { id?: string; kind?: string; ask?: PermissionAsk; question?: QuestionAsk };
     try {
       payload = JSON.parse(line);
     } catch {
@@ -179,26 +216,48 @@ export class PermissionBroker {
     }
 
     const id = payload.id;
-    const ask = payload.ask;
-    if (!id || !ask) return;
+    if (!id) return;
 
-    const reply = (answer: PermissionAnswer): void => {
+    const reply = (answer: PermissionAnswer | QuestionReply): void => {
       if (socket.destroyed) return;
       socket.write(`${JSON.stringify({ id, ...answer })}\n`);
     };
 
-    const decide = this.decide;
-    if (!decide) {
+    const handlers = this.handlers;
+
+    // A question from the MCP server. Note the opposite failure direction from
+    // an approval below: nothing is gated on the answer, so a question that
+    // cannot be asked comes back as an error the model can route around rather
+    // than as a refusal, and never as silence.
+    if (payload.kind === 'question') {
+      const question = payload.question ?? {};
+      if (!handlers) {
+        reply({ labels: [], error: 'this session is not accepting questions' });
+        return;
+      }
+      handlers
+        .question(question)
+        .then(reply)
+        .catch((error: unknown) => {
+          reply({ labels: [], error: describeError(error) });
+        });
+      return;
+    }
+
+    const ask = payload.ask;
+    if (!ask) return;
+
+    if (!handlers) {
       reply({ allow: false, reason: 'the approval channel is not accepting decisions' });
       return;
     }
 
-    decide(ask)
+    handlers
+      .permission(ask)
       .then(reply)
       .catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
         // Failing closed: an approval that cannot be asked has not been given.
-        reply({ allow: false, reason: `approval failed: ${message}` });
+        reply({ allow: false, reason: `approval failed: ${describeError(error)}` });
       });
   }
 

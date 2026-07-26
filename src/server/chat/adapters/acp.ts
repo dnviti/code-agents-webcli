@@ -329,6 +329,33 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     }
   }
 
+  /**
+   * The MCP servers this client offers the agent.
+   *
+   * Only ever the question server, and only when the session wired one up. ACP
+   * spells a server's environment as a list of name/value pairs rather than an
+   * object, which is the one place its shape differs from every other config
+   * this app writes.
+   *
+   * Verified against omp: the entry is accepted on `session/new`, the tool
+   * appears to the model, and calling it reaches this app's socket. Note the
+   * agent renames it on the way through — omp reports the call as
+   * `mcp__ccweb_ask_user_question`, with a single underscore — which is why
+   * nothing downstream matches on an exact tool name.
+   */
+  private mcpServers(): Array<Record<string, unknown>> {
+    const server = this.options.askMcpServer;
+    if (!server) return [];
+    return [
+      {
+        name: server.name,
+        command: server.command,
+        args: server.args,
+        env: Object.entries(server.env).map(([name, value]) => ({ name, value })),
+      },
+    ];
+  }
+
   private applyInitialize(init: Record<string, unknown>): void {
     const agent = record(init.agentCapabilities);
     const prompt = record(agent.promptCapabilities);
@@ -353,7 +380,7 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
         const loaded = await this.call('session/load', {
           sessionId: resumeId,
           cwd: this.options.workingDir,
-          mcpServers: [],
+          mcpServers: this.mcpServers(),
         });
         this.nativeSessionId = resumeId;
         return loaded;
@@ -365,7 +392,10 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
 
     try {
       const created = record(
-        await this.call('session/new', { cwd: this.options.workingDir, mcpServers: [] }),
+        await this.call('session/new', {
+          cwd: this.options.workingDir,
+          mcpServers: this.mcpServers(),
+        }),
       );
       this.nativeSessionId = str(created.sessionId) || null;
       return created;

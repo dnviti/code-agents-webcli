@@ -230,6 +230,7 @@ export class MessageHandler {
         tabs.updateTabStatus(sessionId, 'active');
         return;
       case 'awaiting_permission':
+      case 'awaiting_answer':
         tabs.updateTabStatus(sessionId, 'idle');
         if (background) tabs.updateUnreadIndicator(sessionId, true);
         return;

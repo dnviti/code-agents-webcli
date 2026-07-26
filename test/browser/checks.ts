@@ -237,6 +237,7 @@ async function run(): Promise<void> {
   await checkTheFixedBarsNeverWrap();
   await checkALiveAnswerAppearsAsItStreams();
   await checkSilentStepsLeaveNoRowButKeepTheirTrace();
+  await checkAQuestionIsAnsweredByClicking();
   await checkThePhoneLayoutIsUsable();
   await checkThePhoneShellSurfacesAreUsable();
   await checkALongTabNameStaysInsideTheStrip();
@@ -245,6 +246,200 @@ async function run(): Promise<void> {
   pre.id = 'results';
   pre.textContent = results.join('\n');
   document.body.appendChild(pre);
+}
+
+/**
+ * A question the model asked is answered by clicking, and stays as a record.
+ *
+ * Here rather than in a unit test because every claim is about the rendered
+ * conversation: that the card appears *inside* the transcript at the call that
+ * asked (not in a tray under it), that a multi-select needs a confirm and a
+ * single-select does not, and that the card survives the answer instead of
+ * vanishing. A jsdom assertion on props would pass for a card rendered into
+ * nowhere.
+ */
+async function checkAQuestionIsAnsweredByClicking(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const sent: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('browser-check', {
+    send: (message: Record<string, unknown>) => {
+      sent.push(message);
+    },
+  } as never);
+
+  const askBlock = (toolId: string, input: unknown): Record<string, unknown> => ({
+    kind: 'tool',
+    toolId,
+    name: 'mcp__ccweb__ask_user_question',
+    toolKind: 'other',
+    status: 'running',
+    input,
+  });
+
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check',
+      runtime: 'claude',
+      state: 'awaiting_answer',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        questions: true, interrupt: true, resume: true, fork: false, attachments: true,
+        usage: true, cost: true, plan: false,
+      },
+      messages: [
+        {
+          id: 'm1', seq: 1, turnId: 't1', role: 'user', ts: 1,
+          blocks: [{ kind: 'text', text: 'Fix the parser.' }],
+        },
+        {
+          id: 'm2', seq: 2, turnId: 't1', role: 'assistant', ts: 2,
+          blocks: [
+            askBlock('tool-single', {
+              question: 'Which approach should I take?',
+              header: 'Approach',
+              multiSelect: false,
+              options: [
+                { label: 'Rewrite it', description: 'Slower but cleaner' },
+                { label: 'Patch it', description: 'Faster, more debt' },
+              ],
+            }),
+          ],
+        },
+        {
+          id: 'm3', seq: 3, turnId: 't1', role: 'assistant', ts: 3,
+          blocks: [
+            askBlock('tool-multi', {
+              question: 'Which rules should I apply?',
+              multiSelect: true,
+              options: [{ label: 'semicolons' }, { label: 'trailing commas' }, { label: 'single quotes' }],
+            }),
+          ],
+        },
+      ],
+      pendingPermissions: [],
+      pendingQuestions: [
+        {
+          requestId: 'q-single', toolId: 'tool-single', question: 'Which approach should I take?',
+          header: 'Approach', multiSelect: false, ts: 2,
+          options: [
+            { optionId: 'opt-0', label: 'Rewrite it', description: 'Slower but cleaner' },
+            { optionId: 'opt-1', label: 'Patch it', description: 'Faster, more debt' },
+          ],
+        },
+        {
+          requestId: 'q-multi', toolId: 'tool-multi', question: 'Which rules should I apply?',
+          multiSelect: true, ts: 3,
+          options: [
+            { optionId: 'opt-0', label: 'semicolons' },
+            { optionId: 'opt-1', label: 'trailing commas' },
+            { optionId: 'opt-2', label: 'single quotes' },
+          ],
+        },
+      ],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 3,
+      live: true,
+      bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  const cards = Array.from(host.querySelectorAll('[data-question-card]')) as HTMLElement[];
+  check('both questions render as cards', cards.length === 2, `found ${cards.length}`);
+  if (cards.length !== 2) return;
+
+  const [single, multi] = cards;
+
+  // Inside the conversation, at the call that asked — the thing that makes the
+  // exchange still read as a conversation when scrolled back to. A card in a
+  // pinned tray would be outside this element entirely.
+  const inTranscript = single.closest('[data-message-id="m2"]');
+  check('the card sits in the message that asked', !!inTranscript);
+
+  const optionText = (card: HTMLElement): string => card.textContent || '';
+  check(
+    'the single-choice card offers every option',
+    optionText(single).includes('Rewrite it') && optionText(single).includes('Patch it'),
+  );
+  check('option descriptions are shown', optionText(single).includes('Slower but cleaner'));
+
+  // A single-choice question answers on the click itself; a multi-select must
+  // not, or the first tick would send the answer and the rest would go nowhere.
+  const singleButtons = Array.from(single.querySelectorAll('button')) as HTMLButtonElement[];
+  const patch = singleButtons.find((b) => (b.textContent || '').includes('Patch it'));
+  check('each option is its own control', !!patch);
+
+  const boxes = Array.from(multi.querySelectorAll('input[type="checkbox"]')) as HTMLInputElement[];
+  check('the multi-select card offers checkboxes', boxes.length === 3, `found ${boxes.length}`);
+  const confirm = (Array.from(multi.querySelectorAll('button')) as HTMLButtonElement[])
+    .find((b) => (b.textContent || '').trim() === 'Confirm');
+  check('the multi-select card has a confirm', !!confirm);
+  check('confirm is disabled before anything is picked', !!confirm && confirm.disabled);
+
+  if (boxes.length === 3 && confirm) {
+    boxes[0].click();
+    boxes[2].click();
+    await wait(150);
+    check('confirm becomes available once something is picked', !confirm.disabled);
+    check('picking a checkbox does not answer on its own', sent.length === 0, `${sent.length} sent`);
+    confirm.click();
+    await wait(150);
+  }
+
+  if (patch) {
+    patch.click();
+    await wait(200);
+  }
+
+  const answers = sent.filter((m) => m.type === 'chat_question_answer');
+  check('both answers reach the server', answers.length === 2, `${answers.length} sent`);
+  const multiAnswer = answers.find((m) => m.requestId === 'q-multi');
+  const singleAnswer = answers.find((m) => m.requestId === 'q-single');
+  check(
+    'the multi-select answer carries every pick',
+    !!multiAnswer && JSON.stringify(multiAnswer.optionIds) === JSON.stringify(['opt-0', 'opt-2']),
+    JSON.stringify(multiAnswer?.optionIds),
+  );
+  check(
+    'the single-choice answer carries the one pick',
+    !!singleAnswer && JSON.stringify(singleAnswer.optionIds) === JSON.stringify(['opt-1']),
+    JSON.stringify(singleAnswer?.optionIds),
+  );
+
+  await wait(200);
+  const after = Array.from(host.querySelectorAll('[data-question-card]')) as HTMLElement[];
+  // The card must not vanish on being answered: scrolling back past a decision
+  // should show the decision, which is the acceptance criterion a tray-based
+  // card fails.
+  check('the cards stay in the conversation after answering', after.length === 2, `${after.length} left`);
+  check(
+    'an answered card stops offering buttons',
+    after.every((card) => card.getAttribute('data-question-card') === 'answered'),
+    after.map((c) => c.getAttribute('data-question-card')).join(','),
+  );
+  check('the answered card still shows what was asked', (after[0].textContent || '').includes('Which approach'));
+  check('the answered card shows what was chosen', (after[0].textContent || '').includes('Patch it'));
+
+  root.unmount();
+  host.remove();
 }
 
 /**

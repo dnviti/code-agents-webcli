@@ -51,13 +51,19 @@ export function StreamRibbon({
 }: StreamRibbonProps): React.JSX.Element {
   const isPhone = usePhone();
   const tone: Tone =
-    state === 'error' ? 'error' : state === 'awaiting_permission' ? 'waiting' : 'working';
+    state === 'error'
+      ? 'error'
+      : state === 'awaiting_permission' || state === 'awaiting_answer'
+        ? 'waiting'
+        : 'working';
   const colour = TONE[tone];
   const working = tone === 'working';
 
   const text = label
     || (state === 'awaiting_permission'
       ? 'Waiting for you to answer the approval above'
+      : state === 'awaiting_answer'
+        ? 'Waiting for you to answer the question above'
       : state === 'starting'
         ? 'Starting'
         : state === 'thinking'
@@ -243,7 +249,7 @@ function ribbonLabel(
   turn: TurnSummary | undefined,
   state: ChatState,
 ): string | undefined {
-  if (state === 'awaiting_permission') return undefined;
+  if (state === 'awaiting_permission' || state === 'awaiting_answer') return undefined;
   const scoped = turn ? activityForTurn(turn, events) : events;
   for (let i = scoped.length - 1; i >= 0; i -= 1) {
     const event = scoped[i];

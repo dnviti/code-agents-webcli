@@ -19,6 +19,33 @@
   session. If that session is gone by the time you come back, the app falls back
   to the first tab rather than showing you nothing.
 
+- **The agent can ask you a question and wait for the answer.** Until now the
+  only thing it could put in front of you was an approval — allow or deny a tool
+  it was about to run. Anything else it needed to know, it had to ask in prose,
+  and you had to guess the wording it was hoping for.
+
+  It can now ask a proper question with the answers already written out: which
+  of three approaches to take, which of the four candidate files you meant, which
+  of the problems it found to fix first. The question appears in the conversation
+  where it was asked, you answer by clicking, and the agent picks up from your
+  answer. Questions come in both kinds — pick exactly one, or tick several and
+  confirm.
+
+  The card stays where it was after you answer, showing what was asked and what
+  you chose, so scrolling back past a decision shows the decision. If you close
+  the tab while one is waiting, it is still there — and still answerable — when
+  you come back. A question you would rather not answer can be skipped; the agent
+  is told so and carries on rather than sitting there blocked.
+
+  Questions are asked even in sessions running with approvals bypassed: not being
+  asked before it acts has never meant having your questions answered for you.
+
+  Works with Claude and with omp, each through its own handshake. kimi can reach
+  it too, but often prefers its own built-in question tool, which answers itself
+  without asking anyone — so questions there are hit and miss, and that is kimi's
+  behaviour rather than something this app can steer. Codex, pi and grok report
+  the capability as unavailable rather than offering a button that would do
+  nothing.
 - **You can open what the agent handed off and watch it work.** A delegation
   used to be one line in the agents list: a name, a status badge, a duration.
   Whether it was a sub-agent reading three files or a workflow running a dozen

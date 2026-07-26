@@ -48,6 +48,15 @@ export interface ChatAdapterOptions {
   bypassPermissions?: boolean;
   /** Native session id to resume, when the runtime and the log both have one. */
   resumeSessionId?: string;
+  /**
+   * The MCP server that lets the model ask the user a multiple-choice question.
+   *
+   * Handed to adapters whose runtime takes MCP servers through the protocol
+   * rather than the command line. Claude gets the same server as a `--mcp-config`
+   * argument instead, built by the session; either way the server is the same
+   * script and the same socket.
+   */
+  askMcpServer?: { name: string; command: string; args: string[]; env: Record<string, string> };
   emit: (event: AdapterEvent) => void;
   /**
    * Read a file on the agent's behalf.
