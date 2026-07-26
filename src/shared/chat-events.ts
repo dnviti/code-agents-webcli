@@ -740,7 +740,98 @@ export function normalizeQuestionOptions(raw: unknown): QuestionOption[] {
 
 export function isAskQuestionTool(name: string | undefined): boolean {
   if (!name) return false;
-  return name === ASK_QUESTION_TOOL || name.endsWith(`__${ASK_QUESTION_TOOL}`);
+  // Suffix match on a separator of either width. Claude namespaces MCP tools as
+  // `mcp__<server>__<tool>`; omp reports the same tool as
+  // `mcp__ccweb_ask_user_question`, with one underscore. Both were observed —
+  // an exact-name table would have silently failed for one of them.
+  return name === ASK_QUESTION_TOOL || /(^|_)ask_user_question$/.test(name);
+}
+
+/**
+ * Whether a tool block is this app's question tool, however the runtime named it.
+ *
+ * The name alone is not enough. ACP has no separate tool-name field at all: the
+ * adapter uses the agent's own title for the block ("Asking tabs vs spaces
+ * preference"), and the real tool name turns up inside the arguments instead
+ * (omp puts it in `rawInput.path`). So the arguments are consulted too.
+ */
+export function looksLikeAskCall(name: string | undefined, input: unknown): boolean {
+  if (isAskQuestionTool(name)) return true;
+  if (input === undefined || input === null) return false;
+  try {
+    return JSON.stringify(input).includes(ASK_QUESTION_TOOL);
+  } catch {
+    return false;
+  }
+}
+
+/** A question as it can be read back out of the call that asked it. */
+export interface AskedQuestion {
+  question: string;
+  header?: string;
+  multiSelect: boolean;
+  options: QuestionOption[];
+}
+
+/**
+ * Read a question back out of a tool call's arguments.
+ *
+ * Shared between the session — which pairs an incoming question with the call
+ * that asked it — and the browser, which rebuilds the card from a replayed
+ * transcript. Two implementations that disagreed about which options survive
+ * would put the tick on an option the user did not choose.
+ *
+ * Two shapes are accepted because two were observed: the arguments themselves,
+ * and an envelope carrying them as a JSON string (omp reports the call as
+ * `{ path: 'xd://mcp__ccweb_ask_user_question', content: '{...}' }`). Tolerant
+ * by contract — `input` is `unknown` everywhere else in this file for good
+ * reason, and a malformed call should render as nothing rather than throw.
+ */
+export function askedQuestionFrom(input: unknown): AskedQuestion | null {
+  const object = asRecord(input);
+  if (!object) return null;
+
+  const direct = readQuestion(object);
+  if (direct) return direct;
+
+  // An envelope. `content` is the field omp uses; the others cost nothing to
+  // accept and save a second round of probing if another agent picks one.
+  for (const key of ['content', 'arguments', 'input', 'params']) {
+    const inner = object[key];
+    if (typeof inner === 'string') {
+      try {
+        const parsed = readQuestion(asRecord(JSON.parse(inner)));
+        if (parsed) return parsed;
+      } catch {
+        // Not JSON, so not a question. Keep looking.
+      }
+    } else if (inner && typeof inner === 'object') {
+      const parsed = readQuestion(asRecord(inner));
+      if (parsed) return parsed;
+    }
+  }
+  return null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function readQuestion(object: Record<string, unknown> | undefined): AskedQuestion | null {
+  if (!object) return null;
+  const question = typeof object.question === 'string' ? object.question.trim() : '';
+  if (!question) return null;
+  const options = normalizeQuestionOptions(object.options);
+  if (options.length === 0) return null;
+  return {
+    question,
+    header:
+      typeof object.header === 'string' && object.header.trim() ? object.header.trim() : undefined,
+    multiSelect: object.multiSelect === true,
+    options,
+  };
 }
 
 /**

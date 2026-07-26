@@ -7,7 +7,8 @@ import {
   ImageBlock,
   NoticeBlock,
   ToolBlock,
-  isAskQuestionTool,
+  askedQuestionFrom,
+  looksLikeAskCall,
 } from '../../../shared/chat-events.js';
 import { ChatTranscript } from '../../chat/transcript.js';
 import { compactCount, formatDuration } from '../../chat/tool-meta.js';
@@ -15,7 +16,7 @@ import { Icon } from '../../ui/relay/Icon.js';
 import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { Markdown, markdownText } from './Markdown.js';
 import { PlanPanel } from './PlanPanel.js';
-import { QuestionCard, questionFromToolInput } from './QuestionCard.js';
+import { QuestionCard } from './QuestionCard.js';
 
 /**
  * One message in the transcript — prose, and nothing else.
@@ -346,7 +347,7 @@ function visibleBlocks(message: ChatMessage): number {
   return message.blocks.filter(
     (block) =>
       block.kind !== 'thinking'
-      && (block.kind !== 'tool' || isAskQuestionTool(block.name)),
+      && (block.kind !== 'tool' || looksLikeAskCall(block.name, block.input)),
   ).length;
 }
 
@@ -403,7 +404,7 @@ function summariseWork(
       // The question card is rendered in the conversation, so counting it here
       // as well would put "1 command" on a turn whose only machinery is the
       // question already on screen.
-      if (block.kind === 'tool' && isAskQuestionTool(block.name)) {
+      if (block.kind === 'tool' && looksLikeAskCall(block.name, block.input)) {
         continue;
       }
       if (block.kind === 'tool' && showToolCalls) {
@@ -535,7 +536,7 @@ function BlockView({
       // The one tool call that belongs in the conversation rather than on the
       // rail: it *is* the agent addressing the user. Everything else about a
       // tool call is machinery.
-      if (isAskQuestionTool(block.name)) {
+      if (looksLikeAskCall(block.name, block.input)) {
         return (
           <QuestionBlock
             block={block}
@@ -581,7 +582,7 @@ function QuestionBlock({
   transcript: ChatTranscript;
   onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
 }): React.JSX.Element | null {
-  const asked = questionFromToolInput(block.input);
+  const asked = askedQuestionFrom(block.input);
   // Still streaming its arguments in, or malformed. Nothing to draw yet — and
   // an empty bordered card would read as a question with no answers.
   if (!asked) return null;

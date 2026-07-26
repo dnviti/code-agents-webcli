@@ -1,9 +1,5 @@
 import * as React from 'react';
-import {
-  QuestionOption,
-  QuestionRequest,
-  normalizeQuestionOptions,
-} from '../../../shared/chat-events.js';
+import { QuestionOption, QuestionRequest } from '../../../shared/chat-events.js';
 import { Button } from '../../ui/relay/Button.js';
 import { Icon } from '../../ui/relay/Icon.js';
 
@@ -323,37 +319,3 @@ const SR_ONLY: React.CSSProperties = {
   overflow: 'hidden',
   clip: 'rect(0 0 0 0)',
 };
-
-/**
- * Read a question back out of the tool call that asked it.
- *
- * The transcript's record of a question *is* the tool block — the arguments the
- * model sent are the question, and they are already persisted and replayed. So
- * a card scrolled back to needs no side table to render from, which is what
- * makes the record survive a reload and a server restart.
- *
- * Tolerant by contract: `input` is `unknown` everywhere else in this codebase
- * for good reason, and a malformed call should render as nothing rather than
- * throw inside the transcript.
- */
-export function questionFromToolInput(input: unknown): {
-  question: string;
-  header?: string;
-  multiSelect: boolean;
-  options: QuestionOption[];
-} | null {
-  if (!input || typeof input !== 'object') return null;
-  const object = input as Record<string, unknown>;
-  const question = typeof object.question === 'string' ? object.question.trim() : '';
-  if (!question) return null;
-
-  const options = normalizeQuestionOptions(object.options);
-  if (options.length === 0) return null;
-
-  return {
-    question,
-    header: typeof object.header === 'string' && object.header.trim() ? object.header.trim() : undefined,
-    multiSelect: object.multiSelect === true,
-    options,
-  };
-}

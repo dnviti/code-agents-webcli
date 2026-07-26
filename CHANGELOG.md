@@ -24,8 +24,9 @@
   Questions are asked even in sessions running with approvals bypassed: not being
   asked before it acts has never meant having your questions answered for you.
 
-  Available with Claude today. The plumbing underneath is runtime-neutral, so the
-  other runtimes need only their own handshake wired up.
+  Works with Claude and with the ACP agents (kimi, omp), each through its own
+  handshake. Codex, pi and grok report the capability as unavailable rather than
+  offering a button that would do nothing.
 - **You can open what the agent handed off and watch it work.** A delegation
   used to be one line in the agents list: a name, a status badge, a duration.
   Whether it was a sub-agent reading three files or a workflow running a dozen

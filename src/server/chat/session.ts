@@ -17,11 +17,14 @@ import {
   defaultPermissionOptions,
   isAllowOption,
   isAskQuestionTool,
+  looksLikeAskCall,
+  askedQuestionFrom,
   normalizeQuestionOptions,
+  ASK_MCP_SERVER,
   ASK_QUESTION_TOOL_NAME,
 } from '../../shared/chat-events.js';
 import { isClearingCommand } from '../../shared/slash-commands.js';
-import { AdapterEvent, ChatAdapter } from './adapter.js';
+import { AdapterEvent, ChatAdapter, ChatAdapterOptions } from './adapter.js';
 import {
   PermissionAsk,
   PermissionAnswer,
@@ -30,9 +33,9 @@ import {
   QuestionReply,
   permissionHookSettings,
 } from './permission-broker.js';
-import { askMcpConfig } from './ask-mcp.js';
+import { ASK_SOCKET_ENV, askMcpConfig } from './ask-mcp.js';
 import { ChatStoreLike, ChatSessionRef } from './store.js';
-import { createChatAdapter, supportsChat } from './registry.js';
+import { askChannelFor, createChatAdapter, supportsChat } from './registry.js';
 
 /**
  * One chat conversation, owned by the server.
@@ -173,23 +176,24 @@ export class ChatSession {
   private readonly pending = new Map<string, PendingApproval>();
   private readonly questions = new Map<string, PendingQuestion>();
   /**
-   * Question tool calls the transcript has opened, oldest first, unclaimed.
+   * Question tool calls the transcript has opened and nothing has claimed yet.
    *
    * The MCP server that carries a question has no way to know the tool_use id of
    * the call it is serving — it only ever sees the arguments — so the pairing is
-   * made here instead, from the block the adapter has already reported.
+   * made here instead, from the block the adapter already reported.
    *
-   * A queue rather than a single slot, because a runtime may announce two tool
-   * calls in one message before running either: with one slot the second
-   * announcement would overwrite the first, the first question would claim the
-   * second call's id, and both cards would be drawn in the wrong place. Calls
-   * run in the order they were announced, so first in is first claimed.
+   * Matched on the question text first, and only then on announcement order.
+   * Order alone is not enough, which omp demonstrated: its model got the option
+   * schema wrong, the call was rejected before it ever reached the MCP server,
+   * and it retried. That leaves *two* announced calls for one question, and
+   * claiming the oldest pinned the card to the attempt that failed. Newest match
+   * first is the answer, because a retry is the later of the two.
    *
-   * An unclaimed id left over from a call that never reached the MCP server
-   * would mispair the next question, so the queue is emptied at the end of every
-   * turn — by which point nothing can still be waiting to claim one.
+   * An unclaimed entry left by a call that never reached the server would
+   * mispair a later question, so the list is emptied at the end of every turn —
+   * by which point nothing can still be waiting to claim one.
    */
-  private readonly askToolIds: string[] = [];
+  private askCalls: Array<{ toolId: string; question?: string }> = [];
   /** True once this session actually handed a runtime the question tool. */
   private questionsEnabled = false;
   private runtime = '';
@@ -299,7 +303,9 @@ export class ChatSession {
     // model that asks which of three approaches to take still needs a person.
     const wantsHook = !this.bypass && options.runtime === 'claude' && fs.existsSync(this.deps.hookScript);
     const askScript = this.deps.askScript;
-    const wantsAsk = options.runtime === 'claude' && Boolean(askScript) && fs.existsSync(askScript!);
+    const askChannel = askChannelFor(options.runtime);
+    const wantsAsk = Boolean(askChannel) && Boolean(askScript) && fs.existsSync(askScript!);
+    let askMcpServer: ChatAdapterOptions['askMcpServer'];
 
     if (wantsHook || wantsAsk) {
       // One shared directory, not one per session. A directory named after the
@@ -316,13 +322,25 @@ export class ChatSession {
         extraArgs.push('--settings', permissionHookSettings(this.deps.hookScript, socketPath));
         env.CCWEB_PERMISSION_SOCKET = socketPath;
       }
-      if (wantsAsk) {
+      if (wantsAsk && askChannel === 'cli') {
         extraArgs.push('--mcp-config', askMcpConfig(askScript!, socketPath));
         // Named explicitly rather than relying on the hook to wave it through:
         // with approvals bypassed there is no hook at all, and without this the
         // one tool whose whole purpose is to ask the user something would be the
         // one tool the runtime refused to run.
         extraArgs.push('--allowedTools', ASK_QUESTION_TOOL_NAME);
+        this.questionsEnabled = true;
+      }
+      if (wantsAsk && askChannel === 'protocol') {
+        // ACP agents take their MCP servers in the handshake rather than on the
+        // command line, so this goes to the adapter and is sent with
+        // `session/new`. Same script, same socket, same tool.
+        askMcpServer = {
+          name: ASK_MCP_SERVER,
+          command: process.execPath,
+          args: [askScript!],
+          env: { [ASK_SOCKET_ENV]: socketPath },
+        };
         this.questionsEnabled = true;
       }
     }
@@ -336,6 +354,7 @@ export class ChatSession {
       env,
       bypassPermissions: this.bypass,
       resumeSessionId: options.resumeSessionId,
+      askMcpServer,
       emit: (event) => this.ingest(event),
       readFile: this.deps.readFile
         ? (filePath) => this.deps.readFile!(this.ref.id, filePath)
@@ -457,11 +476,17 @@ export class ChatSession {
     // time the MCP server relays the question itself, the arguments are all it
     // knows. `block_start` carries the name, `tool` patches carry only the id,
     // so this is the one event that can make the pairing.
-    if (stamped.t === 'block_start' && stamped.block.kind === 'tool' && isAskQuestionTool(stamped.block.name)) {
-      this.askToolIds.push(stamped.block.toolId);
+    if (stamped.t === 'block_start' && stamped.block.kind === 'tool') {
+      this.noteAskCall(stamped.block.toolId, stamped.block.name, stamped.block.input);
+    }
+    // Claude streams its arguments in as JSON fragments, so a question tool call
+    // is announced before anything says what it asks. The parsed input lands
+    // later as a patch, which is the first point the text is knowable.
+    if (stamped.t === 'tool' && stamped.patch.input !== undefined) {
+      this.noteAskCall(stamped.toolId, stamped.patch.name, stamped.patch.input);
     }
     if (stamped.t === 'turn_end') {
-      this.askToolIds.length = 0;
+      this.askCalls = [];
     }
     if (stamped.t === 'question') {
       const existing = this.questions.get(stamped.request.requestId);
@@ -800,6 +825,45 @@ export class ChatSession {
   }
 
   /**
+   * Remember a tool call that might be a question, or fill in what it asks.
+   *
+   * Called for every tool block, so the cheap name check comes first. A call
+   * already known is updated rather than duplicated: the same id is reported
+   * twice — once on announcement and again when its arguments finish arriving.
+   */
+  private noteAskCall(toolId: string, name: string | undefined, input: unknown): void {
+    const existing = this.askCalls.find((call) => call.toolId === toolId);
+    if (!existing && !looksLikeAskCall(name, input)) return;
+
+    const question = askedQuestionFrom(input)?.question;
+    if (existing) {
+      if (question) existing.question = question;
+      return;
+    }
+    this.askCalls.push({ toolId, question });
+  }
+
+  /**
+   * Which announced call a question belongs to, if any.
+   *
+   * Claimed as it is answered, so a second question cannot attach itself to the
+   * same block — two cards in one place, one of them unanswerable, is worse than
+   * one card in the pinned fallback.
+   */
+  private claimAskCall(question: string): string | undefined {
+    // Newest text match wins; see the note on `askCalls` for why a retry makes
+    // that the right end to start from.
+    for (let at = this.askCalls.length - 1; at >= 0; at -= 1) {
+      if (this.askCalls[at].question === question) {
+        return this.askCalls.splice(at, 1)[0].toolId;
+      }
+    }
+    // Nothing matched on text — a runtime that reports no arguments, or reports
+    // them in a shape nothing here parses. Order is the fallback, oldest first.
+    return this.askCalls.shift()?.toolId;
+  }
+
+  /**
    * A question from the model, on its way to a person.
    *
    * The promise is the tool call: it resolves when someone clicks, and the MCP
@@ -827,7 +891,7 @@ export class ChatSession {
         // Claimed, not merely read: a second question must not attach itself to
         // the same tool block, which would draw two cards in one place and
         // leave the later one unanswerable.
-        toolId: this.askToolIds.shift(),
+        toolId: this.claimAskCall(question),
         question,
         header: typeof ask.header === 'string' && ask.header.trim() ? ask.header.trim() : undefined,
         multiSelect: ask.multiSelect === true,

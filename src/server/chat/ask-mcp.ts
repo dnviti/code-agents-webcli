@@ -76,17 +76,31 @@ export const ASK_TOOL_DEFINITION = {
       options: {
         type: 'array',
         minItems: 2,
-        description: 'The answers on offer. Keep this to a short, fixed list the user can scan.',
+        description:
+          'The answers on offer. Keep this to a short, fixed list the user can scan. ' +
+          'Each may be an object with a label and an optional description, or just the ' +
+          'label as a plain string.',
+        // A bare string is accepted as well as an object, because omp's model
+        // sent `["Tabs", "Spaces"]`, had the call rejected by schema validation
+        // before it ever reached this server, and had to burn a second round
+        // trip retrying. The shape was always understood here; only the schema
+        // objected.
         items: {
-          type: 'object',
-          properties: {
-            label: { type: 'string', description: 'The option, in a few words.' },
-            description: {
-              type: 'string',
-              description: 'One line on what picking this would mean. Optional but usually worth it.',
+          anyOf: [
+            { type: 'string', description: 'The option, in a few words.' },
+            {
+              type: 'object',
+              properties: {
+                label: { type: 'string', description: 'The option, in a few words.' },
+                description: {
+                  type: 'string',
+                  description:
+                    'One line on what picking this would mean. Optional but usually worth it.',
+                },
+              },
+              required: ['label'],
             },
-          },
-          required: ['label'],
+          ],
         },
       },
     },

@@ -14,9 +14,12 @@ const {
 } = require('../dist/shared/chat-reducer.js');
 const {
   isAskQuestionTool,
+  looksLikeAskCall,
+  askedQuestionFrom,
   normalizeQuestionOptions,
   ASK_QUESTION_TOOL_NAME,
 } = require('../dist/shared/chat-events.js');
+const { askChannelFor } = require('../dist/server/chat/registry.js');
 
 // Choice-based questions from the model, end to end (issue #42).
 //
@@ -567,13 +570,79 @@ describe('asking the user a choice-based question', function () {
       assert.strictEqual(server.env.CCWEB_ASK_SOCKET, '/tmp/s.sock');
     });
 
+    it('knows which runtimes have a verified way to take the server', function () {
+      // Only the ones this has actually been watched working on. A runtime that
+      // gets a flag nobody has seen it parse is a capability claim with nothing
+      // behind it.
+      assert.strictEqual(askChannelFor('claude'), 'cli');
+      assert.strictEqual(askChannelFor('kimi'), 'protocol');
+      assert.strictEqual(askChannelFor('omp'), 'protocol');
+      assert.strictEqual(askChannelFor('codex'), undefined);
+      assert.strictEqual(askChannelFor('nonesuch'), undefined);
+    });
+
     it('matches the namespaced name a runtime reports the call under', function () {
       // What the transcript actually contains, and therefore what the UI has to
       // match on to draw a card instead of a generic tool row.
       assert.ok(isAskQuestionTool('mcp__ccweb__ask_user_question'));
+      // One underscore, not two. This is how omp reports the very same tool,
+      // and an exact-name table would have silently failed for it while
+      // passing for Claude.
+      assert.ok(isAskQuestionTool('mcp__ccweb_ask_user_question'));
       assert.ok(isAskQuestionTool(ASK_TOOL_DEFINITION.name));
       assert.ok(!isAskQuestionTool('Bash'));
       assert.ok(!isAskQuestionTool(undefined));
+    });
+
+    it('recognises a call an ACP agent renamed past recognition', function () {
+      // ACP has no tool-name field: the adapter uses the agent's own title for
+      // the block, so the name is prose. The real name turns up in the
+      // arguments instead, which is why those are consulted too.
+      const rawInput = {
+        path: 'xd://mcp__ccweb_ask_user_question',
+        content: JSON.stringify({ question: 'Tabs or spaces?', options: ['Tabs', 'Spaces'] }),
+      };
+      assert.ok(!isAskQuestionTool('Asking tabs vs spaces preference'));
+      assert.ok(looksLikeAskCall('Asking tabs vs spaces preference', rawInput));
+      assert.ok(!looksLikeAskCall('Reading a file', { path: '/etc/hosts' }));
+    });
+
+    it('reads the question back out of either shape a runtime reports', function () {
+      const direct = askedQuestionFrom({
+        question: 'Tabs or spaces?',
+        header: 'Indent',
+        multiSelect: true,
+        options: [{ label: 'Tabs' }, { label: 'Spaces', description: 'wider' }],
+      });
+      assert.strictEqual(direct.question, 'Tabs or spaces?');
+      assert.strictEqual(direct.multiSelect, true);
+      assert.strictEqual(direct.options[1].description, 'wider');
+
+      // omp's envelope: the arguments arrive as a JSON string beside a path.
+      const wrapped = askedQuestionFrom({
+        path: 'xd://mcp__ccweb_ask_user_question',
+        content: JSON.stringify({ question: 'Tabs or spaces?', options: ['Tabs', 'Spaces'] }),
+      });
+      assert.strictEqual(wrapped.question, 'Tabs or spaces?');
+      assert.deepStrictEqual(wrapped.options.map((o) => o.label), ['Tabs', 'Spaces']);
+      assert.strictEqual(wrapped.multiSelect, false);
+    });
+
+    it('reads nothing out of a call that is not a question', function () {
+      assert.strictEqual(askedQuestionFrom(undefined), null);
+      assert.strictEqual(askedQuestionFrom('nope'), null);
+      assert.strictEqual(askedQuestionFrom({ question: 'no options?' }), null);
+      assert.strictEqual(askedQuestionFrom({ content: 'not json' }), null);
+    });
+
+    it('accepts bare string options in the tool schema', function () {
+      // omp's model sent `["Tabs","Spaces"]`, the call was rejected by schema
+      // validation before it ever reached this server, and it burned a round
+      // trip retrying. The shape was always understood; only the schema objected.
+      const item = ASK_TOOL_DEFINITION.inputSchema.properties.options.items;
+      assert.ok(Array.isArray(item.anyOf), 'options items should accept more than one shape');
+      assert.ok(item.anyOf.some((shape) => shape.type === 'string'));
+      assert.ok(item.anyOf.some((shape) => shape.type === 'object'));
     });
   });
 
