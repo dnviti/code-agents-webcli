@@ -32,6 +32,13 @@ import { PlanPanel } from './PlanPanel.js';
  * they can be read as a sequence of work rather than as interruptions in the
  * middle of a sentence. What is left behind is a work pill: how much happened,
  * and one click to go and look at it. Moved, never hidden.
+ *
+ * A step that was *only* machinery therefore has nothing left to say, and gets
+ * no row at all — a glyph, a clock and a pill with no sentence beside them is a
+ * row the eye has to stop on to learn that nothing was said. Its work is not
+ * lost: the list hands those ids to the next message that does speak (see
+ * `carriedIds`), whose pill counts them and whose "show work" lands on the
+ * first of them. The rail keeps every event either way.
  */
 
 export interface MessageBubbleProps {
@@ -48,6 +55,14 @@ export interface MessageBubbleProps {
   onRetry?: (messageId: string) => void;
   /** Open the rail and scroll its timeline to this message's first event. */
   onShowWork?: (messageId: string) => void;
+  /**
+   * Ids of the silent steps this message speaks for, oldest first, comma-joined.
+   *
+   * A string rather than an array because it is a prop of a `React.memo`
+   * component: a fresh array per render would compare unequal every time and
+   * re-render the whole transcript on every streamed token.
+   */
+  carriedIds?: string;
   /** Put this turn's text back in the composer, unsent. */
   onEdit?: (text: string) => void;
   /** Count reasoning blocks in the work pill, per the chat display settings. */
@@ -63,16 +78,32 @@ export const MessageBubble = React.memo(function MessageBubble({
   onRetry,
   onShowWork,
   onEdit,
+  carriedIds = '',
   showThinking = true,
   showToolCalls = true,
 }: MessageBubbleProps) {
   const id = message.id;
 
+  // This message, plus the silent steps it speaks for — a tool call can report
+  // how long it took after the message it belongs to has closed and the next
+  // one has opened, and a pill that inherited that call has to hear about it.
+  // Still one bubble per event rather than the whole list: nothing here widens
+  // to the transcript.
+  const watched = React.useMemo(() => [id, ...splitIds(carriedIds)], [id, carriedIds]);
+
   const subscribe = React.useCallback(
-    (listener: () => void) => transcript.subscribeMessage(id, listener),
-    [transcript, id],
+    (listener: () => void) => {
+      const offs = watched.map((each) => transcript.subscribeMessage(each, listener));
+      return () => {
+        for (const off of offs) off();
+      };
+    },
+    [transcript, watched],
   );
-  const getVersion = React.useCallback(() => transcript.getMessageVersion(id), [transcript, id]);
+  const getVersion = React.useCallback(
+    () => watched.reduce((sum, each) => sum + transcript.getMessageVersion(each), 0),
+    [transcript, watched],
+  );
   // Static rendering has no subscription to read from, so the server snapshot
   // is a constant; the third argument is required or React throws there.
   const version = React.useSyncExternalStore(subscribe, getVersion, ZERO);
@@ -95,13 +126,23 @@ export const MessageBubble = React.memo(function MessageBubble({
     && current.blocks.length > 0
     && current.blocks.every((block) => block.kind === 'notice');
 
-  // Derived from this message's own blocks, not from a list handed down. An
-  // events array as a prop would be a new object identity every render and
-  // would defeat React.memo for the whole transcript on every streamed token.
+  // Derived from blocks, not from a list handed down. An events array as a prop
+  // would be a new object identity every render and would defeat React.memo for
+  // the whole transcript on every streamed token — which is also why the silent
+  // steps this message speaks for arrive as a joined string of ids.
+  //
+  // Those steps are resolved through the transcript rather than subscribed to:
+  // a step only becomes silent-and-carried once the message after it has opened,
+  // by which time nothing is still streaming into it.
   const work = React.useMemo(
-    () => summariseWork(current, showThinking, showToolCalls),
+    () => {
+      const carried = splitIds(carriedIds)
+        .map((carriedId) => transcript.message(carriedId))
+        .filter((message): message is ChatMessage => Boolean(message));
+      return summariseWork([...carried, current], showThinking, showToolCalls);
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [current, version, showThinking, showToolCalls],
+    [transcript, current, version, carriedIds, showThinking, showToolCalls],
   );
 
   const copy = React.useCallback(() => {
@@ -119,12 +160,22 @@ export const MessageBubble = React.memo(function MessageBubble({
       });
   }, [current]);
 
-  // Nothing left to draw: an assistant turn that was only machinery, with both
-  // display toggles off. An empty bordered row is worse than no row — it reads
-  // as a message that failed to render rather than as one the settings hid.
-  if (!isUser && !isMarker && !current.streaming && visibleBlocks(current) === 0 && work.total === 0) {
-    return null;
-  }
+  // Nothing to say: a step that was only machinery. Its tool calls and its
+  // reasoning are on the rail, and its count is carried onto the next message
+  // that does speak, so the row itself would be an empty bordered strip with a
+  // clock on it — indistinguishable from a message that failed to render.
+  //
+  // Independent of the display settings, and independent of `streaming`: a step
+  // that has so far produced only tool calls is exactly the case this is about,
+  // and the live ribbon is what says the agent is working while it does.
+  //
+  // The one row kept: a message that has opened and produced *nothing* yet,
+  // while streaming. That is the caret between sending and the first block
+  // arriving, and it is a reply about to happen rather than machinery.
+  //
+  // The rule itself lives in `hasVisibleContent` because the list decides which
+  // ids to carry with it, and the two answers must be the same one.
+  if (!hasVisibleContent(current)) return null;
 
   if (isMarker) {
     return (
@@ -192,7 +243,10 @@ export const MessageBubble = React.memo(function MessageBubble({
         {current.streaming && visibleBlocks(current) === 0 ? <Caret /> : null}
 
         {!isUser && work.total > 0 && onShowWork ? (
-          <WorkPill label={work.label} onClick={() => onShowWork(id)} />
+          // Aimed at the earliest step it counts, not at this message: the point
+          // of the pill on a reply that follows silent work is to open the trace
+          // at the *start* of that stretch.
+          <WorkPill label={work.label} onClick={() => onShowWork(work.firstId || id)} />
         ) : null}
 
         {isUser ? null : <Footer model={current.model} usage={current.usage} />}
@@ -272,32 +326,68 @@ function visibleBlocks(message: ChatMessage): number {
   return message.blocks.filter((block) => block.kind !== 'thinking' && block.kind !== 'tool').length;
 }
 
+/**
+ * Whether this message gets a row of its own in the transcript.
+ *
+ * The list needs the same answer the bubble reaches, because it is what decides
+ * which ids are carried onto the next message that speaks. Exported rather than
+ * duplicated: two copies of this rule drifting apart would silently either
+ * double-count a step or drop it from every pill.
+ */
+export function hasVisibleContent(message: ChatMessage): boolean {
+  if (message.role === 'user') return true;
+  if (visibleBlocks(message) > 0) return true;
+  // Opened and still empty: the caret. See the early return in the bubble.
+  return message.blocks.length === 0 && Boolean(message.streaming);
+}
+
+/** Split a carried-ids prop back into ids. */
+function splitIds(joined: string): string[] {
+  return joined ? joined.split(',') : [];
+}
+
 interface WorkSummary {
   total: number;
   label: string;
+  /** The earliest message that contributed, so the pill can point there. */
+  firstId?: string;
 }
 
 /**
- * What the pill says: how much machinery this message carried.
+ * What the pill says: how much machinery these messages carried.
+ *
+ * Takes a list rather than one message because a reply speaks for the silent
+ * steps before it as well as for itself — "3 commands" on a sentence that ran
+ * one of them and inherited two is the honest figure, and a pill per step is
+ * exactly the clutter that was removed.
  *
  * Duration is summed from the calls that reported one rather than measured
  * between timestamps — a message's `ts` is when it opened, and the gap to the
  * next one includes however long the user spent reading.
  */
 function summariseWork(
-  message: ChatMessage,
+  messages: ChatMessage[],
   showThinking: boolean,
   showToolCalls: boolean,
 ): WorkSummary {
   let tools = 0;
   let reasoning = 0;
   let durationMs = 0;
-  for (const block of message.blocks) {
-    if (block.kind === 'tool' && showToolCalls) {
-      tools += 1;
-      if (block.durationMs !== undefined) durationMs += block.durationMs;
-    } else if (block.kind === 'thinking' && showThinking) {
-      reasoning += 1;
+  let firstId: string | undefined;
+  for (const message of messages) {
+    for (const block of message.blocks) {
+      if (block.kind === 'tool' && showToolCalls) {
+        tools += 1;
+        if (block.durationMs !== undefined) durationMs += block.durationMs;
+      } else if (block.kind === 'thinking' && showThinking) {
+        reasoning += 1;
+      } else {
+        continue;
+      }
+      // The first *counted* block, not the first carried id: a step whose only
+      // activity the display settings dropped has nothing on the timeline to
+      // land on, and focusing it would open the rail on nothing.
+      if (firstId === undefined) firstId = message.id;
     }
   }
 
@@ -309,7 +399,7 @@ function summariseWork(
     if (formatted) bits.push(formatted);
   }
 
-  return { total: tools + reasoning, label: bits.join(' · ') };
+  return { total: tools + reasoning, label: bits.join(' · '), firstId };
 }
 
 /**

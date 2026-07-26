@@ -196,6 +196,44 @@ describe('MessageBubble', function () {
     assert.strictEqual(html, '');
   });
 
+  // Issue #46. A step the agent spent entirely on tools said nothing, and a row
+  // with a glyph, a clock and a pill on it is a row the eye stops on to learn
+  // that nothing was said.
+  it('gives a step that only ran commands no row of its own', function () {
+    const tools = [EVERY_BLOCK[1], EVERY_BLOCK[2]];
+    assert.strictEqual(renderBubble(message({ blocks: tools }), { onShowWork: () => {} }), '');
+    // While it is still running, too — the live ribbon is what says the agent
+    // is working, and a row that appears and then vanishes is worse than none.
+    assert.strictEqual(
+      renderBubble(message({ blocks: tools, streaming: true }), { onShowWork: () => {} }),
+      '',
+    );
+  });
+
+  it('still shows the caret for a reply that has opened but produced nothing', function () {
+    // The gap between sending and the first block: a reply about to happen, not
+    // machinery, so suppressing tool-only steps must not take it with them.
+    const html = renderBubble(message({ blocks: [], streaming: true }), { onShowWork: () => {} });
+    assert.ok(/relay-cursor-blink/.test(html));
+  });
+
+  it('counts the silent steps it was handed, not only its own work', function () {
+    const { renderToStaticMarkup, React, MessageBubble } = mod;
+    const silent = message({ blocks: [EVERY_BLOCK[2], EVERY_BLOCK[2]] });
+    const spoke = message({ blocks: [{ kind: 'text', text: 'done' }, EVERY_BLOCK[2]] });
+    const t = transcriptOf([silent, spoke]);
+    const html = renderToStaticMarkup(
+      React.createElement(MessageBubble, {
+        message: spoke,
+        transcript: t,
+        onShowWork: () => {},
+        carriedIds: silent.id,
+      }),
+    );
+    assert.ok(/3 commands/.test(html), 'the pill speaks for the whole stretch');
+    assert.ok(/show work/.test(html));
+  });
+
   it('tells the retry handler which message it belongs to', function () {
     // It used to take no argument, so the handler guessed — and it guessed
     // "whichever turn is selected", which is not the one you clicked.
@@ -406,6 +444,46 @@ describe('MessageList', function () {
     ]);
     assert.ok(/do the thing/.test(html));
     assert.ok(/relay-cursor-blink/.test(html));
+  });
+
+  // Issue #46: the whole point of dropping the silent rows is that their work
+  // still has to be reachable from the conversation.
+  it('hands a silent step’s work to the reply that follows it', function () {
+    const tool = () => ({
+      kind: 'tool',
+      toolId: `t${Math.random()}`,
+      name: 'bash',
+      toolKind: 'execute',
+      status: 'completed',
+      input: { command: 'npm test' },
+    });
+    const html = renderList(
+      [
+        message({ role: 'user', blocks: [{ kind: 'text', text: 'run the tests' }] }),
+        message({ blocks: [tool(), tool()] }),
+        message({ blocks: [{ kind: 'text', text: 'all green' }, tool()] }),
+      ],
+      { onShowWork: () => {} },
+    );
+
+    const rows = html.match(/aria-label="Assistant message"/g) || [];
+    assert.strictEqual(rows.length, 1, 'the silent step must not be a row of its own');
+    assert.ok(/all green/.test(html), 'the reply is still there');
+    assert.ok(/3 commands/.test(html), 'and its pill counts the stretch that led to it');
+  });
+
+  it('drops silent steps a turn never followed with a reply', function () {
+    // Nothing to hang them on, and inventing a row for them is the thing this
+    // removes. The turn strip still counts them and the rail still holds them.
+    const html = renderList(
+      [
+        message({ role: 'user', blocks: [{ kind: 'text', text: 'go' }] }),
+        message({ blocks: [EVERY_BLOCK[2]] }),
+      ],
+      { onShowWork: () => {} },
+    );
+    assert.ok(!/aria-label="Assistant message"/.test(html));
+    assert.ok(/turn 1/.test(html), 'the turn itself is still on screen');
   });
 
   it('renders a 500-message transcript', function () {

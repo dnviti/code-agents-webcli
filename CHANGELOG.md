@@ -29,6 +29,20 @@
   reach the delegation that made them.
 
 ### Changed
+- **The conversation only shows what was actually said.** When the agent spent a
+  step running commands without writing anything, the transcript still drew a
+  row for it: an icon, a clock and a small work pill with no sentence beside
+  them. A long task could put half a dozen of those between one reply and the
+  next, and skimming the chat meant stepping over rows that said nothing.
+
+  Those steps no longer appear in the conversation. The moment a written reply
+  arrives, it carries the pill for everything that led up to it — "3 commands ·
+  1 reasoning · 8.1s" on the sentence that came out of them — and opening it
+  lands on the trace at the *start* of that stretch rather than at the reply's
+  own last command. Nothing is hidden: the trace holds every call exactly as
+  before, and a trace row or a search hit that points at a suppressed step now
+  scrolls to the reply that speaks for it.
+
 - **A phone gets a layout built around the conversation.** It used to be the
   desktop layout at the same size: the figures you read mid-session — the cost,
   the model, the state, whether approvals are bypassed — were set smaller than
@@ -78,6 +92,11 @@
   past the space it had and was painted over the two things below it.
 
 ### Internal
+- A browser check covers the suppressed steps end to end — that they leave no
+  row, that the trace still holds them, and that clicking the reply's pill lands
+  on the first of them. The suite's virtual-time budget grew with it: a run that
+  outgrows the budget reports no results rather than a failure, so it now has
+  room over what the checks need.
 - The automated browser checks run at phone viewports (portrait, keyboard-open
   and landscape), with each of the phone's own disclosures and its menu open in
   turn, and assert the geometry rather than the intent: target size, the space

@@ -4,6 +4,7 @@ import { uploadAttachment } from '../../chat/attachments-api.js';
 import { ChatController, type ChatUnavailable } from '../../chat/controller.js';
 import { fetchStatus, findFiles } from '../../chat/workspace-api.js';
 import { activityEvents } from '../../chat/activity.js';
+import type { ChatTranscript } from '../../chat/transcript.js';
 import { groupTurns, isTurnOpen, turnOf, type TurnSummary } from '../../chat/turns.js';
 import type { ChatPanelId, ChatViewSettings } from '../../chat/view-settings.js';
 import {
@@ -20,7 +21,7 @@ import { PhoneContext } from '../../ui/touch.js';
 import { FloatingMenu } from '../FloatingMenu.js';
 import { Composer } from './Composer.js';
 import { MessageList, type MessageListHandle } from './MessageList.js';
-import { messageText } from './MessageBubble.js';
+import { hasVisibleContent, messageText } from './MessageBubble.js';
 import { PermissionCard } from './PermissionCard.js';
 import { PlanPanel } from './PlanPanel.js';
 import { SessionHeader } from './SessionHeader.js';
@@ -367,13 +368,18 @@ export function ChatView({
     (messageId: string) => {
       const turn = turnOf(messageId, turns);
       if (turn) openTurn(turn.id);
+      // A step that only ran commands has no row of its own (issue #46), and a
+      // trace row or a search hit pointing at one would scroll to an element
+      // that is not in the document — a click that does nothing at all. The
+      // reply that speaks for it is the row to land on instead.
+      const target = rowFor(messageId, turn, transcript);
       // A turn that was just opened has not painted yet — its bubbles have no
       // layout box to scroll to until the next tick. A turn already open
       // scrolls one tick later than it strictly needs to, which nothing on
       // screen can tell apart from immediate.
-      window.setTimeout(() => list.current?.scrollToMessage(messageId), 0);
+      window.setTimeout(() => list.current?.scrollToMessage(target), 0);
     },
-    [turns, openTurn],
+    [turns, openTurn, transcript],
   );
 
   const copyTurn = React.useCallback(
@@ -903,6 +909,40 @@ export function ChatView({
 }
 
 const ZERO = (): number => 0;
+
+/**
+ * The row that stands for a message on screen.
+ *
+ * Itself, unless it is a step that said nothing — then the next message in its
+ * turn that did, because that is the one carrying its work pill. Failing that,
+ * the last one before it, so a turn whose tail is all machinery still lands
+ * somewhere. Falls back to the id given, which scrolls nowhere and is exactly
+ * what happened before this existed.
+ *
+ * Exported so the rule can be asserted directly: everything it guards happens
+ * inside a `setTimeout` around a scroll, which a rendered tree cannot show.
+ */
+export function rowFor(
+  messageId: string,
+  turn: TurnSummary | undefined,
+  transcript: ChatTranscript,
+): string {
+  const message = transcript.message(messageId);
+  if (!turn || !message || hasVisibleContent(message)) return messageId;
+
+  const ids = turn.messageIds;
+  const at = ids.indexOf(messageId);
+  if (at < 0) return messageId;
+
+  const visible = (id: string): boolean => {
+    const other = transcript.message(id);
+    return Boolean(other && hasVisibleContent(other));
+  };
+  const after = ids.slice(at + 1).find(visible);
+  if (after) return after;
+  const before = ids.slice(0, at).filter(visible).pop();
+  return before || messageId;
+}
 
 function viewportHeight(): number {
   return typeof window === 'undefined' ? 900 : window.innerHeight;
