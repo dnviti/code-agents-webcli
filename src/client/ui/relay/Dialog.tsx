@@ -1,4 +1,6 @@
 import * as React from 'react';
+
+import { TOUCH_TARGET } from '../touch.js';
 import { Icon } from './Icon';
 
 export interface DialogProps {
@@ -321,8 +323,13 @@ export function Dialog({
   const headerRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 };
   const titleStyle: React.CSSProperties = { margin: 0, fontFamily: 'var(--font-sans)', fontSize: 'var(--text-body)', fontWeight: 'var(--font-semibold)' as React.CSSProperties['fontWeight'], color: 'var(--foreground)' };
   const closeStyle: React.CSSProperties = {
-    border: 'none', background: 'transparent', color: 'var(--muted-foreground)', cursor: 'pointer', fontSize: 15, lineHeight: 1, padding: 2,
+    border: 'none', background: 'transparent', color: 'var(--muted-foreground)', cursor: 'pointer', fontSize: bottom ? 20 : 15, lineHeight: 1, padding: 2,
     borderRadius: 'var(--radius)',
+    // A bottom sheet is the phone form of this dialog — see `placement` — so
+    // its one control is sized for a thumb rather than a cursor. 17x19px of
+    // glyph is what a finger has to find otherwise, in the corner of the
+    // screen, next to nothing that would forgive a miss.
+    ...(bottom ? { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: TOUCH_TARGET, height: TOUCH_TARGET, marginRight: -10 } : null),
     boxShadow: closeFocusVisible ? 'var(--shadow-focus)' : undefined,
   };
   const descriptionStyle: React.CSSProperties = { margin: '6px 0 0', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-sm)', color: 'var(--muted-foreground)', lineHeight: 'var(--leading-normal)' };

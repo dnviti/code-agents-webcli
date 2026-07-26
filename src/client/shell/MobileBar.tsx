@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { Icon } from '../ui/relay/Icon';
+import { PHONE_TEXT } from '../ui/touch';
 
 export interface MobileBarAction {
   id: string;
@@ -81,7 +82,10 @@ export function MobileBar({ actions }: MobileBarProps): React.JSX.Element {
             color: action.active ? 'var(--foreground)' : 'var(--muted-foreground)',
             opacity: action.disabled ? 0.4 : 1,
             fontFamily: 'var(--font-sans)',
-            fontSize: 'var(--text-2xs)',
+            // This bar only ever exists on a phone, so it takes the phone scale
+            // outright rather than asking whether it is on one. 10px labels
+            // under a 20px glyph were a caption for a control, not its name.
+            fontSize: PHONE_TEXT.meta,
             letterSpacing: 'var(--tracking-wide)',
             cursor: action.disabled ? 'not-allowed' : 'pointer',
             // A tap that paints a lingering highlight reads as a stuck button.

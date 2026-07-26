@@ -21,6 +21,9 @@ import { DEFAULT_CHAT_VIEW } from '../../src/client/chat/view-settings';
 import { createTerminalController, LIVE_SCROLLBACK_LINES } from '../../src/client/terminal/controller';
 import { HistoryView } from '../../src/client/terminal/history-view';
 import { Dialog } from '../../src/client/ui/relay/Dialog';
+import { MobileBar } from '../../src/client/shell/MobileBar';
+import { MoreSheet } from '../../src/client/shell/MoreSheet';
+import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
 
 const results: string[] = [];
 const check = (name: string, ok: boolean, detail = ''): void => {
@@ -227,6 +230,7 @@ async function run(): Promise<void> {
   await checkTheFixedBarsNeverWrap();
   await checkALiveAnswerAppearsAsItStreams();
   await checkThePhoneLayoutIsUsable();
+  await checkThePhoneShellSurfacesAreUsable();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -748,11 +752,16 @@ const PHONE_TARGET = 44;
 const PHONE_GAP = 8;
 
 /** Visible, non-decorative, and not a screen-reader-only clone. */
+/** The view a node actually lives in — this page's, or an iframe's. */
+function viewOf(node: Element): Window {
+  return node.ownerDocument?.defaultView ?? window;
+}
+
 function isPainted(node: Element): boolean {
   const box = node.getBoundingClientRect();
   if (box.width <= 2 || box.height <= 2) return false;
   if (node.closest('[aria-hidden="true"]')) return false;
-  const styles = window.getComputedStyle(node);
+  const styles = viewOf(node).getComputedStyle(node);
   return styles.visibility !== 'hidden' && styles.display !== 'none' && styles.opacity !== '0';
 }
 
@@ -782,7 +791,7 @@ function paintedControls(root: HTMLElement): HTMLElement[] {
 /** Whether any ancestor up to the host deliberately scrolls this node sideways. */
 function scrollsSideways(node: Element): boolean {
   for (let at: Element | null = node.parentElement; at; at = at.parentElement) {
-    const overflowX = window.getComputedStyle(at).overflowX;
+    const overflowX = viewOf(at).getComputedStyle(at).overflowX;
     if (overflowX === 'auto' || overflowX === 'scroll') return true;
   }
   return false;
@@ -798,7 +807,7 @@ function paintedText(root: HTMLElement): Array<{ node: HTMLElement; size: number
       .join(' ')
       .trim();
     if (!own || !isPainted(node)) continue;
-    out.push({ node, size: parseFloat(window.getComputedStyle(node).fontSize) || 0, text: own });
+    out.push({ node, size: parseFloat(viewOf(node).getComputedStyle(node).fontSize) || 0, text: own });
   }
   return out;
 }
@@ -904,7 +913,7 @@ function assertPhoneSurface(host: HTMLElement, where: string): void {
       check(`${label} is on screen in ${where}`, false, 'not found');
       continue;
     }
-    const size = parseFloat(window.getComputedStyle(node).fontSize) || 0;
+    const size = parseFloat(viewOf(node).getComputedStyle(node).fontSize) || 0;
     check(
       `${label} is at least ${PHONE_LIVE_TEXT}px in ${where}`,
       size >= PHONE_LIVE_TEXT - 0.01,
@@ -919,7 +928,7 @@ function assertPhoneSurface(host: HTMLElement, where: string): void {
     if (!isPainted(node)) return false;
     // Popovers and sheets are allowed to be positioned relative to the
     // viewport rather than this host.
-    if (window.getComputedStyle(node).position === 'fixed') return false;
+    if (viewOf(node).getComputedStyle(node).position === 'fixed') return false;
     // Nor is a row that deliberately scrolls sideways off-screen: the workspace
     // tab strip is a scroller with a way back to what it is hiding. What this
     // is looking for is content pushed out of a box that does not scroll.
@@ -1062,3 +1071,124 @@ run().catch((error: unknown) => {
   pre.textContent = `FAIL :: threw :: ${error instanceof Error ? error.stack : String(error)}`;
   document.body.appendChild(pre);
 });
+
+/**
+ * The chat surface is not the whole phone (issue #51).
+ *
+ * The bottom bar, its more sheet and the tab switcher live in the app shell,
+ * above and beside every conversation — none of them is reachable from a
+ * ChatView fixture, so they need their own mount or they go the way the phone
+ * layout went: untested and therefore unchanged.
+ *
+ * The terminal's key strip is deliberately not here. It is the terminal's own
+ * on-screen controls, which issue #51 lists as a non-goal — they were sized
+ * for a thumb when they were added, under their own issue.
+ */
+async function checkThePhoneShellSurfacesAreUsable(): Promise<void> {
+  const noop = (): void => {};
+  const surfaces: Array<[string, () => React.ReactElement]> = [
+    ['the bottom bar', () =>
+      React.createElement(MobileBar, {
+        actions: [
+          { id: 'sessions', label: 'Sessions', icon: 'layers', onPress: noop, expands: true },
+          { id: 'keys', label: 'Keys', icon: 'keyboard', onPress: noop, toggle: true },
+          { id: 'chat', label: 'Chat', icon: 'message-square', onPress: noop, active: true },
+          { id: 'esc', label: 'Esc', icon: 'corner-up-left', onPress: noop },
+          { id: 'more', label: 'More', icon: 'ellipsis', onPress: noop, expands: true },
+        ],
+      } as never)],
+    ['the more sheet', () =>
+      React.createElement(MoreSheet, {
+        open: true, theme: 'dark', logoutUrl: '/logout', canCloseSession: true,
+        install: { supported: true, reason: null } as never,
+        onInstall: noop, onClose: noop, onReconnect: noop, onClearTerminal: noop,
+        onSwitchMode: noop, onCloseSession: noop, onOpenSettings: noop,
+        onToggleTheme: noop, onRename: noop,
+      } as never)],
+    ['the tab switcher', () =>
+      React.createElement(TabSwitcherSheet, {
+        open: true,
+        tabs: [
+          { id: 't1', title: 'a session with a fairly long name', kind: 'terminal' },
+          { id: 't2', title: 'another one', kind: 'chat' },
+        ],
+        activeId: 't1',
+        onSelect: noop, onCloseTab: noop, onNew: noop, onAllSessions: noop, onClose: noop,
+      } as never)],
+  ];
+
+  for (const [name, render] of surfaces) {
+    // An iframe, not a sized div.
+    //
+    // Two of these four surfaces are `Dialog`s, and a Dialog portals to
+    // `document.body` and positions itself against the *viewport*. Measured
+    // inside this page it would be 800px wide whatever the host div says — so
+    // the one thing being asked ("does it fit a phone?") would be answered
+    // about a desktop. An iframe has a viewport of its own.
+    const frame = document.createElement('iframe');
+    frame.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;border:0';
+    document.body.appendChild(frame);
+    const doc = frame.contentDocument as Document;
+    doc.open();
+    doc.write(
+      '<!doctype html><html><head>'
+      + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
+      + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+      + '</head><body style="margin:0"></body></html>',
+    );
+    doc.close();
+    await wait(150);
+
+    const host = doc.body;
+    const root = createRoot(host);
+    root.render(render());
+    await wait(300);
+
+    const target = host;
+    const controls = paintedControls(target);
+    if (controls.length === 0) {
+      check(`${name} renders on a phone`, false, 'no controls found');
+      root.unmount();
+      frame.remove();
+      continue;
+    }
+
+    const small = controls.filter((node) => {
+      const box = node.getBoundingClientRect();
+      return box.width < PHONE_TARGET - 0.5 || box.height < PHONE_TARGET - 0.5;
+    });
+    check(
+      `every control in ${name} is at least ${PHONE_TARGET}px`,
+      small.length === 0,
+      small.length
+        ? small.slice(0, 8).map((n) => {
+            const b = n.getBoundingClientRect();
+            return `${describe(n)}=${Math.round(b.width)}x${Math.round(b.height)}`;
+          }).join(' | ')
+        : `${controls.length} controls`,
+    );
+
+    const tiny = paintedText(target).filter((t) => t.size < PHONE_MIN_TEXT - 0.01);
+    check(
+      `no text in ${name} is smaller than ${PHONE_MIN_TEXT}px`,
+      tiny.length === 0,
+      tiny.length
+        ? tiny.slice(0, 8).map((t) => `${describe(t.node, t.text)}@${t.size}px`).join(' | ')
+        : 'all legible',
+    );
+
+    const offscreen = Array.from(target.querySelectorAll<HTMLElement>('*')).filter((node) => {
+      if (!isPainted(node) || scrollsSideways(node)) return false;
+      const box = node.getBoundingClientRect();
+      return box.right > 391 || box.left < -1;
+    });
+    check(
+      `nothing in ${name} is pushed off the side`,
+      offscreen.length === 0,
+      offscreen.length ? offscreen.slice(0, 6).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
+    );
+
+    root.unmount();
+    frame.remove();
+  }
+}
