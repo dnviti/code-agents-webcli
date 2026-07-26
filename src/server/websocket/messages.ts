@@ -15,6 +15,29 @@ import { sendToWebSocket, broadcastChat, broadcastToSession } from './handler.js
 import { chatUnavailableReason, isChatRuntime } from '../../shared/chat-runtimes.js';
 import { ChatNotRunningError } from '../chat/session.js';
 
+/**
+ * The longest model name worth storing. Real ones are far shorter; this only
+ * has to stop an unbounded string from being persisted and then handed to a
+ * spawn on every future launch of the conversation.
+ */
+const MAX_MODEL_NAME = 200;
+
+/**
+ * Tidy a typed model name into something safe to keep.
+ *
+ * Names are never validated against a list — a runtime knows its own models
+ * and new ones appear without us — so this only removes what can't belong in
+ * one: control characters, which would otherwise ride into the best-effort
+ * `/model <name>` turn as extra lines, and unbounded length.
+ */
+function normaliseModelName(raw: string): string | undefined {
+  const stripped = raw.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').trim();
+  // Sliced by code point, not by code unit: cutting mid-character would store
+  // half a surrogate pair.
+  const cleaned = [...stripped].slice(0, MAX_MODEL_NAME).join('').trim();
+  return cleaned || undefined;
+}
+
 export interface MessageProcessorDeps {
   dev: boolean;
   claudeSessions: Map<string, SessionRecord>;
@@ -88,6 +111,10 @@ export interface ChatManagerLike {
   snapshot(record: SessionRecord): Promise<unknown>;
   send(sessionId: string, turn: { text: string; attachments?: unknown[] }): Promise<void>;
   interrupt(sessionId: string): Promise<void>;
+  /** Switch a live session's model. False when nothing is running, or the adapter cannot. */
+  setModel(sessionId: string, model: string): Promise<boolean>;
+  /** Carry a new model into the options an in-place `/clear` restart replays. */
+  rememberModel(sessionId: string, model: string | undefined): void;
   cancelQueued(sessionId: string, queuedId: string): boolean;
   respondPermission(sessionId: string, requestId: string, optionId: string): boolean;
   stop(sessionId: string): Promise<void>;
@@ -118,6 +145,8 @@ interface IncomingMessage {
   agentKind?: string;
   /** Identifies one turn waiting in the send-ahead queue. */
   queuedId?: string;
+  /** A conversation-scoped model to switch to, or null/empty to clear the override. */
+  model?: string | null;
 }
 
 export class MessageProcessor {
@@ -197,6 +226,10 @@ export class MessageProcessor {
 
       case 'chat_interrupt':
         await this.handleChatInterrupt(wsInfo, data);
+        break;
+
+      case 'chat_set_model':
+        await this.handleChatSetModel(wsInfo, data);
         break;
 
       case 'chat_queue_cancel':
@@ -466,13 +499,21 @@ export class MessageProcessor {
     //
     // Profile values are deliberately *not* read from `options`: everything in
     // safeOptions came from the browser, and the whole point of the profile is
-    // that it is server-side configuration the client cannot forge.
+    // that it is server-side configuration the client cannot forge. (`model`
+    // is the one exception below: a conversation's own override is allowed to
+    // beat it, but only for that conversation, never written back to the profile.)
     const profile = this.deps.resolveRuntimeProfile(agentKind, session.workingDir);
     if (profile) {
       if (profile.model) safeOptions.model = profile.model;
       if (profile.extraArgs?.length) safeOptions.extraArgs = profile.extraArgs;
       if (profile.env && Object.keys(profile.env).length) safeOptions.env = profile.env;
       console.log(`Applying runtime profile "${profile.profileName}" to ${agentKind}`);
+    }
+    // A model chosen for this conversation beats the profile default, but only
+    // for this one launch: it is never written back as a new profile or
+    // personal default.
+    if (session.chatModelOverride) {
+      safeOptions.model = session.chatModelOverride;
     }
 
     // The scrollback recorder is born on the first output byte, before any
@@ -975,7 +1016,9 @@ export class MessageProcessor {
       const chat = await manager.start(session, {
         runtime: agentKind,
         workingDir: session.workingDir,
-        model: profile?.model,
+        // Conversation-scoped override beats the profile default, for this
+        // launch only — see chat_set_model.
+        model: session.chatModelOverride || profile?.model,
         extraArgs: profile?.extraArgs,
         env: profile?.env,
         bypassPermissions,
@@ -1012,6 +1055,7 @@ export class MessageProcessor {
           workingDir: session.workingDir,
           capabilities: chat.currentCapabilities,
           bypassPermissions: chat.bypassing,
+          modelOverride: session.chatModelOverride || null,
         },
         this.deps.claudeSessions,
         this.deps.webSocketConnections,
@@ -1054,7 +1098,12 @@ export class MessageProcessor {
 
     try {
       const snapshot = await manager.snapshot(session);
-      sendToWebSocket(wsInfo.ws, { type: 'chat_snapshot', sessionId, snapshot });
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_snapshot',
+        sessionId,
+        snapshot,
+        modelOverride: session.chatModelOverride || null,
+      });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       sendToWebSocket(wsInfo.ws, {
@@ -1097,6 +1146,23 @@ export class MessageProcessor {
     const text = typeof data.text === 'string' ? data.text : '';
     if (!text.trim() && !(data.attachments || []).length) return;
 
+    // The runtime's own `/model` reaches the same decision by the other door,
+    // so it has to leave the same trace. Without this the command is forwarded
+    // untouched, the conversation really does change model, and then the next
+    // `/clear` restarts it on the model it opened with — the same silent
+    // reversion the model picker was fixed for. Recorded, then forwarded
+    // unchanged: the runtime still runs its own command, and whether it
+    // accepted the name is still its answer to give, not ours.
+    const typedModel = /^\/model[ \t]+(\S.*)$/.exec(text.trim());
+    if (typedModel) {
+      const model = normaliseModelName(typedModel[1]);
+      if (model) {
+        session.chatModelOverride = model;
+        await this.deps.saveSessionsToDisk();
+        manager.rememberModel(session.id, model);
+      }
+    }
+
     try {
       await manager.send(session.id, {
         text,
@@ -1135,6 +1201,123 @@ export class MessageProcessor {
     const session = this.chatSessionFor(wsInfo, data.sessionId);
     if (!manager || !session) return;
     await manager.interrupt(session.id).catch(() => undefined);
+  }
+
+  /**
+   * Change the model for one conversation, independent of the runtime's own
+   * default or the active profile.
+   *
+   * Never pre-validated: what a typed name actually does is only known by
+   * trying it, so this always persists the choice and then reports what
+   * happened, in order of how good an answer it is — live, best-effort sent as
+   * a turn, or merely saved for the next launch. It is deliberately never
+   * written back as a profile or personal default; the override belongs to
+   * this conversation and nothing else.
+   */
+  private async handleChatSetModel(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!session) return;
+
+    const raw = typeof data.model === 'string' ? data.model.trim() : '';
+    const model = raw ? normaliseModelName(raw) : undefined;
+    session.chatModelOverride = model;
+    await this.deps.saveSessionsToDisk();
+
+    // A live session keeps the options it was launched with so that `/clear`
+    // can restart the process in place. The model is the one thing in there
+    // this handler can change, so it has to be carried across too — otherwise
+    // the next `/clear` reinstates the model the conversation opened with,
+    // after the browser has already been told the switch was applied. Resolved
+    // the way a launch resolves it, so clearing lands on the profile default.
+    const profile = this.deps.resolveRuntimeProfile(
+      session.agent as AgentKind,
+      session.workingDir,
+    );
+    this.deps.chatManager?.rememberModel(session.id, model || profile?.model);
+
+    if (!model) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_model_result',
+        sessionId: session.id,
+        model: null,
+        applied: 'cleared',
+        message: 'Cleared the model override. The next session for this conversation will use the runtime default.',
+      });
+      return;
+    }
+
+    const manager = this.deps.chatManager;
+    if (!manager) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_model_result',
+        sessionId: session.id,
+        model,
+        applied: 'pending',
+        message: `Saved. ${model} will be used the next time a session starts for this conversation.`,
+      });
+      return;
+    }
+
+    try {
+      const applied = await manager.setModel(session.id, model);
+      if (applied) {
+        sendToWebSocket(wsInfo.ws, {
+          type: 'chat_model_result',
+          sessionId: session.id,
+          model,
+          applied: 'live',
+          message: `Switched to ${model} for this conversation.`,
+        });
+        return;
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_model_result',
+        sessionId: session.id,
+        model,
+        applied: 'pending',
+        message: `Saved, but switching live failed (${message}). ${model} will be used the next time a session starts.`,
+      });
+      return;
+    }
+
+    // The adapter cannot switch live. If the runtime advertises its own
+    // `/model` command, best-effort send it as an ordinary turn — the same
+    // mechanism the old switchable picker used — and say so honestly: the
+    // CLI's own reply is the real confirmation, not this message.
+    const snapshot = await manager.snapshot(session).catch(() => null) as
+      | { live?: boolean; capabilities?: { commands?: { name: string }[] } }
+      | null;
+    const live = snapshot?.live === true;
+    const hasModelCommand = snapshot?.capabilities?.commands?.some((c) => c.name === 'model') ?? false;
+
+    if (live && hasModelCommand) {
+      try {
+        await manager.send(session.id, { text: `/model ${model}` });
+        sendToWebSocket(wsInfo.ws, {
+          type: 'chat_model_result',
+          sessionId: session.id,
+          model,
+          applied: 'sent',
+          message: `Sent "/model ${model}" to the session — check the transcript to confirm it took.`,
+        });
+        return;
+      } catch {
+        // Falls through to the saved-for-next-time answer below.
+      }
+    }
+
+    sendToWebSocket(wsInfo.ws, {
+      type: 'chat_model_result',
+      sessionId: session.id,
+      model,
+      applied: 'pending',
+      message: `Saved. This runtime cannot change model mid-session — ${model} will be used the next time a new session starts for this conversation.`,
+    });
   }
 
   /**

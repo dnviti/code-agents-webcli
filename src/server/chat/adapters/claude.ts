@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { BaseChatAdapter } from '../adapter.js';
-import { describeSlashCommand } from '../../../shared/slash-commands.js';
+import { defaultSlashCommands, describeSlashCommand } from '../../../shared/slash-commands.js';
 import {
   ChatAttachment,
   ChatBlock,
@@ -48,6 +48,11 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     usage: true,
     cost: true,
     plan: false,
+    // The real list only arrives with the first turn's `init` (see
+    // handleInit below); until then this is what makes the command menu and
+    // its composer button available from the moment the session opens,
+    // rather than staying empty until a message has already been sent.
+    commands: defaultSlashCommands(),
   };
 
   /** Session id we generated for a fresh launch, before init echoes it back. */

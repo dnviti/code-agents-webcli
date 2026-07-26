@@ -47,6 +47,13 @@ export interface MessageListProps {
   /** Which turn the index has selected; its strip is the sticky one. */
   currentTurnId?: string;
   /**
+   * Turns whose body is shown. Absent from this set, a turn's strip stays
+   * mounted (so copy/branch keep working) but its messages are hidden.
+   * Undefined — no caller managing fold state — reads as "every turn open".
+   */
+  openTurnIds?: ReadonlySet<string>;
+  onToggleTurn?: (turnId: string) => void;
+  /**
    * Passed down as primitives, not as a settings object.
    *
    * Every bubble is `React.memo`'d against a message that never changes
@@ -80,6 +87,8 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
       onCopyTurn,
       onForkTurn,
       currentTurnId,
+      openTurnIds,
+      onToggleTurn,
       showThinking = true,
       showToolCalls = true,
     },
@@ -236,15 +245,21 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
       setStuck(true);
     }, [stick]);
 
-    // Which message opens which turn, so the strips can be interleaved in one
-    // pass instead of searching the turn list per message.
-    const stripFor = React.useMemo(() => {
-      const map = new Map<string, TurnSummary>();
-      for (const turn of turns) {
-        if (turn.messageIds.length) map.set(turn.messageIds[0], turn);
-      }
+    // Looked up by id rather than iterated in transcript order: a turn's own
+    // messages are already listed on it, and rendering turn-by-turn (below) is
+    // what lets a collapsed turn hide its whole body as one unit.
+    //
+    // Keyed on `version`, not on `messages`: the transcript appends to its
+    // array in place, so its identity never changes and a `[messages]` map
+    // would be built once at mount and then never see another message. Every
+    // later id would miss and render nothing — a turn whose body stays empty
+    // while its strip keeps counting.
+    const messageById = React.useMemo(() => {
+      const map = new Map<string, (typeof messages)[number]>();
+      for (const message of messages) map.set(message.id, message);
       return map;
-    }, [turns]);
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [messages, version]);
 
     const lastTurnId = turns.length ? turns[turns.length - 1].id : undefined;
 
@@ -330,33 +345,48 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
 
             {messages.length === 0 ? <EmptyState /> : null}
 
-            {messages.map((message) => {
-              const turn = stripFor.get(message.id);
+            {turns.map((turn) => {
+              const open = !openTurnIds || openTurnIds.has(turn.id);
+              const bodyId = turnBodyId(turn.id);
               return (
-                <React.Fragment key={message.id}>
-                  {turn ? (
-                    <TurnStrip
-                      turn={turn}
-                      anchorId={turn.id}
-                      // Sticky for the turn you are in, static above it. The
-                      // selected turn wins over "the last one" so that jumping
-                      // back through the index leaves a header on screen.
-                      variant={turn.id === (currentTurnId || lastTurnId) ? 'current' : 'past'}
-                      copied={copiedTurn === turn.id}
-                      onCopy={() => copyTurn(turn.id)}
-                      onBranch={onForkTurn ? () => onForkTurn(turn.id) : undefined}
-                    />
-                  ) : null}
-                  <MessageBubble
-                    message={message}
-                    transcript={transcript}
-                    onFork={fork}
-                    onRetry={retry}
-                    onShowWork={showWork}
-                    onEdit={edit}
-                    showThinking={showThinking}
-                    showToolCalls={showToolCalls}
+                <React.Fragment key={turn.id}>
+                  <TurnStrip
+                    turn={turn}
+                    anchorId={turn.id}
+                    // Sticky for the turn you are in, static above it. The
+                    // selected turn wins over "the last one" so that jumping
+                    // back through the index leaves a header on screen.
+                    variant={turn.id === (currentTurnId || lastTurnId) ? 'current' : 'past'}
+                    copied={copiedTurn === turn.id}
+                    onCopy={() => copyTurn(turn.id)}
+                    onBranch={onForkTurn ? () => onForkTurn(turn.id) : undefined}
+                    open={open}
+                    onToggleOpen={() => onToggleTurn?.(turn.id)}
+                    bodyId={bodyId}
                   />
+                  {/* Hidden rather than unmounted: a collapsed turn's bubbles
+                      keep their scroll offsets and streaming subscriptions, so
+                      re-expanding it is instant and cannot desync from a turn
+                      that kept running underneath. */}
+                  <div id={bodyId} hidden={!open} style={{ display: open ? 'flex' : 'none', flexDirection: 'column' }}>
+                    {turn.messageIds.map((messageId) => {
+                      const message = messageById.get(messageId);
+                      if (!message) return null;
+                      return (
+                        <MessageBubble
+                          key={message.id}
+                          message={message}
+                          transcript={transcript}
+                          onFork={fork}
+                          onRetry={retry}
+                          onShowWork={showWork}
+                          onEdit={edit}
+                          showThinking={showThinking}
+                          showToolCalls={showToolCalls}
+                        />
+                      );
+                    })}
+                  </div>
                 </React.Fragment>
               );
             })}
@@ -401,6 +431,10 @@ const ZERO = (): number => 0;
  * replayed from disk and carried across versions, and a selector built by
  * concatenation is one odd id away from throwing inside a scroll handler.
  */
+function turnBodyId(turnId: string): string {
+  return `turn-body-${turnId}`;
+}
+
 function cssEscape(value: string): string {
   const escape = (globalThis as { CSS?: { escape?: (v: string) => string } }).CSS?.escape;
   return escape ? escape(value) : value.replace(/["\\]/g, '\\$&');

@@ -1,5 +1,34 @@
 # Changelog
 
+## [5.1.2] - 2026-07-26
+
+### Added
+- **A conversation can run a different model from the one the profile picks.**
+  The model shown beside the composer is now something to click: choose one the
+  runtime has listed, or type a name it has not, and that choice belongs to that
+  one conversation — never written back as a profile or personal default, and
+  never inherited by the next conversation. Where the runtime can change model
+  without restarting, it changes immediately; where it cannot, the choice is
+  saved and used the next time that conversation starts, and the reply says
+  which of the two happened rather than claiming success either way. The same
+  menu offers the way back to the runtime's own default.
+- **Turns fold away.** Each turn's header can be collapsed to hide everything
+  under it, and a turn folds on its own once the next one begins, so a long
+  session reads as a list of what was asked rather than an endless scroll. The
+  turn index can open or close them all at once, and jumping to a turn from the
+  index opens it. A folded turn still says what it was about, and its copy and
+  branch actions keep working while it is shut.
+
+### Fixed
+- **The runtime's own slash commands are there from the moment a conversation
+  opens.** They used to appear only after the first message had been sent,
+  because nothing knew what the agent supported until the agent had spoken.
+- **`/clear` and `/new` really do start over.** The transcript went blank, but
+  the text was handed to the agent like any other message, so the process kept
+  the whole conversation in mind and the next answer brought it all back. They
+  now restart the agent on a genuinely empty conversation, which is what they
+  had appeared to do.
+
 ## [5.1.1] - 2026-07-26
 
 ### Fixed

@@ -105,6 +105,20 @@ export interface SessionRecord {
    * standing permission can never be inherited by another conversation.
    */
   chatBypassPermissions?: boolean;
+  /**
+   * The model this conversation runs with, independent of the runtime's own
+   * default or the active profile.
+   *
+   * Set from a free-typed choice in the composer, not validated against
+   * anything: the acceptance test for a model name is whether the runtime
+   * accepts it, not whether it looks plausible before it is tried. Scoped to
+   * this record only — it is never written back as a profile or personal
+   * default, so it cannot leak into another conversation's launch.
+   *
+   * Absent means "no override", which reads as the profile default exactly
+   * like every row written before this existed.
+   */
+  chatModelOverride?: string;
   terminalOptions: TerminalOptions | null;
   stopRequested: boolean;
   /** Identifies the current PTY run so late callbacks from a previous run are ignored. */

@@ -150,6 +150,8 @@ export class ChatSession {
   private nativeSessionId: string | null = null;
   private startedAt = 0;
   private cwd = '';
+  /** The options this session was last launched with, kept for `/clear` and `/new`. */
+  private lastStartOptions: ChatSessionStartOptions | null = null;
 
   /**
    * True between resuming a conversation and the first thing the user says in it.
@@ -224,6 +226,7 @@ export class ChatSession {
       throw new Error(`${options.runtime} has no chat adapter`);
     }
 
+    this.lastStartOptions = options;
     this.runtime = options.runtime;
     this.cwd = options.workingDir;
     this.bypass = Boolean(options.bypassPermissions);
@@ -544,20 +547,40 @@ export class ChatSession {
       });
     }
     this.ingest({ t: 'msg_end', msgId: messageId });
-    this.setState('thinking');
 
-    await this.adapter.send(turn);
-
-    // After the runtime has accepted it, not before: if the send throws, the
-    // conversation is still there and clearing the window would have thrown
-    // away a transcript for a command that never ran.
-    //
-    // The marker goes in the durable log like everything else, so a browser
-    // that rejoins later replays the clear rather than being handed back the
-    // messages this was supposed to remove.
+    // `/clear` and `/new` promise a conversation the agent has never seen
+    // before, not one that only looks that way. Forwarding the text to the
+    // still-alive process would just add "/clear" to its own context — the
+    // process would still remember everything said before it. A real reset
+    // means a new process with no resume id, the same thing a manual "start
+    // fresh" relaunch already does.
     if (isClearingCommand(turn.text)) {
-      this.ingest({ t: 'marker', kind: 'cleared' });
+      await this.restart();
+      return;
     }
+
+    this.setState('thinking');
+    await this.adapter.send(turn);
+  }
+
+  /**
+   * Stop the running adapter and start a brand new one with no resume id, in
+   * place, without tearing down the `ChatSession` itself.
+   *
+   * The marker that tells a rejoining browser to stop paging back past this
+   * point is emitted by `start()` itself (`startFresh`), so this only has to
+   * get a fresh process running — the same path a manual "start fresh"
+   * relaunch takes, just triggered from inside a live conversation instead of
+   * from the recovery banner.
+   */
+  private async restart(): Promise<void> {
+    const options = this.lastStartOptions;
+    if (!options) return;
+    await this.stop();
+    // Stale until the new process's own `init` event reports its id — cleared
+    // up front so nothing reads the old conversation's id in the meantime.
+    this.nativeSessionId = null;
+    await this.start({ ...options, resumeSessionId: undefined, startFresh: true });
   }
 
   async interrupt(): Promise<void> {
@@ -641,6 +664,40 @@ export class ChatSession {
       this.ingest({ t: 'permission', request });
       this.setState('awaiting_permission');
     });
+  }
+
+  /**
+   * Switch the live process to a different model, for the adapters that can.
+   *
+   * Only Grok exposes this today — its model is a per-invocation flag it can
+   * rewrite for the next turn without a restart. Every other adapter's model
+   * is fixed at spawn, so this reports it could not and the caller falls back
+   * to the runtime's own `/model` command (best-effort) or to persisting the
+   * choice for the next session.
+   */
+  async setModel(model: string): Promise<boolean> {
+    if (!this.adapter?.alive || !this.adapter.setModel) return false;
+    await this.adapter.setModel(model);
+    return true;
+  }
+
+  /**
+   * Record the model an in-place restart must launch with.
+   *
+   * `restart()` replays the options this session was last started with, and
+   * those were resolved once, at launch. Everything in them is fixed for the
+   * life of the conversation except the model, which `chat_set_model` can
+   * change underneath them — so without this a `/clear` would quietly
+   * reinstate the model the conversation happened to open with, discarding a
+   * choice the browser has already been told was applied.
+   *
+   * Takes the effective model rather than the override, so clearing an
+   * override lands on the profile default here exactly as it would on a fresh
+   * launch.
+   */
+  rememberModel(model: string | undefined): void {
+    if (!this.lastStartOptions) return;
+    this.lastStartOptions = { ...this.lastStartOptions, model };
   }
 
   snapshot(): Promise<ChatSnapshot> {

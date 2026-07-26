@@ -35,6 +35,7 @@ interface RuntimeSessionRow {
   native_chat_session_id: string | null;
   owner_session_id: string | null;
   chat_bypass_permissions: number | null;
+  chat_model_override: string | null;
 }
 
 export class SessionStore {
@@ -72,7 +73,8 @@ export class SessionStore {
           surface,
           native_chat_session_id,
           owner_session_id,
-          chat_bypass_permissions
+          chat_bypass_permissions,
+          chat_model_override
         )
         VALUES (
           @id,
@@ -94,7 +96,8 @@ export class SessionStore {
           @surface,
           @native_chat_session_id,
           @owner_session_id,
-          @chat_bypass_permissions
+          @chat_bypass_permissions,
+          @chat_model_override
         )
       `);
 
@@ -157,6 +160,10 @@ export class SessionStore {
         // restart brings it back rather than quietly dropping to manual — and so
         // the header can state the mode of a conversation with nothing running.
         chat_bypass_permissions: session.chatBypassPermissions === true ? 1 : null,
+        // The conversation-scoped model override, if the user has set one.
+        // Persisted so a restart still prefers it over the profile default the
+        // next time a session starts for this conversation.
+        chat_model_override: session.chatModelOverride || null,
       }));
 
       replaceAll(rows);
@@ -193,7 +200,8 @@ export class SessionStore {
             surface,
             native_chat_session_id,
             owner_session_id,
-            chat_bypass_permissions
+            chat_bypass_permissions,
+            chat_model_override
           FROM runtime_sessions
           ORDER BY created_at ASC
         `)
@@ -238,6 +246,11 @@ export class SessionStore {
           // written before this column existed carries — reads as "asks first",
           // so a missing answer can never grant a standing permission.
           chatBypassPermissions: row.chat_bypass_permissions === 1 ? true : undefined,
+          // A stored empty string never happens — the write side always writes
+          // null for "no override" — but an empty string reading as "no
+          // override" rather than a call to switch to nothing is the safe
+          // direction regardless.
+          chatModelOverride: row.chat_model_override || undefined,
         });
       }
 

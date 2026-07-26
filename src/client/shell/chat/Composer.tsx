@@ -79,6 +79,14 @@ export interface ComposerProps {
    * entry of the menu as the current value is right only by accident.
    */
   model?: string;
+  /**
+   * Change this conversation's model, independent of the runtime's own
+   * default. Always available — see ModelChip — regardless of whether the
+   * runtime advertises a model list or a live switch.
+   */
+  onSetModel?: (model: string) => void;
+  /** What the server reported about the last `onSetModel` call, for the chip. */
+  modelFeedback?: { applied: 'live' | 'sent' | 'pending' | 'cleared'; message: string } | null;
   /** Drives what the permission chip reports. */
   bypassPermissions?: boolean;
   /** Changes what the hint row says about who owns Return. */
@@ -160,6 +168,8 @@ export function Composer({
   turnLabel,
   usage,
   model,
+  onSetModel,
+  modelFeedback,
   bypassPermissions = false,
   terminalOpen = false,
 }: ComposerProps) {
@@ -762,9 +772,8 @@ export function Composer({
           <ModelChip
             current={model}
             models={capabilities.models}
-            commands={commands}
-            disabled={disabled}
-            onPick={(value) => onSend(`/model ${value}`, [])}
+            feedback={modelFeedback}
+            onPick={(value) => onSetModel?.(value)}
           />
 
           <PermissionChip bypassPermissions={bypassPermissions} />
@@ -1020,38 +1029,43 @@ function Chip({
 }
 
 /**
- * The model, and the one honest way to change it.
+ * The model, and the one always-honest way to change it.
  *
- * There is no protocol message for "switch model" — every runtime that supports
- * it does so through its own slash command. So the picker is live exactly when
- * the runtime advertises both a model list and a `/model` command, and sends
- * that command as an ordinary turn. Anything else would be a control that looks
- * like it worked.
+ * There is no protocol message every runtime answers to for "switch model" —
+ * some can rewrite it live, most only take it through their own `/model`
+ * command or at spawn — so this control never claims to know in advance which
+ * of those a pick will get. It always accepts a choice, from the list when the
+ * runtime has one and from free text regardless, sends it, and reports back
+ * whatever the server says actually happened. A disabled control that told the
+ * user to start a new session was a worse answer than trying and being honest
+ * about the result.
  */
 function ModelChip({
   current,
   models,
-  commands,
-  disabled,
   onPick,
+  feedback,
 }: {
   /** What the session reported it is running, when it reported anything. */
   current: string | undefined;
   models: ModelChoice[] | undefined;
-  commands: SlashCommand[];
-  disabled: boolean;
   onPick: (value: string) => void;
-}): React.JSX.Element | null {
+  /** What the server said happened to the last pick made here. */
+  feedback?: { applied: 'live' | 'sent' | 'pending' | 'cleared'; message: string } | null;
+}): React.JSX.Element {
   const [open, setOpen] = React.useState(false);
+  const [customValue, setCustomValue] = React.useState('');
   const ref = React.useRef<HTMLDivElement | null>(null);
-  const switchable = Boolean(models && models.length) && commands.some((c) => c.name === 'model');
+  const inputRef = React.useRef<HTMLInputElement | null>(null);
   // The session's own model wins. `models` is a menu in whatever order the
   // runtime listed it, and its first entry is the current one only by accident.
   const matched = models?.find((m) => m.value === current || m.name === current);
-  const label = matched?.name ?? current ?? models?.[0]?.name;
+  const label = matched?.name ?? current ?? 'model';
 
   React.useEffect(() => {
     if (!open) return;
+    setCustomValue('');
+    inputRef.current?.focus();
     const onPointerDown = (event: MouseEvent): void => {
       if (!ref.current?.contains(event.target as Node)) setOpen(false);
     };
@@ -1066,29 +1080,25 @@ function ModelChip({
     };
   }, [open]);
 
-  // Nothing to report and nothing to offer.
-  if (!label) return null;
+  const pick = (value: string): void => {
+    setOpen(false);
+    onPick(value);
+  };
 
-  if (!switchable) {
-    return (
-      <Chip
-        label={`Model ${label}`}
-        reason="This runtime does not accept a model change mid-session; start a new session to change it."
-      >
-        {label}
-      </Chip>
-    );
-  }
+  const submitCustom = (): void => {
+    const value = customValue.trim();
+    if (!value) return;
+    pick(value);
+  };
 
   return (
     <div ref={ref} style={{ position: 'relative', flex: '0 0 auto' }}>
       <button
         type="button"
-        disabled={disabled}
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label="Change model"
-        title="Change model"
+        title={feedback?.message || `Model: ${label}`}
         onClick={() => setOpen((value) => !value)}
         style={{
           display: 'inline-flex',
@@ -1103,8 +1113,7 @@ function ModelChip({
           fontFamily: 'var(--font-mono)',
           fontSize: 'var(--text-2xs)',
           color: 'var(--muted-foreground)',
-          opacity: disabled ? 0.5 : 1,
-          cursor: disabled ? 'not-allowed' : 'pointer',
+          cursor: 'pointer',
         }}
       >
         {label}
@@ -1119,8 +1128,8 @@ function ModelChip({
             right: 0,
             bottom: '100%',
             marginBottom: 6,
-            minWidth: 180,
-            maxHeight: 220,
+            minWidth: 200,
+            maxHeight: 260,
             overflowY: 'auto',
             display: 'flex',
             flexDirection: 'column',
@@ -1133,16 +1142,61 @@ function ModelChip({
             zIndex: 'var(--z-dropdown)' as unknown as number,
           }}
         >
-          {(models ?? []).map((model) => (
+          <div style={{ display: 'flex', gap: 4, padding: '2px 2px 6px' }}>
+            <input
+              ref={inputRef}
+              value={customValue}
+              onChange={(event) => setCustomValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  submitCustom();
+                }
+              }}
+              placeholder="Type any model name…"
+              aria-label="Custom model name"
+              style={{
+                flex: 1,
+                minWidth: 0,
+                height: 24,
+                padding: '0 6px',
+                background: 'var(--background)',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--radius)',
+                color: 'var(--foreground)',
+                font: 'inherit',
+                fontSize: 'var(--text-xs)',
+              }}
+            />
             <button
-              key={model.value}
+              type="button"
+              onClick={submitCustom}
+              disabled={!customValue.trim()}
+              aria-label="Use this model"
+              style={{
+                flex: '0 0 auto',
+                height: 24,
+                padding: '0 8px',
+                background: 'transparent',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--radius)',
+                color: 'var(--foreground)',
+                fontSize: 'var(--text-2xs)',
+                cursor: customValue.trim() ? 'pointer' : 'not-allowed',
+                opacity: customValue.trim() ? 1 : 0.5,
+              }}
+            >
+              Use
+            </button>
+          </div>
+
+          {(models ?? []).map((choice) => (
+            <button
+              key={choice.value}
               type="button"
               role="option"
-              aria-selected={false}
-              onClick={() => {
-                setOpen(false);
-                onPick(model.value);
-              }}
+              aria-selected={choice.value === current || choice.name === current}
+              onClick={() => pick(choice.value)}
               style={{
                 display: 'flex',
                 flexDirection: 'column',
@@ -1159,12 +1213,77 @@ function ModelChip({
                 cursor: 'pointer',
               }}
             >
-              <span style={{ fontFamily: 'var(--font-mono)' }}>{model.name}</span>
-              {model.description ? (
-                <span style={{ color: 'var(--muted-foreground)' }}>{model.description}</span>
+              <span style={{ fontFamily: 'var(--font-mono)' }}>{choice.name}</span>
+              {choice.description ? (
+                <span style={{ color: 'var(--muted-foreground)' }}>{choice.description}</span>
               ) : null}
             </button>
           ))}
+
+          {!models?.length ? (
+            <div
+              style={{
+                padding: '4px 8px 2px',
+                color: 'var(--muted-foreground)',
+                fontSize: 'var(--text-2xs)',
+              }}
+            >
+              This runtime hasn&apos;t listed models — type one above.
+            </div>
+          ) : null}
+
+          {/* The way back. Picking a model is one click; without this, undoing
+              that choice was impossible — the text field refuses to submit
+              empty and every entry above carries a name — so a conversation
+              could be moved off its profile default but never returned to it,
+              and a typo stayed in force for every later launch. */}
+          <button
+            type="button"
+            role="option"
+            aria-selected={false}
+            onClick={() => pick('')}
+            style={{
+              width: '100%',
+              marginTop: 2,
+              padding: '5px 8px',
+              background: 'transparent',
+              border: 0,
+              borderTop: '1px solid var(--border)',
+              borderRadius: 0,
+              color: 'var(--muted-foreground)',
+              font: 'inherit',
+              fontSize: 'var(--text-xs)',
+              textAlign: 'left',
+              cursor: 'pointer',
+            }}
+          >
+            Use the default for this runtime
+          </button>
+        </div>
+      ) : null}
+
+      {!open && feedback ? (
+        <div
+          role="status"
+          style={{
+            position: 'absolute',
+            right: 0,
+            top: '100%',
+            marginTop: 4,
+            maxWidth: 240,
+            padding: '4px 6px',
+            background: 'var(--popover)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius)',
+            color:
+              feedback.applied === 'live'
+                ? 'var(--foreground)'
+                : 'var(--muted-foreground)',
+            fontSize: 'var(--text-2xs)',
+            zIndex: 'var(--z-dropdown)' as unknown as number,
+          }}
+        >
+          {feedback.message}
         </div>
       ) : null}
     </div>

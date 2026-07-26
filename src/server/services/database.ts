@@ -384,6 +384,11 @@ export class AppDatabase {
     // permission on because a column was absent is not a mistake to leave
     // available. INTEGER because SQLite has no boolean.
     this.addColumnIfMissing('runtime_sessions', 'chat_bypass_permissions', 'INTEGER');
+
+    // The model this conversation overrides its runtime/profile default with.
+    // Nullable and null-by-default: every row written before this column
+    // existed has no override recorded, which is exactly what a null means.
+    this.addColumnIfMissing('runtime_sessions', 'chat_model_override', 'TEXT');
   }
 
   /**

@@ -225,6 +225,7 @@ async function run(): Promise<void> {
   await checkATallDialogStaysOnScreen();
   await checkTheComposerShrinksWithTheWorkspaceRail();
   await checkTheFixedBarsNeverWrap();
+  await checkALiveAnswerAppearsAsItStreams();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -517,7 +518,7 @@ async function checkTheFixedBarsNeverWrap(): Promise<void> {
       messages: [
         {
           id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: Date.now(),
-          blocks: [{ kind: 'text', text: 'a question long enough to need the whole column for itself' }],
+          blocks: [{ kind: 'text', text: 'please refactor the authentication middleware so that it validates the bearer token against the new issuer, then update every call site that still assumes the old claim shape, and make sure the integration tests cover the expired-token path as well as the malformed-header path' }],
         },
         {
           id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: Date.now(),
@@ -530,6 +531,14 @@ async function checkTheFixedBarsNeverWrap(): Promise<void> {
             },
           ],
           usage: { inputTokens: 123456, outputTokens: 98765, costUsd: 1234.5678 },
+        },
+        {
+          id: 'u2', seq: 3, turnId: 't2', role: 'user', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'and now a second turn, so the first one folds' }],
+        },
+        {
+          id: 'a2', seq: 4, turnId: 't2', role: 'assistant', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'done' }],
         },
       ],
       pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
@@ -608,6 +617,112 @@ async function checkTheFixedBarsNeverWrap(): Promise<void> {
     root.unmount();
   }
 
+  host.remove();
+}
+
+/**
+ * The chat has to show the answer while it is being written.
+ *
+ * Every layer under this was already covered — the reducer applies the events,
+ * the transcript bumps its version, the strips re-render — and the chat still
+ * went blank in 5.1.2, because the list looked its messages up in a map that
+ * was built once and never rebuilt. Nothing short of mounting the real view
+ * and streaming into it catches that, so this asserts the only thing that
+ * actually matters: the words reach the screen.
+ */
+async function checkALiveAnswerAppearsAsItStreams(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1280px;height:760px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('live-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'live-check',
+    snapshot: {
+      sessionId: 'live-check', runtime: 'claude', state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true, commands: [],
+      },
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'the question already in the transcript' }],
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 1,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/home/dev/project',
+      branch: 'main',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  // Exactly what arrives from the socket while an answer is being written:
+  // a new turn opens, then text lands in it a delta at a time.
+  const event = (payload: unknown): void =>
+    controller.handle({ type: 'chat_event', sessionId: 'live-check', event: payload } as never);
+
+  // Read from the rendered messages only. The turn strip repeats the opening
+  // question as its label, so asserting against the whole subtree would pass
+  // on the strip alone while the body it names is empty — which is the exact
+  // bug being guarded against.
+  const bodyText = (): string =>
+    Array.from(host.querySelectorAll('[data-message-id]'))
+      .map((node) => node.textContent || '')
+      .join(' ');
+
+  event({ t: 'msg_start', id: 'u2', seq: 2, turnId: 't2', role: 'user', ts: Date.now() });
+  event({ t: 'block_start', msgId: 'u2', index: 0, block: { kind: 'text', text: '' } });
+  event({ t: 'block_delta', msgId: 'u2', index: 0, text: 'a question typed while the app is open' });
+  event({ t: 'msg_end', msgId: 'u2' });
+  await wait(250);
+
+  check(
+    'a message sent while the app is open shows up',
+    bodyText().includes('a question typed while the app is open'),
+    'the user\'s own turn never rendered',
+  );
+
+  event({ t: 'msg_start', id: 'a2', seq: 3, turnId: 't2', role: 'assistant', ts: Date.now() });
+  event({ t: 'block_start', msgId: 'a2', index: 0, block: { kind: 'text', text: '' } });
+  await wait(120);
+  event({ t: 'block_delta', msgId: 'a2', index: 0, text: 'the answer as it ' });
+  await wait(120);
+  event({ t: 'block_delta', msgId: 'a2', index: 0, text: 'is being written' });
+  await wait(250);
+
+  const text = bodyText();
+  check(
+    'the answer is on screen before it has finished',
+    text.includes('the answer as it is being written'),
+    text.includes('the answer as it')
+      ? 'the first delta rendered but later ones did not'
+      : 'the streaming turn body stayed empty',
+  );
+
+  // And the transcript really did receive it — so a failure above is the view
+  // not rendering, not the events being wrong.
+  check(
+    'the transcript itself holds the streamed message',
+    controller.transcript.messages.some((m: { id: string }) => m.id === 'a2'),
+    `ids=${controller.transcript.messages.map((m: { id: string }) => m.id).join(',')}`,
+  );
+
+  root.unmount();
   host.remove();
 }
 

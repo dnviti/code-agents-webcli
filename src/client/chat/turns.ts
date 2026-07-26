@@ -21,6 +21,14 @@ import { compactCount, formatDuration } from './tool-meta.js';
 
 export type TurnStatus = 'done' | 'running' | 'failed' | 'waiting';
 
+/** One glyph per status, shared by every surface that shows a turn's outcome. */
+export const STATUS_GLYPH: Record<TurnStatus, { icon: string; color: string; spin?: boolean; word: string }> = {
+  done: { icon: 'check', color: 'var(--success)', word: 'done' },
+  failed: { icon: 'circle-x', color: 'var(--destructive)', word: 'failed' },
+  waiting: { icon: 'shield', color: 'var(--warning)', word: 'waiting for you' },
+  running: { icon: 'loader-circle', color: 'var(--info)', spin: true, word: 'running' },
+};
+
 export interface TurnSummary {
   /** Id of the message that opened the turn — the user's, where there is one. */
   id: string;
@@ -157,6 +165,27 @@ function firstText(message: ChatMessage): string {
 
 export function turnOf(messageId: string, turns: TurnSummary[]): TurnSummary | undefined {
   return turns.find((turn) => turn.messageIds.includes(messageId));
+}
+
+/**
+ * Whether a turn's contents should be shown, folded history vs. the one in
+ * progress.
+ *
+ * The default is "only the newest turn is open" — an unset entry in
+ * `overrides` reads as that default rather than as closed, which is what
+ * makes a brand-new turn open itself and everything before it fold without
+ * either one needing its own entry written first. An override, once made,
+ * wins regardless of which turn is newest — that persistence is what stops
+ * the next turn starting from slamming shut something the user deliberately
+ * opened.
+ */
+export function isTurnOpen(
+  turnId: string,
+  lastTurnId: string,
+  overrides: ReadonlyMap<string, boolean>,
+): boolean {
+  const override = overrides.get(turnId);
+  return override === undefined ? turnId === lastTurnId : override;
 }
 
 export interface TurnMeta {
