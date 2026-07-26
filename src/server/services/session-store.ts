@@ -156,7 +156,7 @@ export class SessionStore {
         // The approval mode the user chose for this conversation. Persisted so a
         // restart brings it back rather than quietly dropping to manual — and so
         // the header can state the mode of a conversation with nothing running.
-        chat_bypass_permissions: session.chatBypassPermissions ? 1 : 0,
+        chat_bypass_permissions: session.chatBypassPermissions === true ? 1 : null,
       }));
 
       replaceAll(rows);
