@@ -1,5 +1,9 @@
 # Changelog
 
+## [5.2.0] - Unreleased
+
+Nothing yet — this section collects the work merged onto the 5.2.0 branch.
+
 ## [5.1.2] - 2026-07-26
 
 ### Added
