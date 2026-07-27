@@ -2429,7 +2429,13 @@ async function checkAnUnreportedFigureIsNeverDrawnAsZero(): Promise<void> {
       { key: 'claude', totals: totals({ jobs: 2, totalTokens: 3000, costUsd: 1.25, tokensReportedJobs: 2, costReportedJobs: 2 }) },
       { key: 'codex', totals: totals({ jobs: 2, totalTokens: 2000, tokensReportedJobs: 2, costReportedJobs: 0 }) },
     ],
-    byModel: [], effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
+    // A job whose runtime never named a model groups under the empty key —
+    // the breakdown must label that, not leave the cell blank.
+    byModel: [
+      { key: 'claude-opus-5', totals: totals({ jobs: 2, totalTokens: 3000, costUsd: 1.25, tokensReportedJobs: 2, costReportedJobs: 2 }) },
+      { key: '', totals: totals({ jobs: 2, totalTokens: 2000, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+    ],
+    effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
   };
 
   const realFetch = window.fetch;
@@ -2481,6 +2487,17 @@ async function checkAnUnreportedFigureIsNeverDrawnAsZero(): Promise<void> {
     'a bucket label on the trend line is a date, not Invalid Date',
     !/Invalid Date/.test(text),
     /Invalid Date/.test(text) ? text.slice(0, 300) : 'every label parsed',
+  );
+
+  const blankLabels = Array.from(doc.querySelectorAll('tbody tr')).filter(
+    (row) => !(row.querySelector('td')?.textContent || '').trim(),
+  );
+  check(
+    'a breakdown row for an unnamed model is labelled, not blank',
+    blankLabels.length === 0,
+    blankLabels.length === 0
+      ? 'every breakdown row has a label'
+      : `${blankLabels.length} row(s) with an empty first cell`,
   );
 
   check(

@@ -257,6 +257,20 @@ function EffortHistogram({
 }
 
 const TURNS_LABELS = ['1', '2', '3-5', '6-10', '11+'] as const;
+
+/**
+ * A breakdown key can be empty — a job whose runtime never named a model
+ * groups under `''`. A blank cell reads as a rendering bug, so say what it
+ * means, in the same words the figures use.
+ */
+function BreakdownKey({ value }: { value: string }): React.JSX.Element {
+  if (value) return <>{value}</>;
+  return (
+    <span style={{ color: 'var(--muted-foreground)' }} title="These jobs ran without a reported model">
+      not reported
+    </span>
+  );
+}
 const TOOLS_LABELS = ['0', '1-2', '3-5', '6-10', '11+'] as const;
 
 function Table({
@@ -330,7 +344,7 @@ function BreakdownTable({ rows }: { rows: UsageBreakdown[] }): React.JSX.Element
     <Table
       columns={['', 'Jobs', 'Turns', 'Tools', 'Tokens', 'Cost']}
       rows={rows.map((row) => [
-        row.key,
+        <BreakdownKey key="key" value={row.key} />,
         row.totals.jobs,
         row.totals.turns,
         row.totals.toolCalls,
@@ -350,7 +364,9 @@ function EffortTable({ rows }: { rows: UsageEffort[] }): React.JSX.Element {
         rows.map((row) => (
           <div key={row.key} style={{ ...cardStyle, display: 'flex', flexWrap: 'wrap', gap: 20, alignItems: 'center' }}>
             <div style={{ minWidth: 90 }}>
-              <div style={{ fontSize: 'var(--text-ui)' }}>{row.key}</div>
+              <div style={{ fontSize: 'var(--text-ui)' }}>
+                <BreakdownKey value={row.key} />
+              </div>
               <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>{row.jobs} jobs</div>
             </div>
             <div>

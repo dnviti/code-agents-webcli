@@ -342,7 +342,7 @@ figure written as an empty cell rather than `0` — the one place that
 distinction would otherwise get lost on the way out:
 
 ```
-GET /api/usage/export?period=month&format=csv
+GET /api/usage/export?from=2026-07-01T00:00:00.000Z&to=2026-08-01T00:00:00.000Z&format=csv
 ```
 
 ```csv

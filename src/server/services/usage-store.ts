@@ -315,32 +315,7 @@ export class UsageStore {
    * been deleted, which is the exact set of rows this view exists for.
    */
   history(query: UsageHistoryQuery): { jobs: UsageJobSummary[]; total: number } {
-    const scope = this.scopeClause(query);
-    const where: string[] = [scope.and.replace(/^ AND /, '')].filter(Boolean);
-    const params: unknown[] = [...scope.params];
-
-    if (query.agent) {
-      where.push('agent = ?');
-      params.push(query.agent);
-    }
-    if (query.model) {
-      where.push('model = ?');
-      params.push(query.model);
-    }
-    if (query.sessionId) {
-      where.push('session_id = ?');
-      params.push(query.sessionId);
-    }
-    if (query.from) {
-      where.push('ended_at >= ?');
-      params.push(query.from);
-    }
-    if (query.to) {
-      where.push('ended_at < ?');
-      params.push(query.to);
-    }
-
-    const clause = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+    const { clause, params } = this.historyClause(query);
     const total = (
       this.database.raw.prepare(`SELECT COUNT(*) AS n FROM usage_jobs${clause}`).get(...params) as {
         n: number;
@@ -415,18 +390,7 @@ export class UsageStore {
    * narrows the range and exports again.
    */
   export(query: UsageHistoryQuery): { jobs: UsageJobSummary[]; truncated: boolean } {
-    const scope = this.scopeClause(query);
-    const where: string[] = [scope.and.replace(/^ AND /, '')].filter(Boolean);
-    const params: unknown[] = [...scope.params];
-    if (query.from) {
-      where.push('ended_at >= ?');
-      params.push(query.from);
-    }
-    if (query.to) {
-      where.push('ended_at < ?');
-      params.push(query.to);
-    }
-    const clause = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+    const { clause, params } = this.historyClause(query);
     // One more than the cap, so hitting it is detectable rather than inferred
     // from a suspiciously round number of rows.
     const rows = this.database.raw
@@ -454,6 +418,41 @@ export class UsageStore {
   }
 
   // ------------------------------------------------------------------ helpers
+
+  /**
+   * Scope plus every filter a history query can carry. Shared by `history()`
+   * and `export()` so the two cannot disagree about what a filter means — an
+   * export that quietly ignored `agent` would hand back more rows than the
+   * screen it was exported from.
+   */
+  private historyClause(query: UsageHistoryQuery): { clause: string; params: unknown[] } {
+    const scope = this.scopeClause(query);
+    const where: string[] = [scope.and.replace(/^ AND /, '')].filter(Boolean);
+    const params: unknown[] = [...scope.params];
+
+    if (query.agent) {
+      where.push('agent = ?');
+      params.push(query.agent);
+    }
+    if (query.model) {
+      where.push('model = ?');
+      params.push(query.model);
+    }
+    if (query.sessionId) {
+      where.push('session_id = ?');
+      params.push(query.sessionId);
+    }
+    if (query.from) {
+      where.push('ended_at >= ?');
+      params.push(query.from);
+    }
+    if (query.to) {
+      where.push('ended_at < ?');
+      params.push(query.to);
+    }
+
+    return { clause: where.length ? ` WHERE ${where.join(' AND ')}` : '', params };
+  }
 
   private breakdown(column: string, where: string, params: unknown[]): UsageBreakdown[] {
     const rows = this.database.raw

@@ -295,6 +295,17 @@ describe('usage routes', function () {
     assert.ok(text.includes('sess-1:t3'));
   });
 
+  it('honours the agent, model and session filters on export, like history does', async function () {
+    const byAgent = await (await get('/api/usage/export?format=json&scope=everyone&agent=codex')).json();
+    assert.deepStrictEqual(byAgent.map((row) => row.id), ['sess-1:t2']);
+
+    const byModel = await (await get('/api/usage/export?format=json&scope=everyone&model=sonnet')).json();
+    assert.deepStrictEqual(byModel.map((row) => row.id), ['sess-1:t1', 'sess-1:t3']);
+
+    const bySession = await (await get('/api/usage/export?format=json&sessionId=sess-nope')).json();
+    assert.deepStrictEqual(bySession, []);
+  });
+
   it('exports JSON when asked', async function () {
     const response = await get('/api/usage/export?format=json&scope=everyone');
     const body = await response.json();
