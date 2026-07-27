@@ -130,7 +130,14 @@ describe('codex app-server adapter', function () {
       assert.strictEqual(session.nativeSessionId, 'th_123');
       assert.strictEqual(session.model, 'gpt-5-codex');
       assert.strictEqual(session.cwd, '/work');
-      assert.deepStrictEqual(only(h.events, 'state')[0], { t: 'state', state: 'idle', ts: session.ts });
+      // Not `ts: session.ts`: the two events are stamped by separate Date.now()
+      // calls, so they differ by a millisecond whenever the clock ticks between
+      // them — which CI hit. What matters is that idle is announced, and at the
+      // same moment as the session, not on the same integer.
+      const state = only(h.events, 'state')[0];
+      assert.strictEqual(state.t, 'state');
+      assert.strictEqual(state.state, 'idle');
+      assert.ok(Math.abs(state.ts - session.ts) <= 50, `state ts ${state.ts} vs session ts ${session.ts}`);
     });
 
     it('resumes by threadId instead of starting fresh when asked to', async function () {
