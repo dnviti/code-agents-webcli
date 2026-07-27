@@ -27,6 +27,13 @@
   mode reports neither tokens nor cost at all; its app-server mode reports
   tokens but no cost, since nothing in its schema prices a turn.
 
+  Cost, wherever it appears, is the provider's API list price for the tokens a
+  job moved — which is the only figure the runtimes report, whether or not the
+  account behind them pays by the token. On a subscription plan nothing is
+  billed per job, so the dashboard says as much in plain sight under its
+  totals: these are what the work would have cost through the API, not what
+  anyone was charged.
+
   The same history is reachable as an API — a dashboard endpoint, a paged job
   history with filters, a single job with its tool breakdown, and a CSV or
   JSON export — all scoped the same way the dashboard is, so an export can

@@ -243,8 +243,8 @@ function PlanSection({
 
       <Quiet>
         Claude&rsquo;s rate-limit window for this whole machine, read from its own files — not
-        your spending, and not this conversation&rsquo;s. Open Usage for what your work actually
-        cost, across every agent.
+        your spending, and not this conversation&rsquo;s. Open Usage for what your own work
+        would cost at API rates, across every agent.
       </Quiet>
     </>
   );

@@ -179,6 +179,28 @@ function Headline({ label, figure }: { label: string; figure: Figure }): React.J
 }
 
 /**
+ * The one thing a spend figure here cannot say for itself.
+ *
+ * Every runtime reports cost as an API list price for the tokens it moved,
+ * whether or not the account paying for it is on the API at all. On a
+ * subscription — Claude Max, ChatGPT Plus and the rest — the bill is flat and
+ * arrives monthly, so a "$1.25" against a job is what that work would have
+ * cost, not money that changed hands. Nothing in the event stream says which
+ * of the two an account is on, so the distinction is stated rather than
+ * detected: on screen, and not only on hover, because someone reconciling a
+ * provider's invoice against this dashboard needs it before they start.
+ */
+function CostCaveat(): React.JSX.Element {
+  return (
+    <div style={{ fontSize: 'var(--text-xs)', color: 'var(--muted-foreground)', lineHeight: 1.5 }}>
+      Cost is the API list price each runtime reports for the tokens it used. On a subscription plan
+      (Claude Max, ChatGPT Plus and the like) nothing is billed per job — read these figures as what
+      the same work would have cost through the API, not as what you were charged.
+    </div>
+  );
+}
+
+/**
  * A hand-rolled bar chart for the trend over time.
  *
  * No charting dependency: this is the one shape the dashboard needs — a
@@ -700,6 +722,8 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
               <Headline label="Turns" figure={{ text: String(dashboard.totals.turns) }} />
               <Headline label="Tool calls" figure={{ text: String(dashboard.totals.toolCalls) }} />
             </div>
+
+            <CostCaveat />
 
             <div>
               <h3 style={sectionTitleStyle}>Trend</h3>
