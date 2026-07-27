@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### Changed
+- **Usage is accounted per chat tab: one entry per conversation, not one per
+  request.** (#88) Statistics filed one row per request, so a morning's work in
+  a single tab landed as dozens of fragments, none of them answerable on its
+  own, and reading what a conversation cost meant adding rows up by hand.
+  Clearing the conversation or starting a new one in the same tab made it
+  worse: everything before the reset was accounted as if it belonged to
+  somewhere else, splitting the one total anybody actually wanted.
+
+  The history now lists conversations. Everything spent in a tab sums into one
+  entry, for as long as the tab exists — across compaction, clearing, starting
+  fresh, closing and reopening the tab, and a server restart. Each entry says
+  enough to recognise the work without opening it: its name, the project, the
+  agent, when it started and when it was last active. A conversation that
+  changed agent or model half way through is listed as having used both rather
+  than being filed under one of them. The requests are still there one level
+  down — open a conversation for its own, or take the Requests view to browse
+  them across conversations.
+
+  Nothing was migrated and no earlier period is counted differently: the tab's
+  id has been on every recorded row since the table existed, so this gathers the
+  whole history rather than dividing it. The headline totals and the
+  project/agent/model breakdowns go on summing jobs, which is the same rows
+  grouped another way, so they agree with the conversation entries by
+  construction. The list underneath now also covers the same range as the
+  figures above it, which it previously did not.
+
 ### Fixed
 - **Skills and project commands are in the `/` menu from the moment a
   conversation opens, not after the first message.** (#71) Typing `/` in a new

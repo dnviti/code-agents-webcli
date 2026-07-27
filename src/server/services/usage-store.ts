@@ -27,6 +27,7 @@ import {
   UsageBreakdown,
   UsageBucket,
   UsageBucketUnit,
+  UsageConversationSummary,
   UsageDashboard,
   UsageEffort,
   UsageFilters,
@@ -390,6 +391,125 @@ export class UsageStore {
       .all(...params, limit, offset) as JobRow[];
 
     return { jobs: rows.map(mapJob), total };
+  }
+
+  /**
+   * Past conversations, most recently active first — one row per chat tab.
+   *
+   * The unit of accounting (#88). Everything spent in a tab sums into one entry
+   * for as long as the tab exists, across compaction, clearing, and starting a
+   * new conversation inside it: those replace the *runtime's* conversation, and
+   * this groups on ours. `native_session_id` is the one that changes there, and
+   * `costBaselineFor` a few methods up is built on exactly that difference.
+   *
+   * Nothing is recorded to make this work and nothing is backfilled. The column
+   * has been written since the table existed, so grouping on it reaches back
+   * over the whole history rather than dividing it into a before and an after.
+   *
+   * Takes the same scope and the same filters as every other read, for the same
+   * reason: a conversation list narrowed differently from the charts above it
+   * is two views disagreeing about what is on screen. And because it is a
+   * grouping of the same rows under the same predicate, the entries add up to
+   * the headline totals by construction — there is no second tally to keep in
+   * step.
+   */
+  conversations(query: UsageHistoryQuery): {
+    conversations: UsageConversationSummary[];
+    total: number;
+  } {
+    const { clause, params } = this.historyClause(query);
+    const db = this.database.raw;
+
+    const total = (
+      db
+        .prepare(`SELECT COUNT(DISTINCT session_id) AS n FROM usage_jobs${clause}`)
+        .get(...params) as { n: number }
+    ).n;
+
+    const limit = clamp(query.limit ?? HISTORY_PAGE, 1, MAX_HISTORY_PAGE);
+    const offset = Math.max(0, Math.trunc(query.offset ?? 0));
+    const rows = db
+      .prepare(`
+        SELECT session_id,
+               MIN(started_at) AS started_at,
+               MAX(ended_at) AS last_active_at,
+               ${TOTALS_COLUMNS}
+        FROM usage_jobs${clause}
+        GROUP BY session_id
+        -- The id breaks ties, so paging is stable when a burst of conversations
+        -- shares a last-active instant: an unstable sort repeats one row on page
+        -- two and drops another entirely.
+        ORDER BY last_active_at DESC, session_id DESC
+        LIMIT ? OFFSET ?
+      `)
+      .all(...params, limit, offset) as Array<
+        TotalsRow & { session_id: string; started_at: string; last_active_at: string }
+      >;
+    if (rows.length === 0) return { conversations: [], total };
+
+    const ids = rows.map((row) => row.session_id);
+    const slots = ids.map(() => '?').join(', ');
+    // The same predicate the totals were computed under, extended to this page.
+    // Scope is a parameter here as everywhere else — narrowing an already
+    // narrowed set of ids would read as safe and would still be the one query
+    // in this file that could name another user's model. And the filters are
+    // here for a plainer reason: an entry whose figures are for one project
+    // must not list the agents it used on another.
+    const pageWhere = `${clause ? `${clause} AND` : ' WHERE'} session_id IN (${slots})`;
+    const pageParams = [...params, ...ids];
+
+    // Three lists per conversation, read as distinct rows rather than through
+    // GROUP_CONCAT(DISTINCT ...): that form takes no separator argument, so it
+    // would hide a conversation's models behind a comma — a character a model
+    // name is perfectly entitled to contain.
+    const distinct = (column: string): Map<string, string[]> => {
+      const found = db
+        .prepare(`
+          SELECT DISTINCT session_id, ${column} AS value FROM usage_jobs
+          ${pageWhere} AND ${column} IS NOT NULL
+          ORDER BY value ASC
+        `)
+        .all(...pageParams) as Array<{ session_id: string; value: string }>;
+      const bySession = new Map<string, string[]>();
+      for (const row of found) {
+        const list = bySession.get(row.session_id);
+        if (list) list.push(row.value);
+        else bySession.set(row.session_id, [row.value]);
+      }
+      return bySession;
+    };
+    const agents = distinct('agent');
+    const models = distinct('model');
+    const projects = distinct('project');
+
+    // The tab's own name, when the tab is still there. A separate read rather
+    // than a join, and a LEFT one in spirit: a job outlives its conversation —
+    // which is most of what a permanent history means here — so a missing row
+    // must leave the entry standing without a name, not remove it.
+    const named = new Map<string, string>();
+    const sessionRows = db
+      .prepare(`
+        SELECT id, name, custom_name FROM runtime_sessions WHERE id IN (${slots})
+      `)
+      .all(...ids) as Array<{ id: string; name: string | null; custom_name: string | null }>;
+    for (const row of sessionRows) {
+      const label = row.custom_name?.trim() || row.name?.trim();
+      if (label) named.set(row.id, label);
+    }
+
+    return {
+      total,
+      conversations: rows.map((row) => ({
+        sessionId: row.session_id,
+        name: named.get(row.session_id) ?? null,
+        agents: agents.get(row.session_id) ?? [],
+        models: models.get(row.session_id) ?? [],
+        projects: projects.get(row.session_id) ?? [],
+        startedAt: row.started_at,
+        lastActiveAt: row.last_active_at,
+        totals: mapTotals(row),
+      })),
+    };
   }
 
   /** Everything the dashboard draws for one range, one scope and one narrowing. */

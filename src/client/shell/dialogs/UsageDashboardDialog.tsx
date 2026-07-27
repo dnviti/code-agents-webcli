@@ -4,6 +4,7 @@ import type {
   UsageBreakdown,
   UsageBucket,
   UsageBucketUnit,
+  UsageConversationSummary,
   UsageDashboard,
   UsageEffort,
   UsageFilters,
@@ -19,6 +20,7 @@ import { UNATTRIBUTED } from '../../../shared/usage-records.js';
 import {
   attributeUsageProject,
   exportUsage,
+  fetchUsageConversations,
   fetchUsageDashboard,
   fetchUsageJob,
   fetchUsageJobs,
@@ -1127,6 +1129,248 @@ function JobDetail({
 }
 
 /**
+ * A conversation's totals, as one figure each.
+ *
+ * The same honesty rule as everywhere else: `costUsd` of zero across zero
+ * reporting jobs is not a conversation that cost nothing.
+ */
+function conversationLabel(conversation: UsageConversationSummary): string {
+  if (conversation.name) return conversation.name;
+  // No name means the tab has been deleted; the id is what is left, and the
+  // leading segment of it is enough to tell two entries apart without turning
+  // the column into a wall of uuid.
+  return `Conversation ${conversation.sessionId.slice(0, 8)}`;
+}
+
+/** A list of values as one cell: one name, or "first +2". */
+function ListCell({ values, empty }: { values: string[]; empty: string }): React.JSX.Element {
+  if (values.length === 0) {
+    return <span style={{ color: 'var(--muted-foreground)' }}>{empty}</span>;
+  }
+  if (values.length === 1) return <>{values[0]}</>;
+  // A conversation that used two agents says so rather than claiming one of
+  // them — the whole list is in the tooltip, and the count is on screen.
+  return (
+    <Tooltip label={values.join(', ')}>
+      <span>
+        {values[0]}
+        <span style={{ color: 'var(--muted-foreground)' }}>{` +${values.length - 1}`}</span>
+      </span>
+    </Tooltip>
+  );
+}
+
+/**
+ * The conversations behind the figures above — one row per chat tab (#88).
+ *
+ * The unit is the tab, not the request: everything spent in it is one entry,
+ * for as long as it exists, across compaction and clearing and starting fresh.
+ * What happened inside is detail about how the work went, and it is one click
+ * away rather than spread over forty rows of this list.
+ *
+ * Narrowed by the same `UsageFilters` as everything above it, for the same
+ * reason the job list is.
+ */
+function ConversationHistory({
+  scope,
+  filters,
+  reloads,
+  onOpen,
+}: {
+  scope: UsageScope;
+  filters: UsageFilters;
+  /** Bumped when something below changes a figure, so the list is re-asked. */
+  reloads: number;
+  onOpen(conversation: UsageConversationSummary): void;
+}): React.JSX.Element {
+  const [offset, setOffset] = React.useState(0);
+  const [page, setPage] = React.useState<{
+    conversations: UsageConversationSummary[];
+    total: number;
+  } | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const filterKey = JSON.stringify(filters);
+
+  React.useEffect(() => {
+    setOffset(0);
+  }, [scope, filterKey]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    setError(null);
+    fetchUsageConversations({ scope, limit: JOBS_PAGE_SIZE, offset, ...filters })
+      .then((result) => { if (!cancelled) setPage(result); })
+      .catch((err: Error) => { if (!cancelled) setError(err.message); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope, offset, filterKey, reloads]);
+
+  const total = page?.total ?? 0;
+  const conversations = page?.conversations ?? [];
+  const from = total === 0 ? 0 : offset + 1;
+  const to = Math.min(total, offset + JOBS_PAGE_SIZE);
+
+  if (error) {
+    return <div style={{ color: 'var(--destructive)', fontSize: 'var(--text-xs)' }}>{error}</div>;
+  }
+
+  return (
+    <div>
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 'var(--text-xs)' }}>
+          <thead>
+            <tr>
+              {['Conversation', 'Project', 'Agent', 'Model', 'Started', 'Last active', 'Requests', 'Tokens', 'Cost'].map(
+                (c, i) => (
+                  <th key={c} style={{ ...headCellStyle, textAlign: i === 0 ? 'left' : 'right' }}>
+                    {c}
+                  </th>
+                ),
+              )}
+            </tr>
+          </thead>
+          <tbody>
+            {conversations.length === 0 ? (
+              <tr>
+                <td colSpan={9} style={{ padding: '10px 8px', color: 'var(--muted-foreground)' }}>
+                  No conversations in this range
+                </td>
+              </tr>
+            ) : (
+              conversations.map((conversation) => (
+                <tr
+                  key={conversation.sessionId}
+                  onClick={() => onOpen(conversation)}
+                  style={{ cursor: 'pointer' }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--accent)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                >
+                  <td style={{ ...bodyCellStyle, textAlign: 'left' }}>{conversationLabel(conversation)}</td>
+                  <td style={bodyCellStyle}>
+                    <ListCell values={conversation.projects} empty="unattributed" />
+                  </td>
+                  <td style={bodyCellStyle}>
+                    <ListCell values={conversation.agents} empty="—" />
+                  </td>
+                  <td style={bodyCellStyle}>
+                    <ListCell values={conversation.models} empty="—" />
+                  </td>
+                  <td style={bodyCellStyle}>{new Date(conversation.startedAt).toLocaleString()}</td>
+                  <td style={bodyCellStyle}>{new Date(conversation.lastActiveAt).toLocaleString()}</td>
+                  <td style={bodyCellStyle}>{conversation.totals.jobs}</td>
+                  <td style={bodyCellStyle}>
+                    <FigureText figure={tokensFigure(conversation.totals)} />
+                  </td>
+                  <td style={bodyCellStyle}>
+                    <FigureText figure={costFigure(conversation.totals)} />
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 }}>
+        <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
+          {total === 0 ? 'No conversations' : `${from}-${to} of ${total}`}
+        </span>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={offset === 0}
+            onClick={() => setOffset(Math.max(0, offset - JOBS_PAGE_SIZE))}
+          >
+            Previous
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={to >= total}
+            onClick={() => setOffset(offset + JOBS_PAGE_SIZE)}
+          >
+            Next
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The history section: conversations, one of them opened, or every request.
+ *
+ * Three states rather than two, because the list of conversations and the list
+ * of every request answer different questions — "what did this piece of work
+ * cost" and "which single request cost that much" — and neither one is the
+ * other with a filter applied. The conversation list is what opens first: it is
+ * the unit anybody thinks in, and the flat list of fragments is the thing #88
+ * is about not showing by default.
+ */
+function History({
+  scope,
+  filters,
+  knownProjects,
+  onChanged,
+}: {
+  scope: UsageScope;
+  filters: UsageFilters;
+  knownProjects: string[];
+  onChanged(): void;
+}): React.JSX.Element {
+  const [mode, setMode] = React.useState<'conversations' | 'requests'>('conversations');
+  const [open, setOpen] = React.useState<UsageConversationSummary | null>(null);
+  const [reloads, setReloads] = React.useState(0);
+  const changed = (): void => {
+    setReloads((n) => n + 1);
+    onChanged();
+  };
+
+  if (open) {
+    return (
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
+          <Button variant="outline" size="sm" onClick={() => setOpen(null)} iconLeft={<Icon name="arrow-left" size={12} />}>
+            All conversations
+          </Button>
+          <span style={{ fontSize: 'var(--text-xs)', fontWeight: 600 }}>{conversationLabel(open)}</span>
+          <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
+            {`${open.totals.jobs} request(s) · ${costFigure(open.totals).text}`}
+          </span>
+        </div>
+        <JobHistory
+          scope={scope}
+          filters={filters}
+          knownProjects={knownProjects}
+          sessionId={open.sessionId}
+          onChanged={changed}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{ marginBottom: 8 }}>
+        <Tabs
+          tabs={[
+            { value: 'conversations', label: 'Conversations' },
+            { value: 'requests', label: 'Requests' },
+          ]}
+          value={mode}
+          onChange={(value) => setMode(value as 'conversations' | 'requests')}
+        />
+      </div>
+      {mode === 'conversations' ? (
+        <ConversationHistory scope={scope} filters={filters} reloads={reloads} onOpen={setOpen} />
+      ) : (
+        <JobHistory scope={scope} filters={filters} knownProjects={knownProjects} onChanged={changed} />
+      )}
+    </div>
+  );
+}
+
+/**
  * The jobs behind the figures above, narrowed by whatever the charts are
  * narrowed by.
  *
@@ -1139,11 +1383,14 @@ function JobHistory({
   scope,
   filters,
   knownProjects,
+  sessionId,
   onChanged,
 }: {
   scope: UsageScope;
   filters: UsageFilters;
   knownProjects: string[];
+  /** Narrow to one conversation — how an entry opens onto its own requests. */
+  sessionId?: string;
   onChanged(): void;
 }): React.JSX.Element {
   const [offset, setOffset] = React.useState(0);
@@ -1161,17 +1408,17 @@ function JobHistory({
     // while deep in the pages otherwise left an empty table, which reads as
     // "this project did no work".
     setOffset(0);
-  }, [scope, filterKey]);
+  }, [scope, filterKey, sessionId]);
 
   React.useEffect(() => {
     let cancelled = false;
     setError(null);
-    fetchUsageJobs({ scope, limit: JOBS_PAGE_SIZE, offset, ...filters })
+    fetchUsageJobs({ scope, limit: JOBS_PAGE_SIZE, offset, sessionId, ...filters })
       .then((result) => { if (!cancelled) setPage(result); })
       .catch((err: Error) => { if (!cancelled) setError(err.message); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope, offset, filterKey, reloads]);
+  }, [scope, offset, filterKey, reloads, sessionId]);
 
   const total = page?.total ?? 0;
   const jobs = page?.jobs ?? [];
@@ -1576,7 +1823,7 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
 
             <div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'space-between' }}>
-                <h3 style={{ ...sectionTitleStyle, margin: 0 }}>Job history</h3>
+                <h3 style={{ ...sectionTitleStyle, margin: 0 }}>History</h3>
                 {hasFilters(filters) ? (
                   <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
                     narrowed to the same selection
@@ -1584,9 +1831,15 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
                 ) : null}
               </div>
               <div style={{ marginTop: 8 }}>
-                <JobHistory
+                <History
                   scope={scope}
-                  filters={filters}
+                  // The range the figures above were actually computed over,
+                  // not the filter state — a period button sets no `from`/`to`
+                  // of its own, so a list built from `filters` alone covered
+                  // all time while the headline covered a day. The two have to
+                  // add up (#88), and this is the one place both readings of
+                  // the range come from.
+                  filters={{ ...filters, from: dashboard.from, to: dashboard.to }}
                   knownProjects={knownProjects}
                   // Attributing work changes the figures above it, so the whole
                   // view is re-asked rather than left showing a breakdown that

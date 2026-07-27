@@ -1,4 +1,5 @@
 import type {
+  UsageConversationSummary,
   UsageDashboard,
   UsageFilters,
   UsageJobRecord,
@@ -106,6 +107,12 @@ export interface UsageJobsQuery extends UsageFilters {
   scope: UsageScope;
   limit?: number;
   offset?: number;
+  /**
+   * Narrow to one conversation. Not one of the dashboard's filters — there is
+   * no breakdown by conversation to click — it is how a conversation entry
+   * opens onto the requests inside it.
+   */
+  sessionId?: string;
 }
 
 export interface UsageJobsPage {
@@ -113,12 +120,34 @@ export interface UsageJobsPage {
   total: number;
 }
 
-export function fetchUsageJobs(query: UsageJobsQuery): Promise<UsageJobsPage> {
+/** The shared half of a `/jobs` and a `/conversations` request. */
+function historyParams(query: UsageJobsQuery): URLSearchParams {
   const params = new URLSearchParams({ scope: query.scope });
   if (query.limit !== undefined) params.set('limit', String(query.limit));
   if (query.offset !== undefined) params.set('offset', String(query.offset));
+  if (query.sessionId) params.set('sessionId', query.sessionId);
   appendFilters(params, query);
-  return getJson<UsageJobsPage>(`/api/usage/jobs?${params.toString()}`);
+  return params;
+}
+
+export function fetchUsageJobs(query: UsageJobsQuery): Promise<UsageJobsPage> {
+  return getJson<UsageJobsPage>(`/api/usage/jobs?${historyParams(query).toString()}`);
+}
+
+export interface UsageConversationsPage {
+  conversations: UsageConversationSummary[];
+  total: number;
+}
+
+/**
+ * The conversations behind the figures, one entry per chat tab.
+ *
+ * Takes the same query as `fetchUsageJobs` on purpose: the two are one list at
+ * two levels of detail, and building the narrowing twice is how they come to
+ * disagree about what is on screen.
+ */
+export function fetchUsageConversations(query: UsageJobsQuery): Promise<UsageConversationsPage> {
+  return getJson<UsageConversationsPage>(`/api/usage/conversations?${historyParams(query).toString()}`);
 }
 
 /**

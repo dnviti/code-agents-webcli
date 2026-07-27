@@ -205,6 +205,46 @@ export interface UsageToolUse {
   jobs: number;
 }
 
+/**
+ * One conversation — one chat tab — and everything spent in it.
+ *
+ * The unit anybody actually thinks in. A tab is one stretch of work on one
+ * thing, and the requests inside it are how that work went, not separate pieces
+ * of work: filing them separately turns a morning into forty fragments none of
+ * which answers "what did this cost".
+ *
+ * Keyed on the tab's own id, which is durable and is not the runtime's id. That
+ * distinction is the whole of why compacting, clearing, or starting a new
+ * conversation in the same tab does not split the entry — those replace the
+ * runtime's conversation, and the tab goes on being the tab.
+ *
+ * `agents`, `models` and `projects` are lists rather than single values because
+ * a conversation is allowed to have changed any of them mid-way, and naming one
+ * of two would be a claim rather than a record. Each is sorted and free of
+ * duplicates; `models` may contain nothing at all when no runtime ever said.
+ */
+export interface UsageConversationSummary {
+  /** The tab's id — `usage_jobs.session_id`. */
+  sessionId: string;
+  /**
+   * What the tab is called, or null when the conversation has since been
+   * deleted. A job outlives its conversation, so this is missing rather than
+   * wrong, and an entry without it still has its project and its agent.
+   */
+  name: string | null;
+  /** Every agent used over the conversation's life, sorted. */
+  agents: string[];
+  /** Every model any of them reported, sorted. Empty when none ever did. */
+  models: string[];
+  /** Every project the work ran in, sorted. Empty when none was recorded. */
+  projects: string[];
+  /** When the earliest recorded job in it started. */
+  startedAt: string;
+  /** When the latest recorded job in it ended. */
+  lastActiveAt: string;
+  totals: UsageTotals;
+}
+
 /** Whether a job's project was measured or asserted. See `UsageJobRecord.project`. */
 export type UsageProjectSource = 'observed' | 'manual' | null;
 
