@@ -705,10 +705,19 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
 
     const usageRaw = record(raw.usage);
     const costUsd = this.turnCost(num(raw.total_cost_usd));
+    // The tokens this turn has not already reported (see `turnTokensLeft`),
+    // the turn's own share of the cumulative cost, and the reading of how full
+    // the window is — which is the last request's own figures, not the turn's
+    // totals, so it is taken from `raw` rather than from what is emitted here.
     const tokens = usageRaw ? this.turnTokensLeft(mapUsage(usageRaw)) : undefined;
+    const context = contextReading(raw);
     const usage: ChatUsage | undefined =
-      tokens || costUsd !== undefined
-        ? { ...(tokens ?? {}), ...(costUsd !== undefined ? { costUsd } : {}) }
+      tokens || costUsd !== undefined || Object.keys(context).length > 0
+        ? {
+            ...(tokens ?? {}),
+            ...(costUsd !== undefined ? { costUsd } : {}),
+            ...context,
+          }
         : undefined;
 
     const sessionId = str(raw.session_id);
@@ -790,8 +799,17 @@ function num(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
-/** The token fields this adapter maps. Cost is not one: it is cumulative. */
-const TOKEN_FIELDS: Array<keyof ChatUsage> = [
+/**
+ * The token fields this adapter maps. Cost is not one: it is cumulative.
+ *
+ * Spelled out rather than `keyof ChatUsage`, which stopped being a list of
+ * token counts the moment that type grew a context reading — one of whose
+ * fields is a word (`contextWindowSource`), and none of which is a quantity
+ * this adds up.
+ */
+type TokenField = 'inputTokens' | 'outputTokens' | 'cacheWriteTokens' | 'cacheReadTokens';
+
+const TOKEN_FIELDS: TokenField[] = [
   'inputTokens',
   'outputTokens',
   'cacheWriteTokens',
@@ -805,6 +823,52 @@ function mapUsage(raw: Record<string, unknown>): ChatUsage {
     cacheWriteTokens: num(raw.cache_creation_input_tokens),
     cacheReadTokens: num(raw.cache_read_input_tokens),
   };
+}
+
+/**
+ * How big claude says the window is, and how much of it the last request filled.
+ *
+ * The capacity comes from claude's own `modelUsage` block, keyed by the model
+ * as it ran — `claude-opus-5[1m]` reports 1,000,000 while the plain model does
+ * not, so the bracketed suffix is load-bearing and the key is used verbatim
+ * rather than canonicalised.
+ *
+ * Occupancy is the *last* iteration's figures, not the turn's totals. A turn
+ * with four round trips reports four iterations, and adding their inputs
+ * together describes work done rather than anything that was ever in the
+ * window at one time — the last one is what actually sat there.
+ */
+function contextReading(raw: Record<string, unknown>): ChatUsage {
+  const reading: ChatUsage = {};
+
+  const modelUsage = record(raw.model_usage) ?? record(raw.modelUsage);
+  if (modelUsage) {
+    for (const value of Object.values(modelUsage)) {
+      const window = num(record(value)?.contextWindow);
+      if (window !== undefined && window > 0) {
+        reading.contextWindow = window;
+        reading.contextWindowSource = 'agent';
+        break;
+      }
+    }
+  }
+
+  const usage = record(raw.usage);
+  const iterations = Array.isArray(usage?.iterations) ? usage.iterations : [];
+  const last = record(iterations[iterations.length - 1]) ?? usage;
+  if (last) {
+    const parts = [
+      num(last.input_tokens),
+      num(last.cache_read_input_tokens),
+      num(last.cache_creation_input_tokens),
+      num(last.output_tokens),
+    ].filter((n): n is number => n !== undefined);
+    if (parts.length > 0) {
+      reading.contextUsed = parts.reduce((sum, n) => sum + n, 0);
+    }
+  }
+
+  return reading;
 }
 
 function toolResultText(content: unknown): string {

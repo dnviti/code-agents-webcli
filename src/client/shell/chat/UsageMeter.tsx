@@ -42,6 +42,9 @@ interface TokenField {
   value: number;
 }
 
+/** Where "nearly full" starts. Amber on the bar begins earlier, at 70%. */
+const WARN_AT_PCT = 80;
+
 export function UsageMeter({ usage, capabilities, compact = false, phone = false, costOnly = false }: UsageMeterProps) {
   // A runtime that advertised no usage/cost reporting can still leave a stale
   // field behind on a reused object; the capability is what says the number is
@@ -62,8 +65,18 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
   const hasTotal = showTokens && usage.totalTokens !== undefined;
   const hasCost = showCost && usage.costUsd !== undefined;
   const hasContext = showTokens && usage.contextWindow !== undefined && usage.contextUsed !== undefined;
+  /**
+   * Occupied, but against a ceiling nobody could establish.
+   *
+   * Written out rather than left blank. A conversation that quietly shows no
+   * context line is indistinguishable from one whose context is fine, and the
+   * whole reason capacity is never guessed here is that a confidently wrong
+   * ceiling invites someone to keep going up to a limit that is not there.
+   */
+  const capacityUnknown =
+    showTokens && usage.contextWindow === undefined && usage.contextUsed !== undefined;
 
-  if (fields.length === 0 && !hasTotal && !hasCost && !hasContext) {
+  if (fields.length === 0 && !hasTotal && !hasCost && !hasContext && !capacityUnknown) {
     return null;
   }
 
@@ -71,6 +84,15 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
     ? Math.min(100, Math.max(0, (usage.contextUsed! / Math.max(1, usage.contextWindow!)) * 100))
     : 0;
   const barColor = contextPct >= 90 ? 'var(--destructive)' : contextPct >= 70 ? 'var(--warning)' : 'var(--success)';
+  // Far enough from the edge that there is still room to finish a thought,
+  // compact, or start fresh — which is the whole point of saying anything.
+  //
+  // In the compact strip this only weights and colours the percentage: that
+  // row is the fixed-width header, and the words that fit here comfortably at
+  // 4% push it past its own width at 95%, which is precisely when a person
+  // needs to be able to read it. The sentence lives in the expanded meter and
+  // in the status panel, and the tooltip carries it either way.
+  const contextWarning = hasContext && contextPct >= WARN_AT_PCT;
 
   const fontSize = phone ? PHONE_TEXT.label : compact ? 'var(--text-2xs)' : 'var(--text-xs)';
 
@@ -104,11 +126,24 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
       >
         {parts.length ? <span>{costOnly && hasCost ? formatCost(usage.costUsd!) : parts.join(' · ')}</span> : null}
         {hasContext && !costOnly ? (
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+          <span
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              ...(contextWarning ? { color: barColor, fontWeight: 'var(--font-semibold)' } : {}),
+            }}
+            title={contextTitle(usage, contextPct)}
+          >
             <ContextBar pct={contextPct} color={barColor} width={40} height={phone ? 6 : 4} />
             {Math.round(contextPct)}%
           </span>
         ) : null}
+        {/* Nothing about an unknown capacity in the compact strip. It is the
+            fixed-width header, and the sentence that fits beside a short token
+            count does not fit beside a long one — the same overflow the
+            warning wording hits at 95%. The expanded meter and the status
+            panel both say it, and neither is width-bound. */}
       </div>
     );
   }
@@ -149,7 +184,7 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
       ) : null}
 
       {hasContext ? (
-        <div style={{ display: 'grid', gap: 3 }}>
+        <div style={{ display: 'grid', gap: 3 }} title={contextTitle(usage, contextPct)}>
           <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
             <span>context</span>
             <span style={{ color: 'var(--foreground)' }}>
@@ -157,6 +192,24 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
             </span>
           </div>
           <ContextBar pct={contextPct} color={barColor} width="100%" height={5} />
+          {contextWarning ? (
+            // A percentage alone is a number to interpret; this says what to do
+            // about it while there is still room to do it.
+            <div role="status" style={{ color: barColor, fontWeight: 'var(--font-semibold)' }}>
+              {contextPct >= 90 ? 'context almost full' : 'context filling up'} —{' '}
+              {formatTokens(Math.max(0, usage.contextWindow! - usage.contextUsed!))} left. Compact or
+              start a new conversation.
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {capacityUnknown ? (
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+          <span>context</span>
+          <span style={{ color: 'var(--foreground)' }}>
+            {formatTokens(usage.contextUsed!)} used · size unknown
+          </span>
         </div>
       ) : null}
     </div>
@@ -199,6 +252,25 @@ function ContextBar({
       />
     </div>
   );
+}
+
+/**
+ * The long form of the reading, including who vouched for the ceiling.
+ *
+ * The provenance matters enough to say: an agent reporting its own window is
+ * describing what it will actually run, while a provider catalogue is a
+ * second-best consulted only when the agent said nothing.
+ */
+function contextTitle(usage: ChatUsage, pct: number): string {
+  const used = usage.contextUsed ?? 0;
+  const window = usage.contextWindow ?? 0;
+  const source =
+    usage.contextWindowSource === 'provider'
+      ? " (window size from the model's provider)"
+      : usage.contextWindowSource === 'agent'
+        ? ' (window size reported by the agent)'
+        : '';
+  return `${used.toLocaleString()} of ${window.toLocaleString()} tokens · ${Math.round(pct)}% full${source}`;
 }
 
 /** 1234 -> "1.2k", 12421 -> "12.4k", 984123 -> "984k", 1_400_000 -> "1.4M". */

@@ -3,6 +3,7 @@ import * as path from 'path';
 import { ChatSnapshot, UserTurn } from '../../shared/chat-events.js';
 import { SessionRecord } from '../types.js';
 import { ChatNotRunningError, ChatSession, ChatSessionStartOptions, ChatUsageSink } from './session.js';
+import { ModelCapacityLookup } from './model-capacity.js';
 import { ChatStore } from './store.js';
 
 /**
@@ -33,6 +34,11 @@ export class ChatSessionManager {
   private readonly sessions = new Map<string, ChatSession>();
   private readonly hookScript: string;
   private readonly askScript: string;
+  /**
+   * One lookup for the whole process, so its catalogue is fetched once rather
+   * than once per conversation. Only consulted for models no agent described.
+   */
+  private readonly capacity = new ModelCapacityLookup();
 
   constructor(private readonly deps: ChatManagerDeps) {
     // Resolved from this module's own location rather than cwd: the server is
@@ -88,6 +94,7 @@ export class ChatSessionManager {
           this.writeFile(sessionId, filePath, contents),
         onLifecycle: this.deps.onLifecycle,
         usage: this.deps.usage,
+        capacity: this.capacity,
       },
     );
 

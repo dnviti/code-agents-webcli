@@ -104,6 +104,19 @@ export interface ChatSessionDeps {
    * fixture that predates it constructs a session with no sink at all.
    */
   usage?: ChatUsageSink;
+  /**
+   * Who to ask how large a model's context window is, when the agent won't say.
+   *
+   * Optional in the same spirit as `usage`: a session runs perfectly well
+   * without one, and simply reports that capacity is unknown for the agents
+   * that publish none.
+   */
+  capacity?: ModelCapacitySource;
+}
+
+/** Asked only for models no agent described; see `model-capacity.ts`. */
+export interface ModelCapacitySource {
+  contextWindowFor(model: string | undefined): Promise<number | null>;
 }
 
 /**
@@ -270,6 +283,22 @@ export class ChatSession {
   private cwd = '';
   /** The options this session was last launched with, kept for `/clear` and `/new`. */
   private lastStartOptions: ChatSessionStartOptions | null = null;
+
+  /**
+   * The model whose context window is being reported, and where it came from.
+   *
+   * Four of the agents here publish their own window and this never asks
+   * anyone; pi and kimi publish none, and for those the model's provider is
+   * asked instead — once per model, not once per turn. `askedFor` is what
+   * stops a conversation from re-asking a question that already came back
+   * empty on every single message.
+   *
+   * All three reset when the model changes, because the whole point is that a
+   * switch to a smaller model must not carry the larger one's ceiling forward.
+   */
+  private contextModel?: string;
+  private contextWindowFromAgent = false;
+  private capacityAskedFor?: string;
 
   /**
    * True between resuming a conversation and the first thing the user says in it.
@@ -734,6 +763,7 @@ export class ChatSession {
     if (stamped.t === 'permission_resolved') {
       this.pending.delete(stamped.requestId);
     }
+    this.noteContext(stamped);
 
     try {
       this.deps.store.append(this.ref, [stamped]);
@@ -765,6 +795,71 @@ export class ChatSession {
   private setState(state: ChatState): void {
     if (this.state === state) return;
     this.ingest({ t: 'state', state });
+  }
+
+  /**
+   * Keep the context reading pointed at the model that is actually running.
+   *
+   * Two jobs. The first is noticing when the model changes: a conversation
+   * that switches from a million-token model to a two-hundred-thousand one and
+   * keeps the old ceiling would show a bar that is comfortably under a quarter
+   * full while the real window is nearly gone. Everything learned about the
+   * old model is dropped on the switch rather than adjusted.
+   *
+   * The second is filling the gap for the agents that publish no capacity at
+   * all, by asking the provider whose model they named. That is a network call,
+   * so it happens once per model and never blocks the conversation: the answer
+   * arrives as an ordinary `usage` event whenever it arrives, and if it never
+   * does, the reading says capacity is unknown and means it.
+   */
+  private noteContext(event: ChatEvent): void {
+    if (event.t === 'session' || event.t === 'msg_start') {
+      const model = event.model;
+      if (model && model !== this.contextModel) {
+        // Only a *change* discards what is known. Learning the model for the
+        // first time must not: an ACP agent announces its window during the
+        // handshake and names the model a beat later, and treating that as a
+        // switch would throw away the agent's own figure and go asking a
+        // catalogue for a worse one.
+        if (this.contextModel !== undefined) {
+          this.contextWindowFromAgent = false;
+          this.capacityAskedFor = undefined;
+        }
+        this.contextModel = model;
+      }
+    }
+
+    if (event.t === 'usage' && event.usage.contextWindow !== undefined) {
+      // Only an agent's own figure closes the question. A window this session
+      // resolved itself must not mark the agent as having answered, or a later
+      // switch back to a model the agent *does* describe would never re-ask.
+      if (event.usage.contextWindowSource !== 'provider') this.contextWindowFromAgent = true;
+    }
+
+    if (this.contextWindowFromAgent || !this.contextModel) return;
+    if (this.capacityAskedFor === this.contextModel) return;
+    const capacity = this.deps.capacity;
+    if (!capacity) return;
+
+    const model = this.contextModel;
+    this.capacityAskedFor = model;
+    void capacity
+      .contextWindowFor(model)
+      .then((window) => {
+        // The conversation may have moved on to another model while this was
+        // in flight, and a stale ceiling is the exact failure this guards.
+        if (window === null || this.contextModel !== model) return;
+        if (this.contextWindowFromAgent) return;
+        this.ingest({
+          t: 'usage',
+          usage: { contextWindow: window, contextWindowSource: 'provider' },
+        });
+      })
+      .catch(() => {
+        // A lookup that fails is not an event: the reading already says
+        // unknown, which is the truthful state, and there is nothing here a
+        // person could act on.
+      });
   }
 
   /**
