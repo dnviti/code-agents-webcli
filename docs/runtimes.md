@@ -60,8 +60,9 @@ older build you get a warning in the server log rather than a silent relocation.
 ## The WebUI (beta)
 
 Alongside the terminal, most runtimes can open as a **chat** surface: the CLI is
-run headless and its structured output is rendered as a conversation — message
-bubbles, tool-call cards, diffs, plans, permission prompts — instead of as a TUI.
+run in a structured mode of its own and its output is rendered as a conversation
+— message bubbles, tool-call cards, diffs, plans, permission prompts — instead
+of as a TUI.
 
 Launch it with the **WebUI (Beta)** button on the runtime's card in the launcher.
 
@@ -77,19 +78,55 @@ protocol are different processes, so there is nothing to switch between.
 
 It is beta, and labelled as such in the UI.
 
+### Tool activity
+
+When an agent runs a command or edits a file, that shows up in the conversation
+as its own card — separate from the agent's reasoning — and is counted in
+**Usage**. This is checked per agent rather than assumed, because each of these
+CLIs is driven differently and describes its own work differently.
+
+| Runtime | Reports its work as | Verified against |
+| --- | --- | --- |
+| Claude Code | `tool_use` blocks | a recorded session |
+| Codex | `commandExecution` and `fileChange` items | a recorded app-server turn |
+| pi | `tool_execution_start` / `tool_execution_end` | a recorded turn |
+| Grok Build | ACP `tool_call` / `tool_call_update` | a live run against 0.2.112 |
+| Kimi Code, Oh My Pi | ACP `tool_call` / `tool_call_update` | live runs |
+
+Nothing is shown that the agent did not report doing. Where an agent reports a
+tool by name only, the card carries the name and its status and nothing else —
+an inferred command in the record would be worse than a missing one.
+
+**Grok Build is driven over ACP (`grok agent stdio`) rather than its headless
+mode, and this is why.** Headless mode has no tool channel at all: asked to read
+a file and run a command, it emitted eighty-three thought events, one line of
+text and a summary, while the file it wrote appeared on disk. A conversation
+driven that way showed an agent thinking and answering and never doing, and its
+tool counts in Usage read as zero next to agents where the same work was counted
+properly. Grok reports the identical work over ACP, so that is the entry point
+the app uses. It brings permission prompts, a model list and per-turn cost with
+it, and sessions recorded under the old mode still open — Grok kept the record
+all along; only its headless output was silent about it.
+
 ### The `/` menu
 
 Typing `/` in the composer — or pressing the **Slash commands and skills**
 button beside it — lists what the conversation can run, from the moment it
 opens rather than after a first message has been sent.
 
-**What the runtime says about itself always wins.** The ACP agents (Kimi Code,
-Oh My Pi) volunteer their list as the session starts; Claude Code sends its own
-with the first turn. When that list arrives it *replaces* whatever was shown
-before it, entire.
+**What the runtime says about itself wins, for the commands it names.** The ACP
+agents (Grok Build, Kimi Code, Oh My Pi) volunteer their list as the session
+starts; Claude Code sends its own with the first turn. When that list arrives it
+*replaces* the stand-in for anything it names.
 
-Until then — and permanently, for Codex, Grok Build and pi, which never report
-one — the menu shows what is installed for the session, read from the
+What it does not replace is what is installed on disk. Grok announces seven
+built-ins (`compact`, `context`, and so on) and says nothing about your
+`.grok/skills`, so a wholesale replacement would take your own skills off the
+menu a few milliseconds after the conversation opened. They are added back after
+the runtime has had its say.
+
+Until that list arrives — and permanently, for Codex and pi, which never report
+one — the menu is only what is installed for the session, read from the
 directories each runtime's own installer writes into:
 
 | Runtime | Read from |

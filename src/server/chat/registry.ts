@@ -6,15 +6,15 @@ import { ChatAdapter, ChatAdapterOptions } from './adapter.js';
 import { AcpChatAdapter } from './adapters/acp.js';
 import { ClaudeChatAdapter } from './adapters/claude.js';
 import { CodexChatAdapter } from './adapters/codex.js';
-import { GrokChatAdapter } from './adapters/grok.js';
 import { PiChatAdapter } from './adapters/pi.js';
 
 /**
  * Which runtimes can be driven as a chat, and by which adapter.
  *
  * Four adapter families cover them, and the ACP one covers three CLIs by itself
- * because they all speak the Agent Client Protocol — adding a fourth ACP agent
- * is a row in this table, not a new adapter.
+ * because they all speak the Agent Client Protocol — adding another ACP agent
+ * is a row in this table, not a new adapter, which is exactly how grok moved
+ * onto it (see below).
  *
  * A runtime absent from this table is terminal-only, and the launcher says so
  * rather than offering a Chat option that would fail on click. That is the rule
@@ -112,9 +112,52 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
       usage: true,
     },
   },
+  /**
+   * Grok speaks ACP too, and that is the entry point this app drives it on.
+   *
+   * Its headless mode (`grok -p --output-format streaming-json`) has no tool
+   * channel whatsoever — probed against 0.2.112 with a prompt that read a file
+   * and ran a command, and the wire carried 83 `thought` events, one `text` and
+   * an `end`, while the file it wrote appeared on disk. A conversation driven
+   * that way shows an agent thinking and answering and never doing, which is a
+   * transparency problem before it is a metrics one (issue #73).
+   *
+   * `grok agent stdio` reports the identical work as ordinary ACP `tool_call` /
+   * `tool_call_update`, and brings permissions, a model list, `loadSession` and
+   * per-turn cost with it. `session/load` even loads sessions headless mode
+   * created — replaying the tool calls headless never streamed — so nothing
+   * already recorded is stranded by the change.
+   *
+   * `--no-leader` is deliberate: grok will otherwise attach to a shared leader
+   * process, and one leader behind every session on a multi-user installation
+   * is a state-sharing boundary nobody chose.
+   *
+   * `askChannel` stays unset. Grok accepts `mcpServers` on `session/new`, but
+   * nobody has watched a question from it reach this app's socket, and this
+   * table does not advertise what has not been seen working.
+   */
   grok: {
-    factory: (options) => new GrokChatAdapter(options),
-    advertised: { streaming: true, toolCalls: true, usage: true },
+    factory: (options) =>
+      new AcpChatAdapter({
+        ...options,
+        runtime: 'grok',
+        acpArgs: [
+          'agent',
+          ...(options.bypassPermissions ? ['--always-approve'] : []),
+          '--no-leader',
+          'stdio',
+        ],
+      }),
+    advertised: {
+      streaming: true,
+      thinking: true,
+      toolCalls: true,
+      permissions: true,
+      interrupt: true,
+      resume: true,
+      usage: true,
+      cost: true,
+    },
   },
   pi: {
     factory: (options) => new PiChatAdapter(options),

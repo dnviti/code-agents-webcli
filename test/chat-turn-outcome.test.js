@@ -6,7 +6,6 @@ const path = require('path');
 const { AcpChatAdapter } = require('../dist/server/chat/adapters/acp.js');
 const { ClaudeChatAdapter } = require('../dist/server/chat/adapters/claude.js');
 const { CodexAppServerAdapter } = require('../dist/server/chat/adapters/codex.js');
-const { GrokChatAdapter } = require('../dist/server/chat/adapters/grok.js');
 const { PiChatAdapter } = require('../dist/server/chat/adapters/pi.js');
 const { NO_CHAT_CAPABILITIES } = require('../dist/shared/chat-events.js');
 const { applyChatEvent, createTranscript } = require('../dist/shared/chat-reducer.js');
@@ -211,38 +210,6 @@ describe('what a turn ended as', function () {
     });
   });
 
-  describe('grok', function () {
-    function drive(lines) {
-      const events = [];
-      const adapter = new GrokChatAdapter({
-        sessionId: 's1',
-        workingDir: '/tmp',
-        command: 'grok',
-        emit: (event) => events.push(event),
-      });
-      adapter.turnId = 't1';
-      adapter.msgId = 'm1';
-      adapter.blockIndex = 0;
-      adapter.openBlockKind = null;
-      adapter.messageStarted = false;
-      adapter.sawTerminalEvent = false;
-      for (const line of lines) adapter.handleMessage(line);
-      return replay(events, adapter.capabilities);
-    }
-
-    it('ends a turn grok closed with EndTurn as done', function () {
-      // Capitalised, where every other runtime spells it end_turn. A table that
-      // matched case would have called this one failed by never matching it.
-      assert.strictEqual(badgeOf(drive(fixture('grok-stream'))).status, 'done');
-    });
-
-    it('ends a turn grok stopped on an error as failed', function () {
-      // The live rate-limit probe: grok's `error` line is terminal, no `end`
-      // line ever arrives, and the turn genuinely did not complete.
-      assert.strictEqual(badgeOf(drive(fixture('grok-error'))).status, 'failed');
-    });
-  });
-
   describe('pi', function () {
     function drive(name) {
       const events = [];
@@ -338,6 +305,21 @@ describe('what a turn ended as', function () {
 
     it('ends an opencode turn with a tool call in it as done', async function () {
       assert.strictEqual(badgeOf(await drive('acp-opencode')).status, 'done');
+    });
+
+    // Grok is here rather than in a runtime block of its own since #73 moved it
+    // onto ACP and deleted the headless adapter the old cases drove. Its
+    // capitalised `EndTurn` — the spelling that would have been read as failure
+    // by a table that matched case — is still covered by the vocabulary test at
+    // the top of this file.
+    it('ends a grok turn as done', async function () {
+      // The last turn rather than the only one: grok's capture echoes the
+      // prompt back as a user message, so the replay folds into two. That is a
+      // separate defect about who owns the echo, and reading the turn that
+      // actually ended is what this file is asking about.
+      const state = await drive('acp-grok');
+      const grouped = turns.groupTurns(state.messages, state.state);
+      assert.strictEqual(grouped[grouped.length - 1].status, 'done');
     });
   });
 

@@ -5,7 +5,6 @@ const path = require('path');
 
 const { ChatSession } = require('../dist/server/chat/session.js');
 const { PiChatAdapter } = require('../dist/server/chat/adapters/pi.js');
-const { GrokChatAdapter } = require('../dist/server/chat/adapters/grok.js');
 const { CodexExecAdapter } = require('../dist/server/chat/adapters/codex.js');
 
 // Issue #89: a queued message was handed over the instant the previous turn
@@ -86,9 +85,14 @@ function memoryStore() {
   };
 }
 
+// The adapters that spawn one process per turn, which is the whole class this
+// bug lived in. Grok was a third until #73 moved it onto ACP: it now holds one
+// long-lived process for the session, so the gap between "this turn is over"
+// and "a new process is ready" that this file exists to close no longer exists
+// for it. Its handover is covered against a real ACP capture in
+// `chat-tool-activity.test.js`.
 const ADAPTERS = [
   { runtime: 'pi', Adapter: PiChatAdapter },
-  { runtime: 'grok', Adapter: GrokChatAdapter },
   { runtime: 'codex', Adapter: CodexExecAdapter },
 ];
 

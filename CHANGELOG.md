@@ -199,6 +199,43 @@
   cumulative counter would have said $0.0173. The app's existing treatment of
   it was right.
 
+- **Grok Build shows what it actually does.** (#73) A conversation where Grok
+  rewrote four files looked exactly like one where it thought hard and wrote a
+  paragraph: the commands it ran and the files it edited never appeared as
+  activity of their own, only as its own narration folded into its reasoning.
+  You could not follow along, the record of the conversation had no account of
+  what happened to your working folder, and the spend figures were wrong in a
+  way nobody would suspect — tool counts read as zero for Grok next to agents
+  where the same work was counted properly.
+
+  The cause was not a mapping bug. Grok's headless mode has no tool channel at
+  all: asked to read a file and run a command, it emitted eighty-three thought
+  events, one line of text and a summary, while the file it wrote appeared on
+  disk. So Grok is now driven over ACP (`grok agent stdio`), which reports the
+  identical work as ordinary tool calls — with what each one touched and what
+  came back. That is a row in the runtime table rather than a new adapter,
+  since three other agents already speak the same protocol.
+
+  Everything else about Grok improves with it: permission prompts instead of
+  approve-everything-or-nothing, the model list published in the handshake
+  instead of typed from memory, and interruption that leaves the session
+  standing. **Conversations recorded before this still open** — Grok kept the
+  record all along, and loading one replays even the tool calls its headless
+  output was silent about.
+
+  The other five agents were checked the same way rather than assumed correct,
+  each against its own recorded output, and each shows, keeps and counts its
+  tool activity properly. That per-agent answer is written down in
+  `docs/runtimes.md`, and the tests behind it run every agent's real captured
+  output through its real adapter, so an agent whose activity silently stops
+  being captured fails the build.
+
+  Two things the check turned up on the way. The launcher advertised
+  `toolCalls` for Grok while the adapter it built said the opposite — the one
+  place the app promises to be honest about capability said the wrong thing.
+  And a skill installed in `.grok/skills` no longer disappears from the `/`
+  menu when a runtime announces its own built-in commands.
+
 - **Skills and project commands are in the `/` menu from the moment a
   conversation opens, not after the first message.** (#71) Typing `/` in a new
   chat listed a handful of the runtime's built-in commands and nothing else:
@@ -215,10 +252,11 @@
   agents (Kimi Code, Oh My Pi) volunteer their list as the session starts, and
   Claude Code's arrives with the first turn and **replaces** whatever stood in
   for it, entire — a fallback is a stand-in until the real answer arrives, never
-  something merged into it. Where a runtime never reports one — Codex, Grok
-  Build and pi — the menu lists what is installed for that session, read from
-  the directories each runtime's own installer writes into, including enabled
-  plugins for Claude.
+  something merged into it. Where a runtime never reports one — Codex and pi —
+  the menu lists what is installed for that session, read from the directories
+  each runtime's own installer writes into, including enabled plugins for
+  Claude. (Grok Build was in that group until #73 below moved it onto a
+  protocol where it does report one.)
 
   Entries carry the description their author wrote in the skill's frontmatter,
   which also fills in the column for Claude, whose own list is names and nothing

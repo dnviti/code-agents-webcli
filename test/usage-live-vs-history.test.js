@@ -32,7 +32,6 @@ const { applyChatEvent, createTranscript } = require('../dist/shared/chat-reduce
 const { tokenTotal } = require('../dist/shared/usage-records.js');
 
 const { ClaudeChatAdapter } = require('../dist/server/chat/adapters/claude.js');
-const { GrokChatAdapter } = require('../dist/server/chat/adapters/grok.js');
 const { PiChatAdapter } = require('../dist/server/chat/adapters/pi.js');
 const { AcpChatAdapter } = require('../dist/server/chat/adapters/acp.js');
 const { CodexAppServerAdapter } = require('../dist/server/chat/adapters/codex.js');
@@ -50,7 +49,7 @@ const flush = () => new Promise((resolve) => setImmediate(resolve));
 // --------------------------------------------------------------- the adapters
 //
 // Each of these replays one capture through the adapter that reads it, exactly
-// as the tests next door do (`chat-claude`, `chat-grok`, `chat-pi`, `chat-acp`,
+// as the tests next door do (`chat-claude`, `chat-pi`, `chat-acp`,
 // `chat-codex`), and hands back the events a session would have ingested.
 
 async function claudeRun() {
@@ -63,22 +62,6 @@ async function claudeRun() {
   return events;
 }
 
-async function grokRun() {
-  const events = [];
-  const adapter = new GrokChatAdapter({
-    sessionId: 's', workingDir: '/w', command: 'grok', emit: (e) => events.push(e),
-  });
-  // What send() sets up before the turn's process is spawned.
-  adapter.turnId = 't1';
-  adapter.msgId = 'm1';
-  adapter.blockIndex = 0;
-  adapter.openBlockKind = null;
-  adapter.messageStarted = false;
-  adapter.sawTerminalEvent = false;
-  for (const line of fixture('grok-stream')) adapter.handleMessage(line);
-  return events;
-}
-
 async function piRun() {
   const events = [];
   const adapter = new PiChatAdapter({
@@ -88,12 +71,13 @@ async function piRun() {
   return events;
 }
 
-function acpRun(name) {
+function acpRun(name, runtime) {
   return async () => {
     const events = [];
     const adapter = new AcpChatAdapter({
       sessionId: 's', workingDir: '/w', command: '/nonexistent', emit: (e) => events.push(e),
       readFile: async () => '',
+      ...(runtime ? { runtime, acpArgs: ['acp'] } : null),
     });
     adapter.writeLine = () => {};
     const lines = fixture(name);
@@ -193,7 +177,9 @@ function recordedRow(dir, runtime, events) {
 
 const AGENTS = [
   { runtime: 'claude', label: 'claude, which reports four buckets and never a total', run: claudeRun },
-  { runtime: 'grok', label: 'grok', run: grokRun },
+  // Grok over ACP since #73 — the headless adapter this used to drive is gone,
+  // and the capture is the one the ACP entry point really produced.
+  { runtime: 'grok', label: 'grok, over ACP', run: acpRun('acp-grok', 'grok') },
   { runtime: 'pi', label: 'pi', run: piRun },
   { runtime: 'codex', label: 'codex, which reports a running total', run: codexRun },
   { runtime: 'kimi', label: 'an ACP agent (omp)', run: acpRun('acp-omp') },

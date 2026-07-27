@@ -87,9 +87,8 @@ adapters use to decide what they can promise the rest of the UI.
 | Claude | counted from the transcript | reported | reported (see below) | reported, per message and per model |
 | Codex (app-server) | counted from the transcript | reported | **not reported** — nothing in the schema prices a turn | reported, per session |
 | Codex (`exec` fallback) | counted from the transcript | **not reported** | **not reported** | **not reported** |
-| Grok | counted from the transcript | reported | reported, per turn (settled below) | reported at turn end |
 | pi | counted from the transcript | reported | reported | reported, per message |
-| ACP agents (omp, kimi, and others behind the ACP bridge) | counted from the transcript | reported | reported | the runtime's current selection |
+| ACP agents (Grok, omp, kimi, and others behind the ACP bridge) | counted from the transcript | reported | reported — Grok's in ticks, see below | the runtime's current selection |
 
 A figure a runtime never reports is stored as `null` and shown as
 **"not reported"** — never as zero. Those are different facts: a job that
@@ -225,8 +224,8 @@ should expect them not to be related at all.
 Runtimes disagree about what a usage figure even means, and treating them all
 the same way silently multiplies somebody's bill.
 
-Claude, Grok, pi and the ACP agents report a figure **for the message or the
-turn**. Those add up: sum every turn's tokens and cost, and the sum is the
+Claude, pi and the ACP agents — Grok among them — report a figure **for the
+message or the turn**. Those add up: sum every turn's tokens and cost, and the sum is the
 conversation's total.
 
 Codex and the ACP agents' `usage_update` instead report **a running total for
@@ -283,25 +282,24 @@ nothing, and the full aggregate for a turn that failed before its first message
 and so has nothing that could have been counted twice. The cost on the same
 event is cumulative in a different way and is corrected separately, just above.
 
-### Grok's cost convention: settled, and it is per-turn
+### Grok quotes cost in ticks, and it is per-turn
 
-Grok's `total_cost_usd` has the same field name and the same shape as
-Claude's — which is exactly the pattern that turned out to be cumulative on
-Claude — and for a long time this was an open question here, because the
-original probe hit the account's rate limit before a second turn completed.
+Grok never sends a dollar figure. It sends **ticks** — an integer count of
+ten-billionths of a dollar, which is how you carry money without floating point.
+The ratio is not documented; it is read off a run that reported the same turn
+both ways, as `total_cost_usd: 0.02338` and `total_cost_usd_ticks: 233800000`.
+The app converts once, in the adapter, and stores dollars like everyone else.
 
-It has since been probed properly, two consecutive turns in one conversation
-against the installed binary:
+Whether that figure was per-turn or cumulative was an open question here for a
+while, and for good reason: Claude's has the same shape and turned out to be
+cumulative, which over-counted every turn after the first until it was fixed.
+Grok's is **per-turn**, confirmed by two consecutive turns in one session —
+163,726,000 ticks, then 34,682,000. A cumulative counter cannot go down. So the
+figures sum, which is how the app already treated them.
 
-| | `total_cost_usd` | `modelUsage."grok-build".costUSD` |
-| --- | --- | --- |
-| first turn | 0.0133752 | 0.0133752 |
-| second turn, resumed | 0.0038766 | 0.0038766 |
-
-A cumulative counter would have reported roughly 0.0173 on the second turn.
-It reported that turn's own cost, so Grok's figure is **per-turn and sums**,
-which is how this app has always treated it. No correction is needed, and the
-per-model breakdown beside it moves with it exactly.
+The cost arrives in `_meta.usage` on the reply to `session/prompt`, not in the
+`usage` field the other ACP agents use. Reading only the field the others use
+filed every Grok turn as free.
 
 ### A resumed conversation, and where its counter starts
 

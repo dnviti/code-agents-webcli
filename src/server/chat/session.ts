@@ -13,6 +13,7 @@ import {
   QueuedTurn,
   QuestionOption,
   QuestionRequest,
+  SlashCommand,
   UserTurn,
   classifyTool,
   defaultPermissionOptions,
@@ -255,6 +256,13 @@ export class ChatSession {
   private askCalls: Array<{ toolId: string; question?: string }> = [];
   /** True once this session actually handed a runtime the question tool. */
   private questionsEnabled = false;
+  /**
+   * Skills and project commands found on disk when this session launched.
+   *
+   * Kept so a runtime that reports its own command list cannot drop them; see
+   * the merge in `ingest`.
+   */
+  private installedCommands: SlashCommand[] = [];
   private runtime = '';
   private bypass = false;
   private nativeSessionId: string | null = null;
@@ -515,10 +523,11 @@ export class ChatSession {
     this.adapter = adapter;
 
     // Every runtime that has not already accounted for what is installed gets
-    // it here — codex, grok and pi never report a command list at all, so
-    // without this their menu stays empty for the whole session. Nothing is
-    // running yet, so nothing can be overwritten: the moment a runtime does
-    // report its own list, that list replaces this one entire.
+    // it here — codex and pi never report a command list at all, so without
+    // this their menu stays empty for the whole session. Kept on the session as
+    // well, because a runtime reporting its own list later must not be able to
+    // drop what is installed on disk; see the merge in `ingest`.
+    this.installedCommands = installedCommands;
     if (installedCommands.length > 0) {
       adapter.capabilities.commands = mergeSlashCommands(
         adapter.capabilities.commands,
@@ -607,6 +616,34 @@ export class ChatSession {
       seq: this.seq,
       ts: (event as { ts?: number }).ts ?? Date.now(),
     } as ChatEvent;
+
+    // What is installed on disk is not the runtime's to forget.
+    //
+    // A runtime that reports its own command list replaces whatever was there,
+    // which is right for the runtimes that report everything they accept — and
+    // wrong for the one that does not. Grok on ACP announces seven built-ins
+    // (`compact`, `context`, ...) and nothing about the skills and project
+    // commands sitting in `.grok/skills`, so a wholesale replacement dropped
+    // every one of them from the menu the moment the handshake finished.
+    //
+    // Merged on the event itself for the same reason the `questions` flag above
+    // is: this list is read from the log by the browser and by any snapshot
+    // replayed later, so a merge applied only to the local copy would be a menu
+    // that differs between the server and every client reading it.
+    if (this.installedCommands.length > 0) {
+      if (stamped.t === 'session' && stamped.capabilities.commands) {
+        stamped.capabilities = {
+          ...stamped.capabilities,
+          commands: mergeSlashCommands(stamped.capabilities.commands, this.installedCommands),
+        };
+      }
+      if (stamped.t === 'capabilities' && stamped.capabilities.commands) {
+        stamped.capabilities = {
+          ...stamped.capabilities,
+          commands: mergeSlashCommands(stamped.capabilities.commands, this.installedCommands),
+        };
+      }
+    }
 
     if (stamped.t === 'session') {
       // Patched on the event itself, not just on the copy kept here. Every

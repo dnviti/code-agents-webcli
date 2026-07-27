@@ -18,7 +18,6 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { GrokChatAdapter } = require('../dist/server/chat/adapters/grok.js');
 const { ClaudeChatAdapter } = require('../dist/server/chat/adapters/claude.js');
 const { PiChatAdapter } = require('../dist/server/chat/adapters/pi.js');
 const { mapModelUsage } = require('../dist/server/chat/adapters/model-usage.js');
@@ -52,93 +51,20 @@ function collect(Adapter, options) {
   return { adapter, events };
 }
 
-/** What `send()` sets up before a grok turn's process is spawned. */
-function openGrokTurn(adapter, n) {
-  adapter.turnCounter = n;
-  adapter.turnId = `t${n}`;
-  adapter.msgId = `m${n}`;
-  adapter.blockIndex = 0;
-  adapter.openBlockKind = null;
-  adapter.messageStarted = false;
-  adapter.sawTerminalEvent = false;
-}
 
 describe('which model actually ran', () => {
-  describe('grok, which used to report none at all', () => {
-    it('names the model from the turn it finished, not the one it was asked for', () => {
-      const { adapter, events } = collect(GrokChatAdapter, { model: 'grok-4.5' });
-      openGrokTurn(adapter, 1);
-      for (const line of fixtureLines('grok-model-usage.jsonl')) adapter.handleMessage(line);
-
-      const turnEnd = events.find((event) => event.t === 'turn_end');
-      assert.deepStrictEqual(turnEnd.models, [
-        {
-          model: 'grok-build',
-          calls: 1,
-          usage: {
-            inputTokens: 11814,
-            outputTokens: 119,
-            cacheReadTokens: 4096,
-            cacheWriteTokens: undefined,
-            costUsd: 0.0128712,
-          },
-        },
-      ]);
-      // `grok-4.5` was requested. `grok-build` is what answered, and what the
-      // record has to say.
-      assert.notStrictEqual(turnEnd.models[0].model, 'grok-4.5');
-    });
-
-    it('is filed against a model rather than against nothing', () => {
-      const { adapter, events } = collect(GrokChatAdapter, {});
-      openGrokTurn(adapter, 1);
-      events.push({ t: 'msg_start', id: 'u1', role: 'user', turnId: 't1' });
-      for (const line of fixtureLines('grok-model-usage.jsonl')) adapter.handleMessage(line);
-
-      const closed = [];
-      const accountant = new UsageAccountant((job) => closed.push(job));
-      let seq = 0;
-      for (const event of events) accountant.observe({ seq: (seq += 1), ts: seq * 1000, ...event });
-
-      assert.strictEqual(closed.length, 1);
-      assert.strictEqual(closed[0].model, 'grok-build');
-      assert.deepStrictEqual(closed[0].models, []); // one model is not a split
-    });
-
-    it('carries what it learned into the next turn, without turning it into a request', () => {
-      const { adapter, events } = collect(GrokChatAdapter, {});
-      openGrokTurn(adapter, 1);
-      for (const line of fixtureLines('grok-model-usage.jsonl')) adapter.handleMessage(line);
-
-      openGrokTurn(adapter, 2);
-      adapter.handleMessage({ type: 'text', data: 'again' });
-      const second = events.filter((event) => event.t === 'msg_start').pop();
-      assert.strictEqual(second.model, 'grok-build');
-      // The flag is untouched: an observation is not a setting, and pinning it
-      // would freeze the conversation on whatever the account defaulted to.
-      assert.deepStrictEqual(adapter.buildArgs(), ['--output-format', 'streaming-json']);
-    });
-
-    it('says nothing at all before a turn has finished', async () => {
-      const { adapter, events } = collect(GrokChatAdapter, { model: 'grok-4.5' });
-      await adapter.start();
-      assert.strictEqual(events[0].t, 'session');
-      assert.strictEqual(events[0].model, undefined);
-    });
-
-    it('stops naming the old model the moment a different one is asked for', async () => {
-      const { adapter, events } = collect(GrokChatAdapter, {});
-      openGrokTurn(adapter, 1);
-      for (const line of fixtureLines('grok-model-usage.jsonl')) adapter.handleMessage(line);
-      await adapter.setModel('grok-4.5');
-
-      openGrokTurn(adapter, 2);
-      adapter.handleMessage({ type: 'text', data: 'again' });
-      const second = events.filter((event) => event.t === 'msg_start').pop();
-      // Not 'grok-build' (stale) and not 'grok-4.5' (merely requested).
-      assert.strictEqual(second.model, undefined);
-    });
-  });
+  /**
+   * Grok's own model reporting moved with it.
+   *
+   * The headless adapter these cases drove was deleted in #73, which put grok
+   * on ACP — where the model is not something the app infers from a finished
+   * turn at all: the agent publishes its list and its current selection during
+   * the handshake, and `session/set_model` changes it. That is asserted against
+   * the real ACP capture in `chat-tool-activity.test.js` ("names the model it
+   * is actually running", "and the models it offers"), and the money filed
+   * against it in `usage-live-vs-history.test.js`. Nothing about the claim this
+   * file makes was dropped; the surface that answers it changed.
+   */
 
   describe('claude, whose billing name is not the name it shows', () => {
     it('records the canonical model, the one its messages carry', () => {
