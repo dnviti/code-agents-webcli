@@ -3,6 +3,7 @@ import { Badge } from '../../ui/relay/Badge.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import { fetchStatus, type WorkspaceStatus } from '../../chat/workspace-api.js';
 import type { ChatTranscript } from '../../chat/transcript.js';
+import type { ContextWindowSource } from '../../../shared/chat-events.js';
 import { PanelBody, PanelHeader, PanelNote, useWorkspaceData } from './PanelShell.js';
 
 /**
@@ -55,6 +56,7 @@ export function StatusPanel({
             window={usage.contextWindow}
             used={usage.contextUsed}
             total={usage.totalTokens}
+            source={usage.contextWindowSource}
           />
         </Group>
 
@@ -138,19 +140,42 @@ function Meter({ used, of }: { used: number; of: number }): React.JSX.Element {
   );
 }
 
+/**
+ * Who said how big the window is.
+ *
+ * Worth a line because the two are not equally authoritative: an agent
+ * reporting its own window is describing the model it will actually run, while
+ * a provider catalogue is what gets consulted when the agent said nothing at
+ * all. Grok is the standing illustration — it reports 512,000 tokens for
+ * `grok-build`, where the nearest catalogue entry says half that.
+ */
+function SourceNote({ source }: { source?: ContextWindowSource }): React.JSX.Element | null {
+  if (!source) return null;
+  return (
+    <Quiet>
+      {source === 'agent'
+        ? 'Window size as reported by the agent.'
+        : "Window size from the model's provider — this agent does not report one."}
+    </Quiet>
+  );
+}
+
 function ContextSection({
   window: size,
   used,
   total,
+  source,
 }: {
   window?: number;
   used?: number;
   total?: number;
+  source?: ContextWindowSource;
 }): React.JSX.Element {
   // Both halves, or it is not a proportion. A window with no occupancy figure
   // still says something useful — how much room the model has at all — so it is
   // shown on its own rather than suppressed.
   if (size !== undefined && used !== undefined) {
+    const pct = (used / Math.max(1, size)) * 100;
     return (
       <>
         <Meter used={used} of={size} />
@@ -160,6 +185,36 @@ function ContextSection({
           value={formatTokens(Math.max(0, size - used))}
           tone={size - used < size * 0.1 ? 'var(--destructive)' : undefined}
         />
+        {pct >= 80 ? (
+          // Said in words and early enough to act on. A bar turning amber is
+          // easy to miss, and by the time it is unmissable the room to do
+          // anything about it is gone.
+          <PanelNote tone={pct >= 90 ? 'destructive' : 'warning'} icon="circle-alert">
+            {pct >= 90
+              ? 'The context is almost full. Compact or start a new conversation before the next turn.'
+              : 'The context is filling up. Consider compacting or starting a new conversation.'}
+          </PanelNote>
+        ) : null}
+        <SourceNote source={source} />
+      </>
+    );
+  }
+
+  // Occupied against a ceiling nobody would state. Shown rather than
+  // suppressed, because a blank section reads as "your context is fine".
+  if (used !== undefined) {
+    return (
+      <>
+        <Row label="In the window" value={formatTokens(used)} />
+        {/* Kept alongside, because they answer different questions: one is
+            what the last request carried, the other is what the whole
+            conversation has spent. Dropping the second here would have made
+            switching to this branch look like the session total vanished. */}
+        {total !== undefined ? <Row label="Tokens this session" value={formatTokens(total)} /> : null}
+        <Quiet>
+          Neither this agent nor the model&apos;s provider would say how large the window is, so
+          there is nothing honest to measure that against.
+        </Quiet>
       </>
     );
   }
@@ -169,6 +224,7 @@ function ContextSection({
       <>
         <Row label="Window" value={formatTokens(size)} />
         <Quiet>This runtime reports the window it has, but not how full it is.</Quiet>
+        <SourceNote source={source} />
       </>
     );
   }

@@ -1,6 +1,7 @@
 import { spawn } from 'child_process';
 import {
   ChatCapabilities,
+  ChatUsage,
   DiffHunk,
   FileDiff,
   NO_CHAT_CAPABILITIES,
@@ -355,6 +356,27 @@ function safeJson(value: unknown): string | undefined {
   }
 }
 
+/**
+ * How big codex says the window is, and how much of it the last request filled.
+ *
+ * Occupancy comes from `last` rather than `total` where codex offers both:
+ * `total` is everything the turn spent across its round trips, which is a
+ * larger number than anything that was ever in the window at one time and
+ * would have the bar filling several times faster than the truth.
+ */
+function contextReading(
+  usage: Record<string, unknown>,
+  total: Record<string, unknown>,
+): ChatUsage {
+  const window = num(usage.modelContextWindow);
+  const last = record(usage.last) ?? total;
+  const used = num(last.totalTokens);
+  return {
+    ...(window !== undefined ? { contextWindow: window, contextWindowSource: 'agent' as const } : {}),
+    ...(used !== undefined ? { contextUsed: used } : {}),
+  };
+}
+
 /** codex's `ReviewDecision` for the two option kinds this adapter offers; anything else means "no". */
 function reviewDecisionFor(optionId: string): string {
   if (optionId === 'allow_once') return 'approved';
@@ -679,7 +701,7 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
         cacheReadTokens: num(total.cachedInputTokens),
         reasoningTokens: num(total.reasoningOutputTokens),
         totalTokens: num(total.totalTokens),
-        contextWindow: num(usage.modelContextWindow),
+        ...contextReading(usage, total),
       },
     });
   }

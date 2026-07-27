@@ -246,6 +246,11 @@ describe('codex app-server adapter', function () {
             reasoningTokens: 0,
             totalTokens: 150,
             contextWindow: 128000,
+            // Whose figure it is, and how much of the window the *last*
+            // request filled — codex reports both, and `last` is what was in
+            // the window rather than what the whole turn spent (issue #82).
+            contextWindowSource: 'agent',
+            contextUsed: 150,
           },
         },
         { t: 'msg_end', msgId: 'a_turn_1', stopReason: 'completed' },

@@ -68,6 +68,58 @@ of the jobs in it actually contributed a token figure or a cost figure
 (`tokensReportedJobs`, `costReportedJobs`), so "$4.10 across 28 of 40 jobs"
 is the shape of the answer, not "$4.10" on its own.
 
+## The context window
+
+The most useful thing to know mid-session is how much of the model's context is
+left, and it is the one figure a wrong answer is worse than no answer for: a bar
+that is confidently under-full invites you to keep going up to a limit that is
+not there. So nothing in this product writes down how big any model is.
+
+Capacity comes from one of two places, in this order:
+
+1. **The agent said so.** Claude reports it in `modelUsage[…].contextWindow`,
+   codex in `tokenUsage.modelContextWindow`, omp and the other ACP agents in
+   `usage_update.size`, and grok publishes one per model in its `session/new`
+   reply. An agent's own figure always wins — it is describing the model it will
+   actually run.
+2. **The provider says so.** pi and kimi report no capacity at all, but both
+   name an OpenRouter model id (kimi's are literally `openrouter/<id>`), so the
+   provider they are already talking to is asked what its own models are. The
+   catalogue is fetched once and matched on the exact id — never on a
+   neighbouring name.
+
+That second step is the one outbound request this feature makes. Nothing about
+the conversation goes with it: the whole catalogue is fetched and matched on
+this machine, so the provider is never told which model is being asked about.
+Set `CODE_AGENTS_WEBCLI_NO_MODEL_CATALOGUE=1` to switch it off — capacity is
+then whatever the agents report, and unknown otherwise.
+
+If neither can answer, the reading says **"size unknown"** and draws no bar.
+That is the same rule as everywhere else here: an absence is reported as an
+absence.
+
+Why the order matters, concretely: grok reports **512,000** tokens for
+`grok-build`, while the nearest catalogue entry (`x-ai/grok-build-0.1`) says
+**256,000**. Half. Matching loosely would have put that number in front of a
+user with no way to tell it was wrong.
+
+**Occupancy** is the *last* request's own figures — input + cache read + cache
+write + output — not the turn's totals. A three-round-trip turn measured today
+totalled 105,027 tokens across its requests while only 37,387 were ever in the
+window at once: a bar built on the totals would have read 10.5% full where the
+truth was 3.7%.
+
+The reading follows a mid-conversation model switch: everything known about the
+old model is discarded on the switch rather than carried forward, so moving from
+a million-token model to a 200,000-token one immediately reads against the
+smaller ceiling.
+
+Above 80% the display says so in words and says what is left; above 90% it says
+it more urgently. The header strip, which is a fixed width, carries the colour
+and the percentage only — the sentence is in the status panel and in the
+expanded meter, because a warning that overflows its own row at 95% is one
+nobody can read at the moment it matters.
+
 ## Cost is a list price, not a bill
 
 Every runtime prices a turn the same way: the tokens it moved, at the

@@ -276,7 +276,25 @@ export interface ChatUsage {
   contextWindow?: number;
   /** Context currently occupied, when the runtime reports it directly. */
   contextUsed?: number;
+  /**
+   * Who said the window is that big.
+   *
+   * `agent` — the runtime reported it about the model it is running.
+   * `provider` — the agent said nothing, so the model's provider was asked.
+   *
+   * Kept because the two are not equally authoritative and the difference is
+   * measurable: grok reports 512,000 tokens for `grok-build`, while the nearest
+   * entry in a provider catalogue says 256,000. Half. An agent's own figure
+   * always wins, and this field is what lets a reader see which one they got.
+   *
+   * Absent alongside a `contextWindow` should not happen; absent alongside no
+   * `contextWindow` is the ordinary "nobody could say" case, which the UI
+   * states in words rather than drawing a bar against a guess.
+   */
+  contextWindowSource?: ContextWindowSource;
 }
+
+export type ContextWindowSource = 'agent' | 'provider';
 
 /** A message as the reducer assembles it. */
 export interface ChatMessage {
@@ -899,5 +917,10 @@ export function mergeUsage(base: ChatUsage | undefined, next: ChatUsage | undefi
     // Not additive: these describe the window, not consumption within it.
     contextWindow: b.contextWindow ?? a.contextWindow,
     contextUsed: b.contextUsed ?? a.contextUsed,
+    // Travels with the window it describes rather than being picked
+    // independently, or a later turn that only refreshed the occupancy would
+    // leave an older window labelled with the newer one's provenance.
+    contextWindowSource:
+      b.contextWindow !== undefined ? b.contextWindowSource : a.contextWindowSource,
   };
 }

@@ -272,6 +272,10 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   private readonly acpArgs: string[];
   private nativeSessionId: string | null = null;
   private model?: string;
+  /** Model value -> the window the agent published for it, where it did. */
+  private readonly modelWindows = new Map<string, number>();
+  /** The last window announced, so a re-read does not re-emit the same figure. */
+  private reportedWindow?: number;
   private turnId: string | null = null;
   private turnStartedAt = 0;
   private current: OpenMessage | null = null;
@@ -437,6 +441,47 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
       if (models.length) this.capabilities.models = models;
       this.model = str(option.currentValue) || undefined;
     }
+    this.readModelWindows(record(session.models));
+    this.emitContextWindow();
+  }
+
+  /**
+   * Model windows, where the agent publishes them next to the model list.
+   *
+   * Grok does, in the `models` block of its `session/new` reply — every entry
+   * carries `_meta.totalContextTokens`. That is the most authoritative source
+   * there is for a window, because it is the agent describing the model it
+   * will actually run: grok reports 512,000 for `grok-build` where the nearest
+   * provider-catalogue entry says 256,000. Half.
+   *
+   * Parsed from a real capture (`.work/probes/raw/ctx-grok.jsonl`), not from a
+   * schema anyone imagined. It reads nothing on the agents wired up here
+   * today, which all publish their models through `configOptions` and none of
+   * them a window — it starts answering the moment grok moves onto ACP (#73).
+   */
+  private readModelWindows(models: Record<string, unknown>): void {
+    for (const raw of list(models.availableModels)) {
+      const model = record(raw);
+      const id = str(model.modelId);
+      const window = num(record(model._meta).totalContextTokens);
+      if (id && window !== undefined && window > 0) this.modelWindows.set(id, window);
+    }
+    const current = str(models.currentModelId);
+    if (current) this.model = current;
+  }
+
+  /**
+   * Tell the session how big the current model's window is, if the agent said.
+   *
+   * Sent as its own `usage` event because it arrives at handshake time, long
+   * before any turn has spent anything — waiting to attach it to a turn's
+   * figures would leave the first conversation without a reading at all.
+   */
+  private emitContextWindow(): void {
+    const window = this.model ? this.modelWindows.get(this.model) : undefined;
+    if (window === undefined || window === this.reportedWindow) return;
+    this.reportedWindow = window;
+    this.emit({ t: 'usage', usage: { contextWindow: window, contextWindowSource: 'agent' } });
   }
 
   // ------------------------------------------------------------- outgoing
@@ -609,7 +654,9 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     this.emit({
       t: 'usage',
       usage: {
-        contextWindow: num(update.size),
+        ...(num(update.size) !== undefined
+          ? { contextWindow: num(update.size), contextWindowSource: 'agent' as const }
+          : {}),
         contextUsed: num(update.used),
         // Only USD has a place in the model; another currency reported as
         // dollars would be a worse answer than no number at all.

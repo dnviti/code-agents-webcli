@@ -611,6 +611,13 @@ function translateUsage(usage: PiUsage | undefined): ChatUsage | undefined {
     reasoningTokens: usage.reasoning,
     totalTokens: usage.totalTokens,
     costUsd: usage.cost?.total,
+    // One pi message is one request, so its own total is what sat in the
+    // window for it. `mergeUsage` keeps the latest rather than adding these
+    // up, which is what makes a per-message figure usable as an occupancy.
+    //
+    // pi says nothing about how large the window is; it does report the
+    // provider and the model id, and the session asks that provider.
+    contextUsed: usage.totalTokens,
   };
 }
 

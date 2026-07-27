@@ -607,9 +607,14 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
 
     const usageRaw = record(raw.usage);
     const costUsd = this.turnCost(num(raw.total_cost_usd));
+    const context = contextReading(raw);
     const usage: ChatUsage | undefined =
       usageRaw || costUsd !== undefined
-        ? { ...(usageRaw ? mapUsage(usageRaw) : {}), ...(costUsd !== undefined ? { costUsd } : {}) }
+        ? {
+            ...(usageRaw ? mapUsage(usageRaw) : {}),
+            ...(costUsd !== undefined ? { costUsd } : {}),
+            ...context,
+          }
         : undefined;
 
     const sessionId = str(raw.session_id);
@@ -688,6 +693,52 @@ function mapUsage(raw: Record<string, unknown>): ChatUsage {
     cacheWriteTokens: num(raw.cache_creation_input_tokens),
     cacheReadTokens: num(raw.cache_read_input_tokens),
   };
+}
+
+/**
+ * How big claude says the window is, and how much of it the last request filled.
+ *
+ * The capacity comes from claude's own `modelUsage` block, keyed by the model
+ * as it ran — `claude-opus-5[1m]` reports 1,000,000 while the plain model does
+ * not, so the bracketed suffix is load-bearing and the key is used verbatim
+ * rather than canonicalised.
+ *
+ * Occupancy is the *last* iteration's figures, not the turn's totals. A turn
+ * with four round trips reports four iterations, and adding their inputs
+ * together describes work done rather than anything that was ever in the
+ * window at one time — the last one is what actually sat there.
+ */
+function contextReading(raw: Record<string, unknown>): ChatUsage {
+  const reading: ChatUsage = {};
+
+  const modelUsage = record(raw.model_usage) ?? record(raw.modelUsage);
+  if (modelUsage) {
+    for (const value of Object.values(modelUsage)) {
+      const window = num(record(value)?.contextWindow);
+      if (window !== undefined && window > 0) {
+        reading.contextWindow = window;
+        reading.contextWindowSource = 'agent';
+        break;
+      }
+    }
+  }
+
+  const usage = record(raw.usage);
+  const iterations = Array.isArray(usage?.iterations) ? usage.iterations : [];
+  const last = record(iterations[iterations.length - 1]) ?? usage;
+  if (last) {
+    const parts = [
+      num(last.input_tokens),
+      num(last.cache_read_input_tokens),
+      num(last.cache_creation_input_tokens),
+      num(last.output_tokens),
+    ].filter((n): n is number => n !== undefined);
+    if (parts.length > 0) {
+      reading.contextUsed = parts.reduce((sum, n) => sum + n, 0);
+    }
+  }
+
+  return reading;
 }
 
 function toolResultText(content: unknown): string {

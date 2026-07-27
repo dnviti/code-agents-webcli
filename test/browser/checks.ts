@@ -30,6 +30,8 @@ import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
 import { UsageDashboardDialog } from '../../src/client/shell/dialogs/UsageDashboardDialog';
 import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
 import { TabBar } from '../../src/client/ui/relay/TabBar';
+import { UsageMeter } from '../../src/client/shell/chat/UsageMeter';
+import { StatusPanel } from '../../src/client/shell/chat/StatusPanel';
 
 const results: string[] = [];
 const check = (name: string, ok: boolean, detail = ''): void => {
@@ -247,6 +249,7 @@ async function run(): Promise<void> {
   await checkAServerOlderThanThePageSaysSo();
   await checkUnattributedWorkCanBeAttributedByHand();
   await checkTheCommandMenuIsFullBeforeTheFirstMessage();
+  await checkTheContextReadingIsHonestAboutItsCeiling();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -3170,4 +3173,149 @@ async function checkTheCommandMenuIsFullBeforeTheFirstMessage(): Promise<void> {
 
   root.unmount();
   host.remove();
+}
+
+/**
+ * Issue #82: what a person actually sees about the context window.
+ *
+ * Three states, because they are three different answers and the product is
+ * only useful if they are told apart. Measured against a real ceiling; measured
+ * against no ceiling at all; and near enough to the edge that it has to say so
+ * while there is still room to act.
+ *
+ * Rendered through the real stylesheets, because every figure here is a
+ * `var(--...)` away from being unreadable.
+ */
+async function checkTheContextReadingIsHonestAboutItsCeiling(): Promise<void> {
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:520px;height:900px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const capabilities = { usage: true, cost: true } as never;
+  const render = (usage: Record<string, unknown>) => {
+    const host = doc.createElement('div');
+    doc.body.appendChild(host);
+    const root = createRoot(host);
+    root.render(React.createElement(UsageMeter, { usage: usage as never, capabilities }));
+    return { host, root };
+  };
+
+  // A window the agent reported, comfortably below the line.
+  const calm = render({
+    totalTokens: 40000,
+    contextWindow: 1000000,
+    contextUsed: 40000,
+    contextWindowSource: 'agent',
+  });
+  await wait(150);
+  const calmText = (calm.host.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'a measured context reads as used of total',
+    calmText.includes('40.0k') && calmText.includes('1.0M') && calmText.includes('4%'),
+    calmText || 'nothing rendered',
+  );
+  check(
+    'and does not shout about a window that is nearly empty',
+    !/almost full|filling up/i.test(calmText),
+    calmText,
+  );
+
+  // The same conversation, near the edge.
+  const full = render({
+    totalTokens: 190000,
+    contextWindow: 200000,
+    contextUsed: 190000,
+    contextWindowSource: 'agent',
+  });
+  await wait(150);
+  const fullText = (full.host.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'a context near its limit says so, and says how much is left',
+    /almost full/i.test(fullText) && fullText.includes('10.0k'),
+    fullText || 'nothing rendered',
+  );
+  check(
+    'and tells the user what to do about it before the limit is reached',
+    /compact|new conversation/i.test(fullText),
+    fullText,
+  );
+
+  // An agent that reports occupancy and no ceiling, and whose provider had no
+  // entry either. The reading must say that rather than going quiet.
+  const unknown = render({ totalTokens: 8074, contextUsed: 8074 });
+  await wait(150);
+  const unknownText = (unknown.host.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'an unestablished capacity is stated, not left blank',
+    /size unknown/i.test(unknownText),
+    unknownText || 'nothing rendered',
+  );
+  check(
+    'and the figure that is known is still shown',
+    unknownText.includes('8.1k'),
+    unknownText,
+  );
+  check(
+    'and no bar is drawn against a number nobody stands behind',
+    !unknown.host.querySelector('[role="progressbar"]'),
+    String(unknown.host.innerHTML).slice(0, 200),
+  );
+
+  // The panel, which is where the provenance and the warning are spelled out.
+  const panelHost = doc.createElement('div');
+  doc.body.appendChild(panelHost);
+  const transcript = {
+    subscribe: () => () => {},
+    getVersion: () => 0,
+    usage: {
+      totalTokens: 190000,
+      contextWindow: 200000,
+      contextUsed: 190000,
+      contextWindowSource: 'provider',
+    },
+  };
+  const panelRoot = createRoot(panelHost);
+  panelRoot.render(
+    React.createElement(StatusPanel, { sessionId: '', transcript: transcript as never }),
+  );
+  await wait(300);
+  const panelText = (panelHost.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'the status panel warns when the context is nearly gone',
+    /almost full/i.test(panelText),
+    panelText.slice(0, 300) || 'nothing rendered',
+  );
+  check(
+    'and says a looked-up window came from the provider, not the agent',
+    /provider/i.test(panelText),
+    panelText.slice(0, 300),
+  );
+
+  // Legibility: this is the readout someone glances at mid-session, and a
+  // 10px warning is one nobody acts on.
+  const warning = Array.from(panelHost.querySelectorAll('*')).find((node) =>
+    /almost full/i.test(node.textContent || '') && node.children.length === 0,
+  ) as HTMLElement | undefined;
+  const size = warning ? parseFloat(doc.defaultView!.getComputedStyle(warning).fontSize) : 0;
+  check(
+    'the warning is set large enough to read',
+    size >= 12,
+    `${size}px`,
+  );
+
+  calm.root.unmount();
+  full.root.unmount();
+  unknown.root.unmount();
+  panelRoot.unmount();
+  frame.remove();
 }

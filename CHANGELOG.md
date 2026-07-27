@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### Added
+- **Every conversation shows how full the model's context is, against that
+  model's real capacity.** (#82) The reading was only there where a runtime
+  happened to volunteer it, and where it was missing there was nothing at all —
+  a raw token count with no ceiling to read it against, on agents used here
+  every day. The ceiling is the part that cannot be guessed: it differs by a
+  factor of five between models, and a bar drawn against an assumed number is
+  worse than no bar, because it invites you to keep going up to a limit that is
+  not there.
+
+  Nothing in the product now records how large any model is. Capacity comes
+  first from the agent, which is the most authoritative source there is — Claude
+  publishes it in `modelUsage`, Codex in `modelContextWindow`, Oh My Pi in its
+  usage updates, and Grok Build one per model in its handshake. For the two that
+  report none, pi and Kimi Code, the model's provider is asked instead: both
+  name an OpenRouter model id, so the catalogue they are already served from
+  answers for them, matched on the exact id and never on a neighbouring name.
+  That ordering is not academic — Grok reports 512,000 tokens for `grok-build`
+  where the nearest catalogue entry says 256,000, half the truth. Where neither
+  can answer, the display says **"size unknown"** and draws no bar, the same way
+  the product already tells "not reported" apart from a real zero.
+
+  How full it is now comes from the *last* request rather than the turn's
+  totals. A three-round-trip turn measured while building this spent 105,027
+  tokens across its requests while only 37,387 were ever in the window at once —
+  the old reading would have shown 10.5% full where the truth was 3.7%.
+  Switching model mid-conversation discards everything known about the previous
+  one, so a move to a smaller model reads against the smaller ceiling
+  immediately instead of carrying the old one forward. Past 80% the panel says
+  so and says how much is left; past 90% it says it more plainly, while there is
+  still room to compact or start fresh.
+
 ### Fixed
 - **Skills and project commands are in the `/` menu from the moment a
   conversation opens, not after the first message.** (#71) Typing `/` in a new
