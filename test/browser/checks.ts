@@ -255,6 +255,7 @@ async function run(): Promise<void> {
   await checkATurnsBadgeSaysHowItEnded();
   await checkAWaitingMessageCanBeSentNow();
   await checkALongQueueCollapsesToOneRow();
+  await checkFoldedHistoryIsNotBuiltUntilItIsOpened();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -4196,5 +4197,239 @@ async function checkALongQueueCollapsesToOneRow(): Promise<void> {
   withinScreen('opened on a phone');
 
   root.unmount();
+  host.remove();
+}
+
+/* -------------------------------------------------------------------------
+ * Folded history is not built until it is opened (issue #81)
+ *
+ * The whole backlog used to be rendered and then hidden, so entering a
+ * conversation paid for every code block, diff and diagram in it — none of
+ * which was on screen, because everything but the newest turn is folded by
+ * default. The proof has to be at the DOM, not at the policy: `retain` is unit
+ * tested on its own, and a list that computes the right retained set and then
+ * mounts everything anyway would pass that and fail the user.
+ *
+ * The bound is asserted the same way — by opening more heavy turns than the
+ * budget allows and looking for the earliest one's content to be gone.
+ */
+async function checkFoldedHistoryIsNotBuiltUntilItIsOpened(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1280px;height:760px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const capabilities = {
+    streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+    interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+    cost: true, plan: true, commands: [],
+  };
+
+  /**
+   * `count` turns, each carrying `chars` of assistant prose and its own marker.
+   *
+   * Split into 2k blocks rather than one long one, so that a heavier turn is
+   * heavier in the document too. A single 60k-character paragraph renders as
+   * exactly as many elements as a 2k one, which would make the comparison
+   * below pass whether or not anything was fixed.
+   */
+  const conversation = (count: number, chars: number): unknown[] => {
+    const messages: unknown[] = [];
+    for (let i = 1; i <= count; i++) {
+      const blocks = Array.from({ length: Math.max(1, Math.round(chars / 2000)) }, (_, b) => ({
+        kind: 'text',
+        text: `${b === 0 ? `MARKER-${i} ` : `part ${b} `}${'filler '.repeat(280)}`,
+      }));
+      messages.push({
+        id: `u${i}`, seq: messages.length + 1, turnId: `t${i}`, role: 'user', ts: 1,
+        blocks: [{ kind: 'text', text: `question number ${i}` }],
+      });
+      messages.push({
+        id: `a${i}`, seq: messages.length + 1, turnId: `t${i}`, role: 'assistant', ts: 2,
+        blocks,
+      });
+    }
+    return messages;
+  };
+
+  const mount = async (id: string, messages: unknown[]) => {
+    const controller = new ChatController(id, { send: () => {} });
+    controller.handle({
+      type: 'chat_snapshot',
+      sessionId: id,
+      snapshot: {
+        sessionId: id, runtime: 'claude', state: 'idle', capabilities,
+        messages,
+        pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1,
+        cursor: messages.length, live: true, bypassPermissions: false,
+      },
+    } as never);
+    const root = createRoot(host);
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/home/dev/project',
+        branch: 'main',
+        view: { ...DEFAULT_CHAT_VIEW },
+        onViewChange: () => {},
+      } as never),
+    );
+    await wait(500);
+    return { controller, root };
+  };
+
+  const bubbles = (): number => host.querySelectorAll('[data-message-id]').length;
+  const nodes = (): number => host.querySelectorAll('*').length;
+  const shows = (marker: string): boolean => (host.textContent || '').includes(marker);
+  const press = (label: string): void => {
+    const button = host.querySelector(`[aria-label="${label}"]`) as HTMLElement | null;
+    button?.click();
+  };
+
+  // ------------------------------------------- what a folded turn costs
+  //
+  // Measured as the difference between a 3-turn and a 40-turn conversation of
+  // the same content, so the one turn that *is* open cancels out and what is
+  // left is the price of 37 folded ones. Run at two very different content
+  // weights: if folded turns were still being built, the heavy figure would be
+  // a multiple of the light one.
+  const overheadPerFoldedTurn = async (label: string, chars: number): Promise<number> => {
+    let small = await mount(`${label}-3`, conversation(3, chars));
+    const smallNodes = nodes();
+    small.root.unmount();
+    await wait(80);
+    const big = await mount(`${label}-40`, conversation(40, chars));
+    const bigNodes = nodes();
+    big.root.unmount();
+    await wait(80);
+    return (bigNodes - smallNodes) / 37;
+  };
+
+  const lightPerTurn = await overheadPerFoldedTurn('fold-light', 2000);
+  const heavyPerTurn = await overheadPerFoldedTurn('fold-heavy', 60_000);
+
+  let mounted = await mount('fold-long', conversation(40, 2000));
+  const longBubbles = bubbles();
+
+  check(
+    'with history folded, the browser has not built those turns',
+    longBubbles === 2,
+    `${longBubbles} message bubbles mounted for a 40-turn conversation`,
+  );
+  // A folded turn is not free — it still has a strip and an index row, which
+  // is what keeps the conversation navigable. What it must not cost is its
+  // *contents*.
+  check(
+    'so entering the tab costs a strip per turn, not that turn’s contents',
+    lightPerTurn < 40,
+    `${lightPerTurn.toFixed(1)} DOM nodes per folded turn`,
+  );
+  // Thirty times the content behind the fold, and the same price per turn.
+  check(
+    'and it does not follow how heavy the folded turns are',
+    Math.abs(heavyPerTurn - lightPerTurn) < 5,
+    `${heavyPerTurn.toFixed(1)} nodes per folded turn at 60k characters against ${lightPerTurn.toFixed(1)} at 2k`,
+  );
+  check(
+    'and the folded turns’ contents are nowhere in the document',
+    !shows('MARKER-1') && !shows('MARKER-20'),
+    'looked for turn 1 and turn 20 in a 40-turn conversation',
+  );
+  check(
+    'while the turn on screen is fully built',
+    shows('MARKER-40'),
+    'the newest turn is open, as it always was',
+  );
+  // Every turn's strip is still there — the conversation is navigable, and
+  // nothing has been made unreachable.
+  check(
+    'every turn still has its strip, so nothing is out of reach',
+    host.querySelectorAll('[data-turn-id]').length === 40,
+    `${host.querySelectorAll('[data-turn-id]').length} strips for 40 turns`,
+  );
+
+  // ------------------------------------------------- opening one builds it
+  press('Expand turn 12');
+  await wait(300);
+  check(
+    'opening a folded turn shows its contents',
+    shows('MARKER-12'),
+    shows('MARKER-12') ? 'turn 12 is on screen' : 'turn 12 opened empty',
+  );
+
+  // Stamped on the node itself: if re-opening rebuilt the turn, React would
+  // have mounted a fresh element and the stamp would be gone. This is the
+  // behaviour hiding-rather-than-unmounting used to buy, and the one thing
+  // this change was most likely to lose.
+  const stamp = host.querySelector('#turn-body-u12 [data-message-id]') as (HTMLElement & { seen?: number }) | null;
+  if (stamp) stamp.seen = 1;
+  press('Collapse turn 12');
+  await wait(200);
+  press('Expand turn 12');
+  await wait(200);
+  const again = host.querySelector('#turn-body-u12 [data-message-id]') as (HTMLElement & { seen?: number }) | null;
+  check(
+    're-folding and re-opening it does not build it a second time',
+    Boolean(again) && again?.seen === 1,
+    again ? (again.seen === 1 ? 'the same element' : 'a rebuilt element') : 'nothing there at all',
+  );
+
+  // ------------------------------- a turn that kept running while folded
+  const event = (payload: unknown): void =>
+    mounted.controller.handle({ type: 'chat_event', sessionId: 'fold-long', event: payload } as never);
+  press('Collapse turn 40');
+  await wait(150);
+  event({ t: 'msg_start', id: 'late', seq: 999, turnId: 't40', role: 'assistant', ts: 3 });
+  event({ t: 'block_start', msgId: 'late', index: 0, block: { kind: 'text', text: 'ARRIVED-WHILE-FOLDED' } });
+  event({ t: 'msg_end', msgId: 'late' });
+  await wait(200);
+  press('Expand turn 40');
+  await wait(250);
+  check(
+    'a turn that kept running while folded opens on its current state',
+    shows('ARRIVED-WHILE-FOLDED'),
+    shows('ARRIVED-WHILE-FOLDED') ? 'the late message is there' : 'opened on a stale snapshot',
+  );
+
+  mounted.root.unmount();
+  await wait(80);
+
+  // ------------------------------------------------------ the kept bound
+  //
+  // Six turns of 60k characters against a 200k budget: the three most recently
+  // opened are kept by the floor, one more fits, and the rest are released.
+  mounted = await mount('fold-heavy', conversation(8, 60_000));
+  for (const turn of [1, 2, 3, 4, 5, 6]) {
+    press(`Expand turn ${turn}`);
+    await wait(200);
+    press(`Collapse turn ${turn}`);
+    await wait(120);
+  }
+  check(
+    'a conversation that keeps growing does not keep growing what is kept',
+    !shows('MARKER-1') && !shows('MARKER-2'),
+    `turn 1 ${shows('MARKER-1') ? 'still built' : 'released'}, turn 2 ${shows('MARKER-2') ? 'still built' : 'released'}`,
+  );
+  check(
+    'while the ones just looked at are still there',
+    shows('MARKER-6') && shows('MARKER-5'),
+    `turn 6 ${shows('MARKER-6') ? 'kept' : 'gone'}, turn 5 ${shows('MARKER-5') ? 'kept' : 'gone'}`,
+  );
+
+  // ------------------------------------------- jumping to a released turn
+  // Found by its label rather than by a turn id: the index row's terse title
+  // is only used when the index is collapsed, and this is a 1280px window.
+  const option = Array.from(host.querySelectorAll('[role="option"]'))
+    .find((row) => (row.textContent || '').includes('question number 1')) as HTMLElement | undefined;
+  option?.click();
+  await wait(350);
+  check(
+    'jumping to a released turn from the index lands on shown content',
+    shows('MARKER-1'),
+    option ? (shows('MARKER-1') ? 'turn 1 is built and on screen' : 'landed on an empty turn') : 'no index row for turn 1',
+  );
+
+  mounted.root.unmount();
   host.remove();
 }

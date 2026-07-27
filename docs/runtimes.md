@@ -170,6 +170,31 @@ an approval or a question, which is where a correction is most often typed;
 sending then clears the card rather than leaving it waiting for an answer that
 can no longer arrive.
 
+### A long conversation
+
+A conversation is grouped into **turns** — one thing you asked for and
+everything the agent did about it — and every turn but the newest is folded
+shut. A folded turn is not drawn until you open it: its code blocks, diffs,
+diagrams and tool output are not built, and neither is the browser memory they
+would occupy. Entering a tab therefore costs about the same whether the
+conversation behind it is three turns long or three hundred.
+
+Nothing is hidden by this. Every turn keeps its strip and its row in the turn
+index, opens on a click, and opens on a jump from the index or from search —
+which lands on the turn's contents, not on an empty one.
+
+What has been opened is kept, so folding a turn and opening it again is
+immediate rather than a second rebuild. What is kept is bounded by how much
+content it holds rather than by a number of turns, because a conversation of
+one-line exchanges and one full of large files are nothing alike at the same
+turn count. Past that bound the material you looked at longest ago is released,
+and built again if you go back to it — so a conversation can run all day
+without the browser's memory use running with it.
+
+The turn in progress is never treated this way. It is prepared whether it is
+folded or open, and a turn that kept running while folded shows its real,
+current state when you open it — not a snapshot from when you folded it.
+
 ## Runtime profiles
 
 **Settings → Runtime profiles** controls how each CLI is launched. Nothing here
