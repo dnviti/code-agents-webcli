@@ -251,15 +251,37 @@ function extractToolContent(items: unknown[]): ToolPayload {
   return payload;
 }
 
-/** ACP token counts, which spell three of the six fields differently. */
+/**
+ * A tick is a ten-billionth of a dollar.
+ *
+ * Grok quotes a turn's cost only in these, on both of its entry points. The
+ * ratio is not documented anywhere; it is read off a headless run that reported
+ * `total_cost_usd: 0.02338` and `total_cost_usd_ticks: 233800000` for the same
+ * turn. An integer count of tiny units is how you carry money without floating
+ * point, so the app converts once, here, and stores dollars like everyone else.
+ */
+const USD_PER_TICK = 1e-10;
+
+/**
+ * ACP token counts, which spell three of the six fields differently.
+ *
+ * And which the agents then spell differently from each other: kimi and omp
+ * report reasoning as `thoughtTokens`, grok as `reasoningTokens`. Both are read
+ * because both were captured — neither is a guess at a name nobody has sent.
+ */
 function turnUsage(raw: Record<string, unknown>): ChatUsage | undefined {
+  const ticks = num(raw.costUsdTicks);
   const usage: ChatUsage = {
     inputTokens: num(raw.inputTokens),
     outputTokens: num(raw.outputTokens),
     totalTokens: num(raw.totalTokens),
     cacheReadTokens: num(raw.cachedReadTokens),
     cacheWriteTokens: num(raw.cachedWriteTokens),
-    reasoningTokens: num(raw.thoughtTokens),
+    reasoningTokens: num(raw.thoughtTokens) ?? num(raw.reasoningTokens),
+    // Spread in rather than assigned, because an explicit `costUsd: undefined`
+    // is a different object from one without the key to everything that
+    // compares these events — the log, the reducer's merge, and the tests.
+    ...(ticks === undefined ? {} : { costUsd: ticks * USD_PER_TICK }),
   };
   const present = Object.values(usage).some((value) => value !== undefined);
   return present ? usage : undefined;
@@ -359,11 +381,17 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   private applyInitialize(init: Record<string, unknown>): void {
     const agent = record(init.agentCapabilities);
     const prompt = record(agent.promptCapabilities);
-    const sessions = record(agent.sessionCapabilities);
 
     this.loadSupported = agent.loadSession === true;
     this.capabilities.attachments = prompt.image === true || prompt.embeddedContext === true;
-    this.capabilities.resume = this.loadSupported && sessions.resume !== undefined;
+    // `loadSession` alone, because `session/load` is the call `openSession`
+    // actually makes. This used to also require `sessionCapabilities.resume`;
+    // kimi, omp and opencode all publish that key so the gate never bit, and
+    // then grok arrived publishing `loadSession: true` with an empty
+    // `sessionCapabilities` — and loads a session perfectly well. Gating a
+    // capability on a key that is not the one being used advertises the
+    // opposite of the truth in the one place the app promises not to.
+    this.capabilities.resume = this.loadSupported;
   }
 
   /**
@@ -417,12 +445,20 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   /**
    * `session/new` answers with the agent's config surface, not just an id.
    *
-   * The model select is the only place any of the three publishes what it can
+   * The model select is the only place any of these agents publishes what it can
    * run, so it is the source for `capabilities.models` and for the model the
    * session reports. Nothing here *sets* a model: no capture shows the call that
    * would, and `setModel` is left unimplemented rather than guessed.
+   *
+   * Two spellings, both captured live. kimi, omp and opencode answer with a
+   * `configOptions` list holding a `model` option; grok answers with a `models`
+   * object of its own. Reading both is not a guess at a third — an agent that
+   * sends neither simply publishes no list, which is what claude does and what
+   * the picker already handles.
    */
   private applySessionConfig(session: Record<string, unknown>): void {
+    this.applyModelState(record(session.models));
+
     for (const raw of list(session.configOptions)) {
       const option = record(raw);
       if (str(option.category) !== 'model' && str(option.id) !== 'model') continue;
@@ -437,6 +473,27 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
       if (models.length) this.capabilities.models = models;
       this.model = str(option.currentValue) || undefined;
     }
+  }
+
+  /**
+   * Grok's model state: `{ currentModelId, availableModels: [{ modelId, ... }] }`.
+   *
+   * Captured from `session/new` and `session/load`; the same object also arrives
+   * unprompted on `_x.ai/models/update`, which this client ignores because a
+   * model list is not worth an extension-specific code path when the handshake
+   * already carries it.
+   */
+  private applyModelState(state: Record<string, unknown>): void {
+    const models: ModelChoice[] = [];
+    for (const raw of list(state.availableModels)) {
+      const choice = record(raw);
+      const value = str(choice.modelId);
+      if (!value) continue;
+      models.push({ value, name: str(choice.name) || value, description: str(choice.description) });
+    }
+    if (models.length) this.capabilities.models = models;
+    const current = str(state.currentModelId);
+    if (current) this.model = current;
   }
 
   // ------------------------------------------------------------- outgoing
@@ -495,6 +552,29 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
       });
     }
     this.emit({ t: 'msg_end', msgId: id });
+  }
+
+  /**
+   * Switch the model this session runs on, where the agent accepts it.
+   *
+   * `session/set_model` is the ACP method for this, and grok answers it —
+   * probed against 0.2.112, which replied `{"model":{"Ok":"grok-4.5"}}` and
+   * followed with a `models/update` naming the new one. An agent that does not
+   * implement it answers `-32601` and this rejects, which is what the caller
+   * already treats as "could not switch live": it falls back to the runtime's
+   * own `/model` command, or to remembering the choice for the next launch.
+   *
+   * That fallback is why this is worth having rather than dangerous. Grok's
+   * headless mode could rewrite `--model` for the next turn, and moving it onto
+   * ACP would otherwise have taken a working model switch away — quietly, since
+   * the picker would have gone on offering the list grok publishes.
+   */
+  async setModel(model: string): Promise<void> {
+    if (!this.nativeSessionId) {
+      throw new Error(`${this.runtime}: no session to set a model on`);
+    }
+    await this.call('session/set_model', { sessionId: this.nativeSessionId, modelId: model });
+    this.model = model;
   }
 
   async interrupt(): Promise<void> {
@@ -884,7 +964,12 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   private finishTurn(turnId: string, result: unknown): void {
     const payload = record(result);
     const stopReason = str(payload.stopReason);
-    const usage = turnUsage(record(payload.usage));
+    // Two places, because the agents put it in two places. kimi and omp answer
+    // `session/prompt` with a `usage` field; grok answers with `_meta.usage`,
+    // which is where ACP tells an agent to put anything the spec does not name.
+    // Reading only the first spelling filed every grok turn as free.
+    const meta = record(payload._meta);
+    const usage = turnUsage(record(payload.usage)) ?? turnUsage(record(meta.usage));
     const hadMessage = this.current !== null;
 
     this.closeMessage(stopReason, usage);

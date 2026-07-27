@@ -778,8 +778,11 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
  * and exits. There is no persistent RPC channel to ask permission on or to
  * interrupt mid-turn, and nothing survives between turns but what this
  * adapter chooses to remember -- so each turn spawns its own process rather
- * than reusing one across `send()` calls, the same shape `GrokChatAdapter`
- * uses for the same reason (see its class comment).
+ * than reusing one across `send()` calls. Grok's headless mode had the same
+ * shape for the same reason until #73 moved it onto ACP, and it is worth
+ * knowing why that happened before reaching for this pattern again: a one-shot
+ * process reports only what its output format carries, and grok's carried no
+ * tool calls at all.
  *
  * Confirmed by `.work/probes/raw/codex-exec.jsonl`: the envelope is
  * `{"type": "thread.started"|"turn.started"|"turn.completed"|"turn.failed"|"error", ...}`,

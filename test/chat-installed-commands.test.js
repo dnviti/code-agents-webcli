@@ -14,6 +14,13 @@ const { mergeSlashCommands } = require('../dist/shared/slash-commands.js');
 // from the moment it opens. These cover the stand-in it shows until its runtime
 // says otherwise: what it finds on disk, and that the runtime's own answer
 // replaces it whole rather than being blended into it.
+//
+// Two layers, and the distinction matters. An *adapter* replaces: what a
+// runtime says it accepts is the truth about that runtime, and half of a stale
+// guess left mixed into it would be worse than either. The *session* then adds
+// back what it found on disk, because a skill installed in `.grok/skills` is
+// not the runtime's to forget — see `chat-tool-activity.test.js`, which covers
+// the case that made this necessary.
 
 let root;
 
@@ -256,13 +263,19 @@ describe('the stand-in menu and the runtime’s own answer', function () {
  * that never reports a command list of its own, ends up advertising what is
  * installed. `/bin/cat` stands in for the CLI — it stays alive on an open pipe
  * and says nothing, which is exactly the runtime this has to work for.
+ *
+ * Driven on pi rather than grok since #73: grok moved onto ACP, and an ACP
+ * adapter opens with a handshake that `/bin/cat` can only echo back, so it is
+ * no longer a runtime that says nothing. It is also no longer a runtime that
+ * never reports a command list — what happens to what is installed when a
+ * runtime *does* report one is covered in `chat-tool-activity.test.js`.
  */
 describe('a session advertises what is installed for it', function () {
   let dir;
 
   beforeEach(function () {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccweb-session-commands-'));
-    const skillDir = path.join(dir, 'home/.grok/skills/commit');
+    const skillDir = path.join(dir, 'home/.pi/agent/skills/commit');
     fs.mkdirSync(skillDir, { recursive: true });
     fs.writeFileSync(
       path.join(skillDir, 'SKILL.md'),
@@ -291,7 +304,7 @@ describe('a session advertises what is installed for it', function () {
         resolveCommand: () => '/bin/cat',
       },
     );
-    await session.start({ runtime: 'grok', workingDir: path.join(dir, 'project'), env });
+    await session.start({ runtime: 'pi', workingDir: path.join(dir, 'project'), env });
     return session;
   }
 

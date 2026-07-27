@@ -55,9 +55,8 @@ adapters use to decide what they can promise the rest of the UI.
 | Claude | counted from the transcript | reported | reported (see below) |
 | Codex (app-server) | counted from the transcript | reported | **not reported** — nothing in the schema prices a turn |
 | Codex (`exec` fallback) | counted from the transcript | **not reported** | **not reported** |
-| Grok | counted from the transcript | reported | reported, but see the open question below |
 | pi | counted from the transcript | reported | reported |
-| ACP agents (omp, kimi, and others behind the ACP bridge) | counted from the transcript | reported | reported |
+| ACP agents (Grok, omp, kimi, and others behind the ACP bridge) | counted from the transcript | reported | reported — Grok's in ticks, see below |
 
 A figure a runtime never reports is stored as `null` and shown as
 **"not reported"** — never as zero. Those are different facts: a job that
@@ -90,8 +89,8 @@ should expect them not to be related at all.
 Runtimes disagree about what a usage figure even means, and treating them all
 the same way silently multiplies somebody's bill.
 
-Claude, Grok, pi and the ACP agents report a figure **for the message or the
-turn**. Those add up: sum every turn's tokens and cost, and the sum is the
+Claude, pi and the ACP agents — Grok among them — report a figure **for the
+message or the turn**. Those add up: sum every turn's tokens and cost, and the sum is the
 conversation's total.
 
 Codex and the ACP agents' `usage_update` instead report **a running total for
@@ -134,20 +133,24 @@ This was also a user-visible bug in its own right, independent of the
 accounting feature: before this correction, the live in-conversation cost
 meter over-counted on every turn after the first.
 
-### Grok's cost convention is an open question
+### Grok quotes cost in ticks, and it is per-turn
 
-Grok's `total_cost_usd` has the same field name and the same shape as
-Claude's — which is exactly the pattern that turned out to be cumulative on
-Claude. It is currently treated as a **per-turn** figure that sums, on the
-strength of the CLI's own documentation describing `end` as carrying that
-turn's usage. But that has not been confirmed live: the probe run against the
-installed binary hit the account's rate limit before a second successful turn
-completed, so there is no captured pair of consecutive `total_cost_usd`
-values to check the way Claude's were checked. If Grok's figure turns out to
-also be cumulative, every Grok conversation's per-turn cost after the first
-turn is currently overstated in exactly the way Claude's was before its fix.
-Treat Grok's per-job cost figures with that caveat until someone re-probes it
-with working quota.
+Grok never sends a dollar figure. It sends **ticks** — an integer count of
+ten-billionths of a dollar, which is how you carry money without floating point.
+The ratio is not documented; it is read off a run that reported the same turn
+both ways, as `total_cost_usd: 0.02338` and `total_cost_usd_ticks: 233800000`.
+The app converts once, in the adapter, and stores dollars like everyone else.
+
+Whether that figure was per-turn or cumulative was an open question here for a
+while, and for good reason: Claude's has the same shape and turned out to be
+cumulative, which over-counted every turn after the first until it was fixed.
+Grok's is **per-turn**, confirmed by two consecutive turns in one session —
+163,726,000 ticks, then 34,682,000. A cumulative counter cannot go down. So the
+figures sum, which is how the app already treated them.
+
+The cost arrives in `_meta.usage` on the reply to `session/prompt`, not in the
+`usage` field the other ACP agents use. Reading only the field the others use
+filed every Grok turn as free.
 
 ### A resumed conversation, and where its counter starts
 
