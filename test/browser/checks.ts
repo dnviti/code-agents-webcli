@@ -243,6 +243,9 @@ async function run(): Promise<void> {
   await checkThePhoneShellSurfacesAreUsable();
   await checkALongTabNameStaysInsideTheStrip();
   await checkAnUnreportedFigureIsNeverDrawnAsZero();
+  await checkTheUsageChartsAreInteractive();
+  await checkAServerOlderThanThePageSaysSo();
+  await checkUnattributedWorkCanBeAttributedByHand();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -2423,8 +2426,24 @@ async function checkAnUnreportedFigureIsNeverDrawnAsZero(): Promise<void> {
   const dashboard = {
     scope: 'self', canSeeEveryone: false, period: 'day',
     from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
+    bucket: 'hour', filters: {},
     totals: totals({ jobs: 4, turns: 9, toolCalls: 12, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }),
-    series: [{ key: '2026-07-27T09:00', totals: totals({ jobs: 4, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }) }],
+    // Two buckets, not one: the second reported nothing at all, and half of
+    // what these checks are for is that it does not come out looking like an
+    // hour that cost zero.
+    series: [
+      { key: '2026-07-27T09:00', totals: totals({ jobs: 4, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }) },
+      { key: '2026-07-27T10:00', totals: totals({ jobs: 2, totalTokens: 900, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+    ],
+    byProject: [
+      { key: 'billing-api', totals: totals({ jobs: 3, totalTokens: 4000, costUsd: 1.25, tokensReportedJobs: 3, costReportedJobs: 2 }) },
+      // The sentinel the server sends for work recorded before projects
+      // existed. Spelled out here rather than imported, because the point of
+      // the check is that the browser renders whatever the wire actually says —
+      // which is exactly how a mismatch between this literal and the constant
+      // caught the sentinel being an unprintable control character.
+      { key: '//unattributed', totals: totals({ jobs: 1, totalTokens: 1000, tokensReportedJobs: 1, costReportedJobs: 0 }) },
+    ],
     byAgent: [
       { key: 'claude', totals: totals({ jobs: 2, totalTokens: 3000, costUsd: 1.25, tokensReportedJobs: 2, costReportedJobs: 2 }) },
       { key: 'codex', totals: totals({ jobs: 2, totalTokens: 2000, tokensReportedJobs: 2, costReportedJobs: 0 }) },
@@ -2528,6 +2547,485 @@ async function checkAnUnreportedFigureIsNeverDrawnAsZero(): Promise<void> {
   );
 
   root.unmount();
+  frame.remove();
+  window.fetch = realFetch;
+}
+
+/**
+ * Issue #66's acceptance criteria, which are all claims about pixels and
+ * events rather than about types.
+ *
+ * "The charts are interactive" survives a typecheck no matter how it is built:
+ * an SVG `<title>` compiles, renders, and is unreachable by a finger, by the
+ * keyboard and by a screen reader. So this drives the real dialog against a
+ * real response and checks the things a viewer actually does — focus a bar,
+ * press it, press a breakdown row — and, crucially, checks what went back to
+ * the *server* as a result. A selection that highlights a bar without
+ * re-asking the question is a chart that only looks interactive.
+ */
+async function checkTheUsageChartsAreInteractive(): Promise<void> {
+  const totals = (over: Record<string, number>) => ({
+    jobs: 0, turns: 0, toolCalls: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    reasoningTokens: 0, totalTokens: 0, costUsd: 0,
+    tokensReportedJobs: 0, costReportedJobs: 0,
+    ...over,
+  });
+
+  const dashboard = {
+    scope: 'self', canSeeEveryone: false, period: 'day',
+    from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
+    bucket: 'hour', filters: {},
+    totals: totals({ jobs: 6, turns: 11, toolCalls: 14, totalTokens: 5900, costUsd: 1.25, tokensReportedJobs: 6, costReportedJobs: 2 }),
+    series: [
+      { key: '2026-07-27T09:00', totals: totals({ jobs: 4, turns: 8, toolCalls: 10, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }) },
+      // Reported nothing on cost. Must not be drawn as a bar of height zero.
+      { key: '2026-07-27T10:00', totals: totals({ jobs: 2, turns: 3, toolCalls: 4, totalTokens: 900, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+    ],
+    byProject: [
+      { key: 'billing-api', totals: totals({ jobs: 3, totalTokens: 4000, costUsd: 1.25, tokensReportedJobs: 3, costReportedJobs: 2 }) },
+      { key: 'web', totals: totals({ jobs: 3, totalTokens: 1900, tokensReportedJobs: 3, costReportedJobs: 0 }) },
+    ],
+    byAgent: [
+      { key: 'claude', totals: totals({ jobs: 4, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }) },
+      { key: 'codex', totals: totals({ jobs: 2, totalTokens: 900, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+    ],
+    byModel: [{ key: 'claude-opus-5', totals: totals({ jobs: 6, totalTokens: 5900, costUsd: 1.25, tokensReportedJobs: 6, costReportedJobs: 2 }) }],
+    effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
+  };
+
+  const asked: string[] = [];
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+    asked.push(url);
+    const body = url.includes('/api/usage/dashboard') ? dashboard : { jobs: [], total: 0 };
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof window.fetch;
+
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:1100px;height:900px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const root = createRoot(doc.body);
+  root.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
+  await wait(600);
+
+  const bars = (): HTMLButtonElement[] =>
+    Array.from(doc.querySelectorAll<HTMLButtonElement>('[role="group"] button'));
+
+  check(
+    'every point on the trend is a real control, not a decoration',
+    bars().length === 2 && bars().every((b) => b.tagName === 'BUTTON'),
+    `${bars().length} control(s) on the trend`,
+  );
+
+  check(
+    'a point announces its own figures to a screen reader',
+    bars().some((b) => /1\.25/.test(b.getAttribute('aria-label') || '')),
+    bars().map((b) => b.getAttribute('aria-label')).join(' | ').slice(0, 200),
+  );
+
+  // No pointer, no hover: just reaching the control, the way a keyboard tab
+  // stop or a tap on a touch screen does.
+  bars()[1].focus();
+  await wait(120);
+  const live = doc.querySelector('[aria-live="polite"]') as HTMLElement | null;
+  check(
+    'reaching a point reveals its figures without a mouse',
+    Boolean(live && /not reported/i.test(live.textContent || '')),
+    live ? (live.textContent || '').slice(0, 160) : 'no readout region',
+  );
+
+  // The two facts this dashboard exists to keep apart, one pixel from each
+  // other on a chart: an hour that reported no cost, and an hour that cost
+  // nothing. If both bars paint the same, the chart is lying about one.
+  const fills = bars().map((b) => {
+    const span = b.querySelector('span') as HTMLElement;
+    const style = (frame.contentWindow as Window).getComputedStyle(span);
+    return `${style.backgroundColor}/${style.borderTopStyle}`;
+  });
+  check(
+    'a bucket nothing reported is drawn differently from one that cost zero',
+    fills[0] !== fills[1],
+    fills.join(' vs '),
+  );
+
+  const measureTab = Array.from(doc.querySelectorAll<HTMLElement>('button, [role="tab"]')).find(
+    (el) => (el.textContent || '').trim() === 'Tokens',
+  );
+  check('the trend offers a measure other than cost', Boolean(measureTab), measureTab ? 'found' : 'no Tokens control');
+  measureTab?.click();
+  await wait(200);
+  check(
+    'switching the measure redraws the chart against it',
+    bars().some((b) => /Tokens/i.test(b.getAttribute('aria-label') || '')),
+    bars().map((b) => b.getAttribute('aria-label')).join(' | ').slice(0, 200),
+  );
+
+  // Selecting a breakdown row must reach the server, not merely tint a row.
+  const before = asked.length;
+  const projectButton = Array.from(doc.querySelectorAll<HTMLButtonElement>('button')).find(
+    (b) => (b.textContent || '').trim() === 'billing-api',
+  );
+  check('a breakdown row can be selected', Boolean(projectButton), projectButton ? 'found' : 'no billing-api row');
+  projectButton?.click();
+  await wait(400);
+  const sinceRow = asked.slice(before);
+  check(
+    'selecting a project re-asks the whole dashboard for that project',
+    sinceRow.some((u) => u.includes('/api/usage/dashboard') && u.includes('project=billing-api')),
+    sinceRow.join(' | ').slice(0, 300) || 'nothing was re-requested',
+  );
+  check(
+    'and narrows the job list underneath it by the same thing',
+    sinceRow.some((u) => u.includes('/api/usage/jobs') && u.includes('project=billing-api')),
+    sinceRow.filter((u) => u.includes('/jobs')).join(' | ').slice(0, 300) || 'the job list was not re-requested',
+  );
+
+  const chipText = (doc.querySelector('[aria-label="Active filters"]') as HTMLElement | null)?.textContent || '';
+  check(
+    'the narrowing says on screen what it is',
+    /billing-api/.test(chipText),
+    chipText.slice(0, 160) || 'no filter chips',
+  );
+
+  // Pressing a bar narrows to that hour — the drill-down from the chart.
+  const beforeBar = asked.length;
+  bars()[0].click();
+  await wait(400);
+  const sinceBar = asked.slice(beforeBar);
+  check(
+    'selecting a point on the trend narrows the range to it',
+    sinceBar.some((u) => u.includes('/api/usage/dashboard') && u.includes('from=') && u.includes('to=')),
+    sinceBar.join(' | ').slice(0, 300) || 'nothing was re-requested',
+  );
+
+  // And it must be undoable in one action, from the chip rather than by
+  // finding precisely the same bar again.
+  const beforeClear = asked.length;
+  const clearAll = Array.from(doc.querySelectorAll<HTMLButtonElement>('button')).find(
+    (b) => (b.textContent || '').trim() === 'Clear all',
+  );
+  check('there is one control that clears everything', Boolean(clearAll), clearAll ? 'found' : 'no Clear all');
+  clearAll?.click();
+  await wait(400);
+  check(
+    'clearing puts the unnarrowed question back',
+    asked.slice(beforeClear).some((u) => u.includes('/api/usage/dashboard') && !u.includes('project=')),
+    asked.slice(beforeClear).join(' | ').slice(0, 300) || 'nothing was re-requested',
+  );
+
+  const sortButton = Array.from(doc.querySelectorAll<HTMLButtonElement>('button')).find(
+    (b) => (b.getAttribute('aria-label') || '') === 'Sort by Jobs',
+  );
+  check('a breakdown can be re-sorted by another measure', Boolean(sortButton), sortButton ? 'found' : 'no sort control');
+
+  // Phone width: the whole point of dropping the fixed-width SVG.
+  frame.style.width = '390px';
+  await wait(300);
+  const spilling = Array.from(doc.body.querySelectorAll<HTMLElement>('*')).filter((node) => {
+    if (!isPainted(node) || scrollsSideways(node)) return false;
+    const box = node.getBoundingClientRect();
+    return box.right > 391 || box.left < -1;
+  });
+  check(
+    'the charts stay inside a phone-width window',
+    spilling.length === 0,
+    spilling.length ? spilling.slice(0, 6).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
+  );
+
+  root.unmount();
+  frame.remove();
+  window.fetch = realFetch;
+}
+
+/**
+ * The page served out of `dist/public` by a server process that started before
+ * the build that produced it.
+ *
+ * A real crash, and an easy one to hit: rebuilding refreshes the bundle a
+ * running server hands out without refreshing the routes it answers with, so
+ * the browser gets a response one version behind the code reading it. The
+ * breakdown it expects is simply absent, and spreading `undefined` took the
+ * whole dialog down — including any chance of saying why. Guarding the table
+ * alone would have been worse: an absent breakdown would then draw as a
+ * project list with nothing in it, which is a different and more believable
+ * lie.
+ */
+async function checkAServerOlderThanThePageSaysSo(): Promise<void> {
+  const totals = {
+    jobs: 1, turns: 1, toolCalls: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    reasoningTokens: 0, totalTokens: 100, costUsd: 0.5,
+    tokensReportedJobs: 1, costReportedJobs: 1,
+  };
+  // Exactly what 5.3.0 answered with: no `byProject`, no `bucket`, no `filters`.
+  const oldShape = {
+    scope: 'self', canSeeEveryone: false, period: 'day',
+    from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
+    totals,
+    series: [{ key: '2026-07-27T09:00', totals }],
+    byAgent: [{ key: 'claude', totals }],
+    byModel: [{ key: 'claude-opus-5', totals }],
+    effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
+  };
+
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+    const body = url.includes('/api/usage/dashboard') ? oldShape : { jobs: [], total: 0 };
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof window.fetch;
+
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  let crashed: string | null = null;
+  (frame.contentWindow as Window).addEventListener('error', (event) => {
+    crashed = String((event as ErrorEvent).message || 'error');
+  });
+
+  const root = createRoot(doc.body);
+  root.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
+  await wait(600);
+
+  const text = (doc.body.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'a response from an older server does not take the dialog down',
+    crashed === null && text.length > 0,
+    crashed ?? (text ? 'still rendering' : 'nothing on screen'),
+  );
+  check(
+    'and says the server is behind the page, rather than showing empty figures',
+    /older than this page/i.test(text) && /restart the server/i.test(text),
+    text.slice(0, 240) || 'nothing on screen',
+  );
+  check(
+    'and does not draw the missing breakdown as a project list with nothing in it',
+    !/Nothing here yet/.test(text),
+    text.slice(0, 240),
+  );
+
+  root.unmount();
+  frame.remove();
+  window.fetch = realFetch;
+}
+
+/**
+ * Attributing work to a project by hand, from the job it belongs to.
+ *
+ * The claim is not "a form exists" — it is that pressing Save sends the right
+ * assertion for the right job, and that the interface never offers to edit a
+ * project that was actually observed. Both are invisible to a typecheck: an
+ * edit control rendered for an observed job compiles perfectly and produces a
+ * button whose only possible outcome is the server refusing it.
+ */
+async function checkUnattributedWorkCanBeAttributedByHand(): Promise<void> {
+  const totals = (over: Record<string, number>) => ({
+    jobs: 0, turns: 0, toolCalls: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    reasoningTokens: 0, totalTokens: 0, costUsd: 0,
+    tokensReportedJobs: 0, costReportedJobs: 0,
+    ...over,
+  });
+  const one = totals({ jobs: 1, totalTokens: 100, costUsd: 0.5, tokensReportedJobs: 1, costReportedJobs: 1 });
+
+  const dashboard = {
+    scope: 'self', canSeeEveryone: false, period: 'day',
+    from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
+    bucket: 'hour', filters: {},
+    totals: one,
+    series: [{ key: '2026-07-27T09:00', totals: one }],
+    byProject: [
+      { key: 'billing-api', totals: one },
+      { key: '//unattributed', totals: one },
+    ],
+    byAgent: [{ key: 'claude', totals: one }],
+    byModel: [{ key: 'claude-opus-5', totals: one }],
+    effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
+  };
+
+  const jobFields = {
+    sessionId: 'sess-1', nativeSessionId: null, turnId: 't1', userId: 7, userLogin: 'dnviti',
+    agent: 'claude', model: 'claude-opus-5',
+    startedAt: '2026-07-27T09:14:02.000Z', endedAt: '2026-07-27T09:14:41.000Z',
+    durationMs: 39000, outcome: 'completed', turns: 3, toolCalls: 5,
+    inputTokens: 10, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0,
+    reasoningTokens: null, totalTokens: 100, costUsd: 0.5,
+    reportsUsage: true, reportsCost: true,
+  };
+  const unattributed = { ...jobFields, id: 'sess-1:t1', project: null, projectSource: null };
+  const observed = { ...jobFields, id: 'sess-2:t9', sessionId: 'sess-2', project: 'billing-api', projectSource: 'observed' };
+
+  const posted: Array<{ url: string; body: unknown }> = [];
+  let openId = 'sess-1:t1';
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+    if ((init?.method || 'GET').toUpperCase() === 'POST') {
+      posted.push({ url, body: JSON.parse(String(init?.body ?? '{}')) });
+      return new Response(JSON.stringify({ updated: 2, project: 'billing-api' }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url.includes('/api/usage/dashboard')) {
+      return new Response(JSON.stringify(dashboard), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (/\/api\/usage\/jobs\/[^?]/.test(url)) {
+      const body = url.includes('sess-2') ? observed : unattributed;
+      return new Response(JSON.stringify({ ...body, tools: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ jobs: [openId === 'sess-2:t9' ? observed : unattributed], total: 1 }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    });
+  }) as typeof window.fetch;
+
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:1100px;height:900px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const root = createRoot(doc.body);
+  root.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
+  await wait(600);
+
+  const text = () => (doc.body.textContent || '').replace(/\s+/g, ' ');
+  const byLabel = (label: string) =>
+    Array.from(doc.querySelectorAll<HTMLButtonElement>('button')).find(
+      (b) => (b.textContent || '').trim() === label,
+    );
+
+  check(
+    'the dashboard says where unattributed work can be fixed',
+    /attribute it/i.test(text()),
+    text().slice(0, 2000),
+  );
+
+  // Open the unattributed job from the history — the last table on the page.
+  // Not `tbody tr`, which is the first breakdown row four panels above it.
+  const historyRow = (): HTMLElement | null => {
+    const tables = Array.from(doc.querySelectorAll('table'));
+    return (tables[tables.length - 1]?.querySelector('tbody tr') as HTMLElement | null) ?? null;
+  };
+  historyRow()?.click();
+  await wait(400);
+  check('a job opens from the history', /Job detail/i.test(text()), text().slice(0, 160));
+
+  const attributeButton = byLabel('Attribute…');
+  check(
+    'an unattributed job offers to be attributed',
+    Boolean(attributeButton),
+    attributeButton ? 'found' : 'no attribute control',
+  );
+  attributeButton?.click();
+  await wait(200);
+
+  const field = doc.querySelector('input[aria-label="Project name"]') as HTMLInputElement | null;
+  check('the form asks for a project name', Boolean(field), field ? 'found' : 'no input');
+
+  const suggestions = Array.from(doc.querySelectorAll('datalist option')).map((o) => (o as HTMLOptionElement).value);
+  check(
+    'and suggests the projects already in use, so a name is not retyped by guess',
+    suggestions.includes('billing-api') && !suggestions.some((v) => v.includes('unattributed')),
+    suggestions.join(', ') || 'no suggestions',
+  );
+
+  const sessionBox = doc.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
+  check(
+    'the whole conversation is the default, since that is the unit people fix',
+    Boolean(sessionBox && sessionBox.checked),
+    sessionBox ? `checked=${sessionBox.checked}` : 'no checkbox',
+  );
+
+  if (field) {
+    const setter = Object.getOwnPropertyDescriptor(
+      (frame.contentWindow as Window & typeof globalThis).HTMLInputElement.prototype,
+      'value',
+    )?.set;
+    setter?.call(field, 'billing-api');
+    field.dispatchEvent(new (frame.contentWindow as Window & typeof globalThis).Event('input', { bubbles: true }));
+  }
+  await wait(150);
+  byLabel('Save')?.click();
+  await wait(400);
+
+  check(
+    'saving sends the attribution for that job',
+    posted.length === 1 && posted[0].url.includes('sess-1%3At1/project'),
+    posted.map((p) => p.url).join(' | ') || 'nothing was sent',
+  );
+  check(
+    'and sends the name and the whole-conversation choice with it',
+    posted.length === 1
+      && (posted[0].body as { project: string }).project === 'billing-api'
+      && (posted[0].body as { applyToSession: boolean }).applyToSession === true,
+    JSON.stringify(posted[0]?.body ?? null),
+  );
+  check(
+    'and reports how much work it actually changed',
+    /2 job\(s\) attributed/.test(text()),
+    text().slice(0, 240),
+  );
+
+  // Now the other half of the claim: an observed project offers no edit at all.
+  // A fresh mount rather than a re-render — re-rendering the same tree keeps
+  // the open-job state, so the "second" job never actually opened and the
+  // check passed by looking at the first one.
+  root.unmount();
+  await wait(100);
+  openId = 'sess-2:t9';
+  const second = createRoot(doc.body);
+  second.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
+  await wait(600);
+  historyRow()?.click();
+  await wait(400);
+
+  check(
+    'the second job opened',
+    /Job detail/i.test(text()) && /billing-api/.test(text()),
+    text().slice(0, 200),
+  );
+
+  check(
+    'a project that was observed offers no way to overwrite it',
+    !byLabel('Attribute…') && !byLabel('Change'),
+    byLabel('Change') || byLabel('Attribute…')
+      ? 'an edit control was offered for a measured value'
+      : 'no edit offered',
+  );
+
+  second.unmount();
   frame.remove();
   window.fetch = realFetch;
 }

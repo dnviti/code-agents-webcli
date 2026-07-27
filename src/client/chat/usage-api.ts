@@ -1,5 +1,6 @@
 import type {
   UsageDashboard,
+  UsageFilters,
   UsageJobRecord,
   UsageJobSummary,
   UsagePeriod,
@@ -45,21 +46,66 @@ export function localTzOffsetMinutes(): number {
   return -new Date().getTimezoneOffset();
 }
 
-export function fetchUsageDashboard(period: UsagePeriod, scope: UsageScope): Promise<UsageDashboard> {
+/**
+ * Every filter, appended in one place.
+ *
+ * The dashboard, the job list and the export each build their own query string
+ * but must be narrowed identically — a drill-down that reached the chart and
+ * not the list underneath it is the bug this exists to make impossible.
+ * Undefined and empty are both dropped, so an absent filter never travels as
+ * `agent=` and gets read on the far side as "an agent whose name is nothing".
+ */
+function appendFilters(params: URLSearchParams, filters: UsageFilters | undefined): void {
+  if (!filters) return;
+  for (const key of ['agent', 'model', 'project', 'user', 'from', 'to'] as const) {
+    const value = filters[key];
+    if (value) params.set(key, value);
+  }
+}
+
+export async function fetchUsageDashboard(
+  period: UsagePeriod,
+  scope: UsageScope,
+  filters?: UsageFilters,
+): Promise<UsageDashboard> {
   const params = new URLSearchParams({
     period,
     scope,
     tz: String(localTzOffsetMinutes()),
   });
-  return getJson<UsageDashboard>(`/api/usage/dashboard?${params.toString()}`);
+  appendFilters(params, filters);
+  const dashboard = await getJson<UsageDashboard>(`/api/usage/dashboard?${params.toString()}`);
+
+  // The same tell as the 404 above, one version later: this page is being
+  // served out of `dist/public` by a server process that started before the
+  // build that produced it, so the routes in memory are older than the bundle
+  // they just handed over. Said here, once, rather than left to surface as a
+  // render crash several components down — a missing breakdown is not a
+  // dashboard with nothing in it, and quietly drawing it as one would be the
+  // worse failure of the two.
+  if (!Array.isArray(dashboard.byProject) || !dashboard.bucket) {
+    throw new Error(
+      'This server is older than this page — it has no per-project usage figures. '
+        + 'Restart the server and reload.',
+    );
+  }
+  return dashboard;
 }
 
-export interface UsageJobsQuery {
+export interface UsageFacets {
+  agents: string[];
+  models: string[];
+  projects: string[];
+}
+
+export function fetchUsageFacets(scope: UsageScope): Promise<UsageFacets> {
+  return getJson<UsageFacets>(`/api/usage/facets?${new URLSearchParams({ scope }).toString()}`);
+}
+
+export interface UsageJobsQuery extends UsageFilters {
   scope: UsageScope;
   limit?: number;
   offset?: number;
-  agent?: string;
-  model?: string;
 }
 
 export interface UsageJobsPage {
@@ -71,8 +117,7 @@ export function fetchUsageJobs(query: UsageJobsQuery): Promise<UsageJobsPage> {
   const params = new URLSearchParams({ scope: query.scope });
   if (query.limit !== undefined) params.set('limit', String(query.limit));
   if (query.offset !== undefined) params.set('offset', String(query.offset));
-  if (query.agent) params.set('agent', query.agent);
-  if (query.model) params.set('model', query.model);
+  appendFilters(params, query);
   return getJson<UsageJobsPage>(`/api/usage/jobs?${params.toString()}`);
 }
 
@@ -91,6 +136,44 @@ export function fetchUsageJob(id: string, scope: UsageScope): Promise<UsageJobRe
 }
 
 /**
+ * Attribute work to a project by hand, for jobs nobody recorded one for.
+ *
+ * A POST rather than a PATCH on the job, because what this changes is not the
+ * job's own measurement of anything — the record it writes is a person's
+ * assertion about work that finished long ago, and the server keeps the two
+ * apart. Sending `null` withdraws an attribution made this way; an observed
+ * one cannot be touched from here at all, and the server says so by changing
+ * nothing.
+ *
+ * `applyToSession` is the bulk case, and the common one: a conversation ran in
+ * one folder, so attributing the whole conversation at once is what somebody
+ * fixing a backlog actually wants. It only ever reaches the jobs in that
+ * conversation that have no project.
+ */
+export async function attributeUsageProject(
+  jobId: string,
+  options: { project: string | null; applyToSession?: boolean; scope: UsageScope },
+): Promise<{ updated: number; project: string | null }> {
+  const response = await fetch(
+    `/api/usage/jobs/${encodeURIComponent(jobId)}/project?${new URLSearchParams({ scope: options.scope }).toString()}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ project: options.project, applyToSession: Boolean(options.applyToSession) }),
+    },
+  );
+  if (!response.ok) {
+    const detail = await response
+      .json()
+      .then((body: { error?: string; message?: string }) => body.message || body.error)
+      .catch(() => null);
+    throw new Error(detail || `Could not attribute this work (${response.status})`);
+  }
+  return (await response.json()) as { updated: number; project: string | null };
+}
+
+/**
  * The URL the export button downloads from.
  *
  * A URL rather than a fetch-then-blob, same reasoning as `rawFileUrl` in
@@ -98,8 +181,20 @@ export function fetchUsageJob(id: string, scope: UsageScope): Promise<UsageJobRe
  * names the file, and fetching the CSV here would only buffer it in memory to
  * hand the same bytes straight back.
  */
-export function usageExportUrl(scope: UsageScope, from: string, to: string): string {
-  const params = new URLSearchParams({ scope, from, to, format: 'csv' });
+export function usageExportUrl(
+  scope: UsageScope,
+  from: string,
+  to: string,
+  filters?: UsageFilters,
+): string {
+  const params = new URLSearchParams({ scope, format: 'csv' });
+  // The window last, so it wins: `from`/`to` here are the range actually on
+  // screen, which is already the narrowed one whenever a time selection is
+  // active. A filter set that also carried a window would otherwise decide the
+  // export's range from a different reading than the dashboard's.
+  appendFilters(params, filters);
+  params.set('from', from);
+  params.set('to', to);
   return `/api/usage/export?${params.toString()}`;
 }
 
@@ -110,9 +205,14 @@ export function usageExportUrl(scope: UsageScope, from: string, to: string): str
  * workspace-api.ts, this lets the browser name and save the file itself
  * rather than this code re-implementing a save dialog around a blob.
  */
-export function exportUsage(scope: UsageScope, from: string, to: string): void {
+export function exportUsage(
+  scope: UsageScope,
+  from: string,
+  to: string,
+  filters?: UsageFilters,
+): void {
   const anchor = document.createElement('a');
-  anchor.href = usageExportUrl(scope, from, to);
+  anchor.href = usageExportUrl(scope, from, to, filters);
   anchor.rel = 'noopener';
   document.body.appendChild(anchor);
   anchor.click();

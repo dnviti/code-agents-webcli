@@ -23,14 +23,18 @@ import { ChatUsage } from '../../shared/chat-events.js';
 import { AppDatabase } from './database.js';
 import {
   EMPTY_TOTALS,
+  UNATTRIBUTED,
   UsageBreakdown,
   UsageBucket,
+  UsageBucketUnit,
   UsageDashboard,
   UsageEffort,
+  UsageFilters,
   UsageJobRecord,
   UsageJobSummary,
   UsageOutcome,
   UsagePeriod,
+  UsageProjectSource,
   UsageScope,
   UsageToolUse,
   UsageTotals,
@@ -45,6 +49,7 @@ export interface UsageJobInput {
   userLogin: string;
   agent: string;
   model: string | null;
+  project: string | null;
   startedAt: string;
   endedAt: string;
   durationMs: number | null;
@@ -69,7 +74,7 @@ export interface UsageQuery {
   scope: UsageScope;
 }
 
-export interface UsageRangeQuery extends UsageQuery {
+export interface UsageRangeQuery extends UsageQuery, UsageFilters {
   period: UsagePeriod;
   /** The instant the period is anchored on. Defaults to now. */
   anchor?: Date;
@@ -77,15 +82,11 @@ export interface UsageRangeQuery extends UsageQuery {
   tzOffsetMinutes?: number;
 }
 
-export interface UsageHistoryQuery extends UsageQuery {
+export interface UsageHistoryQuery extends UsageQuery, UsageFilters {
   limit?: number;
   offset?: number;
-  /** Narrow to one agent, one model, or one conversation. */
-  agent?: string;
-  model?: string;
+  /** Narrow to one conversation. Not a dashboard filter — there is no such breakdown. */
   sessionId?: string;
-  from?: string;
-  to?: string;
 }
 
 interface JobRow {
@@ -97,6 +98,8 @@ interface JobRow {
   user_login: string;
   agent: string;
   model: string | null;
+  project: string | null;
+  project_source: string | null;
   started_at: string;
   ended_at: string;
   duration_ms: number | null;
@@ -184,12 +187,12 @@ export class UsageStore {
       db.prepare(`
         INSERT OR REPLACE INTO usage_jobs (
           id, session_id, native_session_id, turn_id, user_id, user_login,
-          agent, model, started_at, ended_at, duration_ms, outcome,
+          agent, model, project, project_source, started_at, ended_at, duration_ms, outcome,
           turns, tool_calls,
           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
           reasoning_tokens, total_tokens, cost_usd,
           reports_usage, reports_cost
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         job.sessionId,
@@ -199,6 +202,9 @@ export class UsageStore {
         job.userLogin,
         job.agent,
         job.model,
+        job.project ?? null,
+        // Recorded, not asserted: this came off the session as the work ran.
+        job.project ? 'observed' : null,
         job.startedAt,
         job.endedAt,
         job.durationMs,
@@ -290,6 +296,61 @@ export class UsageStore {
     };
   }
 
+  /**
+   * Attribute work by hand to a project, for jobs nobody recorded one for.
+   *
+   * The one write on this table that is not a measurement, and it is fenced
+   * accordingly:
+   *
+   * - **An observed project is never overwritten.** It is what the session was
+   *   actually pointed at while the work ran. A person who disagrees with it is
+   *   disagreeing with a fact, and letting them edit it would make every other
+   *   project figure a claim rather than a record.
+   * - **A manual one can be corrected or withdrawn**, by anyone who could have
+   *   made it — a typo that can never be fixed is worse than no attribution.
+   * - **Scope is the same parameter every read takes**, so this cannot reach a
+   *   job the caller is not allowed to see, let alone one they cannot see at
+   *   all.
+   *
+   * Returns how many rows actually changed, which is not the same as how many
+   * were asked for: a caller that names a session with nine jobs, six of them
+   * already observed, is told three. Silently reporting nine would read as
+   * "done" for work that was deliberately left alone.
+   */
+  attributeProject(
+    target: { jobId?: string; sessionId?: string },
+    project: string | null,
+    query: UsageQuery,
+  ): number {
+    const scope = this.scopeClause(query);
+    const where: string[] = [...scope.parts];
+    const whereParams: unknown[] = [...scope.params];
+
+    if (target.jobId) {
+      where.push('id = ?');
+      whereParams.push(target.jobId);
+    } else if (target.sessionId) {
+      where.push('session_id = ?');
+      whereParams.push(target.sessionId);
+    } else {
+      // No target is not "every job I own". Refusing beats guessing at a scope
+      // this wide.
+      return 0;
+    }
+    // The fence. Both halves matter: the first admits work nobody attributed,
+    // the second admits corrections to work somebody attributed by hand.
+    where.push("(project IS NULL OR project_source = 'manual')");
+
+    // The source is derived here rather than passed in, so "cleared" cannot be
+    // recorded as a manual attribution to nothing — a row with a null project
+    // and a source is a state nothing else in this file knows how to read.
+    const source: UsageProjectSource = project ? 'manual' : null;
+    const result = this.database.raw
+      .prepare(`UPDATE usage_jobs SET project = ?, project_source = ? WHERE ${where.join(' AND ')}`)
+      .run(project, source, ...whereParams);
+    return result.changes ?? 0;
+  }
+
   // ------------------------------------------------------------------ reading
 
   /** One job with its tool breakdown, or null if it is not this viewer's to see. */
@@ -331,18 +392,31 @@ export class UsageStore {
     return { jobs: rows.map(mapJob), total };
   }
 
-  /** Everything the dashboard draws for one range and one scope. */
+  /** Everything the dashboard draws for one range, one scope and one narrowing. */
   dashboard(query: UsageRangeQuery, canSeeEveryone: boolean): UsageDashboard {
     const tz = Number.isFinite(query.tzOffsetMinutes) ? Math.trunc(query.tzOffsetMinutes as number) : 0;
     const scope: UsageScope = query.scope === 'everyone' && canSeeEveryone ? 'everyone' : 'self';
-    const { from, to, buckets, format } = rangeFor(query.period, query.anchor ?? new Date(), tz);
+    const { from, to, buckets, format, unit, windowed } = windowFor(
+      query.period,
+      query.anchor ?? new Date(),
+      tz,
+      query.from,
+      query.to,
+    );
     const base = this.scopeClause({ userId: query.userId, scope });
-    const where = `WHERE ended_at >= ? AND ended_at < ?${base.and}`;
+    // Every breakdown the dashboard draws reads this one predicate, which is
+    // what makes "narrow to a project" narrow the totals, the trend, the effort
+    // figures and the tool counts together. A filter applied to some of them
+    // and not the rest is a dashboard whose parts disagree about what is on
+    // screen.
+    const narrow = filterClause(query);
+    const where = `WHERE ended_at >= ? AND ended_at < ?${base.and}${narrow.and}`;
     // The same predicate, qualified, for the one query that joins. Built rather
     // than rewritten out of the string above: a regex over SQL is a bug waiting
     // for the first column name that contains another one.
-    const joined = `WHERE j.ended_at >= ? AND j.ended_at < ?${base.and.replace('user_id', 'j.user_id')}`;
-    const params = [from.toISOString(), to.toISOString(), ...base.params];
+    const joinedNarrow = filterClause(query, 'j.');
+    const joined = `WHERE j.ended_at >= ? AND j.ended_at < ?${base.and.replace('user_id', 'j.user_id')}${joinedNarrow.and}`;
+    const params = [from.toISOString(), to.toISOString(), ...base.params, ...narrow.params];
     const shift = `${tz >= 0 ? '+' : '-'}${Math.abs(tz)} minutes`;
 
     const totalsRow = this.database.raw
@@ -368,13 +442,25 @@ export class UsageStore {
       period: query.period,
       from: from.toISOString(),
       to: to.toISOString(),
+      bucket: unit,
+      // Echoed back rather than assumed: the client draws a "clear this filter"
+      // control from it, and a control that clears something the server never
+      // applied is worse than no control at all. Which is exactly why the
+      // window is reported as the one that was *used* — a half or inverted
+      // range is ignored above, and echoing it back verbatim would advertise a
+      // narrowing that never happened.
+      filters: {
+        ...activeFilters({ ...query, from: undefined, to: undefined }),
+        ...(windowed ? { from: from.toISOString(), to: to.toISOString() } : {}),
+      },
       totals: mapTotals(totalsRow),
       series,
       byAgent: this.breakdown('agent', where, params),
-      byModel: this.breakdown("COALESCE(model, '')", where, params),
+      byModel: this.breakdown('model', where, params),
+      byProject: this.breakdown('project', where, params),
       byUser: scope === 'everyone' ? this.breakdown('user_login', where, params) : undefined,
       effortByAgent: this.effort('agent', where, params),
-      effortByModel: this.effort("COALESCE(model, '')", where, params),
+      effortByModel: this.effort('model', where, params),
       topTools: this.tools(joined, params, false),
       topToolsByAgent: this.tools(joined, params, true),
     };
@@ -402,19 +488,27 @@ export class UsageStore {
     };
   }
 
-  /** The agents and models seen in the record, for filter menus. */
-  facets(query: UsageQuery): { agents: string[]; models: string[] } {
+  /** The agents, models and projects seen in the record, for filter menus. */
+  facets(query: UsageQuery): { agents: string[]; models: string[]; projects: string[] } {
     const scope = this.scopeClause(query);
-    const clause = scope.and ? ` WHERE ${scope.and.replace(/^ AND /, '')}` : '';
+    const clause = scope.parts.length ? ` WHERE ${scope.parts.join(' AND ')}` : '';
+    const distinct = (column: string): string[] => {
+      const rows = this.database.raw
+        .prepare(
+          `SELECT DISTINCT ${column} AS value FROM usage_jobs${clause}`
+            + `${clause ? ' AND' : ' WHERE'} ${column} IS NOT NULL ORDER BY value ASC`,
+        )
+        .all(...scope.params) as Array<{ value: string }>;
+      return rows.map((row) => row.value);
+    };
     const agents = this.database.raw
       .prepare(`SELECT DISTINCT agent FROM usage_jobs${clause} ORDER BY agent ASC`)
       .all(...scope.params) as Array<{ agent: string }>;
-    const models = this.database.raw
-      .prepare(
-        `SELECT DISTINCT model FROM usage_jobs${clause}${clause ? ' AND' : ' WHERE'} model IS NOT NULL ORDER BY model ASC`,
-      )
-      .all(...scope.params) as Array<{ model: string }>;
-    return { agents: agents.map((r) => r.agent), models: models.map((r) => r.model) };
+    // Projects the viewer may not see are not merely hidden from the figures —
+    // they are absent from the menu too. A filter list is a directory of what
+    // exists, and one that named every project in the installation would leak
+    // the shape of everyone else's work to a viewer scoped to their own.
+    return { agents: agents.map((r) => r.agent), models: distinct('model'), projects: distinct('project') };
   }
 
   // ------------------------------------------------------------------ helpers
@@ -427,21 +521,16 @@ export class UsageStore {
    */
   private historyClause(query: UsageHistoryQuery): { clause: string; params: unknown[] } {
     const scope = this.scopeClause(query);
-    const where: string[] = [scope.and.replace(/^ AND /, '')].filter(Boolean);
-    const params: unknown[] = [...scope.params];
+    const narrow = filterClause(query);
+    const where: string[] = [...scope.parts, ...narrow.parts];
+    const params: unknown[] = [...scope.params, ...narrow.params];
 
-    if (query.agent) {
-      where.push('agent = ?');
-      params.push(query.agent);
-    }
-    if (query.model) {
-      where.push('model = ?');
-      params.push(query.model);
-    }
     if (query.sessionId) {
       where.push('session_id = ?');
       params.push(query.sessionId);
     }
+    // The window, which `filterClause` leaves out because the dashboard folds
+    // it into its own range instead. Here it is an ordinary predicate.
     if (query.from) {
       where.push('ended_at >= ?');
       params.push(query.from);
@@ -463,7 +552,10 @@ export class UsageStore {
         ORDER BY cost_usd DESC, total_tokens DESC, jobs DESC
       `)
       .all(...params) as Array<TotalsRow & { key: string | null }>;
-    return rows.map((row) => ({ key: row.key ?? '', totals: mapTotals(row) }));
+    // A null groups under the sentinel, not under `''`. Both would render the
+    // same, but only one of them survives a round trip through a query string
+    // when the viewer clicks that row to filter by it.
+    return rows.map((row) => ({ key: row.key ?? UNATTRIBUTED, totals: mapTotals(row) }));
   }
 
   /**
@@ -499,7 +591,7 @@ export class UsageStore {
       .all(...params) as Array<Record<string, number | string | null>>;
 
     return rows.map((row) => ({
-      key: String(row.key ?? ''),
+      key: row.key === null || row.key === undefined ? UNATTRIBUTED : String(row.key),
       jobs: Number(row.jobs ?? 0),
       turnsAvg: round2(Number(row.turns_avg ?? 0)),
       turnsMax: Number(row.turns_max ?? 0),
@@ -555,10 +647,63 @@ export class UsageStore {
    * "everyone" and "this user" are produced by the same code path and a new
    * query cannot accidentally get the wide one by omission.
    */
-  private scopeClause(query: UsageQuery): { and: string; params: unknown[] } {
-    if (query.scope === 'everyone') return { and: '', params: [] };
-    return { and: ' AND user_id = ?', params: [query.userId] };
+  private scopeClause(query: UsageQuery): { parts: string[]; and: string; params: unknown[] } {
+    if (query.scope === 'everyone') return { parts: [], and: '', params: [] };
+    return { parts: ['user_id = ?'], and: ' AND user_id = ?', params: [query.userId] };
   }
+}
+
+/**
+ * The narrowing a query carries, as SQL predicates.
+ *
+ * Shared by the dashboard and the job history so a filter cannot mean one thing
+ * on a chart and another in the list that chart drills into. `from`/`to` are
+ * deliberately absent here — the dashboard folds them into its own window,
+ * and applying them twice would produce an empty range whenever the two
+ * disagreed.
+ *
+ * The sentinel is spelled `IS NULL` rather than `= ' unattributed'`: the
+ * grouping key is a rendering decision, the null is the stored fact, and a
+ * filter that matched the rendering would find nothing at all.
+ */
+function filterClause(
+  filters: UsageFilters,
+  prefix = '',
+): { parts: string[]; and: string; params: unknown[] } {
+  const parts: string[] = [];
+  const params: unknown[] = [];
+  const nullable = (column: string, value: string | undefined): void => {
+    if (value === undefined || value === '') return;
+    if (value === UNATTRIBUTED) {
+      parts.push(`${prefix}${column} IS NULL`);
+      return;
+    }
+    parts.push(`${prefix}${column} = ?`);
+    params.push(value);
+  };
+
+  if (filters.agent) {
+    parts.push(`${prefix}agent = ?`);
+    params.push(filters.agent);
+  }
+  nullable('model', filters.model);
+  nullable('project', filters.project);
+  if (filters.user) {
+    parts.push(`${prefix}user_login = ?`);
+    params.push(filters.user);
+  }
+
+  return { parts, and: parts.map((p) => ` AND ${p}`).join(''), params };
+}
+
+/** The filters that are actually doing something, for echoing back to the client. */
+function activeFilters(filters: UsageFilters): UsageFilters {
+  const out: UsageFilters = {};
+  for (const key of ['agent', 'model', 'project', 'user', 'from', 'to'] as const) {
+    const value = filters[key];
+    if (value !== undefined && value !== '') out[key] = value;
+  }
+  return out;
 }
 
 function mapJob(row: JobRow): UsageJobSummary {
@@ -571,6 +716,8 @@ function mapJob(row: JobRow): UsageJobSummary {
     userLogin: row.user_login,
     agent: row.agent,
     model: row.model,
+    project: row.project,
+    projectSource: (row.project_source as UsageProjectSource) ?? null,
     startedAt: row.started_at,
     endedAt: row.ended_at,
     durationMs: row.duration_ms,
@@ -619,7 +766,7 @@ export function rangeFor(
   period: UsagePeriod,
   anchor: Date,
   tzOffsetMinutes: number,
-): { from: Date; to: Date; buckets: string[]; format: string } {
+): { from: Date; to: Date; buckets: string[]; format: string; unit: UsageBucketUnit } {
   const shift = tzOffsetMinutes * 60_000;
   const local = new Date(anchor.getTime() + shift);
   const y = local.getUTCFullYear();
@@ -635,7 +782,7 @@ export function rangeFor(
     // instant — `new Date` on it returns Invalid Date — and the key is
     // documented as an ISO one, so anything that formats it for an axis label
     // would print exactly that.
-    return { from: toUtc(start), to: toUtc(start + 24 * 3_600_000), buckets, format: '%Y-%m-%dT%H:00' };
+    return { from: toUtc(start), to: toUtc(start + 24 * 3_600_000), buckets, format: '%Y-%m-%dT%H:00', unit: 'hour' };
   }
 
   if (period === 'week') {
@@ -644,19 +791,99 @@ export function rangeFor(
     const weekday = (new Date(Date.UTC(y, m, d)).getUTCDay() + 6) % 7;
     const start = Date.UTC(y, m, d - weekday);
     for (let i = 0; i < 7; i += 1) buckets.push(iso(new Date(start + i * 86_400_000), 'day'));
-    return { from: toUtc(start), to: toUtc(start + 7 * 86_400_000), buckets, format: '%Y-%m-%d' };
+    return { from: toUtc(start), to: toUtc(start + 7 * 86_400_000), buckets, format: '%Y-%m-%d', unit: 'day' };
   }
 
   if (period === 'month') {
     const start = Date.UTC(y, m, 1);
     const end = Date.UTC(y, m + 1, 1);
     for (let t = start; t < end; t += 86_400_000) buckets.push(iso(new Date(t), 'day'));
-    return { from: toUtc(start), to: toUtc(end), buckets, format: '%Y-%m-%d' };
+    return { from: toUtc(start), to: toUtc(end), buckets, format: '%Y-%m-%d', unit: 'day' };
   }
 
   const start = Date.UTC(y, 0, 1);
   for (let i = 0; i < 12; i += 1) buckets.push(iso(new Date(Date.UTC(y, i, 1)), 'month'));
-  return { from: toUtc(start), to: toUtc(Date.UTC(y + 1, 0, 1)), buckets, format: '%Y-%m' };
+  return { from: toUtc(start), to: toUtc(Date.UTC(y + 1, 0, 1)), buckets, format: '%Y-%m', unit: 'month' };
+}
+
+const HOUR_MS = 3_600_000;
+const DAY_MS = 86_400_000;
+/** Two years. A window wider than this is a mistake or an attempt, not a question. */
+const MAX_WINDOW_MS = 2 * 366 * DAY_MS;
+/** More bars than this is a smear, and more rows than a browser should be handed. */
+const MAX_BUCKETS = 800;
+
+/**
+ * The range the dashboard covers, whether it came from a period or from a
+ * viewer clicking one bar of the trend.
+ *
+ * Granularity is derived from how wide the window is, not from which period
+ * button is lit. That is the whole of what makes drilling in work: click a
+ * month and you get its days, click one of those days and you get its hours,
+ * with no second notion of "zoom level" to keep in step with the first. The
+ * thresholds are chosen so an unnarrowed period lands exactly where it used to
+ * — a day on hours, a week and a month on days, a year on months.
+ */
+export function windowFor(
+  period: UsagePeriod,
+  anchor: Date,
+  tzOffsetMinutes: number,
+  fromISO?: string,
+  toISO?: string,
+): { from: Date; to: Date; buckets: string[]; format: string; unit: UsageBucketUnit; windowed: boolean } {
+  const from = parseInstant(fromISO);
+  const to = parseInstant(toISO);
+  // Both ends or neither. One end alone leaves the other implied by the period,
+  // and a window whose start and end were decided by two different mechanisms
+  // is the kind of thing that reads correctly right up until a month boundary.
+  if (!from || !to || to.getTime() <= from.getTime()) {
+    return { ...rangeFor(period, anchor, tzOffsetMinutes), windowed: false };
+  }
+
+  const span = Math.min(to.getTime() - from.getTime(), MAX_WINDOW_MS);
+  const end = new Date(from.getTime() + span);
+  const unit: UsageBucketUnit = span > 62 * DAY_MS ? 'month' : span > 36 * HOUR_MS ? 'day' : 'hour';
+  const shift = tzOffsetMinutes * 60_000;
+  const local = new Date(from.getTime() + shift);
+  const y = local.getUTCFullYear();
+  const m = local.getUTCMonth();
+  const d = local.getUTCDate();
+
+  // Aligned down to the unit boundary in the viewer's own frame, so the first
+  // bar is a whole hour or a whole day rather than a stub starting at 09:37.
+  let cursor =
+    unit === 'hour'
+      ? Date.UTC(y, m, d, local.getUTCHours())
+      : unit === 'day'
+        ? Date.UTC(y, m, d)
+        : Date.UTC(y, m, 1);
+  const localEnd = end.getTime() + shift;
+  const buckets: string[] = [];
+  let months = 0;
+  while (cursor < localEnd && buckets.length < MAX_BUCKETS) {
+    buckets.push(iso(new Date(cursor), unit));
+    if (unit === 'hour') cursor += HOUR_MS;
+    else if (unit === 'day') cursor += DAY_MS;
+    else {
+      months += 1;
+      cursor = Date.UTC(y, m + months, 1);
+    }
+  }
+
+  return {
+    from,
+    to: end,
+    buckets,
+    format: unit === 'hour' ? '%Y-%m-%dT%H:00' : unit === 'day' ? '%Y-%m-%d' : '%Y-%m',
+    unit,
+    windowed: true,
+  };
+}
+
+function parseInstant(value: string | undefined): Date | null {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
 function iso(date: Date, unit: 'hour' | 'day' | 'month'): string {

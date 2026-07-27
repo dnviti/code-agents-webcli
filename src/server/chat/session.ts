@@ -39,6 +39,7 @@ import { ChatStoreLike, ChatSessionRef } from './store.js';
 import { askChannelFor, createChatAdapter, supportsChat } from './registry.js';
 import { FinishedJob, UsageAccountant } from './usage-accounting.js';
 import { UsageJobInput } from '../services/usage-store.js';
+import { projectNameFor } from '../../shared/usage-records.js';
 
 /**
  * One chat conversation, owned by the server.
@@ -644,6 +645,12 @@ export class ChatSession {
         userLogin: usage.loginFor(this.ref.ownerUserId),
         agent: this.runtime,
         model: job.model,
+        // Read now, from the folder this session is pointed at now. A session
+        // that is re-pointed mid-flight leaves the work it already did filed
+        // under the project it actually ran in — the alternative, resolving it
+        // when the dashboard asks, would rewrite last month's figures every
+        // time somebody moved a folder.
+        project: projectNameFor(this.cwd),
         startedAt: new Date(job.startedAt).toISOString(),
         endedAt: new Date(job.endedAt).toISOString(),
         durationMs: job.durationMs,
