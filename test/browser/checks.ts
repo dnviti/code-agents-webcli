@@ -249,6 +249,7 @@ async function run(): Promise<void> {
   await checkTheUsageChartsAreInteractive();
   await checkAServerOlderThanThePageSaysSo();
   await checkUnattributedWorkCanBeAttributedByHand();
+  await checkTheHistoryListsConversationsRatherThanRequests();
   await checkTheCommandMenuIsFullBeforeTheFirstMessage();
   await checkANewConversationCanBeStartedFromTheComposer();
   await checkTheFileEditorShowsTheFile();
@@ -2822,9 +2823,13 @@ async function checkTheUsageChartsAreInteractive(): Promise<void> {
     sinceRow.join(' | ').slice(0, 300) || 'nothing was re-requested',
   );
   check(
-    'and narrows the job list underneath it by the same thing',
-    sinceRow.some((u) => u.includes('/api/usage/jobs') && u.includes('project=billing-api')),
-    sinceRow.filter((u) => u.includes('/jobs')).join(' | ').slice(0, 300) || 'the job list was not re-requested',
+    // The list underneath is the conversations one (#88); the claim is
+    // unchanged — a narrowing reaches it, rather than leaving it answering a
+    // different question from the charts above.
+    'and narrows the list underneath it by the same thing',
+    sinceRow.some((u) => u.includes('/api/usage/conversations') && u.includes('project=billing-api')),
+    sinceRow.filter((u) => u.includes('/conversations')).join(' | ').slice(0, 300)
+      || 'the conversation list was not re-requested',
   );
 
   const chipText = (doc.querySelector('[aria-label="Active filters"]') as HTMLElement | null)?.textContent || '';
@@ -2897,6 +2902,190 @@ async function checkTheUsageChartsAreInteractive(): Promise<void> {
  * project list with nothing in it, which is a different and more believable
  * lie.
  */
+/**
+ * The history reads as conversations, and one of them opens onto its requests.
+ *
+ * The claim #88 makes is about what is on screen, and a typecheck cannot see
+ * any of it: a dashboard that asked for conversations and then drew the flat
+ * job list compiles perfectly. So this renders the real dialog against real
+ * responses and asks four things a person would ask — is the list the tabs
+ * rather than the requests, does an entry carry enough to recognise it, does a
+ * conversation that used two agents say so instead of naming one, and is the
+ * detail still reachable underneath.
+ */
+async function checkTheHistoryListsConversationsRatherThanRequests(): Promise<void> {
+  const totals = (over: Record<string, number>) => ({
+    jobs: 0, turns: 0, toolCalls: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    reasoningTokens: 0, totalTokens: 0, costUsd: 0,
+    tokensReportedJobs: 0, costReportedJobs: 0,
+    ...over,
+  });
+
+  const dashboard = {
+    scope: 'self', canSeeEveryone: false, period: 'day',
+    from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
+    bucket: 'hour', filters: {},
+    totals: totals({ jobs: 41, totalTokens: 90_000, costUsd: 7.5, tokensReportedJobs: 41, costReportedJobs: 41 }),
+    series: [], byProject: [], byAgent: [], byModel: [],
+    effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
+  };
+
+  // Two tabs, forty-one requests between them. The first is the case the issue
+  // is about: a morning's work in one tab, which used to be forty rows.
+  const conversations = {
+    total: 2,
+    conversations: [
+      {
+        sessionId: 'tab-morning',
+        name: 'Refactoring the parser',
+        agents: ['claude', 'codex'],
+        models: ['claude-opus-5', 'gpt-5'],
+        projects: ['billing-api'],
+        startedAt: '2026-07-27T09:00:00.000Z',
+        lastActiveAt: '2026-07-27T12:30:00.000Z',
+        totals: totals({ jobs: 40, totalTokens: 88_000, costUsd: 7.25, tokensReportedJobs: 40, costReportedJobs: 40 }),
+      },
+      {
+        // No name: this tab has been closed, and the entry survives it.
+        sessionId: 'aa11bb22-cc33-dd44',
+        name: null,
+        agents: ['claude'],
+        models: [],
+        projects: [],
+        startedAt: '2026-07-27T08:00:00.000Z',
+        lastActiveAt: '2026-07-27T08:05:00.000Z',
+        totals: totals({ jobs: 1, totalTokens: 2000, costUsd: 0.25, tokensReportedJobs: 1, costReportedJobs: 1 }),
+      },
+    ],
+  };
+
+  const job = (id: string, turnId: string) => ({
+    id, sessionId: 'tab-morning', nativeSessionId: null, turnId,
+    userId: 1, userLogin: 'octocat', agent: 'claude', model: 'claude-opus-5',
+    project: 'billing-api', projectSource: 'observed',
+    startedAt: '2026-07-27T09:00:00.000Z', endedAt: '2026-07-27T09:01:00.000Z',
+    durationMs: 60_000, outcome: 'completed', turns: 2, toolCalls: 3,
+    inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0,
+    reasoningTokens: 0, totalTokens: 150, costUsd: 0.2,
+    reportsUsage: true, reportsCost: true,
+  });
+
+  const asked: string[] = [];
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+    asked.push(url);
+    const body = url.includes('/api/usage/dashboard')
+      ? dashboard
+      : url.includes('/api/usage/conversations')
+        ? conversations
+        : url.includes('/api/usage/jobs')
+          ? { total: 2, jobs: [job('tab-morning:t1', 't1'), job('tab-morning:t2', 't2')] }
+          : { agents: [], models: [], projects: [] };
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof window.fetch;
+
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:1100px;height:900px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const root = createRoot(doc.body);
+  root.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
+  await wait(700);
+
+  const text = (): string => (doc.body.textContent || '').replace(/\s+/g, ' ');
+
+  check(
+    'the history asks the server for conversations, not for every request',
+    asked.some((url) => url.includes('/api/usage/conversations')),
+    asked.join(' | ').slice(0, 300) || 'nothing was requested',
+  );
+
+  check(
+    // Otherwise the headline covers a day and the list covers all time, and
+    // the entries visibly fail to add up to the figure above them.
+    'over the same range the figures above it were computed for',
+    asked.some(
+      (url) =>
+        url.includes('/api/usage/conversations')
+        && url.includes(`from=${encodeURIComponent(dashboard.from)}`)
+        && url.includes(`to=${encodeURIComponent(dashboard.to)}`),
+    ),
+    asked.filter((u) => u.includes('/conversations')).join(' | ').slice(0, 300),
+  );
+
+  // Read the row, not the page: every figure on this screen is a run of digits
+  // next to another one, and a regexp over the whole document would find "40"
+  // inside the headline totals whether or not the row rendered at all.
+  const entryRow = (): HTMLElement | undefined =>
+    (Array.from(doc.querySelectorAll('tbody tr')) as HTMLElement[]).find((row) =>
+      (row.textContent || '').includes('Refactoring the parser'),
+    );
+  const cells = (row: HTMLElement | undefined): string[] =>
+    Array.from(row?.querySelectorAll('td') ?? []).map((cell) => (cell.textContent || '').trim());
+
+  check(
+    'a tab used forty times is one entry carrying all forty',
+    cells(entryRow()).includes('40'),
+    cells(entryRow()).join(' | ') || 'the conversation row did not render',
+  );
+
+  check(
+    'and the entry says enough to recognise it — project, agent, when it ran',
+    /billing-api/.test(text()) && /claude/.test(text()) && /2026|27\/0?7|0?7\/27/.test(text()),
+    text().slice(0, 400),
+  );
+
+  check(
+    'a conversation that used two agents is not shown as having used one',
+    /claude\s*\+1/.test(text()),
+    text().slice(0, 400),
+  );
+
+  check(
+    'a conversation whose tab is gone still appears, named by what is left',
+    /Conversation aa11bb22/.test(text()),
+    text().slice(0, 400),
+  );
+
+  // The detail below the entry: open the first conversation and the requests
+  // inside it must be what is asked for, narrowed to that conversation.
+  const entry = entryRow();
+  check('the conversation entry is a row that can be opened', Boolean(entry), 'no such row');
+  entry?.click();
+  await wait(400);
+
+  check(
+    'opening it asks for that conversation\'s own requests',
+    asked.some((url) => url.includes('/api/usage/jobs') && url.includes('sessionId=tab-morning')),
+    asked.filter((u) => u.includes('/jobs')).join(' | ').slice(0, 300) || 'no job request was made',
+  );
+
+  const backButton = Array.from(doc.querySelectorAll('button')).find(
+    (b) => /all conversations/i.test(b.textContent || ''),
+  );
+  check(
+    'and there is a way back to the list',
+    Boolean(backButton),
+    Array.from(doc.querySelectorAll('button')).map((b) => b.textContent).join(' | ').slice(0, 200),
+  );
+
+  root.unmount();
+  frame.remove();
+  window.fetch = realFetch;
+}
+
 async function checkAServerOlderThanThePageSaysSo(): Promise<void> {
   const totals = {
     jobs: 1, turns: 1, toolCalls: 0,
@@ -3066,6 +3255,16 @@ async function checkUnattributedWorkCanBeAttributedByHand(): Promise<void> {
     text().slice(0, 2000),
   );
 
+  // The history opens on conversations now (#88), and a single job is a level
+  // below that. Attribution is a per-request question, so this check takes the
+  // Requests view — which is exactly the reason that view still exists.
+  const requestsTab = Array.from(doc.querySelectorAll<HTMLElement>('[role="tab"], button')).find(
+    (el) => (el.textContent || '').trim() === 'Requests',
+  );
+  check('the history offers the requests behind the conversations', Boolean(requestsTab), 'no Requests control');
+  requestsTab?.click();
+  await wait(400);
+
   // Open the unattributed job from the history — the last table on the page.
   // Not `tbody tr`, which is the first breakdown row four panels above it.
   const historyRow = (): HTMLElement | null => {
@@ -3142,6 +3341,12 @@ async function checkUnattributedWorkCanBeAttributedByHand(): Promise<void> {
   const second = createRoot(doc.body);
   second.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
   await wait(600);
+  // A fresh mount is back on the conversation list, so the requests view has to
+  // be taken again — the state that was reset is exactly why this is a remount.
+  Array.from(doc.querySelectorAll<HTMLElement>('[role="tab"], button'))
+    .find((el) => (el.textContent || '').trim() === 'Requests')
+    ?.click();
+  await wait(400);
   historyRow()?.click();
   await wait(400);
 

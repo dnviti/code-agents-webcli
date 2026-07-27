@@ -43,6 +43,38 @@ or `error` rather than being dropped. A turn the process died in the middle of
 took exactly as many round trips as it got to; that is a fact about the crash,
 not an absence of one.
 
+## The unit you read: the conversation
+
+A job is the unit that is *recorded*. It is not the unit anybody thinks in. A
+morning's work in one chat tab is one piece of work — "this conversation, about
+this thing, cost this much" — and filing it as forty rows makes the tab's own
+record less usable the more the tab is used.
+
+So the dashboard's history lists **conversations**, one row per chat tab, and
+everything spent in a tab sums into that one entry:
+
+- **Compacting the conversation does not start a new entry.** Neither does
+  clearing it, nor starting a new one inside the same tab. Those replace the
+  *runtime's* conversation — a new native session id — and the tab goes on
+  being the tab.
+- **Closing the tab and reopening it, or coming back after a server restart,
+  continues the same entry.** The id it is keyed on is the session's own,
+  which is durable; a job carries it whether the session row still exists or
+  not.
+- **A conversation that used more than one agent or model says so**, rather
+  than being filed under whichever one happened to be first.
+- **The requests are still there**, one level down: open a conversation for its
+  own jobs, or take the Requests view to browse them across conversations.
+
+Nothing was migrated to make this work, and no earlier period is counted
+differently. The tab's id has been on every job row since the table existed, so
+grouping on it reaches back over the whole history.
+
+Two tabs are never merged into one entry because they share a project — the
+by-project breakdown is what answers that question, and it goes on summing
+jobs. The headline totals and the breakdowns are the same rows grouped other
+ways, so they agree with the conversation entries by construction.
+
 ## The per-agent honesty table
 
 Not every runtime reports the same things, and the app does not pretend
@@ -404,6 +436,41 @@ under the key `" unattributed"` (with the leading space). It is a sentinel
 rather than an empty string precisely so it can be sent straight back as a
 filter value: an empty query parameter is indistinguishable from an absent one,
 and "show me only the unattributed work" is a real question.
+
+### `GET /api/usage/conversations`
+
+Paged history **one entry per chat tab**, most recently active first. Takes
+exactly the same query parameters as `/api/usage/jobs` below and means the same
+thing by them — the two are one list at two levels of detail.
+
+Each entry carries the tab's totals, when it started and when it was last
+active, and the agents, models and projects used over its life as *lists*: a
+conversation that changed agent half way through says so rather than being
+filed under one of them. `name` is the tab's own name, or `null` once the tab
+has been deleted — a job outlives its conversation, and the entry survives
+without a name rather than disappearing.
+
+```
+GET /api/usage/conversations?limit=20
+```
+
+```json
+{
+  "total": 2,
+  "conversations": [
+    {
+      "sessionId": "sess-abc",
+      "name": "Refactoring the parser",
+      "agents": ["claude", "codex"],
+      "models": ["claude-opus-5", "gpt-5"],
+      "projects": ["billing-api"],
+      "startedAt": "2026-07-27T09:00:00.000Z",
+      "lastActiveAt": "2026-07-27T12:30:00.000Z",
+      "totals": { "jobs": 40, "costUsd": 7.25, "...": "..." }
+    }
+  ]
+}
+```
 
 ### `GET /api/usage/jobs`
 
