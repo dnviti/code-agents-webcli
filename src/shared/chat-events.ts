@@ -278,6 +278,31 @@ export interface ChatUsage {
   contextUsed?: number;
 }
 
+/**
+ * What one model did during a turn, as the runtime itself reported it.
+ *
+ * The distinction this exists to keep is between the model that was *asked
+ * for* and the model that *ran*. A requested model is a fact about this app; a
+ * reported one is a fact about the work, and only the second belongs in a spend
+ * record. Nothing here is ever filled in from `options.model`.
+ *
+ * A list rather than a field because a turn can legitimately involve more than
+ * one: a subagent runs on a different model, a runtime falls back after a
+ * failure. Claude and grok both report exactly this, keyed by model, and
+ * folding it back into one name would be the misattribution the whole record
+ * exists to avoid.
+ *
+ * `calls` is the runtime's own count of round trips to that model — grok's
+ * `modelCalls`. It is the only per-model measure of effort any of them give;
+ * tool calls are never attributed to a model by anybody, so they are not
+ * attributed here either.
+ */
+export interface TurnModelUsage {
+  model: string;
+  calls?: number;
+  usage?: ChatUsage;
+}
+
 /** A message as the reducer assembles it. */
 export interface ChatMessage {
   id: string;
@@ -541,6 +566,15 @@ export type ChatEvent =
       stopReason?: string;
       usage?: ChatUsage;
       durationMs?: number;
+      /**
+       * Which models actually ran this turn, when the runtime said.
+       *
+       * Late by nature: a runtime that breaks its spend down per model does it
+       * at the end, once it knows. So this is a correction as much as a
+       * report — it is what lets a conversation that opened with no model at
+       * all end the turn naming the one that answered.
+       */
+      models?: TurnModelUsage[];
     }
   /** The runtime revised what it can do — new slash commands, a model switch. */
   | { t: 'capabilities'; seq: number; ts: number; capabilities: Partial<ChatCapabilities> }

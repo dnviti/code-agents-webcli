@@ -3,9 +3,11 @@ import {
   ChatBlock,
   ChatCapabilities,
   ChatUsage,
+  TurnModelUsage,
   UserTurn,
 } from '../../../shared/chat-events.js';
 import { AdapterEvent, BaseChatAdapter, ChatAdapterOptions } from '../adapter.js';
+import { mapModelUsage } from './model-usage.js';
 
 /**
  * Grok Build headless mode (`grok -p <prompt> --output-format streaming-json`).
@@ -62,7 +64,10 @@ export class GrokChatAdapter extends BaseChatAdapter {
 
   /** Learned from the first `end`, or seeded from a prior log; feeds the next `--resume`. */
   private nativeSessionId?: string;
+  /** What was asked for. May be nothing, and usually is. */
   private currentModel?: string;
+  /** What grok said it ran, learned from a completed turn's `modelUsage`. */
+  private reportedModel?: string;
 
   private turnCounter = 0;
   private turnId: string | null = null;
@@ -94,7 +99,9 @@ export class GrokChatAdapter extends BaseChatAdapter {
     this.emit({
       t: 'session',
       nativeSessionId: this.nativeSessionId,
-      model: this.currentModel,
+      // Nothing yet, and honestly so: grok names its model at the end of a
+      // turn, and no turn has run. See `rememberReportedModel`.
+      model: this.reportedModel,
       cwd: this.options.workingDir,
       capabilities: this.capabilities,
     });
@@ -254,6 +261,8 @@ export class GrokChatAdapter extends BaseChatAdapter {
       case 'end': {
         const stopReason = typeof data.stopReason === 'string' ? data.stopReason : undefined;
         const usage = this.mapUsage(data);
+        const models = mapModelUsage(data);
+        this.rememberReportedModel(models);
         if (this.messageStarted) {
           this.emit({ t: 'msg_end', msgId: this.msgId as string, stopReason, usage });
         }
@@ -263,7 +272,7 @@ export class GrokChatAdapter extends BaseChatAdapter {
           // before this is known).
           this.nativeSessionId = data.sessionId;
         }
-        this.closeTurn(stopReason, usage);
+        this.closeTurn(stopReason, usage, models);
         return;
       }
 
@@ -273,7 +282,13 @@ export class GrokChatAdapter extends BaseChatAdapter {
         // Confirmed live (rate-limit probe): an `error` line is terminal -- the process
         // exits right after with no `end` line, so close the turn now rather than wait
         // for one that will not arrive.
-        this.closeTurn('error');
+        //
+        // Spend is read off it all the same: the docs say a prompt-level failure carries
+        // frozen spend fields when usage was recorded, and work that reached a model and
+        // then failed was still charged for. What it charged is what `modelUsage` says.
+        const failedModels = mapModelUsage(data);
+        this.rememberReportedModel(failedModels);
+        this.closeTurn('error', undefined, failedModels);
         return;
       }
 
@@ -301,7 +316,11 @@ export class GrokChatAdapter extends BaseChatAdapter {
       id: this.msgId as string,
       role: 'assistant',
       turnId: this.turnId as string,
-      model: this.currentModel,
+      // The reported model, never the requested one. `--model` says what was
+      // asked for and grok is free to answer with something else; naming the
+      // request here would put a figure in the record that nothing measured.
+      // Blank until the first turn ends, which is the earliest grok says.
+      model: this.reportedModel,
     });
   }
 
@@ -331,10 +350,37 @@ export class GrokChatAdapter extends BaseChatAdapter {
     };
   }
 
-  private closeTurn(stopReason?: string, usage?: ChatUsage): void {
+  /**
+   * Name the next turn's messages after the model this one actually used.
+   *
+   * `modelUsage` arrives at the end, so the turn that produced it has already
+   * had its `msg_start` emitted with whatever was known then — nothing, for a
+   * conversation that never requested a model. `turn_end` carries the
+   * correction for that turn; this is so the *following* turn starts out
+   * naming it, instead of every message in a grok conversation being anonymous
+   * until its own turn finishes.
+   *
+   * Only when one model ran. Where several did, picking one of them to label
+   * the next turn's messages with would be a guess, and the turn's own report
+   * is the honest answer for those.
+   *
+   * It does not touch what `buildArgs` passes: the model reported is not
+   * automatically a model to request. Pinning grok's default onto the next
+   * `--model` flag would silently convert an observation into a setting, and
+   * freeze a conversation on whatever the account happened to default to the
+   * day it started.
+   */
+  private rememberReportedModel(models: TurnModelUsage[] | undefined): void {
+    if (models && models.length === 1) this.reportedModel = models[0].model;
+  }
+
+  private closeTurn(stopReason?: string, usage?: ChatUsage, models?: TurnModelUsage[]): void {
     this.sawTerminalEvent = true;
     if (this.turnId) {
-      this.emit({ t: 'turn_end', turnId: this.turnId, stopReason, usage });
+      // `models` only when there is something to say: an explicit `undefined`
+      // key is a different object from an absent one to anything comparing
+      // events, and this event is compared — in the log, and in tests.
+      this.emit({ t: 'turn_end', turnId: this.turnId, stopReason, usage, ...(models ? { models } : {}) });
     }
     this.turnId = null;
     this.msgId = null;
@@ -359,6 +405,11 @@ export class GrokChatAdapter extends BaseChatAdapter {
     // Model is a per-invocation flag (`-m/--model`), not a mid-session control message,
     // so "switching" just changes what the next spawned turn uses.
     this.currentModel = model;
+    // And what the last turn reported is no longer what the next one will run,
+    // so it stops being shown. It comes back, confirmed, when the next turn
+    // ends — which may name this model or may not, and either way it will be
+    // grok saying it rather than this app assuming.
+    this.reportedModel = undefined;
   }
 }
 

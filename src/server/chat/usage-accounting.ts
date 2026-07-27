@@ -39,7 +39,7 @@
  * downstream, the live meter included: cost on a turn is that turn's cost.
  */
 
-import { ChatEvent, ChatUsage, mergeUsage } from '../../shared/chat-events.js';
+import { ChatEvent, ChatUsage, TurnModelUsage, mergeUsage } from '../../shared/chat-events.js';
 import { UsageOutcome, UsageToolCount } from '../../shared/usage-records.js';
 
 /** Everything the accountant knows about a job it has just closed. */
@@ -55,6 +55,16 @@ export interface FinishedJob {
   toolCalls: number;
   usage: ChatUsage;
   tools: UsageToolCount[];
+  /**
+   * How the spend divides between models, where the runtime divided it.
+   *
+   * Empty for the runtimes that report one model or none — which is not the
+   * same as a single-entry list, and the difference is the point: an entry
+   * here means the runtime measured that model's share, and nothing else may
+   * put a figure in it. `model` above still names the model that answered, so
+   * a reader that does not care about the split is unaffected.
+   */
+  models: TurnModelUsage[];
 }
 
 interface OpenJob {
@@ -71,6 +81,8 @@ interface OpenJob {
   /** How many readings had arrived when this job opened. */
   readingsAtStart: number;
   outcome: UsageOutcome;
+  /** Per-model spend as the runtime reported it at turn end. */
+  models: TurnModelUsage[];
 }
 
 /** The token fields that sum. Context-window fields are deliberately absent. */
@@ -208,6 +220,20 @@ export class UsageAccountant {
 
       case 'turn_end':
         if (event.usage && this.job) this.job.additive = mergeUsage(this.job.additive, event.usage);
+        if (event.models && this.job) {
+          // Late by nature — a runtime only knows the split once the turn is
+          // over — so this lands on the job that is closing, one line before
+          // it closes. It also corrects the job's own model: a grok
+          // conversation opens with none at all, and the name arrives here.
+          this.job.models = event.models;
+          if (event.models.length === 1) this.job.model = event.models[0].model;
+          else if (!this.job.model) {
+            // Several models and nothing said which answered. The busiest is
+            // the closest thing to a main one that was actually measured;
+            // the split beside it keeps the rest from being folded into it.
+            this.job.model = [...event.models].sort((a, b) => (b.calls ?? 0) - (a.calls ?? 0))[0].model;
+          }
+        }
         this.close(event.ts, event.durationMs ?? null, event.turnId);
         return;
 
@@ -253,6 +279,7 @@ export class UsageAccountant {
       absoluteAtStart: this.absolute ? { ...this.absolute } : null,
       readingsAtStart: this.readings,
       outcome: 'completed',
+      models: [],
     };
     this.seenTools.clear();
   }
@@ -301,6 +328,10 @@ export class UsageAccountant {
       toolCalls: job.toolCalls,
       usage,
       tools: [...job.tools].map(([tool, calls]) => ({ tool, calls })),
+      // Only a real split is worth carrying: one model that ran is already
+      // said by `model` above, and a one-row breakdown beside it would be the
+      // same fact stored twice, free to drift.
+      models: job.models.length > 1 ? job.models : [],
     });
   }
 }

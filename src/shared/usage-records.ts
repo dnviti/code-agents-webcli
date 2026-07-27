@@ -111,10 +111,40 @@ export interface UsageJobRecord {
   reportsUsage: boolean;
   reportsCost: boolean;
   tools: UsageToolCount[];
+  /**
+   * How this job's spend divided between models.
+   *
+   * Empty in the ordinary case, where `model` above already says everything
+   * there is to say. A non-empty list means the turn genuinely ran on more
+   * than one — a subagent, a fallback — and these are the runtime's own
+   * figures for each.
+   */
+  models: UsageModelUse[];
 }
 
 /** A job as the history list shows it — the record without its tool breakdown. */
-export type UsageJobSummary = Omit<UsageJobRecord, 'tools'>;
+export type UsageJobSummary = Omit<UsageJobRecord, 'tools' | 'models'>;
+
+/**
+ * What one model did inside a job that used more than one.
+ *
+ * Present only where the runtime broke its own spend down that way — claude
+ * and grok do, on the line that ends a turn. Every field is nullable for the
+ * usual reason: a model the runtime named but reported no figures for is a
+ * different fact from one it reported zeros for.
+ *
+ * `calls` is the runtime's own round-trip count. There is no tool count,
+ * because nobody reports one per model.
+ */
+export interface UsageModelUse {
+  model: string;
+  calls: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  costUsd: number | null;
+}
 
 /**
  * A set of jobs added up.

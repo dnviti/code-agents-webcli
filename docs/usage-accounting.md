@@ -50,14 +50,14 @@ otherwise. The figures below come from each adapter's own `capabilities`
 declaration under `src/server/chat/adapters/`, which is the same source the
 adapters use to decide what they can promise the rest of the UI.
 
-| Agent | Turns / tool calls | Tokens | Cost |
-| --- | --- | --- | --- |
-| Claude | counted from the transcript | reported | reported (see below) |
-| Codex (app-server) | counted from the transcript | reported | **not reported** — nothing in the schema prices a turn |
-| Codex (`exec` fallback) | counted from the transcript | **not reported** | **not reported** |
-| Grok | counted from the transcript | reported | reported, but see the open question below |
-| pi | counted from the transcript | reported | reported |
-| ACP agents (omp, kimi, and others behind the ACP bridge) | counted from the transcript | reported | reported |
+| Agent | Turns / tool calls | Tokens | Cost | Model |
+| --- | --- | --- | --- | --- |
+| Claude | counted from the transcript | reported | reported (see below) | reported, per message and per model |
+| Codex (app-server) | counted from the transcript | reported | **not reported** — nothing in the schema prices a turn | reported, per session |
+| Codex (`exec` fallback) | counted from the transcript | **not reported** | **not reported** | **not reported** |
+| Grok | counted from the transcript | reported | reported, per turn (settled below) | reported at turn end |
+| pi | counted from the transcript | reported | reported | reported, per message |
+| ACP agents (omp, kimi, and others behind the ACP bridge) | counted from the transcript | reported | reported | the runtime's current selection |
 
 A figure a runtime never reports is stored as `null` and shown as
 **"not reported"** — never as zero. Those are different facts: a job that
@@ -67,6 +67,80 @@ aggregate the store returns carries, alongside its totals, a count of how many
 of the jobs in it actually contributed a token figure or a cost figure
 (`tokensReportedJobs`, `costReportedJobs`), so "$4.10 across 28 of 40 jobs"
 is the shape of the answer, not "$4.10" on its own.
+
+## Which model actually ran
+
+A model name in a spend record is only worth having if the runtime said it.
+There are two quite different claims that can hide behind one: the model this
+app **asked for** (`--model`, a flag) and the model that **ran** (whatever the
+runtime reports back). Only the second is a measurement, and only the second
+is recorded. Where a runtime has not confirmed a model yet, the conversation
+shows none rather than showing the request — a request rendered plainly reads
+as a fact, which is worse than a blank.
+
+Each of these was established by running the installed binary, not by reading
+its documentation:
+
+| Agent | What it says the model was | When | Publishes its list? |
+| --- | --- | --- | --- |
+| Claude | `system/init.model`, every assistant `message.model`, and `result.modelUsage` keyed per model | start, per message, turn end | no — the picker keeps its typed box |
+| Codex (app-server) | `thread/start` → `model`, which it names even when nothing was requested | session start | **yes** — `model/list` over the protocol |
+| Grok | `end.modelUsage`, keyed per model with tokens, `modelCalls` and cost | turn end | **yes** — `grok models` |
+| pi | every assistant `message.model`, with its provider | per message | **yes** — `pi --list-models` |
+| ACP agents (kimi, omp, …) | the model select's `currentValue` | session start, and on a switch | **yes** — in the select itself |
+
+Two consequences worth stating plainly:
+
+- **Claude's billing name is not its display name.** `modelUsage` is keyed
+  `claude-opus-5[1m]` — the same model with a context-window suffix — while the
+  messages say `claude-opus-5`. The canonical name wins, so the conversation
+  and the usage view cannot disagree about what ran.
+- **Grok used to report nothing at all.** Its model was neither on the session
+  line nor on a message, so every Grok job was filed against no model and the
+  by-model view had a nameless row absorbing all of it. The name was there the
+  whole time, at the end of the turn, in the one place nothing was reading.
+
+### A turn that ran on more than one model
+
+A subagent runs on its own model; a runtime can fall back after a failure.
+Claude and Grok both report this, as extra keys in the same `modelUsage` map,
+and pi says it by naming a different model on a later message in the same turn.
+
+Where that happens the job is **not** filed as though one model did all of it.
+`usage_jobs.model` still names the model that answered — that is what to call
+the conversation — and a `usage_job_models` row is written per model carrying
+that model's own tokens, cost and round-trip count as the runtime reported
+them. The by-model breakdown reads those rows where they exist and the job's
+own figures where they do not, so it still adds up to exactly the headline
+total.
+
+Three things deliberately stay unattributed in that split:
+
+- **Tool calls.** No runtime says which model asked for which tool, so a split
+  job contributes no tool calls to any model rather than a made-up share.
+- **Reasoning tokens.** Reported for the turn, not per model.
+- **Effort by model.** That panel is about jobs, and a job is one prompt; it
+  groups by the model that answered.
+
+Claude's per-model cost gets one correction on the way in. Its `total_cost_usd`
+is cumulative (see below) and `modelUsage.costUSD` is a slice of that same
+counter, so the *shares* are taken from the report and the turn's own cost is
+what is divided by them. The models in a turn can therefore never add up to
+more than the turn did.
+
+### Choosing a model
+
+Where a runtime publishes the models it accepts, those are offered as a menu:
+Codex over its protocol, the ACP agents in their own model select, and Grok
+and pi through the command each of them ships for it (run once per process and
+cached, the same idea as the installed-commands fallback for the `/` menu).
+Where a runtime publishes nothing — Claude — the picker keeps its typed field
+and says the runtime listed nothing, rather than showing an empty menu.
+
+The field doubles as a filter, because pi lists several hundred models and an
+unfiltered menu that long is a scroll nobody reads. A name that matches
+nothing listed can still be sent: a runtime's list is what it advertises, not
+a promise about what it will refuse.
 
 ## Cost is a list price, not a bill
 
@@ -134,20 +208,25 @@ This was also a user-visible bug in its own right, independent of the
 accounting feature: before this correction, the live in-conversation cost
 meter over-counted on every turn after the first.
 
-### Grok's cost convention is an open question
+### Grok's cost convention: settled, and it is per-turn
 
 Grok's `total_cost_usd` has the same field name and the same shape as
 Claude's — which is exactly the pattern that turned out to be cumulative on
-Claude. It is currently treated as a **per-turn** figure that sums, on the
-strength of the CLI's own documentation describing `end` as carrying that
-turn's usage. But that has not been confirmed live: the probe run against the
-installed binary hit the account's rate limit before a second successful turn
-completed, so there is no captured pair of consecutive `total_cost_usd`
-values to check the way Claude's were checked. If Grok's figure turns out to
-also be cumulative, every Grok conversation's per-turn cost after the first
-turn is currently overstated in exactly the way Claude's was before its fix.
-Treat Grok's per-job cost figures with that caveat until someone re-probes it
-with working quota.
+Claude — and for a long time this was an open question here, because the
+original probe hit the account's rate limit before a second turn completed.
+
+It has since been probed properly, two consecutive turns in one conversation
+against the installed binary:
+
+| | `total_cost_usd` | `modelUsage."grok-build".costUSD` |
+| --- | --- | --- |
+| first turn | 0.0133752 | 0.0133752 |
+| second turn, resumed | 0.0038766 | 0.0038766 |
+
+A cumulative counter would have reported roughly 0.0173 on the second turn.
+It reported that turn's own cost, so Grok's figure is **per-turn and sums**,
+which is how this app has always treated it. No correction is needed, and the
+per-model breakdown beside it moves with it exactly.
 
 ### A resumed conversation, and where its counter starts
 
@@ -424,9 +503,33 @@ response to probe for another user's job ids.
   "tools": [
     { "tool": "Read", "calls": 3 },
     { "tool": "Edit", "calls": 2 }
+  ],
+  "models": [
+    {
+      "model": "claude-opus-5",
+      "calls": 3,
+      "inputTokens": 800,
+      "outputTokens": 150,
+      "cacheReadTokens": null,
+      "cacheWriteTokens": null,
+      "costUsd": 0.75
+    },
+    {
+      "model": "claude-haiku-4-5",
+      "calls": 1,
+      "inputTokens": 200,
+      "outputTokens": 50,
+      "cacheReadTokens": null,
+      "cacheWriteTokens": null,
+      "costUsd": 0.25
+    }
   ]
 }
 ```
+
+`models` is empty for the ordinary case — a turn that ran on one model is
+already described by the `model` field — and non-empty only where the runtime
+reported a genuine split. See "A turn that ran on more than one model" above.
 
 ### `POST /api/usage/jobs/:id/project`
 

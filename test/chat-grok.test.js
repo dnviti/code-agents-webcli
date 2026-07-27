@@ -83,7 +83,11 @@ describe('grok chat adapter', function () {
       const stripped = stripTs(events);
       assert.strictEqual(stripped[0].t, 'session');
       assert.strictEqual(stripped[0].nativeSessionId, 'r1');
-      assert.strictEqual(stripped[0].model, 'grok-build');
+      // Not 'grok-build', which is only what was *asked for*. Grok names the
+      // model it ran at the end of a turn and nowhere else, so a session that
+      // has run none names none rather than presenting the request as a
+      // measurement. (#75)
+      assert.strictEqual(stripped[0].model, undefined);
       assert.strictEqual(stripped[0].cwd, '/tmp');
       assert.deepStrictEqual(stripped[1], { t: 'state', state: 'idle' });
     });

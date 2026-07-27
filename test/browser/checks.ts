@@ -247,6 +247,7 @@ async function run(): Promise<void> {
   await checkAServerOlderThanThePageSaysSo();
   await checkUnattributedWorkCanBeAttributedByHand();
   await checkTheCommandMenuIsFullBeforeTheFirstMessage();
+  await checkTheModelShownIsTheModelThatRan();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -2896,7 +2897,19 @@ async function checkUnattributedWorkCanBeAttributedByHand(): Promise<void> {
     }
     if (/\/api\/usage\/jobs\/[^?]/.test(url)) {
       const body = url.includes('sess-2') ? observed : unattributed;
-      return new Response(JSON.stringify({ ...body, tools: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+      // The second job ran on two models, the way a delegating turn does. The
+      // first carries no `models` key at all — which is also what a server
+      // older than this page answers, and must not blank the dialog. (#75)
+      const models = url.includes('sess-2')
+        ? [
+            { model: 'claude-opus-5', calls: 3, inputTokens: 800, outputTokens: 150, cacheReadTokens: null, cacheWriteTokens: null, costUsd: 0.75 },
+            { model: 'claude-haiku-4-5', calls: 1, inputTokens: 200, outputTokens: 50, cacheReadTokens: null, cacheWriteTokens: null, costUsd: 0.25 },
+          ]
+        : undefined;
+      return new Response(
+        JSON.stringify({ ...body, tools: [], ...(models ? { models } : {}) }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
     }
     return new Response(JSON.stringify({ jobs: [openId === 'sess-2:t9' ? observed : unattributed], total: 1 }), {
       status: 200, headers: { 'content-type': 'application/json' },
@@ -3016,6 +3029,12 @@ async function checkUnattributedWorkCanBeAttributedByHand(): Promise<void> {
     'the second job opened',
     /Job detail/i.test(text()) && /billing-api/.test(text()),
     text().slice(0, 200),
+  );
+
+  check(
+    'a job that ran on two models shows both, with each one own spend (#75)',
+    /claude-haiku-4-5/.test(text()) && /\$0\.7500/.test(text()) && /\$0\.2500/.test(text()),
+    text().slice(0, 400),
   );
 
   check(
@@ -3167,6 +3186,174 @@ async function checkTheCommandMenuIsFullBeforeTheFirstMessage(): Promise<void> {
     textarea.value.trim().startsWith('/complex-work'),
     JSON.stringify(textarea.value),
   );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * The model the conversation shows is the one that ran, and its menu is usable.
+ *
+ * Three things this covers that no unit test can (#75): a grok conversation
+ * opens naming no model and is renamed by the turn that finishes, a turn split
+ * across models says so on the chip rather than picking one, and a runtime that
+ * publishes hundreds of models produces a list somebody can actually find one
+ * in.
+ */
+async function checkTheModelShownIsTheModelThatRan(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const capabilities = {
+    streaming: true, thinking: true, toolCalls: false, diffs: false, permissions: false,
+    interrupt: true, resume: true, fork: false, attachments: false, usage: true,
+    cost: true, plan: false,
+    models: [
+      { value: 'grok-build', name: 'grok-build', description: 'default' },
+      { value: 'grok-4.5', name: 'grok-4.5' },
+      { value: 'sxs-claude-opus-4-6', name: 'sxs-claude-opus-4-6' },
+    ],
+  };
+
+  const controller = new ChatController('model-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'model-check',
+    snapshot: {
+      sessionId: 'model-check',
+      runtime: 'grok',
+      state: 'idle',
+      capabilities,
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'what model are you' }],
+        },
+        {
+          id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'answering' }],
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'grok',
+      runtimeLabel: 'Grok',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(250);
+
+  const chip = (): HTMLElement | null => host.querySelector('[aria-label="Change model"]');
+  const chipText = (): string => (chip()?.textContent ?? '').trim();
+
+  // A grok conversation that has run no turn knows no model, and the app does
+  // not fill the gap with the one it asked for.
+  check(
+    'a conversation whose runtime has not named a model does not invent one',
+    !/grok-(build|4\.5)/.test(chipText()),
+    chipText() || 'empty',
+  );
+
+  // The turn that finishes is what names it.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'model-check',
+    event: {
+      t: 'turn_end', seq: 3, ts: Date.now(), turnId: 't1',
+      models: [{ model: 'grok-build', calls: 1, usage: { costUsd: 0.0128 } }],
+    },
+  } as never);
+  await wait(200);
+  check(
+    'the turn that finishes names the model that ran',
+    chipText().includes('grok-build'),
+    chipText() || 'empty',
+  );
+
+  // A turn split across models is not shown as one model.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'model-check',
+    event: {
+      t: 'msg_start', seq: 4, ts: Date.now(), id: 'a2', role: 'assistant', turnId: 't2',
+      model: 'grok-build',
+    },
+  } as never);
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'model-check',
+    event: {
+      t: 'turn_end', seq: 5, ts: Date.now(), turnId: 't2',
+      models: [
+        { model: 'grok-build', calls: 3 },
+        { model: 'sxs-claude-opus-4-6', calls: 1 },
+      ],
+    },
+  } as never);
+  await wait(200);
+  check(
+    'a turn that ran on two models says so instead of naming one',
+    chipText().includes('grok-build') && chipText().includes('+1'),
+    chipText() || 'empty',
+  );
+  check(
+    'and the other model is named where there is room for it',
+    (chip()?.getAttribute('title') ?? '').includes('sxs-claude-opus-4-6'),
+    chip()?.getAttribute('title') ?? 'no title',
+  );
+
+  // The menu: what the runtime published, and findable.
+  chip()?.click();
+  await wait(200);
+  const list = (): HTMLElement | null => host.querySelector('[role="listbox"][aria-label="Models"]');
+  const options = (): string[] =>
+    Array.from(list()?.querySelectorAll('[role="option"]') ?? []).map(
+      (row) => (row.textContent ?? '').trim(),
+    );
+  check(
+    'the picker offers the models the runtime published',
+    options().some((row) => row.includes('grok-4.5'))
+      && options().some((row) => row.includes('sxs-claude-opus-4-6')),
+    options().join(' | ').slice(0, 200) || 'nothing listed',
+  );
+
+  const field = list()?.querySelector('input') as HTMLInputElement | null;
+  check('and a field to find one in', Boolean(field));
+  if (field) {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    setter?.call(field, 'opus');
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    await wait(200);
+    check(
+      'typing narrows the list rather than only offering to send what was typed',
+      options().some((row) => row.includes('sxs-claude-opus-4-6'))
+        && !options().some((row) => row.includes('grok-4.5')),
+      options().join(' | ').slice(0, 200) || 'nothing listed',
+    );
+    // And a model the runtime never listed is still reachable, which is the
+    // whole reason this is one field and not two.
+    setter?.call(field, 'something-unlisted');
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    await wait(150);
+    const use = Array.from(list()?.querySelectorAll('button') ?? []).find(
+      (button) => (button.textContent ?? '').trim() === 'Use',
+    ) as HTMLElement | undefined;
+    check(
+      'a model that matches nothing listed can still be sent',
+      Boolean(use) && !(use as HTMLButtonElement).disabled,
+      use ? 'enabled' : 'no Use control',
+    );
+  }
 
   root.unmount();
   host.remove();

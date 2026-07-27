@@ -3,8 +3,9 @@
  *
  * Sits on the app's own SQLite file next to the session store, and follows the
  * same shape — one class, one method per operation, positional parameters, rows
- * cast at the boundary. It owns two tables (`usage_jobs`, `usage_job_tools`)
- * whose schema is declared with all the others in `database.ts`.
+ * cast at the boundary. It owns three tables (`usage_jobs`, `usage_job_tools`
+ * and `usage_job_models`) whose schema is declared with all the others in
+ * `database.ts`.
  *
  * Two rules run through everything here:
  *
@@ -66,6 +67,23 @@ export interface UsageJobInput {
   reportsUsage: boolean;
   reportsCost: boolean;
   tools: Array<{ tool: string; calls: number }>;
+  /**
+   * How the spend divided between models, where the runtime divided it.
+   *
+   * Empty for the ordinary case. `model` above still names the model that
+   * answered, so nothing that reads one row is affected; these exist so that a
+   * turn a subagent ran on another model is not filed as though the answering
+   * model did all of it.
+   */
+  models?: Array<{
+    model: string;
+    calls: number | null;
+    inputTokens: number | null;
+    outputTokens: number | null;
+    cacheReadTokens: number | null;
+    cacheWriteTokens: number | null;
+    costUsd: number | null;
+  }>;
 }
 
 /** Who is asking, and for whose figures. */
@@ -222,6 +240,27 @@ export class UsageStore {
         job.reportsCost ? 1 : 0,
       );
 
+      db.prepare('DELETE FROM usage_job_models WHERE job_id = ?').run(id);
+      const insertModel = db.prepare(`
+        INSERT INTO usage_job_models (
+          job_id, model, calls, input_tokens, output_tokens,
+          cache_read_tokens, cache_write_tokens, cost_usd
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const split of job.models ?? []) {
+        if (!split.model) continue;
+        insertModel.run(
+          id,
+          split.model,
+          split.calls,
+          split.inputTokens,
+          split.outputTokens,
+          split.cacheReadTokens,
+          split.cacheWriteTokens,
+          split.costUsd,
+        );
+      }
+
       db.prepare('DELETE FROM usage_job_tools WHERE job_id = ?').run(id);
       const insertTool = db.prepare(
         'INSERT INTO usage_job_tools (job_id, tool, calls) VALUES (?, ?, ?)',
@@ -364,7 +403,26 @@ export class UsageStore {
     const tools = this.database.raw
       .prepare('SELECT tool, calls FROM usage_job_tools WHERE job_id = ? ORDER BY calls DESC, tool ASC')
       .all(id) as Array<{ tool: string; calls: number }>;
-    return { ...mapJob(row), tools };
+    const models = this.database.raw
+      .prepare(`
+        SELECT model, calls, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd
+        FROM usage_job_models WHERE job_id = ?
+        ORDER BY COALESCE(cost_usd, 0) DESC, model ASC
+      `)
+      .all(id) as Array<Record<string, string | number | null>>;
+    return {
+      ...mapJob(row),
+      tools,
+      models: models.map((split) => ({
+        model: String(split.model),
+        calls: split.calls as number | null,
+        inputTokens: split.input_tokens as number | null,
+        outputTokens: split.output_tokens as number | null,
+        cacheReadTokens: split.cache_read_tokens as number | null,
+        cacheWriteTokens: split.cache_write_tokens as number | null,
+        costUsd: split.cost_usd as number | null,
+      })),
+    };
   }
 
   /**
@@ -456,7 +514,7 @@ export class UsageStore {
       totals: mapTotals(totalsRow),
       series,
       byAgent: this.breakdown('agent', where, params),
-      byModel: this.breakdown('model', where, params),
+      byModel: this.modelBreakdown(joined, params),
       byProject: this.breakdown('project', where, params),
       byUser: scope === 'everyone' ? this.breakdown('user_login', where, params) : undefined,
       effortByAgent: this.effort('agent', where, params),
@@ -508,7 +566,20 @@ export class UsageStore {
     // they are absent from the menu too. A filter list is a directory of what
     // exists, and one that named every project in the installation would leak
     // the shape of everyone else's work to a viewer scoped to their own.
-    return { agents: agents.map((r) => r.agent), models: distinct('model'), projects: distinct('project') };
+    // Models include the ones a turn was split across, not only the ones that
+    // answered. The breakdown shows those rows and the filter matches them, so
+    // leaving them out of the menu would offer a narrowing for every model
+    // except the ones only a subagent ever ran.
+    const splitModels = this.database.raw
+      .prepare(`
+        SELECT DISTINCT m.model AS value
+        FROM usage_job_models m
+        JOIN usage_jobs ON usage_jobs.id = m.job_id${clause ? `${clause.replace(' WHERE', ' AND')}` : ''}
+      `)
+      .all(...scope.params) as Array<{ value: string }>;
+    const models = [...new Set([...distinct('model'), ...splitModels.map((row) => row.value)])].sort();
+
+    return { agents: agents.map((r) => r.agent), models, projects: distinct('project') };
   }
 
   // ------------------------------------------------------------------ helpers
@@ -541,6 +612,72 @@ export class UsageStore {
     }
 
     return { clause: where.length ? ` WHERE ${where.join(' AND ')}` : '', params };
+  }
+
+  /**
+   * Spend per model, honouring a turn that ran on more than one.
+   *
+   * A LEFT JOIN rather than a `GROUP BY model`, and the whole method exists for
+   * the difference. A job with no split joins to one null row and contributes
+   * exactly what it always did, under its own model. A job with a split
+   * contributes one row per model, each carrying that model's own figures as
+   * the runtime reported them — so a turn where a subagent ran on something
+   * else stops being filed as though the answering model did all of it.
+   *
+   * What each column can honestly say differs, and the CASE expressions are
+   * where that is decided:
+   *
+   *   - `jobs` counts distinct jobs, so a split job counts once against each
+   *     model it touched. It is "jobs that used this model", which is the
+   *     reading the number is put to.
+   *   - `turns` takes the runtime's own per-model round-trip count where there
+   *     is one. That is a measurement, not a division of the job's total.
+   *   - `tool_calls` is left to the unsplit rows alone. No runtime says which
+   *     model asked for which tool, and spreading a job's count across its
+   *     models would invent the one figure nobody reported.
+   *   - tokens and cost come from the split row when it has them, and are zero
+   *     when it does not — never the job's own totals, which belong to the
+   *     whole turn and would be counted once per model. A split row's
+   *     `total_tokens` is added up from its own four fields, which is that
+   *     total's definition rather than an estimate of it; reasoning tokens
+   *     nobody breaks down stay at zero rather than being apportioned.
+   */
+  private modelBreakdown(joined: string, params: unknown[]): UsageBreakdown[] {
+    const split = (column: string): string =>
+      `SUM(CASE WHEN m.model IS NULL THEN COALESCE(j.${column}, 0) ELSE COALESCE(m.${column}, 0) END)`;
+    const reported = (column: string): string =>
+      `CASE WHEN m.model IS NULL THEN j.${column} ELSE m.${column} END`;
+
+    const rows = this.database.raw
+      .prepare(`
+        SELECT COALESCE(m.model, j.model) AS key,
+          COUNT(DISTINCT j.id) AS jobs,
+          SUM(CASE WHEN m.model IS NULL THEN j.turns ELSE COALESCE(m.calls, 0) END) AS turns,
+          SUM(CASE WHEN m.model IS NULL THEN j.tool_calls ELSE 0 END) AS tool_calls,
+          ${split('input_tokens')} AS input_tokens,
+          ${split('output_tokens')} AS output_tokens,
+          ${split('cache_read_tokens')} AS cache_read_tokens,
+          ${split('cache_write_tokens')} AS cache_write_tokens,
+          SUM(CASE WHEN m.model IS NULL THEN COALESCE(j.reasoning_tokens, 0) ELSE 0 END) AS reasoning_tokens,
+          SUM(CASE WHEN m.model IS NULL THEN COALESCE(j.total_tokens, 0)
+                   ELSE COALESCE(m.input_tokens, 0) + COALESCE(m.output_tokens, 0)
+                        + COALESCE(m.cache_read_tokens, 0) + COALESCE(m.cache_write_tokens, 0)
+              END) AS total_tokens,
+          ${split('cost_usd')} AS cost_usd,
+          SUM(CASE WHEN ${reported('input_tokens')} IS NOT NULL
+                     OR ${reported('output_tokens')} IS NOT NULL
+                     OR ${reported('cache_read_tokens')} IS NOT NULL
+                     OR ${reported('cache_write_tokens')} IS NOT NULL
+                   THEN 1 ELSE 0 END) AS tokens_reported_jobs,
+          SUM(CASE WHEN ${reported('cost_usd')} IS NOT NULL THEN 1 ELSE 0 END) AS cost_reported_jobs
+        FROM usage_jobs j
+        LEFT JOIN usage_job_models m ON m.job_id = j.id
+        ${joined}
+        GROUP BY key
+        ORDER BY cost_usd DESC, total_tokens DESC, jobs DESC
+      `)
+      .all(...params) as Array<TotalsRow & { key: string | null }>;
+    return rows.map((row) => ({ key: row.key ?? UNATTRIBUTED, totals: mapTotals(row) }));
   }
 
   private breakdown(column: string, where: string, params: unknown[]): UsageBreakdown[] {
@@ -686,7 +823,22 @@ function filterClause(
     parts.push(`${prefix}agent = ?`);
     params.push(filters.agent);
   }
-  nullable('model', filters.model);
+  if (filters.model && filters.model !== UNATTRIBUTED) {
+    // Either the model that answered, or one the turn was split across. A job
+    // whose subagent ran on the model being asked about is a job that used it,
+    // and narrowing to only the answering model would hide exactly the work
+    // the per-model breakdown exists to make visible — click the row, and the
+    // spend it stands for is gone.
+    parts.push(
+      `(${prefix}model = ? OR EXISTS (`
+        + `SELECT 1 FROM usage_job_models mm WHERE mm.job_id = ${prefix}id AND mm.model = ?))`,
+    );
+    params.push(filters.model, filters.model);
+  } else {
+    // Unattributed stays literal: a job with no model at all, which no split
+    // row can rescue — a job that has split rows has models by definition.
+    nullable('model', filters.model);
+  }
   nullable('project', filters.project);
   if (filters.user) {
     parts.push(`${prefix}user_login = ?`);

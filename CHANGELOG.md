@@ -3,6 +3,52 @@
 ## [Unreleased]
 
 ### Fixed
+- **Every agent now reports the model it actually ran, and the picker offers
+  the models it accepts.** (#75) A model name in a spend record is only worth
+  having if the runtime said it, and two quite different claims were hiding
+  behind one: the model this app *asked for* and the model that *ran*. Grok
+  reported neither — its conversations showed no model at all, and every Grok
+  job was filed against nothing, so the by-model view built to answer "what are
+  we spending this on" had a nameless row absorbing the lot. Elsewhere the
+  request was being shown where a measurement belonged, which is worse than a
+  blank because it looks like a fact.
+
+  Every supported agent was probed against its installed binary, and the answer
+  turned out to be that all of them say so somewhere. Grok names its models at
+  the end of a turn, in `modelUsage`, in the one place nothing was reading;
+  Claude reports the same structure on the line that closes a turn; pi names
+  the model on every message it sends. Those are now what the conversation
+  shows and what the record files. A model that has only been requested is
+  shown nowhere until the runtime confirms it. Claude's billing alias
+  (`claude-opus-5[1m]`) is filed under the canonical name its messages carry,
+  so the conversation and the usage view cannot disagree about what ran.
+
+  A turn that ran on more than one model — a subagent, a fallback — is no
+  longer recorded as though one model did all of it. The job still names the
+  model that answered, and each model's own tokens, cost and round-trip count
+  are kept beside it, visible on the job and folded into the by-model
+  breakdown, which still adds up to exactly the headline total. Tool calls are
+  left unattributed there on purpose: no runtime says which model asked for
+  which tool. Claude's per-model cost is put on the same footing as the turn's
+  own before it is stored, so a cumulative counter can never make the models in
+  a turn cost more than the turn did. Filtering by a model now finds the work a
+  subagent did on it, not only the turns it answered.
+
+  Choosing a model is a menu wherever a runtime publishes one: Codex over its
+  protocol, the ACP agents in their model select, and Grok and pi through the
+  command each ships for it. Claude publishes nothing, so its picker keeps the
+  typed field and says so. The field doubles as a filter — pi lists several
+  hundred models — and a name that matches nothing listed can still be sent.
+
+  Nothing already recorded is reclassified, and no model name appears anywhere
+  that its agent did not report.
+
+  While confirming this, one documented open question was settled: Grok's
+  `total_cost_usd` is per-turn, not cumulative like Claude's. Two consecutive
+  turns in one conversation reported $0.0134 and then $0.0039, where a
+  cumulative counter would have said $0.0173. The app's existing treatment of
+  it was right.
+
 - **Skills and project commands are in the `/` menu from the moment a
   conversation opens, not after the first message.** (#71) Typing `/` in a new
   chat listed a handful of the runtime's built-in commands and nothing else:

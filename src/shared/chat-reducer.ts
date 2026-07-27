@@ -78,6 +78,15 @@ export interface TranscriptState {
   currentTurnId: string | null;
   nativeSessionId?: string;
   model?: string;
+  /**
+   * Every model the last turn was billed to, when the runtime broke it down.
+   *
+   * Beside `model` rather than replacing it: `model` is what to call the
+   * conversation, and stays the model that answered. This is the honest
+   * remainder — a subagent on another model, a fallback — which the header
+   * shows as a count rather than pretending the turn ran on one thing.
+   */
+  turnModels?: string[];
   lastError?: string;
 }
 
@@ -221,6 +230,10 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       if (messageFor(state, event.id) !== null) {
         return NO_CHANGE;
       }
+      // A new turn's models are not known yet, and last turn's are not this
+      // turn's: leaving them would keep a "+1" on the chip for a turn that ran
+      // on one model, which is a claim about work that has not happened.
+      if (event.turnId !== state.currentTurnId) state.turnModels = undefined;
       const message: ChatMessage = {
         id: event.id,
         seq: event.seq,
@@ -522,6 +535,29 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       }
       if (event.usage) {
         state.usage = mergeUsage(state.usage, event.usage);
+      }
+      if (event.models && event.models.length > 0) {
+        state.turnModels = event.models.map((entry) => entry.model);
+        // The header takes the model that answered — the one the messages of
+        // this turn already carry — and only falls back to the busiest of the
+        // reported models when nothing said. Preferring the report outright
+        // would rename a claude conversation from what its messages say to the
+        // billing alias beside it, which is the same name twice and reads as a
+        // model switch nobody made.
+        const answered = state.messages.find(
+          (message) => message.turnId === event.turnId && message.role === 'assistant' && message.model,
+        );
+        state.model = answered?.model
+          ?? [...event.models].sort((a, b) => (b.calls ?? 0) - (a.calls ?? 0))[0].model;
+        // A message that never carried one gets the answer this turn produced,
+        // so scrolling back does not show a blank where the record has a name.
+        if (state.turnModels.length === 1) {
+          for (const message of state.messages) {
+            if (message.turnId === event.turnId && message.role === 'assistant' && !message.model) {
+              message.model = state.turnModels[0];
+            }
+          }
+        }
       }
       return { messageIndex: null, structural: true, meta: true, applied: true };
     }
