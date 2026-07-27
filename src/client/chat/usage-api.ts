@@ -63,7 +63,7 @@ function appendFilters(params: URLSearchParams, filters: UsageFilters | undefine
   }
 }
 
-export function fetchUsageDashboard(
+export async function fetchUsageDashboard(
   period: UsagePeriod,
   scope: UsageScope,
   filters?: UsageFilters,
@@ -74,7 +74,22 @@ export function fetchUsageDashboard(
     tz: String(localTzOffsetMinutes()),
   });
   appendFilters(params, filters);
-  return getJson<UsageDashboard>(`/api/usage/dashboard?${params.toString()}`);
+  const dashboard = await getJson<UsageDashboard>(`/api/usage/dashboard?${params.toString()}`);
+
+  // The same tell as the 404 above, one version later: this page is being
+  // served out of `dist/public` by a server process that started before the
+  // build that produced it, so the routes in memory are older than the bundle
+  // they just handed over. Said here, once, rather than left to surface as a
+  // render crash several components down — a missing breakdown is not a
+  // dashboard with nothing in it, and quietly drawing it as one would be the
+  // worse failure of the two.
+  if (!Array.isArray(dashboard.byProject) || !dashboard.bucket) {
+    throw new Error(
+      'This server is older than this page — it has no per-project usage figures. '
+        + 'Restart the server and reload.',
+    );
+  }
+  return dashboard;
 }
 
 export interface UsageFacets {

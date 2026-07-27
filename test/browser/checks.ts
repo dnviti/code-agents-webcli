@@ -244,6 +244,7 @@ async function run(): Promise<void> {
   await checkALongTabNameStaysInsideTheStrip();
   await checkAnUnreportedFigureIsNeverDrawnAsZero();
   await checkTheUsageChartsAreInteractive();
+  await checkAServerOlderThanThePageSaysSo();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -2739,6 +2740,89 @@ async function checkTheUsageChartsAreInteractive(): Promise<void> {
     'the charts stay inside a phone-width window',
     spilling.length === 0,
     spilling.length ? spilling.slice(0, 6).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
+  );
+
+  root.unmount();
+  frame.remove();
+  window.fetch = realFetch;
+}
+
+/**
+ * The page served out of `dist/public` by a server process that started before
+ * the build that produced it.
+ *
+ * A real crash, and an easy one to hit: rebuilding refreshes the bundle a
+ * running server hands out without refreshing the routes it answers with, so
+ * the browser gets a response one version behind the code reading it. The
+ * breakdown it expects is simply absent, and spreading `undefined` took the
+ * whole dialog down — including any chance of saying why. Guarding the table
+ * alone would have been worse: an absent breakdown would then draw as a
+ * project list with nothing in it, which is a different and more believable
+ * lie.
+ */
+async function checkAServerOlderThanThePageSaysSo(): Promise<void> {
+  const totals = {
+    jobs: 1, turns: 1, toolCalls: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    reasoningTokens: 0, totalTokens: 100, costUsd: 0.5,
+    tokensReportedJobs: 1, costReportedJobs: 1,
+  };
+  // Exactly what 5.3.0 answered with: no `byProject`, no `bucket`, no `filters`.
+  const oldShape = {
+    scope: 'self', canSeeEveryone: false, period: 'day',
+    from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
+    totals,
+    series: [{ key: '2026-07-27T09:00', totals }],
+    byAgent: [{ key: 'claude', totals }],
+    byModel: [{ key: 'claude-opus-5', totals }],
+    effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
+  };
+
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+    const body = url.includes('/api/usage/dashboard') ? oldShape : { jobs: [], total: 0 };
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof window.fetch;
+
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  let crashed: string | null = null;
+  (frame.contentWindow as Window).addEventListener('error', (event) => {
+    crashed = String((event as ErrorEvent).message || 'error');
+  });
+
+  const root = createRoot(doc.body);
+  root.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
+  await wait(600);
+
+  const text = (doc.body.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'a response from an older server does not take the dialog down',
+    crashed === null && text.length > 0,
+    crashed ?? (text ? 'still rendering' : 'nothing on screen'),
+  );
+  check(
+    'and says the server is behind the page, rather than showing empty figures',
+    /older than this page/i.test(text) && /restart the server/i.test(text),
+    text.slice(0, 240) || 'nothing on screen',
+  );
+  check(
+    'and does not draw the missing breakdown as a project list with nothing in it',
+    !/Nothing here yet/.test(text),
+    text.slice(0, 240),
   );
 
   root.unmount();

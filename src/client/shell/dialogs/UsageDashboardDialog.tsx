@@ -706,7 +706,7 @@ function BreakdownTable({
   selected,
   onSelect,
 }: {
-  rows: UsageBreakdown[];
+  rows: UsageBreakdown[] | undefined;
   unknown: string;
   selected?: string;
   onSelect(key: string): void;
@@ -714,7 +714,11 @@ function BreakdownTable({
   const [sort, setSort] = React.useState<UsageMeasure>('costUsd');
   const measure = measureBy(sort);
   const sorted = React.useMemo(
-    () => [...rows].sort((a, b) => measure.amount(b.totals) - measure.amount(a.totals)),
+    // Defended rather than assumed. `usage-api` rejects a response missing a
+    // breakdown before it reaches here, but a table that throws on an absent
+    // array takes the entire dialog down with it — including the message
+    // explaining what went wrong.
+    () => [...(rows ?? [])].sort((a, b) => measure.amount(b.totals) - measure.amount(a.totals)),
     [rows, measure],
   );
   const max = Math.max(1, ...sorted.map((r) => measure.amount(r.totals)));
