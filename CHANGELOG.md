@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [5.3.1] - 2026-07-27
+
 ### Added
 - **Usage broken down per project, so spend can be tracked per piece of
   work.** (#65) Until now every figure was pooled across every codebase people
