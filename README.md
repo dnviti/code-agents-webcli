@@ -100,6 +100,7 @@ The image ships the web server only — the agent CLIs are not bundled. See
 | [Running as a service](docs/running-as-a-service.md) | systemd, Docker and Compose, reverse proxies, ngrok |
 | [Updating](docs/updating.md) | The update banner, who may apply it, which installs can and cannot |
 | [Usage analytics](docs/analytics.md) | What the usage screens read and how the numbers are derived |
+| [Usage accounting](docs/usage-accounting.md) | The durable per-user job history and dashboard: what is recorded, per-agent honesty, the API |
 | [Architecture](docs/architecture.md) | How the pieces fit together |
 | [Troubleshooting](docs/troubleshooting.md) | Symptoms, causes, fixes |
 

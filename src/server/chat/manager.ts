@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ChatSnapshot, UserTurn } from '../../shared/chat-events.js';
 import { SessionRecord } from '../types.js';
-import { ChatNotRunningError, ChatSession, ChatSessionStartOptions } from './session.js';
+import { ChatNotRunningError, ChatSession, ChatSessionStartOptions, ChatUsageSink } from './session.js';
 import { ChatStore } from './store.js';
 
 /**
@@ -25,6 +25,8 @@ export interface ChatManagerDeps {
     sessionId: string,
     change: { nativeSessionId?: string; exited?: boolean },
   ) => void;
+  /** Passed through to every session; see ChatSessionDeps.usage. */
+  usage?: ChatUsageSink;
 }
 
 export class ChatSessionManager {
@@ -85,6 +87,7 @@ export class ChatSessionManager {
         writeFile: (sessionId, filePath, contents) =>
           this.writeFile(sessionId, filePath, contents),
         onLifecycle: this.deps.onLifecycle,
+        usage: this.deps.usage,
       },
     );
 

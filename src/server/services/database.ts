@@ -144,6 +144,14 @@ export class AppDatabase {
     return this.isEligibleInstaller ? this.isEligibleInstaller(githubId) : true;
   }
 
+  /** One account by id, or null once it has been deleted. */
+  getUserById(userId: number): AuthenticatedUser | null {
+    const row = this.db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as
+      | UserRow
+      | undefined;
+    return row ? mapUserRow(row) : null;
+  }
+
   getUserSetting(userId: number, key: string): string | null {
     return this.getSetting(`user:${userId}:${key}`);
   }
@@ -345,6 +353,64 @@ export class AppDatabase {
         max_buffer_size INTEGER NOT NULL DEFAULT 1000,
         last_accessed INTEGER NOT NULL DEFAULT 0
       );
+
+      /*
+       * One row per unit of agent work, kept forever.
+       *
+       * No foreign key to users, and the login stored alongside the id: this
+       * table is meant to outlive the accounts in it. A cascade would delete
+       * last quarter's spending along with somebody's access, and a bare id
+       * would leave a history nobody can read. The same reasoning keeps
+       * session_id free of a reference — a job is still a job after its
+       * conversation has been deleted, which is most of the point.
+       *
+       * Every measured column is nullable, and a null is load-bearing: it means
+       * the runtime reported nothing, which is a different fact from reporting
+       * zero. Nothing in this table describes what was said, only what it cost.
+       */
+      CREATE TABLE IF NOT EXISTS usage_jobs (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        native_session_id TEXT,
+        turn_id TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        user_login TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        model TEXT,
+        started_at TEXT NOT NULL,
+        ended_at TEXT NOT NULL,
+        duration_ms INTEGER,
+        outcome TEXT NOT NULL,
+        turns INTEGER NOT NULL,
+        tool_calls INTEGER NOT NULL,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cache_read_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        reasoning_tokens INTEGER,
+        total_tokens INTEGER,
+        cost_usd REAL,
+        reports_usage INTEGER NOT NULL,
+        reports_cost INTEGER NOT NULL
+      );
+
+      /* Which tools a job called, and how often. Cascades: a tool count with no
+         job is not a fact anybody can use. */
+      CREATE TABLE IF NOT EXISTS usage_job_tools (
+        job_id TEXT NOT NULL REFERENCES usage_jobs(id) ON DELETE CASCADE,
+        tool TEXT NOT NULL,
+        calls INTEGER NOT NULL,
+        PRIMARY KEY (job_id, tool)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_usage_jobs_user_ended
+        ON usage_jobs(user_id, ended_at);
+
+      CREATE INDEX IF NOT EXISTS idx_usage_jobs_ended
+        ON usage_jobs(ended_at);
+
+      CREATE INDEX IF NOT EXISTS idx_usage_jobs_native
+        ON usage_jobs(native_session_id);
 
       CREATE INDEX IF NOT EXISTS idx_runtime_sessions_owner
         ON runtime_sessions(owner_user_id);

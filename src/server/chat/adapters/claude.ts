@@ -60,6 +60,21 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
   private freshSessionId?: string;
   private nativeSessionId?: string;
   private activeTurnId: string | null = null;
+  /**
+   * The highest cumulative cost this conversation has reported so far.
+   *
+   * Seeded from what the conversation was already billed, because the CLI's own
+   * counter survives a `--resume` into a new process. See `turnCost`.
+   */
+  private costWatermark = this.options.costBaselineUsd ?? 0;
+  /**
+   * True while the conversation's already-spent total is unknown.
+   *
+   * Set for a resume with nothing on record — see `costBaselineUsd`. The first
+   * reading becomes the watermark and is reported as no cost at all, rather
+   * than as a turn that somehow cost everything the conversation ever did.
+   */
+  private costBaselineUnknown = this.options.costBaselineUsd === null;
   /** Id of the assistant message currently streaming, or null between turns. */
   private currentMsgId: string | null = null;
   /** Captured from message_delta, applied when message_stop closes the message. */
@@ -541,12 +556,43 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     }
   }
 
+  /**
+   * This turn's own cost, from the running total the CLI reports.
+   *
+   * `total_cost_usd` on a `result` message is cumulative for the conversation,
+   * not for the turn — probed against 2.1.220 by running two prompts through
+   * one process (0.1286 then 0.1790, while the token counts stayed at 2 in / 6
+   * out both times) and then a third through a `--resume` in a *new* process,
+   * which continued from 0.1790 rather than restarting. Its sibling `usage`
+   * object is per-turn; only the money is cumulative.
+   *
+   * Everything downstream sums what a turn reports, so left alone this charged
+   * every conversation its own history again on every turn — the second turn of
+   * a chat showed roughly triple its real cost, the tenth far worse. The
+   * subtraction lives here because this is the one place that knows the
+   * convention; `costBaselineUsd` carries the watermark across a restart, since
+   * the CLI's counter survives one and an in-process variable does not.
+   */
+  private turnCost(reported: number | undefined): number | undefined {
+    if (reported === undefined) return undefined;
+    if (this.costBaselineUnknown) {
+      this.costBaselineUnknown = false;
+      this.costWatermark = reported;
+      return undefined;
+    }
+    const spent = reported - this.costWatermark;
+    this.costWatermark = Math.max(this.costWatermark, reported);
+    // Clamped: a counter that went backwards means the baseline was wrong, and
+    // a negative cost is not a measurement anyone can use.
+    return spent > 0 ? spent : 0;
+  }
+
   private handleResult(raw: Record<string, unknown>): void {
     const subtype = str(raw.subtype);
     const isError = raw.is_error === true;
 
     const usageRaw = record(raw.usage);
-    const costUsd = num(raw.total_cost_usd);
+    const costUsd = this.turnCost(num(raw.total_cost_usd));
     const usage: ChatUsage | undefined =
       usageRaw || costUsd !== undefined
         ? { ...(usageRaw ? mapUsage(usageRaw) : {}), ...(costUsd !== undefined ? { costUsd } : {}) }
