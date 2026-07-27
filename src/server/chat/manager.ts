@@ -230,6 +230,18 @@ export class ChatSessionManager {
     return this.sessions.get(sessionId)?.cancelQueued(queuedId) ?? false;
   }
 
+  /**
+   * Cut the turn in flight short and give the agent one waiting turn now.
+   *
+   * False when there was nothing to promote — an unknown id, a session that is
+   * not running, a delivery already under way.
+   */
+  async sendQueuedNow(sessionId: string, queuedId: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    return session.sendQueuedNow(queuedId);
+  }
+
   respondPermission(sessionId: string, requestId: string, optionId: string): boolean {
     return this.sessions.get(sessionId)?.respondPermission(requestId, optionId) ?? false;
   }

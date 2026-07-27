@@ -31,6 +31,40 @@
   belongs to, so the menu never lists what someone else has installed, and a
   machine with no skills installed shows the built-ins exactly as before.
 
+### Added
+- **A message waiting in line can be sent now, instead of only waiting its
+  turn.** (#70) The composer never refuses a message while the agent works — it
+  queues it — but queuing was the *only* thing that could happen to it. Some
+  messages are worth waiting their turn; others are the reason you are typing at
+  all: "stop, you're editing the wrong file", "no, use the staging database".
+  Those sat in the queue doing nothing while the agent spent another two minutes
+  going the wrong way, because the only way to get in front of a working agent
+  was the stop button — and stopping discards everything else you had queued, so
+  correcting one thing cost you the two messages already lined up.
+
+  Each waiting message now carries a second control, beside the one that removes
+  it, that sends it immediately: the turn in flight is cut short, that message is
+  handed over as a real turn of its own, and **the rest of the line survives** —
+  still waiting, still in the order it was typed, delivered afterwards as usual.
+  Nothing about the default changes: a message sent while the agent is busy still
+  queues.
+
+  The conversation says what happened. A turn cut short this way leaves a marker
+  across the transcript naming the message that did it, so the record does not
+  read as an agent that simply stopped, and a reader coming back later can see
+  why the answer above is half an answer. Anything the interrupted turn was
+  waiting on — an approval, a question — is cleared rather than left on screen
+  inviting an answer that can no longer reach anything.
+
+  The control is offered only where it can do something. Not on an idle agent,
+  which is already working through the line; not on `codex exec`, the one
+  supported runtime that cannot be interrupted at all, where cutting in would
+  hand the process a second turn rather than replacing the first. It *is*
+  offered while the agent waits on a person, which is exactly when a correction
+  gets typed. Pressing it twice sends once, a press that arrives after the
+  message has already gone is a no-op rather than a second delivery, and a
+  second browser open on the same conversation sees the line change.
+
 ## [5.3.1] - 2026-07-27
 
 ### Added

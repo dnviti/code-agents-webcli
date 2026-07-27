@@ -50,6 +50,14 @@ export interface ComposerProps {
   queued?: QueuedTurn[];
   onCancelQueued?: (id: string) => void;
   /**
+   * Deliver one waiting turn now, ahead of the turn in flight.
+   *
+   * Absent when there is nothing to interrupt — a session that has ended, or an
+   * agent already working through the line — so the row does not offer a
+   * control that would do nothing to press.
+   */
+  onSendQueuedNow?: (id: string) => void;
+  /**
    * Rank the working tree against what was typed after `@`.
    *
    * Absent means no file picker at all — the surface has no working directory
@@ -162,6 +170,7 @@ export function Composer({
   onDraftChange,
   queued = [],
   onCancelQueued,
+  onSendQueuedNow,
   onFindFiles,
   seedKey = 0,
   seedDraft = '',
@@ -680,6 +689,7 @@ export function Composer({
               turn={turn}
               position={index + 1}
               onCancel={onCancelQueued ? () => onCancelQueued(turn.id) : undefined}
+              onSendNow={onSendQueuedNow ? () => onSendQueuedNow(turn.id) : undefined}
             />
           ))}
         </div>
@@ -1787,19 +1797,40 @@ function QueuedChip({
   turn,
   position,
   onCancel,
+  onSendNow,
 }: {
   turn: QueuedTurn;
   position: number;
   onCancel?: () => void;
+  onSendNow?: () => void;
 }): React.JSX.Element {
   const attachments = turn.attachments?.length ?? 0;
+  // One press, whatever the click count: the server settles a double click on
+  // its own — the id leaves the queue before anything is interrupted — but this
+  // saves the second round trip and stops the row flashing twice.
+  //
+  // Released again after a moment rather than latched: a promotion the server
+  // declines (it was already delivering something else) leaves this row on
+  // screen, and a control that is dead for the rest of the conversation is a
+  // worse outcome than the double click it was guarding against.
+  const [sending, setSending] = React.useState(false);
+  React.useEffect(() => {
+    if (!sending) return undefined;
+    const timer = setTimeout(() => setSending(false), 2500);
+    return () => clearTimeout(timer);
+  }, [sending]);
+  const isPhone = usePhone();
   return (
     <div
       role="listitem"
       style={{
         display: 'flex',
         alignItems: 'center',
-        gap: 7,
+        // The row carries two controls that do opposite things to the same
+        // message, and on a phone they are 44px targets side by side: below the
+        // touch floor the seam between them is invisible and "send this now"
+        // and "throw this away" become one strip.
+        gap: isPhone ? TOUCH_GAP : 7,
         minHeight: 26,
         padding: '2px 4px 2px 7px',
         background: 'var(--muted)',
@@ -1838,6 +1869,23 @@ function QueuedChip({
           <Icon name="paperclip" size={10} />
           {attachments}
         </span>
+      ) : null}
+      {onSendNow ? (
+        // Deliberately said in full rather than "Send now": the two controls on
+        // this row do opposite things to the same message, and a screen reader
+        // moving between them has only these two labels to tell them apart.
+        <IconButton
+          type="button"
+          size="sm"
+          label={`Send queued message ${position} now, interrupting the agent`}
+          disabled={sending}
+          onClick={() => {
+            setSending(true);
+            onSendNow();
+          }}
+        >
+          <Icon name="arrow-up" size={11} />
+        </IconButton>
       ) : null}
       {onCancel ? (
         <IconButton type="button" size="sm" label={`Remove queued message ${position}`} onClick={onCancel}>

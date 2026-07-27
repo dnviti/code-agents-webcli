@@ -310,6 +310,18 @@ export class ChatController {
   }
 
   /**
+   * Send a waiting turn now, cutting short whatever is running.
+   *
+   * Nothing optimistic here either, and for a stronger reason than above: the
+   * server decides whether this turn is still promotable at all, and a chip
+   * removed locally on a click that arrived too late would leave the browser
+   * showing a queue the session does not have.
+   */
+  sendQueuedNow(queuedId: string): void {
+    this.send({ type: 'chat_queue_send_now', queuedId });
+  }
+
+  /**
    * Answer a multiple-choice question the model asked.
    *
    * `skipped` is explicit rather than inferred from an empty list: "I picked

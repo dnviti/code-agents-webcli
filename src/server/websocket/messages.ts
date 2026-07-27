@@ -116,6 +116,8 @@ export interface ChatManagerLike {
   /** Carry a new model into the options an in-place `/clear` restart replays. */
   rememberModel(sessionId: string, model: string | undefined): void;
   cancelQueued(sessionId: string, queuedId: string): boolean;
+  /** Interrupt what is running and deliver one waiting turn immediately. */
+  sendQueuedNow(sessionId: string, queuedId: string): Promise<boolean>;
   respondPermission(sessionId: string, requestId: string, optionId: string): boolean;
   answerQuestion(
     sessionId: string,
@@ -244,6 +246,10 @@ export class MessageProcessor {
 
       case 'chat_queue_cancel':
         this.handleChatQueueCancel(wsInfo, data);
+        break;
+
+      case 'chat_queue_send_now':
+        await this.handleChatQueueSendNow(wsInfo, data);
         break;
 
       case 'chat_permission_response':
@@ -1350,6 +1356,29 @@ export class MessageProcessor {
     const queuedId = typeof data.queuedId === 'string' ? data.queuedId : '';
     if (!queuedId) return;
     manager.cancelQueued(session.id, queuedId);
+  }
+
+  /**
+   * Send a turn the user typed ahead, now, in front of whatever is running.
+   *
+   * Silent for the same reason the withdrawal above is: by the time the click
+   * arrives that turn may already have started, and the session broadcasts the
+   * queue on every change, so both browsers already agree on what is true. The
+   * one thing that must not happen is a double delivery from a double click,
+   * and that is settled in the session — the id leaves the queue before
+   * anything is interrupted, so the second call finds nothing to promote.
+   */
+  private async handleChatQueueSendNow(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!manager || !session) return;
+
+    const queuedId = typeof data.queuedId === 'string' ? data.queuedId : '';
+    if (!queuedId) return;
+    await manager.sendQueuedNow(session.id, queuedId);
   }
 
   private handleChatPermission(wsInfo: WebSocketInfo, data: IncomingMessage): void {

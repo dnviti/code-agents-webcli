@@ -40,7 +40,7 @@ function createSessionRecord(params = {}) {
 function createChatManager(overrides = {}) {
   const calls = {
     start: [], send: [], interrupt: [], permission: [], page: [], cancelQueued: [],
-    setModel: [], rememberModel: [],
+    sendQueuedNow: [], setModel: [], rememberModel: [],
   };
   return {
     calls,
@@ -82,6 +82,10 @@ function createChatManager(overrides = {}) {
     },
     cancelQueued(sessionId, queuedId) {
       calls.cancelQueued.push({ sessionId, queuedId });
+      return true;
+    },
+    async sendQueuedNow(sessionId, queuedId) {
+      calls.sendQueuedNow.push({ sessionId, queuedId });
       return true;
     },
     respondPermission(sessionId, requestId, optionId) {
@@ -400,6 +404,27 @@ describe('chat wiring', function () {
       const { processor, chatManager } = build({ surface: 'chat', ownerUserId: 999 });
       await processor.handleMessage('ws-1', { type: 'chat_queue_cancel', queuedId: 'queued-9' });
       assert.strictEqual(chatManager.calls.cancelQueued.length, 0);
+    });
+
+    it('forwards a request to send a queued turn now', async function () {
+      const { processor, chatManager } = build({ surface: 'chat' });
+      await processor.handleMessage('ws-1', { type: 'chat_queue_send_now', queuedId: 'queued-9' });
+      assert.deepStrictEqual(chatManager.calls.sendQueuedNow[0], {
+        sessionId: 'session-1',
+        queuedId: 'queued-9',
+      });
+    });
+
+    it('ignores a send-now with no id rather than promoting something arbitrary', async function () {
+      const { processor, chatManager } = build({ surface: 'chat' });
+      await processor.handleMessage('ws-1', { type: 'chat_queue_send_now' });
+      assert.strictEqual(chatManager.calls.sendQueuedNow.length, 0);
+    });
+
+    it('will not let one socket interrupt another user’s conversation', async function () {
+      const { processor, chatManager } = build({ surface: 'chat', ownerUserId: 999 });
+      await processor.handleMessage('ws-1', { type: 'chat_queue_send_now', queuedId: 'queued-9' });
+      assert.strictEqual(chatManager.calls.sendQueuedNow.length, 0);
     });
 
     it('forwards a permission decision', async function () {

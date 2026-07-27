@@ -110,6 +110,29 @@ and its own list is what settles the question. And it is scoped to the session:
 where sessions run in per-user environments each one reads its own home, so the
 menu never becomes a window onto what someone else has installed.
 
+### Typing while the agent works
+
+The composer never refuses a message. Send one while a turn is running and it
+takes its place in line, listed above the field with the others waiting.
+
+Each waiting message carries two controls: one removes it, and one sends it
+**now**. "Now" means now — the turn in flight is cut short, that message is
+handed over as a real turn of its own, and the conversation records the stop and
+which message caused it. Everything else still waiting stays waiting, in the
+order it was typed, and goes over afterwards as usual.
+
+That is the difference from the stop button, which still discards the whole
+line. Correcting one thing used to cost you the two messages you had already
+lined up.
+
+Two cases where the control is not offered, because it could not do anything:
+when the agent is idle and already working through the line, and on a runtime
+that cannot be interrupted at all (`codex exec` — see
+[capability tiers](#capability-tiers)). It *is* offered while the agent waits on
+an approval or a question, which is where a correction is most often typed;
+sending then clears the card rather than leaving it waiting for an answer that
+can no longer arrive.
+
 ## Runtime profiles
 
 **Settings → Runtime profiles** controls how each CLI is launched. Nothing here

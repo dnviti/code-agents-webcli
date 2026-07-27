@@ -755,6 +755,74 @@ export class ChatSession {
     return true;
   }
 
+  /**
+   * Take one waiting turn out of the line and give it to the agent now.
+   *
+   * The queue is the right default — most of what you type while an agent works
+   * is worth waiting its turn — but some of it is the reason you are typing at
+   * all: the wrong file, the wrong database, a test that already exists. Those
+   * are worth the interruption, and until this existed the only way to deliver
+   * one was the stop button, which discards everything else that was waiting.
+   *
+   * So: the chosen turn leaves the line, whatever is in flight is cut short,
+   * and **the rest of the queue stays exactly as it was**, in order, to be
+   * delivered after this turn ends like any other.
+   *
+   * False when there is nothing to promote — an unknown id (already delivered,
+   * already withdrawn, or a second click on the same row), a session that is no
+   * longer running, or a delivery already under way. Silent rather than loud:
+   * every one of those is a race the user cannot lose in a way that matters,
+   * and the queue broadcast that follows tells every browser what is true now.
+   */
+  async sendQueuedNow(id: string): Promise<boolean> {
+    if (!this.adapter?.alive || this.state === 'exited' || this.state === 'error') return false;
+    // A drain in progress owns the runtime for the length of one `deliver`.
+    // Cutting in here would interrupt a turn that has not finished starting.
+    if (this.draining) return false;
+    // A runtime that cannot be interrupted cannot be cut in front of either:
+    // the interrupt would not end the turn, and the promoted message would
+    // reach a process already working on another one — two turns at once, which
+    // is the one thing the queue exists to prevent. Checked before the message
+    // leaves the line, and here rather than only in the browser, because the
+    // browser is not the only thing that can ask.
+    const inFlight = this.state !== 'idle';
+    if (inFlight && !this.adapter.capabilities.interrupt) return false;
+
+    const index = this.queue.findIndex((turn) => turn.id === id);
+    if (index < 0) return false;
+    const [turn] = this.queue.splice(index, 1);
+    this.publishQueue();
+
+    // Held across the interrupt *and* the delivery, because going idle is what
+    // releases the queue: `interrupt` ends in `setState('idle')`, `ingest` runs
+    // `drainQueue` after every event, and without this the first message still
+    // waiting would overtake the one the user actually chose.
+    this.draining = true;
+    try {
+      if (inFlight) {
+        await this.cancelTurnInFlight();
+        // The record has to say the turn stopped because of this message, not
+        // that the agent simply gave up. `marker` rather than an error: being
+        // corrected mid-turn is not a failure, and it belongs to the
+        // conversation rather than to the turn that was stopped.
+        this.ingest({ t: 'marker', kind: 'interrupted', detail: quoteTurn(turn.text) });
+      }
+      await this.deliver({ text: turn.text, attachments: turn.attachments });
+      return true;
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.ingest({ t: 'error', message: `could not send that message: ${message}` });
+      return false;
+    } finally {
+      this.draining = false;
+      // A delivery that threw leaves the state where it was, which may be idle
+      // with messages still waiting — and nothing else would come along to
+      // notice. Harmless in the ordinary case: the agent is working on the
+      // promoted turn, so the guard inside returns immediately.
+      this.drainQueue();
+    }
+  }
+
   /** Drop the whole line. Returns how many turns were discarded. */
   clearQueue(): number {
     const dropped = this.queue.length;
@@ -887,6 +955,27 @@ export class ChatSession {
     // stop that then fired the three messages waiting behind it would be the
     // opposite of what the button says. Someone who wants them can send them.
     const dropped = this.clearQueue();
+    await this.cancelTurnInFlight();
+    if (dropped) {
+      this.ingest({
+        t: 'error',
+        message: `Stopped. ${dropped} queued message${dropped === 1 ? ' was' : 's were'} discarded.`,
+      });
+    }
+  }
+
+  /**
+   * End the turn in flight, leaving the queue alone.
+   *
+   * Everything `interrupt` does *except* discarding what was typed ahead —
+   * which is the whole difference between the stop button and promoting one
+   * waiting message. Kept as one method rather than duplicated, because the
+   * part that matters here is not the adapter call: it is that a cancelled
+   * turn must not leave a permission card or a question on screen waiting for
+   * an answer that can no longer reach anything.
+   */
+  private async cancelTurnInFlight(): Promise<void> {
+    if (!this.adapter) return;
     await this.adapter.interrupt();
     // Anything still waiting on a person is moot once the turn is cancelled,
     // and leaving the cards on screen would invite answers that go nowhere.
@@ -908,12 +997,6 @@ export class ChatSession {
       });
     }
     this.questions.clear();
-    if (dropped) {
-      this.ingest({
-        t: 'error',
-        message: `Stopped. ${dropped} queued message${dropped === 1 ? ' was' : 's were'} discarded.`,
-      });
-    }
     this.setState('idle');
   }
 
@@ -1183,6 +1266,20 @@ export class ChatSession {
     this.broker?.close();
     this.broker = null;
   }
+}
+
+/**
+ * The promoted message, short enough to sit on a rule drawn across the column.
+ *
+ * Enough of it to recognise which message this was, which is what the marker is
+ * for — the message itself is directly below, so this is a label, not a copy.
+ * Whitespace is collapsed because a queued turn can be many lines, and a line
+ * break in a one-line marker breaks the line.
+ */
+function quoteTurn(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  if (!flat) return 'an attachment';
+  return flat.length > 60 ? `“${flat.slice(0, 57)}…”` : `“${flat}”`;
 }
 
 /** One line describing what is being approved, for the card's heading. */
