@@ -3,6 +3,31 @@
 ## [Unreleased]
 
 ### Fixed
+- **Clearing a conversation starts a new one in the same tab, and is a button
+  on the composer.** (#69) `/clear`, `/new` and `/reset` did give the agent a
+  genuinely fresh memory, and left the tab looking closed: the process being
+  replaced is signalled and not waited for, so its own "I have exited" landed
+  *after* the replacement was already answering. The conversation you were
+  sitting in went read-only, every session list called it finished, and the
+  recovery offer — the one meant for an agent that really has gone away — was
+  what you were left looking at. The way out was a new tab, which left the old
+  one behind as a stale entry and lost its name, its place in the strip and the
+  folder it was pointed at.
+
+  A conversation now knows which process is speaking for it, and a superseded
+  one is not heard from again; the session record is told it is running rather
+  than left claiming a process that is gone. Clearing also acts at once when
+  the agent is mid-answer instead of queueing behind the turn it was meant to
+  cut short, and a message typed while the new process is still starting waits
+  for it rather than being refused as a dead session.
+
+  Starting a new conversation is also a **New chat** button in the composer,
+  next to the attach and command controls — available whenever the conversation
+  is healthy, which is exactly when the old "start a new chat" button was not:
+  it lived in the recovery notice and appeared only once the session had
+  already failed. The button, the three spellings and the menu entry are one
+  behaviour: the button sends the same command. Nothing is deleted — the
+  previous conversation stays in the log for history, search and export.
 - **Skills and project commands are in the `/` menu from the moment a
   conversation opens, not after the first message.** (#71) Typing `/` in a new
   chat listed a handful of the runtime's built-in commands and nothing else:

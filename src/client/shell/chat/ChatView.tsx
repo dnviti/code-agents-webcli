@@ -887,6 +887,10 @@ export function ChatView({
               model={controller.modelOverrideValue ?? transcript.model}
               onSetModel={setModel}
               modelFeedback={controller.modelFeedback}
+              // Deliberately the same path as typing it: the button and the
+              // three spellings have to end in one state, and the surest way
+              // to keep them that way is for the button to *be* the command.
+              onNewChat={() => send('/clear', [])}
               bypassPermissions={bypassPermissions}
               terminalOpen={terminalOpen}
             />
