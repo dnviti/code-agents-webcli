@@ -74,6 +74,31 @@ describe('chat syntax highlighter', function () {
       assert.strictEqual(roundTrip(source, null), source);
     });
 
+    // The sweep issue #77 asked for. The file editor drew files in the wrong
+    // order; every other surface that shows a file or a diff — the built-in
+    // editor, a chat code block, the markdown preview — draws it from this
+    // tokenizer instead, so this is where the same fault would live. Run over
+    // real files rather than samples, because the samples are short and the
+    // report was about long ones.
+    it('reproduces whole files from this repository, line for line', function () {
+      const files = {
+        tsx: 'src/client/shell/chat/CodeEditor.tsx',
+        ts: 'src/server/chat/session.ts',
+        json: 'package.json',
+        md: 'README.md',
+      };
+      for (const [lang, file] of Object.entries(files)) {
+        const source = fs.readFileSync(path.join(ROOT, file), 'utf8');
+        const out = roundTrip(source, lang);
+        assert.strictEqual(out.length, source.length, `${file} changed length`);
+        assert.strictEqual(out, source, `${file} did not come back as it went in`);
+        // Order, not just content: a tokenizer that returned the right
+        // characters in the wrong order would pass a length check and render a
+        // file nobody wrote.
+        assert.deepStrictEqual(out.split('\n').slice(0, 40), source.split('\n').slice(0, 40));
+      }
+    });
+
     it('stays lossless on every prefix, as a block streams in', function () {
       for (const [lang, source] of Object.entries(SAMPLES)) {
         for (let i = 0; i <= source.length; i++) {

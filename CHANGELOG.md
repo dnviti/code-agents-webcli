@@ -31,6 +31,40 @@
   belongs to, so the menu never lists what someone else has installed, and a
   machine with no skills installed shows the built-ins exactly as before.
 
+- **The file editor shows the file, in the file's own order.** (#77) Opening a
+  file in the code view could give an editor whose lines were drawn in an order
+  the file is not in — a run of lines from halfway down at the top, a block
+  split across the view — with a bare white box, drag handle and all, over the
+  first line. Everything was there and every line was coloured correctly, which
+  is the worst version of it: the first thing anyone concludes is that the file
+  on disk is broken.
+
+  Neither the editor nor the file was at fault. The editor is a chunk fetched
+  the first time a file is opened, and it arrives as two independent requests —
+  a script and a stylesheet. The loader took the stylesheet on trust: it treated
+  a `<link>` element being present as proof that it had loaded. So one failed
+  CSS fetch — a moment with no route to the server, or the service restarting
+  under an open page, both of which this app treats as routine — left a dead
+  link in the page that every later open read as success. The editor was then
+  built with none of its own rules: its lines lost the positioning that puts
+  them where they belong, leaving the recycling order of the underlying elements
+  as the order on screen, and its hidden input area became an ordinary resizable
+  textarea drawn over line one.
+
+  The loader now owns its stylesheet, discards a failed one so the next open
+  genuinely fetches it again, and — before handing the editor over — asks the
+  browser whether the rules are actually in effect. If they are not, the file
+  opens in the app's own editor with the notice that already existed for a chunk
+  that could not be fetched at all. A plainer editor that is correct beats a
+  full one that shows your source in an order you did not write it in.
+
+  The check that should have caught this exists now too. The browser checks ran
+  from a `file://` page, where a chunk the app fetches by absolute path can
+  never arrive — so every check around this editor could only ever confirm that
+  its *parts* had been built. They are served over HTTP out of the real build
+  now, and one of them opens a real file in the real editor and compares what is
+  on the screen, line by line, against the file — in both themes.
+
 ## [5.3.1] - 2026-07-27
 
 ### Added

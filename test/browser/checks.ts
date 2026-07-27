@@ -30,6 +30,8 @@ import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
 import { UsageDashboardDialog } from '../../src/client/shell/dialogs/UsageDashboardDialog';
 import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
 import { TabBar } from '../../src/client/ui/relay/TabBar';
+import { MonacoEditor } from '../../src/client/shell/chat/MonacoEditor';
+import { monacoStylesApplied } from '../../src/client/chat/monaco';
 
 const results: string[] = [];
 const check = (name: string, ok: boolean, detail = ''): void => {
@@ -247,6 +249,8 @@ async function run(): Promise<void> {
   await checkAServerOlderThanThePageSaysSo();
   await checkUnattributedWorkCanBeAttributedByHand();
   await checkTheCommandMenuIsFullBeforeTheFirstMessage();
+  await checkTheFileEditorShowsTheFile();
+  await checkAReadOnlyFileStaysReadOnly();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -2216,8 +2220,8 @@ async function checkThePhoneShellSurfacesAreUsable(): Promise<void> {
     doc.open();
     doc.write(
       '<!doctype html><html><head>'
-      + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
-      + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+      + '<link rel="stylesheet" href="/css/relay/relay.css">'
+      + '<link rel="stylesheet" href="/css/main.css">'
       + '</head><body style="margin:0"></body></html>',
     );
     doc.close();
@@ -2348,8 +2352,8 @@ async function checkALongTabNameStaysInsideTheStrip(): Promise<void> {
   doc.open();
   doc.write(
     '<!doctype html><html><head>'
-    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
-    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
     + '</head><body style="margin:0"></body></html>',
   );
   doc.close();
@@ -2472,8 +2476,8 @@ async function checkAnUnreportedFigureIsNeverDrawnAsZero(): Promise<void> {
   doc.open();
   doc.write(
     '<!doctype html><html><head>'
-    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
-    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
     + '</head><body style="margin:0"></body></html>',
   );
   doc.close();
@@ -2611,8 +2615,8 @@ async function checkTheUsageChartsAreInteractive(): Promise<void> {
   doc.open();
   doc.write(
     '<!doctype html><html><head>'
-    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
-    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
     + '</head><body style="margin:0"></body></html>',
   );
   doc.close();
@@ -2796,8 +2800,8 @@ async function checkAServerOlderThanThePageSaysSo(): Promise<void> {
   doc.open();
   doc.write(
     '<!doctype html><html><head>'
-    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
-    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
     + '</head><body style="margin:0"></body></html>',
   );
   doc.close();
@@ -2910,8 +2914,8 @@ async function checkUnattributedWorkCanBeAttributedByHand(): Promise<void> {
   doc.open();
   doc.write(
     '<!doctype html><html><head>'
-    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
-    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
     + '</head><body style="margin:0"></body></html>',
   );
   doc.close();
@@ -3166,6 +3170,253 @@ async function checkTheCommandMenuIsFullBeforeTheFirstMessage(): Promise<void> {
     'choosing an entry puts that command in the line, ready to run',
     textarea.value.trim().startsWith('/complex-work'),
     JSON.stringify(textarea.value),
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * Issue #77: the file editor, read the way a person reads it.
+ *
+ * Every check this app had around this editor confirmed that its *parts* were
+ * built — that the host element exists, that the fallback textarea carries the
+ * right label, that a read-only file arrives read-only. All of them passed
+ * while the editor on screen drew files in an order they are not in, with a
+ * bare textarea over the first line, because none of them ever looked at a
+ * rendered editor. They could not: the checks used to run from a `file://`
+ * page, where the chunk this fetches by absolute path can never arrive.
+ *
+ * So this one loads the real chunk over HTTP, opens a real file in it, and
+ * compares what is on the screen against the file.
+ */
+async function checkTheFileEditorShowsTheFile(): Promise<void> {
+  const lines = Array.from({ length: 200 }, (_, i) => `line-${i + 1} const value${i + 1} = ${i + 1};`);
+  const text = lines.join('\n');
+
+  const host = document.createElement('div');
+  // Stacked above whatever earlier checks left on the page — the terminal from
+  // the first check is still mounted at the same corner, and "is anything drawn
+  // over the first line" is a question about *this* editor.
+  host.style.cssText = 'width:900px;height:500px;position:absolute;top:0;left:0;z-index:9999';
+  document.body.appendChild(host);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(MonacoEditor, {
+      value: text,
+      path: '/tmp/browser-check/sample.ts',
+      language: 'ts',
+      ariaLabel: 'Contents of sample.ts',
+    } as never),
+  );
+
+  // The chunk is several megabytes and is fetched, parsed and started here, so
+  // this waits for the editor rather than for a fixed delay.
+  let ready = false;
+  for (let i = 0; i < 120 && !ready; i++) {
+    await wait(100);
+    ready = host.querySelector('[data-monaco-host="ready"]') !== null;
+  }
+  check('the real code editor loads and attaches', ready, host.innerHTML.slice(0, 120));
+  if (!ready) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  /** The rendered lines, top to bottom — which is the order a reader gets. */
+  const onScreen = (): { text: string; top: number }[] =>
+    Array.from(host.querySelectorAll('.view-line'))
+      .map((node) => ({
+        text: (node.textContent ?? '').replace(/ /g, ' ').trimEnd(),
+        top: node.getBoundingClientRect().top,
+      }))
+      .sort((a, b) => a.top - b.top);
+
+  const rendered = onScreen();
+  check('it renders the file, not an empty frame', rendered.length > 5, `${rendered.length} lines`);
+
+  // The heart of the report. Every rendered line must be the line the file has
+  // at that position — so a window that is complete but shuffled fails here.
+  const firstShown = lines.indexOf(rendered[0]?.text ?? '');
+  const inFileOrder =
+    firstShown !== -1 && rendered.every((line, i) => line.text === lines[firstShown + i]);
+  check(
+    'the file is shown in the file’s own order',
+    inFileOrder,
+    inFileOrder ? `from line ${firstShown + 1}` : rendered.slice(0, 8).map((l) => l.text.split(' ')[0]).join(','),
+  );
+
+  const numbers = Array.from(host.querySelectorAll('.line-numbers'))
+    .map((node) => ({ text: (node.textContent ?? '').trim(), top: node.getBoundingClientRect().top }))
+    .sort((a, b) => a.top - b.top)
+    .map((entry) => entry.text);
+  check(
+    'the line numbers say what the lines beside them are',
+    numbers.length > 0 && numbers.every((n, i) => Number(n) === firstShown + i + 1),
+    numbers.slice(0, 6).join(','),
+  );
+
+  // The stylesheet, asked of the layout engine rather than of the network: this
+  // one rule is what positions every line, and losing it is what produced both
+  // halves of the report at once.
+  const firstLine = host.querySelector('.view-line') as HTMLElement | null;
+  check(
+    'the editor’s own stylesheet is in effect',
+    firstLine !== null && getComputedStyle(firstLine).position === 'absolute',
+    firstLine ? getComputedStyle(firstLine).position : 'no line',
+  );
+
+  // The stray box: Monaco's hidden input area, drawn as an ordinary resizable
+  // textarea whenever those rules are missing.
+  const boxes = Array.from(host.querySelectorAll('textarea')).filter(
+    (node) => getComputedStyle(node).resize !== 'none',
+  );
+  check('nothing in the editor is a resizable box', boxes.length === 0, `${boxes.length} found`);
+
+  const lineBox = firstLine?.getBoundingClientRect();
+  const covering = lineBox
+    ? (document.elementFromPoint(lineBox.left + 4, lineBox.top + lineBox.height / 2) as HTMLElement | null)
+    : null;
+  check(
+    'nothing is drawn over the first line',
+    covering !== null && host.contains(covering) && covering.closest('.view-lines') !== null,
+    covering ? `${covering.tagName}.${String(covering.className).slice(0, 40)}` : 'nothing at that point',
+  );
+
+  // Scrolled, because that is where the fault showed itself worst: Monaco
+  // reuses its line elements, so with the positioning rules missing the order
+  // on screen becomes the order they happen to sit in — which looks fine at
+  // first paint and comes apart the moment you move.
+  // Scrolled, because that is where the fault showed itself worst: Monaco
+  // reuses its line elements, so with the positioning rules missing the order
+  // on screen becomes the order they happen to sit in — which looks right at
+  // first paint and comes apart the moment the view moves.
+  //
+  // What is asserted is the invariant, not the movement: this page runs on
+  // virtual time with no compositor, so whether a synthetic wheel actually
+  // carries the viewport anywhere is up to the engine and not worth a flaky
+  // check. Whatever is on screen must be a contiguous run of the file in the
+  // file's order, at rest and after the view is pushed around — which is
+  // exactly what the report showed it was not.
+  const scrollable = host.querySelector('.monaco-scrollable-element') as HTMLElement | null;
+  const wheel = (delta: number): void => {
+    scrollable?.dispatchEvent(
+      new WheelEvent('wheel', { deltaY: delta, deltaMode: 0, bubbles: true, cancelable: true }),
+    );
+  };
+  const stillInOrder = (label: string): void => {
+    const shown = onScreen();
+    const from = lines.indexOf(shown[0]?.text ?? '');
+    check(
+      label,
+      from !== -1 && shown.every((line, i) => line.text === lines[from + i]),
+      `from line ${from + 1}: ${shown.slice(0, 6).map((l) => l.text.split(' ')[0]).join(',')}`,
+    );
+  };
+
+  for (let i = 0; i < 8; i++) wheel(240);
+  await wait(600);
+  stillInOrder('what is on screen after scrolling down is the file, in order');
+
+  for (let i = 0; i < 12; i++) wheel(-240);
+  await wait(600);
+  stillInOrder('and after scrolling back it is still the file, in order');
+
+  // The light theme, since the fault was reported as visible in one theme: the
+  // editor is rebuilt from the live palette on a theme change, and a rendering
+  // that only survives in the dark is not a fix.
+  document.documentElement.classList.add('light');
+  await wait(400);
+  const light = onScreen();
+  const lightFirst = lines.indexOf(light[0]?.text ?? '');
+  check(
+    'and it is still the file, in order, in the light theme',
+    lightFirst !== -1 && light.every((line, i) => line.text === lines[lightFirst + i]),
+    light.slice(0, 4).map((l) => l.text.split(' ')[0]).join(','),
+  );
+  document.documentElement.classList.remove('light');
+  await wait(200);
+
+  // The guard that keeps this from coming back silently. Removing the
+  // stylesheet is exactly the state a failed fetch leaves the page in, and the
+  // loader has to be able to tell — otherwise it hands over an editor that
+  // renders a file in an order it is not in, which is the failure that made
+  // this a bug report rather than a nuisance.
+  const sheet = document.querySelector('link[href="/monaco.bundle.css"]');
+  check('the editor’s stylesheet is loaded by its own loader', sheet !== null);
+  if (sheet) {
+    check('and while it is there, the loader says the rules are in effect', monacoStylesApplied());
+    document.head.removeChild(sheet);
+    await wait(100);
+    check(
+      'with it gone, the loader notices instead of rendering anyway',
+      !monacoStylesApplied(),
+      'this is what a failed stylesheet fetch leaves behind',
+    );
+    document.head.appendChild(sheet);
+    await wait(100);
+  }
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * A file opened read-only cannot be typed into — asked of the editor that is
+ * actually on screen, not of the fallback.
+ */
+async function checkAReadOnlyFileStaysReadOnly(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:700px;height:300px;position:absolute;top:0;left:0';
+  document.body.appendChild(host);
+
+  let changes = 0;
+  const root = createRoot(host);
+  root.render(
+    React.createElement(MonacoEditor, {
+      value: 'const readOnly = true;\nconst second = 2;\n',
+      path: '/tmp/browser-check/locked.ts',
+      language: 'ts',
+      readOnly: true,
+      onChange: () => { changes += 1; },
+      ariaLabel: 'Contents of locked.ts',
+    } as never),
+  );
+
+  let ready = false;
+  for (let i = 0; i < 120 && !ready; i++) {
+    await wait(100);
+    ready = host.querySelector('[data-monaco-host="ready"]') !== null;
+  }
+  check('the read-only file opens in the real editor too', ready);
+  if (!ready) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  // The host reports ready as soon as the editor is created; the first lines
+  // land a frame or two later — and by this point in the suite the page is
+  // frugal with frames, so the editor is nudged into laying itself out rather
+  // than waited on indefinitely. `automaticLayout` watches the host's size.
+  for (let i = 0; i < 40 && host.querySelector('.view-line') === null; i++) {
+    host.style.width = `${700 + (i % 2)}px`;
+    window.dispatchEvent(new Event('resize'));
+    await wait(100);
+  }
+
+  const input = host.querySelector('textarea') as HTMLTextAreaElement | null;
+  check('a read-only file cannot be typed into', input !== null && input.readOnly, String(input?.readOnly));
+  check('and nothing reported a change', changes === 0, `${changes} changes`);
+
+  const shown = Array.from(host.querySelectorAll('.view-line'))
+    .map((node) => (node.textContent ?? '').replace(/ /g, ' ').trimEnd());
+  check(
+    'the read-only view shows the file as it is',
+    shown[0] === 'const readOnly = true;' && shown[1] === 'const second = 2;',
+    shown.length ? shown.join(' / ') : `no lines; editor=${Boolean(host.querySelector('.monaco-editor'))} html=${host.innerHTML.slice(0, 200)}`,
   );
 
   root.unmount();
