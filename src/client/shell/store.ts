@@ -81,6 +81,8 @@ export interface ShellDialogs {
   settings: boolean;
   /** Per-runtime launch configuration: model, args, env, tiers. */
   runtimeProfiles: boolean;
+  /** The per-user environment size picker; only reachable when the server has environments. */
+  environment: boolean;
   newSession: boolean;
   terminalOptions: boolean;
   /** The session list, reachable from the mobile bar and the palette. */
@@ -230,6 +232,7 @@ const INITIAL: ShellState = {
   dialogs: {
     settings: false,
     runtimeProfiles: false,
+    environment: false,
     newSession: false,
     terminalOptions: false,
     sessions: false,

@@ -26,6 +26,26 @@
   not enable it behaves exactly as it did before. See
   [Per-user environments](docs/user-environments.md).
 
+- **The same thing on a Kubernetes cluster.** Point the server at a cluster and
+  each user's environment becomes a Pod instead of a container on this machine,
+  created, reused, resized and removed the same way. Every user's home lives on
+  one shared ReadWriteMany claim, so the file browser, editor and uploads keep
+  working exactly as they do on a single machine.
+
+  Two things do not cross the pod boundary yet, and both are documented: tool
+  approvals and the model's questions travel over a unix socket, and automatic
+  sizing needs metrics-server to have anything to read.
+
+- **You choose how big your own environment is.** *Settings → Workspace
+  environment* offers the sizes your administrator defined — and **Automatic**,
+  which starts from the default, moves up when you have been working it hard for
+  a while, and back down when you have not. It tells you when it moves, and why.
+
+  A size change that can be applied to a running environment is applied at once;
+  one that needs the environment rebuilt waits until nothing is running in it,
+  because rebuilding under a working agent would end the run. The panel says
+  which of the two is happening.
+
 ## [5.2.0] - 2026-07-27
 
 ### Added

@@ -45,6 +45,13 @@ export interface ServerOptions {
   containerMemory?: string;
   containerIdleMinutes?: number;
   containerSetupCommand?: string;
+  containerTiers?: string;
+  containerDefaultTier?: string;
+  containerUserTierChoice?: boolean;
+  kubeContext?: string;
+  kubeNamespace?: string;
+  kubeStorageClaim?: string;
+  kubeServiceAccount?: string;
 }
 
 export interface Aliases {

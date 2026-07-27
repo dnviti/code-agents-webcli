@@ -23,6 +23,8 @@ export interface RunResult {
 export type EngineRunner = (
   file: string,
   args: string[],
+  /** Written to the child's stdin and closed. Used to feed manifests to `kubectl apply`. */
+  input?: string,
 ) => Promise<RunResult>;
 
 export interface CreateContainerSpec {
@@ -52,15 +54,72 @@ export interface ExecSpec {
   tty?: boolean;
 }
 
-const defaultRunner: EngineRunner = (file, args) =>
+/** What one environment is currently consuming, as far as the engine can say. */
+export interface ResourceUsage {
+  /** Cores in use — `1.5` means one and a half cores, not 150% of the limit. */
+  cpuCores: number;
+  memoryBytes: number;
+}
+
+/**
+ * What the manager needs of an engine, and nothing more.
+ *
+ * Written as an interface rather than a base class because the two
+ * implementations share no code worth inheriting: one drives a container
+ * runtime through `docker`/`podman`, the other drives an API server through
+ * `kubectl`, and the only thing they genuinely have in common is this list.
+ */
+export interface EnvironmentEngine {
+  readonly kind: ContainerEngineKind;
+  /**
+   * Bring an environment into existence and into a usable state, whatever
+   * state it was in.
+   *
+   * One call rather than the manager reasoning about statuses, because the
+   * reasoning is engine-specific and getting it wrong is silent: a container
+   * that exists but is stopped is *started*, while a Pod that exists but has
+   * failed cannot be started at all and has to be replaced. Reports whether it
+   * had to build a new one, which is what decides if the setup command runs.
+   */
+  ensure(spec: CreateContainerSpec): Promise<{ created: boolean }>;
+  create(spec: CreateContainerSpec): Promise<void>;
+  start(name: string): Promise<void>;
+  stop(name: string): Promise<void>;
+  remove(name: string): Promise<void>;
+  status(name: string): Promise<string | null>;
+  describe(name: string): Promise<ContainerDescription | null>;
+  exec(spec: ExecSpec, command: string, commandArgs: string[]): Promise<RunResult>;
+  /** Argv for running a command inside an environment, for pty and pipe spawns alike. */
+  execArgs(spec: ExecSpec, command: string, commandArgs: string[]): string[];
+  /** The binary a wrapped command is spawned as. */
+  readonly binary: string;
+  list(label: string): Promise<string[]>;
+  available(): Promise<boolean>;
+  /**
+   * Change an environment's limits without recreating it.
+   *
+   * Returns false when this engine cannot: the caller then rebuilds, which is
+   * lossless but interrupts, so the difference decides whether a user's tier
+   * change applies now or once they are idle.
+   */
+  resize(name: string, cpus: string | null, memory: string | null): Promise<boolean>;
+  /** Current consumption, or null when the engine cannot report it. */
+  usage(name: string): Promise<ResourceUsage | null>;
+}
+
+export const defaultRunner: EngineRunner = (file, args, input) =>
   new Promise((resolve, reject) => {
-    execFile(file, args, { maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+    const child = execFile(file, args, { maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
       if (error) {
         reject(Object.assign(error, { stdout, stderr }));
         return;
       }
       resolve({ stdout, stderr });
     });
+
+    if (input !== undefined) {
+      child.stdin?.end(input);
+    }
   });
 
 /**
@@ -79,7 +138,7 @@ export function selinuxEnforcing(readFile: (p: string) => string = (p) => fs.rea
   }
 }
 
-export class ContainerEngine {
+export class ContainerEngine implements EnvironmentEngine {
   readonly kind: ContainerEngineKind;
   readonly binary: string;
   private readonly run: EngineRunner;
@@ -180,6 +239,18 @@ export class ContainerEngine {
     return args;
   }
 
+  async ensure(spec: CreateContainerSpec): Promise<{ created: boolean }> {
+    const status = await this.status(spec.name);
+    if (!status) {
+      await this.create(spec);
+      return { created: true };
+    }
+    if (status !== 'running') {
+      await this.start(spec.name);
+    }
+    return { created: false };
+  }
+
   async create(spec: CreateContainerSpec): Promise<void> {
     await this.run(this.binary, this.createArgs(spec));
   }
@@ -249,6 +320,56 @@ export class ContainerEngine {
     return stdout.split('\n').map((line) => line.trim()).filter(Boolean);
   }
 
+  /**
+   * Change the limits of a running container in place.
+   *
+   * Both engines can do this without a restart, which is the difference
+   * between a tier change the user sees immediately and one that has to wait
+   * for their agent to finish.
+   */
+  async resize(name: string, cpus: string | null, memory: string | null): Promise<boolean> {
+    const args = ['update'];
+    if (cpus) {
+      args.push('--cpus', cpus);
+    }
+    if (memory) {
+      args.push('--memory', memory);
+      // Without a matching swap limit Docker refuses the change on hosts where
+      // swap accounting is on, and Podman quietly leaves swap at the old value.
+      args.push('--memory-swap', memory);
+    }
+    if (args.length === 1) {
+      return true;
+    }
+    args.push(name);
+    await this.run(this.binary, args);
+    return true;
+  }
+
+  /**
+   * What the container is using right now.
+   *
+   * `--no-stream` so this is one sample rather than a subscription; the caller
+   * is polling on its own schedule and a stream would outlive the question.
+   */
+  async usage(name: string): Promise<ResourceUsage | null> {
+    try {
+      const { stdout } = await this.run(this.binary, [
+        'stats', '--no-stream', '--format', '{{.CPUPerc}}\t{{.MemUsage}}', name,
+      ]);
+      const [cpuPerc, memUsage] = stdout.trim().split('\t');
+      const cpu = Number.parseFloat((cpuPerc || '').replace('%', ''));
+      const memory = parseSize((memUsage || '').split('/')[0]);
+      if (!Number.isFinite(cpu) || memory === null) {
+        return null;
+      }
+      // `stats` reports a percentage of one core, so 250% is 2.5 cores.
+      return { cpuCores: cpu / 100, memoryBytes: memory };
+    } catch {
+      return null;
+    }
+  }
+
   /** Whether the engine binary is present and answering. */
   async available(): Promise<boolean> {
     try {
@@ -258,4 +379,30 @@ export class ContainerEngine {
       return false;
     }
   }
+}
+
+/**
+ * `1.5GiB`, `512MB`, `2g` → bytes.
+ *
+ * Both engines print human sizes in `stats` and accept them in `--memory`, and
+ * the two spellings differ (`GiB` out, `g` in), so one parser serves both
+ * directions. Binary units throughout: that is what the engines mean by `g`.
+ */
+export function parseSize(raw: string): number | null {
+  const match = /^\s*([0-9]*\.?[0-9]+)\s*([a-zA-Z]*)\s*$/.exec(raw || '');
+  if (!match) {
+    return null;
+  }
+  const value = Number.parseFloat(match[1]);
+  // Both `GiB` (what the container engines print) and `Gi` (what Kubernetes
+  // prints) reduce to `g`. Stripping only a trailing `b` left `Mi` unmatched,
+  // which read every Kubernetes memory figure as unparseable — and an
+  // unparseable figure is a missing sample, so automatic sizing silently never
+  // moved on a cluster.
+  const unit = match[2].toLowerCase().replace(/[ib]+$/, '');
+  const scale: Record<string, number> = {
+    '': 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4,
+  };
+  const factor = scale[unit];
+  return factor === undefined || !Number.isFinite(value) ? null : value * factor;
 }

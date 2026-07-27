@@ -348,6 +348,22 @@ export interface WsUpdateRestartingMessage {
   type: 'update_restarting';
 }
 
+/**
+ * Automatic sizing moved this user's environment.
+ *
+ * Sent rather than left to be discovered: a machine that changes size under
+ * someone with no explanation reads as a fault, and the reason is exactly what
+ * makes it read as a feature instead.
+ */
+export interface WsEnvironmentTierChangedMessage {
+  type: 'environment_tier_changed';
+  tier: string;
+  previousTier: string;
+  reason: string;
+  /** `applied` now, or `deferred` until nothing is running. */
+  outcome: string;
+}
+
 export type WsMessage =
   | WsConnectedMessage
   | WsSessionCreatedMessage
@@ -369,6 +385,7 @@ export type WsMessage =
   | WsUpdateOutputMessage
   | WsUpdateDoneMessage
   | WsUpdateRestartingMessage
+  | WsEnvironmentTierChangedMessage
   | WsChatStartedMessage
   | WsChatSnapshotMessage
   | WsChatEventMessage

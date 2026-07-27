@@ -3,6 +3,7 @@
 import type { App } from '../app';
 import type { WsMessage } from '../types';
 import { showOverlay, hideOverlay, showError } from '../ui/overlay';
+import { showNotification } from '../ui/notifications';
 import {
   appendUpdateLog,
   applyUpdateStatus,
@@ -183,6 +184,18 @@ export class MessageHandler {
 
       case 'update_restarting':
         onUpdateRestarting();
+        break;
+
+      case 'environment_tier_changed':
+        // Told once, in passing. The environment panel re-reads itself off the
+        // same event, so a dialog that happens to be open is never stale.
+        showNotification(
+          message.outcome === 'deferred'
+            ? `Your workspace will move to ${message.tier} once nothing is running (${message.reason}).`
+            : `Your workspace moved to ${message.tier} (${message.reason}).`,
+          'info',
+        );
+        window.dispatchEvent(new CustomEvent('cc-environment-changed'));
         break;
 
       case 'update_done':

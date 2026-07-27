@@ -7,6 +7,7 @@ import { createPasteRoutes, PasteRoutesDeps } from './paste.js';
 import { createChatAttachmentRoutes, ChatAttachmentRoutesDeps } from './chat-attachments.js';
 import { createProfileRoutes, ProfileRoutesDeps } from './profiles.js';
 import { createWorkspaceRoutes, WorkspaceRoutesDeps } from './workspace.js';
+import { createEnvironmentRoutes, EnvironmentRoutesDeps } from './environment.js';
 
 export interface RegisterRoutesDeps
   extends HealthRoutesDeps,
@@ -16,7 +17,8 @@ export interface RegisterRoutesDeps
     PasteRoutesDeps,
     ChatAttachmentRoutesDeps,
     ProfileRoutesDeps,
-    WorkspaceRoutesDeps {}
+    WorkspaceRoutesDeps,
+    EnvironmentRoutesDeps {}
 
 export function registerRoutes(app: Express, deps: RegisterRoutesDeps): void {
   app.use(createHealthRoutes(deps));
@@ -27,4 +29,5 @@ export function registerRoutes(app: Express, deps: RegisterRoutesDeps): void {
   app.use(createChatAttachmentRoutes(deps));
   app.use(createProfileRoutes(deps));
   app.use(createWorkspaceRoutes(deps));
+  app.use(createEnvironmentRoutes(deps));
 }

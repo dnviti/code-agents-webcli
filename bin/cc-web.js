@@ -88,7 +88,14 @@ program
   .option('--container-cpus <cpus>', 'CPU limit per user environment, e.g. 2')
   .option('--container-memory <size>', 'memory limit per user environment, e.g. 2g')
   .option('--container-idle-minutes <minutes>', 'stop an environment after this long idle (0 = never)')
-  .option('--container-setup <command>', 'shell run once inside each newly created environment');
+  .option('--container-setup <command>', 'shell run once inside each newly created environment')
+  .option('--container-tiers <spec>', 'sizes users may pick, e.g. "small=1,1g;medium=2,2g;large=4,4g"')
+  .option('--container-default-tier <id>', 'size a user who has never chosen gets')
+  .option('--no-container-user-tier-choice', 'stop users choosing their own size')
+  .option('--kube-context <name>', 'kubectl context to create environments in')
+  .option('--kube-namespace <name>', 'namespace for the environment pods (default: default)')
+  .option('--kube-storage-claim <name>', 'ReadWriteMany claim holding every user home')
+  .option('--kube-service-account <name>', 'service account for the environment pods');
 
 /**
  * Operator commands for the per-user environments.
@@ -107,6 +114,9 @@ function environmentManager() {
     containers: true,
     containerEngine: opts.containerEngine,
     dataDir: opts.dataDir,
+    kubeContext: opts.kubeContext,
+    kubeNamespace: opts.kubeNamespace,
+    kubeStorageClaim: opts.kubeStorageClaim,
   });
   return { manager: new EnvironmentManager({ config, hostHome: process.cwd() }), engine: config.engine };
 }
@@ -230,6 +240,15 @@ async function main() {
         ? Number(options.containerIdleMinutes)
         : undefined,
       containerSetupCommand: options.containerSetup,
+      containerTiers: options.containerTiers,
+      containerDefaultTier: options.containerDefaultTier,
+      // commander turns `--no-x` into `x: false`, so this is only ever false
+      // when the operator asked for it.
+      containerUserTierChoice: options.containerUserTierChoice,
+      kubeContext: options.kubeContext,
+      kubeNamespace: options.kubeNamespace,
+      kubeStorageClaim: options.kubeStorageClaim,
+      kubeServiceAccount: options.kubeServiceAccount,
       folderMode: true // Always use folder mode
     };
 
@@ -261,7 +280,11 @@ async function main() {
       const engine = serverOptions.containerEngine
         || process.env.CODE_AGENTS_WEBCLI_CONTAINER_ENGINE
         || 'docker';
-      console.log(`Environments: one container per user, via ${engine}`);
+      console.log(
+        engine === 'kubernetes'
+          ? `Environments: one pod per user, in namespace ${serverOptions.kubeNamespace || process.env.CODE_AGENTS_WEBCLI_KUBE_NAMESPACE || 'default'}`
+          : `Environments: one container per user, via ${engine}`,
+      );
     }
 
     const appServer = new ClaudeCodeWebServer(serverOptions);

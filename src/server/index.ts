@@ -143,6 +143,7 @@ export class ClaudeCodeWebServer {
   private messageProcessor: MessageProcessor;
   private environments: EnvironmentManager;
   private environmentSweep: ReturnType<typeof setInterval> | null = null;
+  private environmentScale: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: ServerOptions = {}) {
     const config = createConfig(options);
@@ -198,6 +199,13 @@ export class ClaudeCodeWebServer {
       containerMemory: options.containerMemory,
       containerIdleMinutes: options.containerIdleMinutes,
       containerSetupCommand: options.containerSetupCommand,
+      containerTiers: options.containerTiers,
+      containerDefaultTier: options.containerDefaultTier,
+      containerUserTierChoice: options.containerUserTierChoice,
+      kubeContext: options.kubeContext,
+      kubeNamespace: options.kubeNamespace,
+      kubeStorageClaim: options.kubeStorageClaim,
+      kubeServiceAccount: options.kubeServiceAccount,
       dataDir: config.dataDir,
       extraMounts: [
         { hostPath: appRootDir(), containerPath: APP_MOUNT, readOnly: true },
@@ -215,6 +223,9 @@ export class ClaudeCodeWebServer {
     this.environments = new EnvironmentManager({
       config: containerConfig,
       hostHome: this.baseFolder,
+      // Read on every provision rather than cached: the user may change it
+      // from another window between two of their own sessions.
+      getUserTier: (userId) => this.database.getUserSetting(userId, 'environmentTier'),
     });
     this.sessionStore = new SessionStore({ database: this.database });
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
@@ -638,6 +649,34 @@ export class ClaudeCodeWebServer {
     if (!this.environments.enabled) {
       return;
     }
+    this.environmentScale = setInterval(() => {
+      void this.environments.sampleAndScale((userId) => this.userHasLiveSession(userId))
+        .then((changes) => {
+          for (const change of changes) {
+            console.log(
+              `Environment ${change.name}: ${change.from} → ${change.to} (${change.reason}) [${change.outcome}]`,
+            );
+            // Told, not discovered: a size that changes under someone without
+            // a word is indistinguishable from the machine misbehaving.
+            sendToUser(
+              change.userId,
+              {
+                type: 'environment_tier_changed',
+                tier: change.to,
+                previousTier: change.from,
+                reason: change.reason,
+                outcome: change.outcome,
+              },
+              this.webSocketConnections,
+            );
+          }
+        })
+        .catch((error) => {
+          console.error('Automatic environment sizing failed:', error);
+        });
+    }, 30_000);
+    this.environmentScale.unref?.();
+
     this.environmentSweep = setInterval(() => {
       void this.environments.sweepIdle((userId) => this.userHasLiveSession(userId)).then((stopped) => {
         for (const name of stopped) {
@@ -692,6 +731,10 @@ export class ClaudeCodeWebServer {
     if (this.environmentSweep) {
       clearInterval(this.environmentSweep);
       this.environmentSweep = null;
+    }
+    if (this.environmentScale) {
+      clearInterval(this.environmentScale);
+      this.environmentScale = null;
     }
     // Stopped, never removed: the containers are this server's to start and
     // stop, but the data in them is the users' and a restart has to find it.
@@ -810,6 +853,16 @@ export class ClaudeCodeWebServer {
         this.isPathWithinBase(targetPath, userId),
       getUserBaseFolder: (userId?: number) => this.getUserBaseFolder(userId),
       ensureEnvironment: (userId?: number) => this.ensureEnvironment(userId),
+      environments: this.environments,
+      getUserEnvironmentTier: (userId: number) => this.database.getUserSetting(userId, 'environmentTier'),
+      setUserEnvironmentTier: (userId: number, tier: string | null) => {
+        if (tier) {
+          this.database.setUserSetting(userId, 'environmentTier', tier);
+        } else {
+          this.database.deleteUserSetting(userId, 'environmentTier');
+        }
+      },
+      userHasLiveSession: (userId: number) => this.userHasLiveSession(userId),
       getSelectedWorkingDir: (userId: number) => this.getSelectedWorkingDir(userId),
       setSelectedWorkingDir: (userId: number, value: string | null) =>
         this.setSelectedWorkingDir(userId, value),

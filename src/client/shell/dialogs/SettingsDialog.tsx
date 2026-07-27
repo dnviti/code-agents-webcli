@@ -48,6 +48,10 @@ export interface SettingsDialogProps {
   onInstall(): void;
   /** Open the runtime profile editor, which is its own dialog. */
   onOpenRuntimeProfiles(): void;
+  /** Whether this server gives each user their own environment. */
+  environmentsEnabled: boolean;
+  /** Open the environment size picker, which is its own dialog. */
+  onOpenEnvironment(): void;
 }
 
 /**
@@ -106,6 +110,8 @@ export function SettingsDialog({
   install,
   onInstall,
   onOpenRuntimeProfiles,
+  environmentsEnabled,
+  onOpenEnvironment,
 }: SettingsDialogProps): React.JSX.Element | null {
   const [draft, setDraft] = React.useState<AppSettings>(settings);
 
@@ -245,6 +251,20 @@ export function SettingsDialog({
           Configure
         </Button>
       </SettingRow>
+
+      {/* Left out entirely rather than shown disabled: on a server that runs
+          everything on its own machine there is no environment to size, and a
+          greyed-out row would imply a feature that could be turned on here. */}
+      {environmentsEnabled ? (
+        <SettingRow
+          label="Workspace environment"
+          description="Your terminals, agents and files run in a container of your own. Choose how big it is, or let it follow your load."
+        >
+          <Button variant="secondary" onClick={onOpenEnvironment}>
+            Configure
+          </Button>
+        </SettingRow>
+      ) : null}
 
       <SettingRow
         label="Install app"

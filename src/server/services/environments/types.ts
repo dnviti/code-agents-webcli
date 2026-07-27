@@ -9,8 +9,14 @@
  * inspection of every branch.
  */
 
-/** Which container engine drives the environments. */
-export type ContainerEngineKind = 'docker' | 'podman';
+/**
+ * What drives the environments.
+ *
+ * `docker` and `podman` place a container on this machine; `kubernetes` asks a
+ * cluster to schedule a Pod. The rest of the server cannot tell the difference:
+ * all three answer the same small interface.
+ */
+export type ContainerEngineKind = 'docker' | 'podman' | 'kubernetes';
 
 export interface ContainerConfig {
   /** Off by default. Nothing in this module runs unless an administrator opts in. */
@@ -46,6 +52,43 @@ export interface ContainerConfig {
    * Empty by default, so the module stays usable without them.
    */
   extraMounts: Mount[];
+  /** Only read when `engine` is `kubernetes`. */
+  kubernetes: KubernetesConfig;
+  /**
+   * The sizes this installation is willing to hand out, in order.
+   *
+   * Order is meaningful: automatic sizing steps along this list, so the
+   * administrator's sequence is the ladder.
+   */
+  tiers: EnvironmentTier[];
+  /** Which of them a user who has never chosen gets. */
+  defaultTier: string;
+  /** Whether a user may choose their own size at all. */
+  allowUserTierChoice: boolean;
+}
+
+/**
+ * One size an environment may be built at.
+ *
+ * Declared here rather than beside the scaling logic so the config type does
+ * not have to import it back from a module that imports the config.
+ */
+export interface EnvironmentTier {
+  id: string;
+  label: string;
+  /** Cores, as the engines spell them: `1`, `0.5`, `2`. */
+  cpus: string;
+  /** `2g`, `512m`. Translated per engine at the point of use. */
+  memory: string;
+}
+
+export interface KubernetesConfig {
+  /** kubectl context. Null means whatever kubectl is pointed at, which an administrator must choose deliberately. */
+  context: string | null;
+  namespace: string;
+  /** The ReadWriteMany claim holding every user's home. */
+  storageClaim: string;
+  serviceAccount: string | null;
 }
 
 export interface Mount {

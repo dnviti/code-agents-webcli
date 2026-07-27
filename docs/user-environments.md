@@ -15,21 +15,79 @@ it behaves exactly as it did before.
 
 ## What you get
 
-- A container per account, created the first time they sign in and reused after
-  that. Its name contains their GitHub login, so `docker ps` answers "whose is
-  this?" at a glance.
+- A container per account — or a Pod, on Kubernetes — created the first time
+  they sign in and reused after that. Its name contains their GitHub login, so
+  `docker ps` (or `kubectl get pods`) answers "whose is this?" at a glance.
 - A persistent home directory on the host, bind-mounted into the container.
   Packages, shell configuration and agent credentials installed there survive a
   restart, an upgrade, and an explicit teardown of the container.
 - Terminals, agent runs, chat runtimes, the file browser and editor, uploads and
   git all operating inside that account's environment rather than on the host.
-- CPU and memory limits, so one environment cannot take the whole machine.
+- CPU and memory limits, so one environment cannot take the whole machine —
+  chosen by the user from a catalog you define, or followed automatically from
+  their own load.
 - Optional idle stopping, with a transparent restart the next time the user
   comes back.
 
+## Sizes, and who picks them
+
+An installation defines a catalog of sizes — the *tiers* it is willing to hand
+out — and each user picks one of them for themselves, or picks **Automatic** and
+lets their own load pick for them. The choice lives in *Settings → Workspace
+environment*.
+
+```bash
+cc-web --containers \
+       --container-tiers "small=1,1g;medium=2,2g;large=4,4g" \
+       --container-default-tier medium
+```
+
+Order matters: automatic sizing steps along the list, so the sequence you write
+is the ladder it climbs. `--no-container-user-tier-choice` takes the choice away
+and sizes everybody centrally.
+
+If you define no catalog, what you get depends on whether you set a flat limit:
+
+| You configured | Users get |
+| --- | --- |
+| `--container-tiers` | your catalog, and a choice |
+| `--container-cpus` / `--container-memory`, no catalog | exactly that one size, no choice |
+| neither | the stock ladder above, and a choice |
+
+So the flat limits keep meaning what they always meant, and a catalog is
+something you add on purpose.
+
+### Automatic
+
+Automatic starts at the default and samples the environment every 30 seconds:
+
+- **Up** after 3 consecutive samples at or above 85% of the current tier's CPU
+  *or* memory.
+- **Down** after 10 consecutive samples at or below 30%.
+- Five minutes of cooldown after any change, so it cannot oscillate.
+
+Up fast and down slow, deliberately: being a size too small is felt on every
+keystroke, while being a size too large costs the operator some headroom for a
+few minutes. A user whose size changes is told, with the reason.
+
+If usage cannot be read — a Kubernetes cluster with no metrics-server, most
+often — automatic sizing does nothing at all. A missing reading is never treated
+as an idle one, because that would shrink every environment on the cluster out
+from under its owner.
+
+### When a change takes effect
+
+Docker, Podman and Kubernetes 1.33 or newer can change a running environment's
+limits in place, and the change is immediate. Where that is not possible the
+environment has to be rebuilt — lossless, because the home is on a volume, but
+it ends whatever is running. So a change that needs a rebuild **waits until
+nothing is running** and is applied the next time the user starts a session. The
+environment panel says so while it is waiting.
+
 ## Prerequisites
 
-Either engine works, chosen by configuration rather than by a different build.
+Any of the three engines works, chosen by configuration rather than by a
+different build.
 
 **Docker.** The account running the server must be able to talk to the Docker
 daemon — usually membership of the `docker` group. Note what that means: it is
@@ -43,6 +101,24 @@ owned by the account running the server rather than by a subordinate uid.
 On SELinux systems (Fedora, RHEL and derivatives) the bind mounts are labelled
 automatically — `:Z` for the user's own home, `:z` for the app's shared,
 read-only mount — so no `setsebool` or manual `chcon` is needed.
+
+**Kubernetes.** The server talks to the cluster through `kubectl`, which must be
+on its PATH and able to create, delete, exec into and patch pods in the
+namespace you name. Each user's environment is one Pod with `restartPolicy:
+Never` running a container that sleeps; the server execs into it.
+
+```bash
+cc-web --containers --container-engine kubernetes \
+       --kube-context my-cluster \
+       --kube-namespace workspaces \
+       --kube-storage-claim cawc-environments
+```
+
+Name the context explicitly. Left unset, the server uses whatever `kubectl` is
+currently pointed at, which is not something to leave to chance for a process
+whose job is creating pods.
+
+Storage is the part that needs planning: see below.
 
 The base image must contain the agent CLIs you want available and a shell. The
 default, `docker.io/library/node:22-bookworm`, has Node and `bash` but no agent
@@ -60,12 +136,19 @@ cc-web --containers --container-engine podman \
 | Flag | Environment variable | Meaning |
 | --- | --- | --- |
 | `--containers` | `CODE_AGENTS_WEBCLI_CONTAINERS=true` | Enable the feature. Off by default. |
-| `--container-engine <engine>` | `CODE_AGENTS_WEBCLI_CONTAINER_ENGINE` | `docker` (default) or `podman`. |
+| `--container-engine <engine>` | `CODE_AGENTS_WEBCLI_CONTAINER_ENGINE` | `docker` (default), `podman` or `kubernetes`. |
 | `--container-image <image>` | `CODE_AGENTS_WEBCLI_CONTAINER_IMAGE` | Base image. Default `docker.io/library/node:22-bookworm`. |
 | `--container-cpus <n>` | `CODE_AGENTS_WEBCLI_CONTAINER_CPUS` | CPU limit per environment. Unlimited if unset. |
 | `--container-memory <size>` | `CODE_AGENTS_WEBCLI_CONTAINER_MEMORY` | Memory limit, e.g. `4g`. Unlimited if unset. |
 | `--container-idle-minutes <n>` | `CODE_AGENTS_WEBCLI_CONTAINER_IDLE_MINUTES` | Stop an environment after this long with no activity. `0` (default) never stops one. |
 | `--container-setup <command>` | `CODE_AGENTS_WEBCLI_CONTAINER_SETUP` | Shell run once inside each newly *created* environment. |
+| `--container-tiers <spec>` | `CODE_AGENTS_WEBCLI_CONTAINER_TIERS` | `id=cpus,memory` entries separated by `;`. |
+| `--container-default-tier <id>` | `CODE_AGENTS_WEBCLI_CONTAINER_DEFAULT_TIER` | Size for a user who has never chosen. |
+| `--no-container-user-tier-choice` | `CODE_AGENTS_WEBCLI_CONTAINER_USER_TIER_CHOICE=false` | Stop users choosing their own size. |
+| `--kube-context <name>` | `CODE_AGENTS_WEBCLI_KUBE_CONTEXT` | kubectl context. Unset means whatever kubectl points at. |
+| `--kube-namespace <name>` | `CODE_AGENTS_WEBCLI_KUBE_NAMESPACE` | Namespace for the pods. Default `default`. |
+| `--kube-storage-claim <name>` | `CODE_AGENTS_WEBCLI_KUBE_STORAGE_CLAIM` | The RWX claim holding every home. |
+| `--kube-service-account <name>` | `CODE_AGENTS_WEBCLI_KUBE_SERVICE_ACCOUNT` | Service account for the pods. |
 
 `--container-setup` runs on creation, not on reuse — it installs into the
 container's own filesystem, which is the half a rebuild throws away, so it runs
@@ -74,6 +157,48 @@ home persists instead and is not reinstalled.
 
 A setup command that fails is logged and tolerated: the user still gets a
 working environment, just without the extras.
+
+## Storage on Kubernetes
+
+Every user's home lives on **one ReadWriteMany claim**, mounted:
+
+- into the server's own pod at the environments root, and
+- into each user's pod with `subPath: <environment name>`.
+
+That is the exact analogue of the bind mount used on a single machine, and it is
+what keeps the file browser, editor, uploads and git working on ordinary
+filesystem calls rather than shipping bytes through `kubectl exec`.
+
+**ReadWriteMany is not optional.** Two pods need the volume at once — the
+server's and the user's — and a ReadWriteOnce claim cannot do that. NFS,
+CephFS, Azure Files, EFS and Filestore all provide it.
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cawc-environments
+  namespace: workspaces
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 100Gi
+```
+
+Mount it in the server's deployment at the same path as `--data-dir`'s
+`environments/` directory, and the two halves line up.
+
+Two limitations follow from the pod boundary, and both are specific to
+Kubernetes:
+
+- **Tool approvals and the model's questions do not reach the browser.** Both
+  travel over a unix socket, which does not cross a pod boundary. Conversations
+  that bypass approvals are unaffected; conversations that ask for them will not
+  get their prompts. Run those on a single-machine engine until this moves to a
+  network transport.
+- **Automatic sizing needs metrics-server.** Without it `kubectl top` has
+  nothing to report, and automatic sizing stays where it is.
 
 ## Where the data lives
 
@@ -144,8 +269,9 @@ a `--container-memory` value the kernel refuses.
 
 ## What this is not
 
-- It does not schedule environments across machines. Everything runs on the host
-  the server runs on; there is no cluster mode.
-- Users cannot choose or customise their own base image from inside the app.
+- Users cannot choose or customise their own base image from inside the app —
+  only its size.
+- Nothing here autoscales the *cluster*. Automatic sizing changes one user's
+  limits; finding room for the result is the cluster's own business.
 - Environments are never shared between accounts, and one user cannot see
   another's.
