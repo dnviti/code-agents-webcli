@@ -419,6 +419,246 @@ describe('the project a job ran in', function () {
     });
   });
 
+  describe('attributing by hand', function () {
+    let dir;
+    let database;
+    let store;
+    let mine;
+    let theirs;
+
+    beforeEach(function () {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-proj-manual-'));
+      database = new AppDatabase({ dataDir: dir });
+      store = new UsageStore(database);
+      mine = database.upsertGitHubUser({ githubId: '1000', githubLogin: 'installer' }).id;
+      theirs = database.upsertGitHubUser({ githubId: '2000', githubLogin: 'other' }).id;
+
+      // One conversation, three jobs: two nobody recorded a folder for, and one
+      // that was observed running in `api`.
+      store.record(job({ sessionId: 's1', turnId: 't1', userId: mine, project: null }));
+      store.record(job({ sessionId: 's1', turnId: 't2', userId: mine, project: null }));
+      store.record(job({ sessionId: 's1', turnId: 't3', userId: mine, project: 'api' }));
+      // Somebody else's unattributed work.
+      store.record(job({ sessionId: 's2', turnId: 't4', userId: theirs, userLogin: 'other', project: null }));
+    });
+
+    afterEach(function () {
+      database.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    const jobById = (id) => store.job(id, { userId: mine, scope: 'everyone' });
+
+    it('records what was observed as observed, and nothing as nothing', function () {
+      assert.strictEqual(jobById('s1:t3').projectSource, 'observed');
+      assert.strictEqual(jobById('s1:t1').projectSource, null);
+    });
+
+    it('attributes one job, and says it was a person who did it', function () {
+      const updated = store.attributeProject({ jobId: 's1:t1' }, 'billing', { userId: mine, scope: 'self' });
+      assert.strictEqual(updated, 1);
+      const record = jobById('s1:t1');
+      assert.strictEqual(record.project, 'billing');
+      assert.strictEqual(record.projectSource, 'manual');
+      // And only that one.
+      assert.strictEqual(jobById('s1:t2').project, null);
+    });
+
+    it('attributes a whole conversation without touching what was observed', function () {
+      const updated = store.attributeProject({ sessionId: 's1' }, 'billing', { userId: mine, scope: 'self' });
+      // Two, not three: the observed job is a measurement and is left alone.
+      assert.strictEqual(updated, 2);
+      assert.strictEqual(jobById('s1:t1').project, 'billing');
+      assert.strictEqual(jobById('s1:t2').project, 'billing');
+      assert.strictEqual(jobById('s1:t3').project, 'api');
+      assert.strictEqual(jobById('s1:t3').projectSource, 'observed');
+    });
+
+    it('refuses to overwrite an observed project even when named directly', function () {
+      const updated = store.attributeProject({ jobId: 's1:t3' }, 'billing', { userId: mine, scope: 'self' });
+      assert.strictEqual(updated, 0, 'a measurement is not editable');
+      assert.strictEqual(jobById('s1:t3').project, 'api');
+    });
+
+    it('lets a hand-made attribution be corrected — a typo must not be permanent', function () {
+      store.attributeProject({ jobId: 's1:t1' }, 'biling', { userId: mine, scope: 'self' });
+      const updated = store.attributeProject({ jobId: 's1:t1' }, 'billing', { userId: mine, scope: 'self' });
+      assert.strictEqual(updated, 1);
+      assert.strictEqual(jobById('s1:t1').project, 'billing');
+    });
+
+    it('lets a hand-made attribution be withdrawn, back to unattributed', function () {
+      store.attributeProject({ jobId: 's1:t1' }, 'billing', { userId: mine, scope: 'self' });
+      const updated = store.attributeProject({ jobId: 's1:t1' }, null, { userId: mine, scope: 'self' });
+      assert.strictEqual(updated, 1);
+      const record = jobById('s1:t1');
+      assert.strictEqual(record.project, null);
+      // Not "manually attributed to nothing" — a source with no project is a
+      // state nothing else knows how to read.
+      assert.strictEqual(record.projectSource, null);
+    });
+
+    it('will not attribute another person’s work when scoped to your own', function () {
+      const updated = store.attributeProject({ jobId: 's2:t4' }, 'billing', { userId: mine, scope: 'self' });
+      assert.strictEqual(updated, 0);
+      assert.strictEqual(jobById('s2:t4').project, null);
+    });
+
+    it('will not attribute another person’s conversation when scoped to your own', function () {
+      const updated = store.attributeProject({ sessionId: 's2' }, 'billing', { userId: mine, scope: 'self' });
+      assert.strictEqual(updated, 0);
+    });
+
+    it('refuses a target it was not given, rather than attributing everything', function () {
+      const updated = store.attributeProject({}, 'billing', { userId: mine, scope: 'everyone' });
+      assert.strictEqual(updated, 0);
+      assert.strictEqual(jobById('s1:t1').project, null);
+      assert.strictEqual(jobById('s2:t4').project, null);
+    });
+
+    it('counts hand-attributed work into the breakdown it was assigned to', function () {
+      store.attributeProject({ sessionId: 's1' }, 'billing', { userId: mine, scope: 'self' });
+      const body = store.dashboard(
+        { userId: mine, scope: 'self', period: 'day', anchor: ANCHOR, tzOffsetMinutes: 0 },
+        false,
+      );
+      const billing = body.byProject.find((r) => r.key === 'billing');
+      assert.strictEqual(billing.totals.jobs, 2);
+      assert.ok(!body.byProject.some((r) => r.key === UNATTRIBUTED), 'nothing left unattributed');
+      // And the whole thing still adds up.
+      assert.strictEqual(
+        body.byProject.reduce((n, r) => n + r.totals.jobs, 0),
+        body.totals.jobs,
+      );
+    });
+
+    it('is filterable exactly like an observed one', function () {
+      store.attributeProject({ jobId: 's1:t1' }, 'billing', { userId: mine, scope: 'self' });
+      const { total } = store.history({ userId: mine, scope: 'self', project: 'billing' });
+      assert.strictEqual(total, 1);
+    });
+  });
+
+  describe('attributing by hand, over the routes', function () {
+    let dir;
+    let database;
+    let store;
+    let server;
+    let baseUrl;
+    let currentUser;
+    let installerId;
+    let otherId;
+
+    beforeEach(async function () {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-proj-manual-routes-'));
+      database = new AppDatabase({ dataDir: dir });
+      store = new UsageStore(database);
+      installerId = database.upsertGitHubUser({ githubId: '1000', githubLogin: 'installer' }).id;
+      otherId = database.upsertGitHubUser({ githubId: '2000', githubLogin: 'other' }).id;
+      store.record(job({ sessionId: 's1', turnId: 't1', userId: installerId, project: null }));
+      store.record(job({ sessionId: 's1', turnId: 't2', userId: installerId, project: null }));
+      store.record(job({ sessionId: 's2', turnId: 't3', userId: otherId, userLogin: 'other', project: null }));
+      currentUser = { id: installerId, githubId: '1000', githubLogin: 'installer', githubName: null, avatarUrl: null, email: null };
+
+      const app = express();
+      app.use(express.json());
+      app.use((_req, res, next) => {
+        res.locals.authContext = { user: currentUser, authSessionId: null };
+        next();
+      });
+      app.use(createUsageRoutes({ usageStore: store, getInstallerUserId: () => database.getInstallerUserId() }));
+      await new Promise((resolve) => { server = app.listen(0, '127.0.0.1', resolve); });
+      baseUrl = `http://127.0.0.1:${server.address().port}`;
+    });
+
+    afterEach(async function () {
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(resolve));
+      database.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    const attribute = (id, body, query = '') =>
+      fetch(`${baseUrl}/api/usage/jobs/${encodeURIComponent(id)}/project${query}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    it('attributes a job over the wire', async function () {
+      const response = await attribute('s1:t1', { project: 'billing' });
+      assert.strictEqual(response.status, 200);
+      const body = await response.json();
+      assert.strictEqual(body.updated, 1);
+      assert.strictEqual(body.project, 'billing');
+    });
+
+    it('attributes the whole conversation when asked to', async function () {
+      const body = await (await attribute('s1:t1', { project: 'billing', applyToSession: true })).json();
+      assert.strictEqual(body.updated, 2);
+    });
+
+    it('requires a signed-in user', async function () {
+      currentUser = null;
+      assert.strictEqual((await attribute('s1:t1', { project: 'billing' })).status, 401);
+    });
+
+    it('answers 404 for another person’s job, the same as reading it does', async function () {
+      // Not 403: a distinguishable refusal is a way to probe for job ids.
+      currentUser = { id: otherId, githubId: '2000', githubLogin: 'other', githubName: null, avatarUrl: null, email: null };
+      assert.strictEqual((await attribute('s1:t1', { project: 'billing' })).status, 404);
+      assert.strictEqual(store.job('s1:t1', { userId: installerId, scope: 'self' }).project, null);
+    });
+
+    it('refuses a blank name rather than creating a project called nothing', async function () {
+      const response = await attribute('s1:t1', { project: '   ' });
+      assert.strictEqual(response.status, 400);
+      assert.strictEqual((await response.json()).error, 'empty_project');
+    });
+
+    it('refuses a project that is not a string', async function () {
+      assert.strictEqual((await attribute('s1:t1', { project: 42 })).status, 400);
+    });
+
+    it('trims what was typed', async function () {
+      await attribute('s1:t1', { project: '  billing  ' });
+      assert.strictEqual(store.job('s1:t1', { userId: installerId, scope: 'self' }).project, 'billing');
+    });
+
+    it('caps a name at a length a table cell can hold', async function () {
+      await attribute('s1:t1', { project: 'x'.repeat(500) });
+      assert.strictEqual(store.job('s1:t1', { userId: installerId, scope: 'self' }).project.length, 120);
+    });
+
+    it('withdraws an attribution when sent null', async function () {
+      await attribute('s1:t1', { project: 'billing' });
+      const body = await (await attribute('s1:t1', { project: null })).json();
+      assert.strictEqual(body.updated, 1);
+      assert.strictEqual(store.job('s1:t1', { userId: installerId, scope: 'self' }).project, null);
+    });
+
+    it('lets the installer fix somebody else’s missing attribution', async function () {
+      const body = await (await attribute('s2:t3', { project: 'billing' }, '?scope=everyone')).json();
+      assert.strictEqual(body.updated, 1);
+    });
+
+    it('does not let a non-installer reach everyone by asking for it', async function () {
+      currentUser = { id: otherId, githubId: '2000', githubLogin: 'other', githubName: null, avatarUrl: null, email: null };
+      // `s1:t1` is the installer's. Asking for the wide scope resolves back to
+      // this user's own, so the job is simply not theirs to see.
+      assert.strictEqual((await attribute('s1:t1', { project: 'x' }, '?scope=everyone')).status, 404);
+    });
+
+    it('carries the provenance into the export, so a hand-made figure is legible as one', async function () {
+      await attribute('s1:t1', { project: 'billing' });
+      const csv = await (await fetch(`${baseUrl}/api/usage/export`)).text();
+      const [header, ...rows] = csv.trim().split('\n');
+      const column = header.split(',').indexOf('projectSource');
+      assert.ok(column >= 0, header);
+      assert.ok(rows.some((r) => r.split(',')[column] === 'manual'), rows.join(' | '));
+    });
+  });
+
   describe('over the routes', function () {
     let dir;
     let database;
@@ -491,11 +731,25 @@ describe('the project a job ran in', function () {
       assert.strictEqual(unattributed.length, 1);
     });
 
+    it('has a sentinel that a URL, a JSON body and a CSV cell can all carry', function () {
+      // The first version of this was a leading control character, which is a
+      // thing each of those three mangles differently — and which every test
+      // that compared the constant against itself was blind to.
+      assert.ok(!/[\u0000-\u001f]/.test(UNATTRIBUTED), 'no control characters');
+      assert.strictEqual(new URLSearchParams({ project: UNATTRIBUTED }).get('project'), UNATTRIBUTED);
+      assert.strictEqual(JSON.parse(JSON.stringify({ p: UNATTRIBUTED })).p, UNATTRIBUTED);
+    });
+
+    it('cannot collide with a real project name', function () {
+      // A project is a path's last segment, so it can never contain a separator.
+      assert.ok(UNATTRIBUTED.includes('/'));
+      assert.notStrictEqual(projectNameFor('/srv/work' + UNATTRIBUTED), UNATTRIBUTED);
+    });
+
     it('round-trips the unattributed sentinel through a query string', async function () {
-      // The sentinel has a leading space. `URLSearchParams` encodes that as
-      // `+`, Express decodes it back — and if either end of that ever stopped
-      // agreeing, the filter would silently match nothing while the row that
-      // offered it went on looking selectable.
+      // If either end of that encoding ever stopped agreeing, the filter would
+      // silently match nothing while the row that offered it went on looking
+      // selectable.
       const params = new URLSearchParams({ project: UNATTRIBUTED });
       const body = await (await get(`/api/usage/jobs?${params.toString()}`)).json();
       assert.strictEqual(body.total, 1);

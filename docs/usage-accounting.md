@@ -212,6 +212,34 @@ Work recorded before this existed has no project on it, and none is invented
 for it. It groups under **unattributed** — visible, counted in the totals, and
 never quietly folded into a real project's figures.
 
+### Attributing work by hand
+
+Unattributed work can be assigned to a project after the fact. Open any job
+from the history under the dashboard and use **Attribute…** on its project
+field; by default the attribution applies to every unattributed job in that
+conversation, which is the unit people actually fix — a conversation ran in one
+folder.
+
+The rules are narrow on purpose:
+
+- **A project that was observed cannot be overwritten**, and no control is
+  offered to try. It is what the session was pointed at while the work ran. If
+  a person could edit it, every project figure in the dashboard would become a
+  claim rather than a record.
+- **A hand-made attribution can be corrected or withdrawn.** A typo that could
+  never be fixed would be worse than no attribution at all. Withdrawing it
+  returns the work to unattributed.
+- **You can only attribute work you can already see.** The installer, who sees
+  everyone's figures, can also fix anyone's missing attribution; everybody else
+  is confined to their own, and asking for a wider scope resolves back to their
+  own exactly as it does on every read.
+
+The two are kept apart on the record and on screen: a hand-attributed job is
+labelled *by hand* in its detail view, marked in the job list, and carries
+`projectSource` of `manual` in the export. A figure somebody typed and a figure
+something measured are not the same fact, which is the same rule this whole
+subsystem applies to costs.
+
 ## What is not covered
 
 Accounting covers **chat-surface sessions**. A terminal-surface session runs
@@ -360,6 +388,7 @@ GET /api/usage/jobs?agent=claude&limit=20
       "agent": "claude",
       "model": "claude-opus-5",
       "project": "billing-api",
+      "projectSource": "observed",
       "startedAt": "2026-07-27T09:14:02.000Z",
       "endedAt": "2026-07-27T09:14:41.000Z",
       "durationMs": 39000,
@@ -399,6 +428,30 @@ response to probe for another user's job ids.
 }
 ```
 
+### `POST /api/usage/jobs/:id/project`
+
+Attribute a job — or every unattributed job in its conversation — to a project
+by hand. Query parameter: `scope`. Body:
+
+```json
+{ "project": "billing-api", "applyToSession": true }
+```
+
+`project` is trimmed and capped at 120 characters; a blank string is refused
+with `400 empty_project` rather than creating a project whose name is nothing.
+Send `null` to withdraw an attribution made this way.
+
+The response says how many rows actually changed, which is not the same as how
+many were named:
+
+```json
+{ "updated": 2, "project": "billing-api" }
+```
+
+An `updated` of `0` means every job in range already had an observed project —
+those are never overwritten. A job that does not exist and a job that is not
+this viewer's answer identically with `404`, the same as reading one does.
+
 ### `GET /api/usage/facets`
 
 The agents, models and projects actually present in the viewer's own scope, for
@@ -434,8 +487,8 @@ GET /api/usage/export?from=2026-07-01T00:00:00.000Z&to=2026-08-01T00:00:00.000Z&
 ```
 
 ```csv
-id,sessionId,nativeSessionId,turnId,userId,userLogin,agent,model,project,startedAt,endedAt,durationMs,outcome,turns,toolCalls,inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens,reasoningTokens,totalTokens,costUsd,reportsUsage,reportsCost
-sess-abc:turn-9,sess-abc,claude-native-id,turn-9,7,dnviti,claude,claude-opus-5,billing-api,2026-07-27T09:14:02.000Z,2026-07-27T09:14:41.000Z,39000,completed,3,5,1200,640,40000,900,,42740,0.0612,true,true
+id,sessionId,nativeSessionId,turnId,userId,userLogin,agent,model,project,projectSource,startedAt,endedAt,durationMs,outcome,turns,toolCalls,inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens,reasoningTokens,totalTokens,costUsd,reportsUsage,reportsCost
+sess-abc:turn-9,sess-abc,claude-native-id,turn-9,7,dnviti,claude,claude-opus-5,billing-api,observed,2026-07-27T09:14:02.000Z,2026-07-27T09:14:41.000Z,39000,completed,3,5,1200,640,40000,900,,42740,0.0612,true,true
 ```
 
 `format=json` returns the same rows as a JSON array instead, with the usual
@@ -495,7 +548,8 @@ would have cost rather than what anyone was charged. The by-agent and
 by-model breakdowns are the same totals shape, grouped;
 the by-user table appears only for the installer viewing `everyone`. The
 by-project table groups by the folder each job ran in, with work recorded
-before that was tracked under **unattributed** — per-project figures always add
+before that was tracked under **unattributed** — which can be
+[assigned by hand](#attributing-work-by-hand) — per-project figures always add
 up to the overall total for the same range and scope, because nothing is
 dropped to make the grouping tidy.
 

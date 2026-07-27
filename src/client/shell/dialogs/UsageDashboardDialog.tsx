@@ -17,6 +17,7 @@ import type {
 } from '../../../shared/usage-records.js';
 import { UNATTRIBUTED } from '../../../shared/usage-records.js';
 import {
+  attributeUsageProject,
   exportUsage,
   fetchUsageDashboard,
   fetchUsageJob,
@@ -25,6 +26,7 @@ import {
 import { Button } from '../../ui/relay/Button';
 import { Dialog } from '../../ui/relay/Dialog';
 import { Icon } from '../../ui/relay/Icon';
+import { Input } from '../../ui/relay/Input';
 import { Tabs } from '../../ui/relay/Tabs';
 import { Tooltip } from '../../ui/relay/Tooltip';
 import { usePhone } from '../../ui/touch';
@@ -866,17 +868,167 @@ function ToolsTable({ tools }: { tools: UsageToolUse[] }): React.JSX.Element {
   );
 }
 
+/**
+ * Attributing work to a project after the fact.
+ *
+ * Offered only where there is nothing to overwrite — no project at all, or one
+ * somebody else typed here earlier. A job whose project was observed shows the
+ * observation and no control, because the alternative is an interface that
+ * invites you to correct a measurement and then refuses.
+ *
+ * The whole-conversation checkbox is on by default, and is the case that
+ * actually matters: a conversation ran in one folder, so somebody clearing a
+ * backlog of unattributed work wants the conversation, not its ninth turn.
+ */
+function ProjectAttribution({
+  job,
+  scope,
+  knownProjects,
+  onDone,
+}: {
+  job: UsageJobRecord;
+  scope: UsageScope;
+  knownProjects: string[];
+  /**
+   * Reports the outcome upward rather than showing it here, because saving
+   * reloads the job — which unmounts this component and would take the message
+   * with it. "0 jobs attributed" is the one outcome most worth reading, and it
+   * was the one guaranteed to flash and vanish.
+   */
+  onDone(message: string): void;
+}): React.JSX.Element {
+  const [editing, setEditing] = React.useState(false);
+  const [value, setValue] = React.useState(job.project ?? '');
+  const [applyToSession, setApplyToSession] = React.useState(true);
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const listId = `usage-projects-${job.id.replace(/[^a-zA-Z0-9]/g, '-')}`;
+
+  if (job.projectSource === 'observed') {
+    return (
+      <Tooltip label="Read from the folder this session was working in as the job ran">
+        <span>{job.project}</span>
+      </Tooltip>
+    );
+  }
+
+  const save = (next: string | null): void => {
+    setBusy(true);
+    setError(null);
+    attributeUsageProject(job.id, { project: next, applyToSession, scope })
+      .then((outcome) => {
+        setBusy(false);
+        setEditing(false);
+        onDone(
+          outcome.updated === 0
+            ? 'Nothing changed — this work already had a recorded project.'
+            : `${outcome.updated} job(s) attributed.`,
+        );
+      })
+      .catch((err: Error) => {
+        setBusy(false);
+        setError(err.message);
+      });
+  };
+
+  if (!editing) {
+    return (
+      <div style={{ display: 'flex', gap: 6, alignItems: 'baseline', flexWrap: 'wrap' }}>
+          {job.project ? (
+            <Tooltip label="Attributed by hand, not read from a running session">
+              <span>
+                {job.project}
+                <span style={{ color: 'var(--muted-foreground)' }}> (by hand)</span>
+              </span>
+            </Tooltip>
+          ) : (
+            <span style={{ color: 'var(--muted-foreground)' }}>unattributed</span>
+          )}
+          <button
+            type="button"
+            onClick={() => setEditing(true)}
+            style={{
+              background: 'transparent',
+              border: 'none',
+              padding: 0,
+              font: 'inherit',
+              fontSize: 'var(--text-2xs)',
+              color: 'var(--primary)',
+              cursor: 'pointer',
+              textDecoration: 'underline',
+            }}
+          >
+            {job.project ? 'Change' : 'Attribute…'}
+          </button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <datalist id={listId}>
+        {knownProjects.map((name) => <option key={name} value={name} />)}
+      </datalist>
+      <Input
+        size="sm"
+        autoFocus
+        value={value}
+        list={listId}
+        placeholder="Project name"
+        aria-label="Project name"
+        disabled={busy}
+        onChange={(e) => setValue(e.currentTarget.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && value.trim()) save(value.trim());
+          if (e.key === 'Escape') setEditing(false);
+        }}
+      />
+      <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
+        <input
+          type="checkbox"
+          checked={applyToSession}
+          disabled={busy}
+          onChange={(e) => setApplyToSession(e.currentTarget.checked)}
+        />
+        Apply to every unattributed job in this conversation
+      </label>
+      {error ? (
+        <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--destructive)' }}>{error}</span>
+      ) : null}
+      <div style={{ display: 'flex', gap: 6 }}>
+        <Button size="sm" disabled={busy || !value.trim()} onClick={() => save(value.trim())}>
+          Save
+        </Button>
+        <Button variant="outline" size="sm" disabled={busy} onClick={() => setEditing(false)}>
+          Cancel
+        </Button>
+        {job.project ? (
+          <Button variant="ghost" size="sm" disabled={busy} onClick={() => save(null)}>
+            Withdraw
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function JobDetail({
   jobId,
   scope,
+  knownProjects,
   onClose,
+  onChanged,
 }: {
   jobId: string;
   scope: UsageScope;
+  knownProjects: string[];
   onClose(): void;
+  onChanged(): void;
 }): React.JSX.Element {
   const [job, setJob] = React.useState<UsageJobRecord | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [reloads, setReloads] = React.useState(0);
+  const [outcome, setOutcome] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -886,7 +1038,7 @@ function JobDetail({
       .then((record) => { if (!cancelled) setJob(record); })
       .catch((err: Error) => { if (!cancelled) setError(err.message); });
     return () => { cancelled = true; };
-  }, [jobId, scope]);
+  }, [jobId, scope, reloads]);
 
   const costFig = job ? jobCostFigure(job) : null;
   const tokensFig = job ? jobTokensFigure(job) : null;
@@ -910,7 +1062,21 @@ function JobDetail({
             </div>
             <div>
               <div style={{ color: 'var(--muted-foreground)', fontSize: 'var(--text-2xs)' }}>Project</div>
-              <div>{job.project ?? <span style={{ color: 'var(--muted-foreground)' }}>unattributed</span>}</div>
+              <ProjectAttribution
+                job={job}
+                scope={scope}
+                knownProjects={knownProjects}
+                onDone={(message) => {
+                  setOutcome(message);
+                  setReloads((n) => n + 1);
+                  onChanged();
+                }}
+              />
+              {outcome ? (
+                <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)', marginTop: 2 }}>
+                  {outcome}
+                </div>
+              ) : null}
             </div>
             <div>
               <div style={{ color: 'var(--muted-foreground)', fontSize: 'var(--text-2xs)' }}>User</div>
@@ -969,11 +1135,22 @@ function JobDetail({
  * project's jobs here, with no second set of controls to keep in step and no
  * way for the two to end up disagreeing about what is on screen.
  */
-function JobHistory({ scope, filters }: { scope: UsageScope; filters: UsageFilters }): React.JSX.Element {
+function JobHistory({
+  scope,
+  filters,
+  knownProjects,
+  onChanged,
+}: {
+  scope: UsageScope;
+  filters: UsageFilters;
+  knownProjects: string[];
+  onChanged(): void;
+}): React.JSX.Element {
   const [offset, setOffset] = React.useState(0);
   const [page, setPage] = React.useState<{ jobs: UsageJobSummary[]; total: number } | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [openJobId, setOpenJobId] = React.useState<string | null>(null);
+  const [reloads, setReloads] = React.useState(0);
   // `filters` is rebuilt by the parent on every render; its serialised form is
   // what actually changes when a filter does, and it is what the effects below
   // depend on.
@@ -994,7 +1171,7 @@ function JobHistory({ scope, filters }: { scope: UsageScope; filters: UsageFilte
       .catch((err: Error) => { if (!cancelled) setError(err.message); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope, offset, filterKey]);
+  }, [scope, offset, filterKey, reloads]);
 
   const total = page?.total ?? 0;
   const jobs = page?.jobs ?? [];
@@ -1038,7 +1215,18 @@ function JobHistory({ scope, filters }: { scope: UsageScope; filters: UsageFilte
                         {new Date(job.startedAt).toLocaleString()}
                       </td>
                       <td style={bodyCellStyle}>
-                        {job.project ?? <span style={{ color: 'var(--muted-foreground)' }}>unattributed</span>}
+                        {job.project ? (
+                          <>
+                            {job.project}
+                            {job.projectSource === 'manual' ? (
+                              <Tooltip label="Attributed by hand, not read from a running session">
+                                <span style={{ color: 'var(--muted-foreground)' }}> ·</span>
+                              </Tooltip>
+                            ) : null}
+                          </>
+                        ) : (
+                          <span style={{ color: 'var(--muted-foreground)' }}>unattributed</span>
+                        )}
                       </td>
                       <td style={bodyCellStyle}>{job.agent}</td>
                       <td style={bodyCellStyle}>
@@ -1084,7 +1272,13 @@ function JobHistory({ scope, filters }: { scope: UsageScope; filters: UsageFilte
         </>
       )}
       {openJobId ? (
-        <JobDetail jobId={openJobId} scope={scope} onClose={() => setOpenJobId(null)} />
+        <JobDetail
+          jobId={openJobId}
+          scope={scope}
+          knownProjects={knownProjects}
+          onClose={() => setOpenJobId(null)}
+          onChanged={() => { setReloads((n) => n + 1); onChanged(); }}
+        />
       ) : null}
     </div>
   );
@@ -1115,6 +1309,7 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
   const [filters, setFilters] = React.useState<UsageFilters>({});
   const [dashboard, setDashboard] = React.useState<UsageDashboard | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const [reloads, setReloads] = React.useState(0);
   const isPhone = usePhone();
   const filterKey = JSON.stringify(filters);
 
@@ -1142,10 +1337,17 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
       .catch((err: Error) => { if (!cancelled) setError(err.message); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, period, scope, filterKey]);
+  }, [open, period, scope, filterKey, reloads]);
 
   const active = measureBy(measure);
   const bucketUnit: UsageBucketUnit = dashboard?.bucket ?? 'hour';
+  // The projects already in use, offered as suggestions when attributing work
+  // by hand. Taken from the breakdown rather than fetched separately: it is the
+  // same list, already on screen, and a second request could disagree with it.
+  // The sentinel is not a project anybody can type.
+  const knownProjects = (dashboard?.byProject ?? [])
+    .map((row) => row.key)
+    .filter((key) => key !== UNATTRIBUTED && key !== '');
 
   /**
    * The period is the *unnarrowed* range, so choosing a new one drops any
@@ -1297,6 +1499,17 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
                   selected={filters.project}
                   onSelect={(key) => toggle('project', key)}
                 />
+                {/* Said where the problem is visible, not in a help page. Work
+                    with no project is the one row here a viewer can actually
+                    do something about, and the way to do it is two panels
+                    down. */}
+                {dashboard.byProject.some((row) => row.key === UNATTRIBUTED) ? (
+                  <div style={{ marginTop: 6, fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
+                    Work recorded before its folder was tracked shows as unattributed. Open any of
+                    those jobs in the history below to attribute it — and its whole conversation — by
+                    hand.
+                  </div>
+                ) : null}
               </div>
               <div>
                 <h3 style={sectionTitleStyle}>By agent</h3>
@@ -1371,7 +1584,15 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
                 ) : null}
               </div>
               <div style={{ marginTop: 8 }}>
-                <JobHistory scope={scope} filters={filters} />
+                <JobHistory
+                  scope={scope}
+                  filters={filters}
+                  knownProjects={knownProjects}
+                  // Attributing work changes the figures above it, so the whole
+                  // view is re-asked rather than left showing a breakdown that
+                  // disagrees with the row that was just edited.
+                  onChanged={() => setReloads((n) => n + 1)}
+                />
               </div>
             </div>
           </>

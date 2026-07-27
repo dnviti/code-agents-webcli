@@ -24,6 +24,21 @@
   project view is not a way around them, and the project filter menu names only
   projects the viewer may already see.
 
+- **Unattributed work can be assigned to a project by hand.** Work recorded
+  before its folder was tracked has no project, and there was no way to fix
+  that — a backlog of "unattributed" that would never shrink. Any job can now be
+  attributed from its detail view in the job history, and by default the whole
+  conversation goes with it, since a conversation ran in one folder.
+
+  What was *observed* stays observed: a project read off a running session
+  cannot be overwritten, and no control is offered to try, because a
+  measurement a person can edit is not a measurement. An attribution made by
+  hand can be corrected or withdrawn, is labelled as hand-made on screen, and
+  carries a `projectSource` of `manual` into the export — so a per-project total
+  can be read for how much of it was recorded and how much was asserted. You
+  can only attribute work you could already see; the installer can fix anyone's,
+  everyone else only their own.
+
 - **The dashboard charts are interactive.** (#66) They were pictures: the trend
   plotted cost and nothing else, the only way to read a bar was to hover a
   mouse over it — which does nothing at all on a phone or with a keyboard — and

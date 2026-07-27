@@ -34,6 +34,7 @@ import {
   UsageJobSummary,
   UsageOutcome,
   UsagePeriod,
+  UsageProjectSource,
   UsageScope,
   UsageToolUse,
   UsageTotals,
@@ -98,6 +99,7 @@ interface JobRow {
   agent: string;
   model: string | null;
   project: string | null;
+  project_source: string | null;
   started_at: string;
   ended_at: string;
   duration_ms: number | null;
@@ -185,12 +187,12 @@ export class UsageStore {
       db.prepare(`
         INSERT OR REPLACE INTO usage_jobs (
           id, session_id, native_session_id, turn_id, user_id, user_login,
-          agent, model, project, started_at, ended_at, duration_ms, outcome,
+          agent, model, project, project_source, started_at, ended_at, duration_ms, outcome,
           turns, tool_calls,
           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
           reasoning_tokens, total_tokens, cost_usd,
           reports_usage, reports_cost
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         job.sessionId,
@@ -201,6 +203,8 @@ export class UsageStore {
         job.agent,
         job.model,
         job.project ?? null,
+        // Recorded, not asserted: this came off the session as the work ran.
+        job.project ? 'observed' : null,
         job.startedAt,
         job.endedAt,
         job.durationMs,
@@ -290,6 +294,61 @@ export class UsageStore {
       totalTokens: row.total_tokens ?? 0,
       costUsd: row.cost_usd ?? 0,
     };
+  }
+
+  /**
+   * Attribute work by hand to a project, for jobs nobody recorded one for.
+   *
+   * The one write on this table that is not a measurement, and it is fenced
+   * accordingly:
+   *
+   * - **An observed project is never overwritten.** It is what the session was
+   *   actually pointed at while the work ran. A person who disagrees with it is
+   *   disagreeing with a fact, and letting them edit it would make every other
+   *   project figure a claim rather than a record.
+   * - **A manual one can be corrected or withdrawn**, by anyone who could have
+   *   made it — a typo that can never be fixed is worse than no attribution.
+   * - **Scope is the same parameter every read takes**, so this cannot reach a
+   *   job the caller is not allowed to see, let alone one they cannot see at
+   *   all.
+   *
+   * Returns how many rows actually changed, which is not the same as how many
+   * were asked for: a caller that names a session with nine jobs, six of them
+   * already observed, is told three. Silently reporting nine would read as
+   * "done" for work that was deliberately left alone.
+   */
+  attributeProject(
+    target: { jobId?: string; sessionId?: string },
+    project: string | null,
+    query: UsageQuery,
+  ): number {
+    const scope = this.scopeClause(query);
+    const where: string[] = [...scope.parts];
+    const whereParams: unknown[] = [...scope.params];
+
+    if (target.jobId) {
+      where.push('id = ?');
+      whereParams.push(target.jobId);
+    } else if (target.sessionId) {
+      where.push('session_id = ?');
+      whereParams.push(target.sessionId);
+    } else {
+      // No target is not "every job I own". Refusing beats guessing at a scope
+      // this wide.
+      return 0;
+    }
+    // The fence. Both halves matter: the first admits work nobody attributed,
+    // the second admits corrections to work somebody attributed by hand.
+    where.push("(project IS NULL OR project_source = 'manual')");
+
+    // The source is derived here rather than passed in, so "cleared" cannot be
+    // recorded as a manual attribution to nothing — a row with a null project
+    // and a source is a state nothing else in this file knows how to read.
+    const source: UsageProjectSource = project ? 'manual' : null;
+    const result = this.database.raw
+      .prepare(`UPDATE usage_jobs SET project = ?, project_source = ? WHERE ${where.join(' AND ')}`)
+      .run(project, source, ...whereParams);
+    return result.changes ?? 0;
   }
 
   // ------------------------------------------------------------------ reading
@@ -658,6 +717,7 @@ function mapJob(row: JobRow): UsageJobSummary {
     agent: row.agent,
     model: row.model,
     project: row.project,
+    projectSource: (row.project_source as UsageProjectSource) ?? null,
     startedAt: row.started_at,
     endedAt: row.ended_at,
     durationMs: row.duration_ms,

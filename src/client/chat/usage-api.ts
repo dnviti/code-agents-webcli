@@ -136,6 +136,44 @@ export function fetchUsageJob(id: string, scope: UsageScope): Promise<UsageJobRe
 }
 
 /**
+ * Attribute work to a project by hand, for jobs nobody recorded one for.
+ *
+ * A POST rather than a PATCH on the job, because what this changes is not the
+ * job's own measurement of anything — the record it writes is a person's
+ * assertion about work that finished long ago, and the server keeps the two
+ * apart. Sending `null` withdraws an attribution made this way; an observed
+ * one cannot be touched from here at all, and the server says so by changing
+ * nothing.
+ *
+ * `applyToSession` is the bulk case, and the common one: a conversation ran in
+ * one folder, so attributing the whole conversation at once is what somebody
+ * fixing a backlog actually wants. It only ever reaches the jobs in that
+ * conversation that have no project.
+ */
+export async function attributeUsageProject(
+  jobId: string,
+  options: { project: string | null; applyToSession?: boolean; scope: UsageScope },
+): Promise<{ updated: number; project: string | null }> {
+  const response = await fetch(
+    `/api/usage/jobs/${encodeURIComponent(jobId)}/project?${new URLSearchParams({ scope: options.scope }).toString()}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ project: options.project, applyToSession: Boolean(options.applyToSession) }),
+    },
+  );
+  if (!response.ok) {
+    const detail = await response
+      .json()
+      .then((body: { error?: string; message?: string }) => body.message || body.error)
+      .catch(() => null);
+    throw new Error(detail || `Could not attribute this work (${response.status})`);
+  }
+  return (await response.json()) as { updated: number; project: string | null };
+}
+
+/**
  * The URL the export button downloads from.
  *
  * A URL rather than a fetch-then-blob, same reasoning as `rawFileUrl` in

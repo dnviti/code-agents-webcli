@@ -11,6 +11,9 @@ export interface UsageRoutesDeps {
 
 const PERIODS: UsagePeriod[] = ['day', 'week', 'month', 'year'];
 
+/** A project name is a table cell, not a paragraph. */
+const MAX_PROJECT_LENGTH = 120;
+
 /**
  * Whether this viewer may ask for `everyone`.
  *
@@ -123,6 +126,10 @@ const EXPORT_COLUMNS = [
   'agent',
   'model',
   'project',
+  // Carried out of the app, not only shown inside it: someone reconciling a
+  // per-project total against an invoice needs to see which rows were a
+  // person's assertion rather than a recorded fact.
+  'projectSource',
   'startedAt',
   'endedAt',
   'durationMs',
@@ -198,6 +205,68 @@ export function createUsageRoutes(deps: UsageRoutesDeps): Router {
       return;
     }
     res.json(job);
+  });
+
+  /**
+   * Attribute a job — or every unattributed job in its conversation — to a
+   * project by hand.
+   *
+   * The only write in this file, and the checks are stacked rather than
+   * combined so each one fails for its own reason. The scope resolves the same
+   * way every read does, so a viewer who cannot see a job cannot attribute it
+   * either; the installer, who can already see everyone's figures, can also fix
+   * anyone's missing attribution, which is the whole point of a management
+   * view.
+   *
+   * The store refuses to overwrite an observed project, so this route does not
+   * need to re-check that — but it does report how many rows actually changed,
+   * because "nothing changed" is a real and useful answer here.
+   */
+  router.post('/api/usage/jobs/:id/project', (req: Request, res: Response): void => {
+    const user = requireUser(res);
+    if (!user) {
+      res.status(401).json({ error: 'authentication_required' });
+      return;
+    }
+
+    const scope = resolveScope(deps, user, req.query.scope ?? (req.body ?? {}).scope);
+    const jobId = String(req.params.id);
+    const job = deps.usageStore.job(jobId, { userId: user.id, scope });
+    if (!job) {
+      // Same answer as the read, for the same reason: not-found and not-yours
+      // must be indistinguishable, or this becomes a way to probe for job ids.
+      res.status(404).json({ error: 'not_found' });
+      return;
+    }
+
+    const body = (req.body ?? {}) as { project?: unknown; applyToSession?: unknown };
+    if (body.project !== null && typeof body.project !== 'string') {
+      res.status(400).json({
+        error: 'invalid_project',
+        message: 'project must be a string, or null to withdraw an attribution',
+      });
+      return;
+    }
+
+    // A name is what was typed with the whitespace taken off, and one that is
+    // nothing but whitespace is not a name — it would group under a key that
+    // renders as blank, which is the state the sentinel exists to avoid.
+    // Capped for the same reason the session name is: this is a table cell.
+    const project = body.project === null ? null : body.project.trim().slice(0, MAX_PROJECT_LENGTH);
+    if (project === '') {
+      res.status(400).json({
+        error: 'empty_project',
+        message: 'A project name cannot be blank. Send null to withdraw the attribution instead.',
+      });
+      return;
+    }
+
+    const updated = deps.usageStore.attributeProject(
+      body.applyToSession ? { sessionId: job.sessionId } : { jobId },
+      project,
+      { userId: user.id, scope },
+    );
+    res.json({ updated, project });
   });
 
   router.get('/api/usage/facets', (req: Request, res: Response): void => {

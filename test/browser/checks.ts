@@ -245,6 +245,7 @@ async function run(): Promise<void> {
   await checkAnUnreportedFigureIsNeverDrawnAsZero();
   await checkTheUsageChartsAreInteractive();
   await checkAServerOlderThanThePageSaysSo();
+  await checkUnattributedWorkCanBeAttributedByHand();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -2438,8 +2439,10 @@ async function checkAnUnreportedFigureIsNeverDrawnAsZero(): Promise<void> {
       { key: 'billing-api', totals: totals({ jobs: 3, totalTokens: 4000, costUsd: 1.25, tokensReportedJobs: 3, costReportedJobs: 2 }) },
       // The sentinel the server sends for work recorded before projects
       // existed. Spelled out here rather than imported, because the point of
-      // the check is that the browser renders whatever the wire actually says.
-      { key: ' unattributed', totals: totals({ jobs: 1, totalTokens: 1000, tokensReportedJobs: 1, costReportedJobs: 0 }) },
+      // the check is that the browser renders whatever the wire actually says —
+      // which is exactly how a mismatch between this literal and the constant
+      // caught the sentinel being an unprintable control character.
+      { key: '//unattributed', totals: totals({ jobs: 1, totalTokens: 1000, tokensReportedJobs: 1, costReportedJobs: 0 }) },
     ],
     byAgent: [
       { key: 'claude', totals: totals({ jobs: 2, totalTokens: 3000, costUsd: 1.25, tokensReportedJobs: 2, costReportedJobs: 2 }) },
@@ -2826,6 +2829,203 @@ async function checkAServerOlderThanThePageSaysSo(): Promise<void> {
   );
 
   root.unmount();
+  frame.remove();
+  window.fetch = realFetch;
+}
+
+/**
+ * Attributing work to a project by hand, from the job it belongs to.
+ *
+ * The claim is not "a form exists" — it is that pressing Save sends the right
+ * assertion for the right job, and that the interface never offers to edit a
+ * project that was actually observed. Both are invisible to a typecheck: an
+ * edit control rendered for an observed job compiles perfectly and produces a
+ * button whose only possible outcome is the server refusing it.
+ */
+async function checkUnattributedWorkCanBeAttributedByHand(): Promise<void> {
+  const totals = (over: Record<string, number>) => ({
+    jobs: 0, turns: 0, toolCalls: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    reasoningTokens: 0, totalTokens: 0, costUsd: 0,
+    tokensReportedJobs: 0, costReportedJobs: 0,
+    ...over,
+  });
+  const one = totals({ jobs: 1, totalTokens: 100, costUsd: 0.5, tokensReportedJobs: 1, costReportedJobs: 1 });
+
+  const dashboard = {
+    scope: 'self', canSeeEveryone: false, period: 'day',
+    from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
+    bucket: 'hour', filters: {},
+    totals: one,
+    series: [{ key: '2026-07-27T09:00', totals: one }],
+    byProject: [
+      { key: 'billing-api', totals: one },
+      { key: '//unattributed', totals: one },
+    ],
+    byAgent: [{ key: 'claude', totals: one }],
+    byModel: [{ key: 'claude-opus-5', totals: one }],
+    effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
+  };
+
+  const jobFields = {
+    sessionId: 'sess-1', nativeSessionId: null, turnId: 't1', userId: 7, userLogin: 'dnviti',
+    agent: 'claude', model: 'claude-opus-5',
+    startedAt: '2026-07-27T09:14:02.000Z', endedAt: '2026-07-27T09:14:41.000Z',
+    durationMs: 39000, outcome: 'completed', turns: 3, toolCalls: 5,
+    inputTokens: 10, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0,
+    reasoningTokens: null, totalTokens: 100, costUsd: 0.5,
+    reportsUsage: true, reportsCost: true,
+  };
+  const unattributed = { ...jobFields, id: 'sess-1:t1', project: null, projectSource: null };
+  const observed = { ...jobFields, id: 'sess-2:t9', sessionId: 'sess-2', project: 'billing-api', projectSource: 'observed' };
+
+  const posted: Array<{ url: string; body: unknown }> = [];
+  let openId = 'sess-1:t1';
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+    if ((init?.method || 'GET').toUpperCase() === 'POST') {
+      posted.push({ url, body: JSON.parse(String(init?.body ?? '{}')) });
+      return new Response(JSON.stringify({ updated: 2, project: 'billing-api' }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url.includes('/api/usage/dashboard')) {
+      return new Response(JSON.stringify(dashboard), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (/\/api\/usage\/jobs\/[^?]/.test(url)) {
+      const body = url.includes('sess-2') ? observed : unattributed;
+      return new Response(JSON.stringify({ ...body, tools: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({ jobs: [openId === 'sess-2:t9' ? observed : unattributed], total: 1 }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    });
+  }) as typeof window.fetch;
+
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:1100px;height:900px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const root = createRoot(doc.body);
+  root.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
+  await wait(600);
+
+  const text = () => (doc.body.textContent || '').replace(/\s+/g, ' ');
+  const byLabel = (label: string) =>
+    Array.from(doc.querySelectorAll<HTMLButtonElement>('button')).find(
+      (b) => (b.textContent || '').trim() === label,
+    );
+
+  check(
+    'the dashboard says where unattributed work can be fixed',
+    /attribute it/i.test(text()),
+    text().slice(0, 2000),
+  );
+
+  // Open the unattributed job from the history — the last table on the page.
+  // Not `tbody tr`, which is the first breakdown row four panels above it.
+  const historyRow = (): HTMLElement | null => {
+    const tables = Array.from(doc.querySelectorAll('table'));
+    return (tables[tables.length - 1]?.querySelector('tbody tr') as HTMLElement | null) ?? null;
+  };
+  historyRow()?.click();
+  await wait(400);
+  check('a job opens from the history', /Job detail/i.test(text()), text().slice(0, 160));
+
+  const attributeButton = byLabel('Attribute…');
+  check(
+    'an unattributed job offers to be attributed',
+    Boolean(attributeButton),
+    attributeButton ? 'found' : 'no attribute control',
+  );
+  attributeButton?.click();
+  await wait(200);
+
+  const field = doc.querySelector('input[aria-label="Project name"]') as HTMLInputElement | null;
+  check('the form asks for a project name', Boolean(field), field ? 'found' : 'no input');
+
+  const suggestions = Array.from(doc.querySelectorAll('datalist option')).map((o) => (o as HTMLOptionElement).value);
+  check(
+    'and suggests the projects already in use, so a name is not retyped by guess',
+    suggestions.includes('billing-api') && !suggestions.some((v) => v.includes('unattributed')),
+    suggestions.join(', ') || 'no suggestions',
+  );
+
+  const sessionBox = doc.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
+  check(
+    'the whole conversation is the default, since that is the unit people fix',
+    Boolean(sessionBox && sessionBox.checked),
+    sessionBox ? `checked=${sessionBox.checked}` : 'no checkbox',
+  );
+
+  if (field) {
+    const setter = Object.getOwnPropertyDescriptor(
+      (frame.contentWindow as Window & typeof globalThis).HTMLInputElement.prototype,
+      'value',
+    )?.set;
+    setter?.call(field, 'billing-api');
+    field.dispatchEvent(new (frame.contentWindow as Window & typeof globalThis).Event('input', { bubbles: true }));
+  }
+  await wait(150);
+  byLabel('Save')?.click();
+  await wait(400);
+
+  check(
+    'saving sends the attribution for that job',
+    posted.length === 1 && posted[0].url.includes('sess-1%3At1/project'),
+    posted.map((p) => p.url).join(' | ') || 'nothing was sent',
+  );
+  check(
+    'and sends the name and the whole-conversation choice with it',
+    posted.length === 1
+      && (posted[0].body as { project: string }).project === 'billing-api'
+      && (posted[0].body as { applyToSession: boolean }).applyToSession === true,
+    JSON.stringify(posted[0]?.body ?? null),
+  );
+  check(
+    'and reports how much work it actually changed',
+    /2 job\(s\) attributed/.test(text()),
+    text().slice(0, 240),
+  );
+
+  // Now the other half of the claim: an observed project offers no edit at all.
+  // A fresh mount rather than a re-render — re-rendering the same tree keeps
+  // the open-job state, so the "second" job never actually opened and the
+  // check passed by looking at the first one.
+  root.unmount();
+  await wait(100);
+  openId = 'sess-2:t9';
+  const second = createRoot(doc.body);
+  second.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
+  await wait(600);
+  historyRow()?.click();
+  await wait(400);
+
+  check(
+    'the second job opened',
+    /Job detail/i.test(text()) && /billing-api/.test(text()),
+    text().slice(0, 200),
+  );
+
+  check(
+    'a project that was observed offers no way to overwrite it',
+    !byLabel('Attribute…') && !byLabel('Change'),
+    byLabel('Change') || byLabel('Attribute…')
+      ? 'an edit control was offered for a measured value'
+      : 'no edit offered',
+  );
+
+  second.unmount();
   frame.remove();
   window.fetch = realFetch;
 }
