@@ -2,6 +2,95 @@
 
 ## [Unreleased]
 
+### Added
+- **Every conversation shows how full the model's context is, against that
+  model's real capacity.** (#82) The reading was only there where a runtime
+  happened to volunteer it, and where it was missing there was nothing at all —
+  a raw token count with no ceiling to read it against, on agents used here
+  every day. The ceiling is the part that cannot be guessed: it differs by a
+  factor of five between models, and a bar drawn against an assumed number is
+  worse than no bar, because it invites you to keep going up to a limit that is
+  not there.
+
+  Nothing in the product now records how large any model is. Capacity comes
+  first from the agent, which is the most authoritative source there is — Claude
+  publishes it in `modelUsage`, Codex in `modelContextWindow`, Oh My Pi in its
+  usage updates, and Grok Build one per model in its handshake. For the two that
+  report none, pi and Kimi Code, the model's provider is asked instead: both
+  name an OpenRouter model id, so the catalogue they are already served from
+  answers for them, matched on the exact id and never on a neighbouring name.
+  That ordering is not academic — Grok reports 512,000 tokens for `grok-build`
+  where the nearest catalogue entry says 256,000, half the truth. Where neither
+  can answer, the display says **"size unknown"** and draws no bar, the same way
+  the product already tells "not reported" apart from a real zero.
+
+  How full it is now comes from the *last* request rather than the turn's
+  totals. A three-round-trip turn measured while building this spent 105,027
+  tokens across its requests while only 37,387 were ever in the window at once —
+  the old reading would have shown 10.5% full where the truth was 3.7%.
+  Switching model mid-conversation discards everything known about the previous
+  one, so a move to a smaller model reads against the smaller ceiling
+  immediately instead of carrying the old one forward. Past 80% the panel says
+  so and says how much is left; past 90% it says it more plainly, while there is
+  still room to compact or start fresh.
+
+- **A message waiting in line can be sent now, instead of only waiting its
+  turn.** (#70) The composer never refuses a message while the agent works — it
+  queues it — but queuing was the *only* thing that could happen to it. Some
+  messages are worth waiting their turn; others are the reason you are typing at
+  all: "stop, you're editing the wrong file", "no, use the staging database".
+  Those sat in the queue doing nothing while the agent spent another two minutes
+  going the wrong way, because the only way to get in front of a working agent
+  was the stop button — and stopping discards everything else you had queued, so
+  correcting one thing cost you the two messages already lined up.
+
+  Each waiting message now carries a second control, beside the one that removes
+  it, that sends it immediately: the turn in flight is cut short, that message is
+  handed over as a real turn of its own, and **the rest of the line survives** —
+  still waiting, still in the order it was typed, delivered afterwards as usual.
+  Nothing about the default changes: a message sent while the agent is busy still
+  queues.
+
+  The conversation says what happened. A turn cut short this way leaves a marker
+  across the transcript naming the message that did it, so the record does not
+  read as an agent that simply stopped, and a reader coming back later can see
+  why the answer above is half an answer. Anything the interrupted turn was
+  waiting on — an approval, a question — is cleared rather than left on screen
+  inviting an answer that can no longer reach anything.
+
+  The control is offered only where it can do something. Not on an idle agent,
+  which is already working through the line; not on `codex exec`, the one
+  supported runtime that cannot be interrupted at all, where cutting in would
+  hand the process a second turn rather than replacing the first. It *is*
+  offered while the agent waits on a person, which is exactly when a correction
+  gets typed. Pressing it twice sends once, a press that arrives after the
+  message has already gone is a no-op rather than a second delivery, and a
+  second browser open on the same conversation sees the line change.
+
+- **A queue of more than one message collapses to a single row, openable to
+  inspect.** (#79) Every waiting message was drawn as its own full-width row and
+  the list simply grew — so lining up a run of work, which is what the queue is
+  for, pushed the conversation off the top of the screen. On a phone it pushed
+  the composer off the bottom: with up to twenty messages queued the input and
+  the send control were unreachable and the agent's work invisible, which is not
+  a corner case but what the queue does when used as intended.
+
+  Past one message the line now shows the message you added last — the one you
+  are still deciding about — with a count of the rest beside it, so twenty
+  waiting messages take the room of one. The count opens to the full list in
+  order and closes again, and the opened list scrolls inside its own bounded
+  space rather than growing into the conversation. Opening lands on the row you
+  were already looking at, so the list appears to grow upwards out of it instead
+  of leaving you at the top of twenty with the way back off screen.
+
+  Everything a waiting message offers — removing it, and sending it now — is
+  offered on the rows on screen in either state. The list stays as you left it
+  while messages arrive and drain, opening or closing on nothing but your own
+  press, and returns to the plain single row by itself once one message is left.
+  The number waiting is announced to a screen reader as it changes rather than
+  only drawn on a button, and every part of it is reachable by keyboard and
+  sized for a finger.
+
 ### Changed
 - **Folded history is not built until it is opened, and what is kept is
   bounded.** (#81) Entering a conversation rebuilt its entire backlog at once —
@@ -60,38 +149,6 @@
   grouped another way, so they agree with the conversation entries by
   construction. The list underneath now also covers the same range as the
   figures above it, which it previously did not.
-
-### Added
-- **Every conversation shows how full the model's context is, against that
-  model's real capacity.** (#82) The reading was only there where a runtime
-  happened to volunteer it, and where it was missing there was nothing at all —
-  a raw token count with no ceiling to read it against, on agents used here
-  every day. The ceiling is the part that cannot be guessed: it differs by a
-  factor of five between models, and a bar drawn against an assumed number is
-  worse than no bar, because it invites you to keep going up to a limit that is
-  not there.
-
-  Nothing in the product now records how large any model is. Capacity comes
-  first from the agent, which is the most authoritative source there is — Claude
-  publishes it in `modelUsage`, Codex in `modelContextWindow`, Oh My Pi in its
-  usage updates, and Grok Build one per model in its handshake. For the two that
-  report none, pi and Kimi Code, the model's provider is asked instead: both
-  name an OpenRouter model id, so the catalogue they are already served from
-  answers for them, matched on the exact id and never on a neighbouring name.
-  That ordering is not academic — Grok reports 512,000 tokens for `grok-build`
-  where the nearest catalogue entry says 256,000, half the truth. Where neither
-  can answer, the display says **"size unknown"** and draws no bar, the same way
-  the product already tells "not reported" apart from a real zero.
-
-  How full it is now comes from the *last* request rather than the turn's
-  totals. A three-round-trip turn measured while building this spent 105,027
-  tokens across its requests while only 37,387 were ever in the window at once —
-  the old reading would have shown 10.5% full where the truth was 3.7%.
-  Switching model mid-conversation discards everything known about the previous
-  one, so a move to a smaller model reads against the smaller ceiling
-  immediately instead of carrying the old one forward. Past 80% the panel says
-  so and says how much is left; past 90% it says it more plainly, while there is
-  still room to compact or start fresh.
 
 ### Fixed
 - **Clearing a conversation starts a new one in the same tab, and is a button
@@ -360,64 +417,6 @@
   nothing already recorded was reclassified. One thing fixed along the way: a
   turn left mid-stream by a runtime that died used to come back spinning
   forever, on a process that had ended hours before.
-
-### Added
-- **A message waiting in line can be sent now, instead of only waiting its
-  turn.** (#70) The composer never refuses a message while the agent works — it
-  queues it — but queuing was the *only* thing that could happen to it. Some
-  messages are worth waiting their turn; others are the reason you are typing at
-  all: "stop, you're editing the wrong file", "no, use the staging database".
-  Those sat in the queue doing nothing while the agent spent another two minutes
-  going the wrong way, because the only way to get in front of a working agent
-  was the stop button — and stopping discards everything else you had queued, so
-  correcting one thing cost you the two messages already lined up.
-
-  Each waiting message now carries a second control, beside the one that removes
-  it, that sends it immediately: the turn in flight is cut short, that message is
-  handed over as a real turn of its own, and **the rest of the line survives** —
-  still waiting, still in the order it was typed, delivered afterwards as usual.
-  Nothing about the default changes: a message sent while the agent is busy still
-  queues.
-
-  The conversation says what happened. A turn cut short this way leaves a marker
-  across the transcript naming the message that did it, so the record does not
-  read as an agent that simply stopped, and a reader coming back later can see
-  why the answer above is half an answer. Anything the interrupted turn was
-  waiting on — an approval, a question — is cleared rather than left on screen
-  inviting an answer that can no longer reach anything.
-
-  The control is offered only where it can do something. Not on an idle agent,
-  which is already working through the line; not on `codex exec`, the one
-  supported runtime that cannot be interrupted at all, where cutting in would
-  hand the process a second turn rather than replacing the first. It *is*
-  offered while the agent waits on a person, which is exactly when a correction
-  gets typed. Pressing it twice sends once, a press that arrives after the
-  message has already gone is a no-op rather than a second delivery, and a
-  second browser open on the same conversation sees the line change.
-
-- **A queue of more than one message collapses to a single row, openable to
-  inspect.** (#79) Every waiting message was drawn as its own full-width row and
-  the list simply grew — so lining up a run of work, which is what the queue is
-  for, pushed the conversation off the top of the screen. On a phone it pushed
-  the composer off the bottom: with up to twenty messages queued the input and
-  the send control were unreachable and the agent's work invisible, which is not
-  a corner case but what the queue does when used as intended.
-
-  Past one message the line now shows the message you added last — the one you
-  are still deciding about — with a count of the rest beside it, so twenty
-  waiting messages take the room of one. The count opens to the full list in
-  order and closes again, and the opened list scrolls inside its own bounded
-  space rather than growing into the conversation. Opening lands on the row you
-  were already looking at, so the list appears to grow upwards out of it instead
-  of leaving you at the top of twenty with the way back off screen.
-
-  Everything a waiting message offers — removing it, and sending it now — is
-  offered on the rows on screen in either state. The list stays as you left it
-  while messages arrive and drain, opening or closing on nothing but your own
-  press, and returns to the plain single row by itself once one message is left.
-  The number waiting is announced to a screen reader as it changes rather than
-  only drawn on a button, and every part of it is reachable by keyboard and
-  sized for a finger.
 
 ## [5.3.1] - 2026-07-27
 
