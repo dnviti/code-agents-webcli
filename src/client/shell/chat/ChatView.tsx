@@ -169,6 +169,15 @@ export function ChatView({
   const exited = chatState === 'exited';
   const unavailable = controller.unavailableReason;
   const busy = transcript.busy;
+  // Wider than `busy`, which is only what the send button needs to know: a turn
+  // that is waiting on an approval or a question is still a turn in flight, and
+  // it is the one a queued correction most often needs to get in front of.
+  // And narrower in one way: a runtime that cannot be interrupted cannot be cut
+  // in front of, so offering the control there would promise something the
+  // server is right to refuse.
+  const interruptible =
+    Boolean(transcript.capabilities.interrupt)
+    && (busy || chatState === 'awaiting_permission' || chatState === 'awaiting_answer');
 
   const messages = React.useMemo(
     () => transcript.messages,
@@ -325,6 +334,10 @@ export function ChatView({
   );
   const cancelQueued = React.useCallback(
     (queuedId: string) => controller.cancelQueued(queuedId),
+    [controller],
+  );
+  const sendQueuedNow = React.useCallback(
+    (queuedId: string) => controller.sendQueuedNow(queuedId),
     [controller],
   );
   const setModel = React.useCallback(
@@ -870,6 +883,13 @@ export function ChatView({
               placeholder={placeholderFor(chatState, runtimeLabel, isMobile)}
               queued={transcript.queuedTurns}
               onCancelQueued={cancelQueued}
+              // Only offered when there is something to cut in front of. An
+              // idle agent is already working through the line, so "now" is
+              // what is happening anyway; a session that has ended can take
+              // nothing at all. Waiting on a person counts as busy: an approval
+              // on screen is exactly when "no, not that file" gets typed, and
+              // interrupting clears the card rather than stranding it.
+              onSendQueuedNow={interruptible ? sendQueuedNow : undefined}
               onFindFiles={findProjectFiles}
               onUpload={upload}
               draft={draft}

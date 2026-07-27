@@ -634,7 +634,7 @@ function NoticeRule({ block }: { block: NoticeBlock }): React.JSX.Element {
     >
       <span aria-hidden="true" style={{ flex: 1, height: 1, background: 'var(--border)' }} />
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
-        <Icon name="fold-vertical" size={11} />
+        <Icon name={block.notice === 'interrupted' ? 'square' : 'fold-vertical'} size={11} />
         {block.text}
         {block.detail ? (
           <span style={{ fontFamily: 'var(--font-mono)', opacity: 0.75 }}>{block.detail}</span>

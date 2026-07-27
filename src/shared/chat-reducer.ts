@@ -496,11 +496,13 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         return { messageIndex: null, structural: true, meta: true, applied: true };
       }
 
-      // Compaction keeps the transcript and draws a line across it. What was
-      // said still happened and is still worth scrolling back to; the marker
-      // is there because everything above it is no longer in the agent's
-      // context, and an agent that quietly forgets the first hour is a
-      // confusing one.
+      // The two that leave a line rather than empty the window. Compaction is
+      // there because everything above it is no longer in the agent's context,
+      // and an agent that quietly forgets the first hour is a confusing one.
+      // An interruption is there because the turn above it stopped for a
+      // reason — the message immediately below — and a transcript that showed
+      // the stop without the reason would read as an agent that gave up.
+      const interrupted = event.kind === 'interrupted';
       const message: ChatMessage = {
         id: `marker-${event.seq}`,
         seq: event.seq,
@@ -509,8 +511,8 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         ts: event.ts,
         blocks: [{
           kind: 'notice',
-          notice: 'compacted',
-          text: 'Context compacted',
+          notice: interrupted ? 'interrupted' : 'compacted',
+          text: interrupted ? 'Interrupted to send' : 'Context compacted',
           detail: event.detail,
         }],
       };

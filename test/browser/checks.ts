@@ -253,6 +253,7 @@ async function run(): Promise<void> {
   await checkTheFileEditorShowsTheFile();
   await checkAReadOnlyFileStaysReadOnly();
   await checkATurnsBadgeSaysHowItEnded();
+  await checkAWaitingMessageCanBeSentNow();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -3745,6 +3746,181 @@ async function checkATurnsBadgeSaysHowItEnded(): Promise<void> {
     'a failed step inside a done turn is still marked failed where it happened',
     said.filter((word) => word === 'Failed').length >= 2,
     `${said.filter((word) => word === 'Failed').length} steps said Failed`,
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * A message waiting in line can be sent now, and the record says why.
+ *
+ * On screen rather than in a unit test because every claim is about what the
+ * two controls on a queued row are to a person using them: that there are two
+ * of them and they are told apart by their labels, that a finger can hit both
+ * on a phone, that pressing one twice presses it once, and that the control is
+ * absent exactly when it would do nothing. A props assertion would pass for a
+ * pair of buttons drawn on top of each other with the same name.
+ */
+async function checkAWaitingMessageCanBeSentNow(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const outbound: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('queue-check', {
+    send: (message: unknown) => { outbound.push(message as Record<string, unknown>); },
+  });
+  const snapshot = (state: string, live = true, interrupt = true): void => {
+    controller.handle({
+      type: 'chat_snapshot',
+      sessionId: 'queue-check',
+      snapshot: {
+        sessionId: 'queue-check',
+        runtime: 'claude',
+        state,
+        capabilities: {
+          streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+          interrupt, resume: true, fork: false, attachments: true, usage: true,
+          cost: true, plan: false, commands: [],
+        },
+        messages: [{
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: 1,
+          blocks: [{ kind: 'text', text: 'refactor the auth module' }],
+        }],
+        pendingPermissions: [],
+        queued: [
+          { id: 'q1', text: 'and then update the docs', ts: 1 },
+          { id: 'q2', text: 'stop — you are editing the wrong file', ts: 2 },
+        ],
+        firstSeq: 1, replayFrom: 1, cursor: 1, live, bypassPermissions: false,
+      },
+    } as never);
+  };
+
+  const root = createRoot(host);
+  const paint = async (state: string, phone = false, interrupt = true): Promise<void> => {
+    snapshot(state, true, interrupt);
+    const view = React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW, panelOpen: false },
+      onViewChange: () => {},
+      ...(phone ? { isMobile: true } : {}),
+    } as never);
+    root.render(phone ? React.createElement(PhoneContext.Provider, { value: true }, view) : view);
+    await wait(250);
+  };
+
+  const button = (label: RegExp): HTMLButtonElement | undefined =>
+    Array.from(host.querySelectorAll('button')).find((node) =>
+      label.test(node.getAttribute('aria-label') ?? '')) as HTMLButtonElement | undefined;
+
+  await paint('thinking');
+
+  const rows = host.querySelectorAll('[role="list"][aria-label="Messages waiting to be sent"] [role="listitem"]');
+  check('both waiting messages are on screen while the agent works', rows.length === 2, `${rows.length} rows`);
+
+  const sendNow = button(/^Send queued message 2 now/);
+  const remove = button(/^Remove queued message 2$/);
+  check('a waiting message offers a control to send it now', Boolean(sendNow));
+  check('alongside the one that removes it', Boolean(remove));
+  check(
+    'and the two are told apart by their labels, not only by their glyphs',
+    Boolean(sendNow && remove) && sendNow!.getAttribute('aria-label') !== remove!.getAttribute('aria-label'),
+    `${sendNow?.getAttribute('aria-label')} / ${remove?.getAttribute('aria-label')}`,
+  );
+  check(
+    'the control is a button, so the keyboard alone can reach and press it',
+    Boolean(sendNow) && sendNow!.tagName === 'BUTTON' && !sendNow!.disabled
+      && sendNow!.tabIndex >= 0,
+    `${sendNow?.tagName} tabIndex=${sendNow?.tabIndex}`,
+  );
+
+  sendNow?.click();
+  await wait(150);
+  sendNow?.click();
+  await wait(150);
+  const promotions = outbound.filter((m) => m.type === 'chat_queue_send_now');
+  check(
+    'pressing it asks the server for that message, by id',
+    promotions.length >= 1 && promotions[0].queuedId === 'q2',
+    JSON.stringify(promotions[0] ?? null),
+  );
+  check(
+    'and pressing it twice in quick succession sends it once',
+    promotions.length === 1,
+    `${promotions.length} requests`,
+  );
+
+  // Nothing to cut in front of: the line is already moving.
+  await paint('idle');
+  check(
+    'an idle agent is not offered a control that would change nothing',
+    !button(/^Send queued message 1 now/),
+  );
+  check('while the control that withdraws a message stays', Boolean(button(/^Remove queued message 1$/)));
+
+  // Waiting on a person is still a turn in flight — and the one a correction
+  // most often needs to get in front of.
+  await paint('awaiting_permission');
+  check(
+    'a turn waiting on an approval can still be interrupted by a waiting message',
+    Boolean(button(/^Send queued message 1 now/)),
+  );
+
+  // A runtime that cannot be stopped cannot be cut in front of, and the server
+  // refuses — so the row must not offer it.
+  await paint('thinking', false, false);
+  check(
+    'a runtime that cannot be interrupted is not offered the control',
+    !button(/^Send queued message 1 now/),
+  );
+  check(
+    'though its queue can still be edited',
+    Boolean(button(/^Remove queued message 1$/)),
+  );
+
+  await paint('thinking', true);
+  const phoneSendNow = button(/^Send queued message 1 now/);
+  const phoneRemove = button(/^Remove queued message 1$/);
+  const size = phoneSendNow ? laidOutSize(phoneSendNow) : { width: 0, height: 0 };
+  check(
+    'on a phone the new control is big enough to hit',
+    size.width >= 44 && size.height >= 44,
+    `${size.width}x${size.height}`,
+  );
+  if (phoneSendNow && phoneRemove) {
+    const a = phoneSendNow.getBoundingClientRect();
+    const b = phoneRemove.getBoundingClientRect();
+    // The clear space between the two, whichever order they are drawn in — not
+    // the distance between two arbitrary edges, which is large for any pair and
+    // would pass for two buttons directly on top of each other.
+    const gap = Math.max(b.left - a.right, a.left - b.right);
+    check(
+      'and far enough from the one that throws the message away',
+      gap >= PHONE_GAP,
+      `gap ${Math.round(gap)}px`,
+    );
+  }
+
+  // The record of what happened, drawn in the conversation.
+  await paint('thinking');
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'queue-check',
+    event: { t: 'marker', seq: 2, ts: 2, kind: 'interrupted', detail: '“stop — you are editing the wrong file”' },
+  } as never);
+  await wait(250);
+  const rule = Array.from(host.querySelectorAll('[role="separator"]')).find((node) =>
+    (node.getAttribute('aria-label') ?? '').includes('Interrupted'));
+  check('the conversation says the turn was cut short', Boolean(rule));
+  check(
+    'and which message did it',
+    (rule?.getAttribute('aria-label') ?? '').includes('editing the wrong file'),
+    JSON.stringify(rule?.getAttribute('aria-label') ?? null),
   );
 
   root.unmount();

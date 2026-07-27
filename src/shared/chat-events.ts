@@ -257,7 +257,7 @@ export interface ErrorBlock {
  */
 export interface NoticeBlock {
   kind: 'notice';
-  notice: 'compacted' | 'cleared';
+  notice: 'compacted' | 'cleared' | 'interrupted';
   text: string;
   /** Optional detail — how much was reclaimed, what the summary covers. */
   detail?: string;
@@ -578,12 +578,16 @@ export type ChatEvent =
    * agent can no longer see it. `cleared` empties the transcript, because that
    * is what the user asked for — `/clear` means "start again", and a window
    * still full of the previous conversation would be the opposite of that.
+   * `interrupted` records a turn cut short so the message waiting behind it
+   * could be answered first: without it the transcript reads as an agent that
+   * stopped for no reason, and the message that follows looks unrelated to the
+   * work that stopped. `detail` carries what that message was.
    */
   | {
       t: 'marker';
       seq: number;
       ts: number;
-      kind: 'compacted' | 'cleared';
+      kind: 'compacted' | 'cleared' | 'interrupted';
       detail?: string;
     };
 
