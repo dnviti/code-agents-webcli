@@ -68,6 +68,23 @@ of the jobs in it actually contributed a token figure or a cost figure
 (`tokensReportedJobs`, `costReportedJobs`), so "$4.10 across 28 of 40 jobs"
 is the shape of the answer, not "$4.10" on its own.
 
+## Cost is a list price, not a bill
+
+Every runtime prices a turn the same way: the tokens it moved, at the
+provider's published API rates. It does that whether or not the account behind
+it is paying by the token. On a subscription — Claude Max, ChatGPT Plus, a
+Grok plan — the bill is flat and monthly, and no job in this ledger was ever
+charged for individually. The figure is still worth recording, because it is
+the only comparable measure of how expensive a piece of work was, but it
+answers *what would this have cost through the API*, not *what did you pay*.
+
+Nothing in any adapter's event stream says which of the two an account is on:
+the runtimes report a price, not a billing relationship. So the dashboard
+states the caveat in plain sight under the totals rather than trying to detect
+a plan and getting it wrong. Anyone reconciling these numbers against a
+provider's invoice should expect them not to match, and on a subscription
+should expect them not to be related at all.
+
 ## The reporting-convention problem
 
 Runtimes disagree about what a usage figure even means, and treating them all
@@ -365,7 +382,10 @@ read as continuous when it was not.
 Totals lead with jobs, turns, tool calls, tokens and cost, each cost and token
 figure qualified by how many of the jobs it counted actually reported one — a
 total's own honesty travels with it rather than being a separate number to go
-find. The by-agent and by-model breakdowns are the same totals shape, grouped;
+find. Directly under them sits the line that no figure can carry on its own:
+these are API list prices, so on a subscription plan they are what the work
+would have cost rather than what anyone was charged. The by-agent and
+by-model breakdowns are the same totals shape, grouped;
 the by-user table appears only for the installer viewing `everyone`.
 
 The effort tables answer a different question from the cost ones: not "how

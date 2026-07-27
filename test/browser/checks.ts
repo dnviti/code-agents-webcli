@@ -2489,6 +2489,16 @@ async function checkAnUnreportedFigureIsNeverDrawnAsZero(): Promise<void> {
     /Invalid Date/.test(text) ? text.slice(0, 300) : 'every label parsed',
   );
 
+  // A dollar figure on a subscription plan is a list price, not a bill, and
+  // nothing in the data says which plan an account is on — so the caveat has
+  // to be on screen, not on hover, where a tooltip check would pass while a
+  // viewer read the totals as money they had spent.
+  check(
+    'the dashboard says on screen that cost is a list price, not a bill',
+    /subscription/i.test(text) && /would have cost|not as what you were charged/i.test(text),
+    /subscription/i.test(text) ? 'caveat is visible' : text.slice(0, 400),
+  );
+
   const blankLabels = Array.from(doc.querySelectorAll('tbody tr')).filter(
     (row) => !(row.querySelector('td')?.textContent || '').trim(),
   );
