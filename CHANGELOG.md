@@ -154,6 +154,30 @@
   message has already gone is a no-op rather than a second delivery, and a
   second browser open on the same conversation sees the line change.
 
+- **A queue of more than one message collapses to a single row, openable to
+  inspect.** (#79) Every waiting message was drawn as its own full-width row and
+  the list simply grew — so lining up a run of work, which is what the queue is
+  for, pushed the conversation off the top of the screen. On a phone it pushed
+  the composer off the bottom: with up to twenty messages queued the input and
+  the send control were unreachable and the agent's work invisible, which is not
+  a corner case but what the queue does when used as intended.
+
+  Past one message the line now shows the message you added last — the one you
+  are still deciding about — with a count of the rest beside it, so twenty
+  waiting messages take the room of one. The count opens to the full list in
+  order and closes again, and the opened list scrolls inside its own bounded
+  space rather than growing into the conversation. Opening lands on the row you
+  were already looking at, so the list appears to grow upwards out of it instead
+  of leaving you at the top of twenty with the way back off screen.
+
+  Everything a waiting message offers — removing it, and sending it now — is
+  offered on the rows on screen in either state. The list stays as you left it
+  while messages arrive and drain, opening or closing on nothing but your own
+  press, and returns to the plain single row by itself once one message is left.
+  The number waiting is announced to a screen reader as it changes rather than
+  only drawn on a button, and every part of it is reachable by keyboard and
+  sized for a finger.
+
 ## [5.3.1] - 2026-07-27
 
 ### Added

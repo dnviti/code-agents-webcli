@@ -150,6 +150,18 @@ That is the difference from the stop button, which still discards the whole
 line. Correcting one thing used to cost you the two messages you had already
 lined up.
 
+Past one waiting message the line **collapses to a single row**: the message you
+added last, with a count of the rest beside it. Twenty waiting messages take up
+as much room as one — which is the point, because twenty full-width rows are
+taller than a phone screen, and the conversation and the composer both go with
+them. Opening the count shows every message in order, in a box that scrolls
+inside itself rather than growing; everything each message offers is offered on
+the rows on screen, whichever state the list is in.
+
+The list stays as you left it: adding a message never opens a list you closed or
+closes one you opened. Drain back to one message and the plain row returns on
+its own.
+
 Two cases where the control is not offered, because it could not do anything:
 when the agent is idle and already working through the line, and on a runtime
 that cannot be interrupted at all (`codex exec` — see

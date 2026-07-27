@@ -689,21 +689,7 @@ export function Composer({
       {dragActive ? <DropVeil /> : null}
 
       {queued.length > 0 ? (
-        <div
-          role="list"
-          aria-label="Messages waiting to be sent"
-          style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-1)' }}
-        >
-          {queued.map((turn, index) => (
-            <QueuedChip
-              key={turn.id}
-              turn={turn}
-              position={index + 1}
-              onCancel={onCancelQueued ? () => onCancelQueued(turn.id) : undefined}
-              onSendNow={onSendQueuedNow ? () => onSendQueuedNow(turn.id) : undefined}
-            />
-          ))}
-        </div>
+        <QueuedList queued={queued} onCancelQueued={onCancelQueued} onSendQueuedNow={onSendQueuedNow} />
       ) : null}
 
       {entries.length > 0 ? (
@@ -1820,6 +1806,127 @@ function Trailing({ children, mono }: { children: React.ReactNode; mono?: boolea
 }
 
 /**
+ * The line of messages waiting to be sent.
+ *
+ * One waiting message is drawn as it always was. Past that the list collapses
+ * to the newest message alone, with the rest behind a count — because the list
+ * grows to twenty, each row is full width, and twenty rows push the
+ * conversation off the top of the screen and, on a phone, the composer itself
+ * off the bottom. A queue you cannot see past is worse than a queue you cannot
+ * read all of at once.
+ *
+ * The newest is the one on show, not the one about to be sent: it is what you
+ * just typed and are still deciding about, and the one you are most likely to
+ * withdraw.
+ *
+ * The disclosure control lives *on that row* rather than on a line of its own,
+ * which is what keeps a collapsed queue of twenty exactly as tall as a queue of
+ * one. It stays on that row when the list is open, so it is the same mounted
+ * button either way and the keyboard does not lose its place on toggling.
+ */
+function QueuedList({
+  queued,
+  onCancelQueued,
+  onSendQueuedNow,
+}: {
+  queued: QueuedTurn[];
+  onCancelQueued?: (id: string) => void;
+  onSendQueuedNow?: (id: string) => void;
+}): React.JSX.Element {
+  // Held here, above the rows, so a message arriving or leaving re-renders the
+  // list without deciding for the user whether it is open. Nothing reaches in
+  // to set it: an open list stays open as the queue grows, a closed one stays
+  // closed, and neither springs on the user mid-sentence.
+  const [open, setOpen] = React.useState(false);
+  const isPhone = usePhone();
+  const listId = React.useId();
+  const listRef = React.useRef<HTMLDivElement | null>(null);
+
+  // Opening scrolls to the end, so the list appears to grow *upwards* out of
+  // the row that was already there. Without this the box opens at the top of a
+  // queue of twenty and the newest message — the one being looked at, and the
+  // one carrying the control that closes the list again — is off the bottom of
+  // its own scrolling space with nothing saying where it went.
+  //
+  // On the open itself only: re-running it as messages arrive would yank the
+  // list back down under someone reading their way up it.
+  React.useEffect(() => {
+    if (!open) return;
+    const node = listRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [open]);
+
+  const collapsible = queued.length > 1;
+  const collapsed = collapsible && !open;
+  const hidden = queued.length - 1;
+  const rows = collapsed ? [queued[queued.length - 1]] : queued;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+      <div
+        id={listId}
+        ref={listRef}
+        role="list"
+        aria-label="Messages waiting to be sent"
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 'var(--space-1)',
+          // Opened, the list is bounded and scrolls inside its own space. Left
+          // to grow it would do exactly what collapsing exists to prevent —
+          // twenty rows is taller than a phone screen, so the composer and the
+          // conversation would both be gone.
+          ...(collapsible && open
+            ? { maxHeight: isPhone ? '30vh' : 260, overflowY: 'auto', overscrollBehavior: 'contain' }
+            : null),
+        }}
+      >
+        {rows.map((turn) => {
+          const position = queued.indexOf(turn) + 1;
+          return (
+            <QueuedChip
+              key={turn.id}
+              turn={turn}
+              position={position}
+              onCancel={onCancelQueued ? () => onCancelQueued(turn.id) : undefined}
+              onSendNow={onSendQueuedNow ? () => onSendQueuedNow(turn.id) : undefined}
+              disclosure={
+                collapsible && position === queued.length
+                  ? { open, hidden, listId, onToggle: () => setOpen((was) => !was) }
+                  : undefined
+              }
+            />
+          );
+        })}
+      </div>
+      {/* The count changes as the agent works through the line and as you add
+          to it, and a number that only exists as a glyph on a button changes
+          silently. Announced politely, so it waits its turn rather than cutting
+          across what is being read. */}
+      <span role="status" aria-live="polite" style={queueCountStyle}>
+        {collapsible
+          ? collapsed
+            ? `${queued.length} messages waiting to be sent, ${hidden} hidden`
+            : `${queued.length} messages waiting to be sent, all shown`
+          : ''}
+      </span>
+    </div>
+  );
+}
+
+const queueCountStyle: React.CSSProperties = {
+  position: 'absolute',
+  width: 1,
+  height: 1,
+  padding: 0,
+  margin: -1,
+  overflow: 'hidden',
+  clip: 'rect(0 0 0 0)',
+  whiteSpace: 'nowrap',
+  border: 0,
+};
+
+/**
  * One turn waiting in line.
  *
  * A full-width row rather than a pill: the point is to be able to read what you
@@ -1831,11 +1938,13 @@ function QueuedChip({
   position,
   onCancel,
   onSendNow,
+  disclosure,
 }: {
   turn: QueuedTurn;
   position: number;
   onCancel?: () => void;
   onSendNow?: () => void;
+  disclosure?: { open: boolean; hidden: number; listId: string; onToggle: () => void };
 }): React.JSX.Element {
   const attachments = turn.attachments?.length ?? 0;
   // One press, whatever the click count: the server settles a double click on
@@ -1874,6 +1983,48 @@ function QueuedChip({
         animation: 'relay-chip-in var(--duration-base) var(--ease-out)',
       }}
     >
+      {disclosure ? (
+        // Not an IconButton: the count is the point, and a number is not
+        // legible inside an 18px square. Kept at the far left, as far from the
+        // control that throws the message away as the row allows.
+        <button
+          type="button"
+          onClick={disclosure.onToggle}
+          aria-expanded={disclosure.open}
+          aria-controls={disclosure.listId}
+          aria-label={
+            disclosure.open
+              ? `Hide the ${disclosure.hidden} other waiting messages`
+              : `Show ${disclosure.hidden} more waiting ${disclosure.hidden === 1 ? 'message' : 'messages'}`
+          }
+          title={
+            disclosure.open
+              ? `Hide the ${disclosure.hidden} other waiting messages`
+              : `Show ${disclosure.hidden} more waiting ${disclosure.hidden === 1 ? 'message' : 'messages'}`
+          }
+          style={{
+            flex: '0 0 auto',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 2,
+            minWidth: isPhone ? TOUCH_TARGET : 30,
+            minHeight: isPhone ? TOUCH_TARGET : 20,
+            padding: '0 4px',
+            borderRadius: 'var(--radius)',
+            border: '1px solid var(--border)',
+            background: 'transparent',
+            color: 'var(--muted-foreground)',
+            font: 'inherit',
+            fontFamily: 'var(--font-mono)',
+            fontVariantNumeric: 'tabular-nums',
+            cursor: 'pointer',
+          }}
+        >
+          <Icon name={disclosure.open ? 'chevron-down' : 'chevron-right'} size={10} />
+          {disclosure.open ? null : `+${disclosure.hidden}`}
+        </button>
+      ) : null}
       <span
         aria-hidden="true"
         style={{
