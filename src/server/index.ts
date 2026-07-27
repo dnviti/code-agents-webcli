@@ -37,6 +37,7 @@ import { OmpBridge } from './bridges/omp.js';
 import { TerminalBridge } from './bridges/terminal.js';
 import { AppDatabase } from './services/database.js';
 import { SessionStore } from './services/session-store.js';
+import { UsageStore } from './services/usage-store.js';
 import { TranscriptStore } from './services/transcript-store.js';
 import { HistoryStore } from './services/history-store.js';
 import { SessionTeardownRegistry } from './services/session-teardown.js';
@@ -90,6 +91,7 @@ export class ClaudeCodeWebServer {
   private terminalBridge: BridgeInterface;
 
   private database: AppDatabase;
+  private usageStore: UsageStore;
   private sessionStore: SessionStore;
   private transcriptStore: TranscriptStore;
   private chatStore: ChatStore;
@@ -160,6 +162,7 @@ export class ClaudeCodeWebServer {
 
     this.dataDir = config.dataDir;
     this.database = new AppDatabase({ dataDir: config.dataDir });
+    this.usageStore = new UsageStore(this.database);
     this.sessionStore = new SessionStore({ database: this.database });
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
     this.historyStore = new HistoryStore({ storageDir: this.database.storageDir });
@@ -171,6 +174,15 @@ export class ClaudeCodeWebServer {
     this.chatStore = new ChatStore({ storageDir: this.database.storageDir });
     this.chatManager = new ChatSessionManager({
       store: this.chatStore,
+      // The seam between a conversation and the ledger it is billed to. The
+      // chat subsystem knows what a job cost; it does not know SQLite, and the
+      // login it files the work under is not something it can look up.
+      usage: {
+        record: (job) => this.usageStore.record(job),
+        consumedFor: (nativeSessionId) => this.usageStore.consumedFor(nativeSessionId),
+        costBaselineFor: (nativeSessionId) => this.usageStore.costBaselineFor(nativeSessionId),
+        loginFor: (userId) => this.database.getUserById(userId)?.githubLogin ?? String(userId),
+      },
       storageDir: this.database.storageDir,
       broadcast: (sessionId, message) =>
         broadcastChat(
@@ -686,6 +698,7 @@ export class ClaudeCodeWebServer {
       // full of zeros that reads as "nothing left".
       usageAnalytics: this.usageAnalytics,
       usageReader: this.usageReader,
+      usageStore: this.usageStore,
     });
 
   }

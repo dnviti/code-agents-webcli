@@ -27,6 +27,7 @@ import { BottomNav } from '../../src/client/shell/BottomNav';
 import { MoreSheet } from '../../src/client/shell/MoreSheet';
 import { ChatSettingsDialog } from '../../src/client/shell/dialogs/ChatSettingsDialog';
 import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
+import { UsageDashboardDialog } from '../../src/client/shell/dialogs/UsageDashboardDialog';
 import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
 import { TabBar } from '../../src/client/ui/relay/TabBar';
 
@@ -241,6 +242,7 @@ async function run(): Promise<void> {
   await checkThePhoneLayoutIsUsable();
   await checkThePhoneShellSurfacesAreUsable();
   await checkALongTabNameStaysInsideTheStrip();
+  await checkAnUnreportedFigureIsNeverDrawnAsZero();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -2395,4 +2397,127 @@ function OpenFloatingMenu({ actions }: { actions: FloatingMenuAction[] }): React
     { ref, style: { position: 'relative', width: '100%', height: '100%' } },
     React.createElement(FloatingMenu, { actions } as never),
   );
+}
+
+/**
+ * The one acceptance criterion of issue #56 that only a browser can answer.
+ *
+ * "An agent that reports no usage or no cost is shown as not reported and never
+ * as zero" is a claim about pixels, not about types: every layer underneath
+ * keeps the null intact, and it would take exactly one `?? 0` or one
+ * `.toFixed(2)` in a cell to turn the whole distinction into a confident
+ * $0.00 that nobody would ever question. So this renders the real dialog
+ * against a real response and reads what came out.
+ */
+async function checkAnUnreportedFigureIsNeverDrawnAsZero(): Promise<void> {
+  const totals = (over: Record<string, number>) => ({
+    jobs: 0, turns: 0, toolCalls: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    reasoningTokens: 0, totalTokens: 0, costUsd: 0,
+    tokensReportedJobs: 0, costReportedJobs: 0,
+    ...over,
+  });
+
+  // codex reports tokens and never reports cost; claude reports both. A
+  // dashboard that renders these two the same way is the bug.
+  const dashboard = {
+    scope: 'self', canSeeEveryone: false, period: 'day',
+    from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
+    totals: totals({ jobs: 4, turns: 9, toolCalls: 12, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }),
+    series: [{ key: '2026-07-27T09:00', totals: totals({ jobs: 4, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }) }],
+    byAgent: [
+      { key: 'claude', totals: totals({ jobs: 2, totalTokens: 3000, costUsd: 1.25, tokensReportedJobs: 2, costReportedJobs: 2 }) },
+      { key: 'codex', totals: totals({ jobs: 2, totalTokens: 2000, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+    ],
+    // A job whose runtime never named a model groups under the empty key —
+    // the breakdown must label that, not leave the cell blank.
+    byModel: [
+      { key: 'claude-opus-5', totals: totals({ jobs: 2, totalTokens: 3000, costUsd: 1.25, tokensReportedJobs: 2, costReportedJobs: 2 }) },
+      { key: '', totals: totals({ jobs: 2, totalTokens: 2000, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+    ],
+    effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
+  };
+
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+    const body = url.includes('/api/usage/dashboard') ? dashboard : { jobs: [], total: 0 };
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof window.fetch;
+
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:1100px;height:800px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const root = createRoot(doc.body);
+  root.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
+  await wait(600);
+
+  const text = (doc.body.textContent || '').replace(/\s+/g, ' ');
+
+  check(
+    'the usage dashboard renders its figures at all',
+    text.includes('1.25') && /5[.,]0k|5,?000/.test(text),
+    text.slice(0, 200) || 'nothing rendered',
+  );
+
+  check(
+    'a cost no agent reported is not drawn as zero',
+    !/\$0\.00/.test(text),
+    /\$0\.00/.test(text) ? `found $0.00 in: ${text.slice(0, 300)}` : 'no confident zero on screen',
+  );
+
+  check(
+    'a cost no agent reported says so in words',
+    /not reported|cannot report|n\/a/i.test(text),
+    text.includes('not reported') ? 'says not reported' : text.slice(0, 300),
+  );
+
+  check(
+    'a bucket label on the trend line is a date, not Invalid Date',
+    !/Invalid Date/.test(text),
+    /Invalid Date/.test(text) ? text.slice(0, 300) : 'every label parsed',
+  );
+
+  const blankLabels = Array.from(doc.querySelectorAll('tbody tr')).filter(
+    (row) => !(row.querySelector('td')?.textContent || '').trim(),
+  );
+  check(
+    'a breakdown row for an unnamed model is labelled, not blank',
+    blankLabels.length === 0,
+    blankLabels.length === 0
+      ? 'every breakdown row has a label'
+      : `${blankLabels.length} row(s) with an empty first cell`,
+  );
+
+  check(
+    'a partly-reported total says how much of it was measured',
+    /2 of 4|of 4 jobs/i.test(text),
+    /2 of 4/.test(text) ? 'qualified' : text.slice(0, 300),
+  );
+
+  const spilling = Array.from(doc.body.querySelectorAll<HTMLElement>('*')).filter((node) => {
+    if (!isPainted(node) || scrollsSideways(node)) return false;
+    const box = node.getBoundingClientRect();
+    return box.right > 1101 || box.left < -1;
+  });
+  check(
+    'the usage dashboard stays inside the window',
+    spilling.length === 0,
+    spilling.length ? spilling.slice(0, 6).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
+  );
+
+  root.unmount();
+  frame.remove();
+  window.fetch = realFetch;
 }

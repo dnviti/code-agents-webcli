@@ -18,6 +18,7 @@ import { RuntimeProfilesDialog } from './dialogs/RuntimeProfilesDialog';
 import { SessionsDialog } from './dialogs/SessionsDialog';
 import { ChatSettingsDialog } from './dialogs/ChatSettingsDialog';
 import { SettingsDialog } from './dialogs/SettingsDialog';
+import { UsageDashboardDialog } from './dialogs/UsageDashboardDialog';
 import { TerminalOptionsDialog } from './dialogs/TerminalOptionsDialog';
 import { BottomNav, type BottomNavDestination } from './BottomNav';
 import { FloatingMenu, type FloatingMenuAction } from './FloatingMenu';
@@ -276,6 +277,11 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           icon: <Icon name="settings" size={13} />,
           onSelect: () => { closePalette(); actions.openSettings(); },
         },
+        {
+          label: 'Usage',
+          icon: <Icon name="gauge" size={13} />,
+          onSelect: () => { closePalette(); closeDialogs({ usage: true }); },
+        },
         // Offered only while the browser is actually holding a deferred
         // prompt, so the entry is never a control that does nothing.
         ...(state.install === 'available'
@@ -471,6 +477,9 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           </IconButton>
         </>
       )}
+      <IconButton label="Usage" size="sm" onClick={() => closeDialogs({ usage: true })}>
+        <Icon name="gauge" />
+      </IconButton>
       <IconButton label="Settings" size="sm" onClick={actions.openSettings}>
         <Icon name="settings" />
       </IconButton>
@@ -659,6 +668,11 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         }}
       />
 
+      <UsageDashboardDialog
+        open={state.dialogs.usage}
+        onClose={() => closeDialogs({ usage: false })}
+      />
+
       <RuntimeProfilesDialog
         open={state.dialogs.runtimeProfiles}
         onClose={() => closeDialogs({ runtimeProfiles: false })}
@@ -760,6 +774,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         onSwitchMode={actions.switchMode}
         onCloseSession={actions.closeCurrentSession}
         onOpenSettings={actions.openSettings}
+        onOpenUsage={() => closeDialogs({ usage: true, more: false })}
         onToggleTheme={toggleTheme}
         onRename={active ? () => closeDialogs({ rename: active.id, more: false }) : undefined}
       />

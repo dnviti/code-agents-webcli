@@ -1,5 +1,50 @@
 # Changelog
 
+## [5.3.0] - 2026-07-27
+
+### Added
+- **A durable, per-user record of what every job cost, with a dashboard.** Until
+  now the only view of token and dollar spend was the live in-conversation
+  meter, and it forgot everything the moment the tab closed or the session was
+  cleaned up. Every prompt-to-settle unit is now filed as its own row — who ran
+  it, which agent and model, how many turns and tool calls it took, and the
+  token and cost figures the runtime reported — kept forever, in the app's own
+  database, independent of the runtime session, the conversation, and the
+  server process that recorded it. Deleting a conversation removes its
+  transcript, not its billing history.
+
+  A dashboard reads it back: totals and a trend line for the day, week, month
+  or year you pick, broken down by agent and by model, an effort view showing
+  whether an agent typically settles a job in one round trip or several, and
+  the tools it reached for most. A signed-in user sees only their own figures;
+  the installer — the same account that already gates applying an update — can
+  additionally switch to everyone's.
+
+  Not every agent reports the same things, and the dashboard says so rather
+  than guessing: a runtime that never reports a cost or a token figure shows
+  "not reported" for it, never "$0.00" or zero, and every total says how many
+  of the jobs behind it actually contributed a figure. Codex's `exec` fallback
+  mode reports neither tokens nor cost at all; its app-server mode reports
+  tokens but no cost, since nothing in its schema prices a turn.
+
+  The same history is reachable as an API — a dashboard endpoint, a paged job
+  history with filters, a single job with its tool breakdown, and a CSV or
+  JSON export — all scoped the same way the dashboard is, so an export can
+  never carry more than the view it came from.
+
+### Fixed
+- **The live in-conversation cost meter no longer compounds on every turn of a
+  Claude conversation.** Claude's own `total_cost_usd` turns out to be
+  cumulative for the whole conversation rather than per turn — confirmed by
+  probing the running CLI directly, not documented anywhere — and it stays
+  cumulative across a `--resume` into a brand new process. Nothing downstream
+  expected that: every turn after the first was shown its own cost stacked on
+  top of every turn before it, so a ten-turn conversation's meter read roughly
+  ten times too high by the end. The adapter now tracks the highest cumulative
+  figure it has seen and reports only what a turn added past it, so the live
+  meter and the new durable job record agree, and both show a turn's own cost
+  rather than the conversation's running total.
+
 ## [5.2.0] - 2026-07-27
 
 ### Added
