@@ -110,6 +110,31 @@ and its own list is what settles the question. And it is scoped to the session:
 where sessions run in per-user environments each one reads its own home, so the
 menu never becomes a window onto what someone else has installed.
 
+### Starting a new conversation
+
+`/clear`, `/new` and `/reset` — or the **New chat** button beside the composer
+controls — end the conversation and start another one **in the same tab**. The
+tab keeps its name, its place in the strip, its working folder and its runtime,
+and it stays a running session: nothing claims it ended, and no recovery offer
+appears.
+
+The agent behind it is genuinely new. The runtime is restarted with no resume
+id, so the first message afterwards is answered by a process that has never
+seen what came before, and the window does not page back into it.
+
+What is *not* carried across: anything queued behind the conversation you left
+(those turns were for a process that no longer exists), and any standing
+permission granted to it — a bypass belongs to the conversation that asked for
+it, and the new one asks for itself.
+
+Nothing is deleted. The previous conversation stays in the session's log for
+history, search and export; this changes what the window shows and what the
+session is running, not what happened.
+
+There is no confirmation step, on the button or the commands. Asking twice for
+something done many times a day costs more than it protects, given that what
+is on screen is kept rather than destroyed.
+
 ## Runtime profiles
 
 **Settings → Runtime profiles** controls how each CLI is launched. Nothing here

@@ -247,6 +247,7 @@ async function run(): Promise<void> {
   await checkAServerOlderThanThePageSaysSo();
   await checkUnattributedWorkCanBeAttributedByHand();
   await checkTheCommandMenuIsFullBeforeTheFirstMessage();
+  await checkANewConversationCanBeStartedFromTheComposer();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -3166,6 +3167,156 @@ async function checkTheCommandMenuIsFullBeforeTheFirstMessage(): Promise<void> {
     'choosing an entry puts that command in the line, ready to run',
     textarea.value.trim().startsWith('/complex-work'),
     JSON.stringify(textarea.value),
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * Starting a new conversation is a control, not a piece of folklore (#69).
+ *
+ * The check is about the healthy case on purpose. There has always been a
+ * "Start a new chat" button, but only inside the recovery notice — so the one
+ * state it could not be pressed in was the ordinary one, and the only way to
+ * ask while things were working was to know that `/clear` existed and type it.
+ * Rendered rather than asserted on props: what matters is that it is on screen
+ * over a live conversation and that pressing it sends the same command.
+ */
+async function checkANewConversationCanBeStartedFromTheComposer(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const sent: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('browser-check', {
+    send: (message: Record<string, unknown>) => {
+      sent.push(message);
+    },
+  } as never);
+
+  const snapshot = (state: string): Record<string, unknown> => ({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check',
+      runtime: 'claude',
+      state,
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: false, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: false, commands: [{ name: 'clear' }],
+      },
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: 1,
+          blocks: [{ kind: 'text', text: 'that is the parser sorted, thanks' }],
+        },
+        {
+          id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: 2,
+          blocks: [{ kind: 'text', text: 'glad it helped.' }],
+        },
+      ],
+      pendingPermissions: [],
+      queued: [],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 2,
+      live: true,
+      bypassPermissions: false,
+    },
+  });
+
+  controller.handle(snapshot('idle') as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(250);
+
+  const find = (): HTMLButtonElement | null =>
+    host.querySelector('button[aria-label^="Start a new conversation"]');
+
+  const button = find();
+  check('the composer offers a way to start a new conversation', Boolean(button));
+  if (!button) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  check(
+    'it says what it does before it is pressed',
+    (button.getAttribute('title') || '').toLowerCase().includes('new conversation'),
+    button.getAttribute('title') || 'no title',
+  );
+  check(
+    'and it is a button, so the keyboard alone can reach and press it',
+    button.tagName === 'BUTTON' && !button.disabled && button.tabIndex >= 0,
+    `${button.tagName} disabled=${button.disabled} tabIndex=${button.tabIndex}`,
+  );
+  check(
+    'it is offered while the conversation is healthy, not only once it has failed',
+    !host.querySelector('[role="alert"]') && Boolean(find()),
+  );
+
+  button.click();
+  await wait(150);
+  const chatSends = sent.filter((message) => message.type === 'chat_send');
+  check(
+    'pressing it asks for exactly what typing the command asks for',
+    chatSends.length === 1 && chatSends[0].text === '/clear',
+    JSON.stringify(chatSends),
+  );
+
+  // What the server sends back for a clear: a line under the conversation,
+  // then a process starting and going idle. The tab has to come out of that
+  // sequence empty and ready — not read-only, and with nothing offering to
+  // recover a session that is running.
+  for (const event of [
+    { t: 'marker', kind: 'cleared', seq: 3, ts: 3 },
+    { t: 'state', state: 'starting', seq: 4, ts: 4 },
+    { t: 'state', state: 'idle', seq: 5, ts: 5 },
+  ]) {
+    controller.handle({ type: 'chat_event', sessionId: 'browser-check', event } as never);
+  }
+  await wait(250);
+
+  const surface = host.textContent ?? '';
+  check(
+    'after clearing, the window holds none of the conversation it left',
+    !surface.includes('that is the parser sorted'),
+    surface.slice(0, 200),
+  );
+  check(
+    'and nothing says it ended, is read-only, or offers to recover it',
+    !host.querySelector('[role="alert"]') && !/read-only|no longer running|has exited/i.test(surface),
+    surface.slice(0, 240),
+  );
+  const composer = host.querySelector('textarea') as HTMLTextAreaElement | null;
+  check(
+    'a message can be typed straight away',
+    Boolean(composer) && composer?.disabled === false,
+    composer ? `disabled=${composer.disabled}` : 'no composer',
+  );
+
+  // Mid-answer too: the process the turn is running in is the one being
+  // replaced, so there is nothing to wait for.
+  controller.handle(snapshot('thinking') as never);
+  await wait(200);
+  const busyButton = find();
+  check(
+    'and it stays pressable while the agent is still answering',
+    Boolean(busyButton) && busyButton?.disabled === false,
+    busyButton ? `disabled=${busyButton.disabled}` : 'gone while busy',
   );
 
   root.unmount();

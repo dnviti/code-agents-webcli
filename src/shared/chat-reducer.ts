@@ -476,6 +476,13 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         // exists — the session resolves them at the same moment on its side.
         state.pendingQuestions = [];
         state.answeredQuestions = {};
+        // And the approvals with them, for the same reason and one more: an
+        // approval card is drawn above the composer rather than inside the
+        // conversation, so it is the one piece of the old conversation that
+        // would still be on screen — asking whether a tool may run in a
+        // process that has already been replaced. The session drops its side
+        // as it stops.
+        state.pendingPermissions = [];
         // And no paging back past it. The log still holds what was said — this
         // is a view, not a delete — but offering "load earlier messages" right
         // after someone asked for a clean window would undo the thing they

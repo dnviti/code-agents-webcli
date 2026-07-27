@@ -207,11 +207,19 @@ export class ClaudeCodeWebServer {
         if (change.nativeSessionId) {
           record.nativeChatSessionId = change.nativeSessionId;
         }
-        if (change.exited) {
+        if (change.exited === true) {
           // Frees the session for a relaunch in the same tab. Without it the
           // record still claims a process that is gone, and `start_chat`
           // refuses with "A process is already running in this session".
           record.active = false;
+        }
+        if (change.exited === false) {
+          // A conversation replaced in place — `/clear` and the composer's New
+          // chat button — never passes through the launcher, so this is the
+          // only thing that puts the record back. Without it a tab you are
+          // sitting in, with an agent answering, is listed as finished.
+          record.active = true;
+          record.lastActivity = new Date();
         }
       },
     });
