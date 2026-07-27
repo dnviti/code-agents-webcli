@@ -82,9 +82,95 @@ program
   .option('--omp-alias <name>', 'display alias for Oh My Pi (default: env OMP_ALIAS or "Oh My Pi")')
   .option('--ngrok-auth-token <token>', 'ngrok auth token to open a public tunnel')
   .option('--ngrok-domain <domain>', 'ngrok reserved domain to use for the tunnel')
-  .parse();
+  .option('--containers', 'give every signed-in user their own isolated container')
+  .option('--container-engine <engine>', 'docker or podman (default: docker)')
+  .option('--container-image <image>', 'base image each user environment starts from')
+  .option('--container-cpus <cpus>', 'CPU limit per user environment, e.g. 2')
+  .option('--container-memory <size>', 'memory limit per user environment, e.g. 2g')
+  .option('--container-idle-minutes <minutes>', 'stop an environment after this long idle (0 = never)')
+  .option('--container-setup <command>', 'shell run once inside each newly created environment');
 
-const options = program.opts();
+/**
+ * Operator commands for the per-user environments.
+ *
+ * Deliberately outside the running server: an operator revoking somebody's
+ * access needs to remove their environment whether or not the server is up,
+ * and the container engine — not the app — is the authority on what exists.
+ */
+function environmentManager() {
+  const {
+    EnvironmentManager,
+    createContainerConfig,
+  } = require('../dist/server/services/environments/index.js');
+  const opts = program.opts();
+  const config = createContainerConfig({
+    containers: true,
+    containerEngine: opts.containerEngine,
+    dataDir: opts.dataDir,
+  });
+  return { manager: new EnvironmentManager({ config, hostHome: process.cwd() }), engine: config.engine };
+}
+
+/** Turn a missing engine binary into a sentence instead of a spawn errno. */
+async function withEngine(work) {
+  const { manager, engine } = environmentManager();
+  try {
+    return await work(manager);
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      console.error(
+        `${engine} is not installed on this machine, or is not on PATH. `
+        + 'Install it, or name the other engine with --container-engine.',
+      );
+      process.exit(1);
+    }
+    throw error;
+  }
+}
+
+let ranSubcommand = false;
+
+const environments = program
+  .command('env')
+  .description('list and remove per-user container environments');
+
+environments
+  .command('ls')
+  .description('list environments with their owners')
+  .action(async () => {
+    ranSubcommand = true;
+    const list = await withEngine((manager) => manager.list());
+    if (!list.length) {
+      console.log('No per-user environments exist.');
+      return;
+    }
+    console.log(['NAME', 'OWNER', 'USER ID', 'STATUS', 'IMAGE'].join('\t'));
+    for (const item of list) {
+      console.log([
+        item.name,
+        item.githubLogin || '?',
+        item.userId ?? '?',
+        item.status,
+        item.image,
+      ].join('\t'));
+    }
+  });
+
+environments
+  .command('rm <name>')
+  .description('remove an environment')
+  .option('--purge-data', "also delete the user's persistent home directory")
+  .action(async (name, commandOptions) => {
+    ranSubcommand = true;
+    await withEngine((manager) => manager.remove(name, {
+      purgeData: commandOptions.purgeData === true,
+    }));
+    console.log(
+      commandOptions.purgeData
+        ? `Removed ${name} and deleted its data.`
+        : `Removed ${name}. Its data is still on disk; pass --purge-data to delete it too.`,
+    );
+  });
 
 async function openUrl(url) {
   const { default: open } = await import('open');
@@ -92,6 +178,9 @@ async function openUrl(url) {
 }
 
 async function main() {
+  // Read after parsing, not before: this is the object commander fills in.
+  const options = program.opts();
+
   try {
     const port = parseInt(options.port, 10);
     
@@ -130,6 +219,17 @@ async function main() {
       qwenAlias: options.qwenAlias || process.env.QWEN_ALIAS || 'Qwen',
       kimiAlias: options.kimiAlias || process.env.KIMI_ALIAS || 'Kimi',
       ompAlias: options.ompAlias || process.env.OMP_ALIAS || 'Oh My Pi',
+      // Per-user container environments. Absent means the historical
+      // behaviour: everything runs on this host, as this account.
+      containers: options.containers === true,
+      containerEngine: options.containerEngine,
+      containerImage: options.containerImage,
+      containerCpus: options.containerCpus,
+      containerMemory: options.containerMemory,
+      containerIdleMinutes: options.containerIdleMinutes !== undefined
+        ? Number(options.containerIdleMinutes)
+        : undefined,
+      containerSetupCommand: options.containerSetup,
       folderMode: true // Always use folder mode
     };
 
@@ -157,6 +257,12 @@ async function main() {
       .map(([name, alias]) => `${name} → "${alias}"`)
       .join(', ');
     console.log(`Aliases: ${aliasBanner}`);
+    if (serverOptions.containers || process.env.CODE_AGENTS_WEBCLI_CONTAINERS === 'true') {
+      const engine = serverOptions.containerEngine
+        || process.env.CODE_AGENTS_WEBCLI_CONTAINER_ENGINE
+        || 'docker';
+      console.log(`Environments: one container per user, via ${engine}`);
+    }
 
     const appServer = new ClaudeCodeWebServer(serverOptions);
 
@@ -272,4 +378,14 @@ async function main() {
   }
 }
 
-main();
+// parseAsync, not parse: the `env` subcommands below do real work and their
+// actions are async. When no subcommand was given, commander has only filled
+// in the options and starting the server is still the right thing to do.
+program.parseAsync().then(() => {
+  if (!ranSubcommand) {
+    main();
+  }
+}).catch((error) => {
+  console.error(error.message);
+  process.exit(1);
+});

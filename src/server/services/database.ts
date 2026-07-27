@@ -109,6 +109,25 @@ export class AppDatabase {
    * is what a stray row left by a test run or a restored backup produces, since
    * it sorts ahead of the real installer on id alone.
    */
+  /**
+   * One account by its numeric id.
+   *
+   * Needed wherever a user id has to become something human-readable — a
+   * per-user environment is named after the login, and only the id travels
+   * through the session and socket layers.
+   */
+  getUserById(id: number): AuthenticatedUser | null {
+    const row = this.db
+      .prepare(`
+        SELECT id, github_id, github_login, github_name, avatar_url, email
+        FROM users
+        WHERE id = ?
+      `)
+      .get(id) as UserRow | undefined;
+
+    return row ? mapUserRow(row) : null;
+  }
+
   getInstallerUserId(): number | null {
     const pinned = this.getSetting('update.installerUserId');
     if (pinned && /^\d+$/.test(pinned) && this.isPinnableInstaller(Number(pinned))) {

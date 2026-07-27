@@ -2,6 +2,8 @@ import { spawn as spawnPty, IPty } from '../services/pty.js';
 import * as path from 'path';
 import * as fs from 'fs';
 import { execFileSync } from 'child_process';
+import { UserEnvironment } from '../services/environments/types.js';
+import { HostEnvironment } from '../services/environments/manager.js';
 
 export interface BridgeSession {
   process: IPty;
@@ -22,6 +24,11 @@ export interface SessionInfo {
 
 export interface StartSessionOptions {
   workingDir?: string;
+  /**
+   * Where this agent runs. Absent means the host, which is what every caller
+   * passed before per-user environments existed.
+   */
+  environment?: UserEnvironment;
   dangerouslySkipPermissions?: boolean;
   /**
    * Free-text model id from the active runtime profile. Passed via the
@@ -52,6 +59,17 @@ export abstract class BaseBridge {
 
   /** Return the fallback command name when none of the candidates are found. */
   protected abstract getDefaultCommand(): string;
+
+  /**
+   * The CLI's plain name, for callers that must not use a host path.
+   *
+   * A container resolves the command through the image's PATH; the absolute
+   * path this bridge found on the server's own filesystem would simply not be
+   * there. Public because chat sessions need it and they do not extend this.
+   */
+  get defaultCommand(): string {
+    return this.getDefaultCommand();
+  }
 
   /** Return a human-readable name for log messages (e.g. "Claude", "Codex"). */
   protected abstract getDisplayName(): string;
@@ -177,10 +195,20 @@ export abstract class BaseBridge {
         console.log(`Args: ${args.join(' ')}`);
       }
 
-      const ptyProcess = spawnPty(this.resolvedCommand, args, {
+      // The environment decides *where* this runs; on the host it is the
+      // identity, so this is the same spawn it has always been.
+      const environment = options.environment || new HostEnvironment(workingDir);
+      // `resolvedCommand` is an absolute path found on *this* machine at
+      // construction time. Inside a container it is very likely a path that
+      // does not exist, so the plain name is used and the image's own PATH
+      // resolves it — which is also what makes the base image the place where
+      // an administrator decides which agents exist.
+      const command = environment.kind === 'container'
+        ? this.getDefaultCommand()
+        : this.resolvedCommand;
+      const launch = environment.wrap(command, args, {
         cwd: workingDir,
         env: {
-          ...process.env,
           // Profile variables sit between the inherited environment and the
           // terminal settings: they may override an inherited value (that is
           // the point) but never TERM/COLORTERM, which describe this PTY rather
@@ -190,6 +218,14 @@ export abstract class BaseBridge {
           FORCE_COLOR: '1',
           COLORTERM: 'truecolor',
         },
+        tty: true,
+      });
+
+      const ptyProcess = spawnPty(launch.command, launch.args, {
+        // In a container the engine sets the working directory itself, and the
+        // host path means nothing to the engine client.
+        cwd: environment.kind === 'container' ? undefined : workingDir,
+        env: launch.env,
         cols,
         rows,
         name: 'xterm-color',

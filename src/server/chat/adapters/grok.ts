@@ -1,4 +1,5 @@
-import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
+// Processes are launched through BaseChatAdapter.launchChild, which decides
+// between this host and the owner's container.
 import {
   ChatBlock,
   ChatCapabilities,
@@ -148,17 +149,7 @@ export class GrokChatAdapter extends BaseChatAdapter {
     this.exited = false;
     this.stdoutBuffer = '';
 
-    const child = spawn(this.options.command, args, {
-      cwd: this.options.workingDir,
-      env: {
-        ...process.env,
-        ...(this.options.env || {}),
-        NO_COLOR: '1',
-        TERM: 'dumb',
-        FORCE_COLOR: '0',
-      },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }) as ChildProcessWithoutNullStreams;
+    const child = this.launchChild(args, ['pipe', 'pipe', 'pipe']);
     this.child = child;
 
     child.stdout.setEncoding('utf8');

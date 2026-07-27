@@ -14,6 +14,8 @@ import { ScrollbackRecorder } from '../services/scrollback.js';
 import { sendToWebSocket, broadcastChat, broadcastToSession } from './handler.js';
 import { chatUnavailableReason, isChatRuntime } from '../../shared/chat-runtimes.js';
 import { ChatNotRunningError } from '../chat/session.js';
+import { UserEnvironment } from '../services/environments/types.js';
+import { HostEnvironment } from '../services/environments/manager.js';
 
 /**
  * The longest model name worth storing. Real ones are far shorter; this only
@@ -45,7 +47,18 @@ export interface MessageProcessorDeps {
   baseFolder: string;
   sessionDurationHours: number;
   aliases: Aliases;
-  validatePath(targetPath: string): PathValidation;
+  validatePath(targetPath: string, userId?: number): PathValidation;
+  /**
+   * The root this user's paths are measured against; their own home with
+   * per-user environments on.
+   *
+   * Optional, and falling back to `baseFolder`: a deployment (or a test) that
+   * does not know about environments must keep behaving exactly as it did,
+   * which is the same promise the feature flag makes.
+   */
+  getUserBaseFolder?(userId?: number): string;
+  /** Prepare (creating or starting if needed) the environment a user's processes run in. */
+  ensureEnvironment?(userId?: number): Promise<UserEnvironment>;
   getSelectedWorkingDir(userId: number): string | null;
   createSessionRecord(params: {
     id: string;
@@ -106,6 +119,8 @@ export interface ChatManagerLike {
       bypassPermissions?: boolean;
       resumeSessionId?: string;
       startFresh?: boolean;
+      /** Where the runtime runs; absent means this host. */
+      environment?: UserEnvironment;
     },
   ): Promise<{ runtimeKind: string; currentCapabilities: unknown; bypassing: boolean }>;
   snapshot(record: SessionRecord): Promise<unknown>;
@@ -314,6 +329,18 @@ export class MessageProcessor {
     }
   }
 
+  /** The user's own root, or the single shared one when environments are off. */
+  private userBaseFolder(userId?: number): string {
+    return this.deps.getUserBaseFolder?.(userId) ?? this.deps.baseFolder;
+  }
+
+  /** The environment a user's processes run in; this host when there are none. */
+  private async userEnvironment(userId?: number): Promise<UserEnvironment> {
+    return this.deps.ensureEnvironment
+      ? this.deps.ensureEnvironment(userId)
+      : new HostEnvironment(this.deps.baseFolder);
+  }
+
   async createAndJoinSession(
     wsId: string,
     name?: string,
@@ -322,9 +349,9 @@ export class MessageProcessor {
     const wsInfo = this.deps.webSocketConnections.get(wsId);
     if (!wsInfo) return;
 
-    let validWorkingDir = this.deps.baseFolder;
+    let validWorkingDir = this.userBaseFolder(wsInfo.userId);
     if (workingDir) {
-      const validation = this.deps.validatePath(workingDir);
+      const validation = this.deps.validatePath(workingDir, wsInfo.userId);
       if (!validation.valid) {
         sendToWebSocket(wsInfo.ws, {
           type: 'error',
@@ -334,7 +361,13 @@ export class MessageProcessor {
       }
       validWorkingDir = validation.path!;
     } else {
-      validWorkingDir = this.deps.getSelectedWorkingDir(wsInfo.userId) || this.deps.baseFolder;
+      const selected = this.deps.getSelectedWorkingDir(wsInfo.userId);
+      // A directory chosen before per-user environments were switched on can
+      // point outside the user's own home; re-checked here rather than trusted,
+      // so enabling the feature cannot leave anyone pointed at the host.
+      validWorkingDir = selected && this.deps.validatePath(selected, wsInfo.userId).valid
+        ? selected
+        : this.userBaseFolder(wsInfo.userId);
     }
 
     const sessionId = randomUUID();
@@ -553,9 +586,35 @@ export class MessageProcessor {
     const previousRunId = session.runId;
     session.runId = runId;
 
+    // A session created before per-user environments were switched on points at
+    // a folder on the host, which this user's environment cannot see. Moved to
+    // their own root rather than refused: the alternative is a tab that can
+    // never be started again and no way to say why from inside it.
+    if (!this.deps.validatePath(session.workingDir, wsInfo.userId).valid) {
+      session.workingDir = this.userBaseFolder(wsInfo.userId);
+    }
+
+    // Prepared before the pty, not alongside it: creating a container takes a
+    // moment the first time, and a bridge started against an environment that
+    // is not up yet fails with an engine error the user cannot act on.
+    let environment;
+    try {
+      environment = await this.userEnvironment(wsInfo.userId);
+    } catch {
+      session.runId = previousRunId;
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message:
+          'Your workspace environment could not be started. '
+          + 'Ask an administrator to check the container engine on the server.',
+      });
+      return;
+    }
+
     try {
       const runtimeSession = (await bridge.startSession(sessionId, {
         ...safeOptions,
+        environment,
         workingDir: session.workingDir,
         onOutput: (data: string) => {
           const currentSession = this.deps.claudeSessions.get(sessionId);
@@ -1026,9 +1085,28 @@ export class MessageProcessor {
     session.runtimeLabel = this.getRuntimeLabel(agentKind as AgentKind, session);
     session.lastActivity = new Date();
 
+    if (!this.deps.validatePath(session.workingDir, session.ownerUserId).valid) {
+      // Same reasoning as the pty path above.
+      session.workingDir = this.userBaseFolder(session.ownerUserId);
+    }
+
+    let chatEnvironment;
+    try {
+      chatEnvironment = await this.userEnvironment(session.ownerUserId);
+    } catch {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message:
+          'Your workspace environment could not be started. '
+          + 'Ask an administrator to check the container engine on the server.',
+      });
+      return;
+    }
+
     try {
       const chat = await manager.start(session, {
         runtime: agentKind,
+        environment: chatEnvironment,
         workingDir: session.workingDir,
         // Conversation-scoped override beats the profile default, for this
         // launch only — see chat_set_model.

@@ -7,8 +7,10 @@ import { PathValidation, SessionRecord, AuthContext, AuthenticatedUser } from '.
 export interface FolderRoutesDeps {
   baseFolder: string;
   claudeSessions: Map<string, SessionRecord>;
-  validatePath(targetPath: string): PathValidation;
-  isPathWithinBase(targetPath: string): boolean;
+  validatePath(targetPath: string, userId?: number): PathValidation;
+  /** Optional: without it the single shared base folder is used, as before. */
+  getUserBaseFolder?(userId?: number): string;
+  isPathWithinBase(targetPath: string, userId?: number): boolean;
   getSelectedWorkingDir(userId: number): string | null;
   setSelectedWorkingDir(userId: number, value: string | null): void;
   saveSessionsToDisk(): Promise<void>;
@@ -36,10 +38,10 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
       return;
     }
 
-    const basePath = parentPath || deps.getSelectedWorkingDir(user.id) || deps.baseFolder;
+    const basePath = parentPath || deps.getSelectedWorkingDir(user.id) || (deps.getUserBaseFolder?.(user.id) ?? deps.baseFolder);
     const fullPath = path.join(basePath, folderName);
 
-    const parentValidation = deps.validatePath(basePath);
+    const parentValidation = deps.validatePath(basePath, user.id);
     if (!parentValidation.valid) {
       res.status(403).json({
         message: 'Cannot create folder outside the allowed area',
@@ -47,7 +49,7 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
       return;
     }
 
-    const fullValidation = deps.validatePath(fullPath);
+    const fullValidation = deps.validatePath(fullPath, user.id);
     if (!fullValidation.valid) {
       res.status(403).json({
         message: 'Cannot create folder outside the allowed area',
@@ -91,9 +93,9 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
     const requestedPath =
       (req.query.path as string)
       || deps.getSelectedWorkingDir(user.id)
-      || deps.baseFolder;
+      || (deps.getUserBaseFolder?.(user.id) ?? deps.baseFolder);
 
-    const validation = deps.validatePath(requestedPath);
+    const validation = deps.validatePath(requestedPath, user.id);
     if (!validation.valid) {
       res.status(403).json({
         error: validation.error,
@@ -117,14 +119,17 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
         .sort((a, b) => a.name.localeCompare(b.name));
 
       const parentDir = path.dirname(currentPath);
-      const canGoUp = deps.isPathWithinBase(parentDir) && parentDir !== currentPath;
+      const canGoUp = deps.isPathWithinBase(parentDir, user.id) && parentDir !== currentPath;
 
       res.json({
         currentPath,
         parentPath: canGoUp ? parentDir : null,
         folders,
-        home: deps.baseFolder,
-        baseFolder: deps.baseFolder,
+        // The user's own root, not the server's: with per-user environments on
+        // these differ, and a browser told the server's would offer a Home
+        // button leading somewhere it is not allowed to go.
+        home: (deps.getUserBaseFolder?.(user.id) ?? deps.baseFolder),
+        baseFolder: (deps.getUserBaseFolder?.(user.id) ?? deps.baseFolder),
       });
     } catch (error) {
       // fs errors embed absolute paths and errno detail; keep that server-side.
@@ -148,7 +153,7 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
       sessionId?: string;
     };
 
-    const validation = deps.validatePath(selectedPath || '');
+    const validation = deps.validatePath(selectedPath || '', user.id);
     if (!validation.valid) {
       res.status(403).json({
         error: validation.error,
@@ -212,7 +217,7 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
 
     try {
       const { path: selectedPath } = req.body;
-      const validation = deps.validatePath(selectedPath);
+      const validation = deps.validatePath(selectedPath, user.id);
       if (!validation.valid) {
         res.status(403).json({
           error: validation.error,

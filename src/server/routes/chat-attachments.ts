@@ -33,7 +33,7 @@ export const ATTACHMENT_MAX_BYTES = DEFAULT_MAX_ATTACHMENT_BYTES;
 export interface ChatAttachmentRoutesDeps {
   claudeSessions: Map<string, SessionRecord>;
   attachmentStore: AttachmentStoreLike;
-  validatePath(targetPath: string): PathValidation;
+  validatePath(targetPath: string, userId?: number): PathValidation;
 }
 
 interface BodyParserError extends Error {
@@ -80,7 +80,7 @@ function sessionFor(
     return null;
   }
 
-  const validation = deps.validatePath(session.workingDir);
+  const validation = deps.validatePath(session.workingDir, session.ownerUserId);
   if (!validation.valid || !validation.path) {
     res.status(403).json({ error: 'session_outside_base' });
     return null;

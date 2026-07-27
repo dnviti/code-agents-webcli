@@ -98,6 +98,7 @@ The image ships the web server only — the agent CLIs are not bundled. See
 | [Using the terminal](docs/terminal.md) | Scrollback and history, copy/paste, images, mobile, the PWA |
 | [HTTPS and certificates](docs/https-and-certificates.md) | Why HTTPS-only, the local CA, trusting it per device, using your own certificate |
 | [Running as a service](docs/running-as-a-service.md) | systemd, Docker and Compose, reverse proxies, ngrok |
+| [Per-user environments](docs/user-environments.md) | Giving every signed-in user their own container, with persistent storage |
 | [Updating](docs/updating.md) | The update banner, who may apply it, which installs can and cannot |
 | [Usage analytics](docs/analytics.md) | What the usage screens read and how the numbers are derived |
 | [Architecture](docs/architecture.md) | How the pieces fit together |

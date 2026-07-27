@@ -2,6 +2,8 @@ import { spawn as defaultSpawnPty, IPty } from '../services/pty.js';
 import * as path from 'path';
 import * as fs from 'fs';
 import { execFileSync as defaultExecFileSync } from 'child_process';
+import { UserEnvironment } from '../services/environments/types.js';
+import { HostEnvironment } from '../services/environments/manager.js';
 
 export interface TerminalSession {
   process: IPty;
@@ -28,6 +30,11 @@ export interface TerminalSessionInfo {
 
 export interface TerminalStartOptions {
   workingDir?: string;
+  /**
+   * Where this terminal runs. Absent means the host, which is what every
+   * caller passed before per-user environments existed.
+   */
+  environment?: UserEnvironment;
   onOutput?: (data: string) => void;
   onExit?: (exitCode: number, signal: number) => void;
   onError?: (error: Error) => void;
@@ -185,6 +192,36 @@ export class TerminalBridge {
     );
   }
 
+  /**
+   * The shell to launch, asked of whichever machine will run it.
+   *
+   * In a container the host's answer is worthless and actively harmful: this
+   * host's `$SHELL` may be `/home/daniele/.local/bin/zsh`, a path that exists
+   * nowhere in the image. The environment reports what it actually has, probed
+   * once when it was created.
+   */
+  private resolveShellFor(options: TerminalStartOptions): string {
+    const environment = options.environment;
+    if (!environment || environment.kind !== 'container') {
+      return this.resolveShell(options.shell);
+    }
+
+    const available = environment.shells;
+    if (!available.length) {
+      return 'sh';
+    }
+
+    const requested = (options.shell || '').trim();
+    if (requested) {
+      const basename = path.basename(requested);
+      if (available.includes(basename)) {
+        return basename;
+      }
+    }
+
+    return available[0];
+  }
+
   buildLaunchConfig(options: TerminalStartOptions = {}): LaunchConfig {
     const mode: 'shell' | 'command' =
       options.mode === 'command' ? 'command' : 'shell';
@@ -198,7 +235,7 @@ export class TerminalBridge {
         throw new Error('Custom command is required');
       }
 
-      const shellPath = this.resolveShell(options.shell);
+      const shellPath = this.resolveShellFor(options);
       return {
         command: shellPath,
         args: ['-lc', command],
@@ -208,7 +245,7 @@ export class TerminalBridge {
       };
     }
 
-    const shellPath = this.resolveShell(options.shell);
+    const shellPath = this.resolveShellFor(options);
     return {
       command: shellPath,
       args: ['-i'],
@@ -245,17 +282,31 @@ export class TerminalBridge {
       console.log(`Working directory: ${workingDir}`);
       console.log(`Terminal size: ${cols}x${rows}`);
 
-      const terminalProcess = this.spawnPty(
+      // The environment decides *where* the pty's program runs; on the host it
+      // is the identity, so this is the same spawn it has always been.
+      const launch = (options.environment || new HostEnvironment(workingDir)).wrap(
         launchConfig.command,
         launchConfig.args,
         {
           cwd: workingDir,
           env: {
-            ...process.env,
             TERM: 'xterm-256color',
             FORCE_COLOR: '1',
             COLORTERM: 'truecolor',
           },
+          tty: true,
+        },
+      );
+
+      const terminalProcess = this.spawnPty(
+        launch.command,
+        launch.args,
+        {
+          // A container exec sets its own working directory through the
+          // engine, and the host path does not exist for the engine client, so
+          // the spawn's cwd is only meaningful in host mode.
+          cwd: options.environment?.kind === 'container' ? undefined : workingDir,
+          env: launch.env,
           cols,
           rows,
           name: 'xterm-color',

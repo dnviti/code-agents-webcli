@@ -68,6 +68,28 @@ cc-web --help
 | `--dev` | off | Extra diagnostics from the WebSocket layer. |
 | `--https` | — | **Accepted and ignored.** HTTPS is always on; the flag exists so older scripts and units do not break. |
 
+### Per-user environments
+
+Off unless you ask for it; see [Per-user environments](user-environments.md)
+for the prerequisites, where the data lives, and the operator commands.
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--containers` | off | Give every signed-in user their own container. |
+| `--container-engine <engine>` | `docker` | `docker` or `podman`. |
+| `--container-image <image>` | `docker.io/library/node:22-bookworm` | Base image each environment starts from. |
+| `--container-cpus <n>` | unlimited | CPU limit per environment. |
+| `--container-memory <size>` | unlimited | Memory limit per environment, e.g. `4g`. |
+| `--container-idle-minutes <n>` | `0` | Stop an idle environment after this long; `0` never does. |
+| `--container-setup <command>` | — | Shell run once inside each newly created environment. |
+
+Two subcommands operate on them, and work whether or not the server is running:
+
+```bash
+cc-web env ls                                # what exists, and whose it is
+cc-web env rm <name> [--purge-data]          # remove one, optionally with its data
+```
+
 ### TLS
 
 | Flag | Default | What it does |
@@ -133,6 +155,13 @@ Useful in a container or a unit file, where flags are awkward.
 | `GITHUB_ALLOWED_USER_IDS` | `--allowed-github-ids` | empty |
 | `GITHUB_ALLOW_ANY_USER` | `--allow-any-github-user` | `false` — only the exact string `true` enables it |
 | `CODE_AGENTS_WEBCLI_DATA_DIR` | `--data-dir` | `~/.code-agents-webcli` |
+| `CODE_AGENTS_WEBCLI_CONTAINERS` | `--containers` | `false` — only the exact string `true` enables it |
+| `CODE_AGENTS_WEBCLI_CONTAINER_ENGINE` | `--container-engine` | `docker` |
+| `CODE_AGENTS_WEBCLI_CONTAINER_IMAGE` | `--container-image` | `docker.io/library/node:22-bookworm` |
+| `CODE_AGENTS_WEBCLI_CONTAINER_CPUS` | `--container-cpus` | unlimited |
+| `CODE_AGENTS_WEBCLI_CONTAINER_MEMORY` | `--container-memory` | unlimited |
+| `CODE_AGENTS_WEBCLI_CONTAINER_IDLE_MINUTES` | `--container-idle-minutes` | `0` |
+| `CODE_AGENTS_WEBCLI_CONTAINER_SETUP` | `--container-setup` | — |
 | `CLAUDE_ALIAS` … `OMP_ALIAS` | `--*-alias` | see above |
 
 These have **no flag** and can only be set through the environment:
@@ -148,6 +177,11 @@ Two more are read from the ambient environment rather than configured: `HOME`
 terminal session starts).
 
 ## Where state lives
+
+With per-user environments on, each account also gets
+`environments/<prefix>-<login>-<user-id>/` under the data directory — that
+directory is the user's home inside their container, and it is what a backup
+has to include. See [Per-user environments](user-environments.md#where-the-data-lives).
 
 Everything sits under the data directory — `~/.code-agents-webcli` unless
 `--data-dir` says otherwise. The directory is created `0700`.

@@ -308,11 +308,19 @@ export const ASK_SOCKET_ENV = 'CCWEB_ASK_SOCKET';
  * this app is not the only thing using that CLI, and a session-scoped capability
  * should not outlive the session or appear in anyone else's tool list.
  */
-export function askMcpConfig(serverScript: string, socketPath: string): string {
+export function askMcpConfig(
+  serverScript: string,
+  socketPath: string,
+  // Both paths are read by the *runtime*, which may not be running on this
+  // machine: in a per-user container the script and socket arrive through bind
+  // mounts under different paths, and this host's node binary is not there at
+  // all. The caller translates; the default is the host.
+  nodePath: string = process.execPath,
+): string {
   return JSON.stringify({
     mcpServers: {
       [ASK_MCP_SERVER]: {
-        command: process.execPath,
+        command: nodePath,
         args: [serverScript],
         env: { [ASK_SOCKET_ENV]: socketPath },
       },

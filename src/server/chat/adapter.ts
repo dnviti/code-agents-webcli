@@ -1,5 +1,7 @@
 import { spawn, ChildProcessByStdio, ChildProcessWithoutNullStreams } from 'child_process';
 import { Readable } from 'stream';
+import { UserEnvironment } from '../services/environments/types.js';
+import { HostEnvironment } from '../services/environments/manager.js';
 import {
   ChatCapabilities,
   ChatEvent,
@@ -32,6 +34,16 @@ export interface ChatAdapterOptions {
   workingDir: string;
   /** Resolved executable for the runtime, from the existing bridge lookup. */
   command: string;
+  /**
+   * The runtime's plain command name, for when the resolved path is a path on
+   * a machine the process will not run on. Falls back to `command`.
+   */
+  commandName?: string;
+  /**
+   * Where this conversation's runtime runs. Absent means the host — which is
+   * what every caller passed before per-user environments existed.
+   */
+  environment?: UserEnvironment;
   /** Model from the active runtime profile, if any. */
   model?: string;
   /** Extra CLI arguments from the active runtime profile. */
@@ -145,26 +157,64 @@ export abstract class BaseChatAdapter implements ChatAdapter {
     this.options.emit({ ...event, ts: event.ts ?? Date.now() } as AdapterEvent);
   }
 
+  /**
+   * Spawn this runtime's CLI where the conversation's owner lives.
+   *
+   * Every adapter goes through here rather than calling `spawn` itself: the
+   * decision "host or this user's container" has exactly one right answer per
+   * session, and four copies of it is four chances for an agent to run on the
+   * host while the terminal beside it runs in a container.
+   *
+   * `stdio` still belongs to the caller — the runtimes disagree about whether
+   * stdin should be a pipe or closed, and that difference is load-bearing
+   * (see the notes at the codex and pi call sites).
+   */
+  protected launchChild(
+    args: string[],
+    stdio: ['pipe' | 'ignore', 'pipe', 'pipe'],
+  ): ChildProcessWithoutNullStreams {
+    const environment = this.options.environment;
+    // A container exec resolves the command through the image's PATH; the
+    // absolute path found on this host almost certainly is not in the image.
+    const command = environment && environment.kind === 'container'
+      ? this.options.commandName || this.options.command
+      : this.options.command;
+
+    const launch = (environment || new HostEnvironment(this.options.workingDir)).wrap(
+      command,
+      args,
+      {
+        cwd: this.options.workingDir,
+        env: {
+          ...(this.options.env || {}),
+          // These CLIs check for a TTY to decide whether to draw a TUI and to
+          // colour their output. We want neither: chat mode reads the
+          // structured stream, and ANSI in a JSON string is noise the UI would
+          // have to strip.
+          NO_COLOR: '1',
+          TERM: 'dumb',
+          FORCE_COLOR: '0',
+        },
+        // Deliberately no tty: `exec -t` would give the CLI exactly the
+        // terminal it must not detect, and would merge stderr into stdout.
+        tty: false,
+      },
+    );
+
+    return spawn(launch.command, launch.args, {
+      cwd: environment?.kind === 'container' ? undefined : this.options.workingDir,
+      env: launch.env,
+      stdio,
+    }) as ChildProcessWithoutNullStreams;
+  }
+
   async start(): Promise<void> {
     if (this.child) {
       throw new Error(`chat adapter for ${this.runtime} already started`);
     }
 
     const args = this.buildArgs();
-    const child = spawn(this.options.command, args, {
-      cwd: this.options.workingDir,
-      env: {
-        ...process.env,
-        ...(this.options.env || {}),
-        // These CLIs check for a TTY to decide whether to draw a TUI and to
-        // colour their output. We want neither: chat mode reads the structured
-        // stream, and ANSI in a JSON string is noise the UI would have to strip.
-        NO_COLOR: '1',
-        TERM: 'dumb',
-        FORCE_COLOR: '0',
-      },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }) as ChildProcessWithoutNullStreams;
+    const child = this.launchChild(args, ['pipe', 'pipe', 'pipe']);
 
     this.child = child;
 

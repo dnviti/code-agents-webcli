@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Every signed-in user can have their own machine.** Until now everyone who
+  signed in shared this one: the same account, the same home directory, the same
+  installed tools. One person's global install changed the environment for
+  everybody, anyone could read anyone else's files and agent credentials, and
+  nothing on the host said which process belonged to whom.
+
+  Turning on per-user environments gives every account its own container, named
+  after them so `docker ps` answers "whose is this?" at a glance, with a home
+  directory that survives the container being destroyed and rebuilt. A package
+  they install once is still there next time. Their terminals, agent runs, chat
+  runtimes, files, uploads and git all happen in there rather than on the host,
+  and CPU and memory limits stop one of them taking the whole machine. Idle
+  environments can be stopped to reclaim resources and come back on the next
+  sign-in with everything as it was.
+
+  Docker and Podman both work, chosen by configuration. `cc-web env ls` shows
+  what exists and whose it is; `cc-web env rm` removes one, with `--purge-data`
+  when revoking access should take the data too.
+
+  It is off unless an administrator asks for it, and an installation that does
+  not enable it behaves exactly as it did before. See
+  [Per-user environments](docs/user-environments.md).
+
 ## [5.2.0] - 2026-07-27
 
 ### Added
