@@ -186,6 +186,23 @@ const REPLAYABLE = new Set([
 ]);
 
 /**
+ * How often to re-ask an adapter whether it can take the next queued turn.
+ *
+ * Short enough to be indistinguishable from immediate — the thing being waited
+ * on is a child process finishing its exit, measured in single milliseconds —
+ * and the wait only ever happens for adapters that spawn one process per turn.
+ */
+const QUEUE_READY_POLL_MS = 25;
+
+/**
+ * How long to keep waiting before calling a queued message undeliverable.
+ *
+ * Generous on purpose: overshooting costs a message that arrives late, and
+ * undershooting costs one reported as failed while it would still have gone.
+ */
+const QUEUE_READY_TIMEOUT_MS = 15_000;
+
+/**
  * Thrown when the session id is known but nothing is running under it.
  *
  * A distinct type rather than a message to match on, because the recovery for
@@ -270,6 +287,10 @@ export class ChatSession {
   private queue: QueuedTurn[] = [];
   /** Guards the drain against re-entering itself through `send` -> `ingest`. */
   private draining = false;
+  /** Runs the drain again once the adapter has finished letting go of the last turn. */
+  private drainRetry: ReturnType<typeof setTimeout> | null = null;
+  /** When the current wait for a ready adapter began; null when not waiting. */
+  private readySince: number | null = null;
 
   /**
    * Which process the events arriving here belong to.
@@ -790,12 +811,45 @@ export class ChatSession {
       return;
     }
 
-    if (this.state !== 'idle' || this.queue.length > 0) {
+    // `adapterReady` matters here as much as in the drain: pressing Enter the
+    // instant a turn ends puts a message through this path, not the queue's,
+    // and the adapter is no readier for it (#89). Queued rather than refused —
+    // the line is drained the moment it can be.
+    const ready = this.adapterReady;
+    if (this.state !== 'idle' || this.queue.length > 0 || !ready) {
       this.enqueue(turn);
+      // Only this case needs a push. Everything else is waiting on an event
+      // that is certain to come — the running turn's end — but a session that
+      // is *already* idle has had its last event, and a turn parked here for
+      // an adapter still letting go of the previous process would wait for a
+      // drain that nothing was ever going to trigger.
+      if (this.state === 'idle' && !ready) this.drainQueue();
       return;
     }
 
-    await this.deliver(turn);
+    try {
+      await this.deliver(turn);
+    } catch (error: unknown) {
+      // Kept, not thrown back at a browser that has already cleared the box it
+      // was typed in. A message that could not be handed over goes into the
+      // line with the reason on it, exactly like one that failed on its way out
+      // of the queue — same failure, same recovery, whichever path it took.
+      const message = error instanceof Error ? error.message : String(error);
+      this.failQueuedTurn(
+        { id: `queued-${crypto.randomUUID()}`, text: turn.text, attachments: turn.attachments, ts: Date.now() },
+        message,
+      );
+    }
+  }
+
+  /**
+   * Whether the adapter would accept a turn right now.
+   *
+   * Adapters that do not answer are always ready, which is true of every one
+   * driving a single long-lived process.
+   */
+  private get adapterReady(): boolean {
+    return this.adapter?.readyForTurn !== false;
   }
 
   private enqueue(turn: UserTurn): void {
@@ -890,11 +944,31 @@ export class ChatSession {
 
   /** Drop the whole line. Returns how many turns were discarded. */
   clearQueue(): number {
+    this.stopWaitingForReady();
     const dropped = this.queue.length;
     if (!dropped) return 0;
     this.queue = [];
     this.publishQueue();
     return dropped;
+  }
+
+  /**
+   * Try a turn that failed to be delivered again, now.
+   *
+   * The failure stopped the line (see `drainQueue`), so this both clears the
+   * mark and restarts it. Unknown ids are a no-op rather than an error: the
+   * click races the queue's own broadcast, and losing that race costs nothing.
+   */
+  retryQueued(id: string): boolean {
+    const turn = this.queue.find((entry) => entry.id === id);
+    if (!turn || !turn.error) return false;
+    delete turn.error;
+    // To the head, because it was already at the head when it failed and the
+    // ones behind it were typed expecting it to have gone first.
+    this.queue = [turn, ...this.queue.filter((entry) => entry.id !== id)];
+    this.publishQueue();
+    this.drainQueue();
+    return true;
   }
 
   /**
@@ -921,6 +995,26 @@ export class ChatSession {
 
     if (this.state !== 'idle') return;
 
+    // A turn that could not be delivered holds the line rather than being
+    // skipped past. Everything behind it was typed on the assumption that it
+    // had been asked, and asking those against an agent that never saw it is a
+    // worse outcome than a queue that visibly stopped and said why (#89). The
+    // user's two ways out — retry and remove — are both on the row itself.
+    if (this.queue[0].error) return;
+
+    // Before anything is shifted off the line and before a word of it reaches
+    // the transcript: the one-shot adapters call a turn over from a line of
+    // stdout while the process that ran it is still exiting, and `send` in that
+    // window throws. It used to throw *after* `deliver` had already written the
+    // user's message into the conversation and moved the state to `thinking`,
+    // so the message sat there unanswered forever with the rest of the queue
+    // stuck behind it. Asking first costs a tick or two of waiting (#89).
+    if (!this.adapterReady) {
+      this.waitForReady();
+      return;
+    }
+    this.stopWaitingForReady();
+
     this.draining = true;
     const next = this.queue.shift()!;
     this.publishQueue();
@@ -934,11 +1028,87 @@ export class ChatSession {
         // for. See `restarting`.
         if (this.restarting) return;
         const message = error instanceof Error ? error.message : String(error);
-        this.ingest({ t: 'error', message: `could not send a queued message: ${message}` });
+        this.failQueuedTurn(next, message);
       })
       .finally(() => {
         this.draining = false;
+        // One more look, because a delivery does not always leave an event
+        // behind to trigger the next one. `/clear` is the case: it replaces the
+        // process instead of running a turn, and every event that replacement
+        // emits arrives while this drain still holds the guard — so whatever
+        // was queued behind the clear waited on an event that had already been
+        // and gone. Cheap and terminal: a session that is busy or a line that
+        // is empty returns immediately, and each pass takes one turn off.
+        this.drainQueue();
       });
+  }
+
+  /**
+   * Poll until the adapter can take a turn, then drain.
+   *
+   * A poll rather than a fixed settling delay because the wait is a process
+   * exiting, not a duration: any delay long enough to be safe would be long
+   * enough to feel like throttling, and any delay short enough to feel instant
+   * would still be a guess. In the measured case this fires once or twice.
+   */
+  private waitForReady(): void {
+    if (this.drainRetry) return;
+    if (this.readySince === null) this.readySince = Date.now();
+
+    if (Date.now() - this.readySince >= QUEUE_READY_TIMEOUT_MS) {
+      const head = this.queue[0];
+      this.readySince = null;
+      if (head) {
+        this.failQueuedTurn(
+          head,
+          `the ${this.runtime || 'agent'} process was still busy ${Math.round(QUEUE_READY_TIMEOUT_MS / 1000)}s after the last turn ended`,
+          { putBack: false },
+        );
+      }
+      return;
+    }
+
+    this.drainRetry = setTimeout(() => {
+      this.drainRetry = null;
+      this.drainQueue();
+    }, QUEUE_READY_POLL_MS);
+    // Nothing here should hold the process open: a session waiting on a child
+    // that will never come back must not be the reason the server cannot exit.
+    this.drainRetry.unref?.();
+  }
+
+  private stopWaitingForReady(): void {
+    if (this.drainRetry) {
+      clearTimeout(this.drainRetry);
+      this.drainRetry = null;
+    }
+    this.readySince = null;
+  }
+
+  /**
+   * Put a turn that could not be delivered back, with the reason on it.
+   *
+   * Kept rather than dropped, and kept *with its text*, so it is recoverable
+   * without retyping — the queue exists to be trusted while nobody is
+   * watching, and a queue that discards work silently is worse than none.
+   *
+   * `putBack` is false when the turn never left the line in the first place.
+   */
+  private failQueuedTurn(turn: QueuedTurn, reason: string, { putBack = true } = {}): void {
+    const marked: QueuedTurn = { ...turn, error: reason, attempts: (turn.attempts ?? 0) + 1 };
+    if (putBack) {
+      this.queue = [marked, ...this.queue];
+    } else {
+      this.queue = this.queue.map((entry) => (entry.id === turn.id ? marked : entry));
+    }
+    this.publishQueue();
+    this.ingest({ t: 'error', message: `could not send a queued message: ${reason}` });
+    // Only the delivery failed, so a session left saying "working" would be
+    // claiming a turn that never started — and would never drain again, since
+    // a drain needs an idle session.
+    if (this.state === 'thinking' || this.state === 'running') {
+      this.setState('idle');
+    }
   }
 
   private publishQueue(): void {
@@ -1015,6 +1185,13 @@ export class ChatSession {
     // Before the old process is signalled, not after: whatever it emits from
     // here on belongs to a conversation that is over. See `adapterGeneration`.
     this.adapterGeneration++;
+    // The line is *not* carried across, and that is the whole difference #69
+    // made: a clear is taken the moment it is typed rather than waiting its
+    // turn, so whatever is queued here was typed for the process being
+    // replaced and belongs to the conversation the user just left (#69).
+    // Anything typed *after* the clear still arrives — `restarting` parks it
+    // and the fresh process is handed it as soon as it reports idle — which is
+    // the case #89 exists to protect.
     try {
       await this.stop();
       // Stale until the new process's own `init` event reports its id — cleared

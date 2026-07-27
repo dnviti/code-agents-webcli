@@ -110,6 +110,16 @@ export class GrokChatAdapter extends BaseChatAdapter {
     return args;
   }
 
+  /**
+   * The same condition `send()` throws on, asked in advance (#89).
+   *
+   * `closeTurn` runs off the `end` line of stdout, so the turn is over — and
+   * the state idle — while this process is still on its way out.
+   */
+  get readyForTurn(): boolean {
+    return !(this.child && !this.exited);
+  }
+
   async send(turn: UserTurn): Promise<void> {
     if (this.stopped) {
       throw new Error('grok adapter: session already stopped');

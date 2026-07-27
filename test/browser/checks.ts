@@ -237,6 +237,7 @@ async function run(): Promise<void> {
   await checkAnAgentPopupShowsWhatTheAgentIsDoing();
   await checkATallDialogStaysOnScreen();
   await checkTheComposerShrinksWithTheWorkspaceRail();
+  await checkAMessageThatCouldNotBeSentSaysSoAndCanBeRetried();
   await checkTheFixedBarsNeverWrap();
   await checkALiveAnswerAppearsAsItStreams();
   await checkSilentStepsLeaveNoRowButKeepTheirTrace();
@@ -943,6 +944,128 @@ async function checkATallDialogStaysOnScreen(): Promise<void> {
  *      Only a layout engine can tell those apart from a correct layout, which
  *      is why this check lives here.
  */
+/**
+ * A queued message that could not be delivered, as the person who typed it sees it.
+ *
+ * The failure this belongs to (#89) is silent by nature: the message left the
+ * queue, appeared in the conversation and was never answered, and the whole
+ * point of queueing is that nobody is watching while it happens. So the row
+ * that says otherwise has to be real — visible text giving the reason, the
+ * message itself still there to be recovered, and a button that actually asks
+ * the server to try again. Every part of that is a rendering question, which
+ * is why it is checked here rather than in a unit test.
+ */
+async function checkAMessageThatCouldNotBeSentSaysSoAndCanBeRetried(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:420px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const sent: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('browser-check', { send: (message) => sent.push(message) });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check',
+      runtime: 'claude',
+      state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true, commands: [],
+      },
+      messages: [],
+      pendingPermissions: [],
+      queued: [
+        {
+          id: 'q-failed',
+          text: 'the one that did not go',
+          ts: 1,
+          error: 'the pi process was still busy 15s after the last turn ended',
+          attempts: 1,
+        },
+        { id: 'q-waiting', text: 'the one still waiting', ts: 2 },
+      ],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 1,
+      live: true,
+      bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(250);
+
+  const rows = Array.from(
+    host.querySelectorAll('[aria-label="Messages waiting to be sent"] [role="listitem"]'),
+  ) as HTMLElement[];
+  check('both queued messages are on screen', rows.length === 2, `${rows.length} rows`);
+
+  const failedRow = rows[0];
+  const waitingRow = rows[1];
+  const failedText = failedRow?.textContent ?? '';
+
+  check(
+    'the message that could not be sent is still there to be recovered, not retyped',
+    failedText.includes('the one that did not go'),
+    failedText.slice(0, 160),
+  );
+  check(
+    'and it says, in words, that it was not sent and why',
+    failedText.includes('Not sent') && failedText.includes('still busy'),
+    failedText.slice(0, 160),
+  );
+
+  // Announced rather than merely coloured: nobody is looking at the composer
+  // while a queue works through, which is the whole reason the queue exists.
+  check(
+    'the reason is announced, not only drawn',
+    Boolean(failedRow?.querySelector('[role="alert"]')),
+  );
+
+  const retry = Array.from(failedRow?.querySelectorAll('button') ?? []).find((button) =>
+    (button.textContent ?? '').includes('Try again'),
+  ) as HTMLButtonElement | undefined;
+  check('the row offers a way to try it again', Boolean(retry));
+  check(
+    'and it is a real button, so it can be reached from the keyboard',
+    retry?.tagName === 'BUTTON' && !retry.disabled,
+  );
+
+  const before = sent.length;
+  retry?.click();
+  await wait(150);
+  const asked = sent.slice(before).find((message) => message.type === 'chat_queue_retry');
+  check(
+    'pressing it asks the server to send that exact message again',
+    Boolean(asked) && asked?.queuedId === 'q-failed',
+    JSON.stringify(sent.slice(before)),
+  );
+
+  // The offer belongs to the failure, not to the queue: a message that is
+  // simply waiting its turn has nothing to retry.
+  const waitingText = waitingRow?.textContent ?? '';
+  check(
+    'a message that is merely waiting is not dressed up as a failure',
+    !waitingText.includes('Not sent') && !waitingText.includes('Try again'),
+    waitingText.slice(0, 160),
+  );
+
+  root.unmount();
+  host.remove();
+}
+
 async function checkTheComposerShrinksWithTheWorkspaceRail(): Promise<void> {
   const host = document.createElement('div');
   host.style.cssText = 'width:900px;height:360px;position:absolute;top:0;left:0;display:flex';

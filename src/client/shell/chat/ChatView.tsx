@@ -340,6 +340,10 @@ export function ChatView({
     (queuedId: string) => controller.sendQueuedNow(queuedId),
     [controller],
   );
+  const retryQueued = React.useCallback(
+    (queuedId: string) => controller.retryQueued(queuedId),
+    [controller],
+  );
   const setModel = React.useCallback(
     (model: string) => controller.setModel(model),
     [controller],
@@ -890,6 +894,7 @@ export function ChatView({
               // on screen is exactly when "no, not that file" gets typed, and
               // interrupting clears the card rather than stranding it.
               onSendQueuedNow={interruptible ? sendQueuedNow : undefined}
+              onRetryQueued={retryQueued}
               onFindFiles={findProjectFiles}
               onUpload={upload}
               draft={draft}

@@ -127,6 +127,16 @@ export class PiChatAdapter extends BaseChatAdapter {
     this.emit({ t: 'state', state: 'idle' });
   }
 
+  /**
+   * The same condition `send()` throws on, asked in advance (#89).
+   *
+   * `turnInFlight` is cleared by the child's `exit`, but the turn is declared
+   * over by `onAgentSettled` — a line of stdout that arrives first.
+   */
+  get readyForTurn(): boolean {
+    return !this.turnInFlight;
+  }
+
   async send(turn: UserTurn): Promise<void> {
     if (this.stopped) {
       throw new Error('pi chat adapter is stopped');

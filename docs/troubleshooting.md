@@ -121,6 +121,13 @@ failed where the step is shown. Red means the turn did not finish: the agent
 stopped on an error it could not get past, the runtime went away mid-turn, or it
 ended with no answer. A turn you interrupted yourself reads as done.
 
+**A typed-ahead message says "Not sent".**
+It is still there, with its text, on the row above the composer — press **Try
+again**, or the ✕ to discard it. The rest of the line waits behind it on
+purpose: those messages were typed expecting this one to have been asked first.
+Messages are only ever taken out of the queue once the agent has really been
+handed them, so a message shown in the conversation was genuinely sent.
+
 **A session came back "ended" after a restart.**
 Expected. The record, history and transcript persist; the live process does not.
 
