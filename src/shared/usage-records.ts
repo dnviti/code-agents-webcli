@@ -332,3 +332,59 @@ export function addJobToTotals(totals: UsageTotals, job: UsageJobSummary): Usage
     costReportedJobs: totals.costReportedJobs + (job.costUsd !== null ? 1 : 0),
   };
 }
+
+/** The token counts a figure can be built from, however they were reported. */
+export interface TokenCounts {
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  cacheReadTokens?: number | null;
+  cacheWriteTokens?: number | null;
+  reasoningTokens?: number | null;
+  totalTokens?: number | null;
+}
+
+/**
+ * How many tokens a piece of work consumed, or null if nobody said.
+ *
+ * One function, because a job's figure in the live chat and its figure in the
+ * historical dashboard have to be the same number — they were not, and that is
+ * issue #80. The dashboard read the runtime's pre-summed total and nothing
+ * else, so every Claude job in the history said "not reported" beside a cost
+ * that was reported fine: Claude sends the four buckets and never a total.
+ *
+ * A total the runtime gave is always preferred. Only when there is none are
+ * the parts added, and only these parts:
+ *
+ * - **cache tokens count.** For every runtime here that omits a total they are
+ *   their own billed bucket, on top of the input. Measured, not assumed: grok
+ *   sends 7210 in + 1893 out + 41000 cache read and calls the total 50103, and
+ *   an ACP agent's 28234 + 147 + 27136 is exactly its 55517. Anthropic bills
+ *   the same way, and Claude is the runtime this is for.
+ * - **reasoning tokens do not.** They are a slice of the output rather than an
+ *   addition to it — grok's 412 reasoning tokens are inside its 1893 output,
+ *   or its own total would not add up — so counting them would bill part of
+ *   the answer twice.
+ *
+ * The two runtimes that break either rule (codex counts cached input *inside*
+ * its input; opencode counts thinking on top of its output) both report a
+ * total, so neither ever reaches the sum.
+ *
+ * Null when every field is missing, and that null is the whole point of the
+ * file: it means the runtime said nothing, which is not a measured zero. A
+ * runtime that reports a genuine zero reports it as a number and gets one back.
+ */
+export function tokenTotal(usage: TokenCounts | null | undefined): number | null {
+  if (!usage) return null;
+  if (typeof usage.totalTokens === 'number') return usage.totalTokens;
+  const parts = [usage.inputTokens, usage.outputTokens, usage.cacheReadTokens, usage.cacheWriteTokens];
+  let sum: number | null = null;
+  for (const part of parts) {
+    if (typeof part !== 'number') continue;
+    sum = (sum ?? 0) + part;
+  }
+  // Reasoning alone, with no input or output beside it, is still evidence that
+  // something was consumed — a null there would read as "reported nothing"
+  // about a runtime that plainly reported something.
+  if (sum === null && typeof usage.reasoningTokens === 'number') return usage.reasoningTokens;
+  return sum;
+}

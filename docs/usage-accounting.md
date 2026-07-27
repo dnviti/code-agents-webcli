@@ -68,6 +68,35 @@ of the jobs in it actually contributed a token figure or a cost figure
 (`tokensReportedJobs`, `costReportedJobs`), so "$4.10 across 28 of 40 jobs"
 is the shape of the answer, not "$4.10" on its own.
 
+## A job's token total
+
+The Tokens column, the headline total and every breakdown read one number per
+job. Where it comes from is worth being precise about, because most runtimes
+do not hand one over.
+
+**A total the runtime reported is always used as it stands.** Only where there
+is none are the parts added, and only the input, the output and the two cache
+buckets — never the reasoning tokens, which are a slice of the output rather
+than an addition to it. Both halves of that rule are read off what the agents
+actually send: grok reports 7210 input, 1893 output, 41000 cache read and 412
+reasoning, and calls the total 50103, which is the first three and not the
+fourth. codex is the other way round — its cached input is counted *inside* its
+input — and it always reports a total, so the sum is never reached for it.
+
+This matters most for Claude, which reports its four buckets on every message
+and a total on none of them, and where the cache is routinely 99% of the
+figure. Until this rule existed the history filed nothing for those jobs and
+showed **"not reported"** beside a cost that had reported fine.
+
+A job where the runtime reported *nothing* still reads "not reported", and an
+agent that cannot report usage at all still reads as `n/a`. Adding up nothing
+gives nothing, not zero.
+
+**Old history was corrected in place.** The parts were always recorded, so
+jobs filed before this derived their totals from what was already in the row,
+once, on the next start — no period of the dashboard is built on a different
+rule from any other, and nothing was estimated to get there.
+
 ## Cost is a list price, not a bill
 
 Every runtime prices a turn the same way: the tokens it moved, at the
@@ -133,6 +162,20 @@ cost, full stop.
 This was also a user-visible bug in its own right, independent of the
 accounting feature: before this correction, the live in-conversation cost
 meter over-counted on every turn after the first.
+
+### Claude repeats a turn's tokens on the way out
+
+The `result` message that ends a Claude turn carries a `usage` object, and that
+object is the whole turn's aggregate — every token in it has already been
+reported by the turn's own messages as they streamed. Everything downstream
+adds up what a turn reports, so passing it through counted each of those tokens
+twice: the live meter, the composer's session line and the recorded history all
+showed double, consistently enough that nothing looked wrong.
+
+The adapter now reports only the part the turn's messages did not: usually
+nothing, and the full aggregate for a turn that failed before its first message
+and so has nothing that could have been counted twice. The cost on the same
+event is cumulative in a different way and is corrected separately, just above.
 
 ### Grok's cost convention is an open question
 

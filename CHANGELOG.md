@@ -61,6 +61,48 @@
   already failed. The button, the three spellings and the menu entry are one
   behaviour: the button sends the same command. Nothing is deleted — the
   previous conversation stays in the log for history, search and export.
+
+- **The historical dashboard shows the tokens a job used, instead of "not
+  reported" for work whose tokens were on screen the whole time it ran.**
+  (#80) A job's token figure was whatever the runtime volunteered as a
+  pre-summed total — and Claude, the agent most people here run most, sends its
+  four buckets on every message and a total on none of them. So its rows read
+  "not reported" beside a cost that reported fine, and every figure built on
+  the column — the headline total, the breakdowns by project, agent and model,
+  the trend — silently skipped them. Anyone comparing agents or projects by
+  token consumption was comparing whichever handful of jobs happened to
+  survive.
+
+  A job's total is now derived when the runtime gives none, from the parts it
+  does give: the input, the output and the two cache buckets. Reasoning tokens
+  are deliberately left out — they are a slice of the output rather than an
+  addition to it — and a total the runtime did report is always used as it
+  stands, which is what keeps runtimes that count their cached input *inside*
+  their input from being billed for it twice. Both rules are read off what the
+  agents actually send rather than assumed, and there is a regression test per
+  agent, driven by captured wire logs, that compares what a job showed in chat
+  against what it was filed as having consumed.
+
+  **Existing history was corrected in place**, once, on the next start: the
+  parts were always recorded, so nothing was estimated to get there and no
+  period of the dashboard is built on a different rule from any other. Work
+  from an agent that reported nothing still reads "not reported", and an agent
+  that cannot report usage still reads as such — the two stay distinguishable.
+
+- **Claude's tokens were counted twice, everywhere.** Found while checking the
+  above. The `result` message that ends a Claude turn repeats the whole turn's
+  token counts, which the turn's own messages had already reported, and
+  everything downstream adds up what a turn reports — so the live meter, the
+  composer's session line and the recorded history all showed double. Claude's
+  cumulative *cost* was already corrected in the same adapter; its tokens now
+  are too.
+
+- **The composer's session line was leaving out the cache.** It added the input
+  to the output and stopped, which on Claude is a rounding error against the
+  real figure — 101 tokens where the meter beside it said 63.8k. Both readouts
+  and the historical record now come from one function, so they cannot answer
+  the same question three ways again.
+
 - **Skills and project commands are in the `/` menu from the moment a
   conversation opens, not after the first message.** (#71) Typing `/` in a new
   chat listed a handful of the runtime's built-in commands and nothing else:

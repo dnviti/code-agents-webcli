@@ -489,6 +489,36 @@ export class AppDatabase {
       CREATE INDEX IF NOT EXISTS idx_usage_jobs_project
         ON usage_jobs(project, ended_at);
     `);
+
+    // A total for the jobs filed before one was derived from the parts.
+    //
+    // Until #80 a job's total was whatever the runtime volunteered, and Claude
+    // volunteers none — so most of the history read "not reported" for work
+    // whose tokens were on screen while it ran, and every dashboard figure
+    // built on the column skipped those rows. The parts were always recorded,
+    // so this adds up what is already in the row rather than estimating
+    // anything, and it matches `tokenTotal` exactly: the cache buckets count,
+    // reasoning does not (it is a slice of the output, not an addition to it).
+    //
+    // Idempotent, and safe to run on every boot: the WHERE clause excludes
+    // every row it has already written, and a row where the runtime reported
+    // nothing at all has nothing to add up and is left as the null it is.
+    this.db.exec(`
+      UPDATE usage_jobs
+         SET total_tokens = COALESCE(input_tokens, 0)
+                          + COALESCE(output_tokens, 0)
+                          + COALESCE(cache_read_tokens, 0)
+                          + COALESCE(cache_write_tokens, 0)
+       WHERE total_tokens IS NULL
+         AND (input_tokens IS NOT NULL
+           OR output_tokens IS NOT NULL
+           OR cache_read_tokens IS NOT NULL
+           OR cache_write_tokens IS NOT NULL);
+
+      UPDATE usage_jobs
+         SET total_tokens = reasoning_tokens
+       WHERE total_tokens IS NULL AND reasoning_tokens IS NOT NULL;
+    `);
   }
 
   /**

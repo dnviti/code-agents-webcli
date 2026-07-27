@@ -87,6 +87,14 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
   /** Captured from message_delta, applied when message_stop closes the message. */
   private pendingStopReason?: string;
   private pendingUsage?: ChatUsage;
+  /**
+   * The token fields this turn's own messages have already reported.
+   *
+   * The watermark `turnTokensLeft` subtracts, so the aggregate on the turn's
+   * `result` is not counted a second time. Per turn rather than per session:
+   * the aggregate describes the turn.
+   */
+  private turnTokensEmitted: ChatUsage = {};
   /** Indices of open tool_use blocks in the current message, cleared per message. */
   private readonly openToolIndices = new Set<number>();
   /**
@@ -133,6 +141,7 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
 
   async send(turn: UserTurn): Promise<void> {
     this.activeTurnId = randomUUID();
+    this.turnTokensEmitted = {};
     const content: Array<Record<string, unknown>> = [{ type: 'text', text: turn.text }];
     for (const attachment of turn.attachments ?? []) {
       content.push(this.attachmentBlock(attachment));
@@ -474,6 +483,14 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
 
   private handleMessageStop(): void {
     if (!this.currentMsgId) return;
+    if (this.pendingUsage) {
+      for (const field of TOKEN_FIELDS) {
+        const value = this.pendingUsage[field];
+        if (typeof value === 'number') {
+          this.turnTokensEmitted[field] = (this.turnTokensEmitted[field] ?? 0) + value;
+        }
+      }
+    }
     this.emit({
       t: 'msg_end',
       msgId: this.currentMsgId,
@@ -601,15 +618,53 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     return spent > 0 ? spent : 0;
   }
 
+  /**
+   * The part of the `result` usage this turn has not already reported.
+   *
+   * Its sibling `total_cost_usd` is cumulative for the conversation and is
+   * corrected in `turnCost`; the `usage` object beside it is per-turn, and
+   * therefore repeats — field for field — what the turn's own messages already
+   * reported on their `message_delta`. Everything downstream sums what a turn
+   * reports, so passing it through unchanged counted every Claude token twice:
+   * the live session readout, the meter and the recorded history all showed
+   * double, consistently enough that nothing looked broken. Measured on the
+   * `claude-oneshot` capture, where the two messages report 4 / 97 / 16402 /
+   * 47287 between them and the result reports exactly 4 / 97 / 16402 / 47287.
+   *
+   * The remainder rather than nothing at all, because a turn whose messages
+   * reported no usage — an error before the first `message_delta`, a shape a
+   * future CLI invents — has nothing to have counted twice, and dropping the
+   * result's figures there would lose the turn's only reading of itself.
+   */
+  private turnTokensLeft(reported: ChatUsage): ChatUsage | undefined {
+    const left: ChatUsage = {};
+    let any = false;
+    for (const field of TOKEN_FIELDS) {
+      const value = reported[field];
+      if (typeof value !== 'number') continue;
+      const already = this.turnTokensEmitted[field] ?? 0;
+      // Clamped: a result that reports less than its own messages did means the
+      // two are counting different things, and a negative token count is not a
+      // measurement. Zero is, and it is the honest one — the tokens are already
+      // on the messages.
+      const remainder = value - already;
+      left[field] = remainder > 0 ? remainder : 0;
+      any = true;
+    }
+    this.turnTokensEmitted = {};
+    return any ? left : undefined;
+  }
+
   private handleResult(raw: Record<string, unknown>): void {
     const subtype = str(raw.subtype);
     const isError = raw.is_error === true;
 
     const usageRaw = record(raw.usage);
     const costUsd = this.turnCost(num(raw.total_cost_usd));
+    const tokens = usageRaw ? this.turnTokensLeft(mapUsage(usageRaw)) : undefined;
     const usage: ChatUsage | undefined =
-      usageRaw || costUsd !== undefined
-        ? { ...(usageRaw ? mapUsage(usageRaw) : {}), ...(costUsd !== undefined ? { costUsd } : {}) }
+      tokens || costUsd !== undefined
+        ? { ...(tokens ?? {}), ...(costUsd !== undefined ? { costUsd } : {}) }
         : undefined;
 
     const sessionId = str(raw.session_id);
@@ -680,6 +735,14 @@ function str(value: unknown): string | undefined {
 function num(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
+
+/** The token fields this adapter maps. Cost is not one: it is cumulative. */
+const TOKEN_FIELDS: Array<keyof ChatUsage> = [
+  'inputTokens',
+  'outputTokens',
+  'cacheWriteTokens',
+  'cacheReadTokens',
+];
 
 function mapUsage(raw: Record<string, unknown>): ChatUsage {
   return {

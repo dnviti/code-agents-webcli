@@ -256,6 +256,7 @@ async function run(): Promise<void> {
   await checkAWaitingMessageCanBeSentNow();
   await checkALongQueueCollapsesToOneRow();
   await checkFoldedHistoryIsNotBuiltUntilItIsOpened();
+  await checkAConversationTellsOneStoryAboutItsTokens();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -4431,5 +4432,113 @@ async function checkFoldedHistoryIsNotBuiltUntilItIsOpened(): Promise<void> {
   );
 
   mounted.root.unmount();
+  host.remove();
+}
+
+/**
+ * That a conversation tells one story about how many tokens it has used.
+ *
+ * Issue #80. Three surfaces answered the same question differently: the
+ * composer's session line added the input to the output and stopped there, the
+ * header meter added the cache buckets too, and the historical dashboard filed
+ * only a total the runtime had volunteered — which Claude never does. The
+ * figures below are one real turn out of `claude-oneshot.jsonl`, where the
+ * cache is 63,689 of the 63,790 tokens, so a readout that leaves it out is not
+ * slightly low, it is the wrong order of magnitude.
+ */
+async function checkAConversationTellsOneStoryAboutItsTokens(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1000px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('tokens-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'tokens-check',
+    snapshot: {
+      sessionId: 'tokens-check',
+      runtime: 'claude',
+      state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: false, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: false,
+      },
+      messages: [],
+      pendingPermissions: [],
+      queued: [],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 1,
+      live: true,
+      bypassPermissions: false,
+    },
+  } as never);
+
+  const push = (event: Record<string, unknown>, seq: number): void => {
+    controller.handle({
+      type: 'chat_event',
+      sessionId: 'tokens-check',
+      event: { seq, ts: 1_700_000_000_000 + seq, ...event },
+    } as never);
+  };
+
+  push({ t: 'msg_start', id: 'u1', role: 'user', turnId: 'turn-1' }, 1);
+  push({ t: 'block_start', msgId: 'u1', index: 0, block: { kind: 'text', text: 'go' } }, 2);
+  push({ t: 'msg_end', msgId: 'u1' }, 3);
+  push({ t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'turn-1' }, 4);
+  push({ t: 'block_start', msgId: 'a1', index: 0, block: { kind: 'text', text: 'done' } }, 5);
+  // What Claude reports for this turn: four buckets, and no total at all.
+  push({
+    t: 'msg_end',
+    msgId: 'a1',
+    usage: { inputTokens: 4, outputTokens: 97, cacheWriteTokens: 16402, cacheReadTokens: 47287 },
+  }, 6);
+  push({ t: 'turn_end', turnId: 'turn-1', usage: { costUsd: 0.1901 } }, 7);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(300);
+
+  const meter = host.querySelector('[role="group"][aria-label="Session usage"]');
+  const meterText = (meter?.textContent ?? '').replace(/\s+/g, ' ');
+  check(
+    'the session meter counts a Claude turn’s cache, which is almost all of it',
+    /63\.8k tok/.test(meterText),
+    meterText || 'no session meter on screen',
+  );
+
+  // The composer's own line, which is the figure most often glanced at and was
+  // the one leaving the cache out.
+  // Anything but the meter above: the two are separate readouts of one number,
+  // and a selector that could match either would pass on the meter twice.
+  const readout = Array.from(host.querySelectorAll('span')).find(
+    (span) =>
+      /\d+(\.\d+)?k? tok/.test(span.textContent ?? '')
+      && !span.querySelector('span')
+      && !meter?.contains(span),
+  );
+  const readoutText = (readout?.textContent ?? '').replace(/\s+/g, ' ');
+  check(
+    'and the composer’s session line says the same thing, not input plus output alone',
+    /64k tok/.test(readoutText),
+    readoutText || 'no session line on screen',
+  );
+  check(
+    'so the two readouts are not two different answers about one conversation',
+    !/101 tok/.test(readoutText) && !/101 tok/.test(meterText),
+    `${meterText} | ${readoutText}`,
+  );
+
+  root.unmount();
   host.remove();
 }
