@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### Changed
+- **Folded history is not built until it is opened, and what is kept is
+  bounded.** (#81) Entering a conversation rebuilt its entire backlog at once —
+  text, code blocks, diagrams, tool output and file previews all at the same
+  moment — which showed as a visible stutter, content popping in and the view
+  shifting under the pointer before the chat settled. It got worse the longer
+  the conversation was, and it was paid on every entry rather than the first,
+  because the chat surface is remounted per session. Almost all of that work
+  was wasted: every turn but the newest is folded shut, so what was being built
+  was not on screen. The old code rendered every turn and then hid the folded
+  ones.
+
+  A folded turn is now not built at all. Forty turns of history mount the two
+  message bubbles of the turn on screen rather than eighty, and cost a strip
+  and an index row each — twenty-eight DOM nodes, the same whether the turn
+  behind them holds two thousand characters or sixty thousand. Nothing is
+  hidden by it: every turn keeps its strip and its index row, opens on a click,
+  and opens on a jump from the turn index or from search.
+
+  What has been opened is kept, so re-folding and re-opening is immediate
+  rather than a second rebuild — the behaviour hiding-rather-than-unmounting
+  used to buy, kept deliberately. What is kept is bounded by the *content* it
+  holds rather than by a count of turns, since a conversation of one-line
+  exchanges and one full of large files are nothing alike at the same turn
+  count; past the bound the least recently opened material is released and
+  built again on demand, so a long conversation cannot grow the browser's
+  memory use without end.
+
+  The turn in progress is exempt: it is prepared whether folded or open, and a
+  turn that kept running while folded opens on its real current state rather
+  than a snapshot, because a bubble reads its message off the transcript when
+  it mounts.
+
 ### Fixed
 - **Skills and project commands are in the `/` menu from the moment a
   conversation opens, not after the first message.** (#71) Typing `/` in a new

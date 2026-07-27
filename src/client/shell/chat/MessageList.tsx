@@ -2,6 +2,7 @@ import * as React from 'react';
 import type { ChatMessage } from '../../../shared/chat-events.js';
 import { ChatTranscript } from '../../chat/transcript.js';
 import { createStick, BOTTOM_SLACK, type StickHandle } from '../../chat/stick.js';
+import { messageWeight, retain } from '../../chat/retain.js';
 import type { TurnSummary } from '../../chat/turns.js';
 import { Button } from '../../ui/relay/Button.js';
 import { Icon } from '../../ui/relay/Icon.js';
@@ -24,6 +25,11 @@ import { TurnStrip } from './TurnStrip.js';
  * shrinking (the terminal split opening is exactly this), and late async layout.
  * The user scrolling up is an instruction, and it outranks anything the agent is
  * emitting.
+ *
+ * A folded turn's bubbles are not built at all until it is opened, and what has
+ * been built is kept to a bounded amount of content — see `retain`. This used to
+ * render every turn and hide the folded ones, which meant entering a long
+ * conversation prepared its whole backlog for nobody to look at.
  */
 
 export interface MessageListHandle {
@@ -196,11 +202,21 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
       if (el.scrollTop <= TOP_SLACK) requestMore();
     }, [requestMore, stick]);
 
-    const scrollToId = React.useCallback((selector: string) => {
+    const scrollToId = React.useCallback((selector: string, retry = true) => {
       const el = scroller.current;
       if (!el) return;
       const target = el.querySelector(selector) as HTMLElement | null;
-      if (!target) return;
+      if (!target) {
+        // The turn being jumped to may only just have been opened, and its
+        // bubbles are built by that render rather than sitting hidden in the
+        // document already. One frame later they are there. Once only, so a
+        // jump to something that genuinely is not in the transcript settles
+        // instead of retrying forever.
+        if (retry && typeof requestAnimationFrame === 'function') {
+          requestAnimationFrame(() => scrollToId(selector, false));
+        }
+        return;
+      }
       // `scrollTo` on this scroller, never `scrollIntoView`: the latter scrolls
       // every ancestor too and can drag the whole app shell sideways to bring a
       // wide code block into view.
@@ -268,6 +284,64 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
     }, [messages, version]);
 
     const lastTurnId = turns.length ? turns[turns.length - 1].id : undefined;
+
+    // ------------------------------------------------- which turns are built
+    //
+    // An absent `openTurnIds` means nobody is managing fold state, so every
+    // turn reads as open — and every turn is therefore prepared, exactly as it
+    // was before any of this existed.
+    const openSet = React.useMemo(
+      () => openTurnIds ?? new Set(turns.map((turn) => turn.id)),
+      [openTurnIds, turns],
+    );
+
+    // Weighed once per turn and remembered. Only a turn that is neither open
+    // nor live is ever weighed (see `retain`), and such a turn is finished, so
+    // its content cannot change underneath the cache. The message count is in
+    // the key anyway, because paging older history in can extend the first
+    // group.
+    const weights = React.useRef(new Map<string, number>());
+    // Indexed rather than searched: this runs on every render, and a `find`
+    // per candidate turn is quadratic in a conversation long enough for any of
+    // this to matter.
+    const turnById = React.useMemo(() => {
+      const map = new Map<string, TurnSummary>();
+      for (const turn of turns) map.set(turn.id, turn);
+      return map;
+    }, [turns]);
+    const turnIds = React.useMemo(() => turns.map((turn) => turn.id), [turns]);
+    const weightOf = React.useCallback(
+      (turnId: string) => {
+        const turn = turnById.get(turnId);
+        if (!turn) return 0;
+        const key = `${turnId}:${turn.messageIds.length}`;
+        const cached = weights.current.get(key);
+        if (cached !== undefined) return cached;
+        let weight = 0;
+        for (const id of turn.messageIds) {
+          const message = messageById.get(id);
+          if (message) weight += messageWeight(message);
+        }
+        weights.current.set(key, weight);
+        return weight;
+      },
+      [turnById, messageById],
+    );
+
+    // Held in a ref and recomputed during render rather than in an effect: an
+    // effect would paint one frame with the old answer, which on the frame that
+    // opens a turn is a visible empty body. `retain` is idempotent and returns
+    // its previous answer unchanged when nothing moved, so running it twice —
+    // as StrictMode does — cannot drift.
+    const retainedRef = React.useRef<string[]>([]);
+    retainedRef.current = retain(retainedRef.current, {
+      order: turnIds,
+      open: openSet,
+      liveId: lastTurnId,
+      weightOf,
+    });
+    const retainedIds = retainedRef.current;
+    const retained = React.useMemo(() => new Set(retainedIds), [retainedIds]);
 
     // Which strip has just acknowledged a copy. The prop existed and nothing
     // ever set it, so the glyph never flipped and the click had no feedback.
@@ -379,12 +453,16 @@ export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>
                     onToggleOpen={() => onToggleTurn?.(turn.id)}
                     bodyId={bodyId}
                   />
-                  {/* Hidden rather than unmounted: a collapsed turn's bubbles
-                      keep their scroll offsets and streaming subscriptions, so
-                      re-expanding it is instant and cannot desync from a turn
-                      that kept running underneath. */}
+                  {/* A folded turn that has been opened before is hidden rather
+                      than unmounted, so re-opening it is instant. One that has
+                      not is empty until it is opened — that is the whole point
+                      of this, and nothing is lost by it: a bubble reads its
+                      message off the transcript and subscribes to it on mount,
+                      so a turn that kept running while folded shows its current
+                      state when it is finally built, not a snapshot from when
+                      it was folded. */}
                   <div id={bodyId} hidden={!open} style={{ display: open ? 'flex' : 'none', flexDirection: 'column' }}>
-                    {rowsOf(turn.messageIds, messageById).map(({ message, carriedIds }) => (
+                    {!retained.has(turn.id) ? null : rowsOf(turn.messageIds, messageById).map(({ message, carriedIds }) => (
                       <MessageBubble
                         key={message.id}
                         message={message}
