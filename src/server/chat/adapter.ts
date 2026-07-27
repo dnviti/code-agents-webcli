@@ -49,6 +49,28 @@ export interface ChatAdapterOptions {
   /** Native session id to resume, when the runtime and the log both have one. */
   resumeSessionId?: string;
   /**
+   * What this conversation has already been billed, for a runtime whose cost
+   * figure is a running total rather than a per-turn one.
+   *
+   * Claude is the case this exists for, verified against 2.1.220: its `result`
+   * message carries per-turn *token* counts but a `total_cost_usd` that keeps
+   * climbing across the whole conversation — and across a `--resume` into a new
+   * process, which is why the baseline has to come from outside the adapter.
+   * Every consumer downstream, the live meter included, treats cost on a turn
+   * as that turn's cost, so the subtraction happens once, here, at the only
+   * place that knows the runtime's own convention.
+   *
+   * Three states, and the third is the interesting one. Undefined means a fresh
+   * conversation whose counter starts at zero. A number means a resumed
+   * conversation that has been billed exactly that much. `null` means a resumed
+   * conversation with no record at all — one that ran before any of this
+   * existed — where the counter is already somewhere unknown and well above
+   * zero. There the first reading is adopted as the watermark and that turn
+   * reports no cost, because "we cannot tell" is the only true answer and it is
+   * far better than charging one turn for a fortnight of work.
+   */
+  costBaselineUsd?: number | null;
+  /**
    * The MCP server that lets the model ask the user a multiple-choice question.
    *
    * Handed to adapters whose runtime takes MCP servers through the protocol

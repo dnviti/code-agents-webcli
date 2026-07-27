@@ -58,7 +58,11 @@ export function StatusPanel({
           />
         </Group>
 
-        <Group title="Subscription">
+        {/* Named for what it actually reads rather than for what it looked
+            like. It only understands Claude, and it reports the machine, so a
+            heading that said "Subscription" invited every user of every other
+            agent to read it as their own. */}
+        <Group title="Claude rate limit (this machine)">
           <PlanSection plan={data?.plan ?? null} loading={busy && !data} />
         </Group>
 
@@ -190,6 +194,13 @@ function PlanSection({
   if (loading) return <Quiet>Reading…</Quiet>;
   if (!plan) return <Quiet>This server is not tracking a subscription.</Quiet>;
 
+  // What this section is, said plainly, because it used to be read as this
+  // user's spending and it is neither. It comes from Claude Code's own
+  // transcript files on the host, so it covers every account and every project
+  // on this machine and knows nothing about the other agents. The question it
+  // does answer — how close this machine is to its rate-limit window — is not
+  // one the accounting record can answer, which is why it stays.
+
   const limits = plan.limits || null;
   const tokens = Number(plan.sessionStats?.totalTokens ?? 0);
   const cost = Number(plan.sessionStats?.totalCost ?? 0);
@@ -229,6 +240,12 @@ function PlanSection({
           value={window.resetAt ? new Date(window.resetAt).toLocaleTimeString() : '—'}
         />
       ))}
+
+      <Quiet>
+        Claude&rsquo;s rate-limit window for this whole machine, read from its own files — not
+        your spending, and not this conversation&rsquo;s. Open Usage for what your work actually
+        cost, across every agent.
+      </Quiet>
     </>
   );
 }

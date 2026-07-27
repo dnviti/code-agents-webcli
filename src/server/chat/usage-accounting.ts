@@ -1,0 +1,350 @@
+/**
+ * Turning a stream of chat events into one accounting record per job.
+ *
+ * This watches the same events the transcript is built from and answers a
+ * different question: not "what did the agent say" but "what did that cost".
+ * It is deliberately a pure observer — it is fed events, it never asks anything
+ * of the session, and it holds nothing that could not be recomputed by replaying
+ * the log. That is what makes it safe to hang off `ChatSession.ingest`, the one
+ * choke point every event already passes through.
+ *
+ * ## What a job is
+ *
+ * One prompt, and everything the agent did to answer it: the span from the user's
+ * message to the runtime's `turn_end`. Inside that span, *turns* counts the times
+ * the model spoke — the same quantity Claude reports as `num_turns` — and *tool
+ * calls* counts the tool blocks that opened. Every runtime here has the first
+ * boundary; almost none of them report the two counts, which is precisely why
+ * they are counted from the transcript rather than asked for.
+ *
+ * ## Additive versus absolute reporting
+ *
+ * Runtimes disagree about what a usage figure means, and getting this wrong
+ * silently multiplies somebody's bill:
+ *
+ * - claude, grok, pi and the ACP agents report a figure *for the message or the
+ *   turn*. Those sum.
+ * - codex reports a running total for the whole conversation on a standalone
+ *   `usage` event, and so does an ACP `usage_update`. Summing those would count
+ *   every earlier turn again on every later one.
+ *
+ * The rule mirrors the shared reducer exactly, which is the point — the number
+ * filed here and the number on screen come from the same reading of the same
+ * events. Figures on `msg_end`/`turn_end` add up; a standalone `usage` event
+ * replaces, and a job's share of it is what it grew by while that job ran.
+ *
+ * The one thing not handled here is Claude's cumulative *cost*, which is fixed
+ * in the adapter that produces it — see `costBaselineUsd` in the claude adapter.
+ * Correcting it there rather than here keeps a single invariant for everyone
+ * downstream, the live meter included: cost on a turn is that turn's cost.
+ */
+
+import { ChatEvent, ChatUsage, mergeUsage } from '../../shared/chat-events.js';
+import { UsageOutcome, UsageToolCount } from '../../shared/usage-records.js';
+
+/** Everything the accountant knows about a job it has just closed. */
+export interface FinishedJob {
+  turnId: string;
+  nativeSessionId: string | null;
+  model: string | null;
+  startedAt: number;
+  endedAt: number;
+  durationMs: number | null;
+  outcome: UsageOutcome;
+  turns: number;
+  toolCalls: number;
+  usage: ChatUsage;
+  tools: UsageToolCount[];
+}
+
+interface OpenJob {
+  turnId: string;
+  startedAt: number;
+  model: string | null;
+  turns: number;
+  tools: Map<string, number>;
+  toolCalls: number;
+  /** Summed from `msg_end` and `turn_end`. */
+  additive: ChatUsage;
+  /** The running total as it stood when this job opened, or null if none seen yet. */
+  absoluteAtStart: ChatUsage | null;
+  /** How many readings had arrived when this job opened. */
+  readingsAtStart: number;
+  outcome: UsageOutcome;
+}
+
+/** The token fields that sum. Context-window fields are deliberately absent. */
+const COUNTED: Array<keyof ChatUsage> = [
+  'inputTokens',
+  'outputTokens',
+  'cacheReadTokens',
+  'cacheWriteTokens',
+  'reasoningTokens',
+  'totalTokens',
+  'costUsd',
+];
+
+export class UsageAccountant {
+  private job: OpenJob | null = null;
+  /** Roles by message id, so only what the *model* said counts as a turn. */
+  private readonly roles = new Map<string, string>();
+  /** The latest running total from a standalone `usage` event. */
+  private absolute: ChatUsage | null = null;
+  /**
+   * Where this process's running total starts counting from. Settled once, on
+   * the first reading, and never revised — see the constructor.
+   */
+  private floor: ChatUsage | null = null;
+  /**
+   * How many running totals have arrived.
+   *
+   * A job that saw none of them reported nothing on that channel, which is not
+   * the same as reporting zero — without this counter a quiet turn is filed as
+   * a measured zero, and every consumer downstream would believe it.
+   */
+  private readings = 0;
+  private nativeSessionId: string | null = null;
+  private sessionModel: string | null = null;
+  /** Tool blocks already counted, so a re-announced call is not counted twice. */
+  private readonly seenTools = new Set<string>();
+
+  /**
+   * @param prior What this conversation has already been recorded as consuming,
+   *   when this process resumed one. Omitted for a conversation starting fresh.
+   *
+   *   It settles where a running total starts counting from, and the two ways of
+   *   getting that wrong are both expensive: treat a counter that carries
+   *   history as if it started at zero and one job is billed the whole
+   *   conversation; treat a counter that restarted as if it carried history and
+   *   a job is billed nothing. Which of the two a runtime does is not something
+   *   its documentation says, and codex and the ACP agents do not agree.
+   *
+   *   So it is decided from evidence rather than declared: if the first reading
+   *   is at least what we have already recorded, the counter carried the history
+   *   and the floor is that recorded figure; if it is less, the counter plainly
+   *   restarted and the floor is zero. A fresh conversation has recorded nothing,
+   *   which makes the same rule give zero without a special case.
+   */
+  constructor(
+    private readonly onFinished: (job: FinishedJob) => void,
+    private readonly prior?: ChatUsage,
+  ) {}
+
+  /**
+   * Feed one event.
+   *
+   * Nothing here throws: accounting must never be able to take a conversation
+   * down with it. Callers wrap this anyway, but the code is written as if they
+   * did not.
+   */
+  observe(event: ChatEvent): void {
+    switch (event.t) {
+      case 'session':
+        if (event.nativeSessionId) this.nativeSessionId = event.nativeSessionId;
+        if (event.model) this.sessionModel = event.model;
+        return;
+
+      case 'msg_start':
+        this.roles.set(event.id, event.role);
+        if (event.role === 'user') {
+          // The user's own message is what opens a job — it is emitted with the
+          // turn id the moment the turn is accepted, before the runtime has
+          // said anything at all.
+          this.openJob(event.turnId, event.ts);
+        }
+        if (event.model) {
+          this.sessionModel = event.model;
+          if (this.job) this.job.model = event.model;
+        }
+        return;
+
+      case 'msg_end': {
+        if (!this.job) return;
+        if (this.roles.get(event.msgId) === 'assistant') this.job.turns += 1;
+        if (event.usage) this.job.additive = mergeUsage(this.job.additive, event.usage);
+        return;
+      }
+
+      case 'block_start': {
+        if (!this.job || event.block.kind !== 'tool') return;
+        // Keyed on the tool id rather than counted blindly: a runtime that
+        // re-announces a call it already opened (claude does, once its streamed
+        // arguments parse) would otherwise inflate every tool count.
+        if (this.seenTools.has(event.block.toolId)) return;
+        this.seenTools.add(event.block.toolId);
+        this.job.toolCalls += 1;
+        const name = event.block.name || 'unnamed';
+        this.job.tools.set(name, (this.job.tools.get(name) ?? 0) + 1);
+        return;
+      }
+
+      case 'usage': {
+        // Absolute: replaces, never sums. See the note at the top of the file.
+        //
+        // Field by field, and only where a figure was actually given: ACP sends
+        // a context-size update with the cost key present but undefined
+        // whenever the runtime omits a cost or quotes a currency that is not
+        // USD, and spreading that over the stored total erased the watermark —
+        // so the next reading was measured against zero and one job was billed
+        // the entire conversation again.
+        const first = this.absolute === null;
+        const merged: ChatUsage = { ...(this.absolute ?? {}) };
+        for (const [field, value] of Object.entries(event.usage)) {
+          if (value !== undefined) (merged as Record<string, unknown>)[field] = value;
+        }
+        this.absolute = merged;
+        this.readings += 1;
+        if (first && this.floor === null) this.floor = floorFor(merged, this.prior);
+        if (this.job && this.job.absoluteAtStart === null) {
+          this.job.absoluteAtStart = this.floor ?? {};
+          this.job.readingsAtStart = this.readings - 1;
+        }
+        return;
+      }
+
+      case 'error':
+        if (this.job && event.fatal !== false) this.job.outcome = 'error';
+        return;
+
+      case 'turn_end':
+        if (event.usage && this.job) this.job.additive = mergeUsage(this.job.additive, event.usage);
+        this.close(event.ts, event.durationMs ?? null, event.turnId);
+        return;
+
+      case 'state':
+        // A runtime that died mid-turn still did work, and the record says so
+        // rather than losing it. `idle` is not a close: turn_end already is one,
+        // and the session sets idle straight after it.
+        if (event.state === 'exited' || event.state === 'error') {
+          if (this.job) this.job.outcome = 'interrupted';
+          this.close(event.ts, null, null);
+        }
+        return;
+
+      default:
+        return;
+    }
+  }
+
+  /** Close anything still open — the session is going away. */
+  flush(at = Date.now()): void {
+    if (this.job) this.job.outcome = 'interrupted';
+    this.close(at, null, null);
+  }
+
+  private openJob(turnId: string, ts: number): void {
+    // The first user message of a prompt opens the job and every later one is
+    // ignored, because more than one arrives. `deliver` emits ours with the
+    // turn id it minted, and then codex and the ACP agents echo the prompt back
+    // with a turn id of their own — which, when that echo was allowed to close
+    // and reopen, filed a second empty job for every single prompt those agents
+    // ever answered. Half their history was blank rows, and their turns- and
+    // tool-calls-per-job averages came out at exactly half the truth, in the
+    // one comparison those figures exist to support.
+    if (this.job) return;
+    this.job = {
+      turnId,
+      startedAt: ts,
+      model: this.sessionModel,
+      turns: 0,
+      tools: new Map(),
+      toolCalls: 0,
+      additive: {},
+      absoluteAtStart: this.absolute ? { ...this.absolute } : null,
+      readingsAtStart: this.readings,
+      outcome: 'completed',
+    };
+    this.seenTools.clear();
+  }
+
+  private close(ts: number, durationMs: number | null, turnId: string | null): void {
+    const job = this.job;
+    if (!job) return;
+    this.job = null;
+
+    // Only when a reading actually arrived while this job was open. A job that
+    // saw none of them was told nothing on that channel, and subtracting an
+    // unmoved counter from itself would file a row of measured zeros — the one
+    // thing this whole record is built not to do. The spend those zeros stood
+    // for is not lost: it is still inside the next reading, and lands on the
+    // job that was open when it arrived. That is the most a cumulative counter
+    // can honestly support.
+    const sawReading = this.readings > job.readingsAtStart;
+    const grown =
+      sawReading && job.absoluteAtStart ? subtract(this.absolute ?? {}, job.absoluteAtStart) : {};
+    const usage = mergeUsage(job.additive, grown);
+
+    // Nothing was said, nothing was called, nothing was reported: there is no
+    // work here to account for. `/clear` produces one of these — it opens a
+    // turn before it is recognised as a command — and filing it would put a
+    // blank row in the permanent history and count it against every "N of M
+    // jobs reported" figure on the dashboard.
+    const empty =
+      job.turns === 0 && job.toolCalls === 0 && !COUNTED.some((f) => usage[f] !== undefined);
+    if (empty) return;
+
+    this.onFinished({
+      // Always the id this app minted when it accepted the prompt, never the
+      // one the runtime put on `turn_end`. grok and pi number their turns from
+      // a counter that restarts with every process — so after a restart or a
+      // `/clear` their second conversation reuses `t1`, `t2`, and since a
+      // record is keyed on session and turn, the new jobs overwrote the old
+      // ones. Half a conversation's history disappeared, and the spend with it.
+      turnId: job.turnId,
+      nativeSessionId: this.nativeSessionId,
+      model: job.model,
+      startedAt: job.startedAt,
+      endedAt: ts,
+      durationMs: durationMs ?? (ts > job.startedAt ? ts - job.startedAt : null),
+      outcome: job.outcome,
+      turns: job.turns,
+      toolCalls: job.toolCalls,
+      usage,
+      tools: [...job.tools].map(([tool, calls]) => ({ tool, calls })),
+    });
+  }
+}
+
+/**
+ * Where a running total starts counting from, decided from the first reading.
+ *
+ * See the constructor. A reading at or above what this conversation has already
+ * been recorded as using means the counter carried its history across the
+ * resume, so the floor is that recorded figure; a reading below it means the
+ * counter restarted and the floor is zero. Per field, because a runtime is free
+ * to reset some of them and not others.
+ */
+function floorFor(first: ChatUsage, prior: ChatUsage | undefined): ChatUsage {
+  if (!prior) return {};
+  const out: ChatUsage = {};
+  for (const field of COUNTED) {
+    const already = prior[field];
+    const reading = first[field];
+    if (typeof already !== 'number' || already <= 0) continue;
+    if (typeof reading === 'number' && reading >= already) {
+      (out as Record<string, number>)[field] = already;
+    }
+  }
+  return out;
+}
+
+/**
+ * `a - b`, over the fields that count.
+ *
+ * Clamped at zero: a runtime that resets its own counter — a fresh process on a
+ * conversation it is resuming, most obviously — would otherwise hand back a
+ * negative figure, and a negative token count is not a measurement, it is a
+ * missing baseline. Fields absent from `a` stay absent, so "never reported"
+ * survives the subtraction as a null rather than becoming a zero.
+ */
+function subtract(a: ChatUsage, b: ChatUsage): ChatUsage {
+  const out: ChatUsage = {};
+  for (const field of COUNTED) {
+    const left = a[field];
+    if (typeof left !== 'number') continue;
+    const right = b[field];
+    const value = left - (typeof right === 'number' ? right : 0);
+    (out as Record<string, number>)[field] = value > 0 ? value : 0;
+  }
+  return out;
+}

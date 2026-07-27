@@ -93,6 +93,8 @@ export interface ShellDialogs {
   rename: string | null;
   /** The chat surface's own presentation settings. */
   chatSettings: boolean;
+  /** The token/cost accounting dashboard. */
+  usage: boolean;
 }
 
 export interface FolderEntry {
@@ -237,6 +239,7 @@ const INITIAL: ShellState = {
     more: false,
     rename: null,
     chatSettings: false,
+    usage: false,
   },
   folder: {
     open: false,

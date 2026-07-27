@@ -6,6 +6,7 @@ import {
   ChatEvent,
   ChatSnapshot,
   ChatState,
+  ChatUsage,
   MAX_QUEUED_TURNS,
   PermissionOption,
   PermissionRequest,
@@ -36,6 +37,8 @@ import {
 import { ASK_SOCKET_ENV, askMcpConfig } from './ask-mcp.js';
 import { ChatStoreLike, ChatSessionRef } from './store.js';
 import { askChannelFor, createChatAdapter, supportsChat } from './registry.js';
+import { FinishedJob, UsageAccountant } from './usage-accounting.js';
+import { UsageJobInput } from '../services/usage-store.js';
 
 /**
  * One chat conversation, owned by the server.
@@ -87,6 +90,40 @@ export interface ChatSessionDeps {
     sessionId: string,
     change: { nativeSessionId?: string; exited?: boolean },
   ) => void;
+  /**
+   * Where finished work is filed.
+   *
+   * Optional, and every call site tolerates its absence: accounting is a
+   * bystander here, and a session must be able to run without one. Every test
+   * fixture that predates it constructs a session with no sink at all.
+   */
+  usage?: ChatUsageSink;
+}
+
+/**
+ * The accounting side of a session, as this file needs it.
+ *
+ * A narrow interface rather than the store itself so the session depends on
+ * what it uses — file a job, ask what a conversation has been billed — and not
+ * on SQLite.
+ */
+export interface ChatUsageSink {
+  record(job: UsageJobInput): void;
+  /**
+   * What this conversation has already been recorded as consuming.
+   *
+   * The baseline for every runtime that reports a running total rather than a
+   * per-turn figure — tokens here, and cost through `costBaselineFor` for the
+   * one runtime whose cost works that way.
+   */
+  consumedFor(nativeSessionId: string): ChatUsage;
+  /**
+   * What this conversation has already been billed, or null when nothing is
+   * recorded for it at all. See `costBaselineUsd` on the adapter options.
+   */
+  costBaselineFor(nativeSessionId: string): number | null;
+  /** The login to file the work under, resolved once per job. */
+  loginFor(userId: number): string;
 }
 
 export interface ChatSessionStartOptions {
@@ -230,6 +267,15 @@ export class ChatSession {
   /** Guards the drain against re-entering itself through `send` -> `ingest`. */
   private draining = false;
 
+  /**
+   * Watches this session's own events and files what each job cost.
+   *
+   * Rebuilt on every `start()` because the two things it has to know — whether
+   * this process resumed a conversation, and what that conversation had already
+   * been billed — are properties of the launch, not of the session.
+   */
+  private accountant: UsageAccountant | null = null;
+
   constructor(
     private readonly ref: ChatSessionRef,
     private readonly deps: ChatSessionDeps,
@@ -288,6 +334,22 @@ export class ChatSession {
     // a resumed session does not renumber events a browser already holds.
     const stats = await this.deps.store.stat(this.ref);
     this.seq = Math.max(this.seq, stats.cursor);
+
+    // Anything still open belongs to the process that just went away, not to
+    // the one about to start, and a relaunch is exactly where an interrupted
+    // job would otherwise be lost.
+    this.accountant?.flush();
+    this.accountant = this.deps.usage
+      ? new UsageAccountant(
+          (job) => this.fileJob(job),
+          // Only when resuming, and it is what this conversation has already
+          // been recorded as using — the evidence the accountant needs to tell
+          // a counter that carried its history from one that restarted.
+          options.resumeSessionId
+            ? this.deps.usage.consumedFor(options.resumeSessionId)
+            : undefined,
+        )
+      : null;
 
     const env = { ...(options.env || {}) };
     const extraArgs = [...(options.extraArgs || [])];
@@ -354,6 +416,12 @@ export class ChatSession {
       env,
       bypassPermissions: this.bypass,
       resumeSessionId: options.resumeSessionId,
+      // Only when resuming: a conversation the runtime is starting fresh has a
+      // counter that starts at zero, and handing it a baseline would suppress
+      // the whole first turn's cost.
+      costBaselineUsd: options.resumeSessionId
+        ? this.deps.usage?.costBaselineFor(options.resumeSessionId)
+        : undefined,
       askMcpServer,
       emit: (event) => this.ingest(event),
       readFile: this.deps.readFile
@@ -528,6 +596,16 @@ export class ChatSession {
 
     this.deps.broadcast(this.ref.id, { type: 'chat_event', sessionId: this.ref.id, event: stamped });
 
+    // After the log and the socket, and wrapped: accounting is a bystander to
+    // this conversation and must never be able to stop one. A dropped record is
+    // a hole in a report; a throw here would be a chat that stops mid-turn.
+    try {
+      this.accountant?.observe(stamped);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`chat ${this.ref.id}: could not account for an event: ${message}`);
+    }
+
     // Last, and only after the event is on the wire: this is where a turn that
     // ended hands the runtime to whatever was typed while it ran. Doing it here
     // rather than on a timer means the line advances the instant the state
@@ -539,6 +617,54 @@ export class ChatSession {
   private setState(state: ChatState): void {
     if (this.state === state) return;
     this.ingest({ t: 'state', state });
+  }
+
+  /**
+   * File a finished job.
+   *
+   * Note what is *not* here: nothing the user typed, nothing the agent said,
+   * no tool arguments. The record is measurements and identifiers, which is
+   * what lets it be kept forever under rules the transcript could never meet.
+   *
+   * A figure the runtime never reported stays null rather than becoming zero —
+   * the capability flags recorded alongside are what let a reader tell "this
+   * agent cannot report cost" from "this job cost nothing".
+   */
+  private fileJob(job: FinishedJob): void {
+    const usage = this.deps.usage;
+    if (!usage) return;
+    const numeric = (value: number | undefined): number | null =>
+      typeof value === 'number' && Number.isFinite(value) ? value : null;
+    try {
+      usage.record({
+        sessionId: this.ref.id,
+        nativeSessionId: job.nativeSessionId ?? this.nativeSessionId,
+        turnId: job.turnId,
+        userId: this.ref.ownerUserId,
+        userLogin: usage.loginFor(this.ref.ownerUserId),
+        agent: this.runtime,
+        model: job.model,
+        startedAt: new Date(job.startedAt).toISOString(),
+        endedAt: new Date(job.endedAt).toISOString(),
+        durationMs: job.durationMs,
+        outcome: job.outcome,
+        turns: job.turns,
+        toolCalls: job.toolCalls,
+        inputTokens: numeric(job.usage.inputTokens),
+        outputTokens: numeric(job.usage.outputTokens),
+        cacheReadTokens: numeric(job.usage.cacheReadTokens),
+        cacheWriteTokens: numeric(job.usage.cacheWriteTokens),
+        reasoningTokens: numeric(job.usage.reasoningTokens),
+        totalTokens: numeric(job.usage.totalTokens),
+        costUsd: numeric(job.usage.costUsd),
+        reportsUsage: this.capabilities?.usage === true,
+        reportsCost: this.capabilities?.cost === true,
+        tools: job.tools,
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`chat ${this.ref.id}: could not record usage for a job: ${message}`);
+    }
   }
 
   // -------------------------------------------------------------- the queue
@@ -1007,6 +1133,12 @@ export class ChatSession {
     }
     this.questions.clear();
     this.clearQueue();
+
+    // Before the adapter goes: a turn that was still running when someone hit
+    // stop is work that happened, and losing it would make every deliberate
+    // interruption invisible in the record.
+    this.accountant?.flush();
+    this.accountant = null;
 
     const adapter = this.adapter;
     this.adapter = null;

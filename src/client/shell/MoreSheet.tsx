@@ -19,6 +19,7 @@ export interface MoreSheetProps {
   onSwitchMode(): void;
   onCloseSession(): void;
   onOpenSettings(): void;
+  onOpenUsage(): void;
   onToggleTheme(): void;
   onRename?(): void;
 }
@@ -40,7 +41,7 @@ interface SheetAction {
 export function MoreSheet({
   open, theme, logoutUrl, canCloseSession, install, onClose, onInstall,
   onReconnect, onClearTerminal, onSwitchMode, onCloseSession,
-  onOpenSettings, onToggleTheme, onRename,
+  onOpenSettings, onOpenUsage, onToggleTheme, onRename,
 }: MoreSheetProps): React.JSX.Element | null {
   if (!open) return null;
 
@@ -57,6 +58,7 @@ export function MoreSheet({
     { label: 'Switch mode (Shift+Tab)', icon: 'keyboard', onPress: run(onSwitchMode) },
     ...(onRename ? [{ label: 'Rename session', icon: 'pencil', onPress: onRename }] : []),
     { label: 'Settings', icon: 'settings', onPress: run(onOpenSettings) },
+    { label: 'Usage', icon: 'gauge', onPress: run(onOpenUsage) },
     {
       label: theme === 'dark' ? 'Light theme' : 'Dark theme',
       icon: 'monitor',
