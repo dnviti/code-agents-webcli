@@ -592,6 +592,17 @@ export interface QueuedTurn {
   text: string;
   attachments?: ChatAttachment[];
   ts: number;
+  /**
+   * Why the last attempt to hand this turn over failed.
+   *
+   * A turn that could not be delivered stays in line with this set rather than
+   * being dropped: the whole point of queueing is to walk away and trust it,
+   * and a queue that discards work silently is worse than no queue (#89). The
+   * text is still here, so it is recoverable without retyping.
+   */
+  error?: string;
+  /** How many times delivery has been attempted. Absent means not yet tried. */
+  attempts?: number;
 }
 
 /**

@@ -310,6 +310,16 @@ export class ChatController {
   }
 
   /**
+   * Try a turn that could not be delivered again.
+   *
+   * Same rule as cancelling: the server owns the queue and answers with all of
+   * it, so nothing is guessed at here.
+   */
+  retryQueued(queuedId: string): void {
+    this.send({ type: 'chat_queue_retry', queuedId });
+  }
+
+  /**
    * Answer a multiple-choice question the model asked.
    *
    * `skipped` is explicit rather than inferred from an empty list: "I picked

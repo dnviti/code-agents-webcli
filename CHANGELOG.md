@@ -3,6 +3,29 @@
 ## [Unreleased]
 
 ### Fixed
+- **A message typed ahead is never lost between one turn and the next.** (#89)
+  Queued messages went missing, and did it in the worst way available: the
+  message left the queue, appeared in the conversation as though it had been
+  asked, and was never answered — with the rest of the line stuck behind it and
+  the session still showing as working. It happened precisely when the queue is
+  most useful, which is when nobody is watching.
+
+  The cause was a handover a few milliseconds too early. Three of the five
+  runtimes — pi, Grok Build and `codex exec` — run one process per turn and
+  announce the turn's end on a line of output, while the process that wrote it
+  is still exiting. The queue took that as its cue, and the adapter refused the
+  message it was handed, after the message had already been written into the
+  transcript.
+
+  The adapter is now *asked* whether it can take a turn instead of being assumed
+  able to, and nothing leaves the queue or reaches the conversation until it
+  says yes — a wait of a millisecond or two, only for those runtimes, invisible
+  in ordinary use. A message that still cannot be delivered is **kept**, with
+  its text and the reason it did not go, on a row that offers **Try again**; the
+  messages behind it wait rather than jumping it, since they were typed
+  expecting it to have been asked. The same guarantee covers a message sent
+  straight from the composer at that same moment, which took the identical
+  race.
 - **Skills and project commands are in the `/` menu from the moment a
   conversation opens, not after the first message.** (#71) Typing `/` in a new
   chat listed a handful of the runtime's built-in commands and nothing else:

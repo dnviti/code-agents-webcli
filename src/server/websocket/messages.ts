@@ -116,6 +116,7 @@ export interface ChatManagerLike {
   /** Carry a new model into the options an in-place `/clear` restart replays. */
   rememberModel(sessionId: string, model: string | undefined): void;
   cancelQueued(sessionId: string, queuedId: string): boolean;
+  retryQueued(sessionId: string, queuedId: string): boolean;
   respondPermission(sessionId: string, requestId: string, optionId: string): boolean;
   answerQuestion(
     sessionId: string,
@@ -244,6 +245,10 @@ export class MessageProcessor {
 
       case 'chat_queue_cancel':
         this.handleChatQueueCancel(wsInfo, data);
+        break;
+
+      case 'chat_queue_retry':
+        this.handleChatQueueRetry(wsInfo, data);
         break;
 
       case 'chat_permission_response':
@@ -1350,6 +1355,23 @@ export class MessageProcessor {
     const queuedId = typeof data.queuedId === 'string' ? data.queuedId : '';
     if (!queuedId) return;
     manager.cancelQueued(session.id, queuedId);
+  }
+
+  /**
+   * Try a queued turn that could not be delivered again.
+   *
+   * Silent on an unknown id for the same reason as cancelling: the click races
+   * the queue's own broadcast, and the session answers with the whole queue
+   * either way.
+   */
+  private handleChatQueueRetry(wsInfo: WebSocketInfo, data: IncomingMessage): void {
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!manager || !session) return;
+
+    const queuedId = typeof data.queuedId === 'string' ? data.queuedId : '';
+    if (!queuedId) return;
+    manager.retryQueued(session.id, queuedId);
   }
 
   private handleChatPermission(wsInfo: WebSocketInfo, data: IncomingMessage): void {

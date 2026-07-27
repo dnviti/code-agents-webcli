@@ -110,6 +110,21 @@ export interface ChatAdapter {
   start(): Promise<void>;
   /** Queue a user turn. Resolves when the runtime has accepted it, not when it replies. */
   send(turn: UserTurn): Promise<void>;
+  /**
+   * False while a `send()` would be refused, even though the last turn is over.
+   *
+   * Absent means "always ready", which is true of every adapter driving one
+   * long-lived process. The one-shot adapters spawn a process per turn and
+   * announce the turn's end from a line of *stdout*, while that process is
+   * still exiting — so for a few milliseconds the session believes it is idle
+   * and the adapter would still throw. Delivering a queued turn in that window
+   * wrote the user's message into the transcript and then threw, leaving it
+   * asked-but-never-answered with the rest of the queue stuck behind it (#89).
+   *
+   * Each implementation returns exactly the condition its own `send()` throws
+   * on, so this is the same question, asked before the damage instead of after.
+   */
+  readonly readyForTurn?: boolean;
   /** Cancel the running turn, leaving the session alive. */
   interrupt(): Promise<void>;
   /** Answer a pending approval. */

@@ -15,6 +15,7 @@ import { detectMobile } from '../../ui/mobile.js';
 import { PHONE_TEXT, PhoneContext, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { showNotification } from '../../ui/notifications.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { Button } from '../../ui/relay/Button.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
 import { Kbd } from '../../ui/relay/Kbd.js';
 
@@ -49,6 +50,8 @@ export interface ComposerProps {
   /** Turns already accepted and waiting their place in line. */
   queued?: QueuedTurn[];
   onCancelQueued?: (id: string) => void;
+  /** Try a queued turn that could not be handed over again (#89). */
+  onRetryQueued?: (id: string) => void;
   /**
    * Rank the working tree against what was typed after `@`.
    *
@@ -162,6 +165,7 @@ export function Composer({
   onDraftChange,
   queued = [],
   onCancelQueued,
+  onRetryQueued,
   onFindFiles,
   seedKey = 0,
   seedDraft = '',
@@ -680,6 +684,7 @@ export function Composer({
               turn={turn}
               position={index + 1}
               onCancel={onCancelQueued ? () => onCancelQueued(turn.id) : undefined}
+              onRetry={onRetryQueued ? () => onRetryQueued(turn.id) : undefined}
             />
           ))}
         </div>
@@ -1787,23 +1792,30 @@ function QueuedChip({
   turn,
   position,
   onCancel,
+  onRetry,
 }: {
   turn: QueuedTurn;
   position: number;
   onCancel?: () => void;
+  onRetry?: () => void;
 }): React.JSX.Element {
   const attachments = turn.attachments?.length ?? 0;
+  // A message that could not be handed over is still here, with its text, and
+  // says so where it sits — the alternative the queue used to offer was
+  // silence, which is the one thing a queue must never do (#89).
+  const failed = Boolean(turn.error);
   return (
     <div
       role="listitem"
       style={{
         display: 'flex',
         alignItems: 'center',
+        flexWrap: 'wrap',
         gap: 7,
         minHeight: 26,
         padding: '2px 4px 2px 7px',
         background: 'var(--muted)',
-        border: '1px solid var(--border)',
+        border: `1px solid ${failed ? 'var(--destructive)' : 'var(--border)'}`,
         borderRadius: 'var(--radius)',
         color: 'var(--muted-foreground)',
         fontSize: 'var(--text-2xs)',
@@ -1818,7 +1830,7 @@ function QueuedChip({
           fontVariantNumeric: 'tabular-nums',
         }}
       >
-        {position}
+        {failed ? <Icon name="circle-alert" size={11} /> : position}
       </span>
       <span
         style={{
@@ -1839,10 +1851,39 @@ function QueuedChip({
           {attachments}
         </span>
       ) : null}
+      {failed && onRetry ? (
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          iconLeft={<Icon name="rotate-cw" size={11} />}
+          onClick={onRetry}
+          style={{ flex: '0 0 auto', fontSize: 'var(--text-2xs)' }}
+        >
+          Try again
+        </Button>
+      ) : null}
       {onCancel ? (
-        <IconButton type="button" size="sm" label={`Remove queued message ${position}`} onClick={onCancel}>
+        <IconButton
+          type="button"
+          size="sm"
+          label={failed ? `Discard the message that could not be sent` : `Remove queued message ${position}`}
+          onClick={onCancel}
+        >
           <Icon name="x" size={11} />
         </IconButton>
+      ) : null}
+      {failed ? (
+        // Its own line, full width: the reason is a sentence, and squeezing it
+        // beside a message that is already being ellipsised would leave
+        // neither readable. `alert` so it is announced when it appears —
+        // nobody is looking at the composer while a queue works through.
+        <span
+          role="alert"
+          style={{ flex: '1 0 100%', color: 'var(--destructive)', whiteSpace: 'normal' }}
+        >
+          Not sent: {turn.error}
+        </span>
       ) : null}
     </div>
   );

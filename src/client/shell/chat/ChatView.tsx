@@ -327,6 +327,10 @@ export function ChatView({
     (queuedId: string) => controller.cancelQueued(queuedId),
     [controller],
   );
+  const retryQueued = React.useCallback(
+    (queuedId: string) => controller.retryQueued(queuedId),
+    [controller],
+  );
   const setModel = React.useCallback(
     (model: string) => controller.setModel(model),
     [controller],
@@ -870,6 +874,7 @@ export function ChatView({
               placeholder={placeholderFor(chatState, runtimeLabel, isMobile)}
               queued={transcript.queuedTurns}
               onCancelQueued={cancelQueued}
+              onRetryQueued={retryQueued}
               onFindFiles={findProjectFiles}
               onUpload={upload}
               draft={draft}

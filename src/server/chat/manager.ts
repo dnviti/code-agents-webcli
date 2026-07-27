@@ -230,6 +230,10 @@ export class ChatSessionManager {
     return this.sessions.get(sessionId)?.cancelQueued(queuedId) ?? false;
   }
 
+  retryQueued(sessionId: string, queuedId: string): boolean {
+    return this.sessions.get(sessionId)?.retryQueued(queuedId) ?? false;
+  }
+
   respondPermission(sessionId: string, requestId: string, optionId: string): boolean {
     return this.sessions.get(sessionId)?.respondPermission(requestId, optionId) ?? false;
   }

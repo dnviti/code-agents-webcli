@@ -104,6 +104,13 @@ Deliberately — convert it, or set the phone's camera to "Most Compatible".
 The proxy is not forwarding WebSocket upgrades. See
 [reverse proxies](running-as-a-service.md#behind-a-reverse-proxy).
 
+**A typed-ahead message says "Not sent".**
+It is still there, with its text, on the row above the composer — press **Try
+again**, or the ✕ to discard it. The rest of the line waits behind it on
+purpose: those messages were typed expecting this one to have been asked first.
+Messages are only ever taken out of the queue once the agent has really been
+handed them, so a message shown in the conversation was genuinely sent.
+
 **A session came back "ended" after a restart.**
 Expected. The record, history and transcript persist; the live process does not.
 

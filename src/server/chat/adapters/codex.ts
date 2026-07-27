@@ -836,6 +836,16 @@ export class CodexExecAdapter extends BaseChatAdapter {
     return ['exec', '--json', '--dangerously-bypass-approvals-and-sandbox', ...(this.options.extraArgs || [])];
   }
 
+  /**
+   * The same condition `send()` throws on, asked in advance (#89).
+   *
+   * `closeTurn` runs off a stdout event, so the turn ends — and the session
+   * goes idle — while this process is still exiting.
+   */
+  get readyForTurn(): boolean {
+    return !(this.child && !this.exited);
+  }
+
   async send(turn: UserTurn): Promise<void> {
     if (this.child && !this.exited) {
       // One process serves exactly one turn; the session layer is expected
