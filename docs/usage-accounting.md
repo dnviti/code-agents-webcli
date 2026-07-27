@@ -189,6 +189,29 @@ turn is recorded as unknown. Charging one turn for a fortnight of earlier work
 would be a confident wrong answer, where "we cannot tell" is a true one. From
 the second turn onwards the figures are exact.
 
+### Which project a job belongs to
+
+A project is the **name of the folder the session was working in** — the same
+label the session tab, the session list and the conversation header already
+carry. It is read when the job is filed, from the folder the session is pointed
+at at that moment.
+
+Two consequences, both deliberate:
+
+- **A session re-pointed at another folder keeps its earlier work where it
+  was.** Attribution is a fact about where the work ran, not about where the
+  session ended up. Resolving it at reporting time instead would rewrite last
+  month's figures every time somebody moved a folder.
+- **Two folders with the same name in different parents are one project.** The
+  grouping is by name because that is what "which project is this spend on" is
+  a question about — grouping by absolute path splits one project across every
+  machine and every checkout it was ever opened from. If you have `api` under
+  two different customers, give the folders distinguishable names.
+
+Work recorded before this existed has no project on it, and none is invented
+for it. It groups under **unattributed** — visible, counted in the totals, and
+never quietly folded into a real project's figures.
+
 ## What is not covered
 
 Accounting covers **chat-surface sessions**. A terminal-surface session runs
@@ -214,6 +237,13 @@ Export inherits the same restriction as the dashboard or history view it was
 generated from: a non-installer's CSV or JSON export contains only their own
 jobs, however the request is shaped.
 
+Narrowing does not widen. Filtering by project, agent, model or user is a
+predicate applied *inside* the scope the request already resolved to, so a
+viewer scoped to themselves who asks for another person's project — or another
+person's login — is answered with their own empty set, not with somebody
+else's figures. The project filter menu is scoped the same way, so it does not
+even name the projects they cannot see.
+
 ## The API
 
 All routes require a signed-in session and answer `401` otherwise. `scope`
@@ -223,12 +253,28 @@ installer, as above.
 ### `GET /api/usage/dashboard`
 
 Everything one dashboard view draws: totals, a trend series, breakdowns by
-agent/model/user, effort histograms, and the most-called tools.
+project/agent/model/user, effort histograms, and the most-called tools.
 
 Query parameters: `period` (`day` | `week` | `month` | `year`, default `day`),
 `anchor` (ISO instant the period is centred on, default now), `tz` (minutes to
 add to UTC to reach the viewer's own clock, so "today" means their today),
 `scope` (`self` | `everyone`).
+
+It also takes the same narrowing the job history does — `project`, `agent`,
+`model`, `user`, and an explicit `from`/`to` window — and applies it to *every*
+panel it returns, not only to the matching breakdown. Narrowing to one project
+narrows the totals, the trend, all four breakdowns, the effort histograms and
+the tool counts together, so no two parts of one view can end up answering
+different questions.
+
+`from`/`to` override the range the period would have produced, and are honoured
+only as a pair: one end alone, or an end before its start, is ignored rather
+than half-applied. When a window *is* applied, the trend is re-bucketed to suit
+its width — a day-wide window comes back as hours, a month-wide one as days —
+which is what makes selecting a point on the chart and drilling into it work
+without a separate notion of zoom. The `bucket` field says which width was
+used, and `filters` echoes back the narrowing that was actually applied, so a
+client never offers to clear something the server ignored.
 
 ```
 GET /api/usage/dashboard?period=week&tz=120
@@ -241,6 +287,8 @@ GET /api/usage/dashboard?period=week&tz=120
   "period": "week",
   "from": "2026-07-20T00:00:00.000Z",
   "to": "2026-07-27T00:00:00.000Z",
+  "bucket": "day",
+  "filters": {},
   "totals": {
     "jobs": 42,
     "turns": 96,
@@ -258,6 +306,7 @@ GET /api/usage/dashboard?period=week&tz=120
   "series": [{ "key": "2026-07-20", "totals": { "...": "..." } }],
   "byAgent": [{ "key": "claude", "totals": { "...": "..." } }],
   "byModel": [{ "key": "claude-opus-5", "totals": { "...": "..." } }],
+  "byProject": [{ "key": "billing-api", "totals": { "...": "..." } }],
   "effortByAgent": [
     {
       "key": "claude",
@@ -278,11 +327,21 @@ GET /api/usage/dashboard?period=week&tz=120
 
 `byUser` is present only when `scope` resolved to `everyone`.
 
+A breakdown row for work with nothing to group it under — a job whose runtime
+never named a model, or one recorded before projects were tracked — comes back
+under the key `" unattributed"` (with the leading space). It is a sentinel
+rather than an empty string precisely so it can be sent straight back as a
+filter value: an empty query parameter is indistinguishable from an absent one,
+and "show me only the unattributed work" is a real question.
+
 ### `GET /api/usage/jobs`
 
 Paged history, newest first. Query parameters: `scope`, `agent`, `model`,
-`sessionId`, `from`, `to` (ISO, half-open range on `endedAt`), `limit`
-(default 50, capped at 500), `offset`.
+`project`, `user`, `sessionId`, `from`, `to` (ISO, half-open range on
+`endedAt`), `limit` (default 50, capped at 500), `offset`. They are the same
+filters the dashboard takes and mean the same thing, which is what makes
+drilling from a chart into the jobs behind it a matter of carrying the filters
+across rather than re-deriving them.
 
 ```
 GET /api/usage/jobs?agent=claude&limit=20
@@ -300,6 +359,7 @@ GET /api/usage/jobs?agent=claude&limit=20
       "userLogin": "dnviti",
       "agent": "claude",
       "model": "claude-opus-5",
+      "project": "billing-api",
       "startedAt": "2026-07-27T09:14:02.000Z",
       "endedAt": "2026-07-27T09:14:41.000Z",
       "durationMs": 39000,
@@ -341,18 +401,29 @@ response to probe for another user's job ids.
 
 ### `GET /api/usage/facets`
 
-The agents and models actually present in the viewer's own scope, for
+The agents, models and projects actually present in the viewer's own scope, for
 populating filter menus. Query parameter: `scope`.
 
+A viewer scoped to themselves sees only the projects their own work ran in.
+The menu is a directory of what exists, and one that named every project in the
+installation would leak the shape of everyone else's work to someone who cannot
+see the figures behind it.
+
 ```json
-{ "agents": ["claude", "codex", "grok"], "models": ["claude-opus-5", "gpt-5.1-codex"] }
+{
+  "agents": ["claude", "codex", "grok"],
+  "models": ["claude-opus-5", "gpt-5.1-codex"],
+  "projects": ["billing-api", "web"]
+}
 ```
 
 ### `GET /api/usage/export`
 
 Every job in range, oldest first, no paging. Query parameters: `scope`,
-`agent`, `model`, `sessionId`, `from`, `to`, `format` (`csv`, the default, or
-`json`).
+`agent`, `model`, `project`, `user`, `sessionId`, `from`, `to`, `format`
+(`csv`, the default, or `json`). Again the same filters, so an export taken
+while the dashboard is narrowed to one project contains that project and
+reconciles against what was on screen.
 
 CSV is the same columns as the job record, flattened, with an unreported
 figure written as an empty cell rather than `0` — the one place that
@@ -363,8 +434,8 @@ GET /api/usage/export?from=2026-07-01T00:00:00.000Z&to=2026-08-01T00:00:00.000Z&
 ```
 
 ```csv
-id,sessionId,nativeSessionId,turnId,userId,userLogin,agent,model,startedAt,endedAt,durationMs,outcome,turns,toolCalls,inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens,reasoningTokens,totalTokens,costUsd,reportsUsage,reportsCost
-sess-abc:turn-9,sess-abc,claude-native-id,turn-9,7,dnviti,claude,claude-opus-5,2026-07-27T09:14:02.000Z,2026-07-27T09:14:41.000Z,39000,completed,3,5,1200,640,40000,900,,42740,0.0612,true,true
+id,sessionId,nativeSessionId,turnId,userId,userLogin,agent,model,project,startedAt,endedAt,durationMs,outcome,turns,toolCalls,inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens,reasoningTokens,totalTokens,costUsd,reportsUsage,reportsCost
+sess-abc:turn-9,sess-abc,claude-native-id,turn-9,7,dnviti,claude,claude-opus-5,billing-api,2026-07-27T09:14:02.000Z,2026-07-27T09:14:41.000Z,39000,completed,3,5,1200,640,40000,900,,42740,0.0612,true,true
 ```
 
 `format=json` returns the same rows as a JSON array instead, with the usual
@@ -379,6 +450,42 @@ months within a year — computed against the viewer's own timezone offset so
 appears on the trend as a gap rather than disappearing and making the shape
 read as continuous when it was not.
 
+### Exploring it
+
+The charts are controls, not pictures.
+
+- **The trend plots whichever measure you pick** — cost, tokens, jobs, turns or
+  tool calls — rather than cost alone.
+- **Every point is a button.** Hover it, tab to it, or tap it on a touch screen,
+  and its period and exact figures appear above the chart; a screen reader is
+  told the same thing. This is the part an `<svg><title>` cannot do, which is
+  why the chart is not one.
+- **Selecting a point narrows everything to it.** Press a bar and the totals,
+  the breakdowns, the effort and tool figures and the job list below all
+  re-ask the question for that slice of time, and the trend redraws itself one
+  level finer — a month becomes its days, a day becomes its hours — so you can
+  press again and go further in.
+- **Selecting a breakdown row narrows to that project, agent, model or person**,
+  and selections combine: one project, one agent, one afternoon.
+- **Whatever is selected is named on screen**, as a row of chips, each of which
+  clears just that one thing; one more control clears the lot. Nothing can be
+  selected that cannot be undone in a single action.
+- **The job history under the charts is narrowed by the same selection**, so
+  drilling from a total down to the individual jobs behind it takes no
+  re-entering of filters — and neither does the export, which carries the
+  selection with it.
+- **Breakdowns sort by any column**, and each row carries a bar showing its
+  share of whichever measure is sorted on.
+
+A bucket that reported nothing is drawn as a dashed stub in the border colour,
+never as a bar of height zero. On a chart those two facts — "nothing here
+reported a cost" and "this hour cost nothing" — are a pixel apart, and they are
+the distinction this whole subsystem is built to keep.
+
+Selections do not survive closing the dashboard: reopening it asks the
+unnarrowed question again, rather than showing a total that is not the total
+for a reason several screens further down.
+
 Totals lead with jobs, turns, tool calls, tokens and cost, each cost and token
 figure qualified by how many of the jobs it counted actually reported one — a
 total's own honesty travels with it rather than being a separate number to go
@@ -386,7 +493,11 @@ find. Directly under them sits the line that no figure can carry on its own:
 these are API list prices, so on a subscription plan they are what the work
 would have cost rather than what anyone was charged. The by-agent and
 by-model breakdowns are the same totals shape, grouped;
-the by-user table appears only for the installer viewing `everyone`.
+the by-user table appears only for the installer viewing `everyone`. The
+by-project table groups by the folder each job ran in, with work recorded
+before that was tracked under **unattributed** — per-project figures always add
+up to the overall total for the same range and scope, because nothing is
+dropped to make the grouping tidy.
 
 The effort tables answer a different question from the cost ones: not "how
 much did this cost" but "does this agent usually finish in one round trip or

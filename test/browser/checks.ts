@@ -243,6 +243,7 @@ async function run(): Promise<void> {
   await checkThePhoneShellSurfacesAreUsable();
   await checkALongTabNameStaysInsideTheStrip();
   await checkAnUnreportedFigureIsNeverDrawnAsZero();
+  await checkTheUsageChartsAreInteractive();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -2423,8 +2424,22 @@ async function checkAnUnreportedFigureIsNeverDrawnAsZero(): Promise<void> {
   const dashboard = {
     scope: 'self', canSeeEveryone: false, period: 'day',
     from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
+    bucket: 'hour', filters: {},
     totals: totals({ jobs: 4, turns: 9, toolCalls: 12, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }),
-    series: [{ key: '2026-07-27T09:00', totals: totals({ jobs: 4, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }) }],
+    // Two buckets, not one: the second reported nothing at all, and half of
+    // what these checks are for is that it does not come out looking like an
+    // hour that cost zero.
+    series: [
+      { key: '2026-07-27T09:00', totals: totals({ jobs: 4, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }) },
+      { key: '2026-07-27T10:00', totals: totals({ jobs: 2, totalTokens: 900, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+    ],
+    byProject: [
+      { key: 'billing-api', totals: totals({ jobs: 3, totalTokens: 4000, costUsd: 1.25, tokensReportedJobs: 3, costReportedJobs: 2 }) },
+      // The sentinel the server sends for work recorded before projects
+      // existed. Spelled out here rather than imported, because the point of
+      // the check is that the browser renders whatever the wire actually says.
+      { key: ' unattributed', totals: totals({ jobs: 1, totalTokens: 1000, tokensReportedJobs: 1, costReportedJobs: 0 }) },
+    ],
     byAgent: [
       { key: 'claude', totals: totals({ jobs: 2, totalTokens: 3000, costUsd: 1.25, tokensReportedJobs: 2, costReportedJobs: 2 }) },
       { key: 'codex', totals: totals({ jobs: 2, totalTokens: 2000, tokensReportedJobs: 2, costReportedJobs: 0 }) },
@@ -2523,6 +2538,205 @@ async function checkAnUnreportedFigureIsNeverDrawnAsZero(): Promise<void> {
   });
   check(
     'the usage dashboard stays inside the window',
+    spilling.length === 0,
+    spilling.length ? spilling.slice(0, 6).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
+  );
+
+  root.unmount();
+  frame.remove();
+  window.fetch = realFetch;
+}
+
+/**
+ * Issue #66's acceptance criteria, which are all claims about pixels and
+ * events rather than about types.
+ *
+ * "The charts are interactive" survives a typecheck no matter how it is built:
+ * an SVG `<title>` compiles, renders, and is unreachable by a finger, by the
+ * keyboard and by a screen reader. So this drives the real dialog against a
+ * real response and checks the things a viewer actually does — focus a bar,
+ * press it, press a breakdown row — and, crucially, checks what went back to
+ * the *server* as a result. A selection that highlights a bar without
+ * re-asking the question is a chart that only looks interactive.
+ */
+async function checkTheUsageChartsAreInteractive(): Promise<void> {
+  const totals = (over: Record<string, number>) => ({
+    jobs: 0, turns: 0, toolCalls: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    reasoningTokens: 0, totalTokens: 0, costUsd: 0,
+    tokensReportedJobs: 0, costReportedJobs: 0,
+    ...over,
+  });
+
+  const dashboard = {
+    scope: 'self', canSeeEveryone: false, period: 'day',
+    from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
+    bucket: 'hour', filters: {},
+    totals: totals({ jobs: 6, turns: 11, toolCalls: 14, totalTokens: 5900, costUsd: 1.25, tokensReportedJobs: 6, costReportedJobs: 2 }),
+    series: [
+      { key: '2026-07-27T09:00', totals: totals({ jobs: 4, turns: 8, toolCalls: 10, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }) },
+      // Reported nothing on cost. Must not be drawn as a bar of height zero.
+      { key: '2026-07-27T10:00', totals: totals({ jobs: 2, turns: 3, toolCalls: 4, totalTokens: 900, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+    ],
+    byProject: [
+      { key: 'billing-api', totals: totals({ jobs: 3, totalTokens: 4000, costUsd: 1.25, tokensReportedJobs: 3, costReportedJobs: 2 }) },
+      { key: 'web', totals: totals({ jobs: 3, totalTokens: 1900, tokensReportedJobs: 3, costReportedJobs: 0 }) },
+    ],
+    byAgent: [
+      { key: 'claude', totals: totals({ jobs: 4, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }) },
+      { key: 'codex', totals: totals({ jobs: 2, totalTokens: 900, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+    ],
+    byModel: [{ key: 'claude-opus-5', totals: totals({ jobs: 6, totalTokens: 5900, costUsd: 1.25, tokensReportedJobs: 6, costReportedJobs: 2 }) }],
+    effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
+  };
+
+  const asked: string[] = [];
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+    asked.push(url);
+    const body = url.includes('/api/usage/dashboard') ? dashboard : { jobs: [], total: 0 };
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof window.fetch;
+
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:1100px;height:900px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const root = createRoot(doc.body);
+  root.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
+  await wait(600);
+
+  const bars = (): HTMLButtonElement[] =>
+    Array.from(doc.querySelectorAll<HTMLButtonElement>('[role="group"] button'));
+
+  check(
+    'every point on the trend is a real control, not a decoration',
+    bars().length === 2 && bars().every((b) => b.tagName === 'BUTTON'),
+    `${bars().length} control(s) on the trend`,
+  );
+
+  check(
+    'a point announces its own figures to a screen reader',
+    bars().some((b) => /1\.25/.test(b.getAttribute('aria-label') || '')),
+    bars().map((b) => b.getAttribute('aria-label')).join(' | ').slice(0, 200),
+  );
+
+  // No pointer, no hover: just reaching the control, the way a keyboard tab
+  // stop or a tap on a touch screen does.
+  bars()[1].focus();
+  await wait(120);
+  const live = doc.querySelector('[aria-live="polite"]') as HTMLElement | null;
+  check(
+    'reaching a point reveals its figures without a mouse',
+    Boolean(live && /not reported/i.test(live.textContent || '')),
+    live ? (live.textContent || '').slice(0, 160) : 'no readout region',
+  );
+
+  // The two facts this dashboard exists to keep apart, one pixel from each
+  // other on a chart: an hour that reported no cost, and an hour that cost
+  // nothing. If both bars paint the same, the chart is lying about one.
+  const fills = bars().map((b) => {
+    const span = b.querySelector('span') as HTMLElement;
+    const style = (frame.contentWindow as Window).getComputedStyle(span);
+    return `${style.backgroundColor}/${style.borderTopStyle}`;
+  });
+  check(
+    'a bucket nothing reported is drawn differently from one that cost zero',
+    fills[0] !== fills[1],
+    fills.join(' vs '),
+  );
+
+  const measureTab = Array.from(doc.querySelectorAll<HTMLElement>('button, [role="tab"]')).find(
+    (el) => (el.textContent || '').trim() === 'Tokens',
+  );
+  check('the trend offers a measure other than cost', Boolean(measureTab), measureTab ? 'found' : 'no Tokens control');
+  measureTab?.click();
+  await wait(200);
+  check(
+    'switching the measure redraws the chart against it',
+    bars().some((b) => /Tokens/i.test(b.getAttribute('aria-label') || '')),
+    bars().map((b) => b.getAttribute('aria-label')).join(' | ').slice(0, 200),
+  );
+
+  // Selecting a breakdown row must reach the server, not merely tint a row.
+  const before = asked.length;
+  const projectButton = Array.from(doc.querySelectorAll<HTMLButtonElement>('button')).find(
+    (b) => (b.textContent || '').trim() === 'billing-api',
+  );
+  check('a breakdown row can be selected', Boolean(projectButton), projectButton ? 'found' : 'no billing-api row');
+  projectButton?.click();
+  await wait(400);
+  const sinceRow = asked.slice(before);
+  check(
+    'selecting a project re-asks the whole dashboard for that project',
+    sinceRow.some((u) => u.includes('/api/usage/dashboard') && u.includes('project=billing-api')),
+    sinceRow.join(' | ').slice(0, 300) || 'nothing was re-requested',
+  );
+  check(
+    'and narrows the job list underneath it by the same thing',
+    sinceRow.some((u) => u.includes('/api/usage/jobs') && u.includes('project=billing-api')),
+    sinceRow.filter((u) => u.includes('/jobs')).join(' | ').slice(0, 300) || 'the job list was not re-requested',
+  );
+
+  const chipText = (doc.querySelector('[aria-label="Active filters"]') as HTMLElement | null)?.textContent || '';
+  check(
+    'the narrowing says on screen what it is',
+    /billing-api/.test(chipText),
+    chipText.slice(0, 160) || 'no filter chips',
+  );
+
+  // Pressing a bar narrows to that hour — the drill-down from the chart.
+  const beforeBar = asked.length;
+  bars()[0].click();
+  await wait(400);
+  const sinceBar = asked.slice(beforeBar);
+  check(
+    'selecting a point on the trend narrows the range to it',
+    sinceBar.some((u) => u.includes('/api/usage/dashboard') && u.includes('from=') && u.includes('to=')),
+    sinceBar.join(' | ').slice(0, 300) || 'nothing was re-requested',
+  );
+
+  // And it must be undoable in one action, from the chip rather than by
+  // finding precisely the same bar again.
+  const beforeClear = asked.length;
+  const clearAll = Array.from(doc.querySelectorAll<HTMLButtonElement>('button')).find(
+    (b) => (b.textContent || '').trim() === 'Clear all',
+  );
+  check('there is one control that clears everything', Boolean(clearAll), clearAll ? 'found' : 'no Clear all');
+  clearAll?.click();
+  await wait(400);
+  check(
+    'clearing puts the unnarrowed question back',
+    asked.slice(beforeClear).some((u) => u.includes('/api/usage/dashboard') && !u.includes('project=')),
+    asked.slice(beforeClear).join(' | ').slice(0, 300) || 'nothing was re-requested',
+  );
+
+  const sortButton = Array.from(doc.querySelectorAll<HTMLButtonElement>('button')).find(
+    (b) => (b.getAttribute('aria-label') || '') === 'Sort by Jobs',
+  );
+  check('a breakdown can be re-sorted by another measure', Boolean(sortButton), sortButton ? 'found' : 'no sort control');
+
+  // Phone width: the whole point of dropping the fixed-width SVG.
+  frame.style.width = '390px';
+  await wait(300);
+  const spilling = Array.from(doc.body.querySelectorAll<HTMLElement>('*')).filter((node) => {
+    if (!isPainted(node) || scrollsSideways(node)) return false;
+    const box = node.getBoundingClientRect();
+    return box.right > 391 || box.left < -1;
+  });
+  check(
+    'the charts stay inside a phone-width window',
     spilling.length === 0,
     spilling.length ? spilling.slice(0, 6).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
   );

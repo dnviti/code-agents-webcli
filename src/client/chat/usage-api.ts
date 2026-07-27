@@ -1,5 +1,6 @@
 import type {
   UsageDashboard,
+  UsageFilters,
   UsageJobRecord,
   UsageJobSummary,
   UsagePeriod,
@@ -45,21 +46,51 @@ export function localTzOffsetMinutes(): number {
   return -new Date().getTimezoneOffset();
 }
 
-export function fetchUsageDashboard(period: UsagePeriod, scope: UsageScope): Promise<UsageDashboard> {
+/**
+ * Every filter, appended in one place.
+ *
+ * The dashboard, the job list and the export each build their own query string
+ * but must be narrowed identically — a drill-down that reached the chart and
+ * not the list underneath it is the bug this exists to make impossible.
+ * Undefined and empty are both dropped, so an absent filter never travels as
+ * `agent=` and gets read on the far side as "an agent whose name is nothing".
+ */
+function appendFilters(params: URLSearchParams, filters: UsageFilters | undefined): void {
+  if (!filters) return;
+  for (const key of ['agent', 'model', 'project', 'user', 'from', 'to'] as const) {
+    const value = filters[key];
+    if (value) params.set(key, value);
+  }
+}
+
+export function fetchUsageDashboard(
+  period: UsagePeriod,
+  scope: UsageScope,
+  filters?: UsageFilters,
+): Promise<UsageDashboard> {
   const params = new URLSearchParams({
     period,
     scope,
     tz: String(localTzOffsetMinutes()),
   });
+  appendFilters(params, filters);
   return getJson<UsageDashboard>(`/api/usage/dashboard?${params.toString()}`);
 }
 
-export interface UsageJobsQuery {
+export interface UsageFacets {
+  agents: string[];
+  models: string[];
+  projects: string[];
+}
+
+export function fetchUsageFacets(scope: UsageScope): Promise<UsageFacets> {
+  return getJson<UsageFacets>(`/api/usage/facets?${new URLSearchParams({ scope }).toString()}`);
+}
+
+export interface UsageJobsQuery extends UsageFilters {
   scope: UsageScope;
   limit?: number;
   offset?: number;
-  agent?: string;
-  model?: string;
 }
 
 export interface UsageJobsPage {
@@ -71,8 +102,7 @@ export function fetchUsageJobs(query: UsageJobsQuery): Promise<UsageJobsPage> {
   const params = new URLSearchParams({ scope: query.scope });
   if (query.limit !== undefined) params.set('limit', String(query.limit));
   if (query.offset !== undefined) params.set('offset', String(query.offset));
-  if (query.agent) params.set('agent', query.agent);
-  if (query.model) params.set('model', query.model);
+  appendFilters(params, query);
   return getJson<UsageJobsPage>(`/api/usage/jobs?${params.toString()}`);
 }
 
@@ -98,8 +128,20 @@ export function fetchUsageJob(id: string, scope: UsageScope): Promise<UsageJobRe
  * names the file, and fetching the CSV here would only buffer it in memory to
  * hand the same bytes straight back.
  */
-export function usageExportUrl(scope: UsageScope, from: string, to: string): string {
-  const params = new URLSearchParams({ scope, from, to, format: 'csv' });
+export function usageExportUrl(
+  scope: UsageScope,
+  from: string,
+  to: string,
+  filters?: UsageFilters,
+): string {
+  const params = new URLSearchParams({ scope, format: 'csv' });
+  // The window last, so it wins: `from`/`to` here are the range actually on
+  // screen, which is already the narrowed one whenever a time selection is
+  // active. A filter set that also carried a window would otherwise decide the
+  // export's range from a different reading than the dashboard's.
+  appendFilters(params, filters);
+  params.set('from', from);
+  params.set('to', to);
   return `/api/usage/export?${params.toString()}`;
 }
 
@@ -110,9 +152,14 @@ export function usageExportUrl(scope: UsageScope, from: string, to: string): str
  * workspace-api.ts, this lets the browser name and save the file itself
  * rather than this code re-implementing a save dialog around a blob.
  */
-export function exportUsage(scope: UsageScope, from: string, to: string): void {
+export function exportUsage(
+  scope: UsageScope,
+  from: string,
+  to: string,
+  filters?: UsageFilters,
+): void {
   const anchor = document.createElement('a');
-  anchor.href = usageExportUrl(scope, from, to);
+  anchor.href = usageExportUrl(scope, from, to, filters);
   anchor.rel = 'noopener';
   document.body.appendChild(anchor);
   anchor.click();

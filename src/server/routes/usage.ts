@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { UsageStore, UsageHistoryQuery } from '../services/usage-store.js';
 import { AuthenticatedUser } from '../types.js';
-import { UsagePeriod, UsageScope } from '../../shared/usage-records.js';
+import { UsageFilters, UsagePeriod, UsageScope } from '../../shared/usage-records.js';
 import { requireUser } from './helpers.js';
 
 export interface UsageRoutesDeps {
@@ -63,6 +63,30 @@ function stringParam(raw: unknown): string | undefined {
   return typeof raw === 'string' && raw.length > 0 ? raw : undefined;
 }
 
+/**
+ * The narrowing a request carries.
+ *
+ * Read once, in one place, and handed to every route: the dashboard, the job
+ * list it drills into and the export all have to agree about what is on
+ * screen, and three separate readings of the same query string is how they
+ * stop agreeing.
+ *
+ * `user` is not privileged here. It narrows to one login, but it can only ever
+ * narrow *within* the scope the request already resolved to — a viewer scoped
+ * to `self` who asks for somebody else's login gets their own empty set, not
+ * somebody else's figures, because the scope predicate is still there.
+ */
+function filtersFrom(req: Request): UsageFilters {
+  return {
+    agent: stringParam(req.query.agent),
+    model: stringParam(req.query.model),
+    project: stringParam(req.query.project),
+    user: stringParam(req.query.user),
+    from: stringParam(req.query.from),
+    to: stringParam(req.query.to),
+  };
+}
+
 function historyQueryFrom(
   deps: UsageRoutesDeps,
   user: AuthenticatedUser,
@@ -71,11 +95,8 @@ function historyQueryFrom(
   return {
     userId: user.id,
     scope: resolveScope(deps, user, req.query.scope),
-    agent: stringParam(req.query.agent),
-    model: stringParam(req.query.model),
+    ...filtersFrom(req),
     sessionId: stringParam(req.query.sessionId),
-    from: stringParam(req.query.from),
-    to: stringParam(req.query.to),
   };
 }
 
@@ -101,6 +122,7 @@ const EXPORT_COLUMNS = [
   'userLogin',
   'agent',
   'model',
+  'project',
   'startedAt',
   'endedAt',
   'durationMs',
@@ -135,6 +157,7 @@ export function createUsageRoutes(deps: UsageRoutesDeps): Router {
         period: parsePeriod(req.query.period),
         anchor: parseAnchor(req.query.anchor),
         tzOffsetMinutes: parseTz(req.query.tz),
+        ...filtersFrom(req),
       },
       isInstaller(deps, user),
     );

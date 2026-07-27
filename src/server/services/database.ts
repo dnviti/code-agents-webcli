@@ -377,6 +377,7 @@ export class AppDatabase {
         user_login TEXT NOT NULL,
         agent TEXT NOT NULL,
         model TEXT,
+        project TEXT,
         started_at TEXT NOT NULL,
         ended_at TEXT NOT NULL,
         duration_ms INTEGER,
@@ -460,6 +461,20 @@ export class AppDatabase {
     // a null is "never renamed", which is true of every row written before
     // renaming outlived the page that did it.
     this.addColumnIfMissing('runtime_sessions', 'custom_name', 'TEXT');
+
+    // Which project — which working folder, by name — a recorded job ran in.
+    // Nullable and null-by-default, and the null is load-bearing: work filed
+    // before this column existed ran somewhere nobody wrote down, and the
+    // dashboard shows it as unattributed rather than charging it to whichever
+    // project happened to be handy.
+    this.addColumnIfMissing('usage_jobs', 'project', 'TEXT');
+
+    // Declared here rather than with the other indexes above, because the
+    // column it covers is only guaranteed to exist by the line before it.
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_usage_jobs_project
+        ON usage_jobs(project, ended_at);
+    `);
   }
 
   /**
