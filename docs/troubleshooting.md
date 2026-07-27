@@ -104,6 +104,16 @@ Deliberately — convert it, or set the phone's camera to "Most Compatible".
 The proxy is not forwarding WebSocket upgrades. See
 [reverse proxies](running-as-a-service.md#behind-a-reverse-proxy).
 
+**A file opens in the plainer editor, with "the full editor could not be
+loaded".**
+The code editor is a separate chunk fetched the first time you open a file, and
+either its script or its stylesheet did not arrive — a restart under an open
+page, or a moment with no route to the server. Opening a file again fetches it
+again. The editor you get meanwhile is the app's own: it highlights, edits and
+saves, it is simply plainer. It is offered deliberately in preference to the
+full editor without its stylesheet, which would draw the file in the wrong
+order rather than say anything was wrong.
+
 **A session came back "ended" after a restart.**
 Expected. The record, history and transcript persist; the live process does not.
 
