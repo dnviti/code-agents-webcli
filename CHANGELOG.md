@@ -31,6 +31,37 @@
   belongs to, so the menu never lists what someone else has installed, and a
   machine with no skills installed shows the built-ins exactly as before.
 
+- **A turn's badge says how the turn ended, and is right.** (#74) Turns were
+  regularly marked failed when they had succeeded. The mark was never a verdict
+  on the turn: a turn went red if *anything* inside it had gone wrong at any
+  point — a search that found no matches, a test run that reported failures, a
+  command that came back non-zero, a warning the agent read and moved past.
+  Those are ordinary moments in a working turn, and for a coding agent they are
+  most of the work, so the longer and more useful the turn the likelier it was
+  to be marked failed. The badge stopped meaning anything, which cost the one
+  thing it exists for: finding, in a long session, the turn that really did go
+  wrong.
+
+  The outcome now comes from the runtime's own word for how the turn concluded,
+  which every one of them already sends and the app used to discard. A turn that
+  finished and answered reads as done however many steps inside it errored, and
+  the steps stay marked failed where the steps themselves are shown. Red is
+  kept for a turn that did not complete: the agent stopped on an error it could
+  not get past, the runtime went away mid-turn, or the turn ended with no
+  answer. A turn the user interrupted reads as done — nothing went wrong — and
+  so does one whose answer is the agent saying it could not do the thing, since
+  anything else means reading what an answer meant. A word no runtime has used
+  before reads as done rather than as a guess at failure.
+
+  Each runtime says this differently — `end_turn`, `EndTurn`, `stop`,
+  `completed`, or nothing at all for a good turn on pi — so the reading of it is
+  covered per agent by tests over the conversations those agents really
+  produced. A conversation reopened later shows every turn with the outcome it
+  ended with, taken from the log it already recorded; nothing was migrated and
+  nothing already recorded was reclassified. One thing fixed along the way: a
+  turn left mid-stream by a runtime that died used to come back spinning
+  forever, on a process that had ended hours before.
+
 ## [5.3.1] - 2026-07-27
 
 ### Added

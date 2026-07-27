@@ -247,6 +247,7 @@ async function run(): Promise<void> {
   await checkAServerOlderThanThePageSaysSo();
   await checkUnattributedWorkCanBeAttributedByHand();
   await checkTheCommandMenuIsFullBeforeTheFirstMessage();
+  await checkATurnsBadgeSaysHowItEnded();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -3166,6 +3167,182 @@ async function checkTheCommandMenuIsFullBeforeTheFirstMessage(): Promise<void> {
     'choosing an entry puts that command in the line, ready to run',
     textarea.value.trim().startsWith('/complex-work'),
     JSON.stringify(textarea.value),
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * A turn's badge says how the turn ended, and says the same thing everywhere.
+ *
+ * Here rather than in a unit test because the claim is about two surfaces
+ * agreeing on screen: `groupTurns` is one function, but the rail on the left
+ * and the turn's own header are separate components reading it separately, and
+ * "the list disagrees with the header" is a defect that only exists rendered.
+ *
+ * The turn strip only draws its badge while the turn is folded — the open one
+ * has its body to speak for it — so the turns under test are past ones, with a
+ * fourth left open to fold them (issue #74).
+ */
+async function checkATurnsBadgeSaysHowItEnded(): Promise<void> {
+  const host = document.createElement('div');
+  // Wide enough for the turn index to be a rail rather than a sheet.
+  host.style.cssText = 'width:1600px;height:900px;position:absolute;top:0;left:0;display:flex;z-index:9999';
+  document.body.appendChild(host);
+
+  const at = Date.now();
+  const controller = new ChatController('badge-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'badge-check',
+    snapshot: {
+      sessionId: 'badge-check',
+      runtime: 'claude',
+      state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: false, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: false,
+      },
+      messages: [
+        // The turn the issue is about: long, several steps went wrong, and it
+        // finished and answered.
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: at,
+          blocks: [{ kind: 'text', text: 'alpha' }], turnOutcome: 'done',
+        },
+        {
+          id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: at,
+          blocks: [
+            { kind: 'tool', toolId: 'x1', name: 'grep', toolKind: 'search', status: 'failed', error: 'no matches' },
+            { kind: 'tool', toolId: 'x2', name: 'bash', toolKind: 'execute', status: 'failed', error: 'exit 1' },
+            { kind: 'error', text: 'could not read notes.txt' },
+            { kind: 'tool', toolId: 'x3', name: 'bash', toolKind: 'execute', status: 'completed' },
+            { kind: 'text', text: 'all green now' },
+          ],
+          turnOutcome: 'done',
+        },
+        // One that really did fail: the runtime ended it as an error.
+        {
+          id: 'u2', seq: 3, turnId: 't2', role: 'user', ts: at,
+          blocks: [{ kind: 'text', text: 'beta' }], turnOutcome: 'failed',
+        },
+        {
+          id: 'a2', seq: 4, turnId: 't2', role: 'assistant', ts: at,
+          blocks: [{ kind: 'error', text: 'rate limited', fatal: true }], turnOutcome: 'failed',
+        },
+        // An ordinary one, so the check is reading three different answers.
+        {
+          id: 'u3', seq: 5, turnId: 't3', role: 'user', ts: at,
+          blocks: [{ kind: 'text', text: 'gamma' }], turnOutcome: 'done',
+        },
+        {
+          id: 'a3', seq: 6, turnId: 't3', role: 'assistant', ts: at,
+          blocks: [{ kind: 'text', text: 'here you are' }], turnOutcome: 'done',
+        },
+        // Left open, which is what folds the three above it.
+        {
+          id: 'u4', seq: 7, turnId: 't4', role: 'user', ts: at,
+          blocks: [{ kind: 'text', text: 'delta' }],
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 7,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/work',
+      view: { ...DEFAULT_CHAT_VIEW, terminalOpen: false },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  const rows = Array.from(host.querySelectorAll('nav[aria-label="Turns"] [role="option"]')) as HTMLElement[];
+  const strips = Array.from(host.querySelectorAll('[data-turn-id]')) as HTMLElement[];
+
+  check(
+    'the turn index lists every turn',
+    rows.length === 4 && strips.length === 4,
+    `rows=${rows.length} strips=${strips.length}`,
+  );
+  if (rows.length !== 4 || strips.length !== 4) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  // The word behind the glyph — the last child of the row, and what anything
+  // that cannot see a colour reads.
+  const wordOf = (row: HTMLElement): string => (row.lastElementChild?.textContent ?? '').trim();
+  // The badge itself, which is a coloured icon and nothing else. Read as a
+  // computed colour so the two surfaces are compared on what is drawn rather
+  // than on which component drew it.
+  const colourOf = (element: HTMLElement): string => {
+    // The strip carries a fold/unfold control of its own, and its icon comes
+    // first in the DOM — so the badge is the icon that is *not* a control. The
+    // rail's whole row is one button, where the badge is the only icon at all.
+    const icons = Array.from(element.querySelectorAll('.ricon'));
+    const icon = icons.find((node) => !node.closest('button')) ?? icons[0];
+    const span = icon?.parentElement as HTMLElement | null;
+    return span ? getComputedStyle(span).color : '';
+  };
+
+  check(
+    'a long turn with failed steps in it still reads as done',
+    wordOf(rows[0]) === 'done',
+    `${wordOf(rows[0])} for a turn holding 2 failed steps and an error it moved past`,
+  );
+  check(
+    'a turn the runtime ended as an error reads as failed',
+    wordOf(rows[1]) === 'failed',
+    wordOf(rows[1]),
+  );
+  check('an ordinary turn reads as done', wordOf(rows[2]) === 'done', wordOf(rows[2]));
+
+  const failedColour = colourOf(rows[1]);
+  const doneColour = colourOf(rows[0]);
+  check(
+    'failed and done are drawn in different colours',
+    Boolean(failedColour) && Boolean(doneColour) && failedColour !== doneColour,
+    `done=${doneColour} failed=${failedColour}`,
+  );
+
+  for (const index of [0, 1, 2]) {
+    const rail = colourOf(rows[index]);
+    const strip = colourOf(strips[index]);
+    check(
+      `the list and the turn's own header agree about turn ${index + 1}`,
+      Boolean(strip) && strip === rail,
+      `rail=${rail} strip=${strip}`,
+    );
+  }
+
+  // And the steps that failed are still failed where the step is shown: this
+  // was never about hiding them, only about not promoting them to a verdict.
+  // Opening the turn is what a reader does to find out why, so that is what
+  // this does.
+  const expand = host.querySelector('[aria-label="Expand turn 1"]') as HTMLElement | null;
+  expand?.click();
+  await wait(300);
+  // Read from the word rather than the colour: the timeline states a step's
+  // outcome for anything that cannot see one, which is the same reason the
+  // turn's own badge carries a word.
+  const activity = host.querySelector('[aria-label="Activity"]');
+  const said = Array.from(activity?.querySelectorAll('span') ?? [])
+    .map((node) => (node.textContent ?? '').trim())
+    .filter(Boolean);
+  check(
+    'a failed step inside a done turn is still marked failed where it happened',
+    said.filter((word) => word === 'Failed').length >= 2,
+    `${said.filter((word) => word === 'Failed').length} steps said Failed`,
   );
 
   root.unmount();

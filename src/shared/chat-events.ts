@@ -24,6 +24,10 @@
  * that goes stale the week it ships.
  */
 
+import { TurnOutcome } from './turn-outcome.js';
+
+export type { TurnOutcome };
+
 /**
  * Which surface a session is driven through.
  *
@@ -228,6 +232,17 @@ export interface PlanBlock {
 export interface ErrorBlock {
   kind: 'error';
   text: string;
+  /**
+   * True when this is the error the turn died of, rather than one it read and
+   * moved past.
+   *
+   * The distinction is the whole of issue #74: a runtime that reports "could
+   * not read that file" mid-turn and carries on has not failed the turn, and a
+   * runtime whose process went away has. Recorded on the block because that is
+   * what survives into a snapshot — a turn cut short this way never reaches the
+   * `turn_end` that would otherwise say how it ended.
+   */
+  fatal?: boolean;
 }
 
 /**
@@ -289,6 +304,17 @@ export interface ChatMessage {
   blocks: ChatBlock[];
   /** Set once the message completes. */
   stopReason?: string;
+  /**
+   * How the turn this message belongs to ended, stamped at `turn_end`.
+   *
+   * On the messages rather than beside the transcript because the messages are
+   * what survives: a browser rebuilds a conversation from `ChatSnapshot`, which
+   * carries the message list and the session's own fields and nothing else, and
+   * history paging prepends messages alone. Absent means the turn has not ended
+   * — which is a different thing from a turn that ended without saying why, and
+   * the reason this is an outcome and not a raw stop reason.
+   */
+  turnOutcome?: TurnOutcome;
   usage?: ChatUsage;
   /** Model that produced this message, when reported. */
   model?: string;

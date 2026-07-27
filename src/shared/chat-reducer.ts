@@ -31,6 +31,7 @@ import {
   ToolBlock,
   mergeUsage,
 } from './chat-events.js';
+import { turnOutcomeOf } from './turn-outcome.js';
 
 export interface TranscriptState {
   messages: ChatMessage[];
@@ -450,7 +451,11 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // lives in a status pill is an error the user scrolls past and misses.
       const last = state.messages[state.messages.length - 1];
       if (last && last.streaming) {
-        last.blocks.push({ kind: 'error', text: event.message });
+        // `fatal` carried through rather than flattened away: it is the
+        // difference between an error the agent read and moved past and the one
+        // it stopped on, and a turn cut short by the second never reaches a
+        // `turn_end` that could say so.
+        last.blocks.push({ kind: 'error', text: event.message, ...(event.fatal ? { fatal: true } : {}) });
         return {
           messageIndex: state.messages.length - 1,
           structural: false,
@@ -517,8 +522,16 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       if (state.state !== 'error' && state.state !== 'exited') {
         state.state = 'idle';
       }
+      // The runtime's own word for how the turn concluded, kept rather than
+      // dropped: it is the only statement any of them makes about the turn as a
+      // whole, and without it the badge is left inferring one from whichever
+      // steps inside it went wrong (issue #74).
+      const outcome = turnOutcomeOf(event.stopReason);
       for (const message of state.messages) {
-        if (message.turnId === event.turnId) message.streaming = false;
+        if (message.turnId === event.turnId) {
+          message.streaming = false;
+          message.turnOutcome = outcome;
+        }
       }
       if (event.usage) {
         state.usage = mergeUsage(state.usage, event.usage);

@@ -147,18 +147,76 @@ describe('groupTurns', function () {
       assert.strictEqual(mod.groupTurns(messages, 'awaiting_permission')[0].status, 'waiting');
     });
 
-    it('reports failed for a turn holding a failed tool call', function () {
+    it('reports done for a long turn that failed steps along the way', function () {
+      // The complaint in issue #74, in one case: a turn that ran a dozen steps,
+      // had a couple of them go wrong, and finished. A grep with no match and a
+      // test run that reported failures are what this work is made of; neither
+      // is a verdict on the turn.
       const messages = [
-        msg('user', [text('run it')]),
-        msg('assistant', [tool('failed')]),
+        msg('user', [text('make the suite pass')]),
+        msg('assistant', [tool('completed'), tool('failed'), tool('completed'), tool('failed')]),
+        msg('assistant', [text('all green now')], { turnOutcome: 'done' }),
         msg('user', [text('and again')]),
+      ];
+
+      const turn = mod.groupTurns(messages, 'idle')[0];
+
+      assert.strictEqual(turn.status, 'done');
+      // Not hidden — still counted, so the steps stay findable from the turn.
+      assert.strictEqual(turn.failedStepCount, 2);
+    });
+
+    it('reports done for a turn that read an error and carried on', function () {
+      const messages = [
+        msg('user', [text('go')]),
+        msg('assistant', [{ kind: 'error', text: 'could not read notes.txt' }, text('used the other file')], {
+          turnOutcome: 'done',
+        }),
+      ];
+      assert.strictEqual(mod.groupTurns(messages, 'idle')[0].status, 'done');
+    });
+
+    it('reports failed for a turn the runtime ended as failed', function () {
+      const messages = [
+        msg('user', [text('go')]),
+        msg('assistant', [text('starting')], { turnOutcome: 'failed' }),
+        msg('user', [text('again')]),
       ];
       assert.strictEqual(mod.groupTurns(messages, 'idle')[0].status, 'failed');
     });
 
-    it('reports failed for a turn holding an error block', function () {
-      const messages = [msg('user', [text('go')]), msg('assistant', [{ kind: 'error', text: 'stdio closed' }])];
+    it('reports failed for a turn cut short by an error it could not get past', function () {
+      // No turn_end ever arrives for this one: the process went away, so the
+      // only thing that says how the turn ended is the fatal error itself.
+      const messages = [
+        msg('user', [text('go')]),
+        msg('assistant', [{ kind: 'error', text: 'grok exited (code 1)', fatal: true }]),
+      ];
       assert.strictEqual(mod.groupTurns(messages, 'idle')[0].status, 'failed');
+    });
+
+    it('reports failed for the open turn when the session died under it', function () {
+      const messages = [msg('user', [text('go')]), msg('assistant', [tool('running')])];
+      assert.strictEqual(mod.groupTurns(messages, 'exited')[0].status, 'failed');
+      assert.strictEqual(mod.groupTurns(messages, 'error')[0].status, 'failed');
+    });
+
+    it('keeps the outcome a turn ended with when the session dies afterwards', function () {
+      // A one-shot CLI exits the moment it has answered. What the runtime said
+      // when it closed the turn outranks the process going away after it.
+      const messages = [
+        msg('user', [text('go')]),
+        msg('assistant', [text('here you are')], { turnOutcome: 'done' }),
+      ];
+      assert.strictEqual(mod.groupTurns(messages, 'exited')[0].status, 'done');
+    });
+
+    it('reports running for a turn still in flight, never failed', function () {
+      const messages = [
+        msg('user', [text('go')]),
+        msg('assistant', [tool('failed'), tool('running')], { streaming: true }),
+      ];
+      assert.strictEqual(mod.groupTurns(messages, 'running')[0].status, 'running');
     });
 
     it('does not treat a denied call as a failure', function () {

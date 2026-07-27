@@ -104,6 +104,14 @@ Deliberately — convert it, or set the phone's camera to "Most Compatible".
 The proxy is not forwarding WebSocket upgrades. See
 [reverse proxies](running-as-a-service.md#behind-a-reverse-proxy).
 
+**A turn is marked failed and the work looks fine.**
+The badge says how the turn *ended*, not whether anything inside it went wrong.
+A search with no matches, a test run that reported failures or a command that
+came back non-zero leaves the turn marked done, and the step itself stays marked
+failed where the step is shown. Red means the turn did not finish: the agent
+stopped on an error it could not get past, the runtime went away mid-turn, or it
+ended with no answer. A turn you interrupted yourself reads as done.
+
 **A session came back "ended" after a restart.**
 Expected. The record, history and transcript persist; the live process does not.
 
