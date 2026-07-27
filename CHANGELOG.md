@@ -46,6 +46,14 @@
   because rebuilding under a working agent would end the run. The panel says
   which of the two is happening.
 
+### Fixed
+- **`cc-web` started printing its help text instead of starting.** Adding the
+  `env` operator subcommands left the program without an action of its own, and
+  a command line with subcommands answers a bare invocation with help. Running
+  the server with no arguments — which is how almost everyone runs it — did
+  nothing at all. It now starts, and a test runs the real binary to keep it that
+  way.
+
 ## [5.2.0] - 2026-07-27
 
 ### Added

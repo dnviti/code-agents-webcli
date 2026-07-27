@@ -138,8 +138,6 @@ async function withEngine(work) {
   }
 }
 
-let ranSubcommand = false;
-
 const environments = program
   .command('env')
   .description('list and remove per-user container environments');
@@ -148,7 +146,6 @@ environments
   .command('ls')
   .description('list environments with their owners')
   .action(async () => {
-    ranSubcommand = true;
     const list = await withEngine((manager) => manager.list());
     if (!list.length) {
       console.log('No per-user environments exist.');
@@ -171,7 +168,6 @@ environments
   .description('remove an environment')
   .option('--purge-data', "also delete the user's persistent home directory")
   .action(async (name, commandOptions) => {
-    ranSubcommand = true;
     await withEngine((manager) => manager.remove(name, {
       purgeData: commandOptions.purgeData === true,
     }));
@@ -401,14 +397,16 @@ async function main() {
   }
 }
 
-// parseAsync, not parse: the `env` subcommands below do real work and their
-// actions are async. When no subcommand was given, commander has only filled
-// in the options and starting the server is still the right thing to do.
-program.parseAsync().then(() => {
-  if (!ranSubcommand) {
-    main();
-  }
-}).catch((error) => {
+// Starting the server is the root command's own action, not something done
+// after parsing. Once a program has subcommands, commander answers a bare
+// invocation with the help text unless the root has an action of its own — so
+// leaving this out stopped `cc-web` from starting at all, which is the one
+// thing it must always do.
+program.action(() => main());
+
+// parseAsync, not parse: the `env` subcommands do real work and their actions
+// are async.
+program.parseAsync().catch((error) => {
   console.error(error.message);
   process.exit(1);
 });

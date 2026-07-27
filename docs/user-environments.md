@@ -10,8 +10,16 @@ Turning on **per-user environments** gives every signed-in account its own
 container, named after them, with a home directory that survives the container
 being destroyed and rebuilt.
 
-The feature is off unless you ask for it. An installation that does not enable
-it behaves exactly as it did before.
+**The feature is off unless you ask for it.** An installation that enables
+nothing needs no Docker, no Podman and no `kubectl` — none of them is a
+dependency, none is looked for at startup, and none is ever invoked. Terminals,
+agents, files and git run directly on the machine the server runs on, in the
+account that started it, exactly as they always have. Nothing is created in the
+data directory, and the size picker does not appear in Settings.
+
+Enabling it is one flag, and turning it off again is removing that flag: the
+server goes straight back to running on the host. The environments and their
+data stay on disk until an operator removes them.
 
 ## What you get
 
