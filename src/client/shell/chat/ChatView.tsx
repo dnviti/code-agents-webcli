@@ -910,6 +910,10 @@ export function ChatView({
               // modelFeedback instead, so this label never claims a model the
               // session isn't actually on.
               model={controller.modelOverrideValue ?? transcript.model}
+              // Only where the runtime reported a genuine split. An override
+              // is what was asked for, and pairing it with what the last turn
+              // actually ran would read as one claim about one model.
+              alsoRan={controller.modelOverrideValue ? undefined : transcript.turnModels}
               onSetModel={setModel}
               modelFeedback={controller.modelFeedback}
               // Deliberately the same path as typing it: the button and the

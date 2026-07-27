@@ -7,6 +7,7 @@ import {
   mergeSlashCommands,
 } from '../../../shared/slash-commands.js';
 import { describeFrom } from '../installed-commands.js';
+import { mapModelUsage } from './model-usage.js';
 import {
   ChatAttachment,
   ChatBlock,
@@ -655,6 +656,49 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     return any ? left : undefined;
   }
 
+  /**
+   * The per-model breakdown, with its money put on the same footing as the turn.
+   *
+   * `modelUsage.*.costUSD` is a slice of `total_cost_usd`, and that counter is
+   * cumulative over the conversation (see `turnCost` above — the reason this
+   * adapter exists in the shape it does). Passing those figures straight
+   * through would put a per-turn cost on the job and a whole-conversation cost
+   * on the models inside it, and the by-model view would climb past the total
+   * it is a breakdown of, turn after turn.
+   *
+   * So the *shares* are taken from the report and the turn's own cost is what
+   * is divided by them. That is the one thing that stays true whichever way the
+   * counter behaves: a runtime reporting per-turn figures gives shares of a
+   * total equal to the turn's cost, which divides back to exactly what it
+   * reported. Nothing is scaled up — the sum is the turn's own measured cost,
+   * always.
+   *
+   * Tokens are left alone. Claude's `usage` is per-turn, not cumulative, and
+   * the per-model token fields track it.
+   */
+  private modelBreakdown(raw: Record<string, unknown>, turnCostUsd: number | undefined) {
+    const models = mapModelUsage(raw);
+    if (!models) return undefined;
+
+    const reported = models.reduce((total, entry) => total + (entry.usage?.costUsd ?? 0), 0);
+    if (turnCostUsd === undefined || reported <= 0) {
+      // No cost to divide, or nothing to divide it by. The models are still
+      // named — which is the fact this exists for — and carry no money rather
+      // than a made-up share of one.
+      return models.map((entry) => {
+        if (entry.usage?.costUsd === undefined) return entry;
+        const { costUsd, ...rest } = entry.usage;
+        return Object.keys(rest).length > 0 ? { ...entry, usage: rest } : { model: entry.model, calls: entry.calls };
+      });
+    }
+
+    return models.map((entry) => {
+      const share = entry.usage?.costUsd;
+      if (share === undefined) return entry;
+      return { ...entry, usage: { ...entry.usage, costUsd: (share / reported) * turnCostUsd } };
+    });
+  }
+
   private handleResult(raw: Record<string, unknown>): void {
     const subtype = str(raw.subtype);
     const isError = raw.is_error === true;
@@ -689,6 +733,16 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       stopReason: str(raw.stop_reason) ?? subtype,
       usage,
       durationMs: num(raw.duration_ms),
+      ...(() => {
+        const models = this.modelBreakdown(raw, costUsd);
+        return models ? { models } : {};
+      })(),
+      // `modelUsage` is where a Task subagent's spend surfaces: it runs on
+      // whatever model it was launched with and appears here as a second key,
+      // while the assistant messages in the transcript only ever carry the
+      // main agent's. Without this a turn that delegated is filed entirely
+      // against the model that did the delegating. Spread above rather than
+      // assigned here, so a turn that reported none carries no key at all.
     });
     this.activeTurnId = null;
     this.currentMsgId = null;

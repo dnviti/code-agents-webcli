@@ -396,6 +396,29 @@ export class AppDatabase {
         reports_cost INTEGER NOT NULL
       );
 
+      /* How one job's spend divided between models, for the runtimes that say.
+         Rows exist only where a turn genuinely used more than one — a subagent
+         on another model, a fallback after a failure — because a single-model
+         job is already fully described by usage_jobs.model.
+
+         The figures are the runtime's own, not a share worked out here: claude
+         and grok both publish a per-model breakdown of the same turn they
+         publish a total for. The calls column is that runtime's own count of
+         round trips to the model. There is deliberately no tool_calls: no runtime
+         attributes a tool call to a model, and a column nobody can fill
+         honestly invites somebody to fill it dishonestly. */
+      CREATE TABLE IF NOT EXISTS usage_job_models (
+        job_id TEXT NOT NULL REFERENCES usage_jobs(id) ON DELETE CASCADE,
+        model TEXT NOT NULL,
+        calls INTEGER,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cache_read_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        cost_usd REAL,
+        PRIMARY KEY (job_id, model)
+      );
+
       /* Which tools a job called, and how often. Cascades: a tool count with no
          job is not a fact anybody can use. */
       CREATE TABLE IF NOT EXISTS usage_job_tools (
@@ -413,6 +436,9 @@ export class AppDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_usage_jobs_native
         ON usage_jobs(native_session_id);
+
+      CREATE INDEX IF NOT EXISTS idx_usage_job_models_model
+        ON usage_job_models(model);
 
       CREATE INDEX IF NOT EXISTS idx_runtime_sessions_owner
         ON runtime_sessions(owner_user_id);

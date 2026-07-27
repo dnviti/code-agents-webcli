@@ -1114,6 +1114,32 @@ function JobDetail({
             </div>
           </div>
 
+          {/* Defended rather than assumed: this dialog is served to whatever
+              server answers, and one older than this page returns a job record
+              with no split at all. Reading `.length` off that is a blank
+              dialog where a job used to open. */}
+          {(job.models ?? []).length > 0 ? (
+            <div>
+              {/* Only for a turn that genuinely ran on more than one model. A
+                  job with one is fully described by the Model field above, and
+                  a one-row table under it would suggest a split that is not
+                  there. Tokens and cost are the runtime's own per-model
+                  figures; there is no tool column because no runtime says
+                  which model asked for which tool. (#75) */}
+              <h3 style={sectionTitleStyle}>Models this turn ran on</h3>
+              <Table
+                columns={['Model', 'Calls', 'Input', 'Output', 'Cost']}
+                rows={(job.models ?? []).map((split) => [
+                  split.model,
+                  split.calls ?? '—',
+                  split.inputTokens === null ? '—' : formatTokens(split.inputTokens),
+                  split.outputTokens === null ? '—' : formatTokens(split.outputTokens),
+                  split.costUsd === null ? '—' : formatCost(split.costUsd),
+                ])}
+              />
+            </div>
+          ) : null}
+
           <div>
             <h3 style={sectionTitleStyle}>Tools called</h3>
             {job.tools.length === 0 ? (

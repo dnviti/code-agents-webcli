@@ -6,6 +6,7 @@ import {
   TextBlock,
   ThinkingBlock,
   ToolBlock,
+  TurnModelUsage,
   UserTurn,
   classifyTool,
   mergeUsage,
@@ -90,10 +91,45 @@ export class PiChatAdapter extends BaseChatAdapter {
   private currentAssistantMsgId: string | null = null;
   private blockState: BlockTrack[] | null = null;
   private readonly toolStartedAt = new Map<string, number>();
+  /**
+   * What each model did this turn, accumulated from the messages themselves.
+   *
+   * pi has no `modelUsage` summary the way claude and grok do — but it names
+   * the model on every assistant message and carries that message's own usage
+   * beside it, which is the same fact arriving in instalments. One turn can
+   * hold several messages, and pi will switch model between them (a fallback
+   * after a provider error is the case seen in practice), so this is a map
+   * rather than a field.
+   */
+  private readonly turnModels = new Map<string, { calls: number; usage: ChatUsage }>();
+  /** The last model pi said it used, for the session line. Never the requested one. */
+  private reportedModel: string | undefined;
 
   /** The adapter stays usable across turns even with no child running between them. */
   override get alive(): boolean {
     return !this.stopped;
+  }
+
+  /**
+   * This turn's models, or nothing at all if pi named none.
+   *
+   * Spread into the event rather than assigned, so a turn pi named no model
+   * for carries no `models` key at all — an explicit `undefined` is a
+   * different object to anything comparing events, and these are compared.
+   *
+   * Nothing rather than an empty list, and never the requested model: a turn
+   * that died before pi produced a message reached no model that anybody can
+   * name, and `--model` is a request this app made, not an observation it took.
+   */
+  private reportedTurnModels(): { models?: TurnModelUsage[] } {
+    if (this.turnModels.size === 0) return {};
+    return {
+      models: [...this.turnModels].map(([model, seen]) => ({
+        model,
+        calls: seen.calls,
+        ...(Object.keys(seen.usage).length > 0 ? { usage: seen.usage } : {}),
+      })),
+    };
   }
 
   /**
@@ -118,8 +154,12 @@ export class PiChatAdapter extends BaseChatAdapter {
       this.sessionEventEmitted = true;
       this.emit({
         t: 'session',
+        // Deliberately not `options.model`: resuming a session says nothing
+        // about which model answered in it, and the flag is only a request.
+        // pi names the model on its first message and the turn's report
+        // confirms it; until then the conversation shows none.
+        model: this.reportedModel,
         nativeSessionId: this.nativeSessionId,
-        model: this.options.model,
         cwd: this.options.workingDir,
         capabilities: this.capabilities,
       });
@@ -149,6 +189,7 @@ export class PiChatAdapter extends BaseChatAdapter {
     this.turnInterrupted = false;
     this.currentTurnId = `t${++this.turnCounter}`;
     this.currentTurnUsage = {};
+    this.turnModels.clear();
     this.emit({ t: 'state', state: 'running' });
 
     const args = this.buildTurnArgs(turn);
@@ -264,6 +305,7 @@ export class PiChatAdapter extends BaseChatAdapter {
         turnId: this.currentTurnId,
         stopReason: 'error',
         usage: this.currentTurnUsage,
+        ...this.reportedTurnModels(),
       });
       this.currentTurnId = null;
       this.emit({ t: 'state', state: 'idle' });
@@ -360,7 +402,8 @@ export class PiChatAdapter extends BaseChatAdapter {
     this.emit({
       t: 'session',
       nativeSessionId: this.nativeSessionId,
-      model: this.options.model,
+      // Same as in `start()`: what pi reported, which at this point is nothing.
+      model: this.reportedModel,
       cwd: typeof event.cwd === 'string' ? event.cwd : this.options.workingDir,
       capabilities: this.capabilities,
     });
@@ -408,6 +451,15 @@ export class PiChatAdapter extends BaseChatAdapter {
     if (usage) {
       this.currentTurnUsage = mergeUsage(this.currentTurnUsage, usage);
     }
+    if (message.model) {
+      // One message is one round trip to the model, which makes counting them
+      // the same measure grok reports as `modelCalls`.
+      const seen = this.turnModels.get(message.model) ?? { calls: 0, usage: {} };
+      seen.calls += 1;
+      if (usage) seen.usage = mergeUsage(seen.usage, usage);
+      this.turnModels.set(message.model, seen);
+      this.reportedModel = message.model;
+    }
     this.currentAssistantMsgId = null;
     this.blockState = null;
   }
@@ -431,6 +483,7 @@ export class PiChatAdapter extends BaseChatAdapter {
       t: 'turn_end',
       turnId: this.currentTurnId,
       usage: this.currentTurnUsage,
+      ...this.reportedTurnModels(),
     });
     this.emit({ t: 'state', state: 'idle' });
     this.currentTurnId = null;

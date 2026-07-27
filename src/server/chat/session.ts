@@ -25,6 +25,7 @@ import {
   ASK_QUESTION_TOOL_NAME,
 } from '../../shared/chat-events.js';
 import { isClearingCommand, mergeSlashCommands } from '../../shared/slash-commands.js';
+import { installedModels } from './installed-models.js';
 import { listInstalledCommands } from './installed-commands.js';
 import { AdapterEvent, ChatAdapter, ChatAdapterOptions } from './adapter.js';
 import {
@@ -525,6 +526,29 @@ export class ChatSession {
       );
     }
 
+    // And the same for the model picker's menu, for the runtimes that publish
+    // one only through a command of their own. Not awaited: this spawns a
+    // process, the session has nothing to do with its answer, and a menu is
+    // not worth delaying a conversation for. It arrives as a `capabilities`
+    // event whenever it arrives, which is what that event is for.
+    //
+    // It never overwrites a list a runtime published itself. Only grok and pi
+    // are probed at all — everybody else either says so over their protocol or
+    // has no list to give — but the check makes the precedence explicit rather
+    // than incidental: what the runtime says always wins.
+    void installedModels(options.runtime, this.deps.resolveCommand(options.runtime), env)
+      .then((models) => {
+        if (models.length === 0) return;
+        if (this.adapter !== adapter) return; // restarted since; that session owns its own menu
+        if (adapter.capabilities.models?.length) return;
+        adapter.capabilities.models = models;
+        this.ingest({ t: 'capabilities', capabilities: { models } });
+      })
+      .catch(() => {
+        // installedModels does not reject; this is belt and braces so a chat
+        // session can never be taken down by its own picker.
+      });
+
     // Before the first event of the new conversation, so the line lands above
     // it rather than in the middle of it. Only when there is something to draw
     // a line under.
@@ -759,6 +783,15 @@ export class ChatSession {
         reportsUsage: this.capabilities?.usage === true,
         reportsCost: this.capabilities?.cost === true,
         tools: job.tools,
+        models: job.models.map((split) => ({
+          model: split.model,
+          calls: numeric(split.calls),
+          inputTokens: numeric(split.usage?.inputTokens),
+          outputTokens: numeric(split.usage?.outputTokens),
+          cacheReadTokens: numeric(split.usage?.cacheReadTokens),
+          cacheWriteTokens: numeric(split.usage?.cacheWriteTokens),
+          costUsd: numeric(split.usage?.costUsd),
+        })),
       });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);

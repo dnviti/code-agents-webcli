@@ -140,6 +140,65 @@ describe('codex app-server adapter', function () {
       assert.ok(Math.abs(state.ts - session.ts) <= 50, `state ts ${state.ts} vs session ts ${session.ts}`);
     });
 
+    it('offers the models codex says it accepts, without waiting for them (#75)', async function () {
+      const h = harness({});
+      await boot(h);
+
+      // Asked for, but the session was announced without waiting on the answer:
+      // a picker menu is not worth delaying a conversation for.
+      const asked = h.sent.find((message) => message.method === 'model/list');
+      assert.ok(asked, 'codex publishes its models over the protocol');
+      assert.ok(only(h.events, 'session').length === 1);
+
+      // The shape is the running app-server's own, captured from it.
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: asked.id,
+        result: {
+          data: [
+            {
+              id: 'gpt-5.6-terra',
+              model: 'gpt-5.6-terra',
+              displayName: 'GPT-5.6-Terra',
+              description: 'Balanced agentic coding model for everyday work.',
+              hidden: false,
+              isDefault: true,
+            },
+            { id: 'gpt-5.6-luna', displayName: 'GPT-5.6-Luna', hidden: false },
+            { id: 'retired-internal', displayName: 'Retired', hidden: true },
+          ],
+        },
+      });
+      await flush();
+
+      const revised = only(h.events, 'capabilities').pop();
+      assert.deepStrictEqual(revised.capabilities.models, [
+        {
+          value: 'gpt-5.6-terra',
+          name: 'GPT-5.6-Terra',
+          description: 'Balanced agentic coding model for everyday work.',
+        },
+        { value: 'gpt-5.6-luna', name: 'GPT-5.6-Luna' },
+      ]);
+      assert.strictEqual(h.adapter.capabilities.models.length, 2);
+    });
+
+    it('starts fine against a build that has no model/list at all (#75)', async function () {
+      const h = harness({});
+      await boot(h);
+      const asked = h.sent.find((message) => message.method === 'model/list');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: asked.id,
+        error: { code: -32600, message: 'unknown variant `model/list`' },
+      });
+      await flush();
+
+      assert.strictEqual(h.adapter.capabilities.models, undefined);
+      assert.strictEqual(only(h.events, 'error').length, 0);
+      assert.strictEqual(only(h.events, 'session').length, 1);
+    });
+
     it('resumes by threadId instead of starting fresh when asked to', async function () {
       const h = harness({ resumeSessionId: 'th_old' });
       const done = h.adapter.handshake();

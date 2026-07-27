@@ -93,6 +93,15 @@ export interface ComposerProps {
    */
   model?: string;
   /**
+   * Every model the last turn was billed to, when it was more than one.
+   *
+   * A subagent on another model, or a fallback after a failure. The chip shows
+   * the count rather than the names — one line cannot hold three model ids —
+   * and the full list is on the hover title, where it is a record rather than
+   * a guess at which one mattered.
+   */
+  alsoRan?: string[];
+  /**
    * Change this conversation's model, independent of the runtime's own
    * default. Always available — see ModelChip — regardless of whether the
    * runtime advertises a model list or a live switch.
@@ -193,6 +202,7 @@ export function Composer({
   turnLabel,
   usage,
   model,
+  alsoRan,
   onSetModel,
   modelFeedback,
   bypassPermissions = false,
@@ -919,6 +929,7 @@ export function Composer({
             <>
               <ModelChip
                 current={model}
+                alsoRan={alsoRan}
                 models={capabilities.models}
                 feedback={modelFeedback}
                 onPick={(value) => onSetModel?.(value)}
@@ -1233,12 +1244,15 @@ function Chip({
  */
 function ModelChip({
   current,
+  alsoRan,
   models,
   onPick,
   feedback,
 }: {
   /** What the session reported it is running, when it reported anything. */
   current: string | undefined;
+  /** Every model the last turn ran on, when the runtime reported more than one. */
+  alsoRan?: string[];
   models: ModelChoice[] | undefined;
   onPick: (value: string) => void;
   /** What the server said happened to the last pick made here. */
@@ -1252,7 +1266,11 @@ function ModelChip({
   // The session's own model wins. `models` is a menu in whatever order the
   // runtime listed it, and its first entry is the current one only by accident.
   const matched = models?.find((m) => m.value === current || m.name === current);
-  const label = matched?.name ?? current ?? 'model';
+  const named = matched?.name ?? current ?? 'model';
+  // The others are counted, not named: three model ids do not fit on a chip,
+  // and picking one of them to show would undo the point of reporting a split.
+  const others = (alsoRan ?? []).filter((model) => model !== current);
+  const label = others.length > 0 ? `${named} +${others.length}` : named;
 
   React.useEffect(() => {
     if (!open) return;
@@ -1277,6 +1295,26 @@ function ModelChip({
     onPick(value);
   };
 
+  /**
+   * The list, narrowed by what has been typed.
+   *
+   * The same field does both jobs. A runtime that publishes hundreds of models
+   * — pi lists 277 — turns an unfiltered menu into a scroll nobody reads, and
+   * adding a second input beside a box already labelled "type a model name"
+   * would be two ways to say the same thing. Typing narrows; `Use` still sends
+   * whatever was typed, so a model the runtime did not list stays reachable
+   * even when it matches nothing.
+   */
+  const query = customValue.trim().toLowerCase();
+  const shown = query
+    ? (models ?? []).filter(
+        (choice) =>
+          choice.value.toLowerCase().includes(query)
+          || choice.name.toLowerCase().includes(query)
+          || (choice.description ?? '').toLowerCase().includes(query),
+      )
+    : models ?? [];
+
   const submitCustom = (): void => {
     const value = customValue.trim();
     if (!value) return;
@@ -1299,7 +1337,12 @@ function ModelChip({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label="Change model"
-        title={feedback?.message || `Model: ${label}`}
+        title={
+          feedback?.message
+          || (others.length > 0
+            ? `This turn ran on: ${[named, ...others].join(', ')}`
+            : `Model: ${label}`)
+        }
         onClick={() => setOpen((value) => !value)}
         style={{
           display: 'inline-flex',
@@ -1357,7 +1400,7 @@ function ModelChip({
                   submitCustom();
                 }
               }}
-              placeholder="Type any model name…"
+              placeholder={models?.length ? 'Filter, or type any model name…' : 'Type any model name…'}
               aria-label="Custom model name"
               style={{
                 flex: 1,
@@ -1396,7 +1439,7 @@ function ModelChip({
             </button>
           </div>
 
-          {(models ?? []).map((choice) => (
+          {shown.map((choice) => (
             <button
               key={choice.value}
               type="button"
@@ -1436,6 +1479,18 @@ function ModelChip({
               }}
             >
               This runtime hasn&apos;t listed models — type one above.
+            </div>
+          ) : null}
+
+          {models?.length && shown.length === 0 ? (
+            <div
+              style={{
+                padding: '4px 8px 2px',
+                color: 'var(--muted-foreground)',
+                fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-2xs)',
+              }}
+            >
+              No listed model matches — Use sends it anyway.
             </div>
           ) : null}
 

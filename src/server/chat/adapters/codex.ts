@@ -2,6 +2,7 @@ import { spawn } from 'child_process';
 import {
   ChatCapabilities,
   DiffHunk,
+  ModelChoice,
   FileDiff,
   NO_CHAT_CAPABILITIES,
   PermissionOption,
@@ -376,6 +377,8 @@ const CLIENT_INFO = { name: 'code-agents-webcli', title: 'Code Agents Web CLI', 
  */
 const INIT_TIMEOUT_MS = 8_000;
 const THREAD_START_TIMEOUT_MS = 15_000;
+/** Short on purpose: the picker is worth waiting for, but not worth a delayed session. */
+const MODEL_LIST_TIMEOUT_MS = 5_000;
 
 // ------------------------------------------------------------- app-server
 
@@ -449,6 +452,11 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     const thread = record(response.thread);
     this.threadId = str(thread.id) || null;
     this.model = str(response.model);
+    // Not awaited. The picker's menu is worth having but not worth holding a
+    // conversation open for, and the answer arrives on its own event whenever
+    // it arrives — `capabilities` exists for exactly this, a runtime revising
+    // what it can do after it has introduced itself.
+    void this.loadModelList();
 
     this.emit({
       t: 'session',
@@ -458,6 +466,49 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
       capabilities: this.capabilities,
     });
     this.emit({ t: 'state', state: 'idle' });
+  }
+
+  /**
+   * Ask codex which models it will accept, for the picker.
+   *
+   * `model/list` is a real request on this protocol — confirmed against the
+   * running app-server, which rejects an unknown method by name and answers
+   * this one with `{ data: [{ id, displayName, description, isDefault, hidden }] }`.
+   * So codex's picker offers what codex says, rather than asking somebody to
+   * remember a model id and type it correctly.
+   *
+   * Best-effort by construction: a build that does not have the method, or is
+   * slow to answer it, must not stop a conversation opening. The catch leaves
+   * `capabilities.models` unset, which is the same state as a runtime that
+   * publishes nothing — and the picker already says so rather than showing an
+   * empty menu.
+   */
+  private async loadModelList(): Promise<void> {
+    try {
+      const response = record(
+        await this.withTimeout(this.call('model/list', {}), MODEL_LIST_TIMEOUT_MS, 'model/list'),
+      );
+      const entries = Array.isArray(response.data) ? response.data : [];
+      const models: ModelChoice[] = [];
+      for (const entry of entries) {
+        const item = record(entry);
+        if (!item || item.hidden === true) continue;
+        const value = str(item.id) || str(item.model);
+        if (!value) continue;
+        models.push({
+          value,
+          name: str(item.displayName) || value,
+          ...(str(item.description) ? { description: str(item.description) as string } : {}),
+        });
+      }
+      if (models.length > 0) {
+        this.capabilities.models = models;
+        this.emit({ t: 'capabilities', capabilities: { models } });
+      }
+    } catch {
+      // Deliberately silent: nothing about a missing menu is worth an error
+      // event in a transcript, and the conversation is about to start fine.
+    }
   }
 
   private withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {

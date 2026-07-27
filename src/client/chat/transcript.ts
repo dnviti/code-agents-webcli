@@ -417,6 +417,17 @@ export class ChatTranscript {
     return this.state.model;
   }
 
+  /**
+   * Every model the last turn was billed to, when the runtime broke it down.
+   *
+   * One entry — the usual case — says nothing `model` does not already say.
+   * More than one is the fact the header has to carry: the turn did not run on
+   * one model, and a single name would be a claim about work that was split.
+   */
+  get turnModels(): string[] | undefined {
+    return this.state.turnModels;
+  }
+
   get lastError(): string | undefined {
     return this.state.lastError;
   }
