@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [6.0.0] - unreleased
 
 ### Added
 - **Every signed-in user can have their own machine.** Until now everyone who
