@@ -179,7 +179,7 @@ describe('claude chat adapter', function () {
       assert.strictEqual(state.currentTurnId, null, 'turn_end must close the turn');
     });
 
-    it('carries cost and token usage from the result event onto turn_end', function () {
+    it('carries the cost from the result event onto turn_end', function () {
       const { adapter, events } = makeAdapter();
       adapter.send({ text: 'x' });
       for (const line of loadFixture('claude-oneshot.jsonl')) adapter.handleMessage(line);
@@ -188,11 +188,62 @@ describe('claude chat adapter', function () {
       assert.ok(turnEnd);
       assert.strictEqual(turnEnd.stopReason, 'end_turn');
       assert.strictEqual(turnEnd.usage.costUsd, 0.19010849999999999);
-      assert.strictEqual(turnEnd.usage.inputTokens, 4);
-      assert.strictEqual(turnEnd.usage.outputTokens, 97);
-      assert.strictEqual(turnEnd.usage.cacheReadTokens, 47287);
-      assert.strictEqual(turnEnd.usage.cacheWriteTokens, 16402);
       assert.strictEqual(turnEnd.durationMs, 6997);
+    });
+
+    it('does not report the result’s tokens again after the messages reported them', function () {
+      // The `usage` on a result is the turn's aggregate, and the turn's own
+      // messages already reported every token in it on their message_delta.
+      // Everything downstream *sums* what a turn reports, so passing it through
+      // charged this capture 8 in / 194 out / 94574 cache read — twice what
+      // Claude said it used, on the live meter, the session line and the
+      // recorded history alike, and consistently enough to look like a real
+      // number. #80.
+      const { adapter, events } = makeAdapter();
+      adapter.send({ text: 'x' });
+      for (const line of loadFixture('claude-oneshot.jsonl')) adapter.handleMessage(line);
+
+      const perMessage = events
+        .filter((e) => e.t === 'msg_end' && e.usage)
+        .reduce(
+          (sum, e) => ({
+            inputTokens: sum.inputTokens + (e.usage.inputTokens ?? 0),
+            outputTokens: sum.outputTokens + (e.usage.outputTokens ?? 0),
+            cacheReadTokens: sum.cacheReadTokens + (e.usage.cacheReadTokens ?? 0),
+            cacheWriteTokens: sum.cacheWriteTokens + (e.usage.cacheWriteTokens ?? 0),
+          }),
+          { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        );
+      assert.deepStrictEqual(perMessage, {
+        inputTokens: 4,
+        outputTokens: 97,
+        cacheReadTokens: 47287,
+        cacheWriteTokens: 16402,
+      }, 'the messages already account for the whole turn');
+
+      const turnEnd = events.find((e) => e.t === 'turn_end');
+      assert.strictEqual(turnEnd.usage.inputTokens, 0);
+      assert.strictEqual(turnEnd.usage.outputTokens, 0);
+      assert.strictEqual(turnEnd.usage.cacheReadTokens, 0);
+      assert.strictEqual(turnEnd.usage.cacheWriteTokens, 0);
+    });
+
+    it('still reports the result’s tokens when no message reported any', function () {
+      // A turn that failed before its first message_delta has nothing that
+      // could have been counted twice, and the result is its only reading.
+      const { adapter, events } = makeAdapter();
+      adapter.send({ text: 'x' });
+      adapter.handleMessage({
+        type: 'result',
+        subtype: 'success',
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 11, output_tokens: 22, cache_read_input_tokens: 33 },
+      });
+
+      const turnEnd = events.find((e) => e.t === 'turn_end');
+      assert.strictEqual(turnEnd.usage.inputTokens, 11);
+      assert.strictEqual(turnEnd.usage.outputTokens, 22);
+      assert.strictEqual(turnEnd.usage.cacheReadTokens, 33);
     });
 
     it('streams tool arguments as incremental json before the block closes', function () {

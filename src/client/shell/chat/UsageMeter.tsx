@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { ChatCapabilities, ChatUsage } from '../../../shared/chat-events.js';
+import { tokenTotal } from '../../../shared/usage-records.js';
 import { PHONE_TEXT } from '../../ui/touch.js';
 
 /**
@@ -75,11 +76,11 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
 
   if (compact) {
     const parts: string[] = [];
-    if (hasTotal) {
-      parts.push(`${formatTokens(usage.totalTokens!)} tok`);
-    } else if (fields.length) {
-      parts.push(`${formatTokens(fields.reduce((sum, f) => sum + f.value, 0))} tok`);
-    }
+    // The same function the historical dashboard files a job's total with, so
+    // the figure on screen and the figure in the history cannot be two
+    // different readings of the same work — which is what they were (#80).
+    const total = showTokens ? tokenTotal(usage) : null;
+    if (total !== null) parts.push(`${formatTokens(total)} tok`);
     if (hasCost) parts.push(formatCost(usage.costUsd!));
 
     return (

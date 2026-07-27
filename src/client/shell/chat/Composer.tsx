@@ -9,6 +9,7 @@ import {
 } from '../../../shared/chat-events.js';
 import { compactCount } from '../../chat/tool-meta.js';
 import { mentionAtCaret } from '../../../shared/file-match.js';
+import { tokenTotal } from '../../../shared/usage-records.js';
 import { classifyPaste, MAX_IMAGES_PER_PASTE, PasteCandidate } from '../../../shared/paste-classify.js';
 import { MAX_IMAGE_BYTES } from '../../terminal/paste.js';
 import { detectMobile } from '../../ui/mobile.js';
@@ -1053,12 +1054,13 @@ function sessionReadout(turnLabel: string | undefined, usage: ChatUsage | undefi
   const bits: string[] = [];
   if (turnLabel) bits.push(turnLabel);
   if (usage) {
-    const total = usage.totalTokens
-      ?? [usage.inputTokens, usage.outputTokens].reduce<number | undefined>(
-        (sum, value) => (value === undefined ? sum : (sum ?? 0) + value),
-        undefined,
-      );
-    if (total !== undefined) bits.push(`${compactCount(total)} tok`);
+    // `tokenTotal`, not a sum of its own: this used to add the input to the
+    // output and stop there, which on a runtime that reports no total of its
+    // own — Claude — left out the cache buckets, most of the bill. So the
+    // session line, the meter above it and the historical record were three
+    // different answers about one conversation (#80).
+    const total = tokenTotal(usage);
+    if (total !== null) bits.push(`${compactCount(total)} tok`);
     if (usage.costUsd !== undefined) bits.push(`$${usage.costUsd.toFixed(4)}`);
   }
   return bits.join(' · ');

@@ -40,7 +40,7 @@ import { ChatStoreLike, ChatSessionRef } from './store.js';
 import { askChannelFor, createChatAdapter, supportsChat } from './registry.js';
 import { FinishedJob, UsageAccountant } from './usage-accounting.js';
 import { UsageJobInput } from '../services/usage-store.js';
-import { projectNameFor } from '../../shared/usage-records.js';
+import { projectNameFor, tokenTotal } from '../../shared/usage-records.js';
 
 /**
  * One chat conversation, owned by the server.
@@ -689,7 +689,13 @@ export class ChatSession {
         cacheReadTokens: numeric(job.usage.cacheReadTokens),
         cacheWriteTokens: numeric(job.usage.cacheWriteTokens),
         reasoningTokens: numeric(job.usage.reasoningTokens),
-        totalTokens: numeric(job.usage.totalTokens),
+        // Derived when the runtime gave no total of its own, from the parts it
+        // did give — see `tokenTotal`. The alternative, filing the runtime's
+        // total or nothing, is what made the history say "not reported" for
+        // every job Claude ever ran while the same job's tokens were on screen
+        // the whole time it ran (#80). The parts are still filed beside it
+        // unchanged, so nothing here invents a figure: it adds one up.
+        totalTokens: numeric(tokenTotal(job.usage) ?? undefined),
         costUsd: numeric(job.usage.costUsd),
         reportsUsage: this.capabilities?.usage === true,
         reportsCost: this.capabilities?.cost === true,
