@@ -17,9 +17,18 @@ import {
   ChatUsage,
   mergeUsage,
 } from '../../shared/chat-events.js';
+import { TurnOutcome } from '../../shared/turn-outcome.js';
 import { compactCount, formatDuration } from './tool-meta.js';
 
-export type TurnStatus = 'done' | 'running' | 'failed' | 'waiting';
+/**
+ * What a turn's badge says.
+ *
+ * `done` and `failed` are the two ways a turn can have *ended* — see
+ * `TurnOutcome`, which is where that judgement is made from the runtime's own
+ * word for it. The other two are states of a turn still in flight and belong to
+ * the session, not to the turn's history.
+ */
+export type TurnStatus = TurnOutcome | 'running' | 'waiting';
 
 /** One glyph per status, shared by every surface that shows a turn's outcome. */
 export const STATUS_GLYPH: Record<TurnStatus, { icon: string; color: string; spin?: boolean; word: string }> = {
@@ -40,6 +49,14 @@ export interface TurnSummary {
   startedAt: number;
   durationMs?: number;
   toolCount: number;
+  /**
+   * How many tool calls inside the turn ended failed.
+   *
+   * Reported and never acted on. It is the count the badge used to be computed
+   * from, kept as a number so a surface can say "3 of these steps failed" next
+   * to the steps themselves, which is where a failed step belongs.
+   */
+  failedStepCount: number;
   reasoningCount: number;
   /** Summed over every message in the turn. */
   usage: ChatUsage;
@@ -83,7 +100,9 @@ function summarise(
   const opener = group[0];
   let toolCount = 0;
   let reasoningCount = 0;
-  let failed = false;
+  let failedSteps = 0;
+  let diedOn = false;
+  let outcome: TurnOutcome | undefined;
   let streaming = false;
   let usage: ChatUsage = {};
   let lastTs = opener?.ts ?? 0;
@@ -91,11 +110,18 @@ function summarise(
   for (const message of group) {
     if (message.streaming) streaming = true;
     if (message.usage) usage = mergeUsage(usage, message.usage);
+    // The last word wins: a group split at user messages normally holds one
+    // turn, but the tail of a resumed transcript can hold several, and the one
+    // that ended last is the one the badge is about.
+    if (message.turnOutcome) outcome = message.turnOutcome;
     if (message.ts > lastTs) lastTs = message.ts;
     for (const block of message.blocks) {
       if (block.kind === 'tool') {
         toolCount += 1;
-        if (block.status === 'failed') failed = true;
+        // Counted, not promoted. A failed step stays visible on the step —
+        // this is only here so the turn can say how many there were, never so
+        // it can call itself failed because of them.
+        if (block.status === 'failed') failedSteps += 1;
         if (block.durationMs !== undefined) {
           // The runtime's own timings beat wall-clock between message stamps,
           // which include however long the user spent reading.
@@ -103,20 +129,28 @@ function summarise(
         }
       } else if (block.kind === 'thinking') {
         reasoningCount += 1;
-      } else if (block.kind === 'error') {
-        failed = true;
+      } else if (block.kind === 'error' && block.fatal) {
+        // Only the fatal ones. An error the agent read and worked around is a
+        // step, and a step is not a verdict; this one is the runtime saying it
+        // could go no further, which is a turn that never reached a `turn_end`.
+        diedOn = true;
       }
     }
   }
 
+  // A session that is gone cannot be running anything, whatever the transcript
+  // still says. A message left mid-stream by a runtime that died stays flagged
+  // streaming forever — reopening that conversation used to show a turn
+  // spinning on a process that ended hours ago.
+  const dead = chatState === 'error' || chatState === 'exited';
+
   const status: TurnStatus = isLast
     && (chatState === 'awaiting_permission' || chatState === 'awaiting_answer')
     ? 'waiting'
-    : isLast && (streaming || chatState === 'thinking' || chatState === 'running' || chatState === 'starting')
+    : isLast && !dead
+      && (streaming || chatState === 'thinking' || chatState === 'running' || chatState === 'starting')
       ? 'running'
-      : failed
-        ? 'failed'
-        : 'done';
+      : endedAs(outcome, diedOn, isLast, chatState);
 
   const elapsed = lastTs - (opener?.ts ?? lastTs);
 
@@ -131,10 +165,41 @@ function summarise(
     // finished number and is not one.
     durationMs: status === 'running' || elapsed <= 0 ? undefined : elapsed,
     toolCount,
+    failedStepCount: failedSteps,
     reasoningCount,
     usage,
     messageIds: group.map((message) => message.id),
   };
+}
+
+/**
+ * How a turn that is no longer in flight should read.
+ *
+ * In order of authority:
+ *
+ *   1. What the runtime said when it ended the turn. This is the only statement
+ *      any of them makes about the turn as a whole, so it wins outright —
+ *      including over a fatal error that arrived afterwards, which is what a
+ *      one-shot CLI exiting *after* it answered looks like from here.
+ *   2. An error the agent could not get past, when no `turn_end` ever arrived.
+ *      A runtime whose process goes mid-turn never sends one.
+ *   3. The session having died, for the turn that was open when it did. Only
+ *      the last turn can be that one.
+ *
+ * Everything else is `done`. A turn that ran to completion succeeded, whatever
+ * happened inside it and whatever the answer turned out to say — reading an
+ * answer's meaning is not something a badge can do honestly.
+ */
+function endedAs(
+  outcome: TurnOutcome | undefined,
+  diedOn: boolean,
+  isLast: boolean,
+  chatState: ChatState,
+): TurnStatus {
+  if (outcome) return outcome;
+  if (diedOn) return 'failed';
+  if (isLast && (chatState === 'error' || chatState === 'exited')) return 'failed';
+  return 'done';
 }
 
 /** The first line of the user's ask, or the best stand-in the group offers. */
