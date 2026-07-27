@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Skills and project commands are in the `/` menu from the moment a
+  conversation opens, not after the first message.** (#71) Typing `/` in a new
+  chat listed a handful of the runtime's built-in commands and nothing else:
+  everything installed on top — skills, and the commands a project or plugin
+  brings — appeared only once a turn had run, because the app knows the
+  built-ins independently and waited on the runtime for the rest. Anyone who
+  knew a skill by name could still type it blind; anyone who did not had to
+  send a throwaway message, watch the menu fill in, and start over. The
+  composer's own button says it offers commands *and skills*, so the gap read
+  as a broken promise.
+
+  The menu now shows what the session can actually run, before a word is typed.
+  Where a runtime can be asked up front it is, and what it says wins: the ACP
+  agents (Kimi Code, Oh My Pi) volunteer their list as the session starts, and
+  Claude Code's arrives with the first turn and **replaces** whatever stood in
+  for it, entire — a fallback is a stand-in until the real answer arrives, never
+  something merged into it. Where a runtime never reports one — Codex, Grok
+  Build and pi — the menu lists what is installed for that session, read from
+  the directories each runtime's own installer writes into, including enabled
+  plugins for Claude.
+
+  Entries carry the description their author wrote in the skill's frontmatter,
+  which also fills in the column for Claude, whose own list is names and nothing
+  else. A skill whose author wrote no description is listed with none rather
+  than with an invented sentence. Each session reads the home of the person it
+  belongs to, so the menu never lists what someone else has installed, and a
+  machine with no skills installed shows the built-ins exactly as before.
+
 ## [5.3.1] - 2026-07-27
 
 ### Added

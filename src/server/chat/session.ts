@@ -24,7 +24,8 @@ import {
   ASK_MCP_SERVER,
   ASK_QUESTION_TOOL_NAME,
 } from '../../shared/chat-events.js';
-import { isClearingCommand } from '../../shared/slash-commands.js';
+import { isClearingCommand, mergeSlashCommands } from '../../shared/slash-commands.js';
+import { listInstalledCommands } from './installed-commands.js';
 import { AdapterEvent, ChatAdapter, ChatAdapterOptions } from './adapter.js';
 import {
   PermissionAsk,
@@ -408,9 +409,23 @@ export class ChatSession {
       }
     }
 
+    // What this session could run, read off disk before the runtime is even
+    // spawned, so the command menu has something true in it from the moment the
+    // conversation opens rather than after a first message has been sent.
+    //
+    // The home directory comes from the session's own environment where it has
+    // one. That is the whole of the isolation this needs: a session lists what
+    // is installed for the person it belongs to, and never what is installed
+    // for anybody else on the machine.
+    const installedCommands = listInstalledCommands(options.runtime, {
+      home: env.HOME || process.env.HOME,
+      workingDir: options.workingDir,
+    });
+
     const adapter = createChatAdapter(options.runtime, {
       sessionId: this.ref.id,
       workingDir: options.workingDir,
+      installedCommands,
       command: this.deps.resolveCommand(options.runtime),
       model: options.model,
       extraArgs,
@@ -438,6 +453,18 @@ export class ChatSession {
     }
 
     this.adapter = adapter;
+
+    // Every runtime that has not already accounted for what is installed gets
+    // it here — codex, grok and pi never report a command list at all, so
+    // without this their menu stays empty for the whole session. Nothing is
+    // running yet, so nothing can be overwritten: the moment a runtime does
+    // report its own list, that list replaces this one entire.
+    if (installedCommands.length > 0) {
+      adapter.capabilities.commands = mergeSlashCommands(
+        adapter.capabilities.commands,
+        installedCommands,
+      );
+    }
 
     // Before the first event of the new conversation, so the line lands above
     // it rather than in the middle of it. Only when there is something to draw
