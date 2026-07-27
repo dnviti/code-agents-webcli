@@ -248,6 +248,7 @@ async function run(): Promise<void> {
   await checkUnattributedWorkCanBeAttributedByHand();
   await checkTheCommandMenuIsFullBeforeTheFirstMessage();
   await checkAWaitingMessageCanBeSentNow();
+  await checkALongQueueCollapsesToOneRow();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -3241,6 +3242,12 @@ async function checkAWaitingMessageCanBeSentNow(): Promise<void> {
 
   await paint('thinking');
 
+  // Two waiting messages collapse to the newest one (#79), so opening the list
+  // is what puts both of them on screen. Every claim below is about the newest
+  // row, which is the one on show either way.
+  const disclosure = button(/waiting message/);
+  disclosure?.click();
+  await wait(200);
   const rows = host.querySelectorAll('[role="list"][aria-label="Messages waiting to be sent"] [role="listitem"]');
   check('both waiting messages are on screen while the agent works', rows.length === 2, `${rows.length} rows`);
 
@@ -3304,9 +3311,10 @@ async function checkAWaitingMessageCanBeSentNow(): Promise<void> {
     Boolean(button(/^Remove queued message 1$/)),
   );
 
+  // A phone remount starts collapsed again, so the row on show is the newest.
   await paint('thinking', true);
-  const phoneSendNow = button(/^Send queued message 1 now/);
-  const phoneRemove = button(/^Remove queued message 1$/);
+  const phoneSendNow = button(/^Send queued message 2 now/);
+  const phoneRemove = button(/^Remove queued message 2$/);
   const size = phoneSendNow ? laidOutSize(phoneSendNow) : { width: 0, height: 0 };
   check(
     'on a phone the new control is big enough to hit',
@@ -3343,6 +3351,270 @@ async function checkAWaitingMessageCanBeSentNow(): Promise<void> {
     (rule?.getAttribute('aria-label') ?? '').includes('editing the wrong file'),
     JSON.stringify(rule?.getAttribute('aria-label') ?? null),
   );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * A long queue takes one row, and opens.
+ *
+ * Every claim here is a measurement of the laid-out composer, which is the only
+ * place they can be made: that twenty collapsed rows are no taller than one,
+ * that the opened list scrolls inside its own space instead of pushing the
+ * composer off a phone, and that the conversation is still visible behind it. A
+ * unit test on the component's props would pass for a list rendered at four
+ * thousand pixels tall.
+ */
+async function checkALongQueueCollapsesToOneRow(): Promise<void> {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+
+  const outbound: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('queue-size-check', {
+    send: (message: unknown) => { outbound.push(message as Record<string, unknown>); },
+  });
+  const turn = (n: number): Record<string, unknown> => ({
+    id: `q${n}`, text: `waiting message number ${n}, long enough to fill the row it is drawn in`, ts: n,
+  });
+  const snapshot = (count: number): void => {
+    controller.handle({
+      type: 'chat_snapshot',
+      sessionId: 'queue-size-check',
+      snapshot: {
+        sessionId: 'queue-size-check',
+        runtime: 'claude',
+        state: 'thinking',
+        capabilities: {
+          streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+          interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+          cost: true, plan: false, commands: [],
+        },
+        messages: [{
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: 1,
+          blocks: [{ kind: 'text', text: 'work through the list' }],
+        }],
+        pendingPermissions: [],
+        queued: Array.from({ length: count }, (_, i) => turn(i + 1)),
+        firstSeq: 1, replayFrom: 1, cursor: 1, live: true, bypassPermissions: false,
+      },
+    } as never);
+  };
+
+  const root = createRoot(host);
+  const paint = async (count: number, phone: boolean): Promise<void> => {
+    snapshot(count);
+    const view = React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW, panelOpen: false },
+      onViewChange: () => {},
+      ...(phone ? { isMobile: true } : {}),
+    } as never);
+    root.render(phone ? React.createElement(PhoneContext.Provider, { value: true }, view) : view);
+    await wait(250);
+  };
+  // A count only: the queue arriving on its own, without a re-render of the
+  // whole view, is what must not disturb an open or a closed list.
+  const enqueue = async (count: number): Promise<void> => {
+    snapshot(count);
+    await wait(200);
+  };
+
+  const list = (): HTMLElement | null =>
+    host.querySelector('[role="list"][aria-label="Messages waiting to be sent"]');
+  const rowCount = (): number => list()?.querySelectorAll('[role="listitem"]').length ?? 0;
+  const toggle = (): HTMLButtonElement | undefined =>
+    Array.from(host.querySelectorAll('button')).find((node) =>
+      /waiting message/.test(node.getAttribute('aria-label') ?? '')) as HTMLButtonElement | undefined;
+  const status = (): string =>
+    Array.from(host.querySelectorAll('[role="status"]'))
+      .map((node) => node.textContent ?? '')
+      .find((text) => text.includes('waiting to be sent')) ?? '';
+
+  host.style.cssText = 'width:900px;height:700px;position:absolute;top:0;left:0;display:flex';
+
+  // One message is left exactly as it was: no count, no control to press.
+  await paint(1, false);
+  const oneRow = list()?.getBoundingClientRect().height ?? 0;
+  check('a single waiting message is drawn as it always was', rowCount() === 1, `${rowCount()} rows`);
+  check('with nothing to open, because there is nothing behind it', !toggle());
+
+  await paint(20, false);
+  check('twenty waiting messages collapse to one row', rowCount() === 1, `${rowCount()} rows`);
+  const twentyRows = list()?.getBoundingClientRect().height ?? 0;
+  check(
+    'and take no more room than a single message does',
+    twentyRows <= oneRow + 1,
+    `${Math.round(twentyRows)}px vs ${Math.round(oneRow)}px`,
+  );
+  check(
+    'the row on show is the one just typed, not the one about to be sent',
+    (list()?.textContent ?? '').includes('number 20'),
+    JSON.stringify((list()?.textContent ?? '').slice(0, 60)),
+  );
+  check(
+    'the control says how many are behind it',
+    (toggle()?.getAttribute('aria-label') ?? '').includes('19'),
+    JSON.stringify(toggle()?.getAttribute('aria-label') ?? null),
+  );
+  check(
+    'and a screen reader is told the same, in a region that announces changes',
+    status().includes('20') && status().includes('19 hidden'),
+    JSON.stringify(status()),
+  );
+  check(
+    'the control is a button the keyboard alone can reach and press',
+    Boolean(toggle()) && toggle()!.tagName === 'BUTTON' && toggle()!.tabIndex >= 0
+      && toggle()!.getAttribute('aria-expanded') === 'false',
+    `${toggle()?.tagName} tabIndex=${toggle()?.tabIndex} expanded=${toggle()?.getAttribute('aria-expanded')}`,
+  );
+
+  // Opened: everything, in order.
+  toggle()?.click();
+  await wait(250);
+  check('opening it shows every waiting message', rowCount() === 20, `${rowCount()} rows`);
+  check('in the order they will be sent', (() => {
+    const texts = Array.from(list()?.querySelectorAll('[role="listitem"]') ?? [])
+      .map((node) => node.textContent ?? '');
+    return texts[0].includes('number 1,') && texts[19].includes('number 20');
+  })());
+  check(
+    'and says so, rather than leaving the control reading the same either way',
+    toggle()?.getAttribute('aria-expanded') === 'true' && status().includes('all shown'),
+    `${toggle()?.getAttribute('aria-expanded')} / ${JSON.stringify(status())}`,
+  );
+  const opened = list()?.getBoundingClientRect().height ?? 0;
+  check(
+    'the opened list is bounded and scrolls in its own space',
+    opened <= 300 && (list()?.scrollHeight ?? 0) > (list()?.clientHeight ?? 0),
+    `${Math.round(opened)}px tall, ${list()?.scrollHeight}px of content`,
+  );
+  // The control that closes it again rides the newest row, which is the last
+  // one in a box that scrolls — so opening has to land there rather than at the
+  // top of twenty messages with the way back off screen.
+  {
+    const listNode = list();
+    const control = toggle();
+    const box = listNode?.getBoundingClientRect();
+    const seat = control?.getBoundingClientRect();
+    check(
+      'and the control that closes it is still where it was left',
+      Boolean(box && seat) && seat!.top >= box!.top - 1 && seat!.bottom <= box!.bottom + 1,
+      box && seat
+        ? `${Math.round(seat.top)}–${Math.round(seat.bottom)} in ${Math.round(box.top)}–${Math.round(box.bottom)}`
+        : 'no control',
+    );
+    check(
+      'with the message it belongs to, the list having opened upwards out of it',
+      Boolean(listNode && control)
+        && (Array.from(listNode!.querySelectorAll('[role="listitem"]'))
+          .find((row) => row.contains(control!))?.textContent ?? '').includes('number 20'),
+    );
+  }
+
+  // #70's control and the one that withdraws a message are still on the rows
+  // that are on screen — collapsing must not cost the queue what it could do.
+  const removeFirst = Array.from(host.querySelectorAll('button')).find((node) =>
+    (node.getAttribute('aria-label') ?? '') === 'Remove queued message 1') as HTMLButtonElement | undefined;
+  check('a message can still be withdrawn from the opened list', Boolean(removeFirst));
+  check(
+    'and sent now from it',
+    Boolean(Array.from(host.querySelectorAll('button')).find((node) =>
+      /^Send queued message 1 now/.test(node.getAttribute('aria-label') ?? ''))),
+  );
+  removeFirst?.click();
+  await wait(150);
+  check(
+    'removing one asks the server to drop that message, by id',
+    outbound.some((m) => m.type === 'chat_queue_cancel' && m.queuedId === 'q1'),
+    JSON.stringify(outbound.filter((m) => m.type === 'chat_queue_cancel')),
+  );
+
+  // A list the user opened must survive the queue changing under it, in both
+  // directions — this is the criterion a naive `useEffect` on length breaks.
+  await enqueue(21);
+  check('a message arriving while the list is open leaves it open', rowCount() === 21, `${rowCount()} rows`);
+  check('and the count follows it', status().includes('21'), JSON.stringify(status()));
+
+  toggle()?.click();
+  await wait(200);
+  check('closing it returns to the single row', rowCount() === 1, `${rowCount()} rows`);
+  await enqueue(22);
+  check('and a message arriving while it is closed does not spring it open', rowCount() === 1, `${rowCount()} rows`);
+
+  // Draining back down: the plain form returns without the user closing
+  // anything, and without the count lingering.
+  await enqueue(1);
+  check('draining to one message returns to the plain form', rowCount() === 1 && !toggle(), `${rowCount()} rows`);
+  check('with no count left announcing a queue that is gone', status() === '', JSON.stringify(status()));
+
+  // The phone is where this stops being cosmetic: twenty full-width rows are
+  // taller than the screen, so the input, the send control and the
+  // conversation all go with them.
+  host.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;display:flex;overflow:hidden';
+  const withinScreen = (where: string): void => {
+    const frame = host.getBoundingClientRect();
+    const field = host.querySelector('textarea') as HTMLElement | null;
+    const send = Array.from(host.querySelectorAll('button')).find((node) =>
+      /^(Send message|Queue this message)$/.test(node.getAttribute('aria-label') ?? '')) as HTMLElement | undefined;
+    const bubble = host.querySelector('[data-message-id]') as HTMLElement | null;
+    const box = field?.getBoundingClientRect();
+    const sendBox = send?.getBoundingClientRect();
+    check(
+      `${where}, the box you would type in is still on screen`,
+      Boolean(box) && box!.bottom <= frame.bottom + 1 && box!.top >= frame.top - 1 && box!.height > 0,
+      box ? `${Math.round(box.top)}–${Math.round(box.bottom)} in ${Math.round(frame.bottom)}` : 'no field',
+    );
+    check(
+      `${where}, so is the control that sends it`,
+      Boolean(sendBox) && sendBox!.bottom <= frame.bottom + 1 && sendBox!.height >= PHONE_TARGET,
+      sendBox ? `${Math.round(sendBox.bottom)} in ${Math.round(frame.bottom)}, ${Math.round(sendBox.height)}px` : 'none',
+    );
+    const seen = bubble?.getBoundingClientRect();
+    check(
+      `${where}, and the conversation is still visible above it`,
+      Boolean(seen) && seen!.height > 0 && seen!.bottom > frame.top && seen!.top < frame.bottom,
+      seen ? `${Math.round(seen.top)}–${Math.round(seen.bottom)}` : 'nothing rendered',
+    );
+  };
+
+  await paint(20, true);
+  check('a phone collapses the queue to one row too', rowCount() === 1, `${rowCount()} rows`);
+  withinScreen('collapsed on a phone');
+
+  const phoneToggle = toggle();
+  const size = phoneToggle ? laidOutSize(phoneToggle) : { width: 0, height: 0 };
+  check(
+    'the control that opens it is big enough for a finger',
+    size.width >= PHONE_TARGET && size.height >= PHONE_TARGET,
+    `${size.width}x${size.height}`,
+  );
+  const phoneRemove = Array.from(host.querySelectorAll('button')).find((node) =>
+    (node.getAttribute('aria-label') ?? '') === 'Remove queued message 20') as HTMLElement | undefined;
+  if (phoneToggle && phoneRemove) {
+    const a = phoneToggle.getBoundingClientRect();
+    const b = phoneRemove.getBoundingClientRect();
+    const gap = Math.max(b.left - a.right, a.left - b.right);
+    check(
+      'and far enough from the one that throws the message away',
+      gap >= PHONE_GAP,
+      `gap ${Math.round(gap)}px`,
+    );
+  }
+
+  phoneToggle?.click();
+  await wait(250);
+  check('opening it on a phone still shows every message', rowCount() === 20, `${rowCount()} rows`);
+  const phoneOpened = list()?.getBoundingClientRect().height ?? 0;
+  check(
+    'and keeps them inside their own scrolling space rather than the screen',
+    phoneOpened > 0 && phoneOpened <= 740 * 0.45 && (list()?.scrollHeight ?? 0) > (list()?.clientHeight ?? 0),
+    `${Math.round(phoneOpened)}px of a 740px screen, ${list()?.scrollHeight}px of content`,
+  );
+  withinScreen('opened on a phone');
 
   root.unmount();
   host.remove();

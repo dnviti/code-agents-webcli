@@ -157,21 +157,45 @@ describe('Composer', function () {
     assert.ok(busy.includes('will go as soon as this turn finishes'), 'and the composer says what will happen to it');
   });
 
-  it('lists what is waiting, in order, each one withdrawable', function () {
+  it('shows one waiting message whole, and withdrawable', function () {
+    const html = render({
+      busy: true,
+      capabilities: caps({ interrupt: true }),
+      queued: [{ id: 'q1', text: 'first in line', ts: 1 }],
+      onCancelQueued() {},
+    });
+
+    assert.ok(html.includes('aria-label="Messages waiting to be sent"'), 'the line is a labelled region');
+    assert.ok(html.includes('first in line'), 'the message is shown');
+    assert.ok(html.includes('aria-label="Remove queued message 1"'), 'and can be withdrawn');
+    assert.ok(!/aria-label="Show \d+ more waiting/.test(html), 'with nothing to open behind it');
+  });
+
+  it('collapses more than one to the newest, with a count of the rest', function () {
     const html = render({
       busy: true,
       capabilities: caps({ interrupt: true }),
       queued: [
         { id: 'q1', text: 'first in line', ts: 1 },
-        { id: 'q2', text: 'second in line', ts: 2, attachments: [{ url: '/a', mime: 'image/png', name: 'a.png', size: 3 }] },
+        { id: 'q2', text: 'second in line', ts: 2 },
+        { id: 'q3', text: 'third in line', ts: 3, attachments: [{ url: '/a', mime: 'image/png', name: 'a.png', size: 3 }] },
       ],
       onCancelQueued() {},
     });
 
-    assert.ok(html.includes('aria-label="Messages waiting to be sent"'), 'the line is a labelled region');
-    assert.ok(html.indexOf('first in line') < html.indexOf('second in line'), 'oldest first');
-    assert.ok(html.includes('aria-label="Remove queued message 1"'), 'each waiting turn can be withdrawn');
-    assert.ok(html.includes('aria-label="Remove queued message 2"'));
+    // The newest is the one still being reconsidered, so it is the one on show.
+    assert.ok(html.includes('third in line'), 'the message just typed is the one drawn');
+    assert.ok(!html.includes('first in line'), 'the rest are behind the count, not stacked up the screen');
+    assert.ok(html.includes('aria-label="Show 2 more waiting messages"'), 'and the count says how many');
+    assert.ok(html.includes('aria-expanded="false"'), 'the control reports that the list is shut');
+    assert.ok(
+      html.includes('aria-label="Remove queued message 3"'),
+      'the message on show keeps everything it had',
+    );
+    assert.ok(
+      /3 messages waiting to be sent, 2 hidden/.test(html),
+      'and the count reaches a screen reader, not only the glyph on the button',
+    );
   });
 
   it('offers no withdraw control when nothing can act on it', function () {
