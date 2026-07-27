@@ -117,7 +117,14 @@ function run(port) {
       // actually waiting. It is a deadline for the whole suite, and a suite that
       // outgrows it does not report failures — it dumps a page with no results
       // at all, which is why this has room over what the checks currently need.
-      '--virtual-time-budget=90000',
+      //
+      // Raised from 90s when the 5.3.2 checks landed together and started
+      // running it out. Worth knowing what that looks like from the inside: a
+      // spent budget does not stop the page, it makes every timer come back at
+      // once — so a check that waits for something to be drawn spins through
+      // its whole allowance in an instant and reports that it never appeared.
+      // It reads as one flaky check rather than as a deadline.
+      '--virtual-time-budget=240000',
       '--dump-dom',
       `http://127.0.0.1:${port}/page.html`,
     ],

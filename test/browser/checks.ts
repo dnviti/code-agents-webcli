@@ -3754,9 +3754,16 @@ async function checkAReadOnlyFileStaysReadOnly(): Promise<void> {
   // land a frame or two later — and by this point in the suite the page is
   // frugal with frames, so the editor is nudged into laying itself out rather
   // than waited on indefinitely. `automaticLayout` watches the host's size.
+  //
+  // A frame is awaited as well as a timer, and that is the part that matters:
+  // Monaco draws its lines from `requestAnimationFrame`, and under the headless
+  // harness's virtual clock a timer can come back without one ever having run —
+  // which made this check pass or fail on the timing of the suite ahead of it
+  // rather than on anything about the editor.
   for (let i = 0; i < 40 && host.querySelector('.view-line') === null; i++) {
     host.style.width = `${700 + (i % 2)}px`;
     window.dispatchEvent(new Event('resize'));
+    await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
     await wait(100);
   }
 
