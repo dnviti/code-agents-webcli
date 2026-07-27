@@ -246,6 +246,7 @@ async function run(): Promise<void> {
   await checkTheUsageChartsAreInteractive();
   await checkAServerOlderThanThePageSaysSo();
   await checkUnattributedWorkCanBeAttributedByHand();
+  await checkTheCommandMenuIsFullBeforeTheFirstMessage();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -3028,4 +3029,145 @@ async function checkUnattributedWorkCanBeAttributedByHand(): Promise<void> {
   second.unmount();
   frame.remove();
   window.fetch = realFetch;
+}
+
+/**
+ * Issue #71 — the `/` menu is complete before a word has been typed.
+ *
+ * A layout engine is needed for this and a props assertion is not: the claim is
+ * that a person opening a brand-new conversation can *see* their skills, both
+ * by typing a slash and by pressing the control that says it offers commands
+ * and skills. Every part of that — that the popup renders at all with no
+ * messages behind it, that it carries the descriptions, that the button opens
+ * the same list — is a rendered fact.
+ */
+async function checkTheCommandMenuIsFullBeforeTheFirstMessage(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('browser-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check',
+      runtime: 'claude',
+      state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: false, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: false,
+        commands: [
+          { name: 'clear', description: 'Start a new conversation, forgetting everything above' },
+          { name: 'complex-work', description: 'Orchestrate a complex, multi-phase engineering task' },
+          { name: 'figma:figma-use', description: 'Write a design into Figma' },
+          { name: 'undocumented-skill' },
+        ],
+      },
+      // The whole point: nothing has been sent yet.
+      messages: [],
+      pendingPermissions: [],
+      queued: [],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 1,
+      live: true,
+      bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(250);
+
+  const menu = (): HTMLElement | null =>
+    host.querySelector('[role="listbox"][aria-label="Slash commands"]');
+
+  const textarea = host.querySelector('textarea') as HTMLTextAreaElement | null;
+  check('the composer is on screen in a conversation with no messages', Boolean(textarea));
+  if (!textarea) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  const type = (value: string): void => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+    setter?.call(textarea, value);
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+
+  textarea.focus();
+  type('/');
+  await wait(200);
+
+  const typed = menu();
+  const typedText = typed?.textContent ?? '';
+  check('typing a slash opens the menu before any message has been sent', Boolean(typed));
+  check(
+    'and it lists the skills installed for this session, not just the built-ins',
+    typedText.includes('complex-work') && typedText.includes('figma:figma-use'),
+    typedText.slice(0, 200) || 'nothing listed',
+  );
+  check(
+    'each entry carries the description its author wrote',
+    typedText.includes('Orchestrate a complex, multi-phase engineering task'),
+    typedText.slice(0, 240),
+  );
+  check(
+    'and an entry with no description is shown plainly, with no invented one',
+    typedText.includes('undocumented-skill') && !/no description/i.test(typedText),
+    typedText.slice(0, 240),
+  );
+
+  // Narrowing has to reach the skills too — a menu that filters only the
+  // built-ins would look right until the first keystroke after the slash.
+  type('/comp');
+  await wait(200);
+  const narrowedText = menu()?.textContent ?? '';
+  check(
+    'typing narrows to the matching skill',
+    narrowedText.includes('complex-work') && !narrowedText.includes('figma:figma-use'),
+    narrowedText.slice(0, 200) || 'nothing listed',
+  );
+
+  type('');
+  await wait(150);
+  check('clearing the line closes the menu', !menu());
+
+  const button = host.querySelector('[aria-label="Slash commands and skills"]') as HTMLElement | null;
+  check('the composer offers a control for commands and skills', Boolean(button));
+  button?.click();
+  await wait(200);
+  const openedText = menu()?.textContent ?? '';
+  check(
+    'and pressing it shows the same list, with no message sent first',
+    openedText.includes('complex-work') && openedText.includes('clear'),
+    openedText.slice(0, 200) || 'nothing listed',
+  );
+
+  // Picking an entry has to put the command in the line, which is what makes
+  // it behave exactly as typing its name does.
+  const rows = Array.from(host.querySelectorAll('[role="listbox"][aria-label="Slash commands"] [role="option"]'));
+  const pick = rows.find((row) => (row.textContent ?? '').includes('complex-work')) as HTMLElement | undefined;
+  pick?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+  await wait(200);
+  check(
+    'choosing an entry puts that command in the line, ready to run',
+    textarea.value.trim().startsWith('/complex-work'),
+    JSON.stringify(textarea.value),
+  );
+
+  root.unmount();
+  host.remove();
 }

@@ -64,6 +64,31 @@ export function defaultSlashCommands(): { name: string; description: string }[] 
 }
 
 /**
+ * One menu out of several lists, first mention of a name winning.
+ *
+ * Used only to assemble the stand-in menu a session shows before its runtime
+ * has spoken: this app's knowledge of the built-ins, plus the skills and
+ * project commands found installed. Both halves are fallback, so joining them
+ * is not the merging the runtime's own list must never be subjected to — when
+ * that arrives it replaces all of this outright.
+ */
+export function mergeSlashCommands(
+  ...lists: ({ name: string; description?: string }[] | undefined)[]
+): { name: string; description?: string }[] {
+  const seen = new Set<string>();
+  const merged: { name: string; description?: string }[] = [];
+  for (const list of lists) {
+    for (const command of list ?? []) {
+      const name = String(command?.name ?? '').trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      merged.push(command);
+    }
+  }
+  return merged;
+}
+
+/**
  * Commands that empty the conversation.
  *
  * The runtime clears its own context when it sees one of these; the transcript

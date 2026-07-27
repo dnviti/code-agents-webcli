@@ -4,6 +4,7 @@ import {
   ChatCapabilities,
   ChatEvent,
   PermissionRequest,
+  SlashCommand,
   UserTurn,
 } from '../../shared/chat-events.js';
 
@@ -89,6 +90,17 @@ export interface ChatAdapterOptions {
    */
   readFile?: (path: string) => Promise<string>;
   writeFile?: (path: string, contents: string) => Promise<void>;
+  /**
+   * Skills and project commands found installed for this session, as a
+   * stand-in until the runtime says what it accepts.
+   *
+   * Scanned by the session, because where to look is a fact about the person
+   * the session belongs to rather than about the protocol an adapter speaks.
+   * An adapter uses it for two things and no more: showing something in the
+   * command menu before its runtime has volunteered a list, and filling in the
+   * descriptions for a runtime — Claude — that reports names bare.
+   */
+  installedCommands?: SlashCommand[];
 }
 
 export interface ChatAdapter {

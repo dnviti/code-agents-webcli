@@ -1,7 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { BaseChatAdapter } from '../adapter.js';
-import { defaultSlashCommands, describeSlashCommand } from '../../../shared/slash-commands.js';
+import {
+  defaultSlashCommands,
+  describeSlashCommand,
+  mergeSlashCommands,
+} from '../../../shared/slash-commands.js';
+import { describeFrom } from '../installed-commands.js';
 import {
   ChatAttachment,
   ChatBlock,
@@ -52,8 +57,10 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     // The real list only arrives with the first turn's `init` (see
     // handleInit below); until then this is what makes the command menu and
     // its composer button available from the moment the session opens,
-    // rather than staying empty until a message has already been sent.
-    commands: defaultSlashCommands(),
+    // rather than staying empty until a message has already been sent. The
+    // built-ins are this app's own knowledge of what a fresh Claude accepts;
+    // the rest is what the session found installed for this person.
+    commands: mergeSlashCommands(defaultSlashCommands(), this.options.installedCommands),
   };
 
   /** Session id we generated for a fresh launch, before init echoes it back. */
@@ -280,28 +287,35 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     const sessionId = str(raw.session_id) ?? this.freshSessionId ?? this.options.resumeSessionId;
     this.nativeSessionId = sessionId;
 
-    // Claude reports its commands as bare names. The picker has a column for a
-    // description and would otherwise show a list of indistinguishable slashes,
-    // so the built-ins are described from the shared table; anything this
-    // runtime supplies for itself, or a project command with its own
-    // frontmatter, is left exactly as it arrived.
+    // Claude reports its commands as bare names — every skill and every project
+    // command among them, and not a word about any of it. The picker has a
+    // column for a description and would otherwise show a list of
+    // indistinguishable slashes, so each name is looked up: first in the shared
+    // table of built-ins, then in the frontmatter of what is installed on disk.
+    //
+    // Which list is shown is not in question. This one is Claude's, entire, and
+    // it replaces whatever stood in for it; only the descriptions are borrowed,
+    // from the only place the authors' own words exist.
+    const describeInstalled = describeFrom(this.options.installedCommands ?? []);
     const slashCommands = Array.isArray(raw.slash_commands) ? (raw.slash_commands as unknown[]) : [];
     const commands = slashCommands
       .map((entry) => {
         if (typeof entry === 'string') {
-          const description = describeSlashCommand(entry);
+          const description = describeSlashCommand(entry) ?? describeInstalled(entry);
           return description ? { name: entry, description } : { name: entry };
         }
         return null;
       })
       .filter((c): c is { name: string; description?: string } => c !== null);
 
+    if (commands.length > 0) this.capabilities.commands = commands;
+
     this.emit({
       t: 'session',
       nativeSessionId: sessionId,
       model: str(raw.model),
       cwd: str(raw.cwd),
-      capabilities: commands.length > 0 ? { ...this.capabilities, commands } : this.capabilities,
+      capabilities: this.capabilities,
     });
     // Nothing is running yet; the first `system/status: requesting` (sent
     // once a prompt actually lands) is what moves this on to `thinking`.

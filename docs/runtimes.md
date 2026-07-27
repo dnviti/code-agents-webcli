@@ -77,6 +77,39 @@ protocol are different processes, so there is nothing to switch between.
 
 It is beta, and labelled as such in the UI.
 
+### The `/` menu
+
+Typing `/` in the composer — or pressing the **Slash commands and skills**
+button beside it — lists what the conversation can run, from the moment it
+opens rather than after a first message has been sent.
+
+**What the runtime says about itself always wins.** The ACP agents (Kimi Code,
+Oh My Pi) volunteer their list as the session starts; Claude Code sends its own
+with the first turn. When that list arrives it *replaces* whatever was shown
+before it, entire.
+
+Until then — and permanently, for Codex, Grok Build and pi, which never report
+one — the menu shows what is installed for the session, read from the
+directories each runtime's own installer writes into:
+
+| Runtime | Read from |
+| --- | --- |
+| Claude Code | `.claude/skills` and `.claude/commands` in the project and in your home, plus the skills and commands of every enabled plugin |
+| Grok Build | `.grok/skills`, `.grok/commands`, `.agents/skills`, and — as Grok itself does by default — your `~/.claude` directories |
+| pi | `.pi/skills` and `.agents/skills` in the project, `~/.pi/agent/skills` and `~/.agents/skills` in your home |
+| Codex | `~/.codex/skills` and `~/.codex/prompts`, and `.codex/skills` in the project |
+| Kimi Code, Oh My Pi | Nothing — both report their own list before the menu can be opened |
+
+Each entry carries the description its author wrote in the skill's frontmatter.
+An entry whose author wrote none is shown with none: a sentence invented here
+would be a guess presented as documentation.
+
+Two things this is not. It is a list of what is **installed**, not a promise
+that the runtime will accept all of it — a runtime is free to refuse something,
+and its own list is what settles the question. And it is scoped to the session:
+where sessions run in per-user environments each one reads its own home, so the
+menu never becomes a window onto what someone else has installed.
+
 ## Runtime profiles
 
 **Settings → Runtime profiles** controls how each CLI is launched. Nothing here
