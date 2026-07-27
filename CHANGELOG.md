@@ -1,5 +1,68 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Usage broken down per project, so spend can be tracked per piece of
+  work.** (#65) Until now every figure was pooled across every codebase people
+  happened to be working in, which answered "what did claude cost this week"
+  and could not answer "what is this project costing us". Each recorded job now
+  carries the project it ran in — the name of the session's working folder, the
+  same label the session tab and header already show — and the dashboard has a
+  by-project breakdown alongside by-agent and by-model, a project filter that
+  narrows the whole view, a project column in the job history and job detail,
+  and the project in the CSV and JSON export.
+
+  Attribution is decided when a job is filed, so a session re-pointed at
+  another folder leaves its earlier work attributed to where that work actually
+  ran. Projects are grouped by folder name rather than by absolute path, so one
+  project stays one project across machines and checkouts; the cost is that two
+  same-named folders under different parents merge, which is stated in the docs
+  rather than left to be discovered. Work recorded before this existed is shown
+  under **unattributed** rather than being dropped from the totals or charged to
+  a project nobody chose, and the existing visibility rules are unchanged — the
+  project view is not a way around them, and the project filter menu names only
+  projects the viewer may already see.
+
+- **Unattributed work can be assigned to a project by hand.** Work recorded
+  before its folder was tracked has no project, and there was no way to fix
+  that — a backlog of "unattributed" that would never shrink. Any job can now be
+  attributed from its detail view in the job history, and by default the whole
+  conversation goes with it, since a conversation ran in one folder.
+
+  What was *observed* stays observed: a project read off a running session
+  cannot be overwritten, and no control is offered to try, because a
+  measurement a person can edit is not a measurement. An attribution made by
+  hand can be corrected or withdrawn, is labelled as hand-made on screen, and
+  carries a `projectSource` of `manual` into the export — so a per-project total
+  can be read for how much of it was recorded and how much was asserted. You
+  can only attribute work you could already see; the installer can fix anyone's,
+  everyone else only their own.
+
+- **The dashboard charts are interactive.** (#66) They were pictures: the trend
+  plotted cost and nothing else, the only way to read a bar was to hover a
+  mouse over it — which does nothing at all on a phone or with a keyboard — and
+  the breakdowns could be read but not acted on.
+
+  The trend now plots whichever measure you pick (cost, tokens, jobs, turns,
+  tool calls), and every point is a real control: reach it with a pointer, a
+  finger or the Tab key and its period and exact figures appear above the
+  chart, announced to a screen reader as well as drawn. Pressing a point
+  narrows the entire dashboard to that slice of time and redraws the trend one
+  level finer — a month becomes its days, a day becomes its hours — so a spike
+  can be opened up rather than merely noticed. Pressing a breakdown row narrows
+  to that project, agent, model or person, and selections combine. Whatever is
+  selected is named on screen as chips that clear individually or all at once,
+  the job history below is narrowed by the same selection so drilling into the
+  jobs behind a total needs no filters re-entered by hand, and the export
+  carries the selection too. Breakdowns sort by any column and show each row's
+  share as a bar.
+
+  The honesty rule survives into the charts: a bucket that reported nothing is
+  drawn as a dashed stub rather than as a bar of height zero, because on a
+  chart "nothing reported a cost here" and "this hour cost nothing" are one
+  pixel apart.
+
 ## [5.3.0] - 2026-07-27
 
 ### Added

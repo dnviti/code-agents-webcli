@@ -57,6 +57,36 @@ export interface UsageJobRecord {
   agent: string;
   /** Null when the runtime never said which model it used. */
   model: string | null;
+  /**
+   * The folder the work ran in, by name — the thing everyone here already calls
+   * "the project", and the same label the session tab and header carry.
+   *
+   * Nullable, and a null is again a fact rather than a default: every row
+   * written before this column existed ran in *some* folder that nobody
+   * recorded, and inventing one for it would put fabricated figures under a
+   * real project's name. Those rows group under "unattributed" instead.
+   *
+   * A name, not a path. Grouping "what am I spending on this project" by
+   * absolute path splits one project across every machine and every checkout
+   * it was ever opened from; the cost is that two folders sharing a name in
+   * different parents merge, which is stated in the docs rather than hidden.
+   */
+  project: string | null;
+  /**
+   * Where that project name came from.
+   *
+   * `observed` is what the session was actually pointed at when the work ran —
+   * a measurement, and treated as one: nothing overwrites it. `manual` is a
+   * person's assertion, made after the fact about work nobody recorded a folder
+   * for, and it can be corrected or withdrawn by the same person. `null` means
+   * there is no project, so there is nothing to have a provenance.
+   *
+   * The distinction is on the record rather than inferred because it is the
+   * same question this whole file is built around, asked of a different field:
+   * a figure somebody typed and a figure something measured are not the same
+   * fact, and a dashboard that renders them identically is lying about one.
+   */
+  projectSource: UsageProjectSource;
   startedAt: string;
   endedAt: string;
   durationMs: number | null;
@@ -129,6 +159,9 @@ export const EMPTY_TOTALS: UsageTotals = {
 /** The periods the dashboard answers for. */
 export type UsagePeriod = 'day' | 'week' | 'month' | 'year';
 
+/** How wide one point on the trend line is. */
+export type UsageBucketUnit = 'hour' | 'day' | 'month';
+
 /** One point on the trend line: a bucket of time, and what it cost. */
 export interface UsageBucket {
   /** The bucket's first instant, ISO, in the viewer's own offset. */
@@ -172,8 +205,51 @@ export interface UsageToolUse {
   jobs: number;
 }
 
+/** Whether a job's project was measured or asserted. See `UsageJobRecord.project`. */
+export type UsageProjectSource = 'observed' | 'manual' | null;
+
 /** Whose figures a request is asking for. */
 export type UsageScope = 'self' | 'everyone';
+
+/**
+ * The key a breakdown row uses for work with nothing to group it under.
+ *
+ * A sentinel rather than an empty string, because it travels back as a *filter*
+ * — "show me only the unattributed work" is a real question, and an empty
+ * filter value is indistinguishable from no filter at all on a query string.
+ * The store turns it back into `IS NULL`.
+ *
+ * Two slashes because this value goes into a URL and into JSON, so it has to be
+ * both impossible and printable. Impossible: a project is a path's last
+ * segment, and a segment cannot contain a separator, so no folder can ever be
+ * named this. Printable: the first attempt at "impossible" here was a leading
+ * control character, which is a thing a query string, a proxy and a CSV cell
+ * each mangle in their own way, and which reads as an empty label in every log
+ * that touches it.
+ */
+export const UNATTRIBUTED = '//unattributed';
+
+/**
+ * What a dashboard or job list has been narrowed to.
+ *
+ * One type, shared by the request the browser sends and the query the store
+ * runs, so a filter cannot mean one thing on the dashboard and another on the
+ * job list it drills into — which is exactly how an export ends up
+ * disagreeing with the screen it was exported from.
+ */
+export interface UsageFilters {
+  agent?: string;
+  model?: string;
+  project?: string;
+  /** By login, matching the key of a `byUser` row. */
+  user?: string;
+  /** Inclusive start / exclusive end of an explicit window, ISO. */
+  from?: string;
+  to?: string;
+}
+
+/** The measures the trend chart can plot. */
+export type UsageMeasure = 'costUsd' | 'totalTokens' | 'jobs' | 'turns' | 'toolCalls';
 
 /** Everything the dashboard draws, for one range and one scope. */
 export interface UsageDashboard {
@@ -184,17 +260,45 @@ export interface UsageDashboard {
   /** Inclusive start and exclusive end of the range, ISO. */
   from: string;
   to: string;
+  /**
+   * How wide one bucket of `series` is.
+   *
+   * Sent rather than inferred from the period, because a range narrowed to one
+   * bucket is re-bucketed at the next granularity down — drill into a month
+   * and you get days — and a client that guessed from the period would label
+   * every one of those days as a month.
+   */
+  bucket: UsageBucketUnit;
+  /** What this view was narrowed to, echoed back so a client can trust it was applied. */
+  filters: UsageFilters;
   totals: UsageTotals;
-  /** The trend within the range: hours for a day, days for a week or month, months for a year. */
+  /** The trend within the range, one point per `bucket`. */
   series: UsageBucket[];
   byAgent: UsageBreakdown[];
   byModel: UsageBreakdown[];
+  byProject: UsageBreakdown[];
   /** Only present when the scope is `everyone`. */
   byUser?: UsageBreakdown[];
   effortByAgent: UsageEffort[];
   effortByModel: UsageEffort[];
   topTools: UsageToolUse[];
   topToolsByAgent: UsageToolUse[];
+}
+
+/**
+ * The project a working directory belongs to: its last path segment.
+ *
+ * Trailing separators are dropped first, so `/srv/work/api/` and `/srv/work/api`
+ * are one project rather than two — a session started from a folder picker and
+ * one started from a typed path would otherwise never add up together.
+ * The filesystem root has no segment to take, and reports itself as `/`.
+ */
+export function projectNameFor(workingDir: string | null | undefined): string | null {
+  if (!workingDir) return null;
+  const trimmed = workingDir.replace(/[\\/]+$/, '');
+  if (!trimmed) return '/';
+  const segment = trimmed.split(/[\\/]/).pop();
+  return segment || '/';
 }
 
 /**
