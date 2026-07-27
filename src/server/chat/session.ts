@@ -86,7 +86,9 @@ export interface ChatSessionDeps {
    * The session record is the only thing that outlives this process, so a fact
    * that has to survive a restart has to be handed to it while there still is
    * one. `exited` is what lets a browser be told the difference between a chat
-   * that is thinking and a chat that is gone.
+   * that is thinking and a chat that is gone. True when the process ends;
+   * false when a conversation replaced in place has one running again, which
+   * is the only way a record that has been marked finished comes back.
    */
   onLifecycle?: (
     sessionId: string,
@@ -270,6 +272,32 @@ export class ChatSession {
   private draining = false;
 
   /**
+   * Which process the events arriving here belong to.
+   *
+   * `stop()` signals the child and returns without waiting for it, so a
+   * replaced adapter goes on emitting for as long as its process takes to die
+   * — and what it emits last is `state: exited`. Landing that in the log after
+   * the replacement is already running told every browser, and the session
+   * record, that a live conversation had ended: the pane went read-only over a
+   * working agent and only a relaunch could talk it round.
+   *
+   * Bumped by `start()` and again by `restart()` before the old process is
+   * signalled, so each adapter's `emit` closure carries the number it was born
+   * with and anything from an older one is dropped rather than believed.
+   */
+  private adapterGeneration = 0;
+
+  /**
+   * True while a conversation is being replaced by a new one in place.
+   *
+   * Only the queue reads it, and only to stay quiet: a turn already in flight
+   * when the clear lands will fail against the process being torn down, and
+   * "could not be sent" written into the fresh window would be a complaint
+   * about the conversation the user just asked to leave.
+   */
+  private restarting = false;
+
+  /**
    * Watches this session's own events and files what each job cost.
    *
    * Rebuilt on every `start()` because the two things it has to know — whether
@@ -422,6 +450,10 @@ export class ChatSession {
       workingDir: options.workingDir,
     });
 
+    // Claimed before the adapter exists, so its `emit` closure below can be
+    // told apart from the one belonging to a process this replaces.
+    const generation = ++this.adapterGeneration;
+
     const adapter = createChatAdapter(options.runtime, {
       sessionId: this.ref.id,
       workingDir: options.workingDir,
@@ -439,7 +471,13 @@ export class ChatSession {
         ? this.deps.usage?.costBaselineFor(options.resumeSessionId)
         : undefined,
       askMcpServer,
-      emit: (event) => this.ingest(event),
+      // A dying predecessor is not a witness to the conversation that replaced
+      // it. See `adapterGeneration`: everything it still has to say — its own
+      // exit above all — is about a process nobody is talking to any more.
+      emit: (event) => {
+        if (generation !== this.adapterGeneration) return;
+        this.ingest(event);
+      },
       readFile: this.deps.readFile
         ? (filePath) => this.deps.readFile!(this.ref.id, filePath)
         : undefined,
@@ -721,8 +759,29 @@ export class ChatSession {
    * overtake the ones already waiting.
    */
   async send(turn: UserTurn): Promise<void> {
+    // A conversation being replaced has no adapter for a moment, and refusing
+    // here is what put the "this chat is not running" recovery offer in front
+    // of someone who had just cleared and started typing. It is starting, not
+    // gone: the turn waits the way it would for any other busy session and
+    // goes out when the new process reports idle.
+    if (this.restarting) {
+      this.enqueue(turn);
+      return;
+    }
+
     if (!this.adapter || !this.adapter.alive) {
       throw new ChatNotRunningError();
+    }
+
+    // Never queued. Clearing is not another thing to say to the agent, it is
+    // the end of saying things to *this* agent — a `/clear` waiting behind the
+    // answer it was meant to cut short would sit there for as long as that
+    // answer ran, and anything queued behind it goes to a process that is
+    // about to be replaced. Taking it now is also what makes the button and
+    // the three spellings one behaviour rather than four.
+    if (isClearingCommand(turn.text)) {
+      await this.deliver(turn);
+      return;
     }
 
     if (this.state !== 'idle' || this.queue.length > 0) {
@@ -796,6 +855,10 @@ export class ChatSession {
     // the time this promise is pending the guard above already holds on its own.
     this.deliver({ text: next.text, attachments: next.attachments })
       .catch((error: unknown) => {
+        // Silent when a clear is under way: the turn failed because the
+        // process it was for is being replaced, which is what the user asked
+        // for. See `restarting`.
+        if (this.restarting) return;
         const message = error instanceof Error ? error.message : String(error);
         this.ingest({ t: 'error', message: `could not send a queued message: ${message}` });
       })
@@ -874,11 +937,33 @@ export class ChatSession {
   private async restart(): Promise<void> {
     const options = this.lastStartOptions;
     if (!options) return;
-    await this.stop();
-    // Stale until the new process's own `init` event reports its id — cleared
-    // up front so nothing reads the old conversation's id in the meantime.
-    this.nativeSessionId = null;
-    await this.start({ ...options, resumeSessionId: undefined, startFresh: true });
+    this.restarting = true;
+    // Before the old process is signalled, not after: whatever it emits from
+    // here on belongs to a conversation that is over. See `adapterGeneration`.
+    this.adapterGeneration++;
+    try {
+      await this.stop();
+      // Stale until the new process's own `init` event reports its id — cleared
+      // up front so nothing reads the old conversation's id in the meantime.
+      this.nativeSessionId = null;
+      await this.start({ ...options, resumeSessionId: undefined, startFresh: true });
+    } catch (error: unknown) {
+      // Nothing replaced the conversation that was stopped. `start()` has
+      // already written the failure into the transcript and moved the state to
+      // `error`; the record has to hear it too, or the tab goes on claiming a
+      // process that never started and refuses the relaunch that would fix it.
+      this.deps.onLifecycle?.(this.ref.id, { exited: true });
+      throw error;
+    } finally {
+      this.restarting = false;
+    }
+
+    // The record outlives every process this session runs, and `stop()` above
+    // told it one had gone. Saying so again in the other direction is what
+    // keeps the tab a running tab: without it the session lists report a
+    // conversation that is answering as finished, and the next launch in this
+    // tab is refused because a process it no longer has is still claimed.
+    this.deps.onLifecycle?.(this.ref.id, { exited: false });
   }
 
   async interrupt(): Promise<void> {

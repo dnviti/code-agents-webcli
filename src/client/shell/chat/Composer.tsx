@@ -90,6 +90,16 @@ export interface ComposerProps {
   modelFeedback?: { applied: 'live' | 'sent' | 'pending' | 'cleared'; message: string } | null;
   /** Drives what the permission chip reports. */
   bypassPermissions?: boolean;
+  /**
+   * Start a new conversation in this tab, the same thing typing `/clear` does.
+   *
+   * Absent means no control: a surface that cannot clear must not offer a
+   * button that does nothing. Present, it is offered while the conversation is
+   * healthy — which is the whole point of it, the recovery banner having been
+   * the only place this choice lived and appearing only once the session was
+   * already broken.
+   */
+  onNewChat?: () => void;
   /** Changes what the hint row says about who owns Return. */
   terminalOpen?: boolean;
 }
@@ -173,6 +183,7 @@ export function Composer({
   modelFeedback,
   bypassPermissions = false,
   terminalOpen = false,
+  onNewChat,
 }: ComposerProps) {
   const baseId = React.useId();
   const listboxId = `${baseId}-picker`;
@@ -845,6 +856,28 @@ export function Composer({
             disabled={disabled}
           >
             <span style={{ fontFamily: 'var(--font-mono)', fontSize: isMobile ? 15 : 12 }}>/</span>
+          </ChipButton>
+        ) : null}
+
+        {/* Not gated on `busy`: clearing mid-answer is allowed and acts at
+            once — the process the turn is running in is the one being replaced,
+            so waiting for it to finish would only postpone the same
+            interruption. Gated on `disabled` like the rest of the row, because
+            a session with nothing running it has the recovery offer instead,
+            which is where starting again belongs when it is a recovery.
+
+            No confirmation. The typed command does not ask either, and the
+            conversation is not deleted by this — the log keeps it for history,
+            search and export. A dialog in front of something done many times a
+            day costs more than the press it guards. */}
+        {onNewChat && (!isMobile || toolsOpen) ? (
+          <ChipButton
+            label="Start a new conversation — this one is kept, the agent forgets it"
+            text="New chat"
+            onClick={onNewChat}
+            disabled={disabled}
+          >
+            <Icon name="message-square" size={isMobile ? 16 : 12} />
           </ChipButton>
         ) : null}
 
