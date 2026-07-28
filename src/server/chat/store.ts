@@ -5,9 +5,10 @@ import {
   ChatEvent,
   ChatSnapshot,
   ChatTurnIndexEntry,
+  ChatUsage,
   NO_CHAT_CAPABILITIES,
 } from '../../shared/chat-events.js';
-import { applyAll, createTranscript } from '../../shared/chat-reducer.js';
+import { applyAll, createTranscript, foldSessionUsage } from '../../shared/chat-reducer.js';
 import { TurnOutcome, turnOutcomeOf } from '../../shared/turn-outcome.js';
 
 /**
@@ -155,6 +156,16 @@ interface SessionState {
   firstSeq: number;
   count: number;
   logSize: number;
+  /**
+   * What the whole conversation has spent, kept beside the log's geometry.
+   *
+   * Undefined means "not read yet", not "nothing": the first snapshot that
+   * needs it scans the log once and every append after that folds itself in,
+   * so a conversation costs one pass however many times it is rejoined.
+   */
+  usage?: ChatUsage;
+  /** Highest seq already folded into `usage`. */
+  usageSeq: number;
 }
 
 export interface ChatStoreLike {
@@ -322,7 +333,7 @@ export class ChatStore implements ChatStoreLike {
     // 1 rather than 0: chat-reducer treats cursor 0 as "nothing applied yet",
     // so an empty store reporting firstSeq 1 / cursor 0 reads the same way a
     // freshly created transcript does.
-    const state: SessionState = { firstSeq: 1, count: 0, logSize: 0 };
+    const state: SessionState = { firstSeq: 1, count: 0, logSize: 0, usageSeq: 0 };
 
     // Sized before the index is read, and unconditionally: it is what tells
     // repairIndex there is a log to rebuild from when the index cannot be
@@ -542,6 +553,19 @@ export class ChatStore implements ChatStoreLike {
 
     state.count += events.length;
     state.logSize = offset;
+
+    // Kept current here so the running total never has to be re-scanned: the
+    // events are already in hand, and the alternative is reading a
+    // tens-of-megabytes log again on every rejoin. Only extended when it has
+    // been read at all — before that there is nothing to keep current, and the
+    // first snapshot that asks will scan.
+    if (state.usage) {
+      for (const event of events) {
+        if (event.seq <= state.usageSeq) continue;
+        state.usage = foldSessionUsage(state.usage, event);
+        state.usageSeq = event.seq;
+      }
+    }
 
     if (state.count > this.maxEvents || state.logSize > MAX_LOG_BYTES / 2) {
       await this.trimHead(base, state);
@@ -978,6 +1002,39 @@ export class ChatStore implements ChatStoreLike {
   }
 
   /**
+   * What the conversation has spent, over all of it.
+   *
+   * Read from the log for the same reason the turn index is (#86): it is a
+   * property of the recorded conversation, so nothing that happens to be in a
+   * browser's window may decide it. The full pass costs one streamed read of
+   * the log, once per process per conversation — every append after it folds
+   * itself in — against the alternative of a figure that silently shrinks.
+   *
+   * The one limit worth stating: a log whose head has been trimmed cannot
+   * report what the trimmed turns cost. A total already in hand is kept across
+   * a trim rather than recomputed, so that only shows up on a conversation
+   * first opened after its own head was dropped.
+   */
+  private async sessionUsage(
+    base: string,
+    state: SessionState,
+    stats: ChatStats,
+  ): Promise<ChatUsage> {
+    if (state.usage && state.usageSeq >= stats.cursor) return state.usage;
+
+    let usage: ChatUsage = {};
+    let seq = 0;
+    await this.scanLog(base, state, (event) => {
+      usage = foldSessionUsage(usage, event);
+      if (event.seq > seq) seq = event.seq;
+    });
+
+    state.usage = usage;
+    state.usageSeq = Math.max(seq, stats.cursor);
+    return usage;
+  }
+
+  /**
    * Replay of a session, capped to its most recent messages.
    *
    * A month-long session must not cost a full replay on every browser join,
@@ -1004,7 +1061,14 @@ export class ChatStore implements ChatStoreLike {
         messages: transcript.messages,
         state: transcript.state,
         capabilities: transcript.capabilities,
-        usage: transcript.usage,
+        // From the whole conversation, not from the replayed tail. What a
+        // session has spent is a property of the session, and the tail is a
+        // window over its last forty messages: taking it from the transcript
+        // meant a long chat's meter fell to whatever the window happened to
+        // contain the moment the browser reconnected, switched tab or
+        // reloaded — a total that only ever went *down* while the user was
+        // still in the same conversation.
+        usage: await this.sessionUsage(base, state, stats),
         plan: transcript.plan,
         pendingPermissions: transcript.pendingPermissions,
         firstSeq: stats.firstSeq,

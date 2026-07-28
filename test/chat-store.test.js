@@ -345,6 +345,94 @@ describe('ChatStore', function () {
       assert.ok(snapshot.replayFrom > snapshot.firstSeq, 'there is older history to page');
     });
 
+    it('reports what the whole conversation cost, not what the replayed tail cost', async function () {
+      // The bug: session usage was folded out of the replay window, so a chat
+      // long enough to be capped came back with a smaller cost every time the
+      // browser reconnected, switched tab or reloaded — while the user had
+      // never left the conversation.
+      const capped = new ChatStore({ storageDir: dir, snapshotMinMessages: 4 });
+      const session = { id: 'spend', ownerUserId: 1 };
+      const events = [];
+      let seq = 1;
+      for (let i = 0; i < 30; i++) {
+        events.push({ t: 'msg_start', seq: seq++, ts: 1, id: `m${i}`, role: 'assistant', turnId: `t${i}` });
+        events.push({ t: 'msg_end', seq: seq++, ts: 1, msgId: `m${i}` });
+        // Claude reports the money on turn_end, which is exactly the event the
+        // window dropped.
+        events.push({
+          t: 'turn_end',
+          seq: seq++,
+          ts: 1,
+          turnId: `t${i}`,
+          usage: { costUsd: 0.01, outputTokens: 10 },
+        });
+      }
+      capped.append(session, events);
+
+      const snapshot = await capped.snapshot(session);
+      assert.strictEqual(snapshot.messages.length, 4, 'the message cap still holds');
+      assert.ok(
+        Math.abs(snapshot.usage.costUsd - 0.3) < 1e-9,
+        `every turn's cost must be counted, got ${snapshot.usage.costUsd}`,
+      );
+      assert.strictEqual(snapshot.usage.outputTokens, 300);
+    });
+
+    it('keeps the total steady across repeated rejoins, and extends it as the chat goes on', async function () {
+      const capped = new ChatStore({ storageDir: dir, snapshotMinMessages: 2 });
+      const session = { id: 'rejoin', ownerUserId: 1 };
+      let seq = 1;
+      const turn = (cost) => [
+        { t: 'msg_start', seq: seq++, ts: 1, id: `m${seq}`, role: 'assistant', turnId: `t${seq}` },
+        { t: 'msg_end', seq: seq++, ts: 1, msgId: `m${seq - 1}` },
+        { t: 'turn_end', seq: seq++, ts: 1, turnId: `t${seq - 2}`, usage: { costUsd: cost } },
+      ];
+
+      capped.append(session, [...turn(0.5), ...turn(0.25), ...turn(0.25)]);
+      const first = await capped.snapshot(session);
+      const second = await capped.snapshot(session);
+      assert.ok(Math.abs(first.usage.costUsd - 1) < 1e-9);
+      assert.ok(Math.abs(second.usage.costUsd - 1) < 1e-9, 'a second rejoin must read the same');
+
+      // And the running total the store keeps is extended by new turns rather
+      // than left behind by them.
+      capped.append(session, turn(0.5));
+      const third = await capped.snapshot(session);
+      assert.ok(Math.abs(third.usage.costUsd - 1.5) < 1e-9, `got ${third.usage.costUsd}`);
+    });
+
+    it('reads the same total from a cold store as from the one that wrote it', async function () {
+      const session = { id: 'cold', ownerUserId: 1 };
+      const events = [
+        { t: 'msg_start', seq: 1, ts: 1, id: 'm1', role: 'assistant', turnId: 't1' },
+        { t: 'msg_end', seq: 2, ts: 1, msgId: 'm1', usage: { inputTokens: 100 } },
+        { t: 'turn_end', seq: 3, ts: 1, turnId: 't1', usage: { costUsd: 0.75 } },
+      ];
+      store.append(session, events);
+      const warm = await store.snapshot(session);
+
+      // A restarted server has no cached total and must find it in the log.
+      const cold = new ChatStore({ storageDir: dir });
+      const reread = await cold.snapshot(session);
+      assert.deepStrictEqual(reread.usage, warm.usage);
+      assert.ok(Math.abs(reread.usage.costUsd - 0.75) < 1e-9);
+      assert.strictEqual(reread.usage.inputTokens, 100);
+    });
+
+    it('does not let a context report with no money erase the money already spent', async function () {
+      // An ACP runtime reports a running total; a report that carries only the
+      // context window used to write cost back as undefined.
+      const session = { id: 'acp', ownerUserId: 1 };
+      store.append(session, [
+        { t: 'turn_end', seq: 1, ts: 1, turnId: 't1', usage: { costUsd: 0.4 } },
+        { t: 'usage', seq: 2, ts: 1, usage: { contextWindow: 200000, contextUsed: 1200 } },
+      ]);
+
+      const snapshot = await store.snapshot(session);
+      assert.ok(Math.abs(snapshot.usage.costUsd - 0.4) < 1e-9, `got ${snapshot.usage.costUsd}`);
+      assert.strictEqual(snapshot.usage.contextUsed, 1200);
+    });
+
     it('stops walking back rather than replaying a log with no message boundaries', async function () {
       const capped = new ChatStore({
         storageDir: dir,

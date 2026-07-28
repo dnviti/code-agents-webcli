@@ -731,6 +731,9 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
 
   private handleUsage(update: Record<string, unknown>): void {
     const cost = record(update.cost);
+    // Only USD has a place in the model; another currency reported as dollars
+    // would be a worse answer than no number at all.
+    const costUsd = str(cost.currency) === 'USD' ? num(cost.amount) : undefined;
     this.emit({
       t: 'usage',
       usage: {
@@ -738,9 +741,11 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
           ? { contextWindow: num(update.size), contextWindowSource: 'agent' as const }
           : {}),
         contextUsed: num(update.used),
-        // Only USD has a place in the model; another currency reported as
-        // dollars would be a worse answer than no number at all.
-        costUsd: str(cost.currency) === 'USD' ? num(cost.amount) : undefined,
+        // Omitted rather than sent as `undefined`. A running total's fields
+        // replace what came before, and the server-side accountant sees the
+        // key before the JSON hop drops it — so a context report carrying no
+        // money used to erase the money already reported.
+        ...(costUsd !== undefined ? { costUsd } : {}),
       },
     });
   }

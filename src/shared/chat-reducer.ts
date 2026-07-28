@@ -153,6 +153,42 @@ function messageFor(state: TranscriptState, msgId: string): number | null {
 }
 
 /**
+ * What a conversation has spent, folded one event at a time.
+ *
+ * Split out of the reducer's own cases so there is exactly one answer to it.
+ * The server needs this reading of the log *without* building a transcript —
+ * a snapshot replays only the tail, and a session's cost is a property of the
+ * whole conversation, not of the last forty messages — and two implementations
+ * of "how much has this cost" would be two numbers for the browser to show
+ * alternately, which is precisely the bug that made a live meter appear to
+ * reset on every rejoin.
+ *
+ * Returns the new running total rather than mutating the one it was given: the
+ * browser hands this object straight to the meter, which re-renders on the
+ * object changing, so folding in place would leave the number on screen stale.
+ */
+export function foldSessionUsage(usage: ChatUsage, event: ChatEvent): ChatUsage {
+  switch (event.t) {
+    // Per-message and per-turn reports are deltas, so they sum.
+    case 'msg_end':
+    case 'turn_end':
+      return event.usage ? mergeUsage(usage, event.usage) : usage;
+    case 'usage': {
+      // A standalone report is a running total — summing it would count the
+      // same tokens once per report — so its fields replace. Only the ones it
+      // actually carries: a runtime that reports a context window and no money
+      // (or money in a currency this cannot show) would otherwise write cost
+      // back as `undefined` and blank a figure it never spoke about.
+      const next = { ...usage };
+      assignDefined(next, event.usage);
+      return next;
+    }
+    default:
+      return usage;
+  }
+}
+
+/**
  * Merge only the keys that carry a value.
  *
  * A progress report names one thing at a time — the activity now, the tool
@@ -349,7 +385,7 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       if (event.stopReason) message.stopReason = event.stopReason;
       if (event.usage) {
         message.usage = mergeUsage(message.usage, event.usage);
-        state.usage = mergeUsage(state.usage, event.usage);
+        state.usage = foldSessionUsage(state.usage, event);
       }
       return {
         messageIndex: at,
@@ -412,8 +448,9 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
 
     case 'usage': {
       // Runtimes that report a running total would double-count if summed, so
-      // absolute fields overwrite and only cost accumulates across turns.
-      state.usage = { ...state.usage, ...event.usage };
+      // absolute fields overwrite. See `foldSessionUsage` for why only the
+      // fields the report actually carries are written.
+      state.usage = foldSessionUsage(state.usage, event);
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
