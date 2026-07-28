@@ -249,6 +249,71 @@ describe('TurnIndex', function () {
     const html = render('TurnIndex', { turns: [], currentTurnId: '', onSelect() {}, onJumpLatest() {} });
     assert.ok(/No turns yet/.test(html));
   });
+
+  it('says out loud when the list is only what survived a trim', function () {
+    // Past the retention cap the server drops the head of the log and reports
+    // `complete: false`. Nothing repeated it, so a list of the turns that
+    // happened to survive presented itself as the whole conversation (#86).
+    const whole = render('TurnIndex', {
+      turns: TURNS,
+      currentTurnId: 'a',
+      onSelect() {},
+      onJumpLatest() {},
+    });
+    assert.ok(!/earlier turns trimmed/.test(whole), 'an intact index must not cry trim');
+    assert.ok(/>3</.test(whole), 'the count of an intact index is just the count');
+
+    const trimmed = render('TurnIndex', {
+      turns: TURNS,
+      currentTurnId: 'a',
+      complete: false,
+      onSelect() {},
+      onJumpLatest() {},
+    });
+    assert.ok(/earlier turns trimmed/.test(trimmed), 'the trim has to be visible in the list');
+    assert.ok(/>3\+</.test(trimmed), 'the header count must not claim to be the conversation');
+  });
+
+  it('shows the row it is fetching as busy, not as a click that did nothing', function () {
+    const html = render('TurnIndex', {
+      turns: TURNS,
+      currentTurnId: 'a',
+      seekingId: 'a',
+      onSelect() {},
+      onJumpLatest() {},
+    });
+    assert.ok(/aria-busy="true"/.test(html), 'the row being paged in has to say so');
+    assert.ok(/fetching/.test(html), 'and say it in a word, for anything that cannot see a spinner');
+  });
+
+  it('keeps the fold-all pair reachable on the icon rail, as a menu', function () {
+    // Between 1024 and 1280px the index is 44px wide and both fold-all buttons
+    // used to be dropped, with no menu entry and no shortcut anywhere (#34).
+    const labelled = render('TurnIndex', {
+      turns: TURNS,
+      currentTurnId: 'a',
+      onExpandAll() {},
+      onCollapseAll() {},
+      onSelect() {},
+      onJumpLatest() {},
+    });
+    assert.ok(/aria-label="Expand every turn — Ctrl\+E"/.test(labelled));
+    assert.ok(/aria-label="Collapse every turn — Ctrl\+Shift\+E"/.test(labelled));
+
+    const rail = render('TurnIndex', {
+      turns: TURNS,
+      currentTurnId: 'a',
+      collapsed: true,
+      onExpandAll() {},
+      onCollapseAll() {},
+      onSelect() {},
+      onJumpLatest() {},
+    });
+    assert.ok(
+      /aria-label="Turn index actions"/.test(rail),
+      'the icon rail must offer the pair somewhere',
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -538,6 +603,36 @@ describe('the chat keymap', function () {
     assert.strictEqual(mod.keymap.chatCommandFor(key({ key: 'ArrowUp', metaKey: true }), plain), 'previous-turn');
     assert.strictEqual(mod.keymap.chatCommandFor(key({ key: 'Escape' }), plain), 'interrupt');
     assert.strictEqual(mod.keymap.chatCommandFor(key({ key: '`', ctrlKey: true }), plain), 'toggle-terminal');
+  });
+
+  it('folds every turn at once, with Shift as the inverse', function () {
+    // The controls for this live in the index's header, which sheds them below
+    // 1280px — so at every width in between there was no way to reach them at
+    // all, and none from the keyboard at any width (#34).
+    assert.strictEqual(
+      mod.keymap.chatCommandFor(key({ key: 'e', ctrlKey: true }), plain),
+      'expand-all-turns',
+    );
+    assert.strictEqual(
+      mod.keymap.chatCommandFor(key({ key: 'E', ctrlKey: true, shiftKey: true }), plain),
+      'collapse-all-turns',
+    );
+
+    // From the composer too, which is where focus sits: a chord a text field
+    // would swallow would be no shortcut at all here.
+    const typing = { terminalFocused: false, dialogOpen: false, textEntry: true, mac: false };
+    assert.strictEqual(
+      mod.keymap.chatCommandFor(key({ key: 'e', ctrlKey: true }), typing),
+      'expand-all-turns',
+    );
+    // On a Mac Ctrl+E is end-of-line in every text field, so there it is the
+    // field's and Cmd is the app's.
+    const onMac = { ...typing, mac: true };
+    assert.strictEqual(mod.keymap.chatCommandFor(key({ key: 'e', ctrlKey: true }), onMac), null);
+    assert.strictEqual(
+      mod.keymap.chatCommandFor(key({ key: 'e', metaKey: true }), onMac),
+      'expand-all-turns',
+    );
   });
 
   it('leaves the terminal alone, except for the key that gets you out of it', function () {

@@ -3,6 +3,40 @@
 ## [Unreleased]
 
 ### Fixed
+- **Selecting an older turn takes you there.** Past about four thousand events
+  above what was loaded, clicking an entry in the turn index did nothing at all:
+  the row highlighted and stayed highlighted, the conversation did not move, and
+  nothing was said. The walk back gave up at a page ceiling while the history
+  was still on disk, and the caller ignored the answer. In the conversations an
+  index exists for, that was the ordinary case rather than the guard. A jump now
+  goes as far as it has to, says which turn it is fetching while it works, and
+  can be abandoned by doing anything else. The ceiling stays where it belongs:
+  ordinary scrolling still asks for one page at a time.
+
+- **The turn index no longer renumbers a trimmed conversation from 1.** Past the
+  retention cap the oldest events are dropped, and the turns that survived were
+  numbered by their position in what was left — so the index, the count in the
+  header and the dashboard's requests figure disagreed about the same turn. The
+  number of turns that went is now kept with the log, so the survivors keep the
+  numbers they had; and the index says out loud that the older history was
+  trimmed, which the server has been reporting all along to a UI that read it
+  nowhere.
+
+- **Expand-all and collapse-all can be reached at any width.** Between 1024 and
+  1280 pixels the index shrinks to a rail of icons and dropped both, with no
+  menu entry, shortcut or setting behind them — which is every maximised
+  1366x768 laptop and every half-screen on a large monitor. They are now in the
+  index's own menu at that width, and on **Ctrl+E** / **Ctrl+Shift+E**
+  (⌘E on a Mac) from anywhere in the conversation, composer included.
+
+- **A running workflow says what it is doing.** The popup read only the output
+  the tool writes when it finishes, so it showed "waiting for the first stage to
+  report in" for the whole run — which for a dynamic workflow is tens of
+  minutes. It now reads the same live channel a delegation's popup has always
+  read: the stage the run names for itself, the tool it last reached for, and
+  what it has spent, updating as it goes, with the finished log still landing
+  underneath. A run invoked by script path is titled with the script's own name
+  rather than the word "Workflow".
 - **A slash command Claude answers itself now leaves an answer on screen.** Some
   commands — `/effort`, `/model` — are handled by the CLI without going near the
   model, and a locally-handled command emits no streaming events at all. This

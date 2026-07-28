@@ -220,6 +220,13 @@ export function ChatView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [recorded, turns, version],
   );
+  // Whether that list reaches the conversation's first turn. Past the retention
+  // cap the server trims the head of the log and says so — and nothing on
+  // screen has ever repeated it, so a list of the surviving turns has been
+  // presenting itself as the whole conversation (#86). Read on every render
+  // rather than memoised: it arrives with the index, which moves the version
+  // counter this whole component already redraws on.
+  const indexComplete = controller.recordedTurnsComplete;
   const [selectedTurnId, setSelectedTurnId] = React.useState<string | null>(null);
   const lastTurnId = turns.length ? turns[turns.length - 1].id : '';
   // A selection that no longer exists — the conversation was cleared, or the
@@ -281,6 +288,8 @@ export function ChatView({
   }, [turns]);
 
   const [searchOpen, setSearchOpen] = React.useState(false);
+  /** The index row whose turn is being paged in, or null. See `selectTurn`. */
+  const [seeking, setSeeking] = React.useState<string | null>(null);
   // Paired with a counter, not held as a bare id: clicking the same work pill
   // twice has to scroll the rail twice, and a string that did not change would
   // leave the timeline's effect with nothing to react to.
@@ -388,6 +397,11 @@ export function ChatView({
   const send = React.useCallback(
     (text: string, attachments: ChatAttachment[]) => {
       controller.sendTurn(text, attachments);
+      // Asking for something new is the end of wherever you were going: the
+      // list pins to the bottom for the answer, and a jump landing afterwards
+      // would scroll the reply away.
+      controller.cancelSeek();
+      setSeeking(null);
       list.current?.pin();
       setSelectedTurnId(null);
     },
@@ -464,23 +478,49 @@ export function ChatView({
       // to open first. See revealMessage.
       openTurn(id);
       if (messages.some((message) => message.id === id)) {
+        controller.cancelSeek();
+        setSeeking(null);
         list.current?.scrollToTurn(id);
         return;
       }
       // An entry from before what is loaded. The index lists the whole
       // conversation, so choosing one has to fetch it rather than quietly do
       // nothing — the scroll waits until it is actually here.
-      void controller.loadUntilLoaded(id).then((here) => {
-        if (here) list.current?.scrollToTurn(id);
+      //
+      // Held here as well as on the controller because this is what redraws:
+      // the transcript's version counter is what this surface subscribes to,
+      // and "a jump is in flight" is not something the transcript knows.
+      setSeeking(id);
+      void controller.seekTo(id).then((outcome) => {
+        setSeeking((current) => (current === id ? null : current));
+        if (outcome === 'arrived') {
+          list.current?.scrollToTurn(id);
+        } else if (outcome === 'exhausted') {
+          showNotification('That turn is no longer in this conversation’s history.', 'error');
+        } else if (outcome === 'unreachable') {
+          // Which is not the same thing, and must not be said as though it
+          // were: one read did not come back. `abandoned` says nothing at all —
+          // the user has already gone somewhere else and knows it.
+          showNotification('Could not read that far back just now. Try again.', 'error');
+        }
       });
     },
     [openTurn, controller, messages],
   );
 
   const jumpLatest = React.useCallback(() => {
+    // Going to the newest turn is the plainest way of saying you are done going
+    // backwards, so a jump still walking the log is abandoned rather than left
+    // to land and scroll the conversation out from under the arrival.
+    controller.cancelSeek();
+    setSeeking(null);
     setSelectedTurnId(null);
     list.current?.pin();
-  }, []);
+  }, [controller]);
+
+  // Leaving the conversation — a tab switch remounts this surface — abandons a
+  // jump with it. Otherwise it goes on paging a transcript nobody is looking at.
+  React.useEffect(() => () => controller.cancelSeek(), [controller]);
 
   const stepTurn = React.useCallback(
     (delta: number) => {
@@ -639,6 +679,12 @@ export function ChatView({
         case 'next-turn':
           stepTurn(1);
           break;
+        case 'expand-all-turns':
+          expandAllTurns();
+          break;
+        case 'collapse-all-turns':
+          collapseAllTurns();
+          break;
         default:
           break;
       }
@@ -646,7 +692,16 @@ export function ChatView({
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [busy, interrupt, jumpLatest, stepTurn, toggleRail, toggleTerminal]);
+  }, [
+    busy,
+    collapseAllTurns,
+    expandAllTurns,
+    interrupt,
+    jumpLatest,
+    stepTurn,
+    toggleRail,
+    toggleTerminal,
+  ]);
 
   // -------------------------------------------------------------- the pane
 
@@ -684,10 +739,17 @@ export function ChatView({
       // job, and repeating those here would be two answers to one question.
       { id: 'chat-search', label: 'Search this conversation', icon: 'search', expands: true, group: 'surface', onPress: () => setSearchOpen(true) },
       { id: 'chat-turns', label: 'Jump to a turn', icon: 'panel-left', active: indexVisible || indexSheet, expands: true, group: 'surface', onPress: openIndex },
+      // Folding is a thing you do to the conversation, so it belongs with the
+      // things you do to the conversation. This is the phone's route to it —
+      // this menu is only ever drawn on a phone. The band the index's own
+      // header sheds them in, 1024 to 1280px, is answered by the rail's own
+      // menu and by the keyboard, which is where a laptop reaches them (#34).
+      { id: 'chat-expand-all', label: 'Expand every turn', icon: 'maximize-2', group: 'surface', onPress: expandAllTurns },
+      { id: 'chat-collapse-all', label: 'Collapse every turn', icon: 'fold-vertical', group: 'surface', onPress: collapseAllTurns },
       { id: 'chat-display', label: 'Display settings', icon: 'settings', expands: true, group: 'surface', onPress: () => onOpenSettings?.() },
       ...(menuActions ?? []).map((action) => ({ ...action, group: 'session' })),
     ],
-    [indexVisible, indexSheet, openIndex, onOpenSettings, menuActions],
+    [indexVisible, indexSheet, openIndex, expandAllTurns, collapseAllTurns, onOpenSettings, menuActions],
   );
 
   return (
@@ -758,6 +820,8 @@ export function ChatView({
             collapsed={indexCollapsed}
             onExpandAll={expandAllTurns}
             onCollapseAll={collapseAllTurns}
+            complete={indexComplete}
+            seekingId={seeking}
           />
         ) : null}
 
@@ -1081,6 +1145,8 @@ export function ChatView({
                 }}
                 onExpandAll={expandAllTurns}
                 onCollapseAll={collapseAllTurns}
+                complete={indexComplete}
+                seekingId={seeking}
               />
             </div>
             <button
