@@ -231,6 +231,27 @@
   figures above it, which it previously did not.
 
 ### Fixed
+- **An agent that picks its own work back up stays in the turn it was working
+  on — and what that work costs is finally counted.** (#86) An agent that leaves
+  something running in the background — a build, a check, a job it is waiting on
+  — ends its turn and starts again by itself when the thing it was waiting for
+  finishes. Nobody asked a second question, but a second turn appeared anyway:
+  numbered on its own, with no prompt in it to name it by, while the agent was
+  visibly still working on what you had asked a moment earlier.
+
+  Only a request opens a turn now. Work with nothing asked in front of it
+  continues the turn it belongs to, which is the definition #86 settled and is
+  what the conversation on screen already looked like.
+
+  The same fault was quietly costing far more than a row in an index. A job in
+  the accounting is opened by the user's message — so work that had none was
+  filed **nowhere at all**, and everything it spent was dropped. On the
+  conversation this was found in that was **$23 of $40, more than half**, and it
+  was missing from the totals, from every breakdown by project, agent and model,
+  and from the effort comparisons. Those stretches are now filed against the
+  request that caused them, and a conversation's recorded spend adds up to
+  exactly what its log reports.
+
 - **A turn stops spinning when the work is done, and the index says what was
   asked instead of "no prompt".** (#86) Reopening or reloading a long
   conversation gave you a turn list with an extra row on it: numbered on its

@@ -436,6 +436,67 @@ describe('a promoted message, driven through the real session', function () {
   });
 });
 
+// ------------------------------------- the agent picking its own work back up
+
+describe('an agent that resumes with nothing asked of it', function () {
+  // The shape, taken from a real conversation: the agent leaves something
+  // running in the background — a build, a check, a job it is waiting on —
+  // ends its turn, and starts talking again when that finishes. No user message
+  // comes in between, because the user did not ask a second question.
+  const resumed = [
+    { t: 'msg_start', id: 'u1', role: 'user', turnId: 'turn-app' },
+    { t: 'block_start', msgId: 'u1', index: 0, block: { kind: 'text', text: 'merge it when CI is green' } },
+    { t: 'msg_end', msgId: 'u1' },
+    { t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'claude-run-1' },
+    { t: 'block_start', msgId: 'a1', index: 0, block: { kind: 'tool', toolId: 'x', name: 'Bash' } },
+    { t: 'msg_end', msgId: 'a1', usage: { costUsd: 0.5 } },
+    { t: 'turn_end', turnId: 'claude-run-1', stopReason: 'end_turn' },
+    // Forty seconds later, on its own.
+    { t: 'msg_start', id: 'a2', role: 'assistant', turnId: 'claude-run-2' },
+    { t: 'block_start', msgId: 'a2', index: 0, block: { kind: 'tool', toolId: 'y', name: 'Bash' } },
+    { t: 'msg_end', msgId: 'a2', usage: { costUsd: 0.25 } },
+    { t: 'turn_end', turnId: 'claude-run-2', stopReason: 'end_turn' },
+  ];
+
+  const stamped = resumed.map((event, i) => ({ ts: (i + 1) * 1000, seq: i + 1, ...event }));
+
+  it('carries on in the turn it was working on, rather than opening one', function () {
+    const transcript = createTranscript({});
+    for (const event of stamped) applyChatEvent(transcript, event);
+    assert.deepStrictEqual(
+      [...new Set(transcript.messages.map((m) => m.turnId))],
+      ['turn-app'],
+      'nobody asked a second question, so there is no second turn',
+    );
+  });
+
+  it('files what that work cost against the request that caused it', function () {
+    // It used to file nothing at all: a job is opened by the user's message and
+    // there was not one, so everything after the first `turn_end` ran untracked.
+    // On the conversation this was found in, that was more than half its spend.
+    const closed = account(resumed);
+    const last = closed[closed.length - 1];
+    assert.ok(closed.every((job) => job.turnId === 'turn-app'));
+    assert.strictEqual(last.toolCalls, 2, 'both stretches are one turn’s work');
+    assert.ok(
+      Math.abs(last.usage.costUsd - 0.75) < 1e-9,
+      `the resumed half's spend must be filed too, got ${last.usage.costUsd}`,
+    );
+  });
+
+  it('still gives a resumed transcript’s tail a turn of its own', function () {
+    // The one case where an agent speaking first is not a continuation: there
+    // is nothing to continue. It is on screen, so it needs a row.
+    const transcript = createTranscript({});
+    const tail = [
+      { t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'claude-run-1' },
+      { t: 'msg_end', msgId: 'a1' },
+    ].map((event, i) => ({ ts: i + 1, seq: i + 1, ...event }));
+    for (const event of tail) applyChatEvent(transcript, event);
+    assert.strictEqual(transcript.messages[0].turnId, 'claude-run-1');
+  });
+});
+
 // ------------------------------------------------------------- the turn index
 
 describe('the turn index of a recorded conversation', function () {

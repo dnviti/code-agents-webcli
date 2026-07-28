@@ -154,6 +154,14 @@ function messageFor(state: TranscriptState, msgId: string): number | null {
 }
 
 /**
+ * The turn this conversation was last working on, or undefined for one that has
+ * said nothing yet. See `openTurnAfter` for what goes back to it.
+ */
+function lastTurnId(state: TranscriptState): string | undefined {
+  return state.messages[state.messages.length - 1]?.turnId;
+}
+
+/**
  * What a conversation has spent, folded one event at a time.
  *
  * Split out of the reducer's own cases so there is exactly one answer to it.
@@ -281,10 +289,12 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // ask in one, the answer in another with no prompt to name it by.
       //
       // A turn is open from the user's message to `turn_end`, and `turn_end`,
-      // an exit and a `/clear` are the three things that close one — see
-      // `openTurnAfter`, which is that rule and is also what the server's turn
-      // index and its windowed reads apply.
-      const turnId = openTurnAfter(event, state.currentTurnId) as string;
+      // an exit and a `/clear` are the three things that close one — and an
+      // agent that speaks again with no request in front of it goes back to the
+      // turn it was last working on rather than opening one nobody asked for.
+      // See `openTurnAfter`, which is that whole rule and is also what the
+      // server's turn index and its windowed reads apply.
+      const turnId = openTurnAfter(event, state.currentTurnId, lastTurnId(state)) as string;
 
       // A new turn's models are not known yet, and last turn's are not this
       // turn's: leaving them would keep a "+1" on the chip for a turn that ran
@@ -585,7 +595,10 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       const message: ChatMessage = {
         id: `marker-${event.seq}`,
         seq: event.seq,
-        turnId: state.currentTurnId ?? `marker-${event.seq}`,
+        // The turn it was drawn in, or the one it was drawn under: a line
+        // marking what happened to the conversation is not a turn of its own,
+        // and numbering it as one puts a row in the index nobody asked for.
+        turnId: state.currentTurnId ?? lastTurnId(state) ?? `marker-${event.seq}`,
         role: 'system',
         ts: event.ts,
         blocks: [{
