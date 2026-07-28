@@ -104,6 +104,32 @@ export class ChatController {
     private readonly options: ChatControllerOptions,
   ) {}
 
+  /**
+   * Every message type this class answers to, for whoever routes to it.
+   *
+   * Beside the switch it describes, because it is the same list twice and the
+   * copy that lived elsewhere fell behind: `chat_turn_index`, `chat_turn_spend`
+   * and `chat_model_result` were all added here and never added there, so the
+   * registry dropped them before a controller ever saw them. That is not a
+   * missing handler — the message goes to the terminal's handler, which has no
+   * idea what a chat message is, and it is discarded in silence. What it cost:
+   * a conversation numbered by the window instead of by the recording, and no
+   * per-turn spend on screen at all.
+   */
+  static readonly MESSAGE_TYPES: ReadonlySet<string> = new Set([
+    'chat_snapshot',
+    'chat_started',
+    'chat_event',
+    'chat_queue',
+    'chat_page',
+    'chat_page_failed',
+    'chat_unavailable',
+    'chat_model_result',
+    'chat_turn_index',
+    'chat_turn_index_failed',
+    'chat_turn_spend',
+  ]);
+
   get currentSessionId(): string {
     return this.sessionId;
   }
