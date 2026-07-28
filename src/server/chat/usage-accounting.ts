@@ -265,6 +265,13 @@ export class UsageAccountant {
 
       case 'turn_end':
         if (event.usage && this.job) this.job.additive = mergeUsage(this.job.additive, event.usage);
+        if (event.stale) {
+          // The runtime letting go of a half it was told to abandon. The job
+          // stays open — the same turn is running again on the correction —
+          // and what that half cost has already been taken above, because it
+          // was spent on this turn like everything else in it.
+          return;
+        }
         if (this.job) {
           // Added rather than assigned: a steered turn ends twice, once at the
           // interrupt and once when the redirected work finishes, and the round

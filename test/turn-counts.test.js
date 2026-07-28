@@ -334,7 +334,7 @@ describe('a promoted message, driven through the real session', function () {
   const userStarts = (events) =>
     events.filter((e) => e.t === 'msg_start' && e.role === 'user');
 
-  it('gives a promoted message a turn of its own, not the one it cut short', async function () {
+  it('gives a promoted message the turn it was delivered into', async function () {
     const { s, events } = session();
     await s.send({ text: 'refactor the auth module' });
     await s.send({ text: 'no — the staging database' });
@@ -342,17 +342,12 @@ describe('a promoted message, driven through the real session', function () {
     const [waiting] = s.queuedTurns;
     await s.sendQueuedNow(waiting.id);
 
-    const [first, promoted] = userStarts(events);
-    // The interrupt ends the turn — every runtime here answers it that way —
-    // so the work this message asks for happens in a turn that starts after
-    // it. Filing the ask in the turn being cancelled left that work with no
-    // prompt in it at all: a "no prompt" row in the index, spinning beside the
-    // question it was actually answering.
-    assert.notStrictEqual(promoted.turnId, first.turnId, 'the cut-short turn is over');
-    assert.strictEqual(promoted.steer, undefined, 'and this is a request, not a steer into it');
+    const [first, steer] = userStarts(events);
+    assert.strictEqual(steer.turnId, first.turnId, 'the steer joins the running turn');
+    assert.strictEqual(steer.steer, true, 'and says so, since it cannot be worked out later');
   });
 
-  it('opens its turn only once the interrupted one has been closed', async function () {
+  it('does not let the runtime’s answer to the interrupt end that turn', async function () {
     const { s, events } = session();
     await s.send({ text: 'refactor the auth module' });
     await s.send({ text: 'no — the staging database' });
@@ -360,15 +355,68 @@ describe('a promoted message, driven through the real session', function () {
     const [waiting] = s.queuedTurns;
     await s.sendQueuedNow(waiting.id);
 
-    const order = events.filter(
-      (e) => e.t === 'turn_end' || (e.t === 'msg_start' && e.role === 'user'),
+    // Every runtime here answers an interrupt by ending its own run. That is
+    // the half it was told to abandon, not the turn: the correction was
+    // delivered into the turn and the agent carries straight on with it. Left
+    // unmarked, this closed the turn a moment before the redirected work began,
+    // and everything the agent then said landed in a turn with no question in
+    // it — the "no prompt" row, spinning, that was reported.
+    const ends = events.filter((e) => e.t === 'turn_end');
+    assert.strictEqual(ends.length, 1);
+    assert.strictEqual(ends[0].stale, true, 'the acknowledgement must not read as an ending');
+
+    // And the work that follows is grouped into that same turn — read through
+    // the reducer, which is what a browser actually shows.
+    s.ingest({ t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'claude-run-2' });
+    const transcript = createTranscript({});
+    for (const event of events) applyChatEvent(transcript, event);
+    const [first] = userStarts(events);
+    const filed = new Set(transcript.messages.map((m) => m.turnId));
+    assert.deepStrictEqual([...filed], [first.turnId], 'one turn, from the ask to the answer');
+    assert.strictEqual(transcript.currentTurnId, first.turnId, 'and it is still running');
+  });
+
+  it('gives a message that waited in the queue its own turn, not the one before it', async function () {
+    // The distinction the whole path turns on. Interrupting to correct the
+    // agent continues the turn — the correction is about that work. A message
+    // that simply waited its turn is a new request, delivered only once the
+    // previous turn is over, and it must not be folded into it because the
+    // runtime's acknowledgement of some earlier interrupt is still in the air.
+    const { s, events } = session();
+    await s.send({ text: 'refactor the auth module' });
+    await s.send({ text: 'and then the changelog' });
+
+    // The first turn finishes on its own; the drain delivers what was waiting.
+    s.ingest({ t: 'turn_end', turnId: 'claude-run-1', stopReason: 'end_turn' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const [first, queued] = userStarts(events);
+    assert.ok(queued, 'the waiting message has to have been delivered');
+    assert.notStrictEqual(queued.turnId, first.turnId, 'it waited, so it is its own turn');
+    assert.strictEqual(queued.steer, undefined);
+
+    const transcript = createTranscript({});
+    for (const event of events) applyChatEvent(transcript, event);
+    assert.strictEqual(
+      new Set(transcript.messages.map((m) => m.turnId)).size,
+      2,
+      'two requests, two turns',
     );
-    const [, closed, promoted] = order;
-    assert.strictEqual(closed.t, 'turn_end', 'the runtime closes the turn it was told to stop');
-    assert.strictEqual(promoted.t, 'msg_start', 'and only then is the new one opened');
-    // Otherwise that stale `turn_end` lands on the turn just opened and closes
-    // it before a word comes back, and the answer arrives in a third turn that
-    // nobody asked anything in.
+  });
+
+  it('ends the turn when the redirected work itself finishes', async function () {
+    const { s, events } = session();
+    await s.send({ text: 'refactor the auth module' });
+    await s.send({ text: 'no — the staging database' });
+    const [waiting] = s.queuedTurns;
+    await s.sendQueuedNow(waiting.id);
+
+    // The second one is the redirected work finishing, and it really does end
+    // the turn — otherwise a conversation would never close another turn again.
+    s.ingest({ t: 'turn_end', turnId: 'claude-run-2', stopReason: 'end_turn' });
+    const ends = events.filter((e) => e.t === 'turn_end');
+    assert.strictEqual(ends.length, 2);
+    assert.strictEqual(ends[1].stale, undefined);
   });
 
   it('gives a promoted message its own turn when nothing was running', async function () {

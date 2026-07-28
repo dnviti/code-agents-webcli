@@ -37,7 +37,9 @@ export function openTurnAfter(event: ChatEvent, open: string | null): string | n
     case 'msg_start':
       return open ?? event.turnId;
     case 'turn_end':
-      return null;
+      // Except when it is the runtime letting go of work that was interrupted
+      // to redirect it. The turn goes on — see `stale` on the event.
+      return event.stale ? open : null;
     case 'state':
       return event.state === 'exited' || event.state === 'error' ? null : open;
     case 'marker':

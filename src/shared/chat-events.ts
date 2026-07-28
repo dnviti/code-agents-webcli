@@ -678,6 +678,20 @@ export type ChatEvent =
        * all end the turn naming the one that answered.
        */
       models?: TurnModelUsage[];
+      /**
+       * The runtime letting go of work that was cut short, not a turn ending.
+       *
+       * Sending a message ahead of the queue interrupts the agent, and every
+       * runtime here answers an interrupt by ending its own run — but the turn
+       * is not over: the message was delivered *into* it and the agent carries
+       * straight on with it. Left unmarked, that acknowledgement closed the
+       * turn a moment before the redirected work began, so the answer to the
+       * correction arrived in a turn of its own with nobody's question in it.
+       *
+       * What it still carries is what the cut-short half spent, which is real
+       * money and stays on the turn's bill. Only the ending is suppressed.
+       */
+      stale?: true;
     }
   /** The runtime revised what it can do — new slash commands, a model switch. */
   | { t: 'capabilities'; seq: number; ts: number; capabilities: Partial<ChatCapabilities> }

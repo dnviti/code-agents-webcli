@@ -606,26 +606,33 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
     }
 
     case 'turn_end': {
-      if (state.state !== 'error' && state.state !== 'exited') {
-        state.state = 'idle';
-      }
-      // The runtime's own word for how the turn concluded, kept rather than
-      // dropped: it is the only statement any of them makes about the turn as a
-      // whole, and without it the badge is left inferring one from whichever
-      // steps inside it went wrong (issue #74).
-      const outcome = turnOutcomeOf(event.stopReason);
-      // Against the turn the messages are actually filed under, which is the
-      // one this app opened rather than the name the runtime ends it by — see
-      // `msg_start`. Comparing the runtime's own id here stamped the outcome
-      // onto nothing at all.
-      const ended = state.currentTurnId ?? event.turnId;
-      for (const message of state.messages) {
-        if (message.turnId === ended) {
-          message.streaming = false;
-          message.turnOutcome = outcome;
+      // A turn interrupted to redirect it is not a turn that ended: the
+      // message that cut it short was delivered into it and the agent is
+      // already working on it again. What the runtime is acknowledging here is
+      // the half it abandoned, so this takes the spend and leaves the turn
+      // open, running, and unstamped — see `stale` on the event.
+      if (!event.stale) {
+        if (state.state !== 'error' && state.state !== 'exited') {
+          state.state = 'idle';
         }
+        // The runtime's own word for how the turn concluded, kept rather than
+        // dropped: it is the only statement any of them makes about the turn as
+        // a whole, and without it the badge is left inferring one from whichever
+        // steps inside it went wrong (issue #74).
+        const outcome = turnOutcomeOf(event.stopReason);
+        // Against the turn the messages are actually filed under, which is the
+        // one this app opened rather than the name the runtime ends it by — see
+        // `msg_start`. Comparing the runtime's own id here stamped the outcome
+        // onto nothing at all.
+        const ended = state.currentTurnId ?? event.turnId;
+        for (const message of state.messages) {
+          if (message.turnId === ended) {
+            message.streaming = false;
+            message.turnOutcome = outcome;
+          }
+        }
+        state.currentTurnId = null;
       }
-      state.currentTurnId = null;
       if (event.usage) {
         state.usage = mergeUsage(state.usage, event.usage);
       }

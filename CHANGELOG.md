@@ -257,15 +257,21 @@
   forever. The session's own state decides now: when the session says it is
   idle, the turn that was running has finished, whatever a stale flag says.
 
-- **A message sent ahead of the queue gets its own turn, and keeps its
-  question.** (#86) Sending one interrupts whatever the agent is working on, and
-  every runtime here answers an interrupt by ending that turn — so filing the
-  new message *into* the turn being cancelled left the question at the foot of a
-  finished turn while the work it asked for happened in the next one, with
-  nothing in it to name it by. That is where most of the "no prompt" rows came
-  from. A promoted message now waits for the interrupted turn to actually close
-  and then opens its own, and conversations already recorded are read back with
-  the question restored to the work it produced.
+- **Correcting the agent mid-turn stays in that turn, question and all.** (#86)
+  Sending a message ahead of the queue interrupts whatever is running, and every
+  runtime answers an interrupt by ending its own run. That acknowledgement was
+  being read as the turn ending — so the correction was recorded into a turn
+  that closed a moment later, and everything the agent then did about it arrived
+  in a fresh turn with nobody's question in it. That is where most of the "no
+  prompt" rows came from.
+
+  The runtime letting go of work it was told to abandon is now recorded as
+  exactly that, and the turn stays open across it: the correction, the work it
+  redirected and what both halves cost are one turn, which is what the number
+  beside the conversation has meant since #86. A message that simply waited its
+  place in the queue is unaffected — it is delivered after the turn ends and is
+  a turn of its own. Conversations already recorded are read back with the
+  stranded question restored to the work it produced.
 
 - **What a conversation has cost stops falling while you are still in it.** The
   figure was never stored: it was re-added up from the log each time a browser

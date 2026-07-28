@@ -794,7 +794,13 @@ export class ChatStore implements ChatStoreLike {
               carried = null;
               if (turn.label === null) pending = { turn, msgId: event.id };
               if (event.steer) steered = { msgId: event.id, label: null };
-            } else if (turn.label === null && carried) {
+            } else if (steered) {
+              // The agent answered inside the turn the steer joined, which is
+              // what a log written since this was fixed looks like. Nothing was
+              // stranded, so there is nothing to hand on.
+              steered = null;
+            }
+            if (event.role !== 'user' && turn.label === null && carried) {
               // The other half of a steer: this is the work that answers one,
               // and the question is a message back in the turn that was cut
               // short. Naming the row with it is not borrowing the model's
@@ -844,6 +850,9 @@ export class ChatStore implements ChatStoreLike {
             // Against whatever is open, not against the event's own id: a
             // runtime ends the turn under its own name for it, which is never
             // the name this app opened it by.
+            // The runtime letting go of work that was interrupted to redirect
+            // it ends nothing: the turn is running again, on the correction.
+            if (event.stale) return;
             const turn = openTurnId === null ? null : turns[turns.length - 1];
             if (turn) turn.outcome = turnOutcomeOf(event.stopReason);
             // A steer in the turn that just ended was the last thing the user

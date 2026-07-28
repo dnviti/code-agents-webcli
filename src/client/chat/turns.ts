@@ -121,11 +121,11 @@ export function groupTurns(messages: ChatMessage[], chatState: ChatState): TurnS
   });
 
   // The one turn that can be named from outside itself: a conversation already
-  // on disk, where a message promoted past the queue was filed into the turn it
-  // interrupted. Every runtime here answers an interrupt by ending that turn,
-  // so the ask sits at the foot of a finished turn and the work it asked for
-  // happens in the next one with no prompt in it. The question is the user's
-  // own words and it is right there — see `steerLabel`.
+  // on disk, where a message promoted past the queue was stranded by the
+  // runtime's answer to the interrupt, which used to end the turn the message
+  // had just joined. The work it asked for then happened in the next turn with
+  // no prompt in it. The question is the user's own words and it is right there
+  // — see `steerLabel`.
   for (let i = 1; i < turns.length; i++) {
     if (turns[i].label !== NO_PROMPT_LABEL) continue;
     const asked = steerLabel(groups[i - 1]);
@@ -134,15 +134,18 @@ export function groupTurns(messages: ChatMessage[], chatState: ChatState): TurnS
   return turns;
 }
 
-/** The first line of the last steer in a group, when it has one. */
+/**
+ * The first line of a steer left stranded at the end of a group.
+ *
+ * The last message and nothing else: a steer the agent went on to answer inside
+ * its own turn — which is every log written since — has the answer after it,
+ * and that turn needs no help being named. One that ends its group is one the
+ * turn closed on top of, and the work it asked for is in the group below.
+ */
 function steerLabel(group: ChatMessage[]): string {
-  for (let i = group.length - 1; i >= 0; i--) {
-    const message = group[i];
-    if (message.role !== 'user' || !message.steer) continue;
-    const text = firstText(message);
-    if (text) return text;
-  }
-  return '';
+  const last = group[group.length - 1];
+  if (!last || last.role !== 'user' || !last.steer) return '';
+  return firstText(last);
 }
 
 function summarise(
