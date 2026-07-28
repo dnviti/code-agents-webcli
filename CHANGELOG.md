@@ -37,6 +37,18 @@
   through its adapter and asserted on, and a browser check expands all three
   shapes of entry and fails if any of them paints an empty box.
 
+- **The settings dialog is usable on a phone.** Two things were wrong with it,
+  both found by putting the app's own settings dialog into the phone checks —
+  which had covered every other sheet and dialog but not the longest one in the
+  product. Its rows put the explanation and the control side by side, a shape
+  that only works with room for both: at 390px the control kept its width and
+  the sentence beside it was set one word to a line ("Sets / the / terminal /
+  palette / and / the"). Rows stack on a phone now, sentence first, control
+  under it. And the font-size slider was four pixels tall — a native range's hit
+  area is its own box — so changing the terminal's text size meant landing a
+  fingertip on a hairline. It is a touch target's height there now, with the
+  track still painted thin and the desktop row unchanged.
+
 - **The terminal takes its own size back, and asks for the screen again.** The
   PTY is shared, so a split pane, a second browser tab or a phone joining the
   same session resizes it to *their* screen. This client kept one record of the
@@ -227,6 +239,50 @@
   clearing one left the previous answer frozen on screen.
 
 ### Added
+- **A conversation tells you when it has finished, or when it is waiting for
+  you** (#93). Terminal sessions have been notifying for some time, and what
+  they do there is guesswork: nothing has been printed for ninety seconds, or a
+  line went past that looked like the end of something. A conversation never has
+  to guess. It knows when a turn ended and which word the runtime ended it with,
+  and it knows the difference between working and stopped — so notifications now
+  come from the events themselves, for work that **finished**, a turn that
+  **failed**, and the two that cost real time: an agent that has stopped for an
+  **approval** or a **question** and will do nothing at all until it is answered.
+
+  Reading the endings rather than the states is the whole of it. Claude, every
+  ACP agent — Grok Build, Kimi Code, Oh My Pi — and codex in app-server mode
+  emit no state at all when a turn ends, and codex never announces
+  `awaiting_permission` either, only the request that caused it. A watcher built
+  on the state stream would have been silent for most of the agents this app
+  supports; the tab strip's own dot had that bug and has it no longer, which is
+  why a background conversation used to stay green after it had finished.
+
+  Acting on a notification opens that conversation — bringing the window
+  forward, or starting one if the app is closed. The conversation on screen is
+  never announced, where "on screen" means its tab is showing *and* the window
+  has focus: a visible window sitting behind an editor is precisely the case
+  this exists for, and the terminal notifications suppress themselves for it to
+  this day. Several conversations do not become several notifications to dismiss
+  one by one — there is one at a time, and a second conversation turns it into a
+  summary of both.
+
+  They are shown through the service worker rather than by the page, because the
+  page's own constructor throws outright on Android Chrome — the phone this is
+  most useful on would otherwise have got nothing. Where notifications are
+  refused, unsupported, or never allowed, a waiting conversation is still marked
+  in the tab strip and in the phone's session sheet, in its own colour *and* in
+  words, and that mark lasts as long as the wait does: unlike the unread dot it
+  is not cleared by glancing at the tab, and it clears itself when the approval
+  is answered, from wherever it was answered.
+
+  **Settings → Conversation notifications** switches off any of the four events
+  or all of them, and remembers. The browser's own permission is asked from that
+  switch and nowhere else: asking on page load is refused outright by Firefox
+  and Safari, and once refused nothing in the page can ask again. **What
+  notifications say** reduces them to "a conversation needs you" — they are read
+  on lock screens and on shared devices, outside the boundary that signing in
+  protects, so how much leaves the app is the user's choice and not this app's.
+
 - **A turn can be branched into a conversation of its own.** The button was
   promised in 5.1.2 beside copy-a-turn and never built — the changelog said it
   had shipped, and the control existed in no state at all, folded or open, on

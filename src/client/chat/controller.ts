@@ -29,6 +29,14 @@ export interface ChatControllerOptions {
   send: (message: Record<string, unknown>) => void;
   /** Called when the surface should redraw for a reason outside the transcript. */
   onChange?: () => void;
+  /**
+   * Called for each event this conversation actually applied.
+   *
+   * Not called for one the transcript rejected as a replay, which is what makes
+   * it usable as an edge: a reconnect redelivers the tail of the log, and
+   * anything hung off this must not fire again for what it already knows.
+   */
+  onEvent?: (event: ChatEvent) => void;
 }
 
 /**
@@ -341,7 +349,7 @@ export class ChatController {
 
       case 'chat_event': {
         const event = message.event as ChatEvent | undefined;
-        if (event) this.transcript.apply(event);
+        if (event && this.transcript.apply(event)) this.options.onEvent?.(event);
         // `/clear` replaces the conversation in this tab, so the index of the
         // one it replaced is not an index of anything on screen. Dropped and
         // asked for again rather than patched: the server reads it from the

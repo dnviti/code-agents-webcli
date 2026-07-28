@@ -328,6 +328,48 @@ The turn in progress is never treated this way. It is prepared whether it is
 folded or open, and a turn that kept running while folded shows its real,
 current state when you open it — not a snapshot from when you folded it.
 
+### Being told when a conversation needs you
+
+Agent work is slow enough that nobody watches it. A conversation you have left
+tells you when it **finishes**, when a turn **fails**, and — the one that costs
+real time — when it has **stopped to ask you** for an approval or an answer, at
+which point it does nothing at all until it is answered.
+
+None of this is guessed. A conversation knows when a turn ended and how the
+runtime said it ended, and it knows when it is blocked rather than working, so
+these come from the events themselves: no timer that decides silence means
+finished, and no matching of the words that scroll past.
+
+- **Acting on a notification opens that conversation**, whether the app is
+  already open behind something else or has to be started.
+- **The conversation you are looking at never notifies.** Looking at it means
+  its tab is the one on screen *and* the window has focus — a window sitting
+  behind your editor is not one you are watching, which is exactly the case this
+  is for.
+- **They do not pile up.** There is one notification at a time: a second
+  conversation replaces it with a summary of both, and a conversation that
+  finishes four times replaces its own.
+- **Where they are refused, the app still says so.** A waiting conversation is
+  marked in the tab strip and in the session list on a phone, in its own colour
+  and in words, and the mark stays until the thing it is waiting for is
+  answered — including when it is answered from another window or another
+  device.
+
+**Settings → Conversation notifications** switches the whole thing off, or any
+of the four events separately, and the choice survives a reload. The browser has
+to allow notifications first, which it is asked from that switch and nowhere
+else — a page that asks the moment it loads is refused outright by Firefox and
+Safari, and a refusal cannot be taken back from inside the page.
+
+**What notifications say** turns the detail off: on, they name the conversation
+and quote what happened; off, they say only that a conversation needs you.
+Notifications are read on lock screens and on shared devices, outside the
+boundary that signing in protects, so what leaves the app is your choice.
+
+Reaching a phone whose screen is off needs a push subscription and is not part
+of this yet; today a notification reaches another tab, another window, another
+application, and the installed app while it is open in the background.
+
 ## Runtime profiles
 
 **Settings → Runtime profiles** controls how each CLI is launched. Nothing here
