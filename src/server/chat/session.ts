@@ -619,6 +619,24 @@ export class ChatSession {
     // a line under.
     if (options.startFresh && this.seq > 0) {
       this.ingest({ t: 'marker', kind: 'cleared', detail: 'started a new conversation' });
+      // And the conversation it draws a line under is dropped from the log, so
+      // the line is where this one begins rather than a marker in the middle
+      // of a longer record. Emptying the browser's window was never enough: a
+      // reload replays the tail from disk, and the tail still held everything
+      // said before the clear — so the conversation the user had just ended
+      // came straight back, and paging up walked into the rest of it.
+      //
+      // Awaited before the new process starts talking, and enqueued behind the
+      // marker's own append: the truncation and the events either side of it
+      // are ordered by the store's per-log queue, so nothing lands in a log
+      // that is being rewritten. Never fatal — a conversation must not fail to
+      // start because its predecessor could not be cleaned up.
+      try {
+        await this.deps.store.truncateBefore(this.ref, this.seq);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`chat ${this.ref.id}: could not truncate the cleared conversation: ${message}`);
+      }
     }
 
     this.setState('starting');

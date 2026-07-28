@@ -197,6 +197,8 @@ export interface ChatStoreLike {
   read(session: ChatSessionRef, fromSeq: number, count: number): Promise<ChatPage>;
   turnIndex(session: ChatSessionRef): Promise<ChatTurnIndex>;
   snapshot(session: ChatSessionRef, options?: ChatSnapshotOptions): Promise<ChatSnapshot>;
+  /** Drop everything before `seq`, so a cleared conversation cannot be paged back into. */
+  truncateBefore(session: ChatSessionRef, seq: number): Promise<void>;
   listSessions(ownerUserId: number): Promise<string[]>;
   deleteChat(session: ChatSessionRef): Promise<void>;
 }
@@ -629,8 +631,36 @@ export class ChatStore implements ChatStoreLike {
     }
   }
 
+  /** Drop the oldest `trimChunkEvents` events, once the log is over its cap. */
+  private async trimHead(base: string, state: SessionState): Promise<void> {
+    await this.dropOldest(base, state, this.trimChunkEvents);
+  }
+
   /**
-   * Drop the oldest `trimChunkEvents` events by rewriting both files.
+   * Everything before `seq` is gone: the log now begins there.
+   *
+   * What `/clear` means on disk. Emptying the window was never enough — the
+   * events were still on the log, so a reload replayed the tail from before
+   * the clear and the conversation the user had just ended came back, one
+   * scrolled page at a time. Nothing downstream needed teaching about the
+   * boundary, because everything downstream — the replay, the pages, the turn
+   * index, the conversation's own description — is read from the log, and the
+   * head is no longer there to be read.
+   *
+   * Irreversible, deliberately: "start a new conversation" is a promise about
+   * what is left behind, not a view over it. What each turn cost is recorded
+   * separately, in the usage store, and is not touched here.
+   */
+  async truncateBefore(session: ChatSessionRef, seq: number): Promise<void> {
+    const base = this.basePath(session);
+    await this.enqueue(base, async () => {
+      const state = await this.loadState(base);
+      await this.dropOldest(base, state, seq - state.firstSeq);
+    });
+  }
+
+  /**
+   * Drop the oldest `count` events by rewriting both files.
    *
    * The surviving log is copied in fixed-size chunks rather than read into one
    * buffer: at the retention cap that buffer would be tens of megabytes, so a
@@ -638,8 +668,8 @@ export class ChatStore implements ChatStoreLike {
    * uses. Both files are replaced via rename, so a crash mid-trim leaves the
    * previous consistent pair in place.
    */
-  private async trimHead(base: string, state: SessionState): Promise<void> {
-    const drop = Math.min(this.trimChunkEvents, state.count);
+  private async dropOldest(base: string, state: SessionState, count: number): Promise<void> {
+    const drop = Math.min(count, state.count);
     if (drop <= 0) {
       return;
     }
