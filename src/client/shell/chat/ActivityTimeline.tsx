@@ -4,6 +4,7 @@ import {
   ACTIVITY_FILTERS,
   activityMeta,
   filterActivity,
+  reasoningNote,
   type ActivityEvent,
 } from '../../chat/activity.js';
 import type { ActivityFilterId } from '../../chat/view-settings.js';
@@ -313,6 +314,7 @@ const ActivityRow = React.memo(function ActivityRow({
   const failed = event.status === 'failed';
   const running = event.status === 'running' || event.status === 'pending';
   const meta = activityMeta(event);
+  const note = reasoning ? reasoningNote(event.block as ThinkingBlock, running) : null;
 
   const dotColor = reasoning
     ? 'var(--ansi-magenta)'
@@ -441,6 +443,7 @@ const ActivityRow = React.memo(function ActivityRow({
         <div id={bodyId} style={{ display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 }}>
           {reasoning ? (
             <div
+              data-testid="reasoning-body"
               style={{
                 padding: '6px 8px',
                 background: 'var(--terminal-bg)',
@@ -451,7 +454,20 @@ const ActivityRow = React.memo(function ActivityRow({
                 fontSize: 'var(--text-sm)',
               }}
             >
-              <Markdown text={(event.block as ThinkingBlock).text} dense />
+              {note ? (
+                // Never an empty box: an agent that kept its reasoning to
+                // itself is a fact worth stating, and stating it is the whole
+                // of #120. Italic and unmarked-up, so it does not read as
+                // something the agent said.
+                <p
+                  data-testid="reasoning-note"
+                  style={{ margin: 0, fontStyle: 'italic', opacity: 0.9 }}
+                >
+                  {note}
+                </p>
+              ) : (
+                <Markdown text={(event.block as ThinkingBlock).text} dense />
+              )}
             </div>
           ) : (
             <ToolCallCard
@@ -502,6 +518,9 @@ const ActivityRow = React.memo(function ActivityRow({
     && a.name === b.name
     && a.target === b.target
     && a.durationMs === b.durationMs
+    // Claude counts its reasoning out loud while withholding the words, so
+    // this is the only thing about a collapsed reasoning row that moves.
+    && a.tokens === b.tokens
     && a.diffs === b.diffs
     // An open row always redraws. The reducer mutates blocks in place, so the
     // block's identity is stable across a whole streaming call — comparing it

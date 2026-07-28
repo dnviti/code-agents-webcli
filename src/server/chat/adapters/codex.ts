@@ -501,6 +501,8 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
   /** itemId -> block index, for the item kinds `block_end` must address by position. */
   private readonly itemBlockIndex = new Map<string, number>();
   private readonly planText = new Map<string, string>();
+  /** itemId -> which of a reasoning item's two channels is filling its block. */
+  private readonly reasoningChannel = new Map<string, 'content' | 'summary'>();
 
   protected buildArgs(): string[] {
     return ['app-server', ...(this.options.extraArgs || [])];
@@ -718,6 +720,7 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     this.blockIndex = 0;
     this.itemBlockIndex.clear();
     this.planText.clear();
+    this.reasoningChannel.clear();
 
     const userMsgId = `u_${turnId}`;
     this.emit({ t: 'msg_start', id: userMsgId, role: 'user', turnId });
@@ -812,7 +815,18 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
         this.onTextDelta(str(params.itemId) || '', str(params.delta) || '');
         return;
       case 'item/reasoning/textDelta':
-        this.onTextDelta(str(params.itemId) || '', str(params.delta) || '');
+        this.onReasoningDelta(str(params.itemId) || '', 'content', str(params.delta) || '');
+        return;
+      case 'item/reasoning/summaryTextDelta':
+        // The other half of codex's reasoning channel, and for a model whose
+        // raw trace is encrypted it is the only half that carries words. Both
+        // are declared in codex's own schema export
+        // (ReasoningTextDeltaNotification / ReasoningSummaryTextDeltaNotification)
+        // and `item/completed` already prefers `content` over `summary`, so
+        // the same precedence is applied to the live stream — see
+        // `onReasoningDelta`. Dropping this was why a codex turn that only
+        // ever summarised its reasoning streamed an empty panel (#120).
+        this.onReasoningDelta(str(params.itemId) || '', 'summary', str(params.delta) || '');
         return;
       case 'item/plan/delta':
         this.onPlanDelta(str(params.itemId) || '', str(params.delta) || '');
@@ -901,6 +915,38 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     this.emit({ t: 'block_delta', msgId: this.assistantMsgId, index, text: delta });
   }
 
+  /**
+   * A reasoning item growing, from whichever of its two channels is speaking.
+   *
+   * Codex streams the trace and the summary of the same item down separate
+   * notifications, and appending both would interleave two accounts of one
+   * thought. `content` wins where it is offered — the same precedence
+   * `itemToBlock` applies when the item completes — and a summary already
+   * streamed is cleared out of the way rather than left with the trace
+   * appended to its tail.
+   */
+  private onReasoningDelta(itemId: string, channel: 'content' | 'summary', delta: string): void {
+    if (!delta || !this.assistantMsgId) return;
+    const index = this.itemBlockIndex.get(itemId);
+    if (index === undefined) return;
+    const current = this.reasoningChannel.get(itemId);
+    if (current === 'content' && channel === 'summary') return;
+    if (current !== channel) {
+      this.reasoningChannel.set(itemId, channel);
+      // Only reachable when a summary was streaming and the trace arrived
+      // after it: replace rather than append, so the panel holds one of them.
+      if (current === 'summary') {
+        this.emit({
+          t: 'block_end',
+          msgId: this.assistantMsgId,
+          index,
+          block: { kind: 'thinking', text: '' },
+        });
+      }
+    }
+    this.emit({ t: 'block_delta', msgId: this.assistantMsgId, index, text: delta });
+  }
+
   private onPlanDelta(itemId: string, delta: string): void {
     if (!delta) return;
     const text = (this.planText.get(itemId) || '') + delta;
@@ -958,6 +1004,7 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     this.assistantMsgId = null;
     this.itemBlockIndex.clear();
     this.planText.clear();
+    this.reasoningChannel.clear();
   }
 
   protected handleServerRequest(id: number | string, method: string, params: Record<string, unknown>): void {

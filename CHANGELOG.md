@@ -3,6 +3,40 @@
 ## [Unreleased]
 
 ### Fixed
+- **A reasoning entry never opens onto an empty panel** (#120). The trace rail
+  showed "reasoning", and expanding it showed a blank box — three times on an
+  ordinary turn. Nothing said whether the agent had reasoned about nothing,
+  whether the app had dropped the text, or whether the agent had never handed it
+  over, which is the one thing the trace exists to answer.
+
+  All six runtimes were driven to find out, rather than assuming the agent it
+  was reported against was the only one. **pi, Kimi Code and Oh My Pi** hand
+  over their reasoning and always did; **Grok Build** does too, on the traffic it
+  has been recorded producing (its own API was erroring, eight retries deep,
+  while this was being written). **Claude Code does not.** Probed live against
+  2.1.220 at `--effort high`: every thinking block on the wire is
+  `"thinking": ""` with a signature beside it, every `thinking_delta` is empty,
+  and the only account of what was thought is a token estimate on a side
+  channel. **Codex** withholds it too wherever its trace is encrypted and it
+  summarised nothing — which is all 22,987 reasoning items in this machine's own
+  codex history.
+
+  So the entry now says which silence it is. Reasoning text where the agent
+  sends any; "still reasoning" while the block is open; and where an agent kept
+  it, a plain sentence saying so *with the size it did report* — Claude's own
+  running estimate, marked `~` because measured against the same turns' billed
+  thinking tokens it runs high. The collapsed row previews the same thing rather
+  than sitting blank, and the figure beside it now climbs as the agent thinks
+  instead of staying still. Codex's reasoning *summaries* were also being
+  dropped on the way in — the app read only its raw-trace channel, which for an
+  encrypted trace carries nothing — so a codex turn that summarised its thinking
+  showed an empty panel even though the words had arrived.
+
+  Covered per agent, so a runtime that stops sending reasoning is caught rather
+  than quietly rendering nothing: each one's own recorded traffic is replayed
+  through its adapter and asserted on, and a browser check expands all three
+  shapes of entry and fails if any of them paints an empty box.
+
 - **The terminal takes its own size back, and asks for the screen again.** The
   PTY is shared, so a split pane, a second browser tab or a phone joining the
   same session resizes it to *their* screen. This client kept one record of the
