@@ -1,8 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { SessionRecord } from '../types.js';
-import { ChatEvent, ChatSnapshot, NO_CHAT_CAPABILITIES } from '../../shared/chat-events.js';
+import {
+  ChatEvent,
+  ChatSnapshot,
+  ChatTurnIndexEntry,
+  NO_CHAT_CAPABILITIES,
+} from '../../shared/chat-events.js';
 import { applyAll, createTranscript } from '../../shared/chat-reducer.js';
+import { TurnOutcome, turnOutcomeOf } from '../../shared/turn-outcome.js';
 
 /**
  * Append-only store of a chat session's normalized event log.
@@ -113,6 +119,20 @@ export interface ChatPage extends ChatStats {
   from: number;
 }
 
+/**
+ * One turn as the log has it. The wire shape, so the server cannot describe a
+ * turn one way and the browser read it another.
+ */
+export type PersistedTurn = ChatTurnIndexEntry;
+
+export interface ChatTurnIndex {
+  turns: PersistedTurn[];
+  /** Lowest seq still on disk, so a caller can explain a list that starts late. */
+  firstSeq: number;
+  /** False when the head of the log has been trimmed and turns are missing. */
+  complete: boolean;
+}
+
 export interface ChatSnapshotOptions {
   /** The log never names its own runtime; the caller supplies it. */
   runtime?: string;
@@ -141,6 +161,7 @@ export interface ChatStoreLike {
   append(session: ChatSessionRef, events: ChatEvent[]): void;
   stat(session: ChatSessionRef): Promise<ChatStats>;
   read(session: ChatSessionRef, fromSeq: number, count: number): Promise<ChatPage>;
+  turnIndex(session: ChatSessionRef): Promise<ChatTurnIndex>;
   snapshot(session: ChatSessionRef, options?: ChatSnapshotOptions): Promise<ChatSnapshot>;
   listSessions(ownerUserId: number): Promise<string[]>;
   deleteChat(session: ChatSessionRef): Promise<void>;
@@ -611,6 +632,139 @@ export class ChatStore implements ChatStoreLike {
     return this.enqueue(base, async () => this.statsOf(await this.loadState(base)));
   }
 
+  /**
+   * Every turn of a conversation, from the first one still on disk.
+   *
+   * The index beside a conversation used to be built from whatever the browser
+   * was holding, so a long conversation's index quietly started part way
+   * through — the very case where an index is the only practical way to
+   * navigate (#86). It is a property of the recorded conversation, so it is read
+   * from the recorded conversation.
+   *
+   * A full scan of the log, deliberately: the whole point is that it does not
+   * stop at a window. It is cheap because it reads one field per line and keeps
+   * one small row per turn, and it is asked for once when a conversation is
+   * opened rather than as anybody scrolls.
+   *
+   * "From the first one still on disk" is the one limit worth stating plainly:
+   * the head of a very long log is trimmed, and turns that were trimmed away
+   * cannot be listed. `firstSeq` is returned so a caller can say so rather than
+   * present a partial list as a whole one.
+   */
+  async turnIndex(session: ChatSessionRef): Promise<ChatTurnIndex> {
+    const base = this.basePath(session);
+    return this.enqueue(base, async () => {
+      const state = await this.loadState(base);
+      const stats = this.statsOf(state);
+      const turns: PersistedTurn[] = [];
+      const byId = new Map<string, PersistedTurn>();
+      let openTurnId: string | null = null;
+
+      // The same grouping rule the browser applies to the messages it holds
+      // (`groupTurns`): consecutive events sharing a turn id are one turn, and a
+      // turn id that comes back after another has intervened is a second one.
+      // Two implementations of that rule would be two answers to "how many
+      // turns", which is the disagreement this whole change removes.
+      const openTurn = (turnId: string, ts: number, id: string): PersistedTurn => {
+        if (openTurnId === turnId) {
+          const current = turns[turns.length - 1];
+          if (current) return current;
+        }
+        const turn: PersistedTurn = {
+          id,
+          turnId,
+          index: turns.length + 1,
+          label: null,
+          startedAt: ts,
+          outcome: null,
+        };
+        turns.push(turn);
+        byId.set(id, turn);
+        openTurnId = turnId;
+        return turn;
+      };
+
+      let pending: { turn: PersistedTurn; msgId: string } | null = null;
+      await this.scanLog(base, state, (event) => {
+        switch (event.t) {
+          case 'msg_start': {
+            const turn = openTurn(event.turnId, event.ts, event.id);
+            // Only the user's own words may name a turn, and only the first of
+            // them. Anything else is the model titling the reader's question
+            // for them — see `labelFor` on the browser's side.
+            if (event.role === 'user' && turn.label === null) {
+              pending = { turn, msgId: event.id };
+            }
+            return;
+          }
+          case 'block_start': {
+            if (!pending || pending.msgId !== event.msgId) return;
+            if (event.block.kind !== 'text') return;
+            const line = event.block.text.trim().split('\n')[0].trim();
+            if (!line) return;
+            pending.turn.label = line;
+            pending = null;
+            return;
+          }
+          case 'turn_end': {
+            const turn = turns[turns.length - 1];
+            if (turn && turn.turnId === event.turnId) {
+              turn.outcome = turnOutcomeOf(event.stopReason);
+            }
+            // Whatever comes next belongs to a turn that has not started yet.
+            openTurnId = null;
+            return;
+          }
+          default:
+            return;
+        }
+      });
+
+      return { turns, firstSeq: stats.firstSeq, complete: stats.firstSeq <= 1 };
+    });
+  }
+
+  /**
+   * Walk every event in the log, oldest first, one line at a time.
+   *
+   * Streamed rather than read whole: a long conversation's log is tens of
+   * megabytes, and the caller here keeps one small row per turn out of it. The
+   * point of this method is that it never holds the log in memory.
+   */
+  private async scanLog(
+    base: string,
+    state: SessionState,
+    visit: (event: ChatEvent) => void,
+  ): Promise<void> {
+    let handle: fs.promises.FileHandle;
+    try {
+      handle = await fs.promises.open(`${base}.jsonl`, 'r');
+    } catch {
+      // No log is an empty conversation, not a failure.
+      return;
+    }
+    try {
+      const CHUNK = 1 << 16;
+      const buffer = Buffer.alloc(CHUNK);
+      let carry = '';
+      let position = 0;
+      for (;;) {
+        const { bytesRead } = await handle.read(buffer, 0, CHUNK, position);
+        if (bytesRead === 0) break;
+        position += bytesRead;
+        const lines = (carry + buffer.toString('utf8', 0, bytesRead)).split('\n');
+        // The last piece is whatever fell across the chunk boundary; it is only
+        // a whole line once the next read confirms it, or once the file ends.
+        carry = lines.pop() ?? '';
+        for (const line of lines) visitLine(line, visit);
+        if (position >= state.logSize) break;
+      }
+      if (carry) visitLine(carry, visit);
+    } finally {
+      await handle.close();
+    }
+  }
+
   async read(session: ChatSessionRef, fromSeq: number, count: number): Promise<ChatPage> {
     const base = this.basePath(session);
     return this.enqueue(base, async () => {
@@ -885,6 +1039,23 @@ export class ChatStore implements ChatStoreLike {
  * Reads a bounded prefix: the first line is all that is wanted, and a log whose
  * first record is enormous must not be pulled into memory to find its number.
  */
+/**
+ * Parse one log line and hand it on, skipping anything unreadable.
+ *
+ * A single corrupted record must not take a whole index down with it — the same
+ * rule `readSlice` applies to a page, for the same reason.
+ */
+function visitLine(line: string, visit: (event: ChatEvent) => void): void {
+  const text = line.trim();
+  if (!text) return;
+  try {
+    visit(JSON.parse(text) as ChatEvent);
+  } catch {
+    // Deliberately silent: an index is asked for on every open, and one bad
+    // line would otherwise log on every one of them forever.
+  }
+}
+
 async function firstSeqInLog(base: string): Promise<number | null> {
   const buffer = Buffer.alloc(64 * 1024);
   let read = 0;

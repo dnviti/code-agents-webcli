@@ -2,6 +2,7 @@ import {
   ChatAttachment,
   ChatEvent,
   ChatSnapshot,
+  ChatTurnIndexEntry,
   QueuedTurn,
   NO_CHAT_CAPABILITIES,
 } from '../../shared/chat-events.js';
@@ -73,6 +74,14 @@ export class ChatController {
   private nextRequestId = 1;
   /** Request id of the page in flight, or null. */
   private pendingPage: string | null = null;
+  /**
+   * The conversation's recorded turns, or null until the server has answered.
+   *
+   * Null is not an empty list: before the answer arrives — and on any server
+   * that cannot supply one — the index falls back to the turns this browser
+   * holds, which is what it always showed.
+   */
+  private turnIndex: { turns: ChatTurnIndexEntry[]; complete: boolean } | null = null;
   private pageTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Set while the conversation is readable but has nothing running it. */
@@ -117,6 +126,9 @@ export class ChatController {
         if (!snapshot) return true;
         this.settlePage();
         this.transcript.hydrate(snapshot);
+        // Asked for once per open. The list only grows at the end, and the end
+        // is the part this browser is certain to be holding.
+        this.requestTurnIndex();
         this.modelOverride =
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
         this.options.onChange?.();
@@ -178,6 +190,22 @@ export class ChatController {
       case 'chat_event': {
         const event = message.event as ChatEvent | undefined;
         if (event) this.transcript.apply(event);
+        return true;
+      }
+
+      case 'chat_turn_index': {
+        const turns = message.turns as ChatTurnIndexEntry[] | undefined;
+        this.turnIndex = {
+          turns: Array.isArray(turns) ? turns : [],
+          complete: message.complete !== false,
+        };
+        this.options.onChange?.();
+        return true;
+      }
+
+      case 'chat_turn_index_failed': {
+        // Nothing to recover: the index falls back to the turns this browser
+        // holds, which is what it showed before there was a recorded one.
         return true;
       }
 
@@ -407,6 +435,61 @@ export class ChatController {
     });
   }
 
+  /** Every turn of this conversation as recorded, or null if none was served. */
+  get recordedTurns(): { turns: ChatTurnIndexEntry[]; complete: boolean } | null {
+    return this.turnIndex;
+  }
+
+  private requestTurnIndex(): void {
+    this.send({
+      type: 'chat_turn_index_request',
+      requestId: `chat-turns-${this.nextRequestId++}`,
+    });
+  }
+
+  /**
+   * Page back until a turn is held, or until there is no more history.
+   *
+   * The index lists the whole conversation, so selecting an entry from before
+   * what is loaded has to fetch it rather than quietly do nothing — which is
+   * what "selecting an older one should take the user there" means (#86).
+   *
+   * Bounded by `hasMore` and by a page ceiling, because the alternative is a
+   * loop that reads a whole conversation into a browser to answer a click. A
+   * request that runs out of pages resolves false and the caller leaves the
+   * selection where it was.
+   */
+  async loadUntilLoaded(messageId: string, maxPages = 20): Promise<boolean> {
+    for (let page = 0; page < maxPages; page++) {
+      if (this.transcript.messages.some((message) => message.id === messageId)) return true;
+      if (!this.transcript.hasMore) return false;
+      // One page at a time, awaited: `loadMore` is guarded against overlapping
+      // requests, so firing them in parallel would fetch one page and drop the
+      // rest on the floor.
+      const settled = await this.nextPage();
+      if (!settled) return false;
+    }
+    return this.transcript.messages.some((message) => message.id === messageId);
+  }
+
+  /**
+   * One page, resolved when its reply lands or its timeout fires.
+   *
+   * A page already in flight is joined rather than refused. Scrolling to the
+   * top of a short transcript fetches one on its own, so a click on the index
+   * arriving in that window would otherwise give up on the first step and go
+   * nowhere — which looks exactly like the index not being wired up at all.
+   */
+  private nextPage(): Promise<boolean> {
+    if (!this.transcript.loadingMore && !this.transcript.hasMore) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      this.pageWaiters.push(resolve);
+      if (!this.transcript.loadingMore) this.loadMore();
+    });
+  }
+
+  private pageWaiters: Array<(settled: boolean) => void> = [];
+
   get isLoadingMore(): boolean {
     return this.transcript.loadingMore;
   }
@@ -419,6 +502,9 @@ export class ChatController {
     }
     this.pendingPage = null;
     this.transcript.setLoadingMore(false);
+    const waiters = this.pageWaiters;
+    this.pageWaiters = [];
+    for (const resolve of waiters) resolve(true);
   }
 
   /** Every outgoing message names its session; a browser drives several. */

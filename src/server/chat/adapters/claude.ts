@@ -733,15 +733,20 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       });
     }
 
-    // num_turns (the internal round-trip count for this turn) has nowhere
-    // to go: turn_end carries stopReason/usage/durationMs only. Dropped
-    // rather than misfiled into one of those.
+    // `num_turns` is Claude's own count of the round trips this turn took, and
+    // it now has somewhere to go (#86). It is not the turn count — the turn is
+    // the whole of what this event ends — which is why it travels under its own
+    // name, as the one figure here nobody had to infer.
     this.emit({
       t: 'turn_end',
       turnId: this.activeTurnId ?? randomUUID(),
       stopReason: str(raw.stop_reason) ?? subtype,
       usage,
       durationMs: num(raw.duration_ms),
+      ...(() => {
+        const modelTurns = num(raw.num_turns);
+        return modelTurns === undefined ? {} : { modelTurns };
+      })(),
       ...(() => {
         const models = this.modelBreakdown(raw, costUsd);
         return models ? { models } : {};

@@ -66,11 +66,24 @@ export interface TurnSummary {
 /**
  * Split messages into turns.
  *
- * A turn starts at every `role === 'user'` message and ends before the next one.
+ * **By `turnId`, not by user message.** The turn id is minted where the work is
+ * accepted and stamped on every message the turn produced, so grouping on it
+ * gives the same turns the accounting recorded — which is the whole of #86: the
+ * count beside a conversation and the count in the statistics were two different
+ * readings of two different things, and neither could be checked against the
+ * other. A user message that shares the turn in progress is a steer: it was
+ * delivered into that work, so it belongs to it and does not open a turn.
+ *
  * Messages that arrive before the first user turn — a resumed transcript's tail,
- * a compaction marker, a system notice — are a turn of their own rather than
- * being dropped: they are on screen, so they need a strip and an index row like
- * everything else.
+ * a compaction marker, a system notice — carry turn ids of their own and group
+ * by the same rule. They are on screen, so they need a strip and an index row
+ * like everything else.
+ *
+ * Consecutive-only: a turn id that reappears after another turn has intervened
+ * opens a second group rather than reaching back into the first. Runtimes that
+ * number their turns from a counter restarting with every process reuse `t1`
+ * within one conversation, and merging across the gap would fold two unrelated
+ * pieces of work into one row of the index.
  *
  * `chatState` only ever decides the *last* turn's status. An earlier turn cannot
  * be the one that is running, and reading a session-level state onto all of them
@@ -78,8 +91,12 @@ export interface TurnSummary {
  */
 export function groupTurns(messages: ChatMessage[], chatState: ChatState): TurnSummary[] {
   const groups: ChatMessage[][] = [];
+  let openTurnId: string | undefined;
   for (const message of messages) {
-    if (message.role === 'user' || groups.length === 0) groups.push([]);
+    if (groups.length === 0 || message.turnId !== openTurnId) {
+      groups.push([]);
+      openTurnId = message.turnId;
+    }
     groups[groups.length - 1].push(message);
   }
 
@@ -202,22 +219,56 @@ function endedAs(
   return 'done';
 }
 
-/** The first line of the user's ask, or the best stand-in the group offers. */
+/**
+ * The first line of the user's ask — and nothing else, ever.
+ *
+ * The index is scanned for the one thing the reader remembers, which is what
+ * they asked. An entry titled with something the model said is not merely
+ * unhelpful, it is unsearchable by the only key anybody has, and it was what a
+ * turn ended up carrying whenever the user's own text was not the first text the
+ * group offered (#86). So a turn with no prompt behind it says so plainly rather
+ * than borrowing a sentence from the answer.
+ *
+ * Any user message in the group will do, not just the opener: a steer is a user
+ * message inside a turn it did not open, and a turn whose opener carried only
+ * attachments is better named by the words that came with them than by the word
+ * "attachment".
+ */
 function labelFor(group: ChatMessage[]): string {
-  const opener = group[0];
-  if (opener && opener.role === 'user') {
-    const text = firstText(opener);
-    if (text) return text;
-    // An attachments-only turn still opened one and still needs a name.
-    const image = opener.blocks.find((block) => block.kind === 'image');
-    if (image) return 'attachment';
-  }
   for (const message of group) {
+    if (message.role !== 'user') continue;
     const text = firstText(message);
     if (text) return text;
   }
-  return 'transcript';
+  // An attachments-only turn still opened one and still needs a name.
+  const attached = group.some(
+    (message) => message.role === 'user' && message.blocks.some((block) => block.kind === 'image'),
+  );
+  if (attached) return 'attachment';
+
+  // A notice is the app's own word for what happened — a compaction, a fresh
+  // start — and naming a turn with one is not the thing being prohibited here.
+  // What may never title a turn is the *model's* output, which is why this
+  // reads notices only and only off messages the model did not write.
+  for (const message of group) {
+    if (message.role === 'assistant') continue;
+    for (const block of message.blocks) {
+      if (block.kind === 'notice' && block.text.trim()) return block.text;
+    }
+  }
+
+  return NO_PROMPT_LABEL;
 }
+
+/**
+ * What a turn with no user prompt is called.
+ *
+ * These are real: the tail of a resumed conversation, a compaction marker, a
+ * system notice. They are on screen and need a row, and naming them for what
+ * they are keeps the index honest — every other row is a quotation of something
+ * the reader typed, and this one visibly is not.
+ */
+export const NO_PROMPT_LABEL = 'no prompt';
 
 function firstText(message: ChatMessage): string {
   for (const block of message.blocks) {
@@ -227,6 +278,68 @@ function firstText(message: ChatMessage): string {
     if (block.kind === 'notice') return block.text;
   }
   return '';
+}
+
+/**
+ * One row of the index beside a conversation.
+ *
+ * Less than a `TurnSummary` on purpose: most of a conversation is not loaded,
+ * and the index still has to list all of it. Everything here can be answered
+ * from the recorded log — a number, what was asked, how it ended — while tool
+ * counts, durations and spend need the messages and stay on `TurnSummary`.
+ */
+export interface TurnIndexRow {
+  id: string;
+  index: number;
+  label: string;
+  status: TurnStatus;
+  /** False for a turn that is recorded but not held by this browser yet. */
+  loaded: boolean;
+}
+
+/**
+ * The conversation's whole run of turns: what was recorded, corrected by what
+ * is live.
+ *
+ * The recorded list is the spine, because it is the only one that reaches back
+ * to the first turn however little has been loaded (#86). The live turns are
+ * laid over it for two things the log cannot answer: the status of a turn still
+ * running, and turns that have happened since the list was fetched — which is
+ * always at least the one being typed into.
+ *
+ * With no recorded list — an old server, a store that failed — this degrades to
+ * exactly what the index showed before, rather than to nothing.
+ */
+export function turnIndexRows(
+  persisted: ReadonlyArray<{ id: string; index: number; label: string | null; outcome: TurnOutcome | null }>,
+  live: TurnSummary[],
+): TurnIndexRow[] {
+  const byId = new Map(live.map((turn) => [turn.id, turn]));
+  const rows: TurnIndexRow[] = [];
+  const seen = new Set<string>();
+
+  for (const turn of persisted) {
+    seen.add(turn.id);
+    const loaded = byId.get(turn.id);
+    rows.push({
+      id: turn.id,
+      index: turn.index,
+      // The loaded turn's label wins where there is one: it is read by the same
+      // rule from the same words, and it is the one that updates as a turn the
+      // user is still typing into takes shape.
+      label: loaded ? loaded.label : turn.label ?? NO_PROMPT_LABEL,
+      status: loaded ? loaded.status : turn.outcome ?? 'done',
+      loaded: Boolean(loaded),
+    });
+  }
+
+  let next = rows.length ? rows[rows.length - 1].index + 1 : 1;
+  for (const turn of live) {
+    if (seen.has(turn.id)) continue;
+    rows.push({ id: turn.id, index: next, label: turn.label, status: turn.status, loaded: true });
+    next += 1;
+  }
+  return rows;
 }
 
 export function turnOf(messageId: string, turns: TurnSummary[]): TurnSummary | undefined {

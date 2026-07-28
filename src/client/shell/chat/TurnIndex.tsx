@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { Icon } from '../../ui/relay/Icon.js';
 import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
-import { STATUS_GLYPH, type TurnSummary } from '../../chat/turns.js';
+import { STATUS_GLYPH, type TurnIndexRow } from '../../chat/turns.js';
 
 /**
  * Every turn in the conversation, as a list you can jump around.
@@ -18,7 +18,8 @@ import { STATUS_GLYPH, type TurnSummary } from '../../chat/turns.js';
  */
 
 export interface TurnIndexProps {
-  turns: TurnSummary[];
+  /** Every turn of the conversation, loaded or not — see `turnIndexRows`. */
+  turns: TurnIndexRow[];
   currentTurnId: string;
   onSelect(id: string): void;
   onJumpLatest(): void;
@@ -232,7 +233,7 @@ function TurnRow({
   collapsed,
   onSelect,
 }: {
-  turn: TurnSummary;
+  turn: TurnIndexRow;
   active: boolean;
   collapsed: boolean;
   onSelect: () => void;
@@ -254,7 +255,13 @@ function TurnRow({
       onMouseLeave={() => setHover(false)}
       // The number and the outcome are the whole row once it is collapsed, so
       // the title carries what the label would have said.
-      title={collapsed ? `Turn ${turn.index} — ${glyph.word}: ${turn.label}` : turn.label}
+      title={
+        collapsed
+          ? `Turn ${turn.index} — ${glyph.word}: ${turn.label}`
+          : turn.loaded
+            ? turn.label
+            : `${turn.label} — not loaded yet; selecting it fetches it`
+      }
       style={{
         display: 'flex',
         alignItems: 'center',

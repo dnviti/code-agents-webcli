@@ -11,11 +11,36 @@
  * ## What a job is
  *
  * One prompt, and everything the agent did to answer it: the span from the user's
- * message to the runtime's `turn_end`. Inside that span, *turns* counts the times
- * the model spoke — the same quantity Claude reports as `num_turns` — and *tool
- * calls* counts the tool blocks that opened. Every runtime here has the first
- * boundary; almost none of them report the two counts, which is precisely why
- * they are counted from the transcript rather than asked for.
+ * message to the runtime's `turn_end`. **That span is a turn** — the unit is the
+ * measurement, so the turn count is the number of these and there is nothing else
+ * to count (#86). Every runtime here has that boundary, which is what makes the
+ * figure mean the same thing whichever one ran the work.
+ *
+ * Two quantities live inside the span. *Tool calls* counts the tool blocks that
+ * opened, from the transcript, because a tool block is a tool call in every
+ * protocol here. *Model turns* — round trips to the model — is taken only where
+ * the runtime reports its own, and is null otherwise. It used to be counted as
+ * assistant messages, and that was the defect behind #86: an agent that separates
+ * its thinking from its answer filed six where an agent that says everything at
+ * once filed one, for identical work, and those figures were what the dashboard
+ * compared agents by. The two are kept apart by name on every surface: the turn
+ * is the unit, a model turn is one round trip inside it.
+ *
+ * ## What a mid-work message belongs to
+ *
+ * A message typed while the agent is working is not automatically part of that
+ * work. What decides it is where it was delivered:
+ *
+ * - Queued behind the running turn → it starts its own job when it goes out. It
+ *   was never part of the work that was running.
+ * - Pushed into the running turn to redirect it (`sendQueuedNow`) → it continues
+ *   that job rather than opening one. Steering the current work is part of that
+ *   work.
+ *
+ * The session says which by giving a steer the running turn's own id and marking
+ * the message `steer`; this reopens the job it just closed and files one record
+ * for the pair. `INSERT OR REPLACE` on `<session>:<turn>` is what makes that
+ * safe — the second filing replaces the first rather than adding to it.
  *
  * ## Additive versus absolute reporting
  *
@@ -51,7 +76,8 @@ export interface FinishedJob {
   endedAt: number;
   durationMs: number | null;
   outcome: UsageOutcome;
-  turns: number;
+  /** The runtime's own round-trip count, or null where it does not report one. */
+  modelTurns: number | null;
   toolCalls: number;
   usage: ChatUsage;
   tools: UsageToolCount[];
@@ -71,7 +97,19 @@ interface OpenJob {
   turnId: string;
   startedAt: number;
   model: string | null;
-  turns: number;
+  /** Null until a runtime reports one; summed when a steer continues the turn. */
+  modelTurns: number | null;
+  /**
+   * Whether the agent said anything at all in this turn.
+   *
+   * Not a count — it never leaves this class — and that is the point. It exists
+   * only to tell a turn that happened from one that did not, a job the old
+   * assistant-message count did as a side effect. `/clear` is the case it is
+   * for: it opens a turn before it is recognised as a command, and filing that
+   * would put a blank row in the permanent history for every clear anybody ever
+   * typed.
+   */
+  spoke: boolean;
   tools: Map<string, number>;
   toolCalls: number;
   /** Summed from `msg_end` and `turn_end`. */
@@ -98,8 +136,15 @@ const COUNTED: Array<keyof ChatUsage> = [
 
 export class UsageAccountant {
   private job: OpenJob | null = null;
-  /** Roles by message id, so only what the *model* said counts as a turn. */
-  private readonly roles = new Map<string, string>();
+  /**
+   * The job just closed, kept only until the next one opens.
+   *
+   * A steer arrives immediately after the interrupt that closed the turn it is
+   * steering, so this is what it reopens. One deep: any later message is a new
+   * turn by definition, and holding more would be holding a history this class
+   * has no business having.
+   */
+  private lastClosed: OpenJob | null = null;
   /** The latest running total from a standalone `usage` event. */
   private absolute: ChatUsage | null = null;
   /**
@@ -157,12 +202,13 @@ export class UsageAccountant {
         return;
 
       case 'msg_start':
-        this.roles.set(event.id, event.role);
         if (event.role === 'user') {
           // The user's own message is what opens a job — it is emitted with the
           // turn id the moment the turn is accepted, before the runtime has
           // said anything at all.
-          this.openJob(event.turnId, event.ts);
+          this.openJob(event.turnId, event.ts, event.steer === true);
+        } else if (this.job) {
+          this.job.spoke = true;
         }
         if (event.model) {
           this.sessionModel = event.model;
@@ -172,7 +218,6 @@ export class UsageAccountant {
 
       case 'msg_end': {
         if (!this.job) return;
-        if (this.roles.get(event.msgId) === 'assistant') this.job.turns += 1;
         if (event.usage) this.job.additive = mergeUsage(this.job.additive, event.usage);
         return;
       }
@@ -220,6 +265,13 @@ export class UsageAccountant {
 
       case 'turn_end':
         if (event.usage && this.job) this.job.additive = mergeUsage(this.job.additive, event.usage);
+        if (this.job) {
+          // Added rather than assigned: a steered turn ends twice, once at the
+          // interrupt and once when the redirected work finishes, and the round
+          // trips of both halves were spent on the one turn.
+          const reported = reportedModelTurns(event.modelTurns, event.models);
+          if (reported !== null) this.job.modelTurns = (this.job.modelTurns ?? 0) + reported;
+        }
         if (event.models && this.job) {
           // Late by nature — a runtime only knows the split once the turn is
           // over — so this lands on the job that is closing, one line before
@@ -258,7 +310,7 @@ export class UsageAccountant {
     this.close(at, null, null);
   }
 
-  private openJob(turnId: string, ts: number): void {
+  private openJob(turnId: string, ts: number, steer: boolean): void {
     // The first user message of a prompt opens the job and every later one is
     // ignored, because more than one arrives. `deliver` emits ours with the
     // turn id it minted, and then codex and the ACP agents echo the prompt back
@@ -268,11 +320,29 @@ export class UsageAccountant {
     // tool-calls-per-job averages came out at exactly half the truth, in the
     // one comparison those figures exist to support.
     if (this.job) return;
+
+    // A steer is not a new turn, it is more of the one that was just cut short
+    // (#86). The interrupt has already closed and filed that job, so this picks
+    // it back up: same id, same start, its counters carried, and when it closes
+    // again the filing replaces the first rather than standing beside it. The
+    // outcome starts over because the turn is running again — being redirected
+    // is not how it ended, and it has not ended yet.
+    const resumed = steer && this.lastClosed?.turnId === turnId ? this.lastClosed : null;
+    this.lastClosed = null;
+    if (resumed) {
+      this.job = { ...resumed, outcome: 'completed' };
+      // Deliberately not cleared: a tool the runtime re-announces across the
+      // interrupt is the same call, and the whole point of the set is that it
+      // is only counted once.
+      return;
+    }
+
     this.job = {
       turnId,
       startedAt: ts,
       model: this.sessionModel,
-      turns: 0,
+      modelTurns: null,
+      spoke: false,
       tools: new Map(),
       toolCalls: 0,
       additive: {},
@@ -288,6 +358,10 @@ export class UsageAccountant {
     const job = this.job;
     if (!job) return;
     this.job = null;
+    // Before the empty check, not after: a turn interrupted before it said
+    // anything is filed nowhere, but it is still the turn a steer arriving next
+    // is continuing, and it still owns its id.
+    this.lastClosed = job;
 
     // Only when a reading actually arrived while this job was open. A job that
     // saw none of them was told nothing on that channel, and subtracting an
@@ -307,7 +381,7 @@ export class UsageAccountant {
     // blank row in the permanent history and count it against every "N of M
     // jobs reported" figure on the dashboard.
     const empty =
-      job.turns === 0 && job.toolCalls === 0 && !COUNTED.some((f) => usage[f] !== undefined);
+      !job.spoke && job.toolCalls === 0 && !COUNTED.some((f) => usage[f] !== undefined);
     if (empty) return;
 
     this.onFinished({
@@ -324,7 +398,7 @@ export class UsageAccountant {
       endedAt: ts,
       durationMs: durationMs ?? (ts > job.startedAt ? ts - job.startedAt : null),
       outcome: job.outcome,
-      turns: job.turns,
+      modelTurns: job.modelTurns,
       toolCalls: job.toolCalls,
       usage,
       tools: [...job.tools].map(([tool, calls]) => ({ tool, calls })),
@@ -334,6 +408,34 @@ export class UsageAccountant {
       models: job.models.length > 1 ? job.models : [],
     });
   }
+}
+
+/**
+ * A turn's round-trip count, strictly as the runtime gave it.
+ *
+ * Two runtimes report one, in two shapes: Claude puts `num_turns` on the line
+ * that ends the turn, and a per-model breakdown carries a `calls` for each model
+ * that ran. The breakdown is only usable when *every* entry has a figure —
+ * adding up the ones that answered and ignoring the ones that did not would
+ * produce a confident number that undercounts, which is the exact failure this
+ * whole change is about.
+ *
+ * Null means nobody said, and null is carried all the way to the screen.
+ */
+function reportedModelTurns(
+  modelTurns: number | undefined,
+  models: TurnModelUsage[] | undefined,
+): number | null {
+  if (typeof modelTurns === 'number' && Number.isFinite(modelTurns) && modelTurns >= 0) {
+    return modelTurns;
+  }
+  if (!models || models.length === 0) return null;
+  let sum = 0;
+  for (const model of models) {
+    if (typeof model.calls !== 'number' || !Number.isFinite(model.calls)) return null;
+    sum += model.calls;
+  }
+  return sum;
 }
 
 /**

@@ -100,17 +100,27 @@ function render(props) {
   );
 }
 
+// Turn ids as an adapter stamps them: a user message opens a turn and the reply
+// carries the same id. Turns are grouped on it (#86), so a fixture that gave
+// every message the same id would render one turn for a whole conversation.
+let fixtureTurn = 0;
+
 function message(id, seq, role, text, extra) {
+  if (role === 'user' && !(extra && extra.turnId)) fixtureTurn += 1;
   return {
     id,
     seq,
-    turnId: 't1',
+    turnId: `t${fixtureTurn || 1}`,
     role,
     ts: 1,
     blocks: [{ kind: 'text', text }],
     ...extra,
   };
 }
+
+beforeEach(function () {
+  fixtureTurn = 0;
+});
 
 describe('ChatView', function () {
   it('renders an empty transcript as a quiet prompt, not a blank pane', function () {
@@ -661,7 +671,9 @@ describe('ChatView', function () {
     controller.interrupt();
 
     assert.deepStrictEqual(
-      controller.sent.map((m) => m.type),
+      // The index request is sent when the conversation is hydrated, before any
+      // of this — see the turn index (#86).
+      controller.sent.map((m) => m.type).filter((type) => type !== 'chat_turn_index_request'),
       ['chat_send', 'chat_permission_response', 'chat_interrupt'],
     );
   });

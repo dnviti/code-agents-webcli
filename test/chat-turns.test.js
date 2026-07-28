@@ -39,13 +39,21 @@ after(function () {
 });
 
 let seq = 0;
+let turn = 0;
 
+// Turn ids the way an adapter actually stamps them: a user message opens a turn
+// and everything the agent says about it carries the same id. Numbering every
+// message separately — which this helper used to do — is a shape no runtime
+// produces, and it hid the fact that grouping is by turn id (#86). Pass an
+// explicit `turnId` for the two cases that matter: a steer, which shares the
+// running turn, and a runtime echoing the prompt back under an id of its own.
 function msg(role, blocks, extra = {}) {
   seq += 1;
+  if (role === 'user' && extra.turnId === undefined) turn += 1;
   return {
     id: `m${seq}`,
     seq,
-    turnId: `t${seq}`,
+    turnId: `t${turn}`,
     role,
     ts: seq * 1000,
     blocks,
@@ -74,6 +82,7 @@ function thinking(value = 'weighing it up') {
 
 beforeEach(function () {
   seq = 0;
+  turn = 0;
 });
 
 describe('groupTurns', function () {

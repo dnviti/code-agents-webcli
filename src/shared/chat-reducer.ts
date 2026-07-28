@@ -231,23 +231,39 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       if (messageFor(state, event.id) !== null) {
         return NO_CHANGE;
       }
+      // A user message arriving while a turn is still open belongs to that
+      // turn, whatever id it came with.
+      //
+      // Two things produce one: a steer, which already carries the running id
+      // and is only confirmed here, and a runtime echoing the prompt back under
+      // an id of its own — which codex and the ACP agents both do. The echo is
+      // the same request, so filing it as a second turn made the conversation
+      // show twice the turns the accounting recorded, for those agents only
+      // (#86). The rule is the accountant's, word for word: a request that
+      // arrives while one is in flight does not open a turn.
+      const turnId =
+        event.role === 'user' && state.currentTurnId !== null
+          ? state.currentTurnId
+          : event.turnId;
+
       // A new turn's models are not known yet, and last turn's are not this
       // turn's: leaving them would keep a "+1" on the chip for a turn that ran
       // on one model, which is a claim about work that has not happened.
-      if (event.turnId !== state.currentTurnId) state.turnModels = undefined;
+      if (turnId !== state.currentTurnId) state.turnModels = undefined;
       const message: ChatMessage = {
         id: event.id,
         seq: event.seq,
-        turnId: event.turnId,
+        turnId,
         role: event.role,
         ts: event.ts,
         blocks: [],
         streaming: true,
         model: event.model,
+        ...(event.steer ? { steer: true as const } : {}),
       };
       state.index[event.id] = state.messages.length;
       state.messages.push(message);
-      state.currentTurnId = event.turnId;
+      state.currentTurnId = turnId;
       return {
         messageIndex: state.messages.length - 1,
         structural: true,
@@ -454,6 +470,11 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
 
     case 'state': {
       state.state = event.state;
+      // A runtime that died did not end its turn, and nothing else will. Left
+      // open, the next thing the user typed would be folded into a turn whose
+      // process is gone — the mirror of the `turn_end` case, and the same rule
+      // the accountant applies when it closes a job on an exit (#86).
+      if (event.state === 'exited' || event.state === 'error') state.currentTurnId = null;
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
@@ -488,6 +509,10 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         state.index = {};
         state.plan = [];
         state.lastError = undefined;
+        // Including the turn that was open: `/clear` is taken the moment it is
+        // typed, mid-turn if need be, and the conversation it interrupted is
+        // gone. Anything typed after it starts a turn of its own.
+        state.currentTurnId = null;
         // The cards go with the conversation they were asked in. A question
         // card left behind would be drawn against a tool block that is no
         // longer on screen, and answering it would reach a turn that no longer

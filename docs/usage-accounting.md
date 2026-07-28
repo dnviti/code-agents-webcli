@@ -1,7 +1,7 @@
 # Usage accounting
 
 Durable, per-user history of what agent work has cost: tokens, dollars,
-turns and tool calls, filed as one row per job and kept forever. This is a
+round trips and tool calls, filed as one row per turn and kept forever. This is a
 different thing from [Usage analytics](analytics.md): that page reads
 Claude Code's own local transcripts to estimate a five-hour billing window for
 one CLI, and disappears with the file. This page is written by the server
@@ -10,10 +10,10 @@ even the deletion of the conversation the work happened in.
 
 ## What is recorded, and what is not
 
-Every job files: who ran it (user id and login, denormalised so the row
+Every turn files: who ran it (user id and login, denormalised so the row
 outlives the account), which agent and model, when it started and ended, how
-it ended, how many turns and tool calls it took, the token and cost figures
-the runtime reported, and which tool names were called how many times.
+it ended, how many tool calls it took, the token and cost figures the runtime
+reported, and which tool names were called how many times.
 
 What is never recorded: anything you or the agent said. No prompt text, no
 reply text, no file contents, no tool arguments, no tool output. The
@@ -22,26 +22,52 @@ things that happen to share some numbers — a record that quoted the
 conversation would just be a transcript wearing a different name, kept around
 after every rule protecting the real one had stopped applying to it.
 
-## What a "job" is
+## What a turn is
 
-A job is one prompt-to-settle unit: the span from a user's message to the
-point the runtime declares the turn over. Two counts are derived from the
-transcript rather than asked of the runtime, because almost none of them
-report either directly:
+**One user request and everything the agent did about it** — the span from a
+user's message to the point the runtime declares the turn over. One row of
+`usage_jobs` is one turn, which is why there is no turn count stored on the
+row: counting turns is counting rows, and every runtime here has that
+boundary, so the figure means the same thing whichever agent ran the work.
 
-- **Turns** — the number of times the model itself spoke inside that span.
-  This is the same quantity Claude Code reports as `num_turns`, generalised to
-  every runtime so "how many round trips did this take" is answerable for
-  agents that have no such field of their own.
+What a message typed *while the agent is working* belongs to is decided by
+where it was delivered, and it is recorded when the work runs because it
+cannot be reconstructed afterwards:
+
+- Sent into the turn already running, to redirect it (the "send now" control on
+  a queued message) → it **continues that turn**. Steering the current work is
+  part of that work, not a new request.
+- Left in the queue until the current turn finishes → it is **its own turn**,
+  counted when it starts. It was never part of the work that was running.
+
+Two counts sit inside a turn:
+
+- **Model turns** — round trips to the model, and *only* where the runtime
+  counts its own: Claude's `num_turns`, or a per-model call count. Where nobody
+  says, it is `null` and reads as "not reported". It used to be counted as the
+  number of assistant messages the transcript showed, which is a property of
+  how an agent chops up its output rather than of the work: identical work
+  filed 1 under an agent that answers in one stretch and 6 under one that
+  separates its thinking from its answer, and those were the figures the
+  dashboard compared agents by.
 - **Tool calls** — the number of tool blocks the transcript opened. A tool
   that is re-announced once its streamed arguments finish parsing (Claude does
   this) is counted once, not twice.
 
-A job that never got a reply — the process died, the session was stopped, the
+A turn that never got a reply — the process died, the session was stopped, the
 runtime reported an error — is still filed, with an outcome of `interrupted`
 or `error` rather than being dropped. A turn the process died in the middle of
 took exactly as many round trips as it got to; that is a fact about the crash,
 not an absence of one.
+
+The same definition drives the conversation: the turn strip, the index beside
+it and the accounting all group on the turn id the session stamps, so the
+count you read next to a conversation and the count in the statistics are the
+same number read twice. The index is served from the recorded log rather than
+assembled from whatever the browser has loaded, so it lists every turn from the
+first one still on disk however little of the conversation is on screen, and
+every entry is titled with the user's own ask — a turn with no prompt behind it
+says so rather than borrowing a line from the model.
 
 ## The unit you read: the conversation
 
@@ -82,22 +108,39 @@ otherwise. The figures below come from each adapter's own `capabilities`
 declaration under `src/server/chat/adapters/`, which is the same source the
 adapters use to decide what they can promise the rest of the UI.
 
-| Agent | Turns / tool calls | Tokens | Cost | Model |
-| --- | --- | --- | --- | --- |
-| Claude | counted from the transcript | reported | reported (see below) | reported, per message and per model |
-| Codex (app-server) | counted from the transcript | reported | **not reported** — nothing in the schema prices a turn | reported, per session |
-| Codex (`exec` fallback) | counted from the transcript | **not reported** | **not reported** | **not reported** |
-| pi | counted from the transcript | reported | reported | reported, per message |
-| ACP agents (Grok, omp, kimi, and others behind the ACP bridge) | counted from the transcript | reported | reported — Grok's in ticks, see below | the runtime's current selection |
+Turns and tool calls are always known — they are measured here, from the
+boundary and the blocks every runtime produces. Model turns are the runtime's
+own figure or nothing at all, which is why they have a column of their own.
+
+| Agent | Tool calls | Model turns | Tokens | Cost | Model |
+| --- | --- | --- | --- | --- | --- |
+| Claude | counted here | reported (`num_turns`) | reported | reported (see below) | reported, per message and per model |
+| Codex (app-server) | counted here | **not reported** | reported | **not reported** — nothing in the schema prices a turn | reported, per session |
+| Codex (`exec` fallback) | counted here | **not reported** | **not reported** | **not reported** | **not reported** |
+| pi | counted here | **not reported** | reported | reported | reported, per message |
+| ACP agents (Grok, omp, kimi, and others behind the ACP bridge) | counted here | only where a per-model call count arrives | reported | reported — Grok's in ticks, see below | the runtime's current selection |
 
 A figure a runtime never reports is stored as `null` and shown as
 **"not reported"** — never as zero. Those are different facts: a job that
 cost nothing and a job whose cost nobody measured look the same on a naive
 total, and this app keeps them apart all the way to the database. Every
 aggregate the store returns carries, alongside its totals, a count of how many
-of the jobs in it actually contributed a token figure or a cost figure
-(`tokensReportedJobs`, `costReportedJobs`), so "$4.10 across 28 of 40 jobs"
-is the shape of the answer, not "$4.10" on its own.
+of the turns in it actually contributed a token figure, a cost figure or a
+round-trip count (`tokensReportedTurns`, `costReportedTurns`,
+`modelTurnsReportedTurns`), so "$4.10 across 28 of 40 turns" is the shape of
+the answer, not "$4.10" on its own. The effort panel averages model turns over
+the turns that reported one, never over all of them — reading a silent runtime
+as zero would have put it at the top of every efficiency comparison on the page
+for having reported nothing.
+
+### Figures recorded before this rule
+
+The turn count needs no correction and older periods are directly comparable:
+every row ever written was already one prompt, so the corrected count is a
+recount of nothing. The model-turn column is empty for everything recorded
+before it existed — the old figure was the discarded meaning, and copying it
+across would make an inference indistinguishable from a measurement in the one
+place built to keep those apart.
 
 ## A job's token total
 
@@ -179,7 +222,7 @@ Three things deliberately stay unattributed in that split:
 - **Tool calls.** No runtime says which model asked for which tool, so a split
   job contributes no tool calls to any model rather than a made-up share.
 - **Reasoning tokens.** Reported for the turn, not per model.
-- **Effort by model.** That panel is about jobs, and a job is one prompt; it
+- **Effort by model.** That panel is about turns, and a turn is one prompt; it
   groups by the model that answered.
 
 Claude's per-model cost gets one correction on the way in. Its `total_cost_usd`
@@ -522,8 +565,8 @@ GET /api/usage/dashboard?period=week&tz=120
   "bucket": "day",
   "filters": {},
   "totals": {
-    "jobs": 42,
-    "turns": 96,
+    "turns": 42,
+    "modelTurns": 96,
     "toolCalls": 210,
     "inputTokens": 154200,
     "outputTokens": 38900,
@@ -542,18 +585,19 @@ GET /api/usage/dashboard?period=week&tz=120
   "effortByAgent": [
     {
       "key": "claude",
-      "jobs": 30,
-      "turnsAvg": 2.4,
-      "turnsMax": 11,
+      "turns": 30,
+      "modelTurnsReportedTurns": 30,
+      "modelTurnsAvg": 2.4,
+      "modelTurnsMax": 11,
       "toolCallsAvg": 3.1,
       "toolCallsMax": 22,
-      "turnsHistogram": [10, 8, 7, 4, 1],
+      "modelTurnsHistogram": [10, 8, 7, 4, 1],
       "toolCallsHistogram": [5, 9, 8, 6, 2]
     }
   ],
   "effortByModel": [{ "...": "..." }],
-  "topTools": [{ "tool": "Read", "agent": null, "calls": 88, "jobs": 40 }],
-  "topToolsByAgent": [{ "tool": "Read", "agent": "claude", "calls": 60, "jobs": 25 }]
+  "topTools": [{ "tool": "Read", "agent": null, "calls": 88, "turns": 40 }],
+  "topToolsByAgent": [{ "tool": "Read", "agent": "claude", "calls": 60, "turns": 25 }]
 }
 ```
 
@@ -595,7 +639,7 @@ GET /api/usage/conversations?limit=20
       "projects": ["billing-api"],
       "startedAt": "2026-07-27T09:00:00.000Z",
       "lastActiveAt": "2026-07-27T12:30:00.000Z",
-      "totals": { "jobs": 40, "costUsd": 7.25, "...": "..." }
+      "totals": { "turns": 40, "costUsd": 7.25, "...": "..." }
     }
   ]
 }

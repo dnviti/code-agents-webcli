@@ -20,7 +20,7 @@ function job(overrides = {}) {
     endedAt: '2024-01-15T02:00:00.000Z',
     durationMs: 60_000,
     outcome: 'completed',
-    turns: 2,
+    modelTurns: 2,
     toolCalls: 3,
     inputTokens: 100,
     outputTokens: 50,
@@ -84,7 +84,7 @@ describe('usage routes', function () {
         agent: 'codex',
         model: null,
         endedAt: '2024-01-15T03:00:00.000Z',
-        turns: 1,
+        modelTurns: 1,
         toolCalls: 4,
         costUsd: null,
         reportsCost: false,
@@ -154,9 +154,9 @@ describe('usage routes', function () {
   it('defaults to the caller\'s own jobs on the dashboard', async function () {
     const body = await (await get(`/api/usage/dashboard?period=day&anchor=${ANCHOR}`)).json();
     assert.strictEqual(body.scope, 'self');
-    assert.strictEqual(body.totals.jobs, 2);
+    assert.strictEqual(body.totals.turns, 2);
     assert.strictEqual(body.totals.costUsd, 1.5);
-    assert.strictEqual(body.totals.costReportedJobs, 1);
+    assert.strictEqual(body.totals.costReportedTurns, 1);
     assert.strictEqual(body.byUser, undefined);
   });
 
@@ -166,7 +166,7 @@ describe('usage routes', function () {
     ).json();
     assert.strictEqual(body.scope, 'everyone');
     assert.strictEqual(body.canSeeEveryone, true);
-    assert.strictEqual(body.totals.jobs, 3);
+    assert.strictEqual(body.totals.turns, 3);
     assert.strictEqual(round2(body.totals.costUsd), 3.5);
     assert.ok(Array.isArray(body.byUser));
     assert.strictEqual(body.byUser.length, 2);
@@ -179,7 +179,7 @@ describe('usage routes', function () {
     ).json();
     assert.strictEqual(body.scope, 'self');
     assert.strictEqual(body.canSeeEveryone, false);
-    assert.strictEqual(body.totals.jobs, 1);
+    assert.strictEqual(body.totals.turns, 1);
     assert.strictEqual(body.totals.costUsd, 2);
     assert.strictEqual(body.byUser, undefined);
   });
@@ -196,13 +196,13 @@ describe('usage routes', function () {
     const bucket03 = body.series.find((b) => b.key === '2024-01-15T03:00');
     const bucket04 = body.series.find((b) => b.key === '2024-01-15T04:00');
     const bucket05 = body.series.find((b) => b.key === '2024-01-15T05:00');
-    assert.strictEqual(bucket02.totals.jobs, 1);
+    assert.strictEqual(bucket02.totals.turns, 1);
     assert.strictEqual(bucket02.totals.costUsd, 1.5);
-    assert.strictEqual(bucket03.totals.jobs, 1);
-    assert.strictEqual(bucket03.totals.costReportedJobs, 0);
-    assert.strictEqual(bucket04.totals.jobs, 1);
+    assert.strictEqual(bucket03.totals.turns, 1);
+    assert.strictEqual(bucket03.totals.costReportedTurns, 0);
+    assert.strictEqual(bucket04.totals.turns, 1);
     assert.strictEqual(bucket04.totals.costUsd, 2);
-    assert.strictEqual(bucket05.totals.jobs, 0);
+    assert.strictEqual(bucket05.totals.turns, 0);
   });
 
   it('surfaces top tools, and differing per-agent tool counts', async function () {

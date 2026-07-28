@@ -95,7 +95,7 @@ describe('a conversation files what it cost', () => {
     assert.strictEqual(job.model, 'claude-sonnet-5');
     assert.strictEqual(job.sessionId, 'sess-1');
     assert.strictEqual(job.nativeSessionId, 'conv-1');
-    assert.strictEqual(job.turns, 2);
+    assert.strictEqual(job.modelTurns, null);
     assert.strictEqual(job.toolCalls, 1);
     assert.strictEqual(job.inputTokens, 150);
     assert.strictEqual(job.outputTokens, 30);

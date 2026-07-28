@@ -132,6 +132,11 @@ export interface ChatManagerLike {
     fromSeq: number,
     count: number,
   ): Promise<{ events: unknown[]; firstSeq: number; from?: number; cursor: number }>;
+  turnIndex(record: SessionRecord): Promise<{
+    turns: unknown[];
+    firstSeq: number;
+    complete: boolean;
+  }>;
 }
 
 interface IncomingMessage {
@@ -267,6 +272,10 @@ export class MessageProcessor {
 
       case 'chat_history_request':
         await this.handleChatHistory(wsInfo, data);
+        break;
+
+      case 'chat_turn_index_request':
+        await this.handleChatTurnIndex(wsInfo, data);
         break;
 
       case 'chat_subscribe':
@@ -1468,6 +1477,41 @@ export class MessageProcessor {
         message,
       });
       sendToWebSocket(wsInfo.ws, { type: 'error', message });
+    }
+  }
+
+  /**
+   * The full turn index of one conversation.
+   *
+   * Answered from the recorded log, so the list is the same however much of the
+   * conversation the asking browser has loaded (#86). A failure is answered on
+   * the chat channel for the same reason a page failure is: the index shows a
+   * spinner while it waits, and silence leaves it spinning forever.
+   */
+  private async handleChatTurnIndex(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!manager || !session) return;
+
+    try {
+      const index = await manager.turnIndex(session);
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_turn_index',
+        sessionId: session.id,
+        requestId: data.requestId || null,
+        ...index,
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_turn_index_failed',
+        sessionId: session.id,
+        requestId: data.requestId || null,
+        message,
+      });
     }
   }
 

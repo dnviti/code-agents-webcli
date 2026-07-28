@@ -4,7 +4,7 @@ import { ChatSnapshot, UserTurn } from '../../shared/chat-events.js';
 import { SessionRecord } from '../types.js';
 import { ChatNotRunningError, ChatSession, ChatSessionStartOptions, ChatUsageSink } from './session.js';
 import { ModelCapacityLookup } from './model-capacity.js';
-import { ChatStore } from './store.js';
+import { ChatStore, ChatTurnIndex } from './store.js';
 
 /**
  * Owns the live chat sessions.
@@ -196,6 +196,17 @@ export class ChatSessionManager {
   }
 
   /** One page of older events, for a browser scrolling back through a long chat. */
+  /**
+   * The conversation's whole run of turns, for the index beside it.
+   *
+   * Read from the log rather than assembled from what a browser holds, which is
+   * the point: an index that starts where the last page happened to stop is
+   * useless in exactly the conversations long enough to need one (#86).
+   */
+  turnIndex(record: SessionRecord): Promise<ChatTurnIndex> {
+    return this.deps.store.turnIndex({ id: record.id, ownerUserId: record.ownerUserId });
+  }
+
   readPage(
     record: SessionRecord,
     fromSeq: number,

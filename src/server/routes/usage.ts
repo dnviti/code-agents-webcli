@@ -134,7 +134,10 @@ const EXPORT_COLUMNS = [
   'endedAt',
   'durationMs',
   'outcome',
-  'turns',
+  // One row is one turn, so there is no turn column to export — counting the
+  // rows is the count (#86). This is the other quantity, and it is empty for
+  // every runtime that does not report its own round trips.
+  'modelTurns',
   'toolCalls',
   'inputTokens',
   'outputTokens',

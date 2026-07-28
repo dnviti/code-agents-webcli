@@ -56,7 +56,8 @@ export interface UsageJobInput {
   endedAt: string;
   durationMs: number | null;
   outcome: UsageOutcome;
-  turns: number;
+  /** The runtime's own round-trip count, null where it does not report one. */
+  modelTurns: number | null;
   toolCalls: number;
   inputTokens: number | null;
   outputTokens: number | null;
@@ -123,7 +124,9 @@ interface JobRow {
   ended_at: string;
   duration_ms: number | null;
   outcome: string;
+  /** The superseded column. Written for older builds, read by nothing. */
   turns: number;
+  model_turns: number | null;
   tool_calls: number;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -137,8 +140,8 @@ interface JobRow {
 }
 
 interface TotalsRow {
-  jobs: number;
-  turns: number | null;
+  turns: number;
+  model_turns: number | null;
   tool_calls: number | null;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -149,6 +152,7 @@ interface TotalsRow {
   cost_usd: number | null;
   tokens_reported_jobs: number | null;
   cost_reported_jobs: number | null;
+  model_turns_reported_jobs: number | null;
 }
 
 /**
@@ -158,10 +162,14 @@ interface TotalsRow {
  * input is null, and a null total would have to be defended against at every
  * call site. The `*_reported_jobs` counters are what keeps that COALESCE honest:
  * they say how many of the rows in the sum had anything to contribute.
+ *
+ * `turns` is `COUNT(*)`, not a sum of anything: one row is one turn (#86). It is
+ * the only figure here that cannot be under-reported, because no runtime has to
+ * volunteer it.
  */
 const TOTALS_COLUMNS = `
-  COUNT(*) AS jobs,
-  SUM(turns) AS turns,
+  COUNT(*) AS turns,
+  SUM(COALESCE(model_turns, 0)) AS model_turns,
   SUM(tool_calls) AS tool_calls,
   SUM(COALESCE(input_tokens, 0)) AS input_tokens,
   SUM(COALESCE(output_tokens, 0)) AS output_tokens,
@@ -177,7 +185,8 @@ const TOTALS_COLUMNS = `
              OR reasoning_tokens IS NOT NULL
              OR total_tokens IS NOT NULL
            THEN 1 ELSE 0 END) AS tokens_reported_jobs,
-  SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS cost_reported_jobs
+  SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS cost_reported_jobs,
+  SUM(CASE WHEN model_turns IS NOT NULL THEN 1 ELSE 0 END) AS model_turns_reported_jobs
 `;
 
 const HISTORY_PAGE = 50;
@@ -207,11 +216,11 @@ export class UsageStore {
         INSERT OR REPLACE INTO usage_jobs (
           id, session_id, native_session_id, turn_id, user_id, user_login,
           agent, model, project, project_source, started_at, ended_at, duration_ms, outcome,
-          turns, tool_calls,
+          turns, model_turns, tool_calls,
           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
           reasoning_tokens, total_tokens, cost_usd,
           reports_usage, reports_cost
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         job.sessionId,
@@ -228,7 +237,11 @@ export class UsageStore {
         job.endedAt,
         job.durationMs,
         job.outcome,
-        job.turns,
+        // The superseded column, kept satisfiable rather than meaningful: it is
+        // NOT NULL and a build from before #86 opening this file still reads it.
+        // The nearest honest thing to put there is the figure that replaced it.
+        job.modelTurns ?? 0,
+        job.modelTurns ?? null,
         job.toolCalls,
         job.inputTokens,
         job.outputTokens,
@@ -747,11 +760,14 @@ export class UsageStore {
    * What each column can honestly say differs, and the CASE expressions are
    * where that is decided:
    *
-   *   - `jobs` counts distinct jobs, so a split job counts once against each
-   *     model it touched. It is "jobs that used this model", which is the
-   *     reading the number is put to.
-   *   - `turns` takes the runtime's own per-model round-trip count where there
-   *     is one. That is a measurement, not a division of the job's total.
+   *   - `turns` counts distinct turns, so a split turn counts once against each
+   *     model it touched. It is "turns that used this model", which is the
+   *     reading the number is put to — and the one place a turn is deliberately
+   *     counted more than once, because the column it sits under is the model
+   *     rather than the work.
+   *   - `model_turns` takes the runtime's own per-model round-trip count where
+   *     there is one. That is a measurement, not a division of the job's total,
+   *     and a split row with no `calls` contributes nothing rather than a zero.
    *   - `tool_calls` is left to the unsplit rows alone. No runtime says which
    *     model asked for which tool, and spreading a job's count across its
    *     models would invent the one figure nobody reported.
@@ -771,8 +787,11 @@ export class UsageStore {
     const rows = this.database.raw
       .prepare(`
         SELECT COALESCE(m.model, j.model) AS key,
-          COUNT(DISTINCT j.id) AS jobs,
-          SUM(CASE WHEN m.model IS NULL THEN j.turns ELSE COALESCE(m.calls, 0) END) AS turns,
+          COUNT(DISTINCT j.id) AS turns,
+          SUM(CASE WHEN m.model IS NULL THEN COALESCE(j.model_turns, 0)
+                   ELSE COALESCE(m.calls, 0) END) AS model_turns,
+          SUM(CASE WHEN (CASE WHEN m.model IS NULL THEN j.model_turns ELSE m.calls END)
+                        IS NOT NULL THEN 1 ELSE 0 END) AS model_turns_reported_jobs,
           SUM(CASE WHEN m.model IS NULL THEN j.tool_calls ELSE 0 END) AS tool_calls,
           ${split('input_tokens')} AS input_tokens,
           ${split('output_tokens')} AS output_tokens,
@@ -794,7 +813,7 @@ export class UsageStore {
         LEFT JOIN usage_job_models m ON m.job_id = j.id
         ${joined}
         GROUP BY key
-        ORDER BY cost_usd DESC, total_tokens DESC, jobs DESC
+        ORDER BY cost_usd DESC, total_tokens DESC, turns DESC
       `)
       .all(...params) as Array<TotalsRow & { key: string | null }>;
     return rows.map((row) => ({ key: row.key ?? UNATTRIBUTED, totals: mapTotals(row) }));
@@ -806,7 +825,7 @@ export class UsageStore {
         SELECT ${column} AS key, ${TOTALS_COLUMNS}
         FROM usage_jobs ${where}
         GROUP BY key
-        ORDER BY cost_usd DESC, total_tokens DESC, jobs DESC
+        ORDER BY cost_usd DESC, total_tokens DESC, turns DESC
       `)
       .all(...params) as Array<TotalsRow & { key: string | null }>;
     // A null groups under the sentinel, not under `''`. Both would render the
@@ -818,24 +837,32 @@ export class UsageStore {
   /**
    * Effort per group, as counts rather than percentiles.
    *
-   * Only completed jobs count: a turn the process died in the middle of took
+   * Only completed turns count: a turn the process died in the middle of took
    * exactly as many round trips as it got to, which is a fact about the crash
    * and not about the agent.
+   *
+   * `AVG` and `MAX` over `model_turns` skip nulls, which is what makes this
+   * table honest now that most runtimes report nothing: the average is over the
+   * turns that answered, and `model_turns_reported` says how many those were.
+   * The histogram counts the same rows. Reading a silent runtime as zero would
+   * have put it at the top of every efficiency comparison on the page — for
+   * having reported nothing at all.
    */
   private effort(column: string, where: string, params: unknown[]): UsageEffort[] {
     const rows = this.database.raw
       .prepare(`
         SELECT ${column} AS key,
-          COUNT(*) AS jobs,
-          AVG(turns) AS turns_avg,
-          MAX(turns) AS turns_max,
+          COUNT(*) AS turns,
+          SUM(CASE WHEN model_turns IS NOT NULL THEN 1 ELSE 0 END) AS model_turns_reported,
+          AVG(model_turns) AS model_turns_avg,
+          MAX(model_turns) AS model_turns_max,
           AVG(tool_calls) AS tools_avg,
           MAX(tool_calls) AS tools_max,
-          SUM(CASE WHEN turns <= 1 THEN 1 ELSE 0 END) AS t0,
-          SUM(CASE WHEN turns = 2 THEN 1 ELSE 0 END) AS t1,
-          SUM(CASE WHEN turns BETWEEN 3 AND 5 THEN 1 ELSE 0 END) AS t2,
-          SUM(CASE WHEN turns BETWEEN 6 AND 10 THEN 1 ELSE 0 END) AS t3,
-          SUM(CASE WHEN turns > 10 THEN 1 ELSE 0 END) AS t4,
+          SUM(CASE WHEN model_turns <= 1 THEN 1 ELSE 0 END) AS t0,
+          SUM(CASE WHEN model_turns = 2 THEN 1 ELSE 0 END) AS t1,
+          SUM(CASE WHEN model_turns BETWEEN 3 AND 5 THEN 1 ELSE 0 END) AS t2,
+          SUM(CASE WHEN model_turns BETWEEN 6 AND 10 THEN 1 ELSE 0 END) AS t3,
+          SUM(CASE WHEN model_turns > 10 THEN 1 ELSE 0 END) AS t4,
           SUM(CASE WHEN tool_calls = 0 THEN 1 ELSE 0 END) AS c0,
           SUM(CASE WHEN tool_calls BETWEEN 1 AND 2 THEN 1 ELSE 0 END) AS c1,
           SUM(CASE WHEN tool_calls BETWEEN 3 AND 5 THEN 1 ELSE 0 END) AS c2,
@@ -843,18 +870,22 @@ export class UsageStore {
           SUM(CASE WHEN tool_calls > 10 THEN 1 ELSE 0 END) AS c4
         FROM usage_jobs ${where} AND outcome = 'completed'
         GROUP BY key
-        ORDER BY jobs DESC
+        ORDER BY turns DESC
       `)
       .all(...params) as Array<Record<string, number | string | null>>;
 
     return rows.map((row) => ({
       key: row.key === null || row.key === undefined ? UNATTRIBUTED : String(row.key),
-      jobs: Number(row.jobs ?? 0),
-      turnsAvg: round2(Number(row.turns_avg ?? 0)),
-      turnsMax: Number(row.turns_max ?? 0),
+      turns: Number(row.turns ?? 0),
+      modelTurnsReportedTurns: Number(row.model_turns_reported ?? 0),
+      // Null rather than 0 from SQLite when every row in the group was silent,
+      // and 0 is the right thing to send then: the count beside it is what says
+      // the average is of nothing, so the figure itself never has to.
+      modelTurnsAvg: round2(Number(row.model_turns_avg ?? 0)),
+      modelTurnsMax: Number(row.model_turns_max ?? 0),
       toolCallsAvg: round2(Number(row.tools_avg ?? 0)),
       toolCallsMax: Number(row.tools_max ?? 0),
-      turnsHistogram: [
+      modelTurnsHistogram: [
         Number(row.t0 ?? 0),
         Number(row.t1 ?? 0),
         Number(row.t2 ?? 0),
@@ -876,7 +907,7 @@ export class UsageStore {
     const rows = this.database.raw
       .prepare(`
         SELECT t.tool AS tool, ${key} AS agent_key,
-               SUM(t.calls) AS calls, COUNT(DISTINCT t.job_id) AS jobs
+               SUM(t.calls) AS calls, COUNT(DISTINCT t.job_id) AS turns
         FROM usage_job_tools t
         JOIN usage_jobs j ON j.id = t.job_id
         ${where}
@@ -888,12 +919,12 @@ export class UsageStore {
         ORDER BY calls DESC, tool ASC
         LIMIT 100
       `)
-      .all(...params) as Array<{ tool: string; agent_key: string; calls: number; jobs: number }>;
+      .all(...params) as Array<{ tool: string; agent_key: string; calls: number; turns: number }>;
     return rows.map((row) => ({
       tool: row.tool,
       agent: perAgent ? row.agent_key : null,
       calls: row.calls,
-      jobs: row.jobs,
+      turns: row.turns,
     }));
   }
 
@@ -994,7 +1025,8 @@ function mapJob(row: JobRow): UsageJobSummary {
     endedAt: row.ended_at,
     durationMs: row.duration_ms,
     outcome: row.outcome as UsageOutcome,
-    turns: row.turns,
+    // `row.turns` is deliberately not read: it holds the superseded quantity.
+    modelTurns: row.model_turns,
     toolCalls: row.tool_calls,
     inputTokens: row.input_tokens,
     outputTokens: row.output_tokens,
@@ -1010,8 +1042,8 @@ function mapJob(row: JobRow): UsageJobSummary {
 
 function mapTotals(row: TotalsRow): UsageTotals {
   return {
-    jobs: row.jobs ?? 0,
     turns: row.turns ?? 0,
+    modelTurns: row.model_turns ?? 0,
     toolCalls: row.tool_calls ?? 0,
     inputTokens: row.input_tokens ?? 0,
     outputTokens: row.output_tokens ?? 0,
@@ -1020,8 +1052,9 @@ function mapTotals(row: TotalsRow): UsageTotals {
     reasoningTokens: row.reasoning_tokens ?? 0,
     totalTokens: row.total_tokens ?? 0,
     costUsd: row.cost_usd ?? 0,
-    tokensReportedJobs: row.tokens_reported_jobs ?? 0,
-    costReportedJobs: row.cost_reported_jobs ?? 0,
+    tokensReportedTurns: row.tokens_reported_jobs ?? 0,
+    costReportedTurns: row.cost_reported_jobs ?? 0,
+    modelTurnsReportedTurns: row.model_turns_reported_jobs ?? 0,
   };
 }
 

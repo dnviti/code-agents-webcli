@@ -325,6 +325,14 @@ export class ChatSession {
   private queue: QueuedTurn[] = [];
   /** Guards the drain against re-entering itself through `send` -> `ingest`. */
   private draining = false;
+  /**
+   * The turn currently running, by id, or null between turns.
+   *
+   * Only one thing reads it: a message promoted past the queue while the agent
+   * is working continues *this* turn instead of starting one, because it is
+   * being delivered into the work rather than waiting for its own (#86).
+   */
+  private turnInFlightId: string | null = null;
   /** Runs the drain again once the adapter has finished letting go of the last turn. */
   private drainRetry: ReturnType<typeof setTimeout> | null = null;
   /** When the current wait for a ready adapter began; null when not waiting. */
@@ -674,6 +682,13 @@ export class ChatSession {
       }
     }
 
+    // The turn a steer would join, and only for as long as there is one to join.
+    // Cleared here rather than where the state changes because `turn_end` is the
+    // one event every runtime agrees means "that turn is over", and a stale id
+    // would make the next message look like a continuation of work that had
+    // already finished — which is the count going wrong in the other direction.
+    if (stamped.t === 'turn_end') this.turnInFlightId = null;
+
     if (stamped.t === 'session') {
       // Patched on the event itself, not just on the copy kept here. Every
       // reader of this log — this session, the browser's reducer, a snapshot
@@ -897,7 +912,7 @@ export class ChatSession {
         endedAt: new Date(job.endedAt).toISOString(),
         durationMs: job.durationMs,
         outcome: job.outcome,
-        turns: job.turns,
+        modelTurns: job.modelTurns,
         toolCalls: job.toolCalls,
         inputTokens: numeric(job.usage.inputTokens),
         outputTokens: numeric(job.usage.outputTokens),
@@ -1081,6 +1096,12 @@ export class ChatSession {
     // releases the queue: `interrupt` ends in `setState('idle')`, `ingest` runs
     // `drainQueue` after every event, and without this the first message still
     // waiting would overtake the one the user actually chose.
+    // Read before the interrupt, because the interrupt is what ends the turn and
+    // ending it is what clears this. A promoted message delivered into work that
+    // was running continues that work's turn; one promoted while the session was
+    // idle has no work to join and starts its own (#86).
+    const steering = inFlight ? this.turnInFlightId : null;
+
     this.draining = true;
     try {
       if (inFlight) {
@@ -1091,7 +1112,7 @@ export class ChatSession {
         // conversation rather than to the turn that was stopped.
         this.ingest({ t: 'marker', kind: 'interrupted', detail: quoteTurn(turn.text) });
       }
-      await this.deliver({ text: turn.text, attachments: turn.attachments });
+      await this.deliver({ text: turn.text, attachments: turn.attachments }, steering ?? undefined);
       return true;
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1284,7 +1305,16 @@ export class ChatSession {
     });
   }
 
-  private async deliver(turn: UserTurn): Promise<void> {
+  /**
+   * Hand one turn to the runtime, recording the user's own message first.
+   *
+   * @param continuesTurnId The turn this message is being delivered *into*, when
+   *   it is a steer — see `sendQueuedNow`. Sharing that turn's id is what makes
+   *   the transcript group the two together and the accounting file them as one
+   *   turn, which is the definition #86 settled: steering the current work is
+   *   part of that work, not a new request.
+   */
+  private async deliver(turn: UserTurn, continuesTurnId?: string): Promise<void> {
     if (!this.adapter || !this.adapter.alive) {
       throw new ChatNotRunningError();
     }
@@ -1298,8 +1328,15 @@ export class ChatSession {
     // it is the same in every protocol, and a transcript missing what the user
     // asked is useless for resuming, exporting or searching.
     const messageId = `user-${crypto.randomUUID()}`;
-    const turnId = `turn-${crypto.randomUUID()}`;
-    this.ingest({ t: 'msg_start', id: messageId, role: 'user', turnId });
+    const turnId = continuesTurnId ?? `turn-${crypto.randomUUID()}`;
+    this.turnInFlightId = turnId;
+    this.ingest({
+      t: 'msg_start',
+      id: messageId,
+      role: 'user',
+      turnId,
+      ...(continuesTurnId ? { steer: true as const } : {}),
+    });
     this.ingest({
       t: 'block_start',
       msgId: messageId,
