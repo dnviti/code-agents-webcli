@@ -205,6 +205,11 @@ export function foldSessionUsage(usage: ChatUsage, event: ChatEvent): ChatUsage 
       // back as `undefined` and blank a figure it never spoke about.
       const next = { ...usage };
       assignDefined(next, event.usage);
+      // The one thing `assignDefined` has no way to express, and must not
+      // learn: a report that names no window because nobody could size the
+      // model is asking for the ceiling to come down, where every other report
+      // that leaves the field out is simply not talking about it.
+      if (event.usage.contextWindowSource === 'unknown') next.contextWindow = undefined;
       return next;
     }
     default:
@@ -267,6 +272,12 @@ function clearedUsage(usage: ChatUsage): ChatUsage {
   if (usage.contextWindow !== undefined) {
     next.contextWindow = usage.contextWindow;
     next.contextWindowSource = usage.contextWindowSource;
+  } else if (usage.contextWindowSource === 'unknown') {
+    // And so does the absence of one, for the same reason: clearing changes
+    // the conversation, not the model, and the model nobody could size is
+    // still that model. Carried rather than dropped so a clear cannot quietly
+    // turn "we asked and nobody knew" back into "nobody has asked yet".
+    next.contextWindowSource = 'unknown';
   }
   return next;
 }

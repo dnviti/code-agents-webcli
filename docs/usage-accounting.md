@@ -188,7 +188,7 @@ its documentation:
 | --- | --- | --- | --- |
 | Claude | `system/init.model`, every assistant `message.model`, and `result.modelUsage` keyed per model | start, per message, turn end | no — the picker keeps its typed box |
 | Codex (app-server) | `thread/start` → `model`, which it names even when nothing was requested | session start | **yes** — `model/list` over the protocol |
-| Grok | `end.modelUsage`, keyed per model with tokens, `modelCalls` and cost | turn end | **yes** — `grok models` |
+| Grok | `models.currentModelId` when the session opens, and `_meta.usage.modelUsage` on the reply that ends a turn — keyed per model with tokens, `modelCalls` and a cost in ten-billionths of a dollar | session start, turn end | **yes** — in that same reply |
 | pi | every assistant `message.model`, with its provider | per message | **yes** — `pi --list-models` |
 | ACP agents (kimi, omp, …) | the model select's `currentValue` | session start, and on a switch | **yes** — in the select itself |
 
@@ -202,6 +202,9 @@ Two consequences worth stating plainly:
   line nor on a message, so every Grok job was filed against no model and the
   by-model view had a nameless row absorbing all of it. The name was there the
   whole time, at the end of the turn, in the one place nothing was reading.
+  That map is read now, and it brought the only round-trip count Grok publishes
+  anywhere with it — `modelCalls`, which is why the Model turns column stopped
+  saying "not reported" on every Grok row.
 
 ### A turn that ran on more than one model
 
@@ -285,6 +288,19 @@ write + output — not the turn's totals. A three-round-trip turn measured today
 totalled 105,027 tokens across its requests while only 37,387 were ever in the
 window at once: a bar built on the totals would have read 10.5% full where the
 truth was 3.7%.
+
+Where that figure comes from differs per agent — Claude's own last `result`,
+codex's `tokenUsage.last`, `usage_update.used` from omp and opencode — and Grok
+is the one that puts it somewhere the protocol does not name: `_meta.totalTokens`,
+on nearly every `session/update` it sends — 287 of the 289 captured; the
+exceptions echo back what the user typed, which is why a reading that is absent
+is skipped rather than taken as zero. It sends no `usage_update` whatsoever, so until that was read a Grok
+conversation had a 512,000-token ceiling with nothing measured against it: no
+percentage, no bar, and no 80% warning it could ever reach. The reply that ends
+one of its turns carries both figures a line apart — `_meta.totalTokens` for the
+last request, `_meta.usage.totalTokens` for the turn — and on the turn measured
+here they are 16,637 and 65,943. Filing the second as occupancy would have been
+four times worse than the blank it replaced.
 
 The reading follows a mid-conversation model switch: everything known about the
 old model is discarded on the switch rather than carried forward, so moving from

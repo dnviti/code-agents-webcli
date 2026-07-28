@@ -12,12 +12,14 @@ import {
   ToolBlock,
   ToolKind,
   ToolStatus,
+  TurnModelUsage,
   UserTurn,
   classifyTool,
   isAllowOption,
   rankedEfforts,
 } from '../../../shared/chat-events.js';
 import { ChatAdapterOptions, JsonRpcChatAdapter, permissionRequest } from '../adapter.js';
+import { mapModelUsage } from './model-usage.js';
 
 /**
  * Agent Client Protocol client.
@@ -289,6 +291,44 @@ function turnUsage(raw: Record<string, unknown>): ChatUsage | undefined {
   return present ? usage : undefined;
 }
 
+/**
+ * Which models actually ran the turn, in the spelling ACP agents use for it.
+ *
+ * `mapModelUsage` reads the names claude and headless grok both publish —
+ * `cacheReadInputTokens`, `costUSD`. Over ACP the same grok sends the same map
+ * spelled the way it spells the turn's own totals, `cachedReadTokens` and money
+ * as a count of ticks, so the entries are respelled on the way in rather than
+ * teaching the shared reader a third vocabulary for one fact.
+ *
+ * The map is real and was being dropped whole. Off grok's `session/prompt`
+ * reply, under `_meta.usage`:
+ * `{"grok-build":{"inputTokens":65551,…,"modelCalls":4,"costUsdTicks":357174000}}`.
+ * One key there because one model answered — but that `modelCalls` is the only
+ * round-trip count grok reports at all, and a turn that delegated to a second
+ * model would say so here and nowhere else.
+ *
+ * The tick cost passes straight through, unlike claude's, which has to be
+ * rescaled: grok's `costUsdTicks` is the turn's own, and the entries sum to it
+ * exactly, so a share of it would be the same number arrived at less honestly.
+ */
+function acpModelUsage(usage: Record<string, unknown>): TurnModelUsage[] | undefined {
+  const respelled: Record<string, unknown> = {};
+  for (const [model, value] of Object.entries(record(usage.modelUsage))) {
+    const fields = record(value);
+    const ticks = num(fields.costUsdTicks);
+    respelled[model] = {
+      ...fields,
+      // The agent's own spelling wins where it used it: this is a translation
+      // for the agents that spell it the other way, not a correction.
+      cacheReadInputTokens: num(fields.cacheReadInputTokens) ?? num(fields.cachedReadTokens),
+      cacheCreationInputTokens:
+        num(fields.cacheCreationInputTokens) ?? num(fields.cachedWriteTokens),
+      ...(ticks === undefined ? {} : { costUSD: ticks * USD_PER_TICK }),
+    };
+  }
+  return mapModelUsage({ modelUsage: respelled });
+}
+
 export class AcpChatAdapter extends JsonRpcChatAdapter {
   readonly runtime: string;
   capabilities: ChatCapabilities = { ...ACP_BASE_CAPABILITIES };
@@ -300,6 +340,8 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   private readonly modelWindows = new Map<string, number>();
   /** The last window announced, so a re-read does not re-emit the same figure. */
   private reportedWindow?: number;
+  /** The last occupancy announced, for the same reason and on the same rule. */
+  private reportedUsed?: number;
   /**
    * The id of the config option that carries this agent's thinking level.
    *
@@ -360,6 +402,13 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
 
       const session = await this.openSession(init);
       this.applySessionConfig(record(session));
+      // Before the `session` event rather than after it, which is where the
+      // remembered effort goes: this event is what names the model the
+      // conversation is running on, and naming the one we are one round trip
+      // away from replacing would be a false start every relaunch. It also puts
+      // the switch ahead of the effort ladder, which on kimi and grok alike
+      // belongs to the model rather than to the session.
+      await this.applyLaunchModel();
 
       this.emit({
         t: 'session',
@@ -704,7 +753,39 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     const window = this.model ? this.modelWindows.get(this.model) : undefined;
     if (window === undefined || window === this.reportedWindow) return;
     this.reportedWindow = window;
-    this.emit({ t: 'usage', usage: { contextWindow: window, contextWindowSource: 'agent' } });
+    // Named, because this arrives ahead of anything that says which model is
+    // running now: a switch is confirmed on its own channel and the next
+    // message to carry a model belongs to the turn after it. Unnamed, the
+    // session files grok-4.5's 500,000 against grok-build and then retracts it.
+    this.emit({
+      t: 'usage',
+      usage: { contextWindow: window, contextWindowSource: 'agent', contextWindowModel: this.model },
+    });
+  }
+
+  /**
+   * Tell the session how much of that window is occupied right now.
+   *
+   * ACP's own channel for this is `usage_update.used`, which omp and opencode
+   * send and grok does not send once — so a grok conversation had a 512,000
+   * ceiling, no reading against it, and no 80% warning it could ever reach.
+   *
+   * What grok sends instead is `totalTokens` in the `_meta` of every
+   * `session/update`, and it is the right figure rather than a near one: across
+   * the captured turn it moves 1038 → 8363 → 16,381 → 16,641 → 16,812 while
+   * that turn's four requests *totalled* 65,943 tokens. It is the last
+   * request's own occupancy, which is the definition this product measures
+   * against; filing the turn's total here would have drawn a bar four times too
+   * full and been worse than the blank it replaced.
+   *
+   * Deduplicated like the window above, because grok repeats the same figure on
+   * every chunk of a streamed answer and a durable log should record what
+   * changed rather than how often it was mentioned.
+   */
+  private emitContextUsed(used: number | undefined): void {
+    if (used === undefined || used === this.reportedUsed) return;
+    this.reportedUsed = used;
+    this.emit({ t: 'usage', usage: { contextUsed: used } });
   }
 
   /**
@@ -843,6 +924,11 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     // speak when something actually moved.
     if (this.applyModelEffort()) this.publishEfforts();
     this.emitEffort();
+    // So does the window: grok publishes one per model, and `grok-4.5` is
+    // 500,000 where `grok-build` is 512,000. The config-option road gets this
+    // for free because it re-reads the whole session; this road has to say it,
+    // or the meter goes on measuring against the model that was left behind.
+    this.emitContextWindow();
   }
 
   /**
@@ -922,6 +1008,46 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
         this.model ? ` for ${this.model}` : ''
       }, so its thinking cannot be changed from here`,
     );
+  }
+
+  /**
+   * Put a launched-with model into effect, once there is a session to set it on.
+   *
+   * ACP has no launch flag for this either. `session/new` takes a cwd and a
+   * list of MCP servers and nothing else, and the `--model` flag the bridges
+   * pass belongs to these CLIs' interactive modes — nobody has watched
+   * `grok agent stdio` or `kimi acp` read one, and a flag an agent refuses at
+   * spawn takes the whole conversation down, which is precisely what a
+   * remembered preference must never do. So the choice is applied immediately
+   * afterwards, down exactly the road `setModel` takes.
+   *
+   * Without this the choice survived right up to the next process start and
+   * then silently did not. `/clear` restarts the process in place and replays
+   * the options the session was started with; so does relaunching after the
+   * server restarted, or from the unavailable banner. Every turn after one of
+   * those was answered and billed on the profile's model while the composer
+   * went on asserting the chosen one, because the chip renders the override
+   * ahead of the reported model and the per-turn "also ran" hint that would
+   * have exposed it is suppressed while an override exists.
+   *
+   * Best-effort in the same sense as the level below: a model this agent will
+   * not take must not stop the conversation opening, and it is a live
+   * possibility — a model remembered from another runtime's picker is a name
+   * this one has never heard of. The failure is worth a line in the transcript
+   * because it is the one thing the picker cannot show by itself.
+   */
+  private async applyLaunchModel(): Promise<void> {
+    const wanted = this.options.model;
+    if (!wanted || wanted === this.model) return;
+    try {
+      await this.setModel(wanted);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit({
+        t: 'error',
+        message: `${this.runtime}: could not start on model "${wanted}": ${message}`,
+      });
+    }
   }
 
   /**
@@ -1021,6 +1147,16 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
       return;
     }
     if (method !== 'session/update') return;
+    // Ahead of the switch, because the reading rides on the envelope rather
+    // than on any one kind of update: the first one to carry it in the captured
+    // session is an `available_commands_update` at handshake time, whose own
+    // payload says nothing about usage, and it is the only reason the meter has
+    // a figure before the first prompt. Only grok fills this `_meta` at all —
+    // and not on every update it sends, which is why a missing reading is
+    // skipped rather than read as zero. Across the
+    // 1,386 updates captured from omp, opencode and kimi not one carries the
+    // key — so it can never compete with their `usage_update`.
+    this.emitContextUsed(num(record(params._meta).totalTokens));
     const update = record(params.update);
     const kind = str(update.sessionUpdate);
 
@@ -1403,7 +1539,15 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     // Reading only the first spelling filed every grok turn as free.
     const meta = record(payload._meta);
     const usage = turnUsage(record(payload.usage)) ?? turnUsage(record(meta.usage));
+    const models = acpModelUsage(record(payload.usage)) ?? acpModelUsage(record(meta.usage));
     const hadMessage = this.current !== null;
+
+    // The scalars beside `_meta.usage` are not the turn's, they are the last
+    // request's — 16,616 in and 21 out against a turn total of 65,551 and 392 —
+    // so the one figure taken from them is the occupancy, which is the only
+    // thing the last request on its own is the right measure of. Emitted before
+    // the turn closes so it lands inside the job it belongs to.
+    this.emitContextUsed(num(meta.totalTokens));
 
     this.closeMessage(stopReason, usage);
     this.emit({
@@ -1413,6 +1557,12 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
       // Counted once. msg_end already folded it into the session total, so
       // repeating it here would double every number the UI shows.
       usage: hadMessage ? undefined : usage,
+      // Not subject to that rule: nothing else in the stream carries the split,
+      // and it is a breakdown of the turn rather than an addition to it.
+      // Grok also announces the same map on a `turn_completed` notification a
+      // beat before this reply — byte-identical, checked against the capture —
+      // and reading both would file every grok turn's round trips twice.
+      ...(models ? { models } : {}),
       durationMs: this.turnStartedAt ? Date.now() - this.turnStartedAt : undefined,
     });
     if (this.turnId === turnId) this.turnId = null;
