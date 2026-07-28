@@ -599,6 +599,95 @@ describe('ChatStore', function () {
     });
   });
 
+  /**
+   * What `/clear` costs the log.
+   *
+   * The bug these pin down: clearing emptied the browser's window and left the
+   * log untouched, so reloading the page replayed the tail from disk and the
+   * conversation the user had just ended came back — and because a freshly
+   * cleared pane is too short to scroll, the client asked for the page above it
+   * unprompted and pulled in the rest.
+   */
+  describe('truncateBefore', function () {
+    /** A user/assistant exchange, so a truncation can be seen in the messages. */
+    function exchange(startSeq, label) {
+      const turnId = `turn-${label}`;
+      return [
+        { t: 'msg_start', seq: startSeq, ts: startSeq, id: `u-${label}`, role: 'user', turnId },
+        {
+          t: 'block_start',
+          seq: startSeq + 1,
+          ts: startSeq + 1,
+          msgId: `u-${label}`,
+          index: 0,
+          block: { kind: 'text', text: `question ${label}` },
+        },
+        { t: 'msg_end', seq: startSeq + 2, ts: startSeq + 2, msgId: `u-${label}`, stopReason: 'end_turn' },
+        { t: 'turn_end', seq: startSeq + 3, ts: startSeq + 3, turnId },
+      ];
+    }
+
+    it('leaves a cleared conversation with nothing above the line', async function () {
+      const session = { id: 's1', ownerUserId: 1 };
+      const before = [...exchange(1, 'old-a'), ...exchange(5, 'old-b')];
+      const marker = { t: 'marker', seq: 9, ts: 9, kind: 'cleared', detail: 'started a new conversation' };
+      store.append(session, [...before, marker, ...exchange(10, 'new')]);
+
+      await store.truncateBefore(session, marker.seq);
+
+      const snapshot = await store.snapshot(session);
+      const texts = snapshot.messages.flatMap((message) =>
+        message.blocks.filter((block) => block.kind === 'text').map((block) => block.text),
+      );
+      assert.deepStrictEqual(texts, ['question new'], 'a reload must open on the new conversation alone');
+      // The two together are what stops the client asking for an older page:
+      // there is no history below where the replay began.
+      assert.strictEqual(snapshot.firstSeq, marker.seq);
+      assert.strictEqual(snapshot.replayFrom, marker.seq);
+
+      const older = await store.read(session, 1, 20);
+      assert.strictEqual(
+        older.events[0].seq,
+        marker.seq,
+        'paging back past the line must find nothing to bring in',
+      );
+      const index = await store.turnIndex(session);
+      assert.deepStrictEqual(index.turns.map((turn) => turn.turnId), ['turn-new']);
+      assert.strictEqual(index.complete, true, 'the index reaches the conversation it lists');
+    });
+
+    it('keeps numbering across the cut, so what follows still reads back', async function () {
+      const session = { id: 's1', ownerUserId: 1 };
+      store.append(session, makeEvents(1, 10));
+
+      await store.truncateBefore(session, 6);
+      store.append(session, makeEvents(11, 2));
+
+      const stats = await store.stat(session);
+      assert.strictEqual(stats.firstSeq, 6);
+      assert.strictEqual(stats.cursor, 12);
+      const page = await store.read(session, 1, 20);
+      assert.deepStrictEqual(
+        page.events.map((event) => event.seq),
+        [6, 7, 8, 9, 10, 11, 12],
+      );
+    });
+
+    it('does nothing when the log already starts there or later', async function () {
+      const session = { id: 's1', ownerUserId: 1 };
+      store.append(session, makeEvents(1, 4));
+
+      await store.truncateBefore(session, 1);
+      await store.truncateBefore(session, 0);
+
+      const page = await store.read(session, 1, 10);
+      assert.deepStrictEqual(
+        page.events.map((event) => event.seq),
+        [1, 2, 3, 4],
+      );
+    });
+  });
+
   describe('deleteChat', function () {
     it('removes the log and index for that session only', async function () {
       store.append({ id: 'gone', ownerUserId: 1 }, makeEvents(1, 1));

@@ -256,6 +256,21 @@
   figures above it, which it previously did not.
 
 ### Fixed
+- **`/clear` now really does end the conversation.** It emptied the window and
+  started a new agent process, which was the half you could see — but the
+  conversation it replaced was still on the log, so reloading the page brought
+  the whole of it straight back. Worse without touching anything: a freshly
+  cleared pane is too short to scroll, so the browser asked for the page above
+  it unprompted and pulled the old conversation in on its own.
+
+  Clearing now cuts the log at the line it draws: the conversation begins where
+  the clear happened, so a reload opens on the new conversation, there is no
+  older page to fetch, and the turn index lists the new turns alone. This is a
+  delete, deliberately — "start again" is a promise about what is left behind,
+  not a view over it. What each turn cost is recorded separately and is not
+  touched, so the statistics page still shows the spend of the conversation you
+  cleared.
+
 - **An agent that picks its own work back up stays in the turn it was working
   on — and what that work costs is finally counted.** (#86) An agent that leaves
   something running in the background — a build, a check, a job it is waiting on

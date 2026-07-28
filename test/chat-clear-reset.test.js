@@ -14,8 +14,10 @@ const { ChatSession } = require('../dist/server/chat/session.js');
 
 function memoryStore() {
   const events = [];
+  const truncations = [];
   return {
     events,
+    truncations,
     append(_ref, batch) {
       events.push(...batch);
     },
@@ -24,6 +26,9 @@ function memoryStore() {
     },
     async read() {
       return { events: [], firstSeq: 1, from: 1, cursor: events.length };
+    },
+    async truncateBefore(_ref, seq) {
+      truncations.push(seq);
     },
   };
 }
@@ -343,6 +348,24 @@ describe('clearing leaves the tab live', function () {
     assert.ok(marker >= 0);
     const errors = store.events.slice(marker).filter((e) => e.t === 'error');
     assert.deepStrictEqual(errors, [], 'a dropped queue is what was asked for, not a failure');
+    await s.stop();
+  });
+
+  it('cuts the log at the marker, so the clear survives a reload', async function () {
+    const { s, store } = liveSession();
+    await s.start({ runtime: 'claude', workingDir: os.tmpdir() });
+    const old = s.adapter;
+
+    await s.send({ text: '/clear' });
+    await died(old);
+
+    const marker = store.events.find((e) => e.t === 'marker' && e.kind === 'cleared');
+    assert.ok(marker, 'the window was told to empty');
+    assert.deepStrictEqual(
+      store.truncations,
+      [marker.seq],
+      'emptying the window is not enough: the log has to start at the line, or a reload replays what was above it',
+    );
     await s.stop();
   });
 
