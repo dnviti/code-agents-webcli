@@ -256,6 +256,21 @@
   figures above it, which it previously did not.
 
 ### Fixed
+- **The turn index and every per-turn cost were being thrown away before they
+  reached the screen.** The chat layer routes server messages by a list of the
+  types it owns, and that list had fallen three behind the messages the chat
+  controller actually answers: the recorded turn index, a turn's filed spend,
+  and the result of a model change. A type missing from it is not merely
+  unhandled — it goes to the terminal's handler, which has no idea what a chat
+  message is, and it is dropped in silence.
+
+  So the conversation numbered its turns by the browser's window instead of by
+  the recording — "turn 1" for turn 40, and no prompt to name a half-loaded turn
+  by — and no turn ever showed what it cost, however carefully the server filed
+  and announced it. Both figures were correct at every step but the last one.
+  The list is now the controller's own, kept beside the switch it mirrors, with
+  a test that fails if the two drift apart again.
+
 - **`/clear` now really does end the conversation.** It emptied the window and
   started a new agent process, which was the half you could see — but the
   conversation it replaced was still on the log, so reloading the page brought

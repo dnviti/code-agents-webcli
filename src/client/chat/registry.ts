@@ -26,19 +26,13 @@ export interface ChatRegistryOptions {
 /**
  * Messages this registry owns. Anything else belongs to the terminal path.
  *
- * A type missing from this set is not merely unhandled — it is handed to the
- * terminal's own handler, which does not know what a chat message is. Every
- * `case` in ChatController.handle needs an entry here.
+ * Taken from the controller rather than restated here. A type missing from it
+ * is not merely unhandled — it is handed to the terminal's own handler, which
+ * does not know what a chat message is, and it disappears without a word. This
+ * used to be a second list kept by hand, and it fell three types behind the
+ * switch it was meant to mirror.
  */
-const CHAT_MESSAGE_TYPES = new Set([
-  'chat_snapshot',
-  'chat_started',
-  'chat_event',
-  'chat_queue',
-  'chat_page',
-  'chat_page_failed',
-  'chat_unavailable',
-]);
+const CHAT_MESSAGE_TYPES = ChatController.MESSAGE_TYPES;
 
 export class ChatRegistry {
   private readonly controllers = new Map<string, ChatController>();
