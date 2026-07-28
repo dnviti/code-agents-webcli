@@ -182,6 +182,7 @@ export class ClaudeCodeWebServer {
         consumedFor: (nativeSessionId) => this.usageStore.consumedFor(nativeSessionId),
         costBaselineFor: (nativeSessionId) => this.usageStore.costBaselineFor(nativeSessionId),
         loginFor: (userId) => this.database.getUserById(userId)?.githubLogin ?? String(userId),
+        spendByTurn: (sessionId, userId) => this.usageStore.spendByTurn(sessionId, userId),
       },
       storageDir: this.database.storageDir,
       broadcast: (sessionId, message) =>

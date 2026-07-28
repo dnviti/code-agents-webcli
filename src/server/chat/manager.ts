@@ -203,8 +203,24 @@ export class ChatSessionManager {
    * the point: an index that starts where the last page happened to stop is
    * useless in exactly the conversations long enough to need one (#86).
    */
-  turnIndex(record: SessionRecord): Promise<ChatTurnIndex> {
-    return this.deps.store.turnIndex({ id: record.id, ownerUserId: record.ownerUserId });
+  async turnIndex(record: SessionRecord): Promise<ChatTurnIndex> {
+    const index = await this.deps.store.turnIndex({
+      id: record.id,
+      ownerUserId: record.ownerUserId,
+    });
+    // What each turn cost, joined on from the accounting. Not read from the log
+    // beside it: the money on a `turn_end` is a per-turn figure for some
+    // runtimes and a running total for others, and the one place that
+    // difference has already been worked out is the row the accountant filed.
+    const spend = this.deps.usage?.spendByTurn(record.id, record.ownerUserId);
+    if (!spend || spend.size === 0) return index;
+    return {
+      ...index,
+      turns: index.turns.map((turn) => {
+        const usage = spend.get(turn.turnId);
+        return usage ? { ...turn, usage } : turn;
+      }),
+    };
   }
 
   readPage(

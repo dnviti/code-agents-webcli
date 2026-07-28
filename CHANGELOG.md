@@ -3,6 +3,31 @@
 ## [Unreleased]
 
 ### Added
+- **What each turn cost, beside the turn.** The conversation showed what the
+  whole chat had spent and nothing about where it went — so the expensive turn
+  and the cheap one looked identical, and the only way to find out which was
+  which was to leave the conversation for the statistics page. Every row of the
+  turn index now carries its own figure, and so does the strip over the turn
+  itself.
+
+  It is the accounting's figure, not a second calculation of it: the money can't
+  be added up from the messages on screen, because half the runtimes report a
+  running total rather than a per-turn one, and turning that into "what this
+  turn cost" means differencing it against where the turn began. Taking it from
+  the row the accountant filed is also the only way the number beside a turn and
+  the number on the dashboard can be relied on to agree. It appears the moment a
+  turn ends rather than on the next reload.
+
+  A turn nobody could price — one still running, or a runtime that reports no
+  money at all — shows nothing rather than `$0.00`, and a turn that cost less
+  than a cent keeps four decimals instead of being rounded away to nothing.
+
+  The strip over a turn also stopped letting a long prompt crowd its figures
+  out. Everything to the right of the label is a measurement, and a measurement
+  cut in half — `16 too…`, `9 rea…` — is not one; so the prompt is now the only
+  thing on the bar that gives its width up, cut to whatever room is left with
+  the whole of it on hover.
+
 - **The turn count is a real measurement of the work, and every surface agrees
   about it.** (#86) The word meant two different things at once. In a
   conversation a turn was something you asked for and everything the agent did

@@ -94,6 +94,8 @@ export class ChatTranscript {
    */
   private queued: QueuedTurn[] = [];
   private recorded: ChatTurnIndexEntry[] | null = null;
+  /** What each finished turn cost, by turn id. See `spendFor`. */
+  private readonly spend = new Map<string, ChatUsage>();
 
   /**
    * What the server last said about the process behind this conversation.
@@ -271,8 +273,32 @@ export class ChatTranscript {
     return this.recorded;
   }
 
+  /**
+   * What a turn that has ended cost, as the accounting filed it.
+   *
+   * Held beside the recorded index rather than inside it because it arrives
+   * from two directions: with the index when a conversation is opened, and one
+   * turn at a time as they finish. Both are the same figure from the same
+   * place — see `spendByTurn` — so a turn ending is a correction to this map
+   * and never a second opinion.
+   */
+  get turnSpend(): ReadonlyMap<string, ChatUsage> {
+    return this.spend;
+  }
+
+  /** One turn's recorded spend, as the session files it. */
+  setTurnSpend(turnId: string, usage: ChatUsage): void {
+    this.spend.set(turnId, usage);
+    this.notify();
+  }
+
   setRecordedTurns(turns: ChatTurnIndexEntry[]): void {
     this.recorded = turns;
+    for (const turn of turns) {
+      // A turn still running has no filed figure yet, and must not be given an
+      // empty one — the surfaces read "nothing recorded" off its absence.
+      if (turn.usage) this.spend.set(turn.turnId, turn.usage);
+    }
     this.notify();
   }
 

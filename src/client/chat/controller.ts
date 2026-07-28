@@ -3,6 +3,7 @@ import {
   ChatEvent,
   ChatSnapshot,
   ChatTurnIndexEntry,
+  ChatUsage,
   QueuedTurn,
   NO_CHAT_CAPABILITIES,
 } from '../../shared/chat-events.js';
@@ -205,6 +206,17 @@ export class ChatController {
         // would read it has already been computed (#86).
         this.transcript.setRecordedTurns(Array.isArray(turns) ? turns : []);
         this.turnIndexComplete = message.complete !== false;
+        this.options.onChange?.();
+        return true;
+      }
+
+      case 'chat_turn_spend': {
+        // One turn's bill, the moment the accounting files it. Same figure the
+        // index carries on open, so a turn's cost appears as it finishes rather
+        // than the next time the conversation is opened.
+        const turnId = typeof message.turnId === 'string' ? message.turnId : '';
+        const usage = message.usage as ChatUsage | undefined;
+        if (turnId && usage) this.transcript.setTurnSpend(turnId, usage);
         this.options.onChange?.();
         return true;
       }

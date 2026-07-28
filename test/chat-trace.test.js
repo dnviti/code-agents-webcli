@@ -266,7 +266,7 @@ describe('TurnStrip', function () {
     assert.ok(/background:var\(--muted\)/.test(past.replace(/\s/g, '')));
   });
 
-  it('lets the counts shrink and never the money', function () {
+  it('gives the room up from the label and never from a figure', function () {
     const html = render('TurnStrip', {
       turn: turn({ durationMs: 8100, usage: { costUsd: 0.0412 } }),
       variant: 'current',
@@ -276,15 +276,16 @@ describe('TurnStrip', function () {
 
     assert.ok(/3tools/.test(flat) && /2reasoning/.test(flat));
     assert.ok(/8\.1s/.test(flat));
-    assert.ok(/\$0\.0412/.test(flat));
-    // The two figures somebody came here to read are the two that must not
-    // ellipsise, so they are the ones pinned at their own width — while the
-    // counts beside them are allowed to give their width up first.
+    assert.ok(/\$0\.04/.test(flat), 'to the cent, once there is a cent to show');
+    // Nothing in the meta group may ellipsise: every one of them is a
+    // measurement, and "16 too…" or "9 rea…" is a number nobody can read. The
+    // label is what shrinks — it is the only thing on the bar that still means
+    // something when it is cut.
     // Every <span style="..."> in the strip, keyed by the text inside it.
     const styles = new Map();
     // Lookahead on the closing `<`: consuming it would swallow the opening
     // bracket of the very next span and skip every nested one.
-    for (const [, style, text] of html.matchAll(/<span style="([^"]*)"[^>]*>([^<]*)(?=<)/g)) {
+    for (const [, style, text] of html.matchAll(/<span[^>]*style="([^"]*)"[^>]*>([^<]*)(?=<)/g)) {
       styles.set(text.trim(), style.replace(/\s/g, ''));
     }
     const styleOf = (text) => {
@@ -293,10 +294,24 @@ describe('TurnStrip', function () {
       return style;
     };
 
-    assert.ok(styleOf('$0.0412').includes('flex:00auto'), 'the money must not shrink');
+    assert.ok(styleOf('$0.04').includes('flex:00auto'), 'the money must not shrink');
     assert.ok(styleOf('8.1s').includes('flex:00auto'), 'the duration must not shrink either');
-    assert.ok(styleOf('3 tools').includes('flex:01auto'), 'the counts give up their width first');
-    assert.ok(styleOf('3 tools').includes('text-overflow:ellipsis'));
+    assert.ok(styleOf('3 tools').includes('flex:00auto'), 'nor the counts');
+    assert.ok(styleOf('2 reasoning').includes('flex:00auto'), 'nor those');
+    assert.ok(!styleOf('3 tools').includes('text-overflow:ellipsis'), 'a cut count is not a count');
+
+    const label = styleOf('what file did I just upload?');
+    assert.ok(label.includes('flex:11auto') || label.includes('flex:110'), `label was ${label}`);
+    assert.ok(label.includes('text-overflow:ellipsis'), 'the label is what gets cut');
+    assert.ok(label.includes('min-width:0'), 'and it can actually give the room back');
+  });
+
+  it('keeps the whole prompt on hover, since the bar only shows the start of it', function () {
+    const asked = 'oltre alla spesa complessiva per la chat, inserisci anche la spesa su ogni turno';
+    const html = render('TurnStrip', { turn: turn({ label: asked }), variant: 'current', onCopy() {} });
+    // Cut on screen, whole in the tooltip — the point of cutting it is that
+    // nothing is lost by doing so.
+    assert.ok(html.includes(`title="${asked}"`), html.slice(0, 300));
   });
 
   it('carries the scroll anchor on the sticky element itself', function () {

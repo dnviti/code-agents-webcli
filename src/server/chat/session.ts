@@ -143,6 +143,8 @@ export interface ChatUsageSink {
   costBaselineFor(nativeSessionId: string): number | null;
   /** The login to file the work under, resolved once per job. */
   loginFor(userId: number): string;
+  /** What each turn of this conversation cost, for the index beside it. */
+  spendByTurn(sessionId: string, userId: number): Map<string, ChatUsage>;
 }
 
 export interface ChatSessionStartOptions {
@@ -986,7 +988,21 @@ export class ChatSession {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`chat ${this.ref.id}: could not record usage for a job: ${message}`);
+      return;
     }
+
+    // Said out loud as well as filed, so the figure beside the turn appears the
+    // moment the turn ends rather than the next time the conversation is
+    // opened. It is the filed figure, not a second reading of the events: a
+    // browser cannot work out what a turn cost on the runtimes that report a
+    // running total, and two answers to "what did this cost" is the disagreement
+    // #86 exists to remove.
+    this.deps.broadcast(this.ref.id, {
+      type: 'chat_turn_spend',
+      sessionId: this.ref.id,
+      turnId: job.turnId,
+      usage: job.usage,
+    });
   }
 
   // -------------------------------------------------------------- the queue

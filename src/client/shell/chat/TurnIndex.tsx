@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { Icon } from '../../ui/relay/Icon.js';
 import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
-import { STATUS_GLYPH, type TurnIndexRow } from '../../chat/turns.js';
+import { STATUS_GLYPH, formatTurnCost, type TurnIndexRow } from '../../chat/turns.js';
 
 /**
  * Every turn in the conversation, as a list you can jump around.
@@ -326,6 +326,25 @@ function TurnRow({
           }}
         >
           {turn.label}
+        </span>
+      )}
+      {/* What this one turn cost. Only where it was actually recorded: a turn
+          still running has no figure yet and a runtime that reports no money
+          never will, and "$0.00" for either of those is a number nobody
+          measured. Right of the label, in the same monospace as every other
+          figure on this screen, so a column of them reads down the list. */}
+      {collapsed || turn.costUsd === undefined ? null : (
+        <span
+          title={`this turn cost $${turn.costUsd.toFixed(4)}`}
+          style={{
+            flex: '0 0 auto',
+            fontFamily: 'var(--font-mono)',
+            fontSize: isPhone ? PHONE_TEXT.meta : 10,
+            color: 'var(--muted-foreground)',
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        >
+          {formatTurnCost(turn.costUsd)}
         </span>
       )}
       {/* The word behind the glyph, for anything that cannot see a glyph. */}

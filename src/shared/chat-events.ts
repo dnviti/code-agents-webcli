@@ -355,6 +355,21 @@ export interface ChatTurnIndexEntry {
   startedAt: number;
   /** How the turn ended, or null while it is still running. */
   outcome: TurnOutcome | null;
+  /**
+   * What this one turn cost, as the accounting recorded it.
+   *
+   * From the accounting rather than added up from the messages, because the
+   * money cannot be added up from the messages: half the runtimes here report a
+   * running total rather than a per-turn figure, and turning that into "what
+   * this turn cost" means taking the difference against where the turn started
+   * — which is what the accountant did when it filed the row this reads back.
+   * Taking it from the same place is also the only way the figure beside a turn
+   * and the figure on the dashboard can be relied on to agree.
+   *
+   * Absent for a turn still running, and for one whose runtime reported
+   * nothing — which is a different thing from zero, and says so on screen.
+   */
+  usage?: ChatUsage;
 }
 
 export interface ChatMessage {

@@ -199,15 +199,23 @@ export function ChatView({
   // window can answer; the number each turn carries and the words it is named
   // by are facts about the conversation, and come from the recording (#86).
   const recorded = transcript.recordedTurns;
-  const turns = React.useMemo(
-    () => reconcileTurns(groupTurns(messages, chatState), recorded),
+  // What each finished turn cost, as the accounting filed it — see `spendFor`.
+  // Read through the version counter like everything else here: it arrives with
+  // the index and then one turn at a time as they end.
+  const spend = React.useMemo(
+    () => transcript.turnSpend,
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [messages, version, chatState, recorded],
+    [transcript, version],
+  );
+  const turns = React.useMemo(
+    () => reconcileTurns(groupTurns(messages, chatState), recorded, spend),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [messages, version, chatState, recorded, spend],
   );
   // The index lists the conversation, not the part of it this browser holds:
   // the recorded run of turns with the live ones laid over it.
   const indexRows = React.useMemo(
-    () => turnIndexRows(recorded, turns),
+    () => turnIndexRows(recorded, turns, spend),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [recorded, turns, version],
   );
