@@ -3,6 +3,39 @@
 ## [Unreleased]
 
 ### Fixed
+- **A model chosen for a conversation survives a restart, on every runtime.** On
+  grok, kimi and Oh My Pi the switch was applied to the running process and
+  nowhere else: the adapter never carried the choice into a launch, so `/clear`
+  — which restarts the process in place — or any relaunch brought the agent up
+  on its own default, while the chip in the composer went on naming the model
+  the user picked. Every turn after that was answered and billed on a model
+  nobody chose, with nothing on screen to say so. The choice is now reapplied
+  over the protocol as soon as the session opens, down whichever road each agent
+  published; a model an agent refuses leaves an error in the conversation
+  instead of taking it down.
+
+- **Grok reports the context it is using, and what each model did.** It publishes
+  both — occupancy on the `_meta` of nearly every update it sends, the per-model
+  breakdown on the reply that ends a turn — and neither was being read, because
+  the adapter only knew the one channel the other ACP agents use. So a Grok
+  conversation had a 512,000-token ceiling with nothing measured against it: no
+  percentage, no bar, and no way to reach the warning that says the window is
+  filling up. It also read "not reported" in the dashboard's Model turns column
+  on every row. The occupancy taken is the last request's own figure, not the
+  turn's total — that turn totalled 65,943 tokens with 16,637 ever in the window
+  at once, and filing the larger number would have drawn a bar four times too
+  full.
+
+- **A ceiling nobody can vouch for comes down instead of standing there.**
+  Switch mid-conversation to a model the agent does not describe and no
+  catalogue lists, and the previous model's window stayed on screen — the bar,
+  the percentage, and the "N left, compact or start a new conversation" warning,
+  all describing the conversation you had just left, while occupancy went on
+  climbing against a model that may be far smaller. A context that was nearly
+  full read as comfortable. The reading now says the size is unknown and means
+  it. It says that only when nobody can answer: a window the agent itself
+  published for the model it just moved to is kept, and a lookup that could not
+  be reached is not mistaken for one that answered no.
 - **A slash command Claude answers itself now leaves an answer on screen.** Some
   commands — `/effort`, `/model` — are handled by the CLI without going near the
   model, and a locally-handled command emits no streaming events at all. This

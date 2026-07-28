@@ -296,17 +296,43 @@ export interface ChatUsage {
    *
    * `agent` — the runtime reported it about the model it is running.
    * `provider` — the agent said nothing, so the model's provider was asked.
+   * `unknown` — nobody could, and the reading has no ceiling in it.
    *
-   * Kept because the two are not equally authoritative and the difference is
-   * measurable: grok reports 512,000 tokens for `grok-build`, while the nearest
-   * entry in a provider catalogue says 256,000. Half. An agent's own figure
-   * always wins, and this field is what lets a reader see which one they got.
+   * The first two are kept because they are not equally authoritative and the
+   * difference is measurable: grok reports 512,000 tokens for `grok-build`,
+   * while the nearest entry in a provider catalogue says 256,000. Half. An
+   * agent's own figure always wins, and this field is what lets a reader see
+   * which one they got.
+   *
+   * The third exists because a ceiling sometimes has to come *down*. Switch to
+   * a model neither the agent nor the catalogue can size and the previous
+   * model's figure would otherwise stand there being read as this one's — the
+   * bar, the percentage, the "N left" warning, all describing a conversation
+   * the user has left. Leaving `contextWindow` out cannot say that: every merge
+   * here reads an absent number as "this report is silent about it", which is
+   * exactly what keeps a streaming patch from blanking the figures beside it.
+   * So the retraction is spoken, and `mergeUsage` is the one place that acts on
+   * it.
    *
    * Absent alongside a `contextWindow` should not happen; absent alongside no
-   * `contextWindow` is the ordinary "nobody could say" case, which the UI
+   * `contextWindow` is the ordinary "nobody has said yet" case, which the UI
    * states in words rather than drawing a bar against a guess.
    */
   contextWindowSource?: ContextWindowSource;
+  /**
+   * Which model the window above is about.
+   *
+   * An agent states its ceiling for the model it is running, and that statement
+   * reaches the session *before* the first message that names the model — a
+   * switch is confirmed on its own channel and the naming message belongs to
+   * the next turn. Unattributed, the session reads the new model's figure as
+   * the old one's, then asks a catalogue about an id no catalogue has heard of
+   * and takes the agent's own answer down as unknown.
+   *
+   * Absent means nobody said, which is the ordinary case: a runtime whose model
+   * cannot change mid-conversation has nothing to disambiguate.
+   */
+  contextWindowModel?: string;
 }
 
 /**
@@ -334,7 +360,7 @@ export interface TurnModelUsage {
   usage?: ChatUsage;
 }
 
-export type ContextWindowSource = 'agent' | 'provider';
+export type ContextWindowSource = 'agent' | 'provider' | 'unknown';
 
 /** A message as the reducer assembles it. */
 /**
@@ -1165,6 +1191,12 @@ export function mergeUsage(base: ChatUsage | undefined, next: ChatUsage | undefi
     if (x === undefined && y === undefined) return undefined;
     return (x || 0) + (y || 0);
   };
+  // The one report that takes a figure away instead of contributing one: the
+  // conversation moved to a model nobody can size, and the ceiling that is up
+  // belongs to the model it left. Said out loud precisely because `??` below
+  // would otherwise keep the old number — an omitted field means "no news"
+  // everywhere else here, and has to go on meaning that.
+  const retracted = b.contextWindowSource === 'unknown';
   return {
     inputTokens: add(a.inputTokens, b.inputTokens),
     outputTokens: add(a.outputTokens, b.outputTokens),
@@ -1174,12 +1206,14 @@ export function mergeUsage(base: ChatUsage | undefined, next: ChatUsage | undefi
     totalTokens: add(a.totalTokens, b.totalTokens),
     costUsd: add(a.costUsd, b.costUsd),
     // Not additive: these describe the window, not consumption within it.
-    contextWindow: b.contextWindow ?? a.contextWindow,
+    contextWindow: retracted ? undefined : (b.contextWindow ?? a.contextWindow),
     contextUsed: b.contextUsed ?? a.contextUsed,
     // Travels with the window it describes rather than being picked
     // independently, or a later turn that only refreshed the occupancy would
     // leave an older window labelled with the newer one's provenance.
     contextWindowSource:
-      b.contextWindow !== undefined ? b.contextWindowSource : a.contextWindowSource,
+      retracted || b.contextWindow !== undefined ? b.contextWindowSource : a.contextWindowSource,
+    contextWindowModel:
+      retracted || b.contextWindow !== undefined ? b.contextWindowModel : a.contextWindowModel,
   };
 }

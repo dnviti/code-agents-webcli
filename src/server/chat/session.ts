@@ -318,10 +318,18 @@ export class ChatSession {
    *
    * All three reset when the model changes, because the whole point is that a
    * switch to a smaller model must not carry the larger one's ceiling forward.
+   *
+   * `windowStated` is what makes that true of a switch nobody can answer:
+   * dropping what this object knows is not enough when the figure is already
+   * written into the log and being read off the screen, so it has to be taken
+   * down out loud. See `retractContextWindow`.
    */
   private contextModel?: string;
   private contextWindowFromAgent = false;
   private capacityAskedFor?: string;
+  private contextWindowStated = false;
+  /** The model the standing agent-reported ceiling was stated for, when named. */
+  private agentWindowModel?: string;
 
   /**
    * True between resuming a conversation and the first thing the user says in it.
@@ -459,6 +467,14 @@ export class ChatSession {
     // a resumed session does not renumber events a browser already holds.
     const stats = await this.deps.store.stat(this.ref);
     this.seq = Math.max(this.seq, stats.cursor);
+    // A ceiling can only be taken down if something knows one is up, and this
+    // object learns that by watching events go past — which a process that has
+    // just started has not done. The browser, meanwhile, folds the whole log
+    // and is showing whatever it says. So a conversation with a log behind it
+    // is assumed to be stating something: at worst the retraction is a log
+    // entry that changes nothing on screen, where the other way round is issue
+    // #82 surviving every server restart.
+    this.contextWindowStated = stats.cursor > 0;
 
     // Anything still open belongs to the process that just went away, not to
     // the one about to start, and a relaunch is exactly where an interrupted
@@ -898,7 +914,8 @@ export class ChatSession {
    * all, by asking the provider whose model they named. That is a network call,
    * so it happens once per model and never blocks the conversation: the answer
    * arrives as an ordinary `usage` event whenever it arrives, and if it never
-   * does, the reading says capacity is unknown and means it.
+   * does, the reading says capacity is unknown and means it — including when it
+   * had been saying something else a moment earlier.
    */
   private noteContext(event: ChatEvent): void {
     if (event.t === 'session' || event.t === 'msg_start') {
@@ -909,7 +926,14 @@ export class ChatSession {
         // handshake and names the model a beat later, and treating that as a
         // switch would throw away the agent's own figure and go asking a
         // catalogue for a worse one.
-        if (this.contextModel !== undefined) {
+        //
+        // Nor does a change the agent has already answered. It states the new
+        // model's ceiling the moment the switch is accepted, which is before
+        // any message names that model, so this event is the *second* thing to
+        // arrive about it. Discarding here would send us asking a catalogue
+        // about an id it has never heard of — grok's are internal — and take
+        // down a figure grok had just published.
+        if (this.contextModel !== undefined && this.agentWindowModel !== model) {
           this.contextWindowFromAgent = false;
           this.capacityAskedFor = undefined;
         }
@@ -917,37 +941,80 @@ export class ChatSession {
       }
     }
 
-    if (event.t === 'usage' && event.usage.contextWindow !== undefined) {
-      // Only an agent's own figure closes the question. A window this session
-      // resolved itself must not mark the agent as having answered, or a later
-      // switch back to a model the agent *does* describe would never re-ask.
-      if (event.usage.contextWindowSource !== 'provider') this.contextWindowFromAgent = true;
+    if (event.t === 'usage') {
+      if (event.usage.contextWindow !== undefined) {
+        // Only an agent's own figure closes the question. A window this session
+        // resolved itself must not mark the agent as having answered, or a
+        // later switch back to a model the agent *does* describe would never
+        // re-ask.
+        if (event.usage.contextWindowSource !== 'provider') {
+          this.contextWindowFromAgent = true;
+          this.agentWindowModel = event.usage.contextWindowModel;
+        }
+        this.contextWindowStated = true;
+      } else if (event.usage.contextWindowSource === 'unknown') {
+        this.contextWindowStated = false;
+        this.agentWindowModel = undefined;
+      }
     }
 
     if (this.contextWindowFromAgent || !this.contextModel) return;
     if (this.capacityAskedFor === this.contextModel) return;
-    const capacity = this.deps.capacity;
-    if (!capacity) return;
 
     const model = this.contextModel;
     this.capacityAskedFor = model;
-    void capacity
-      .contextWindowFor(model)
+    // A lookup that answers null and no lookup at all are the same answer about
+    // this model; a lookup that *threw* is not an answer and is kept apart
+    // below. All of them travel the same deferred path: this runs inside
+    // `ingest`, so emitting from here and now would number an event after the
+    // one being handled and put it on the wire ahead of it.
+    const asked: Promise<number | null | undefined> = this.deps.capacity
+      ? this.deps.capacity.contextWindowFor(model).catch(() => undefined)
+      : Promise.resolve(null);
+    void asked
       .then((window) => {
         // The conversation may have moved on to another model while this was
         // in flight, and a stale ceiling is the exact failure this guards.
-        if (window === null || this.contextModel !== model) return;
-        if (this.contextWindowFromAgent) return;
+        if (this.contextModel !== model || this.contextWindowFromAgent) return;
+        if (window === undefined) {
+          // Not reachable is not an answer. Retracting on it would let one bad
+          // moment on the network leave a knowable model reading "size unknown"
+          // for the rest of the conversation, because nothing re-asks once a
+          // model has been asked about. Forget having asked instead.
+          if (this.capacityAskedFor === model) this.capacityAskedFor = undefined;
+          return;
+        }
+        if (window === null) {
+          // Nobody can size this one — not the agent, and not the catalogue.
+          // What is on screen is the model the conversation left, so it comes
+          // down rather than being left there to be read as this model's.
+          this.retractContextWindow();
+          return;
+        }
         this.ingest({
           t: 'usage',
           usage: { contextWindow: window, contextWindowSource: 'provider' },
         });
       })
       .catch(() => {
-        // A lookup that fails is not an event: the reading already says
-        // unknown, which is the truthful state, and there is nothing here a
-        // person could act on.
+        // Accounting for capacity is a bystander to the conversation, like the
+        // accountant above: there is nothing here a person could act on.
       });
+  }
+
+  /**
+   * Take the ceiling down, and say so.
+   *
+   * A `usage` report with a source and no window, because leaving the number
+   * out is how every other report says "I am not talking about that field" —
+   * the rule that keeps a streaming patch from blanking the figures beside it.
+   * Only sent when there is something to retract: a conversation whose window
+   * was never established already reads as unknown, and an event saying so
+   * again would be a log entry that changes nothing.
+   */
+  private retractContextWindow(): void {
+    if (!this.contextWindowStated) return;
+    this.ingest({ t: 'usage', usage: { contextWindowSource: 'unknown' } });
   }
 
   /**

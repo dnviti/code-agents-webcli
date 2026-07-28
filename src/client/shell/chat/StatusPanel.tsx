@@ -150,7 +150,11 @@ function Meter({ used, of }: { used: number; of: number }): React.JSX.Element {
  * `grok-build`, where the nearest catalogue entry says half that.
  */
 function SourceNote({ source }: { source?: ContextWindowSource }): React.JSX.Element | null {
-  if (!source) return null;
+  // `unknown` is the absence of a window rather than a claim about one — it is
+  // how a conversation says the model it moved to could not be sized, and the
+  // sections with no size to show say that in their own words. Falling through
+  // here would credit the provider with a figure nobody gave.
+  if (!source || source === 'unknown') return null;
   return (
     <Quiet>
       {source === 'agent'

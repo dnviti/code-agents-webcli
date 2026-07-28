@@ -306,7 +306,7 @@ A profile targets one runtime and carries four things, all optional:
 
 | Field | What it does |
 | --- | --- |
-| **Model** | Passed as `--model <value>` to the CLIs that have the flag (all but Cursor Agent and Qwen Code) |
+| **Model** | Passed as `--model <value>` to the CLIs that have the flag (all but Cursor Agent and Qwen Code). A chat conversation on an ACP agent — Grok Build, Kimi Code, Oh My Pi — has no flag to pass it on, so the value is applied over the protocol the moment the session opens, and again after anything that restarts it: `/clear`, a server restart, the unavailable banner |
 | **Extra arguments** | Appended after the app's own flags, so they win on CLIs where the last flag wins |
 | **Environment** | Injected into the spawned process |
 | **Capability tiers** | `floor` / `mid` / `high` / `top`, written into the runtime's own config |

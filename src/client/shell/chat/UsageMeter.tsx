@@ -75,8 +75,18 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
    */
   const capacityUnknown =
     showTokens && usage.contextWindow === undefined && usage.contextUsed !== undefined;
+  /**
+   * A window whose occupancy nobody reports — kimi's whole conversation.
+   *
+   * The mirror image of the case above, and stated for the same reason. A
+   * header that shows the tokens and the cost and then simply stops where the
+   * context reading goes is read as "not full yet", which is the one thing
+   * nobody here knows.
+   */
+  const fillUnknown =
+    showTokens && usage.contextWindow !== undefined && usage.contextUsed === undefined;
 
-  if (fields.length === 0 && !hasTotal && !hasCost && !hasContext && !capacityUnknown) {
+  if (fields.length === 0 && !hasTotal && !hasCost && !hasContext && !capacityUnknown && !fillUnknown) {
     return null;
   }
 
@@ -139,11 +149,26 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
             {Math.round(contextPct)}%
           </span>
         ) : null}
-        {/* Nothing about an unknown capacity in the compact strip. It is the
-            fixed-width header, and the sentence that fits beside a short token
-            count does not fit beside a long one — the same overflow the
-            warning wording hits at 95%. The expanded meter and the status
-            panel both say it, and neither is width-bound. */}
+        {/* Half a reading, in the only form this row holds: the figure somebody
+            gave, and a question mark for the one nobody did. Still no sentence
+            here — the words that fit beside a short token count do not fit
+            beside a long one, the same overflow the warning wording hits at
+            95% — but silence was worse than terse. A strip that shows tokens
+            and cost and then stops where the context goes is read as "not full
+            yet", which is the one thing nobody knows. The expanded meter and
+            the status panel say it in words; the tooltip does here. */}
+        {fillUnknown && !costOnly ? (
+          <span title={fillTitle(usage.contextWindow!)}>? of {formatTokens(usage.contextWindow!)}</span>
+        ) : null}
+        {/* Without repeating the figure already standing to its left: some
+            runtimes report occupancy and the token total from the same count,
+            and `8.1k tok · $0.02  8.1k of ?` reads as a stutter rather than as
+            a second fact. What is worth saying there is the question mark. */}
+        {capacityUnknown && !costOnly ? (
+          <span title={sizeTitle(usage.contextUsed!)}>
+            {usage.contextUsed === total ? 'window ?' : `${formatTokens(usage.contextUsed!)} of ?`}
+          </span>
+        ) : null}
       </div>
     );
   }
@@ -212,6 +237,18 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
           </span>
         </div>
       ) : null}
+
+      {fillUnknown ? (
+        <div
+          style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}
+          title={fillTitle(usage.contextWindow!)}
+        >
+          <span>context</span>
+          <span style={{ color: 'var(--foreground)' }}>
+            {formatTokens(usage.contextWindow!)} window · fill not reported
+          </span>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -271,6 +308,16 @@ function contextTitle(usage: ChatUsage, pct: number): string {
         ? ' (window size reported by the agent)'
         : '';
   return `${used.toLocaleString()} of ${window.toLocaleString()} tokens · ${Math.round(pct)}% full${source}`;
+}
+
+/** The long form of a window with no occupancy figure to put in it. */
+function fillTitle(window: number): string {
+  return `${window.toLocaleString()}-token window · this runtime does not report how much of it is in use`;
+}
+
+/** And of an occupancy with no window to measure it against. */
+function sizeTitle(used: number): string {
+  return `${used.toLocaleString()} tokens in the context · nobody could say how large the window is`;
 }
 
 /** 1234 -> "1.2k", 12421 -> "12.4k", 984123 -> "984k", 1_400_000 -> "1.4M". */
