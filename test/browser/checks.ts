@@ -264,6 +264,7 @@ async function run(): Promise<void> {
   await checkTheModelShownIsTheModelThatRan();
   await checkTheContextReadingIsHonestAboutItsCeiling();
   await checkTheTurnIndexListsTheWholeConversation();
+  await checkClearingResetsTheFiguresAboveTheChat();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -5568,4 +5569,161 @@ async function checkTheContextReadingIsHonestAboutItsCeiling(): Promise<void> {
   unknown.root.unmount();
   panelRoot.unmount();
   frame.remove();
+}
+
+/**
+ * `/clear` resets the figures over the chat, rather than carrying them into the
+ * conversation that replaces the one they were about.
+ *
+ * Driven through the real controller and the real header, because the claim is
+ * about what someone reads after clearing: a bill of $0, no tokens, and an
+ * empty context bar. Asserting the folded state alone would pass just as well
+ * for a meter that had gone blank — and a readout that disappears when you
+ * clear looks like one that broke, not one that reset.
+ */
+async function checkClearingResetsTheFiguresAboveTheChat(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1000px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('cleared-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'cleared-check',
+    snapshot: {
+      sessionId: 'cleared-check',
+      runtime: 'claude',
+      state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: false, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: false,
+      },
+      messages: [],
+      pendingPermissions: [],
+      queued: [],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 1,
+      live: true,
+      bypassPermissions: false,
+    },
+  } as never);
+
+  const push = (event: Record<string, unknown>, seq: number): void => {
+    controller.handle({
+      type: 'chat_event',
+      sessionId: 'cleared-check',
+      event: { seq, ts: 1_700_000_000_000 + seq, ...event },
+    } as never);
+  };
+
+  // A conversation with some hours on it: expensive, and most of a large
+  // window used up — which is the state people clear from.
+  push({ t: 'msg_start', id: 'u1', role: 'user', turnId: 'turn-1' }, 1);
+  push({ t: 'block_start', msgId: 'u1', index: 0, block: { kind: 'text', text: 'go' } }, 2);
+  push({ t: 'msg_end', msgId: 'u1' }, 3);
+  push({ t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'turn-1' }, 4);
+  push({ t: 'block_start', msgId: 'a1', index: 0, block: { kind: 'thinking', text: 'weighing it' } }, 5);
+  push({
+    t: 'block_start',
+    msgId: 'a1',
+    index: 1,
+    block: { kind: 'tool', toolId: 'x1', name: 'Bash', status: 'done', durationMs: 90000 },
+  }, 6);
+  push({ t: 'block_start', msgId: 'a1', index: 2, block: { kind: 'text', text: 'done' } }, 7);
+  push({ t: 'msg_end', msgId: 'a1', usage: { inputTokens: 120000, outputTokens: 43000 } }, 8);
+  push({ t: 'turn_end', turnId: 'turn-1', usage: { costUsd: 12.4 } }, 9);
+  push({
+    t: 'usage',
+    usage: { contextWindow: 200000, contextUsed: 163000, contextWindowSource: 'agent' },
+  }, 10);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(300);
+
+  const meterText = (): string =>
+    (host.querySelector('[role="group"][aria-label="Session usage"]')?.textContent ?? '')
+      .replace(/\s+/g, ' ');
+
+  const before = meterText();
+  check(
+    'the header reads the conversation’s spend before it is cleared',
+    /\$12\.40/.test(before) && /8[12]%/.test(before),
+    before || 'no session meter on screen',
+  );
+
+  // What the turn itself says, on the rule that opens it: the counts, the
+  // clock and the money on one line.
+  const stripText = (): string =>
+    ((host.querySelector('[data-turn-id]') as HTMLElement | null)?.textContent ?? '')
+      .replace(/\s+/g, ' ');
+  const beforeSpend = stripText();
+  check(
+    'a turn shows its steps, its reasoning and its clock',
+    /1 tool/.test(beforeSpend) && /1 reasoning/.test(beforeSpend) && /\dm|\ds/.test(beforeSpend),
+    beforeSpend || 'no turn strip on screen',
+  );
+
+  controller.handle({
+    type: 'chat_turn_spend',
+    sessionId: 'cleared-check',
+    turnId: 'turn-1',
+    usage: { costUsd: 12.4 },
+  } as never);
+  await wait(200);
+  const afterSpend = stripText();
+  check(
+    'and what it cost, on the same line as the rest',
+    /\$12\.40/.test(afterSpend) && /1 tool/.test(afterSpend) && /1 reasoning/.test(afterSpend),
+    afterSpend || 'no turn strip on screen',
+  );
+
+  push({ t: 'marker', kind: 'cleared', detail: 'started a new conversation' }, 11);
+  await wait(300);
+
+  const after = meterText();
+  check(
+    'clearing puts the money back to zero',
+    /\$0\.00/.test(after) && !/12\.40/.test(after),
+    after || 'no session meter on screen',
+  );
+  check(
+    'and the tokens with it',
+    /\b0 tok/.test(after),
+    after,
+  );
+  check(
+    'and the context bar reads empty rather than still full',
+    // Not `\b0%`: the cost runs straight into the percentage — "$0.000%" — and
+    // there is no word boundary between two zeroes.
+    /0%/.test(after) && !/8[12]%/.test(after),
+    after,
+  );
+  // The bar itself, not only the number beside it: this is the piece someone
+  // reads at a glance to decide whether there is room to keep going.
+  const bar = host.querySelector('[role="progressbar"]');
+  check(
+    'the bar agrees with the figure it sits next to',
+    bar?.getAttribute('aria-valuenow') === '0',
+    `aria-valuenow=${bar?.getAttribute('aria-valuenow') ?? 'no bar'}`,
+  );
+  check(
+    'and the meter is still there to be read, rather than gone',
+    Boolean(host.querySelector('[role="group"][aria-label="Session usage"]')),
+    after || 'the header went blank',
+  );
+
+  root.unmount();
+  host.remove();
 }

@@ -417,6 +417,78 @@ describe('nothing of the old conversation outlives it', function () {
     assert.deepStrictEqual(state.pendingPermissions, []);
   });
 
+  it('takes the figures above it with it', function () {
+    // The header reads tokens, money and a context bar. All three are
+    // statements about the conversation that has just ended, and a new one
+    // opening under the old one's bill — or under a bar saying 80% of a window
+    // that is now empty — is reporting the wrong conversation.
+    const state = createTranscript({});
+    applyChatEvent(state, {
+      t: 'usage',
+      seq: 1,
+      ts: 1,
+      usage: {
+        inputTokens: 12000,
+        outputTokens: 3400,
+        totalTokens: 15400,
+        costUsd: 4.21,
+        contextUsed: 160000,
+        contextWindow: 200000,
+        contextWindowSource: 'agent',
+      },
+    });
+
+    applyChatEvent(state, { t: 'marker', kind: 'cleared', seq: 2, ts: 2 });
+
+    assert.deepStrictEqual(state.usage, {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      contextUsed: 0,
+      costUsd: 0,
+      // The model's capacity, not the conversation's spend: a new conversation
+      // on the same model has the same window, and dropping it would show
+      // "size unknown" for a size that is known.
+      contextWindow: 200000,
+      contextWindowSource: 'agent',
+    });
+  });
+
+  it('reports zero rather than nothing, so the meter resets instead of vanishing', function () {
+    // Zero is the answer here, and an empty object is not it: the meter draws
+    // nothing at all for a runtime that reported nothing, so emptying the
+    // fields would blank the header rather than reset it.
+    const state = createTranscript({});
+    applyChatEvent(state, { t: 'usage', seq: 1, ts: 1, usage: { totalTokens: 900, costUsd: 0.5 } });
+    applyChatEvent(state, { t: 'marker', kind: 'cleared', seq: 2, ts: 2 });
+
+    assert.strictEqual(state.usage.totalTokens, 0);
+    assert.strictEqual(state.usage.costUsd, 0);
+  });
+
+  it('invents no figure for a runtime that reported none', function () {
+    // The other half of the same rule. A runtime that reports no money must
+    // not come back from a clear claiming it spent $0.00 — that is an answer,
+    // and nobody gave one.
+    const state = createTranscript({});
+    applyChatEvent(state, { t: 'usage', seq: 1, ts: 1, usage: { totalTokens: 900 } });
+    applyChatEvent(state, { t: 'marker', kind: 'cleared', seq: 2, ts: 2 });
+
+    assert.strictEqual(state.usage.totalTokens, 0);
+    assert.strictEqual(state.usage.costUsd, undefined);
+  });
+
+  it('a line that is not a clear leaves the figures alone', function () {
+    // Compaction empties the agent's context, not the conversation: what it
+    // has cost so far is still what it has cost.
+    const state = createTranscript({});
+    applyChatEvent(state, { t: 'usage', seq: 1, ts: 1, usage: { totalTokens: 900, costUsd: 0.5 } });
+    applyChatEvent(state, { t: 'marker', kind: 'compacted', seq: 2, ts: 2 });
+
+    assert.strictEqual(state.usage.totalTokens, 900);
+    assert.strictEqual(state.usage.costUsd, 0.5);
+  });
+
   it('says the session ended when the replacement could not be started', async function () {
     const store = memoryStore();
     const lifecycle = [];

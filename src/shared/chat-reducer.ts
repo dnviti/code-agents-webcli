@@ -178,6 +178,12 @@ function lastTurnId(state: TranscriptState): string | undefined {
  */
 export function foldSessionUsage(usage: ChatUsage, event: ChatEvent): ChatUsage {
   switch (event.t) {
+    // A clear ends the conversation the figures were about, so they go back to
+    // nothing along with it. Handled here rather than only in the reducer
+    // because the server folds the log without building a transcript, and the
+    // two answers to "what has this cost" have to be the same one.
+    case 'marker':
+      return event.kind === 'cleared' ? clearedUsage(usage) : usage;
     // Per-message and per-turn reports are deltas, so they sum.
     case 'msg_end':
     case 'turn_end':
@@ -195,6 +201,45 @@ export function foldSessionUsage(usage: ChatUsage, event: ChatEvent): ChatUsage 
     default:
       return usage;
   }
+}
+
+/** Every token field a runtime can report, so a reset covers all of them. */
+const TOKEN_FIELDS = [
+  'inputTokens',
+  'outputTokens',
+  'cacheReadTokens',
+  'cacheWriteTokens',
+  'reasoningTokens',
+  'totalTokens',
+  'contextUsed',
+] as const;
+
+/**
+ * What the meter reads after a clear: nothing spent, nothing occupied.
+ *
+ * Zeroed rather than emptied. An empty object renders no meter at all, and a
+ * header that goes blank the moment somebody clears looks like a readout that
+ * broke rather than one that reset — where zero is the true and useful answer:
+ * this conversation has spent nothing yet. Every field the runtime had been
+ * reporting is set to zero and no field it had not is invented, so a runtime
+ * that reports no money still shows no money.
+ *
+ * The context *window* survives, because it is a fact about the model rather
+ * than about the conversation — a new conversation on the same model has the
+ * same capacity, and dropping it would replace "0%" with "size unknown" for a
+ * size that is perfectly well known.
+ */
+function clearedUsage(usage: ChatUsage): ChatUsage {
+  const next: ChatUsage = {};
+  for (const field of TOKEN_FIELDS) {
+    if (usage[field] !== undefined) next[field] = 0;
+  }
+  if (usage.costUsd !== undefined) next.costUsd = 0;
+  if (usage.contextWindow !== undefined) {
+    next.contextWindow = usage.contextWindow;
+    next.contextWindowSource = usage.contextWindowSource;
+  }
+  return next;
 }
 
 /**
@@ -560,6 +605,12 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         state.index = {};
         state.plan = [];
         state.lastError = undefined;
+        // And the figures above it go back to nothing: the tokens, the money
+        // and the context bar were all statements about the conversation that
+        // has just ended. Left running, the new conversation opens carrying the
+        // last one's bill — and a context bar reading 80% full of a window that
+        // is now empty, which is the reading somebody clears in order to fix.
+        state.usage = foldSessionUsage(state.usage, event);
         // Including the turn that was open: `/clear` is taken the moment it is
         // typed, mid-turn if need be, and the conversation it interrupted is
         // gone. Anything typed after it starts a turn of its own.
