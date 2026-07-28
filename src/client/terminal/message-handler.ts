@@ -225,16 +225,43 @@ export class MessageHandler {
     const sessionId = message.sessionId;
     if (!tabs || !sessionId) return;
 
-    const event = message.event as { t?: string; state?: string } | undefined;
+    const event = message.event as {
+      t?: string;
+      state?: string;
+      stale?: boolean;
+      fatal?: boolean;
+    } | undefined;
     if (!event) return;
 
     const background = sessionId !== this.app.currentClaudeSessionId;
 
-    if (event.t === 'permission') {
-      // The one event that is genuinely blocking: the agent has stopped and
+    if (event.t === 'permission' || event.t === 'question') {
+      // The two events that are genuinely blocking: the agent has stopped and
       // will not move again until somebody answers.
       tabs.updateTabStatus(sessionId, 'idle');
       if (background) tabs.updateUnreadIndicator(sessionId, true);
+      return;
+    }
+
+    if (event.t === 'turn_end') {
+      // The end of a turn is the *only* thing on the wire that says a
+      // conversation stopped working, for claude, for every ACP runtime and for
+      // codex in app-server mode: none of them emits a `state` event when a
+      // turn ends, and the server does not synthesise one because the log
+      // already carries this. Watching states alone left those tabs marked as
+      // running until something else happened to move them, which on a finished
+      // conversation is never.
+      //
+      // A `stale` end is the runtime letting go of work that was interrupted,
+      // with the turn carrying straight on into what interrupted it. Nothing
+      // has stopped, so nothing is reported.
+      if (!event.stale) tabs.updateTabStatus(sessionId, 'idle');
+      return;
+    }
+
+    if (event.t === 'error') {
+      // A runtime that dies says so here and never sends `turn_end` at all.
+      if (event.fatal) tabs.markSessionError(sessionId, true);
       return;
     }
 

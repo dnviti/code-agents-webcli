@@ -336,9 +336,18 @@ export class ChatTranscript {
     this.notify();
   }
 
-  apply(event: ChatEvent): void {
+  /**
+   * Fold one event in, and say whether it was new.
+   *
+   * The answer is the reducer's own: an event at or below the cursor is a
+   * replay and changes nothing. Returned rather than kept private because it is
+   * the only honest edge in this client — a reconnect redelivers the tail of
+   * the log, and a caller that wants to act *once* per thing that happened has
+   * no other way to tell the difference.
+   */
+  apply(event: ChatEvent): boolean {
     const change = applyChatEvent(this.state, event);
-    if (!change.applied) return;
+    if (!change.applied) return false;
 
     this.version++;
 
@@ -347,11 +356,12 @@ export class ChatTranscript {
       const message = this.state.messages[change.messageIndex];
       if (message) {
         this.bumpMessage(message.id);
-        return;
+        return true;
       }
     }
 
     this.bumpAll();
+    return true;
   }
 
   applyAll(events: ChatEvent[]): void {
