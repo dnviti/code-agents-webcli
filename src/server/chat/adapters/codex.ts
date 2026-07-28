@@ -1315,6 +1315,19 @@ export class CodexChatAdapter implements ChatAdapter {
     return this.delegate?.alive ?? false;
   }
 
+  /**
+   * Forwarded, or the readiness gate is dead for codex.
+   *
+   * Only the exec fallback answers this — it spawns a child per turn, and a
+   * turn sent while the previous child is still exiting is refused. Left off
+   * this facade, `ChatSession` read "ready" unconditionally for codex, so the
+   * session wrote the user's message into the conversation and moved to
+   * thinking before the send that was going to throw (#89).
+   */
+  get readyForTurn(): boolean {
+    return this.delegate?.readyForTurn !== false;
+  }
+
   async start(): Promise<void> {
     const buffered: AdapterEvent[] = [];
     this.sink = (event) => buffered.push(event);

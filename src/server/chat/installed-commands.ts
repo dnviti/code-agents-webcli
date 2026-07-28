@@ -84,6 +84,38 @@ const LOCATIONS: Record<string, Location[]> = {
 };
 
 /**
+ * Which runtimes enumerate what is installed when they report their own list.
+ *
+ * The same kind of per-runtime knowledge as `LOCATIONS`, and it belongs beside
+ * it: both are statements about what a runtime does with the skills and
+ * commands its own installer wrote to disk.
+ *
+ * It exists because "the runtime's list replaces the stand-in" is true of one
+ * runtime here and false of another. Claude's `init` names everything it will
+ * accept — 104 entries on this machine, its skills and its plugins' among them
+ * — so anything the scan adds on top is a name Claude has no command for, which
+ * is exactly what `/shadcn` was: on the menu, and delivered as ordinary prompt
+ * text to an agent that could only read it (#71). Grok on ACP announces seven
+ * built-ins and nothing about `.grok/skills`, so for grok the same replacement
+ * empties the menu milliseconds after the handshake (#73).
+ *
+ * Absent means false, which keeps a runtime nobody has checked on the safe
+ * side: its user's skills stay on the menu rather than disappearing the moment
+ * it says anything at all.
+ */
+const ENUMERATES_INSTALLED: Record<string, boolean> = {
+  claude: true,
+  grok: false,
+  pi: false,
+  codex: false,
+};
+
+/** Whether this runtime's own command list can be taken as the whole of one. */
+export function enumeratesInstalledCommands(runtime: string): boolean {
+  return ENUMERATES_INSTALLED[runtime] === true;
+}
+
+/**
  * Ceilings, so a session cannot be held up by somebody's home directory.
  *
  * The scan runs once, between the launch request and the first event, and a
