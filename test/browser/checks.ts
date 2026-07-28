@@ -6521,8 +6521,14 @@ async function checkTheFileTreeAndTheShellAreSizedForAThumb(): Promise<void> {
     const controls = paintedControls(host);
     check('the shell draws its tab strip on a phone', controls.length >= 4, `${controls.length} controls`);
 
+    // A key of the on-screen strip is judged on height alone, for the reason
+    // written where assertPhoneSurface does the same: a keyboard row cannot be
+    // nine 44px-wide keys on a 390px screen, and is aimed at vertically.
+    const inKeyStrip = (node: HTMLElement): boolean =>
+      Boolean(node.closest('[aria-label="Terminal keys"]'));
     const small = controls.filter((node) => {
       const box = laidOutSize(node);
+      if (inKeyStrip(node)) return box.height < PHONE_TARGET;
       return box.width < PHONE_TARGET || box.height < PHONE_TARGET;
     });
     check(
@@ -6544,6 +6550,7 @@ async function checkTheFileTreeAndTheShellAreSizedForAThumb(): Promise<void> {
     const crowded: string[] = [];
     for (let i = 1; i < byLeft.length; i++) {
       if (scrollBoxOf(byLeft[i]) !== scrollBoxOf(byLeft[i - 1])) continue;
+      if (inKeyStrip(byLeft[i]) && inKeyStrip(byLeft[i - 1])) continue;
       const gap = byLeft[i].getBoundingClientRect().left - byLeft[i - 1].getBoundingClientRect().right;
       if (gap >= -0.5 && gap < PHONE_GAP - 0.5) {
         crowded.push(`${describe(byLeft[i - 1])}↔${describe(byLeft[i])}=${Math.round(gap)}px`);

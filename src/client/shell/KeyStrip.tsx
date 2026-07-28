@@ -13,7 +13,7 @@ import type { MobileKey } from '../ui/mobile';
  * whatever nine equal shares of the screen come to, which is where the phone
  * checks exempt it by name.
  */
-export const KEY_STRIP_HEIGHT = 54;
+export const KEY_STRIP_HEIGHT = 56;
 
 export interface KeyStripProps {
   /** Paints Ctrl as engaged; the next input goes out as a control code. */
@@ -83,7 +83,9 @@ export function KeyStrip({ ctrlLatched, onKey, onToggleCtrl, onShowKeyboard }: K
         height: KEY_STRIP_HEIGHT,
         padding: '5px 8px',
         // Each key fills the strip's own height, so the target is the band the
-        // thumb sees rather than something inset inside it.
+        // thumb sees rather than something inset inside it. The strip is the
+        // floor plus its own padding and border, or the keys come out a pixel
+        // short of it.
         alignContent: 'stretch',
         boxSizing: 'border-box',
         borderTop: '1px solid var(--border)',
