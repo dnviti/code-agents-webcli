@@ -1,4 +1,5 @@
 import { ChatController } from './controller.js';
+import type { ChatEvent } from '../../shared/chat-events.js';
 
 /**
  * Every chat conversation this browser is watching, one controller each.
@@ -21,6 +22,21 @@ export interface ChatRegistryOptions {
    * "the visible tab moved" from "a background agent said something".
    */
   onChange: (sessionId: string) => void;
+  /**
+   * One event, as the conversation actually applied it.
+   *
+   * Separate from `onChange` because the two answer different questions.
+   * `onChange` says the surface should redraw and carries no reason, which is
+   * all a renderer needs; this carries what happened, which is what deciding
+   * whether to interrupt somebody needs — a turn that *ended* is a different
+   * fact from a transcript that is now one message longer.
+   *
+   * Only called for events the transcript accepted. A reconnect replays what
+   * the browser already holds, and re-announcing a turn that finished ten
+   * minutes ago is exactly the sort of notification that gets the feature
+   * switched off.
+   */
+  onEvent?: (sessionId: string, event: ChatEvent) => void;
 }
 
 /**
@@ -72,6 +88,7 @@ export class ChatRegistry {
     const controller = new ChatController(sessionId, {
       send: this.options.send,
       onChange: () => this.options.onChange(sessionId),
+      onEvent: (event) => this.options.onEvent?.(sessionId, event),
     });
     this.controllers.set(sessionId, controller);
     return controller;

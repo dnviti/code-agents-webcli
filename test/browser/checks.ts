@@ -29,6 +29,8 @@ import { FloatingMenu, type FloatingMenuAction } from '../../src/client/shell/Fl
 import { BottomNav } from '../../src/client/shell/BottomNav';
 import { MoreSheet } from '../../src/client/shell/MoreSheet';
 import { ChatSettingsDialog } from '../../src/client/shell/dialogs/ChatSettingsDialog';
+import { SettingsDialog } from '../../src/client/shell/dialogs/SettingsDialog';
+import { DEFAULT_NOTIFICATIONS } from '../../src/client/ui/settings';
 import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
 import { UsageDashboardDialog } from '../../src/client/shell/dialogs/UsageDashboardDialog';
 import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
@@ -279,6 +281,8 @@ async function run(): Promise<void> {
   await checkTheUsageWindowReachesBeforeThisYear();
   await checkTheEffortHistogramsAreReadableWithoutAMouse();
   await checkTheFileTreeAndTheShellAreSizedForAThumb();
+  await checkAnExpandedReasoningRowIsNeverEmpty();
+  await checkAWaitingConversationIsVisibleWithoutOpeningIt();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -2823,6 +2827,22 @@ async function checkThePhoneShellSurfacesAreUsable(): Promise<void> {
     ['the chat settings dialog', () =>
       React.createElement(ChatSettingsDialog, {
         open: true, settings: DEFAULT_CHAT_VIEW, onChange: noop, onClose: noop,
+      } as never)],
+    // The app's own settings dialog, which was never in this list: it is the
+    // longest dialog in the product and the only place several behaviours can
+    // be changed at all — including which conversations may interrupt you.
+    ['the settings dialog', () =>
+      React.createElement(SettingsDialog, {
+        open: true,
+        settings: {
+          fontSize: 14,
+          theme: 'github-dark',
+          terminalFontFamily: 'jetbrains-mono',
+          chatBypassPermissions: false,
+          notifications: DEFAULT_NOTIFICATIONS,
+        },
+        onPreview: noop, onSave: noop, onClose: noop,
+        install: 'available', onInstall: noop, onOpenRuntimeProfiles: noop,
       } as never)],
     ['the sessions dialog', () =>
       React.createElement(SessionsDialog, {
@@ -7762,4 +7782,282 @@ async function checkTheEffortHistogramsAreReadableWithoutAMouse(): Promise<void>
   root.unmount();
   frame.remove();
   window.fetch = realFetch;
+}
+
+/**
+ * Every reasoning row opens onto something, whichever agent filled it.
+ *
+ * Here rather than in a unit test because the defect *was* a rendered box:
+ * `<Markdown text="">` produces a bordered panel with nothing inside it, which
+ * every assertion about props and blocks passes straight through. What is
+ * checked is what a reader sees — that expanding a reasoning row paints words,
+ * that the collapsed row above it says something, and that the two agree (#120).
+ *
+ * The three rows are the three shapes reasoning arrives in, taken from what the
+ * runtimes were watched doing: text (pi, grok, kimi, omp), no text with a
+ * reported size (claude), and no text at all (a codex item whose trace is
+ * encrypted and which summarised nothing).
+ */
+async function checkAnExpandedReasoningRowIsNeverEmpty(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1280px;height:820px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('reasoning-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'reasoning-check',
+    snapshot: {
+      sessionId: 'reasoning-check', runtime: 'claude', state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true, commands: [],
+      },
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'how many sheep are left?' }],
+        },
+        {
+          id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: Date.now(),
+          blocks: [
+            { kind: 'thinking', text: 'ALL-BUT-NINE is the trap in this riddle.' },
+            { kind: 'thinking', text: '', tokens: 135 },
+            { kind: 'thinking', text: '' },
+            { kind: 'text', text: 'nine' },
+          ],
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/home/dev/project',
+      branch: 'main',
+      view: { ...DEFAULT_CHAT_VIEW, activityFilter: 'reasoning' },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  const rail = host.querySelector('[aria-label="Activity"]') as HTMLElement;
+  const rows = (): HTMLElement[] =>
+    Array.from(rail.querySelectorAll<HTMLElement>('button[aria-expanded]'));
+
+  check(
+    'all three reasoning rows are on the rail',
+    rows().length === 3,
+    `${rows().length} rows: ${rows().map((r) => (r.textContent || '').slice(0, 30)).join(' | ')}`,
+  );
+
+  // Every collapsed row says something before it is opened — the preview line
+  // is the only thing a reader has when deciding whether to expand it.
+  const previews = rows().map((row) => (row.textContent || '').replace(/\s+/g, ' ').trim());
+  check(
+    'the row with reasoning text previews it',
+    (previews[0] || '').includes('ALL-BUT-NINE'),
+    previews[0] || '(nothing)',
+  );
+  check(
+    'the row with no text says so instead of showing a bare label',
+    /text not reported/.test(previews[1] || '') && /135/.test(previews[1] || ''),
+    previews[1] || '(nothing)',
+  );
+  check(
+    'and so does the row that reported nothing at all',
+    /text not reported/.test(previews[2] || ''),
+    previews[2] || '(nothing)',
+  );
+
+  for (const [at, name] of [[0, 'with text'], [1, 'with a size only'], [2, 'with nothing']] as Array<[number, string]>) {
+    rows()[at].click();
+    await wait(120);
+  }
+  await wait(200);
+
+  const bodies = Array.from(rail.querySelectorAll<HTMLElement>('[data-testid="reasoning-body"]'));
+  check(
+    'expanding a reasoning row opens a panel for each',
+    bodies.length === 3,
+    `${bodies.length} panels`,
+  );
+
+  bodies.forEach((body, at) => {
+    const painted = paintedText(body);
+    const words = painted.map((entry) => entry.text).join(' ').trim();
+    check(
+      `reasoning row ${at + 1} of 3 shows words rather than an empty box`,
+      words.length > 0 && body.getBoundingClientRect().height > 0,
+      `"${words.slice(0, 90)}" h=${Math.round(body.getBoundingClientRect().height)}`,
+    );
+  });
+
+  const said = (at: number): string =>
+    paintedText(bodies[at]).map((entry) => entry.text).join(' ');
+  check(
+    'the agent’s own reasoning is what is shown where there is any',
+    said(0).includes('ALL-BUT-NINE'),
+    said(0).slice(0, 90),
+  );
+  check(
+    'a withheld reasoning block says it was withheld, and how much of it there was',
+    /not the text of it/.test(said(1)) && /135/.test(said(1)),
+    said(1).slice(0, 120),
+  );
+  check(
+    'a block the agent said nothing about is explained rather than blank',
+    /reasoned here, but not the text of it/.test(said(2)),
+    said(2).slice(0, 120),
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * A conversation that has stopped for the user is identifiable from outside it.
+ *
+ * This is the fallback the whole notification feature rests on: permission can
+ * be refused, and on iOS outside an installed app it is not even offered, so
+ * the marks inside the product are the only thing some people will ever get.
+ *
+ * It cannot be a unit test. Every claim here is about paint — that the waiting
+ * dot resolves to a different colour from the unread dot, and that the phone
+ * sheet, which is the *only* cross-session surface on a phone because the tab
+ * strip is not rendered there at all, actually draws the words at a size an eye
+ * can read. Without the app's own stylesheets every `var(--warning)` resolves
+ * to the empty string and a test on the inline style would pass on a dot that
+ * paints black.
+ */
+async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;position:absolute;top:0;left:0';
+  document.body.appendChild(host);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(TabBar, {
+      tabs: [
+        // `status: 'running'` on the waiting two is the case that matters and
+        // the one that was wrong: a tab's status is the server's "the process
+        // is alive", which stays true of an agent that stopped to ask
+        // something — so after a reload, or after the tab has been joined, a
+        // blocked conversation arrives here as running.
+        { id: 'waiting', title: 'infra', status: 'running', unread: true, attention: 'approval' },
+        { id: 'asked', title: 'docs', status: 'running', unread: true, attention: 'question' },
+        { id: 'unread', title: 'webcli', status: 'idle', unread: true },
+        { id: 'quiet', title: 'notes', status: 'running' },
+      ],
+      activeId: 'quiet',
+      onSelect: () => {},
+      onClose: () => {},
+      onNew: () => {},
+      ariaLabel: 'Sessions',
+    } as never),
+  );
+  await wait(200);
+
+  const strip = host.querySelector('[role="tablist"][aria-label="Sessions"]') as HTMLElement;
+  const tabs = Array.from(strip.querySelectorAll<HTMLElement>('[role="tab"]'));
+  const dotOf = (tab: HTMLElement): HTMLElement => tab.firstElementChild as HTMLElement;
+  const colourOf = (tab: HTMLElement): string => getComputedStyle(dotOf(tab)).backgroundColor;
+
+  const waiting = colourOf(tabs[0]);
+  const asked = colourOf(tabs[1]);
+  const unread = colourOf(tabs[2]);
+  const quiet = colourOf(tabs[3]);
+
+  check(
+    'a conversation waiting for approval is not painted as ordinary unread output',
+    waiting !== unread && /rgb/.test(waiting),
+    `approval=${waiting} unread=${unread}`,
+  );
+  check(
+    'a conversation that asked a question is told apart from one waiting for approval',
+    asked !== waiting && asked !== unread,
+    `question=${asked} approval=${waiting}`,
+  );
+  check(
+    'a stopped conversation is not painted as one that is working',
+    waiting !== quiet && asked !== quiet && /rgb/.test(quiet),
+    `approval=${waiting} question=${asked} running=${quiet}`,
+  );
+  check(
+    'and nothing pulses while it waits',
+    getComputedStyle(dotOf(tabs[0])).animationName === 'none'
+      && getComputedStyle(dotOf(tabs[3])).animationName !== 'none',
+    `waiting=${getComputedStyle(dotOf(tabs[0])).animationName} running=${getComputedStyle(dotOf(tabs[3])).animationName}`,
+  );
+  check(
+    'and the waiting dot says so in words, not only in colour',
+    dotOf(tabs[0]).getAttribute('aria-label') === 'Waiting for approval'
+      && dotOf(tabs[1]).getAttribute('aria-label') === 'Asked you a question'
+      && dotOf(tabs[2]).getAttribute('aria-label') === null,
+    `${dotOf(tabs[0]).getAttribute('aria-label')} / ${dotOf(tabs[1]).getAttribute('aria-label')}`,
+  );
+
+  root.unmount();
+  host.remove();
+
+  // The phone, where this is the only place the answer exists: AppShell renders
+  // no tab strip below the mobile breakpoint.
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const sheetRoot = createRoot(doc.body);
+  sheetRoot.render(
+    React.createElement(
+      PhoneContext.Provider,
+      { value: true },
+      React.createElement(TabSwitcherSheet, {
+        open: true,
+        tabs: [
+          { id: 'waiting', title: 'infra', status: 'running', unread: true, attention: 'approval', workingDir: '/srv/infra' },
+          { id: 'quiet', title: 'notes', status: 'running', unread: false, attention: null, workingDir: '/srv/notes' },
+        ],
+        activeId: 'quiet',
+        onSelect: () => {},
+        onCloseTab: () => {},
+        onNew: () => {},
+        onAllSessions: () => {},
+        onClose: () => {},
+      } as never),
+    ),
+  );
+  await wait(300);
+  settle(doc);
+
+  const said = paintedText(doc.body).find((entry) => entry.text === 'Waiting for approval');
+  check(
+    'the phone’s session sheet says which conversation is waiting',
+    Boolean(said),
+    said ? `${said.size}px` : paintedText(doc.body).map((entry) => entry.text).slice(0, 8).join(' | '),
+  );
+  check(
+    'and says it at a size that can be read',
+    Boolean(said) && (said as { size: number }).size >= PHONE_MIN_TEXT,
+    said ? `${said.size}px, floor ${PHONE_MIN_TEXT}px` : 'not drawn',
+  );
+
+  sheetRoot.unmount();
+  frame.remove();
 }

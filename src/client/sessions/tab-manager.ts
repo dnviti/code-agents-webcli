@@ -9,10 +9,13 @@
 
 import type { App } from '../app';
 import type { SessionInfo } from '../types';
+import type { ConversationAttention } from '../../shared/chat-alerts';
 import { clearChatSurface } from '../chat/surface';
+import { noteConversationClosed, noteConversationOpened } from '../chat/attention';
 import { forgetTerminals } from '../chat/chat-terminal';
 import { shellStore, type ShellTab } from '../shell/store';
 import { playNotificationSound, showNotification } from '../ui/notifications';
+import { takeRequestedConversation } from '../ui/notify';
 
 /** What the strip needs about a tab that `SessionInfo` does not already say. */
 interface TabRecord {
@@ -217,6 +220,7 @@ export class SessionTabManager {
           kind: '',
           workingDir: session.workingDir,
           unread: session.unreadOutput,
+          attention: session.attention ?? null,
         } satisfies ShellTab;
       })
       .filter((tab): tab is ShellTab => tab !== null);
@@ -426,6 +430,11 @@ export class SessionTabManager {
       if (session.unreadOutput) this.updateUnreadIndicator(sessionId, false);
     }
 
+    // The user is here; whatever was said about this conversation outside the
+    // app has been acted on. The tab's own mark is left alone — a conversation
+    // still waiting for an approval is still waiting for it.
+    noteConversationOpened(sessionId);
+
     if (!options.skipHistoryUpdate) {
       this.updateTabHistory(sessionId);
     }
@@ -463,6 +472,11 @@ export class SessionTabManager {
     // conversation's events; without this the socket keeps receiving them for
     // a transcript nothing will ever render.
     this.app.chats.drop(sessionId);
+    // And anything outstanding about it. Nothing will ever arrive to end the
+    // alert now — the events it would have ended on are no longer being
+    // delivered — so a closed conversation would go on being counted in the
+    // summary for the rest of the session.
+    noteConversationClosed(sessionId);
     // A conversation owns the shells opened inside it, and the server ends them
     // with it. What is left here is this page's half of them — live xterms, open
     // sockets, and a note that would have a reopened split trying to rejoin ptys
@@ -627,6 +641,14 @@ export class SessionTabManager {
    * is what the app has always done.
    */
   initialTabId(): string | null {
+    // A window opened by acting on a notification, when there was no window to
+    // bring forward. It outranks the remembered tab: the user asked for this
+    // conversation a second ago, and the remembered one is where they happened
+    // to be last time. Read once — see `takeRequestedConversation` — so a
+    // reload does not drag them back here.
+    const requested = takeRequestedConversation();
+    if (requested && this.tabs.has(requested)) return requested;
+
     const remembered = recallActiveTab();
     if (remembered && this.tabs.has(remembered)) return remembered;
     return this.getOrderedTabIds()[0] ?? this.tabs.keys().next().value ?? null;
@@ -745,6 +767,33 @@ export class SessionTabManager {
     if (!session || session.unreadOutput === hasUnread) return;
     session.unreadOutput = hasUnread;
     this.syncShell();
+  }
+
+  /**
+   * Record that a conversation is stopped, waiting on a person.
+   *
+   * Not cleared by looking at the tab, unlike unread: this is derived from the
+   * conversation's own state and stops being true when the thing it is waiting
+   * for is answered — which may happen in another window, or on a phone.
+   */
+  setAttention(sessionId: string, attention: ConversationAttention | null): void {
+    const session = this.activeSessions.get(sessionId);
+    if (!session || (session.attention ?? null) === attention) return;
+    session.attention = attention;
+    this.syncShell();
+  }
+
+  /**
+   * What a notification should call this conversation.
+   *
+   * The tab's own label rather than the raw session name, so a conversation
+   * nobody has renamed is announced as the folder it is working in instead of
+   * as "Session 7/23/2026, 10:26:39 AM".
+   */
+  conversationLabel(sessionId: string): string {
+    const record = this.tabs.get(sessionId);
+    if (record?.displayName) return record.displayName;
+    return this.activeSessions.get(sessionId)?.name || 'Conversation';
   }
 
   markSessionError(sessionId: string, hasError = true): void {

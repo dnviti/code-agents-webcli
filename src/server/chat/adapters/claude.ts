@@ -138,6 +138,26 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
   /** Indices of open tool_use blocks in the current message, cleared per message. */
   private readonly openToolIndices = new Set<number>();
   /**
+   * The thinking block currently open, and how much of its size is reported.
+   *
+   * Claude never sends the words. Probed against 2.1.220 with `--effort high`
+   * on a turn that reasoned twice: every `content_block_start` announced
+   * `{"type":"thinking","thinking":"","signature":""}`, every `thinking_delta`
+   * carried `"thinking":""`, and the closing snapshot in the `assistant`
+   * message carried an empty `thinking` beside a full signature. The reasoning
+   * is real — it is billed on `output_tokens_details.thinking_tokens` — and the
+   * only account of it on the wire is the `system`/`thinking_tokens` line
+   * running alongside, which reports a cumulative estimate *per block* (50 then
+   * 114 for the first, restarting at 50 then 152 for the second).
+   *
+   * So this pairs that side channel with the block it belongs to: `counted` is
+   * how much of the running estimate has already been emitted, and the
+   * difference goes out as a `block_delta`. Cumulative-minus-counted rather
+   * than the `estimated_tokens_delta` sitting next to it, because the two agree
+   * where both are present and this one also survives a line going missing.
+   */
+  private openThinking: { index: number; counted: number } | null = null;
+  /**
    * `task_id` → the `tool_use_id` of the call that started it.
    *
    * `task_updated` identifies the run only by `task_id`, so the pairing seen on
@@ -513,8 +533,33 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       this.handleTask(subtype, raw);
       return;
     }
+    if (subtype === 'thinking_tokens') {
+      this.handleThinkingTokens(raw);
+      return;
+    }
     // hook_started / hook_response / anything else is session-internal
     // plumbing a transcript viewer has no use for.
+  }
+
+  /**
+   * The size of a reasoning block Claude will not show the contents of.
+   *
+   * Attributed to the open thinking block, and dropped when there is none: the
+   * line names no block of its own, and guessing which one it meant would put a
+   * figure on the wrong row. Its counter restarts per block, so a smaller
+   * reading than the last one is a new block being counted rather than the
+   * model un-thinking — hence the clamp, which also keeps a negative token
+   * count out of the transcript if the ordering ever changes.
+   */
+  private handleThinkingTokens(raw: Record<string, unknown>): void {
+    const open = this.openThinking;
+    if (!open || !this.currentMsgId) return;
+    const cumulative = num(raw.estimated_tokens);
+    if (cumulative === undefined) return;
+    const added = cumulative - open.counted;
+    if (added <= 0) return;
+    open.counted = cumulative;
+    this.emit({ t: 'block_delta', msgId: this.currentMsgId, index: open.index, tokens: added });
   }
 
   /**
@@ -682,6 +727,7 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     const message = record(event.message);
     this.currentMsgId = (message && str(message.id)) || randomUUID();
     this.openToolIndices.clear();
+    this.openThinking = null;
     this.streamedThisTurn = true;
 
     if (!this.activeTurnId) {
@@ -711,6 +757,12 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       block = { kind: 'text', text: str(contentBlock.text) ?? '' };
     } else if (kind === 'thinking') {
       block = { kind: 'thinking', text: str(contentBlock.thinking) ?? '', signature: str(contentBlock.signature) };
+      // From here on, the thinking_tokens line running beside the stream is
+      // describing *this* block, counting from zero again. Replacing the whole
+      // record rather than moving an index is what makes the restart safe: a
+      // second block counting up from 50 against the first block's watermark
+      // of 114 would report nothing until it passed it. See `openThinking`.
+      this.openThinking = { index, counted: 0 };
     } else if (kind === 'tool_use') {
       const toolId = str(contentBlock.id);
       if (!toolId) return; // no way to route later patches without one
@@ -768,6 +820,9 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     // the call is about to run, not that the runtime is done with it -- the
     // result lands later, out of band, as a `user` tool_result message.
     const wasTool = this.openToolIndices.delete(index);
+    // A closing thinking block deliberately leaves `openThinking` alone: the
+    // next one replaces it with its own watermark, and a `thinking_tokens`
+    // line that trails the stop still belongs to the block it was counting.
     this.emit({
       t: 'block_end',
       msgId: this.currentMsgId,

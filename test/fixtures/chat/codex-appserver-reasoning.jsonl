@@ -1,0 +1,13 @@
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"th_120","turn":{"id":"turn_1","items":[],"status":"inProgress","error":null,"startedAt":1000,"completedAt":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"th_120","turnId":"turn_1","item":{"type":"reasoning","id":"item_r1","content":[],"summary":[]}}}
+{"jsonrpc":"2.0","method":"item/reasoning/summaryTextDelta","params":{"threadId":"th_120","turnId":"turn_1","itemId":"item_r1","summaryIndex":0,"delta":"Counting the sheep"}}
+{"jsonrpc":"2.0","method":"item/reasoning/summaryTextDelta","params":{"threadId":"th_120","turnId":"turn_1","itemId":"item_r1","summaryIndex":0,"delta":" before answering."}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"th_120","turnId":"turn_1","item":{"type":"reasoning","id":"item_r1","content":[],"summary":["Counting the sheep before answering."]}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"th_120","turnId":"turn_1","item":{"type":"reasoning","id":"item_r2","content":[],"summary":[]}}}
+{"jsonrpc":"2.0","method":"item/reasoning/textDelta","params":{"threadId":"th_120","turnId":"turn_1","itemId":"item_r2","contentIndex":0,"delta":"All but nine"}}
+{"jsonrpc":"2.0","method":"item/reasoning/textDelta","params":{"threadId":"th_120","turnId":"turn_1","itemId":"item_r2","contentIndex":0,"delta":" is the trap."}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"th_120","turnId":"turn_1","item":{"type":"reasoning","id":"item_r2","content":["All but nine is the trap."],"summary":[]}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"th_120","turnId":"turn_1","item":{"type":"reasoning","id":"item_r3","content":[],"summary":[]}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"th_120","turnId":"turn_1","item":{"type":"reasoning","id":"item_r3","content":[],"summary":[]}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"th_120","turnId":"turn_1","item":{"type":"agentMessage","id":"item_a1","text":"Nine.","phase":null,"memoryCitation":null}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th_120","turn":{"id":"turn_1","items":[],"status":"completed","error":null,"startedAt":1000,"completedAt":2000,"durationMs":1000}}}

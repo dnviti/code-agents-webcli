@@ -108,6 +108,33 @@ the app uses. It brings permission prompts, a model list and per-turn cost with
 it, and sessions recorded under the old mode still open — Grok kept the record
 all along; only its headless output was silent about it.
 
+### What the trace shows of the agent's thinking
+
+A reasoning entry sits on the trace rail beside the tool calls, and expanding it
+shows the agent's own words. **How much of them there are to show is the agent's
+decision, not this app's**, and the four runtimes fall into three groups —
+checked one at a time, because one of them working says nothing about the rest.
+
+| Runtime | Hands over | Checked against |
+| --- | --- | --- |
+| pi | the reasoning text, as it is produced | a live run at `--thinking high` |
+| Kimi Code, Oh My Pi | the reasoning text, as ACP thought chunks | live runs |
+| Grok Build | the reasoning text, as ACP thought chunks | its recorded traffic — its own API was erroring when this was written |
+| Claude Code | **the size only** — every thinking block on the wire is empty, with a signature beside it and a running token estimate on a side channel | a live run at `--effort high`, 2.1.220 |
+| Codex | its reasoning summary, where the model produces one. Where the trace is encrypted and nothing was summarised, nothing | its own schema and 22,987 recorded reasoning items, all of them encrypted — the account was over its usage limit |
+
+**An entry never expands onto an empty panel.** Where the text is missing the
+entry says which of the three silences it is: still reasoning, reasoning the
+agent measured but withheld — with the size it reported — or reasoning it said
+nothing about beyond that it happened. The count on a turn's work pill (`2
+reasoning`) counts the thinking that happened, whether or not its text came
+with it.
+
+The size shown beside a withheld block is the runtime's own live estimate and
+is marked `~` for a reason: measured against the same turns' billed thinking
+tokens it runs high (114 against 71, 152 against 118). The figures in **Usage**
+come from the runtime's accounting, never from this estimate.
+
 ### The `/` menu
 
 Typing `/` in the composer — or pressing the **Slash commands and skills**
@@ -300,6 +327,48 @@ without the browser's memory use running with it.
 The turn in progress is never treated this way. It is prepared whether it is
 folded or open, and a turn that kept running while folded shows its real,
 current state when you open it — not a snapshot from when you folded it.
+
+### Being told when a conversation needs you
+
+Agent work is slow enough that nobody watches it. A conversation you have left
+tells you when it **finishes**, when a turn **fails**, and — the one that costs
+real time — when it has **stopped to ask you** for an approval or an answer, at
+which point it does nothing at all until it is answered.
+
+None of this is guessed. A conversation knows when a turn ended and how the
+runtime said it ended, and it knows when it is blocked rather than working, so
+these come from the events themselves: no timer that decides silence means
+finished, and no matching of the words that scroll past.
+
+- **Acting on a notification opens that conversation**, whether the app is
+  already open behind something else or has to be started.
+- **The conversation you are looking at never notifies.** Looking at it means
+  its tab is the one on screen *and* the window has focus — a window sitting
+  behind your editor is not one you are watching, which is exactly the case this
+  is for.
+- **They do not pile up.** There is one notification at a time: a second
+  conversation replaces it with a summary of both, and a conversation that
+  finishes four times replaces its own.
+- **Where they are refused, the app still says so.** A waiting conversation is
+  marked in the tab strip and in the session list on a phone, in its own colour
+  and in words, and the mark stays until the thing it is waiting for is
+  answered — including when it is answered from another window or another
+  device.
+
+**Settings → Conversation notifications** switches the whole thing off, or any
+of the four events separately, and the choice survives a reload. The browser has
+to allow notifications first, which it is asked from that switch and nowhere
+else — a page that asks the moment it loads is refused outright by Firefox and
+Safari, and a refusal cannot be taken back from inside the page.
+
+**What notifications say** turns the detail off: on, they name the conversation
+and quote what happened; off, they say only that a conversation needs you.
+Notifications are read on lock screens and on shared devices, outside the
+boundary that signing in protects, so what leaves the app is your choice.
+
+Reaching a phone whose screen is off needs a push subscription and is not part
+of this yet; today a notification reaches another tab, another window, another
+application, and the installed app while it is open in the background.
 
 ## Runtime profiles
 

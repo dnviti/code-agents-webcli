@@ -138,6 +138,7 @@ function tabItems(tabs: ShellTab[]): TabItem[] {
     title: tab.title,
     status: tab.status === 'running' ? 'running' : tab.status === 'error' ? 'error' : 'idle',
     unread: tab.unread,
+    attention: tab.attention,
     tooltip: tab.workingDir ?? tab.title,
   }));
 }
@@ -408,7 +409,10 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           id: 'sessions',
           label: 'Sessions',
           icon: 'layout-list',
-          badge: state.tabs.some((t) => t.unread && t.id !== state.activeId),
+          // A conversation that has stopped for an approval counts as much as
+          // one with unread output: on a phone this destination badge is the
+          // only cross-session signal there is — the tab strip is not rendered.
+          badge: state.tabs.some((t) => (t.unread || t.attention !== null) && t.id !== state.activeId),
           onGo: () => closeDialogs({ tabs: true }),
         },
       ]
@@ -425,7 +429,10 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           id: 'sessions',
           label: 'Sessions',
           icon: 'layout-list',
-          badge: state.tabs.some((t) => t.unread && t.id !== state.activeId),
+          // A conversation that has stopped for an approval counts as much as
+          // one with unread output: on a phone this destination badge is the
+          // only cross-session signal there is — the tab strip is not rendered.
+          badge: state.tabs.some((t) => (t.unread || t.attention !== null) && t.id !== state.activeId),
           onGo: () => closeDialogs({ tabs: true }),
         },
       ];
