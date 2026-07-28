@@ -231,6 +231,32 @@
   figures above it, which it previously did not.
 
 ### Fixed
+- **What a conversation has cost stops falling while you are still in it.** The
+  figure was never stored: it was re-added up from the log each time a browser
+  asked for the conversation, and what a browser is given is the *tail* of it —
+  the last forty messages, which is the right amount of transcript to open and
+  the wrong basis for a total. Claude reports the money at the end of a turn, so
+  every turn older than that window was not merely excluded, it was never read
+  from disk. The number the meter showed was therefore the cost of the recent
+  part of the conversation, and it was re-derived — and dropped — on every
+  reconnect, tab switch and reload. Nothing about it looked like an event you
+  could point at, which is why it read as resetting at random; scrolling back
+  through the history did not restore it either.
+
+  A conversation's spend is now read from the whole conversation, the way its
+  turn index already is: it is a property of what was recorded, so nothing that
+  happens to be in a browser's window may decide it. One streamed pass of the
+  log per conversation, and every event after it keeps the total current, so a
+  rejoin costs no more than it did. There is one honest limit, unchanged: a log
+  long enough to have had its head trimmed cannot say what the trimmed turns
+  cost.
+
+  Separately, on the ACP runtimes — grok, qwen, kimi, gemini — a report that
+  carried the context window and no money **erased the money already spent**.
+  Those runtimes report running totals, whose fields replace rather than sum,
+  and the absent cost was being sent as an explicit "no value" rather than left
+  out. A report now states only what it actually measured.
+
 - **Clearing a conversation starts a new one in the same tab, and is a button
   on the composer.** (#69) `/clear`, `/new` and `/reset` did give the agent a
   genuinely fresh memory, and left the tab looking closed: the process being
