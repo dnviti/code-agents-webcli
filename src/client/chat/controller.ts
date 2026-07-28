@@ -1,5 +1,6 @@
 import {
   ChatAttachment,
+  ChatCapabilities,
   ChatEvent,
   ChatSnapshot,
   ChatTurnIndexEntry,
@@ -206,6 +207,32 @@ export class ChatController {
         // message rather than assumed, so the badge cannot claim a mode the
         // process is not running in.
         this.transcript.setBypassing(message.bypassPermissions === true);
+        // And what the thing that just started can do, which nothing else on
+        // this path will say. The launch has carried them all along and this
+        // handler read past them: a conversation resumed from history kept the
+        // capabilities its snapshot arrived with, so a browser that hydrated
+        // with none — every conversation longer than the replay window, before
+        // the store learned to recover them (#30) — stayed without a command
+        // menu, an attachment control or a working stop button until the user
+        // sent a throwaway message.
+        //
+        // Nothing re-requests a snapshot here, and that is not an oversight to
+        // route around: the surface is already 'chat', so no re-subscribe
+        // fires, and hydrating a live conversation from the log to learn one
+        // field would throw away everything arriving on it.
+        //
+        // All of them except the command list, when the conversation already
+        // holds one. What a launch announces there is this app's stand-in —
+        // the built-ins plus whatever the disk scan found — and claude does not
+        // publish its real list until the `init` of its first turn, so folding
+        // the stand-in in on every relaunch would take the runtime's own names
+        // back off the menu and put names it has no command for back on.
+        const capabilities = message.capabilities as Partial<ChatCapabilities> | undefined;
+        if (capabilities) {
+          const held = this.transcript.capabilities.commands;
+          const { commands, ...rest } = capabilities;
+          this.transcript.setCapabilities(held && held.length ? rest : capabilities);
+        }
         this.modelOverride =
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
         this.effortOverride =

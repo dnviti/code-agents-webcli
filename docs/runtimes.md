@@ -114,16 +114,22 @@ Typing `/` in the composer — or pressing the **Slash commands and skills**
 button beside it — lists what the conversation can run, from the moment it
 opens rather than after a first message has been sent.
 
-**What the runtime says about itself wins, for the commands it names.** The ACP
-agents (Grok Build, Kimi Code, Oh My Pi) volunteer their list as the session
-starts; Claude Code sends its own with the first turn. When that list arrives it
-*replaces* the stand-in for anything it names.
+**What the runtime says about itself wins.** The ACP agents (Grok Build, Kimi
+Code, Oh My Pi) volunteer their list as the session starts; Claude Code sends
+its own with the first turn. When that list arrives it *replaces* the stand-in.
 
-What it does not replace is what is installed on disk. Grok announces seven
+For Claude Code that is the end of it. Its list names everything it accepts —
+your skills, your project commands and every enabled plugin's among them — so
+anything kept on top of it would be a name Claude has no command for: the menu
+would offer it, and picking it would send the text to the agent as an ordinary
+message, with nothing on the other end to run it.
+
+Grok is why the rule is per-runtime rather than absolute. It announces seven
 built-ins (`compact`, `context`, and so on) and says nothing about your
 `.grok/skills`, so a wholesale replacement would take your own skills off the
-menu a few milliseconds after the conversation opened. They are added back after
-the runtime has had its say.
+menu a few milliseconds after the conversation opened. There — and only for the
+runtimes that leave their skills out of their own list — what was found on disk
+is added back after the runtime has had its say.
 
 Until that list arrives — and permanently, for Codex and pi, which never report
 one — the menu is only what is installed for the session, read from the

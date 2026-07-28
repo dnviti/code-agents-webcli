@@ -321,6 +321,21 @@ export class ChatTranscript {
     this.notify();
   }
 
+  /**
+   * Fold in what a launch announced about the runtime behind this conversation.
+   *
+   * A merge, exactly as a `capabilities` event is one, and for a reason that
+   * only shows up on a relaunch: what a process can say about itself at the
+   * moment it starts is less than the conversation already knows — claude
+   * publishes its slash commands in the `init` of its first turn — so replacing
+   * the set wholesale would empty the picker at the moment the runtime came
+   * back.
+   */
+  setCapabilities(capabilities: Partial<ChatCapabilities>): void {
+    this.state.capabilities = { ...this.state.capabilities, ...capabilities };
+    this.notify();
+  }
+
   apply(event: ChatEvent): void {
     const change = applyChatEvent(this.state, event);
     if (!change.applied) return;

@@ -3,6 +3,47 @@
 ## [Unreleased]
 
 ### Fixed
+- **"Send this one now" keeps the message it is sending.** On a runtime that
+  spawns a process per turn, this cut the running work short and then lost what
+  the user had typed: the interrupt only signals the child, so the send that
+  followed was refused while it was still exiting, and the promoted message —
+  already out of the queue — was gone. What was left on screen was the turn cut
+  short, the message printed as though it had been asked, and one line of error;
+  then the *next* queued message was delivered, so the agent answered a
+  follow-up written on the assumption the correction had landed. The promotion
+  now waits for the runtime the way every other delivery does, and a delivery
+  that fails puts the message back at the head of the line with the reason on
+  it, which is what makes it retryable rather than retypable.
+
+- **A cleared conversation is no longer offered back with its old memory.** The
+  clear dropped the runtime's session id from the running session and nowhere
+  else. The record that outlives the process kept it — its writer could not
+  express "there is no id" — so a conversation cleared and then left alone came
+  back after a server restart showing the emptied transcript above an offer to
+  pick it up where it left off, and taking that offer handed the agent every
+  turn the user had cleared to be rid of. The record is told now, and told after
+  the log it lived in has actually been dropped: a record with no id sends the
+  server to the head of the log for one, so the other order would have been
+  undone by the very next rejoin.
+
+- **A resumed conversation has its commands, attachments and stop button
+  straight away.** A snapshot took what the runtime can do from the replayed
+  tail alone, and Claude announces that once, at the head of the log — so any
+  conversation past the replay window came back with none of it: no slash menu,
+  no attachment control, an inert stop button and empty model and effort menus,
+  until the user sent a throwaway message or switched tabs and back. The same
+  conversation a few messages shorter came back complete, so the failure looked
+  arbitrary. What the runtime said is now read from the whole log, and a
+  relaunch no longer throws away the capabilities it has been carrying all
+  along.
+
+- **The runtime's own command list is the command list.** A scan of what is
+  installed on disk was merged back over it for every runtime, so on Claude a
+  skill it does not accept — a disabled plugin's, a directory it rejects —
+  stayed in the `/` menu, and choosing it sent text no command matches. The
+  merge is kept exactly where it is needed: grok announces seven built-ins and
+  nothing about `.grok/skills`, and taking it literally there would empty a
+  user's own menu milliseconds after the handshake.
 - **A slash command Claude answers itself now leaves an answer on screen.** Some
   commands — `/effort`, `/model` — are handled by the CLI without going near the
   model, and a locally-handled command emits no streaming events at all. This

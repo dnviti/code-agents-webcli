@@ -200,6 +200,16 @@ export function chatCapableRuntimes(): string[] {
  * during their handshake, so a live session's capabilities always win over
  * this. It exists so the launcher can grey out a Chat button honestly rather
  * than starting a process to find out.
+ *
+ * Not the answer for a conversation whose process is gone, which is the obvious
+ * place to reach for it and was the wrong one (#30). This table is a runtime's
+ * shape, and what goes missing from a resumed conversation is everything that
+ * is not: the slash commands claude found in *this* project, the model list a
+ * probe went and read, the effort ladder. Those were recorded in the log when
+ * the runtime said them, so the store reads them back out of it — see
+ * `sessionCapabilities` in store.ts. A row from this table would have restored
+ * none of the three, and would have stated the rest on behalf of a process that
+ * is not running to be asked.
  */
 export function advertisedChatCapabilities(runtime: string): ChatCapabilities {
   const entry = RUNTIMES[runtime];

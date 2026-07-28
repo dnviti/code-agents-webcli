@@ -2,13 +2,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { SessionRecord } from '../types.js';
 import {
+  ChatCapabilities,
   ChatEvent,
   ChatSnapshot,
   ChatTurnIndexEntry,
   ChatUsage,
   NO_CHAT_CAPABILITIES,
 } from '../../shared/chat-events.js';
-import { applyChatEvent, createTranscript, foldSessionUsage } from '../../shared/chat-reducer.js';
+import {
+  applyChatEvent,
+  createTranscript,
+  foldCapabilities,
+  foldSessionUsage,
+} from '../../shared/chat-reducer.js';
 import { TurnOutcome, turnOutcomeOf } from '../../shared/turn-outcome.js';
 import { TurnBoundary, openTurnAfter, openTurnBefore } from '../../shared/turn-boundaries.js';
 
@@ -189,6 +195,16 @@ interface SessionState {
   turnBoundaries?: TurnBoundary[];
   /** Highest seq already folded into `turnBoundaries`. */
   turnBoundarySeq: number;
+  /**
+   * What the runtime said it could do, kept here for the same reason `usage`
+   * is: it is a fact about the conversation, and it is recorded at the top of
+   * one rather than anywhere near its end.
+   *
+   * Undefined means "not read yet".
+   */
+  capabilities?: ChatCapabilities;
+  /** Highest seq already folded into `capabilities`. */
+  capabilitySeq: number;
 }
 
 export interface ChatStoreLike {
@@ -364,6 +380,7 @@ export class ChatStore implements ChatStoreLike {
       logSize: 0,
       usageSeq: 0,
       turnBoundarySeq: 0,
+      capabilitySeq: 0,
     };
 
     // Sized before the index is read, and unconditionally: it is what tells
@@ -626,6 +643,17 @@ export class ChatStore implements ChatStoreLike {
       }
     }
 
+    // And what the runtime says it can do, on the same terms: a relaunch
+    // introduces itself again part way down the log, and the alternative is
+    // re-reading everything above it to learn what it just said.
+    if (state.capabilities) {
+      for (const event of events) {
+        if (event.seq <= state.capabilitySeq) continue;
+        state.capabilities = foldCapabilities(state.capabilities, event);
+        state.capabilitySeq = event.seq;
+      }
+    }
+
     if (state.count > this.maxEvents || state.logSize > MAX_LOG_BYTES / 2) {
       await this.trimHead(base, state);
     }
@@ -656,6 +684,14 @@ export class ChatStore implements ChatStoreLike {
     await this.enqueue(base, async () => {
       const state = await this.loadState(base);
       await this.dropOldest(base, state, seq - state.firstSeq);
+      // What the runtime said it could do belongs to the conversation that has
+      // just been dropped, and this process would go on answering with it: the
+      // cache is keyed on the log having grown, and a truncation leaves the
+      // cursor where it was. A retention trim is the other caller of
+      // `dropOldest` and does not want this — nothing about the runtime changed
+      // there — so it is forgotten here rather than down inside the drop.
+      state.capabilities = undefined;
+      state.capabilitySeq = 0;
     });
   }
 
@@ -1141,6 +1177,49 @@ export class ChatStore implements ChatStoreLike {
   }
 
   /**
+   * What the runtime told this conversation it could do, over all of it.
+   *
+   * Read from the whole log, and it has to be: the tail is a window over the
+   * last forty messages, and the single event carrying a runtime's capabilities
+   * is emitted when that runtime *starts* — for claude, in the `init` of its
+   * first turn, which on a conversation of any length is hundreds of events
+   * above the window. Taken from the replay alone, a resumed conversation of
+   * twenty-odd exchanges came back with no slash commands, no attachment
+   * control, no model or effort menu and a stop button that could not stop a
+   * running turn, while the same conversation ten messages shorter came back
+   * whole — a failure with no explanation the user could see (#30).
+   *
+   * The fold is the reducer's, not a second reading of it: a `session` event is
+   * a runtime introducing itself and replaces the set, a `capabilities` event
+   * adds to it. That matters on a conversation that has been resumed under a
+   * runtime whose command list has changed since, where a merge would go on
+   * offering commands the process no longer has.
+   *
+   * Cached exactly like `sessionUsage`, with the same limit: a log whose head
+   * has been trimmed cannot report what a runtime said before the trim, so a
+   * conversation first opened after its own head was dropped has only what it
+   * said since.
+   */
+  private async sessionCapabilities(
+    base: string,
+    state: SessionState,
+    stats: ChatStats,
+  ): Promise<ChatCapabilities> {
+    if (state.capabilities && state.capabilitySeq >= stats.cursor) return state.capabilities;
+
+    let capabilities: ChatCapabilities = { ...NO_CHAT_CAPABILITIES };
+    let seq = 0;
+    await this.scanLog(base, state, (event) => {
+      capabilities = foldCapabilities(capabilities, event);
+      if (event.seq > seq) seq = event.seq;
+    });
+
+    state.capabilities = capabilities;
+    state.capabilitySeq = Math.max(seq, stats.cursor);
+    return capabilities;
+  }
+
+  /**
    * Every point in the log at which the open turn changed.
    *
    * What a windowed read needs and cannot work out for itself: a snapshot
@@ -1219,7 +1298,13 @@ export class ChatStore implements ChatStoreLike {
       // is applied against the turn that was open when it happened, and the
       // replay lands exactly where a full one would.
       const boundaries = await this.turnBoundaries(base, state, stats);
-      const transcript = createTranscript(NO_CHAT_CAPABILITIES);
+      // Seeded with what the conversation recorded rather than with nothing,
+      // for the same reason its usage is taken from the log: the window cannot
+      // be a basis for a fact about the session. Anything the window does carry
+      // is applied over this and lands on the same answer.
+      const transcript = createTranscript({
+        ...(await this.sessionCapabilities(base, state, stats)),
+      });
       let at = 0;
       let open: string | null = null;
       for (const event of events) {

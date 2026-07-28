@@ -24,7 +24,7 @@ export interface ChatManagerDeps {
   /** Passed through to every session; see ChatSessionDeps.onLifecycle. */
   onLifecycle?: (
     sessionId: string,
-    change: { nativeSessionId?: string; exited?: boolean },
+    change: { nativeSessionId?: string | null; exited?: boolean },
   ) => void;
   /** Passed through to every session; see ChatSessionDeps.usage. */
   usage?: ChatUsageSink;

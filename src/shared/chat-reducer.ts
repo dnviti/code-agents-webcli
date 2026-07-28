@@ -170,6 +170,28 @@ function lastTurnId(state: TranscriptState): string | undefined {
 }
 
 /**
+ * Fold one event's word about the runtime into what is known so far.
+ *
+ * Split out for the same reason as the usage fold below, and with the same
+ * hazard behind it: a snapshot replays only the tail, but what a runtime can do
+ * is announced once at the head, so the server has to read this from the whole
+ * log without building a transcript. Two implementations would be two answers
+ * to "is there a command menu" for the same conversation.
+ *
+ * An introduction replaces — a process that has just started is describing
+ * itself, not adding to whatever the last one said — while a later report
+ * merges into it.
+ */
+export function foldCapabilities(
+  capabilities: ChatCapabilities,
+  event: ChatEvent,
+): ChatCapabilities {
+  if (event.t === 'session') return { ...event.capabilities };
+  if (event.t === 'capabilities') return { ...capabilities, ...event.capabilities };
+  return capabilities;
+}
+
+/**
  * What a conversation has spent, folded one event at a time.
  *
  * Split out of the reducer's own cases so there is exactly one answer to it.
@@ -313,14 +335,14 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
 
   switch (event.t) {
     case 'session': {
-      state.capabilities = event.capabilities;
+      state.capabilities = foldCapabilities(state.capabilities, event);
       if (event.nativeSessionId) state.nativeSessionId = event.nativeSessionId;
       if (event.model) state.model = event.model;
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
     case 'capabilities': {
-      state.capabilities = { ...state.capabilities, ...event.capabilities };
+      state.capabilities = foldCapabilities(state.capabilities, event);
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 

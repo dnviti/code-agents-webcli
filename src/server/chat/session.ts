@@ -27,7 +27,7 @@ import {
 } from '../../shared/chat-events.js';
 import { isClearingCommand, mergeSlashCommands } from '../../shared/slash-commands.js';
 import { installedModels } from './installed-models.js';
-import { listInstalledCommands } from './installed-commands.js';
+import { enumeratesInstalledCommands, listInstalledCommands } from './installed-commands.js';
 import { AdapterEvent, ChatAdapter, ChatAdapterOptions } from './adapter.js';
 import {
   PermissionAsk,
@@ -91,10 +91,14 @@ export interface ChatSessionDeps {
    * that is thinking and a chat that is gone. True when the process ends;
    * false when a conversation replaced in place has one running again, which
    * is the only way a record that has been marked finished comes back.
+   *
+   * `nativeSessionId` is null for a conversation that no longer has one, which
+   * is a fact the record has to be able to hold: leaving out the field says
+   * "nothing to report about the id", and a clear has something to report (#43).
    */
   onLifecycle?: (
     sessionId: string,
-    change: { nativeSessionId?: string; exited?: boolean },
+    change: { nativeSessionId?: string | null; exited?: boolean },
   ) => void;
   /**
    * Where finished work is filed.
@@ -647,6 +651,21 @@ export class ChatSession {
         const message = error instanceof Error ? error.message : String(error);
         console.warn(`chat ${this.ref.id}: could not truncate the cleared conversation: ${message}`);
       }
+
+      // And nothing goes on naming the conversation that was just dropped. The
+      // replacement announces an id of its own on its first turn and not
+      // before, so a conversation cleared and then left alone kept the pre-clear
+      // id: reopening it after a server restart showed the emptied transcript
+      // over a banner offering to resume, and taking that offer spawned the
+      // runtime against the very memory the clear had destroyed (#43).
+      //
+      // Said *after* the truncation on purpose. The record is not the only
+      // place that answers this question — a record with no id sends the
+      // manager and the sessions route to the head of the log for one — so
+      // clearing the record while the old `session` event was still readable
+      // would have the id put straight back on the next rejoin.
+      this.nativeSessionId = null;
+      this.deps.onLifecycle?.(this.ref.id, { nativeSessionId: null });
     }
 
     this.setState('starting');
@@ -701,20 +720,26 @@ export class ChatSession {
       ts: (event as { ts?: number }).ts ?? Date.now(),
     } as ChatEvent;
 
-    // What is installed on disk is not the runtime's to forget.
+    // What is installed on disk is not the runtime's to forget — unless the
+    // runtime is one that lists it itself.
     //
     // A runtime that reports its own command list replaces whatever was there,
     // which is right for the runtimes that report everything they accept — and
     // wrong for the one that does not. Grok on ACP announces seven built-ins
     // (`compact`, `context`, ...) and nothing about the skills and project
     // commands sitting in `.grok/skills`, so a wholesale replacement dropped
-    // every one of them from the menu the moment the handshake finished.
+    // every one of them from the menu the moment the handshake finished (#73).
+    // Claude names every skill and plugin command it accepts, so putting the
+    // scan back on top of that could only add names Claude has no command for
+    // — picking one sent it as prose and nothing ran (#71). Which of the two a
+    // runtime is, is knowledge about the runtime and is kept with the rest of
+    // it, in `installed-commands.ts`.
     //
     // Merged on the event itself for the same reason the `questions` flag above
     // is: this list is read from the log by the browser and by any snapshot
     // replayed later, so a merge applied only to the local copy would be a menu
     // that differs between the server and every client reading it.
-    if (this.installedCommands.length > 0) {
+    if (this.installedCommands.length > 0 && !enumeratesInstalledCommands(this.runtime)) {
       if (stamped.t === 'session' && stamped.capabilities.commands) {
         stamped.capabilities = {
           ...stamped.capabilities,
@@ -1150,15 +1175,20 @@ export class ChatSession {
    * are worth the interruption, and until this existed the only way to deliver
    * one was the stop button, which discards everything else that was waiting.
    *
-   * So: the chosen turn leaves the line, whatever is in flight is cut short,
-   * and **the rest of the queue stays exactly as it was**, in order, to be
-   * delivered after this turn ends like any other.
+   * So: whatever is in flight is cut short, the chosen turn is handed over —
+   * or, when the runtime has not let go of the work yet, put back at the head
+   * of the line so it is the next thing delivered — and **the rest of the queue
+   * stays exactly as it was**, in order, behind it.
    *
-   * False when there is nothing to promote — an unknown id (already delivered,
-   * already withdrawn, or a second click on the same row), a session that is no
-   * longer running, or a delivery already under way. Silent rather than loud:
-   * every one of those is a race the user cannot lose in a way that matters,
-   * and the queue broadcast that follows tells every browser what is true now.
+   * False when the runtime was not handed the turn on this call — nothing to
+   * promote (an unknown id: already delivered, already withdrawn, or a second
+   * click on the same row), a session that is no longer running, a delivery
+   * already under way, or a runtime that has not finished letting go of the
+   * turn it was just told to abandon. Only the last of those leaves the message
+   * on its way out, at the head of the line. Silent rather than loud either
+   * way: every one of them is a race the user cannot lose in a way that
+   * matters, and the queue broadcast that follows tells every browser what is
+   * true now.
    */
   async sendQueuedNow(id: string): Promise<boolean> {
     if (!this.adapter?.alive || this.state === 'exited' || this.state === 'error') return false;
@@ -1204,11 +1234,49 @@ export class ChatSession {
         // conversation rather than to the turn that was stopped.
         this.ingest({ t: 'marker', kind: 'interrupted', detail: quoteTurn(turn.text) });
       }
+
+      // The gate `send` and the drain have had since #89, missing from the one
+      // path that hands a turn over without ever having asked. On pi it is not
+      // a race but the rule: `interrupt()` signals the child and returns, and
+      // `readyForTurn` stays false until that child's `exit` — a macrotask
+      // away, so nothing between here and the send could change the answer and
+      // the send threw every single time, taking the promoted message with it
+      // (#70). Parked at the head instead, the way `send` parks a turn the
+      // adapter cannot take yet: the drain's poll hands it over the moment the
+      // process lets go, milliseconds later.
+      //
+      // The interrupt stands. The work is already dead and the marker above
+      // already quotes this message, so the one outcome that is not acceptable
+      // here is the message going away with the turn it stopped.
+      if (!this.adapterReady) {
+        // And it arrives as its own turn rather than as a steer: the work it
+        // was going to redirect is over by the time the runtime can take it, so
+        // the `turn_end` that closes that work really does close it.
+        this.staleTurnEndUntil = null;
+        this.queue = [turn, ...this.queue];
+        this.publishQueue();
+        // Armed here rather than left to the drain, which returns before it
+        // reaches this on a session that is not idle yet. Without it a child
+        // that ignores the signal and never exits leaves the message sitting at
+        // the head with no error on it — and a turn with no error is not one
+        // the retry control will touch, so it would be kept and unreachable.
+        this.waitForReady();
+        return false;
+      }
+
       await this.deliver({ text: turn.text, attachments: turn.attachments }, steering ?? undefined);
       return true;
     } catch (error: unknown) {
+      // Back in the line with the reason on it, exactly like a turn that failed
+      // on its way out of the queue — same failure, same recovery. Writing the
+      // error and stopping there lost the message outright: it had left the
+      // queue before the interrupt, so nothing on screen still held what the
+      // user had typed and there was nothing to retry (#70). The ack window
+      // goes for the same reason it does above — nothing is going to carry on
+      // the turn this stopped.
+      this.staleTurnEndUntil = null;
       const message = error instanceof Error ? error.message : String(error);
-      this.ingest({ t: 'error', message: `could not send that message: ${message}` });
+      this.failQueuedTurn(turn, message, { putBack: true });
       return false;
     } finally {
       this.draining = false;
@@ -1493,6 +1561,8 @@ export class ChatSession {
       await this.stop();
       // Stale until the new process's own `init` event reports its id — cleared
       // up front so nothing reads the old conversation's id in the meantime.
+      // The record hears it too, but from inside `start`, once the log this
+      // one lived in has actually been dropped (#43).
       this.nativeSessionId = null;
       await this.start({ ...options, resumeSessionId: undefined, startFresh: true });
     } catch (error: unknown) {
