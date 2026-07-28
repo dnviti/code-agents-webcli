@@ -345,6 +345,126 @@ describe('ChatStore', function () {
       assert.ok(snapshot.replayFrom > snapshot.firstSeq, 'there is older history to page');
     });
 
+    it('files a half-loaded turn under the turn it belongs to, not the runtime’s name for it', async function () {
+      // The conversation on screen when this was reported: one long turn, the
+      // window cut past the question that opened it, and the index showing a
+      // row reading "no prompt" — spinning — beside the finished turn it was
+      // actually part of. The messages had been filed under the runtime's own
+      // id for the turn, which is an id the recorded index has never heard of,
+      // so nothing downstream could repair the label either.
+      const capped = new ChatStore({ storageDir: dir, snapshotMinMessages: 3 });
+      const session = { id: 'midturn', ownerUserId: 1 };
+      const events = [];
+      let seq = 1;
+      events.push({ t: 'msg_start', seq: seq++, ts: 1, id: 'ask', role: 'user', turnId: 'turn-app' });
+      events.push({
+        t: 'block_start', seq: seq++, ts: 1, msgId: 'ask', index: 0,
+        block: { kind: 'text', text: 'why is the cost reset?' },
+      });
+      events.push({ t: 'msg_end', seq: seq++, ts: 1, msgId: 'ask' });
+      // The agent answers over many messages, under a name of its own — which
+      // is what every adapter here actually does.
+      for (let i = 0; i < 10; i++) {
+        events.push({ t: 'msg_start', seq: seq++, ts: 1, id: `a${i}`, role: 'assistant', turnId: 'claude-run-1' });
+        events.push({ t: 'msg_end', seq: seq++, ts: 1, msgId: `a${i}` });
+      }
+      capped.append(session, events);
+
+      const snapshot = await capped.snapshot(session);
+      assert.ok(snapshot.messages.length < 11, 'the window has to have cut the question');
+      assert.ok(
+        snapshot.messages.every((m) => m.turnId === 'turn-app'),
+        `a windowed replay must resume the open turn, got ${JSON.stringify(
+          snapshot.messages.map((m) => m.turnId),
+        )}`,
+      );
+      // And it says what is still open, so the next event to arrive live joins
+      // that turn instead of opening one nobody asked anything in.
+      assert.strictEqual(snapshot.currentTurnId, 'turn-app');
+    });
+
+    it('does not turn an interruption line carried from further back into a turn', async function () {
+      // Markers are not cut at the message boundary — a compaction or an
+      // interruption is the reason the conversation reads as it does, so the
+      // window carries them however old they are. But they *are* messages, and
+      // replayed with no turn open one becomes a turn of its own: a second row
+      // in the index, numbered 1 again, for a line the turn above it already
+      // covers.
+      const capped = new ChatStore({ storageDir: dir, snapshotMinMessages: 2 });
+      const session = { id: 'marked', ownerUserId: 1 };
+      const events = [];
+      let seq = 1;
+      events.push({ t: 'msg_start', seq: seq++, ts: 1, id: 'ask', role: 'user', turnId: 'turn-app' });
+      events.push({ t: 'msg_end', seq: seq++, ts: 1, msgId: 'ask' });
+      events.push({ t: 'marker', seq: seq++, ts: 1, kind: 'interrupted', detail: 'stop' });
+      for (let i = 0; i < 6; i++) {
+        events.push({ t: 'msg_start', seq: seq++, ts: 1, id: `a${i}`, role: 'assistant', turnId: 'claude-run-1' });
+        events.push({ t: 'msg_end', seq: seq++, ts: 1, msgId: `a${i}` });
+      }
+      capped.append(session, events);
+
+      const snapshot = await capped.snapshot(session);
+      const marker = snapshot.messages.find((m) => m.role === 'system');
+      assert.ok(marker, 'the line has to survive the window');
+      assert.strictEqual(marker.turnId, 'turn-app', 'and belongs to the turn it was drawn in');
+    });
+
+    it('names a turn from the steer it answers, in conversations already recorded', async function () {
+      // History only: promoting a message past the queue used to file it into
+      // the turn it interrupted, which that interrupt then ended — leaving the
+      // question in a finished turn and the work in one with no prompt at all.
+      // The words are the user's own and they are right there in the log.
+      const session = { id: 'steered', ownerUserId: 1 };
+      const events = [];
+      let seq = 1;
+      events.push({ t: 'msg_start', seq: seq++, ts: 1, id: 'ask', role: 'user', turnId: 'turn-app' });
+      events.push({
+        t: 'block_start', seq: seq++, ts: 1, msgId: 'ask', index: 0,
+        block: { kind: 'text', text: 'refactor the auth module' },
+      });
+      events.push({ t: 'marker', seq: seq++, ts: 1, kind: 'interrupted', detail: 'no —' });
+      events.push({
+        t: 'msg_start', seq: seq++, ts: 1, id: 'steer', role: 'user',
+        turnId: 'turn-app', steer: true,
+      });
+      events.push({
+        t: 'block_start', seq: seq++, ts: 1, msgId: 'steer', index: 0,
+        block: { kind: 'text', text: 'no — the staging database' },
+      });
+      events.push({ t: 'turn_end', seq: seq++, ts: 1, turnId: 'claude-run-1', stopReason: 'end_turn' });
+      events.push({ t: 'msg_start', seq: seq++, ts: 1, id: 'a1', role: 'assistant', turnId: 'claude-run-2' });
+      store.append(session, events);
+
+      const index = await store.turnIndex(session);
+      assert.deepStrictEqual(
+        index.turns.map((t) => t.label),
+        ['refactor the auth module', 'no — the staging database'],
+      );
+    });
+
+    it('says which turn a page of history starts inside', async function () {
+      const session = { id: 'paged', ownerUserId: 1 };
+      const events = [];
+      let seq = 1;
+      events.push({ t: 'msg_start', seq: seq++, ts: 1, id: 'ask', role: 'user', turnId: 'turn-app' });
+      events.push({ t: 'msg_end', seq: seq++, ts: 1, msgId: 'ask' });
+      events.push({ t: 'msg_start', seq: seq++, ts: 1, id: 'a1', role: 'assistant', turnId: 'claude-run-1' });
+      events.push({ t: 'msg_end', seq: seq++, ts: 1, msgId: 'a1' });
+      events.push({ t: 'turn_end', seq: seq++, ts: 1, turnId: 'claude-run-1', stopReason: 'end_turn' });
+      events.push({ t: 'msg_start', seq: seq++, ts: 1, id: 'ask2', role: 'user', turnId: 'turn-app-2' });
+      store.append(session, events);
+
+      // Scrolled back to the middle of the first turn: the browser replays this
+      // slice through the reducer, and without the turn it starts inside every
+      // message in it is filed under the runtime's id.
+      const inside = await store.read(session, 3, 2);
+      assert.strictEqual(inside.openTurnId, 'turn-app');
+
+      // And a page starting between two turns says so rather than guessing.
+      const between = await store.read(session, 6, 1);
+      assert.strictEqual(between.openTurnId, null);
+    });
+
     it('reports what the whole conversation cost, not what the replayed tail cost', async function () {
       // The bug: session usage was folded out of the replay window, so a chat
       // long enough to be capped came back with a smaller cost every time the

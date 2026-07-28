@@ -8,8 +8,9 @@ import {
   ChatUsage,
   NO_CHAT_CAPABILITIES,
 } from '../../shared/chat-events.js';
-import { applyAll, createTranscript, foldSessionUsage } from '../../shared/chat-reducer.js';
+import { applyChatEvent, createTranscript, foldSessionUsage } from '../../shared/chat-reducer.js';
 import { TurnOutcome, turnOutcomeOf } from '../../shared/turn-outcome.js';
+import { TurnBoundary, openTurnAfter, openTurnBefore } from '../../shared/turn-boundaries.js';
 
 /**
  * Append-only store of a chat session's normalized event log.
@@ -112,6 +113,17 @@ export interface ChatStats {
 export interface ChatPage extends ChatStats {
   events: ChatEvent[];
   /**
+   * The turn open where this page starts, or null when it starts between two.
+   *
+   * A page is a slice out of the middle of the log and the client replays it
+   * through the reducer, which has no way to know what was open before the
+   * first event it is handed. Without this, every page that begins inside a
+   * turn files its messages under the runtime's own id for that turn — a row
+   * in the index with no prompt to name it by, and no match against the
+   * recorded turn it is half of.
+   */
+  openTurnId?: string | null;
+  /**
    * Lowest seq this page covers, after clamping the request to what is on
    * disk. The client folds it into its own paging floor; without it a client
    * cannot tell a page that reached the head of the log from one that did not,
@@ -166,6 +178,17 @@ interface SessionState {
   usage?: ChatUsage;
   /** Highest seq already folded into `usage`. */
   usageSeq: number;
+  /**
+   * Every point at which the open turn changed, kept beside the log's geometry
+   * for the same reason `usage` is: it is read from the whole log, and a
+   * windowed read must not pay for that more than once per conversation.
+   *
+   * Undefined means "not read yet". A handful of rows per turn — it is the
+   * turn boundaries, not the turns' contents.
+   */
+  turnBoundaries?: TurnBoundary[];
+  /** Highest seq already folded into `turnBoundaries`. */
+  turnBoundarySeq: number;
 }
 
 export interface ChatStoreLike {
@@ -333,7 +356,13 @@ export class ChatStore implements ChatStoreLike {
     // 1 rather than 0: chat-reducer treats cursor 0 as "nothing applied yet",
     // so an empty store reporting firstSeq 1 / cursor 0 reads the same way a
     // freshly created transcript does.
-    const state: SessionState = { firstSeq: 1, count: 0, logSize: 0, usageSeq: 0 };
+    const state: SessionState = {
+      firstSeq: 1,
+      count: 0,
+      logSize: 0,
+      usageSeq: 0,
+      turnBoundarySeq: 0,
+    };
 
     // Sized before the index is read, and unconditionally: it is what tells
     // repairIndex there is a log to rebuild from when the index cannot be
@@ -567,6 +596,23 @@ export class ChatStore implements ChatStoreLike {
       }
     }
 
+    // The turn boundaries the same way, and for the same reason: they are read
+    // from the whole log, and a browser rejoining mid-turn asks for them on
+    // every snapshot.
+    const boundaries = state.turnBoundaries;
+    if (boundaries) {
+      let open = boundaries.length > 0 ? boundaries[boundaries.length - 1].turnId : null;
+      for (const event of events) {
+        if (event.seq <= state.turnBoundarySeq) continue;
+        const next = openTurnAfter(event, open);
+        if (next !== open) {
+          boundaries.push({ seq: event.seq, turnId: next });
+          open = next;
+        }
+        state.turnBoundarySeq = event.seq;
+      }
+    }
+
     if (state.count > this.maxEvents || state.logSize > MAX_LOG_BYTES / 2) {
       await this.trimHead(base, state);
     }
@@ -707,6 +753,19 @@ export class ChatStore implements ChatStoreLike {
       };
 
       let pending: { turn: PersistedTurn; msgId: string } | null = null;
+      /**
+       * The words of a steer, held for the turn that answers them.
+       *
+       * Only conversations already on disk have any: a message promoted past
+       * the queue used to be filed into the turn it interrupted, and every
+       * runtime here answers an interrupt by ending that turn — so the ask sat
+       * at the foot of a finished turn while the work it asked for happened in
+       * the next one, which had no prompt in it at all. That is the "no prompt"
+       * row this reads back out. New logs cannot produce one; `deliver` gives a
+       * promoted message its own turn now.
+       */
+      let steered: { msgId: string; label: string | null } | null = null;
+      let carried: string | null = null;
       // Set once a `/clear` has cut the log: what is left starts at turn 1 by
       // construction, so nothing is missing however far back the log was
       // trimmed.
@@ -725,17 +784,36 @@ export class ChatStore implements ChatStoreLike {
             // Nothing has to be migrated, and nothing was recorded wrongly —
             // the events were always right, it was the reading of them that
             // split a request from its answer.
-            const turnId = openTurnId ?? event.turnId;
+            const turnId = openTurnAfter(event, openTurnId) as string;
             const turn = openTurn(turnId, event.ts, event.id);
             // Only the user's own words may name a turn, and only the first of
             // them. Anything else is the model titling the reader's question
             // for them — see `labelFor` on the browser's side.
-            if (event.role === 'user' && turn.label === null) {
-              pending = { turn, msgId: event.id };
+            if (event.role === 'user') {
+              // A turn opened by the user's own words never borrows any.
+              carried = null;
+              if (turn.label === null) pending = { turn, msgId: event.id };
+              if (event.steer) steered = { msgId: event.id, label: null };
+            } else if (steered) {
+              // The agent answered inside the turn the steer joined, which is
+              // what a log written since this was fixed looks like. Nothing was
+              // stranded, so there is nothing to hand on.
+              steered = null;
+            }
+            if (event.role !== 'user' && turn.label === null && carried) {
+              // The other half of a steer: this is the work that answers one,
+              // and the question is a message back in the turn that was cut
+              // short. Naming the row with it is not borrowing the model's
+              // words — it is the user's own, read from where they landed.
+              turn.label = carried;
+              carried = null;
             }
             return;
           }
           case 'block_start': {
+            if (steered && steered.msgId === event.msgId && event.block.kind === 'text') {
+              steered.label = event.block.text.trim().split('\n')[0].trim() || null;
+            }
             if (!pending || pending.msgId !== event.msgId) return;
             if (event.block.kind !== 'text') return;
             const line = event.block.text.trim().split('\n')[0].trim();
@@ -754,6 +832,8 @@ export class ChatStore implements ChatStoreLike {
               turns.length = 0;
               openTurnId = null;
               pending = null;
+              steered = null;
+              carried = null;
               cleared = true;
             }
             return;
@@ -763,15 +843,22 @@ export class ChatStore implements ChatStoreLike {
             // so whatever comes next is a new one. Again the reducer's rule: a
             // turn left open here would swallow the first thing the user typed
             // after the crash.
-            if (event.state === 'exited' || event.state === 'error') openTurnId = null;
+            openTurnId = openTurnAfter(event, openTurnId);
             return;
           }
           case 'turn_end': {
             // Against whatever is open, not against the event's own id: a
             // runtime ends the turn under its own name for it, which is never
             // the name this app opened it by.
+            // The runtime letting go of work that was interrupted to redirect
+            // it ends nothing: the turn is running again, on the correction.
+            if (event.stale) return;
             const turn = openTurnId === null ? null : turns[turns.length - 1];
             if (turn) turn.outcome = turnOutcomeOf(event.stopReason);
+            // A steer in the turn that just ended was the last thing the user
+            // said, and it was said *to* whatever comes next — see `steered`.
+            carried = steered?.label ?? null;
+            steered = null;
             // Whatever comes next belongs to a turn that has not started yet.
             openTurnId = null;
             return;
@@ -837,11 +924,12 @@ export class ChatStore implements ChatStoreLike {
       const end = Math.min(stats.cursor + 1, start + wanted);
 
       if (wanted === 0 || end <= start) {
-        return { ...stats, events: [], from: start };
+        return { ...stats, events: [], from: start, openTurnId: null };
       }
 
       const events = await this.readSlice(base, state, start, end);
-      return { ...stats, events, from: start };
+      const boundaries = await this.turnBoundaries(base, state, stats);
+      return { ...stats, events, from: start, openTurnId: openTurnBefore(boundaries, start) };
     });
   }
 
@@ -1035,6 +1123,47 @@ export class ChatStore implements ChatStoreLike {
   }
 
   /**
+   * Every point in the log at which the open turn changed.
+   *
+   * What a windowed read needs and cannot work out for itself: a snapshot
+   * replays the tail and a page is a slice of the middle, so both routinely
+   * start inside a turn whose opening message is nowhere in what they hold.
+   * Replayed from a standing start, that turn's messages are filed under the
+   * runtime's own name for it rather than the conversation's — an index row
+   * reading "no prompt" beside a question that was asked, and one the recorded
+   * index cannot be matched against to repair it.
+   *
+   * A full scan, cached exactly like `sessionUsage`: once per conversation per
+   * process, with every append folding itself in. What it keeps is a few rows
+   * per turn — where each one opened and where it closed — never the log.
+   */
+  private async turnBoundaries(
+    base: string,
+    state: SessionState,
+    stats: ChatStats,
+  ): Promise<TurnBoundary[]> {
+    if (state.turnBoundaries && state.turnBoundarySeq >= stats.cursor) {
+      return state.turnBoundaries;
+    }
+
+    const boundaries: TurnBoundary[] = [];
+    let open: string | null = null;
+    let seq = 0;
+    await this.scanLog(base, state, (event) => {
+      const next = openTurnAfter(event, open);
+      if (next !== open) {
+        boundaries.push({ seq: event.seq, turnId: next });
+        open = next;
+      }
+      if (event.seq > seq) seq = event.seq;
+    });
+
+    state.turnBoundaries = boundaries;
+    state.turnBoundarySeq = Math.max(seq, stats.cursor);
+    return boundaries;
+  }
+
+  /**
    * Replay of a session, capped to its most recent messages.
    *
    * A month-long session must not cost a full replay on every browser join,
@@ -1052,8 +1181,32 @@ export class ChatStore implements ChatStoreLike {
 
       const { from: windowStart, events } = await this.replayTail(base, state, stats);
 
+      // Which turn is open is told to the replay rather than worked out by it.
+      //
+      // A tail cannot work it out. It routinely begins inside a turn whose
+      // opening message the window cut, so replayed cold that turn's messages
+      // are filed under the runtime's own id for it — a row in the index with
+      // no prompt to name it by, and one the recorded index cannot be matched
+      // against to repair. Nor is a single seed at the edge enough: the events
+      // carried from before the window include a compaction or interruption
+      // line, which *is* a message, and the turns opened between them were cut
+      // away, so a fold across that stretch loses the thread again.
+      //
+      // The boundaries are the whole log's answer for every seq, so each event
+      // is applied against the turn that was open when it happened, and the
+      // replay lands exactly where a full one would.
+      const boundaries = await this.turnBoundaries(base, state, stats);
       const transcript = createTranscript(NO_CHAT_CAPABILITIES);
-      applyAll(transcript, events);
+      let at = 0;
+      let open: string | null = null;
+      for (const event of events) {
+        while (at < boundaries.length && boundaries[at].seq < event.seq) {
+          open = boundaries[at].turnId;
+          at += 1;
+        }
+        transcript.currentTurnId = open;
+        applyChatEvent(transcript, event);
+      }
 
       return {
         sessionId: session.id,
@@ -1074,6 +1227,10 @@ export class ChatStore implements ChatStoreLike {
         firstSeq: stats.firstSeq,
         replayFrom: windowStart,
         cursor: stats.cursor,
+        // Where the replay left off, so live events arriving after this join
+        // continue the turn they belong to instead of opening one of their own
+        // under the runtime's name for it.
+        currentTurnId: transcript.currentTurnId,
         live: options.live ?? false,
         bypassPermissions: options.bypassPermissions ?? false,
       };

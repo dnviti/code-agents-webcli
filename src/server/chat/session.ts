@@ -218,6 +218,18 @@ const QUEUE_READY_POLL_MS = 25;
 const QUEUE_READY_TIMEOUT_MS = 15_000;
 
 /**
+ * How long after an interrupt a `turn_end` still counts as the answer to it.
+ *
+ * The runtimes here acknowledge in milliseconds, so this is already generous
+ * by orders of magnitude, and it is deliberately not more. This window applies
+ * to the interrupt path alone — a message that waited its turn in the queue is
+ * delivered after the turn ended and starts its own — and the failure it has to
+ * stay away from is swallowing a real ending: a turn left open would fold the
+ * next queued message into work it has nothing to do with.
+ */
+const INTERRUPT_ACK_WINDOW_MS = 5_000;
+
+/**
  * Thrown when the session id is known but nothing is running under it.
  *
  * A distinct type rather than a message to match on, because the recovery for
@@ -333,6 +345,11 @@ export class ChatSession {
    * being delivered into the work rather than waiting for its own (#86).
    */
   private turnInFlightId: string | null = null;
+  /**
+   * Until when a `turn_end` is the runtime letting go of interrupted work
+   * rather than the turn ending. Null when nothing has been interrupted.
+   */
+  private staleTurnEndUntil: number | null = null;
   /** Runs the drain again once the adapter has finished letting go of the last turn. */
   private drainRetry: ReturnType<typeof setTimeout> | null = null;
   /** When the current wait for a ready adapter began; null when not waiting. */
@@ -682,12 +699,38 @@ export class ChatSession {
       }
     }
 
-    // The turn a steer would join, and only for as long as there is one to join.
-    // Cleared here rather than where the state changes because `turn_end` is the
-    // one event every runtime agrees means "that turn is over", and a stale id
-    // would make the next message look like a continuation of work that had
-    // already finished — which is the count going wrong in the other direction.
-    if (stamped.t === 'turn_end') this.turnInFlightId = null;
+    if (stamped.t === 'turn_end') {
+      // The first `turn_end` after an interrupt sent to make room for a message
+      // is the runtime letting go of the half it was told to abandon — not this
+      // turn ending. The turn is running again, on the correction that caused
+      // the interrupt, and every reader downstream is told so on the event
+      // itself rather than left to work it out (#86).
+      //
+      // One deep, time-bounded, and only while a turn is actually open: the
+      // runtimes here answer in milliseconds, and a `turn_end` arriving after
+      // that window is the redirected work finishing, which really does end the
+      // turn. Every one of those bounds is there to fail in the same safe
+      // direction — an ending taken for an acknowledgement would leave the turn
+      // open and fold the next queued message into it, and a queued message is
+      // its own turn by definition, delivered only once this one is over.
+      const acknowledging =
+        this.staleTurnEndUntil !== null
+        && Date.now() <= this.staleTurnEndUntil
+        && this.turnInFlightId !== null;
+      if (acknowledging) {
+        this.staleTurnEndUntil = null;
+        stamped.stale = true;
+      } else {
+        this.staleTurnEndUntil = null;
+        // The turn a steer would join, and only for as long as there is one to
+        // join. Cleared here rather than where the state changes because
+        // `turn_end` is the one event every runtime agrees means "that turn is
+        // over", and a stale id would make the next message look like a
+        // continuation of work that had already finished — which is the count
+        // going wrong in the other direction.
+        this.turnInFlightId = null;
+      }
+    }
 
     if (stamped.t === 'session') {
       // Patched on the event itself, not just on the copy kept here. Every
@@ -1096,15 +1139,20 @@ export class ChatSession {
     // releases the queue: `interrupt` ends in `setState('idle')`, `ingest` runs
     // `drainQueue` after every event, and without this the first message still
     // waiting would overtake the one the user actually chose.
-    // Read before the interrupt, because the interrupt is what ends the turn and
-    // ending it is what clears this. A promoted message delivered into work that
-    // was running continues that work's turn; one promoted while the session was
-    // idle has no work to join and starts its own (#86).
+    // Read before the interrupt, because the interrupt is what ends the runtime's
+    // own run and ending it is what clears this. A promoted message delivered
+    // into work that was running continues that work's turn; one promoted while
+    // the session was idle has no work to join and starts its own (#86).
     const steering = inFlight ? this.turnInFlightId : null;
 
     this.draining = true;
     try {
       if (inFlight) {
+        // Every runtime here answers an interrupt by ending its run, and that
+        // acknowledgement is not this turn ending — the turn is about to carry
+        // on with the correction. Said before the interrupt because the answer
+        // to it can arrive during the await.
+        this.staleTurnEndUntil = Date.now() + INTERRUPT_ACK_WINDOW_MS;
         await this.cancelTurnInFlight();
         // The record has to say the turn stopped because of this message, not
         // that the agent simply gave up. `marker` rather than an error: being
@@ -1312,7 +1360,10 @@ export class ChatSession {
    *   it is a steer — see `sendQueuedNow`. Sharing that turn's id is what makes
    *   the transcript group the two together and the accounting file them as one
    *   turn, which is the definition #86 settled: steering the current work is
-   *   part of that work, not a new request.
+   *   part of that work, not a new request. What made that come apart was not
+   *   the id but the runtime's acknowledgement of the interrupt arriving as a
+   *   `turn_end` — see `staleTurnEndUntil`, which is what keeps the turn open
+   *   across it.
    */
   private async deliver(turn: UserTurn, continuesTurnId?: string): Promise<void> {
     if (!this.adapter || !this.adapter.alive) {

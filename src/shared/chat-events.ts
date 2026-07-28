@@ -678,6 +678,20 @@ export type ChatEvent =
        * all end the turn naming the one that answered.
        */
       models?: TurnModelUsage[];
+      /**
+       * The runtime letting go of work that was cut short, not a turn ending.
+       *
+       * Sending a message ahead of the queue interrupts the agent, and every
+       * runtime here answers an interrupt by ending its own run — but the turn
+       * is not over: the message was delivered *into* it and the agent carries
+       * straight on with it. Left unmarked, that acknowledgement closed the
+       * turn a moment before the redirected work began, so the answer to the
+       * correction arrived in a turn of its own with nobody's question in it.
+       *
+       * What it still carries is what the cut-short half spent, which is real
+       * money and stays on the turn's bill. Only the ending is suppressed.
+       */
+      stale?: true;
     }
   /** The runtime revised what it can do — new slash commands, a model switch. */
   | { t: 'capabilities'; seq: number; ts: number; capabilities: Partial<ChatCapabilities> }
@@ -798,6 +812,19 @@ export interface ChatSnapshot {
    * reporting a fully-replayed session, and default to offering no paging.
    */
   replayFrom?: number;
+  /**
+   * The turn still open where the replay ended, or null when none is.
+   *
+   * A snapshot is a window, and a browser that joins mid-turn has to know which
+   * turn the next event belongs to. Without it the first message to arrive
+   * after the join opens a turn of its own under the runtime's id — a row in
+   * the index with no prompt to name it by, spinning next to the turn it is
+   * actually part of.
+   *
+   * Optional so a snapshot from a server that predates it reads as "nothing
+   * open", which is the behaviour this replaces rather than a wrong claim.
+   */
+  currentTurnId?: string | null;
   /** Highest seq written. */
   cursor: number;
   /** True when the runtime process is alive. */

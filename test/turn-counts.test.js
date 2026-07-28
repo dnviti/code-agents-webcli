@@ -272,9 +272,9 @@ describe('the same work through different agents', function () {
   });
 });
 
-// -------------------------------------------------- the turn a steer joins
+// -------------------------------------------------- the turn a promotion opens
 
-describe('a steer, driven through the real session', function () {
+describe('a promoted message, driven through the real session', function () {
   function fakeAdapter() {
     return {
       runtime: 'claude',
@@ -285,7 +285,11 @@ describe('a steer, driven through the real session', function () {
       async send(turn) {
         this.sent.push(turn.text);
       },
-      async interrupt() {},
+      async interrupt() {
+        // As every real runtime does: an interrupt is answered with a
+        // `turn_end` of the runtime's own, which is what ends the turn.
+        this.emit?.({ t: 'turn_end', turnId: 'cut-short', stopReason: 'interrupted' });
+      },
       respondPermission() {},
       async stop() {
         this.alive = false;
@@ -320,7 +324,9 @@ describe('a steer, driven through the real session', function () {
         resolveCommand: () => 'claude',
       },
     );
-    s.adapter = fakeAdapter();
+    const adapter = fakeAdapter();
+    adapter.emit = (event) => s.ingest(event);
+    s.adapter = adapter;
     s.state = 'idle';
     return { s, events };
   }
@@ -339,6 +345,78 @@ describe('a steer, driven through the real session', function () {
     const [first, steer] = userStarts(events);
     assert.strictEqual(steer.turnId, first.turnId, 'the steer joins the running turn');
     assert.strictEqual(steer.steer, true, 'and says so, since it cannot be worked out later');
+  });
+
+  it('does not let the runtime’s answer to the interrupt end that turn', async function () {
+    const { s, events } = session();
+    await s.send({ text: 'refactor the auth module' });
+    await s.send({ text: 'no — the staging database' });
+
+    const [waiting] = s.queuedTurns;
+    await s.sendQueuedNow(waiting.id);
+
+    // Every runtime here answers an interrupt by ending its own run. That is
+    // the half it was told to abandon, not the turn: the correction was
+    // delivered into the turn and the agent carries straight on with it. Left
+    // unmarked, this closed the turn a moment before the redirected work began,
+    // and everything the agent then said landed in a turn with no question in
+    // it — the "no prompt" row, spinning, that was reported.
+    const ends = events.filter((e) => e.t === 'turn_end');
+    assert.strictEqual(ends.length, 1);
+    assert.strictEqual(ends[0].stale, true, 'the acknowledgement must not read as an ending');
+
+    // And the work that follows is grouped into that same turn — read through
+    // the reducer, which is what a browser actually shows.
+    s.ingest({ t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'claude-run-2' });
+    const transcript = createTranscript({});
+    for (const event of events) applyChatEvent(transcript, event);
+    const [first] = userStarts(events);
+    const filed = new Set(transcript.messages.map((m) => m.turnId));
+    assert.deepStrictEqual([...filed], [first.turnId], 'one turn, from the ask to the answer');
+    assert.strictEqual(transcript.currentTurnId, first.turnId, 'and it is still running');
+  });
+
+  it('gives a message that waited in the queue its own turn, not the one before it', async function () {
+    // The distinction the whole path turns on. Interrupting to correct the
+    // agent continues the turn — the correction is about that work. A message
+    // that simply waited its turn is a new request, delivered only once the
+    // previous turn is over, and it must not be folded into it because the
+    // runtime's acknowledgement of some earlier interrupt is still in the air.
+    const { s, events } = session();
+    await s.send({ text: 'refactor the auth module' });
+    await s.send({ text: 'and then the changelog' });
+
+    // The first turn finishes on its own; the drain delivers what was waiting.
+    s.ingest({ t: 'turn_end', turnId: 'claude-run-1', stopReason: 'end_turn' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const [first, queued] = userStarts(events);
+    assert.ok(queued, 'the waiting message has to have been delivered');
+    assert.notStrictEqual(queued.turnId, first.turnId, 'it waited, so it is its own turn');
+    assert.strictEqual(queued.steer, undefined);
+
+    const transcript = createTranscript({});
+    for (const event of events) applyChatEvent(transcript, event);
+    assert.strictEqual(
+      new Set(transcript.messages.map((m) => m.turnId)).size,
+      2,
+      'two requests, two turns',
+    );
+  });
+
+  it('ends the turn when the redirected work itself finishes', async function () {
+    const { s, events } = session();
+    await s.send({ text: 'refactor the auth module' });
+    await s.send({ text: 'no — the staging database' });
+    const [waiting] = s.queuedTurns;
+    await s.sendQueuedNow(waiting.id);
+
+    // The second one is the redirected work finishing, and it really does end
+    // the turn — otherwise a conversation would never close another turn again.
+    s.ingest({ t: 'turn_end', turnId: 'claude-run-2', stopReason: 'end_turn' });
+    const ends = events.filter((e) => e.t === 'turn_end');
+    assert.strictEqual(ends.length, 2);
+    assert.strictEqual(ends[1].stale, undefined);
   });
 
   it('gives a promoted message its own turn when nothing was running', async function () {

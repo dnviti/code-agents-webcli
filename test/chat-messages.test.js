@@ -598,3 +598,56 @@ describe('MessageList', function () {
 function iconPaths(html) {
   return (html.match(/ d="[^"]+"/g) || []).join('|');
 }
+
+describe('a browser that joins in the middle of a turn', function () {
+  it('places what arrives next in the turn that was already open', function () {
+    const t = new mod.ChatTranscript();
+    // The snapshot a long conversation gives back: the tail of a turn whose
+    // question is outside the window, and the id of the turn it is part of.
+    t.hydrate({
+      sessionId: 's1',
+      runtime: 'claude',
+      messages: [message({ id: 'a1', turnId: 'turn-app', role: 'assistant' })],
+      state: 'thinking',
+      capabilities: t.capabilities,
+      pendingPermissions: [],
+      firstSeq: 40,
+      replayFrom: 40,
+      cursor: 60,
+      currentTurnId: 'turn-app',
+      live: true,
+      bypassPermissions: false,
+    });
+
+    // The runtime says the next message under a name of its own, as they all do.
+    t.apply({ t: 'msg_start', seq: 61, ts: 1, id: 'a2', role: 'assistant', turnId: 'claude-run-1' });
+
+    const turns = mod.groupTurns(t.messages, t.state.state);
+    assert.strictEqual(turns.length, 1, 'the answer must not open a turn of its own');
+    assert.strictEqual(turns[0].turnId, 'turn-app');
+  });
+
+  it('starts a fresh turn when the server said nothing was open', function () {
+    const t = new mod.ChatTranscript();
+    t.hydrate({
+      sessionId: 's1',
+      runtime: 'claude',
+      messages: [message({ id: 'a1', turnId: 'turn-app', role: 'assistant' })],
+      state: 'idle',
+      capabilities: t.capabilities,
+      pendingPermissions: [],
+      firstSeq: 40,
+      replayFrom: 40,
+      cursor: 60,
+      currentTurnId: null,
+      live: true,
+      bypassPermissions: false,
+    });
+
+    t.apply({ t: 'msg_start', seq: 61, ts: 1, id: 'u1', role: 'user', turnId: 'turn-next' });
+
+    const turns = mod.groupTurns(t.messages, t.state.state);
+    assert.strictEqual(turns.length, 2);
+    assert.strictEqual(turns[1].turnId, 'turn-next');
+  });
+});

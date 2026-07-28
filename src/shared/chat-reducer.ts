@@ -32,6 +32,7 @@ import {
   mergeUsage,
 } from './chat-events.js';
 import { turnOutcomeOf } from './turn-outcome.js';
+import { openTurnAfter } from './turn-boundaries.js';
 
 export interface TranscriptState {
   messages: ChatMessage[];
@@ -280,8 +281,10 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // ask in one, the answer in another with no prompt to name it by.
       //
       // A turn is open from the user's message to `turn_end`, and `turn_end`,
-      // an exit and a `/clear` are the three things that close one.
-      const turnId = state.currentTurnId ?? event.turnId;
+      // an exit and a `/clear` are the three things that close one — see
+      // `openTurnAfter`, which is that rule and is also what the server's turn
+      // index and its windowed reads apply.
+      const turnId = openTurnAfter(event, state.currentTurnId) as string;
 
       // A new turn's models are not known yet, and last turn's are not this
       // turn's: leaving them would keep a "+1" on the chip for a turn that ran
@@ -512,7 +515,7 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // open, the next thing the user typed would be folded into a turn whose
       // process is gone — the mirror of the `turn_end` case, and the same rule
       // the accountant applies when it closes a job on an exit (#86).
-      if (event.state === 'exited' || event.state === 'error') state.currentTurnId = null;
+      state.currentTurnId = openTurnAfter(event, state.currentTurnId);
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
@@ -603,26 +606,33 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
     }
 
     case 'turn_end': {
-      if (state.state !== 'error' && state.state !== 'exited') {
-        state.state = 'idle';
-      }
-      // The runtime's own word for how the turn concluded, kept rather than
-      // dropped: it is the only statement any of them makes about the turn as a
-      // whole, and without it the badge is left inferring one from whichever
-      // steps inside it went wrong (issue #74).
-      const outcome = turnOutcomeOf(event.stopReason);
-      // Against the turn the messages are actually filed under, which is the
-      // one this app opened rather than the name the runtime ends it by — see
-      // `msg_start`. Comparing the runtime's own id here stamped the outcome
-      // onto nothing at all.
-      const ended = state.currentTurnId ?? event.turnId;
-      for (const message of state.messages) {
-        if (message.turnId === ended) {
-          message.streaming = false;
-          message.turnOutcome = outcome;
+      // A turn interrupted to redirect it is not a turn that ended: the
+      // message that cut it short was delivered into it and the agent is
+      // already working on it again. What the runtime is acknowledging here is
+      // the half it abandoned, so this takes the spend and leaves the turn
+      // open, running, and unstamped — see `stale` on the event.
+      if (!event.stale) {
+        if (state.state !== 'error' && state.state !== 'exited') {
+          state.state = 'idle';
         }
+        // The runtime's own word for how the turn concluded, kept rather than
+        // dropped: it is the only statement any of them makes about the turn as
+        // a whole, and without it the badge is left inferring one from whichever
+        // steps inside it went wrong (issue #74).
+        const outcome = turnOutcomeOf(event.stopReason);
+        // Against the turn the messages are actually filed under, which is the
+        // one this app opened rather than the name the runtime ends it by — see
+        // `msg_start`. Comparing the runtime's own id here stamped the outcome
+        // onto nothing at all.
+        const ended = state.currentTurnId ?? event.turnId;
+        for (const message of state.messages) {
+          if (message.turnId === ended) {
+            message.streaming = false;
+            message.turnOutcome = outcome;
+          }
+        }
+        state.currentTurnId = null;
       }
-      state.currentTurnId = null;
       if (event.usage) {
         state.usage = mergeUsage(state.usage, event.usage);
       }

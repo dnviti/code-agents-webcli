@@ -119,7 +119,33 @@ export function groupTurns(messages: ChatMessage[], chatState: ChatState): TurnS
     const last = i === groups.length - 1;
     turns.push(summarise(group, i + 1, last, chatState));
   });
+
+  // The one turn that can be named from outside itself: a conversation already
+  // on disk, where a message promoted past the queue was stranded by the
+  // runtime's answer to the interrupt, which used to end the turn the message
+  // had just joined. The work it asked for then happened in the next turn with
+  // no prompt in it. The question is the user's own words and it is right there
+  // — see `steerLabel`.
+  for (let i = 1; i < turns.length; i++) {
+    if (turns[i].label !== NO_PROMPT_LABEL) continue;
+    const asked = steerLabel(groups[i - 1]);
+    if (asked) turns[i].label = asked;
+  }
   return turns;
+}
+
+/**
+ * The first line of a steer left stranded at the end of a group.
+ *
+ * The last message and nothing else: a steer the agent went on to answer inside
+ * its own turn — which is every log written since — has the answer after it,
+ * and that turn needs no help being named. One that ends its group is one the
+ * turn closed on top of, and the work it asked for is in the group below.
+ */
+function steerLabel(group: ChatMessage[]): string {
+  const last = group[group.length - 1];
+  if (!last || last.role !== 'user' || !last.steer) return '';
+  return firstText(last);
 }
 
 function summarise(
@@ -169,16 +195,21 @@ function summarise(
     }
   }
 
-  // A session that is gone cannot be running anything, whatever the transcript
-  // still says. A message left mid-stream by a runtime that died stays flagged
-  // streaming forever — reopening that conversation used to show a turn
-  // spinning on a process that ended hours ago.
-  const dead = chatState === 'error' || chatState === 'exited';
+  // The session decides, not the message flags. A message left mid-stream stays
+  // flagged streaming forever — by a runtime that died, by a `msg_end` that was
+  // lost, by a window that was cut before it arrived — and a turn read off that
+  // flag alone spins on work that finished hours ago.
+  //
+  // So `streaming` is only ever corroboration: it can say a turn is running
+  // while the session is *between* its own state events, and it can say nothing
+  // at all once the session has settled. Idle is settled — every adapter says
+  // so as it ends a turn — and so are the two ways a session ends.
+  const settled = chatState === 'idle' || chatState === 'error' || chatState === 'exited';
 
   const status: TurnStatus = isLast
     && (chatState === 'awaiting_permission' || chatState === 'awaiting_answer')
     ? 'waiting'
-    : isLast && !dead
+    : isLast && !settled
       && (streaming || chatState === 'thinking' || chatState === 'running' || chatState === 'starting')
       ? 'running'
       : endedAs(outcome, diedOn, isLast, chatState);
