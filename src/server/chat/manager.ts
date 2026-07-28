@@ -268,6 +268,18 @@ export class ChatSessionManager {
     this.sessions.get(sessionId)?.rememberModel(model);
   }
 
+  /** Switch a live session's reasoning effort. False when nothing is running, or the adapter cannot. */
+  async setEffort(sessionId: string, effort: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    return session.setEffort(effort);
+  }
+
+  /** Carry a new effort level into the options an in-place `/clear` restart replays. */
+  rememberEffort(sessionId: string, effort: string | undefined): void {
+    this.sessions.get(sessionId)?.rememberEffort(effort);
+  }
+
   /** Drop a turn that was typed ahead and has not run yet. */
   cancelQueued(sessionId: string, queuedId: string): boolean {
     return this.sessions.get(sessionId)?.cancelQueued(queuedId) ?? false;

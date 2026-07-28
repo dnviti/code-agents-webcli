@@ -1254,6 +1254,10 @@ export class ChatStore implements ChatStoreLike {
         // continue the turn they belong to instead of opening one of their own
         // under the runtime's name for it.
         currentTurnId: transcript.currentTurnId,
+        // Replayed out of the log along with everything else, so a rejoin knows
+        // what the runtime said it was thinking at even when nobody ever chose
+        // a level for this conversation.
+        effort: transcript.effort,
         live: options.live ?? false,
         bypassPermissions: options.bypassPermissions ?? false,
       };

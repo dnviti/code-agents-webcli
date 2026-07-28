@@ -58,6 +58,20 @@ export interface ModelSwitchResult {
 }
 
 /**
+ * What actually happened when this browser last asked to change the effort level.
+ *
+ * One state more than the model has. A model name is free text and cannot be
+ * judged before it is tried, but an effort level can: the control only offers
+ * what the running runtime published, so a level that is not on that list did
+ * not come from the control, and the server says `refused` and stores nothing
+ * rather than carrying a bad value into every future launch.
+ */
+export interface EffortSwitchResult {
+  applied: 'live' | 'sent' | 'pending' | 'cleared' | 'refused';
+  message: string;
+}
+
+/**
  * How long a page request may go unanswered before the control comes back.
  *
  * Not a latency budget — a page is a positioned read of a local file and comes
@@ -99,6 +113,20 @@ export class ChatController {
   /** What the server reported happened to the last model change requested. */
   private modelResult: ModelSwitchResult | null = null;
 
+  /**
+   * The effort level this conversation was told to run at, as the record holds it.
+   *
+   * Beside the transcript's own `effort` rather than inside it for the same
+   * reason the model override is: the transcript carries what the *runtime*
+   * reported, and this carries what the *record* says was chosen. They agree
+   * almost always, and the interesting moment is the one where they do not —
+   * a conversation whose process has died still has a chosen level, and nothing
+   * is reporting it any more.
+   */
+  private effortOverride: string | null = null;
+  /** What the server reported happened to the last effort change requested. */
+  private effortResult: EffortSwitchResult | null = null;
+
   constructor(
     readonly sessionId: string,
     private readonly options: ChatControllerOptions,
@@ -125,6 +153,7 @@ export class ChatController {
     'chat_page_failed',
     'chat_unavailable',
     'chat_model_result',
+    'chat_effort_result',
     'chat_turn_index',
     'chat_turn_index_failed',
     'chat_turn_spend',
@@ -155,6 +184,8 @@ export class ChatController {
         this.requestTurnIndex();
         this.modelOverride =
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
+        this.effortOverride =
+          typeof message.effortOverride === 'string' ? message.effortOverride : null;
         this.options.onChange?.();
         return true;
       }
@@ -177,6 +208,8 @@ export class ChatController {
         this.transcript.setBypassing(message.bypassPermissions === true);
         this.modelOverride =
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
+        this.effortOverride =
+          typeof message.effortOverride === 'string' ? message.effortOverride : null;
         this.options.onChange?.();
         return true;
       }
@@ -191,6 +224,25 @@ export class ChatController {
           this.modelOverride = typeof message.model === 'string' ? message.model : null;
         }
         this.modelResult = {
+          applied,
+          message: String(message.message || ''),
+        };
+        this.options.onChange?.();
+        return true;
+      }
+
+      case 'chat_effort_result': {
+        const applied = (message.applied as EffortSwitchResult['applied']) || 'pending';
+        // Same rule as the model, and the same reason: only 'live' and 'cleared'
+        // mean the conversation is running at this level now. 'sent' is awaiting
+        // the runtime's own word for it, 'pending' will not be true until a
+        // relaunch that may never come, and 'refused' was never stored at all —
+        // showing any of them on the chip would put a number on the screen that
+        // nothing is actually running at.
+        if (applied === 'live' || applied === 'cleared') {
+          this.effortOverride = typeof message.effort === 'string' ? message.effort : null;
+        }
+        this.effortResult = {
           applied,
           message: String(message.message || ''),
         };
@@ -451,6 +503,29 @@ export class ChatController {
     this.send({ type: 'chat_set_model', model });
   }
 
+  /** The effort level chosen for this conversation, or null if none was. */
+  get effortOverrideValue(): string | null {
+    return this.effortOverride;
+  }
+
+  /** What happened the last time this browser asked to change the effort level. */
+  get effortFeedback(): EffortSwitchResult | null {
+    return this.effortResult;
+  }
+
+  /**
+   * Ask the server to change how hard this conversation thinks, or clear the
+   * choice with an empty string.
+   *
+   * Unlike the model, the server does check this one against what the runtime
+   * published — but the check belongs there and not here, because only the
+   * server can see the live session's capabilities, and a browser holding a
+   * stale menu is exactly the case the check exists for.
+   */
+  setEffort(effort: string): void {
+    this.send({ type: 'chat_set_effort', effort });
+  }
+
   /** Tell the server this browser wants this conversation's live events. */
   subscribe(): void {
     this.send({ type: 'chat_subscribe' });
@@ -580,6 +655,11 @@ export class ChatController {
     // be worse than showing nothing.
     this.modelOverride = null;
     this.modelResult = null;
+    // And the effort level with it, for the same reason: the record's own value
+    // is on its way and a stale one on the chip in the meantime would claim the
+    // conversation is thinking at a level nothing has confirmed.
+    this.effortOverride = null;
+    this.effortResult = null;
     // `hydrate` clears the queue from the (absent) snapshot field, so the line
     // does not survive into a session that never accepted it.
     this.transcript.hydrate({

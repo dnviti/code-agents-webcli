@@ -147,6 +147,69 @@ and its own list is what settles the question. And it is scoped to the session:
 where sessions run in per-user environments each one reads its own home, so the
 menu never becomes a window onto what someone else has installed.
 
+### How hard the agent thinks
+
+Every runtime the WebUI drives has a reasoning-effort knob, and no two spell it
+the same way. The button beside the model in the composer offers **exactly what
+the runtime you are talking to published, in its own words** — nothing is
+translated, and no level is offered that the agent would refuse.
+
+| Runtime | Levels | How it is set | Live? |
+| --- | --- | --- | --- |
+| Claude Code | `low` `medium` `high` `xhigh` `max` `ultracode` | `--effort` at launch; `/effort` mid-session | yes |
+| Codex | whatever `model/list` reports for the model in use — `low` through `xhigh`, and as far as `max` and `ultra` on some | `model_reasoning_effort` at launch, the turn's own `effort` after that | from the next turn |
+| Grok Build | the levels the current model publishes — `low` `medium` `high` on Grok 4.5, none at all on Grok Build | carried on a model change | yes |
+| Kimi Code | `off` `on` | an ACP config option | yes |
+| Oh My Pi | `off` `auto` `low` `high` `max` | an ACP config option | yes |
+| pi | `off` `minimal` `low` `medium` `high` `xhigh` `max` | `--thinking`, on the next turn's process | from the next turn |
+
+**The button is not there when there is nothing to offer.** Grok on its default
+model publishes no ladder, so no control appears — rather than one that could
+only ever refuse. This is the one place the effort control behaves differently
+from the model picker beside it, which always lets you type a name and try it: a
+model name can only be judged by trying it, and a level cannot. Sending pi a
+level it does not have is the worst case of all, because pi does not fail — it
+prints a warning to a log nobody reads and answers at its own default, which
+would leave the button reporting a level that was never running.
+
+**The colour is the level.** At the bottom of a runtime's ladder the chip is the
+same grey as everything else on the row; as the level climbs it gains colour and
+a slow pulse, and at the top it is the loudest thing in the composer. That is
+deliberate — maximum effort is the most expensive setting available, sometimes
+by a wide margin, and a control that looked the same at `low` and at `max` would
+be hiding the one figure worth noticing. The colour is never the only signal:
+the level is named in text, and the little meter beside the name fills in
+proportion to where the level sits on **its own runtime's** ladder, which is the
+only honest way to compare Kimi's `on` against Claude's `xhigh`. If you have
+asked your system for reduced motion, the pulse does not run and nothing is
+lost.
+
+**What is remembered, and where.** Two things, answering two questions. The
+level *this conversation* runs at is kept on the server with the conversation,
+so it survives a reload, a rejoin, and a `/clear` — which restarts the process
+in place and would otherwise put it back where it started. The level to open the
+*next* conversation at is kept in your browser, per runtime, so somebody who
+runs Claude at `max` and Kimi at `on` gets both back rather than one setting
+fighting over two ladders that have nothing in common.
+
+Typing `/effort high` into the composer reaches the same place as the button:
+the runtime runs its own command, and the choice is recorded so a later `/clear`
+does not quietly undo it.
+
+One caveat worth knowing, because Claude has two vocabularies rather than one.
+Its `/effort` command answers `Usage: /effort <low|medium|high|xhigh|max|ultracode|auto>`
+— seven words. Its `--effort` launch flag takes six of them: `ultracode` is
+accepted in silence, and `auto` answers with a warning to a log nobody reads and
+then runs at Claude's own default.
+
+`ultracode` is therefore on the menu — it is Claude's most expensive setting, and
+worth reading before reaching for: the reasoning depth is `xhigh`, and what it
+adds on top is breadth, fanning the work out across orchestrated agents. `auto`
+is not on the menu, and typing `/effort auto` is deliberately **not** recorded:
+it really does change the session you are in, but a level that cannot be passed
+at launch would be silently dropped by every session after this one while the
+control went on claiming it. Only levels the runtime published are remembered.
+
 ### Starting a new conversation
 
 `/clear`, `/new` and `/reset` — or the **New chat** button beside the composer

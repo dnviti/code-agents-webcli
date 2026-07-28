@@ -276,6 +276,118 @@ describe('Composer', function () {
     });
   });
 
+  // The effort chip's popup is click-toggled state like the model chip's, so a
+  // static render only ever shows it shut — these assert the trigger and what it
+  // says about the level in force, not the menu behind it. The ladder here is
+  // claude's, spaced the way `rankedEfforts` spaces a five-level list, because
+  // the rank is what the colour and the meter are both computed from and a made
+  // up spacing would be testing arithmetic this component does not do.
+  describe('the effort control', function () {
+    const efforts = [
+      { value: 'low', name: 'Low', rank: 0 },
+      { value: 'medium', name: 'Medium', rank: 0.25 },
+      { value: 'high', name: 'High', rank: 0.5 },
+      { value: 'xhigh', name: 'Extra high', rank: 0.75 },
+      { value: 'max', name: 'Max', rank: 1 },
+    ];
+
+    it('offers a control when the runtime published a ladder to choose from', function () {
+      const html = render({ capabilities: caps({ efforts }) });
+      assert.ok(
+        html.includes('aria-label="Change how hard the agent thinks"'),
+        'a published ladder is the whole precondition for the control',
+      );
+      assert.ok(html.includes('aria-haspopup="listbox"'), 'the trigger says a menu is behind it');
+      assert.ok(html.includes('aria-expanded="false"'), 'and that the menu is currently shut');
+    });
+
+    // The deliberate difference from the model chip above, which is always
+    // present. A model can be typed at any runtime and tried, so offering the
+    // control is never wrong. An effort level cannot: with no published ladder
+    // there is no value the server would accept, so the control could only ever
+    // refuse — and it would charge the row for the privilege, which on a phone
+    // means pushing Send onto a line of its own to make room for a button that
+    // does nothing.
+    it('takes itself off the row entirely for a runtime that published no ladder', function () {
+      const html = render({ capabilities: caps({}) });
+      assert.ok(
+        !html.includes('aria-label="Change how hard the agent thinks"'),
+        'no ladder means no control at all — not a disabled one, and not an empty one',
+      );
+      assert.ok(html.includes('aria-label="Change model"'), 'while the model control, which can always be tried, stays');
+      assert.ok(html.includes('aria-label="Send message"'), 'and the space goes back to the control that needed it');
+    });
+
+    it('takes itself off the row for a runtime that published an empty ladder', function () {
+      const html = render({ capabilities: caps({ efforts: [] }) });
+      assert.ok(
+        !html.includes('aria-label="Change how hard the agent thinks"'),
+        'a ladder with no rungs on it is the same offer as no ladder',
+      );
+    });
+
+    it('names the level this conversation is running at, not the cheapest on the ladder', function () {
+      const html = render({ effort: 'high', capabilities: caps({ efforts }) });
+      assert.ok(html.includes('>High<'), 'the level in force is the one on the chip');
+      assert.ok(!html.includes('Low'), 'the first entry of the ladder is not a default label');
+      assert.ok(html.includes('title="Effort: High"'), 'and the long form names it too');
+    });
+
+    it('colours and fills the chip by where the level sits on its own runtime’s ladder', function () {
+      const low = render({ effort: 'low', capabilities: caps({ efforts }) });
+      const high = render({ effort: 'max', capabilities: caps({ efforts }) });
+      // The bottom stop is a bare ramp variable; the top is the last stop mixed
+      // fully over the one below it, which is what interpolating rather than
+      // snapping costs at the end of the ladder.
+      const lowTone = 'var(--effort-0)';
+      const highTone = 'color-mix(in oklab, var(--effort-4) 100%, var(--effort-3))';
+      assert.ok(low.includes(`color:${lowTone}`), 'the bottom of the ladder is the same grey as every other chip');
+      assert.ok(high.includes(`color:${highTone}`), 'the top of it reaches the loud end of the ramp');
+      assert.ok(!high.includes(`color:${lowTone}`), 'the two ends are not the same colour');
+      // `low` is rank 0, so one bar; `max` is rank 1, so all four. The meter is
+      // what survives a colourblind reader, so it has to move with the level
+      // rather than sit at a decorative constant.
+      const bars = (html, tone) => html.split(`background:${tone}`).length - 1;
+      assert.strictEqual(bars(low, lowTone), 1, 'the least thinking lights one bar');
+      assert.strictEqual(bars(high, highTone), 4, 'the most lights all of them');
+      assert.strictEqual(bars(low, 'var(--border)'), 3, 'and the rest of the meter stays unlit at the bottom');
+      assert.strictEqual(bars(high, 'var(--border)'), 0, 'with nothing left unlit at the top');
+    });
+
+    it('claims no rank for a level the runtime never published', function () {
+      // A level left over from before a model switch narrowed the ladder. It
+      // cannot be placed on this runtime's scale, so the chip declines to name
+      // it rather than attaching this ladder's colour and meter to it.
+      const html = render({ effort: 'ultra', capabilities: caps({ efforts }) });
+      assert.ok(!html.includes('ultra'), 'a level off the ladder is not read back as though it were on it');
+      assert.ok(html.includes('>effort<'), 'the chip names nothing instead');
+      assert.ok(!html.includes('var(--effort-'), 'and takes none of the ramp with it');
+      assert.strictEqual(
+        (html.match(/background:var\(--border\)/g) || []).length,
+        4,
+        'every bar stays unfilled, because there is no rank to fill them to',
+      );
+    });
+
+    it('is not disabled when the whole composer is', function () {
+      // Same reasoning as the model control: a dead session is exactly when this
+      // is worth touching, because the level is stored against the conversation
+      // and applies the next time one starts.
+      const html = render({ disabled: true, capabilities: caps({ efforts }) });
+      assert.ok(html.includes('aria-label="Change how hard the agent thinks"'), 'the control survives a dead session');
+      assert.ok(
+        !/aria-label="Change how hard the agent thinks"[^>]*disabled/.test(html),
+        'and stays usable, because what it saves is for next time',
+      );
+    });
+
+    it('shows nothing extra before anything has been picked', function () {
+      const html = render({ capabilities: caps({ efforts }) });
+      assert.ok(!html.includes('role="status"'), 'no stray feedback region until the server has said something');
+      assert.ok(!html.includes('role="listbox"'), 'and the menu stays shut until it is asked for');
+    });
+  });
+
   it('survives an empty draft and a very long one', function () {
     const empty = render({ draft: '' });
     assert.ok(empty.length > 0);

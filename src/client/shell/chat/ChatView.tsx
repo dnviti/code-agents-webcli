@@ -4,6 +4,7 @@ import { uploadAttachment } from '../../chat/attachments-api.js';
 import { ChatController, type ChatUnavailable } from '../../chat/controller.js';
 import { fetchStatus, findFiles } from '../../chat/workspace-api.js';
 import { activityEvents } from '../../chat/activity.js';
+import { loadEffortPreferences, rememberEffort } from '../../chat/effort-preference.js';
 import type { ChatTranscript } from '../../chat/transcript.js';
 import {
   groupTurns,
@@ -307,6 +308,51 @@ export function ChatView({
     [onViewChange, view],
   );
 
+  /**
+   * Open a fresh conversation at the level this runtime was last used at.
+   *
+   * The other half of `setEffort` below. That one records the choice; this one
+   * is what makes recording it worth anything — without it a preference would
+   * be written on every pick and read by nobody.
+   *
+   * Five conditions, and each rules out a way of being wrong.
+   *
+   * **It only touches a conversation that has not started.** This is the one
+   * that matters, and the one this was first written without. Every other guard
+   * is equally true of a conversation opened weeks ago and merely looked at
+   * again: the surface is keyed on the session id so this effect remounts on
+   * every tab switch, `live` and the published ladder both survive on the
+   * retained transcript, and a conversation whose chip was never touched carries
+   * no override — so clicking a tab silently re-levelled it, wrote the level to
+   * its record, and on claude pushed a hidden `/effort` turn into the running
+   * process. A preference is for opening the *next* conversation, never for
+   * reaching back into one already under way. An empty transcript is what says
+   * "this one has not begun".
+   *
+   * It waits for the runtime to publish a ladder, because until then there is
+   * nothing to check a remembered level against and the server would rightly
+   * refuse it. It only acts when the record carries no level of its own, so a
+   * conversation that has already been set is never quietly moved off it. It
+   * checks the level is still on the ladder, because a runtime can narrow one
+   * (codex publishes the ladder of the *current* model, and models differ) and a
+   * stale favourite must not become a refusal the user has to read. And it fires
+   * once per session, so this cannot become a loop with a server that answers
+   * `pending`.
+   */
+  const seededEffort = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (seededEffort.current === controller.sessionId) return;
+    if (!transcript.live) return;
+    if (transcript.messages.length > 0) return;
+    const ladder = transcript.capabilities.efforts;
+    if (!ladder?.length) return;
+    if (controller.effortOverrideValue) return;
+    const remembered = loadEffortPreferences()[runtime];
+    if (!remembered || !ladder.some((level) => level.value === remembered)) return;
+    seededEffort.current = controller.sessionId;
+    controller.setEffort(remembered);
+  }, [controller, runtime, transcript, version]);
+
   // ------------------------------------------------------------------ zones
 
   const panelsAvailable = enabledPanels(view).length > 0;
@@ -378,6 +424,28 @@ export function ChatView({
   const setModel = React.useCallback(
     (model: string) => controller.setModel(model),
     [controller],
+  );
+  /**
+   * Send the level, and remember it for the next conversation on this runtime.
+   *
+   * Two different memories, written in the same breath. The server is told
+   * because this conversation has to actually run at the level; the browser is
+   * told because the next new conversation on this runtime should open there
+   * rather than back at the default, which is what "remember the last setting"
+   * means to somebody who has just set it.
+   *
+   * Stored on the way out rather than on the server's reply, and on purpose:
+   * `pending` and `sent` mean the running session did not take the level, but
+   * the *choice* was still made and a fresh session is exactly where it would
+   * apply. Waiting for `live` would drop the preference in precisely the case
+   * it is most useful — a runtime that can only take a level at launch.
+   */
+  const setEffort = React.useCallback(
+    (effort: string) => {
+      controller.setEffort(effort);
+      rememberEffort(runtime, effort || null);
+    },
+    [controller, runtime],
   );
   const upload = React.useCallback(
     (file: File) => uploadAttachment(controller.sessionId, file),
@@ -956,6 +1024,14 @@ export function ChatView({
               alsoRan={controller.modelOverrideValue ? undefined : transcript.turnModels}
               onSetModel={setModel}
               modelFeedback={controller.modelFeedback}
+              // Same precedence as the model above, and for the same reason:
+              // the record's chosen level wins once the server has confirmed
+              // it, and otherwise the transcript carries whatever the runtime
+              // itself last reported. Both can be absent, which honestly means
+              // nobody has chosen and the runtime has not said.
+              effort={controller.effortOverrideValue ?? transcript.effort}
+              onSetEffort={setEffort}
+              effortFeedback={controller.effortFeedback}
               // Deliberately the same path as typing it: the button and the
               // three spellings have to end in one state, and the surest way
               // to keep them that way is for the button to *be* the command.

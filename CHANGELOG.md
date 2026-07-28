@@ -2,7 +2,80 @@
 
 ## [Unreleased]
 
+### Fixed
+- **A slash command Claude answers itself now leaves an answer on screen.** Some
+  commands — `/effort`, `/model` — are handled by the CLI without going near the
+  model, and a locally-handled command emits no streaming events at all. This
+  app's transcript is built from streaming and treats the snapshot that follows
+  as a patch, so there was nothing for those replies to patch and they were
+  dropped: typing one showed the command, a turn, `$0`, and no answer, for a
+  command that had in fact worked. An answer nothing streamed is now a message
+  in its own right.
+
+- **The composer's own answers redraw when they arrive.** The store's
+  equality guard compared the six values the chat surface republishes and, since
+  a controller reporting its own change moves none of them, told no listener
+  anything had happened. Everything held on the controller rather than on the
+  transcript was affected — the model override and the line reporting what the
+  server actually did with a change. It looked fine wherever the runtime emitted
+  an event in the same moment, which is why switching a model looked right and
+  clearing one left the previous answer frozen on screen.
+
 ### Added
+- **How hard the agent thinks, as a control in the composer.** Every runtime the
+  WebUI drives has a reasoning-effort setting and there was no way to reach any
+  of them: the conversation ran at whatever the CLI considered normal, and the
+  only way to change that was to close the tab and start the agent by hand in a
+  terminal. There is now a button beside the model, and it offers **exactly what
+  the runtime you are talking to published, in that runtime's own words** —
+  Claude's `low` through `max` and its undocumented `ultracode`, Codex's ladder
+  for the model actually in use as far as `ultra`, Grok's per-model levels,
+  Kimi's `off`/`on`, Oh My Pi's `auto`, pi's seven. Nothing is translated between
+  them and no level is invented.
+
+  Each road was probed against the installed CLI rather than written from a
+  schema, and two of them turned out not to be where they looked. Grok's
+  `--reasoning-effort` flag does nothing on the protocol this app drives it over
+  — launching at `low` and at `high` both left it reporting `high` — and the
+  setting actually travels on a model change. Claude has no control request for
+  it at all, but answers `/effort` as an ordinary turn, for free: no model call,
+  no money, and its own sentence back confirming the level. That confirmation is
+  what the button waits for, so the chip reports what the agent said it is doing
+  rather than what this app asked for. Where a runtime cannot be told until its
+  next turn, it says so instead of claiming otherwise.
+
+  The level is coloured on a scale — the same grey as every other control at the
+  bottom of a ladder, and the loudest thing on the row at the top, with a pulse
+  that quickens as it climbs. Maximum effort is the most expensive setting
+  available and a control that looked identical at both ends would hide that.
+  Colour is never the only carrier: the level is named, and a small meter fills
+  in proportion to where it sits on its own runtime's ladder, which is the only
+  honest way to put Kimi's `on` beside Claude's `xhigh`. Reduced motion turns
+  the pulse off and loses nothing.
+
+  Where a runtime publishes no ladder — Grok on its default model — no button
+  appears at all, rather than one that could only refuse. That is the one way
+  this differs from the model picker beside it, and the reason is pi: an
+  unrecognised level there is not an error, it is a warning on a stream nobody
+  reads followed by an answer at the default level, which would leave the
+  control reporting something that was never running.
+
+  What the conversation is running at is kept with the conversation, so it
+  survives a reload, a rejoin and a `/clear`. What to open the *next*
+  conversation at is kept per runtime in the browser, because the ladders are
+  not comparable and one remembered setting spread across all six would be
+  wrong five times — and a remembered level only ever opens a conversation that
+  has not started, never one you have merely gone back to look at.
+
+  Two of the runtimes do not refuse a level they do not have; they warn on a
+  stream nobody reads and answer at their own default, which is the quietest
+  possible way to get the opposite of what was asked for. So a level is checked
+  against what the runtime published at every point it could enter — the button,
+  a `/effort` typed by hand, a record carried over from when the conversation ran
+  on another agent — and Claude's own answer is read back rather than assumed,
+  because it reports a refusal as a *successful* result whose text happens to
+  say no.
+
 - **What each turn cost, beside the turn.** The conversation showed what the
   whole chat had spent and nothing about where it went — so the expensive turn
   and the cheap one looked identical, and the only way to find out which was
@@ -256,6 +329,24 @@
   figures above it, which it previously did not.
 
 ### Fixed
+- **A slash command Claude answers itself left no answer on screen.** Anything
+  the model produces arrives token by token, and this app builds the message
+  from those tokens and uses the complete copy that follows only to fill in
+  details. A command the CLI handles without going near the model — `/effort`,
+  `/model` — has no tokens: it sends the finished reply and nothing else. There
+  was no message for that copy to fill in, so it was dropped, and typing one of
+  those commands produced a turn, a `$0`, and silence where the confirmation
+  should have been. The reply is now built into a message of its own, but only
+  for a turn in which nothing streamed at all — which is what stops an ordinary
+  answer being written into the transcript twice.
+
+- **The feedback under the model picker never went away.** It stayed until the
+  conversation was reset, so a second answer landed on top of the first; on a
+  phone, where both bubbles resolve against the composer rather than their own
+  chip, they shared coordinates exactly and the older one was invisible
+  underneath. It now clears itself after long enough to read, and on a phone it
+  opens upward rather than down over the navigation bar.
+
 - **The turn index and every per-turn cost were being thrown away before they
   reached the screen.** The chat layer routes server messages by a list of the
   types it owns, and that list had fallen three behind the messages the chat

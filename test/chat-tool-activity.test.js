@@ -532,7 +532,33 @@ describe('switching a model on an ACP agent', function () {
     await pending;
   });
 
-  it('rejects when the agent has no such method, so the caller can fall back', async function () {
+  // Kimi and omp publish a `model` config option, and a switch goes down that
+  // road rather than `session/set_model` — because it is the only one that
+  // brings the rest of the configuration back with it. Probed against kimi:
+  // `session/set_model` answers `{}` and says nothing about the new model, while
+  // setting the model *as a config option* answers with the whole option list
+  // rebuilt, thinking ladder included — which genuinely differs per model
+  // (`off`/`on` on one, `off`/`low`/`medium`/`high`/`xhigh` on another). Taking
+  // the quiet road left the effort control offering levels the new model refuses.
+  it('sets the model as a config option where the agent published one, so the rest of the configuration comes back', async function () {
+    const h = await booted('kimi', 'acp-kimi-tools.jsonl');
+    const pending = h.adapter.setModel('kimi-k2');
+    await flush();
+
+    const request = h.sent.find((message) => message.method === 'session/set_config_option');
+    assert.ok(request, 'expected the config-option road, not session/set_model');
+    assert.strictEqual(request.params.configId, 'model');
+    assert.strictEqual(request.params.value, 'kimi-k2');
+    assert.ok(
+      !h.sent.some((message) => message.method === 'session/set_model'),
+      'the quiet road is not also taken',
+    );
+
+    h.adapter.handleMessage({ jsonrpc: '2.0', id: request.id, result: { configOptions: [] } });
+    await pending;
+  });
+
+  it('rejects when the agent refuses the switch, so the caller can fall back', async function () {
     // -32601 is what an agent that never implemented this answers. The websocket
     // handler catches it and offers the runtime's own `/model` command instead
     // — which is strictly better than reporting a switch that never happened.
@@ -540,7 +566,7 @@ describe('switching a model on an ACP agent', function () {
     const pending = h.adapter.setModel('kimi-k2');
     await flush();
 
-    const request = h.sent.find((message) => message.method === 'session/set_model');
+    const request = h.sent.find((message) => message.method === 'session/set_config_option');
     h.adapter.handleMessage({
       jsonrpc: '2.0',
       id: request.id,

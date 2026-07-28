@@ -3,6 +3,7 @@ import {
   ChatRole,
   ChatUsage,
   DiffHunk,
+  EffortChoice,
   FileDiff,
   ModelChoice,
   PermissionOption,
@@ -14,6 +15,7 @@ import {
   UserTurn,
   classifyTool,
   isAllowOption,
+  rankedEfforts,
 } from '../../../shared/chat-events.js';
 import { ChatAdapterOptions, JsonRpcChatAdapter, permissionRequest } from '../adapter.js';
 
@@ -298,6 +300,26 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   private readonly modelWindows = new Map<string, number>();
   /** The last window announced, so a re-read does not re-emit the same figure. */
   private reportedWindow?: number;
+  /**
+   * The id of the config option that carries this agent's thinking level.
+   *
+   * The option's own `id`, never the literal `thinking`, because this is what
+   * goes back as `configId` on `session/set_config_option` — and an agent that
+   * names its option something else would be unsettable from a hardcoded
+   * string. Null means the agent published no `thought_level` category at all,
+   * which is grok's case and the reason there is a second road below.
+   */
+  private effortOptionId: string | null = null;
+  /** The `model` config option's own id, where the agent published one. */
+  private modelOptionId: string | null = null;
+  /** Model value -> the effort ladder that model's `_meta` published, where it did. */
+  private readonly modelEfforts = new Map<string, EffortChoice[]>();
+  /** Model value -> the level that model's `_meta` said it was running at. */
+  private readonly modelEffortLevels = new Map<string, string>();
+  /** The level the agent said it is on. Never one this app merely asked for. */
+  private effort: string | null = null;
+  /** The last level announced, so a re-read does not re-emit the same one. */
+  private reportedEffort?: string | null;
   private turnId: string | null = null;
   private turnStartedAt = 0;
   private current: OpenMessage | null = null;
@@ -346,6 +368,18 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
         cwd: this.options.workingDir,
         capabilities: this.capabilities,
       });
+      // What the agent itself said it is thinking at, before this app has asked
+      // it for anything. Emitted even when the answer is null, because null is
+      // the true answer for an agent with no ladder and the chip has to be told
+      // to stay empty rather than keep whatever the last runtime left on it.
+      this.emitEffort();
+      // Awaited, unlike the codex adapter's `loadModelList`: a level applied
+      // after the session reports idle is a level the conversation's first turn
+      // did not run at. It costs one round trip, and it cannot fail the
+      // handshake — `applyLaunchEffort` swallows the rejection into an error
+      // event and lets the conversation open at whatever level the agent is
+      // already on.
+      await this.applyLaunchEffort();
       this.emit({ t: 'state', state: 'idle' });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
@@ -476,9 +510,61 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
       }
       if (models.length) this.capabilities.models = models;
       this.model = str(option.currentValue) || undefined;
+      // Kept for `setModel`, which needs it back as `configId`. See there for
+      // why the config-option road is preferred over `session/set_model`.
+      this.modelOptionId = str(option.id) || 'model';
     }
+    this.applyEffortOptions(list(session.configOptions));
     this.readModelWindows(record(session.models));
+    // After both spellings of the model have been read, because grok's ladder
+    // belongs to a model rather than to the session and picking the wrong
+    // model's would publish levels the agent will refuse.
+    this.applyModelEffort();
     this.emitContextWindow();
+  }
+
+  /**
+   * The thinking level, where the agent publishes it as an ACP config option.
+   *
+   * Alongside the `model` and `mode` categories `applySessionConfig` already
+   * walks there is a `thought_level` one, and it is where kimi and omp both put
+   * this. Read off `session/new` live this session — kimi answers
+   * `{"type":"select","id":"thinking","name":"Thinking","category":"thought_level",
+   * "currentValue":"on","options":[{"value":"off"...},{"value":"on"...}]}` and
+   * omp the same shape with five levels, `off`, `auto`, `low`, `high`, `max`,
+   * where `auto` carries the description "Auto-detect per prompt (low–xhigh)".
+   *
+   * Matched on the category first and the id second, mirroring the two-way
+   * match on the model option directly above: the category is what the protocol
+   * names, the id is only what these two agents happen to call theirs.
+   *
+   * Both publish their options cheapest-first, which is the order
+   * `rankedEfforts` wants, so the list is ranked as it arrives. That puts omp's
+   * `auto` in the middle of its ladder, which is where a level that picks per
+   * prompt honestly belongs.
+   *
+   * `currentValue` is the agent describing itself, and is the only thing this
+   * adapter will emit an `effort` event on the strength of. The option's id is
+   * kept for the setter, which wants it back as `configId`.
+   */
+  private applyEffortOptions(options: unknown[]): void {
+    for (const raw of options) {
+      const option = record(raw);
+      if (str(option.category) !== 'thought_level' && str(option.id) !== 'thinking') continue;
+      const id = str(option.id);
+      if (!id) continue;
+
+      const levels: Array<{ value: string; name?: string; description?: string }> = [];
+      for (const rawChoice of list(option.options)) {
+        const choice = record(rawChoice);
+        const value = str(choice.value);
+        if (!value) continue;
+        levels.push({ value, name: str(choice.name) || value, description: str(choice.description) });
+      }
+      if (levels.length) this.capabilities.efforts = rankedEfforts(levels);
+      this.effortOptionId = id;
+      this.effort = str(option.currentValue) ?? null;
+    }
   }
 
   /**
@@ -494,16 +580,117 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
    * schema anyone imagined. It reads nothing on the agents wired up here
    * today, which all publish their models through `configOptions` and none of
    * them a window — it starts answering the moment grok moves onto ACP (#73).
+   *
+   * The same `_meta` is also where grok keeps its thinking ladder, so this walk
+   * collects that too rather than making a second pass over the same list. The
+   * two facts arrive together because they are the same kind of fact: what this
+   * particular model, as this particular agent will run it, can do.
    */
   private readModelWindows(models: Record<string, unknown>): void {
     for (const raw of list(models.availableModels)) {
       const model = record(raw);
       const id = str(model.modelId);
-      const window = num(record(model._meta).totalContextTokens);
+      const meta = record(model._meta);
+      const window = num(meta.totalContextTokens);
       if (id && window !== undefined && window > 0) this.modelWindows.set(id, window);
+      if (id) this.readModelEffort(id, meta);
     }
     const current = str(models.currentModelId);
     if (current) this.model = current;
+  }
+
+  /**
+   * One model's thinking ladder, as grok publishes it on the model itself.
+   *
+   * `grok agent --no-leader stdio` (0.2.x, probed live) publishes no
+   * `thought_level` config option at all. What it publishes instead is, on each
+   * entry of `models.availableModels`, a `_meta` carrying
+   * `supportsReasoningEffort: true`, the level that model is currently on as
+   * `reasoningEffort`, and the ladder as
+   * `reasoningEfforts: [{id,value,label,description,default}]`.
+   *
+   * That list arrives **ceiling-first** — `high`, `medium`, `low` — and
+   * `rankedEfforts` ranks a list cheapest-first, so it is reversed before
+   * ranking. Ranked as published, grok's cheapest level would be painted as its
+   * most expensive one, which is the one thing the rank exists to get right.
+   * Copied before reversing because `reverse()` is in-place and the array
+   * belongs to the parsed message, not to us.
+   *
+   * A model with no `supportsReasoningEffort` gets no entry, and that is not an
+   * omission: grok's default model `grok-build` genuinely has no such knob, so a
+   * session that opens on it publishes no ladder and the control says so.
+   */
+  private readModelEffort(id: string, meta: Record<string, unknown>): void {
+    if (meta.supportsReasoningEffort !== true) return;
+
+    const levels: Array<{ value: string; name?: string; description?: string }> = [];
+    for (const raw of list(meta.reasoningEfforts).slice().reverse()) {
+      const level = record(raw);
+      // `value` and `id` are the same string on every entry captured; reading
+      // both means an entry that carries only one of them is still usable.
+      const value = str(level.value) || str(level.id);
+      if (!value) continue;
+      levels.push({ value, name: str(level.label) || value, description: str(level.description) });
+    }
+    if (levels.length) this.modelEfforts.set(id, rankedEfforts(levels));
+    const current = str(meta.reasoningEffort);
+    if (current) this.modelEffortLevels.set(id, current);
+  }
+
+  /**
+   * Publish the current model's ladder, for the agents that hang it there.
+   *
+   * Only the current model's, because only the current model's can be set:
+   * grok's setter is `session/set_model`, which carries the level for the model
+   * it names. Switching model therefore switches ladder, and switching to a
+   * model that cannot think harder takes the ladder away entirely — which is
+   * why this clears rather than leaves the previous model's levels standing.
+   *
+   * Returns whether the published ladder changed, so a mid-session model change
+   * can tell the browser and a handshake — which is about to send the whole
+   * capability set with the `session` event anyway — does not have to.
+   */
+  private applyModelEffort(): boolean {
+    // A config option wins where the agent published one: it is the protocol's
+    // own place for this, and no captured agent publishes both.
+    if (this.effortOptionId) return false;
+
+    const previous = this.capabilities.efforts;
+    const efforts = this.model ? this.modelEfforts.get(this.model) : undefined;
+    if (efforts) {
+      this.capabilities.efforts = efforts;
+      this.effort = (this.model ? this.modelEffortLevels.get(this.model) : undefined) ?? null;
+    } else {
+      delete this.capabilities.efforts;
+      this.effort = null;
+    }
+    return this.capabilities.efforts !== previous;
+  }
+
+  /**
+   * Announce the level the agent said it is running at.
+   *
+   * Deduplicated against the last one announced, exactly as the context window
+   * is and for the same reason: re-reading a config surface is not news, and
+   * the transcript is a durable record of what changed rather than of what was
+   * checked. The first call always announces, null included.
+   */
+  private emitEffort(): void {
+    if (this.effort === this.reportedEffort) return;
+    this.reportedEffort = this.effort;
+    this.emit({ t: 'effort', effort: this.effort });
+  }
+
+  /**
+   * Tell the session the ladder itself changed under it.
+   *
+   * Sent as an empty list rather than left out when there is no ladder any
+   * more: a `capabilities` event is merged field by field, so omitting the key
+   * would leave the previous model's levels on offer for a model that will
+   * refuse every one of them.
+   */
+  private publishEfforts(): void {
+    this.emit({ t: 'capabilities', capabilities: { efforts: this.capabilities.efforts || [] } });
   }
 
   /**
@@ -618,8 +805,155 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     if (!this.nativeSessionId) {
       throw new Error(`${this.runtime}: no session to set a model on`);
     }
+    // Down the config-option road where the agent published one, because that is
+    // the only road that brings the rest of the session's configuration back.
+    //
+    // Probed against kimi this session, switching from `kimi-k2.7-code` to
+    // `~openai/gpt-mini-latest`. `session/set_model` succeeds and answers `{}` —
+    // nothing about the new model at all. `session/set_config_option` with the
+    // *model* option answers with the whole `configOptions` list rebuilt, and
+    // the thinking ladder in it has genuinely changed: `off`/`on` before,
+    // `off`/`low`/`medium`/`high`/`xhigh` after, with `currentValue` moved from
+    // `on` to `high`.
+    //
+    // That difference is not cosmetic. Taking the `set_model` road left the chip
+    // offering `on` — which the new model refuses by name — and hiding the three
+    // levels it had just gained, until the conversation was relaunched.
+    if (this.modelOptionId) {
+      const reply = record(
+        await this.call('session/set_config_option', {
+          sessionId: this.nativeSessionId,
+          configId: this.modelOptionId,
+          value: model,
+        }),
+      );
+      this.model = model;
+      this.applySessionConfig(reply);
+      this.publishEfforts();
+      this.emitEffort();
+      return;
+    }
+
     await this.call('session/set_model', { sessionId: this.nativeSessionId, modelId: model });
     this.model = model;
+    // The ladder belongs to the model on grok, so a model switch can hand the
+    // session a different set of levels or none at all. Grok also confirms the
+    // switch with a notification that says the same thing, and the second pass
+    // through here is a no-op — both `applyModelEffort` and `emitEffort` only
+    // speak when something actually moved.
+    if (this.applyModelEffort()) this.publishEfforts();
+    this.emitEffort();
+  }
+
+  /**
+   * Change how hard this agent thinks, down whichever road it published.
+   *
+   * Two roads, because the agents this adapter serves genuinely have two, and
+   * both were probed live against the installed CLIs this session.
+   *
+   * kimi and omp put the level in a `thought_level` config option, and the
+   * setter is `session/set_config_option` with `{ sessionId, configId, value }`.
+   * It is `configId` and not `optionId`: the wrong spelling came back from kimi
+   * as `-32602 Invalid params` with
+   * `{"configId":{"_errors":["Invalid input: expected string, received undefined"]}}`,
+   * which is about as unambiguous as a protocol gets. Every other name for the
+   * method itself — `session/set_config`, `session/select_config_option`,
+   * `session/set_option`, `session/setConfigOption` — answered `-32601`.
+   * The reply is the whole `configOptions` list again with `currentValue`
+   * already moved, so it is fed back through the same parser the handshake uses
+   * rather than assuming we got the level we asked for; kimi's ladder depends on
+   * the model, so a menu that changed shape is picked up in the same pass.
+   *
+   * grok has no such option and no `session/set_reasoning_effort` either
+   * (`-32601`), and ignores `--reasoning-effort` on the `agent stdio` path —
+   * launching with `low`, `medium`, `high` and a bogus value all left the level
+   * it reported at `high`, because that flag belongs to headless mode. What does
+   * move it is `session/set_model` carrying `_meta.reasoningEffort`, and only
+   * that: `reasoningEffort` at the top level, `effort`, `reasoningEffortId` and
+   * a `modelId` of `grok-4.5:low` all either errored or left the level where it
+   * was.
+   *
+   * A rejection is left to propagate. The caller reports a failed change as
+   * pending-with-reason and shows the message, and these agents write a good
+   * one — kimi refuses with `Unknown thinking effort for model
+   * "openrouter/moonshotai/kimi-k2.7-code": bogus_xyz` and omp with `Unknown ACP
+   * thinking level: bogus_xyz`, each naming the level it would not take.
+   */
+  async setEffort(effort: string): Promise<void> {
+    if (!this.nativeSessionId) {
+      throw new Error(`${this.runtime}: no session to set a reasoning effort on`);
+    }
+
+    if (this.effortOptionId) {
+      const updated = record(
+        await this.call('session/set_config_option', {
+          sessionId: this.nativeSessionId,
+          configId: this.effortOptionId,
+          value: effort,
+        }),
+      );
+      this.applyEffortOptions(list(updated.configOptions));
+      // Published unconditionally rather than on a comparison: the reply is a
+      // freshly built list every time, and one capability event per level the
+      // user chose is a great deal cheaper than a menu that quietly went stale.
+      this.publishEfforts();
+      this.emitEffort();
+      return;
+    }
+
+    if (this.model && this.modelEfforts.has(this.model)) {
+      // Resolving here means grok accepted the call — its reply is only
+      // `{"_meta":{"model":{"Ok":"grok-4.5"}}}`. What actually moves the chip is
+      // the `_x.ai/session_notification` that follows, carrying
+      // `reasoning_effort`, and `handleModelChanged` emits the event off that.
+      // Resolving on the acceptance is still honest: grok validates the level on
+      // this call, so a level it will not run rejects here rather than being
+      // silently dropped on the floor.
+      await this.call('session/set_model', {
+        sessionId: this.nativeSessionId,
+        modelId: this.model,
+        _meta: { reasoningEffort: effort },
+      });
+      return;
+    }
+
+    throw new Error(
+      `${this.runtime} published no reasoning-effort levels${
+        this.model ? ` for ${this.model}` : ''
+      }, so its thinking cannot be changed from here`,
+    );
+  }
+
+  /**
+   * Put a launched-with level into effect, once there is a session to put it on.
+   *
+   * ACP has no launch flag for this. `session/new` takes a cwd and a list of MCP
+   * servers and nothing else, and the level lives in a config option — or, on
+   * grok, on a model — that does not exist until the session does. So a
+   * remembered choice is applied immediately afterwards, down exactly the road
+   * `setEffort` takes, and the agent confirms it exactly as it would confirm a
+   * change made mid-conversation.
+   *
+   * Best-effort in the sense the codex adapter's `loadModelList` is: a level
+   * this agent will not take must not stop the conversation opening. It is a
+   * live possibility rather than a theoretical one, because kimi's ladder
+   * depends on the model — a level remembered under one model is refused under
+   * another. Unlike a missing model list this is worth a line in the transcript,
+   * since the user asked for this level and would otherwise watch the chip
+   * silently disagree with the picker.
+   */
+  private async applyLaunchEffort(): Promise<void> {
+    const wanted = this.options.effort;
+    if (!wanted || wanted === this.effort) return;
+    try {
+      await this.setEffort(wanted);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit({
+        t: 'error',
+        message: `${this.runtime}: could not start at reasoning effort "${wanted}": ${message}`,
+      });
+    }
   }
 
   async interrupt(): Promise<void> {
@@ -675,6 +1009,17 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   }
 
   protected handleNotification(method: string, params: Record<string, unknown>): void {
+    if (method === '_x.ai/session_notification') {
+      // Grok's own notification channel, which it runs *alongside* the standard
+      // `session/update` one rather than instead of it. Only the one update kind
+      // anybody has watched arrive on it is read here: routing the whole channel
+      // into the switch below would mean any update grok chose to send down both
+      // pipes got counted twice, and doubling a message chunk is a worse failure
+      // than ignoring an extension nobody has captured.
+      const extension = record(params.update);
+      if (str(extension.sessionUpdate) === 'model_changed') this.handleModelChanged(extension);
+      return;
+    }
     if (method !== 'session/update') return;
     const update = record(params.update);
     const kind = str(update.sessionUpdate);
@@ -711,6 +1056,42 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
         // whole point of a normalised vocabulary.
         return;
     }
+  }
+
+  /**
+   * Grok saying which model, and at which thinking level, it is now running.
+   *
+   * The confirmation half of `setEffort`'s second road, probed live:
+   * `session/set_model` with `{"modelId":"grok-4.5","_meta":{"reasoningEffort":"low"}}`
+   * replies `{"_meta":{"model":{"Ok":"grok-4.5"}}}` and then sends
+   * `_x.ai/session_notification` with
+   * `{"sessionUpdate":"model_changed","model_id":"grok-4.5","reasoning_effort":"low"}`.
+   * The reply says the call was accepted; this says what grok is actually doing,
+   * which is the only thing worth putting on the chip.
+   *
+   * Snake_case here, camelCase in the `session/new` reply that named the same
+   * two things — the same agent, in the same session. Both spellings are read
+   * because a wrong guess would be indistinguishable from grok never answering,
+   * and neither is invented: each was seen on the wire.
+   */
+  private handleModelChanged(update: Record<string, unknown>): void {
+    const modelId = str(update.model_id) || str(update.modelId);
+    if (modelId && modelId !== this.model) {
+      this.model = modelId;
+      // A different model can mean a different ladder, or no ladder — grok's
+      // default `grok-build` has none at all.
+      if (this.applyModelEffort()) this.publishEfforts();
+    }
+
+    const effort = str(update.reasoning_effort) || str(update.reasoningEffort);
+    if (effort) {
+      // Remembered against the model as well as reported, so that a later
+      // switch away and back does not resurrect the level from the handshake
+      // snapshot after the agent has told us it moved on.
+      if (this.model) this.modelEffortLevels.set(this.model, effort);
+      this.effort = effort;
+    }
+    this.emitEffort();
   }
 
   private handleCommands(update: Record<string, unknown>): void {

@@ -16,6 +16,7 @@ import {
   ToolStatus,
   UserTurn,
   classifyTool,
+  rankedEfforts,
 } from '../../../shared/chat-events.js';
 
 /**
@@ -62,6 +63,44 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     // built-ins are this app's own knowledge of what a fresh Claude accepts;
     // the rest is what the session found installed for this person.
     commands: mergeSlashCommands(defaultSlashCommands(), this.options.installedCommands),
+    // Claude's own ladder, in its own words. Nothing in the protocol publishes
+    // it — `init` names the model and the slash commands and stops there — so
+    // this was assembled from the runtime describing itself in two places, and
+    // the two do not agree.
+    //
+    // `--help` documents five: `--effort <level>  Effort level for the current
+    // session (low, medium, high, xhigh, max)`. But `/effort` with no argument
+    // answers `Usage: /effort <low|medium|high|xhigh|max|ultracode|auto>`, and
+    // of those two extras exactly one is also a launch flag. Probed against
+    // 2.1.220: `--effort ultracode` is accepted in silence, while `--effort
+    // auto` prints `Warning: Unknown --effort value 'auto' — ignoring it`. The
+    // CLI's own discrimination between the two is what puts `ultracode` on this
+    // list and keeps `auto` off it — a level that worked live and then vanished
+    // at the next launch would be worse than one never offered.
+    //
+    // Evenly ranked. `ultracode` sits at the top because that is where Claude's
+    // own usage line puts it and because it is unmistakably the most expensive
+    // thing here — though its gloss is worth reading before assuming it is
+    // simply "more than max": the reasoning depth is xhigh, and what it adds is
+    // breadth, fanning the work out across orchestrated agents. Every
+    // description below is Claude's own sentence where it gives one, read back
+    // off the confirmation it sends when the level is set.
+    //
+    // A build that does not know a level does NOT refuse it, which is the whole
+    // reason `knownLevel` gates the flag in `buildArgs`. Probed: `claude --effort
+    // auto --version` prints `Warning: Unknown --effort value 'auto' — ignoring
+    // it and using the default effort` and exits 0. So the failure is the quiet
+    // one — the conversation runs at Claude's default while everything upstream
+    // reports the level that was asked for — and nothing off this list is ever
+    // allowed onto the command line.
+    efforts: rankedEfforts([
+      { value: 'low', name: 'Low', description: 'the least thinking on offer, for mechanical work' },
+      { value: 'medium', name: 'Medium', description: 'a middling amount of thought' },
+      { value: 'high', name: 'High', description: 'more thought, for work that needs turning over' },
+      { value: 'xhigh', name: 'Extra high', description: 'deeper reasoning than high, just below maximum' },
+      { value: 'max', name: 'Max', description: 'maximum capability and the deepest reasoning; slow, and easy to overthink with' },
+      { value: 'ultracode', name: 'Ultracode', description: 'xhigh reasoning plus dynamic workflow orchestration' },
+    ]),
   };
 
   /** Session id we generated for a fresh launch, before init echoes it back. */
@@ -105,6 +144,80 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
    * `task_started` is what lets its closing status reach the right delegation.
    */
   private readonly tasksByTaskId = new Map<string, string>();
+  /**
+   * The `/effort` turn in flight, or null when none is.
+   *
+   * Set for the few milliseconds between writing the command and the `result`
+   * that answers it. While it is set this adapter is deliberately deaf: see
+   * `setEffort`, which is the only thing that sets it and the only place the
+   * whole arrangement is explained.
+   */
+  private pendingEffort: {
+    level: string;
+    resolve: () => void;
+    reject: (error: Error) => void;
+    timer: NodeJS.Timeout;
+    /**
+     * The same promise `setEffort` handed its caller.
+     *
+     * Held so `send()` can wait on it without a second one to keep in step. It
+     * is always awaited with a `.catch`, because a rejection here belongs to
+     * whoever asked for the level and has already been given it once — an
+     * unhandled one on this copy would take the process down over a failure
+     * somebody is already reporting.
+     */
+    settled: Promise<void>;
+  } | null = null;
+  /**
+   * How many `/effort` answers are still owed by a switch nobody is waiting for.
+   *
+   * Incremented whenever a pending switch is abandoned — a timeout, the child
+   * exiting, or a message typed over the top of it. The command was written to
+   * stdin and Claude will answer it whenever it gets there; by then
+   * `pendingEffort` is null, so `handleResult`'s guard no longer recognises the
+   * line and it fell through into the ordinary turn-closing path. What that did
+   * was end the user's *next* real turn the moment the stale answer arrived —
+   * at zero cost, before it had produced anything — leaving the reply that
+   * followed to open a turn of its own with nobody's question in it.
+   *
+   * Claude's own figures are what tell the two apart: it answers this command
+   * locally, so the result carries `num_turns: 0`, which no turn that reached
+   * the model ever does.
+   */
+  private staleEffortResults = 0;
+  /**
+   * True once streaming has opened an assistant message for the current turn.
+   *
+   * The whole of this adapter's snapshot handling rests on streaming having
+   * built the message first — snapshots only ever patch what is already there.
+   * That holds for anything the model answered, because a model answer always
+   * arrives as deltas.
+   *
+   * It does not hold for a command the CLI answers by itself. `/effort auto`
+   * and `/model x` are handled locally, and locally-handled commands emit no
+   * `stream_event` whatsoever: verified against 2.1.220, which for one of them
+   * sends exactly two lines, an `assistant` snapshot and a `result` with
+   * `num_turns: 0`. So the reply had nothing to patch and was dropped on the
+   * floor — the transcript showed the command, a turn, `$0`, and no answer.
+   *
+   * Reset per turn rather than per message so a turn with several assistant
+   * messages in it still only materialises a snapshot when the *first* one
+   * never streamed.
+   */
+  private streamedThisTurn = false;
+
+  /**
+   * The level, when this build of Claude is known to have one by that name.
+   *
+   * Checked against `capabilities.efforts` rather than a second list kept in
+   * step by hand. Anything else comes back as nothing, because passing it would
+   * mean the flag warned on a stream nobody reads and the conversation ran at
+   * Claude's default while the chip reported the level that was asked for.
+   */
+  private knownLevel(effort: string | undefined): string | undefined {
+    if (!effort) return undefined;
+    return this.capabilities.efforts?.some((level) => level.value === effort) ? effort : undefined;
+  }
 
   protected buildArgs(): string[] {
     const args = [
@@ -133,6 +246,30 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     if (this.options.model) {
       args.push('--model', this.options.model);
     }
+    const effort = this.knownLevel(this.options.effort);
+    if (effort) {
+      // Documented by 2.1.220's own `--help`: `--effort <level>  Effort level
+      // for the current session (low, medium, high, xhigh, max)`.
+      //
+      // Filtered rather than passed through, and the reason is a correction to
+      // what this comment used to claim. An unrecognised value is NOT refused:
+      // `claude --effort auto --version` prints `Warning: Unknown --effort value
+      // 'auto' — ignoring it and using the default effort` and exits 0. So this
+      // fails exactly the way pi's does — silently, at the runtime's own default,
+      // while everything upstream goes on reporting the level that was asked for.
+      //
+      // Three real ways a level that is not on this ladder reaches here: a
+      // `/effort` typed into the composer, whose accepted set is wider than the
+      // flag's by exactly one word — `auto`, which the command takes and the
+      // flag warns about; a conversation whose record was written while it ran
+      // on another runtime; and a record written by a future build with a
+      // longer ladder.
+      //
+      // Placed beside `--model` rather than among `extraArgs`, which go on
+      // staying last: both are the session's own choice, and whatever a profile
+      // spells out for itself is still written after them.
+      args.push('--effort', effort);
+    }
     if (this.options.extraArgs) {
       args.push(...this.options.extraArgs);
     }
@@ -140,9 +277,41 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     return args;
   }
 
+  async start(): Promise<void> {
+    await super.start();
+    // A `/effort` turn waiting for its answer is a promise somebody upstream is
+    // holding, and the only thing that ever settles it is a `result` line from
+    // this child. If the child goes away first — a crash, a `stop()`, the user
+    // closing the session — no such line is coming, and without this the caller
+    // would sit on it until the timeout in `setEffort` expired. The timeout is
+    // the backstop; this is the truthful answer, available immediately.
+    this.child?.on('exit', () => {
+      this.abandonEffort(new Error('claude exited before it confirmed the effort level'));
+    });
+  }
+
   async send(turn: UserTurn): Promise<void> {
+    // Give up on any `/effort` still in flight rather than waiting for it. The
+    // suppression `setEffort` installs would otherwise swallow this turn's own
+    // opening events — the user's message would simply never appear — and the
+    // first version of this waited on the pending promise to avoid that.
+    //
+    // Waiting was the wrong trade. It held a typed message for as long as the
+    // switch took to answer, up to the whole 8-second ceiling if the answer
+    // never came, and a composer that swallows a keystroke for eight seconds is
+    // a worse failure than a level that did not change. The person typing has
+    // said what they want; the button press is the thing to drop.
+    //
+    // `abandonEffort` rejects the switch — which the caller reports honestly as
+    // "saved, not applied" — and leaves the answer owed. `staleEffortResults`
+    // is what stops that answer, when it does arrive, being mistaken for the end
+    // of this turn.
+    if (this.pendingEffort) {
+      this.abandonEffort(new Error('a message was sent before the effort level was confirmed'));
+    }
     this.activeTurnId = randomUUID();
     this.turnTokensEmitted = {};
+    this.streamedThisTurn = false;
     const content: Array<Record<string, unknown>> = [{ type: 'text', text: turn.text }];
     for (const attachment of turn.attachments ?? []) {
       content.push(this.attachmentBlock(attachment));
@@ -181,6 +350,106 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
   respondPermission(_requestId: string, _optionId: string): void {
     // capabilities.permissions is false, so the UI has no button that calls
     // this yet; kept as a no-op until the MCP permission bridge lands.
+  }
+
+  /**
+   * Change the reasoning level of a session that is already running.
+   *
+   * There is no control request for this, and that was not assumed — it was
+   * probed. Every plausible spelling was written to the running CLI's stdin in
+   * bidirectional stream-json mode (`set_effort`, `effort`,
+   * `set_reasoning_effort`) and all three came back
+   * `{"subtype":"error","error":"Unsupported control request subtype: set_effort"}`,
+   * on the same socket where `set_model` and `set_permission_mode` answered
+   * `{"subtype":"success"}`. So the road `interrupt()` takes is closed here.
+   *
+   * The road that is open is the slash command, sent down the ordinary *user*
+   * channel. Claude advertises it — the `init` message's `slash_commands` array
+   * contains `"effort"` alongside `"model"` — and writing the line below
+   * produced an assistant message and then
+   * `{"type":"result","subtype":"success","total_cost_usd":0,"num_turns":0,
+   * "result":"Set effort level to xhigh (this session only): ..."}`. Zero
+   * dollars and zero model round trips: the CLI answers it locally. That is what
+   * makes spending a turn on a button press affordable at all.
+   *
+   * It is nonetheless a *turn*, and everything this app knows about a
+   * conversation is derived from turn structure — where one begins, what it
+   * cost, how many round trips it took. So two things follow, and they are the
+   * whole of why this method is longer than a write:
+   *
+   * First, it refuses to interleave. A control turn written while the agent is
+   * working would fold a message the user never typed into a turn they did,
+   * taking its costs and its round-trip count with it. `pending` is the honest
+   * answer there, and a throw is how the caller is told to give it.
+   *
+   * Second, everything the runtime says while it is in flight is dropped on the
+   * floor — the echo of the command, the assistant turn answering it, the
+   * streamed tokens of that answer (see the guards in `handleStatus`,
+   * `handleStreamEvent`, `handleAssistantSnapshot` and `handleUserEcho`). The
+   * user pressed a button; they did not type a command. A user message they did
+   * not write, answered by an assistant message about a setting, is a lie in the
+   * transcript and a phantom turn in the accounting — one that would sit in the
+   * turn index with its own row and its own zero-cost bill.
+   *
+   * The promise resolves only on Claude's own confirmation, because the caller
+   * reports `live` to the user on the strength of it.
+   */
+  async setEffort(effort: string): Promise<void> {
+    if (this.activeTurnId !== null) {
+      throw new Error(
+        'claude is mid-turn, and a control turn sent now would be folded into it',
+      );
+    }
+    if (!this.alive) {
+      throw new Error('claude is not running, so there is no session to change the level of');
+    }
+    if (this.pendingEffort) {
+      throw new Error('claude is already being asked to change effort level');
+    }
+
+    // The whole state goes up before the write, not after: `handleResult` runs
+    // off a stdout `data` event and cannot land inside the synchronous body of
+    // the executor below, but ordering it this way means there is no
+    // arrangement of the event loop in which an answer arrives with nothing
+    // here to receive it.
+    let resolve!: () => void;
+    let reject!: (error: Error) => void;
+    const settled = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    const timer = setTimeout(() => {
+      this.abandonEffort(
+        new Error(`claude did not confirm the effort level within ${EFFORT_TIMEOUT_MS}ms`),
+      );
+    }, EFFORT_TIMEOUT_MS);
+    this.pendingEffort = { level: effort, resolve, reject, timer, settled };
+    this.writeLine({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'text', text: `/effort ${effort}` }] },
+    });
+    return settled;
+  }
+
+  /**
+   * Give up on a `/effort` turn that will never be answered.
+   *
+   * Rejecting rather than resolving quietly, and emitting no `effort` event at
+   * all, because the level was never confirmed by anybody: the caller turns this
+   * into `pending`, which says "asked, not seen to take" — where a resolve would
+   * put a level on the chip on the strength of this app having asked for it.
+   * Also the one thing that lifts the suppression above, so a session that
+   * outlives a failed switch is not left deaf to its own runtime.
+   */
+  private abandonEffort(error: Error): void {
+    const pending = this.pendingEffort;
+    if (!pending) return;
+    this.pendingEffort = null;
+    clearTimeout(pending.timer);
+    // The command is already on its way to Claude and will still be answered.
+    // See `staleEffortResults` for what that answer would otherwise do.
+    this.staleEffortResults += 1;
+    pending.reject(error);
   }
 
   protected handleMessage(message: unknown): void {
@@ -327,12 +596,36 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       cwd: str(raw.cwd),
       capabilities: this.capabilities,
     });
+    // What level this session is running at, as far as anyone here can honestly
+    // say. `init` carries the model, the cwd and the command list and says
+    // nothing whatever about effort — checked against 2.1.220's own init line,
+    // `{"model":"claude-opus-5[1m]","slash_commands":["effort","model",...]}`,
+    // which advertises that the *command* exists without ever reporting the
+    // level it is currently on. So the only fact available at launch is the flag
+    // this adapter passed a moment ago in `buildArgs`, and that is what is
+    // reported.
+    //
+    // `null` when no flag was passed, and it means "whatever Claude's own
+    // default is" rather than the bottom of the ladder. The CLI has never told
+    // us which of its five that is, so naming one would be a guess — and the
+    // chip renders what arrives here as the agent's own word for what it is
+    // doing.
+    this.emit({ t: 'effort', effort: this.options.effort ?? null });
     // Nothing is running yet; the first `system/status: requesting` (sent
     // once a prompt actually lands) is what moves this on to `thinking`.
     this.emit({ t: 'state', state: 'idle' });
   }
 
   private handleStatus(raw: Record<string, unknown>): void {
+    // Whether the CLI reports a status at all for a command it answers locally
+    // was never established — the capture in `setEffort` shows an assistant
+    // message and a result, and nothing was written down about what came
+    // between. Which is exactly why this is guarded: if it does say
+    // `requesting`, the session would move to `thinking` and stay there, because
+    // the only thing that ever moves it back is the `turn_end` that the
+    // suppressed result never produces. Saying nothing leaves the session idle,
+    // which is the truth — no work was ever requested of the model.
+    if (this.pendingEffort) return;
     const status = str(raw.status);
     if (status === 'requesting') {
       this.emit({ t: 'state', state: 'thinking' });
@@ -344,6 +637,13 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
   }
 
   private handleStreamEvent(raw: Record<string, unknown>): void {
+    // Tokens belonging to the answer to a command nobody typed (see
+    // `setEffort`). Dropped at the top rather than filtered later, because
+    // `handleMessageStart` opens a message — and mints a turn id for it if none
+    // is running — so a single delta let through here would put a message in the
+    // transcript and a turn in the index that the rest of this arrangement then
+    // has nothing to close.
+    if (this.pendingEffort) return;
     const event = record(raw.event);
     if (!event) return;
     // A partial belonging to a sub-agent, if the runtime ever streams one.
@@ -382,6 +682,7 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     const message = record(event.message);
     this.currentMsgId = (message && str(message.id)) || randomUUID();
     this.openToolIndices.clear();
+    this.streamedThisTurn = true;
 
     if (!this.activeTurnId) {
       // A message_start with no turn in flight means send() was never
@@ -511,10 +812,56 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
    * boundary landing inside a multi-byte escape, say) -- never to create a
    * second copy of the message.
    */
+  /**
+   * Turn an unstreamed assistant snapshot into a message of its own.
+   *
+   * Only ever reached for a turn in which streaming opened nothing at all, so
+   * there is no message for this to duplicate — that condition, rather than the
+   * shape of the snapshot, is what makes it safe. Marks the turn as streamed on
+   * the way out so a second snapshot for the same answer cannot build it twice.
+   *
+   * Text blocks only. A locally-handled command has no tools and no reasoning,
+   * and the loop below this still handles `tool_use` for every other case.
+   */
+  private materialiseSnapshot(
+    raw: Record<string, unknown>,
+    message: Record<string, unknown> | undefined,
+    content: unknown[],
+  ): void {
+    const text = content
+      .map((entry) => record(entry))
+      .filter((block): block is Record<string, unknown> => Boolean(block) && str(block!.type) === 'text')
+      .map((block) => str(block.text) ?? '')
+      .join('');
+    if (!text) return;
+
+    this.streamedThisTurn = true;
+    if (!this.activeTurnId) this.activeTurnId = randomUUID();
+    const msgId = (message && str(message.id)) || randomUUID();
+    this.emit({
+      t: 'msg_start',
+      id: msgId,
+      role: 'assistant',
+      turnId: this.activeTurnId,
+      model: message ? str(message.model) : undefined,
+    });
+    this.emit({ t: 'block_start', msgId, index: 0, block: { kind: 'text', text } });
+    this.emit({ t: 'msg_end', msgId, stopReason: str(raw.stop_reason) });
+  }
+
   private handleAssistantSnapshot(raw: Record<string, unknown>): void {
+    // The snapshot of that same unasked-for answer (see `setEffort`). Nothing
+    // it could patch exists — the streaming half was dropped above — so at best
+    // this emits patches addressed to blocks nobody ever opened.
+    if (this.pendingEffort) return;
     const message = record(raw.message);
     const content = message && Array.isArray(message.content) ? (message.content as unknown[]) : [];
     const parent = str(raw.parent_tool_use_id);
+    // An answer nothing streamed, which means the CLI produced it without going
+    // near the model — a slash command it handles itself. This is the only
+    // carrier that reply has, so it is built into a real message here rather
+    // than used to patch one that was never opened. See `streamedThisTurn`.
+    if (!parent && !this.streamedThisTurn) this.materialiseSnapshot(raw, message, content);
     for (const entry of content) {
       const block = record(entry);
       if (!block || str(block.type) !== 'tool_use') continue;
@@ -551,6 +898,12 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
 
   /** A `user` message here is Claude echoing tool results, never a human turn. */
   private handleUserEcho(raw: Record<string, unknown>): void {
+    // The echo of the `/effort` line itself, among anything else the CLI sends
+    // back on the user channel while it is answering it (see `setEffort`). The
+    // user pressed a button and never typed a command; a message in their own
+    // voice that they did not write is the one thing a transcript must never
+    // contain.
+    if (this.pendingEffort) return;
     const message = record(raw.message);
     const content = message && Array.isArray(message.content) ? (message.content as unknown[]) : [];
     const parent = str(raw.parent_tool_use_id);
@@ -699,7 +1052,77 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     });
   }
 
+  /**
+   * The `result` that closes a `/effort` turn, consumed instead of reported.
+   *
+   * Everything below this line in `handleResult` is skipped deliberately, and
+   * each omission is the point rather than an oversight. No `turn_end`, because
+   * no turn began — the user's own last turn ended long before this one was
+   * written, and `activeTurnId` is left exactly as it was found. No usage, and
+   * above all no visit to `turnCost`: that method moves a watermark on every
+   * reading, and letting a turn Claude itself billed at `total_cost_usd: 0` and
+   * `num_turns: 0` through it would consume a reading the *next* real turn needs
+   * to measure itself against.
+   *
+   * What is taken is the level, and it is taken from Claude's own sentence:
+   * "Set effort level to xhigh (this session only): ...". Reading it back rather
+   * than echoing the level asked for is the difference between reporting what
+   * the runtime did and reporting what this app requested — and they are the
+   * same only until the day the CLI normalises a level, or accepts an alias, or
+   * quietly clamps one. The level asked for is the fallback for a build that
+   * words its confirmation differently, which is a small guess on top of a
+   * success the runtime did report, and nothing like a guess on top of silence.
+   *
+   * A failed result is not a level at all. It rejects, emits nothing, and the
+   * caller says `pending` — the same as never having been answered, which is
+   * what it amounts to.
+   */
+  private consumeEffortResult(raw: Record<string, unknown>): void {
+    const pending = this.pendingEffort;
+    if (!pending) return;
+    this.pendingEffort = null;
+    clearTimeout(pending.timer);
+
+    const text = str(raw.result) ?? '';
+    // A refusal does not look like a failure, which is the trap this reads
+    // around. Asked for a level it does not have, 2.1.220 answers
+    // `{"is_error":false,"subtype":"success","result":"Invalid argument: ultra.
+    // Valid options are: low, medium, high, xhigh, max, ultracode, auto"}` —
+    // a *successful* result whose text is a rejection. Keying off `is_error`
+    // alone reported that to the user as "Now thinking at ultra."
+    //
+    // So the confirmation sentence is the only thing that counts as one. There
+    // is no falling back to the level that was asked for: the whole reason this
+    // waits for an answer at all is to report what Claude did rather than what
+    // this app requested, and a fallback would quietly undo that in exactly the
+    // case where the two differ.
+    const confirmed = /set effort level to (\w+)/i.exec(text)?.[1];
+    if (raw.is_error === true || !confirmed) {
+      pending.reject(new Error(text || `claude did not confirm the effort level ${pending.level}`));
+      return;
+    }
+
+    this.emit({ t: 'effort', effort: confirmed });
+    pending.resolve();
+  }
+
   private handleResult(raw: Record<string, unknown>): void {
+    if (this.pendingEffort) {
+      this.consumeEffortResult(raw);
+      return;
+    }
+
+    // The answer to a switch that was given up on. Dropped rather than reported:
+    // nobody is waiting for it, the level it names may or may not have taken,
+    // and letting it through here would close whatever turn is running now. See
+    // `staleEffortResults`; `num_turns: 0` is Claude's own mark of a command it
+    // answered without going near the model, which is what makes this safe to
+    // key on rather than a guess at which result belongs to what.
+    if (this.staleEffortResults > 0 && num(raw.num_turns) === 0) {
+      this.staleEffortResults -= 1;
+      return;
+    }
+
     const subtype = str(raw.subtype);
     const isError = raw.is_error === true;
 
@@ -762,6 +1185,20 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     this.currentMsgId = null;
   }
 }
+
+/**
+ * How long a `/effort` turn may go unanswered before it is given up on.
+ *
+ * Generous by an order of magnitude, on purpose. The CLI answers this one in
+ * milliseconds because no model is involved — `total_cost_usd: 0`,
+ * `num_turns: 0`, handled locally — so anything approaching eight seconds is not
+ * a slow answer but a CLI that never understood the question, and every one of
+ * those seconds is spent with this adapter deaf to its own runtime (see the
+ * suppression `setEffort` describes). Long enough that a machine under load
+ * never trips it; short enough that a session which does is usable again well
+ * before anybody reaches for the reload button.
+ */
+const EFFORT_TIMEOUT_MS = 8000;
 
 /**
  * A task's own status word, mapped onto the transcript's tool statuses.

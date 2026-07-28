@@ -535,6 +535,19 @@ export interface ChatCapabilities {
   commands?: SlashCommand[];
   /** Selectable models, when the runtime advertises a list. */
   models?: ModelChoice[];
+  /**
+   * Reasoning-effort levels this runtime will accept, cheapest first.
+   *
+   * Absent means the runtime has no effort knob anyone has watched working, and
+   * the control says so instead of offering levels that would be rejected. Every
+   * list here came from the runtime itself — either published in its handshake
+   * (codex, grok, kimi, omp) or read off its own `--help` and confirmed by
+   * feeding it a bad value and reading the complaint (claude, pi).
+   *
+   * The ladders are not comparable across runtimes: `high` is the top of grok's
+   * and the middle of pi's. That is what `rank` is for.
+   */
+  efforts?: EffortChoice[];
 }
 
 export interface SlashCommand {
@@ -548,6 +561,48 @@ export interface ModelChoice {
   value: string;
   name: string;
   description?: string;
+}
+
+/**
+ * One reasoning-effort level, as the runtime that offers it named it.
+ *
+ * `value` is sent back to that runtime verbatim, so it is never a word this app
+ * invented: kimi answers `on`/`off`, pi answers `xhigh`, codex answers `ultra`,
+ * and a level spelled any other way is refused by name.
+ */
+export interface EffortChoice {
+  value: string;
+  name: string;
+  description?: string;
+  /**
+   * Where this level sits on its own runtime's ladder — 0 is the least thinking
+   * on offer, 1 the most.
+   *
+   * Carried rather than derived from list order because the UI colours by it,
+   * and a colour derived from position in a list would make kimi's `on` (of two)
+   * a different weight from pi's `max` (of seven) when both are that runtime's
+   * ceiling. It also gives the levels that are not points on a ladder somewhere
+   * honest to sit: omp's `auto` picks per prompt, so it ranks mid.
+   */
+  rank: number;
+}
+
+/**
+ * Evenly-spaced ranks for a ladder given cheapest-first.
+ *
+ * The common case — a runtime whose levels really are a straight line — so the
+ * adapters that have one do not each write the same division out.
+ */
+export function rankedEfforts(
+  levels: Array<{ value: string; name?: string; description?: string }>,
+): EffortChoice[] {
+  const last = Math.max(1, levels.length - 1);
+  return levels.map((level, index) => ({
+    value: level.value,
+    name: level.name ?? level.value,
+    ...(level.description ? { description: level.description } : {}),
+    rank: index / last,
+  }));
 }
 
 /**
@@ -711,6 +766,19 @@ export type ChatEvent =
   /** The runtime revised what it can do — new slash commands, a model switch. */
   | { t: 'capabilities'; seq: number; ts: number; capabilities: Partial<ChatCapabilities> }
   /**
+   * The runtime said which reasoning-effort level it is now running.
+   *
+   * Emitted only where the runtime itself reported the level — at a handshake
+   * that names it, or after a change the runtime acknowledged. Nothing emits
+   * this on the strength of having *asked*: the whole point of a separate event
+   * is that the chip shows what the agent said it is doing, not what this app
+   * requested and hopes it got. A request that was accepted but not confirmed
+   * travels the same road a model switch does, as `applied: 'sent'`.
+   *
+   * `null` means the runtime is back on its own default.
+   */
+  | { t: 'effort'; seq: number; ts: number; effort: string | null }
+  /**
    * Something happened to the conversation itself.
    *
    * `compacted` leaves a marker in place and keeps the transcript: what was
@@ -853,6 +921,21 @@ export interface ChatSnapshot {
    * without it a restart is a stranger reading someone else's transcript.
    */
   nativeSessionId?: string;
+  /**
+   * The reasoning-effort level the runtime last reported, when it reported one.
+   *
+   * Replayed like everything else here, and needed for the same reason the
+   * transcript keeps it at all: an `effort` event is the runtime describing
+   * itself, and a browser rejoining a live conversation has no other way to
+   * learn what it is thinking at. Without it, a reload of a codex session that
+   * opened at `xhigh` — and is still running at `xhigh` — showed the control
+   * blank, because the conversation had never *chosen* a level and so the record
+   * had nothing to send either.
+   *
+   * Optional so a snapshot written before this existed reads as "nobody said",
+   * which is exactly what it is.
+   */
+  effort?: string;
   bypassPermissions: boolean;
 }
 

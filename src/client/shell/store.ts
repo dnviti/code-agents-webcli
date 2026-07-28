@@ -50,6 +50,29 @@ export interface ShellChat {
   runtime: string;
   runtimeLabel: string;
   workingDir: string;
+  /**
+   * Bumped every time this slice is republished, so that it always is.
+   *
+   * The store's `shallowEqual` guard exists to stop a redundant patch waking
+   * every subscriber, and it is right about almost everything here. It was wrong
+   * about this slice in one specific and invisible way: a controller announcing
+   * that something it owns has changed republishes the *same* six values — same
+   * controller object, same session id, same runtime — so the guard saw no
+   * change and told nobody.
+   *
+   * What that cost was every piece of conversation state living on the
+   * controller rather than on the transcript: the model override, the effort
+   * level, and above all the feedback line that reports what the server actually
+   * did with a change. Those only ever redrew when something else happened to
+   * move the transcript in the same moment, which is why a `live` switch looked
+   * fine and a `cleared` or `pending` one left the previous answer on screen —
+   * the runtime emits an event for the first and nothing at all for the others.
+   *
+   * A counter rather than dropping the guard for this slice, because the guard
+   * is load-bearing everywhere else and "this republication is meaningful" is a
+   * claim the caller should have to make rather than a property of the shape.
+   */
+  revision: number;
 }
 
 /*
@@ -260,6 +283,7 @@ const INITIAL: ShellState = {
     runtime: '',
     runtimeLabel: '',
     workingDir: '',
+    revision: 0,
   },
   plan: null,
   toasts: [],

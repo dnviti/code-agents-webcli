@@ -3,6 +3,7 @@ import {
   ChatAttachment,
   ChatCapabilities,
   ChatUsage,
+  EffortChoice,
   ModelChoice,
   QueuedTurn,
   SlashCommand,
@@ -109,6 +110,25 @@ export interface ComposerProps {
   onSetModel?: (model: string) => void;
   /** What the server reported about the last `onSetModel` call, for the chip. */
   modelFeedback?: { applied: 'live' | 'sent' | 'pending' | 'cleared'; message: string } | null;
+  /**
+   * The reasoning-effort level this conversation is running at.
+   *
+   * Distinct from `capabilities.efforts`, which is the ladder — and distinct in
+   * a way that matters more here than it does for the model, because a level's
+   * whole meaning is its position on that ladder. `high` names the top of grok's
+   * and the middle of pi's.
+   */
+  effort?: string;
+  /**
+   * Change how hard the agent thinks. Unlike the model this is only offered
+   * where the runtime published a ladder to choose from; see EffortChip.
+   */
+  onSetEffort?: (effort: string) => void;
+  /** What the server reported about the last `onSetEffort` call, for the chip. */
+  effortFeedback?: {
+    applied: 'live' | 'sent' | 'pending' | 'cleared' | 'refused';
+    message: string;
+  } | null;
   /** Drives what the permission chip reports. */
   bypassPermissions?: boolean;
   /**
@@ -205,6 +225,9 @@ export function Composer({
   alsoRan,
   onSetModel,
   modelFeedback,
+  effort,
+  onSetEffort,
+  effortFeedback,
   bypassPermissions = false,
   terminalOpen = false,
   onNewChat,
@@ -935,6 +958,18 @@ export function Composer({
                 onPick={(value) => onSetModel?.(value)}
               />
 
+              {/* Next to the model because they are the same kind of decision
+                  — which brain, and how hard it works — and because this one
+                  removes itself entirely when the runtime publishes no ladder,
+                  so the row does not gain a permanent gap for a control that
+                  half the runtimes cannot offer. */}
+              <EffortChip
+                current={effort}
+                efforts={capabilities.efforts}
+                feedback={effortFeedback}
+                onPick={(value) => onSetEffort?.(value)}
+              />
+
               <PermissionChip bypassPermissions={bypassPermissions} />
             </>
           ) : null}
@@ -1550,6 +1585,364 @@ function ModelChip({
         </div>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * Where a level sits on its runtime's ladder, as a colour.
+ *
+ * The five stops are CSS custom properties (see `--effort-0..4` in relay.css),
+ * so the ramp themes itself and this only has to say where between two of them
+ * a rank falls. Interpolating rather than snapping to the nearest stop matters
+ * for the longer ladders: pi has seven levels, and rounding each to one of five
+ * colours would give two pairs of neighbours the same one — which is precisely
+ * the comparison the colour exists to make.
+ *
+ * `in oklab` because the alternative interpolates through sRGB and takes the
+ * green-to-amber leg through a muddy olive that reads as neither.
+ */
+function effortTone(rank: number): string {
+  const clamped = Math.min(1, Math.max(0, rank));
+  const position = clamped * 4;
+  const stop = Math.min(3, Math.floor(position));
+  const mix = Math.round((position - stop) * 100);
+  if (mix === 0) return `var(--effort-${stop})`;
+  return `color-mix(in oklab, var(--effort-${stop + 1}) ${mix}%, var(--effort-${stop}))`;
+}
+
+/** Bars in the little meter drawn on the chip. Four reads at 26px; five does not. */
+const EFFORT_BARS = 4;
+
+/**
+ * How hard the agent thinks, and the one place to change it.
+ *
+ * Every runtime here has a reasoning-effort knob and no two spell it the same
+ * way — claude runs low through max, kimi is off or on, codex goes as far as
+ * `ultra`, omp has an `auto` that decides per prompt. So this control offers
+ * exactly what the running runtime published and nothing else. There is no free
+ * text and no unified vocabulary: unlike a model name, a level this app invented
+ * would either be refused mid-turn or, on pi, warned about on a stderr nobody
+ * reads and then silently ignored while the chip claimed it was live.
+ *
+ * Three things say the level at once, and that redundancy is the design rather
+ * than decoration. The **text** names it. The **meter** fills in proportion to
+ * where it sits on its own runtime's ladder, which is the only honest way to
+ * compare `on` against `xhigh`. The **colour** runs from the same grey as every
+ * other chip on the row up to the loudest thing in the palette, so a glance
+ * costs nothing. Colour alone would fail a colourblind reader; the meter alone
+ * would not catch the eye; the animation — which scales with the level too —
+ * would fail anyone who has asked for less motion, and does, deliberately.
+ */
+function EffortChip({
+  current,
+  efforts,
+  onPick,
+  feedback,
+}: {
+  /** The level in force, as the record or the runtime reported it, if either did. */
+  current: string | undefined;
+  /** What this runtime says it accepts, cheapest first, or undefined if it says nothing. */
+  efforts: EffortChoice[] | undefined;
+  onPick: (value: string) => void;
+  /** What the server said happened to the last pick made here. */
+  feedback?: {
+    applied: 'live' | 'sent' | 'pending' | 'cleared' | 'refused';
+    message: string;
+  } | null;
+}): React.JSX.Element | null {
+  const [open, setOpen] = React.useState(false);
+  const ref = React.useRef<HTMLDivElement | null>(null);
+  const isPhone = usePhone();
+
+  /**
+   * The answer goes away on its own, after long enough to read it.
+   *
+   * It used to sit there until the conversation was reset, which made it a
+   * permanent fixture rather than a reply: two of these — this one and the model
+   * picker's, anchored at the same height — overlap into a pile of opaque boxes,
+   * and on a phone, where both resolve against the composer instead of against
+   * their own chip, they land on exactly the same coordinates and the older one
+   * is simply invisible underneath.
+   *
+   * Keyed on the message so a second answer restarts the clock rather than
+   * inheriting the remains of the first one's.
+   */
+  const [showFeedback, setShowFeedback] = React.useState(false);
+  const message = feedback?.message;
+  React.useEffect(() => {
+    if (!message) return;
+    setShowFeedback(true);
+    const timer = setTimeout(() => setShowFeedback(false), 7000);
+    return () => clearTimeout(timer);
+  }, [message]);
+
+  React.useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent): void => {
+      if (!ref.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown, true);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown, true);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  // Nothing at all rather than a disabled control, and this is the one place
+  // this file departs from how the model picker behaves. A model can always be
+  // typed at a runtime and tried, so offering it is never wrong. An effort level
+  // cannot: with no published ladder there is no value that would be accepted,
+  // and a control that can only ever refuse is worse than the space it occupies
+  // — especially on a phone, where it would push Send onto its own line to do it.
+  if (!efforts?.length) return null;
+
+  const matched = efforts.find((level) => level.value === current);
+  // Only what the runtime named. An unrecognised `current` is a level from
+  // before a model switch narrowed the ladder, and calling it by its old name
+  // would attach this runtime's meter and colour to a level it no longer has.
+  const rank = matched?.rank ?? 0;
+  const label = matched?.name ?? 'effort';
+  const tone = matched ? effortTone(rank) : 'var(--muted-foreground)';
+  const filled = matched ? Math.max(1, Math.round(rank * EFFORT_BARS)) : 0;
+
+  // Both scale with the level, so the chip is still at the bottom of the ladder
+  // and unmistakable at the top. `rank === 0` gets no animation whatsoever: the
+  // least thinking on offer should look like the quietest thing on the row.
+  const pulsing = rank > 0;
+  const pulse: React.CSSProperties = pulsing
+    ? {
+        animation: `relay-effort-pulse ${(3.4 - rank * 2.1).toFixed(2)}s var(--ease-in-out) infinite`,
+        // Read by the keyframe. Kept as custom properties because a keyframe
+        // cannot see a component's props, and hand-writing five keyframes to
+        // cover five intensities would fix the ramp to whichever ladder was
+        // longest.
+        ['--effort-glow-on' as string]: `color-mix(in oklab, ${tone} ${Math.round(24 + rank * 46)}%, transparent)`,
+        ['--effort-glow-size' as string]: `${(3 + rank * 6).toFixed(1)}px`,
+      }
+    : {};
+
+  const pick = (value: string): void => {
+    setOpen(false);
+    onPick(value);
+  };
+
+  return (
+    <div style={{ position: isPhone ? 'static' : 'relative', flex: '0 0 auto' }} ref={ref}>
+      <button
+        type="button"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label="Change how hard the agent thinks"
+        title={
+          feedback?.message
+          || (matched
+            ? `Effort: ${matched.name}${matched.description ? ` — ${matched.description}` : ''}`
+            : 'Effort: whatever this runtime does by default')
+        }
+        onClick={() => setOpen((value) => !value)}
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 5,
+          height: isPhone ? TOUCH_TARGET : 26,
+          padding: isPhone ? '0 10px' : '0 8px',
+          whiteSpace: 'nowrap',
+          background: open ? 'var(--accent)' : 'transparent',
+          // The border carries the colour too, at a fraction of it. The same
+          // idiom the branch and permission chips use, so a coloured chip on
+          // this row looks like the others rather than like a new species.
+          border: `1px solid ${matched ? `color-mix(in oklab, ${tone} 42%, var(--border))` : 'var(--border)'}`,
+          borderRadius: 'var(--radius)',
+          fontFamily: 'var(--font-mono)',
+          fontSize: isPhone ? PHONE_TEXT.label : 'var(--text-2xs)',
+          color: tone,
+          cursor: 'pointer',
+          ...pulse,
+        }}
+      >
+        <EffortMeter filled={filled} tone={tone} />
+        {label}
+        <Icon name="chevron-down" size={9} />
+      </button>
+
+      {open ? (
+        <div
+          role="listbox"
+          aria-label="Effort levels"
+          style={{
+            position: 'absolute',
+            right: 0,
+            left: isPhone ? 0 : undefined,
+            bottom: '100%',
+            marginBottom: 6,
+            minWidth: isPhone ? 0 : 220,
+            maxHeight: isPhone ? '50vh' : 300,
+            overflowY: 'auto',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 1,
+            padding: 'var(--space-1)',
+            background: 'var(--popover)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius)',
+            boxShadow: 'var(--shadow-popover)',
+            animation: 'relay-rise var(--duration-fast) var(--ease-out)',
+            zIndex: 'var(--z-dropdown)' as unknown as number,
+          }}
+        >
+          {efforts.map((level) => {
+            const selected = level.value === current;
+            const levelTone = effortTone(level.rank);
+            return (
+              <button
+                key={level.value}
+                type="button"
+                role="option"
+                aria-selected={selected}
+                onClick={() => pick(level.value)}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  width: '100%',
+                  minHeight: isPhone ? TOUCH_TARGET : undefined,
+                  padding: isPhone ? '8px 12px' : '5px 8px',
+                  background: selected ? 'var(--accent)' : 'transparent',
+                  border: 0,
+                  borderRadius: 'var(--radius)',
+                  color: selected ? 'var(--foreground)' : 'var(--muted-foreground)',
+                  font: 'inherit',
+                  fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
+                  textAlign: 'left',
+                  cursor: 'pointer',
+                }}
+              >
+                {/* The same meter as the chip, so the menu is a ladder you can
+                    see rather than a list of words whose order you have to
+                    take on trust. */}
+                <EffortMeter
+                  filled={Math.max(1, Math.round(level.rank * EFFORT_BARS))}
+                  tone={levelTone}
+                />
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ color: levelTone }}>{level.name}</span>
+                  {level.description ? (
+                    <span
+                      style={{
+                        display: 'block',
+                        color: 'var(--muted-foreground)',
+                        fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
+                        whiteSpace: 'normal',
+                      }}
+                    >
+                      {level.description}
+                    </span>
+                  ) : null}
+                </span>
+                {selected ? <Icon name="check" size={11} /> : null}
+              </button>
+            );
+          })}
+
+          {/* The way back, for the same reason the model picker has one: every
+              row above names a level, so without this a conversation could be
+              moved off the runtime's own default and never returned to it. */}
+          <button
+            type="button"
+            role="option"
+            aria-selected={!matched}
+            onClick={() => pick('')}
+            style={{
+              width: '100%',
+              marginTop: 2,
+              minHeight: isPhone ? TOUCH_TARGET : undefined,
+              padding: isPhone ? '8px 12px' : '5px 8px',
+              background: 'transparent',
+              border: 0,
+              borderTop: '1px solid var(--border)',
+              borderRadius: 0,
+              color: 'var(--muted-foreground)',
+              font: 'inherit',
+              fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
+              textAlign: 'left',
+              cursor: 'pointer',
+            }}
+          >
+            Use the default for this runtime
+          </button>
+        </div>
+      ) : null}
+
+      {!open && feedback && showFeedback ? (
+        <div
+          role="status"
+          style={{
+            position: 'absolute',
+            right: 0,
+            // Upward on a phone, and the reason is that `top: 100%` resolves
+            // against the composer there rather than against this chip — the
+            // wrapper is `static` so the popover can have the composer's width.
+            // Below the composer is the bottom navigation bar, which this would
+            // cover: an opaque box at `--z-dropdown` sitting on the buttons, or
+            // off the screen entirely once the safe-area inset is counted.
+            ...(isPhone ? { bottom: '100%', marginBottom: 6 } : { top: '100%', marginTop: 4 }),
+            maxWidth: 240,
+            padding: '4px 6px',
+            background: 'var(--popover)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius)',
+            // A refusal is the one outcome worth colouring: it means the level
+            // was not stored and nothing changed, which a grey note reading like
+            // every other grey note would let slide past.
+            color:
+              feedback.applied === 'live'
+                ? 'var(--foreground)'
+                : feedback.applied === 'refused'
+                  ? 'var(--warning)'
+                  : 'var(--muted-foreground)',
+            fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-2xs)',
+            zIndex: 'var(--z-dropdown)' as unknown as number,
+          }}
+        >
+          {feedback.message}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The level as bars, for everyone the colour does not reach.
+ *
+ * `aria-hidden` because the level is already named in text beside it and the
+ * button carries its own label; a screen reader announcing four decorative
+ * spans would be reading out the picture of the word it just read.
+ */
+function EffortMeter({ filled, tone }: { filled: number; tone: string }): React.JSX.Element {
+  return (
+    <span
+      aria-hidden="true"
+      style={{ display: 'inline-flex', alignItems: 'flex-end', gap: 1, height: 9, flex: '0 0 auto' }}
+    >
+      {Array.from({ length: EFFORT_BARS }, (_, index) => (
+        <span
+          key={index}
+          style={{
+            width: 2,
+            // Rising bars rather than equal ones: the shape says "a scale" on
+            // its own, before the fill does, which is what makes an unfilled
+            // meter still legible as the bottom of a ladder.
+            height: 3 + index * 2,
+            background: index < filled ? tone : 'var(--border)',
+            transition: 'background var(--duration-base) var(--ease-out)',
+          }}
+        />
+      ))}
+    </span>
   );
 }
 

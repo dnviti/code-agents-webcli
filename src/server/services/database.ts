@@ -489,6 +489,12 @@ export class AppDatabase {
     // existed has no override recorded, which is exactly what a null means.
     this.addColumnIfMissing('runtime_sessions', 'chat_model_override', 'TEXT');
 
+    // The reasoning-effort level this conversation overrides its runtime's
+    // default with. Nullable and null-by-default for the same reason as the
+    // model above: a row written before this column existed chose no level, and
+    // null is what "chose no level" has always meant.
+    this.addColumnIfMissing('runtime_sessions', 'chat_effort_override', 'TEXT');
+
     // The label the user chose for this session. Nullable and null-by-default:
     // a null is "never renamed", which is true of every row written before
     // renaming outlived the page that did it.

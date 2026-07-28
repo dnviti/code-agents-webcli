@@ -10,6 +10,7 @@ import {
   UserTurn,
   classifyTool,
   mergeUsage,
+  rankedEfforts,
 } from '../../../shared/chat-events.js';
 
 /**
@@ -78,6 +79,38 @@ export class PiChatAdapter extends BaseChatAdapter {
     // No plan/todo tool in pi's built-in tool list (read, bash, edit, write,
     // grep, find, ls).
     plan: false,
+    // pi's thinking ladder, in the order its own `--help` prints it:
+    // `--thinking <level>   Set thinking level: off, minimal, low, medium,
+    // high, xhigh, max`. That order is the ranking, so `rankedEfforts` spaces
+    // the seven evenly from `off` at 0 to `max` at 1.
+    //
+    // Confirmed a second time, and more strongly, by handing pi a level it does
+    // not have: `--thinking bogus_xyz` put `Warning: Invalid thinking level
+    // "bogus_xyz". Valid values: off, minimal, low, medium, high, xhigh, max`
+    // on stderr. That is pi enumerating its own vocabulary while refusing a
+    // word — the set it will actually accept, rather than the set someone wrote
+    // down once and may not have kept up with.
+    //
+    // Getting the spelling exactly right matters more than it looks, because
+    // that message is only a *warning*: pi carried on and answered the prompt
+    // at its default level. A level this app gets wrong does not fail loudly,
+    // it quietly thinks at an amount nobody chose while the UI reports the
+    // level as live. Nothing outside this list ever reaches the command line
+    // (see `knownLevel`).
+    //
+    // `off` is one of the seven, not a way of spelling "no override". Asking pi
+    // for `off` is asking it not to think, which is a decision someone made;
+    // leaving the level alone entirely is a different thing, and the control's
+    // own "use the runtime default" row is where that one lives.
+    efforts: rankedEfforts([
+      { value: 'off', name: 'Off', description: 'No thinking at all — a level in its own right.' },
+      { value: 'minimal', name: 'Minimal', description: 'The least that is still thinking.' },
+      { value: 'low', name: 'Low', description: 'A little, for work that barely needs it.' },
+      { value: 'medium', name: 'Medium', description: 'The middle of the seven.' },
+      { value: 'high', name: 'High', description: 'Enough for work with steps in it.' },
+      { value: 'xhigh', name: 'Extra high', description: 'Past high, short of the ceiling.' },
+      { value: 'max', name: 'Max', description: 'Everything pi will spend on thinking.' },
+    ]),
   };
 
   private turnCounter = 0;
@@ -104,6 +137,24 @@ export class PiChatAdapter extends BaseChatAdapter {
   private readonly turnModels = new Map<string, { calls: number; usage: ChatUsage }>();
   /** The last model pi said it used, for the session line. Never the requested one. */
   private reportedModel: string | undefined;
+  /**
+   * The thinking level every future spawn is launched at.
+   *
+   * Seeded from the launch option and then owned here, rather than written back
+   * into `this.options.effort`, for two reasons. `options` is the caller's
+   * object — the session built it and still reads it to decide what a relaunch
+   * would look like — so mutating it would quietly rewrite the request the
+   * session believes it made. And keeping the two apart preserves a distinction
+   * the rest of this class is careful about: `options.effort` is what this
+   * conversation was started with, this is what the next `pi` will actually be
+   * handed. `buildArgs()` reads this one.
+   *
+   * Seeded through the same membership check `setEffort` uses, so a launch
+   * option pi has no such level for is dropped here rather than reported as
+   * running. Declared after `capabilities` because it reads that list; class
+   * fields initialise top to bottom.
+   */
+  private effort: string | undefined = this.knownLevel(this.options.effort);
 
   /** The adapter stays usable across turns even with no child running between them. */
   override get alive(): boolean {
@@ -142,6 +193,20 @@ export class PiChatAdapter extends BaseChatAdapter {
     if (this.options.model) {
       args.push('--model', this.options.model);
     }
+    if (this.effort) {
+      // The whole of the effort mechanism, for this runtime. One turn is one
+      // process (see the class comment) and this builder runs fresh inside
+      // every `send()`, so a level changed between turns is simply on the
+      // command line of the next child: nothing to restart, no protocol to
+      // speak, and no running pi to be out of step with.
+      //
+      // Never a value this app invented: an unrecognised level does not fail
+      // the turn, it warns on stderr and runs at pi's default (the capture is
+      // quoted beside `capabilities.efforts`), so a wrong word here reads to
+      // the user as a level that is live and is not. Both ways in — the launch
+      // option and `setEffort` — go through `knownLevel` first.
+      args.push('--thinking', this.effort);
+    }
     if (this.options.extraArgs) {
       args.push(...this.options.extraArgs);
     }
@@ -164,7 +229,72 @@ export class PiChatAdapter extends BaseChatAdapter {
         capabilities: this.capabilities,
       });
     }
+    // The level the next turn will spawn at — and, unlike the model just above,
+    // this genuinely is the flag we are about to pass rather than something pi
+    // said. The difference is worth being blunt about. The `session` event
+    // reports `reportedModel` because pi names its model on every message, so
+    // there a request and an observation are two separate facts and only the
+    // second is worth showing. Thinking has no second fact: pi never names its
+    // level on the wire — not on the `session` line, not on a message, not in
+    // the usage — so the argv is the only place the level exists at all.
+    // Reporting it is reporting the one thing anybody knows, not dressing a
+    // request up as an answer.
+    //
+    // What makes that safe enough to show is that nothing off pi's own ladder
+    // ever reaches the command line (`knownLevel` gates both ways in), so the
+    // one way this could be a lie — pi warning about an unknown level and
+    // running at its default — cannot arise.
+    //
+    // Emitted whether or not there is a session to resume: the level belongs to
+    // the next spawn rather than to the session being resumed, and pi's own
+    // `session` line carries nothing about thinking to hang it off instead.
+    this.emit({ t: 'effort', effort: this.effort ?? null });
     this.emit({ t: 'state', state: 'idle' });
+  }
+
+  /**
+   * The level, when pi is known to have one by that name.
+   *
+   * Membership is checked against `capabilities.efforts`, which is the set pi
+   * itself named while refusing a bad value, so this answers the question with
+   * pi's own vocabulary rather than a second copy of the ladder kept in step by
+   * hand. Anything else comes back as nothing, because the alternative is
+   * passing a word pi warns about and then ignores — thinking at a level nobody
+   * chose while the app displays one it never got.
+   */
+  private knownLevel(effort: string | undefined): string | undefined {
+    if (!effort) return undefined;
+    return this.capabilities.efforts?.some((level) => level.value === effort) ? effort : undefined;
+  }
+
+  /**
+   * Switch thinking level, which for a spawn-per-turn adapter costs nothing.
+   *
+   * There is no live process to convince. `buildArgs()` runs inside every
+   * `send()`, so setting the field *is* the change: the next pi is spawned with
+   * `--thinking <level>` and starts there, with no relaunch, no protocol
+   * message and nothing to acknowledge. That is why this resolves at once and
+   * still honours what the contract asks of it — resolving means the runtime
+   * took the level, and the only window in which pi has not taken it is the
+   * window in which no pi is running. A turn already in flight keeps the level
+   * it was spawned with, which is the only thing it could do.
+   *
+   * The event is emitted here because nothing else ever will: no later line of
+   * pi's output mentions the level (see `start()`), so a caller waiting for the
+   * runtime to confirm would wait for the life of the session.
+   *
+   * A level pi does not have is rejected rather than stored, and it has to be:
+   * accepting one would put a `--thinking` pi warns about and ignores on the
+   * next command line while this event told the user it was live. The caller's
+   * failure path — reporting that the level could not be switched — is a far
+   * better outcome than a chip that quietly means nothing.
+   */
+  async setEffort(effort: string): Promise<void> {
+    if (!this.knownLevel(effort)) {
+      throw new Error(`pi: no thinking level called "${effort}"`);
+    }
+    this.effort = effort;
+    this.emit({ t: 'effort', effort });
   }
 
   /**

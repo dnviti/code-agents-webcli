@@ -35,6 +35,15 @@ export interface ChatAdapterOptions {
   command: string;
   /** Model from the active runtime profile, if any. */
   model?: string;
+  /**
+   * Reasoning-effort level to launch at, when the conversation has chosen one.
+   *
+   * Spelled in the runtime's own vocabulary, because that is what it will be
+   * handed: `xhigh` for claude and pi, `on` for kimi, `ultra` for codex. The
+   * layers above never translate between ladders — a level chosen for one
+   * runtime is not offered to another.
+   */
+  effort?: string;
   /** Extra CLI arguments from the active runtime profile. */
   extraArgs?: string[];
   /** Environment from the active runtime profile. */
@@ -131,6 +140,18 @@ export interface ChatAdapter {
   respondPermission(requestId: string, optionId: string): void;
   /** Switch model mid-session, for runtimes that allow it. */
   setModel?(model: string): Promise<void>;
+  /**
+   * Switch reasoning effort mid-session, for runtimes that allow it.
+   *
+   * Resolving means the runtime took it, and an implementation must not resolve
+   * on anything weaker than that — the caller reports `live` to the user on the
+   * strength of this promise. Where a runtime cannot be asked until the next
+   * turn (codex, pi), the implementation stores the level, resolves, and emits
+   * the `effort` event itself; where it answers immediately (grok, kimi, omp,
+   * claude) it waits for that answer. Absent means the runtime has no way to
+   * change level without a relaunch, and the caller says so instead of guessing.
+   */
+  setEffort?(effort: string): Promise<void>;
   /** Branch the conversation at an earlier point, for runtimes that support it. */
   fork?(atMessageId: string): Promise<string | null>;
   stop(): Promise<void>;

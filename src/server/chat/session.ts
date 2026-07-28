@@ -151,6 +151,15 @@ export interface ChatSessionStartOptions {
   runtime: string;
   workingDir: string;
   model?: string;
+  /**
+   * Reasoning-effort level to launch at, spelled the way this runtime spells it.
+   *
+   * Only ever a value the runtime itself published, because it is passed
+   * straight through to the CLI: pi warns and then runs at its default when the
+   * level is wrong, which is the quietest possible way to get the opposite of
+   * what was asked for.
+   */
+  effort?: string;
   extraArgs?: string[];
   env?: Record<string, string>;
   bypassPermissions?: boolean;
@@ -546,6 +555,7 @@ export class ChatSession {
       installedCommands,
       command: this.deps.resolveCommand(options.runtime),
       model: options.model,
+      effort: options.effort,
       extraArgs,
       env,
       bypassPermissions: this.bypass,
@@ -1766,6 +1776,37 @@ export class ChatSession {
   rememberModel(model: string | undefined): void {
     if (!this.lastStartOptions) return;
     this.lastStartOptions = { ...this.lastStartOptions, model };
+  }
+
+  /**
+   * Switch the live process to a different reasoning-effort level.
+   *
+   * Unlike the model, most runtimes can do this: claude answers its own
+   * `/effort` command for free, kimi and omp expose it as an ACP config option,
+   * grok carries it on a model change, and codex and pi apply it to the next
+   * turn they start. What they have in common is that the adapter only resolves
+   * once its runtime has taken the level — so `true` here means the session is
+   * genuinely running at it, and anything else falls through to the caller's
+   * saved-for-next-launch answer rather than claiming a change nobody made.
+   */
+  async setEffort(effort: string): Promise<boolean> {
+    if (!this.adapter?.alive || !this.adapter.setEffort) return false;
+    await this.adapter.setEffort(effort);
+    return true;
+  }
+
+  /**
+   * Record the effort level an in-place restart must launch with.
+   *
+   * The same trap `rememberModel` exists for, and a worse one here: an effort
+   * change is confirmed by the runtime and shown as live, so a `/clear` that
+   * replayed the launch options verbatim would put the conversation back on the
+   * level it opened with while the control went on reporting the level the user
+   * chose — a disagreement nothing on screen would explain.
+   */
+  rememberEffort(effort: string | undefined): void {
+    if (!this.lastStartOptions) return;
+    this.lastStartOptions = { ...this.lastStartOptions, effort };
   }
 
   snapshot(): Promise<ChatSnapshot> {

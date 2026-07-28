@@ -262,6 +262,8 @@ async function run(): Promise<void> {
   await checkFoldedHistoryIsNotBuiltUntilItIsOpened();
   await checkAConversationTellsOneStoryAboutItsTokens();
   await checkTheModelShownIsTheModelThatRan();
+  await checkTheEffortChipSaysAndSetsHowHardTheAgentThinks();
+  await checkARememberedLevelSeedsOnlyFreshWorkAndSurvivesAReload();
   await checkTheContextReadingIsHonestAboutItsCeiling();
   await checkTheTurnIndexListsTheWholeConversation();
   await checkClearingResetsTheFiguresAboveTheChat();
@@ -5422,6 +5424,500 @@ async function checkTheModelShownIsTheModelThatRan(): Promise<void> {
 
   root.unmount();
   host.remove();
+}
+
+/**
+ * How hard the agent thinks: shown, changed, and absent when it cannot be.
+ *
+ * Four things here need a layout engine and get one nowhere else. The colour
+ * ramp is `color-mix(in oklab, var(--effort-N) …)` over custom properties, so
+ * nothing short of a real cascade can say whether `low` and `max` actually look
+ * different — a unit test reads the same two style strings whether the ramp
+ * resolves or silently does not. The meter is the carrier of meaning for anyone
+ * the colour does not reach, so its fill has to be counted from painted
+ * backgrounds rather than from the prop that was passed in. The popup is
+ * click-toggled state that opens *upward* out of a bar pinned to the bottom of
+ * the screen, which is a geometry question. And the chip removing itself for a
+ * runtime with no ladder is only worth anything if what it makes room for —
+ * Send — is still there and still hittable.
+ *
+ * Measured through a canvas round-trip rather than by parsing the computed
+ * string: Chrome serialises a computed `color-mix(in oklab, …)` as `oklab(…)`,
+ * not as `rgb()`, so hand-parsing rgb() would read every mixed stop as
+ * unparseable and quietly agree with itself.
+ */
+async function checkTheEffortChipSaysAndSetsHowHardTheAgentThinks(): Promise<void> {
+  // Cleared first because ChatView seeds a new conversation from the level this
+  // runtime was last used at, and a leftover preference would send a
+  // `chat_set_effort` nobody in this check asked for — which is exactly what the
+  // "exactly one message" assertions below are about.
+  window.localStorage.removeItem('cc-web-chat-effort');
+
+  // claude's ladder, spaced the way `rankedEfforts` spaces a five-level list.
+  const efforts = [
+    { value: 'low', name: 'Low', description: 'the least thinking on offer', rank: 0 },
+    { value: 'medium', name: 'Medium', rank: 0.25 },
+    { value: 'high', name: 'High', rank: 0.5 },
+    { value: 'xhigh', name: 'Extra high', rank: 0.75 },
+    { value: 'max', name: 'Max', description: 'the most thinking this runtime will do', rank: 1 },
+  ];
+
+  const baseCapabilities = {
+    streaming: true, thinking: true, toolCalls: false, diffs: false, permissions: false,
+    interrupt: true, resume: true, fork: false, attachments: false, usage: true,
+    cost: true, plan: false,
+  };
+
+  const snapshotFor = (sessionId: string, capabilities: unknown) => ({
+    type: 'chat_snapshot',
+    sessionId,
+    snapshot: {
+      sessionId,
+      runtime: 'claude',
+      state: 'idle',
+      capabilities,
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'think about this' }],
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 1,
+      live: true, bypassPermissions: false,
+    },
+  });
+
+  // Any CSS colour to the three bytes a person's eye receives. A fresh context
+  // per call, and `#000` first so an unparseable value leaves black behind
+  // rather than the previous measurement.
+  const rgbOf = (value: string): [number, number, number] => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1;
+    canvas.height = 1;
+    const ctx = canvas.getContext('2d') as CanvasRenderingContext2D;
+    ctx.fillStyle = '#000';
+    ctx.fillStyle = value;
+    ctx.fillRect(0, 0, 1, 1);
+    const pixel = ctx.getImageData(0, 0, 1, 1).data;
+    return [pixel[0], pixel[1], pixel[2]];
+  };
+  /** Distance from grey. Zero for anything on the black-to-white line. */
+  const chroma = (rgb: [number, number, number]): number =>
+    Math.max(...rgb) - Math.min(...rgb);
+
+  // Measured standing still, and this is a headless limitation stated rather
+  // than hidden. Virtual time drives timers, not the compositor's animation
+  // clock, so a CSS transition or entry animation here never advances past its
+  // first frame: the meter's bars would read as their pre-transition colour for
+  // ever, and the menu would be measured 8px down the `relay-rise` it is
+  // permanently at the start of. Both settle inside 150ms in a real browser.
+  // The resting values are also exactly what a reader who has asked for less
+  // motion is served, which is half of who this control is drawn for.
+  const still = document.createElement('style');
+  still.textContent =
+    '.effort-check-surface, .effort-check-surface * { animation: none !important; transition: none !important; }';
+  document.head.appendChild(still);
+
+  const host = document.createElement('div');
+  host.className = 'effort-check-surface';
+  host.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const sent: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('effort-check', {
+    send: (message: unknown) => sent.push(message as Record<string, unknown>),
+  } as never);
+  controller.handle(snapshotFor('effort-check', { ...baseCapabilities, efforts }) as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(250);
+
+  const chip = (): HTMLElement | null =>
+    host.querySelector('[aria-label="Change how hard the agent thinks"]');
+  check('a runtime that publishes a ladder gets a control to move along it', Boolean(chip()));
+
+  // The ramp has to exist before anything measured against it means a thing.
+  // This repo has shipped a check that measured an element no stylesheet had
+  // ever reached, so the variables are asserted directly as well as by effect.
+  const rampDeclared = getComputedStyle(document.documentElement)
+    .getPropertyValue('--effort-4')
+    .trim();
+  check(
+    'the effort ramp is really in the cascade, not measured off an unstyled page',
+    rampDeclared.length > 0,
+    rampDeclared || 'no --effort-4 declared',
+  );
+
+  const setLevel = (effort: string, seq: number): void =>
+    controller.handle({
+      type: 'chat_event',
+      sessionId: 'effort-check',
+      event: { t: 'effort', seq, ts: Date.now(), effort },
+    } as never);
+
+  const borderRgb = rgbOf(
+    getComputedStyle(document.documentElement).getPropertyValue('--border').trim(),
+  ).join(',');
+  const litBars = (): number => {
+    const meter = chip()?.querySelector('span[aria-hidden="true"]');
+    return Array.from(meter?.children ?? []).filter(
+      (bar) => rgbOf(getComputedStyle(bar as HTMLElement).backgroundColor).join(',') !== borderRgb,
+    ).length;
+  };
+
+  setLevel('low', 2);
+  await wait(200);
+  const lowRgb = rgbOf(getComputedStyle(chip() as HTMLElement).color);
+  const lowBars = litBars();
+  check('the chip names the level the runtime reported', (chip()?.textContent ?? '').includes('Low'), chip()?.textContent ?? 'empty');
+
+  setLevel('max', 3);
+  await wait(200);
+  const maxRgb = rgbOf(getComputedStyle(chip() as HTMLElement).color);
+  const maxBars = litBars();
+  check('and follows the runtime to the top of its ladder', (chip()?.textContent ?? '').includes('Max'), chip()?.textContent ?? 'empty');
+
+  const mutedRgb = rgbOf(
+    getComputedStyle(document.documentElement).getPropertyValue('--muted-foreground').trim(),
+  );
+  check(
+    'the least thinking on offer looks like every other quiet chip on the row',
+    chroma(lowRgb) <= 2 && Math.abs(lowRgb[0] - mutedRgb[0]) <= 2,
+    `chip=rgb(${lowRgb}) muted=rgb(${mutedRgb})`,
+  );
+  check(
+    'and the most does not — the ramp arrives as colour, not as a nominally different style string',
+    chroma(maxRgb) > 60 && lowRgb.join(',') !== maxRgb.join(','),
+    `low=rgb(${lowRgb}) chroma=${chroma(lowRgb)} | max=rgb(${maxRgb}) chroma=${chroma(maxRgb)}`,
+  );
+  check(
+    'the meter fills further for more thinking, so the level survives a reader the colour never reaches',
+    lowBars >= 1 && maxBars > lowBars,
+    `low=${lowBars} bars, max=${maxBars} bars`,
+  );
+
+  // The menu.
+  chip()?.click();
+  await wait(200);
+  const list = (): HTMLElement | null =>
+    host.querySelector('[role="listbox"][aria-label="Effort levels"]');
+  const options = (): HTMLElement[] =>
+    Array.from(list()?.querySelectorAll('[role="option"]') ?? []) as HTMLElement[];
+  check(
+    'the menu offers every level the runtime published, and a way back to its default',
+    options().length === efforts.length + 1,
+    `${options().length} rows: ${options().map((row) => (row.textContent ?? '').trim().slice(0, 12)).join(' | ')}`,
+  );
+
+  // Opened upward, because this bar is pinned to the bottom of the window: a
+  // menu that dropped down would be entirely below the fold.
+  const listBox = list()?.getBoundingClientRect();
+  const chipBox = chip()?.getBoundingClientRect();
+  check(
+    'the menu opens above the chip and lands inside the window',
+    Boolean(listBox && chipBox)
+      && listBox!.height > 0
+      && listBox!.bottom <= chipBox!.top + 1
+      && listBox!.top >= 0
+      && listBox!.left >= 0
+      && listBox!.right <= window.innerWidth,
+    listBox
+      ? `menu ${Math.round(listBox.top)}–${Math.round(listBox.bottom)}, chip top ${Math.round(chipBox!.top)}, viewport ${window.innerWidth}x${window.innerHeight}`
+      : 'no menu',
+  );
+
+  // Picked by position on the ladder rather than by label text, because two of
+  // claude's levels differ only in a word ("High" and "Extra high").
+  const picks = (): Array<Record<string, unknown>> =>
+    sent.filter((message) => message.type === 'chat_set_effort');
+  const xhigh = options()[3];
+  check('the fourth rung is the one the runtime named fourth', (xhigh?.textContent ?? '').includes('Extra high'), xhigh?.textContent ?? 'missing');
+  xhigh?.click();
+  await wait(200);
+  check(
+    'picking a level asks the server for exactly that level, once',
+    picks().length === 1 && picks()[0].effort === 'xhigh',
+    JSON.stringify(picks()),
+  );
+  check('and the menu shuts behind the pick', !list(), list() ? 'still open' : 'closed');
+
+  // The way back. Without it a conversation moved off the runtime's own default
+  // could never be returned to it.
+  chip()?.click();
+  await wait(200);
+  const rows = options();
+  const fallback = rows[rows.length - 1];
+  check(
+    'the last row offers the runtime’s own default back',
+    (fallback?.textContent ?? '').trim() === 'Use the default for this runtime',
+    fallback?.textContent ?? 'missing',
+  );
+  fallback?.click();
+  await wait(200);
+  check(
+    'and choosing it clears the level rather than picking the cheapest one',
+    picks().length === 2 && picks()[1].effort === '',
+    JSON.stringify(picks()),
+  );
+
+  root.unmount();
+  host.remove();
+
+  // A runtime with no ladder: no control, and the room it gives back is the
+  // point of the omission, so Send has to still be there and still be the thing
+  // under the pointer.
+  const bare = document.createElement('div');
+  bare.className = 'effort-check-surface';
+  bare.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(bare);
+  const bareController = new ChatController('effort-bare', { send: () => {} } as never);
+  bareController.handle(snapshotFor('effort-bare', baseCapabilities) as never);
+  const bareRoot = createRoot(bare);
+  bareRoot.render(
+    React.createElement(ChatView, {
+      controller: bareController,
+      runtime: 'kimi',
+      runtimeLabel: 'Kimi',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(250);
+
+  const strayChip = bare.querySelector('[aria-label="Change how hard the agent thinks"]');
+  check(
+    'a runtime that published no ladder gets no effort control at all',
+    !strayChip,
+    strayChip ? `a chip reading "${(strayChip.textContent ?? '').trim()}" nothing could accept` : 'no chip on the row',
+  );
+  const send = bare.querySelector('[aria-label="Send message"]') as HTMLElement | null;
+  const sendBox = send?.getBoundingClientRect();
+  const underPointer = sendBox
+    ? document.elementFromPoint(sendBox.left + sendBox.width / 2, sendBox.top + sendBox.height / 2)
+    : null;
+  check(
+    'and the space it would have taken still belongs to Send, which stays reachable',
+    Boolean(send) && Boolean(underPointer) && send!.contains(underPointer as Node),
+    sendBox
+      ? `send at ${Math.round(sendBox.left)},${Math.round(sendBox.top)} ${Math.round(sendBox.width)}x${Math.round(sendBox.height)}`
+      : 'no send control',
+  );
+
+  bareRoot.unmount();
+  bare.remove();
+  still.remove();
+}
+
+/**
+ * A remembered level opens the next conversation, never reaches into an old one,
+ * and a reload still shows what the runtime is actually running at.
+ *
+ * Three regressions, all from the same review, and all of them need a mounted
+ * ChatView because what went wrong lived in an effect and in what the chip drew.
+ *
+ * **Re-levelling a conversation that had already started** was the worst of
+ * them. The seeding effect's other guards all pass for a conversation opened
+ * weeks ago and merely clicked back into: the chat surface is keyed on the
+ * session id so the effect remounts on every tab switch, `live` and the
+ * published ladder both survive on the retained transcript, and a conversation
+ * whose chip was never touched carries no `effortOverride`. So visiting a tab
+ * silently re-levelled it from a browser preference — wrote the level onto its
+ * server record and, on claude, pushed a hidden `/effort` turn into the running
+ * process. Nothing about that is visible from a props assertion; the send is the
+ * only trace, so the send is what is counted. `transcript.messages.length > 0`
+ * is what tells the two cases apart, and both directions are asserted here so
+ * that "send nothing, ever" cannot pass for a fix.
+ *
+ * **The runtime-reported level surviving a reload** is the third. A codex
+ * session that launched at `xhigh` and is still running at `xhigh` has never
+ * *chosen* a level, so its record holds nothing and the only witness is the
+ * `effort` the server replays on the snapshot. `ChatTranscript.hydrate` used to
+ * drop that field, and the chip fell back to the grey `effort` placeholder with
+ * an empty meter over a session that was demonstrably thinking hard.
+ */
+async function checkARememberedLevelSeedsOnlyFreshWorkAndSurvivesAReload(): Promise<void> {
+  const KEY = 'cc-web-chat-effort';
+  // Put back afterwards, and read before anything is written: this key is real
+  // user state, and the effort chip check above clears it outright. Neither
+  // check may leave the other looking at what it wrote.
+  const priorPreference = window.localStorage.getItem(KEY);
+  window.localStorage.setItem(KEY, JSON.stringify({ claude: 'xhigh' }));
+
+  const efforts = [
+    { value: 'low', name: 'Low', rank: 0 },
+    { value: 'medium', name: 'Medium', rank: 0.25 },
+    { value: 'high', name: 'High', rank: 0.5 },
+    { value: 'xhigh', name: 'Extra high', rank: 0.75 },
+    { value: 'max', name: 'Max', rank: 1 },
+  ];
+  const capabilities = {
+    streaming: true, thinking: true, toolCalls: false, diffs: false, permissions: false,
+    interrupt: true, resume: true, fork: false, attachments: false, usage: true,
+    cost: true, plan: false, efforts,
+  };
+
+  /**
+   * A snapshot as the server sends it on a rejoin: live, ladder published, and
+   * `effortOverride` absent because nobody ever picked a level here.
+   */
+  const snapshotFor = (
+    sessionId: string,
+    options: { messages: boolean; effort?: string },
+  ): Record<string, unknown> => ({
+    type: 'chat_snapshot',
+    sessionId,
+    effortOverride: null,
+    snapshot: {
+      sessionId,
+      runtime: 'claude',
+      state: 'idle',
+      capabilities,
+      messages: options.messages
+        ? [
+            {
+              id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: Date.now(),
+              blocks: [{ kind: 'text', text: 'a conversation that already happened' }],
+            },
+          ]
+        : [],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 1,
+      live: true, bypassPermissions: false,
+      ...(options.effort ? { effort: options.effort } : {}),
+    },
+  });
+
+  const still = document.createElement('style');
+  still.textContent =
+    '.effort-seed-surface, .effort-seed-surface * { animation: none !important; transition: none !important; }';
+  document.head.appendChild(still);
+
+  /** Mount a ChatView over one snapshot and answer with what it asked the server for. */
+  const mount = async (
+    sessionId: string,
+    options: { messages: boolean; effort?: string },
+  ): Promise<{ sent: Array<Record<string, unknown>>; host: HTMLElement; unmount: () => void; controller: ChatController }> => {
+    const host = document.createElement('div');
+    host.className = 'effort-seed-surface';
+    host.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;display:flex';
+    document.body.appendChild(host);
+    const sent: Array<Record<string, unknown>> = [];
+    const controller = new ChatController(sessionId, {
+      send: (message: unknown) => sent.push(message as Record<string, unknown>),
+    } as never);
+    controller.handle(snapshotFor(sessionId, options) as never);
+    const root = createRoot(host);
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude',
+        workingDir: '/tmp/project',
+        view: DEFAULT_CHAT_VIEW,
+        onViewChange: () => {},
+      } as never),
+    );
+    await wait(300);
+    return {
+      sent, host, controller,
+      unmount: () => {
+        root.unmount();
+        host.remove();
+      },
+    };
+  };
+
+  const picksIn = (sent: Array<Record<string, unknown>>): Array<Record<string, unknown>> =>
+    sent.filter((message) => message.type === 'chat_set_effort');
+
+  // 1. The conversation that has already started. Merely being looked at.
+  const old = await mount('effort-seed-old', { messages: true });
+  check(
+    'opening a conversation that has already started never re-levels it from a browser preference',
+    picksIn(old.sent).length === 0,
+    JSON.stringify(picksIn(old.sent)),
+  );
+  old.unmount();
+
+  // 2. The fresh one, so that "never send" cannot pass for the fix above.
+  const fresh = await mount('effort-seed-fresh', { messages: false });
+  check(
+    'and a conversation that has not begun still opens at the level this runtime was last used at',
+    picksIn(fresh.sent).length === 1 && picksIn(fresh.sent)[0].effort === 'xhigh',
+    JSON.stringify(picksIn(fresh.sent)),
+  );
+  fresh.unmount();
+
+  // 3. The reload. Preference cleared first, so the level on the chip can only
+  // have come from the snapshot the server replayed and not from this browser.
+  window.localStorage.removeItem(KEY);
+  const reloaded = await mount('effort-seed-reload', { messages: true, effort: 'xhigh' });
+  const chip = reloaded.host.querySelector(
+    '[aria-label="Change how hard the agent thinks"]',
+  ) as HTMLElement | null;
+  check(
+    'a reload of a session running at a level nobody chose still names that level',
+    (chip?.textContent ?? '').includes('Extra high'),
+    chip ? `chip reads "${(chip.textContent ?? '').trim()}"` : 'no chip',
+  );
+
+  // Counted off painted backgrounds rather than off the prop, because the grey
+  // placeholder the bug produced is a chip that still renders a meter — an empty
+  // one. Same canvas round-trip as the check above: Chrome serialises a computed
+  // `color-mix(in oklab, …)` as `oklab(…)`, which no rgb() parser reads.
+  const rgbOf = (value: string): string => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1;
+    canvas.height = 1;
+    const ctx = canvas.getContext('2d') as CanvasRenderingContext2D;
+    ctx.fillStyle = '#000';
+    ctx.fillStyle = value;
+    ctx.fillRect(0, 0, 1, 1);
+    const pixel = ctx.getImageData(0, 0, 1, 1).data;
+    return `${pixel[0]},${pixel[1]},${pixel[2]}`;
+  };
+  const borderRgb = rgbOf(
+    getComputedStyle(document.documentElement).getPropertyValue('--border').trim(),
+  );
+  const meter = chip?.querySelector('span[aria-hidden="true"]');
+  const litBars = Array.from(meter?.children ?? []).filter(
+    (bar) => rgbOf(getComputedStyle(bar as HTMLElement).backgroundColor) !== borderRgb,
+  ).length;
+  check(
+    'and draws a filled meter for it rather than the empty one a blank level gets',
+    litBars >= 2,
+    `${litBars} of ${meter?.children.length ?? 0} bars lit`,
+  );
+  check(
+    'the transcript is where that level lives, so anything else can read it too',
+    reloaded.controller.transcript.effort === 'xhigh',
+    String(reloaded.controller.transcript.effort),
+  );
+  reloaded.unmount();
+
+  // A snapshot from a runtime that never reported a level: "nobody said", which
+  // is the state most conversations spend their life in, and not a throw.
+  const silent = await mount('effort-seed-silent', { messages: true });
+  check(
+    'a session whose runtime never said reads as nobody having said, not as a level or a crash',
+    silent.controller.transcript.effort === undefined,
+    String(silent.controller.transcript.effort),
+  );
+  silent.unmount();
+
+  still.remove();
+  if (priorPreference === null) window.localStorage.removeItem(KEY);
+  else window.localStorage.setItem(KEY, priorPreference);
 }
 import { UsageMeter } from '../../src/client/shell/chat/UsageMeter';
 import { StatusPanel } from '../../src/client/shell/chat/StatusPanel';

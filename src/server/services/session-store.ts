@@ -36,6 +36,7 @@ interface RuntimeSessionRow {
   owner_session_id: string | null;
   chat_bypass_permissions: number | null;
   chat_model_override: string | null;
+  chat_effort_override: string | null;
   custom_name: string | null;
 }
 
@@ -76,6 +77,7 @@ export class SessionStore {
           owner_session_id,
           chat_bypass_permissions,
           chat_model_override,
+          chat_effort_override,
           custom_name
         )
         VALUES (
@@ -100,6 +102,7 @@ export class SessionStore {
           @owner_session_id,
           @chat_bypass_permissions,
           @chat_model_override,
+          @chat_effort_override,
           @custom_name
         )
       `);
@@ -167,6 +170,11 @@ export class SessionStore {
         // Persisted so a restart still prefers it over the profile default the
         // next time a session starts for this conversation.
         chat_model_override: session.chatModelOverride || null,
+        // The conversation-scoped effort level, if one was chosen. Persisted for
+        // the same reason and read back the same way: without it, a rejoin after
+        // a server restart shows the chip at the runtime default while the
+        // process it describes is still running at the level the user picked.
+        chat_effort_override: session.chatEffortOverride || null,
         // The label the user chose. Without this a restart brings a session back
         // under the name it was created with, which is the one thing the user
         // renamed it to get away from.
@@ -209,6 +217,7 @@ export class SessionStore {
             owner_session_id,
             chat_bypass_permissions,
             chat_model_override,
+            chat_effort_override,
             custom_name
           FROM runtime_sessions
           ORDER BY created_at ASC
@@ -259,6 +268,10 @@ export class SessionStore {
           // override" rather than a call to switch to nothing is the safe
           // direction regardless.
           chatModelOverride: row.chat_model_override || undefined,
+          // Same treatment, same reason: an empty string reads as "no level
+          // chosen" rather than as an instruction to pass the runtime an empty
+          // `--effort`, which every one of them would refuse.
+          chatEffortOverride: row.chat_effort_override || undefined,
           // An empty string reads as "never renamed" for the same reason: the
           // write side only ever stores a trimmed non-empty name or null.
           customName: row.custom_name || undefined,

@@ -3,6 +3,7 @@ import {
   ChatCapabilities,
   ChatUsage,
   DiffHunk,
+  EffortChoice,
   ModelChoice,
   FileDiff,
   NO_CHAT_CAPABILITIES,
@@ -13,6 +14,7 @@ import {
   UserTurn,
   classifyTool,
   defaultPermissionOptions,
+  rankedEfforts,
 } from '../../../shared/chat-events.js';
 import {
   AdapterChild,
@@ -378,6 +380,48 @@ function contextReading(
   };
 }
 
+// ------------------------------------------------------------ effort ladder
+
+/**
+ * One `model/list` entry's reasoning-effort ladder, as codex published it.
+ *
+ * Read off a live `model/list` against codex-cli 0.145.0 rather than inferred
+ * from the vendored schema: every entry came back carrying
+ * `supportedReasoningEfforts: Array<{ reasoningEffort, description }>` next to a
+ * `defaultReasoningEffort`, and the arrays arrived cheapest-first —
+ * `low, medium, high, xhigh, max, ultra` for gpt-5.6-terra, the same list
+ * stopping at `xhigh` for gpt-5.5. That order *is* the ladder, so it is kept
+ * exactly as sent and `rankedEfforts` spaces the ranks along whatever length it
+ * turns out to be.
+ *
+ * Which is also why the offered levels come from here and not from the
+ * `ReasoningEffort` union in `.work/probes/raw/codex-ts/ReasoningEffort.ts`:
+ * that enum stops at `xhigh`, while the running build offers `max` and `ultra`
+ * on its newer models. Where the generated schema and the process disagree
+ * about what the process accepts, the process wins.
+ *
+ * The descriptions are codex's own, verbatim ("Balances speed and reasoning
+ * depth for everyday tasks"), and so are the names: there is no table here
+ * turning `xhigh` into "Extra high", because the value is the exact string that
+ * gets handed back to codex and a label that differs from it only makes a
+ * mismatch harder to see.
+ *
+ * Undefined rather than an empty array when the field is missing, so a build
+ * that predates it leaves the control saying this runtime publishes no ladder
+ * instead of opening an empty menu.
+ */
+function effortLadder(model: Record<string, unknown> | undefined): EffortChoice[] | undefined {
+  const levels: Array<{ value: string; description?: string }> = [];
+  for (const raw of list(model?.supportedReasoningEfforts)) {
+    const option = record(raw);
+    const value = str(option.reasoningEffort);
+    if (!value) continue;
+    const description = str(option.description);
+    levels.push({ value, ...(description ? { description } : {}) });
+  }
+  return levels.length ? rankedEfforts(levels) : undefined;
+}
+
 /** codex's `ReviewDecision` for the two option kinds this adapter offers; anything else means "no". */
 function reviewDecisionFor(optionId: string): string {
   if (optionId === 'allow_once') return 'approved';
@@ -428,6 +472,29 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
 
   private threadId: string | null = null;
   private model?: string;
+  /**
+   * The level codex itself said this thread opened at.
+   *
+   * `thread/start` and `thread/resume` both answer with a top-level
+   * `reasoningEffort`, whether or not anything was asked for — with no config
+   * at all a live probe came back `"xhigh"`, which is what this machine's own
+   * codex configuration defaults to rather than anything this app chose. So it
+   * is the runtime describing itself, and the only thing the `effort` event is
+   * ever emitted on at launch.
+   */
+  private reportedEffort: string | null = null;
+  /**
+   * The level to hang on every `turn/start` from here, once someone has asked
+   * for one. Null until `setEffort` is called.
+   *
+   * Deliberately a second field rather than reusing `reportedEffort`. That one
+   * is codex's word about the thread; this one is this app's standing request
+   * for it. Folded together, either the launch level would be re-asserted on
+   * every turn — pinning a level nobody picked onto a request codex does not
+   * validate — or the record of what codex actually said would be overwritten
+   * the first time the control was touched.
+   */
+  private turnEffort: string | null = null;
   private turnId: string | null = null;
   private assistantMsgId: string | null = null;
   private blockIndex = 0;
@@ -454,6 +521,25 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
 
     const params: Record<string, unknown> = { cwd: this.options.workingDir };
     if (this.options.model) params.model = this.options.model;
+    if (this.options.effort) {
+      // There is no `effort` parameter on `thread/start`; the level travels in
+      // the free-form `config` map, under the same key codex's own
+      // `-c model_reasoning_effort=…` writes into. Probed live against
+      // codex-cli 0.145.0 by opening three threads on gpt-5.5 and reading the
+      // reply back each time: no `config` answered `reasoningEffort: "xhigh"`
+      // (the configured default on this machine), `{"model_reasoning_effort":
+      // "low"}` answered `"low"` and `{"model_reasoning_effort":"xhigh"}`
+      // answered `"xhigh"`. So the key is read, and read at thread start rather
+      // than accepted and ignored.
+      //
+      // That this lands in `thread/resume` too — `params` is spread into both —
+      // is wanted, and the schema agrees: `ThreadResumeParams` carries the same
+      // optional `config` map, documented there as "configuration overrides for
+      // the resumed thread". A conversation deliberately moved off the default
+      // level should come back on the level it was left on, not silently revert
+      // to whatever the profile says.
+      params.config = { model_reasoning_effort: this.options.effort };
+    }
     if (this.options.bypassPermissions) {
       // Belt-and-braces alongside handleServerRequest's own auto-approve:
       // this asks codex not to send approval requests at all, but the
@@ -474,6 +560,12 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     const thread = record(response.thread);
     this.threadId = str(thread.id) || null;
     this.model = str(response.model);
+    // Not what was asked for — what codex says it got. The two differ whenever
+    // nothing was asked for at all, and the reply is the only place the answer
+    // appears: `reasoningEffort` sits at the top level of both the
+    // `thread/start` and the `thread/resume` response, alongside `model` and
+    // `cwd`, in the schema and in the live capture both.
+    this.reportedEffort = str(response.reasoningEffort) ?? null;
     // Not awaited. The picker's menu is worth having but not worth holding a
     // conversation open for, and the answer arrives on its own event whenever
     // it arrives — `capabilities` exists for exactly this, a runtime revising
@@ -487,11 +579,18 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
       cwd: str(response.cwd) || this.options.workingDir,
       capabilities: this.capabilities,
     });
+    // After `session`, because that event is what introduces the runtime and a
+    // level arriving ahead of it has nothing to be shown against. `null` here
+    // is codex's own answer rather than a hole in ours: `reasoningEffort` is
+    // `ReasoningEffort | null` in the generated reply type, and null means the
+    // thread is running on the model's own default with nothing overriding it —
+    // which is exactly what the event's null already means.
+    this.emit({ t: 'effort', effort: this.reportedEffort });
     this.emit({ t: 'state', state: 'idle' });
   }
 
   /**
-   * Ask codex which models it will accept, for the picker.
+   * Ask codex which models it will accept, and how hard each will think.
    *
    * `model/list` is a real request on this protocol — confirmed against the
    * running app-server, which rejects an unknown method by name and answers
@@ -499,11 +598,23 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
    * So codex's picker offers what codex says, rather than asking somebody to
    * remember a model id and type it correctly.
    *
+   * The same entries carry the effort ladder, which is why one call feeds both
+   * controls: a live `model/list` on codex-cli 0.145.0 returned
+   * `supportedReasoningEfforts` and `defaultReasoningEffort` per model, and the
+   * ladders are genuinely per model — gpt-5.6-terra offers six levels up to
+   * `ultra`, gpt-5.5 four stopping at `xhigh`. Publishing a union of them all
+   * would offer levels the running model refuses, so only the current model's
+   * ladder is published: the entry matching what `thread/start` said is running,
+   * and failing that the one codex flagged `isDefault`, which is the model that
+   * same thread would have been given.
+   *
    * Best-effort by construction: a build that does not have the method, or is
    * slow to answer it, must not stop a conversation opening. The catch leaves
-   * `capabilities.models` unset, which is the same state as a runtime that
-   * publishes nothing — and the picker already says so rather than showing an
-   * empty menu.
+   * `capabilities.models` and `capabilities.efforts` unset, which is the same
+   * state as a runtime that publishes nothing — and both controls already say so
+   * rather than showing an empty menu. The same guard applies field by field
+   * within a successful answer: a build old enough to list models without
+   * listing their efforts publishes the models and stays quiet about the rest.
    */
   private async loadModelList(): Promise<void> {
     try {
@@ -512,8 +623,22 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
       );
       const entries = Array.isArray(response.data) ? response.data : [];
       const models: ModelChoice[] = [];
+      let running: Record<string, unknown> | undefined;
+      let byDefault: Record<string, unknown> | undefined;
       for (const entry of entries) {
         const item = record(entry);
+        // Matched ahead of the `hidden` filter, and on both spellings. Ahead of
+        // it because hidden means "do not offer this in the picker", not "this
+        // cannot be what the thread is running" — and if it is what the thread
+        // is running, its ladder is the one that applies. Both spellings because
+        // the entry carries `id` and `model` separately and they are not always
+        // the same string; matching on one alone would quietly fall through to
+        // the default entry's ladder for a model that has its own.
+        if (this.model && (str(item.id) === this.model || str(item.model) === this.model)) {
+          running = item;
+        }
+        if (!byDefault && item.isDefault === true) byDefault = item;
+
         if (!item || item.hidden === true) continue;
         const value = str(item.id) || str(item.model);
         if (!value) continue;
@@ -523,9 +648,19 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
           ...(str(item.description) ? { description: str(item.description) as string } : {}),
         });
       }
+
+      const efforts = effortLadder(running || byDefault);
+      const patch: Partial<ChatCapabilities> = {};
       if (models.length > 0) {
         this.capabilities.models = models;
-        this.emit({ t: 'capabilities', capabilities: { models } });
+        patch.models = models;
+      }
+      if (efforts) {
+        this.capabilities.efforts = efforts;
+        patch.efforts = efforts;
+      }
+      if (Object.keys(patch).length > 0) {
+        this.emit({ t: 'capabilities', capabilities: patch });
       }
     } catch {
       // Deliberately silent: nothing about a missing menu is worth an error
@@ -564,7 +699,18 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
       );
     }
 
-    const response = record(await this.call('turn/start', { threadId: this.threadId, input }));
+    const params: Record<string, unknown> = { threadId: this.threadId, input };
+    if (this.turnEffort) {
+      // Only ever a level `setEffort` was given, and `setEffort` is only ever
+      // given one off the menu `model/list` published. That chain matters here
+      // rather than at the far end of it, because `turn/start` does not check
+      // this field: a probe sent a level codex has never heard of and got back
+      // `OK` with a perfectly ordinary turn object. A typo would therefore not
+      // fail — it would run the whole turn at some level nobody can name.
+      params.effort = this.turnEffort;
+    }
+
+    const response = record(await this.call('turn/start', params));
     const turnId = str(record(response.turn).id) || `turn-${Date.now()}`;
 
     this.turnId = turnId;
@@ -578,6 +724,42 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     this.emit({ t: 'block_start', msgId: userMsgId, index: 0, block: { kind: 'text', text: turn.text } });
     this.emit({ t: 'msg_end', msgId: userMsgId });
     this.emit({ t: 'state', state: 'thinking' });
+  }
+
+  /**
+   * Move this thread onto a different reasoning-effort level.
+   *
+   * There is no method for it. Nothing in the vendored bindings is shaped like
+   * `thread/set_effort`, and guessing an RPC name to see whether it answers
+   * only puts a `-32601` in somebody's transcript. What does exist is
+   * `turn/start`'s own `effort`, documented in
+   * `.work/probes/raw/codex-ts/v2/TurnStartParams.ts` as "Override the
+   * reasoning effort for this turn and subsequent turns" — the same wording its
+   * neighbours `model`, `cwd` and `approvalPolicy` carry, all of which are
+   * thread-level settings reached through a turn. So the level is remembered
+   * here and attached to every turn from now on, which `send()` does.
+   *
+   * That is also why this resolves at once instead of waiting for a turn to
+   * prove it. Resolving is a claim about what happens next, and what happens
+   * next is that the very next `turn/start` carries the new level: the
+   * parameter rides on the request that *begins* a turn, so there is no window
+   * in which a turn could still run at the old one. The alternative — staying
+   * silent until the user happens to send a message — would leave the control
+   * showing a level the session is no longer going to use, for as long as they
+   * did not, and a control that lies for an unbounded stretch is worse than one
+   * that admits it cannot switch at all.
+   *
+   * The `effort` event is emitted from here on the same footing, and it is
+   * worth being exact about what it claims. Codex has not been asked anything
+   * yet and has not answered; what is being reported is not "codex confirmed"
+   * but "this is the level the next turn runs at", which this adapter is the
+   * thing that decides. There is no later confirmation to wait for either:
+   * `TurnStartResponse` is `{ turn }` and nothing else, so a turn that accepts
+   * the override says nothing about it.
+   */
+  async setEffort(effort: string): Promise<void> {
+    this.turnEffort = effort;
+    this.emit({ t: 'effort', effort });
   }
 
   async interrupt(): Promise<void> {
@@ -1168,6 +1350,33 @@ export class CodexChatAdapter implements ChatAdapter {
 
   respondPermission(requestId: string, optionId: string): void {
     this.delegate?.respondPermission(requestId, optionId);
+  }
+
+  /**
+   * Handed straight to whichever adapter is actually running.
+   *
+   * This is not ceremony: callers reach codex through this class and nothing
+   * else, so a router that did not forward would leave `setEffort` implemented
+   * on an object nobody holds, and the control would report "this runtime
+   * cannot change level" about a runtime that plainly can.
+   *
+   * The rejection is the honest half. `setEffort` is optional on the interface
+   * and its absence is how a runtime says it has no such knob — but a router
+   * cannot make a method vanish when the delegate it happens to have chosen
+   * lacks one, and `exec --json` lacks one for a good reason: it spawns a
+   * process per turn with the prompt in argv and has no live session to change
+   * anything on. So a fallback session rejects rather than resolving on a
+   * promise it cannot keep. Nothing reaches this in practice — the effort menu
+   * is published by the app-server adapter alone, so an exec session offers no
+   * levels to pick from — which is precisely why it must not resolve if it ever
+   * does.
+   */
+  async setEffort(effort: string): Promise<void> {
+    const delegate = this.delegate;
+    if (!delegate?.setEffort) {
+      throw new Error('codex: this session cannot change reasoning effort without a relaunch');
+    }
+    await delegate.setEffort(effort);
   }
 
   async stop(): Promise<void> {

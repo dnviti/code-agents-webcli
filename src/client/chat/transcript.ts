@@ -173,6 +173,10 @@ export class ChatTranscript {
       // after this join belong to it, and without it the first of them opens a
       // turn of its own named after nothing the user typed.
       currentTurnId: snapshot.currentTurnId ?? null,
+      // The level the runtime reported, which `createTranscript` would otherwise
+      // drop — leaving the control blank over a live session that is still
+      // thinking at whatever it opened on.
+      effort: snapshot.effort,
     });
     // A server that does not report its replay floor gets `firstSeq`, which
     // reads as "nothing older" — no paging offered rather than paging that can
@@ -492,6 +496,17 @@ export class ChatTranscript {
    */
   get turnModels(): string[] | undefined {
     return this.state.turnModels;
+  }
+
+  /**
+   * The reasoning-effort level the runtime last reported running at.
+   *
+   * Undefined until a runtime says, which is the state most conversations spend
+   * their life in: an agent left on its own default reports nothing, and
+   * inventing a level for it would put a number on a decision nobody made.
+   */
+  get effort(): string | undefined {
+    return this.state.effort;
   }
 
   get lastError(): string | undefined {

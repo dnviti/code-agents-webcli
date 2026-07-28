@@ -89,6 +89,14 @@ export interface TranscriptState {
    * shows as a count rather than pretending the turn ran on one thing.
    */
   turnModels?: string[];
+  /**
+   * The reasoning-effort level the runtime last said it was running.
+   *
+   * Only ever set from an `effort` event, which only ever carries something a
+   * runtime reported. Absent means nobody has said — which is not the same as
+   * "the default", and the control is careful to show the difference.
+   */
+  effort?: string;
   lastError?: string;
 }
 
@@ -313,6 +321,14 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
 
     case 'capabilities': {
       state.capabilities = { ...state.capabilities, ...event.capabilities };
+      return { messageIndex: null, structural: false, meta: true, applied: true };
+    }
+
+    case 'effort': {
+      // Cleared rather than left standing when the runtime reports null: it has
+      // gone back to its own default, and a stale level on the chip would keep
+      // claiming a choice nobody is running any more.
+      state.effort = event.effort ?? undefined;
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 

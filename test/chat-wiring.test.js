@@ -36,12 +36,31 @@ function createSessionRecord(params = {}) {
   };
 }
 
+/**
+ * Claude's own ladder, as its adapter publishes it — the one the fake session
+ * answers with unless a test hands over another. Only `value` is read by the
+ * server, but the rest is carried so the fixture stays the shape the browser
+ * actually receives.
+ */
+const EFFORT_LADDER = [
+  { value: 'low', name: 'Low', rank: 0 },
+  { value: 'medium', name: 'Medium', rank: 0.2 },
+  { value: 'high', name: 'High', rank: 0.4 },
+  { value: 'xhigh', name: 'Extra high', rank: 0.6 },
+  { value: 'max', name: 'Max', rank: 0.8 },
+  { value: 'ultracode', name: 'Ultracode', rank: 1 },
+];
+
 /** A chat manager that records what it was asked to do. */
 function createChatManager(overrides = {}) {
   const calls = {
     start: [], send: [], interrupt: [], permission: [], page: [], cancelQueued: [],
-    sendQueuedNow: [], setModel: [], rememberModel: [],
+    sendQueuedNow: [], setModel: [], rememberModel: [], setEffort: [], rememberEffort: [],
   };
+  // `efforts` is not a manager method: it is the effort ladder the default
+  // `snapshot` publishes, lifted out so a test can swap the ladder — or pass
+  // null for a runtime that publishes none — without restating a whole snapshot.
+  const { efforts = EFFORT_LADDER, ...methods } = overrides;
   return {
     calls,
     has: () => false,
@@ -51,6 +70,13 @@ function createChatManager(overrides = {}) {
     },
     rememberModel(sessionId, model) {
       calls.rememberModel.push({ sessionId, model });
+    },
+    async setEffort(sessionId, effort) {
+      calls.setEffort.push({ sessionId, effort });
+      return false;
+    },
+    rememberEffort(sessionId, effort) {
+      calls.rememberEffort.push({ sessionId, effort });
     },
     async start(record, options) {
       calls.start.push({ record, options });
@@ -66,7 +92,7 @@ function createChatManager(overrides = {}) {
         runtime: 'claude',
         messages: [{ id: 'm1', seq: 1, turnId: 't1', role: 'user', ts: 1, blocks: [] }],
         state: 'idle',
-        capabilities: {},
+        capabilities: efforts ? { efforts } : {},
         pendingPermissions: [],
         firstSeq: 0,
         cursor: 1,
@@ -97,7 +123,7 @@ function createChatManager(overrides = {}) {
       calls.page.push({ id: record.id, fromSeq, count });
       return { events: [], firstSeq: 0, cursor: 0 };
     },
-    ...overrides,
+    ...methods,
   };
 }
 
@@ -641,6 +667,310 @@ describe('chat wiring', function () {
       await processor.startChat('ws-1', 'claude', {});
 
       assert.strictEqual(chatManager.calls.start[0].options.model, 'profile-default');
+    });
+  });
+
+  // How hard the agent thinks travels the same road the model does — chosen for
+  // one conversation, stored on the record so a relaunch or a `/clear` cannot
+  // quietly undo it — with one rule the model deliberately does not have: a
+  // level is only ever a word out of a list the runtime published, so an
+  // unrecognised one is refused outright rather than saved. Saving it would be
+  // the harmful outcome: pi warns about the unknown level on stderr where
+  // nobody reads it and then runs at its own default, so the picker would show
+  // a level the conversation is not thinking at, on every launch from then on.
+  describe('chat_set_effort', function () {
+    it('applies live when the adapter can change how hard it thinks without a restart', async function () {
+      const { processor, chatManager, session, sent } = build(
+        { surface: 'chat' },
+        { setEffort: async (sessionId, effort) => { chatManager.calls.setEffort.push({ sessionId, effort }); return true; } },
+      );
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_effort', effort: 'high' });
+
+      assert.deepStrictEqual(chatManager.calls.setEffort[0], { sessionId: 'session-1', effort: 'high' });
+      assert.strictEqual(session.chatEffortOverride, 'high', 'the choice is persisted regardless of how it applied');
+      assert.deepStrictEqual(chatManager.calls.rememberEffort[0], {
+        sessionId: 'session-1',
+        effort: 'high',
+      });
+      const result = lastOfType(sent, 'chat_effort_result');
+      assert.strictEqual(result.applied, 'live');
+      assert.strictEqual(result.effort, 'high');
+    });
+
+    it('saves for the next session when nothing live can take the change', async function () {
+      const { processor, chatManager, session, sent } = build({ surface: 'chat' });
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_effort', effort: 'max' });
+
+      assert.strictEqual(chatManager.calls.send.length, 0, 'no slash command where the runtime advertises none');
+      assert.strictEqual(session.chatEffortOverride, 'max', 'still persisted for the next launch');
+      const result = lastOfType(sent, 'chat_effort_result');
+      assert.strictEqual(result.applied, 'pending');
+      assert.match(result.message, /next session/i);
+    });
+
+    it('falls back to a best-effort slash command when the runtime advertises /effort but cannot switch live', async function () {
+      const { processor, chatManager, session, sent } = build(
+        { surface: 'chat' },
+        {
+          async snapshot(record) {
+            return {
+              sessionId: record.id,
+              runtime: 'claude',
+              messages: [],
+              state: 'idle',
+              capabilities: { efforts: EFFORT_LADDER, commands: [{ name: 'effort' }] },
+              pendingPermissions: [],
+              firstSeq: 0,
+              cursor: 0,
+              live: true,
+              bypassPermissions: false,
+            };
+          },
+        },
+      );
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_effort', effort: 'xhigh' });
+
+      assert.strictEqual(chatManager.calls.send.length, 1, 'the slash command must be sent as a turn');
+      assert.deepStrictEqual(chatManager.calls.send[0].turn, { text: '/effort xhigh' });
+      assert.strictEqual(session.chatEffortOverride, 'xhigh');
+      const result = lastOfType(sent, 'chat_effort_result');
+      assert.strictEqual(result.applied, 'sent');
+    });
+
+    it('reports pending rather than live when the adapter’s live switch throws', async function () {
+      const { processor, session, sent } = build(
+        { surface: 'chat' },
+        { setEffort: async () => { throw new Error('a turn is already running'); } },
+      );
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_effort', effort: 'low' });
+
+      assert.strictEqual(session.chatEffortOverride, 'low', 'still saved for the next launch despite the failed live attempt');
+      const result = lastOfType(sent, 'chat_effort_result');
+      assert.strictEqual(result.applied, 'pending');
+      assert.match(result.message, /a turn is already running/, 'the user is told why it did not take');
+    });
+
+    it('clears the override rather than treating an empty string as a level', async function () {
+      const { processor, chatManager, session, sent } = build({ surface: 'chat' });
+      session.chatEffortOverride = 'max';
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_effort', effort: '' });
+
+      assert.strictEqual(session.chatEffortOverride, undefined);
+      assert.strictEqual(chatManager.calls.rememberEffort.length, 1, 'a /clear restart has to hear about the clearing too');
+      assert.strictEqual(
+        chatManager.calls.rememberEffort[0].effort,
+        undefined,
+        'and hear it as "no level", not as some default level this server invented',
+      );
+      const result = lastOfType(sent, 'chat_effort_result');
+      assert.strictEqual(result.applied, 'cleared');
+      assert.strictEqual(result.effort, null);
+    });
+
+    it('refuses a level the running runtime does not offer, and names the ones it does', async function () {
+      // `ultra` is a real level — codex's ceiling — which is exactly why storing
+      // it against a claude conversation would look reasonable and be wrong.
+      const { processor, chatManager, session, sent } = build({ surface: 'chat' });
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_effort', effort: 'ultra' });
+
+      assert.strictEqual(session.chatEffortOverride, undefined, 'a refused level must not be stored');
+      assert.strictEqual(chatManager.calls.setEffort.length, 0, 'and must never reach the adapter');
+      assert.strictEqual(chatManager.calls.rememberEffort.length, 0);
+      const result = lastOfType(sent, 'chat_effort_result');
+      assert.strictEqual(result.applied, 'refused');
+      assert.strictEqual(result.effort, null);
+      assert.match(result.message, /low, medium, high, xhigh, max/, 'a refusal that does not say what would work is a dead end');
+    });
+
+    it('refuses anything that is not a bare word, and stores nothing', async function () {
+      const { processor, chatManager, session, sent } = build({ surface: 'chat' });
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_effort', effort: 'HIGH; rm -rf /' });
+
+      assert.strictEqual(session.chatEffortOverride, undefined);
+      assert.strictEqual(lastOfType(sent, 'chat_effort_result').applied, 'refused');
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_effort', effort: 'x'.repeat(200) });
+
+      assert.strictEqual(session.chatEffortOverride, undefined, 'nor does length get truncated into something storable');
+      assert.strictEqual(lastOfType(sent, 'chat_effort_result').applied, 'refused');
+      assert.strictEqual(chatManager.calls.setEffort.length, 0);
+      assert.strictEqual(chatManager.calls.rememberEffort.length, 0);
+    });
+
+    it('accepts a well-formed level from a session that has published no ladder', async function () {
+      // The ladder arrives with the running process, so before anything has
+      // launched — or after it has died — there is nothing to check against.
+      // Refusing then would make it impossible to choose a level in advance.
+      const { processor, session, sent } = build({ surface: 'chat' }, { efforts: null });
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_effort', effort: 'ultra' });
+
+      assert.strictEqual(session.chatEffortOverride, 'ultra');
+      assert.strictEqual(lastOfType(sent, 'chat_effort_result').applied, 'pending');
+    });
+
+    it('will not set an effort override for a session belonging to another user', async function () {
+      const { processor, chatManager, session } = build({ surface: 'chat', ownerUserId: 999 });
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_effort', effort: 'max' });
+
+      assert.strictEqual(chatManager.calls.setEffort.length, 0);
+      assert.strictEqual(session.chatEffortOverride, undefined);
+    });
+
+    it('lets a saved level reach the runtime on the next launch', async function () {
+      const { processor, chatManager, session } = build({ surface: 'chat' });
+      session.chatEffortOverride = 'xhigh';
+
+      await processor.startChat('ws-1', 'claude', {});
+
+      assert.strictEqual(chatManager.calls.start[0].options.effort, 'xhigh');
+    });
+
+    it('launches with no level at all when the conversation chose none', async function () {
+      // Deliberately no profile fallback behind it: profiles are server-wide and
+      // an effort level has never had one, so "unset" has to mean the runtime is
+      // handed no flag and runs at whatever it considers normal.
+      const { processor, chatManager } = build({ surface: 'chat' });
+      processor.deps.resolveRuntimeProfile = () => ({
+        profileName: 'p',
+        model: 'profile-default',
+        // Offered by the profile and still not taken: the model beside it is.
+        effort: 'profile-effort',
+      });
+
+      await processor.startChat('ws-1', 'claude', {});
+
+      assert.strictEqual(chatManager.calls.start[0].options.model, 'profile-default');
+      assert.strictEqual(chatManager.calls.start[0].options.effort, undefined);
+    });
+
+    // The same choice by the other door. Forwarding it untouched left the record
+    // unaware, so the next /clear restarted the conversation at the old level.
+    it('records an /effort typed straight into the composer, and still forwards it', async function () {
+      const { processor, chatManager, session } = build({ surface: 'chat' });
+
+      await processor.handleMessage('ws-1', { type: 'chat_send', text: '/effort xhigh' });
+
+      assert.strictEqual(session.chatEffortOverride, 'xhigh');
+      assert.deepStrictEqual(chatManager.calls.rememberEffort[0], {
+        sessionId: 'session-1',
+        effort: 'xhigh',
+      });
+      assert.strictEqual(
+        chatManager.calls.send[0].turn.text,
+        '/effort xhigh',
+        'the runtime still has to receive its own command',
+      );
+    });
+
+    it('leaves an ordinary message that merely mentions /effort alone', async function () {
+      const { processor, chatManager, session } = build({ surface: 'chat' });
+
+      await processor.handleMessage('ws-1', { type: 'chat_send', text: 'what does /effort do?' });
+
+      assert.strictEqual(session.chatEffortOverride, undefined);
+      assert.strictEqual(chatManager.calls.rememberEffort.length, 0);
+    });
+
+    it('forwards a typed level the runtime accepts as a command but never published, without recording it', async function () {
+      // A runtime's slash command and its launch flag do not take the same
+      // words. Claude's `/effort` answers `Usage: /effort
+      // <low|medium|high|xhigh|max|ultracode|auto>` — seven words for a flag
+      // that takes six. `auto` is the odd one out, and it was probed both ways:
+      // `--effort auto` prints `Warning: Unknown --effort value 'auto' —
+      // ignoring it and using the default effort` and carries on, while
+      // `--effort ultracode` is accepted in silence and so is on the ladder.
+      //
+      // So typing `/effort auto` really does change the live session — and
+      // storing it made every launch after that one silently run at claude's
+      // default while the chip still claimed the level.
+      const { processor, chatManager, session } = build({ surface: 'chat' });
+
+      await processor.handleMessage('ws-1', { type: 'chat_send', text: '/effort auto' });
+
+      assert.strictEqual(
+        session.chatEffortOverride,
+        undefined,
+        'a level absent from the published ladder must not become the launch flag',
+      );
+      assert.strictEqual(chatManager.calls.rememberEffort.length, 0);
+      assert.strictEqual(
+        chatManager.calls.send[0].turn.text,
+        '/effort auto',
+        'what the runtime does with its own command is the runtime’s business',
+      );
+    });
+
+    it('records a typed ultracode, because the launch flag takes that one', async function () {
+      // The control for the test above: same shape, same path, and the only
+      // difference is that this level is one claude will still be running at
+      // after a `/clear` replays the launch options.
+      const { processor, chatManager, session } = build({ surface: 'chat' });
+
+      await processor.handleMessage('ws-1', { type: 'chat_send', text: '/effort ultracode' });
+
+      assert.strictEqual(session.chatEffortOverride, 'ultracode');
+      assert.deepStrictEqual(chatManager.calls.rememberEffort, [
+        { sessionId: 'session-1', effort: 'ultracode' },
+      ]);
+    });
+
+    it('records nothing from a typed level when the session has published no ladder at all', async function () {
+      // Nothing to check the word against means no evidence the runtime would
+      // take it on the command line, and a level that cannot be verified is
+      // still forwarded rather than stored: replaying an unverified flag is
+      // what the chip lied about.
+      const { processor, chatManager, session } = build({ surface: 'chat' }, { efforts: null });
+
+      await processor.handleMessage('ws-1', { type: 'chat_send', text: '/effort high' });
+
+      assert.strictEqual(session.chatEffortOverride, undefined);
+      assert.strictEqual(chatManager.calls.rememberEffort.length, 0);
+      assert.strictEqual(chatManager.calls.send[0].turn.text, '/effort high');
+    });
+
+    it('drops a level from the previous runtime when the conversation is launched as another one', async function () {
+      // The stored word came out of codex's ladder and means nothing to claude,
+      // which — like pi — warns on a stream nobody reads and then runs at its
+      // own default rather than refusing. Left in place it would have been put
+      // on claude's command line while the control reported a level the
+      // conversation was never on.
+      const { processor, chatManager, session } = build({ surface: 'chat', agent: 'codex' });
+      session.chatEffortOverride = 'ultra';
+
+      await processor.startChat('ws-1', 'claude', {});
+
+      assert.strictEqual(
+        chatManager.calls.start[0].options.effort,
+        undefined,
+        'codex’s level must not reach a claude launch',
+      );
+      assert.strictEqual(
+        session.chatEffortOverride,
+        undefined,
+        'and the record has to forget it too, or the chip keeps claiming it',
+      );
+    });
+
+    it('keeps the level when the same runtime is launched again', async function () {
+      // The control on the rule above: clearing unconditionally would silently
+      // drop the chosen level on every relaunch, /clear included, which is the
+      // exact bug the record exists to prevent.
+      const { processor, chatManager, session } = build({ surface: 'chat', agent: 'codex' });
+      session.chatEffortOverride = 'ultra';
+
+      await processor.startChat('ws-1', 'codex', {});
+
+      assert.strictEqual(chatManager.calls.start[0].options.effort, 'ultra');
+      assert.strictEqual(session.chatEffortOverride, 'ultra');
     });
   });
 
