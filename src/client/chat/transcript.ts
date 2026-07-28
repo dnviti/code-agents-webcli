@@ -167,6 +167,10 @@ export class ChatTranscript {
       pendingQuestions: snapshot.pendingQuestions || [],
       firstSeq: snapshot.firstSeq,
       cursor: snapshot.cursor,
+      // The turn the server's replay was still inside. Live events arriving
+      // after this join belong to it, and without it the first of them opens a
+      // turn of its own named after nothing the user typed.
+      currentTurnId: snapshot.currentTurnId ?? null,
     });
     // A server that does not report its replay floor gets `firstSeq`, which
     // reads as "nothing older" — no paging offered rather than paging that can
@@ -215,6 +219,18 @@ export class ChatTranscript {
     this.state.messages = [...fresh, ...this.state.messages];
     reindexTranscript(this.state);
     this.bumpAll();
+  }
+
+  /**
+   * Start this transcript inside a turn that opened before its first event.
+   *
+   * For the scratch transcript a page is replayed through: the slice begins
+   * wherever the browser scrolled back to, which is routinely the middle of a
+   * turn, and the server says which one so the messages are filed under the
+   * turn the conversation recorded rather than the runtime's name for it.
+   */
+  seedOpenTurn(turnId: string | null | undefined): void {
+    this.state.currentTurnId = turnId ?? null;
   }
 
   get loadingMore(): boolean {

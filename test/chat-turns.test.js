@@ -228,6 +228,20 @@ describe('groupTurns', function () {
       assert.strictEqual(mod.groupTurns(messages, 'running')[0].status, 'running');
     });
 
+    it('does not spin on a message left flagged streaming once the session is idle', function () {
+      // What the user saw: a turn that had finished, still showing the working
+      // spinner. A `streaming` flag is only ever cleared by an event, and the
+      // events that clear it go missing in ordinary ways — a window cut before
+      // `msg_end`, a runtime that dropped it, a reconnect. The session's own
+      // state is the authority on whether anything is running, and idle is the
+      // word every adapter ends a turn with.
+      const messages = [
+        msg('user', [text('go')]),
+        msg('assistant', [text('all done')], { streaming: true }),
+      ];
+      assert.strictEqual(mod.groupTurns(messages, 'idle')[0].status, 'done');
+    });
+
     it('does not treat a denied call as a failure', function () {
       // "You refused this" is not "this broke", and the index must not paint
       // the user's own decision red.

@@ -211,7 +211,13 @@ export class ChatSessionManager {
     record: SessionRecord,
     fromSeq: number,
     count: number,
-  ): Promise<{ events: unknown[]; firstSeq: number; from: number; cursor: number }> {
+  ): Promise<{
+    events: unknown[];
+    firstSeq: number;
+    from: number;
+    cursor: number;
+    openTurnId: string | null;
+  }> {
     return this.deps.store
       .read({ id: record.id, ownerUserId: record.ownerUserId }, fromSeq, count)
       .then((page) => ({
@@ -219,6 +225,9 @@ export class ChatSessionManager {
         firstSeq: page.firstSeq,
         from: page.from,
         cursor: page.cursor,
+        // The turn the page starts inside, so the browser replays the slice
+        // into the turn the conversation recorded rather than a new one.
+        openTurnId: page.openTurnId ?? null,
       }));
   }
 

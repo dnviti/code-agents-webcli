@@ -218,6 +218,16 @@ const QUEUE_READY_POLL_MS = 25;
 const QUEUE_READY_TIMEOUT_MS = 15_000;
 
 /**
+ * How long a promoted message waits for the turn it interrupted to close.
+ *
+ * The runtimes here answer an interrupt in tens of milliseconds, so this is
+ * only ever a ceiling on a wait nobody notices — and it is short because what
+ * it protects against is a runtime that never answers at all, where the right
+ * behaviour is to send the message anyway rather than sit on it.
+ */
+const INTERRUPT_SETTLE_MS = 2_000;
+
+/**
  * Thrown when the session id is known but nothing is running under it.
  *
  * A distinct type rather than a message to match on, because the recovery for
@@ -328,11 +338,13 @@ export class ChatSession {
   /**
    * The turn currently running, by id, or null between turns.
    *
-   * Only one thing reads it: a message promoted past the queue while the agent
-   * is working continues *this* turn instead of starting one, because it is
-   * being delivered into the work rather than waiting for its own (#86).
+   * What it is for: a message promoted past the queue interrupts this turn, and
+   * the new one must not open until the runtime has actually closed it — see
+   * `settleInterruptedTurn` (#86).
    */
   private turnInFlightId: string | null = null;
+  /** Woken when `turn_end` clears `turnInFlightId`. See `settleInterruptedTurn`. */
+  private turnEndWaiters: Array<() => void> = [];
   /** Runs the drain again once the adapter has finished letting go of the last turn. */
   private drainRetry: ReturnType<typeof setTimeout> | null = null;
   /** When the current wait for a ready adapter began; null when not waiting. */
@@ -687,7 +699,12 @@ export class ChatSession {
     // one event every runtime agrees means "that turn is over", and a stale id
     // would make the next message look like a continuation of work that had
     // already finished — which is the count going wrong in the other direction.
-    if (stamped.t === 'turn_end') this.turnInFlightId = null;
+    if (stamped.t === 'turn_end') {
+      this.turnInFlightId = null;
+      const waiters = this.turnEndWaiters;
+      this.turnEndWaiters = [];
+      for (const wake of waiters) wake();
+    }
 
     if (stamped.t === 'session') {
       // Patched on the event itself, not just on the copy kept here. Every
@@ -1096,12 +1113,6 @@ export class ChatSession {
     // releases the queue: `interrupt` ends in `setState('idle')`, `ingest` runs
     // `drainQueue` after every event, and without this the first message still
     // waiting would overtake the one the user actually chose.
-    // Read before the interrupt, because the interrupt is what ends the turn and
-    // ending it is what clears this. A promoted message delivered into work that
-    // was running continues that work's turn; one promoted while the session was
-    // idle has no work to join and starts its own (#86).
-    const steering = inFlight ? this.turnInFlightId : null;
-
     this.draining = true;
     try {
       if (inFlight) {
@@ -1111,8 +1122,20 @@ export class ChatSession {
         // corrected mid-turn is not a failure, and it belongs to the
         // conversation rather than to the turn that was stopped.
         this.ingest({ t: 'marker', kind: 'interrupted', detail: quoteTurn(turn.text) });
+        // And then wait for the runtime to agree that it has: the interrupt is
+        // asynchronous, and every runtime here answers it with a `turn_end` of
+        // its own a moment later. Delivering into that gap is what produced the
+        // conversation this fixes — the new message opened a turn, the stale
+        // `turn_end` closed it before a word came back, and the answer arrived
+        // in a turn of its own with nobody's question in it (#86).
+        await this.settleInterruptedTurn();
       }
-      await this.deliver({ text: turn.text, attachments: turn.attachments }, steering ?? undefined);
+      // Its own turn, never the interrupted one. A steer is a message delivered
+      // into work that carries on afterwards; this one stopped that work on
+      // purpose, so filing the ask under the turn being cancelled leaves it in
+      // a turn that is over while the work it asks for happens in a turn with
+      // no prompt to name it by.
+      await this.deliver({ text: turn.text, attachments: turn.attachments });
       return true;
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1308,13 +1331,15 @@ export class ChatSession {
   /**
    * Hand one turn to the runtime, recording the user's own message first.
    *
-   * @param continuesTurnId The turn this message is being delivered *into*, when
-   *   it is a steer — see `sendQueuedNow`. Sharing that turn's id is what makes
-   *   the transcript group the two together and the accounting file them as one
-   *   turn, which is the definition #86 settled: steering the current work is
-   *   part of that work, not a new request.
+   * Always a turn of its own. It used to be able to join the turn in flight —
+   * a "steer", for a message promoted past the queue — and that could not be
+   * made true: promoting one interrupts the running turn, every runtime here
+   * answers an interrupt by ending it, and a message filed into a turn that is
+   * over leaves the work it asks for in a turn with no prompt in it (#86). The
+   * `steer` field stays in the event vocabulary because logs already written
+   * carry it, and they still group and account exactly as they did.
    */
-  private async deliver(turn: UserTurn, continuesTurnId?: string): Promise<void> {
+  private async deliver(turn: UserTurn): Promise<void> {
     if (!this.adapter || !this.adapter.alive) {
       throw new ChatNotRunningError();
     }
@@ -1328,14 +1353,13 @@ export class ChatSession {
     // it is the same in every protocol, and a transcript missing what the user
     // asked is useless for resuming, exporting or searching.
     const messageId = `user-${crypto.randomUUID()}`;
-    const turnId = continuesTurnId ?? `turn-${crypto.randomUUID()}`;
+    const turnId = `turn-${crypto.randomUUID()}`;
     this.turnInFlightId = turnId;
     this.ingest({
       t: 'msg_start',
       id: messageId,
       role: 'user',
       turnId,
-      ...(continuesTurnId ? { steer: true as const } : {}),
     });
     this.ingest({
       t: 'block_start',
@@ -1432,6 +1456,39 @@ export class ChatSession {
         message: `Stopped. ${dropped} queued message${dropped === 1 ? ' was' : 's were'} discarded.`,
       });
     }
+  }
+
+  /**
+   * Wait for the interrupted turn to actually end, briefly.
+   *
+   * `adapter.interrupt()` returns once the runtime has been *told*; the turn is
+   * over when the runtime says so, which is a `turn_end` arriving a moment
+   * later. In between, the log is in a state nothing downstream can read
+   * correctly: a message delivered there opens a turn that the stale `turn_end`
+   * then closes, so the answer to it lands in a third turn with no prompt in it
+   * — which is the "no prompt" row, spinning, that this whole path is about.
+   *
+   * Bounded, and it returns rather than throws when the grace runs out: a
+   * runtime that never answers an interrupt must not be able to swallow a
+   * message the user has already sent. Waiting a moment is worth it; waiting
+   * forever is not.
+   */
+  private async settleInterruptedTurn(): Promise<void> {
+    if (!this.turnInFlightId) return;
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = (): void => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(finish, INTERRUPT_SETTLE_MS);
+      // Never keeps the process alive: this is a courtesy wait inside a request
+      // nobody is blocked on but the one browser that asked.
+      timer.unref?.();
+      this.turnEndWaiters.push(finish);
+    });
   }
 
   /**

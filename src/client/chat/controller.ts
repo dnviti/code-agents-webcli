@@ -222,7 +222,8 @@ export class ChatController {
         const events = (message.events as ChatEvent[] | undefined) || [];
         const firstSeq = Number(message.firstSeq) || 0;
         const from = typeof message.from === 'number' ? message.from : undefined;
-        this.absorbPage(events, firstSeq, from);
+        const openTurnId = typeof message.openTurnId === 'string' ? message.openTurnId : null;
+        this.absorbPage(events, firstSeq, from, openTurnId);
         this.settlePage();
         this.options.onChange?.();
         return true;
@@ -259,13 +260,23 @@ export class ChatController {
    * into messages is the reducer. Rebuilding that logic here is how the two
    * halves of a paged conversation start disagreeing.
    */
-  private absorbPage(events: ChatEvent[], firstSeq: number, from?: number): void {
+  private absorbPage(
+    events: ChatEvent[],
+    firstSeq: number,
+    from?: number,
+    openTurnId?: string | null,
+  ): void {
     if (!events.length) {
       this.transcript.prepend([], firstSeq, from);
       return;
     }
 
     const scratch = new ChatTranscript(this.transcript.capabilities);
+    // A page starts wherever the scroll reached, which is routinely inside a
+    // turn: without the turn the server says was open there, every paged-in
+    // message is filed under the runtime's id and the history fills with rows
+    // that have no prompt to name them.
+    scratch.seedOpenTurn(openTurnId);
     scratch.applyAll(events);
     this.transcript.prepend(scratch.messages, firstSeq, from);
   }

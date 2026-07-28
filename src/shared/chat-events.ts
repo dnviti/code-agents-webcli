@@ -798,6 +798,19 @@ export interface ChatSnapshot {
    * reporting a fully-replayed session, and default to offering no paging.
    */
   replayFrom?: number;
+  /**
+   * The turn still open where the replay ended, or null when none is.
+   *
+   * A snapshot is a window, and a browser that joins mid-turn has to know which
+   * turn the next event belongs to. Without it the first message to arrive
+   * after the join opens a turn of its own under the runtime's id — a row in
+   * the index with no prompt to name it by, spinning next to the turn it is
+   * actually part of.
+   *
+   * Optional so a snapshot from a server that predates it reads as "nothing
+   * open", which is the behaviour this replaces rather than a wrong claim.
+   */
+  currentTurnId?: string | null;
   /** Highest seq written. */
   cursor: number;
   /** True when the runtime process is alive. */

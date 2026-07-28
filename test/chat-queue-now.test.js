@@ -30,6 +30,12 @@ function fakeAdapter() {
     },
     async interrupt() {
       this.interrupts += 1;
+      // What a real runtime does about it: claude, grok, codex and the ACP
+      // agents all answer an interrupt by ending the turn, a moment later and
+      // on their own thread. A fake that stayed silent let the promoted
+      // message be delivered into a turn nothing had closed — a shape none of
+      // them produces, and the one the session now waits to avoid.
+      this.emit?.({ t: 'turn_end', turnId: 'cut-short', stopReason: 'interrupted' });
     },
     respondPermission() {},
     async stop() {
@@ -75,6 +81,9 @@ function session() {
     },
   );
   const adapter = fakeAdapter();
+  // The channel a real adapter is built with; these tests hand the session an
+  // adapter directly, so it is wired here instead.
+  adapter.emit = (event) => s.ingest(event);
   s.adapter = adapter;
   s.state = 'idle';
   return { s, store, broadcasts, adapter };

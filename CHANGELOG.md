@@ -231,6 +231,42 @@
   figures above it, which it previously did not.
 
 ### Fixed
+- **A turn stops spinning when the work is done, and the index says what was
+  asked instead of "no prompt".** (#86) Reopening or reloading a long
+  conversation gave you a turn list with an extra row on it: numbered on its
+  own, titled **"no prompt"**, and turning its working spinner over a chat that
+  had finished minutes earlier.
+
+  What a browser is given is the *tail* of a conversation, and a tail routinely
+  starts in the middle of a turn — the question that opened it is simply not in
+  the window. Replayed from a standing start, the first message in the window
+  opened a turn of its own under the runtime's private name for it. That name is
+  one the recorded conversation has never used, so the row could not be matched
+  against the recording that still holds the question, and nothing could repair
+  the title. The same thing happened again a message at a time as you scrolled
+  back through history, and once more the moment a browser joined a turn already
+  in progress. Which turn is open is now told to the replay rather than guessed
+  by it, at every edge: a half-loaded turn is filed under the turn it belongs to,
+  carries the number the conversation gave it, and is titled with what was
+  actually asked.
+
+  The spinner was a second fault behind the same symptom. A message carries a
+  "still streaming" flag that only an event can clear, and those events go
+  missing in ordinary ways — a window cut before the end of a message, a
+  reconnect, a runtime that dropped one. A turn read off that flag alone spun
+  forever. The session's own state decides now: when the session says it is
+  idle, the turn that was running has finished, whatever a stale flag says.
+
+- **A message sent ahead of the queue gets its own turn, and keeps its
+  question.** (#86) Sending one interrupts whatever the agent is working on, and
+  every runtime here answers an interrupt by ending that turn — so filing the
+  new message *into* the turn being cancelled left the question at the foot of a
+  finished turn while the work it asked for happened in the next one, with
+  nothing in it to name it by. That is where most of the "no prompt" rows came
+  from. A promoted message now waits for the interrupted turn to actually close
+  and then opens its own, and conversations already recorded are read back with
+  the question restored to the work it produced.
+
 - **What a conversation has cost stops falling while you are still in it.** The
   figure was never stored: it was re-added up from the log each time a browser
   asked for the conversation, and what a browser is given is the *tail* of it —

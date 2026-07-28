@@ -272,9 +272,9 @@ describe('the same work through different agents', function () {
   });
 });
 
-// -------------------------------------------------- the turn a steer joins
+// -------------------------------------------------- the turn a promotion opens
 
-describe('a steer, driven through the real session', function () {
+describe('a promoted message, driven through the real session', function () {
   function fakeAdapter() {
     return {
       runtime: 'claude',
@@ -285,7 +285,11 @@ describe('a steer, driven through the real session', function () {
       async send(turn) {
         this.sent.push(turn.text);
       },
-      async interrupt() {},
+      async interrupt() {
+        // As every real runtime does: an interrupt is answered with a
+        // `turn_end` of the runtime's own, which is what ends the turn.
+        this.emit?.({ t: 'turn_end', turnId: 'cut-short', stopReason: 'interrupted' });
+      },
       respondPermission() {},
       async stop() {
         this.alive = false;
@@ -320,7 +324,9 @@ describe('a steer, driven through the real session', function () {
         resolveCommand: () => 'claude',
       },
     );
-    s.adapter = fakeAdapter();
+    const adapter = fakeAdapter();
+    adapter.emit = (event) => s.ingest(event);
+    s.adapter = adapter;
     s.state = 'idle';
     return { s, events };
   }
@@ -328,7 +334,7 @@ describe('a steer, driven through the real session', function () {
   const userStarts = (events) =>
     events.filter((e) => e.t === 'msg_start' && e.role === 'user');
 
-  it('gives a promoted message the turn it was delivered into', async function () {
+  it('gives a promoted message a turn of its own, not the one it cut short', async function () {
     const { s, events } = session();
     await s.send({ text: 'refactor the auth module' });
     await s.send({ text: 'no — the staging database' });
@@ -336,9 +342,33 @@ describe('a steer, driven through the real session', function () {
     const [waiting] = s.queuedTurns;
     await s.sendQueuedNow(waiting.id);
 
-    const [first, steer] = userStarts(events);
-    assert.strictEqual(steer.turnId, first.turnId, 'the steer joins the running turn');
-    assert.strictEqual(steer.steer, true, 'and says so, since it cannot be worked out later');
+    const [first, promoted] = userStarts(events);
+    // The interrupt ends the turn — every runtime here answers it that way —
+    // so the work this message asks for happens in a turn that starts after
+    // it. Filing the ask in the turn being cancelled left that work with no
+    // prompt in it at all: a "no prompt" row in the index, spinning beside the
+    // question it was actually answering.
+    assert.notStrictEqual(promoted.turnId, first.turnId, 'the cut-short turn is over');
+    assert.strictEqual(promoted.steer, undefined, 'and this is a request, not a steer into it');
+  });
+
+  it('opens its turn only once the interrupted one has been closed', async function () {
+    const { s, events } = session();
+    await s.send({ text: 'refactor the auth module' });
+    await s.send({ text: 'no — the staging database' });
+
+    const [waiting] = s.queuedTurns;
+    await s.sendQueuedNow(waiting.id);
+
+    const order = events.filter(
+      (e) => e.t === 'turn_end' || (e.t === 'msg_start' && e.role === 'user'),
+    );
+    const [, closed, promoted] = order;
+    assert.strictEqual(closed.t, 'turn_end', 'the runtime closes the turn it was told to stop');
+    assert.strictEqual(promoted.t, 'msg_start', 'and only then is the new one opened');
+    // Otherwise that stale `turn_end` lands on the turn just opened and closes
+    // it before a word comes back, and the answer arrives in a third turn that
+    // nobody asked anything in.
   });
 
   it('gives a promoted message its own turn when nothing was running', async function () {

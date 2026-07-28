@@ -2312,6 +2312,12 @@ async function checkTheTurnIndexListsTheWholeConversation(): Promise<void> {
         {
           id: 'a40', seq: 80, turnId: 't40', role: 'assistant', ts: 80,
           blocks: [{ kind: 'text', text: 'the discovery that simplified it' }],
+          // Still flagged mid-stream, with the session idle. That combination
+          // is ordinary: the flag is only ever cleared by an event, and the
+          // window that carried this message was cut before the one that would
+          // have. The turn is finished — the session says so — and the row must
+          // not sit there spinning on it.
+          streaming: true,
         },
       ],
       pendingPermissions: [],
@@ -2420,6 +2426,20 @@ async function checkTheTurnIndexListsTheWholeConversation(): Promise<void> {
     'a half-loaded turn is titled from the recording, not "no prompt"',
     !(rows[0]?.textContent || '').includes('no prompt'),
     (rows[0]?.textContent || '').slice(0, 80) || 'no first row',
+  );
+  // The reported defect, read off the icon rather than off the state that
+  // decides it: the chat had finished and the row was still turning.
+  const spinning = rows.filter((row) =>
+    Array.from(row.querySelectorAll('*')).some((node) =>
+      ((node as HTMLElement).style?.animation || '').includes('relay-spin'),
+    ),
+  );
+  check(
+    'no row spins once the session says it is idle',
+    spinning.length === 0,
+    spinning.length
+      ? `${spinning.length} spinning: ${(spinning[0].textContent || '').slice(0, 40)}`
+      : 'none',
   );
   check(
     'the newest row still carries the number the conversation gave it',
