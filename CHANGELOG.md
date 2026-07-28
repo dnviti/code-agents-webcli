@@ -64,6 +64,13 @@
   at all — is named from the recording too, instead of reading "no prompt"
   beside a question that was asked perfectly clearly and is still on file.
 
+- **The turn list runs newest first.** (#86) The turn you are looking for is
+  almost always the one that just happened, and it was at the bottom — so in a
+  long conversation you scrolled to the end of the index to reach the thing
+  already on screen. Only the order changed: a turn keeps the number the
+  conversation gave it, so the list opens on 49 and counts down. Arrow keys,
+  Home and End follow what is drawn, so "down" is down the list.
+
 - **The turn index lists the whole conversation, and every entry is named after
   what you asked.** (#86) It was assembled from whatever the browser happened to
   be holding, so a long conversation's index quietly started part way through —

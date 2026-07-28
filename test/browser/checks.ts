@@ -2395,23 +2395,36 @@ async function checkTheTurnIndexListsTheWholeConversation(): Promise<void> {
     rows.length === 40,
     `${rows.length} rows for a 40-turn conversation holding 1`,
   );
+  // Newest first: the turn you are looking at is the top row, and the first
+  // turn of the conversation is the last one.
   check(
-    'and it starts at the first turn rather than part way through',
-    (rows[0]?.textContent || '').includes('set up the parser'),
+    'the newest turn is the first row',
+    (rows[0]?.textContent || '').includes('and now the changelog'),
     (rows[0]?.textContent || '').slice(0, 80) || 'no first row',
   );
   check(
+    'and it reaches back to the first turn at the bottom',
+    (rows[39]?.textContent || '').includes('set up the parser'),
+    (rows[39]?.textContent || '').slice(0, 80) || 'no last row',
+  );
+  check(
     'a turn with no prompt behind it says so instead of quoting the model',
-    (rows[1]?.textContent || '').includes('no prompt'),
-    (rows[1]?.textContent || '').slice(0, 80) || 'no second row',
+    (rows[38]?.textContent || '').includes('no prompt'),
+    (rows[38]?.textContent || '').slice(0, 80) || 'no second-from-last row',
   );
   // The turn on screen, whose opening ask is not in the window. It reads "no
   // prompt" if the label is taken from the loaded messages — which is what the
-  // index showed for the turn the user was looking at (#86).
+  // index showed for the turn the user was looking at (#86). It is the top row,
+  // and its number is still the conversation's.
   check(
     'a half-loaded turn is titled from the recording, not "no prompt"',
-    (rows[39]?.textContent || '').includes('and now the changelog'),
-    (rows[39]?.textContent || '').slice(0, 80) || 'no last row',
+    !(rows[0]?.textContent || '').includes('no prompt'),
+    (rows[0]?.textContent || '').slice(0, 80) || 'no first row',
+  );
+  check(
+    'the newest row still carries the number the conversation gave it',
+    (rows[0]?.textContent || '').trim().startsWith('40'),
+    (rows[0]?.textContent || '').slice(0, 40) || 'no first row',
   );
 
   // A transcript this short is already scrolled to its top, so the list asks
@@ -2431,12 +2444,13 @@ async function checkTheTurnIndexListsTheWholeConversation(): Promise<void> {
   // means fetching it first. Asserted on the outcome rather than on the request
   // — a transcript this short is at its own top and asks for pages unprompted,
   // so counting requests would measure the scroll position, not the click.
-  (rows[0] as HTMLElement | undefined)?.click();
+  const oldest = rows[39] as HTMLElement | undefined;
+  oldest?.click();
   await wait(200);
   check(
     'and the entry stays selected while it is being fetched',
-    rows[0]?.getAttribute('aria-selected') === 'true',
-    String(rows[0]?.getAttribute('aria-selected')),
+    oldest?.getAttribute('aria-selected') === 'true',
+    String(oldest?.getAttribute('aria-selected')),
   );
 
   controller.handle({
@@ -4223,7 +4237,14 @@ async function checkATurnsBadgeSaysHowItEnded(): Promise<void> {
   );
   await wait(400);
 
-  const rows = Array.from(host.querySelectorAll('nav[aria-label="Turns"] [role="option"]')) as HTMLElement[];
+  // The index runs newest-first, the transcript oldest-first, so the rows are
+  // put back into the conversation's order before being read against the
+  // strips. Reversed here rather than asserted away: which end the list starts
+  // at is a presentation choice, and every claim below is about a turn rather
+  // than about a position.
+  const rows = (
+    Array.from(host.querySelectorAll('nav[aria-label="Turns"] [role="option"]')) as HTMLElement[]
+  ).reverse();
   const strips = Array.from(host.querySelectorAll('[data-turn-id]')) as HTMLElement[];
 
   check(

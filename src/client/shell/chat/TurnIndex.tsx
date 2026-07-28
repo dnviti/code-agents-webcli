@@ -45,14 +45,24 @@ export function TurnIndex({
   const listRef = React.useRef<HTMLDivElement | null>(null);
   const isPhone = usePhone();
 
+  // Newest first. The list is read from the top, and the turn you are almost
+  // always looking for is the one that just happened — in a long conversation
+  // the alternative is scrolling to the bottom of the index to reach the thing
+  // already on screen. Only the order changes: a turn keeps the number the
+  // conversation gave it, so the top of the list is 49 and it counts down.
+  const ordered = React.useMemo(() => [...turns].reverse(), [turns]);
+
+  // Arrow keys, Home and End follow what is drawn rather than the clock, so
+  // "down" is down the list. That makes them older, which is the direction the
+  // list now runs in.
   const move = React.useCallback(
     (delta: number) => {
-      if (!turns.length) return;
-      const at = turns.findIndex((turn) => turn.id === currentTurnId);
-      const next = Math.min(turns.length - 1, Math.max(0, (at < 0 ? 0 : at) + delta));
-      onSelect(turns[next].id);
+      if (!ordered.length) return;
+      const at = ordered.findIndex((turn) => turn.id === currentTurnId);
+      const next = Math.min(ordered.length - 1, Math.max(0, (at < 0 ? 0 : at) + delta));
+      onSelect(ordered[next].id);
     },
-    [turns, currentTurnId, onSelect],
+    [ordered, currentTurnId, onSelect],
   );
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>): void => {
@@ -64,10 +74,10 @@ export function TurnIndex({
       move(-1);
     } else if (event.key === 'Home') {
       event.preventDefault();
-      if (turns.length) onSelect(turns[0].id);
+      if (ordered.length) onSelect(ordered[0].id);
     } else if (event.key === 'End') {
       event.preventDefault();
-      if (turns.length) onSelect(turns[turns.length - 1].id);
+      if (ordered.length) onSelect(ordered[ordered.length - 1].id);
     }
   };
 
@@ -142,7 +152,7 @@ export function TurnIndex({
           </p>
         ) : null}
 
-        {turns.map((turn) => (
+        {ordered.map((turn) => (
           <TurnRow
             key={turn.id}
             turn={turn}
