@@ -53,6 +53,15 @@ const TRIM_CHUNK_BYTES = 1024 * 1024;
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 
 /**
+ * Third file, written only for a conversation branched from another: the
+ * history its agent is to be handed when the first message goes.
+ *
+ * Not a log record, deliberately. The log is what was said in this
+ * conversation, and this is a message that has not been sent yet.
+ */
+const CONTEXT_SUFFIX = '.ctx';
+
+/**
  * How a conversation's opening is read: in chunks, up to a ceiling.
  *
  * The two facts wanted are at very different depths. The runtime's session id
@@ -146,6 +155,20 @@ export interface ChatTurnIndex {
   complete: boolean;
 }
 
+/** One conversation cut at a turn, and what the whole of it has spent. */
+export interface TurnCut {
+  /** Every event from the head of the log through the end of that turn. */
+  events: ChatEvent[];
+  turn: PersistedTurn;
+  /** False when the head of the log was trimmed, so the cut starts late. */
+  complete: boolean;
+  /**
+   * The session's own running usage, which is where the model's context window
+   * is recorded — the one figure a branch has to be measured against.
+   */
+  usage: ChatUsage;
+}
+
 export interface ChatSnapshotOptions {
   /** The log never names its own runtime; the caller supplies it. */
   runtime?: string;
@@ -201,6 +224,14 @@ export interface ChatStoreLike {
   truncateBefore(session: ChatSessionRef, seq: number): Promise<void>;
   listSessions(ownerUserId: number): Promise<string[]>;
   deleteChat(session: ChatSessionRef): Promise<void>;
+  /**
+   * The two halves of a branch's opening context, optional because almost no
+   * conversation has one and every hand-built store in the tests predates it.
+   * A session that finds neither method simply opens with nothing carried,
+   * which is what every conversation did before branching existed.
+   */
+  openingContext?(session: ChatSessionRef): Promise<string | null>;
+  clearOpeningContext?(session: ChatSessionRef): Promise<void>;
 }
 
 export class ChatStore implements ChatStoreLike {
@@ -782,7 +813,7 @@ export class ChatStore implements ChatStoreLike {
       // was waiting on finishing — has no turn open and is still in the turn it
       // was working on. Comparing against `openTurnId` alone filed that as a
       // second row carrying the same id.
-      const openTurn = (turnId: string, ts: number, id: string): PersistedTurn => {
+      const openTurn = (turnId: string, ts: number, id: string, seq: number): PersistedTurn => {
         const current = turns[turns.length - 1];
         if (current && current.turnId === turnId) {
           openTurnId = turnId;
@@ -794,6 +825,7 @@ export class ChatStore implements ChatStoreLike {
           index: turns.length + 1,
           label: null,
           startedAt: ts,
+          startSeq: seq,
           outcome: null,
         };
         turns.push(turn);
@@ -825,7 +857,7 @@ export class ChatStore implements ChatStoreLike {
               openTurnId,
               turns[turns.length - 1]?.turnId,
             ) as string;
-            const turn = openTurn(turnId, event.ts, event.id);
+            const turn = openTurn(turnId, event.ts, event.id, event.seq);
             // Only the user's own words may name a turn, and only the first of
             // them. Anything else is the model titling the reader's question
             // for them — see `labelFor` on the browser's side.
@@ -888,6 +920,83 @@ export class ChatStore implements ChatStoreLike {
 
       return { turns, firstSeq: stats.firstSeq, complete: cleared || stats.firstSeq <= 1 };
     });
+  }
+
+  /**
+   * The conversation as far as one turn, inclusive.
+   *
+   * Where a branch is cut. "Up to and including that turn" is answered from the
+   * turn index rather than by matching ids against events, because the index is
+   * already this store's answer to which turn a message belongs to — a second
+   * reading of that here would be a second answer, and the two would disagree
+   * about exactly the case the index exists for: a turn the agent carried on
+   * with after ending it. So the cut is the seq the *next* turn opens at, and
+   * everything before that belongs to this one however it is filed.
+   *
+   * Two passes over the log, which is a price worth paying once for an action
+   * somebody asked for by name. The slice is held whole because it is about to
+   * be written whole into another log; the store's own retention cap is what
+   * bounds it, and a conversation past that cap has already lost its head.
+   *
+   * Null when no such turn is on disk — a turn from before the log was trimmed,
+   * or an id from another conversation.
+   */
+  async turnCut(session: ChatSessionRef, turnId: string): Promise<TurnCut | null> {
+    const index = await this.turnIndex(session);
+    const at = index.turns.findIndex((turn) => turn.turnId === turnId);
+    if (at < 0) return null;
+
+    const base = this.basePath(session);
+    return this.enqueue(base, async () => {
+      const state = await this.loadState(base);
+      const stats = this.statsOf(state);
+      // The turn after this one opens where this one's copy has to stop. Absent
+      // — this is the newest turn — means everything still being said belongs
+      // to it, so the cut runs to the end of the log.
+      const next = index.turns[at + 1]?.startSeq;
+      const end = next === undefined ? stats.cursor + 1 : next;
+      const events = await this.readSlice(base, state, state.firstSeq, end);
+      return {
+        events,
+        turn: index.turns[at],
+        complete: index.complete,
+        usage: await this.sessionUsage(base, state, stats),
+      };
+    });
+  }
+
+  /**
+   * Keep the context a conversation is to open with, beside its log.
+   *
+   * On disk rather than in memory because the promise it carries outlives this
+   * process: a branch is created, the browser opens its tab, and the first
+   * message may not be typed for an hour. Held only until that message goes —
+   * see `clearOpeningContext` — so a conversation that has started is a
+   * conversation with nothing left here.
+   */
+  async setOpeningContext(session: ChatSessionRef, context: string): Promise<void> {
+    const base = this.basePath(session);
+    await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    await fs.promises.writeFile(`${base}${CONTEXT_SUFFIX}`, context, 'utf8');
+  }
+
+  /** The context this conversation opens with, or null once it has been used. */
+  async openingContext(session: ChatSessionRef): Promise<string | null> {
+    try {
+      const text = await fs.promises.readFile(`${this.basePath(session)}${CONTEXT_SUFFIX}`, 'utf8');
+      return text || null;
+    } catch {
+      // The ordinary case by a wide margin: every conversation that was not
+      // branched has nothing here, and that is not a failure to report.
+      return null;
+    }
+  }
+
+  /** It has been handed over; there is no second first turn. */
+  async clearOpeningContext(session: ChatSessionRef): Promise<void> {
+    await fs.promises
+      .rm(`${this.basePath(session)}${CONTEXT_SUFFIX}`, { force: true })
+      .catch(() => undefined);
   }
 
   /**
@@ -1308,7 +1417,7 @@ export class ChatStore implements ChatStoreLike {
     await this.enqueue(base, async () => {
       this.states.delete(base);
       await Promise.all(
-        ['.jsonl', '.idx', '.jsonl.tmp', '.idx.tmp'].map((suffix) =>
+        ['.jsonl', '.idx', '.jsonl.tmp', '.idx.tmp', CONTEXT_SUFFIX].map((suffix) =>
           fs.promises.rm(`${base}${suffix}`, { force: true }).catch(() => undefined),
         ),
       );

@@ -1,6 +1,7 @@
 import * as React from 'react';
 import { ChatAttachment, ChatState } from '../../../shared/chat-events.js';
 import { uploadAttachment } from '../../chat/attachments-api.js';
+import { branchConversation, type BranchedConversation } from '../../chat/branch-api.js';
 import { ChatController, type ChatUnavailable } from '../../chat/controller.js';
 import { fetchStatus, findFiles } from '../../chat/workspace-api.js';
 import { activityEvents } from '../../chat/activity.js';
@@ -94,6 +95,16 @@ export interface ChatViewProps {
    * transcript it floats over the conversation and clears everything.
    */
   menuActions?: SurfaceAction[];
+  /**
+   * Put a conversation this surface created in front of the user.
+   *
+   * Branching makes a second conversation, and opening a tab on it is the
+   * shell's job rather than this component's — this one only knows about the
+   * conversation it is showing. Absent, a branch is still made and recorded and
+   * the user is told where to find it, which is a weaker outcome than a new tab
+   * but not a control that silently did nothing.
+   */
+  onOpenConversation?: (conversation: BranchedConversation) => void;
 }
 
 /** One control on the phone's floating menu. */
@@ -139,6 +150,7 @@ export function ChatView({
   theme,
   onToggleTheme,
   menuActions,
+  onOpenConversation,
 }: ChatViewProps) {
   const transcript = controller.transcript;
 
@@ -545,6 +557,52 @@ export function ChatView({
     [turns, transcript],
   );
 
+  // One at a time. The request creates a conversation, and a double-tap on a
+  // phone would create two of them a second apart.
+  const [branching, setBranching] = React.useState(false);
+  /**
+   * Carry on from this turn in a conversation of its own.
+   *
+   * The turn id goes to the server and everything that matters happens there:
+   * the history up to and including it is copied into a new conversation, and
+   * the same history is left waiting as that conversation's opening context so
+   * its agent knows what came before. Nothing here touches this conversation —
+   * a branch is a second thread, not an edit to the one it grew out of.
+   *
+   * A refusal is reported in the words the server chose: the only failure with
+   * an obvious next move is a history too large for the model's window, and
+   * that sentence carries the three figures needed to act on it.
+   */
+  const branchTurn = React.useCallback(
+    (anchorId: string) => {
+      // The strips are anchored on the opening *message*, like copy beside it,
+      // and the server cuts on the turn's own id — the one thing that stays
+      // stable when only half a turn is loaded and the message the window opens
+      // on is the agent's rather than the user's.
+      const turn = turns.find((item) => item.id === anchorId);
+      if (!turn || branching) return;
+      setBranching(true);
+      branchConversation(controller.sessionId, turn.turnId)
+        .then((conversation) => {
+          if (onOpenConversation) {
+            onOpenConversation(conversation);
+            return;
+          }
+          showNotification(
+            `Branched at turn ${conversation.turnIndex}. Open “${conversation.name}” from the session list.`,
+          );
+        })
+        .catch((error: unknown) => {
+          showNotification(
+            error instanceof Error ? error.message : 'That branch could not be made',
+            'error',
+          );
+        })
+        .finally(() => setBranching(false));
+    },
+    [branching, controller, onOpenConversation, turns],
+  );
+
   /** Send the ask that opened *this message's* turn again, as a new turn. */
   const retryTurn = React.useCallback((messageId: string) => {
     // Resolved from the message that was clicked, never from the selection: an
@@ -823,6 +881,7 @@ export function ChatView({
             onShowWork={showWork}
             onEditTurn={seedDraft}
             onCopyTurn={copyTurn}
+            onForkTurn={branchTurn}
             onRetry={retryTurn}
             showThinking={view.showThinking}
             showToolCalls={view.showToolCalls}

@@ -25,7 +25,7 @@ import {
   ASK_MCP_SERVER,
   ASK_QUESTION_TOOL_NAME,
 } from '../../shared/chat-events.js';
-import { isClearingCommand, mergeSlashCommands } from '../../shared/slash-commands.js';
+import { isClearingCommand, isSlashCommand, mergeSlashCommands } from '../../shared/slash-commands.js';
 import { installedModels } from './installed-models.js';
 import { listInstalledCommands } from './installed-commands.js';
 import { AdapterEvent, ChatAdapter, ChatAdapterOptions } from './adapter.js';
@@ -322,6 +322,16 @@ export class ChatSession {
   private contextModel?: string;
   private contextWindowFromAgent = false;
   private capacityAskedFor?: string;
+
+  /**
+   * The history this conversation was branched with, until the first turn takes it.
+   *
+   * `undefined` means the store has not been asked yet; `null` means it was and
+   * there is nothing — which is every conversation that was not branched. Read
+   * once and remembered either way, because it is asked for on every delivery
+   * and almost every answer is "no".
+   */
+  private carried: string | null | undefined;
 
   /**
    * True between resuming a conversation and the first thing the user says in it.
@@ -647,6 +657,12 @@ export class ChatSession {
         const message = error instanceof Error ? error.message : String(error);
         console.warn(`chat ${this.ref.id}: could not truncate the cleared conversation: ${message}`);
       }
+      // And the branch history goes with it, if this conversation had one
+      // waiting. `/clear` promises an agent that has never seen any of it, and
+      // handing over the very history just dropped from the transcript would be
+      // that promise broken in the most confusing possible way.
+      this.carried = null;
+      void this.deps.store.clearOpeningContext?.(this.ref);
     }
 
     this.setState('starting');
@@ -1462,7 +1478,44 @@ export class ChatSession {
     }
 
     this.setState('thinking');
-    await this.adapter.send(turn);
+
+    // A branched conversation opens with the history it was cut from, and this
+    // is the only place it can reach the agent: it rides *with* the first thing
+    // the user says rather than as a turn of its own, so the transcript above
+    // holds the user's own words and nothing else. What the runtime receives and
+    // what the record shows are deliberately different here, and that difference
+    // is the whole point — see chat/branch.ts.
+    //
+    // Read after the state has moved, never before: `retryQueued` relies on
+    // `deliver` reaching `thinking` before it awaits anything, and a disk read
+    // in front of that would open a window where a second turn saw an idle
+    // session and overtook this one.
+    //
+    // Never in front of a command. Everything except `/clear` and `/new`
+    // reaches the runtime as ordinary turn text, so a briefing glued to
+    // `/review` is not a command any more — it runs as prose, and the history
+    // is spent on a turn that was never going to read it. It waits for
+    // something the model is actually being asked.
+    const carried = isSlashCommand(turn.text) ? null : await this.openingContext();
+    await this.adapter.send(carried ? { ...turn, text: `${carried}\n\n${turn.text}` } : turn);
+
+    // Only once it has actually gone. A delivery that threw is put back in the
+    // line and tried again, and the retry has to carry what this attempt never
+    // handed over. Awaited rather than left to finish on its own: the send has
+    // already succeeded, so the cost is nothing, and a process that exits in
+    // that gap would come back and hand a whole conversation's history to some
+    // later, unrelated turn.
+    if (carried) {
+      this.carried = null;
+      await this.deps.store.clearOpeningContext?.(this.ref);
+    }
+  }
+
+  /** The branch history still waiting to be handed over, or null. */
+  private async openingContext(): Promise<string | null> {
+    if (this.carried !== undefined) return this.carried;
+    this.carried = (await this.deps.store.openingContext?.(this.ref)) ?? null;
+    return this.carried;
   }
 
   /**

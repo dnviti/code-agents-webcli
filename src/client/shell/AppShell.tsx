@@ -36,6 +36,7 @@ import { TabContextMenu } from './TabContextMenu';
 import { TerminalHost } from './TerminalHost';
 import { ChatView } from './chat/ChatView';
 import type { ChatController } from '../chat/controller';
+import type { BranchedConversation } from '../chat/branch-api';
 import { CHAT_PANEL_ICONS, type ChatPanelId, type ChatViewSettings } from '../chat/view-settings';
 import { Toasts } from './Toasts';
 import { UpdateBannerView } from './UpdateBannerView';
@@ -109,6 +110,14 @@ export interface ShellActions {
   // Chat surface
   /** Persist and publish a change to the chat's display settings. */
   setChatView(next: ChatViewSettings): void;
+  /**
+   * Open a conversation the chat surface has just created — today, a branch.
+   *
+   * It already exists on the server with its transcript on disk; what is left is
+   * a tab, the switch onto it and the launch of its agent, none of which the
+   * surface inside a conversation has any business doing for itself.
+   */
+  openConversation(conversation: BranchedConversation): void;
 
   // Update banner
   updateAction(): void;
@@ -595,6 +604,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
             onViewChange={setView}
             onOpenSettings={() => closeDialogs({ chatSettings: true })}
             menuActions={sessionActions}
+            onOpenConversation={actions.openConversation}
             // The chat surface owns the whole viewport, so the tab strip's own
             // theme button is off-screen while a conversation is showing.
             theme={state.theme}

@@ -25,6 +25,7 @@ import {
   ChatUsage,
   PermissionRequest,
   PlanItem,
+  NoticeBlock,
   QuestionRequest,
   TextBlock,
   ThinkingBlock,
@@ -210,6 +211,26 @@ export function foldSessionUsage(usage: ChatUsage, event: ChatEvent): ChatUsage 
       return usage;
   }
 }
+
+/**
+ * What each rule drawn across a conversation says.
+ *
+ * A table rather than a chain of ternaries because there are four of them now
+ * and the words are the whole of what a rule communicates: a reader sees one
+ * short phrase and has to understand from it that the transcript above is no
+ * longer what the agent can see, or was said somewhere else entirely. `cleared`
+ * is here for completeness — it empties the window rather than drawing a line,
+ * and is handled before this is reached.
+ */
+const NOTICES: Record<
+  NoticeBlock['notice'],
+  { notice: NoticeBlock['notice']; text: string }
+> = {
+  compacted: { notice: 'compacted', text: 'Context compacted' },
+  interrupted: { notice: 'interrupted', text: 'Interrupted to send' },
+  branched: { notice: 'branched', text: 'Branched from an earlier conversation' },
+  cleared: { notice: 'cleared', text: 'New conversation' },
+};
 
 /** Every token field a runtime can report, so a reset covers all of them. */
 const TOKEN_FIELDS = [
@@ -652,28 +673,35 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         return { messageIndex: null, structural: true, meta: true, applied: true };
       }
 
-      // The two that leave a line rather than empty the window. Compaction is
+      // The ones that leave a line rather than empty the window. Compaction is
       // there because everything above it is no longer in the agent's context,
       // and an agent that quietly forgets the first hour is a confusing one.
       // An interruption is there because the turn above it stopped for a
       // reason — the message immediately below — and a transcript that showed
-      // the stop without the reason would read as an agent that gave up.
-      const interrupted = event.kind === 'interrupted';
+      // the stop without the reason would read as an agent that gave up. A
+      // branch is there because everything above it happened in another
+      // conversation, and a copied history presented as this one's own would
+      // be the same lie in the other direction.
+      const notice = NOTICES[event.kind];
       const message: ChatMessage = {
         id: `marker-${event.seq}`,
         seq: event.seq,
         // The turn it was drawn in, or the one it was drawn under: a line
         // marking what happened to the conversation is not a turn of its own,
         // and numbering it as one puts a row in the index nobody asked for.
-        turnId: state.currentTurnId ?? lastTurnId(state) ?? `marker-${event.seq}`,
+        //
+        // Except the one that says where this conversation came from. Joined to
+        // the last carried turn it disappears the moment that turn folds, which
+        // is the moment the branch is used — so the only statement that the
+        // history above belongs to another conversation is the one thing a
+        // reader cannot find. It stands on its own instead.
+        turnId:
+          event.kind === 'branched'
+            ? `marker-${event.seq}`
+            : state.currentTurnId ?? lastTurnId(state) ?? `marker-${event.seq}`,
         role: 'system',
         ts: event.ts,
-        blocks: [{
-          kind: 'notice',
-          notice: interrupted ? 'interrupted' : 'compacted',
-          text: interrupted ? 'Interrupted to send' : 'Context compacted',
-          detail: event.detail,
-        }],
+        blocks: [{ kind: 'notice', ...notice, detail: event.detail }],
       };
       state.messages.push(message);
       state.index[message.id] = state.messages.length - 1;

@@ -35,6 +35,8 @@ import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
 import { TabBar } from '../../src/client/ui/relay/TabBar';
 import { MonacoEditor } from '../../src/client/shell/chat/MonacoEditor';
 import { monacoStylesApplied } from '../../src/client/chat/monaco';
+import { Toasts } from '../../src/client/shell/Toasts';
+import { shellStore } from '../../src/client/shell/store';
 
 const results: string[] = [];
 const check = (name: string, ok: boolean, detail = ''): void => {
@@ -263,6 +265,7 @@ async function run(): Promise<void> {
   await checkAWaitingMessageCanBeSentNow();
   await checkALongQueueCollapsesToOneRow();
   await checkFoldedHistoryIsNotBuiltUntilItIsOpened();
+  await checkATurnCanBeBranchedFromItsHeader();
   await checkAConversationTellsOneStoryAboutItsTokens();
   await checkTheModelShownIsTheModelThatRan();
   await checkTheEffortChipSaysAndSetsHowHardTheAgentThinks();
@@ -5151,6 +5154,241 @@ async function checkFoldedHistoryIsNotBuiltUntilItIsOpened(): Promise<void> {
 
   mounted.root.unmount();
   host.remove();
+}
+
+/**
+ * That a turn can be branched from its own header, folded or open.
+ *
+ * Issue #34 asked for copy and branch together on a turn's header, and the
+ * changelog said both had shipped. Copy had; branch was a prop nothing ever
+ * passed, so the control existed in no state at all — which is why the claim
+ * being made here is about the rendered header rather than about a callback.
+ *
+ * The rest is what makes it a branch rather than a button: the turn the server
+ * is asked to cut at is the one whose header was pressed, the conversation that
+ * comes back is handed to the shell to open, and a history too large for the
+ * model's window is refused *to the user's face* — a refusal that only reached
+ * the console would leave someone waiting for a tab that is never coming.
+ */
+async function checkATurnCanBeBranchedFromItsHeader(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1280px;height:800px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const capabilities = {
+    streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+    interrupt: true, resume: true,
+    // Deliberately false, and every adapter in this app says the same: not one
+    // of these CLIs can fork a session at a point. Branching is built on top of
+    // the transcript instead, so the control must not depend on this.
+    fork: false,
+    attachments: true, usage: true, cost: true, plan: true, commands: [],
+  };
+
+  const messages: unknown[] = [];
+  for (let i = 1; i <= 3; i++) {
+    messages.push({
+      id: `u${i}`, seq: messages.length + 1, turnId: `t${i}`, role: 'user', ts: 1,
+      blocks: [{ kind: 'text', text: `question number ${i}` }],
+    });
+    messages.push({
+      id: `a${i}`, seq: messages.length + 1, turnId: `t${i}`, role: 'assistant', ts: 2,
+      blocks: [{ kind: 'text', text: `answer number ${i}` }],
+    });
+  }
+
+  const posted: Array<{ url: string; body: { turnId?: string } }> = [];
+  let reply = (): Response =>
+    new Response(
+      JSON.stringify({
+        success: true,
+        sessionId: 'branch-1',
+        name: 'Refactoring the parser — branch at turn 2',
+        workingDir: '/home/dev/project',
+        runtime: 'claude',
+        turnIndex: 2,
+        turns: 2,
+        estimatedTokens: 900,
+        contextWindow: 200_000,
+        sizeChecked: true,
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+    // Only the branch request is this check's business. The surface also asks
+    // for the working directory's git branch on mount, and counting that as a
+    // branch request would have the assertions below reading the wrong call.
+    if (!url.endsWith('/branch')) {
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    posted.push({ url, body: JSON.parse(String(init?.body ?? '{}')) });
+    return reply();
+  }) as typeof window.fetch;
+
+  const controller = new ChatController('branch-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'branch-check',
+    snapshot: {
+      sessionId: 'branch-check', runtime: 'claude', state: 'idle', capabilities,
+      messages, pendingPermissions: [], queued: [],
+      firstSeq: 1, replayFrom: 1, cursor: messages.length, live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const opened: Array<{ sessionId: string; turnIndex: number }> = [];
+
+  // The toast stack, mounted for real: "the user is told" is a claim about the
+  // screen, and reading the store instead would pass for a message nothing
+  // paints.
+  function ToastHost(): React.ReactElement {
+    const state = React.useSyncExternalStore(
+      shellStore.subscribe, shellStore.getSnapshot, shellStore.getSnapshot,
+    );
+    return React.createElement(Toasts, {
+      toasts: state.toasts, isMobile: false, onDismiss: () => {},
+    } as never);
+  }
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(
+      React.Fragment,
+      null,
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/home/dev/project',
+        view: { ...DEFAULT_CHAT_VIEW },
+        onViewChange: () => {},
+        onOpenConversation: (conversation: { sessionId: string; turnIndex: number }) =>
+          opened.push(conversation),
+      } as never),
+      React.createElement(ToastHost, null),
+    ),
+  );
+  await wait(400);
+
+  const BRANCH = '[aria-label="Branch a new session from this turn"]';
+  const strip = (anchor: string): HTMLElement | null =>
+    host.querySelector(`[data-turn-id="${anchor}"]`) as HTMLElement | null;
+  const branchButton = (anchor: string): HTMLElement | null =>
+    (strip(anchor)?.querySelector(BRANCH) as HTMLElement | null) ?? null;
+
+  // Turn 3 is the newest and opens itself; 1 and 2 are folded. Both states are
+  // the acceptance criterion, and the folded one is the one that was never
+  // covered — see the note in ChatView on `openTurnIds`.
+  const foldedBody = host.querySelector('#turn-body-u2') as HTMLElement | null;
+  check(
+    'the fixture really has a folded turn and an open one',
+    Boolean(foldedBody?.hidden) && !(host.querySelector('#turn-body-u3') as HTMLElement | null)?.hidden,
+    `turn 2 hidden=${foldedBody?.hidden}, turn 3 hidden=${(host.querySelector('#turn-body-u3') as HTMLElement | null)?.hidden}`,
+  );
+  check(
+    'a folded turn offers to branch from its header',
+    Boolean(branchButton('u2')),
+    branchButton('u2') ? 'the control is there' : 'no branch control on the collapsed strip',
+  );
+  check(
+    'and so does an open one',
+    Boolean(branchButton('u3')),
+    branchButton('u3') ? 'the control is there' : 'no branch control on the open strip',
+  );
+
+  branchButton('u2')?.click();
+  await wait(300);
+
+  check(
+    'pressing it asks the server to branch this conversation',
+    posted.length === 1 && posted[0].url.endsWith('/api/sessions/branch-check/branch'),
+    posted.length ? posted[0].url : 'nothing was requested',
+  );
+  check(
+    'at the turn whose header was pressed, by the id the recording uses',
+    posted[0]?.body?.turnId === 't2',
+    `turnId=${JSON.stringify(posted[0]?.body?.turnId)}`,
+  );
+  check(
+    'and the conversation that comes back is handed over to be opened',
+    opened.length === 1 && opened[0].sessionId === 'branch-1' && opened[0].turnIndex === 2,
+    JSON.stringify(opened),
+  );
+
+  // ------------------------------------------- a branch that will not fit
+  reply = (): Response =>
+    new Response(
+      JSON.stringify({
+        error: 'context_too_large',
+        message:
+          'Branching from turn 3 would carry about 260,000 tokens of history, and this '
+          + "model's 200,000-token window leaves 100,000 for it. Branch from an earlier turn.",
+      }),
+      { status: 413, headers: { 'content-type': 'application/json' } },
+    );
+
+  branchButton('u3')?.click();
+  await wait(300);
+
+  const toast = (document.body.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'a history too big for the window is refused in words, on screen',
+    /would carry about 260,000 tokens/.test(toast) && /Branch from an earlier turn/.test(toast),
+    toast.slice(0, 200) || 'nothing was said',
+  );
+  check(
+    'and nothing is opened for a branch that was refused',
+    opened.length === 1,
+    `${opened.length} conversations opened`,
+  );
+
+  root.unmount();
+  host.remove();
+  await wait(50);
+
+  // ------------------------------------------------------- on a phone
+  const phone = document.createElement('div');
+  phone.style.cssText = 'width:390px;height:780px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(phone);
+
+  const phoneRoot = createRoot(phone);
+  phoneRoot.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/home/dev/project',
+      isMobile: true,
+      view: { ...DEFAULT_CHAT_VIEW, panelOpen: false },
+      onViewChange: () => {},
+      onOpenConversation: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  const phoneBranch = phone.querySelector(`[data-turn-id="u2"] ${BRANCH}`) as HTMLElement | null;
+  const box = phoneBranch ? laidOutSize(phoneBranch) : { width: 0, height: 0 };
+  check(
+    'the branch control is reachable by a finger, not only by a mouse',
+    Boolean(phoneBranch) && isPainted(phoneBranch as Element)
+      && box.width >= 44 && box.height >= 44,
+    phoneBranch ? `${Math.round(box.width)}x${Math.round(box.height)}` : 'no branch control on the phone',
+  );
+  check(
+    'and it stays inside the phone, rather than off the right edge',
+    Boolean(phoneBranch)
+      && (phoneBranch as HTMLElement).getBoundingClientRect().right
+        <= phone.getBoundingClientRect().right + 1,
+    phoneBranch
+      ? `${Math.round((phoneBranch as HTMLElement).getBoundingClientRect().right)} against ${Math.round(phone.getBoundingClientRect().right)}`
+      : 'no branch control on the phone',
+  );
+
+  phoneRoot.unmount();
+  phone.remove();
+  window.fetch = realFetch;
 }
 
 /**
