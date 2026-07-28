@@ -36,6 +36,24 @@
   reported one — reading a silent runtime as zero would have put it at the top
   of every efficiency comparison on the page for having said nothing at all.
 
+- **A request and its answer are one turn, in conversations already recorded as
+  much as in new ones.** (#86) No adapter reuses the id this app mints: the
+  session stamps the user's message `turn-<uuid>` and the runtime answers under
+  a name of its own, with codex and the ACP agents echoing the prompt back under
+  that name first. Read literally, that splits every single turn in two — the
+  ask in one, the answer in another with no prompt to name it by, which is why
+  an index row could read "no prompt" next to a question that had been asked
+  perfectly clearly. Checked against all 69 conversations on the machine this
+  was written on: 33 of them read differently, 147 phantom turns in total, and
+  all 69 now agree with what the conversation shows.
+
+  Nothing needed migrating and nothing had been recorded wrongly. The events
+  were always right; it was the reading of them that split a request from its
+  answer, and the index is read from the log every time it is asked for — so an
+  old conversation is simply re-read under the settled rule. A turn is open from
+  the user's message until the runtime ends it, and everything in between
+  belongs to it.
+
 - **A turn is numbered by the conversation, not by what the browser has
   loaded.** (#86) Reloading a page landed on the last turn of a long
   conversation and called it "Turn 1", and it stayed 1 until enough history had

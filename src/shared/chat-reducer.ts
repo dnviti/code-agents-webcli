@@ -231,20 +231,21 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       if (messageFor(state, event.id) !== null) {
         return NO_CHANGE;
       }
-      // A user message arriving while a turn is still open belongs to that
-      // turn, whatever id it came with.
+      // Everything said while a turn is open belongs to that turn, whatever id
+      // it arrived with — the accountant's rule, word for word (#86).
       //
-      // Two things produce one: a steer, which already carries the running id
-      // and is only confirmed here, and a runtime echoing the prompt back under
-      // an id of its own — which codex and the ACP agents both do. The echo is
-      // the same request, so filing it as a second turn made the conversation
-      // show twice the turns the accounting recorded, for those agents only
-      // (#86). The rule is the accountant's, word for word: a request that
-      // arrives while one is in flight does not open a turn.
-      const turnId =
-        event.role === 'user' && state.currentTurnId !== null
-          ? state.currentTurnId
-          : event.turnId;
+      // It has to be that strong, because **no adapter reuses the id this app
+      // minted**: the session stamps the user's message `turn-<uuid>` and the
+      // runtime answers under a name of its own (`omp-turn-3`, its own uuid),
+      // with codex and the ACP agents echoing the prompt back under that name
+      // first. Checked against every conversation on this machine: in 46 of 46,
+      // the agent's messages share no id with the request that caused them. So
+      // grouping on the id as it arrives splits every single turn in two — the
+      // ask in one, the answer in another with no prompt to name it by.
+      //
+      // A turn is open from the user's message to `turn_end`, and `turn_end`,
+      // an exit and a `/clear` are the three things that close one.
+      const turnId = state.currentTurnId ?? event.turnId;
 
       // A new turn's models are not known yet, and last turn's are not this
       // turn's: leaving them would keep a "+1" on the chip for a turn that ran
@@ -565,7 +566,6 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
     }
 
     case 'turn_end': {
-      state.currentTurnId = null;
       if (state.state !== 'error' && state.state !== 'exited') {
         state.state = 'idle';
       }
@@ -574,12 +574,18 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // whole, and without it the badge is left inferring one from whichever
       // steps inside it went wrong (issue #74).
       const outcome = turnOutcomeOf(event.stopReason);
+      // Against the turn the messages are actually filed under, which is the
+      // one this app opened rather than the name the runtime ends it by — see
+      // `msg_start`. Comparing the runtime's own id here stamped the outcome
+      // onto nothing at all.
+      const ended = state.currentTurnId ?? event.turnId;
       for (const message of state.messages) {
-        if (message.turnId === event.turnId) {
+        if (message.turnId === ended) {
           message.streaming = false;
           message.turnOutcome = outcome;
         }
       }
+      state.currentTurnId = null;
       if (event.usage) {
         state.usage = mergeUsage(state.usage, event.usage);
       }

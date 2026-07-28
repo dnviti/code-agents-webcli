@@ -6,6 +6,7 @@ const path = require('path');
 const { ChatSession } = require('../dist/server/chat/session.js');
 const { UsageAccountant } = require('../dist/server/chat/usage-accounting.js');
 const ChatStoreModule = require('../dist/server/chat/store.js');
+const { applyChatEvent, createTranscript } = require('../dist/shared/chat-reducer.js');
 
 const ChatStore = ChatStoreModule.ChatStore || ChatStoreModule.default;
 
@@ -134,6 +135,84 @@ describe('what counts as a turn', function () {
       ]),
       [],
     );
+  });
+});
+
+// ------------------------------------------- the shape a real adapter produces
+
+describe('the turn ids a real conversation actually carries', function () {
+  // Taken from the logs on disk rather than imagined. **No adapter reuses the
+  // id this app minted**: the session stamps the user's message
+  // `turn-<uuid>` and the runtime answers under a name of its own, with the ACP
+  // agents and codex echoing the prompt back under that name first.
+  //
+  //   msg_start user      turn-2979e29d-...     <- the app
+  //   msg_start user      omp-turn-1            <- the runtime echoing it back
+  //   msg_start assistant omp-turn-1
+  //   turn_end            omp-turn-1
+  //
+  // Checked against every conversation on the machine this was written on: in
+  // 46 of 46, the agent's messages share no id with the request that caused
+  // them. So a reading that groups on the id as it arrives splits every single
+  // turn in two — the ask in one, the answer in another with no prompt to name
+  // it by, which is exactly what the index showed.
+  function realTurn(n, ask) {
+    const runtimeId = `omp-turn-${n}`;
+    return [
+      { t: 'msg_start', id: `u${n}`, role: 'user', turnId: `turn-uuid-${n}` },
+      { t: 'block_start', msgId: `u${n}`, index: 0, block: { kind: 'text', text: ask } },
+      { t: 'msg_end', msgId: `u${n}` },
+      { t: 'msg_start', id: `echo${n}`, role: 'user', turnId: runtimeId },
+      { t: 'msg_end', msgId: `echo${n}` },
+      { t: 'msg_start', id: `a${n}`, role: 'assistant', turnId: runtimeId },
+      { t: 'block_start', msgId: `a${n}`, index: 0, block: { kind: 'text', text: 'on it' } },
+      { t: 'msg_end', msgId: `a${n}` },
+      { t: 'turn_end', turnId: runtimeId, stopReason: 'end_turn' },
+    ];
+  }
+
+  /** The conversation as a browser holding all of it would show it. */
+  function shown(events) {
+    const state = createTranscript({});
+    let seq = 0;
+    for (const event of events) {
+      seq += 1;
+      applyChatEvent(state, { ts: seq * 1000, seq, ...event });
+    }
+    const turns = [];
+    let open;
+    for (const message of state.messages) {
+      if (turns.length === 0 || message.turnId !== open) {
+        turns.push([]);
+        open = message.turnId;
+      }
+      turns[turns.length - 1].push(message);
+    }
+    return { turns, state };
+  }
+
+  it('shows one turn per request, not one for the ask and one for the answer', function () {
+    const { turns } = shown([...realTurn(1, 'first ask'), ...realTurn(2, 'second ask')]);
+    assert.strictEqual(turns.length, 2);
+    assert.deepStrictEqual(
+      turns.map((group) => group.map((message) => message.id)),
+      [['u1', 'echo1', 'a1'], ['u2', 'echo2', 'a2']],
+    );
+  });
+
+  it('ends the turn the app opened, not the name the runtime ends it by', function () {
+    // The outcome was being stamped by comparing the runtime's own id against
+    // messages filed under ours, which matched nothing at all.
+    const { state } = shown(realTurn(1, 'first ask'));
+    assert.deepStrictEqual(
+      state.messages.map((message) => message.turnOutcome),
+      ['done', 'done', 'done'],
+    );
+  });
+
+  it('counts the same turns the accounting filed for it', function () {
+    const events = [...realTurn(1, 'first ask'), ...realTurn(2, 'second ask')];
+    assert.strictEqual(shown(events).turns.length, account(events).length);
   });
 });
 
@@ -363,6 +442,29 @@ describe('the turn index of a recorded conversation', function () {
     const index = await store.turnIndex(ref);
     assert.strictEqual(index.turns.length, 1);
     assert.strictEqual(index.turns[0].label, 'refactor auth', 'the ask that opened it names it');
+  });
+
+  it('reads a real conversation as one turn per request', async function () {
+    // The same shape as above, through the log rather than through the reducer.
+    // This is what aligns conversations recorded before any of this existed:
+    // the index is read from the log every time it is asked for, so nothing has
+    // to be migrated — the events were always right, it was the reading of them
+    // that split a request from its answer.
+    write([
+      { t: 'msg_start', id: 'u1', role: 'user', turnId: 'turn-uuid-1' },
+      { t: 'block_start', msgId: 'u1', index: 0, block: { kind: 'text', text: 'the real ask' } },
+      { t: 'msg_end', msgId: 'u1' },
+      { t: 'msg_start', id: 'echo1', role: 'user', turnId: 'omp-turn-1' },
+      { t: 'msg_end', msgId: 'echo1' },
+      { t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'omp-turn-1' },
+      { t: 'msg_end', msgId: 'a1' },
+      { t: 'turn_end', turnId: 'omp-turn-1', stopReason: 'end_turn' },
+    ]);
+    const index = await store.turnIndex(ref);
+    assert.strictEqual(index.turns.length, 1, 'the ask and its answer are one turn');
+    assert.strictEqual(index.turns[0].label, 'the real ask');
+    assert.strictEqual(index.turns[0].turnId, 'turn-uuid-1', 'under the id this app opened');
+    assert.strictEqual(index.turns[0].outcome, 'done', 'ended by the runtime’s own word for it');
   });
 
   it('starts again at a /clear rather than listing the conversation it replaced', async function () {

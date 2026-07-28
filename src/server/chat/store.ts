@@ -657,14 +657,13 @@ export class ChatStore implements ChatStoreLike {
       const state = await this.loadState(base);
       const stats = this.statsOf(state);
       const turns: PersistedTurn[] = [];
-      const byId = new Map<string, PersistedTurn>();
       let openTurnId: string | null = null;
 
-      // The same grouping rule the browser applies to the messages it holds
-      // (`groupTurns`): consecutive events sharing a turn id are one turn, and a
-      // turn id that comes back after another has intervened is a second one.
-      // Two implementations of that rule would be two answers to "how many
-      // turns", which is the disagreement this whole change removes.
+      // The same grouping rule the browser applies to the messages it holds:
+      // consecutive events sharing a turn id are one turn, and a turn id that
+      // comes back after another has intervened is a second one. Two
+      // implementations of that rule would be two answers to "how many turns",
+      // which is the disagreement this whole change removes.
       const openTurn = (turnId: string, ts: number, id: string): PersistedTurn => {
         if (openTurnId === turnId) {
           const current = turns[turns.length - 1];
@@ -679,7 +678,6 @@ export class ChatStore implements ChatStoreLike {
           outcome: null,
         };
         turns.push(turn);
-        byId.set(id, turn);
         openTurnId = turnId;
         return turn;
       };
@@ -692,7 +690,19 @@ export class ChatStore implements ChatStoreLike {
       await this.scanLog(base, state, (event) => {
         switch (event.t) {
           case 'msg_start': {
-            const turn = openTurn(event.turnId, event.ts, event.id);
+            // Everything said while a turn is open belongs to it, whatever id
+            // it arrived with — the reducer's rule, word for word, because a
+            // second reading of it is a second answer.
+            //
+            // Applied here rather than only in the browser, the alignment
+            // reaches every conversation already on disk: the index is read
+            // from the log each time it is asked for, so an old conversation is
+            // re-read under the settled rule rather than left as it was filed.
+            // Nothing has to be migrated, and nothing was recorded wrongly —
+            // the events were always right, it was the reading of them that
+            // split a request from its answer.
+            const turnId = openTurnId ?? event.turnId;
+            const turn = openTurn(turnId, event.ts, event.id);
             // Only the user's own words may name a turn, and only the first of
             // them. Anything else is the model titling the reader's question
             // for them — see `labelFor` on the browser's side.
@@ -724,11 +734,20 @@ export class ChatStore implements ChatStoreLike {
             }
             return;
           }
+          case 'state': {
+            // A runtime that died did not end its turn and nothing else will,
+            // so whatever comes next is a new one. Again the reducer's rule: a
+            // turn left open here would swallow the first thing the user typed
+            // after the crash.
+            if (event.state === 'exited' || event.state === 'error') openTurnId = null;
+            return;
+          }
           case 'turn_end': {
-            const turn = turns[turns.length - 1];
-            if (turn && turn.turnId === event.turnId) {
-              turn.outcome = turnOutcomeOf(event.stopReason);
-            }
+            // Against whatever is open, not against the event's own id: a
+            // runtime ends the turn under its own name for it, which is never
+            // the name this app opened it by.
+            const turn = openTurnId === null ? null : turns[turns.length - 1];
+            if (turn) turn.outcome = turnOutcomeOf(event.stopReason);
             // Whatever comes next belongs to a turn that has not started yet.
             openTurnId = null;
             return;
