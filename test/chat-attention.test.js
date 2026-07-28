@@ -402,6 +402,8 @@ describe('telling the user a conversation needs them', function () {
       },
     });
     assert.strictEqual(app.attention.get('s1'), 'question');
+    assert.strictEqual(shown.length, 1, 'a question interrupts as an approval does');
+    assert.match(shown[0].options.body, /Pick one/, 'and says what it asked, when detail is on');
 
     mod.noteConversationOpened('s1');
     await flush();
