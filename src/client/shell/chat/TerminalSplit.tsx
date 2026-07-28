@@ -12,6 +12,7 @@ import {
   clampTerminalHeight,
 } from '../../chat/view-settings.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { PHONE_SPACE, PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET } from '../../ui/touch.js';
 
 /**
  * A shell at the bottom of the conversation, in the same working directory.
@@ -270,13 +271,19 @@ export function TerminalSplit({
       >
         <div
           style={{
+            // Never `flex: 1`, and never a share of the pane: whatever this
+            // strip takes comes off the shell below it, which is the thing the
+            // user opened. The phone sizes cost it 24px; an on-screen key strip
+            // will want its own band out of the same height.
             flex: '0 0 auto',
             display: 'flex',
             alignItems: 'center',
-            gap: 2,
+            // Also what keeps the actions on the right apart once a long tab
+            // label has eaten the auto margin between them.
+            gap: isMobile ? TOUCH_GAP : 2,
             minWidth: 0,
-            height: 28,
-            padding: '0 8px',
+            height: isMobile ? TOUCH_TARGET + TOUCH_GAP : 28,
+            padding: isMobile ? `0 ${PHONE_SPACE.edge}px` : '0 8px',
             background: 'var(--tab-bar)',
             borderTop: '1px solid var(--border)',
             borderBottom: '1px solid var(--border)',
@@ -285,13 +292,20 @@ export function TerminalSplit({
           <div
             role="tablist"
             aria-label="Terminals"
-            style={{ display: 'flex', alignItems: 'center', gap: 2, minWidth: 0, overflowX: 'auto' }}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: isMobile ? TOUCH_GAP : 2,
+              minWidth: 0,
+              overflowX: 'auto',
+            }}
           >
             {tabs.map((tab) => (
               <TerminalTab
                 key={tab.id}
                 tab={tab}
                 active={tab.id === activeId}
+                phone={isMobile}
                 onSelect={() => setActiveId(tab.id)}
                 onClose={() => closeTab(tab.id)}
               />
@@ -301,6 +315,7 @@ export function TerminalSplit({
           <TabAction
             label="Open another terminal here"
             icon="plus"
+            phone={isMobile}
             onClick={() => open(`shell ${panes.length + 1}`)}
           />
 
@@ -310,7 +325,12 @@ export function TerminalSplit({
               display: 'flex',
               alignItems: 'center',
               gap: 8,
-              minWidth: 0,
+              // Never shrunk. These are 44px squares on a phone, and a crowded
+              // strip used to take the difference out of them — which put
+              // "close the terminal" past the right edge of a 390px screen,
+              // clipped rather than scrolled to. What gives instead is the tab
+              // list, which scrolls sideways and can be got back.
+              flex: '0 0 auto',
             }}
           >
             {isMobile ? null : (
@@ -331,8 +351,18 @@ export function TerminalSplit({
                   : 'same worktree as the chat'}
               </span>
             )}
-            <TabAction label="Clear this terminal" icon="eraser" onClick={() => active?.clear()} />
-            <TabAction label="Close the terminal — Ctrl+`" icon="x" onClick={onClose} />
+            <TabAction
+              label="Clear this terminal"
+              icon="eraser"
+              phone={isMobile}
+              onClick={() => active?.clear()}
+            />
+            <TabAction
+              label="Close the terminal — Ctrl+`"
+              icon="x"
+              phone={isMobile}
+              onClick={onClose}
+            />
           </span>
         </div>
 
@@ -364,11 +394,13 @@ const PHASE_DOT: Record<ChatTerminal['phase'], { color: string; pulse: boolean; 
 function TerminalTab({
   tab,
   active,
+  phone,
   onSelect,
   onClose,
 }: {
   tab: TabView;
   active: boolean;
+  phone: boolean;
   onSelect: () => void;
   onClose: () => void;
 }): React.JSX.Element {
@@ -378,16 +410,19 @@ function TerminalTab({
       style={{
         display: 'inline-flex',
         alignItems: 'center',
-        gap: 6,
+        // Two separate targets in one chip — select and close — so the gap
+        // between them is the one that decides whether choosing a shell closes
+        // it instead.
+        gap: phone ? TOUCH_GAP : 6,
         flex: '0 0 auto',
-        height: 22,
-        padding: '0 4px 0 9px',
+        height: phone ? TOUCH_TARGET : 22,
+        padding: phone ? `0 ${TOUCH_GAP}px 0 ${PHONE_SPACE.inline}px` : '0 4px 0 9px',
         whiteSpace: 'nowrap',
         background: active ? 'var(--tab-active)' : 'var(--tab-inactive)',
         border: '1px solid var(--border)',
         borderBottomColor: active ? 'var(--tab-active)' : 'var(--border)',
         fontFamily: 'var(--font-mono)',
-        fontSize: 10.5,
+        fontSize: phone ? PHONE_TEXT.body : 10.5,
         color: active ? 'var(--tab-active-foreground)' : 'var(--tab-inactive-foreground)',
       }}
     >
@@ -400,6 +435,9 @@ function TerminalTab({
           display: 'inline-flex',
           alignItems: 'center',
           gap: 6,
+          // The chip's own height, so the whole of it selects rather than the
+          // line of text across its middle.
+          minHeight: phone ? TOUCH_TARGET : undefined,
           background: 'transparent',
           border: 0,
           padding: 0,
@@ -431,8 +469,8 @@ function TerminalTab({
           display: 'inline-flex',
           alignItems: 'center',
           justifyContent: 'center',
-          width: 14,
-          height: 14,
+          width: phone ? TOUCH_TARGET : 14,
+          height: phone ? TOUCH_TARGET : 14,
           background: 'transparent',
           border: 0,
           padding: 0,
@@ -441,7 +479,7 @@ function TerminalTab({
           cursor: 'pointer',
         }}
       >
-        <Icon name="x" size={9} />
+        <Icon name="x" size={phone ? 16 : 9} />
       </button>
     </span>
   );
@@ -450,10 +488,12 @@ function TerminalTab({
 function TabAction({
   label,
   icon,
+  phone,
   onClick,
 }: {
   label: string;
   icon: string;
+  phone: boolean;
   onClick: () => void;
 }): React.JSX.Element {
   const [hover, setHover] = React.useState(false);
@@ -470,8 +510,8 @@ function TabAction({
         alignItems: 'center',
         justifyContent: 'center',
         flex: '0 0 auto',
-        width: 22,
-        height: 22,
+        width: phone ? TOUCH_TARGET : 22,
+        height: phone ? TOUCH_TARGET : 22,
         background: hover ? 'var(--accent)' : 'transparent',
         border: 0,
         borderRadius: 'var(--radius)',
@@ -479,7 +519,7 @@ function TabAction({
         cursor: 'pointer',
       }}
     >
-      <Icon name={icon} size={11} />
+      <Icon name={icon} size={phone ? 18 : 11} />
     </button>
   );
 }

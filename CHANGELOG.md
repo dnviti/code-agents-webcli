@@ -3,6 +3,35 @@
 ## [Unreleased]
 
 ### Fixed
+- **The usage dashboard can look at a period that has ended.** Its window was
+  always anchored on "now" and the client never sent the anchor the API has
+  always accepted, so nothing before 1 January of the viewer's own year could be
+  reached — not the charts, not the history list, not the export, while the rows
+  sat in the database and could be had by typing a URL by hand. Today that costs
+  nothing, because accounting began in July; from the first of January it would
+  have taken the whole previous year off the screen. There are now arrows, a
+  date field and a way back to the present, and the window belongs to the whole
+  page: the history under the charts and the export follow it. Nothing offers to
+  walk into the future, and a window that holds nothing says so.
+
+- **The effort histograms can be read without a mouse.** Every bar was a plain
+  `div` inside a hover tooltip, so the keyboard never reached one and a screen
+  reader heard five orphan labels — "1", "2", "3-5", "6-10", "11+" — with no
+  numbers against them. The distribution is the whole question that panel
+  answers. Each bucket is now a real control that says how many turns fall in
+  it, announces itself when reached, and answers a tap. The dashboard's own
+  accessibility checks had been running against fixtures with the histograms
+  empty, which is how this stayed hidden through thirteen of them; they carry a
+  real distribution now.
+
+- **The phone layout reaches the file tree and the shell.** Two of the five
+  destinations in the bottom bar never received the touch scale: the file tree
+  drew 26px rows with 10px size figures and no gap between them, so a mistap
+  opened the wrong file, and the terminal's tab bar put 22px buttons two pixels
+  apart. Both are at the touch floor now, with type no smaller than the rest of
+  the phone layout. The phone checks were pressing "Files" and asserting only
+  that something appeared — they now open each destination and hold it to the
+  same rules as the conversation, including that nothing is pushed off the side.
 - **A slash command Claude answers itself now leaves an answer on screen.** Some
   commands — `/effort`, `/model` — are handled by the CLI without going near the
   model, and a locally-handled command emits no streaming events at all. This
