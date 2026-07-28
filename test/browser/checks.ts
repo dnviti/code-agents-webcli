@@ -17,6 +17,7 @@ import { createRoot } from 'react-dom/client';
 
 import { ChatController } from '../../src/client/chat/controller';
 import { ChatView } from '../../src/client/shell/chat/ChatView';
+import { TurnStrip } from '../../src/client/shell/chat/TurnStrip';
 import { DEFAULT_CHAT_VIEW } from '../../src/client/chat/view-settings';
 import { createTerminalController, LIVE_SCROLLBACK_LINES } from '../../src/client/terminal/controller';
 import { HistoryView } from '../../src/client/terminal/history-view';
@@ -255,6 +256,7 @@ async function run(): Promise<void> {
   await checkTheFileEditorShowsTheFile();
   await checkAReadOnlyFileStaysReadOnly();
   await checkATurnsBadgeSaysHowItEnded();
+  await checkATurnsFiguresAreNeverCutShort();
   await checkAWaitingMessageCanBeSentNow();
   await checkALongQueueCollapsesToOneRow();
   await checkFoldedHistoryIsNotBuiltUntilItIsOpened();
@@ -4379,6 +4381,86 @@ async function checkATurnsBadgeSaysHowItEnded(): Promise<void> {
     'a failed step inside a done turn is still marked failed where it happened',
     said.filter((word) => word === 'Failed').length >= 2,
     `${said.filter((word) => word === 'Failed').length} steps said Failed`,
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * A turn's figures stay whole; the prompt beside them is what gets cut.
+ *
+ * Measured on screen rather than asserted as CSS, because the claim is about
+ * what a person can read: a long first line used to push the counts into
+ * ellipsis — "16 too…", "9 rea…" — and a truncated measurement is not a
+ * measurement. `scrollWidth > clientWidth` is the browser saying "this text did
+ * not fit", which no props assertion can stand in for.
+ */
+async function checkATurnsFiguresAreNeverCutShort(): Promise<void> {
+  const host = document.createElement('div');
+  // Narrow on purpose: this is the width at which something has to give. A
+  // block container, not a flex one — the strip fills the column it sits in,
+  // and a flex parent would let it size to its own content and never squeeze.
+  host.style.cssText = 'width:820px;height:400px;position:absolute;top:0;left:0;display:block;z-index:9999';
+  document.body.appendChild(host);
+
+  const asked =
+    'oltre alla spesa complessiva per la chat, inserisci anche la spesa su ogni singolo turno, '
+    + 'mi interessa di sapere quanto mi sono costati i turni singolarmente';
+  const root = createRoot(host);
+  root.render(
+    React.createElement(TurnStrip, {
+      turn: {
+        id: 'm1',
+        turnId: 't1',
+        index: 11,
+        label: asked,
+        status: 'done',
+        startedAt: Date.now(),
+        durationMs: 616000,
+        toolCount: 69,
+        failedStepCount: 0,
+        reasoningCount: 9,
+        usage: { costUsd: 10.16 },
+        messageIds: ['m1'],
+      },
+      variant: 'past',
+      open: false,
+      onToggleOpen: () => {},
+      onCopy: () => {},
+    } as never),
+  );
+  await wait(200);
+
+  const strip = host.querySelector('[role="heading"]') as HTMLElement | null;
+  const spans = Array.from(strip?.querySelectorAll('span') ?? []) as HTMLElement[];
+  const cut = (node: HTMLElement): boolean => node.scrollWidth > node.clientWidth + 1;
+  const figures = spans.filter((node) => /^(\d+ (tools?|reasoning)|\$[\d.]+|[\d.]+m? ?[\dms]*)$/.test(
+    (node.textContent || '').trim(),
+  ));
+  const truncatedFigures = figures.filter(cut).map((node) => (node.textContent || '').trim());
+
+  check(
+    'the strip draws every figure the turn produced',
+    figures.length >= 4,
+    figures.map((node) => (node.textContent || '').trim()).join(' | ') || 'no figures on the strip',
+  );
+  check(
+    'no figure on a turn strip is cut short',
+    truncatedFigures.length === 0,
+    truncatedFigures.join(' | ') || 'none',
+  );
+
+  const label = spans.find((node) => (node.textContent || '').trim() === asked);
+  check(
+    'the prompt is what gives the room up',
+    Boolean(label) && cut(label as HTMLElement),
+    label ? `${label.clientWidth}px of ${label.scrollWidth}px shown` : 'no label on the strip',
+  );
+  check(
+    'and the whole of it is still there on hover',
+    label?.getAttribute('title') === asked,
+    (label?.getAttribute('title') || 'no title').slice(0, 60),
   );
 
   root.unmount();

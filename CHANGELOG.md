@@ -22,6 +22,12 @@
   money at all — shows nothing rather than `$0.00`, and a turn that cost less
   than a cent keeps four decimals instead of being rounded away to nothing.
 
+  The strip over a turn also stopped letting a long prompt crowd its figures
+  out. Everything to the right of the label is a measurement, and a measurement
+  cut in half — `16 too…`, `9 rea…` — is not one; so the prompt is now the only
+  thing on the bar that gives its width up, cut to whatever room is left with
+  the whole of it on hover.
+
 - **The turn count is a real measurement of the work, and every surface agrees
   about it.** (#86) The word meant two different things at once. In a
   conversation a turn was something you asked for and everything the agent did
