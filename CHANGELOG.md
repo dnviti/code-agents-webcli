@@ -3,6 +3,40 @@
 ## [Unreleased]
 
 ### Fixed
+- **The terminal takes its own size back, and asks for the screen again.** The
+  PTY is shared, so a split pane, a second browser tab or a phone joining the
+  same session resizes it to *their* screen. This client kept one record of the
+  size it had last sent, made once and never reset, so it saw nothing to send
+  and went on drawing a full-width screen over a half-width PTY — and since the
+  attached CLI paints only the cells it thinks changed, what was left was the
+  skeleton with the ticking values moving on it that issue #17 was reported for.
+  The record is now dropped whenever this client's claim on the PTY may be
+  stale: a socket opening, a session joined, a reattach over a socket that never
+  dropped (closing a split, which is the case that had no event at all), and
+  coming back to the tab — which is the only signal there is when the resize
+  happened in another window entirely. A join also dips the height a row and
+  puts it straight back, because re-sending a size the PTY already has asks for
+  no repaint: two real SIGWINCHes are what resizing the browser window was doing
+  by hand.
+
+- **A pasted image is attached again, not typed as a path.** The upload always
+  worked; how the resulting path was handed to the terminal did not. It went out
+  as a raw socket write, so it reached the program as characters typed at the
+  prompt with none of the markers that say a paste happened, and an agent that
+  attaches pasted image paths saw only a filename. It now leaves through the
+  same paste path as any other paste — the one-line change issue #18 asked for
+  in its own title, which had never been made — and the raw sender it used is
+  gone from the interface, so nothing can reach for it again.
+
+- **The shell inside a conversation can be driven from a phone.** It inherited
+  the on-screen-keyboard suppression that made terminals usable on touch, but
+  not the key strip that suppression depends on: no Escape, Tab, Enter, arrows
+  or Ctrl, and since a tap no longer summons the keyboard either, the pane was
+  something you could read and not use. The strip now sits inside the split,
+  wired to that pane's own session rather than to whichever session the shell
+  considers current — so an arrow follows the cursor-key mode of the terminal
+  you are looking at — and the conversation's floating menu steps up out of its
+  way instead of covering the key that summons the keyboard.
 - **A slash command Claude answers itself now leaves an answer on screen.** Some
   commands — `/effort`, `/model` — are handled by the CLI without going near the
   model, and a locally-handled command emits no streaming events at all. This

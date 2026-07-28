@@ -27,6 +27,7 @@ import { IconButton } from '../../ui/relay/IconButton.js';
 import { showNotification } from '../../ui/notifications.js';
 import { PhoneContext } from '../../ui/touch.js';
 import { FloatingMenu } from '../FloatingMenu.js';
+import { KEY_STRIP_HEIGHT } from '../KeyStrip.js';
 import { Composer } from './Composer.js';
 import { MessageList, type MessageListHandle } from './MessageList.js';
 import { hasVisibleContent, messageText } from './MessageBubble.js';
@@ -791,8 +792,16 @@ export function ChatView({
           >
           {/* Over the conversation, clear of everything else. Anchored to the
               transcript rather than to the shell: at the shell's bottom right
-              it sat exactly on the send button. */}
-          {isMobile ? <FloatingMenu actions={phoneMenu} /> : null}
+              it sat exactly on the send button. Lifted over the terminal's key
+              strip when that is open, or the button covers the right-hand keys
+              — including the one that summons the keyboard, which is the only
+              way left to type letters into that pane. */}
+          {isMobile ? (
+            <FloatingMenu
+              actions={phoneMenu}
+              bottomOffset={terminalOpen ? KEY_STRIP_HEIGHT : 0}
+            />
+          ) : null}
 
           {searchOpen ? (
             <TranscriptSearch

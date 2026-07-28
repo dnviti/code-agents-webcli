@@ -16,7 +16,9 @@ import * as React from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { ChatController } from '../../src/client/chat/controller';
+import { forgetTerminals } from '../../src/client/chat/chat-terminal';
 import { ChatView } from '../../src/client/shell/chat/ChatView';
+import { TerminalSplit } from '../../src/client/shell/chat/TerminalSplit';
 import { TurnStrip } from '../../src/client/shell/chat/TurnStrip';
 import { DEFAULT_CHAT_VIEW } from '../../src/client/chat/view-settings';
 import { createTerminalController, LIVE_SCROLLBACK_LINES } from '../../src/client/terminal/controller';
@@ -245,6 +247,7 @@ async function run(): Promise<void> {
   await checkAQuestionIsAnsweredByClicking();
   await checkThePhoneLayoutIsUsable();
   await checkThePhoneShellSurfacesAreUsable();
+  await checkTheConversationsTerminalCanBeDrivenFromAPhone();
   await checkALongTabNameStaysInsideTheStrip();
   await checkAnUnreportedFigureIsNeverDrawnAsZero();
   await checkTheUsageChartsAreInteractive();
@@ -6222,4 +6225,241 @@ async function checkClearingResetsTheFiguresAboveTheChat(): Promise<void> {
 
   root.unmount();
   host.remove();
+}
+
+/**
+ * The shell inside a conversation can be driven from a phone.
+ *
+ * Issue #21 stopped every terminal in this app from summoning the on-screen
+ * keyboard — it used to pop over half the screen on every tap — and gave the
+ * terminal surface a key strip in exchange. The pane inside a conversation is a
+ * session of its own with its own socket, so it inherited the suppression and
+ * none of the keys: no Escape, no Tab, no Enter, no arrows, no Ctrl. Readable,
+ * and impossible to type into.
+ *
+ * Driven rather than inspected, because a strip that renders and writes to the
+ * wrong session is the failure this is about: the keys are asserted by what
+ * leaves *this* pane's socket. The server is faked at both ends — the session it
+ * would create and the socket it would open — since where a key arrives is the
+ * question, and a pty is not part of it.
+ */
+async function checkTheConversationsTerminalCanBeDrivenFromAPhone(): Promise<void> {
+  const frames: string[] = [];
+  const opened: string[] = [];
+
+  const realFetch = window.fetch;
+  const realWebSocket = window.WebSocket;
+
+  window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+    if (url.includes('/api/sessions/')) {
+      return new Response(JSON.stringify({ sessionId: 'shell-in-a-conversation' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return realFetch(input as never, init);
+  }) as typeof window.fetch;
+
+  class FakeSocket {
+    static readonly OPEN = 1;
+    readyState = FakeSocket.OPEN;
+    onopen: (() => void) | null = null;
+    onmessage: ((event: MessageEvent) => void) | null = null;
+    onclose: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    constructor(url: string) {
+      opened.push(url);
+      // Asynchronously, as a real one connects: the pane sends its geometry
+      // from `onopen`, and a handler called before it is assigned is a handler
+      // that never runs.
+      setTimeout(() => this.onopen?.(), 0);
+    }
+    send(data: string): void {
+      frames.push(data);
+    }
+    close(): void {
+      this.readyState = 3;
+    }
+  }
+  window.WebSocket = FakeSocket as never;
+
+  const host = document.createElement('div');
+  // Above whatever earlier checks left mounted, because `elementFromPoint` is
+  // asked below whether a thumb actually reaches these keys and the first
+  // check's terminal is still sitting in the same corner. Bottom-aligned, which
+  // is where the split lives: under the transcript, over the composer.
+  host.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;z-index:9999;'
+    + 'display:flex;flex-direction:column;justify-content:flex-end;background:var(--background)';
+  document.body.appendChild(host);
+
+  const props = {
+    chatSessionId: 'phone-conversation',
+    workingDir: '/home/dev/projects/alpha',
+    height: 300,
+    onResize: () => {},
+    onClose: () => {},
+    theme: 'dark' as const,
+  };
+
+  const root = createRoot(host);
+  root.render(React.createElement(TerminalSplit, { ...props, isMobile: true }));
+  for (let i = 0; i < 40 && opened.length === 0; i++) await wait(50);
+  await wait(200);
+
+  const strip = host.querySelector('[role="group"][aria-label="Terminal keys"]') as HTMLElement | null;
+  check(
+    'the shell inside a conversation carries the on-screen keys on a phone',
+    Boolean(strip),
+    strip ? 'the strip is there' : 'the split renders no strip, so the pane cannot be typed into',
+  );
+
+  if (strip) {
+    const keys = [
+      'Latch Ctrl for the next key', 'Send Escape', 'Send Tab', 'Send Enter',
+      'Send Up arrow', 'Send Down arrow', 'Send Left arrow', 'Send Right arrow',
+      'Show on-screen keyboard',
+    ];
+    const missing = keys.filter((label) => !strip.querySelector(`[aria-label="${label}"]`));
+    check(
+      'and every key a phone keyboard does not have',
+      missing.length === 0,
+      missing.join(', ') || `all ${keys.length}`,
+    );
+
+    // Present is not reachable: the strip lives inside the split's own height,
+    // so a key drawn under the terminal body or below the pane's bottom edge
+    // would read as fine in the markup and be untappable on glass.
+    const unreachable = keys.filter((label) => {
+      const button = strip.querySelector(`[aria-label="${label}"]`) as HTMLElement | null;
+      if (!button) return true;
+      const box = button.getBoundingClientRect();
+      const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+      return !hit || !button.contains(hit);
+    });
+    check(
+      'each of them is the thing under the finger',
+      unreachable.length === 0,
+      unreachable.join(', ') || 'all reachable',
+    );
+
+    const terminal = host.querySelector('.xterm') as HTMLElement | null;
+    const termBox = terminal?.getBoundingClientRect();
+    const stripBox = strip.getBoundingClientRect();
+    check(
+      'the keys sit under the shell rather than over it',
+      Boolean(termBox) && termBox!.bottom <= stripBox.top + 1 && termBox!.height > 60,
+      termBox
+        ? `terminal ${Math.round(termBox.height)}px tall, ending at ${Math.round(termBox.bottom)}, strip from ${Math.round(stripBox.top)}`
+        : 'no terminal in the split',
+    );
+
+    const press = (label: string): void => {
+      const button = strip.querySelector(`[aria-label="${label}"]`) as HTMLElement | null;
+      button?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
+      button?.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
+    };
+
+    /** What has reached this pane's socket as terminal input, in order. */
+    const typed = (): string[] =>
+      frames
+        .map((frame) => {
+          try {
+            return JSON.parse(frame) as { type?: string; data?: string };
+          } catch {
+            return {};
+          }
+        })
+        .filter((message) => message.type === 'input')
+        .map((message) => String(message.data));
+
+    press('Send Escape');
+    press('Send Tab');
+    press('Send Enter');
+    await wait(150);
+    check(
+      'pressing them types into the conversation’s own shell',
+      typed().join('|') === '\x1b|\t|\r',
+      JSON.stringify(typed()),
+    );
+    check(
+      'over that shell’s socket rather than the session the app has in focus',
+      opened.length === 1 && opened[0].includes('shell-in-a-conversation'),
+      opened.join(', ') || 'nothing ever connected',
+    );
+
+    const ctrl = strip.querySelector('[aria-label="Latch Ctrl for the next key"]') as HTMLElement | null;
+    press('Latch Ctrl for the next key');
+    await wait(150);
+    check(
+      'Ctrl latches here too, and paints itself engaged',
+      ctrl?.getAttribute('aria-pressed') === 'true',
+      `aria-pressed=${ctrl?.getAttribute('aria-pressed') ?? 'no Ctrl key'}`,
+    );
+
+    press('Send Left arrow');
+    await wait(150);
+    check(
+      'so the next key goes out modified',
+      typed().slice(-1)[0] === '\x1b[1;5D',
+      JSON.stringify(typed().slice(-1)),
+    );
+    check(
+      'and the latch lets go after the one key',
+      ctrl?.getAttribute('aria-pressed') === 'false',
+      `aria-pressed=${ctrl?.getAttribute('aria-pressed') ?? 'no Ctrl key'}`,
+    );
+
+    press('Send Up arrow');
+    await wait(150);
+    check(
+      'an unlatched arrow is the plain one',
+      typed().slice(-1)[0] === '\x1b[A',
+      JSON.stringify(typed().slice(-1)),
+    );
+
+    // The letters, which no strip can carry: since #21 a tap on a terminal no
+    // longer summons the keyboard, so this button is the only way to type a
+    // word into this pane — and it has to summon it against *this* textarea,
+    // not the main terminal's.
+    press('Show on-screen keyboard');
+    await wait(150);
+    const textarea = host.querySelector('.xterm-helper-textarea') as HTMLTextAreaElement | null;
+    check(
+      'and the keyboard can be summoned over this pane',
+      textarea?.inputMode === 'text' && document.activeElement === textarea,
+      textarea
+        ? `inputMode=${textarea.inputMode} focused=${document.activeElement === textarea}`
+        : 'the pane has no input area',
+    );
+  }
+
+  root.unmount();
+
+  // Nothing of this on a desktop: those keys are on the keyboard already, and
+  // the strip would cost the shell three rows to say so.
+  const desktop = createRoot(host);
+  desktop.render(
+    React.createElement(TerminalSplit, {
+      ...props,
+      chatSessionId: 'desktop-conversation',
+      isMobile: false,
+    }),
+  );
+  await wait(400);
+  check(
+    'and a desktop split is left exactly as it was',
+    !host.querySelector('[aria-label="Terminal keys"]'),
+    host.querySelector('[aria-label="Terminal keys"]') ? 'the strip followed onto the desktop' : 'no strip',
+  );
+  desktop.unmount();
+
+  host.remove();
+  // The panes outlive the component that mounted them on purpose, so releasing
+  // them is this fixture's job — otherwise their xterms and their sockets stay
+  // alive for every check after this one.
+  forgetTerminals('phone-conversation');
+  forgetTerminals('desktop-conversation');
+  window.fetch = realFetch;
+  window.WebSocket = realWebSocket;
 }

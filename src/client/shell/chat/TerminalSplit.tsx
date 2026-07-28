@@ -11,7 +11,10 @@ import {
   TERMINAL_VIEWPORT_RESERVE,
   clampTerminalHeight,
 } from '../../chat/view-settings.js';
+import { toggleCtrlLatch } from '../../ui/mobile.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { KeyStrip } from '../KeyStrip.js';
+import { shellStore } from '../store.js';
 
 /**
  * A shell at the bottom of the conversation, in the same working directory.
@@ -78,6 +81,16 @@ export function TerminalSplit({
   // squeezing the transcript until something else happened to re-render.
   const viewport = useViewportHeight();
   const applied = clampTerminalHeight(drag ?? height, viewport);
+
+  // Read from the store rather than taken as a prop: the latch is shared state
+  // that this pane's own `onData` already consumes, so threading it through
+  // ChatView would only make the surface carry a value that belongs to neither
+  // it nor the transcript.
+  const ctrlLatched = React.useSyncExternalStore(
+    shellStore.subscribe,
+    () => shellStore.getSnapshot().ctrlLatched,
+    () => false,
+  );
 
   const open = React.useCallback(
     (label: string, existing?: string) => {
@@ -349,6 +362,28 @@ export function TerminalSplit({
             cursor: 'text',
           }}
         />
+
+        {/* The same strip the terminal surface has, addressed at this pane.
+            Inside the split's own height on purpose: it costs the shell a few
+            rows rather than the conversation, and the drag handle keeps meaning
+            what it says. A phone keyboard has no Escape, Tab or arrows, and
+            since #21 a tap no longer summons it at all — without this the shell
+            in a conversation is something you can read and cannot drive.
+
+            Not gated on the `keysVisible` preference the terminal surface
+            honours, because in chat mode that toggle has given up its slot in
+            the bottom bar to the workspace panel: honouring it would let a
+            preference set on another screen leave this pane undrivable with no
+            way to say otherwise. This strip is scoped to a disclosure the user
+            opened by hand and closes by closing it. */}
+        {isMobile ? (
+          <KeyStrip
+            ctrlLatched={ctrlLatched}
+            onKey={(key) => active?.sendKey(key)}
+            onToggleCtrl={toggleCtrlLatch}
+            onShowKeyboard={() => active?.showKeyboard()}
+          />
+        ) : null}
       </div>
     </div>
   );

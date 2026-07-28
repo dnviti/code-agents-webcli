@@ -185,16 +185,48 @@ const CURSOR_KEYS: Record<'up' | 'down' | 'left' | 'right', string> = {
 };
 
 /**
- * Send one strip key to the active session.
+ * The terminal a strip key is meant for.
  *
- * Cursor keys follow the terminal's application-cursor-keys mode: a full-
- * screen app that switched the mode on expects SS3 (\x1bOA) and ignores or
- * misreads CSI (\x1b[A), and readline-style prompts expect the reverse. A
- * latched Ctrl turns the arrow into its modified form (CSI 1;5X) — word jumps
- * in prompts that bind them.
+ * The strip used to write to `app.socket` and nothing else, which was the whole
+ * truth for as long as the app had one terminal on screen. The shell inside a
+ * conversation is a session of its own, with its own socket and its own idea of
+ * cursor-key mode (see chat/chat-terminal.ts), so "which session" became a
+ * question the caller has to answer rather than one that can be read off the
+ * app.
  */
+export interface KeyTarget {
+  /** False while there is nothing connected to send to. */
+  connected(): boolean;
+  send(data: string): void;
+  /**
+   * Whether the program on the other end asked for application cursor keys: it
+   * expects SS3 (\x1bOA) and ignores or misreads CSI (\x1b[A), and
+   * readline-style prompts expect the reverse.
+   */
+  applicationCursorKeys(): boolean;
+}
+
+/** Send one strip key to whichever session the shell has in focus. */
 export function sendMobileKey(app: App, key: MobileKey): void {
-  if (!app.socket || app.socket.readyState !== WebSocket.OPEN) return;
+  sendMobileKeyTo(
+    {
+      connected: () => app.socket?.readyState === WebSocket.OPEN,
+      send: (data) => app.send({ type: 'input', data }),
+      applicationCursorKeys: () => Boolean(app.terminal?.modes.applicationCursorKeysMode),
+    },
+    key,
+  );
+}
+
+/**
+ * Send one strip key to a named terminal.
+ *
+ * A latched Ctrl turns an arrow into its modified form (CSI 1;5X) — word jumps
+ * in prompts that bind them — and is consumed either way, so it cannot leak
+ * into whatever the user types next.
+ */
+export function sendMobileKeyTo(target: KeyTarget, key: MobileKey): void {
+  if (!target.connected()) return;
 
   const ctrl = shellStore.getSnapshot().ctrlLatched;
   let data: string;
@@ -216,7 +248,7 @@ export function sendMobileKey(app: App, key: MobileKey): void {
       const letter = CURSOR_KEYS[key];
       if (ctrl) {
         data = `\x1b[1;5${letter}`;
-      } else if (app.terminal?.modes.applicationCursorKeysMode) {
+      } else if (target.applicationCursorKeys()) {
         data = `\x1bO${letter}`;
       } else {
         data = `\x1b[${letter}`;
@@ -225,7 +257,7 @@ export function sendMobileKey(app: App, key: MobileKey): void {
   }
 
   if (ctrl) shellStore.setState({ ctrlLatched: false });
-  app.send({ type: 'input', data });
+  target.send(data);
 }
 
 export function switchMode(app: App): void {

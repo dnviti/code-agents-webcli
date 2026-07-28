@@ -66,7 +66,6 @@ class Split {
     const pasteTarget: ImagePasteTarget = {
       element: terminalDiv,
       getSessionId: () => this.sessionId,
-      sendText: (text) => this.socket?.send(JSON.stringify({ type: 'input', data: text })),
       pasteText: (text) => this.terminal?.paste(text),
       isConnected: () => this.socket?.readyState === WebSocket.OPEN,
     };

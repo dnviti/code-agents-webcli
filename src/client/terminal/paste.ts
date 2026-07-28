@@ -15,8 +15,6 @@ export interface ImagePasteTarget {
   /** The element handed to controller.open(). */
   element: HTMLElement;
   getSessionId(): string | null;
-  /** The only thing that differs between the main terminal and a split. */
-  sendText(text: string): void;
   /**
    * Re-emit clipboard text as a paste.
    *
@@ -219,12 +217,16 @@ async function handleImages(
         continue;
       }
 
-      target.sendText(insertText);
+      // Through xterm's paste path rather than a raw socket write, so the
+      // markers go out exactly when the attached program has asked for them.
+      // That is what tells an agent the path was pasted rather than typed, and
+      // it is the difference between an attachment and a filename sitting at
+      // the prompt (issue #18); a plain shell gets what it always got.
+      target.pasteText(insertText);
     }
 
     if (trailingText && target.getSessionId() === sessionId && target.isConnected()) {
-      // Last, so the caret ends after the user's own words. Through xterm's
-      // paste path, so it is bracketed exactly as an ordinary paste would be.
+      // Last, so the caret ends after the user's own words.
       target.pasteText(trailingText);
     }
   } finally {

@@ -27,7 +27,8 @@
 import { createTerminalController, type TerminalController } from '../terminal/controller.js';
 import { stripUnsupportedTerminalSequences } from '../terminal/text.js';
 import { attachImageDrop, attachImagePaste, type ImagePasteTarget } from '../terminal/paste.js';
-import { withCtrlLatch } from '../ui/mobile.js';
+import { sendMobileKeyTo, withCtrlLatch, type KeyTarget, type MobileKey } from '../ui/mobile.js';
+import { summonKeyboard } from '../terminal/keyboard.js';
 import { relayTerminalTheme } from '../shell/terminal-theme.js';
 
 export type ChatTerminalPhase = 'starting' | 'live' | 'exited' | 'error';
@@ -126,7 +127,6 @@ export class ChatTerminal {
     const pasteTarget: ImagePasteTarget = {
       element: this.element,
       getSessionId: () => this.sessionId,
-      sendText: (text) => this.socket?.send(JSON.stringify({ type: 'input', data: text })),
       pasteText: (text) => this.controller?.terminal.paste(text),
       isConnected: () => this.socket?.readyState === WebSocket.OPEN,
     };
@@ -320,6 +320,44 @@ export class ChatTerminal {
 
   focus(): void {
     this.controller?.terminal.focus();
+  }
+
+  /**
+   * One key from the on-screen strip, into this pane's own session.
+   *
+   * The strip has only ever addressed `app.socket`, the session the shell has
+   * in focus, and this pane is never that session. So on a phone the terminal
+   * in a conversation inherited issue #21's keyboard suppression — every tap
+   * used to pop the on-screen keyboard, so it no longer does — without the keys
+   * that suppression was survivable because of: no Escape, no Tab, no Enter, no
+   * arrows, no Ctrl. It could be read and not driven.
+   */
+  sendKey(key: MobileKey): void {
+    sendMobileKeyTo(this.keyTarget(), key);
+  }
+
+  private keyTarget(): KeyTarget {
+    return {
+      connected: () => this.socket?.readyState === WebSocket.OPEN,
+      send: (data) => this.socket?.send(JSON.stringify({ type: 'input', data })),
+      // This pane's mode, not the main terminal's: a full-screen program here
+      // and a shell prompt there want opposite encodings of the same arrow.
+      applicationCursorKeys: () =>
+        Boolean(this.controller?.terminal.modes.applicationCursorKeysMode),
+    };
+  }
+
+  /**
+   * Bring the on-screen keyboard up over this pane.
+   *
+   * `summonKeyboard()` reaches for the textarea that was focused last and falls
+   * back to the *main* terminal's, so on a phone that has not yet tapped into
+   * this shell the keyboard would come up typing into another session. Focusing
+   * first makes this pane the one it finds.
+   */
+  showKeyboard(): void {
+    this.focus();
+    summonKeyboard();
   }
 
   /** True when the pty, not the page, owns the keyboard. */
