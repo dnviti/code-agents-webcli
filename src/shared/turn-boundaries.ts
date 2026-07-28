@@ -28,14 +28,34 @@ import { ChatEvent } from './chat-events.js';
 /**
  * The turn open after `event`, given the one open before it.
  *
- * Null is "none open": whatever comes next starts a turn. Three things close
- * one — the runtime ending it, the process going (which means nothing ever
- * will), and `/clear`, which ends the conversation the turn belonged to.
+ * Null is "none open": a user's request starts the next turn. Three things
+ * close one — the runtime ending it, the process going (which means nothing
+ * ever will), and `/clear`, which ends the conversation the turn belonged to.
+ *
+ * `previous` is the last turn this conversation had, and it is what an agent
+ * speaking again with no request in front of it goes back to. That happens for
+ * real: an agent that started something in the background — a build, a check, a
+ * job it was waiting on — ends its turn and then picks the same work back up
+ * when the thing it was waiting for finishes. Nobody asked a second question,
+ * so there is no second request, and only a request makes a turn. Read as one,
+ * that stretch became a turn with no prompt to name it by — and, worse, work
+ * the accounting had nowhere to file, because a job is opened by the user's
+ * message and there was not one.
  */
-export function openTurnAfter(event: ChatEvent, open: string | null): string | null {
+export function openTurnAfter(
+  event: ChatEvent,
+  open: string | null,
+  previous?: string | null,
+): string | null {
   switch (event.t) {
     case 'msg_start':
-      return open ?? event.turnId;
+      if (open) return open;
+      // Only a request opens a turn. Anything else picks up where the
+      // conversation left off, and opens one of its own only when there is no
+      // "left off" — the tail of a resumed transcript, which is on screen and
+      // has to be somewhere.
+      if (event.role === 'user') return event.turnId;
+      return previous ?? event.turnId;
     case 'turn_end':
       // Except when it is the runtime letting go of work that was interrupted
       // to redirect it. The turn goes on — see `stale` on the event.

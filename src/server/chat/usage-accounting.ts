@@ -207,8 +207,17 @@ export class UsageAccountant {
           // turn id the moment the turn is accepted, before the runtime has
           // said anything at all.
           this.openJob(event.turnId, event.ts, event.steer === true);
-        } else if (this.job) {
-          this.job.spoke = true;
+        } else {
+          // The agent speaking with no job open is the agent picking its own
+          // work back up: it ended the turn waiting on something — a build, a
+          // check, a job running in the background — and carried on when that
+          // finished. Nobody asked a second question, so this is the same turn,
+          // and it is reopened rather than left to run untracked. It used to be
+          // exactly that: **more than half of a long conversation's spend was
+          // never filed at all**, because a job is opened by a user's message
+          // and there was not one.
+          if (!this.job) this.resume();
+          if (this.job) this.job.spoke = true;
         }
         if (event.model) {
           this.sessionModel = event.model;
@@ -317,6 +326,27 @@ export class UsageAccountant {
     this.close(at, null, null);
   }
 
+  /**
+   * Pick the job that just closed back up, if there is one.
+   *
+   * Two things reach here, and they are the same thing seen twice: a steer,
+   * which is more of the turn the interrupt cut short, and an agent resuming
+   * work of its own accord after ending a turn. Neither is a new request, and
+   * only a request is a new turn — so this is the same job, with its counters,
+   * its start and its id, and when it closes again the filing replaces the
+   * first rather than standing beside it. The outcome starts over because the
+   * turn is running again: how it paused is not how it ended.
+   */
+  private resume(): void {
+    const resumed = this.lastClosed;
+    this.lastClosed = null;
+    if (!resumed) return;
+    this.job = { ...resumed, outcome: 'completed' };
+    // `seenTools` is deliberately not cleared: a tool the runtime re-announces
+    // across the pause is the same call, and the whole point of the set is that
+    // it is only counted once.
+  }
+
   private openJob(turnId: string, ts: number, steer: boolean): void {
     // The first user message of a prompt opens the job and every later one is
     // ignored, because more than one arrives. `deliver` emits ours with the
@@ -334,15 +364,11 @@ export class UsageAccountant {
     // again the filing replaces the first rather than standing beside it. The
     // outcome starts over because the turn is running again — being redirected
     // is not how it ended, and it has not ended yet.
-    const resumed = steer && this.lastClosed?.turnId === turnId ? this.lastClosed : null;
-    this.lastClosed = null;
-    if (resumed) {
-      this.job = { ...resumed, outcome: 'completed' };
-      // Deliberately not cleared: a tool the runtime re-announces across the
-      // interrupt is the same call, and the whole point of the set is that it
-      // is only counted once.
+    if (steer && this.lastClosed?.turnId === turnId) {
+      this.resume();
       return;
     }
+    this.lastClosed = null;
 
     this.job = {
       turnId,

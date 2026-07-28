@@ -602,13 +602,24 @@ export class ChatStore implements ChatStoreLike {
     const boundaries = state.turnBoundaries;
     if (boundaries) {
       let open = boundaries.length > 0 ? boundaries[boundaries.length - 1].turnId : null;
+      // The last turn the conversation had, which is where an agent speaking
+      // again with nothing asked of it goes back to.
+      let previous: string | null = null;
+      for (let i = boundaries.length - 1; i >= 0; i--) {
+        if (boundaries[i].turnId !== null) {
+          previous = boundaries[i].turnId;
+          break;
+        }
+      }
       for (const event of events) {
         if (event.seq <= state.turnBoundarySeq) continue;
-        const next = openTurnAfter(event, open);
+        const next = openTurnAfter(event, open, previous);
         if (next !== open) {
           boundaries.push({ seq: event.seq, turnId: next });
           open = next;
         }
+        // See `turnBoundaries`: a `/clear` leaves nothing to carry on from.
+        previous = event.t === 'marker' && event.kind === 'cleared' ? null : next ?? previous;
         state.turnBoundarySeq = event.seq;
       }
     }
@@ -734,10 +745,18 @@ export class ChatStore implements ChatStoreLike {
       // comes back after another has intervened is a second one. Two
       // implementations of that rule would be two answers to "how many turns",
       // which is the disagreement this whole change removes.
+      //
+      // Against the last turn in the list rather than against the one currently
+      // open, because those differ in the case this exists for: an agent that
+      // picks its own work back up after ending a turn — a background job it
+      // was waiting on finishing — has no turn open and is still in the turn it
+      // was working on. Comparing against `openTurnId` alone filed that as a
+      // second row carrying the same id.
       const openTurn = (turnId: string, ts: number, id: string): PersistedTurn => {
-        if (openTurnId === turnId) {
-          const current = turns[turns.length - 1];
-          if (current) return current;
+        const current = turns[turns.length - 1];
+        if (current && current.turnId === turnId) {
+          openTurnId = turnId;
+          return current;
         }
         const turn: PersistedTurn = {
           id,
@@ -753,19 +772,6 @@ export class ChatStore implements ChatStoreLike {
       };
 
       let pending: { turn: PersistedTurn; msgId: string } | null = null;
-      /**
-       * The words of a steer, held for the turn that answers them.
-       *
-       * Only conversations already on disk have any: a message promoted past
-       * the queue used to be filed into the turn it interrupted, and every
-       * runtime here answers an interrupt by ending that turn — so the ask sat
-       * at the foot of a finished turn while the work it asked for happened in
-       * the next one, which had no prompt in it at all. That is the "no prompt"
-       * row this reads back out. New logs cannot produce one; `deliver` gives a
-       * promoted message its own turn now.
-       */
-      let steered: { msgId: string; label: string | null } | null = null;
-      let carried: string | null = null;
       // Set once a `/clear` has cut the log: what is left starts at turn 1 by
       // construction, so nothing is missing however far back the log was
       // trimmed.
@@ -784,36 +790,21 @@ export class ChatStore implements ChatStoreLike {
             // Nothing has to be migrated, and nothing was recorded wrongly —
             // the events were always right, it was the reading of them that
             // split a request from its answer.
-            const turnId = openTurnAfter(event, openTurnId) as string;
+            const turnId = openTurnAfter(
+              event,
+              openTurnId,
+              turns[turns.length - 1]?.turnId,
+            ) as string;
             const turn = openTurn(turnId, event.ts, event.id);
             // Only the user's own words may name a turn, and only the first of
             // them. Anything else is the model titling the reader's question
             // for them — see `labelFor` on the browser's side.
-            if (event.role === 'user') {
-              // A turn opened by the user's own words never borrows any.
-              carried = null;
-              if (turn.label === null) pending = { turn, msgId: event.id };
-              if (event.steer) steered = { msgId: event.id, label: null };
-            } else if (steered) {
-              // The agent answered inside the turn the steer joined, which is
-              // what a log written since this was fixed looks like. Nothing was
-              // stranded, so there is nothing to hand on.
-              steered = null;
-            }
-            if (event.role !== 'user' && turn.label === null && carried) {
-              // The other half of a steer: this is the work that answers one,
-              // and the question is a message back in the turn that was cut
-              // short. Naming the row with it is not borrowing the model's
-              // words — it is the user's own, read from where they landed.
-              turn.label = carried;
-              carried = null;
+            if (event.role === 'user' && turn.label === null) {
+              pending = { turn, msgId: event.id };
             }
             return;
           }
           case 'block_start': {
-            if (steered && steered.msgId === event.msgId && event.block.kind === 'text') {
-              steered.label = event.block.text.trim().split('\n')[0].trim() || null;
-            }
             if (!pending || pending.msgId !== event.msgId) return;
             if (event.block.kind !== 'text') return;
             const line = event.block.text.trim().split('\n')[0].trim();
@@ -832,8 +823,6 @@ export class ChatStore implements ChatStoreLike {
               turns.length = 0;
               openTurnId = null;
               pending = null;
-              steered = null;
-              carried = null;
               cleared = true;
             }
             return;
@@ -855,11 +844,10 @@ export class ChatStore implements ChatStoreLike {
             if (event.stale) return;
             const turn = openTurnId === null ? null : turns[turns.length - 1];
             if (turn) turn.outcome = turnOutcomeOf(event.stopReason);
-            // A steer in the turn that just ended was the last thing the user
-            // said, and it was said *to* whatever comes next — see `steered`.
-            carried = steered?.label ?? null;
-            steered = null;
-            // Whatever comes next belongs to a turn that has not started yet.
+            // Whatever comes next belongs to a turn that has not started yet —
+            // unless it is the agent picking this same work back up, which is
+            // not something anybody asked for and so not a turn. See
+            // `openTurnAfter`.
             openTurnId = null;
             return;
           }
@@ -1148,13 +1136,18 @@ export class ChatStore implements ChatStoreLike {
 
     const boundaries: TurnBoundary[] = [];
     let open: string | null = null;
+    let previous: string | null = null;
     let seq = 0;
     await this.scanLog(base, state, (event) => {
-      const next = openTurnAfter(event, open);
+      const next = openTurnAfter(event, open, previous);
       if (next !== open) {
         boundaries.push({ seq: event.seq, turnId: next });
         open = next;
       }
+      // `/clear` is a new conversation in the same tab, so there is nothing
+      // left to carry on from: the turns above it belong to the one the user
+      // walked away from.
+      previous = event.t === 'marker' && event.kind === 'cleared' ? null : next ?? previous;
       if (event.seq > seq) seq = event.seq;
     });
 

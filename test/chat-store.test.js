@@ -409,11 +409,13 @@ describe('ChatStore', function () {
       assert.strictEqual(marker.turnId, 'turn-app', 'and belongs to the turn it was drawn in');
     });
 
-    it('names a turn from the steer it answers, in conversations already recorded', async function () {
-      // History only: promoting a message past the queue used to file it into
-      // the turn it interrupted, which that interrupt then ended — leaving the
+    it('reads work an old log stranded back into the turn it came from', async function () {
+      // History: promoting a message past the queue used to file it into the
+      // turn it interrupted, which that interrupt then ended — leaving the
       // question in a finished turn and the work in one with no prompt at all.
-      // The words are the user's own and they are right there in the log.
+      // Nothing opened that second turn, so under the settled rule there is no
+      // second turn: the work goes back where it came from, and the row is
+      // titled by the request that started all of it.
       const session = { id: 'steered', ownerUserId: 1 };
       const events = [];
       let seq = 1;
@@ -438,8 +440,28 @@ describe('ChatStore', function () {
       const index = await store.turnIndex(session);
       assert.deepStrictEqual(
         index.turns.map((t) => t.label),
-        ['refactor the auth module', 'no — the staging database'],
+        ['refactor the auth module'],
       );
+    });
+
+    it('does not carry a turn across a /clear', async function () {
+      // An agent speaking with nothing asked of it carries on in the turn it
+      // was working on — but `/clear` is a new conversation in the same tab,
+      // and the turns above it belong to the one the user walked away from.
+      const session = { id: 'cleared', ownerUserId: 1 };
+      let seq = 1;
+      store.append(session, [
+        { t: 'msg_start', seq: seq++, ts: 1, id: 'u1', role: 'user', turnId: 'turn-old' },
+        { t: 'msg_end', seq: seq++, ts: 1, msgId: 'u1' },
+        { t: 'turn_end', seq: seq++, ts: 1, turnId: 'run-1', stopReason: 'end_turn' },
+        { t: 'marker', seq: seq++, ts: 1, kind: 'cleared', detail: 'started a new conversation' },
+        { t: 'msg_start', seq: seq++, ts: 1, id: 'a1', role: 'assistant', turnId: 'run-2' },
+      ]);
+
+      const index = await store.turnIndex(session);
+      assert.deepStrictEqual(index.turns.map((t) => t.turnId), ['run-2']);
+      const snapshot = await store.snapshot(session);
+      assert.deepStrictEqual(snapshot.messages.map((m) => m.turnId), ['run-2']);
     });
 
     it('says which turn a page of history starts inside', async function () {
