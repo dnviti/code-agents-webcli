@@ -365,6 +365,28 @@ describe('the turn index of a recorded conversation', function () {
     assert.strictEqual(index.turns[0].label, 'refactor auth', 'the ask that opened it names it');
   });
 
+  it('starts again at a /clear rather than listing the conversation it replaced', async function () {
+    // The log is append-only, so everything before the marker is still on disk
+    // — and belongs to the conversation the user left. The transcript stops
+    // paging back there, and the index has to start there too, or it would list
+    // turns a browser can never be shown.
+    write([
+      ...conversation(3),
+      { t: 'marker', kind: 'cleared', detail: 'started a new conversation' },
+      ...conversation(2).map((event, i) => ({
+        ...event,
+        ...(event.t === 'msg_start' ? { id: `new-${event.id}` } : {}),
+        ...(event.t === 'block_start' ? { msgId: `new-${event.msgId}` } : {}),
+        ...(event.t === 'msg_end' ? { msgId: `new-${event.msgId}` } : {}),
+        ...(event.t === 'turn_end' ? { turnId: `n${i}` } : {}),
+      })),
+    ]);
+    const index = await store.turnIndex(ref);
+    assert.strictEqual(index.turns.length, 2, 'only the conversation now on screen');
+    assert.deepStrictEqual(index.turns.map((turn) => turn.index), [1, 2]);
+    assert.strictEqual(index.complete, true, 'a cleared log starts at turn 1 by construction');
+  });
+
   it('agrees with what the accounting recorded for the same conversation', async function () {
     // The acceptance criterion in one line: the two surfaces are built from the
     // same events by the same rule, so they cannot disagree about how many

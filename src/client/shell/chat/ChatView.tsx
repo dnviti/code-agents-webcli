@@ -8,6 +8,7 @@ import type { ChatTranscript } from '../../chat/transcript.js';
 import {
   groupTurns,
   isTurnOpen,
+  reconcileTurns,
   turnIndexRows,
   turnOf,
   type TurnSummary,
@@ -194,18 +195,21 @@ export function ChatView({
   // Derived per render and memoised on the version counter, never stored.
   // Turn grouping is a view of the transcript, and a second copy of it in state
   // is a second thing that can be wrong about the conversation.
+  // The conversation's own turns, not the loaded window's. Grouping is what the
+  // window can answer; the number each turn carries and the words it is named
+  // by are facts about the conversation, and come from the recording (#86).
+  const recorded = transcript.recordedTurns;
   const turns = React.useMemo(
-    () => groupTurns(messages, chatState),
+    () => reconcileTurns(groupTurns(messages, chatState), recorded),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [messages, version, chatState],
+    [messages, version, chatState, recorded],
   );
   // The index lists the conversation, not the part of it this browser holds:
-  // the recorded run of turns with the live ones laid over it (#86). Derived
-  // rather than stored, like the turns themselves.
+  // the recorded run of turns with the live ones laid over it.
   const indexRows = React.useMemo(
-    () => turnIndexRows(controller.recordedTurns?.turns ?? [], turns),
+    () => turnIndexRows(recorded, turns),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [controller, turns, version],
+    [recorded, turns, version],
   );
   const [selectedTurnId, setSelectedTurnId] = React.useState<string | null>(null);
   const lastTurnId = turns.length ? turns[turns.length - 1].id : '';

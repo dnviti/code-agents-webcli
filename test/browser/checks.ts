@@ -2305,14 +2305,13 @@ async function checkTheTurnIndexListsTheWholeConversation(): Promise<void> {
       runtime: 'claude',
       state: 'idle',
       capabilities: { streaming: true, questions: false },
+      // The replay landed *inside* the last turn, which is what a reload of a
+      // long conversation actually gives you: the ask that opened it is not in
+      // the window, only the answer to it.
       messages: [
         {
-          id: 'u40', seq: 79, turnId: 't40', role: 'user', ts: 79,
-          blocks: [{ kind: 'text', text: 'and now the changelog' }],
-        },
-        {
           id: 'a40', seq: 80, turnId: 't40', role: 'assistant', ts: 80,
-          blocks: [{ kind: 'text', text: 'done' }],
+          blocks: [{ kind: 'text', text: 'the discovery that simplified it' }],
         },
       ],
       pendingPermissions: [],
@@ -2336,7 +2335,8 @@ async function checkTheTurnIndexListsTheWholeConversation(): Promise<void> {
     id: `u${i + 1}`,
     turnId: `t${i + 1}`,
     index: i + 1,
-    label: i === 0 ? 'set up the parser' : `ask ${i + 1}`,
+    label:
+      i === 0 ? 'set up the parser' : i === 39 ? 'and now the changelog' : `ask ${i + 1}`,
     startedAt: (i + 1) * 1000,
     outcome: 'done',
   }));
@@ -2366,6 +2366,28 @@ async function checkTheTurnIndexListsTheWholeConversation(): Promise<void> {
   );
   await wait(400);
 
+  // The number on the strip over the conversation, which is what a reload
+  // actually shows you: holding the last turn of forty, it must say 40. It said
+  // "TURN 1" until the whole history had been paged in, because the number came
+  // from the position in the loaded window rather than from the conversation.
+  // Read off the strip itself rather than the page text: the index panel also
+  // shows a count, and a check that matched anywhere would pass on that.
+  const strip = frame.querySelector('[data-turn-id]');
+  const stripText = (strip?.textContent || '').replace(/\s+/g, ' ');
+  const foldLabel = strip
+    ?.querySelector('[aria-label^="Collapse turn"], [aria-label^="Expand turn"]')
+    ?.getAttribute('aria-label');
+  check(
+    'the turn on screen is numbered by the conversation, not by the window',
+    foldLabel === 'Collapse turn 40' || foldLabel === 'Expand turn 40',
+    foldLabel || 'no turn strip on screen',
+  );
+  check(
+    'the conversation is on screen under that number',
+    stripText.length > 0,
+    stripText.slice(0, 80) || 'the strip is empty',
+  );
+
   const list = frame.querySelector('[aria-label="Conversation turns"]');
   const rows = list ? Array.from(list.querySelectorAll('[role="option"]')) : [];
   check(
@@ -2383,8 +2405,11 @@ async function checkTheTurnIndexListsTheWholeConversation(): Promise<void> {
     (rows[1]?.textContent || '').includes('no prompt'),
     (rows[1]?.textContent || '').slice(0, 80) || 'no second row',
   );
+  // The turn on screen, whose opening ask is not in the window. It reads "no
+  // prompt" if the label is taken from the loaded messages — which is what the
+  // index showed for the turn the user was looking at (#86).
   check(
-    'the turn the browser is holding is titled with what was asked',
+    'a half-loaded turn is titled from the recording, not "no prompt"',
     (rows[39]?.textContent || '').includes('and now the changelog'),
     (rows[39]?.textContent || '').slice(0, 80) || 'no last row',
   );

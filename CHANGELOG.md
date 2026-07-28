@@ -36,6 +36,16 @@
   reported one — reading a silent runtime as zero would have put it at the top
   of every efficiency comparison on the page for having said nothing at all.
 
+- **A turn is numbered by the conversation, not by what the browser has
+  loaded.** (#86) Reloading a page landed on the last turn of a long
+  conversation and called it "Turn 1", and it stayed 1 until enough history had
+  been paged back in for the count to come right by accident — so the number on
+  screen was a fact about the loading window rather than about the work. It now
+  reads 49 of 49 on the first paint, and counts back to 48, 47 as older turns
+  arrive. A turn the reload landed *inside* — its opening ask not in the window
+  at all — is named from the recording too, instead of reading "no prompt"
+  beside a question that was asked perfectly clearly and is still on file.
+
 - **The turn index lists the whole conversation, and every entry is named after
   what you asked.** (#86) It was assembled from whatever the browser happened to
   be holding, so a long conversation's index quietly started part way through —

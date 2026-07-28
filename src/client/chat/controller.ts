@@ -75,13 +75,10 @@ export class ChatController {
   /** Request id of the page in flight, or null. */
   private pendingPage: string | null = null;
   /**
-   * The conversation's recorded turns, or null until the server has answered.
-   *
-   * Null is not an empty list: before the answer arrives — and on any server
-   * that cannot supply one — the index falls back to the turns this browser
-   * holds, which is what it always showed.
+   * False once the server says the head of the log was trimmed, so the recorded
+   * index cannot reach the conversation's own first turn.
    */
-  private turnIndex: { turns: ChatTurnIndexEntry[]; complete: boolean } | null = null;
+  private turnIndexComplete = true;
   private pageTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Set while the conversation is readable but has nothing running it. */
@@ -190,15 +187,24 @@ export class ChatController {
       case 'chat_event': {
         const event = message.event as ChatEvent | undefined;
         if (event) this.transcript.apply(event);
+        // `/clear` replaces the conversation in this tab, so the index of the
+        // one it replaced is not an index of anything on screen. Dropped and
+        // asked for again rather than patched: the server reads it from the
+        // log, which is where the boundary is recorded.
+        if (event && event.t === 'marker' && event.kind === 'cleared') {
+          this.transcript.setRecordedTurns([]);
+          this.requestTurnIndex();
+        }
         return true;
       }
 
       case 'chat_turn_index': {
         const turns = message.turns as ChatTurnIndexEntry[] | undefined;
-        this.turnIndex = {
-          turns: Array.isArray(turns) ? turns : [],
-          complete: message.complete !== false,
-        };
+        // Onto the transcript, not held here: it has to travel on the version
+        // counter the views subscribe to, or it lands after every memo that
+        // would read it has already been computed (#86).
+        this.transcript.setRecordedTurns(Array.isArray(turns) ? turns : []);
+        this.turnIndexComplete = message.complete !== false;
         this.options.onChange?.();
         return true;
       }
@@ -435,9 +441,9 @@ export class ChatController {
     });
   }
 
-  /** Every turn of this conversation as recorded, or null if none was served. */
-  get recordedTurns(): { turns: ChatTurnIndexEntry[]; complete: boolean } | null {
-    return this.turnIndex;
+  /** Whether the recorded index reaches the conversation's first turn. */
+  get recordedTurnsComplete(): boolean {
+    return this.turnIndexComplete;
   }
 
   private requestTurnIndex(): void {

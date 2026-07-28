@@ -685,6 +685,10 @@ export class ChatStore implements ChatStoreLike {
       };
 
       let pending: { turn: PersistedTurn; msgId: string } | null = null;
+      // Set once a `/clear` has cut the log: what is left starts at turn 1 by
+      // construction, so nothing is missing however far back the log was
+      // trimmed.
+      let cleared = false;
       await this.scanLog(base, state, (event) => {
         switch (event.t) {
           case 'msg_start': {
@@ -706,6 +710,20 @@ export class ChatStore implements ChatStoreLike {
             pending = null;
             return;
           }
+          case 'marker': {
+            // `/clear` starts a new conversation in the same tab, and the log
+            // is append-only — everything before this belongs to the one the
+            // user left. The transcript stops paging back here, so the index
+            // has to start again here too, or it would list forty turns a
+            // browser can never be shown (#86, #43).
+            if (event.kind === 'cleared') {
+              turns.length = 0;
+              openTurnId = null;
+              pending = null;
+              cleared = true;
+            }
+            return;
+          }
           case 'turn_end': {
             const turn = turns[turns.length - 1];
             if (turn && turn.turnId === event.turnId) {
@@ -720,7 +738,7 @@ export class ChatStore implements ChatStoreLike {
         }
       });
 
-      return { turns, firstSeq: stats.firstSeq, complete: stats.firstSeq <= 1 };
+      return { turns, firstSeq: stats.firstSeq, complete: cleared || stats.firstSeq <= 1 };
     });
   }
 

@@ -273,6 +273,94 @@ describe('groupTurns', function () {
   });
 });
 
+describe('reconcileTurns', function () {
+  // The defect from the screenshot: reload a 49-turn conversation, the browser
+  // holds the tail, and the strip says "Turn 1". The number is a fact about the
+  // conversation, not about the window a browser happens to be looking through.
+  const recorded = (count) =>
+    Array.from({ length: count }, (_, i) => ({
+      id: `u${i + 1}`,
+      turnId: `t${i + 1}`,
+      index: i + 1,
+      label: `ask ${i + 1}`,
+      outcome: 'done',
+    }));
+
+  it('numbers a loaded turn by where it sits in the conversation', function () {
+    // One turn loaded out of forty-nine, and it is the forty-ninth.
+    const messages = [
+      msg('user', [text('the last thing')], { turnId: 't49' }),
+      msg('assistant', [text('done')], { turnId: 't49' }),
+    ];
+    const turns = mod.reconcileTurns(mod.groupTurns(messages, 'idle'), recorded(49));
+    assert.strictEqual(turns.length, 1);
+    assert.strictEqual(turns[0].index, 49, 'the strip must say 49, not 1');
+  });
+
+  it('counts back as older turns are paged in', function () {
+    const messages = [
+      msg('user', [text('the one before')], { turnId: 't48' }),
+      msg('user', [text('the last thing')], { turnId: 't49' }),
+    ];
+    const turns = mod.reconcileTurns(mod.groupTurns(messages, 'idle'), recorded(49));
+    assert.deepStrictEqual(turns.map((t) => t.index), [48, 49]);
+  });
+
+  it('names a half-loaded turn from the recording, not "no prompt"', function () {
+    // The replay landed inside the turn, so the ask is not in the window — but
+    // it is on file, and the index is scanned for exactly that ask.
+    const messages = [msg('assistant', [text('picking up where we left off')], { turnId: 't49' })];
+    const turns = mod.reconcileTurns(mod.groupTurns(messages, 'idle'), recorded(49));
+    assert.strictEqual(turns[0].label, 'ask 49');
+  });
+
+  it('continues past the end for a turn newer than the index', function () {
+    // The turn being typed into is not in a list fetched before it existed.
+    const messages = [
+      msg('user', [text('the last thing')], { turnId: 't49' }),
+      msg('user', [text('and one more')], { turnId: 't50' }),
+    ];
+    const turns = mod.reconcileTurns(mod.groupTurns(messages, 'idle'), recorded(49));
+    assert.deepStrictEqual(turns.map((t) => t.index), [49, 50]);
+  });
+
+  it('leaves the turns alone when no recording has arrived', function () {
+    const messages = [msg('user', [text('one')]), msg('user', [text('two')])];
+    const grouped = mod.groupTurns(messages, 'idle');
+    assert.deepStrictEqual(
+      mod.reconcileTurns(grouped, null).map((t) => t.index),
+      [1, 2],
+    );
+    assert.deepStrictEqual(
+      mod.reconcileTurns(grouped, []).map((t) => t.index),
+      [1, 2],
+    );
+  });
+});
+
+describe('turnIndexRows', function () {
+  it('lists every recorded turn, marking which are held', function () {
+    const recorded = [
+      { id: 'u1', turnId: 't1', index: 1, label: 'first', outcome: 'done' },
+      { id: 'u2', turnId: 't2', index: 2, label: 'second', outcome: 'failed' },
+    ];
+    const live = mod.groupTurns([msg('user', [text('second')], { turnId: 't2' })], 'idle');
+    const rows = mod.turnIndexRows(recorded, live);
+
+    assert.deepStrictEqual(rows.map((r) => r.index), [1, 2]);
+    assert.deepStrictEqual(rows.map((r) => r.loaded), [false, true]);
+    assert.deepStrictEqual(rows.map((r) => r.label), ['first', 'second']);
+    assert.strictEqual(rows[1].status, 'done', 'a loaded turn’s live status wins');
+  });
+
+  it('falls back to the loaded turns when nothing was recorded', function () {
+    const live = mod.groupTurns([msg('user', [text('only this')])], 'idle');
+    const rows = mod.turnIndexRows(null, live);
+    assert.deepStrictEqual(rows.map((r) => r.label), ['only this']);
+    assert.strictEqual(rows[0].loaded, true);
+  });
+});
+
 describe('turnOf', function () {
   it('finds the turn a message belongs to', function () {
     const messages = [

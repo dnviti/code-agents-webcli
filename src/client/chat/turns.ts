@@ -41,7 +41,21 @@ export const STATUS_GLYPH: Record<TurnStatus, { icon: string; color: string; spi
 export interface TurnSummary {
   /** Id of the message that opened the turn — the user's, where there is one. */
   id: string;
-  /** 1-based display number. */
+  /**
+   * The turn's own id, as the session stamped it.
+   *
+   * What the recorded conversation is matched on, and it has to be: a turn only
+   * half loaded opens on whatever message the replay reached first, which is
+   * routinely the agent's rather than the user's, so the opening *message* id is
+   * not stable enough to identify a turn by.
+   */
+  turnId: string;
+  /**
+   * 1-based number of this turn in the conversation.
+   *
+   * The conversation's, not the loaded window's — see `reconcileTurns`. A
+   * browser holding the last turn of forty-nine says 49.
+   */
   index: number;
   /** First line of the user's text, trimmed. */
   label: string;
@@ -173,6 +187,7 @@ function summarise(
 
   return {
     id: opener ? opener.id : `turn-${index}`,
+    turnId: opener ? opener.turnId : `turn-${index}`,
     index,
     label: labelFor(group),
     status,
@@ -281,6 +296,64 @@ function firstText(message: ChatMessage): string {
 }
 
 /**
+ * What the recorded conversation says about one turn. See `ChatTurnIndexEntry`.
+ *
+ * Structural rather than the imported type so this file stays free of the wire
+ * vocabulary, and so a caller with no index at all can pass an empty list.
+ */
+export interface RecordedTurn {
+  id: string;
+  turnId: string;
+  index: number;
+  label: string | null;
+  outcome: TurnOutcome | null;
+}
+
+/**
+ * Number and name the loaded turns from the conversation they belong to.
+ *
+ * A browser holds a window, not a conversation, and everything derived from
+ * that window inherits its edges. Numbering was one of them: a reload landed on
+ * the last turn of forty-nine and called it "Turn 1", and it stayed 1 until
+ * enough history had been paged in for the count to be right by accident. The
+ * number is a fact about the conversation, so it is read from the conversation.
+ *
+ * Labels come back the same way. A turn only half loaded opens on whatever
+ * message the replay reached first — routinely the agent's — so it has no user
+ * text in the window to be named from and read as "no prompt" beside a question
+ * that was asked perfectly clearly, and is still on file.
+ *
+ * Matched on `turnId` for the same reason: the opening *message* of a partly
+ * loaded turn is not the message that opened it.
+ *
+ * With no recorded index — it has not arrived yet, or the server is older than
+ * this page — the turns are returned exactly as they came, which is the
+ * positional numbering this has always had.
+ */
+export function reconcileTurns(
+  turns: TurnSummary[],
+  recorded: ReadonlyArray<RecordedTurn> | null,
+): TurnSummary[] {
+  if (!recorded || recorded.length === 0) return turns;
+  const byTurnId = new Map(recorded.map((turn) => [turn.turnId, turn]));
+
+  // Turns the index has not heard of are the ones that happened since it was
+  // fetched — the turn being typed into, most of all. They continue from
+  // whatever came before them rather than restarting at 1.
+  let next = 0;
+  return turns.map((turn) => {
+    const known = byTurnId.get(turn.turnId);
+    const index = known ? known.index : next + 1;
+    next = index;
+    // The live label wins only where the recording has none: a turn still being
+    // typed is not in the index yet, and one recorded without a prompt did not
+    // have one.
+    const label = known?.label ?? (turn.label === NO_PROMPT_LABEL ? NO_PROMPT_LABEL : turn.label);
+    return index === turn.index && label === turn.label ? turn : { ...turn, index, label };
+  });
+}
+
+/**
  * One row of the index beside a conversation.
  *
  * Less than a `TurnSummary` on purpose: most of a conversation is not loaded,
@@ -289,11 +362,16 @@ function firstText(message: ChatMessage): string {
  * counts, durations and spend need the messages and stay on `TurnSummary`.
  */
 export interface TurnIndexRow {
+  /**
+   * What selecting the row goes to: the opening message, as loaded where the
+   * turn is loaded and as recorded where it is not — which is also the message
+   * paging back has to reach, so one field says both.
+   */
   id: string;
   index: number;
   label: string;
   status: TurnStatus;
-  /** False for a turn that is recorded but not held by this browser yet. */
+  /** False when the turn is recorded but not held by this browser yet. */
   loaded: boolean;
 }
 
@@ -311,33 +389,37 @@ export interface TurnIndexRow {
  * exactly what the index showed before, rather than to nothing.
  */
 export function turnIndexRows(
-  persisted: ReadonlyArray<{ id: string; index: number; label: string | null; outcome: TurnOutcome | null }>,
+  recorded: ReadonlyArray<RecordedTurn> | null,
   live: TurnSummary[],
 ): TurnIndexRow[] {
-  const byId = new Map(live.map((turn) => [turn.id, turn]));
+  const byTurnId = new Map(live.map((turn) => [turn.turnId, turn]));
   const rows: TurnIndexRow[] = [];
   const seen = new Set<string>();
 
-  for (const turn of persisted) {
-    seen.add(turn.id);
-    const loaded = byId.get(turn.id);
+  for (const turn of recorded ?? []) {
+    seen.add(turn.turnId);
+    const loaded = byTurnId.get(turn.turnId);
     rows.push({
-      id: turn.id,
+      // The loaded turn's opening message where there is one: a turn cut off by
+      // the loading window opens on a different message than the recording says,
+      // and scrolling to a message this browser does not have goes nowhere.
+      id: loaded ? loaded.id : turn.id,
       index: turn.index,
-      // The loaded turn's label wins where there is one: it is read by the same
-      // rule from the same words, and it is the one that updates as a turn the
-      // user is still typing into takes shape.
-      label: loaded ? loaded.label : turn.label ?? NO_PROMPT_LABEL,
+      label: turn.label ?? loaded?.label ?? NO_PROMPT_LABEL,
       status: loaded ? loaded.status : turn.outcome ?? 'done',
       loaded: Boolean(loaded),
     });
   }
 
-  let next = rows.length ? rows[rows.length - 1].index + 1 : 1;
   for (const turn of live) {
-    if (seen.has(turn.id)) continue;
-    rows.push({ id: turn.id, index: next, label: turn.label, status: turn.status, loaded: true });
-    next += 1;
+    if (seen.has(turn.turnId)) continue;
+    rows.push({
+      id: turn.id,
+      index: turn.index,
+      label: turn.label,
+      status: turn.status,
+      loaded: true,
+    });
   }
   return rows;
 }
