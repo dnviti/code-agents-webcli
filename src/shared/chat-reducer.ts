@@ -477,6 +477,14 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         const tool = block as ToolBlock;
         tool.inputPartial = (tool.inputPartial || '') + event.json;
       }
+      // Additive, like the text beside it: a runtime that will not show its
+      // reasoning still counts it out loud as it goes, and the row's size
+      // figure should climb while the model is still thinking rather than
+      // appearing all at once when the block closes.
+      if (event.tokens !== undefined && block.kind === 'thinking') {
+        const thinking = block as ThinkingBlock;
+        thinking.tokens = (thinking.tokens ?? 0) + event.tokens;
+      }
       return { messageIndex: at, structural: false, meta: false, applied: true };
     }
 

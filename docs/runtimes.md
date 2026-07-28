@@ -108,6 +108,33 @@ the app uses. It brings permission prompts, a model list and per-turn cost with
 it, and sessions recorded under the old mode still open — Grok kept the record
 all along; only its headless output was silent about it.
 
+### What the trace shows of the agent's thinking
+
+A reasoning entry sits on the trace rail beside the tool calls, and expanding it
+shows the agent's own words. **How much of them there are to show is the agent's
+decision, not this app's**, and the four runtimes fall into three groups —
+checked one at a time, because one of them working says nothing about the rest.
+
+| Runtime | Hands over | Checked against |
+| --- | --- | --- |
+| pi | the reasoning text, as it is produced | a live run at `--thinking high` |
+| Kimi Code, Oh My Pi | the reasoning text, as ACP thought chunks | live runs |
+| Grok Build | the reasoning text, as ACP thought chunks | its recorded traffic — its own API was erroring when this was written |
+| Claude Code | **the size only** — every thinking block on the wire is empty, with a signature beside it and a running token estimate on a side channel | a live run at `--effort high`, 2.1.220 |
+| Codex | its reasoning summary, where the model produces one. Where the trace is encrypted and nothing was summarised, nothing | its own schema and 22,987 recorded reasoning items, all of them encrypted — the account was over its usage limit |
+
+**An entry never expands onto an empty panel.** Where the text is missing the
+entry says which of the three silences it is: still reasoning, reasoning the
+agent measured but withheld — with the size it reported — or reasoning it said
+nothing about beyond that it happened. The count on a turn's work pill (`2
+reasoning`) counts the thinking that happened, whether or not its text came
+with it.
+
+The size shown beside a withheld block is the runtime's own live estimate and
+is marked `~` for a reason: measured against the same turns' billed thinking
+tokens it runs high (114 against 71, 152 against 118). The figures in **Usage**
+come from the runtime's accounting, never from this estimate.
+
 ### The `/` menu
 
 Typing `/` in the composer — or pressing the **Slash commands and skills**

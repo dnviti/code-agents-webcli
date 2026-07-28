@@ -281,6 +281,7 @@ async function run(): Promise<void> {
   await checkTheUsageWindowReachesBeforeThisYear();
   await checkTheEffortHistogramsAreReadableWithoutAMouse();
   await checkTheFileTreeAndTheShellAreSizedForAThumb();
+  await checkAnExpandedReasoningRowIsNeverEmpty();
   await checkAWaitingConversationIsVisibleWithoutOpeningIt();
 
   const pre = document.createElement('pre');
@@ -7621,6 +7622,144 @@ async function checkTheEffortHistogramsAreReadableWithoutAMouse(): Promise<void>
   root.unmount();
   frame.remove();
   window.fetch = realFetch;
+}
+
+/**
+ * Every reasoning row opens onto something, whichever agent filled it.
+ *
+ * Here rather than in a unit test because the defect *was* a rendered box:
+ * `<Markdown text="">` produces a bordered panel with nothing inside it, which
+ * every assertion about props and blocks passes straight through. What is
+ * checked is what a reader sees — that expanding a reasoning row paints words,
+ * that the collapsed row above it says something, and that the two agree (#120).
+ *
+ * The three rows are the three shapes reasoning arrives in, taken from what the
+ * runtimes were watched doing: text (pi, grok, kimi, omp), no text with a
+ * reported size (claude), and no text at all (a codex item whose trace is
+ * encrypted and which summarised nothing).
+ */
+async function checkAnExpandedReasoningRowIsNeverEmpty(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1280px;height:820px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('reasoning-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'reasoning-check',
+    snapshot: {
+      sessionId: 'reasoning-check', runtime: 'claude', state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true, commands: [],
+      },
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'how many sheep are left?' }],
+        },
+        {
+          id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: Date.now(),
+          blocks: [
+            { kind: 'thinking', text: 'ALL-BUT-NINE is the trap in this riddle.' },
+            { kind: 'thinking', text: '', tokens: 135 },
+            { kind: 'thinking', text: '' },
+            { kind: 'text', text: 'nine' },
+          ],
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/home/dev/project',
+      branch: 'main',
+      view: { ...DEFAULT_CHAT_VIEW, activityFilter: 'reasoning' },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  const rail = host.querySelector('[aria-label="Activity"]') as HTMLElement;
+  const rows = (): HTMLElement[] =>
+    Array.from(rail.querySelectorAll<HTMLElement>('button[aria-expanded]'));
+
+  check(
+    'all three reasoning rows are on the rail',
+    rows().length === 3,
+    `${rows().length} rows: ${rows().map((r) => (r.textContent || '').slice(0, 30)).join(' | ')}`,
+  );
+
+  // Every collapsed row says something before it is opened — the preview line
+  // is the only thing a reader has when deciding whether to expand it.
+  const previews = rows().map((row) => (row.textContent || '').replace(/\s+/g, ' ').trim());
+  check(
+    'the row with reasoning text previews it',
+    (previews[0] || '').includes('ALL-BUT-NINE'),
+    previews[0] || '(nothing)',
+  );
+  check(
+    'the row with no text says so instead of showing a bare label',
+    /text not reported/.test(previews[1] || '') && /135/.test(previews[1] || ''),
+    previews[1] || '(nothing)',
+  );
+  check(
+    'and so does the row that reported nothing at all',
+    /text not reported/.test(previews[2] || ''),
+    previews[2] || '(nothing)',
+  );
+
+  for (const [at, name] of [[0, 'with text'], [1, 'with a size only'], [2, 'with nothing']] as Array<[number, string]>) {
+    rows()[at].click();
+    await wait(120);
+  }
+  await wait(200);
+
+  const bodies = Array.from(rail.querySelectorAll<HTMLElement>('[data-testid="reasoning-body"]'));
+  check(
+    'expanding a reasoning row opens a panel for each',
+    bodies.length === 3,
+    `${bodies.length} panels`,
+  );
+
+  bodies.forEach((body, at) => {
+    const painted = paintedText(body);
+    const words = painted.map((entry) => entry.text).join(' ').trim();
+    check(
+      `reasoning row ${at + 1} of 3 shows words rather than an empty box`,
+      words.length > 0 && body.getBoundingClientRect().height > 0,
+      `"${words.slice(0, 90)}" h=${Math.round(body.getBoundingClientRect().height)}`,
+    );
+  });
+
+  const said = (at: number): string =>
+    paintedText(bodies[at]).map((entry) => entry.text).join(' ');
+  check(
+    'the agent’s own reasoning is what is shown where there is any',
+    said(0).includes('ALL-BUT-NINE'),
+    said(0).slice(0, 90),
+  );
+  check(
+    'a withheld reasoning block says it was withheld, and how much of it there was',
+    /not the text of it/.test(said(1)) && /135/.test(said(1)),
+    said(1).slice(0, 120),
+  );
+  check(
+    'a block the agent said nothing about is explained rather than blank',
+    /reasoned here, but not the text of it/.test(said(2)),
+    said(2).slice(0, 120),
+  );
+
+  root.unmount();
+  host.remove();
 }
 
 /**

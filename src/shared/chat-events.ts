@@ -125,6 +125,23 @@ export interface ThinkingBlock {
   text: string;
   /** Some runtimes stream a signature alongside; kept for fidelity, unused in UI. */
   signature?: string;
+  /**
+   * How much reasoning the runtime said this block holds, in its own estimate.
+   *
+   * The field exists for the runtimes that report *that* the model reasoned
+   * without handing over a word of it. Claude Code is the one measured here: as
+   * of 2.1.220 every `thinking` block on the wire carries `"thinking": ""` and a
+   * signature, and the only description of what was thought is a running token
+   * estimate on the side. So a reasoning entry either has text or has this, and
+   * the UI renders whichever it was given rather than an empty box (#120).
+   *
+   * An estimate, and named as one: measured against the same turn's billed
+   * `thinking_tokens` it runs high (114 reported against 71 billed, 152 against
+   * 118), because it is a live count made while the block is still open. Shown
+   * with a `~` for that reason. It is never a substitute for the usage figures —
+   * those come from the runtime's own accounting and are what the meter reads.
+   */
+  tokens?: number;
 }
 
 export interface ToolBlock {
@@ -686,9 +703,20 @@ export type ChatEvent =
   | { t: 'block_start'; seq: number; ts: number; msgId: string; index: number; block: ChatBlock }
   /**
    * Append to an open block. `text` extends a text/thinking block; `json`
-   * extends a tool block's streaming arguments.
+   * extends a tool block's streaming arguments; `tokens` adds to a thinking
+   * block's reported size, for a runtime that reports the size of reasoning it
+   * will not show (see `ThinkingBlock.tokens`).
    */
-  | { t: 'block_delta'; seq: number; ts: number; msgId: string; index: number; text?: string; json?: string }
+  | {
+      t: 'block_delta';
+      seq: number;
+      ts: number;
+      msgId: string;
+      index: number;
+      text?: string;
+      json?: string;
+      tokens?: number;
+    }
   | { t: 'block_end'; seq: number; ts: number; msgId: string; index: number; block?: Partial<ChatBlock> }
   | { t: 'msg_end'; seq: number; ts: number; msgId: string; stopReason?: string; usage?: ChatUsage }
   /**
