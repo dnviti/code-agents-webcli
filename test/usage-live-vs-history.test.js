@@ -265,7 +265,7 @@ describe('a job’s tokens: what the chat showed against what was filed', functi
     const { rows, store } = recordedRow(dir, 'claude', events);
     const dashboard = store.dashboard({ userId: 7, scope: 'self', period: 'month' }, false);
     assert.strictEqual(dashboard.totals.totalTokens, rows[0].totalTokens);
-    assert.strictEqual(dashboard.totals.tokensReportedJobs, 1);
+    assert.strictEqual(dashboard.totals.tokensReportedTurns, 1);
     // And the breakdowns, which are what a user compares agents and projects by.
     const byAgent = dashboard.byAgent.find((entry) => entry.key === 'claude');
     assert.strictEqual(byAgent.totals.totalTokens, rows[0].totalTokens);

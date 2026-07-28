@@ -5,7 +5,14 @@ import { ChatController, type ChatUnavailable } from '../../chat/controller.js';
 import { fetchStatus, findFiles } from '../../chat/workspace-api.js';
 import { activityEvents } from '../../chat/activity.js';
 import type { ChatTranscript } from '../../chat/transcript.js';
-import { groupTurns, isTurnOpen, turnOf, type TurnSummary } from '../../chat/turns.js';
+import {
+  groupTurns,
+  isTurnOpen,
+  reconcileTurns,
+  turnIndexRows,
+  turnOf,
+  type TurnSummary,
+} from '../../chat/turns.js';
 import type { ChatPanelId, ChatViewSettings } from '../../chat/view-settings.js';
 import {
   DEFAULT_CHAT_VIEW,
@@ -188,18 +195,34 @@ export function ChatView({
   // Derived per render and memoised on the version counter, never stored.
   // Turn grouping is a view of the transcript, and a second copy of it in state
   // is a second thing that can be wrong about the conversation.
+  // The conversation's own turns, not the loaded window's. Grouping is what the
+  // window can answer; the number each turn carries and the words it is named
+  // by are facts about the conversation, and come from the recording (#86).
+  const recorded = transcript.recordedTurns;
   const turns = React.useMemo(
-    () => groupTurns(messages, chatState),
+    () => reconcileTurns(groupTurns(messages, chatState), recorded),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [messages, version, chatState],
+    [messages, version, chatState, recorded],
+  );
+  // The index lists the conversation, not the part of it this browser holds:
+  // the recorded run of turns with the live ones laid over it.
+  const indexRows = React.useMemo(
+    () => turnIndexRows(recorded, turns),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [recorded, turns, version],
   );
   const [selectedTurnId, setSelectedTurnId] = React.useState<string | null>(null);
   const lastTurnId = turns.length ? turns[turns.length - 1].id : '';
   // A selection that no longer exists — the conversation was cleared, or the
   // turn scrolled out of the loaded window — falls back to the newest rather
   // than leaving the index highlighting nothing.
+  // Checked against the index rather than the loaded turns: choosing an entry
+  // from before what is held is the case the index exists for, and a guard that
+  // only knew the loaded ones dropped the highlight the instant it was set
+  // (#86). A selection that is in neither — the conversation was cleared —
+  // still falls back to the newest rather than highlighting nothing.
   const currentTurnId =
-    selectedTurnId && turns.some((turn) => turn.id === selectedTurnId)
+    selectedTurnId && indexRows.some((row) => row.id === selectedTurnId)
       ? selectedTurnId
       : lastTurnId;
 
@@ -364,9 +387,18 @@ export function ChatView({
       // immediately — only a jump *inside* a turn's body needs to wait for it
       // to open first. See revealMessage.
       openTurn(id);
-      list.current?.scrollToTurn(id);
+      if (messages.some((message) => message.id === id)) {
+        list.current?.scrollToTurn(id);
+        return;
+      }
+      // An entry from before what is loaded. The index lists the whole
+      // conversation, so choosing one has to fetch it rather than quietly do
+      // nothing — the scroll waits until it is actually here.
+      void controller.loadUntilLoaded(id).then((here) => {
+        if (here) list.current?.scrollToTurn(id);
+      });
     },
-    [openTurn],
+    [openTurn, controller, messages],
   );
 
   const jumpLatest = React.useCallback(() => {
@@ -643,7 +675,7 @@ export function ChatView({
             whole conversation would have to tab past every message in it. */}
         {indexVisible ? (
           <TurnIndex
-            turns={turns}
+            turns={indexRows}
             currentTurnId={currentTurnId}
             onSelect={selectTurn}
             onJumpLatest={jumpLatest}
@@ -953,7 +985,7 @@ export function ChatView({
           >
             <div style={{ display: 'flex', boxShadow: 'var(--shadow-lg)' }}>
               <TurnIndex
-                turns={turns}
+                turns={indexRows}
                 currentTurnId={currentTurnId}
                 onSelect={(id) => {
                   setIndexSheet(false);

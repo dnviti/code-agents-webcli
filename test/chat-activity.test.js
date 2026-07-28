@@ -43,9 +43,14 @@ after(function () {
 
 let seq = 0;
 
+// A user message opens a turn and the agent's reply carries the same id, which
+// is how an adapter stamps them and how turns are grouped (#86).
+let turn = 0;
+
 function msg(role, blocks, extra = {}) {
   seq += 1;
-  return { id: `m${seq}`, seq, turnId: 't1', role, ts: seq * 1000, blocks, ...extra };
+  if (role === 'user' && extra.turnId === undefined) turn += 1;
+  return { id: `m${seq}`, seq, turnId: `t${turn}`, role, ts: seq * 1000, blocks, ...extra };
 }
 
 function tool(overrides = {}) {
@@ -62,6 +67,7 @@ function tool(overrides = {}) {
 
 beforeEach(function () {
   seq = 0;
+  turn = 0;
 });
 
 describe('activityEvents', function () {

@@ -2,6 +2,7 @@ import {
   ChatAttachment,
   ChatEvent,
   ChatSnapshot,
+  ChatTurnIndexEntry,
   QueuedTurn,
   NO_CHAT_CAPABILITIES,
 } from '../../shared/chat-events.js';
@@ -73,6 +74,11 @@ export class ChatController {
   private nextRequestId = 1;
   /** Request id of the page in flight, or null. */
   private pendingPage: string | null = null;
+  /**
+   * False once the server says the head of the log was trimmed, so the recorded
+   * index cannot reach the conversation's own first turn.
+   */
+  private turnIndexComplete = true;
   private pageTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Set while the conversation is readable but has nothing running it. */
@@ -117,6 +123,9 @@ export class ChatController {
         if (!snapshot) return true;
         this.settlePage();
         this.transcript.hydrate(snapshot);
+        // Asked for once per open. The list only grows at the end, and the end
+        // is the part this browser is certain to be holding.
+        this.requestTurnIndex();
         this.modelOverride =
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
         this.options.onChange?.();
@@ -178,6 +187,31 @@ export class ChatController {
       case 'chat_event': {
         const event = message.event as ChatEvent | undefined;
         if (event) this.transcript.apply(event);
+        // `/clear` replaces the conversation in this tab, so the index of the
+        // one it replaced is not an index of anything on screen. Dropped and
+        // asked for again rather than patched: the server reads it from the
+        // log, which is where the boundary is recorded.
+        if (event && event.t === 'marker' && event.kind === 'cleared') {
+          this.transcript.setRecordedTurns([]);
+          this.requestTurnIndex();
+        }
+        return true;
+      }
+
+      case 'chat_turn_index': {
+        const turns = message.turns as ChatTurnIndexEntry[] | undefined;
+        // Onto the transcript, not held here: it has to travel on the version
+        // counter the views subscribe to, or it lands after every memo that
+        // would read it has already been computed (#86).
+        this.transcript.setRecordedTurns(Array.isArray(turns) ? turns : []);
+        this.turnIndexComplete = message.complete !== false;
+        this.options.onChange?.();
+        return true;
+      }
+
+      case 'chat_turn_index_failed': {
+        // Nothing to recover: the index falls back to the turns this browser
+        // holds, which is what it showed before there was a recorded one.
         return true;
       }
 
@@ -407,6 +441,61 @@ export class ChatController {
     });
   }
 
+  /** Whether the recorded index reaches the conversation's first turn. */
+  get recordedTurnsComplete(): boolean {
+    return this.turnIndexComplete;
+  }
+
+  private requestTurnIndex(): void {
+    this.send({
+      type: 'chat_turn_index_request',
+      requestId: `chat-turns-${this.nextRequestId++}`,
+    });
+  }
+
+  /**
+   * Page back until a turn is held, or until there is no more history.
+   *
+   * The index lists the whole conversation, so selecting an entry from before
+   * what is loaded has to fetch it rather than quietly do nothing — which is
+   * what "selecting an older one should take the user there" means (#86).
+   *
+   * Bounded by `hasMore` and by a page ceiling, because the alternative is a
+   * loop that reads a whole conversation into a browser to answer a click. A
+   * request that runs out of pages resolves false and the caller leaves the
+   * selection where it was.
+   */
+  async loadUntilLoaded(messageId: string, maxPages = 20): Promise<boolean> {
+    for (let page = 0; page < maxPages; page++) {
+      if (this.transcript.messages.some((message) => message.id === messageId)) return true;
+      if (!this.transcript.hasMore) return false;
+      // One page at a time, awaited: `loadMore` is guarded against overlapping
+      // requests, so firing them in parallel would fetch one page and drop the
+      // rest on the floor.
+      const settled = await this.nextPage();
+      if (!settled) return false;
+    }
+    return this.transcript.messages.some((message) => message.id === messageId);
+  }
+
+  /**
+   * One page, resolved when its reply lands or its timeout fires.
+   *
+   * A page already in flight is joined rather than refused. Scrolling to the
+   * top of a short transcript fetches one on its own, so a click on the index
+   * arriving in that window would otherwise give up on the first step and go
+   * nowhere — which looks exactly like the index not being wired up at all.
+   */
+  private nextPage(): Promise<boolean> {
+    if (!this.transcript.loadingMore && !this.transcript.hasMore) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      this.pageWaiters.push(resolve);
+      if (!this.transcript.loadingMore) this.loadMore();
+    });
+  }
+
+  private pageWaiters: Array<(settled: boolean) => void> = [];
+
   get isLoadingMore(): boolean {
     return this.transcript.loadingMore;
   }
@@ -419,6 +508,9 @@ export class ChatController {
     }
     this.pendingPage = null;
     this.transcript.setLoadingMore(false);
+    const waiters = this.pageWaiters;
+    this.pageWaiters = [];
+    for (const resolve of waiters) resolve(true);
   }
 
   /** Every outgoing message names its session; a browser drives several. */

@@ -39,7 +39,7 @@ function job(overrides = {}) {
     endedAt: '2024-01-15T02:00:00.000Z',
     durationMs: 60_000,
     outcome: 'completed',
-    turns: 2,
+    modelTurns: 2,
     toolCalls: 3,
     inputTokens: 100,
     outputTokens: 50,
@@ -139,7 +139,7 @@ describe('usage is accounted per chat tab', function () {
       assert.strictEqual(total, 1);
       assert.strictEqual(conversations.length, 1);
       assert.strictEqual(conversations[0].sessionId, 'tab-1');
-      assert.strictEqual(conversations[0].totals.jobs, 6);
+      assert.strictEqual(conversations[0].totals.turns, 6);
     });
 
     it("adds up to everything spent in it", function () {
@@ -173,7 +173,7 @@ describe('usage is accounted per chat tab', function () {
 
       const { conversations, total } = store.conversations({ userId: 7, scope: 'self' });
       assert.strictEqual(total, 1, 'still one conversation, not one per reset');
-      assert.strictEqual(conversations[0].totals.jobs, 4);
+      assert.strictEqual(conversations[0].totals.turns, 4);
       assert.strictEqual(
         round(conversations[0].totals.costUsd),
         round(jobs.reduce((sum, j) => sum + (j.costUsd ?? 0), 0)),
@@ -215,7 +215,7 @@ describe('usage is accounted per chat tab', function () {
 
       const { conversations } = store.conversations({ userId: 1, scope: 'self' });
       assert.strictEqual(conversations.length, 1);
-      assert.strictEqual(conversations[0].totals.jobs, 2);
+      assert.strictEqual(conversations[0].totals.turns, 2);
     });
 
     it('agrees with the headline totals, with nothing counted twice or dropped', function () {
@@ -230,20 +230,20 @@ describe('usage is accounted per chat tab', function () {
       const { conversations } = store.conversations({ userId: 1, scope: 'self' });
       const summed = conversations.reduce(
         (acc, c) => ({
-          jobs: acc.jobs + c.totals.jobs,
+          turns: acc.turns + c.totals.turns,
           costUsd: acc.costUsd + c.totals.costUsd,
           totalTokens: acc.totalTokens + c.totals.totalTokens,
         }),
-        { jobs: 0, costUsd: 0, totalTokens: 0 },
+        { turns: 0, costUsd: 0, totalTokens: 0 },
       );
 
-      assert.strictEqual(summed.jobs, dashboard.totals.jobs);
+      assert.strictEqual(summed.turns, dashboard.totals.turns);
       assert.strictEqual(round(summed.costUsd), round(dashboard.totals.costUsd));
       assert.strictEqual(summed.totalTokens, dashboard.totals.totalTokens);
 
       // And the breakdowns, which are the same rows grouped another way.
-      const byAgent = dashboard.byAgent.reduce((sum, row) => sum + row.totals.jobs, 0);
-      assert.strictEqual(byAgent, summed.jobs);
+      const byAgent = dashboard.byAgent.reduce((sum, row) => sum + row.totals.turns, 0);
+      assert.strictEqual(byAgent, summed.turns);
     });
 
     it('names a conversation the way its tab is named', function () {
@@ -276,7 +276,7 @@ describe('usage is accounted per chat tab', function () {
       const [conversation] = store.conversations({ userId: 1, scope: 'self' }).conversations;
       assert.strictEqual(conversation.sessionId, 'long-gone');
       assert.strictEqual(conversation.name, null);
-      assert.strictEqual(conversation.totals.jobs, 1);
+      assert.strictEqual(conversation.totals.turns, 1);
     });
 
     it('is ordered by when each was last used', function () {
@@ -311,7 +311,7 @@ describe('usage is accounted per chat tab', function () {
       assert.deepStrictEqual(wide.agents, ['claude', 'codex']);
 
       const [narrow] = store.conversations({ userId: 1, scope: 'self', project: 'api' }).conversations;
-      assert.strictEqual(narrow.totals.jobs, 1);
+      assert.strictEqual(narrow.totals.turns, 1);
       assert.deepStrictEqual(narrow.agents, ['claude']);
       assert.deepStrictEqual(narrow.models, ['sonnet']);
     });
@@ -327,7 +327,7 @@ describe('usage is accounted per chat tab', function () {
       }));
 
       const [mine] = store.conversations({ userId: 1, scope: 'self' }).conversations;
-      assert.strictEqual(mine.totals.jobs, 1);
+      assert.strictEqual(mine.totals.turns, 1);
       assert.deepStrictEqual(mine.agents, ['claude']);
       assert.deepStrictEqual(mine.models, ['sonnet']);
     });
@@ -376,7 +376,7 @@ describe('usage is accounted per chat tab', function () {
       assert.strictEqual(body.total, 2);
       assert.strictEqual(body.conversations.length, 2);
       assert.deepStrictEqual(
-        body.conversations.map((c) => c.totals.jobs).sort(),
+        body.conversations.map((c) => c.totals.turns).sort(),
         [1, 2],
       );
     });

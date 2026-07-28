@@ -340,7 +340,7 @@ describe('which model actually ran', () => {
       endedAt: '2026-03-04T10:01:00.000Z',
       durationMs: 60000,
       outcome: 'completed',
-      turns: 4,
+      modelTurns: 4,
       toolCalls: 3,
       inputTokens: 1000,
       outputTokens: 200,
@@ -413,19 +413,21 @@ describe('which model actually ran', () => {
       assert.strictEqual(byModel[0].key, 'claude-opus-5');
       assert.strictEqual(byModel[0].totals.costUsd, 1);
       assert.strictEqual(byModel[0].totals.toolCalls, 3);
-      assert.strictEqual(byModel[0].totals.turns, 4);
+      // One turn, whose runtime said it took four round trips.
+      assert.strictEqual(byModel[0].totals.turns, 1);
+      assert.strictEqual(byModel[0].totals.modelTurns, 4);
     });
 
     it('counts a split job once against each model it touched', () => {
       store.record(job({ models: split }));
-      for (const row of dashboard().byModel) assert.strictEqual(row.totals.jobs, 1);
+      for (const row of dashboard().byModel) assert.strictEqual(row.totals.turns, 1);
     });
 
-    it('takes the runtime own per-model call count as that model turns', () => {
+    it('takes the runtime own per-model call count as that model round trips', () => {
       store.record(job({ models: split }));
       const byModel = dashboard().byModel;
-      assert.strictEqual(byModel.find((row) => row.key === 'claude-opus-5').totals.turns, 3);
-      assert.strictEqual(byModel.find((row) => row.key === 'claude-haiku-4-5').totals.turns, 1);
+      assert.strictEqual(byModel.find((row) => row.key === 'claude-opus-5').totals.modelTurns, 3);
+      assert.strictEqual(byModel.find((row) => row.key === 'claude-haiku-4-5').totals.modelTurns, 1);
     });
 
     it('attributes no tool call to a model nobody said made it', () => {
@@ -436,7 +438,7 @@ describe('which model actually ran', () => {
     it('finds the job when the model asked about only ran as a subagent', () => {
       store.record(job({ models: split }));
       const view = dashboard({ model: 'claude-haiku-4-5' });
-      assert.strictEqual(view.totals.jobs, 1);
+      assert.strictEqual(view.totals.turns, 1);
       const history = store.history({ userId: 1, scope: 'self', model: 'claude-haiku-4-5' });
       assert.strictEqual(history.total, 1);
       assert.strictEqual(history.jobs[0].turnId, 't1');

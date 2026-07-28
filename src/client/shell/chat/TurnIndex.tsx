@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { Icon } from '../../ui/relay/Icon.js';
 import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
-import { STATUS_GLYPH, type TurnSummary } from '../../chat/turns.js';
+import { STATUS_GLYPH, type TurnIndexRow } from '../../chat/turns.js';
 
 /**
  * Every turn in the conversation, as a list you can jump around.
@@ -18,7 +18,8 @@ import { STATUS_GLYPH, type TurnSummary } from '../../chat/turns.js';
  */
 
 export interface TurnIndexProps {
-  turns: TurnSummary[];
+  /** Every turn of the conversation, loaded or not — see `turnIndexRows`. */
+  turns: TurnIndexRow[];
   currentTurnId: string;
   onSelect(id: string): void;
   onJumpLatest(): void;
@@ -44,14 +45,24 @@ export function TurnIndex({
   const listRef = React.useRef<HTMLDivElement | null>(null);
   const isPhone = usePhone();
 
+  // Newest first. The list is read from the top, and the turn you are almost
+  // always looking for is the one that just happened — in a long conversation
+  // the alternative is scrolling to the bottom of the index to reach the thing
+  // already on screen. Only the order changes: a turn keeps the number the
+  // conversation gave it, so the top of the list is 49 and it counts down.
+  const ordered = React.useMemo(() => [...turns].reverse(), [turns]);
+
+  // Arrow keys, Home and End follow what is drawn rather than the clock, so
+  // "down" is down the list. That makes them older, which is the direction the
+  // list now runs in.
   const move = React.useCallback(
     (delta: number) => {
-      if (!turns.length) return;
-      const at = turns.findIndex((turn) => turn.id === currentTurnId);
-      const next = Math.min(turns.length - 1, Math.max(0, (at < 0 ? 0 : at) + delta));
-      onSelect(turns[next].id);
+      if (!ordered.length) return;
+      const at = ordered.findIndex((turn) => turn.id === currentTurnId);
+      const next = Math.min(ordered.length - 1, Math.max(0, (at < 0 ? 0 : at) + delta));
+      onSelect(ordered[next].id);
     },
-    [turns, currentTurnId, onSelect],
+    [ordered, currentTurnId, onSelect],
   );
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>): void => {
@@ -63,10 +74,10 @@ export function TurnIndex({
       move(-1);
     } else if (event.key === 'Home') {
       event.preventDefault();
-      if (turns.length) onSelect(turns[0].id);
+      if (ordered.length) onSelect(ordered[0].id);
     } else if (event.key === 'End') {
       event.preventDefault();
-      if (turns.length) onSelect(turns[turns.length - 1].id);
+      if (ordered.length) onSelect(ordered[ordered.length - 1].id);
     }
   };
 
@@ -141,7 +152,7 @@ export function TurnIndex({
           </p>
         ) : null}
 
-        {turns.map((turn) => (
+        {ordered.map((turn) => (
           <TurnRow
             key={turn.id}
             turn={turn}
@@ -232,7 +243,7 @@ function TurnRow({
   collapsed,
   onSelect,
 }: {
-  turn: TurnSummary;
+  turn: TurnIndexRow;
   active: boolean;
   collapsed: boolean;
   onSelect: () => void;
@@ -254,7 +265,13 @@ function TurnRow({
       onMouseLeave={() => setHover(false)}
       // The number and the outcome are the whole row once it is collapsed, so
       // the title carries what the label would have said.
-      title={collapsed ? `Turn ${turn.index} — ${glyph.word}: ${turn.label}` : turn.label}
+      title={
+        collapsed
+          ? `Turn ${turn.index} — ${glyph.word}: ${turn.label}`
+          : turn.loaded
+            ? turn.label
+            : `${turn.label} — not loaded yet; selecting it fetches it`
+      }
       style={{
         display: 'flex',
         alignItems: 'center',

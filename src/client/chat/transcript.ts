@@ -24,6 +24,7 @@ import {
   ChatMessage,
   ChatSnapshot,
   ChatState,
+  ChatTurnIndexEntry,
   ChatUsage,
   PermissionRequest,
   PlanItem,
@@ -92,6 +93,7 @@ export class ChatTranscript {
    * every component that needs both.
    */
   private queued: QueuedTurn[] = [];
+  private recorded: ChatTurnIndexEntry[] | null = null;
 
   /**
    * What the server last said about the process behind this conversation.
@@ -233,6 +235,28 @@ export class ChatTranscript {
   /** Replace the line with what the server just said it is. */
   setQueued(turns: QueuedTurn[]): void {
     this.queued = turns;
+    this.notify();
+  }
+
+  /**
+   * Every turn of this conversation as recorded, or null until the server says.
+   *
+   * Held here rather than on the controller so it travels on the version
+   * counter every surface already subscribes to. It arrives once, well after
+   * the snapshot, and a view memoised on the transcript's version would
+   * otherwise never recompute for it — the index went on showing the one turn
+   * the browser happened to hold, which is the defect it exists to fix (#86).
+   *
+   * Null is not an empty list: it means nobody has answered yet, or the server
+   * is older than this page, and the turn strip falls back to numbering what it
+   * holds. An empty list is a conversation with no turns in it.
+   */
+  get recordedTurns(): ChatTurnIndexEntry[] | null {
+    return this.recorded;
+  }
+
+  setRecordedTurns(turns: ChatTurnIndexEntry[]): void {
+    this.recorded = turns;
     this.notify();
   }
 

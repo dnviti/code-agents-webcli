@@ -59,9 +59,46 @@ describe('usage accounting', () => {
       assert.strictEqual(closed[0].outcome, 'completed');
     });
 
-    it('counts what the model said, not what the user said, as turns', () => {
+    it('does not count messages as round trips, however many the agent sent', () => {
+      // The defect behind #86, from the other side: three assistant messages
+      // used to be filed as three "turns", so an agent that separates its
+      // thinking from its answer looked like three times the work of one that
+      // does not. Nothing here reported a round-trip count, so the honest
+      // answer is null.
       const { closed } = run(turn('t1', { assistantMessages: 3 }));
-      assert.strictEqual(closed[0].turns, 3);
+      assert.strictEqual(closed[0].modelTurns, null);
+      assert.strictEqual(closed.length, 1, 'one prompt is one turn, whatever came back');
+    });
+
+    it('takes the runtime\'s own round-trip count where it reports one', () => {
+      const { closed } = run([
+        { t: 'msg_start', id: 'u', role: 'user', turnId: 't1' },
+        { t: 'msg_start', id: 'a', role: 'assistant', turnId: 't1' },
+        { t: 'msg_end', msgId: 'a' },
+        // Claude's num_turns, which used to be dropped on the floor in favour
+        // of the derived figure.
+        { t: 'turn_end', turnId: 't1', modelTurns: 6 },
+      ]);
+      assert.strictEqual(closed[0].modelTurns, 6);
+    });
+
+    it('adds up a per-model breakdown only when every model reported', () => {
+      const split = (calls) => [
+        { t: 'msg_start', id: 'u', role: 'user', turnId: 't1' },
+        { t: 'msg_start', id: 'a', role: 'assistant', turnId: 't1' },
+        { t: 'msg_end', msgId: 'a' },
+        { t: 'turn_end', turnId: 't1', models: calls },
+      ];
+      assert.strictEqual(
+        run(split([{ model: 'a', calls: 2 }, { model: 'b', calls: 3 }])).closed[0].modelTurns,
+        5,
+      );
+      // One model that did not say leaves the total unknowable: adding up the
+      // rest would report a confident figure that undercounts.
+      assert.strictEqual(
+        run(split([{ model: 'a', calls: 2 }, { model: 'b', calls: null }])).closed[0].modelTurns,
+        null,
+      );
     });
 
     it('counts tool calls once each, even when a call is re-announced', () => {
@@ -96,7 +133,7 @@ describe('usage accounting', () => {
       ]);
       assert.strictEqual(closed.length, 1);
       assert.strictEqual(closed[0].outcome, 'interrupted');
-      assert.strictEqual(closed[0].turns, 1);
+      assert.strictEqual(closed[0].modelTurns, null);
     });
 
     it('leaves a figure nobody reported undefined rather than zero', () => {
@@ -231,7 +268,7 @@ describe('usage accounting', () => {
       endedAt: '2026-03-04T10:01:00.000Z',
       durationMs: 60000,
       outcome: 'completed',
-      turns: 2,
+      modelTurns: 2,
       toolCalls: 3,
       inputTokens: 100,
       outputTokens: 50,
@@ -280,8 +317,8 @@ describe('usage accounting', () => {
         { userId: 1, scope: 'self', period: 'day', anchor: new Date('2026-03-04T12:00:00Z'), tzOffsetMinutes: 0 },
         false,
       );
-      assert.strictEqual(dash.totals.jobs, 2);
-      assert.strictEqual(dash.totals.costReportedJobs, 1);
+      assert.strictEqual(dash.totals.turns, 2);
+      assert.strictEqual(dash.totals.costReportedTurns, 1);
       assert.strictEqual(dash.totals.costUsd, 0.25);
     });
 
@@ -302,14 +339,14 @@ describe('usage accounting', () => {
         false,
       );
       assert.strictEqual(denied.scope, 'self');
-      assert.strictEqual(denied.totals.jobs, 1);
+      assert.strictEqual(denied.totals.turns, 1);
       assert.strictEqual(denied.byUser, undefined);
 
       const allowed = store.dashboard(
         { userId: 1, scope: 'everyone', period: 'day', anchor: new Date('2026-03-04T12:00:00Z'), tzOffsetMinutes: 0 },
         true,
       );
-      assert.strictEqual(allowed.totals.jobs, 2);
+      assert.strictEqual(allowed.totals.turns, 2);
       assert.strictEqual(allowed.byUser.length, 2);
     });
 
@@ -341,7 +378,7 @@ describe('usage accounting', () => {
         false,
       );
       assert.strictEqual(dash.series.length, 24);
-      const busy = dash.series.filter((bucket) => bucket.totals.jobs > 0).map((bucket) => bucket.key);
+      const busy = dash.series.filter((bucket) => bucket.totals.turns > 0).map((bucket) => bucket.key);
       assert.deepStrictEqual(busy, ['2026-03-04T11:00', '2026-03-04T12:00']);
     });
 
@@ -352,26 +389,26 @@ describe('usage accounting', () => {
         false,
       );
       assert.strictEqual(dash.series.length, 31);
-      assert.strictEqual(dash.series.filter((b) => b.totals.jobs === 0).length, 30);
+      assert.strictEqual(dash.series.filter((b) => b.totals.turns === 0).length, 30);
     });
 
     it('compares effort between agents, over completed jobs only', () => {
-      store.record(job({ turnId: 'a', agent: 'claude', turns: 1, toolCalls: 0 }));
-      store.record(job({ turnId: 'b', agent: 'claude', turns: 7, toolCalls: 9 }));
-      store.record(job({ turnId: 'c', agent: 'codex', turns: 2, toolCalls: 1 }));
-      store.record(job({ turnId: 'd', agent: 'codex', turns: 99, toolCalls: 99, outcome: 'interrupted' }));
+      store.record(job({ turnId: 'a', agent: 'claude', modelTurns: 1, toolCalls: 0 }));
+      store.record(job({ turnId: 'b', agent: 'claude', modelTurns: 7, toolCalls: 9 }));
+      store.record(job({ turnId: 'c', agent: 'codex', modelTurns: 2, toolCalls: 1 }));
+      store.record(job({ turnId: 'd', agent: 'codex', modelTurns: 99, toolCalls: 99, outcome: 'interrupted' }));
 
       const dash = store.dashboard(
         { userId: 1, scope: 'self', period: 'day', anchor: new Date('2026-03-04T12:00:00Z'), tzOffsetMinutes: 0 },
         false,
       );
       const effort = Object.fromEntries(dash.effortByAgent.map((row) => [row.key, row]));
-      assert.strictEqual(effort.claude.turnsAvg, 4);
-      assert.strictEqual(effort.claude.turnsMax, 7);
-      assert.deepStrictEqual(effort.claude.turnsHistogram, [1, 0, 0, 1, 0]);
+      assert.strictEqual(effort.claude.modelTurnsAvg, 4);
+      assert.strictEqual(effort.claude.modelTurnsMax, 7);
+      assert.deepStrictEqual(effort.claude.modelTurnsHistogram, [1, 0, 0, 1, 0]);
       // The interrupted job is not evidence about how many turns codex takes.
-      assert.strictEqual(effort.codex.jobs, 1);
-      assert.strictEqual(effort.codex.turnsAvg, 2);
+      assert.strictEqual(effort.codex.turns, 1);
+      assert.strictEqual(effort.codex.modelTurnsAvg, 2);
     });
 
     it('shows which tools are used most, and how that differs by agent', () => {
@@ -381,7 +418,7 @@ describe('usage accounting', () => {
         { userId: 1, scope: 'self', period: 'day', anchor: new Date('2026-03-04T12:00:00Z'), tzOffsetMinutes: 0 },
         false,
       );
-      assert.deepStrictEqual(dash.topTools[0], { tool: 'Bash', agent: null, calls: 6, jobs: 2 });
+      assert.deepStrictEqual(dash.topTools[0], { tool: 'Bash', agent: null, calls: 6, turns: 2 });
       const perAgent = dash.topToolsByAgent.filter((row) => row.tool === 'Bash');
       assert.deepStrictEqual(
         perAgent.map((row) => [row.agent, row.calls]).sort(),

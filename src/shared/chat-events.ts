@@ -337,6 +337,26 @@ export interface TurnModelUsage {
 export type ContextWindowSource = 'agent' | 'provider';
 
 /** A message as the reducer assembles it. */
+/**
+ * One turn as the recorded conversation has it, for the index beside it.
+ *
+ * Sent whole rather than paged: it is the index of the conversation, and an
+ * index that begins where the last page happened to stop is not one (#86).
+ * Thin enough that "whole" stays cheap — a turn contributes one line of it.
+ */
+export interface ChatTurnIndexEntry {
+  /** The opening message's id, which is what a client scrolls to. */
+  id: string;
+  turnId: string;
+  /** 1-based over the whole conversation, not over what is loaded. */
+  index: number;
+  /** The user's first line, or null for a turn nobody prompted. */
+  label: string | null;
+  startedAt: number;
+  /** How the turn ended, or null while it is still running. */
+  outcome: TurnOutcome | null;
+}
+
 export interface ChatMessage {
   id: string;
   /** Monotonic per session. Orders messages and anchors history paging. */
@@ -363,6 +383,13 @@ export interface ChatMessage {
   model?: string;
   /** True while the runtime is still appending to this message. */
   streaming?: boolean;
+  /**
+   * Set on a user message delivered into the turn that was already running.
+   *
+   * It shares that turn's `turnId`, so it is grouped into it rather than
+   * starting one — see the event of the same name.
+   */
+  steer?: true;
 }
 
 /**
@@ -529,7 +556,28 @@ export type ChatEvent =
       cwd?: string;
       capabilities: ChatCapabilities;
     }
-  | { t: 'msg_start'; seq: number; ts: number; id: string; role: ChatRole; turnId: string; model?: string }
+  | {
+      t: 'msg_start';
+      seq: number;
+      ts: number;
+      id: string;
+      role: ChatRole;
+      turnId: string;
+      model?: string;
+      /**
+       * Set on a user message that was delivered *into* the turn already
+       * running, rather than waiting for its own (#86).
+       *
+       * Recorded rather than worked out later, because it cannot be worked out
+       * later: two messages typed while the agent was busy look identical
+       * afterwards, and which of them steered the running work and which waited
+       * its turn is the whole of what decides the turn count. A steer carries
+       * the running turn's own `turnId`, so the transcript and the accounting
+       * both fold it into the turn it belongs to; this flag is what says that
+       * was deliberate.
+       */
+      steer?: true;
+    }
   | { t: 'block_start'; seq: number; ts: number; msgId: string; index: number; block: ChatBlock }
   /**
    * Append to an open block. `text` extends a text/thinking block; `json`
@@ -610,6 +658,17 @@ export type ChatEvent =
       stopReason?: string;
       usage?: ChatUsage;
       durationMs?: number;
+      /**
+       * How many round trips to the model the turn took, where the runtime
+       * counts them itself — Claude's `num_turns`.
+       *
+       * Only ever the runtime's own figure. Counting the messages that came out
+       * instead is what made this number mean a different thing per agent, so
+       * there is nowhere here for a derived one to go: a runtime that does not
+       * report it leaves this unset, and every surface downstream says "not
+       * reported" rather than showing a count it inferred (#86).
+       */
+      modelTurns?: number;
       /**
        * Which models actually ran this turn, when the runtime said.
        *

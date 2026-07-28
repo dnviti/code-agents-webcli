@@ -3,6 +3,86 @@
 ## [Unreleased]
 
 ### Added
+- **The turn count is a real measurement of the work, and every surface agrees
+  about it.** (#86) The word meant two different things at once. In a
+  conversation a turn was something you asked for and everything the agent did
+  about it; in the statistics it was how many separate pieces the agent's answer
+  happened to arrive in — which depends on the agent's writing style, not on the
+  work. The same job filed 1 under an agent that answers in one stretch and 6
+  under one that separates its thinking from its answer, and that figure was the
+  headline number, appeared in every breakdown by project, agent and model, and
+  drove the averages and the distribution chart that exist specifically to
+  compare agents against each other.
+
+  A turn is now **one user request and everything the agent did about it**,
+  defined in one place and read by every surface. Nothing had to be recounted:
+  the accounting was already recording exactly that unit under the name "job",
+  so the corrected figure is the number of rows, every row ever written is
+  already one prompt, and older periods stay directly comparable.
+
+  What a message typed while the agent is working belongs to is now decided
+  where the work runs and recorded with it, because it cannot be reconstructed
+  afterwards: pushed into the running turn to redirect it, it continues that
+  turn; left in the queue until the turn finishes, it is a turn of its own. The
+  conversation groups on the same recorded turn, so a runtime that echoes your
+  prompt back under an id of its own — codex and the ACP agents both do — no
+  longer shows twice the turns that were actually recorded.
+
+  Round trips to the model survive as **model turns**, under their own name and
+  their own column, and only where a runtime counts its own: Claude's
+  `num_turns` was being discarded in favour of the derived figure and is now the
+  figure. Everywhere else it reads **"not reported"** rather than a number
+  somebody inferred, and the effort averages are taken over the turns that
+  reported one — reading a silent runtime as zero would have put it at the top
+  of every efficiency comparison on the page for having said nothing at all.
+
+- **A request and its answer are one turn, in conversations already recorded as
+  much as in new ones.** (#86) No adapter reuses the id this app mints: the
+  session stamps the user's message `turn-<uuid>` and the runtime answers under
+  a name of its own, with codex and the ACP agents echoing the prompt back under
+  that name first. Read literally, that splits every single turn in two — the
+  ask in one, the answer in another with no prompt to name it by, which is why
+  an index row could read "no prompt" next to a question that had been asked
+  perfectly clearly. Checked against all 69 conversations on the machine this
+  was written on: 33 of them read differently, 147 phantom turns in total, and
+  all 69 now agree with what the conversation shows.
+
+  Nothing needed migrating and nothing had been recorded wrongly. The events
+  were always right; it was the reading of them that split a request from its
+  answer, and the index is read from the log every time it is asked for — so an
+  old conversation is simply re-read under the settled rule. A turn is open from
+  the user's message until the runtime ends it, and everything in between
+  belongs to it.
+
+- **A turn is numbered by the conversation, not by what the browser has
+  loaded.** (#86) Reloading a page landed on the last turn of a long
+  conversation and called it "Turn 1", and it stayed 1 until enough history had
+  been paged back in for the count to come right by accident — so the number on
+  screen was a fact about the loading window rather than about the work. It now
+  reads 49 of 49 on the first paint, and counts back to 48, 47 as older turns
+  arrive. A turn the reload landed *inside* — its opening ask not in the window
+  at all — is named from the recording too, instead of reading "no prompt"
+  beside a question that was asked perfectly clearly and is still on file.
+
+- **The turn list runs newest first.** (#86) The turn you are looking for is
+  almost always the one that just happened, and it was at the bottom — so in a
+  long conversation you scrolled to the end of the index to reach the thing
+  already on screen. Only the order changed: a turn keeps the number the
+  conversation gave it, so the list opens on 49 and counts down. Arrow keys,
+  Home and End follow what is drawn, so "down" is down the list.
+
+- **The turn index lists the whole conversation, and every entry is named after
+  what you asked.** (#86) It was assembled from whatever the browser happened to
+  be holding, so a long conversation's index quietly started part way through —
+  the one case where an index is the only practical way to navigate. It is now
+  served from the recorded conversation, lists every turn from the first one,
+  and selecting an older entry fetches it and takes you there. Entries are
+  titled with the user's own prompt: an entry could previously end up carrying
+  model output, whatever text the turn happened to offer first, which made the
+  index unsearchable by the only thing anybody remembers — what they asked. A
+  turn with no prompt behind it now says so rather than borrowing a line from
+  the model.
+
 - **Every conversation shows how full the model's context is, against that
   model's real capacity.** (#82) The reading was only there where a runtime
   happened to volunteer it, and where it was missing there was nothing at all —

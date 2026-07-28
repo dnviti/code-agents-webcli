@@ -383,6 +383,11 @@ export class AppDatabase {
         ended_at TEXT NOT NULL,
         duration_ms INTEGER,
         outcome TEXT NOT NULL,
+        /* Superseded by model_turns, and read by nothing here — see the
+           migration below. Still declared, still written, because it is NOT NULL
+           and a build from before #86 opening this same file inserts into it. A
+           downgrade is a normal part of how this app is updated, so the column
+           an older build needs outlives the meaning this one gave up. */
         turns INTEGER NOT NULL,
         tool_calls INTEGER NOT NULL,
         input_tokens INTEGER,
@@ -508,6 +513,25 @@ export class AppDatabase {
       UPDATE usage_jobs SET project_source = 'observed'
         WHERE project IS NOT NULL AND project_source IS NULL;
     `);
+
+    // How many round trips to the model a turn took, where the runtime says.
+    //
+    // The column beside it, `turns`, held a different quantity under the same
+    // name: the number of assistant messages the transcript happened to show,
+    // which is how an agent chops up its output rather than how much work it
+    // did (#86). A turn is now one row of this table — see `UsageJobRecord` —
+    // so the count nobody can disagree about is `COUNT(*)`, and this column
+    // holds the other quantity under a name that says which one it is.
+    //
+    // The old column is left where it is and read by nothing. Dropping it would
+    // rewrite the whole table, and an older build reading the same file still
+    // expects it to be there — a downgrade is a normal part of updating here.
+    // The old values are *not* copied across: they were derived, this column is
+    // reported-only, and moving one into the other would make an inference
+    // indistinguishable from a measurement in the one place built to keep those
+    // apart. Rows from before this change read "not reported", which is what
+    // they are.
+    this.addColumnIfMissing('usage_jobs', 'model_turns', 'INTEGER');
 
     // Declared here rather than with the other indexes above, because the
     // column it covers is only guaranteed to exist by the line before it.

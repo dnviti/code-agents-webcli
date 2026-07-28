@@ -147,36 +147,62 @@ interface Figure {
 }
 
 /**
- * The honesty rule for a total: `costUsd` of zero across zero reporting jobs
- * and `costUsd` of zero across every job are opposite facts, and this is the
+ * The honesty rule for a total: `costUsd` of zero across zero reporting turns
+ * and `costUsd` of zero across every turn are opposite facts, and this is the
  * one place that turns `UsageTotals` into the sentence a viewer should read.
  */
 function costFigure(totals: UsageTotals): Figure {
-  if (totals.jobs === 0) return { text: '—', muted: true, title: 'No jobs in this range' };
-  if (totals.costReportedJobs === 0) {
-    return { text: 'not reported', muted: true, title: 'None of these jobs reported a cost' };
+  if (totals.turns === 0) return { text: '—', muted: true, title: 'No turns in this range' };
+  if (totals.costReportedTurns === 0) {
+    return { text: 'not reported', muted: true, title: 'None of these turns reported a cost' };
   }
-  if (totals.costReportedJobs < totals.jobs) {
+  if (totals.costReportedTurns < totals.turns) {
     return {
-      text: `${formatCost(totals.costUsd)} across ${totals.costReportedJobs} of ${totals.jobs} jobs`,
-      title: `${totals.jobs - totals.costReportedJobs} job(s) did not report a cost and are excluded from this figure`,
+      text: `${formatCost(totals.costUsd)} across ${totals.costReportedTurns} of ${totals.turns} turns`,
+      title: `${totals.turns - totals.costReportedTurns} turn(s) did not report a cost and are excluded from this figure`,
     };
   }
   return { text: formatCost(totals.costUsd) };
 }
 
 function tokensFigure(totals: UsageTotals): Figure {
-  if (totals.jobs === 0) return { text: '—', muted: true, title: 'No jobs in this range' };
-  if (totals.tokensReportedJobs === 0) {
-    return { text: 'not reported', muted: true, title: 'None of these jobs reported token counts' };
+  if (totals.turns === 0) return { text: '—', muted: true, title: 'No turns in this range' };
+  if (totals.tokensReportedTurns === 0) {
+    return { text: 'not reported', muted: true, title: 'None of these turns reported token counts' };
   }
-  if (totals.tokensReportedJobs < totals.jobs) {
+  if (totals.tokensReportedTurns < totals.turns) {
     return {
-      text: `${formatTokens(totals.totalTokens)} across ${totals.tokensReportedJobs} of ${totals.jobs} jobs`,
-      title: `${totals.jobs - totals.tokensReportedJobs} job(s) did not report token counts and are excluded from this figure`,
+      text: `${formatTokens(totals.totalTokens)} across ${totals.tokensReportedTurns} of ${totals.turns} turns`,
+      title: `${totals.turns - totals.tokensReportedTurns} turn(s) did not report token counts and are excluded from this figure`,
     };
   }
   return { text: formatTokens(totals.totalTokens) };
+}
+
+/**
+ * Model turns, which most runtimes never report — so the absence has to be said
+ * rather than drawn as a zero.
+ *
+ * The figure beside it is the number of turns that had one to contribute, for
+ * the same reason cost carries one: a sum over an unknown fraction of the range
+ * is not a total, and this is the quantity where the fraction is usually small.
+ */
+function modelTurnsFigure(totals: UsageTotals): Figure {
+  if (totals.turns === 0) return { text: '—', muted: true, title: 'No turns in this range' };
+  if (totals.modelTurnsReportedTurns === 0) {
+    return {
+      text: 'not reported',
+      muted: true,
+      title: 'None of these turns ran on an agent that reports its round trips to the model',
+    };
+  }
+  if (totals.modelTurnsReportedTurns < totals.turns) {
+    return {
+      text: `${totals.modelTurns} across ${totals.modelTurnsReportedTurns} of ${totals.turns} turns`,
+      title: `${totals.turns - totals.modelTurnsReportedTurns} turn(s) ran on an agent that does not report round trips and are excluded from this figure`,
+    };
+  }
+  return { text: String(totals.modelTurns) };
 }
 
 function countFigure(n: number): Figure {
@@ -188,10 +214,10 @@ function countFigure(n: number): Figure {
  *
  * The distinction between a measure the *runtime* reports and one this app
  * counts for itself is carried in `reported`, and it is why this is a table
- * rather than a switch on a string. Cost and tokens can be absent — nobody
- * said — where jobs, turns and tool calls are counted from the transcript and
- * are therefore always known. A chart that drew all five the same way would
- * invent measurements for the first two.
+ * rather than a switch on a string. Cost, tokens and model turns can be absent
+ * — nobody said — where turns and tool calls are measured here and are
+ * therefore always known. A chart that drew all five the same way would invent
+ * measurements for the three that can be missing.
  */
 interface Measure {
   value: UsageMeasure;
@@ -206,35 +232,40 @@ const MEASURES: Measure[] = [
     value: 'costUsd',
     label: 'Cost',
     amount: (t) => t.costUsd,
-    reported: (t) => t.costReportedJobs > 0,
+    reported: (t) => t.costReportedTurns > 0,
     figure: costFigure,
   },
   {
     value: 'totalTokens',
     label: 'Tokens',
     amount: (t) => t.totalTokens,
-    reported: (t) => t.tokensReportedJobs > 0,
+    reported: (t) => t.tokensReportedTurns > 0,
     figure: tokensFigure,
   },
   {
-    value: 'jobs',
-    label: 'Jobs',
-    amount: (t) => t.jobs,
-    reported: (t) => t.jobs > 0,
-    figure: (t) => countFigure(t.jobs),
-  },
-  {
+    // One per request the user made — the same turns the conversation shows,
+    // counted where the work ran rather than from what a browser has loaded.
     value: 'turns',
     label: 'Turns',
     amount: (t) => t.turns,
-    reported: (t) => t.jobs > 0,
+    reported: (t) => t.turns > 0,
     figure: (t) => countFigure(t.turns),
+  },
+  {
+    // Round trips to the model *inside* those turns, and a different quantity:
+    // only the runtimes that count their own report it, so it plots as absent
+    // rather than as zero for the rest.
+    value: 'modelTurns',
+    label: 'Model turns',
+    amount: (t) => t.modelTurns,
+    reported: (t) => t.modelTurnsReportedTurns > 0,
+    figure: modelTurnsFigure,
   },
   {
     value: 'toolCalls',
     label: 'Tool calls',
     amount: (t) => t.toolCalls,
-    reported: (t) => t.jobs > 0,
+    reported: (t) => t.turns > 0,
     figure: (t) => countFigure(t.toolCalls),
   },
 ];
@@ -503,7 +534,7 @@ function TrendChart({
             <span style={{ color: 'var(--foreground)' }}>{bucketLabel(shown.key, unit)}</span>
             {` · ${measure.label} `}
             <FigureText figure={measure.figure(shown.totals)} />
-            {` · ${shown.totals.jobs} job(s)`}
+            {` · ${shown.totals.turns} turn(s)`}
           </>
         ) : (
           `${measure.label} over time — select a point for its figures`
@@ -527,7 +558,7 @@ function TrendChart({
               key={bucket.key}
               type="button"
               aria-pressed={selected}
-              aria-label={`${bucketLabel(bucket.key, unit)}: ${measure.label} ${figure.text}, ${bucket.totals.jobs} job(s)`}
+              aria-label={`${bucketLabel(bucket.key, unit)}: ${measure.label} ${figure.text}, ${bucket.totals.turns} turn(s)`}
               title={`${bucketLabel(bucket.key, unit)} · ${measure.label} ${figure.text}`}
               onMouseEnter={() => setActive(bucket.key)}
               onFocus={() => setActive(bucket.key)}
@@ -617,7 +648,7 @@ function EffortHistogram({
   );
 }
 
-const TURNS_LABELS = ['1', '2', '3-5', '6-10', '11+'] as const;
+const MODEL_TURNS_LABELS = ['1', '2', '3-5', '6-10', '11+'] as const;
 const TOOLS_LABELS = ['0', '1-2', '3-5', '6-10', '11+'] as const;
 
 function BreakdownKey({ value, unknown }: { value: string; unknown: string }): React.JSX.Element {
@@ -628,7 +659,7 @@ function BreakdownKey({ value, unknown }: { value: string; unknown: string }): R
       title={
         unknown === 'unattributed'
           ? 'Recorded before this app knew which project a job ran in'
-          : 'These jobs ran without a reported model'
+          : 'These turns ran without a reported model'
       }
     >
       {unknown}
@@ -687,8 +718,8 @@ function Table({
 // ---------------------------------------------------------------- breakdowns
 
 const BREAKDOWN_COLUMNS: Array<{ label: string; measure: UsageMeasure }> = [
-  { label: 'Jobs', measure: 'jobs' },
   { label: 'Turns', measure: 'turns' },
+  { label: 'Model turns', measure: 'modelTurns' },
   { label: 'Tools', measure: 'toolCalls' },
   { label: 'Tokens', measure: 'totalTokens' },
   { label: 'Cost', measure: 'costUsd' },
@@ -809,8 +840,10 @@ function BreakdownTable({
                       <BreakdownKey value={row.key} unknown={unknown} />
                     </button>
                   </td>
-                  <td style={bodyCellStyle}>{row.totals.jobs}</td>
                   <td style={bodyCellStyle}>{row.totals.turns}</td>
+                  <td style={bodyCellStyle}>
+                    <FigureText figure={modelTurnsFigure(row.totals)} />
+                  </td>
                   <td style={bodyCellStyle}>{row.totals.toolCalls}</td>
                   <td style={bodyCellStyle}>
                     <FigureText figure={tokensFigure(row.totals)} />
@@ -840,17 +873,28 @@ function EffortTable({ rows, unknown }: { rows: UsageEffort[]; unknown: string }
               <div style={{ fontSize: 'var(--text-ui)' }}>
                 <BreakdownKey value={row.key} unknown={unknown} />
               </div>
-              <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>{row.jobs} jobs</div>
+              <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>{row.turns} turns</div>
             </div>
             <div>
+              {/* Said out loud rather than drawn as an empty chart: an agent
+                  that never reports its round trips has no shape here, and a
+                  bar chart of nothing reads as a measurement of little. */}
               <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
-                turns/job · avg {formatAvg(row.turnsAvg)} · max {row.turnsMax}
+                {row.modelTurnsReportedTurns === 0
+                  ? 'model turns/turn · not reported'
+                  : `model turns/turn · avg ${formatAvg(row.modelTurnsAvg)} · max ${row.modelTurnsMax}${
+                      row.modelTurnsReportedTurns < row.turns
+                        ? ` · of ${row.modelTurnsReportedTurns} of ${row.turns} turns`
+                        : ''
+                    }`}
               </div>
-              <EffortHistogram histogram={row.turnsHistogram} labels={TURNS_LABELS} />
+              {row.modelTurnsReportedTurns > 0 ? (
+                <EffortHistogram histogram={row.modelTurnsHistogram} labels={MODEL_TURNS_LABELS} />
+              ) : null}
             </div>
             <div>
               <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
-                tool calls/job · avg {formatAvg(row.toolCallsAvg)} · max {row.toolCallsMax}
+                tool calls/turn · avg {formatAvg(row.toolCallsAvg)} · max {row.toolCallsMax}
               </div>
               <EffortHistogram histogram={row.toolCallsHistogram} labels={TOOLS_LABELS} />
             </div>
@@ -864,8 +908,8 @@ function EffortTable({ rows, unknown }: { rows: UsageEffort[]; unknown: string }
 function ToolsTable({ tools }: { tools: UsageToolUse[] }): React.JSX.Element {
   return (
     <Table
-      columns={tools.some((t) => t.agent) ? ['Tool', 'Agent', 'Calls', 'Jobs'] : ['Tool', 'Calls', 'Jobs']}
-      rows={tools.map((t) => (t.agent ? [t.tool, t.agent, t.calls, t.jobs] : [t.tool, t.calls, t.jobs]))}
+      columns={tools.some((t) => t.agent) ? ['Tool', 'Agent', 'Calls', 'Turns'] : ['Tool', 'Calls', 'Turns']}
+      rows={tools.map((t) => (t.agent ? [t.tool, t.agent, t.calls, t.turns] : [t.tool, t.calls, t.turns]))}
     />
   );
 }
@@ -1097,8 +1141,16 @@ function JobDetail({
               <div>{job.durationMs !== null ? `${(job.durationMs / 1000).toFixed(1)}s` : '—'}</div>
             </div>
             <div>
-              <div style={{ color: 'var(--muted-foreground)', fontSize: 'var(--text-2xs)' }}>Turns</div>
-              <div>{job.turns}</div>
+              <div style={{ color: 'var(--muted-foreground)', fontSize: 'var(--text-2xs)' }}>Model turns</div>
+              <div>
+                {job.modelTurns === null ? (
+                  <span style={{ color: 'var(--muted-foreground)' }} title={`${job.agent} does not report round trips to the model`}>
+                    not reported
+                  </span>
+                ) : (
+                  job.modelTurns
+                )}
+              </div>
             </div>
             <div>
               <div style={{ color: 'var(--muted-foreground)', fontSize: 'var(--text-2xs)' }}>Tool calls</div>
@@ -1283,7 +1335,7 @@ function ConversationHistory({
                   </td>
                   <td style={bodyCellStyle}>{new Date(conversation.startedAt).toLocaleString()}</td>
                   <td style={bodyCellStyle}>{new Date(conversation.lastActiveAt).toLocaleString()}</td>
-                  <td style={bodyCellStyle}>{conversation.totals.jobs}</td>
+                  <td style={bodyCellStyle}>{conversation.totals.turns}</td>
                   <td style={bodyCellStyle}>
                     <FigureText figure={tokensFigure(conversation.totals)} />
                   </td>
@@ -1361,7 +1413,7 @@ function History({
           </Button>
           <span style={{ fontSize: 'var(--text-xs)', fontWeight: 600 }}>{conversationLabel(open)}</span>
           <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
-            {`${open.totals.jobs} request(s) · ${costFigure(open.totals).text}`}
+            {`${open.totals.turns} request(s) · ${costFigure(open.totals).text}`}
           </span>
         </div>
         <JobHistory
@@ -1461,7 +1513,7 @@ function JobHistory({
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 'var(--text-xs)' }}>
               <thead>
                 <tr>
-                  {['When', 'Project', 'Agent', 'Model', 'Turns', 'Tools', 'Tokens', 'Cost'].map((c, i) => (
+                  {['When', 'Project', 'Agent', 'Model', 'Model turns', 'Tools', 'Tokens', 'Cost'].map((c, i) => (
                     <th key={c} style={{ ...headCellStyle, textAlign: i === 0 ? 'left' : 'right' }}>
                       {c}
                     </th>
@@ -1472,7 +1524,7 @@ function JobHistory({
                 {jobs.length === 0 ? (
                   <tr>
                     <td colSpan={8} style={{ padding: '10px 8px', color: 'var(--muted-foreground)' }}>
-                      No jobs in this range
+                      No turns in this range
                     </td>
                   </tr>
                 ) : (
@@ -1505,7 +1557,9 @@ function JobHistory({
                       <td style={bodyCellStyle}>
                         {job.model ?? <span style={{ color: 'var(--muted-foreground)' }}>—</span>}
                       </td>
-                      <td style={bodyCellStyle}>{job.turns}</td>
+                      <td style={bodyCellStyle}>
+                        {job.modelTurns ?? <span style={{ color: 'var(--muted-foreground)' }}>—</span>}
+                      </td>
                       <td style={bodyCellStyle}>{job.toolCalls}</td>
                       <td style={bodyCellStyle}>
                         <FigureText figure={jobTokensFigure(job)} />
@@ -1521,7 +1575,7 @@ function JobHistory({
           </div>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 }}>
             <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
-              {total === 0 ? 'No jobs' : `${from}-${to} of ${total}`}
+              {total === 0 ? 'No turns' : `${from}-${to} of ${total}`}
             </span>
             <div style={{ display: 'flex', gap: 6 }}>
               <Button
@@ -1736,8 +1790,8 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
             >
               <Headline label="Cost" figure={costFigure(dashboard.totals)} />
               <Headline label="Tokens" figure={tokensFigure(dashboard.totals)} />
-              <Headline label="Jobs" figure={{ text: String(dashboard.totals.jobs) }} />
               <Headline label="Turns" figure={{ text: String(dashboard.totals.turns) }} />
+              <Headline label="Model turns" figure={modelTurnsFigure(dashboard.totals)} />
               <Headline label="Tool calls" figure={{ text: String(dashboard.totals.toolCalls) }} />
             </div>
 

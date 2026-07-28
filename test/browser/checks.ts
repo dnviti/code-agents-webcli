@@ -261,6 +261,7 @@ async function run(): Promise<void> {
   await checkAConversationTellsOneStoryAboutItsTokens();
   await checkTheModelShownIsTheModelThatRan();
   await checkTheContextReadingIsHonestAboutItsCeiling();
+  await checkTheTurnIndexListsTheWholeConversation();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -419,7 +420,14 @@ async function checkAQuestionIsAnsweredByClicking(): Promise<void> {
     boxes[2].click();
     await wait(150);
     check('confirm becomes available once something is picked', !confirm.disabled);
-    check('picking a checkbox does not answer on its own', sent.length === 0, `${sent.length} sent`);
+    // Answers only. Opening a conversation also asks for its turn index (#86),
+    // which is not an answer to anything and must not read as one.
+    const answersSoFar = sent.filter((m) => m.type === 'chat_question_answer');
+    check(
+      'picking a checkbox does not answer on its own',
+      answersSoFar.length === 0,
+      `${answersSoFar.length} sent`,
+    );
     confirm.click();
     await wait(150);
   }
@@ -2269,6 +2277,208 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
   host.remove();
 }
 
+/**
+ * The index beside a conversation lists all of it, not the part that is loaded.
+ *
+ * The defect this covers is invisible to a unit test of the merge: a browser
+ * holding the last two turns of a hundred-turn conversation used to draw an
+ * index of two, numbered 1 and 2, in the one case where an index is the only
+ * way to navigate (#86). So this asserts what is actually on screen — the count,
+ * the numbering, and that each row is titled with what the *user* asked.
+ */
+async function checkTheTurnIndexListsTheWholeConversation(): Promise<void> {
+  const frame = document.createElement('div');
+  frame.style.cssText = 'width:1400px;height:800px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(frame);
+
+  const sent: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('browser-check', {
+    send: (message: Record<string, unknown>) => sent.push(message),
+  } as never);
+
+  // What a browser actually holds after opening a long conversation: the tail.
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check',
+      runtime: 'claude',
+      state: 'idle',
+      capabilities: { streaming: true, questions: false },
+      // The replay landed *inside* the last turn, which is what a reload of a
+      // long conversation actually gives you: the ask that opened it is not in
+      // the window, only the answer to it.
+      messages: [
+        {
+          id: 'a40', seq: 80, turnId: 't40', role: 'assistant', ts: 80,
+          blocks: [{ kind: 'text', text: 'the discovery that simplified it' }],
+        },
+      ],
+      pendingPermissions: [],
+      pendingQuestions: [],
+      firstSeq: 1,
+      replayFrom: 79,
+      cursor: 80,
+      live: true,
+      bypassPermissions: false,
+    },
+  } as never);
+
+  check(
+    'opening a conversation asks for its whole turn index',
+    sent.some((message) => message.type === 'chat_turn_index_request'),
+    sent.map((message) => String(message.type)).join(' | ') || 'nothing was asked for',
+  );
+
+  // What the server answers with: every turn, from the first.
+  const recorded = Array.from({ length: 40 }, (_, i) => ({
+    id: `u${i + 1}`,
+    turnId: `t${i + 1}`,
+    index: i + 1,
+    label:
+      i === 0 ? 'set up the parser' : i === 39 ? 'and now the changelog' : `ask ${i + 1}`,
+    startedAt: (i + 1) * 1000,
+    outcome: 'done',
+  }));
+  // One with no user prompt behind it, which must say so rather than quote the
+  // model — the tail of a resumed conversation is the ordinary case.
+  recorded[1] = { ...recorded[1], label: null } as never;
+
+  controller.handle({
+    type: 'chat_turn_index',
+    sessionId: 'browser-check',
+    turns: recorded,
+    firstSeq: 1,
+    complete: true,
+  } as never);
+  await wait(50);
+
+  const root = createRoot(frame);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  // The number on the strip over the conversation, which is what a reload
+  // actually shows you: holding the last turn of forty, it must say 40. It said
+  // "TURN 1" until the whole history had been paged in, because the number came
+  // from the position in the loaded window rather than from the conversation.
+  // Read off the strip itself rather than the page text: the index panel also
+  // shows a count, and a check that matched anywhere would pass on that.
+  const strip = frame.querySelector('[data-turn-id]');
+  const stripText = (strip?.textContent || '').replace(/\s+/g, ' ');
+  const foldLabel = strip
+    ?.querySelector('[aria-label^="Collapse turn"], [aria-label^="Expand turn"]')
+    ?.getAttribute('aria-label');
+  check(
+    'the turn on screen is numbered by the conversation, not by the window',
+    foldLabel === 'Collapse turn 40' || foldLabel === 'Expand turn 40',
+    foldLabel || 'no turn strip on screen',
+  );
+  check(
+    'the conversation is on screen under that number',
+    stripText.length > 0,
+    stripText.slice(0, 80) || 'the strip is empty',
+  );
+
+  const list = frame.querySelector('[aria-label="Conversation turns"]');
+  const rows = list ? Array.from(list.querySelectorAll('[role="option"]')) : [];
+  check(
+    'the index lists every turn, not only the ones loaded',
+    rows.length === 40,
+    `${rows.length} rows for a 40-turn conversation holding 1`,
+  );
+  // Newest first: the turn you are looking at is the top row, and the first
+  // turn of the conversation is the last one.
+  check(
+    'the newest turn is the first row',
+    (rows[0]?.textContent || '').includes('and now the changelog'),
+    (rows[0]?.textContent || '').slice(0, 80) || 'no first row',
+  );
+  check(
+    'and it reaches back to the first turn at the bottom',
+    (rows[39]?.textContent || '').includes('set up the parser'),
+    (rows[39]?.textContent || '').slice(0, 80) || 'no last row',
+  );
+  check(
+    'a turn with no prompt behind it says so instead of quoting the model',
+    (rows[38]?.textContent || '').includes('no prompt'),
+    (rows[38]?.textContent || '').slice(0, 80) || 'no second-from-last row',
+  );
+  // The turn on screen, whose opening ask is not in the window. It reads "no
+  // prompt" if the label is taken from the loaded messages — which is what the
+  // index showed for the turn the user was looking at (#86). It is the top row,
+  // and its number is still the conversation's.
+  check(
+    'a half-loaded turn is titled from the recording, not "no prompt"',
+    !(rows[0]?.textContent || '').includes('no prompt'),
+    (rows[0]?.textContent || '').slice(0, 80) || 'no first row',
+  );
+  check(
+    'the newest row still carries the number the conversation gave it',
+    (rows[0]?.textContent || '').trim().startsWith('40'),
+    (rows[0]?.textContent || '').slice(0, 40) || 'no first row',
+  );
+
+  // A transcript this short is already scrolled to its top, so the list asks
+  // for a page on its own. Settle that one first, or the click below would be
+  // measured against a request it did not make.
+  controller.handle({
+    type: 'chat_page',
+    sessionId: 'browser-check',
+    events: [],
+    firstSeq: 1,
+    from: 40,
+    cursor: 80,
+  } as never);
+  await wait(200);
+
+  // Choosing one from before what is loaded has to take the user there, which
+  // means fetching it first. Asserted on the outcome rather than on the request
+  // — a transcript this short is at its own top and asks for pages unprompted,
+  // so counting requests would measure the scroll position, not the click.
+  const oldest = rows[39] as HTMLElement | undefined;
+  oldest?.click();
+  await wait(200);
+  check(
+    'and the entry stays selected while it is being fetched',
+    oldest?.getAttribute('aria-selected') === 'true',
+    String(oldest?.getAttribute('aria-selected')),
+  );
+
+  controller.handle({
+    type: 'chat_page',
+    sessionId: 'browser-check',
+    events: [
+      { t: 'msg_start', seq: 1, ts: 1, id: 'u1', role: 'user', turnId: 't1' },
+      { t: 'block_start', seq: 2, ts: 1, msgId: 'u1', index: 0, block: { kind: 'text', text: 'set up the parser' } },
+      { t: 'msg_end', seq: 3, ts: 1, msgId: 'u1' },
+      { t: 'turn_end', seq: 4, ts: 1, turnId: 't1', stopReason: 'end_turn' },
+    ],
+    firstSeq: 1,
+    from: 1,
+    cursor: 80,
+  } as never);
+  await wait(400);
+
+  const transcriptText = frame.textContent || '';
+  check(
+    'selecting an older entry brings that turn into the conversation',
+    transcriptText.includes('set up the parser'),
+    transcriptText.includes('set up the parser') ? 'the turn is here' : 'the turn never arrived',
+  );
+
+  root.unmount();
+  frame.remove();
+}
+
 run().catch((error: unknown) => {
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -2551,10 +2761,10 @@ function OpenFloatingMenu({ actions }: { actions: FloatingMenuAction[] }): React
  */
 async function checkAnUnreportedFigureIsNeverDrawnAsZero(): Promise<void> {
   const totals = (over: Record<string, number>) => ({
-    jobs: 0, turns: 0, toolCalls: 0,
+    turns: 0, modelTurns: 0, toolCalls: 0,
     inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
     reasoningTokens: 0, totalTokens: 0, costUsd: 0,
-    tokensReportedJobs: 0, costReportedJobs: 0,
+    tokensReportedTurns: 0, costReportedTurns: 0, modelTurnsReportedTurns: 0,
     ...over,
   });
 
@@ -2564,32 +2774,32 @@ async function checkAnUnreportedFigureIsNeverDrawnAsZero(): Promise<void> {
     scope: 'self', canSeeEveryone: false, period: 'day',
     from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
     bucket: 'hour', filters: {},
-    totals: totals({ jobs: 4, turns: 9, toolCalls: 12, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }),
+    totals: totals({ turns: 4, modelTurns: 9, toolCalls: 12, totalTokens: 5000, costUsd: 1.25, tokensReportedTurns: 4, costReportedTurns: 2 }),
     // Two buckets, not one: the second reported nothing at all, and half of
     // what these checks are for is that it does not come out looking like an
     // hour that cost zero.
     series: [
-      { key: '2026-07-27T09:00', totals: totals({ jobs: 4, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }) },
-      { key: '2026-07-27T10:00', totals: totals({ jobs: 2, totalTokens: 900, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+      { key: '2026-07-27T09:00', totals: totals({ turns: 4, totalTokens: 5000, costUsd: 1.25, tokensReportedTurns: 4, costReportedTurns: 2 }) },
+      { key: '2026-07-27T10:00', totals: totals({ turns: 2, totalTokens: 900, tokensReportedTurns: 2, costReportedTurns: 0 }) },
     ],
     byProject: [
-      { key: 'billing-api', totals: totals({ jobs: 3, totalTokens: 4000, costUsd: 1.25, tokensReportedJobs: 3, costReportedJobs: 2 }) },
+      { key: 'billing-api', totals: totals({ turns: 3, totalTokens: 4000, costUsd: 1.25, tokensReportedTurns: 3, costReportedTurns: 2 }) },
       // The sentinel the server sends for work recorded before projects
       // existed. Spelled out here rather than imported, because the point of
       // the check is that the browser renders whatever the wire actually says —
       // which is exactly how a mismatch between this literal and the constant
       // caught the sentinel being an unprintable control character.
-      { key: '//unattributed', totals: totals({ jobs: 1, totalTokens: 1000, tokensReportedJobs: 1, costReportedJobs: 0 }) },
+      { key: '//unattributed', totals: totals({ turns: 1, totalTokens: 1000, tokensReportedTurns: 1, costReportedTurns: 0 }) },
     ],
     byAgent: [
-      { key: 'claude', totals: totals({ jobs: 2, totalTokens: 3000, costUsd: 1.25, tokensReportedJobs: 2, costReportedJobs: 2 }) },
-      { key: 'codex', totals: totals({ jobs: 2, totalTokens: 2000, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+      { key: 'claude', totals: totals({ turns: 2, totalTokens: 3000, costUsd: 1.25, tokensReportedTurns: 2, costReportedTurns: 2 }) },
+      { key: 'codex', totals: totals({ turns: 2, totalTokens: 2000, tokensReportedTurns: 2, costReportedTurns: 0 }) },
     ],
     // A job whose runtime never named a model groups under the empty key —
     // the breakdown must label that, not leave the cell blank.
     byModel: [
-      { key: 'claude-opus-5', totals: totals({ jobs: 2, totalTokens: 3000, costUsd: 1.25, tokensReportedJobs: 2, costReportedJobs: 2 }) },
-      { key: '', totals: totals({ jobs: 2, totalTokens: 2000, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+      { key: 'claude-opus-5', totals: totals({ turns: 2, totalTokens: 3000, costUsd: 1.25, tokensReportedTurns: 2, costReportedTurns: 2 }) },
+      { key: '', totals: totals({ turns: 2, totalTokens: 2000, tokensReportedTurns: 2, costReportedTurns: 0 }) },
     ],
     effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
   };
@@ -2702,10 +2912,10 @@ async function checkAnUnreportedFigureIsNeverDrawnAsZero(): Promise<void> {
  */
 async function checkTheUsageChartsAreInteractive(): Promise<void> {
   const totals = (over: Record<string, number>) => ({
-    jobs: 0, turns: 0, toolCalls: 0,
+    turns: 0, modelTurns: 0, toolCalls: 0,
     inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
     reasoningTokens: 0, totalTokens: 0, costUsd: 0,
-    tokensReportedJobs: 0, costReportedJobs: 0,
+    tokensReportedTurns: 0, costReportedTurns: 0, modelTurnsReportedTurns: 0,
     ...over,
   });
 
@@ -2713,21 +2923,21 @@ async function checkTheUsageChartsAreInteractive(): Promise<void> {
     scope: 'self', canSeeEveryone: false, period: 'day',
     from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
     bucket: 'hour', filters: {},
-    totals: totals({ jobs: 6, turns: 11, toolCalls: 14, totalTokens: 5900, costUsd: 1.25, tokensReportedJobs: 6, costReportedJobs: 2 }),
+    totals: totals({ turns: 6, modelTurns: 11, toolCalls: 14, totalTokens: 5900, costUsd: 1.25, tokensReportedTurns: 6, costReportedTurns: 2 }),
     series: [
-      { key: '2026-07-27T09:00', totals: totals({ jobs: 4, turns: 8, toolCalls: 10, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }) },
+      { key: '2026-07-27T09:00', totals: totals({ turns: 4, modelTurns: 8, toolCalls: 10, totalTokens: 5000, costUsd: 1.25, tokensReportedTurns: 4, costReportedTurns: 2 }) },
       // Reported nothing on cost. Must not be drawn as a bar of height zero.
-      { key: '2026-07-27T10:00', totals: totals({ jobs: 2, turns: 3, toolCalls: 4, totalTokens: 900, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+      { key: '2026-07-27T10:00', totals: totals({ turns: 2, modelTurns: 3, toolCalls: 4, totalTokens: 900, tokensReportedTurns: 2, costReportedTurns: 0 }) },
     ],
     byProject: [
-      { key: 'billing-api', totals: totals({ jobs: 3, totalTokens: 4000, costUsd: 1.25, tokensReportedJobs: 3, costReportedJobs: 2 }) },
-      { key: 'web', totals: totals({ jobs: 3, totalTokens: 1900, tokensReportedJobs: 3, costReportedJobs: 0 }) },
+      { key: 'billing-api', totals: totals({ turns: 3, totalTokens: 4000, costUsd: 1.25, tokensReportedTurns: 3, costReportedTurns: 2 }) },
+      { key: 'web', totals: totals({ turns: 3, totalTokens: 1900, tokensReportedTurns: 3, costReportedTurns: 0 }) },
     ],
     byAgent: [
-      { key: 'claude', totals: totals({ jobs: 4, totalTokens: 5000, costUsd: 1.25, tokensReportedJobs: 4, costReportedJobs: 2 }) },
-      { key: 'codex', totals: totals({ jobs: 2, totalTokens: 900, tokensReportedJobs: 2, costReportedJobs: 0 }) },
+      { key: 'claude', totals: totals({ turns: 4, totalTokens: 5000, costUsd: 1.25, tokensReportedTurns: 4, costReportedTurns: 2 }) },
+      { key: 'codex', totals: totals({ turns: 2, totalTokens: 900, tokensReportedTurns: 2, costReportedTurns: 0 }) },
     ],
-    byModel: [{ key: 'claude-opus-5', totals: totals({ jobs: 6, totalTokens: 5900, costUsd: 1.25, tokensReportedJobs: 6, costReportedJobs: 2 }) }],
+    byModel: [{ key: 'claude-opus-5', totals: totals({ turns: 6, totalTokens: 5900, costUsd: 1.25, tokensReportedTurns: 6, costReportedTurns: 2 }) }],
     effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
   };
 
@@ -2868,7 +3078,8 @@ async function checkTheUsageChartsAreInteractive(): Promise<void> {
   );
 
   const sortButton = Array.from(doc.querySelectorAll<HTMLButtonElement>('button')).find(
-    (b) => (b.getAttribute('aria-label') || '') === 'Sort by Jobs',
+    // "Jobs" until #86, when the unit got the name it always was: a turn.
+    (b) => (b.getAttribute('aria-label') || '') === 'Sort by Turns',
   );
   check('a breakdown can be re-sorted by another measure', Boolean(sortButton), sortButton ? 'found' : 'no sort control');
 
@@ -2917,10 +3128,10 @@ async function checkTheUsageChartsAreInteractive(): Promise<void> {
  */
 async function checkTheHistoryListsConversationsRatherThanRequests(): Promise<void> {
   const totals = (over: Record<string, number>) => ({
-    jobs: 0, turns: 0, toolCalls: 0,
+    turns: 0, modelTurns: 0, toolCalls: 0,
     inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
     reasoningTokens: 0, totalTokens: 0, costUsd: 0,
-    tokensReportedJobs: 0, costReportedJobs: 0,
+    tokensReportedTurns: 0, costReportedTurns: 0, modelTurnsReportedTurns: 0,
     ...over,
   });
 
@@ -2928,7 +3139,7 @@ async function checkTheHistoryListsConversationsRatherThanRequests(): Promise<vo
     scope: 'self', canSeeEveryone: false, period: 'day',
     from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
     bucket: 'hour', filters: {},
-    totals: totals({ jobs: 41, totalTokens: 90_000, costUsd: 7.5, tokensReportedJobs: 41, costReportedJobs: 41 }),
+    totals: totals({ turns: 41, totalTokens: 90_000, costUsd: 7.5, tokensReportedTurns: 41, costReportedTurns: 41 }),
     series: [], byProject: [], byAgent: [], byModel: [],
     effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
   };
@@ -2946,7 +3157,7 @@ async function checkTheHistoryListsConversationsRatherThanRequests(): Promise<vo
         projects: ['billing-api'],
         startedAt: '2026-07-27T09:00:00.000Z',
         lastActiveAt: '2026-07-27T12:30:00.000Z',
-        totals: totals({ jobs: 40, totalTokens: 88_000, costUsd: 7.25, tokensReportedJobs: 40, costReportedJobs: 40 }),
+        totals: totals({ turns: 40, totalTokens: 88_000, costUsd: 7.25, tokensReportedTurns: 40, costReportedTurns: 40 }),
       },
       {
         // No name: this tab has been closed, and the entry survives it.
@@ -2957,7 +3168,7 @@ async function checkTheHistoryListsConversationsRatherThanRequests(): Promise<vo
         projects: [],
         startedAt: '2026-07-27T08:00:00.000Z',
         lastActiveAt: '2026-07-27T08:05:00.000Z',
-        totals: totals({ jobs: 1, totalTokens: 2000, costUsd: 0.25, tokensReportedJobs: 1, costReportedJobs: 1 }),
+        totals: totals({ turns: 1, totalTokens: 2000, costUsd: 0.25, tokensReportedTurns: 1, costReportedTurns: 1 }),
       },
     ],
   };
@@ -2967,7 +3178,7 @@ async function checkTheHistoryListsConversationsRatherThanRequests(): Promise<vo
     userId: 1, userLogin: 'octocat', agent: 'claude', model: 'claude-opus-5',
     project: 'billing-api', projectSource: 'observed',
     startedAt: '2026-07-27T09:00:00.000Z', endedAt: '2026-07-27T09:01:00.000Z',
-    durationMs: 60_000, outcome: 'completed', turns: 2, toolCalls: 3,
+    durationMs: 60_000, outcome: 'completed', modelTurns: 2, toolCalls: 3,
     inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0,
     reasoningTokens: 0, totalTokens: 150, costUsd: 0.2,
     reportsUsage: true, reportsCost: true,
@@ -3090,10 +3301,10 @@ async function checkTheHistoryListsConversationsRatherThanRequests(): Promise<vo
 
 async function checkAServerOlderThanThePageSaysSo(): Promise<void> {
   const totals = {
-    jobs: 1, turns: 1, toolCalls: 0,
+    turns: 1, modelTurns: 1, toolCalls: 0,
     inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
     reasoningTokens: 0, totalTokens: 100, costUsd: 0.5,
-    tokensReportedJobs: 1, costReportedJobs: 1,
+    tokensReportedTurns: 1, costReportedTurns: 1,
   };
   // Exactly what 5.3.0 answered with: no `byProject`, no `bucket`, no `filters`.
   const oldShape = {
@@ -3169,13 +3380,13 @@ async function checkAServerOlderThanThePageSaysSo(): Promise<void> {
  */
 async function checkUnattributedWorkCanBeAttributedByHand(): Promise<void> {
   const totals = (over: Record<string, number>) => ({
-    jobs: 0, turns: 0, toolCalls: 0,
+    turns: 0, modelTurns: 0, toolCalls: 0,
     inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
     reasoningTokens: 0, totalTokens: 0, costUsd: 0,
-    tokensReportedJobs: 0, costReportedJobs: 0,
+    tokensReportedTurns: 0, costReportedTurns: 0, modelTurnsReportedTurns: 0,
     ...over,
   });
-  const one = totals({ jobs: 1, totalTokens: 100, costUsd: 0.5, tokensReportedJobs: 1, costReportedJobs: 1 });
+  const one = totals({ turns: 1, totalTokens: 100, costUsd: 0.5, tokensReportedTurns: 1, costReportedTurns: 1 });
 
   const dashboard = {
     scope: 'self', canSeeEveryone: false, period: 'day',
@@ -3196,7 +3407,7 @@ async function checkUnattributedWorkCanBeAttributedByHand(): Promise<void> {
     sessionId: 'sess-1', nativeSessionId: null, turnId: 't1', userId: 7, userLogin: 'dnviti',
     agent: 'claude', model: 'claude-opus-5',
     startedAt: '2026-07-27T09:14:02.000Z', endedAt: '2026-07-27T09:14:41.000Z',
-    durationMs: 39000, outcome: 'completed', turns: 3, toolCalls: 5,
+    durationMs: 39000, outcome: 'completed', modelTurns: 3, toolCalls: 5,
     inputTokens: 10, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0,
     reasoningTokens: null, totalTokens: 100, costUsd: 0.5,
     reportsUsage: true, reportsCost: true,
@@ -4026,7 +4237,14 @@ async function checkATurnsBadgeSaysHowItEnded(): Promise<void> {
   );
   await wait(400);
 
-  const rows = Array.from(host.querySelectorAll('nav[aria-label="Turns"] [role="option"]')) as HTMLElement[];
+  // The index runs newest-first, the transcript oldest-first, so the rows are
+  // put back into the conversation's order before being read against the
+  // strips. Reversed here rather than asserted away: which end the list starts
+  // at is a presentation choice, and every claim below is about a turn rather
+  // than about a position.
+  const rows = (
+    Array.from(host.querySelectorAll('nav[aria-label="Turns"] [role="option"]')) as HTMLElement[]
+  ).reverse();
   const strips = Array.from(host.querySelectorAll('[data-turn-id]')) as HTMLElement[];
 
   check(
