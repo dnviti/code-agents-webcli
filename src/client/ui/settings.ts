@@ -6,6 +6,7 @@ import { shellStore } from '../shell/store';
 import { setThemeMode } from '../shell/theme';
 import type {
   AppSettings,
+  NotifySettings,
   TerminalFontFamilyId,
   ThemePresetId,
 } from '../types';
@@ -173,6 +174,22 @@ const TERMINAL_THEMES: Record<ThemePresetId, NonNullable<ITerminalOptions['theme
   },
 };
 
+/**
+ * Everything on.
+ *
+ * A notification still needs the browser's own permission, which this app asks
+ * for from a click in the settings dialog and nowhere else — so "on" here means
+ * "as soon as you allow it", not "the moment the page loads".
+ */
+export const DEFAULT_NOTIFICATIONS: NotifySettings = {
+  enabled: true,
+  finished: true,
+  failed: true,
+  approval: true,
+  question: true,
+  details: true,
+};
+
 const DEFAULTS: AppSettings = {
   fontSize: 14,
   theme: 'github-dark',
@@ -180,6 +197,7 @@ const DEFAULTS: AppSettings = {
   // Off. Every other default in this file is a matter of taste; this one
   // decides whether an agent can act on this machine without being asked.
   chatBypassPermissions: false,
+  notifications: DEFAULT_NOTIFICATIONS,
 };
 
 const THEME_ALIASES: Record<string, ThemePresetId> = {
@@ -224,11 +242,33 @@ export function loadSettings(): AppSettings {
       // Strict equality, not truthiness: anything in storage that is not
       // literally `true` leaves approvals on.
       chatBypassPermissions: parsed.chatBypassPermissions === true,
+      notifications: normalizeNotifications(parsed.notifications),
     };
   } catch (error) {
     console.error('Failed to load settings:', error);
     return { ...DEFAULTS };
   }
+}
+
+/**
+ * Coerce whatever storage hands back into a complete set of choices.
+ *
+ * `!== false` rather than `=== true`, the opposite of the approval bypass above
+ * and for the same reason read the other way: the safe side of a notification
+ * toggle is on. A blob written before this feature existed has no `notifications`
+ * key at all, and reading its absence as silence would ship a feature that is
+ * off for everybody who has ever opened the app.
+ */
+function normalizeNotifications(value: unknown): NotifySettings {
+  const input = (value && typeof value === 'object' ? value : {}) as Partial<NotifySettings>;
+  return {
+    enabled: input.enabled !== false,
+    finished: input.finished !== false,
+    failed: input.failed !== false,
+    approval: input.approval !== false,
+    question: input.question !== false,
+    details: input.details !== false,
+  };
 }
 
 function normalizeTerminalFontFamily(value: unknown): TerminalFontFamilyId {
@@ -252,11 +292,16 @@ function normalizeTerminalFontFamily(value: unknown): TerminalFontFamilyId {
  * it should not trust its input to be a valid preset id.
  */
 export function saveSettings(app: App, next: AppSettings): void {
+  // Every field is named here on purpose, and every field has to be: this
+  // literal is what gets written, so a setting added to the type and to
+  // `loadSettings` but forgotten here reads back correctly until the first save
+  // and then reverts for good.
   const settings: AppSettings = {
     fontSize: clampFontSize(next.fontSize),
     theme: normalizeThemePreset(next.theme),
     terminalFontFamily: normalizeTerminalFontFamily(next.terminalFontFamily),
     chatBypassPermissions: next.chatBypassPermissions === true,
+    notifications: normalizeNotifications(next.notifications),
   };
 
   try {
@@ -282,6 +327,12 @@ export function applySettings(app: App, settings: AppSettings): void {
   // button that acts on it, instead of the two reading storage separately and
   // disagreeing about what is about to happen.
   shellStore.setState({ chatBypassPermissions: settings.chatBypassPermissions === true });
+
+  // Same reason, and one more: the code that decides whether a finished
+  // conversation may interrupt somebody runs on a socket message, nowhere near
+  // React, and reading localStorage on every chat event of every conversation
+  // would be a parse per token.
+  shellStore.setState({ notifications: normalizeNotifications(settings.notifications) });
 
   document.documentElement.setAttribute('data-theme', settings.theme);
   document.documentElement.setAttribute('data-color-mode', getThemeMode(settings.theme));

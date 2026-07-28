@@ -29,6 +29,8 @@ import { FloatingMenu, type FloatingMenuAction } from '../../src/client/shell/Fl
 import { BottomNav } from '../../src/client/shell/BottomNav';
 import { MoreSheet } from '../../src/client/shell/MoreSheet';
 import { ChatSettingsDialog } from '../../src/client/shell/dialogs/ChatSettingsDialog';
+import { SettingsDialog } from '../../src/client/shell/dialogs/SettingsDialog';
+import { DEFAULT_NOTIFICATIONS } from '../../src/client/ui/settings';
 import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
 import { UsageDashboardDialog } from '../../src/client/shell/dialogs/UsageDashboardDialog';
 import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
@@ -279,6 +281,7 @@ async function run(): Promise<void> {
   await checkTheUsageWindowReachesBeforeThisYear();
   await checkTheEffortHistogramsAreReadableWithoutAMouse();
   await checkTheFileTreeAndTheShellAreSizedForAThumb();
+  await checkAWaitingConversationIsVisibleWithoutOpeningIt();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -2823,6 +2826,22 @@ async function checkThePhoneShellSurfacesAreUsable(): Promise<void> {
     ['the chat settings dialog', () =>
       React.createElement(ChatSettingsDialog, {
         open: true, settings: DEFAULT_CHAT_VIEW, onChange: noop, onClose: noop,
+      } as never)],
+    // The app's own settings dialog, which was never in this list: it is the
+    // longest dialog in the product and the only place several behaviours can
+    // be changed at all — including which conversations may interrupt you.
+    ['the settings dialog', () =>
+      React.createElement(SettingsDialog, {
+        open: true,
+        settings: {
+          fontSize: 14,
+          theme: 'github-dark',
+          terminalFontFamily: 'jetbrains-mono',
+          chatBypassPermissions: false,
+          notifications: DEFAULT_NOTIFICATIONS,
+        },
+        onPreview: noop, onSave: noop, onClose: noop,
+        install: 'available', onInstall: noop, onOpenRuntimeProfiles: noop,
       } as never)],
     ['the sessions dialog', () =>
       React.createElement(SessionsDialog, {
@@ -7602,4 +7621,144 @@ async function checkTheEffortHistogramsAreReadableWithoutAMouse(): Promise<void>
   root.unmount();
   frame.remove();
   window.fetch = realFetch;
+}
+
+/**
+ * A conversation that has stopped for the user is identifiable from outside it.
+ *
+ * This is the fallback the whole notification feature rests on: permission can
+ * be refused, and on iOS outside an installed app it is not even offered, so
+ * the marks inside the product are the only thing some people will ever get.
+ *
+ * It cannot be a unit test. Every claim here is about paint — that the waiting
+ * dot resolves to a different colour from the unread dot, and that the phone
+ * sheet, which is the *only* cross-session surface on a phone because the tab
+ * strip is not rendered there at all, actually draws the words at a size an eye
+ * can read. Without the app's own stylesheets every `var(--warning)` resolves
+ * to the empty string and a test on the inline style would pass on a dot that
+ * paints black.
+ */
+async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;position:absolute;top:0;left:0';
+  document.body.appendChild(host);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(TabBar, {
+      tabs: [
+        // `status: 'running'` on the waiting two is the case that matters and
+        // the one that was wrong: a tab's status is the server's "the process
+        // is alive", which stays true of an agent that stopped to ask
+        // something — so after a reload, or after the tab has been joined, a
+        // blocked conversation arrives here as running.
+        { id: 'waiting', title: 'infra', status: 'running', unread: true, attention: 'approval' },
+        { id: 'asked', title: 'docs', status: 'running', unread: true, attention: 'question' },
+        { id: 'unread', title: 'webcli', status: 'idle', unread: true },
+        { id: 'quiet', title: 'notes', status: 'running' },
+      ],
+      activeId: 'quiet',
+      onSelect: () => {},
+      onClose: () => {},
+      onNew: () => {},
+      ariaLabel: 'Sessions',
+    } as never),
+  );
+  await wait(200);
+
+  const strip = host.querySelector('[role="tablist"][aria-label="Sessions"]') as HTMLElement;
+  const tabs = Array.from(strip.querySelectorAll<HTMLElement>('[role="tab"]'));
+  const dotOf = (tab: HTMLElement): HTMLElement => tab.firstElementChild as HTMLElement;
+  const colourOf = (tab: HTMLElement): string => getComputedStyle(dotOf(tab)).backgroundColor;
+
+  const waiting = colourOf(tabs[0]);
+  const asked = colourOf(tabs[1]);
+  const unread = colourOf(tabs[2]);
+  const quiet = colourOf(tabs[3]);
+
+  check(
+    'a conversation waiting for approval is not painted as ordinary unread output',
+    waiting !== unread && /rgb/.test(waiting),
+    `approval=${waiting} unread=${unread}`,
+  );
+  check(
+    'a conversation that asked a question is told apart from one waiting for approval',
+    asked !== waiting && asked !== unread,
+    `question=${asked} approval=${waiting}`,
+  );
+  check(
+    'a stopped conversation is not painted as one that is working',
+    waiting !== quiet && asked !== quiet && /rgb/.test(quiet),
+    `approval=${waiting} question=${asked} running=${quiet}`,
+  );
+  check(
+    'and nothing pulses while it waits',
+    getComputedStyle(dotOf(tabs[0])).animationName === 'none'
+      && getComputedStyle(dotOf(tabs[3])).animationName !== 'none',
+    `waiting=${getComputedStyle(dotOf(tabs[0])).animationName} running=${getComputedStyle(dotOf(tabs[3])).animationName}`,
+  );
+  check(
+    'and the waiting dot says so in words, not only in colour',
+    dotOf(tabs[0]).getAttribute('aria-label') === 'Waiting for approval'
+      && dotOf(tabs[1]).getAttribute('aria-label') === 'Asked you a question'
+      && dotOf(tabs[2]).getAttribute('aria-label') === null,
+    `${dotOf(tabs[0]).getAttribute('aria-label')} / ${dotOf(tabs[1]).getAttribute('aria-label')}`,
+  );
+
+  root.unmount();
+  host.remove();
+
+  // The phone, where this is the only place the answer exists: AppShell renders
+  // no tab strip below the mobile breakpoint.
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const sheetRoot = createRoot(doc.body);
+  sheetRoot.render(
+    React.createElement(
+      PhoneContext.Provider,
+      { value: true },
+      React.createElement(TabSwitcherSheet, {
+        open: true,
+        tabs: [
+          { id: 'waiting', title: 'infra', status: 'running', unread: true, attention: 'approval', workingDir: '/srv/infra' },
+          { id: 'quiet', title: 'notes', status: 'running', unread: false, attention: null, workingDir: '/srv/notes' },
+        ],
+        activeId: 'quiet',
+        onSelect: () => {},
+        onCloseTab: () => {},
+        onNew: () => {},
+        onAllSessions: () => {},
+        onClose: () => {},
+      } as never),
+    ),
+  );
+  await wait(300);
+  settle(doc);
+
+  const said = paintedText(doc.body).find((entry) => entry.text === 'Waiting for approval');
+  check(
+    'the phone’s session sheet says which conversation is waiting',
+    Boolean(said),
+    said ? `${said.size}px` : paintedText(doc.body).map((entry) => entry.text).slice(0, 8).join(' | '),
+  );
+  check(
+    'and says it at a size that can be read',
+    Boolean(said) && (said as { size: number }).size >= PHONE_MIN_TEXT,
+    said ? `${said.size}px, floor ${PHONE_MIN_TEXT}px` : 'not drawn',
+  );
+
+  sheetRoot.unmount();
+  frame.remove();
 }

@@ -10,7 +10,8 @@
 // that used to call `document.getElementById(...).classList.add('active')` call
 // `shellStore.setState({ ... })` instead and keep the rest of their logic.
 
-import type { SessionListItem } from '../types';
+import type { NotifySettings, SessionListItem } from '../types';
+import type { ConversationAttention } from '../../shared/chat-alerts';
 import type { ConfirmRequest } from '../ui/confirm';
 import { DEFAULT_CHAT_VIEW, type ChatViewSettings } from '../chat/view-settings';
 
@@ -24,6 +25,16 @@ export interface ShellTab {
   kind: string;
   workingDir: string | null;
   unread: boolean;
+  /**
+   * Whether this conversation has stopped and is waiting on a person.
+   *
+   * A scalar rather than an object because tabs are compared one level deep
+   * (see `shallowEqual`), and because it is the one thing about a conversation
+   * a tab strip can usefully say: this is not progress, it is a stop that only
+   * the user can end. Null for terminals and for conversations that are working
+   * or idle.
+   */
+  attention: ConversationAttention | null;
   /**
    * Which surface this session runs on, fixed when it was started.
    *
@@ -238,6 +249,15 @@ export interface ShellState {
    * promising something other than what it does.
    */
   chatBypassPermissions: boolean;
+  /**
+   * When a conversation may interrupt the user, mirrored out of AppSettings.
+   *
+   * Read on every chat event of every conversation this browser watches, which
+   * is why it is here rather than parsed out of localStorage at the point of
+   * use. Six flat booleans, so the store's one-level equality check still sees
+   * a no-op patch for what it is.
+   */
+  notifications: NotifySettings;
   /** Which chat panels are shown, and what the transcript renders. */
   chatView: ChatViewSettings;
 }
@@ -294,6 +314,17 @@ const INITIAL: ShellState = {
   logoutUrl: null,
   install: 'unsupported',
   chatBypassPermissions: false,
+  // Replaced by `applySettings` during boot, before the first render. On until
+  // then so a conversation that finishes during startup is not silently missed
+  // by a store that had not read the user's choice yet.
+  notifications: {
+    enabled: true,
+    finished: true,
+    failed: true,
+    approval: true,
+    question: true,
+    details: true,
+  },
   chatView: DEFAULT_CHAT_VIEW,
 };
 

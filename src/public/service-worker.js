@@ -97,3 +97,42 @@ self.addEventListener('message', (event) => {
     self.skipWaiting();
   }
 });
+
+/**
+ * Acting on a conversation notification.
+ *
+ * The page shows these through this worker rather than through its own
+ * `new Notification`, because that constructor throws outright on Android
+ * Chrome — the phone case the feature exists for. The cost is that the click
+ * arrives here, in a worker that cannot switch tabs and may have no page at
+ * all, so this does the two things only a worker can: bring an existing window
+ * forward and tell it which conversation to open, or open one at a URL that
+ * says the same thing.
+ *
+ * `includeUncontrolled` matters on the first load after an update, when the
+ * page that raised the notification is not yet claimed by this worker and would
+ * otherwise be invisible here — the click would open a second window over the
+ * one already showing the conversation.
+ */
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const sessionId = (event.notification.data && event.notification.data.sessionId) || '';
+
+  event.waitUntil((async () => {
+    const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    for (const client of clients) {
+      try {
+        await client.focus();
+      } catch {
+        // Some platforms refuse to focus without a very recent gesture; the
+        // message below still puts the right conversation on screen.
+      }
+      client.postMessage({ type: 'cc-web-open-conversation', sessionId });
+      return;
+    }
+
+    await self.clients.openWindow(
+      sessionId ? `/?conversation=${encodeURIComponent(sessionId)}` : '/',
+    );
+  })());
+});
