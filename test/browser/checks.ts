@@ -1871,9 +1871,18 @@ function assertPhoneSurface(host: HTMLElement, where: string, atRest = false): v
   const hostBox = host.getBoundingClientRect();
 
   // 1. Every control a finger is meant to hit.
+  //
+  //    A key on the on-screen key strip is judged on height alone. Nine keys
+  //    cannot each be 44px wide on a 390px screen — 460px of keys before any
+  //    gaps — and no platform's own keyboard tries: a keyboard row is aimed at
+  //    vertically, along a band the width of the screen. The exemption is by
+  //    name and only for width, so the row still has to be a full target tall
+  //    and everything that is not a key still has to be square.
   const controls = paintedControls(host);
+  const isKey = (node: HTMLElement): boolean => Boolean(node.closest('[aria-label="Terminal keys"]'));
   const small = controls.filter((node) => {
     const box = laidOutSize(node);
+    if (isKey(node)) return box.height < PHONE_TARGET;
     return box.width < PHONE_TARGET || box.height < PHONE_TARGET;
   });
   check(
@@ -1908,6 +1917,9 @@ function assertPhoneSurface(host: HTMLElement, where: string, atRest = false): v
       // Both comfortably over the floor on the axis they meet on — see
       // PHONE_GAP_EXEMPT_AT.
       if (a.width >= PHONE_GAP_EXEMPT_AT && b.width >= PHONE_GAP_EXEMPT_AT) continue;
+      // Two keys of the same key strip, for the reason above: a keyboard row is
+      // a row, and the space between its keys is what makes it one.
+      if (isKey(byLeft[i]) && isKey(byLeft[j])) continue;
       const gap = b.left - a.right;
       // Only the nearest neighbour to the right matters; anything further is
       // separated by that one.
