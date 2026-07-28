@@ -575,6 +575,31 @@ describe('ChatStore', function () {
       assert.strictEqual(snapshot.usage.contextUsed, 1200);
     });
 
+    it('starts the total again at a clear, warm or cold', async function () {
+      // The figures over a chat are about the conversation on screen. A clear
+      // ends that conversation, so a browser rejoining afterwards must not be
+      // handed the bill of the one before it — and the running total the store
+      // keeps in memory has to reset with the log it describes.
+      const session = { id: 'cleared', ownerUserId: 1 };
+      store.append(session, [
+        { t: 'msg_start', seq: 1, ts: 1, id: 'm1', role: 'assistant', turnId: 't1' },
+        { t: 'msg_end', seq: 2, ts: 1, msgId: 'm1', usage: { inputTokens: 900 } },
+        { t: 'turn_end', seq: 3, ts: 1, turnId: 't1', usage: { costUsd: 4.2 } },
+      ]);
+      assert.ok(Math.abs((await store.snapshot(session)).usage.costUsd - 4.2) < 1e-9);
+
+      store.append(session, [{ t: 'marker', kind: 'cleared', seq: 4, ts: 2 }]);
+      const after = await store.snapshot(session);
+      assert.strictEqual(after.usage.costUsd, 0, `got ${after.usage.costUsd}`);
+      assert.strictEqual(after.usage.inputTokens, 0);
+
+      // And a server that restarts reads the same thing off the log rather
+      // than the total from before the line.
+      const cold = new ChatStore({ storageDir: dir });
+      const reread = await cold.snapshot(session);
+      assert.ok(!reread.usage.costUsd, `a cold read must not resurrect it, got ${reread.usage.costUsd}`);
+    });
+
     it('stops walking back rather than replaying a log with no message boundaries', async function () {
       const capped = new ChatStore({
         storageDir: dir,

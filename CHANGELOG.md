@@ -271,6 +271,14 @@
   touched, so the statistics page still shows the spend of the conversation you
   cleared.
 
+  The figures over the chat go back to nothing with it: `$0.00`, `0 tok` and an
+  empty context bar. They are statements about the conversation on screen, and
+  the new one used to open carrying the last one's bill — under a bar reading
+  80% full of a window that was now empty, which is the reading people clear in
+  order to fix. Zeroed rather than blanked, because a header that empties looks
+  like a readout that broke instead of one that reset, and no figure is invented
+  for a runtime that reports none.
+
 - **An agent that picks its own work back up stays in the turn it was working
   on — and what that work costs is finally counted.** (#86) An agent that leaves
   something running in the background — a build, a check, a job it is waiting on
