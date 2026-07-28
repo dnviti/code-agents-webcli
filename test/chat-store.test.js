@@ -136,6 +136,37 @@ describe('ChatStore', function () {
       assert.strictEqual(page.events.length, 11);
     });
 
+    it('keeps the numbers of the turns that survive, so nothing renumbers to 1', async function () {
+      // Past the retention cap the head goes, and with it the turns that were
+      // there. The ones left are still the fourth and fifth thing the user
+      // asked, and the index, the header's count and the spend record all have
+      // to say so — reading the number off a row's position in what survives is
+      // what made the three disagree (#86).
+      const trimmed = new ChatStore({ storageDir: dir, maxEvents: 12, trimChunkEvents: 6 });
+      const session = { id: 'trimmed-turns', ownerUserId: 1 };
+      let seq = 1;
+      const ask = (turnId) => [
+        { t: 'msg_start', seq: seq++, ts: 1, id: `u-${turnId}`, role: 'user', turnId },
+        { t: 'msg_end', seq: seq++, ts: 1, msgId: `u-${turnId}` },
+        { t: 'turn_end', seq: seq++, ts: 1, turnId, stopReason: 'end_turn' },
+      ];
+      trimmed.append(session, [...ask('one'), ...ask('two'), ...ask('three')]);
+      await trimmed.stat(session);
+      const before = await trimmed.turnIndex(session);
+      assert.deepStrictEqual(before.turns.map((turn) => turn.index), [1, 2, 3]);
+
+      trimmed.append(session, [...ask('four'), ...ask('five')]);
+      const after = await trimmed.turnIndex(session);
+
+      assert.deepStrictEqual(
+        after.turns.map((turn) => turn.turnId),
+        ['three', 'four', 'five'],
+        'the trim did not drop what this test is about',
+      );
+      assert.deepStrictEqual(after.turns.map((turn) => turn.index), [3, 4, 5]);
+      assert.strictEqual(after.complete, false, 'and it says the older ones are gone');
+    });
+
     it('lets a client tell it fell off the back', async function () {
       const trimmed = new ChatStore({ storageDir: dir, maxEvents: 10, trimChunkEvents: 5 });
       const session = { id: 's1', ownerUserId: 1 };

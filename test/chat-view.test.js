@@ -662,6 +662,30 @@ describe('ChatView', function () {
     );
   });
 
+  it('repeats the server’s word that the older history was trimmed away', function () {
+    // `complete: false` has been on the wire and stored on the controller since
+    // the index was written, and no surface read it: the index listed the turns
+    // that survived the retention cap as though they were the conversation
+    // (#86). Driven through the real message so the whole path is under test —
+    // a prop passed by hand would prove nothing about the wiring.
+    const controller = controllerWith({
+      messages: [message('u1', 1, 'user', 'the surviving ask')],
+      cursor: 1,
+    });
+    controller.handle({
+      type: 'chat_turn_index',
+      sessionId: 's1',
+      complete: false,
+      turns: [
+        { id: 'u1', turnId: 't1', index: 4001, label: 'the surviving ask', startedAt: 1, outcome: 'done' },
+      ],
+    });
+
+    const html = render({ controller });
+    assert.ok(/earlier turns trimmed/.test(html), 'the index has to admit what it cannot show');
+    assert.ok(/4001/.test(html), 'and keep the numbers the recording gave the survivors');
+  });
+
   it('wires the composer and the approval buttons to the controller', function () {
     // The rendered markup cannot prove a callback landed, so the wiring is
     // checked against the messages the controller would put on the socket.

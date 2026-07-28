@@ -45,8 +45,12 @@ import { TurnBoundary, openTurnAfter, openTurnBefore } from '../../shared/turn-b
 
 const MAGIC = 0x43414348; // "CACH" - distinct from history-store's "CAWH" so the two
 // index formats can never be cross-read by mistake if a path is ever confused.
-const FORMAT_VERSION = 1;
-const HEADER_BYTES = 16;
+const FORMAT_VERSION = 2;
+// Version 2 widened the header by one 64-bit field: how many turns the log has
+// dropped, which is the only thing a trimmed conversation cannot work out for
+// itself. An index written by version 1 fails the check and is rebuilt from the
+// log, which is a path this file already has and already exercises.
+const HEADER_BYTES = 24;
 const ENTRY_BYTES = 4;
 
 /** uint32 offsets cap the log; trimming keeps it far below this. */
@@ -197,6 +201,15 @@ interface SessionState {
   firstSeq: number;
   count: number;
   logSize: number;
+  /**
+   * Turns that were trimmed off the head, so the ones left keep their numbers.
+   *
+   * Persisted in the index header because it is the one fact about a
+   * conversation that its surviving log cannot reconstruct. Zero for a
+   * conversation that has never been trimmed, and reset by a `/clear`, which
+   * genuinely does start the numbering again.
+   */
+  turnsDropped: number;
   /**
    * What the whole conversation has spent, kept beside the log's geometry.
    *
@@ -409,6 +422,7 @@ export class ChatStore implements ChatStoreLike {
       firstSeq: 1,
       count: 0,
       logSize: 0,
+      turnsDropped: 0,
       usageSeq: 0,
       turnBoundarySeq: 0,
       capabilitySeq: 0,
@@ -431,6 +445,7 @@ export class ChatStore implements ChatStoreLike {
           await handle.read(header, 0, HEADER_BYTES, 0);
           if (header.readUInt32BE(0) === MAGIC && header.readUInt16BE(4) === FORMAT_VERSION) {
             state.firstSeq = Number(header.readBigUInt64BE(8));
+            state.turnsDropped = Number(header.readBigUInt64BE(16));
             state.count = Math.floor((size - HEADER_BYTES) / ENTRY_BYTES);
             usable = true;
           }
@@ -454,7 +469,12 @@ export class ChatStore implements ChatStoreLike {
       console.warn(`Chat index ${base}.idx is unreadable; rebuilding it from the log.`);
       state.firstSeq = (await firstSeqInLog(base)) ?? 1;
       state.count = 0;
-      await fs.promises.writeFile(`${base}.idx`, headerBuffer(state.firstSeq));
+      // Rebuilt from a log whose head may be long gone: how many turns went
+      // with it is not in the log, so the count starts again from what is left.
+      // The numbers a rebuilt conversation shows are its own, and they are at
+      // least self-consistent from here on.
+      state.turnsDropped = 0;
+      await fs.promises.writeFile(`${base}.idx`, headerBuffer(state.firstSeq, state.turnsDropped));
     }
 
     await this.repairIndex(base, state);
@@ -741,6 +761,13 @@ export class ChatStore implements ChatStoreLike {
       return;
     }
 
+    // Counted before the log loses them, because afterwards nothing can. A turn
+    // is numbered by how many came before it in the conversation, and reading
+    // that off the position of a row in what survives renumbers every trimmed
+    // conversation from 1 — so the index, the header's count and the spend
+    // record disagree about the same turn (#86).
+    const dropped = state.turnsDropped + (await this.turnsBelow(base, state, state.firstSeq + drop));
+
     const idxHandle = await fs.promises.open(`${base}.idx`, 'r');
     let cutOffset = 0;
     let remaining: Buffer;
@@ -767,14 +794,32 @@ export class ChatStore implements ChatStoreLike {
 
     await fs.promises.writeFile(
       `${base}.idx.tmp`,
-      Buffer.concat([headerBuffer(state.firstSeq + drop), remaining]),
+      Buffer.concat([headerBuffer(state.firstSeq + drop, dropped), remaining]),
     );
     await fs.promises.rename(`${base}.jsonl.tmp`, `${base}.jsonl`);
     await fs.promises.rename(`${base}.idx.tmp`, `${base}.idx`);
 
     state.firstSeq += drop;
     state.count -= drop;
+    state.turnsDropped = dropped;
     state.logSize = keptBytes;
+  }
+
+  /**
+   * How many turns opened below `seq`.
+   *
+   * The boundaries are already tracked for the turn index, so this is a read of
+   * something the store knows rather than another pass over the log — and it is
+   * only ever asked at a trim, which is rare and already rewriting two files.
+   * A boundary with no turn id is the gap between two turns, not a turn.
+   */
+  private async turnsBelow(base: string, state: SessionState, seq: number): Promise<number> {
+    const stats: ChatStats = {
+      firstSeq: state.firstSeq,
+      cursor: state.count > 0 ? state.firstSeq + state.count - 1 : 0,
+    };
+    const boundaries = await this.turnBoundaries(base, state, stats);
+    return boundaries.filter((boundary) => boundary.seq < seq && boundary.turnId !== null).length;
   }
 
   private async copyLogTail(base: string, from: number, length: number): Promise<void> {
@@ -858,7 +903,7 @@ export class ChatStore implements ChatStoreLike {
         const turn: PersistedTurn = {
           id,
           turnId,
-          index: turns.length + 1,
+          index: numberFrom + turns.length + 1,
           label: null,
           startedAt: ts,
           startSeq: seq,
@@ -874,6 +919,10 @@ export class ChatStore implements ChatStoreLike {
       // construction, so nothing is missing however far back the log was
       // trimmed.
       let cleared = false;
+      // What a turn is numbered from. Trimming the head does not renumber what
+      // is left; a `/clear` does, because it genuinely starts a conversation
+      // over in the same tab and nothing above it is reachable any more.
+      let numberFrom = state.turnsDropped;
       await this.scanLog(base, state, (event) => {
         switch (event.t) {
           case 'msg_start': {
@@ -922,6 +971,7 @@ export class ChatStore implements ChatStoreLike {
               openTurnId = null;
               pending = null;
               cleared = true;
+              numberFrom = 0;
             }
             return;
           }
@@ -1561,12 +1611,13 @@ async function firstSeqInLog(base: string): Promise<number | null> {
   }
 }
 
-function headerBuffer(firstSeq: number): Buffer {
+function headerBuffer(firstSeq: number, turnsDropped = 0): Buffer {
   const header = Buffer.alloc(HEADER_BYTES);
   header.writeUInt32BE(MAGIC, 0);
   header.writeUInt16BE(FORMAT_VERSION, 4);
   header.writeUInt16BE(0, 6);
   header.writeBigUInt64BE(BigInt(firstSeq), 8);
+  header.writeBigUInt64BE(BigInt(turnsDropped), 16);
   return header;
 }
 

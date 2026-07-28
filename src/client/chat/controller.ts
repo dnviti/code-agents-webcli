@@ -84,6 +84,38 @@ const PAGE_TIMEOUT_MS = 15000;
 
 const PAGE_SIZE = 200;
 
+/**
+ * How much a page fetched for an explicit destination asks for.
+ *
+ * The server's own per-read ceiling, and it is worth asking for all of it here:
+ * a jump four thousand events back is eight round trips at this size and twenty
+ * at the scrolling one, while the read itself is a positioned file read either
+ * way. Scrolling keeps the smaller page, because there the point is to arrive
+ * with the least the reader can already use.
+ */
+const SEEK_PAGE_SIZE = 500;
+
+/**
+ * What happened to a jump to a message the browser did not hold.
+ *
+ * Three answers rather than a boolean, because the caller says something
+ * different about each: `arrived` scrolls, `exhausted` has to admit the turn is
+ * not on disk any more, and `abandoned` says nothing at all — the user has
+ * already gone somewhere else, and a notice about the journey they left is
+ * noise about a decision they made.
+ */
+/**
+ * How a jump ended.
+ *
+ * `exhausted` and `unreachable` are kept apart because they want different
+ * words on screen: the first is the log genuinely not holding that turn any
+ * more, the second is a read that failed or timed out, which says nothing about
+ * whether the turn is there. Telling a user their turn is gone because one
+ * page did not come back is a wrong answer given confidently, and on a slow
+ * link a long walk has a hundred chances to hit it.
+ */
+export type SeekOutcome = 'arrived' | 'exhausted' | 'unreachable' | 'abandoned';
+
 export class ChatController {
   readonly transcript = new ChatTranscript(NO_CHAT_CAPABILITIES);
 
@@ -96,6 +128,19 @@ export class ChatController {
    */
   private turnIndexComplete = true;
   private pageTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** The message an explicit jump is still paging back towards, or null. */
+  private seeking: string | null = null;
+  /**
+   * Which jump is the current one.
+   *
+   * A seek walks the log a page at a time and every step is a round trip, so
+   * there is always a window in which the user changes their mind — picks
+   * another entry, jumps to the latest, or leaves the conversation. Bumping
+   * this abandons whatever is in flight without cancelling the page it is
+   * waiting on, which is already on its way and still worth folding in.
+   */
+  private seekGeneration = 0;
 
   /** Set while the conversation is readable but has nothing running it. */
   private unavailable: ChatUnavailable | null = null;
@@ -179,6 +224,10 @@ export class ChatController {
         const snapshot = message.snapshot as ChatSnapshot | undefined;
         if (!snapshot) return true;
         this.settlePage();
+        // A rejoin replaces the window a jump was walking back through, and its
+        // paging floor with it. Whatever it was looking for has to be asked for
+        // again from where the conversation now stands.
+        this.cancelSeek();
         this.transcript.hydrate(snapshot);
         // Asked for once per open. The list only grows at the end, and the end
         // is the part this browser is certain to be holding.
@@ -299,6 +348,12 @@ export class ChatController {
         // log, which is where the boundary is recorded.
         if (event && event.t === 'marker' && event.kind === 'cleared') {
           this.transcript.setRecordedTurns([]);
+          // And with it the claim that older turns were trimmed away. A clear
+          // starts the numbering over by construction, so an emptied
+          // conversation carrying that flag draws "0+" and "earlier turns
+          // trimmed" for the one round trip until the fresh index lands —
+          // exactly the false statement the flag exists to prevent.
+          this.turnIndexComplete = true;
           this.requestTurnIndex();
         }
         return true;
@@ -569,12 +624,20 @@ export class ChatController {
    * the momentum settles, and each one would otherwise fetch the same page.
    */
   loadMore(): void {
+    this.requestPage(PAGE_SIZE);
+  }
+
+  /**
+   * The page request itself, at whatever size the caller is reading for.
+   *
+   * Scrolling asks for a screenful; a jump to a named turn asks for as much as
+   * the server will read at once, because there the pages are a journey rather
+   * than the thing being read. See `SEEK_PAGE_SIZE`.
+   */
+  private requestPage(size: number): void {
     if (this.transcript.loadingMore || !this.transcript.hasMore) return;
 
-    const fromSeq = Math.max(
-      this.transcript.firstSeq,
-      this.transcript.oldestSeq - PAGE_SIZE,
-    );
+    const fromSeq = Math.max(this.transcript.firstSeq, this.transcript.oldestSeq - size);
     const requestId = `chat-page-${this.nextRequestId++}`;
     this.pendingPage = requestId;
     this.transcript.setLoadingMore(true);
@@ -587,7 +650,7 @@ export class ChatController {
     this.send({
       type: 'chat_history_request',
       fromSeq,
-      count: PAGE_SIZE,
+      count: size,
       requestId,
     });
   }
@@ -605,28 +668,82 @@ export class ChatController {
   }
 
   /**
-   * Page back until a turn is held, or until there is no more history.
+   * Page back until a message is held, however far back it is.
    *
    * The index lists the whole conversation, so selecting an entry from before
    * what is loaded has to fetch it rather than quietly do nothing — which is
    * what "selecting an older one should take the user there" means (#86).
    *
-   * Bounded by `hasMore` and by a page ceiling, because the alternative is a
-   * loop that reads a whole conversation into a browser to answer a click. A
-   * request that runs out of pages resolves false and the caller leaves the
-   * selection where it was.
+   * **No page ceiling.** There used to be one, twenty pages of two hundred
+   * events, and in the conversations an index exists for that ceiling was the
+   * ordinary case rather than the guard: a click four thousand events above the
+   * window ran out of pages, resolved false, and left a highlighted row over a
+   * transcript that had not moved. Clicking again walked another four thousand
+   * and eventually landed, with nothing on screen to say that was what was
+   * happening. The reason a ceiling exists at all — that ordinary scrolling
+   * must not be able to walk a whole log into a browser — is about scrolling,
+   * and scrolling still asks for one page at a time through `loadMore`. This is
+   * an address the user typed, and it arrives.
+   *
+   * What replaces the ceiling as the guard against a loop that cannot end is
+   * progress: a page that does not lower the paging floor has fetched nothing,
+   * which is what a failed read and a server that has clamped the request both
+   * look like from here, and there is no point asking the same question again.
+   *
+   * One page at a time, awaited, so the surface keeps painting between them and
+   * the user can leave at any point — see `cancelSeek`.
    */
-  async loadUntilLoaded(messageId: string, maxPages = 20): Promise<boolean> {
-    for (let page = 0; page < maxPages; page++) {
-      if (this.transcript.messages.some((message) => message.id === messageId)) return true;
-      if (!this.transcript.hasMore) return false;
-      // One page at a time, awaited: `loadMore` is guarded against overlapping
-      // requests, so firing them in parallel would fetch one page and drop the
-      // rest on the floor.
-      const settled = await this.nextPage();
-      if (!settled) return false;
+  async seekTo(messageId: string): Promise<SeekOutcome> {
+    const mine = ++this.seekGeneration;
+    this.seeking = messageId;
+    this.options.onChange?.();
+    try {
+      let floor = this.transcript.oldestSeq;
+      for (;;) {
+        if (this.seekGeneration !== mine) return 'abandoned';
+        if (this.transcript.messages.some((message) => message.id === messageId)) return 'arrived';
+        if (!this.transcript.hasMore) return 'exhausted';
+        const settled = await this.nextPage(SEEK_PAGE_SIZE);
+        // Checked again on this side of the await, not only at the top: a
+        // rejoin, a disposal or a tab switch all land during a page, and
+        // reading the outcome off what the page did would announce "that turn
+        // is no longer in this conversation" for a jump the user simply left.
+        if (this.seekGeneration !== mine) return 'abandoned';
+        // A read that failed or timed out says nothing about whether the turn
+        // is there — only that this attempt did not reach it. Kept apart from
+        // the log genuinely ending, because the two want different words.
+        if (!settled) return 'unreachable';
+        if (this.transcript.oldestSeq >= floor) return 'unreachable';
+        floor = this.transcript.oldestSeq;
+      }
+    } finally {
+      // Only if this is still the jump in flight: a later one owns the flag now
+      // and clearing it here would take its indicator down with it.
+      if (this.seekGeneration === mine) {
+        this.seeking = null;
+        this.options.onChange?.();
+      }
     }
-    return this.transcript.messages.some((message) => message.id === messageId);
+  }
+
+  /**
+   * Stop going backwards.
+   *
+   * For everything that means "I am done with where I was going": jumping to
+   * the latest turn, sending a message, closing the conversation. The pages
+   * already asked for still arrive and are still folded in — they are history
+   * this browser now holds — but nothing scrolls and nothing is announced.
+   */
+  cancelSeek(): void {
+    if (this.seeking === null) return;
+    this.seekGeneration += 1;
+    this.seeking = null;
+    this.options.onChange?.();
+  }
+
+  /** The message a jump is being fetched for, so a surface can say it is working. */
+  get seekingMessageId(): string | null {
+    return this.seeking;
   }
 
   /**
@@ -637,11 +754,11 @@ export class ChatController {
    * arriving in that window would otherwise give up on the first step and go
    * nowhere — which looks exactly like the index not being wired up at all.
    */
-  private nextPage(): Promise<boolean> {
+  private nextPage(size = PAGE_SIZE): Promise<boolean> {
     if (!this.transcript.loadingMore && !this.transcript.hasMore) return Promise.resolve(false);
     return new Promise((resolve) => {
       this.pageWaiters.push(resolve);
-      if (!this.transcript.loadingMore) this.loadMore();
+      if (!this.transcript.loadingMore) this.requestPage(size);
     });
   }
 
@@ -671,11 +788,13 @@ export class ChatController {
 
   /** Release timers, e.g. when the session's tab is closed. */
   dispose(): void {
+    this.cancelSeek();
     this.settlePage();
   }
 
   /** Drop everything, e.g. when the session is being restarted. */
   reset(): void {
+    this.cancelSeek();
     this.settlePage();
     // Not a claim either way: the next snapshot or chat_started carries the
     // record's real override, and showing a stale one in the meantime would
@@ -687,6 +806,9 @@ export class ChatController {
     // conversation is thinking at a level nothing has confirmed.
     this.effortOverride = null;
     this.effortResult = null;
+    // Likewise the trimmed-history flag: it describes a log this controller is
+    // no longer pointed at.
+    this.turnIndexComplete = true;
     // `hydrate` clears the queue from the (absent) snapshot field, so the line
     // does not survive into a session that never accepted it.
     this.transcript.hydrate({

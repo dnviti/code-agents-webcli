@@ -168,10 +168,13 @@ const HEADING = /^\s*(?:[▸▶►→•·#]+\s+|(?:phase|stage)\s*:?\s+)(.+)$/i
  * A workflow's streamed output, split into the sections its own headings
  * mark — or, failing that, one section holding the whole log.
  *
- * There is no structured progress channel: a workflow tool call reports the
- * same way any other one does, a growing string of output. This is a best
- * effort at the same phase/agent structure the run itself narrates, and it
- * degrades to a flat log rather than guessing at structure that is not there.
+ * This is about the log and only the log. It used to say there was no
+ * structured channel at all, which was the belief behind a popup that said
+ * "waiting for the first stage" for a whole run: the runtime does report while
+ * it works, on the same task channel a delegation uses (#45). What arrives
+ * there is what the run is doing now; the log is what it narrated. This is a
+ * best effort at the phase structure inside that narration, and it degrades to
+ * a flat log rather than guessing at structure that is not there.
  */
 export function parseWorkflowLog(output: string | undefined): WorkflowLogSection[] {
   const sections: WorkflowLogSection[] = [];

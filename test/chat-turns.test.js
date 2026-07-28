@@ -338,6 +338,59 @@ describe('reconcileTurns', function () {
     assert.deepStrictEqual(turns.map((t) => t.index), [49, 50]);
   });
 
+  it('numbers a turn the recording has not heard of *above* the ones it has', function () {
+    // What a trimmed log looks like from here: the recorded index starts at
+    // 4,001 because everything older was dropped, and the window holds one turn
+    // above the first the recording names — a page that began inside it, under
+    // the runtime's own id. Numbering that turn 1 put "Turn 01" directly above
+    // "Turn 4001" in the index, which is the position of a row in an array and
+    // not a fact about the conversation.
+    const recorded = [
+      { id: 'u4001', turnId: 't4001', index: 4001, label: 'ask 4001', outcome: 'done' },
+      { id: 'u4002', turnId: 't4002', index: 4002, label: 'ask 4002', outcome: 'done' },
+    ];
+    const messages = [
+      msg('assistant', [text('…finishing the one before')], { turnId: 'runtime-7' }),
+      msg('user', [text('ask 4001')], { turnId: 't4001' }),
+      msg('user', [text('ask 4002')], { turnId: 't4002' }),
+    ];
+    const turns = mod.reconcileTurns(mod.groupTurns(messages, 'idle'), recorded);
+    assert.deepStrictEqual(turns.map((t) => t.index), [4000, 4001, 4002]);
+  });
+
+  it('numbers unrecorded turns above the first recorded one without repeating it', function () {
+    // Three turns the recording has not reached sitting above turn 2: counting
+    // back would put one at 0 and one at -1. The clamp keeps them at 1, and
+    // what matters then is that the list stays readable — no number used twice
+    // and no number out of order — rather than merely "all at least 1", which
+    // is true of the numbering this replaced as well.
+    const recorded = [{ id: 'u2', turnId: 't2', index: 2, label: 'ask 2', outcome: 'done' }];
+    const messages = [
+      msg('user', [text('older a')], { turnId: 'told-a' }),
+      msg('user', [text('older b')], { turnId: 'told-b' }),
+      msg('user', [text('older c')], { turnId: 'told-c' }),
+      msg('user', [text('ask 2')], { turnId: 't2' }),
+    ];
+    const turns = mod.reconcileTurns(mod.groupTurns(messages, 'idle'), recorded);
+    const numbers = turns.map((t) => t.index);
+
+    assert.ok(numbers.every((index) => index >= 1), numbers.join(','));
+    assert.deepStrictEqual(
+      [...numbers].sort((a, b) => a - b),
+      numbers,
+      `the index runs backwards somewhere: ${numbers.join(',')}`,
+    );
+    // The index reverses this list to draw newest-first, so the rows have to
+    // leave here oldest-first: a turn the recording never named, appended at
+    // the end, was drawn as the newest turn of the conversation.
+    const rows = mod.turnIndexRows(recorded, turns).map((row) => row.index);
+    assert.deepStrictEqual(
+      rows,
+      [...rows].sort((a, b) => a - b),
+      `the rows are not in the order their numbers claim: ${rows.join(',')}`,
+    );
+  });
+
   it('leaves the turns alone when no recording has arrived', function () {
     const messages = [msg('user', [text('one')]), msg('user', [text('two')])];
     const grouped = mod.groupTurns(messages, 'idle');
@@ -365,6 +418,23 @@ describe('turnIndexRows', function () {
     assert.deepStrictEqual(rows.map((r) => r.loaded), [false, true]);
     assert.deepStrictEqual(rows.map((r) => r.label), ['first', 'second']);
     assert.strictEqual(rows[1].status, 'done', 'a loaded turn’s live status wins');
+  });
+
+  it('puts a turn the recording never named where its number says, not last', function () {
+    // Live turns are appended after the recorded spine, which is right for the
+    // turn being typed into and wrong for one held *above* the recording's
+    // first — and the list is drawn newest-first, so a row tacked onto the end
+    // is drawn at the top, as the newest turn in the conversation.
+    const recorded = [
+      { id: 'u4001', turnId: 't4001', index: 4001, label: 'ask 4001', outcome: 'done' },
+    ];
+    const messages = [
+      msg('assistant', [text('…finishing the one before')], { turnId: 'runtime-7' }),
+      msg('user', [text('ask 4001')], { turnId: 't4001' }),
+    ];
+    const live = mod.reconcileTurns(mod.groupTurns(messages, 'idle'), recorded);
+    const rows = mod.turnIndexRows(recorded, live);
+    assert.deepStrictEqual(rows.map((r) => r.index), [4000, 4001]);
   });
 
   it('falls back to the loaded turns when nothing was recorded', function () {

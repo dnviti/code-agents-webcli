@@ -362,14 +362,34 @@ export function reconcileTurns(
     return spend && spend.size > 0 ? turns.map((turn) => withSpend(turn, spend)) : turns;
   }
   const byTurnId = new Map(recorded.map((turn) => [turn.turnId, turn]));
+  const filed = turns.map((turn) => byTurnId.get(turn.turnId));
 
   // Turns the index has not heard of are the ones that happened since it was
   // fetched — the turn being typed into, most of all. They continue from
   // whatever came before them rather than restarting at 1.
+  //
+  // Including the ones the window holds *above* the first turn the recording
+  // names: those count back from it. Anything else numbers a turn by its
+  // position in this array, and that position is a fact about how much of the
+  // conversation this browser happens to hold — it put a turn numbered 1
+  // directly above turn 4,001 in a conversation long enough for the head of its
+  // log to have been trimmed, which is the one place the number matters.
+  const first = filed.findIndex(Boolean);
+  const firstIndex = first >= 0 ? (filed[first] as RecordedTurn).index : 0;
   let next = 0;
-  return turns.map((turn) => {
-    const known = byTurnId.get(turn.turnId);
-    const index = known ? known.index : next + 1;
+  return turns.map((turn, at) => {
+    const known = filed[at];
+    // Above the first turn the recording names, count back from it and floor at
+    // 1. Counting *forward* from a floored anchor is what put 1,2,3 above a
+    // turn the recording calls 2: numbers repeated and then running backwards
+    // in a list that reads by number. Clamped per turn, the crowding all lands
+    // on 1, which is the honest shape of "we know these came first and no more
+    // than that".
+    const index = known
+      ? known.index
+      : at < first
+        ? Math.max(1, firstIndex - (first - at))
+        : next + 1;
     next = index;
     // The live label wins only where the recording has none: a turn still being
     // typed is not in the index yet, and one recorded without a prompt did not
@@ -471,7 +491,12 @@ export function turnIndexRows(
       costUsd: spend?.get(turn.turnId)?.costUsd ?? turn.usage.costUsd,
     });
   }
-  return rows;
+  // Live turns the recording has not heard of are appended, and they are almost
+  // always the newest ones — but not necessarily: a window that reaches above
+  // the first turn the recording names holds turns that belong at the *top*,
+  // and one of those tacked onto the end reads as the newest turn in the
+  // conversation. The number says where each row goes, so it decides.
+  return rows.sort((a, b) => a.index - b.index);
 }
 
 export function turnOf(messageId: string, turns: TurnSummary[]): TurnSummary | undefined {

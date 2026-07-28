@@ -239,6 +239,7 @@ async function run(): Promise<void> {
 
   await checkModeQueriesDoNotKillTheTerminal();
   await checkAWorkflowPopupBehavesLikeTheFilePopup();
+  await checkARunningWorkflowSaysWhatItIsDoing();
   await checkAnAgentPopupShowsWhatTheAgentIsDoing();
   await checkATallDialogStaysOnScreen();
   await checkTheComposerShrinksWithTheWorkspaceRail();
@@ -685,6 +686,144 @@ async function checkAWorkflowPopupBehavesLikeTheFilePopup(): Promise<void> {
     !!afterSwitch && !!afterSwitch.textContent?.includes('all clear'),
     afterSwitch ? 'still open' : 'unmounted with the agents tab',
   );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * Issue #45, the second half: a workflow that is still running says what it is
+ * doing, and goes on saying it as the run moves.
+ *
+ * The popup above it opens on a call that already has output. This one opens on
+ * the state a real Claude workflow is in for most of its life — a tool call with
+ * `{scriptPath}`, no output, and minutes to go — and asks whether anything at
+ * all changes on screen while the runtime reports. Every event replayed here is
+ * one the adapter emits from `task_started`/`task_progress` (see handleTask in
+ * adapters/claude.ts); the unit test proves the same states render, this proves
+ * they arrive without a remount and that nothing keeps pulsing after the end.
+ */
+async function checkARunningWorkflowSaysWhatItIsDoing(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1100px;height:600px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('workflow-live-check', { send: () => {} });
+  const transcript = controller.transcript;
+  transcript.apply({ t: 'msg_start', seq: 1, ts: 1, id: 'm1', role: 'assistant', turnId: 't1' });
+  transcript.apply({
+    t: 'block_start',
+    seq: 2,
+    ts: 2,
+    msgId: 'm1',
+    index: 0,
+    block: {
+      kind: 'tool',
+      toolId: 'wf2',
+      name: 'Workflow',
+      toolKind: 'task',
+      status: 'running',
+      // What Claude actually sends for this tool, and all it sends.
+      input: { scriptPath: '/home/dev/.claude/workflows/review-changes.md' },
+    },
+  });
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW, panelOpen: true, panelTab: 'agents', panelWidth: 420 },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(200);
+
+  const rail = host.querySelector('aside[aria-label="Workspace"]') as HTMLElement | null;
+  (rail?.querySelector('[role="button"]') as HTMLElement | null)?.click();
+  await wait(50);
+
+  const panel = host.querySelector('[role="dialog"]') as HTMLElement | null;
+  check('a workflow with no output yet still opens', !!panel);
+  if (!panel) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  check(
+    'the title says which workflow this is, not just "Workflow"',
+    !!panel.textContent?.includes('review-changes'),
+  );
+  check(
+    'a workflow that has reported nothing yet says so',
+    !!panel.textContent?.includes('Waiting for the first stage'),
+  );
+
+  transcript.apply({
+    t: 'agent_progress',
+    seq: 3,
+    ts: 3,
+    parentToolId: 'wf2',
+    patch: { activity: 'Stage 1 of 5: review', status: 'running', prompt: undefined },
+  });
+  await wait(50);
+  check(
+    'the stage the workflow is on appears while it runs',
+    !!panel.textContent?.includes('Stage 1 of 5: review'),
+  );
+  check(
+    'the waiting line goes once the workflow is reporting',
+    !panel.textContent?.includes('Waiting for the first stage'),
+  );
+
+  transcript.apply({
+    t: 'agent_step',
+    seq: 4,
+    ts: 4,
+    parentToolId: 'wf2',
+    step: {
+      id: 'p1',
+      name: 'Bash',
+      toolKind: 'execute',
+      status: 'running',
+      input: { command: 'npm test' },
+      ts: 4,
+    },
+  });
+  transcript.apply({
+    t: 'agent_progress',
+    seq: 5,
+    ts: 5,
+    parentToolId: 'wf2',
+    patch: { activity: 'Stage 2 of 5: implement', toolUses: 1, totalTokens: 18400 },
+  });
+  await wait(50);
+  check(
+    'a phase and the stage after it both land without a refresh',
+    !!panel.textContent?.includes('npm test') && !!panel.textContent?.includes('Stage 2 of 5'),
+  );
+
+  // The one glyph that says "still going": the loader-circle arc, matched by
+  // its own path because the icons carry nothing else to recognise them by.
+  const spinner = (): Element | null => panel.querySelector('.ricon path[d^="M21 12a9 9 0 1 1-6.219"]');
+  check('the running stage is marked as running', !!spinner());
+
+  // The tool_result at last. The log it carries is the record of the run, and
+  // the live view above it must stop behaving like something still in motion.
+  transcript.apply({
+    t: 'tool',
+    seq: 6,
+    ts: 6,
+    toolId: 'wf2',
+    patch: { status: 'completed', output: '▸ Review\nchecking file a\n▸ Verify\nall clear' },
+  });
+  await wait(50);
+  check('the finished log arrives in the popup that watched the run', !!panel.textContent?.includes('all clear'));
+  check('the phases the run went through are still listed after it', !!panel.textContent?.includes('npm test'));
+  check('nothing still says "running" over a workflow that has finished', !spinner());
 
   root.unmount();
   host.remove();
