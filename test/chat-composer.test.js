@@ -386,6 +386,44 @@ describe('Composer', function () {
       assert.ok(!html.includes('role="status"'), 'no stray feedback region until the server has said something');
       assert.ok(!html.includes('role="listbox"'), 'and the menu stays shut until it is asked for');
     });
+
+    // Issue #119. The popup itself is raised by an effect and so never renders
+    // in a static pass — the browser check owns that half. What is visible here
+    // is the other half of the same rule: the hover, which a live confirmation
+    // used to hold for the rest of the conversation, displacing the description
+    // of what the control does with a sentence the chip underneath the pointer
+    // already spells out.
+    it('lets a change that took effect pass in silence, and reports the ones the chip cannot show', function () {
+      const live = render({
+        effort: 'high',
+        capabilities: caps({ efforts }),
+        effortFeedback: { applied: 'live', message: 'Now thinking at high.' },
+      });
+      assert.ok(
+        !live.includes('Now thinking at high.'),
+        'a level that landed is announced by the chip redrawing, not by a second copy of the news',
+      );
+      assert.ok(
+        live.includes('title="Effort: High"'),
+        'so the hover goes back to describing the control',
+      );
+      assert.ok(live.includes('>High<'), 'and the chip is the thing carrying the change');
+
+      // Every other outcome means the conversation is not running at what was
+      // picked. Dropping these would leave a change looking made that was not.
+      for (const applied of ['refused', 'pending', 'sent', 'cleared']) {
+        const message = `an outcome the chip cannot show for itself: ${applied}`;
+        const html = render({
+          effort: 'high',
+          capabilities: caps({ efforts }),
+          effortFeedback: { applied, message },
+        });
+        assert.ok(
+          html.includes(message),
+          `${applied} is not a change that simply took effect, so it still has to reach the user`,
+        );
+      }
+    });
   });
 
   it('survives an empty draft and a very long one', function () {
