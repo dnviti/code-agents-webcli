@@ -37,6 +37,8 @@ import { MonacoEditor } from '../../src/client/shell/chat/MonacoEditor';
 import { monacoStylesApplied } from '../../src/client/chat/monaco';
 import { Toasts } from '../../src/client/shell/Toasts';
 import { shellStore } from '../../src/client/shell/store';
+import { FileTreePanel } from '../../src/client/shell/chat/FileTreePanel';
+import { TerminalSplit } from '../../src/client/shell/chat/TerminalSplit';
 
 const results: string[] = [];
 const check = (name: string, ok: boolean, detail = ''): void => {
@@ -274,6 +276,9 @@ async function run(): Promise<void> {
   await checkTheContextReadingIsHonestAboutItsCeiling();
   await checkTheTurnIndexListsTheWholeConversation();
   await checkClearingResetsTheFiguresAboveTheChat();
+  await checkTheUsageWindowReachesBeforeThisYear();
+  await checkTheEffortHistogramsAreReadableWithoutAMouse();
+  await checkTheFileTreeAndTheShellAreSizedForAThumb();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -1806,11 +1811,18 @@ function isPainted(node: Element): boolean {
  * A control nested inside another control is dropped: the outer one is what a
  * finger aims at, and counting both reports a 0px gap between a chip and its
  * own icon every time.
+ *
+ * `treeitem` is here because the file tree is built out of divs: its rows take
+ * a tap and open a file, and by tag alone none of them is a control — so the
+ * whole of the Files destination shipped at 26px rows and every rule below
+ * reported the surface clean (issue #51).
  */
 function paintedControls(root: HTMLElement): HTMLElement[] {
   const rootBox = root.getBoundingClientRect();
   const all = Array.from(
-    root.querySelectorAll<HTMLElement>('button, input, select, textarea, [role="tab"], [role="option"], a[href]'),
+    root.querySelectorAll<HTMLElement>(
+      'button, input, select, textarea, [role="tab"], [role="option"], [role="treeitem"], a[href]',
+    ),
   ).filter(isPainted).filter((node) => {
     // A sheet's scrim is a control by markup and a gesture by intent: it is the
     // empty half of the screen you tap to dismiss, so it abuts the sheet on
@@ -1882,6 +1894,19 @@ function paintedText(root: HTMLElement): Array<{ node: HTMLElement; size: number
     out.push({ node, size: parseFloat(viewOf(node).getComputedStyle(node).fontSize) || 0, text: own });
   }
   return out;
+}
+
+/**
+ * The box the user types their message into.
+ *
+ * Not simply the first `textarea`: xterm keeps a hidden one of its own for IME
+ * and clipboard, it comes first in the DOM once the shell is open, and it is
+ * 0x0 at `left: -9999em` — so with the terminal on screen the composer rules
+ * below were measuring the terminal's plumbing and reporting the composer as
+ * having no height.
+ */
+function composerField(host: HTMLElement): HTMLElement | null {
+  return Array.from(host.querySelectorAll<HTMLElement>('textarea')).find(isPainted) ?? null;
 }
 
 function describe(node: HTMLElement, text?: string): string {
@@ -1991,9 +2016,18 @@ function assertPhoneSurface(host: HTMLElement, where: string, atRest = false): v
   const hostBox = host.getBoundingClientRect();
 
   // 1. Every control a finger is meant to hit.
+  //
+  //    A key on the on-screen key strip is judged on height alone. Nine keys
+  //    cannot each be 44px wide on a 390px screen — 460px of keys before any
+  //    gaps — and no platform's own keyboard tries: a keyboard row is aimed at
+  //    vertically, along a band the width of the screen. The exemption is by
+  //    name and only for width, so the row still has to be a full target tall
+  //    and everything that is not a key still has to be square.
   const controls = paintedControls(host);
+  const isKey = (node: HTMLElement): boolean => Boolean(node.closest('[aria-label="Terminal keys"]'));
   const small = controls.filter((node) => {
     const box = laidOutSize(node);
+    if (isKey(node)) return box.height < PHONE_TARGET;
     return box.width < PHONE_TARGET || box.height < PHONE_TARGET;
   });
   check(
@@ -2028,6 +2062,9 @@ function assertPhoneSurface(host: HTMLElement, where: string, atRest = false): v
       // Both comfortably over the floor on the axis they meet on — see
       // PHONE_GAP_EXEMPT_AT.
       if (a.width >= PHONE_GAP_EXEMPT_AT && b.width >= PHONE_GAP_EXEMPT_AT) continue;
+      // Two keys of the same key strip, for the reason above: a keyboard row is
+      // a row, and the space between its keys is what makes it one.
+      if (isKey(byLeft[i]) && isKey(byLeft[j])) continue;
       const gap = b.left - a.right;
       // Only the nearest neighbour to the right matters; anything further is
       // separated by that one.
@@ -2099,7 +2136,7 @@ function assertPhoneSurface(host: HTMLElement, where: string, atRest = false): v
   //    read aloud to somebody who has turned a screen reader on. A drawn word
   //    is the only thing that answers the question for everybody.
   const header = host.querySelector('header') as HTMLElement | null;
-  const composer = (host.querySelector('textarea')?.parentElement ?? null) as HTMLElement | null;
+  const composer = (composerField(host)?.parentElement ?? null) as HTMLElement | null;
   for (const [region, box] of [['the header', header], ['the composer row', composer]] as Array<
     [string, HTMLElement | null]
   >) {
@@ -2130,6 +2167,12 @@ function assertPhoneSurface(host: HTMLElement, where: string, atRest = false): v
     // tab strip is a scroller with a way back to what it is hiding. What this
     // is looking for is content pushed out of a box that does not scroll.
     if (scrollsSideways(node)) return false;
+    // Nor xterm's own rendering surface. Its canvas is as wide as the terminal
+    // has columns, and the columns come from a fit against the real pane at
+    // runtime; a fixture that mounts a terminal without one is measuring the
+    // default eighty columns, which says nothing about this layout. The pane
+    // around it is not exempt — only what xterm paints inside it.
+    if (node.closest('.xterm')) return false;
     const box = node.getBoundingClientRect();
     return box.right > hostBox.right + 1 || box.left < hostBox.left - 1;
   });
@@ -2187,7 +2230,7 @@ function assertPhoneSurface(host: HTMLElement, where: string, atRest = false): v
 
   // 9. The composer is the one thing that must survive every viewport: a
   //    phone with no way to type is not a degraded layout, it is a dead app.
-  const textarea = host.querySelector('textarea') as HTMLElement | null;
+  const textarea = composerField(host);
   if (!textarea) {
     check(`the composer is reachable in ${where}`, false, 'no textarea');
   } else {
@@ -2372,7 +2415,42 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
   // the far side of a press: which item paints as current, and whether the
   // surface actually changed. Static markup shows a bar that looks right and
   // navigates nowhere.
+  //
+  // And every rule the resting surface is held to is re-run *at* each
+  // destination. Arriving somewhere and finding desktop density is the same
+  // defect as never arriving, and this block used to prove only the arrival:
+  // the Files rail shipped 26px rows and the shell 22px tabs while the phone
+  // checks reported the layout clean (issue #51).
   {
+    // The workspace route, answered — otherwise Files arrives at an error note
+    // and the tree this is here to measure is never on screen. Everything else
+    // still goes to the real server, including the terminal's own create,
+    // which 404s and leaves the pane in its error phase: the tab strip is
+    // drawn either way, and the strip is what is being measured.
+    const realFetch = window.fetch;
+    window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+      // `.call(window)`, because a bare `fetch` off a saved reference throws
+      // "Illegal invocation" — it needs its window as the receiver.
+      if (!url.includes('/api/workspace/')) return realFetch.call(window, input as RequestInfo, init);
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            root: '/home/dev/projects/webcli',
+            path: '',
+            truncated: false,
+            entries: [
+              { name: 'src', path: '/home/dev/projects/webcli/src', isDirectory: true },
+              { name: 'test', path: '/home/dev/projects/webcli/test', isDirectory: true },
+              { name: 'package.json', path: '/home/dev/projects/webcli/package.json', isDirectory: false, size: 4312 },
+              { name: 'README.md', path: '/home/dev/projects/webcli/README.md', isDirectory: false, size: 918 },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    }) as typeof window.fetch;
+
     host.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;display:flex;overflow:hidden';
     const root = createRoot(host);
     root.render(React.createElement(PhoneSurface, { controller }));
@@ -2387,6 +2465,7 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
     for (const [label, expect] of [
       ['Trace', 'a rail'],
       ['Files', 'a rail'],
+      ['Shell', 'a terminal'],
       ['Chat', 'the transcript'],
     ] as Array<[string, string]>) {
       const item = Array.from(bar?.querySelectorAll('button') ?? []).find(
@@ -2402,15 +2481,27 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
       check(`pressing ${label} marks it as where you are`, current() === label, current() || 'nothing current');
 
       const showsRail = Boolean(host.querySelector('aside[aria-label="Workspace"]'));
+      const showsShell = Boolean(host.querySelector('[role="tablist"][aria-label="Terminals"]'));
       const showsTranscript = Boolean(host.querySelector('[data-message-id]'));
       check(
         `pressing ${label} actually shows ${expect}`,
-        expect === 'a rail' ? showsRail : showsTranscript && !showsRail,
-        `rail=${showsRail} transcript=${showsTranscript}`,
+        expect === 'a rail'
+          ? showsRail
+          : expect === 'a terminal'
+            ? showsShell
+            : showsTranscript && !showsRail,
+        `rail=${showsRail} shell=${showsShell} transcript=${showsTranscript}`,
       );
+
+      // The Files rail is fetched, so wait for the tree rather than measuring
+      // the "Loading files…" note that stands in for it.
+      if (label === 'Files') await wait(300);
+      settle(host.ownerDocument);
+      assertPhoneSurface(host, `the ${label} destination`);
     }
 
     root.unmount();
+    window.fetch = realFetch;
   }
 
   // Reachable, not merely legible wherever it happened to be drawn. Collapsing
@@ -3145,7 +3236,21 @@ async function checkTheUsageChartsAreInteractive(): Promise<void> {
       { key: 'codex', totals: totals({ turns: 2, totalTokens: 900, tokensReportedTurns: 2, costReportedTurns: 0 }) },
     ],
     byModel: [{ key: 'claude-opus-5', totals: totals({ turns: 6, totalTokens: 5900, costUsd: 1.25, tokensReportedTurns: 6, costReportedTurns: 2 }) }],
-    effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
+    // Real distributions, because an empty one renders no histogram at all —
+    // which is how the effort panel went on being unreachable by keyboard
+    // through every check written to prove the charts were not (#66).
+    effortByAgent: [{
+      key: 'claude',
+      turns: 6,
+      modelTurnsReportedTurns: 6,
+      modelTurnsAvg: 2.8,
+      modelTurnsMax: 9,
+      toolCallsAvg: 2.3,
+      toolCallsMax: 7,
+      modelTurnsHistogram: [2, 2, 1, 1, 0],
+      toolCallsHistogram: [1, 2, 2, 1, 0],
+    }],
+    effortByModel: [], topTools: [], topToolsByAgent: [],
   };
 
   const asked: string[] = [];
@@ -3175,8 +3280,11 @@ async function checkTheUsageChartsAreInteractive(): Promise<void> {
   root.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
   await wait(600);
 
+  // The trend's own group, named. Every chart on this dashboard is a group of
+  // buttons now, so an unqualified `[role="group"] button` collects the effort
+  // histograms' buckets and the period arrows along with the trend's bars.
   const bars = (): HTMLButtonElement[] =>
-    Array.from(doc.querySelectorAll<HTMLButtonElement>('[role="group"] button'));
+    Array.from(doc.querySelectorAll<HTMLButtonElement>('[role="group"][aria-label$="over time"] button'));
 
   check(
     'every point on the trend is a real control, not a decoration',
@@ -3194,7 +3302,14 @@ async function checkTheUsageChartsAreInteractive(): Promise<void> {
   // stop or a tap on a touch screen does.
   bars()[1].focus();
   await wait(120);
-  const live = doc.querySelector('[aria-live="polite"]') as HTMLElement | null;
+  // Scoped to the trend's own subtree. Unqualified, this took the first polite
+  // region in the dialog, which is now the window control's name — so a check
+  // about the trend's readout was reading a date and reporting on a chart it
+  // had never looked at.
+  const trendRow = doc.querySelector('[role="group"][aria-label$="over time"]');
+  const live = (trendRow?.parentElement ?? doc).querySelector(
+    '[aria-live="polite"]',
+  ) as HTMLElement | null;
   check(
     'reaching a point reveals its figures without a mouse',
     Boolean(live && /not reported/i.test(live.textContent || '')),
@@ -6839,4 +6954,652 @@ async function checkTheConversationsTerminalCanBeDrivenFromAPhone(): Promise<voi
   forgetTerminals('desktop-conversation');
   window.fetch = realFetch;
   window.WebSocket = realWebSocket;
+}
+
+/**
+ * The two chat destinations the phone scale stopped short of (issue #51).
+ *
+ * The bar leads to five places and two of them were still drawn for a mouse:
+ * the file tree's rows were 26px tall and edge to edge, with the size figure
+ * beside each name at 10px, and the shell's tab strip was 28px of 22px tabs
+ * with a 14px close button two pixels from its neighbour.
+ *
+ * Measured against the components directly, not through the shell: reaching
+ * the tree needs the workspace API and reaching the shell needs a pty, and the
+ * bar-driven pass above already covers the route. What is asserted here is the
+ * geometry of the surfaces themselves, including the states the route does not
+ * reach — an expanded subdirectory, a changed file's badge.
+ *
+ * Each half is asserted twice, once inside a phone provider and once outside
+ * it. Nothing about this issue may move on a desktop, and a check that only
+ * looks at the phone cannot tell a scale that was applied from a scale that
+ * replaced the desktop one.
+ */
+async function checkTheFileTreeAndTheShellAreSizedForAThumb(): Promise<void> {
+  const ROOT = '/home/dev/projects/webcli';
+  const entries = [
+    { name: 'src', path: `${ROOT}/src`, isDirectory: true },
+    { name: 'package.json', path: `${ROOT}/package.json`, isDirectory: false, size: 4312 },
+    { name: 'README.md', path: `${ROOT}/README.md`, isDirectory: false, size: 918 },
+  ];
+  const children = [
+    { name: 'index.ts', path: `${ROOT}/src/index.ts`, isDirectory: false, size: 2048 },
+    { name: 'server.ts', path: `${ROOT}/src/server.ts`, isDirectory: false, size: 15360 },
+  ];
+
+  const mount = (
+    css: string,
+    node: React.ReactElement,
+  ): { host: HTMLElement; root: ReturnType<typeof createRoot> } => {
+    const host = document.createElement('div');
+    host.style.cssText = css;
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    root.render(node);
+    return { host, root };
+  };
+
+  const tree = (phone: boolean): React.ReactElement =>
+    React.createElement(
+      PhoneContext.Provider,
+      { value: phone },
+      React.createElement(FileTreePanel, {
+        root: ROOT,
+        entries,
+        onExpand: () => Promise.resolve(children),
+        onOpen: () => {},
+        // A row carrying a change badge is the busiest a row gets, and the
+        // badge is the smallest type in it — 10px, from a primitive that has
+        // no phone size of its own.
+        changed: { [`${ROOT}/package.json`]: 'update', [`${ROOT}/src/index.ts`]: 'create' },
+        onRefresh: () => {},
+      } as never),
+    );
+
+  const shell = (phone: boolean, id: string): React.ReactElement =>
+    React.createElement(TerminalSplit, {
+      chatSessionId: id,
+      workingDir: ROOT,
+      height: 260,
+      onResize: () => {},
+      onClose: () => {},
+      isMobile: phone,
+      theme: 'dark',
+    } as never);
+
+  const COLUMN = 'position:absolute;top:0;left:0;display:flex;flex-direction:column;overflow:hidden';
+
+  // The tree, on a phone.
+  {
+    const { host, root } = mount(`width:390px;height:740px;${COLUMN}`, tree(true));
+    await wait(300);
+    // Opened, because a nested level is a different code path — the rows under
+    // an expanded directory are rendered by a second call with a deeper indent,
+    // and an indent is exactly the sort of thing that eats a row's height.
+    (host.querySelector('[role="treeitem"]') as HTMLElement | null)?.click();
+    await wait(250);
+    settle(document);
+
+    const rows = Array.from(host.querySelectorAll<HTMLElement>('[role="treeitem"]')).filter(isPainted);
+    check('the file tree draws its rows on a phone', rows.length >= 5, `${rows.length} rows`);
+
+    const short = rows.filter((row) => laidOutSize(row).height < PHONE_TARGET);
+    check(
+      `every file tree row is at least ${PHONE_TARGET}px tall on a phone`,
+      short.length === 0,
+      short.length
+        ? short.slice(0, 6).map((r) => `${describe(r)}=${laidOutSize(r).height}px`).join(' | ')
+        : `${rows.length} rows`,
+    );
+
+    // Rows stack, so the gap that matters between them is the vertical one —
+    // the rule in assertPhoneSurface only compares controls sitting side by
+    // side, which no two rows of a tree ever do.
+    const byTop = [...rows].sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+    const touching: string[] = [];
+    for (let i = 1; i < byTop.length; i++) {
+      const gap = byTop[i].getBoundingClientRect().top - byTop[i - 1].getBoundingClientRect().bottom;
+      if (gap < PHONE_GAP - 0.5) {
+        touching.push(`${describe(byTop[i - 1])}↔${describe(byTop[i])}=${Math.round(gap)}px`);
+      }
+    }
+    check(
+      `file tree rows are at least ${PHONE_GAP}px apart on a phone`,
+      touching.length === 0,
+      touching.length ? touching.slice(0, 6).join(' | ') : `${rows.length} rows`,
+    );
+
+    const tiny = paintedText(host).filter((t) => t.size < PHONE_MIN_TEXT - 0.01);
+    check(
+      `no text in the file tree is smaller than ${PHONE_MIN_TEXT}px on a phone`,
+      tiny.length === 0,
+      tiny.length
+        ? tiny.slice(0, 8).map((t) => `${describe(t.node, t.text)}@${t.size}px`).join(' | ')
+        : 'all legible',
+    );
+
+    // The strip at the top of the tree has to be as tall as what is in it:
+    // IconButton takes the touch floor on a phone by itself, so a 34px header
+    // left the one control that reloads the tree hanging out of both ends of
+    // its own border.
+    const refresh = host.querySelector('[aria-label="Refresh file tree"]') as HTMLElement | null;
+    const strip = refresh?.parentElement ?? null;
+    const refreshBox = refresh?.getBoundingClientRect();
+    const stripBox = strip?.getBoundingClientRect();
+    check(
+      'the file tree’s refresh control fits inside its own strip on a phone',
+      Boolean(refreshBox && stripBox)
+        && refreshBox!.top >= stripBox!.top - 0.5
+        && refreshBox!.bottom <= stripBox!.bottom + 0.5,
+      refreshBox && stripBox
+        ? `control ${Math.round(refreshBox.top)}–${Math.round(refreshBox.bottom)},`
+          + ` strip ${Math.round(stripBox.top)}–${Math.round(stripBox.bottom)}`
+        : 'no refresh control',
+    );
+
+    root.unmount();
+    host.remove();
+  }
+
+  // And the same tree on a desktop, unchanged.
+  {
+    const { host, root } = mount(`width:900px;height:600px;${COLUMN}`, tree(false));
+    await wait(300);
+    settle(document);
+
+    const rows = Array.from(host.querySelectorAll<HTMLElement>('[role="treeitem"]')).filter(isPainted);
+    const heights = Array.from(new Set(rows.map((row) => laidOutSize(row).height)));
+    check(
+      'the file tree keeps its 26px rows off a phone',
+      rows.length > 0 && heights.length === 1 && heights[0] === 26,
+      heights.join(',') || 'no rows',
+    );
+
+    const sizes = paintedText(host).filter((t) => /^\d/.test(t.text) && /[BKMG]$/.test(t.text));
+    check(
+      'and the size beside a file is still the caption it was off a phone',
+      sizes.length > 0 && sizes.every((t) => t.size === 10),
+      sizes.map((t) => `${t.text}@${t.size}px`).join(' | ') || 'no size figures',
+    );
+
+    root.unmount();
+    host.remove();
+  }
+
+  // The shell, on a phone.
+  {
+    const { host, root } = mount(`width:390px;height:420px;${COLUMN}`, shell(true, 'phone-shell-check'));
+    // Longer than the rest: the pane creates its session over the network, and
+    // this server has no API — the tab strip is drawn either way, but the strip
+    // redraws when the attempt fails and measuring it mid-flight is a race.
+    await wait(600);
+    settle(document);
+
+    const controls = paintedControls(host);
+    check('the shell draws its tab strip on a phone', controls.length >= 4, `${controls.length} controls`);
+
+    // A key of the on-screen strip is judged on height alone, for the reason
+    // written where assertPhoneSurface does the same: a keyboard row cannot be
+    // nine 44px-wide keys on a 390px screen, and is aimed at vertically.
+    const inKeyStrip = (node: HTMLElement): boolean =>
+      Boolean(node.closest('[aria-label="Terminal keys"]'));
+    const small = controls.filter((node) => {
+      const box = laidOutSize(node);
+      if (inKeyStrip(node)) return box.height < PHONE_TARGET;
+      return box.width < PHONE_TARGET || box.height < PHONE_TARGET;
+    });
+    check(
+      `every control in the shell is at least ${PHONE_TARGET}px on a phone`,
+      small.length === 0,
+      small.length
+        ? small.slice(0, 8).map((n) => {
+            const b = laidOutSize(n);
+            return `${describe(n)}=${b.width}x${b.height}`;
+          }).join(' | ')
+        : `${controls.length} controls`,
+    );
+
+    // Selecting a shell and closing it are neighbours inside one chip, which
+    // is the pair a thumb confuses.
+    const byLeft = [...controls].sort(
+      (a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left,
+    );
+    const crowded: string[] = [];
+    for (let i = 1; i < byLeft.length; i++) {
+      if (scrollBoxOf(byLeft[i]) !== scrollBoxOf(byLeft[i - 1])) continue;
+      if (inKeyStrip(byLeft[i]) && inKeyStrip(byLeft[i - 1])) continue;
+      const gap = byLeft[i].getBoundingClientRect().left - byLeft[i - 1].getBoundingClientRect().right;
+      if (gap >= -0.5 && gap < PHONE_GAP - 0.5) {
+        crowded.push(`${describe(byLeft[i - 1])}↔${describe(byLeft[i])}=${Math.round(gap)}px`);
+      }
+    }
+    check(
+      `neighbouring controls in the shell are at least ${PHONE_GAP}px apart on a phone`,
+      crowded.length === 0,
+      crowded.length ? crowded.slice(0, 6).join(' | ') : 'no crowded pairs',
+    );
+
+    // A second shell, because one tab leaves room the real case does not: the
+    // right-hand actions are 44px squares now, and a crowded strip used to take
+    // the difference out of them and push "close the terminal" off the screen —
+    // clipped, with nothing between it and the viewport that scrolls.
+    const another = host.querySelector('[aria-label="Open another terminal here"]') as HTMLElement | null;
+    another?.click();
+    await wait(400);
+    settle(document);
+
+    const hostBox = host.getBoundingClientRect();
+    const spilling = paintedControls(host).filter(
+      (node) => node.getBoundingClientRect().right > hostBox.right + 0.5,
+    );
+    check(
+      'nothing in the shell is pushed off the side of a phone, however many tabs it has',
+      spilling.length === 0,
+      spilling.length
+        ? spilling.slice(0, 6).map((n) => {
+            const b = n.getBoundingClientRect();
+            return `${describe(n)}@${Math.round(b.left)}–${Math.round(b.right)} of ${Math.round(hostBox.right)}`;
+          }).join(' | ')
+        : `${host.querySelectorAll('[role="tab"]').length} tabs, all inside`,
+    );
+
+    const tiny = paintedText(host).filter((t) => t.size < PHONE_MIN_TEXT - 0.01);
+    check(
+      `no text in the shell is smaller than ${PHONE_MIN_TEXT}px on a phone`,
+      tiny.length === 0,
+      tiny.length
+        ? tiny.slice(0, 8).map((t) => `${describe(t.node, t.text)}@${t.size}px`).join(' | ')
+        : 'all legible',
+    );
+
+    // Bigger chrome comes out of the shell underneath it, and the shell is
+    // what the user opened. Asserted because another band — the on-screen key
+    // strip — is landing inside this same height: the strip may grow, but it
+    // does not get to own the pane.
+    const strip = (host.querySelector('[role="tablist"][aria-label="Terminals"]')?.parentElement
+      ?? null) as HTMLElement | null;
+    const pane = (strip?.parentElement ?? null) as HTMLElement | null;
+    const body = (strip?.nextElementSibling ?? null) as HTMLElement | null;
+    check(
+      'the tab strip takes no more than a touch target out of the pane on a phone',
+      Boolean(strip && pane && body) && strip!.offsetHeight <= PHONE_TARGET + PHONE_GAP + 2,
+      strip && pane && body
+        ? `strip ${strip.offsetHeight}px, shell ${body.offsetHeight}px of ${pane.offsetHeight}px`
+        : 'no tab strip',
+    );
+
+    root.unmount();
+    host.remove();
+  }
+
+  // And the same shell on a desktop, unchanged.
+  {
+    const { host, root } = mount(`width:900px;height:420px;${COLUMN}`, shell(false, 'desktop-shell-check'));
+    await wait(600);
+    settle(document);
+
+    const strip = (host.querySelector('[role="tablist"][aria-label="Terminals"]')?.parentElement
+      ?? null) as HTMLElement | null;
+    check(
+      'the shell keeps its 28px tab strip off a phone',
+      strip?.offsetHeight === 28,
+      `${strip?.offsetHeight ?? 'no'}px`,
+    );
+
+    const close = host.querySelector('[aria-label^="Close the terminal"]') as HTMLElement | null;
+    check(
+      'and its actions are the desktop size they were',
+      Boolean(close) && laidOutSize(close!).height === 22 && laidOutSize(close!).width === 22,
+      close ? `${laidOutSize(close).width}x${laidOutSize(close).height}` : 'no close action',
+    );
+
+    root.unmount();
+    host.remove();
+  }
+}
+
+/**
+ * The record is queryable from the dashboard for longer than a calendar year.
+ *
+ * Every window the dialog could ask for was the one containing the moment it
+ * asked: four period tabs, no previous or next, no date field, and the only
+ * movement available — pressing a bar of the trend — lands inside the period
+ * already on screen. So nothing before the first of January was reachable,
+ * and from 2027-01-01 the whole of 2026 would leave the figures, the trend,
+ * the history and the export while sitting untouched in `usage_jobs` (#56).
+ *
+ * Driven here rather than asserted on state because the claim is about what
+ * goes back to the *server*: a control that moves a label and re-asks nothing
+ * has moved nothing, and one that moves the charts while the list underneath
+ * goes on answering for today leaves the page contradicting itself.
+ */
+async function checkTheUsageWindowReachesBeforeThisYear(): Promise<void> {
+  const totals = (over: Record<string, number>) => ({
+    turns: 0, modelTurns: 0, toolCalls: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    reasoningTokens: 0, totalTokens: 0, costUsd: 0,
+    tokensReportedTurns: 0, costReportedTurns: 0, modelTurnsReportedTurns: 0,
+    ...over,
+  });
+
+  // The server's own behaviour, in one line: the window is the day the anchor
+  // falls in, and an anchor it was never sent means today. A stub that ignored
+  // the anchor would let a broken control pass by answering the same thing
+  // whatever it was asked.
+  const dayFor = (anchor: string | null): { from: string; to: string } => {
+    const at = anchor ? new Date(anchor) : new Date();
+    const start = Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate());
+    return { from: new Date(start).toISOString(), to: new Date(start + 86_400_000).toISOString() };
+  };
+
+  const asked: string[] = [];
+  let answered = dayFor(null);
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+    asked.push(url);
+    if (!url.includes('/api/usage/dashboard')) {
+      return new Response(JSON.stringify({ jobs: [], total: 0, conversations: [] }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }
+    const anchor = new URL(url, window.location.origin).searchParams.get('anchor');
+    answered = dayFor(anchor);
+    // Today has work in it and every earlier day is empty: the case the
+    // control has to be honest about, since walking back through a record
+    // that starts in July 2026 is mostly walking through nothing.
+    const figures = anchor
+      ? totals({})
+      : totals({ turns: 4, totalTokens: 5000, costUsd: 1.25, tokensReportedTurns: 4, costReportedTurns: 4 });
+    return new Response(
+      JSON.stringify({
+        scope: 'self', canSeeEveryone: false, period: 'day',
+        ...answered,
+        bucket: 'hour', filters: {},
+        totals: figures,
+        series: [{ key: '2026-07-27T09:00', totals: figures }],
+        byProject: [], byAgent: [], byModel: [],
+        effortByAgent: [], effortByModel: [], topTools: [], topToolsByAgent: [],
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+  }) as typeof window.fetch;
+
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:1100px;height:900px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const root = createRoot(doc.body);
+  root.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
+  await wait(600);
+
+  const byLabel = (prefix: string): HTMLButtonElement | undefined =>
+    Array.from(doc.querySelectorAll<HTMLButtonElement>('button')).find(
+      (b) => (b.getAttribute('aria-label') || '').startsWith(prefix),
+    );
+  const windowName = (): string =>
+    ((doc.querySelector('[role="group"][aria-label="The period on screen"] [aria-live="polite"]') as HTMLElement | null)
+      ?.textContent || '').trim();
+  const anchorsAsked = (): string[] =>
+    asked
+      .filter((u) => u.includes('/api/usage/dashboard'))
+      .map((u) => new URL(u, window.location.origin).searchParams.get('anchor'))
+      .filter((a): a is string => Boolean(a));
+
+  const back = byLabel('Previous');
+  check(
+    'the dashboard offers a way off the period that contains now',
+    Boolean(back),
+    back ? 'found' : Array.from(doc.querySelectorAll('button')).map((b) => describe(b)).join(' | ').slice(0, 240),
+  );
+
+  const named = windowName();
+  check(
+    'and names the window it is showing',
+    named.length > 0,
+    named || 'no window name on screen',
+  );
+
+  check(
+    'the walk forward stops at the present',
+    Boolean(byLabel('Next')?.disabled),
+    byLabel('Next') ? `disabled=${byLabel('Next')?.disabled}` : 'no Next control',
+  );
+
+  const dateField = doc.querySelector<HTMLInputElement>('input[type="date"]');
+  const today = new Date();
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  check(
+    'and neither does the date field',
+    dateField?.max === `${today.getFullYear()}-${pad(today.getMonth() + 1)}-${pad(today.getDate())}`,
+    dateField ? `max=${dateField.max}` : 'no date field',
+  );
+
+  back?.click();
+  await wait(400);
+  check(
+    'moving the window back asks the server for that window',
+    anchorsAsked().length === 1 && new Date(anchorsAsked()[0]).getTime() < Date.now(),
+    anchorsAsked().join(' | ') || 'no anchor ever left the browser',
+  );
+
+  check(
+    'and the window on screen is the one that was asked for',
+    windowName() !== named && windowName().length > 0,
+    `${named} -> ${windowName()}`,
+  );
+
+  // The list is not a second query with its own idea of when: it takes the
+  // range the figures were computed over, so a moved window has to reach it.
+  check(
+    'the history under the charts follows the window',
+    asked.some((u) => u.includes('/api/usage/conversations') && u.includes(encodeURIComponent(answered.from))),
+    `${answered.from} vs ${asked.filter((u) => u.includes('/conversations')).slice(-1)[0] || 'nothing asked'}`,
+  );
+
+  check(
+    'a window with nothing in it says so, rather than drawing an empty chart',
+    /Nothing was recorded in this day/i.test((doc.body.textContent || '').replace(/\s+/g, ' ')),
+    (doc.body.textContent || '').replace(/\s+/g, ' ').slice(0, 240),
+  );
+
+  // Twice back is two days back. Stepping from the range that came back rather
+  // than from the anchor makes the second press recompute the first one.
+  byLabel('Previous')?.click();
+  await wait(400);
+  const walked = anchorsAsked();
+  check(
+    'pressing again moves another period, not over the same one twice',
+    walked.length === 2 && new Date(walked[1]).getTime() < new Date(walked[0]).getTime(),
+    walked.join(' | '),
+  );
+
+  const now = Array.from(doc.querySelectorAll<HTMLButtonElement>('button')).find(
+    (b) => (b.textContent || '').trim() === 'Now',
+  );
+  check('there is one control back to the present', Boolean(now), now ? 'found' : 'no Now control');
+  now?.click();
+  await wait(400);
+  check(
+    'and it puts the unmoved question back',
+    asked.slice(-4).some((u) => u.includes('/api/usage/dashboard') && !u.includes('anchor=')),
+    asked.slice(-4).join(' | ').slice(0, 300),
+  );
+
+  frame.style.width = '390px';
+  await wait(300);
+  const spilling = Array.from(doc.body.querySelectorAll<HTMLElement>('*')).filter((node) => {
+    if (!isPainted(node) || scrollsSideways(node)) return false;
+    const box = node.getBoundingClientRect();
+    return box.right > 391 || box.left < -1;
+  });
+  check(
+    'the window control stays inside a phone-width window',
+    spilling.length === 0,
+    spilling.length ? spilling.slice(0, 6).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
+  );
+
+  root.unmount();
+  frame.remove();
+  window.fetch = realFetch;
+}
+
+/**
+ * The effort histograms, read without a mouse.
+ *
+ * #66's criterion is that every chart is operable with the keyboard alone and
+ * announces its values — and the trend chart satisfies it while these did not.
+ * Each bar was a bare `<div>` inside a tooltip that mounts on mouseenter, so
+ * the counts reached no keyboard, no screen reader and no touch screen, and
+ * the panel read as an agent name followed by five loose numbers.
+ *
+ * It survived thirteen checks written for that criterion because every usage
+ * fixture in this file sends `effortByAgent: []`, so the component under test
+ * was never rendered. This one sends real distributions.
+ */
+async function checkTheEffortHistogramsAreReadableWithoutAMouse(): Promise<void> {
+  const totals = (over: Record<string, number>) => ({
+    turns: 0, modelTurns: 0, toolCalls: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    reasoningTokens: 0, totalTokens: 0, costUsd: 0,
+    tokensReportedTurns: 0, costReportedTurns: 0, modelTurnsReportedTurns: 0,
+    ...over,
+  });
+  const effort = (key: string) => ({
+    key,
+    turns: 12,
+    modelTurnsReportedTurns: 12,
+    modelTurnsAvg: 3.4,
+    modelTurnsMax: 11,
+    toolCallsAvg: 2.1,
+    toolCallsMax: 9,
+    modelTurnsHistogram: [4, 3, 3, 1, 1],
+    toolCallsHistogram: [2, 4, 3, 2, 1],
+  });
+
+  const figures = totals({ turns: 12, modelTurns: 41, toolCalls: 25, totalTokens: 5000, costUsd: 1.25, tokensReportedTurns: 12, costReportedTurns: 12, modelTurnsReportedTurns: 12 });
+  const dashboard = {
+    scope: 'self', canSeeEveryone: false, period: 'day',
+    from: '2026-07-27T00:00:00.000Z', to: '2026-07-28T00:00:00.000Z',
+    bucket: 'hour', filters: {},
+    totals: figures,
+    series: [{ key: '2026-07-27T09:00', totals: figures }],
+    byProject: [], byAgent: [], byModel: [],
+    effortByAgent: [effort('claude')],
+    effortByModel: [effort('claude-opus-5')],
+    topTools: [], topToolsByAgent: [],
+  };
+
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+    const body = url.includes('/api/usage/dashboard') ? dashboard : { jobs: [], total: 0, conversations: [] };
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof window.fetch;
+
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:1100px;height:900px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const root = createRoot(doc.body);
+  root.render(React.createElement(UsageDashboardDialog, { open: true, onClose: () => {} } as never));
+  await wait(600);
+
+  const histograms = Array.from(doc.querySelectorAll<HTMLElement>('[role="group"][aria-label*="per turn"]'));
+  check(
+    'an effort histogram announces what it is a distribution of',
+    histograms.length >= 2 && histograms.some((h) => /claude/.test(h.getAttribute('aria-label') || '')),
+    histograms.map((h) => h.getAttribute('aria-label')).join(' | ').slice(0, 240) || 'no named histogram',
+  );
+
+  const bars = histograms.length ? Array.from(histograms[0].querySelectorAll<HTMLButtonElement>('button')) : [];
+  check(
+    'every bucket of it is a real control, not a decoration',
+    bars.length === 5 && bars.every((b) => b.tagName === 'BUTTON'),
+    `${bars.length} control(s) in the first histogram`,
+  );
+
+  check(
+    'and carries its own count into the accessibility tree',
+    bars.length === 5 && bars.every((b) => /\d+ of \d+ turn/.test(b.getAttribute('aria-label') || '')),
+    bars.map((b) => b.getAttribute('aria-label')).join(' | ').slice(0, 240),
+  );
+
+  // The five tokens that used to be loose on the page: each has to belong to
+  // something that says what it counts.
+  const orphans = histograms.flatMap((h) =>
+    Array.from(h.querySelectorAll<HTMLElement>('span')).filter(
+      (span) => (span.textContent || '').trim() !== '' && !span.closest('button[aria-label]'),
+    ),
+  );
+  check(
+    'no number on the effort panel is left without a quantity attached',
+    orphans.length === 0,
+    orphans.map((n) => describe(n)).join(' | ').slice(0, 240) || 'every label belongs to a control',
+  );
+
+  // No pointer: just reaching the bar, the way a tab stop does.
+  bars[1]?.focus();
+  await wait(150);
+  check(
+    'a bucket can be reached with the keyboard alone',
+    doc.activeElement === bars[1],
+    describe(doc.activeElement as HTMLElement),
+  );
+
+  const readout = histograms[0]?.parentElement?.querySelector('[aria-live="polite"]') as HTMLElement | null;
+  check(
+    'and reaching it reveals its figures without a mouse',
+    Boolean(readout && /\d+ of \d+ turn/.test(readout.textContent || '')),
+    readout ? (readout.textContent || '').slice(0, 120) || 'readout is empty' : 'no readout region',
+  );
+
+  // A touch screen has no hover to reveal a tooltip with, so pressing has to
+  // be the same act as reaching.
+  bars[1]?.blur();
+  await wait(100);
+  bars[3]?.click();
+  await wait(150);
+  check(
+    'and pressing it says the same thing, for a screen with no hover',
+    Boolean(readout && /\d+ of \d+ turn/.test(readout.textContent || '')),
+    readout ? (readout.textContent || '').slice(0, 120) || 'readout is empty' : 'no readout region',
+  );
+
+  frame.style.width = '390px';
+  await wait(300);
+  const spilling = Array.from(doc.body.querySelectorAll<HTMLElement>('*')).filter((node) => {
+    if (!isPainted(node) || scrollsSideways(node)) return false;
+    const box = node.getBoundingClientRect();
+    return box.right > 391 || box.left < -1;
+  });
+  check(
+    'the effort panel stays inside a phone-width window',
+    spilling.length === 0,
+    spilling.length ? spilling.slice(0, 6).map((n) => describe(n)).join(' | ') : 'nothing overflowing',
+  );
+
+  root.unmount();
+  frame.remove();
+  window.fetch = realFetch;
 }

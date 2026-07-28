@@ -28,10 +28,11 @@ import {
 import { Button } from '../../ui/relay/Button';
 import { Dialog } from '../../ui/relay/Dialog';
 import { Icon } from '../../ui/relay/Icon';
+import { IconButton } from '../../ui/relay/IconButton';
 import { Input } from '../../ui/relay/Input';
 import { Tabs } from '../../ui/relay/Tabs';
 import { Tooltip } from '../../ui/relay/Tooltip';
-import { usePhone } from '../../ui/touch';
+import { PHONE_TEXT, usePhone } from '../../ui/touch';
 
 export interface UsageDashboardDialogProps {
   open: boolean;
@@ -46,6 +47,88 @@ const PERIODS: Array<{ value: UsagePeriod; label: string }> = [
 ];
 
 const JOBS_PAGE_SIZE = 20;
+
+/**
+ * The first instant of the period a moment falls in, in the viewer's own
+ * calendar.
+ *
+ * Deliberately the same rule as the server's `rangeFor` — Monday-first weeks
+ * included — because the two have to name the same windows. This one is only
+ * ever used to describe and to bound the anchor; the range the figures are
+ * actually computed over is still the server's, and arrives in `from`/`to`.
+ */
+export function periodStart(at: Date, period: UsagePeriod): Date {
+  const y = at.getFullYear();
+  const m = at.getMonth();
+  const d = at.getDate();
+  if (period === 'day') return new Date(y, m, d);
+  if (period === 'week') return new Date(y, m, d - ((at.getDay() + 6) % 7));
+  if (period === 'month') return new Date(y, m, 1);
+  return new Date(y, 0, 1);
+}
+
+/**
+ * One period forward or back, as an instant inside the period arrived at.
+ *
+ * Midday, and mid-month for the wider periods, rather than the boundary itself:
+ * the server bounds every window with one fixed offset — the viewer's offset at
+ * the moment of asking — so an anchor sitting exactly on a local midnight lands
+ * an hour the wrong side of that boundary for half the year, and the arrows
+ * would walk over the same day twice and never reach the one between.
+ *
+ * Stepping from the anchor rather than from the range that came back also means
+ * two quick presses move two periods: a second press while the first answer is
+ * still in flight would otherwise recompute the same step from the range still
+ * on screen.
+ */
+export function stepAnchor(anchor: Date, period: UsagePeriod, direction: 1 | -1): Date {
+  const y = anchor.getFullYear();
+  const m = anchor.getMonth();
+  const d = anchor.getDate();
+  if (period === 'day') return new Date(y, m, d + direction, 12);
+  if (period === 'week') return new Date(y, m, d + 7 * direction, 12);
+  if (period === 'month') return new Date(y, m + direction, 15, 12);
+  return new Date(y + direction, 6, 15, 12);
+}
+
+/** `2026-07-27`, the only shape an `<input type="date">` reads or writes. */
+function dateValue(at: Date): string {
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
+}
+
+/**
+ * A typed date back into an anchor, or null.
+ *
+ * A date field reports every intermediate value as the user types into it, so
+ * `0002-07-27` arrives on the way to `2026-07-27`. Rejected rather than
+ * honoured: jumping the dashboard to the year 2 and back is a worse experience
+ * than a keystroke that does nothing.
+ */
+function parseDateValue(value: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return null;
+  const [, y, m, d] = match;
+  if (Number(y) < 2000) return null;
+  return new Date(Number(y), Number(m) - 1, Number(d), 12);
+}
+
+/** The window a period covers, named the way somebody would say it out loud. */
+function periodLabel(at: Date, period: UsagePeriod): string {
+  const start = periodStart(at, period);
+  if (period === 'year') return String(start.getFullYear());
+  if (period === 'month') return start.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+  if (period === 'week') {
+    // The last instant inside the window, not the first outside it: a week
+    // labelled up to the Monday after it reads as eight days.
+    const last = new Date(periodStart(stepAnchor(at, 'week', 1), 'week').getTime() - 1);
+    return `${start.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })} – ${last.toLocaleDateString(
+      undefined,
+      { day: 'numeric', month: 'short', year: 'numeric' },
+    )}`;
+  }
+  return start.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+}
 
 /**
  * A bucket key back into the instant it names, in the viewer's own clock.
@@ -482,6 +565,129 @@ function FilterChips({
   );
 }
 
+/**
+ * Which window the figures are for, and the only way out of the one the clock
+ * is standing in.
+ *
+ * Everything downstream reads its range out of the answer this asks for — the
+ * history list and the export both take `from`/`to` from the dashboard — so
+ * moving the anchor moves the whole page rather than the charts alone.
+ *
+ * The window is named from the anchor rather than from the range that came
+ * back, because that range is the *narrowed* one whenever a bar has been
+ * pressed: an hour of Monday morning is still a day of July, and a control
+ * that renamed itself "27 Jul, 09:00" would be describing the drill-down the
+ * chips already describe.
+ */
+function PeriodNavigator({
+  period,
+  anchor,
+  empty,
+  narrowed,
+  onAnchor,
+}: {
+  period: UsagePeriod;
+  /** Null while the window is wherever now is — which is where it starts. */
+  anchor: Date | null;
+  /** Whether the window that came back holds no turns at all. */
+  empty: boolean;
+  narrowed: boolean;
+  onAnchor(next: Date | null): void;
+}): React.JSX.Element {
+  const phone = usePhone();
+  const now = new Date();
+  const at = anchor ?? now;
+  // Nothing has happened after now, so there is nothing ahead to walk into.
+  // Compared period-start to period-start rather than instant to instant: the
+  // window holding this moment is the last one there is, and half of it is
+  // still in the future.
+  const latest = periodStart(at, period).getTime() >= periodStart(now, period).getTime();
+
+  const pick = (value: string): void => {
+    const picked = parseDateValue(value);
+    if (!picked) return;
+    if (periodStart(picked, period).getTime() > periodStart(now, period).getTime()) return;
+    onAnchor(picked);
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <div
+        style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}
+        role="group"
+        aria-label="The period on screen"
+      >
+        {/* IconButton, not an icon-only Button: only this one is a square at
+            the touch floor, and the dashboard is one of the phone's own
+            destinations. */}
+        <IconButton
+          variant="outline"
+          size={phone ? 'lg' : 'md'}
+          aria-label={`Previous ${period}`}
+          onClick={() => onAnchor(stepAnchor(at, period, -1))}
+        >
+          <Icon name="arrow-left" size={phone ? 18 : 12} />
+        </IconButton>
+        <span
+          // The whole page has just been re-asked for a different range, and
+          // the name of that range is the one thing on screen that says which.
+          aria-live="polite"
+          style={{
+            fontSize: phone ? PHONE_TEXT.body : 'var(--text-ui)',
+            minWidth: 150,
+            textAlign: 'center',
+          }}
+        >
+          {periodLabel(at, period)}
+        </span>
+        <IconButton
+          variant="outline"
+          size={phone ? 'lg' : 'md'}
+          aria-label={`Next ${period}`}
+          disabled={latest}
+          onClick={() => onAnchor(stepAnchor(at, period, 1))}
+        >
+          <Icon name="arrow-right" size={phone ? 18 : 12} />
+        </IconButton>
+        <div style={{ width: 150 }}>
+          <Input
+            size="sm"
+            type="date"
+            value={dateValue(periodStart(at, period))}
+            // Belt as well as braces: the arrow is already disabled at the
+            // present, and a date field that offers next March is an interface
+            // promising a record that cannot exist.
+            max={dateValue(now)}
+            aria-label={`Show the ${period} containing a date`}
+            onChange={(e) => pick(e.currentTarget.value)}
+          />
+        </div>
+        {/* Disabled only when the window is already the live one — which is
+            not the same as its being the current period. Step back and forward
+            again and the anchor is a fixed instant inside today; keyed on
+            `latest`, the only control that unpins it would be unavailable, and
+            a dialog left open across midnight would go on answering for the
+            day that ended. */}
+        <Button variant="ghost" size="sm" disabled={anchor === null} onClick={() => onAnchor(null)}>
+          Now
+        </Button>
+      </div>
+      {empty ? (
+        <span
+          style={{
+            fontSize: phone ? PHONE_TEXT.meta : 'var(--text-2xs)',
+            color: 'var(--muted-foreground)',
+          }}
+        >
+          {narrowed
+            ? `Nothing in this ${period} matches the selection above.`
+            : `Nothing was recorded in this ${period}. Step back, or pick a date, to look further into the past.`}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 // --------------------------------------------------------------------- trend
 
 /**
@@ -618,32 +824,97 @@ function TrendChart({
   );
 }
 
-/** The five fixed buckets a `UsageEffort` histogram carries, turns or tool calls. */
+/**
+ * The five fixed buckets a `UsageEffort` histogram carries, turns or tool calls.
+ *
+ * Built the way `TrendChart` above is built, and for the reason it was: these
+ * were bare `<div>`s inside a `Tooltip`, which mounts on mouseenter or on focus
+ * from a focusable descendant — and there was none. So the counts existed in no
+ * place a keyboard or a screen reader could reach, and "Effort by agent" read
+ * as an agent, a turn count, and then five loose numbers with no quantity
+ * attached to any of them (#66). The distribution is the entire question this
+ * panel answers.
+ *
+ * Nothing is selected by pressing a bar, so pressing one does what hovering it
+ * does: says what it counts. That is not a control with no action — it is the
+ * only action a touch screen has, where there is no hover to reveal a tooltip
+ * with.
+ */
 function EffortHistogram({
+  label,
   histogram,
   labels,
 }: {
+  /** What the distribution is *of* — the panel heading is too far away to carry it. */
+  label: string;
   histogram: readonly [number, number, number, number, number];
   labels: readonly [string, string, string, string, string];
 }): React.JSX.Element {
+  const phone = usePhone();
+  const [active, setActive] = React.useState<number | null>(null);
   const max = Math.max(1, ...histogram);
+  const total = histogram.reduce((sum, count) => sum + count, 0);
+
   return (
-    <div style={{ display: 'flex', alignItems: 'flex-end', gap: 4, height: 44 }}>
-      {histogram.map((count, i) => (
-        <Tooltip key={labels[i]} label={`${labels[i]}: ${count} job(s)`}>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, width: 22 }}>
-            <div
+    <div>
+      <div
+        style={{ display: 'flex', alignItems: 'flex-end', gap: phone ? 8 : 4, height: 44 }}
+        role="group"
+        aria-label={label}
+        onMouseLeave={() => setActive(null)}
+      >
+        {histogram.map((count, i) => (
+          <button
+            key={labels[i]}
+            type="button"
+            aria-label={`${labels[i]}: ${count} of ${total} turn(s)`}
+            title={`${labels[i]}: ${count} of ${total} turn(s)`}
+            onMouseEnter={() => setActive(i)}
+            onFocus={() => setActive(i)}
+            onBlur={() => setActive(null)}
+            // Set, never toggled: a real press arrives after mouseenter and
+            // after focus, so a toggle finds the bar already active and clears
+            // the readout the press was for. On a keyboard the same — Tab
+            // shows the figure and Enter took it away again.
+            onClick={() => setActive(i)}
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'flex-end',
+              gap: 2,
+              // Wider on a phone: this is the affordance the change adds for
+              // touch, and a 22px target with 4px between them is not one.
+              width: phone ? 40 : 22,
+              height: '100%',
+              padding: 0,
+              border: 'none',
+              background: 'transparent',
+              cursor: 'pointer',
+            }}
+          >
+            <span
               style={{
                 width: '100%',
                 height: Math.max(2, (count / max) * 32),
                 background: count > 0 ? 'var(--primary)' : 'var(--border)',
+                opacity: active !== null && active !== i ? 0.6 : 1,
                 borderRadius: 1,
               }}
             />
             <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>{labels[i]}</span>
-          </div>
-        </Tooltip>
-      ))}
+          </button>
+        ))}
+      </div>
+      <div
+        // Always mounted, same as the trend's readout: a region that appears
+        // when a bar is reached is announced as new content rather than as the
+        // answer to what was just reached.
+        aria-live="polite"
+        style={{ minHeight: 14, fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}
+      >
+        {active === null ? '' : `${labels[active]} · ${histogram[active]} of ${total} turn(s)`}
+      </div>
     </div>
   );
 }
@@ -889,14 +1160,22 @@ function EffortTable({ rows, unknown }: { rows: UsageEffort[]; unknown: string }
                     }`}
               </div>
               {row.modelTurnsReportedTurns > 0 ? (
-                <EffortHistogram histogram={row.modelTurnsHistogram} labels={MODEL_TURNS_LABELS} />
+                <EffortHistogram
+                  label={`${keyLabel(row.key, unknown)} · model turns per turn`}
+                  histogram={row.modelTurnsHistogram}
+                  labels={MODEL_TURNS_LABELS}
+                />
               ) : null}
             </div>
             <div>
               <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
                 tool calls/turn · avg {formatAvg(row.toolCallsAvg)} · max {row.toolCallsMax}
               </div>
-              <EffortHistogram histogram={row.toolCallsHistogram} labels={TOOLS_LABELS} />
+              <EffortHistogram
+                label={`${keyLabel(row.key, unknown)} · tool calls per turn`}
+                histogram={row.toolCallsHistogram}
+                labels={TOOLS_LABELS}
+              />
             </div>
           </div>
         ))
@@ -1631,6 +1910,8 @@ function JobHistory({
  */
 export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProps): React.JSX.Element | null {
   const [period, setPeriod] = React.useState<UsagePeriod>('day');
+  /** Null means "wherever now is", which is what the server assumes anyway. */
+  const [anchor, setAnchor] = React.useState<Date | null>(null);
   const [scope, setScope] = React.useState<UsageScope>('self');
   const [measure, setMeasure] = React.useState<UsageMeasure>('costUsd');
   const [filters, setFilters] = React.useState<UsageFilters>({});
@@ -1639,19 +1920,24 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
   const [reloads, setReloads] = React.useState(0);
   const isPhone = usePhone();
   const filterKey = JSON.stringify(filters);
+  const anchorKey = anchor ? anchor.toISOString() : '';
 
   React.useEffect(() => {
     // A dashboard reopened is a question asked afresh. Carrying the last
     // visit's narrowing back in would show a total that is not the total, with
-    // the reason for it several screens further down.
-    if (open) setFilters({});
+    // the reason for it several screens further down. The window it was left
+    // parked on is the same kind of stale: "Usage" should mean this week's.
+    if (open) {
+      setFilters({});
+      setAnchor(null);
+    }
   }, [open]);
 
   React.useEffect(() => {
     if (!open) return;
     let cancelled = false;
     setError(null);
-    fetchUsageDashboard(period, scope, filters)
+    fetchUsageDashboard(period, scope, filters, anchor ?? undefined)
       .then((result) => {
         if (cancelled) return;
         setDashboard(result);
@@ -1664,7 +1950,7 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
       .catch((err: Error) => { if (!cancelled) setError(err.message); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, period, scope, filterKey, reloads]);
+  }, [open, period, scope, filterKey, anchorKey, reloads]);
 
   const active = measureBy(measure);
   const bucketUnit: UsageBucketUnit = dashboard?.bucket ?? 'hour';
@@ -1683,6 +1969,17 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
    */
   const changePeriod = (next: UsagePeriod): void => {
     setPeriod(next);
+    setFilters(({ from: _from, to: _to, ...rest }) => rest);
+  };
+
+  /**
+   * Moving the window drops the selection made inside the old one, for the same
+   * reason changing the period does: an hour of last Tuesday is not a slice of
+   * this week, and carried across it would leave every figure on screen
+   * answering for a range no control on the page names.
+   */
+  const changeAnchor = (next: Date | null): void => {
+    setAnchor(next);
     setFilters(({ from: _from, to: _to, ...rest }) => rest);
   };
 
@@ -1758,19 +2055,31 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
       }
     >
       <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'center', justifyContent: 'space-between' }}>
-          <Tabs
-            tabs={PERIODS.map((p) => ({ value: p.value, label: p.label }))}
-            value={period}
-            onChange={(v) => changePeriod(v as UsagePeriod)}
-          />
-          {dashboard?.canSeeEveryone ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'center', justifyContent: 'space-between' }}>
             <Tabs
-              tabs={[{ value: 'self', label: 'Just me' }, { value: 'everyone', label: 'Everyone' }]}
-              value={scope}
-              onChange={(v) => setScope(v as UsageScope)}
+              tabs={PERIODS.map((p) => ({ value: p.value, label: p.label }))}
+              value={period}
+              onChange={(v) => changePeriod(v as UsagePeriod)}
             />
-          ) : null}
+            {dashboard?.canSeeEveryone ? (
+              <Tabs
+                tabs={[{ value: 'self', label: 'Just me' }, { value: 'everyone', label: 'Everyone' }]}
+                value={scope}
+                onChange={(v) => setScope(v as UsageScope)}
+              />
+            ) : null}
+          </div>
+          <PeriodNavigator
+            period={period}
+            anchor={anchor}
+            // An empty window is only worth remarking on once the answer is in;
+            // while it is loading there is nothing to say and a line saying
+            // "nothing recorded" would be a guess.
+            empty={Boolean(dashboard) && dashboard?.totals.turns === 0}
+            narrowed={hasFilters(filters)}
+            onAnchor={changeAnchor}
+          />
         </div>
 
         <FilterChips filters={filters} onChange={setFilters} />

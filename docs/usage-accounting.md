@@ -547,9 +547,10 @@ Everything one dashboard view draws: totals, a trend series, breakdowns by
 project/agent/model/user, effort histograms, and the most-called tools.
 
 Query parameters: `period` (`day` | `week` | `month` | `year`, default `day`),
-`anchor` (ISO instant the period is centred on, default now), `tz` (minutes to
-add to UTC to reach the viewer's own clock, so "today" means their today),
-`scope` (`self` | `everyone`).
+`anchor` (ISO instant the period is centred on, default now — this is what the
+dashboard's arrows and date field send, and the only way to ask about a period
+that has already ended), `tz` (minutes to add to UTC to reach the viewer's own
+clock, so "today" means their today), `scope` (`self` | `everyone`).
 
 It also takes the same narrowing the job history does — `project`, `agent`,
 `model`, `user`, and an explicit `from`/`to` window — and applies it to *every*
@@ -826,6 +827,19 @@ months within a year — computed against the viewer's own timezone offset so
 appears on the trend as a gap rather than disappearing and making the shape
 read as continuous when it was not.
 
+The arrows beside it move that window: a period back, a period forward, or
+straight to a date typed into the field between them, with **Now** returning to
+whichever window the clock is in. Nothing offers to walk past the present —
+there is no record ahead of it — and a window holding nothing says so rather
+than drawing an empty chart and leaving you to guess whether the arrows worked.
+Since jobs are [kept forever](#where-the-data-lives), this is how a year that
+has ended stays readable: without it the **Year** tab would mean the calendar
+year the viewer is standing in, and every job filed before the first of January
+would leave the dashboard, the trend, the history list and the export while
+sitting untouched in the database. The window is the whole page's, not the
+charts': moving it moves the history underneath and the file the export button
+downloads.
+
 ### Exploring it
 
 The charts are controls, not pictures.
@@ -881,7 +895,12 @@ much did this cost" but "does this agent usually finish in one round trip or
 does it flail". They are histograms of turns and tool calls per completed job,
 in fixed buckets (1 / 2 / 3-5 / 6-10 / 11+), rather than an average or a
 percentile — a shape says where an agent sits on that spectrum where a single
-number does not, and fixed buckets let two agents be read side by side.
+number does not, and fixed buckets let two agents be read side by side. Each
+bucket of them is a button, the same as a point on the trend: tab to one or tap
+it and its count appears under the bars, and a screen reader is told which
+distribution it is in and how many of the turns fell in that bucket. A shape is
+worth nothing to somebody who cannot see it, and a row of bare bars leaves the
+figures the panel exists for reachable by mouse alone.
 Interrupted and errored jobs are excluded from effort: a turn the process died
 inside of took exactly as many round trips as it got to before dying, which
 describes the crash rather than the agent's usual behaviour.
