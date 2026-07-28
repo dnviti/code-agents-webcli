@@ -8,7 +8,9 @@ import { summonKeyboard } from '../terminal/keyboard';
 import { createNewSession, runTerminalCommand, startTerminalShell } from '../ui/modals';
 import { loadSettings, applySettings, saveSettings } from '../ui/settings';
 import { loadChatView, saveChatView, type ChatViewSettings } from '../chat/view-settings';
+import type { BranchedConversation } from '../chat/branch-api';
 import { onBannerAction, onBannerDismiss, onBannerToggleLog } from '../ui/update-banner';
+import { showNotification } from '../ui/notifications';
 import { hideOverlay, showError } from '../ui/overlay';
 import { AppShell, type ShellActions } from './AppShell';
 import { RuntimeLauncher, type ResumableConversation } from './RuntimeLauncher';
@@ -153,6 +155,69 @@ async function resumeConversation(app: App, conversation: ResumableConversation)
 }
 
 /**
+ * Open the conversation a branch just created, in a tab of its own.
+ *
+ * The server has already made it: the record exists, the carried history is on
+ * disk, and the opening context is waiting for the first message. All that is
+ * left is what only a browser can do — put it on screen and start its agent.
+ *
+ * A tab beside the original rather than in place of it, which is the whole
+ * shape of the feature: the conversation branched from is still running, still
+ * has its own agent, and is one tab away.
+ *
+ * The launch names no mode at all, and that is load-bearing in both directions.
+ * `resume: true` would hand the agent a runtime conversation this branch does
+ * not have — it is meeting the history for the first time, out of the opening
+ * context, which is the honest version of what a fork would have done had any
+ * of these CLIs offered one. And `resume: false` is worse: it means *start
+ * fresh*, which draws a line under the transcript and truncates everything
+ * above it, so the branch would open by deleting the history it was made of.
+ */
+async function openBranch(app: App, conversation: BranchedConversation): Promise<void> {
+  const runtime = (conversation.runtime || 'claude') as AgentKind;
+  try {
+    if (app.sessionTabManager) {
+      app.sessionTabManager.addTab(
+        conversation.sessionId,
+        conversation.name,
+        'idle',
+        conversation.workingDir,
+        false,
+      );
+      await app.sessionTabManager.switchToTab(conversation.sessionId);
+    } else {
+      await app.joinSession(conversation.sessionId);
+    }
+
+    app.send({
+      type: 'start_chat',
+      agentKind: runtime,
+      sessionId: conversation.sessionId,
+      options: {},
+    });
+
+    // What was carried, and — where no window size was on record — that nothing
+    // was measured against it. Said once, here, rather than left for the user to
+    // discover when the agent answers as though the history were shorter than it
+    // is.
+    //
+    // "on record" and not "never reported": the size is read from the source
+    // conversation's own log, and a long enough conversation has had the event
+    // carrying it trimmed off the head. The runtime may well have said; this
+    // process cannot see that it did, and saying so would be a guess dressed as
+    // a fact — on exactly the conversations most likely to overflow.
+    showNotification(
+      conversation.sizeChecked
+        ? `Branched at turn ${conversation.turnIndex}, carrying ${conversation.turns} turn${conversation.turns === 1 ? '' : 's'}.`
+        : `Branched at turn ${conversation.turnIndex}, carrying ${conversation.turns} turn${conversation.turns === 1 ? '' : 's'}. `
+          + 'No window size was on record for this conversation, so the history was not checked against one.',
+    );
+  } catch (error: unknown) {
+    showError(error instanceof Error ? error.message : 'That branch could not be opened');
+  }
+}
+
+/**
  * The runtime picker.
  *
  * Rendered as a child of the shell rather than into its own root: the overlay
@@ -274,6 +339,7 @@ function buildActions(app: App): ShellActions {
       // the store can never hold a setting that would not survive a reload.
       shellStore.setState({ chatView: saveChatView(next) });
     },
+    openConversation: (conversation) => void openBranch(app, conversation),
 
     setTheme: applyTheme,
     readSettings: () => loadSettings(),

@@ -257,7 +257,7 @@ export interface ErrorBlock {
  */
 export interface NoticeBlock {
   kind: 'notice';
-  notice: 'compacted' | 'cleared' | 'interrupted';
+  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched';
   text: string;
   /** Optional detail — how much was reclaimed, what the summary covers. */
   detail?: string;
@@ -350,6 +350,15 @@ export interface ChatTurnIndexEntry {
   turnId: string;
   /** 1-based over the whole conversation, not over what is loaded. */
   index: number;
+  /**
+   * Where this turn opens in the log, so a reader can cut the conversation at
+   * it — which is what branching from a turn needs and nothing else has.
+   *
+   * Optional because it rides on the wire: a browser talking to a server that
+   * predates it must read "not stated" rather than zero, which would name the
+   * head of the log as every turn's start.
+   */
+  startSeq?: number;
   /** The user's first line, or null for a turn nobody prompted. */
   label: string | null;
   startedAt: number;
@@ -790,12 +799,19 @@ export type ChatEvent =
    * could be answered first: without it the transcript reads as an agent that
    * stopped for no reason, and the message that follows looks unrelated to the
    * work that stopped. `detail` carries what that message was.
+   *
+   * `branched` closes the history a new conversation was started from. What is
+   * above it was said somewhere else and copied here to be read; what is below
+   * it is this conversation's own. The agent is handed the same history as its
+   * opening context, and the line is where a reader is told so — a branch that
+   * looked like an ordinary transcript would be claiming the agent lived
+   * through it (#34).
    */
   | {
       t: 'marker';
       seq: number;
       ts: number;
-      kind: 'compacted' | 'cleared' | 'interrupted';
+      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched';
       detail?: string;
     };
 

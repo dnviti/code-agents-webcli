@@ -15,6 +15,9 @@ import { TranscriptStoreLike } from '../services/transcript-store.js';
 import { HistoryStoreLike } from '../services/history-store.js';
 import { SessionTeardownLike } from '../services/session-teardown.js';
 import { stripAnsi } from '../services/ansi.js';
+import { ChatEvent } from '../../shared/chat-events.js';
+import { planBranch, tooLargeMessage } from '../chat/branch.js';
+import { TurnCut } from '../chat/store.js';
 import { getOwnedSession, requireUser } from './helpers.js';
 
 /**
@@ -72,6 +75,14 @@ export interface SessionRoutesDeps {
       nativeSessionId: string | null;
       firstMessage: string | null;
     }>;
+    /**
+     * The three calls a branch needs, optional for the same reason the store
+     * itself is: a deployment without a chat log has no conversation to branch
+     * and the route says so rather than throwing.
+     */
+    turnCut?(session: { id: string; ownerUserId: number }, turnId: string): Promise<TurnCut | null>;
+    append?(session: { id: string; ownerUserId: number }, events: ChatEvent[]): void;
+    setOpeningContext?(session: { id: string; ownerUserId: number }, context: string): Promise<void>;
   };
 }
 
@@ -364,6 +375,143 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     });
   });
 
+  /**
+   * Start a new conversation from a turn of this one.
+   *
+   * The new conversation gets the history up to and including that turn in its
+   * own log — so it is there to read — and the same history waiting as the
+   * opening context of its first turn, so the agent it is handed to knows what
+   * came before rather than reading over the user's shoulder. See chat/branch.ts
+   * for what is actually sent and why it is a rendition.
+   *
+   * The conversation branched from is not touched. Not one event: the cut is a
+   * read, and everything written lands in the record created here.
+   *
+   * A branch that will not fit the model's window is refused with the figures
+   * rather than trimmed to size, and a conversation whose runtime never
+   * reported a window is branched with the check skipped and *said* to have
+   * been — the alternative is measuring against a ceiling nobody stated, which
+   * is the wrong ceiling this app declines to invent everywhere else.
+   */
+  router.post('/api/sessions/:sessionId/branch', async (req: Request, res: Response): Promise<void> => {
+    const user = requireUser(res);
+    if (!user) {
+      res.status(401).json({ error: 'authentication_required' });
+      return;
+    }
+
+    const source = getOwnedSession(deps.claudeSessions, req.params.sessionId as string, user);
+    if (!source || source.surface !== 'chat') {
+      res.status(404).json({ error: 'unknown_conversation', message: 'That conversation does not exist' });
+      return;
+    }
+
+    const turnId = typeof req.body?.turnId === 'string' ? req.body.turnId.trim() : '';
+    if (!turnId) {
+      res.status(400).json({ error: 'invalid_turn', message: 'No turn was named' });
+      return;
+    }
+
+    const store = deps.chatStore;
+    if (!store?.turnCut || !store.append || !store.setOpeningContext) {
+      res.status(501).json({
+        error: 'branching_unavailable',
+        message: 'This server cannot branch conversations',
+      });
+      return;
+    }
+
+    try {
+      const cut = await store.turnCut({ id: source.id, ownerUserId: source.ownerUserId }, turnId);
+      if (!cut) {
+        res.status(404).json({
+          error: 'unknown_turn',
+          message: 'That turn is no longer in this conversation',
+        });
+        return;
+      }
+
+      const plan = planBranch(cut);
+      if (!plan.fits) {
+        // 413 rather than 400: the request was perfectly well formed and the
+        // thing it asked for is too big, which is the one distinction that
+        // tells a caller retrying with an earlier turn would help.
+        res.status(413).json({
+          error: 'context_too_large',
+          message: tooLargeMessage(plan, cut.turn.index),
+          estimatedTokens: plan.estimatedTokens,
+          contextWindow: plan.contextWindow,
+          budgetTokens: plan.budgetTokens,
+        });
+        return;
+      }
+
+      const sessionId = randomUUID();
+      const branch = deps.createSessionRecord({
+        id: sessionId,
+        ownerUserId: user.id,
+        name: branchName(source, cut.turn.index),
+        workingDir: source.workingDir,
+      });
+      // The conversation this one came from, running the same agent in the same
+      // place. Not `agent`, which says a process is up: nothing is running here
+      // until the browser launches it.
+      branch.surface = 'chat';
+      branch.lastAgent = source.lastAgent;
+      branch.runtimeLabel = source.runtimeLabel;
+      // The model and the effort level travel with it, because they are how
+      // this line of work was being done and the branch is a continuation of
+      // it — and because the window the history was just measured against is
+      // that model's. The bypass flag deliberately does not: it is a standing
+      // permission granted to the conversation that asked for it, and a
+      // conversation that inherited one would be acting without being asked on
+      // the strength of somebody else's answer.
+      branch.chatModelOverride = source.chatModelOverride;
+      branch.chatEffortOverride = source.chatEffortOverride;
+
+      const ref = { id: sessionId, ownerUserId: user.id };
+      store.append(ref, plan.events);
+      // `append` is fire-and-forget by contract — it runs on the event path and
+      // may not fail a live conversation — so the write is confirmed here
+      // instead, through the store's own per-log queue: a stat cannot answer
+      // until the append ahead of it has finished, and an append that threw
+      // leaves nothing behind it to count.
+      const stats = await store.stat(ref);
+      if (stats.cursor < plan.events.length) {
+        res.status(500).json({
+          error: 'branch_not_written',
+          message: 'The branch could not be written to disk',
+        });
+        return;
+      }
+      await store.setOpeningContext(ref, plan.context);
+
+      deps.claudeSessions.set(sessionId, branch);
+      void deps.transcriptStore.ensureTranscript(branch);
+      void deps.saveSessionsToDisk();
+
+      res.json({
+        success: true,
+        sessionId,
+        name: branch.name,
+        workingDir: branch.workingDir,
+        runtime: branch.lastAgent,
+        turnIndex: cut.turn.index,
+        turns: plan.turns,
+        estimatedTokens: plan.estimatedTokens,
+        // Absent means no window was ever reported, so nothing was measured.
+        // Named rather than left to be inferred from a missing number: a caller
+        // has to be able to tell a branch that fits from one nobody could size.
+        contextWindow: plan.contextWindow,
+        sizeChecked: plan.budgetTokens !== undefined,
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Failed to branch session ${source.id}:`, error);
+      res.status(500).json({ error: 'branch_failed', message });
+    }
+  });
+
   router.get('/api/sessions/:sessionId', (req: Request, res: Response): void => {
     const user = requireUser(res);
     if (!user) {
@@ -553,6 +701,17 @@ function toPlainText(value: string): string {
 /** What to call a session in front of the user: their name for it if they gave one. */
 function displayName(session: SessionRecord): string {
   return session.customName || session.name;
+}
+
+/**
+ * What a branch's tab is called.
+ *
+ * Named after where it came from, because that is the only thing that
+ * distinguishes it from the conversation beside it in the strip: same folder,
+ * same agent, same first thirty turns. Capped like any other stored name.
+ */
+function branchName(source: SessionRecord, turnIndex: number): string {
+  return `${displayName(source)} — branch at turn ${turnIndex}`.slice(0, MAX_NAME_LENGTH);
 }
 
 function exportFileName(session: SessionRecord): string {

@@ -22,6 +22,45 @@
   clearing one left the previous answer frozen on screen.
 
 ### Added
+- **A turn can be branched into a conversation of its own.** The button was
+  promised in 5.1.2 beside copy-a-turn and never built — the changelog said it
+  had shipped, and the control existed in no state at all, folded or open, on
+  any screen size. It is there now, on every turn's header, and pressing it
+  opens a **new conversation in a new tab** that carries the history up to and
+  including that turn.
+
+  Not a fork in the runtime's sense, because no runtime here has one: not one of
+  the six CLIs can split a session at a point, every adapter says so, and none
+  of them has been made to claim otherwise. What happens instead is two things
+  this app can do for itself. The transcript up to that turn is copied into the
+  new conversation's own log, so the history is there to read. And the same
+  history is handed to the agent as the opening context of its first turn, so
+  the first thing you ask is answered by something that knows what came before —
+  a branch that only copied the transcript would leave you talking to an agent
+  reading over your shoulder.
+
+  What the agent is sent is a rendition and says so in its own opening words: it
+  is told plainly that this is a record of a conversation it was not in, that
+  nothing in it was said by it here, and that tool output and reasoning are not
+  carried. It arrives *with* your first message rather than as a turn of its
+  own, so the conversation on screen opens with your words and not with a wall
+  of quoted history standing in as though you had typed it. A rule across the
+  transcript marks where the carried history ends and this conversation begins.
+
+  **When the history does not fit the model's window, the branch is refused
+  rather than trimmed.** The reply names what it would have carried, what the
+  window is, and what that leaves — enough to branch from an earlier turn
+  instead. Where the runtime has never reported a window size, nothing is
+  measured and you are told that nothing was measured, in the notice and in the
+  transcript both; guessing at a ceiling would be the more confident answer and
+  the wrong one.
+
+  The conversation branched from is not touched — not one event — and goes on
+  running in its own tab. The branch opens in the same directory on the same
+  agent and carries the model and effort level that conversation was using. It
+  does not carry a bypass of tool approvals: that is a standing permission
+  granted to the conversation that asked for it.
+
 - **How hard the agent thinks, as a control in the composer.** Every runtime the
   WebUI drives has a reasoning-effort setting and there was no way to reach any
   of them: the conversation ran at whatever the CLI considered normal, and the
@@ -1031,8 +1070,10 @@
   under it, and a turn folds on its own once the next one begins, so a long
   session reads as a list of what was asked rather than an endless scroll. The
   turn index can open or close them all at once, and jumping to a turn from the
-  index opens it. A folded turn still says what it was about, and its copy and
-  branch actions keep working while it is shut.
+  index opens it. A folded turn still says what it was about, and its copy
+  action keeps working while it is shut. (This entry also claimed a branch
+  action. There was none: the control was never built, in this release or any
+  other before it. Branching from a turn is in Unreleased above.)
 
 ### Fixed
 - **The runtime's own slash commands are there from the moment a conversation

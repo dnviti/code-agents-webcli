@@ -104,6 +104,18 @@ export function isClearingCommand(text: string): boolean {
   return CLEARING.has(first.slice(1).toLowerCase());
 }
 
+/**
+ * Whether a message is a command rather than something to say to the model.
+ *
+ * The first word only, and a leading slash: everything a runtime treats as a
+ * command arrives as ordinary turn text, so this is the only thing that tells
+ * `/review` from a sentence beginning with a slash.
+ */
+export function isSlashCommand(text: string): boolean {
+  const first = String(text || '').trim().split(/\s+/, 1)[0] ?? '';
+  return first.length > 1 && first.startsWith('/');
+}
+
 /** Commands that summarise the conversation to reclaim context. */
 export function isCompactingCommand(text: string): boolean {
   const first = String(text || '').trim().split(/\s+/, 1)[0] ?? '';

@@ -607,6 +607,12 @@ function QuestionBlock({
   );
 }
 
+/** The same glyph the action that caused each rule is drawn with elsewhere. */
+const NOTICE_GLYPH: Partial<Record<NoticeBlock['notice'], string>> = {
+  interrupted: 'square',
+  branched: 'git-branch',
+};
+
 /**
  * A rule across the conversation, marking something that happened to it.
  *
@@ -634,7 +640,7 @@ function NoticeRule({ block }: { block: NoticeBlock }): React.JSX.Element {
     >
       <span aria-hidden="true" style={{ flex: 1, height: 1, background: 'var(--border)' }} />
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
-        <Icon name={block.notice === 'interrupted' ? 'square' : 'fold-vertical'} size={11} />
+        <Icon name={NOTICE_GLYPH[block.notice] ?? 'fold-vertical'} size={11} />
         {block.text}
         {block.detail ? (
           <span style={{ fontFamily: 'var(--font-mono)', opacity: 0.75 }}>{block.detail}</span>
