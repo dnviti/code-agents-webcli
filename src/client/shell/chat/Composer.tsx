@@ -1655,6 +1655,27 @@ function EffortChip({
   const isPhone = usePhone();
 
   /**
+   * Only the outcomes this control cannot say for itself (issue #119).
+   *
+   * A change that took effect needs no announcement. The chip redraws the
+   * instant it lands — the level named, metered and coloured — so a box beside
+   * it reading "Now thinking at high" spends the user's attention repeating
+   * what their eye has already reached, and on a phone, where it resolves
+   * against the composer rather than against this chip, it repeats it on top of
+   * the field they were about to type into.
+   *
+   * The other four outcomes are precisely the ones the chip gets wrong on its
+   * own, so they are still said out loud: a `refused` level was never stored
+   * and the conversation is still running at the old one; `sent` is waiting on
+   * the runtime's own word in the transcript; and `pending` and `cleared` do
+   * not reach the conversation in progress at all — `cleared` least visibly of
+   * the three, because the chip has already dropped back to the default it will
+   * not actually run at until the next session. Silently swallowing any of
+   * those would leave a change looking made that was not.
+   */
+  const notice = feedback && feedback.applied !== 'live' ? feedback : null;
+
+  /**
    * The answer goes away on its own, after long enough to read it.
    *
    * It used to sit there until the conversation was reset, which made it a
@@ -1668,7 +1689,7 @@ function EffortChip({
    * inheriting the remains of the first one's.
    */
   const [showFeedback, setShowFeedback] = React.useState(false);
-  const message = feedback?.message;
+  const message = notice?.message;
   React.useEffect(() => {
     if (!message) return;
     setShowFeedback(true);
@@ -1738,7 +1759,13 @@ function EffortChip({
         aria-expanded={open}
         aria-label="Change how hard the agent thinks"
         title={
-          feedback?.message
+          // The same rule as the box, and for the same reason: a hover that
+          // reads "Now thinking at high" would have displaced the description
+          // of what this control *does* for the rest of the conversation, in
+          // favour of a sentence the chip beneath the pointer already spells
+          // out. An outcome the chip cannot show still takes the slot, so a
+          // refusal stays findable after its box has timed out.
+          notice?.message
           || (matched
             ? `Effort: ${matched.name}${matched.description ? ` — ${matched.description}` : ''}`
             : 'Effort: whatever this runtime does by default')
@@ -1877,7 +1904,7 @@ function EffortChip({
         </div>
       ) : null}
 
-      {!open && feedback && showFeedback ? (
+      {!open && notice && showFeedback ? (
         <div
           role="status"
           style={{
@@ -1897,18 +1924,14 @@ function EffortChip({
             borderRadius: 'var(--radius)',
             // A refusal is the one outcome worth colouring: it means the level
             // was not stored and nothing changed, which a grey note reading like
-            // every other grey note would let slide past.
-            color:
-              feedback.applied === 'live'
-                ? 'var(--foreground)'
-                : feedback.applied === 'refused'
-                  ? 'var(--warning)'
-                  : 'var(--muted-foreground)',
+            // every other grey note would let slide past. The rest are "saved,
+            // but not yet" — true, worth reading once, and not worth alarm.
+            color: notice.applied === 'refused' ? 'var(--warning)' : 'var(--muted-foreground)',
             fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-2xs)',
             zIndex: 'var(--z-dropdown)' as unknown as number,
           }}
         >
-          {feedback.message}
+          {notice.message}
         </div>
       ) : null}
     </div>

@@ -3,6 +3,29 @@
 ## [Unreleased]
 
 ### Fixed
+- **Changing the effort level no longer announces itself** (#119). Every pick
+  raised a box beside the composer reading "Now thinking at high" — an opaque
+  panel that overlapped the controls around it and, on a phone, landed on the
+  field the user was about to type into, because it resolves against the
+  composer there rather than against its own chip. It was also the one thing on
+  screen saying nothing new: the chip redraws to the new level the instant it
+  lands, spelling it out, filling its meter to where the level sits on that
+  runtime's own ladder, and colouring it.
+
+  So a change that took effect is now silent, and the four outcomes that are
+  *not* that still speak, because they are exactly the ones the chip gets wrong
+  on its own: a **refused** level was never stored and the conversation is still
+  running at the old one; **sent** is waiting on the runtime's own reply in the
+  transcript; and **pending** and **cleared** do not reach the conversation in
+  progress at all — `cleared` least visibly of the three, since the chip has
+  already dropped back to a default it will not actually run at until the next
+  session. Muting those would leave a change looking made that was not. The
+  hover went back to describing the control as well, instead of holding the
+  confirmation for the rest of the conversation.
+
+  The model picker's equivalent is left alone for now; it is raised as an open
+  question on the issue rather than decided here.
+
 - **The terminal takes its own size back, and asks for the screen again.** The
   PTY is shared, so a split pane, a second browser tab or a phone joining the
   same session resizes it to *their* screen. This client kept one record of the

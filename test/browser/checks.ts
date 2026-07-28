@@ -6019,22 +6019,36 @@ async function checkTheEffortChipSaysAndSetsHowHardTheAgentThinks(): Promise<voi
   document.body.appendChild(host);
 
   const sent: Array<Record<string, unknown>> = [];
+  // Redrawn on `onChange`, because the app redraws on it.
+  //
+  // A `chat_effort_result` lands on the controller and nowhere else — not on
+  // the transcript, which is what this surface subscribes to — so the shell's
+  // store bumps a revision for exactly this case and re-renders ChatView. A
+  // fixture without that holds its first paint for ever, and every assertion
+  // below about what the server said would be measured against a screen that
+  // never heard it: a removed popup and a broken one look identical from there.
+  let redraw = (): void => {};
   const controller = new ChatController('effort-check', {
     send: (message: unknown) => sent.push(message as Record<string, unknown>),
+    onChange: () => redraw(),
   } as never);
   controller.handle(snapshotFor('effort-check', { ...baseCapabilities, efforts }) as never);
 
   const root = createRoot(host);
-  root.render(
-    React.createElement(ChatView, {
-      controller,
-      runtime: 'claude',
-      runtimeLabel: 'Claude',
-      workingDir: '/tmp/project',
-      view: DEFAULT_CHAT_VIEW,
-      onViewChange: () => {},
-    } as never),
-  );
+  const paint = (): void => {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude',
+        workingDir: '/tmp/project',
+        view: DEFAULT_CHAT_VIEW,
+        onViewChange: () => {},
+      } as never),
+    );
+  };
+  paint();
+  redraw = paint;
   await wait(250);
 
   const chip = (): HTMLElement | null =>
@@ -6165,6 +6179,72 @@ async function checkTheEffortChipSaysAndSetsHowHardTheAgentThinks(): Promise<voi
     JSON.stringify(picks()),
   );
 
+  // What the control does *not* say (issue #119).
+  //
+  // The chip is the announcement. It redraws to the new level — named, metered
+  // and coloured — the moment one lands, so a box beside it repeating the word
+  // spends a glance on news the eye has already had. The outcomes the chip
+  // cannot show for itself are the ones that still have to speak, and they are
+  // asserted here beside the silence: removing the confirmation and muting a
+  // refusal are one edit apart, and only a pair of checks tells them apart.
+  //
+  // Effects, not markup — the box is state a `useEffect` raises, so a rendered
+  // string is not evidence either way and only a real browser settles it.
+  const noticeIn = (surface: HTMLElement): HTMLElement | null =>
+    (surface
+      .querySelector('[aria-label="Change how hard the agent thinks"]')
+      ?.parentElement?.querySelector('[role="status"]') ?? null) as HTMLElement | null;
+  const noticeText = (surface: HTMLElement): string => (noticeIn(surface)?.textContent ?? '').trim();
+  const answer = (
+    target: ChatController,
+    sessionId: string,
+    applied: string,
+    message: string,
+    level: string | null,
+  ): void =>
+    target.handle({ type: 'chat_effort_result', sessionId, applied, effort: level, message } as never);
+  const REFUSAL = 'claude does not offer "ludicrous". It accepts: low, medium, high, xhigh, max.';
+
+  answer(controller, 'effort-check', 'live', 'Now thinking at xhigh.', 'xhigh');
+  await wait(200);
+  check(
+    'a level that took effect pops nothing up beside the composer',
+    !noticeIn(host),
+    noticeIn(host) ? `a box reading "${noticeText(host)}"` : 'nothing beside the chip',
+  );
+  check(
+    'because the chip itself has already moved to it — the news is dropped, not lost',
+    (chip()?.textContent ?? '').includes('Extra high'),
+    chip()?.textContent ?? 'empty',
+  );
+  check(
+    'and the hover went back to describing the control instead of repeating the change',
+    (chip()?.getAttribute('title') ?? '').startsWith('Effort:'),
+    chip()?.getAttribute('title') ?? 'no title',
+  );
+
+  answer(controller, 'effort-check', 'refused', REFUSAL, null);
+  await wait(200);
+  check(
+    'a refused level still says so — nothing was stored and the old one is still running',
+    noticeText(host).includes('does not offer'),
+    noticeText(host) || 'silence',
+  );
+
+  answer(
+    controller,
+    'effort-check',
+    'pending',
+    'Saved. This conversation will run at max from its next session.',
+    'max',
+  );
+  await wait(200);
+  check(
+    'and so does one that will only reach a future session',
+    noticeText(host).includes('next session'),
+    noticeText(host) || 'silence',
+  );
+
   root.unmount();
   host.remove();
 
@@ -6211,6 +6291,86 @@ async function checkTheEffortChipSaysAndSetsHowHardTheAgentThinks(): Promise<voi
 
   bareRoot.unmount();
   bare.remove();
+
+  // The phone, which is where the confirmation cost the most (issue #119).
+  //
+  // The wrapper is `static` there so the menu can have the composer's width,
+  // which means this box resolves against the composer rather than against its
+  // own chip: it landed on the field the user was about to type into, with the
+  // navigation bar directly under it. So the silence is measured here as
+  // geometry rather than taken on trust from the desktop mount — and the
+  // refusal, the one message that must survive, is measured for fit in the
+  // place it had the least room.
+  //
+  // The chip lives behind "Show the other controls" on a phone: a fixture that
+  // measured the resting row would find no chip, no box, and agree with itself.
+  const phone = document.createElement('div');
+  phone.className = 'effort-check-surface';
+  phone.style.cssText =
+    'width:390px;height:740px;position:absolute;top:0;left:0;display:flex;overflow:hidden';
+  document.body.appendChild(phone);
+  let redrawPhone = (): void => {};
+  const phoneController = new ChatController('effort-phone', {
+    send: () => {},
+    onChange: () => redrawPhone(),
+  } as never);
+  phoneController.handle(snapshotFor('effort-phone', { ...baseCapabilities, efforts }) as never);
+  const phoneRoot = createRoot(phone);
+  const paintPhone = (): void => {
+    phoneRoot.render(React.createElement(PhoneSurface, { controller: phoneController }));
+  };
+  paintPhone();
+  redrawPhone = paintPhone;
+  await wait(300);
+  (phone.querySelector('[aria-label="Show the other controls"]') as HTMLElement | null)?.click();
+  await wait(300);
+
+  const phoneChip = phone.querySelector('[aria-label="Change how hard the agent thinks"]');
+  check(
+    'the effort control is reachable on a phone at all, behind the other controls',
+    Boolean(phoneChip),
+    phoneChip ? 'on the expanded row' : 'no chip even once the other controls are open',
+  );
+
+  answer(phoneController, 'effort-phone', 'live', 'Now thinking at max.', 'max');
+  await wait(300);
+  check(
+    'a successful change on a phone covers neither the composer nor the bar, because nothing appears',
+    !noticeIn(phone),
+    noticeIn(phone) ? `a box reading "${noticeText(phone)}"` : 'nothing over the composer',
+  );
+
+  answer(phoneController, 'effort-phone', 'refused', REFUSAL, null);
+  await wait(300);
+  const refusalBox = noticeIn(phone)?.getBoundingClientRect();
+  const fieldBox = composerField(phone)?.getBoundingClientRect();
+  const navBox = (
+    phone.querySelector('nav[aria-label="Go to"]') as HTMLElement | null
+  )?.getBoundingClientRect();
+  const phoneBox = phone.getBoundingClientRect();
+  /** True when the two boxes share no pixel — 1px of slack for a shared border. */
+  const clearOf = (a: DOMRect, b: DOMRect): boolean =>
+    a.bottom <= b.top + 1 || a.top >= b.bottom - 1 || a.right <= b.left + 1 || a.left >= b.right - 1;
+  check(
+    'a refusal on a phone is on screen and clear of both the field and the bar',
+    Boolean(refusalBox && fieldBox && navBox)
+      && refusalBox!.height > 0
+      && refusalBox!.top >= phoneBox.top - 1
+      && refusalBox!.bottom <= phoneBox.bottom + 1
+      && clearOf(refusalBox!, fieldBox!)
+      && clearOf(refusalBox!, navBox!),
+    [
+      refusalBox
+        ? `notice ${Math.round(refusalBox.top)}–${Math.round(refusalBox.bottom)}`
+        : 'no refusal shown at all',
+      fieldBox ? `field ${Math.round(fieldBox.top)}–${Math.round(fieldBox.bottom)}` : 'no composer',
+      navBox ? `bar ${Math.round(navBox.top)}–${Math.round(navBox.bottom)}` : 'no bottom bar',
+      `surface ${Math.round(phoneBox.top)}–${Math.round(phoneBox.bottom)}`,
+    ].join(', '),
+  );
+
+  phoneRoot.unmount();
+  phone.remove();
   still.remove();
 }
 
