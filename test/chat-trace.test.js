@@ -276,7 +276,7 @@ describe('TurnStrip', function () {
 
     assert.ok(/3tools/.test(flat) && /2reasoning/.test(flat));
     assert.ok(/8\.1s/.test(flat));
-    assert.ok(/\$0\.0412/.test(flat));
+    assert.ok(/\$0\.04/.test(flat), 'to the cent, once there is a cent to show');
     // The two figures somebody came here to read are the two that must not
     // ellipsise, so they are the ones pinned at their own width — while the
     // counts beside them are allowed to give their width up first.
@@ -293,7 +293,7 @@ describe('TurnStrip', function () {
       return style;
     };
 
-    assert.ok(styleOf('$0.0412').includes('flex:00auto'), 'the money must not shrink');
+    assert.ok(styleOf('$0.04').includes('flex:00auto'), 'the money must not shrink');
     assert.ok(styleOf('8.1s').includes('flex:00auto'), 'the duration must not shrink either');
     assert.ok(styleOf('3 tools').includes('flex:01auto'), 'the counts give up their width first');
     assert.ok(styleOf('3 tools').includes('text-overflow:ellipsis'));

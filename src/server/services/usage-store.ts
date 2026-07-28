@@ -350,6 +350,48 @@ export class UsageStore {
   }
 
   /**
+   * What each turn of one conversation cost, by turn id.
+   *
+   * The figure the dashboard shows, read back beside the conversation it came
+   * from — deliberately the same number and not a second calculation of it. A
+   * browser can add up the tokens on the messages it holds, but not the money:
+   * the runtimes that report a running total rather than a per-turn one need
+   * the difference taken against where the turn started, which is exactly what
+   * the accountant did when it filed this row.
+   *
+   * Scoped to the owner like every other read here. A turn with no row is a
+   * turn that has not ended yet, or one whose runtime reported nothing.
+   */
+  spendByTurn(sessionId: string, userId: number): Map<string, ChatUsage> {
+    const rows = this.database.raw
+      .prepare(`
+        SELECT turn_id, input_tokens, output_tokens, cache_read_tokens,
+               cache_write_tokens, reasoning_tokens, total_tokens, cost_usd
+        FROM usage_jobs WHERE session_id = ? AND user_id = ?
+      `)
+      .all(sessionId, userId) as Array<Record<string, number | string | null>>;
+
+    const spend = new Map<string, ChatUsage>();
+    for (const row of rows) {
+      // A null is a fact here as everywhere else on this table: the runtime
+      // reported nothing on that channel, which is not the same as zero, and
+      // the surface showing it says "not reported" rather than "$0.00".
+      const figure = (value: number | string | null): number | undefined =>
+        typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+      spend.set(String(row.turn_id), {
+        inputTokens: figure(row.input_tokens),
+        outputTokens: figure(row.output_tokens),
+        cacheReadTokens: figure(row.cache_read_tokens),
+        cacheWriteTokens: figure(row.cache_write_tokens),
+        reasoningTokens: figure(row.reasoning_tokens),
+        totalTokens: figure(row.total_tokens),
+        costUsd: figure(row.cost_usd),
+      });
+    }
+    return spend;
+  }
+
+  /**
    * Attribute work by hand to a project, for jobs nobody recorded one for.
    *
    * The one write on this table that is not a measurement, and it is fenced

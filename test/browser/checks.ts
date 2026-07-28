@@ -2345,6 +2345,9 @@ async function checkTheTurnIndexListsTheWholeConversation(): Promise<void> {
       i === 0 ? 'set up the parser' : i === 39 ? 'and now the changelog' : `ask ${i + 1}`,
     startedAt: (i + 1) * 1000,
     outcome: 'done',
+    // What each turn cost, as the accounting filed it. The first is under a
+    // cent, which must not round away to "$0.00" beside real work.
+    usage: i === 0 ? { costUsd: 0.0031 } : { costUsd: 0.42 + i },
   }));
   // One with no user prompt behind it, which must say so rather than quote the
   // model — the tail of a resumed conversation is the ordinary case.
@@ -2445,6 +2448,40 @@ async function checkTheTurnIndexListsTheWholeConversation(): Promise<void> {
     'the newest row still carries the number the conversation gave it',
     (rows[0]?.textContent || '').trim().startsWith('40'),
     (rows[0]?.textContent || '').slice(0, 40) || 'no first row',
+  );
+
+  // What each turn cost, beside the turn — the whole point of asking. Read off
+  // the rendered row rather than off the data behind it.
+  const newestRow = (rows[0]?.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'each turn carries what it cost',
+    newestRow.includes('$39.42'),
+    newestRow.slice(0, 60) || 'no first row',
+  );
+  const oldestRow = (rows[39]?.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'a turn under a cent is not rounded away to nothing',
+    oldestRow.includes('$0.0031'),
+    oldestRow.slice(0, 60) || 'no last row',
+  );
+
+  // And it arrives as a turn ends, without reopening the conversation: the
+  // session says what it filed the moment it files it.
+  controller.handle({
+    type: 'chat_turn_spend',
+    sessionId: 'browser-check',
+    turnId: 't40',
+    usage: { costUsd: 1.25 },
+  } as never);
+  await wait(120);
+  const afterSpend = (
+    frame.querySelector('[aria-label="Conversation turns"]')?.querySelectorAll('[role="option"]')[0]
+      ?.textContent || ''
+  ).replace(/\s+/g, ' ');
+  check(
+    'a turn ending updates its cost in place',
+    afterSpend.includes('$1.25'),
+    afterSpend.slice(0, 60) || 'no first row',
   );
 
   // A transcript this short is already scrolled to its top, so the list asks

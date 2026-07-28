@@ -406,6 +406,47 @@ describe('isTurnOpen', function () {
   });
 });
 
+describe('what each turn cost', function () {
+  // The figure comes from the accounting, keyed by turn id, and is laid over
+  // the turns a browser holds. It cannot be added up from the messages: the
+  // money only exists once a turn has ended, and on half the runtimes it has to
+  // be differenced against a running total to mean "this turn".
+  const recorded = [
+    { id: 'm1', turnId: 't1', index: 1, label: 'run the tests', outcome: 'done' },
+    { id: 'm3', turnId: 't2', index: 2, label: 'now deploy', outcome: 'done' },
+  ];
+  const spend = new Map([['t1', { costUsd: 0.42 }]]);
+
+  function twoTurns() {
+    return [
+      msg('user', [text('run the tests')]),
+      msg('assistant', [text('all green')], { usage: { outputTokens: 12 } }),
+      msg('user', [text('now deploy')]),
+      msg('assistant', [text('deployed')]),
+    ];
+  }
+
+  it('puts the recorded bill on the turn without losing its live tokens', function () {
+    const turns = mod.reconcileTurns(mod.groupTurns(twoTurns(), 'idle'), recorded, spend);
+    assert.strictEqual(turns[0].usage.costUsd, 0.42);
+    assert.strictEqual(turns[0].usage.outputTokens, 12, 'the live tokens survive the merge');
+    assert.strictEqual(mod.formatTurnMeta(turns[0]).cost, '$0.42');
+  });
+
+  it('carries it onto the index rows, and says nothing where nothing was filed', function () {
+    const turns = mod.reconcileTurns(mod.groupTurns(twoTurns(), 'idle'), recorded, spend);
+    const rows = mod.turnIndexRows(recorded, turns, spend);
+    assert.strictEqual(rows[0].costUsd, 0.42);
+    assert.strictEqual(rows[1].costUsd, undefined, 'a turn nobody priced shows no figure');
+  });
+
+  it('works with no accounting at all, which is an older server', function () {
+    const turns = mod.reconcileTurns(mod.groupTurns(twoTurns(), 'idle'), recorded);
+    assert.strictEqual(turns[0].usage.costUsd, undefined);
+    assert.strictEqual(mod.turnIndexRows(recorded, turns)[0].costUsd, undefined);
+  });
+});
+
 describe('formatTurnMeta', function () {
   it('says nothing rather than zero for a turn that did nothing', function () {
     const messages = [msg('user', [text('hello')]), msg('assistant', [text('hi')])];
@@ -416,14 +457,25 @@ describe('formatTurnMeta', function () {
     assert.strictEqual(meta.cost, '');
   });
 
-  it('pluralises tools and formats money to four places', function () {
+  it('pluralises tools and rounds money to the cent once there is one', function () {
     const messages = [
       msg('user', [text('go')]),
-      msg('assistant', [tool('completed')], { usage: { costUsd: 0.0412 } }),
+      msg('assistant', [tool('completed')], { usage: { costUsd: 0.4212 } }),
     ];
     const meta = mod.formatTurnMeta(mod.groupTurns(messages, 'idle')[0]);
 
     assert.strictEqual(meta.tools, '1 tool');
-    assert.strictEqual(meta.cost, '$0.0412');
+    assert.strictEqual(meta.cost, '$0.42');
+  });
+
+  it('keeps four places below a cent, where rounding would say "nothing"', function () {
+    // A turn that cost $0.0031 did not cost nothing, and a column of "$0.00"
+    // beside real work is worse than no column at all.
+    const messages = [
+      msg('user', [text('go')]),
+      msg('assistant', [tool('completed')], { usage: { costUsd: 0.0031 } }),
+    ];
+    assert.strictEqual(mod.formatTurnMeta(mod.groupTurns(messages, 'idle')[0]).cost, '$0.0031');
+    assert.strictEqual(mod.formatTurnCost(0), '$0', 'a measured zero is still a figure');
   });
 });

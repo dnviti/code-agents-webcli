@@ -321,6 +321,18 @@ export interface RecordedTurn {
 }
 
 /**
+ * What each finished turn cost, by turn id.
+ *
+ * Taken from the accounting rather than added up from the messages on screen,
+ * and it has to be: the money is only reported per turn by some runtimes, while
+ * the rest report a running total that has to be differenced against where the
+ * turn began. That is the accountant's job and it has already done it. Adding
+ * up what a browser happens to hold would also mean a turn's cost changed with
+ * how much of it had been scrolled into view.
+ */
+export type TurnSpend = ReadonlyMap<string, ChatUsage>;
+
+/**
  * Number and name the loaded turns from the conversation they belong to.
  *
  * A browser holds a window, not a conversation, and everything derived from
@@ -344,8 +356,11 @@ export interface RecordedTurn {
 export function reconcileTurns(
   turns: TurnSummary[],
   recorded: ReadonlyArray<RecordedTurn> | null,
+  spend?: TurnSpend,
 ): TurnSummary[] {
-  if (!recorded || recorded.length === 0) return turns;
+  if (!recorded || recorded.length === 0) {
+    return spend && spend.size > 0 ? turns.map((turn) => withSpend(turn, spend)) : turns;
+  }
   const byTurnId = new Map(recorded.map((turn) => [turn.turnId, turn]));
 
   // Turns the index has not heard of are the ones that happened since it was
@@ -360,8 +375,23 @@ export function reconcileTurns(
     // typed is not in the index yet, and one recorded without a prompt did not
     // have one.
     const label = known?.label ?? (turn.label === NO_PROMPT_LABEL ? NO_PROMPT_LABEL : turn.label);
-    return index === turn.index && label === turn.label ? turn : { ...turn, index, label };
+    const same = index === turn.index && label === turn.label;
+    return withSpend(same ? turn : { ...turn, index, label }, spend);
   });
+}
+
+/**
+ * Put the recorded bill on a turn, keeping what the messages already say.
+ *
+ * Merged rather than replaced: the tokens on the messages are live and arrive
+ * as the turn runs, while the money only exists once the turn has ended and the
+ * accounting has filed it. The filed figures win where they exist, because they
+ * are the ones the dashboard shows.
+ */
+function withSpend(turn: TurnSummary, spend?: TurnSpend): TurnSummary {
+  const recorded = spend?.get(turn.turnId);
+  if (!recorded) return turn;
+  return { ...turn, usage: mergeUsage(turn.usage, recorded) };
 }
 
 /**
@@ -384,6 +414,12 @@ export interface TurnIndexRow {
   status: TurnStatus;
   /** False when the turn is recorded but not held by this browser yet. */
   loaded: boolean;
+  /**
+   * What this turn cost, or undefined where nothing was recorded for it — a
+   * turn still running, or a runtime that reports no money at all. Undefined is
+   * not zero and the row says so by showing nothing.
+   */
+  costUsd?: number;
 }
 
 /**
@@ -402,6 +438,7 @@ export interface TurnIndexRow {
 export function turnIndexRows(
   recorded: ReadonlyArray<RecordedTurn> | null,
   live: TurnSummary[],
+  spend?: TurnSpend,
 ): TurnIndexRow[] {
   const byTurnId = new Map(live.map((turn) => [turn.turnId, turn]));
   const rows: TurnIndexRow[] = [];
@@ -419,6 +456,7 @@ export function turnIndexRows(
       label: turn.label ?? loaded?.label ?? NO_PROMPT_LABEL,
       status: loaded ? loaded.status : turn.outcome ?? 'done',
       loaded: Boolean(loaded),
+      costUsd: spend?.get(turn.turnId)?.costUsd,
     });
   }
 
@@ -430,6 +468,7 @@ export function turnIndexRows(
       label: turn.label,
       status: turn.status,
       loaded: true,
+      costUsd: spend?.get(turn.turnId)?.costUsd ?? turn.usage.costUsd,
     });
   }
   return rows;
@@ -474,13 +513,28 @@ export interface TurnMeta {
  * Empty rather than zero: "0 tools" is a fact nobody needed, and every one of
  * these sits on a 28px row that has to hold a number without wrapping.
  */
+/**
+ * A turn's bill, as short as it can be without lying about it.
+ *
+ * Two decimals once there are two worth showing, and four below a cent — a turn
+ * that cost $0.0031 is not a turn that cost nothing, and rounding it to "$0.00"
+ * would say it was. Zero stays "$0", which is a figure a runtime actually
+ * reported; a turn nobody measured shows nothing at all rather than a zero,
+ * which is decided by the caller, not here.
+ */
+export function formatTurnCost(costUsd: number): string {
+  if (costUsd === 0) return '$0';
+  if (costUsd >= 0.01) return `$${costUsd.toFixed(2)}`;
+  return `$${costUsd.toFixed(4)}`;
+}
+
 export function formatTurnMeta(turn: TurnSummary): TurnMeta {
   const out = turn.usage.outputTokens;
   return {
     tools: turn.toolCount ? `${turn.toolCount} tool${turn.toolCount === 1 ? '' : 's'}` : '',
     reasoning: turn.reasoningCount ? `${turn.reasoningCount} reasoning` : '',
     duration: turn.durationMs === undefined ? '' : formatDuration(turn.durationMs),
-    cost: turn.usage.costUsd === undefined ? '' : `$${turn.usage.costUsd.toFixed(4)}`,
+    cost: turn.usage.costUsd === undefined ? '' : formatTurnCost(turn.usage.costUsd),
     tokens: out === undefined ? '' : `${compactCount(out)} out`,
   };
 }

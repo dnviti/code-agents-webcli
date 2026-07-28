@@ -150,6 +150,46 @@ describe('a conversation files what it cost', () => {
     assert.strictEqual(row.inputTokens, 42);
   });
 
+  it('reports what each turn of the conversation cost, by turn', () => {
+    // The figure that goes beside a turn in the index. Taken from the row the
+    // accountant filed rather than added up in the browser: half the runtimes
+    // report a running total rather than a per-turn one, and only this side
+    // knows where each turn started.
+    feed([
+      { t: 'msg_start', id: 'u1', role: 'user', turnId: 'turn-1' },
+      { t: 'msg_end', msgId: 'u1' },
+      { t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'turn-1' },
+      { t: 'msg_end', msgId: 'a1', usage: { outputTokens: 20 } },
+      { t: 'turn_end', turnId: 'turn-1', usage: { costUsd: 0.4 } },
+      { t: 'msg_start', id: 'u2', role: 'user', turnId: 'turn-2' },
+      { t: 'msg_end', msgId: 'u2' },
+      { t: 'msg_start', id: 'a2', role: 'assistant', turnId: 'turn-2' },
+      { t: 'msg_end', msgId: 'a2', usage: { outputTokens: 5 } },
+      { t: 'turn_end', turnId: 'turn-2', usage: { costUsd: 0.05 } },
+    ]);
+
+    const spend = store.spendByTurn('sess-1', 7);
+    assert.strictEqual(spend.get('turn-1').costUsd, 0.4);
+    assert.strictEqual(spend.get('turn-2').costUsd, 0.05);
+    assert.strictEqual(spend.get('turn-1').outputTokens, 20);
+    // Somebody else's conversation is not readable by asking nicely.
+    assert.strictEqual(store.spendByTurn('sess-1', 99).size, 0);
+  });
+
+  it('leaves a turn nobody could price without a figure, rather than at zero', () => {
+    session.runtime = 'codex';
+    session.capabilities = { usage: true, cost: false };
+    feed([
+      { t: 'msg_start', id: 'u1', role: 'user', turnId: 'turn-1' },
+      { t: 'msg_end', msgId: 'u1' },
+      { t: 'usage', usage: { totalTokens: 900 } },
+      { t: 'turn_end', turnId: 'turn-1' },
+    ]);
+    const spend = store.spendByTurn('sess-1', 7);
+    assert.strictEqual(spend.get('turn-1').costUsd, undefined, 'unmeasured is not $0.00');
+    assert.strictEqual(spend.get('turn-1').totalTokens, 900);
+  });
+
   it('keeps one row when the same job is somehow filed twice', () => {
     const events = [
       { t: 'msg_start', id: 'u1', role: 'user', turnId: 'turn-1' },
