@@ -118,7 +118,21 @@ own figure or nothing at all, which is why they have a column of their own.
 | Codex (app-server) | counted here | **not reported** | reported | **not reported** — nothing in the schema prices a turn | reported, per session |
 | Codex (`exec` fallback) | counted here | **not reported** | **not reported** | **not reported** | **not reported** |
 | pi | counted here | **not reported** | reported | reported | reported, per message |
-| ACP agents (Grok, omp, kimi, and others behind the ACP bridge) | counted here | only where a per-model call count arrives | reported | reported — Grok's in ticks, see below | the runtime's current selection |
+| Grok (ACP) | counted here | only where a per-model call count arrives | reported | reported, in ticks — see below | the runtime's current selection |
+| Oh My Pi / opencode (ACP) | counted here | only where a per-model call count arrives | reported | reported, as a session running total | the runtime's current selection |
+| Kimi (ACP) | counted here | **not reported** | **not reported** | **not reported** | the runtime's current selection |
+
+Kimi is the exception the rest of that block used to hide. Probed against
+kimi 0.29.1 over two prompts: not one `usage_update` notification, prompt
+replies of `{"stopReason":"end_turn"}` with no `usage` key, and no `_meta` on
+any `session/update`. `test/fixtures/chat/acp-kimi-tools.jsonl` is one of those
+turns — a reply, a read and a write — and there is no figure in it anywhere.
+This is protocol-legal: `usage_update` is a vendor extension that omp, opencode
+and grok implement and kimi does not, so a silent ACP agent is a thing the app
+has to be able to describe rather than a bug to fix in the adapter. Its
+`capabilities.usage` and `capabilities.cost` are therefore `false`, and its jobs
+file as **"n/a"** in the dashboard rather than "not reported" — see the
+distinction below.
 
 A figure a runtime never reports is stored as `null` and shown as
 **"not reported"** — never as zero. Those are different facts: a job that
@@ -132,6 +146,44 @@ the answer, not "$4.10" on its own. The effort panel averages model turns over
 the turns that reported one, never over all of them — reading a silent runtime
 as zero would have put it at the top of every efficiency comparison on the page
 for having reported nothing.
+
+### Which surface says "n/a" and which says "not reported"
+
+Two surfaces, two vocabularies, and they are not in disagreement — they are
+answering different questions, so it is worth being explicit about which is
+which.
+
+**The usage dashboard reads history**, and every job in it was filed with the
+capability flags of the runtime that ran it. It can therefore separate the two
+facts and does: `n/a` means *this agent cannot report that figure at all* (kimi
+for both, Codex for cost), and **"not reported"** means *this job, from an agent
+that can report, carried no figure*. Both are shown in preference to a zero.
+
+**A live conversation reads one turn at a time**, and has only ever made one
+claim: this runtime has now finished a turn and said nothing about tokens
+and/or money. That is an observation, not a capability lookup — deliberately,
+because `capabilities.usage === false` is also what every transcript looks like
+in the second before its handshake lands, and drawing the words from it would
+put "not reported" on every conversation with every agent for that second. So
+the header strip, the composer's status line and the Status panel all say
+**"not reported"**, which is what an observation of silence is called
+everywhere else in this document. Each of those says as much as its width
+allows, and no more: the Status panel has room for a sentence and names the
+runtime and which of the two figures it withholds; the header strip and the
+composer's status line say "usage not reported" once rather than naming both
+halves; and the phone's collapsed header, which has room for about fourteen
+characters, drops the noun and says "not reported" beside where the money would
+have been. Every one of the header's short forms carries the whole sentence as
+a tooltip, and the Status panel writes it out for anyone who cannot hover.
+
+The statement is only ever made from a turn that ran to its own end. An
+interrupt sent to steer, a stop-button cancel and a turn the adapter ended
+because the runtime broke all stop the runtime before the point where it would
+have priced the turn — Claude prices a turn in its final `result`, an ACP agent
+in the reply to `session/prompt` — so nothing is concluded from any of them.
+Otherwise pressing stop would have taught the app that Claude reports neither
+tokens nor cost, and it would have gone on saying so for the rest of that
+conversation.
 
 ### Figures recorded before this rule
 

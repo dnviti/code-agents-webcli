@@ -566,6 +566,41 @@ Reaching a phone whose screen is off needs a push subscription and is not part
 of this yet; today a notification reaches another tab, another window, another
 application, and the installed app while it is open in the background.
 
+### What each runtime tells you about tokens, cost and the context window
+
+The header strip, the line under the composer and the **Status** panel all read
+the same four figures, and every one of them is a figure a runtime actually
+sent. Nothing here is estimated, averaged or priced from a table this app keeps:
+if a runtime does not report something, the interface says **"not reported"**
+rather than drawing a zero that looks like an answer.
+
+The table below is an audit, not a promise. Each row was read off a capture in
+`test/fixtures/chat/` or a live probe, and the captures are what the tests
+replay.
+
+| Runtime | Context window | How full it is | Tokens per turn | Cost | Read from |
+| --- | --- | --- | --- | --- | --- |
+| Claude | reported, per model | reported, from the last round trip | reported, four buckets | reported | `claude-model-usage.jsonl`, `claude-multi-turn-result.jsonl` |
+| Codex (app-server) | reported | reported | reported | **not reported** — nothing in the schema prices a turn | `codex-appserver-text-turn.jsonl` |
+| Oh My Pi | reported | reported | reported | reported, as a session running total | `acp-omp.jsonl` |
+| opencode | reported | reported | reported | reported | `acp-opencode.jsonl` |
+| Grok | reported, on `session/new` | reported, off the update envelope | reported | reported, per turn, in ticks | `acp-grok.jsonl`, `acp-grok-session-new.json` |
+| pi | **not reported** — the provider is asked instead | reported | reported | reported | `pi-final-turn.jsonl` |
+| Kimi | **not reported** — the provider is asked instead | **not reported** | **not reported** | **not reported** | `acp-kimi-tools.jsonl`, probe of 0.29.1 |
+
+Two things follow from it that are worth knowing before you read a header:
+
+- **A window can come from somewhere other than the agent.** Where a runtime
+  publishes no window, the model's provider is asked for one, once per model,
+  and the panel says which of the two you are looking at. An agent's own figure
+  always wins — grok reports 512,000 tokens for `grok-build` where the nearest
+  catalogue entry says half that. With no network, or with the catalogue turned
+  off, a runtime in that position simply has no window and says so.
+- **"Not reported" is only ever said after a turn has finished.** A conversation
+  that has not run yet shows nothing, because nothing is known about it yet, and
+  the two states are deliberately different: one means *this agent will never
+  tell you*, the other means *hold on*.
+
 ## Runtime profiles
 
 **Settings → Runtime profiles** controls how each CLI is launched. Nothing here

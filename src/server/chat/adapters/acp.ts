@@ -66,6 +66,29 @@ const ACP_BASE_CAPABILITIES: ChatCapabilities = {
   plan: true,
 };
 
+/**
+ * ACP agents that report no tokens and no money, measured rather than assumed.
+ *
+ * `usage_update` is a vendor extension. omp, opencode and grok send spend on
+ * one channel or another; kimi sends none of it — probed against kimi 0.29.1
+ * over two prompts with zero `usage_update` notifications, prompt replies of
+ * `{"stopReason":"end_turn"}` with no `usage` key, and no `_meta` on any
+ * session/update. `test/fixtures/chat/acp-kimi-tools.jsonl` is one of those
+ * turns, tool calls and all.
+ *
+ * Advertising `usage: true` for it was not a harmless optimism: the session
+ * files `reportsUsage: capabilities.usage === true` into the permanent record,
+ * so every kimi job went into the history as "this runtime reports usage" with
+ * nothing in the columns — which the dashboard prints as "not reported", the
+ * label reserved for an agent that *could* have spoken and did not.
+ *
+ * Named agents rather than a flag on the base set, because the honest default
+ * for an ACP agent nobody has probed is still the optimistic one: the handshake
+ * corrects it upward, and a turn that ends having said nothing corrects it
+ * downward from evidence (see `noteSpend` in session.ts).
+ */
+const NO_SPEND_REPORTING = new Set(['kimi']);
+
 export interface AcpChatAdapterOptions extends ChatAdapterOptions {
   /** Which CLI this instance drives. Labels errors; never changes behaviour. */
   runtime?: string;
@@ -374,6 +397,9 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     super(options);
     this.runtime = options.runtime || 'acp';
     this.acpArgs = options.acpArgs || ['acp'];
+    if (NO_SPEND_REPORTING.has(this.runtime)) {
+      this.capabilities = { ...this.capabilities, usage: false, cost: false };
+    }
   }
 
   protected buildArgs(): string[] {
@@ -1235,7 +1261,16 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
       t: 'usage',
       usage: {
         ...(num(update.size) !== undefined
-          ? { contextWindow: num(update.size), contextWindowSource: 'agent' as const }
+          ? {
+              contextWindow: num(update.size),
+              contextWindowSource: 'agent' as const,
+              // Named, exactly as `emitContextWindow` names it and for the same
+              // reason: an unattributed ceiling belongs to no model, so the next
+              // message that says which model is running reads as a switch away
+              // from one the agent never claimed — and the session takes omp's
+              // own figure down and goes asking a catalogue for a worse one.
+              contextWindowModel: this.model,
+            }
           : {}),
         contextUsed: num(update.used),
         // Omitted rather than sent as `undefined`. A running total's fields

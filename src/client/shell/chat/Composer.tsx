@@ -1182,6 +1182,22 @@ function sessionReadout(turnLabel: string | undefined, usage: ChatUsage | undefi
     const total = tokenTotal(usage);
     if (total !== null) bits.push(`${compactCount(total)} tok`);
     if (usage.costUsd !== undefined) bits.push(`$${usage.costUsd.toFixed(4)}`);
+    // Otherwise this line degrades to a bare `turn 3` against a runtime that
+    // reports nothing, which reads as a session that has spent nothing. Only
+    // ever off a spoken absence — the session states it after watching a turn
+    // finish, and a transcript that has simply not heard yet says nothing here,
+    // as it should.
+    //
+    // One phrase when both halves are silent, the same rule the compact meter
+    // follows and for the same reason: this line is one nowrap span that
+    // neither shrinks nor wraps, and "tokens not reported · cost not reported"
+    // measured 445px against a 390px phone — 55px of it off the side of the
+    // screen (test/browser/checks.ts).
+    const noTokens = total === null && usage.usageSource === 'none';
+    const noCost = usage.costUsd === undefined && usage.costSource === 'none';
+    if (noTokens && noCost) bits.push('usage not reported');
+    else if (noTokens) bits.push('tokens not reported');
+    else if (noCost) bits.push('cost not reported');
   }
   return bits.join(' · ');
 }

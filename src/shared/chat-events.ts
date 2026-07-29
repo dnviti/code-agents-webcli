@@ -418,6 +418,30 @@ export interface ChatUsage {
   reasoningTokens?: number;
   totalTokens?: number;
   costUsd?: number;
+  /**
+   * Whether anybody has reported tokens for this conversation at all.
+   *
+   * The same spoken-absence trick `contextWindowSource: 'unknown'` plays below,
+   * and it exists for the same reason: an omitted field means "no news" all
+   * through this merge, so a runtime that will never report anything and a
+   * conversation whose first turn has not finished yet are otherwise the same
+   * empty object. The UI has to stay silent about the second, and kimi — which
+   * sends no `usage_update`, no usage on its prompt reply, and no `_meta`
+   * anywhere — is the whole of the first.
+   *
+   * `none` is a measurement, not a guess: the session states it only after a
+   * turn has actually completed with the runtime having done work in it. `agent`
+   * is set by any report that carries a figure, which is what stops an earlier
+   * `none` from standing over money that has since arrived. Absent still means
+   * nobody has said, which is every conversation for its first few seconds.
+   *
+   * Deliberately *not* derived from `capabilities.usage === false`: that is also
+   * the state of every transcript before its handshake lands, so a label driven
+   * off it would print "not reported" on every chat against every agent.
+   */
+  usageSource?: SpendSource;
+  /** The same, for money. Codex reports tokens and prices nothing. */
+  costSource?: SpendSource;
   /** Context window size, when known, so the UI can show how full it is. */
   contextWindow?: number;
   /** Context currently occupied, when the runtime reports it directly. */
@@ -492,6 +516,14 @@ export interface TurnModelUsage {
 }
 
 export type ContextWindowSource = 'agent' | 'provider' | 'unknown';
+
+/**
+ * Who gave a spend figure, or that nobody will.
+ *
+ * There is no `provider` here on purpose: nothing outside the runtime can say
+ * what a turn cost, and this app deliberately buys no price list to guess with.
+ */
+export type SpendSource = 'agent' | 'none';
 
 /** A message as the reducer assembles it. */
 /**
@@ -1461,6 +1493,32 @@ export function isAllowOption(option: PermissionOption | undefined): boolean {
   return option?.kind === 'allow_once' || option?.kind === 'allow_always';
 }
 
+/**
+ * The token fields that mean "this cost something", for the silence test.
+ *
+ * `contextUsed` is not one of them. It answers how full the window is, which
+ * the context reading already states in its own words; a runtime that reports
+ * occupancy and no spend has genuinely reported no spend.
+ */
+const SPEND_TOKEN_FIELDS = [
+  'inputTokens',
+  'outputTokens',
+  'cacheReadTokens',
+  'cacheWriteTokens',
+  'reasoningTokens',
+  'totalTokens',
+] as const;
+
+/** Whether a reading carries any token count at all. */
+export function carriesTokens(usage: ChatUsage | undefined): boolean {
+  return usage !== undefined && SPEND_TOKEN_FIELDS.some((field) => usage[field] !== undefined);
+}
+
+/** And whether it carries money. */
+export function carriesCost(usage: ChatUsage | undefined): boolean {
+  return usage?.costUsd !== undefined;
+}
+
 /** Sum two usage records, tolerating the many fields runtimes omit. */
 export function mergeUsage(base: ChatUsage | undefined, next: ChatUsage | undefined): ChatUsage {
   const a = base || {};
@@ -1475,7 +1533,7 @@ export function mergeUsage(base: ChatUsage | undefined, next: ChatUsage | undefi
   // would otherwise keep the old number — an omitted field means "no news"
   // everywhere else here, and has to go on meaning that.
   const retracted = b.contextWindowSource === 'unknown';
-  return {
+  const merged: ChatUsage = {
     inputTokens: add(a.inputTokens, b.inputTokens),
     outputTokens: add(a.outputTokens, b.outputTokens),
     cacheReadTokens: add(a.cacheReadTokens, b.cacheReadTokens),
@@ -1494,4 +1552,12 @@ export function mergeUsage(base: ChatUsage | undefined, next: ChatUsage | undefi
     contextWindowModel:
       retracted || b.contextWindow !== undefined ? b.contextWindowModel : a.contextWindowModel,
   };
+  // Not additive either, and read off the sum rather than off `b`: a reading
+  // that has figures in it answers the question by having them, so a `none`
+  // stated on a turn that spent nothing cannot go on standing over money that
+  // arrived afterwards. Otherwise the last thing anybody said carries, which is
+  // how a spoken silence survives the turns that follow it.
+  merged.usageSource = carriesTokens(merged) ? 'agent' : (b.usageSource ?? a.usageSource);
+  merged.costSource = carriesCost(merged) ? 'agent' : (b.costSource ?? a.costSource);
+  return merged;
 }

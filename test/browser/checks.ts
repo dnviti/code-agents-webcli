@@ -341,6 +341,8 @@ async function run(): Promise<void> {
   await checkTheContextReadingIsHonestAboutItsCeiling();
   await checkTheTurnIndexListsTheWholeConversation();
   await checkClearingResetsTheFiguresAboveTheChat();
+  await checkASilentRuntimeSaysSoRatherThanGoingBlank();
+  await checkTheSilenceFitsThePhonesCollapsedHeader();
   await checkTheUsageWindowReachesBeforeThisYear();
   await checkTheEffortHistogramsAreReadableWithoutAMouse();
   await checkTheFileTreeAndTheShellAreSizedForAThumb();
@@ -9309,6 +9311,293 @@ async function checkClearingResetsTheFiguresAboveTheChat(): Promise<void> {
     'and the meter is still there to be read, rather than gone',
     Boolean(host.querySelector('[role="group"][aria-label="Session usage"]')),
     after || 'the header went blank',
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * Issue #136: a runtime that reports nothing says so, where a person looks.
+ *
+ * kimi sends no token counts and no prices — probed, and the same in the
+ * capture under `test/fixtures/chat/acp-kimi-tools.jsonl` — and the header used
+ * to render nothing at all for it. Nothing is also what a conversation that has
+ * simply not spent anything yet looks like, so a user could not tell "this
+ * agent will never tell you" from "hold on".
+ *
+ * Driven through the real controller, the real header and the real composer,
+ * because the claim is about what is on screen: the folded state holding
+ * `usageSource: 'none'` proves only that the layer that was changed changed.
+ * And measured rather than merely found — an opacity-0 span is present in every
+ * `querySelector` and readable by nobody.
+ *
+ * The events are the ones a kimi session produces: an answer, a turn that ends
+ * carrying no figures but the spoken silence the session writes onto it, and a
+ * window that came from the model's provider rather than from kimi.
+ *
+ * Two mounts, because the surface is two surfaces: the desktop strip below and
+ * the phone's collapsed header after it, which is a different component with a
+ * different budget for words.
+ */
+function silentRuntimeController(
+  id: string,
+  options: { bypassPermissions?: boolean; state?: string } = {},
+): ChatController {
+  const controller = new ChatController(id, { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: id,
+    snapshot: {
+      sessionId: id,
+      runtime: 'kimi',
+      state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: false, fork: false, attachments: false,
+        // Honest, as of #136, and the reason the label must not sit behind them.
+        usage: false, cost: false, plan: true,
+      },
+      messages: [],
+      pendingPermissions: [],
+      queued: [],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 1,
+      live: true,
+      bypassPermissions: options.bypassPermissions ?? false,
+    },
+  } as never);
+
+  const push = (event: Record<string, unknown>, seq: number): void => {
+    controller.handle({
+      type: 'chat_event',
+      sessionId: id,
+      event: { seq, ts: 1_700_000_000_000 + seq, ...event },
+    } as never);
+  };
+
+  push({ t: 'msg_start', id: 'u1', role: 'user', turnId: 'turn-1' }, 1);
+  push({ t: 'block_start', msgId: 'u1', index: 0, block: { kind: 'text', text: 'go' } }, 2);
+  push({ t: 'msg_end', msgId: 'u1' }, 3);
+  push({ t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'turn-1' }, 4);
+  push({ t: 'block_start', msgId: 'a1', index: 0, block: { kind: 'text', text: 'DONE' } }, 5);
+  push({ t: 'msg_end', msgId: 'a1' }, 6);
+  push({ t: 'turn_end', turnId: 'turn-1', usage: { usageSource: 'none', costSource: 'none' } }, 7);
+  push({
+    t: 'usage',
+    usage: { contextWindow: 1048576, contextWindowSource: 'provider' },
+  }, 8);
+  if (options.state) push({ t: 'state', state: options.state }, 9);
+
+  return controller;
+}
+
+/** The desktop strip, at the width the header actually gets on a laptop. */
+async function checkASilentRuntimeSaysSoRatherThanGoingBlank(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1000px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = silentRuntimeController('silent-check');
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'kimi',
+      runtimeLabel: 'Kimi',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(300);
+
+  const meter = host.querySelector('[role="group"][aria-label="Session usage"]') as HTMLElement | null;
+  const meterText = (meter?.textContent ?? '').replace(/\s+/g, ' ');
+  check(
+    'a runtime that reports nothing says so in the header instead of leaving it blank',
+    /not reported/i.test(meterText),
+    meterText || 'the header showed nothing at all',
+  );
+  check(
+    'and does not manufacture a zero out of a measurement nobody took',
+    !/\$0\.00/.test(meterText) && !/\b0 tok/.test(meterText),
+    meterText,
+  );
+  check(
+    'and still shows the window the model’s provider could size',
+    /\? of 1\.0M/.test(meterText),
+    meterText,
+  );
+
+  // Visible, not merely in the DOM. Everything below is measured off the leaf
+  // that carries the words.
+  const label = Array.from(host.querySelectorAll('*')).find(
+    (node) => node.children.length === 0 && /not reported/i.test(node.textContent || ''),
+  ) as HTMLElement | undefined;
+  const style = label ? getComputedStyle(label) : null;
+  const box = label ? label.getBoundingClientRect() : null;
+  check(
+    'the words are painted rather than present',
+    Boolean(
+      box && box.width > 0 && box.height > 0
+      && style && style.visibility !== 'hidden' && style.display !== 'none'
+      && Number(style.opacity) > 0.5,
+    ),
+    label
+      ? `${Math.round(box!.width)}x${Math.round(box!.height)} opacity=${style!.opacity} visibility=${style!.visibility}`
+      : 'no element carries the words',
+  );
+  const fontSize = style ? parseFloat(style.fontSize) : 0;
+  check(
+    'and set at the size the rest of the header strip is, not shrunk away',
+    fontSize >= 10,
+    `${fontSize}px`,
+  );
+
+  // The composer's status line, the other place the figures live. It used to
+  // degrade to a bare turn number for a runtime like this.
+  const readout = (host.textContent ?? '').replace(/\s+/g, ' ');
+  check(
+    'the composer says it too, rather than leaving a bare turn number',
+    /turn 1 · usage not reported/.test(readout),
+    readout.slice(-200) || 'nothing rendered',
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * The same sentence on the surface with the least room for it (#136, AC4).
+ *
+ * The phone's header is collapsed by default and is one fixed-height row: a
+ * status word, then the cost, the bypass shield and the chevron pushed to the
+ * right edge. Before this the cost was `$0.12` or nothing at all; it is now up
+ * to seventeen characters of "cost not reported" in the same strip, at 15px,
+ * against 390px of screen — and the two spans either side of it are
+ * `flex: 0 0 auto`, so anything that does not fit does not shrink, it leaves
+ * the header. The desktop mount above can never see that: it has 1000px.
+ *
+ * So this measures the strip rather than reading it. The words have to be on
+ * one line, the chevron has to still be inside the header, and the row has to
+ * still be one row — with the widest state label the header has ("asked you a
+ * question") and the shield showing, which is the tightest this strip ever
+ * gets. Text metrics are the reason it is a browser check and not a string
+ * match on `renderToStaticMarkup`, which has no layout at all.
+ */
+async function checkTheSilenceFitsThePhonesCollapsedHeader(): Promise<void> {
+  const host = document.createElement('div');
+  // No `overflow:hidden`: hiding the overflow is exactly what would stop this
+  // check seeing the chevron leave the strip.
+  host.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = silentRuntimeController('silent-phone', {
+    bypassPermissions: true,
+    state: 'awaiting_answer',
+  });
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'kimi',
+      runtimeLabel: 'Kimi',
+      workingDir: '/tmp/project',
+      // ChatView publishes `PhoneContext` from this itself, so a provider
+      // wrapped around it would be overwritten and the header would render at
+      // desktop sizing while agreeing that it is a phone.
+      isMobile: true,
+      view: { ...DEFAULT_CHAT_VIEW, panelOpen: false },
+      onViewChange: () => {},
+      onOpenConversations: () => {},
+    } as never),
+  );
+  await wait(300);
+
+  const strip = host.querySelector('[aria-expanded][aria-controls]') as HTMLElement | null;
+  const stripText = (strip?.textContent ?? '').replace(/\s+/g, ' ');
+  check(
+    'the phone’s collapsed header says the cost is not reported, rather than nothing',
+    /not reported/i.test(stripText) && !/\$0\.00/.test(stripText),
+    stripText || 'no collapsed header strip on screen',
+  );
+
+  const label = strip
+    ? (Array.from(strip.querySelectorAll('*')).find(
+        (node) => node.children.length === 0 && /not reported/i.test(node.textContent || ''),
+      ) as HTMLElement | undefined)
+    : undefined;
+  const style = label ? getComputedStyle(label) : null;
+  const box = label ? label.getBoundingClientRect() : null;
+  const fontSize = style ? parseFloat(style.fontSize) : 0;
+  check(
+    'and paints the words at the size the rest of the strip is',
+    Boolean(
+      box && box.width > 0 && box.height > 0
+      && style && style.visibility !== 'hidden' && style.display !== 'none'
+      && Number(style.opacity) > 0.5,
+    ) && fontSize >= 15,
+    label
+      ? `${Math.round(box!.width)}x${Math.round(box!.height)} ${fontSize}px opacity=${style!.opacity}`
+      : 'no element carries the words',
+  );
+  // One line: a phrase that wrapped would double the leaf's height, and this
+  // row is fixed at 44px with a status word and three icons already on it.
+  check(
+    'without wrapping onto a second line inside a one-line strip',
+    Boolean(box && fontSize && box.height <= fontSize * 1.8),
+    box ? `${Math.round(box.height)}px tall at ${fontSize}px` : 'no element carries the words',
+  );
+
+  // The two things the strip exists to carry, both of which live to the right
+  // of the new words and neither of which may shrink.
+  const stripBox = strip?.getBoundingClientRect();
+  const chevron = strip?.querySelector('svg:last-of-type') as SVGElement | null;
+  const chevronBox = chevron?.getBoundingClientRect();
+  check(
+    'the chevron that opens the header is still inside it',
+    Boolean(stripBox && chevronBox && chevronBox.width > 0 && chevronBox.right <= stripBox.right + 0.5),
+    chevronBox && stripBox
+      ? `chevron right ${Math.round(chevronBox.right)} vs strip right ${Math.round(stripBox.right)}`
+      : 'no chevron in the strip',
+  );
+  const header = strip?.closest('header') as HTMLElement | null;
+  const headerBox = header?.getBoundingClientRect();
+  check(
+    'and the collapsed header is still one row of the height it was',
+    Boolean(headerBox && headerBox.height <= 56),
+    headerBox ? `${Math.round(headerBox.height)}px tall` : 'no header',
+  );
+  check(
+    'and nothing on the strip is pushed off the side of the phone',
+    Boolean(strip && strip.scrollWidth <= strip.clientWidth + 1),
+    strip ? `content ${strip.scrollWidth}px in a ${strip.clientWidth}px strip` : 'no strip',
+  );
+
+  // The other surface this change lengthened, and the other one with no room:
+  // the composer's status line, which on a phone lives behind the tools row and
+  // holds its figures in one unshrinkable nowrap span.
+  (host.querySelector('[aria-label="Show the other controls"]') as HTMLElement | null)?.click();
+  await wait(200);
+  const readout = Array.from(host.querySelectorAll('span')).find(
+    (node) => /usage not reported/.test(node.textContent || ''),
+  ) as HTMLElement | undefined;
+  const readoutBox = readout?.getBoundingClientRect();
+  check(
+    'the composer’s status line says it on a phone as well',
+    Boolean(readoutBox && readoutBox.width > 0),
+    readout ? (readout.textContent ?? '').replace(/\s+/g, ' ') : 'no status line on the phone composer',
+  );
+  check(
+    'and says it inside the width of the phone rather than off the edge',
+    Boolean(readoutBox && readoutBox.left >= -0.5 && readoutBox.right <= 390.5),
+    readoutBox
+      ? `${Math.round(readoutBox.left)}–${Math.round(readoutBox.right)} of 0–390`
+      : 'no status line on the phone composer',
   );
 
   root.unmount();
