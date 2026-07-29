@@ -538,7 +538,10 @@ function PhaseSection({
         >
           {title}
         </span>
-        {view.failed > 0 ? (
+        {/* The count, unless the state badge beside it is already the word:
+            a phase where everything died read "Fail  2 failed  failed", which
+            is one badge saying what the next one says (#140). */}
+        {view.failed > 0 && view.state !== 'failed' ? (
           <Badge variant="destructive">
             {view.failed} failed
           </Badge>

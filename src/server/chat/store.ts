@@ -101,6 +101,11 @@ const MESSAGE_SCOPED: ReadonlySet<string> = new Set([
   'block_delta',
   'block_end',
   'msg_end',
+  // A workflow failing writes a message of its own (#140), which makes it one
+  // of these and not a session-level fact. Left out, a failure from hours
+  // earlier replayed into every rejoin and was redrawn at the top of the
+  // window, in a turn of its own, above the conversation it happened inside.
+  'workflow_failed',
 ]);
 
 export interface ChatStoreOptions {

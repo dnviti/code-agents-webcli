@@ -171,6 +171,22 @@ function lastTurnId(state: TranscriptState): string | undefined {
 }
 
 /**
+ * The reply still arriving, or -1.
+ *
+ * Searched from the end rather than read off it, because the end is not always
+ * the reply: a rule drawn across the conversation is pushed there while one is
+ * still streaming. Bounded because the answer is always within a message or two
+ * of the end — a scan of an hour-long transcript on every error is not.
+ */
+function lastStreamingIndex(state: TranscriptState): number {
+  const floor = Math.max(0, state.messages.length - 8);
+  for (let i = state.messages.length - 1; i >= floor; i -= 1) {
+    if (state.messages[i].streaming) return i;
+  }
+  return -1;
+}
+
+/**
  * Fold one event's word about the runtime into what is known so far.
  *
  * Split out for the same reason as the usage fold below, and with the same
@@ -754,19 +770,21 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       if (event.fatal) state.state = 'error';
       // Surfaced in the transcript as well as the header: an error that only
       // lives in a status pill is an error the user scrolls past and misses.
-      const last = state.messages[state.messages.length - 1];
+      //
+      // The last message that is *streaming*, not simply the last one. A rule
+      // drawn across a conversation — a compaction, an interruption, a workflow
+      // that failed in the background (#140) — is pushed onto the end while a
+      // reply is still arriving, and answering "is the last message open?" with
+      // that rule dropped every error for the rest of the turn.
+      const openIndex = lastStreamingIndex(state);
+      const last = openIndex === -1 ? undefined : state.messages[openIndex];
       if (last && last.streaming) {
         // `fatal` carried through rather than flattened away: it is the
         // difference between an error the agent read and moved past and the one
         // it stopped on, and a turn cut short by the second never reaches a
         // `turn_end` that could say so.
         last.blocks.push({ kind: 'error', text: event.message, ...(event.fatal ? { fatal: true } : {}) });
-        return {
-          messageIndex: state.messages.length - 1,
-          structural: false,
-          meta: true,
-          applied: true,
-        };
+        return { messageIndex: openIndex, structural: false, meta: true, applied: true };
       }
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }

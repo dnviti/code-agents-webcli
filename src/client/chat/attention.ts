@@ -44,7 +44,13 @@ export function noteChatEvent(app: App, sessionId: string, event: ChatEvent): vo
   } else if (endsAlert(event)) {
     // The conversation is moving again, or somebody answered it — possibly on
     // another device. A notification still sitting in the tray is now a lie.
-    clearAlert(sessionId);
+    //
+    // Except a failure, when all that happened is the conversation going back
+    // to work. A background workflow fails while its own turn is still running
+    // — that is the ordinary shape — and the `state` event a second later used
+    // to take the notification away again before anybody read it (#140). What
+    // failed still failed; only somebody arriving clears that.
+    clearAlert(sessionId, event.t === 'state' ? 'failed' : undefined);
   }
 
   syncConversationAttention(app, sessionId);

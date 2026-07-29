@@ -423,6 +423,23 @@ describe('a workflow that failed reads as failed (#140)', function () {
         /forced workflow failure/,
         'the runtime’s own reason did not survive',
       );
+      // The frames are dropped: what this becomes is a line in a conversation,
+      // read on a phone. The whole thing stays on the run for the popup.
+      assert.doesNotMatch(
+        announced[0].reason || '',
+        /\n\s+at /,
+        'a stack trace was sent to the chat',
+      );
+    });
+
+    it('keeps the whole error, frames and all, on the run itself', function () {
+      const run = workflowBlock(transcriptOf(failedEvents())).agent;
+
+      assert.match(
+        run.error || '',
+        /\n\s+at /,
+        'the popup lost the frames the chat line does not want',
+      );
     });
 
     it('announces it once, though the runtime says it twice', function () {
@@ -448,6 +465,56 @@ describe('a workflow that failed reads as failed (#140)', function () {
         replay().filter((event) => event.t === 'workflow_failed'),
         [],
         'a run that reported success was announced as failed',
+      );
+    });
+
+    it('announces the error the run reported, not the sentence wrapped round it', function () {
+      // Two texts describe this failure: `task_updated.patch.error` (the error)
+      // and `task_notification.summary` ('Dynamic workflow "<the run's own
+      // description>" failed: …'). Whichever lands first wins, and in the
+      // capture that is the error. Pinned because /forced workflow failure/
+      // matches both, so every other assertion here is blind to which arrived.
+      const [announced] = failedEvents().filter((event) => event.t === 'workflow_failed');
+
+      assert.doesNotMatch(
+        announced.reason || '',
+        /^Dynamic workflow/,
+        'the runtime’s framing was announced instead of the error itself',
+      );
+      assert.match(announced.reason || '', /^Error: probe/);
+    });
+
+    it('counts a failure per workflow, not per session', function () {
+      // The guard has to be keyed on the call that launched the run. A session
+      // -wide "already announced" flag passes every single-run test there is.
+      const events = [];
+      const adapter = new ClaudeChatAdapter({
+        sessionId: 'app-session-1',
+        workingDir: '/tmp',
+        command: 'claude',
+        emit: (event) => events.push(event),
+      });
+      for (const [taskId, toolId] of [['k1', 'toolu_a'], ['k2', 'toolu_b']]) {
+        adapter.handleMessage({
+          type: 'system',
+          subtype: 'task_started',
+          task_id: taskId,
+          tool_use_id: toolId,
+          task_type: 'local_workflow',
+          workflow_name: `run-${taskId}`,
+        });
+        adapter.handleMessage({
+          type: 'system',
+          subtype: 'task_updated',
+          task_id: taskId,
+          patch: { status: 'failed', error: `${taskId} broke` },
+        });
+      }
+
+      assert.deepStrictEqual(
+        events.filter((event) => event.t === 'workflow_failed').map((event) => event.parentToolId),
+        ['toolu_a', 'toolu_b'],
+        'the second workflow’s failure was swallowed as a duplicate of the first',
       );
     });
 
@@ -487,6 +554,40 @@ describe('a workflow that failed reads as failed (#140)', function () {
         progress[progress.length - 1].patch.status,
         'failed',
         'the sub-agent’s own run no longer records that it failed',
+      );
+    });
+
+    it('leaves an ordinary delegation alone on the notification channel too', function () {
+      // The other half of the new routing. `task_notification` carries a status
+      // and a `tool_use_id` and says nothing about what kind of task it was, so
+      // the guard is the only thing keeping a sub-agent's failure out.
+      const events = [];
+      const adapter = new ClaudeChatAdapter({
+        sessionId: 'app-session-1',
+        workingDir: '/tmp',
+        command: 'claude',
+        emit: (event) => events.push(event),
+      });
+      adapter.handleMessage({
+        type: 'system',
+        subtype: 'task_started',
+        task_id: 'k1',
+        tool_use_id: 'toolu_sub',
+        task_type: 'local_agent',
+      });
+      adapter.handleMessage({
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: 'k1',
+        tool_use_id: 'toolu_sub',
+        status: 'failed',
+        summary: 'Agent "Explore" failed: it broke',
+      });
+
+      assert.deepStrictEqual(
+        events.filter((event) => event.t === 'workflow_failed'),
+        [],
+        'a sub-agent’s notification was announced as a workflow failure',
       );
     });
   });
@@ -683,6 +784,46 @@ describe('a workflow that failed reads as failed (#140)', function () {
         workflowBlock(state).status,
         'failed',
         'the failure was dropped because its tool call had not arrived yet',
+      );
+    });
+
+    it('does not swallow the errors that come after it', function () {
+      // The failure's message is pushed onto the end of the transcript while a
+      // reply is still arriving, so it becomes the last message without being
+      // the open one. An `error` that asked only "is the last message
+      // streaming?" was dropped for the rest of the turn.
+      const state = createTranscript({});
+      applyChatEvent(state, { t: 'msg_start', seq: 1, ts: 1, id: 'm1', role: 'assistant', turnId: 't1' });
+      applyChatEvent(state, {
+        t: 'block_start',
+        seq: 2,
+        ts: 2,
+        msgId: 'm1',
+        index: 0,
+        block: { kind: 'tool', toolId: 'w1', name: 'Workflow', toolKind: 'task', status: 'completed' },
+      });
+      applyChatEvent(state, {
+        t: 'workflow_failed',
+        seq: 3,
+        ts: 3,
+        parentToolId: 'w1',
+        name: 'audit',
+        reason: 'boom',
+      });
+      applyChatEvent(state, {
+        t: 'error',
+        seq: 4,
+        ts: 4,
+        message: 'could not read /etc/hosts',
+        fatal: false,
+      });
+
+      const reply = state.messages.find((message) => message.id === 'm1');
+      assert.ok(
+        reply.blocks.some(
+          (block) => block.kind === 'error' && block.text.includes('/etc/hosts'),
+        ),
+        'an error after the failure never reached the transcript',
       );
     });
 

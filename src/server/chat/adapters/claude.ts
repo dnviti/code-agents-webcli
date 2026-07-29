@@ -611,11 +611,12 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     }
 
     if (subtype === 'task_notification') {
-      // The summary is the runtime's own sentence about the run — "Dynamic
-      // workflow "x" failed: ..." — and it is the better of the two failure
-      // texts on offer, so it wins where both arrive. Announced from here as
-      // well as from `task_updated` because either can be the one that lands:
-      // `announceWorkflowFailure` keeps the second from being a second failure.
+      // The runtime's other way of saying the same thing, and the only one that
+      // arrives if `task_updated` does not. It does *not* win where both do:
+      // `task_updated` is a line earlier in the capture and carries the error
+      // itself, where this wraps it in the run's own description sentence —
+      // which names the workflow by something no other surface calls it.
+      // `announceWorkflowFailure` is first-wins, so whichever lands is the one.
       if (str(raw.status) === 'failed') {
         this.announceWorkflowFailure(parentToolId, str(raw.summary));
       }
@@ -683,7 +684,7 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       t: 'workflow_failed',
       parentToolId,
       name: this.workflowTasks.get(parentToolId),
-      reason,
+      reason: failureReason(reason),
     });
   }
 
@@ -1410,6 +1411,34 @@ const EFFORT_TIMEOUT_MS = 8000;
  * event corrects, while showing a working agent as finished stops its detail
  * view updating for good.
  */
+/** How much of a runtime's reason a line in the conversation may carry. */
+const REASON_LIMIT = 300;
+
+/**
+ * A failure reason as a sentence, not as a stack trace.
+ *
+ * What the runtime hands over is a thrown `Error` with its frames glued on —
+ * `Error: probe: forced workflow failure…\n    at <anonymous> (workflow.js:15:7)
+ * \n    at processTicksAndRejections (native)` in the capture. The frames are
+ * the only part a reader cannot act on, and what this becomes is a message in a
+ * conversation, read on a phone.
+ *
+ * Stripped rather than reduced to its first line, because the reasons that
+ * matter most here are prose and often more than one sentence: a usage limit
+ * says when it resets, a refused model says what to do instead. `AgentRun.error`
+ * keeps the whole thing, frames and all, for the popup and the row.
+ */
+function failureReason(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const text = raw
+    .split('\n')
+    .filter((line) => !/^\s+at\s/.test(line))
+    .join('\n')
+    .trim();
+  if (!text) return undefined;
+  return text.length <= REASON_LIMIT ? text : `${text.slice(0, REASON_LIMIT - 1).trimEnd()}…`;
+}
+
 function toolStatus(value: string): ToolStatus {
   switch (value) {
     case 'completed':

@@ -173,8 +173,16 @@ export function raiseAlert(alert: RaisedAlert, details: boolean): void {
   void paint();
 }
 
-/** The user has dealt with this conversation, or it no longer needs them. */
-export function clearAlert(sessionId: string): void {
+/**
+ * The user has dealt with this conversation, or it no longer needs them.
+ *
+ * `keep` spares one kind. Only the conversation going back to work uses it, and
+ * only for `failed`: an approval that started running again was plainly
+ * answered, but a workflow that broke is not un-broken by the agent carrying on
+ * afterwards — which it does, seconds later, in the ordinary case (#140).
+ */
+export function clearAlert(sessionId: string, keep?: ChatAlertKind): void {
+  if (keep && outstanding.get(sessionId)?.kind === keep) return;
   if (!outstanding.delete(sessionId)) return;
   void paint();
 }

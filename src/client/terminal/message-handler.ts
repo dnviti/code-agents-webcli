@@ -265,6 +265,19 @@ export class MessageHandler {
       return;
     }
 
+    if (event.t === 'workflow_failed') {
+      // The in-app half of telling somebody. The desktop notification is the
+      // other half and it is the one that may not exist — permission is
+      // `default` until a person grants it, and a browser that never got it
+      // leaves the tab as the only surface saying anything happened at all.
+      //
+      // Unread rather than the error mark: the *conversation* has not failed
+      // and may be working perfectly well on something else. What is waiting is
+      // something to read (#140).
+      if (background) tabs.updateUnreadIndicator(sessionId, true);
+      return;
+    }
+
     if (event.t !== 'state') return;
 
     switch (event.state) {

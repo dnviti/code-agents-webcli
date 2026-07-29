@@ -142,7 +142,11 @@ function ActivityRow({
         gap: 7,
         padding: '7px 10px',
         borderBottom: '1px solid var(--border)',
-        opacity: entry.running ? 1 : 0.75,
+        // Finished work is dimmed so the working rows carry the panel — but not
+        // a run that failed. Faded to 0.75 the red it is written in composites
+        // to about 3.3:1 against the rail, under the 4.5:1 body text needs, and
+        // the one row nobody should have to squint at is the broken one (#140).
+        opacity: entry.running || entry.status === 'failed' ? 1 : 0.75,
         cursor: 'pointer',
       }}
     >

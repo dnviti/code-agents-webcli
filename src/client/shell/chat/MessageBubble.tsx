@@ -138,18 +138,7 @@ export const MessageBubble = React.memo(function MessageBubble({
   const [copied, setCopied] = React.useState(false);
   const isPhone = usePhone();
   const isUser = current.role === 'user';
-  // A marker is not a turn: no surface, no glyph, no controls, and the full
-  // width of the column — it is a line drawn across the conversation.
-  //
-  // Errors count as well as notices, because the conversation now writes one of
-  // its own: a workflow that failed after its turn was over has nothing to be
-  // appended to and gets a message to itself (#140). Given the assistant's
-  // chrome it would be an avatar and a copy button around a failure nobody
-  // said — the same misattribution the compaction rule is drawn to avoid.
-  const isMarker =
-    current.role === 'system'
-    && current.blocks.length > 0
-    && current.blocks.every((block) => block.kind === 'notice' || block.kind === 'error');
+  const isMarker = isRule(current);
 
   // Derived from blocks, not from a list handed down. An events array as a prop
   // would be a new object identity every render and would defeat React.memo for
@@ -203,6 +192,12 @@ export const MessageBubble = React.memo(function MessageBubble({
   if (!hasVisibleContent(current)) return null;
 
   if (isMarker) {
+    // A rule carries no clock, because a compaction or a branch happens *to*
+    // the turn it is drawn in and shares its moment. A failure filed this way
+    // does not: a background workflow is filed under the turn that launched it
+    // and can break half an hour after that turn ended, so this one row says
+    // when (#140).
+    const stamped = current.blocks.some((block) => block.kind === 'error');
     return (
       <div data-message-id={id} style={{ padding: '10px 14px' }}>
         {current.blocks.map((block, i) =>
@@ -212,6 +207,18 @@ export const MessageBubble = React.memo(function MessageBubble({
             <NoticeRule key={i} block={block as NoticeBlock} />
           ),
         )}
+        {stamped ? (
+          <div
+            style={{
+              marginTop: 4,
+              fontFamily: 'var(--font-mono)',
+              fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
+              color: 'var(--muted-foreground)',
+            }}
+          >
+            {clockTime(current.ts)}
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -375,6 +382,28 @@ function visibleBlocks(message: ChatMessage): number {
  * duplicated: two copies of this rule drifting apart would silently either
  * double-count a step or drop it from every pill.
  */
+/**
+ * A message drawn as a line across the conversation rather than as a turn: no
+ * surface, no glyph, no controls, the full width of the column.
+ *
+ * Errors count as well as notices, because the conversation now writes one of
+ * its own — a workflow that failed after its turn was over has nothing to be
+ * appended to and gets a message to itself (#140). Given the assistant's chrome
+ * it would be an avatar and a copy button around a failure nobody said, which
+ * is the misattribution the compaction rule is drawn this way to avoid.
+ *
+ * Exported because `MessageList` has to reach the same answer: a rule has no
+ * action row, so the silent steps before it would be handed to something that
+ * drops them, and the tool calls they hold would leave the transcript.
+ */
+export function isRule(message: ChatMessage): boolean {
+  return (
+    message.role === 'system'
+    && message.blocks.length > 0
+    && message.blocks.every((block) => block.kind === 'notice' || block.kind === 'error')
+  );
+}
+
 export function hasVisibleContent(message: ChatMessage): boolean {
   if (message.role === 'user') return true;
   if (visibleBlocks(message) > 0) return true;
@@ -749,6 +778,11 @@ function ImageView({ block }: { block: ImageBlock }) {
 }
 
 function ErrorCallout({ block, onRetry }: { block: ErrorBlock; onRetry?: () => void }) {
+  // A sentence, so it is written at the size a sentence is written at. Left on
+  // `--text-sm` it sat 3px under the prose around it on a phone and exactly on
+  // the floor the browser checks measure to — the one message in the
+  // conversation that has to be read, in the smallest type on screen.
+  const isPhone = usePhone();
   return (
     <div
       style={{
@@ -760,7 +794,7 @@ function ErrorCallout({ block, onRetry }: { block: ErrorBlock; onRetry?: () => v
         border: '1px solid color-mix(in oklab, var(--destructive) 38%, transparent)',
         background: 'color-mix(in oklab, var(--destructive) 8%, transparent)',
         color: 'var(--destructive)',
-        fontSize: 'var(--text-sm)',
+        fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-sm)',
         borderRadius: 'var(--radius)',
       }}
     >
