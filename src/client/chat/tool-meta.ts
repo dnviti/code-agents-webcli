@@ -51,6 +51,10 @@ export const TOOL_STATUS: Record<ToolStatus, StatusStyle> = {
   failed: { icon: 'circle-x', label: 'Failed', color: 'var(--destructive)', badge: 'destructive' },
   denied: { icon: 'shield', label: 'Denied', color: 'var(--warning)', badge: 'warning' },
   canceled: { icon: 'x', label: 'Canceled', color: 'var(--muted-foreground)', badge: 'outline' },
+  // No spin, deliberately: this is the status a call gets precisely because
+  // nothing is going to happen to it, and a spinner that never stops is what
+  // it replaces (#139).
+  unknown: { icon: 'circle-help', label: 'No longer reporting', color: 'var(--muted-foreground)', badge: 'outline' },
 };
 
 /** Output lines shown before a block clamps itself. */

@@ -30,6 +30,7 @@ import {
   TextBlock,
   ThinkingBlock,
   ToolBlock,
+  ToolStatus,
   mergeUsage,
 } from './chat-events.js';
 import { turnOutcomeOf } from './turn-outcome.js';
@@ -383,6 +384,53 @@ function locateAgentRun(
   return [messageIndex, block.agent];
 }
 
+
+/** The statuses that mean a call is over, whatever happened to it. */
+const SETTLED_TOOL: ReadonlySet<ToolStatus> = new Set<ToolStatus>([
+  'completed',
+  'failed',
+  'denied',
+  'canceled',
+  'unknown',
+]);
+
+/**
+ * Calls left open inside a turn that has ended, settled honestly (#139).
+ *
+ * Nothing in this pipeline ever closed a tool block on a turn-level event. The
+ * runtimes routinely stop reporting on a call before the turn is over — an ACP
+ * agent that backgrounds a task never sends a terminal update at all, and
+ * Claude ends a turn with an unresolved block whenever a tool errors during
+ * execution — so a delegation would spin as "running" for ever, on its row, in
+ * its badge, on the trace rail and in the panel's running count, beside a
+ * conversation that had plainly finished and a trace showing no activity at
+ * all. `unknown` is the honest word: nobody stopped it and nothing is known to
+ * have broken; the runtime simply went quiet and its turn is over.
+ *
+ * One exemption, and it is the whole reason this is not a blunt sweep. A run
+ * that is still reporting about *itself* — a background workflow, whose own
+ * report says it is running — outlives the turn that started it by design.
+ * Those are left alone here and settle when they say so. `force` removes the
+ * exemption, for the one case where nothing can report again: the runtime is
+ * gone.
+ */
+function settleUnreportedTools(state: TranscriptState, turnId: string | null, force: boolean): boolean {
+  if (!turnId) return false;
+  let touched = false;
+  for (const message of state.messages) {
+    if (message.turnId !== turnId) continue;
+    for (const block of message.blocks) {
+      if (block.kind !== 'tool') continue;
+      if (SETTLED_TOOL.has(block.status)) continue;
+      const runStatus = block.agent?.status;
+      if (!force && runStatus !== undefined && !SETTLED_TOOL.has(runStatus)) continue;
+      block.status = 'unknown';
+      touched = true;
+    }
+  }
+  return touched;
+}
+
 /**
  * Apply one event.
  *
@@ -577,7 +625,16 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       const [messageIndex, blockIndex] = located;
       const block = state.messages[messageIndex]?.blocks[blockIndex];
       if (!block || block.kind !== 'tool') return NO_CHANGE;
+      // A completion that arrives after the turn ended still lands: the whole
+      // point of settling a call as `unknown` is that it is the answer until a
+      // better one turns up. What must not land is a patch that puts it back to
+      // running — a progress report from a runtime that has already gone quiet
+      // once would restart a spinner nothing will ever stop (#139).
+      const reopens =
+        block.status === 'unknown'
+        && (event.patch.status === undefined || !SETTLED_TOOL.has(event.patch.status));
       Object.assign(block, event.patch);
+      if (reopens) block.status = 'unknown';
       return { messageIndex, structural: false, meta: false, applied: true };
     }
 
@@ -761,7 +818,13 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // open, the next thing the user typed would be folded into a turn whose
       // process is gone — the mirror of the `turn_end` case, and the same rule
       // the accountant applies when it closes a job on an exit (#86).
+      const wasOpen = state.currentTurnId;
       state.currentTurnId = openTurnAfter(event, state.currentTurnId);
+      if (event.state === 'exited' || event.state === 'error') {
+        // Nothing can report once the child is gone, so the exemption for a run
+        // still reporting about itself does not apply here (#139).
+        settleUnreportedTools(state, wasOpen, true);
+      }
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
@@ -895,6 +958,11 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
             message.turnOutcome = outcome;
           }
         }
+        // And the calls inside it that never reported an ending (#139). Inside
+        // `!event.stale` on purpose: an interrupt-to-redirect acknowledges the
+        // half it abandoned and the turn is still running, so nothing in it has
+        // stopped reporting yet.
+        settleUnreportedTools(state, ended, false);
         state.currentTurnId = null;
       }
       if (event.usage) {
