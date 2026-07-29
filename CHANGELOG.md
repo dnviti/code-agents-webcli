@@ -5,6 +5,17 @@
 ## [5.3.3] - 2026-07-29
 
 ### Fixed
+- **The same answer twice is answered twice** (#128). The box that reports an
+  outcome the control cannot show for itself now leaves after seven seconds,
+  which was the fix for it piling up with the effort chip's. It was raised by an
+  effect keyed on the message's *text*, so an outcome repeated word for word —
+  the same model picked again on a runtime that cannot switch mid-session, or
+  "use the default for this runtime" clicked twice — left that key unchanged once
+  the box had gone, and the second click was answered with nothing at all. On a
+  phone, where the chip can show neither a pending model nor a clear, that was
+  the entire response to a deliberate action. Keyed on the answer itself now, so
+  two identical ones are still two. The seven-second dismissal had no check
+  either way; both halves have one now.
 - **A delegation that stopped reporting reads that way in its own window too**
   (#139). The status for a call nothing will ever report on again reached the
   tool-status table, the Agents panel and the workflow popup, and missed the

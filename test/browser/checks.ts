@@ -8055,6 +8055,32 @@ async function checkTheModelShownIsTheModelThatRan(): Promise<void> {
     noticeText(host) || 'silence',
   );
 
+  // The box leaves on its own, and a repeat of the same answer brings it back.
+  //
+  // Both halves were unguarded, and the second one was broken: the effect that
+  // raises the box was keyed on the message *text*, so an outcome repeated word
+  // for word — the same model picked twice on a runtime that cannot switch
+  // mid-session, or "use the default for this runtime" clicked twice — left the
+  // dependency unchanged after the timeout had already hidden it, and the second
+  // click answered with nothing at all. On a phone, where the chip cannot show a
+  // pending model or a clear, that was the whole response to a deliberate action.
+  //
+  // Virtual milliseconds: this costs budget, not wall-clock.
+  await wait(7200);
+  check(
+    'the answer goes away on its own instead of becoming a fixture beside the composer',
+    !noticeIn(host),
+    noticeIn(host) ? `still reading "${noticeText(host)}"` : 'gone',
+  );
+
+  answer(controller, 'model-check', 'cleared', 'Cleared the model override. The next session for this conversation will use the runtime default.', null);
+  await wait(200);
+  check(
+    'and the very same answer, given again, is announced again rather than swallowed',
+    noticeText(host).includes('Cleared the model override'),
+    noticeText(host) || 'silence — the repeat was swallowed',
+  );
+
   root.unmount();
   host.remove();
 
