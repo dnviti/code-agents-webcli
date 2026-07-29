@@ -3,6 +3,17 @@
 ## [Unreleased]
 
 ### Fixed
+- **The same answer twice is answered twice** (#128). The box that reports an
+  outcome the control cannot show for itself now leaves after seven seconds,
+  which was the fix for it piling up with the effort chip's. It was raised by an
+  effect keyed on the message's *text*, so an outcome repeated word for word —
+  the same model picked again on a runtime that cannot switch mid-session, or
+  "use the default for this runtime" clicked twice — left that key unchanged once
+  the box had gone, and the second click was answered with nothing at all. On a
+  phone, where the chip can show neither a pending model nor a clear, that was
+  the entire response to a deliberate action. Keyed on the answer itself now, so
+  two identical ones are still two. The seven-second dismissal had no check
+  either way; both halves have one now.
 - **The Status panel stops making up your subscription** (#137). It used to
   open on a plan badge reading `max20`, a meter reading "Tokens 0 of 220.0k"
   and a "Left 220.0k" underneath it. None of that was a fact about anybody's
