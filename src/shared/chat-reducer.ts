@@ -30,6 +30,7 @@ import {
   TextBlock,
   ThinkingBlock,
   ToolBlock,
+  isSessionMintedMessageId,
   mergeUsage,
 } from './chat-events.js';
 import { turnOutcomeOf } from './turn-outcome.js';
@@ -423,6 +424,35 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
     case 'msg_start': {
       // Idempotent: a replayed start must not fork the message in two.
       if (messageFor(state, event.id) !== null) {
+        return NO_CHANGE;
+      }
+      // A prompt the runtime handed back, in a conversation recorded before the
+      // adapters stopped doing it (#129).
+      //
+      // Every ACP runtime and both codex modes used to write the user's message
+      // into the transcript a second time, under a turn id of their own, right
+      // after the session had written it — one prompt, two identical bubbles.
+      // The adapters no longer do it and the session now refuses it, but the
+      // logs already on disk still hold both, and they are replayed through
+      // this reducer every time one of those conversations is opened. Drawing
+      // them is not something a migration should have to fix.
+      //
+      // The test is what the echo *is*, not what it looks like: only
+      // `ChatSession.deliver` ever writes a user message in this app, and it
+      // always mints `user-<uuid>`. So a message claiming to be the user, with
+      // an id nothing in this app would have minted, arriving inside a turn
+      // that already carries the user's own — that is a runtime repeating the
+      // prompt. A real second prompt cannot be caught by it: a real one comes
+      // from `deliver`, and is therefore session-minted. `steer` is excluded
+      // because a steer is also `deliver`'s and shares the open turn on purpose.
+      if (
+        event.role === 'user'
+        && !event.steer
+        && state.currentTurnId
+        && event.turnId !== state.currentTurnId
+        && !isSessionMintedMessageId(event.id)
+        && state.messages.some((m) => m.turnId === state.currentTurnId && m.role === 'user')
+      ) {
         return NO_CHANGE;
       }
       // Everything said while a turn is open belongs to that turn, whatever id

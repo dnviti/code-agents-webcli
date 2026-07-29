@@ -8,8 +8,13 @@ import {
   NoticeBlock,
   ToolBlock,
   askedQuestionFrom,
-  looksLikeAskCall,
 } from '../../../shared/chat-events.js';
+import {
+  blockDraws,
+  drawsQuestion,
+  hasVisibleContent,
+  isRule,
+} from '../../../shared/chat-visibility.js';
 import { ChatTranscript } from '../../chat/transcript.js';
 import { compactCount, formatDuration } from '../../chat/tool-meta.js';
 import { Icon } from '../../ui/relay/Icon.js';
@@ -278,7 +283,7 @@ export const MessageBubble = React.memo(function MessageBubble({
             caret={Boolean(current.streaming) && i === current.blocks.length - 1}
           />
         ))}
-        {current.streaming && visibleBlocks(current) === 0 ? <Caret /> : null}
+        {current.streaming && !current.blocks.some(blockDraws) ? <Caret /> : null}
 
         {isUser ? null : <Footer model={current.model} usage={current.usage} />}
       </div>
@@ -359,57 +364,15 @@ const SR_ONLY: React.CSSProperties = {
 };
 
 /**
- * How many blocks this message would actually paint.
+ * Whether a message is drawn at all, and whether it is drawn as a rule.
  *
- * Tool calls are machinery and live on the trace rail — with one exception. A
- * question the model asked is a tool call only in the mechanical sense; what it
- * actually is, is the agent talking to the user, and burying it on the rail
- * would hide the one card the turn is blocked behind.
+ * Both rules moved to `shared/chat-visibility.ts` for #132, because three
+ * places have to reach the same answer — this bubble, the list folding silent
+ * steps onto the next reply, and a test asking it of a real recording without
+ * bundling React. Re-exported here so the callers that already import them from
+ * this module keep working.
  */
-function visibleBlocks(message: ChatMessage): number {
-  return message.blocks.filter(
-    (block) =>
-      block.kind !== 'thinking'
-      && (block.kind !== 'tool' || looksLikeAskCall(block.name, block.input)),
-  ).length;
-}
-
-/**
- * Whether this message gets a row of its own in the transcript.
- *
- * The list needs the same answer the bubble reaches, because it is what decides
- * which ids are carried onto the next message that speaks. Exported rather than
- * duplicated: two copies of this rule drifting apart would silently either
- * double-count a step or drop it from every pill.
- */
-/**
- * A message drawn as a line across the conversation rather than as a turn: no
- * surface, no glyph, no controls, the full width of the column.
- *
- * Errors count as well as notices, because the conversation now writes one of
- * its own — a workflow that failed after its turn was over has nothing to be
- * appended to and gets a message to itself (#140). Given the assistant's chrome
- * it would be an avatar and a copy button around a failure nobody said, which
- * is the misattribution the compaction rule is drawn this way to avoid.
- *
- * Exported because `MessageList` has to reach the same answer: a rule has no
- * action row, so the silent steps before it would be handed to something that
- * drops them, and the tool calls they hold would leave the transcript.
- */
-export function isRule(message: ChatMessage): boolean {
-  return (
-    message.role === 'system'
-    && message.blocks.length > 0
-    && message.blocks.every((block) => block.kind === 'notice' || block.kind === 'error')
-  );
-}
-
-export function hasVisibleContent(message: ChatMessage): boolean {
-  if (message.role === 'user') return true;
-  if (visibleBlocks(message) > 0) return true;
-  // Opened and still empty: the caret. See the early return in the bubble.
-  return message.blocks.length === 0 && Boolean(message.streaming);
-}
+export { hasVisibleContent, isRule };
 
 /** Split a carried-ids prop back into ids. */
 function splitIds(joined: string): string[] {
@@ -458,7 +421,7 @@ function summariseWork(
       // The question card is rendered in the conversation, so counting it here
       // as well would put "1 command" on a turn whose only machinery is the
       // question already on screen.
-      if (block.kind === 'tool' && looksLikeAskCall(block.name, block.input)) {
+      if (block.kind === 'tool' && drawsQuestion(block)) {
         continue;
       }
       if (block.kind === 'tool' && showToolCalls) {
@@ -646,7 +609,7 @@ function BlockView({
       // The one tool call that belongs in the conversation rather than on the
       // rail: it *is* the agent addressing the user. Everything else about a
       // tool call is machinery.
-      if (looksLikeAskCall(block.name, block.input)) {
+      if (drawsQuestion(block)) {
         return (
           <QuestionBlock
             block={block}

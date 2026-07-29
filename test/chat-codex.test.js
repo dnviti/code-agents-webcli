@@ -234,7 +234,9 @@ describe('codex app-server adapter', function () {
   });
 
   describe('sending a turn', function () {
-    it('writes the user message into the transcript and starts the turn', async function () {
+    it('starts the turn and leaves the user’s own message to the session (#129)', async function () {
+      // It used to write one of its own, on top of the one `ChatSession.deliver`
+      // had already written — one prompt, two identical bubbles in one turn.
       const h = harness();
       await boot(h);
       h.events.length = 0;
@@ -247,10 +249,16 @@ describe('codex app-server adapter', function () {
       h.adapter.handleMessage({ jsonrpc: '2.0', id: started.id, result: { turn: { id: 'turn_1' } } });
       await sendPromise;
 
-      const start = only(h.events, 'msg_start')[0];
-      assert.strictEqual(start.role, 'user');
-      assert.strictEqual(start.turnId, 'turn_1');
-      assert.deepStrictEqual(only(h.events, 'block_start')[0].block, { kind: 'text', text: 'Hello?' });
+      assert.deepStrictEqual(
+        only(h.events, 'msg_start').filter((event) => event.role === 'user'),
+        [],
+        'the adapter must not open a user message of its own',
+      );
+      assert.deepStrictEqual(
+        only(h.events, 'block_start').filter((event) => JSON.stringify(event.block).includes('Hello?')),
+        [],
+        'nor write the prompt into the transcript a second time',
+      );
       assert.strictEqual(only(h.events, 'state').pop().state, 'thinking');
     });
 

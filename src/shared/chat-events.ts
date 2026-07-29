@@ -1178,6 +1178,22 @@ export const NO_CHAT_CAPABILITIES: ChatCapabilities = {
 /** The MCP server this app exposes to the runtimes it launches. */
 export const ASK_MCP_SERVER = 'ccweb';
 
+/**
+ * Whether a message id is one this app minted for the user's own turn.
+ *
+ * `ChatSession.deliver` is the only writer of a user message, and it always
+ * mints `user-<uuid>`. Everything else claiming to be the user came from a
+ * runtime — the prompt handed straight back, which is what put two identical
+ * bubbles in one turn for every ACP runtime and both codex modes (#129).
+ *
+ * A shape test rather than a list of the ids those runtimes used, because the
+ * question is "did this app write it", and the answer for anything this app did
+ * not write is no, whatever the runtime chose to call it.
+ */
+export function isSessionMintedMessageId(id: string): boolean {
+  return /^user-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+}
+
 /** The one tool that server offers: put a multiple-choice question to the user. */
 export const ASK_QUESTION_TOOL = 'ask_user_question';
 

@@ -7,7 +7,8 @@ import type { TurnSummary } from '../../chat/turns.js';
 import { Button } from '../../ui/relay/Button.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import { usePhone } from '../../ui/touch.js';
-import { MessageBubble, hasVisibleContent, isRule } from './MessageBubble.js';
+import { foldRows } from '../../../shared/chat-visibility.js';
+import { MessageBubble } from './MessageBubble.js';
 import { TurnStrip } from './TurnStrip.js';
 
 /**
@@ -545,28 +546,18 @@ interface Row {
  * still holds every event.
  */
 function rowsOf(messageIds: string[], byId: Map<string, ChatMessage>): Row[] {
-  const rows: Row[] = [];
-  let silent: string[] = [];
-  for (const messageId of messageIds) {
-    const message = byId.get(messageId);
-    if (!message) continue;
-    if (!hasVisibleContent(message)) {
-      silent.push(message.id);
-      continue;
-    }
-    // A rule across the conversation cannot speak for the work before it: it
-    // has no action row to put the counter in, so anything handed to it is
-    // dropped rather than carried. The steps go on waiting for the next message
-    // that can. Without this a workflow failing mid-turn took the trace entry
-    // point for its own tool call off the transcript (#140).
-    if (isRule(message)) {
-      rows.push({ message, carriedIds: '' });
-      continue;
-    }
-    rows.push({ message, carriedIds: silent.join(',') });
-    silent = [];
-  }
-  return rows;
+  const messages = messageIds
+    .map((messageId) => byId.get(messageId))
+    .filter((message): message is ChatMessage => Boolean(message));
+  // The rule itself lives in `shared/chat-visibility.ts` (#132), so a test can
+  // ask it of a real recorded conversation without bundling React, and so the
+  // bubble deciding whether to draw itself and this deciding what to fold onto
+  // what cannot drift apart. Ids are joined here because `carriedIds` crosses
+  // into React as a prop, where a fresh array every render is a fresh identity.
+  return foldRows(messages).map((row) => ({
+    message: row.message,
+    carriedIds: row.carriedIds.join(','),
+  }));
 }
 
 /**

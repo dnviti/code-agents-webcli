@@ -1036,7 +1036,11 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       .filter((block): block is Record<string, unknown> => Boolean(block) && str(block!.type) === 'text')
       .map((block) => str(block.text) ?? '')
       .join('');
-    if (!text) return;
+    // Not `!text`: a reply that is only whitespace is a reply that says
+    // nothing, and recorded as content it earns the step a bordered row with
+    // nothing to read in it (#132). This is a whole snapshot rather than a
+    // stream, so there is no open block for a lone space to belong to.
+    if (!text.trim()) return;
 
     this.streamedThisTurn = true;
     if (!this.activeTurnId) this.activeTurnId = randomUUID();
