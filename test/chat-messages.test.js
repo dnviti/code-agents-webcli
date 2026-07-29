@@ -339,6 +339,68 @@ describe('MessageBubble', function () {
     );
   });
 
+  // Issue #132. #46 decided from the *kind* of a step's blocks, so a reply that
+  // was a single space counted as having spoken. Oh My Pi sends exactly that on
+  // almost every step, and the row it earned was a bordered strip with a model
+  // name, a clock and a work counter and no sentence anywhere in it.
+  it('gives a step whose whole reply was a space no row either', function () {
+    const blocks = [{ kind: 'text', text: '   ' }, EVERY_BLOCK[2]];
+    assert.strictEqual(renderBubble(message({ blocks }), { onShowWork: () => {} }), '');
+    assert.strictEqual(
+      renderBubble(message({ blocks, streaming: true }), { onShowWork: () => {} }),
+      '',
+      'and not while it is running either — that is when the strips actually appear',
+    );
+  });
+
+  it('gives an empty plan no row of its own', function () {
+    assert.strictEqual(
+      renderBubble(message({ blocks: [{ kind: 'plan', items: [] }] }), { onShowWork: () => {} }),
+      '',
+    );
+  });
+
+  it('reads a command that mentions the question tool as a command, not a question', function () {
+    // The loose test for "is this the question tool" matches a call whose
+    // arguments merely name it — a `grep ask_user_question` did, was promoted
+    // out of the trace into the conversation, and then drew nothing.
+    const grep = {
+      kind: 'tool',
+      toolId: 'g1',
+      name: 'Bash',
+      toolKind: 'execute',
+      status: 'completed',
+      input: { command: 'grep -rn ask_user_question .' },
+    };
+    assert.strictEqual(
+      renderBubble(message({ blocks: [grep] }), { onShowWork: () => {} }),
+      '',
+      'a command is not a question, and a question card with no question in it paints nothing',
+    );
+
+    // And it is counted as the command it is, rather than skipped as a question
+    // already on screen.
+    const { renderToStaticMarkup, React, MessageBubble } = mod;
+    const silent = message({ blocks: [grep] });
+    const spoke = message({ blocks: [{ kind: 'text', text: 'done' }] });
+    const t = transcriptOf([silent, spoke]);
+    const html = renderToStaticMarkup(
+      React.createElement(MessageBubble, {
+        message: spoke,
+        transcript: t,
+        onShowWork: () => {},
+        carriedIds: silent.id,
+      }),
+    );
+    // Read off the control's label, not its text: the counter is a glyph and a
+    // number, and the glyph is inline SVG whose whitespace survives having the
+    // tags taken off it.
+    assert.ok(
+      /aria-label="Show work: 1 command/.test(html),
+      `the grep should be counted on the reply that follows it — got ${(/aria-label="Show work:[^"]*/.exec(html) || ['no work control'])[0]}`,
+    );
+  });
+
   it('still shows the caret for a reply that has opened but produced nothing', function () {
     // The gap between sending and the first block: a reply about to happen, not
     // machinery, so suppressing tool-only steps must not take it with them.

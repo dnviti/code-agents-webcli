@@ -132,6 +132,58 @@ describe('acp chat adapter', function () {
   });
 
   describe('streaming messages', function () {
+    it('never opens a reply for a chunk that is only whitespace (#132)', async function () {
+      // Oh My Pi sends one of these beside the tool activity on almost every
+      // step. Recorded as content it made the step "a step that said something"
+      // and earned it the bordered row #46 exists to remove — a model name, a
+      // clock, a work counter, and nothing to read. Driven on a real capture:
+      // the blank chunks are in the recording, not in this file.
+      const h = harness({ readFile: async () => 'The magic word is BANANAPHONE.\n' });
+      await feed(h, await boot(h, fixture('acp-kimi-tools')));
+
+      const blanks = only(h.events, 'block_start').filter(
+        (event) => event.block.kind === 'text' && !event.block.text.trim(),
+      );
+      assert.deepStrictEqual(
+        blanks.map((event) => JSON.stringify(event.block.text)),
+        [],
+        'a blank reply is not a reply and must not be written down as one',
+      );
+      // The real answer is untouched.
+      const texts = only(h.events, 'block_start')
+        .filter((event) => event.block.kind === 'text')
+        .map((event) => event.block.text);
+      assert.ok(texts.length > 0, 'the agent did answer, and that answer is still recorded');
+    });
+
+    it('still keeps the space between two words (#132)', async function () {
+      // The regression the obvious version of the fix causes: a chunk that is
+      // only a space, arriving *inside* an open reply, is the space between two
+      // words. Dropping those records "Helloworld".
+      const h = harness();
+      await boot(h, fixture('acp-omp'));
+      h.events.length = 0;
+      for (const text of ['Hello', ' ', 'world']) {
+        h.adapter.handleMessage({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'x',
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+          },
+        });
+        await flush();
+      }
+      const opened = only(h.events, 'block_start').filter((event) => event.block.kind === 'text');
+      const deltas = only(h.events, 'block_delta').map((event) => event.text);
+      assert.strictEqual(opened.length, 1, 'one reply, opened once');
+      assert.strictEqual(
+        opened[0].block.text + deltas.join(''),
+        'Hello world',
+        'the space between the words survives',
+      );
+    });
+
     it('folds thought chunks into one thinking block and starts a new message on a new id', async function () {
       const h = harness({ readFile: async () => 'The magic word is BANANAPHONE.\n' });
       await feed(h, await boot(h, fixture('acp-omp')));

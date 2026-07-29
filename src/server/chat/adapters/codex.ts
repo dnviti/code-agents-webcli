@@ -16,6 +16,7 @@ import {
   defaultPermissionOptions,
   rankedEfforts,
 } from '../../../shared/chat-events.js';
+import { blockDraws } from '../../../shared/chat-visibility.js';
 import {
   AdapterChild,
   AdapterEvent,
@@ -245,6 +246,11 @@ function itemToBlock(item: Record<string, unknown>) {
       return null;
 
     case 'agentMessage':
+      // Not filtered for blankness here: this same mapper opens the block that
+      // the streaming deltas are then addressed into by index, and a reply that
+      // is empty when it starts is every reply. The blank guard for #132 is at
+      // the two places a block is opened for an item that is already finished —
+      // see `onItem` and the exec adapter — where the text is final.
       return { kind: 'text' as const, text: str(item.text) || '' };
 
     case 'reasoning': {
@@ -899,7 +905,12 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     const index = this.itemBlockIndex.get(itemId);
     if (index === undefined) {
       // item/completed with no matching item/started: nothing was
-      // streaming, so open and close it in the same breath.
+      // streaming, so open and close it in the same breath. This is the one
+      // place the text is final at the moment the block is opened, so it is
+      // where a reply that says nothing is refused rather than recorded — a
+      // blank one would make the step "a step that spoke" and earn it a
+      // bordered row with nothing to read (#132).
+      if (!blockDraws(block)) return;
       const fresh = this.blockIndex++;
       this.itemBlockIndex.set(itemId, fresh);
       this.emit({ t: 'block_start', msgId, index: fresh, block });
@@ -1278,6 +1289,9 @@ export class CodexExecAdapter extends BaseChatAdapter {
         if (!itemType || itemType === 'userMessage' || itemType === 'hookPrompt') return;
         const block = itemToBlock(item);
         if (!block) return;
+        // Exec mode reports each item once, already finished, so this is the
+        // only chance to refuse one that would paint nothing (#132).
+        if (!blockDraws(block)) return;
         if (!this.assistantMsgId) {
           this.assistantMsgId = `a_${this.turnId}`;
           this.emit({ t: 'msg_start', id: this.assistantMsgId, role: 'assistant', turnId: this.turnId || '' });

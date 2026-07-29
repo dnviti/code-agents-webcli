@@ -664,6 +664,17 @@ export class PiChatAdapter extends BaseChatAdapter {
     }
   }
 
+  /**
+   * The empty block a stream opens before its first delta.
+   *
+   * Deliberately still emitted, unlike the whole-message paths in the ACP,
+   * claude-snapshot and codex adapters, which now refuse to record a reply that
+   * is only whitespace (#132). This protocol addresses its deltas by index, so
+   * the block has to exist before they arrive; there is no text to judge yet,
+   * and refusing to open it would drop the reply, not tidy it. A block that
+   * ends up with nothing in it draws nothing — that is the display rule's job,
+   * and this is the correct division between the two.
+   */
   private openBlock(msgId: string, index: number, item: PiContentItem): BlockTrack {
     if (item.type === 'thinking') {
       const block: ThinkingBlock = { kind: 'thinking', text: '', signature: item.thinkingSignature };

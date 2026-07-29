@@ -69,6 +69,23 @@ if (!fs.existsSync(path.join(dir, '..', '..', 'dist', 'public', 'css', 'componen
   );
 }
 
+// A real Oh My Pi conversation, at the level the browser receives it (#132).
+//
+// Already a ChatEvent log — these are the app's own recordings, not a runtime's
+// wire format — so there is no adapter to replay it through: parsed and handed
+// straight over. Five steps whose whole reply was a space, and the one that
+// finally said something.
+fs.writeFileSync(
+  path.join(dir, 'empty-rows-events.json'),
+  JSON.stringify(
+    fs
+      .readFileSync(path.join(dir, '..', 'fixtures', 'chat', 'omp-empty-rows.jsonl'), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line)),
+  ),
+);
+
 // The esbuild `bin` entry is a native executable, not a script: use the API.
 //
 // Minified, at the shipped target: the settings are half of what is under test.
