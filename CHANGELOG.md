@@ -3,6 +3,51 @@
 ## [Unreleased]
 
 ### Fixed
+- **An agent that reports no tokens and no cost now says so, instead of leaving
+  the header blank** (#136). The report that started this said Oh My Pi showed
+  no context window, no token counts and no cost. It turned out not to
+  reproduce: omp reports all four, the app reads all four, and a session on it
+  gets `85.7k tok · $0.1253` and a context bar in the header exactly as Claude
+  does. That is now covered by a test driven off omp's own recording, so it
+  cannot quietly stop being true.
+
+  What the report was really about is what an empty header *means*, and the app
+  had only one way to draw two very different things. A conversation whose first
+  turn has not finished has no figures. A conversation with Kimi will never have
+  any — probed, and confirmed in the recording the tests replay: Kimi sends no
+  usage notifications, no token counts on its replies, and no cost anywhere.
+  Both looked identical: nothing where the numbers go, which reads as "you have
+  not spent anything yet".
+
+  The rule now is that silence has to be *spoken*, and only a finished turn can
+  speak it. Once a turn has actually done work and ended having reported no
+  tokens or no money, the conversation records that fact once, and the header
+  strip, the line under the composer and the Status panel all say **not
+  reported** in place of the blank. Before that point they stay quiet, because
+  nothing is known yet — and a runtime that goes quiet for one turn and reports
+  on the next reads as having reported, not as silent.
+
+  Kimi also stops claiming it can report tokens and money. Every agent behind
+  the protocol bridge advertised both, which was optimism for most of them and
+  simply wrong for Kimi — and it was durable, because that claim is what the
+  permanent usage history files against every job. Kimi's jobs read as "n/a" in
+  the usage dashboard now, the label for a runtime that cannot report, rather
+  than "not reported", which is reserved for one that could have and did not.
+  The other bridge agents keep the optimistic default: their handshake corrects
+  it upward, and a silent turn corrects it downward from evidence.
+
+  One quieter fix rides along. A runtime that publishes how big its context
+  window is did not always say which model the window was about, so a model
+  change mid-conversation could make the app read the agent's own figure as the
+  previous model's, throw it away, and go asking a model catalogue for a worse
+  one. Oh My Pi, Codex and Claude all name the model now.
+
+  Two things it deliberately does not do. It does not price a turn the app was
+  not told the price of — there is no price table here and there will not be
+  one, so "cost not reported" for Codex means exactly that. And it does not work
+  out what a runtime can report by watching it: the usage dashboard keeps "this
+  agent cannot report" and "this agent could have and did not" apart on purpose,
+  and those stay two different answers.
 - **On a phone the message is the largest text in the conversation again**
   (#92). It had become the smallest. Everything around it — the turn header, the
   tool and reasoning summary, the model and token line, the timestamps — was

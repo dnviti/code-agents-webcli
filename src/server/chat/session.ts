@@ -15,6 +15,8 @@ import {
   QuestionRequest,
   SlashCommand,
   UserTurn,
+  carriesCost,
+  carriesTokens,
   classifyTool,
   defaultPermissionOptions,
   isAllowOption,
@@ -334,6 +336,33 @@ export class ChatSession {
   private contextWindowStated = false;
   /** The model the standing agent-reported ceiling was stated for, when named. */
   private agentWindowModel?: string;
+
+  /**
+   * Whether this conversation has ever been told what it spent.
+   *
+   * The four booleans behind the "not reported" the header shows for a runtime
+   * that reports nothing. `spoke*` is the observation — any report carrying a
+   * token count or a price, on any channel. `stated*` is the answer already
+   * being on the log, so it is said once rather than on the end of every turn.
+   *
+   * Kept here rather than worked out in the browser because the transcript
+   * cannot tell an agent that will never speak from one that has not spoken
+   * yet, and the difference is only knowable from having watched a turn finish.
+   * See `noteSpend`.
+   */
+  private spokeTokens = false;
+  private spokeCost = false;
+  private statedTokenSilence = false;
+  private statedCostSilence = false;
+  /**
+   * Whether the runtime has done anything at all in the turn now open.
+   *
+   * A `/clear` opens and closes a turn before it is recognised as a command,
+   * and an empty turn is not evidence about what a runtime reports — filing one
+   * as "reports nothing" would put the label on a conversation whose agent had
+   * not yet been asked for anything.
+   */
+  private turnDidWork = false;
 
   /**
    * The history this conversation was branched with, until the first turn takes it.
@@ -969,6 +998,7 @@ export class ChatSession {
       this.pending.delete(stamped.requestId);
     }
     this.noteContext(stamped);
+    this.noteSpend(stamped);
 
     try {
       this.deps.store.append(this.ref, [stamped]);
@@ -1116,6 +1146,54 @@ export class ChatSession {
   private retractContextWindow(): void {
     if (!this.contextWindowStated) return;
     this.ingest({ t: 'usage', usage: { contextWindowSource: 'unknown' } });
+  }
+
+  /**
+   * Say, once, that this runtime reports no tokens and/or no money.
+   *
+   * Every surface that shows spend had exactly two things to draw: a figure, or
+   * nothing. Nothing is what a conversation looks like in its first second, so
+   * the header stayed blank for kimi — which reports no `usage_update`, no
+   * usage on its prompt reply and no `_meta` at all — and a user could not tell
+   * that from a session that simply had not spent anything yet.
+   *
+   * The statement is a measurement and is made where the measurement finishes:
+   * a turn in which the runtime actually did something has ended, and nothing
+   * on any channel carried a count or a price. Done once per conversation,
+   * because the log is a record of what changed.
+   *
+   * Written onto the `turn_end` that proves it rather than ingested as its own
+   * event. `ingest` is what calls this, so a second `ingest` from in here would
+   * number and broadcast the new event *ahead* of the turn_end that caused it —
+   * the same re-entrancy the capacity lookup above defers a promise to avoid.
+   * Patching the event in hand needs no ordering at all, and it lands on the
+   * one event a reader would look at to ask the question.
+   */
+  private noteSpend(event: ChatEvent): void {
+    if (event.t === 'msg_start' && event.role !== 'user') this.turnDidWork = true;
+    if (event.t === 'block_start' && event.block.kind === 'tool') this.turnDidWork = true;
+
+    if (event.t === 'usage' || event.t === 'msg_end' || event.t === 'turn_end') {
+      if (carriesTokens(event.usage)) this.spokeTokens = true;
+      if (carriesCost(event.usage)) this.spokeCost = true;
+    }
+
+    if (event.t !== 'turn_end') return;
+    const worked = this.turnDidWork;
+    this.turnDidWork = false;
+    if (!worked) return;
+
+    const silence: ChatUsage = {};
+    if (!this.spokeTokens && !this.statedTokenSilence) {
+      this.statedTokenSilence = true;
+      silence.usageSource = 'none';
+    }
+    if (!this.spokeCost && !this.statedCostSilence) {
+      this.statedCostSilence = true;
+      silence.costSource = 'none';
+    }
+    if (silence.usageSource === undefined && silence.costSource === undefined) return;
+    event.usage = { ...event.usage, ...silence };
   }
 
   /**

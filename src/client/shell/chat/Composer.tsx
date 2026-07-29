@@ -1146,6 +1146,13 @@ function sessionReadout(turnLabel: string | undefined, usage: ChatUsage | undefi
     const total = tokenTotal(usage);
     if (total !== null) bits.push(`${compactCount(total)} tok`);
     if (usage.costUsd !== undefined) bits.push(`$${usage.costUsd.toFixed(4)}`);
+    // Otherwise this line degrades to a bare `turn 3` against a runtime that
+    // reports nothing, which reads as a session that has spent nothing. Only
+    // ever off a spoken absence — the session states it after watching a turn
+    // finish, and a transcript that has simply not heard yet says nothing here,
+    // as it should.
+    if (total === null && usage.usageSource === 'none') bits.push('tokens not reported');
+    if (usage.costUsd === undefined && usage.costSource === 'none') bits.push('cost not reported');
   }
   return bits.join(' · ');
 }

@@ -31,6 +31,8 @@ import {
   ThinkingBlock,
   ToolBlock,
   ToolStatus,
+  carriesCost,
+  carriesTokens,
   isSessionMintedMessageId,
   mergeUsage,
 } from './chat-events.js';
@@ -251,6 +253,14 @@ export function foldSessionUsage(usage: ChatUsage, event: ChatEvent): ChatUsage 
       // model is asking for the ceiling to come down, where every other report
       // that leaves the field out is simply not talking about it.
       if (event.usage.contextWindowSource === 'unknown') next.contextWindow = undefined;
+      // And the mirror of it, which `assignDefined` cannot express either: a
+      // report carrying figures says somebody reports them, so an earlier
+      // "this runtime reports nothing" has to come off. `mergeUsage` reaches
+      // the same conclusion on the additive path; the two have to agree or the
+      // header and the history end up saying different things about one
+      // conversation.
+      if (carriesTokens(event.usage)) next.usageSource = 'agent';
+      if (carriesCost(event.usage)) next.costSource = 'agent';
       return next;
     }
     default:
@@ -320,6 +330,13 @@ function clearedUsage(usage: ChatUsage): ChatUsage {
     // turn "we asked and nobody knew" back into "nobody has asked yet".
     next.contextWindowSource = 'unknown';
   }
+  // Same rule, third time: what the runtime reports is a fact about the
+  // runtime, and a clear replaces the conversation rather than the agent
+  // running it. Dropped here, clearing a kimi chat would turn "this agent
+  // reports nothing" back into "nobody has said yet", and the header would go
+  // quiet again until the next turn ended.
+  if (usage.usageSource === 'none') next.usageSource = 'none';
+  if (usage.costSource === 'none') next.costSource = 'none';
   return next;
 }
 

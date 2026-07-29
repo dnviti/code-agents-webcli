@@ -317,6 +317,12 @@ describe('codex app-server adapter', function () {
             // request filled — codex reports both, and `last` is what was in
             // the window rather than what the whole turn spent (issue #82).
             contextWindowSource: 'agent',
+            // And which model it is about. `thread/tokenUsage/updated` never
+            // says, so it comes off the thread codex opened — without it a
+            // model switch mid-thread makes the session read codex's own
+            // ceiling as the previous model's and go asking a catalogue for a
+            // worse one (#136).
+            contextWindowModel: 'gpt-5-codex',
             contextUsed: 150,
           },
         },

@@ -340,6 +340,7 @@ async function run(): Promise<void> {
   await checkTheContextReadingIsHonestAboutItsCeiling();
   await checkTheTurnIndexListsTheWholeConversation();
   await checkClearingResetsTheFiguresAboveTheChat();
+  await checkASilentRuntimeSaysSoRatherThanGoingBlank();
   await checkTheUsageWindowReachesBeforeThisYear();
   await checkTheEffortHistogramsAreReadableWithoutAMouse();
   await checkTheFileTreeAndTheShellAreSizedForAThumb();
@@ -8810,6 +8811,144 @@ async function checkClearingResetsTheFiguresAboveTheChat(): Promise<void> {
     'and the meter is still there to be read, rather than gone',
     Boolean(host.querySelector('[role="group"][aria-label="Session usage"]')),
     after || 'the header went blank',
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * Issue #136: a runtime that reports nothing says so, where a person looks.
+ *
+ * kimi sends no token counts and no prices — probed, and the same in the
+ * capture under `test/fixtures/chat/acp-kimi-tools.jsonl` — and the header used
+ * to render nothing at all for it. Nothing is also what a conversation that has
+ * simply not spent anything yet looks like, so a user could not tell "this
+ * agent will never tell you" from "hold on".
+ *
+ * Driven through the real controller, the real header and the real composer,
+ * because the claim is about what is on screen: the folded state holding
+ * `usageSource: 'none'` proves only that the layer that was changed changed.
+ * And measured rather than merely found — an opacity-0 span is present in every
+ * `querySelector` and readable by nobody.
+ *
+ * The events are the ones a kimi session produces: an answer, a turn that ends
+ * carrying no figures but the spoken silence the session writes onto it, and a
+ * window that came from the model's provider rather than from kimi.
+ */
+async function checkASilentRuntimeSaysSoRatherThanGoingBlank(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1000px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('silent-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'silent-check',
+    snapshot: {
+      sessionId: 'silent-check',
+      runtime: 'kimi',
+      state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: false, fork: false, attachments: false,
+        // Honest, as of #136, and the reason the label must not sit behind them.
+        usage: false, cost: false, plan: true,
+      },
+      messages: [],
+      pendingPermissions: [],
+      queued: [],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 1,
+      live: true,
+      bypassPermissions: false,
+    },
+  } as never);
+
+  const push = (event: Record<string, unknown>, seq: number): void => {
+    controller.handle({
+      type: 'chat_event',
+      sessionId: 'silent-check',
+      event: { seq, ts: 1_700_000_000_000 + seq, ...event },
+    } as never);
+  };
+
+  push({ t: 'msg_start', id: 'u1', role: 'user', turnId: 'turn-1' }, 1);
+  push({ t: 'block_start', msgId: 'u1', index: 0, block: { kind: 'text', text: 'go' } }, 2);
+  push({ t: 'msg_end', msgId: 'u1' }, 3);
+  push({ t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'turn-1' }, 4);
+  push({ t: 'block_start', msgId: 'a1', index: 0, block: { kind: 'text', text: 'DONE' } }, 5);
+  push({ t: 'msg_end', msgId: 'a1' }, 6);
+  push({ t: 'turn_end', turnId: 'turn-1', usage: { usageSource: 'none', costSource: 'none' } }, 7);
+  push({
+    t: 'usage',
+    usage: { contextWindow: 1048576, contextWindowSource: 'provider' },
+  }, 8);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'kimi',
+      runtimeLabel: 'Kimi',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(300);
+
+  const meter = host.querySelector('[role="group"][aria-label="Session usage"]') as HTMLElement | null;
+  const meterText = (meter?.textContent ?? '').replace(/\s+/g, ' ');
+  check(
+    'a runtime that reports nothing says so in the header instead of leaving it blank',
+    /not reported/i.test(meterText),
+    meterText || 'the header showed nothing at all',
+  );
+  check(
+    'and does not manufacture a zero out of a measurement nobody took',
+    !/\$0\.00/.test(meterText) && !/\b0 tok/.test(meterText),
+    meterText,
+  );
+  check(
+    'and still shows the window the model’s provider could size',
+    /\? of 1\.0M/.test(meterText),
+    meterText,
+  );
+
+  // Visible, not merely in the DOM. Everything below is measured off the leaf
+  // that carries the words.
+  const label = Array.from(host.querySelectorAll('*')).find(
+    (node) => node.children.length === 0 && /not reported/i.test(node.textContent || ''),
+  ) as HTMLElement | undefined;
+  const style = label ? getComputedStyle(label) : null;
+  const box = label ? label.getBoundingClientRect() : null;
+  check(
+    'the words are painted rather than present',
+    Boolean(
+      box && box.width > 0 && box.height > 0
+      && style && style.visibility !== 'hidden' && style.display !== 'none'
+      && Number(style.opacity) > 0.5,
+    ),
+    label
+      ? `${Math.round(box!.width)}x${Math.round(box!.height)} opacity=${style!.opacity} visibility=${style!.visibility}`
+      : 'no element carries the words',
+  );
+  const fontSize = style ? parseFloat(style.fontSize) : 0;
+  check(
+    'and set at the size the rest of the header strip is, not shrunk away',
+    fontSize >= 10,
+    `${fontSize}px`,
+  );
+
+  // The composer's status line, the other place the figures live. It used to
+  // degrade to a bare turn number for a runtime like this.
+  const readout = (host.textContent ?? '').replace(/\s+/g, ' ');
+  check(
+    'the composer says it too, rather than leaving a bare turn number',
+    /tokens not reported/.test(readout) && /cost not reported/.test(readout),
+    readout.slice(-200) || 'nothing rendered',
   );
 
   root.unmount();

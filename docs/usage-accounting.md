@@ -118,7 +118,21 @@ own figure or nothing at all, which is why they have a column of their own.
 | Codex (app-server) | counted here | **not reported** | reported | **not reported** — nothing in the schema prices a turn | reported, per session |
 | Codex (`exec` fallback) | counted here | **not reported** | **not reported** | **not reported** | **not reported** |
 | pi | counted here | **not reported** | reported | reported | reported, per message |
-| ACP agents (Grok, omp, kimi, and others behind the ACP bridge) | counted here | only where a per-model call count arrives | reported | reported — Grok's in ticks, see below | the runtime's current selection |
+| Grok (ACP) | counted here | only where a per-model call count arrives | reported | reported, in ticks — see below | the runtime's current selection |
+| Oh My Pi / opencode (ACP) | counted here | only where a per-model call count arrives | reported | reported, as a session running total | the runtime's current selection |
+| Kimi (ACP) | counted here | **not reported** | **not reported** | **not reported** | the runtime's current selection |
+
+Kimi is the exception the rest of that block used to hide. Probed against
+kimi 0.29.1 over two prompts: not one `usage_update` notification, prompt
+replies of `{"stopReason":"end_turn"}` with no `usage` key, and no `_meta` on
+any `session/update`. `test/fixtures/chat/acp-kimi-tools.jsonl` is one of those
+turns — a reply, a read and a write — and there is no figure in it anywhere.
+This is protocol-legal: `usage_update` is a vendor extension that omp, opencode
+and grok implement and kimi does not, so a silent ACP agent is a thing the app
+has to be able to describe rather than a bug to fix in the adapter. Its
+`capabilities.usage` and `capabilities.cost` are therefore `false`, and its jobs
+file as **"n/a"** in the dashboard rather than "not reported" — see the
+distinction below.
 
 A figure a runtime never reports is stored as `null` and shown as
 **"not reported"** — never as zero. Those are different facts: a job that

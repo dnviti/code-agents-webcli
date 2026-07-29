@@ -67,7 +67,11 @@ interface RuntimeChatEntry {
  * only what the launcher shows beforehand; the session replaces it the moment
  * the agent introduces itself.
  */
-function acp(runtime: string, acpArgs: string[]): RuntimeChatEntry {
+function acp(
+  runtime: string,
+  acpArgs: string[],
+  advertised: Partial<ChatCapabilities> = {},
+): RuntimeChatEntry {
   return {
     factory: (options) => new AcpChatAdapter({ ...options, runtime, acpArgs }),
     askChannel: 'protocol',
@@ -79,6 +83,7 @@ function acp(runtime: string, acpArgs: string[]): RuntimeChatEntry {
       interrupt: true,
       usage: true,
       cost: true,
+      ...advertised,
     },
   };
 }
@@ -169,7 +174,12 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
       cost: true,
     },
   },
-  kimi: acp('kimi', ['acp']),
+  // Probed, not assumed: kimi 0.29.1 over ACP sends no `usage_update`, no
+  // `usage` on its prompt reply and no `_meta` on any update, so it reports
+  // neither tokens nor money. The adapter narrows the *running* session's
+  // capabilities the same way (`NO_SPEND_REPORTING` in acp.ts); this row is
+  // what the pre-session table says, and the two must not disagree.
+  kimi: acp('kimi', ['acp'], { usage: false, cost: false }),
   omp: acp('omp', ['acp']),
 };
 
