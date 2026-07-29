@@ -376,12 +376,64 @@ describe('Composer', function () {
       // The word "model" used to sit on the chip for the whole of a
       // conversation whose runtime never emits a session event, which is every
       // conversation before its first turn.
-      it('names the default instead of the word “model” when nothing has reported one', function () {
+      //
+      // Restated: this asserted the *default* was what the chip named, which was
+      // the defect the adversarial review caught. A default is what the next new
+      // chat would open on — it changes under an open conversation every time
+      // the same account picks a model in another tab, and it may never have
+      // been applied to this one at all. What the chip names is the model the
+      // launch actually used, which the server now sends as `modelPinned`.
+      it('names the model this conversation launched on, not the word “model”', function () {
         const html = render({
           capabilities: caps({}),
+          modelPinned: 'profile-model',
           modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
         });
-        assert.ok(html.includes('>profile-model<'), 'the default in force is what the chip names');
+        assert.ok(html.includes('>profile-model<'), 'what the launch used is what the chip names');
+      });
+
+      // The half of the same defect that the restatement above cannot show: a
+      // default the conversation was never launched on must not reach the chip.
+      it('never names a default this conversation was not launched on', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: null,
+          modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+        });
+        assert.ok(
+          !html.includes('>claude-opus-4-6<'),
+          'this conversation launched with no model flag; the standing choice is for the next one',
+        );
+        assert.ok(html.includes('>model<'), 'so the chip claims nothing, as it always did');
+      });
+
+      // And says so, rather than leaving a sentence about the default to be read
+      // as a statement about what is running.
+      it('says a pinned conversation is staying on its model when the default has moved', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'claude-sonnet-4-5',
+          modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+        });
+        assert.ok(
+          html.includes('Staying on claude-sonnet-4-5.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+        assert.ok(
+          html.includes('Your standing choice for this runtime: claude-opus-4-6.'),
+          'and the default is still named, as the answer for the next new chat',
+        );
+      });
+
+      // The pin and the default agreeing is the ordinary case, and it must not
+      // produce a sentence telling the user something is staying put.
+      it('says nothing about staying when the pin is the default', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'profile-model',
+          modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(!html.includes('Staying on'), html.match(/title="Model[^"]*"/)?.[0] || 'no title');
       });
 
       // Version skew: a server that predates this says nothing, and the control

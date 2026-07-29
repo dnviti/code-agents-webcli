@@ -734,7 +734,11 @@ export interface ModelChoice {
  *
  * A statement about the default, never about the process that happens to be
  * running: a conversation with an override of its own is running that instead,
- * and the picker pairs the two rather than replacing one with the other. Said
+ * and one with neither is running whatever its launch resolved — which travels
+ * separately, as `modelPinned`. The picker pairs them rather than letting one
+ * stand in for another; using this as the model in force was how the chip came
+ * to name a standing choice that had never been applied to the conversation
+ * showing it. Said
  * out loud because a model picked out of a menu used to be invisible the moment
  * it was in force — the chip fell back to the literal word "model", and nothing
  * anywhere named the profile that had pinned it (issue #135).

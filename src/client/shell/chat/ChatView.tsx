@@ -1196,6 +1196,13 @@ export function ChatView({
               // a model without a restart, so a post-launch seed would push a
               // visible `/model` turn into a brand new claude conversation.
               modelDefault={controller.modelDefaultValue}
+              // What this conversation was actually launched on, which is the
+              // only truthful thing to name when the user chose nothing and the
+              // runtime reports nothing — claude reports nothing, ever. The
+              // default above cannot stand in for it: it is what the *next* new
+              // chat would open on, and it changes under an open conversation
+              // every time the account's standing choice does.
+              modelPinned={controller.modelPinnedValue}
               // Apart from `model` above, because that one is the override *or*
               // whatever the runtime last reported and the picker has to tell
               // those two apart to say which it is describing.

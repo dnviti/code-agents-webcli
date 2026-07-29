@@ -258,11 +258,23 @@ preference held in the browser could only be applied *after* the launch, which
 on Claude means a visible `/model` turn pushed into a conversation you have not
 typed in yet. It is scoped to your account and never readable from another.
 
-**A conversation already under way is never re-modelled.** The standing choice
-seeds a conversation that has not yet run; a relaunch, a resume from the launcher
-and the recovery banner's restart all come back on the model that conversation
-was already using. Changing your standing choice, or the active profile, affects
-the next new chat and nothing that is open.
+**A conversation already under way is never re-modelled.** Every chat records
+the model its launch actually used, and that is what it comes back on: a
+relaunch, a resume from the launcher and the recovery banner's restart all return
+to the model that conversation was already using — including across a server
+restart, which is the moment every open conversation gets relaunched. Changing
+your standing choice, or the active profile, affects the next new chat and
+nothing that is open, and a conversation that launched with no model flag at all
+keeps that answer too.
+
+The chip names that recorded model rather than the default, which is the
+difference between describing this conversation and describing the next one. When
+the two differ the line above the list says which model the conversation is
+staying on, and then what a new chat would open on instead.
+
+A **branch** opens on the model its source was actually running, for the same
+reason: the context estimate that decided whether the branch fits was measured
+against that model's window.
 
 Two deliberate omissions. A **terminal** session is unaffected: it runs the CLI's
 own interface, where the model is yours to change inside the tool and nothing

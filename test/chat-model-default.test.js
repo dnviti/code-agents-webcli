@@ -34,6 +34,11 @@ function createSessionRecord(params = {}) {
     // Null unless a test says otherwise: this and the surface together are what
     // "this conversation has never chatted" is read off.
     sessionStartTime: params.sessionStartTime ?? null,
+    // The model a previous launch of this conversation actually used. Three
+    // states: a name, `null` for "launched with no flag", and absent for a
+    // record that predates the pin — which is the only one that still falls to
+    // the profile once the conversation has chatted.
+    chatModelPinned: params.chatModelPinned,
     sessionUsage: {},
     maxBufferSize: 1000,
   };
@@ -206,6 +211,12 @@ describe('the model a new chat opens on', function () {
   // Applied to one already under way it would re-model a running conversation
   // from a decision made somewhere else afterwards — which is what a relaunch,
   // a resume from the launcher and the unavailable banner's restart all are.
+  //
+  // Restated after the adversarial review: this session predates the pin — a
+  // row loaded from a database written before the column existed — which is the
+  // only case in which the profile still answers for a conversation that has
+  // already chatted. Every conversation launched since carries a pin, and the
+  // three tests below are what the guarantee actually rests on.
   it('never re-models a conversation that has already chatted', async function () {
     const { processor, calls } = build({
       stored: { 'user:7:chatModel:claude': 'claude-opus-4-6' },
@@ -216,6 +227,85 @@ describe('the model a new chat opens on', function () {
     await processor.startChat('ws-1', 'claude', {});
 
     assert.strictEqual(launchedModel(calls), 'profile-model');
+  });
+
+  // The defect the review found, at full size: the seeded model reached the
+  // process but nothing on the record, so the second launch — which is what a
+  // server restart makes of every open conversation — resolved from scratch and
+  // landed somewhere else. Two launches through the real processor, because the
+  // whole claim is about what the second one is told.
+  it('comes back on the same model when the conversation is relaunched', async function () {
+    const { processor, session, calls } = build({
+      stored: { 'user:7:chatModel:claude': 'claude-opus-4-6' },
+      profile: { profileName: 'House', model: 'profile-model' },
+    });
+
+    await processor.startChat('ws-1', 'claude', {});
+    session.active = false;
+    // What reopening a conversation from the list sends (mount.tsx), and what
+    // the unavailable banner's restart sends.
+    await processor.startChat('ws-1', 'claude', { resume: true });
+
+    assert.strictEqual(calls.start[0].options.model, 'claude-opus-4-6');
+    assert.strictEqual(calls.start[1].options.model, 'claude-opus-4-6', 'and again on the resume');
+  });
+
+  // The same conversation, after the account changed its mind somewhere else.
+  // A standing choice is for the next new chat; this one keeps what it opened on.
+  it('keeps its own model when the standing choice changes underneath it', async function () {
+    const { processor, session, settings, calls } = build({
+      stored: { 'user:7:chatModel:claude': 'claude-opus-4-6' },
+    });
+
+    await processor.startChat('ws-1', 'claude', {});
+    settings.set(7, 'claude', 'claude-haiku');
+    session.active = false;
+    await processor.startChat('ws-1', 'claude', { resume: true });
+
+    assert.strictEqual(calls.start[1].options.model, 'claude-opus-4-6');
+  });
+
+  // A conversation that deliberately ran bare has an answer of its own, and a
+  // profile configured afterwards must not overwrite it.
+  it('stays bare when it launched bare and a profile appears later', async function () {
+    const built = build({});
+
+    await built.processor.startChat('ws-1', 'claude', {});
+    assert.strictEqual(built.calls.start[0].options.model, undefined);
+
+    built.session.active = false;
+    built.session.chatModelPinned = null;
+    // The profile the installer added in between.
+    const withProfile = build({
+      profile: { profileName: 'House', model: 'profile-model' },
+      session: {
+        surface: 'chat',
+        sessionStartTime: new Date(),
+        agent: 'claude',
+        lastAgent: 'claude',
+        chatModelPinned: null,
+      },
+    });
+    await withProfile.processor.startChat('ws-1', 'claude', { resume: true });
+
+    assert.strictEqual(launchedModel(withProfile.calls), undefined);
+  });
+
+  // A pin is a fact in one runtime's vocabulary. Carried into another it would
+  // be `--model <a name this CLI has never heard of>`.
+  it('drops the pin when the conversation is relaunched on a different runtime', async function () {
+    const { processor, calls } = build({
+      session: {
+        surface: 'chat',
+        sessionStartTime: new Date(),
+        lastAgent: 'claude',
+        chatModelPinned: 'claude-opus-4-6',
+      },
+    });
+
+    await processor.startChat('ws-1', 'kimi', {});
+
+    assert.strictEqual(launchedModel(calls), undefined);
   });
 
   // `sessionStartTime` alone would fail this: the terminal launch path sets it
@@ -332,6 +422,49 @@ describe('what the browser is told about where the model came from', function ()
       source: 'personal',
     });
   });
+
+  // And the model this conversation is actually on, separately, because they
+  // are different facts and the chip needs the second one: claude reports no
+  // model at all, so without this the only thing left to name was the default —
+  // which the conversation may never have been launched on.
+  it('says what this conversation launched on, apart from what the default is', async function () {
+    const { processor, sent } = build({ stored: { 'user:7:chatModel:claude': 'claude-opus-4-6' } });
+
+    await processor.startChat('ws-1', 'claude', {});
+
+    assert.strictEqual(lastOfType(sent, 'chat_started').modelPinned, 'claude-opus-4-6');
+  });
+
+  it('says null when the launch passed no model flag at all', async function () {
+    const { processor, sent } = build();
+
+    await processor.startChat('ws-1', 'claude', {});
+
+    assert.strictEqual(lastOfType(sent, 'chat_started').modelPinned, null);
+  });
+
+  // The reload case, which is the one the chip had no honest answer for: the
+  // runtime has reported nothing to this browser yet.
+  it('repeats what the conversation is on when a browser rejoins it', async function () {
+    const { processor, session, sent } = build({
+      stored: { 'user:7:chatModel:claude': 'claude-haiku' },
+      session: {
+        surface: 'chat',
+        agent: 'claude',
+        sessionStartTime: new Date(),
+        chatModelPinned: 'claude-opus-4-6',
+      },
+    });
+
+    await processor.subscribeChat(
+      processor.deps.webSocketConnections.get('ws-1'),
+      session.id,
+    );
+
+    const snapshot = lastOfType(sent, 'chat_snapshot');
+    assert.strictEqual(snapshot.modelPinned, 'claude-opus-4-6', 'what it is running');
+    assert.strictEqual(snapshot.modelDefault.model, 'claude-haiku', 'what the next new chat gets');
+  });
 });
 
 describe('recording the account’s choice', function () {
@@ -396,6 +529,32 @@ describe('recording the account’s choice', function () {
       model: null,
       source: 'runtime',
     });
+  });
+
+  // "Use the default for this runtime" has to reach the defaults, and the pin
+  // sits above them: left in place it would send the conversation straight back
+  // to the model it happened to launch on. The one case where re-reading the
+  // defaults is not a retcon — the user asked, in this conversation, for them
+  // to decide again.
+  it('drops the pin as well, so clearing really does fall back to the profile', async function () {
+    const { processor, session, calls } = build({
+      profile: { profileName: 'House', model: 'profile-model' },
+      session: {
+        surface: 'chat',
+        agent: 'claude',
+        lastAgent: 'claude',
+        sessionStartTime: new Date(),
+        chatModelPinned: 'claude-opus-4-6',
+      },
+    });
+
+    await processor.handleMessage('ws-1', { type: 'chat_set_model', model: '' });
+    assert.strictEqual(session.chatModelPinned, undefined);
+
+    session.active = false;
+    await processor.startChat('ws-1', 'claude', { resume: true });
+
+    assert.strictEqual(launchedModel(calls), 'profile-model');
   });
 
   it('records a /model typed into the composer by the same rule', async function () {

@@ -131,6 +131,16 @@ export interface ComposerProps {
    */
   modelOverride?: string | null;
   /**
+   * The model this conversation was launched on, when the server says.
+   *
+   * The third of three, and none of them is a substitute for another: `model`
+   * is the override or whatever the runtime last reported, `modelDefault` is
+   * what a *new* conversation would open on, and this is what the process
+   * actually started with. Claude reports no model at all, so on that runtime
+   * this is the only truthful answer the chip has (#135).
+   */
+  modelPinned?: string | null;
+  /**
    * The reasoning-effort level this conversation is running at.
    *
    * Distinct from `capabilities.efforts`, which is the ladder — and distinct in
@@ -247,6 +257,7 @@ export function Composer({
   modelFeedback,
   modelDefault,
   modelOverride,
+  modelPinned,
   effort,
   onSetEffort,
   effortFeedback,
@@ -979,6 +990,7 @@ export function Composer({
                 feedback={modelFeedback}
                 fallback={modelDefault}
                 override={modelOverride}
+                pinned={modelPinned}
                 onPick={(value) => onSetModel?.(value)}
               />
 
@@ -1350,6 +1362,7 @@ function ModelChip({
   feedback,
   fallback,
   override,
+  pinned,
 }: {
   /** What the session reported it is running, when it reported anything. */
   current: string | undefined;
@@ -1363,6 +1376,14 @@ function ModelChip({
   fallback?: ChatModelDefault | null;
   /** This conversation's own choice, as distinct from what the runtime reported. */
   override?: string | null;
+  /**
+   * The model this conversation was actually launched on; null when unsaid.
+   *
+   * Apart from `fallback` because they answer different questions, and the chip
+   * would be lying if it used one for the other: this is what the process is
+   * running, that is what the next new chat would open on.
+   */
+  pinned?: string | null;
 }): React.JSX.Element {
   const [open, setOpen] = React.useState(false);
   const [customValue, setCustomValue] = React.useState('');
@@ -1419,12 +1440,17 @@ function ModelChip({
    *
    * The word "model" used to sit here for the whole of a conversation whose
    * runtime never emits a session event — which on a profile-pinned install
-   * meant the pin was genuinely in force and nowhere on screen (#135). Naming
-   * the default is a weaker claim than naming the running model, and the only
-   * reason it is safe to make is that the title and the menu both say which of
-   * the two this is.
+   * meant the pin was genuinely in force and nowhere on screen (#135).
+   *
+   * The pin, and never the default. They are routinely different and the
+   * difference is the whole point: the default is what the *next* new chat
+   * would open on, so naming it here would put a model on the chip that this
+   * conversation was never launched on and never will be — and it would change
+   * under an open conversation the moment the same account picked a model
+   * anywhere else. The pin is what the launch actually used, so naming it is a
+   * statement about this conversation and nothing else.
    */
-  const effective = current ?? fallback?.model ?? undefined;
+  const effective = current ?? pinned ?? undefined;
   // The session's own model wins. `models` is a menu in whatever order the
   // runtime listed it, and its first entry is the current one only by accident.
   const matched = models?.find((m) => m.value === effective || m.name === effective);
@@ -1437,17 +1463,25 @@ function ModelChip({
   /**
    * Why this model and not another — the question the picker could not answer.
    *
-   * Two sentences at most, because there are only ever two facts: whether this
-   * conversation was moved off the default, and what the default is. A server
-   * that said nothing about the default produces nothing here rather than a
-   * guess, so an older one degrades to the wording that shipped before.
+   * Two sentences at most, because there are only ever two facts: what fixed
+   * this conversation's model, and what the default is. A server that said
+   * nothing about the default produces nothing here rather than a guess, so an
+   * older one degrades to the wording that shipped before.
+   *
+   * The middle case is the one that has to be said out loud rather than implied:
+   * a conversation pinned to a model the default no longer names is *staying*
+   * on it, and a line that only described the default would read as a claim
+   * about what is running.
    */
   const clearPhrase = fallback ? describeModelClear(fallback) : null;
+  const staysOn = pinned && pinned !== fallback?.model ? `Staying on ${pinned}.` : null;
   const sourceLine = !fallback
     ? null
     : override
       ? `Chosen for this conversation only. ${clearPhrase}`
-      : describeModelDefault(fallback);
+      : staysOn
+        ? `${staysOn} ${describeModelDefault(fallback)}`
+        : describeModelDefault(fallback);
 
   React.useEffect(() => {
     if (!open) return;

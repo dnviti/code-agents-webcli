@@ -201,6 +201,20 @@ export class ChatController {
    * existed, rather than asserting a source it was never told.
    */
   private modelDefault: ChatModelDefault | null = null;
+  /**
+   * The model this conversation is fixed to, as its record holds it.
+   *
+   * A statement about *this* conversation, unlike the default above, and the
+   * reason the two cannot be collapsed: on claude the runtime never reports a
+   * model at all, so a chip with nothing else to show once fell back to the
+   * default — and a default the conversation was never launched on is a name it
+   * is not running (#135).
+   *
+   * Null both for "the runtime was given no flag" and for a server that said
+   * nothing, and the chip treats them the same way: it names no model. The
+   * distinction only matters on the server, where the launch is resolved.
+   */
+  private modelPinned: string | null = null;
   /** What the server reported happened to the last model change requested. */
   private modelResult: ModelSwitchResult | null = null;
 
@@ -280,6 +294,7 @@ export class ChatController {
         this.modelOverride =
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
         this.modelDefault = readModelDefault(message.modelDefault);
+        this.modelPinned = typeof message.modelPinned === 'string' ? message.modelPinned : null;
         this.effortOverride =
           typeof message.effortOverride === 'string' ? message.effortOverride : null;
         this.options.onChange?.();
@@ -331,6 +346,7 @@ export class ChatController {
         this.modelOverride =
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
         this.modelDefault = readModelDefault(message.modelDefault);
+        this.modelPinned = typeof message.modelPinned === 'string' ? message.modelPinned : null;
         this.effortOverride =
           typeof message.effortOverride === 'string' ? message.effortOverride : null;
         this.options.onChange?.();
@@ -633,6 +649,13 @@ export class ChatController {
     return this.modelDefault;
   }
 
+  /**
+   * The model this conversation is fixed to, or null when nothing says.
+   */
+  get modelPinnedValue(): string | null {
+    return this.modelPinned;
+  }
+
   /** What happened the last time this browser asked to change the model. */
   get modelFeedback(): ModelSwitchResult | null {
     return this.modelResult;
@@ -865,6 +888,11 @@ export class ChatController {
     // record's real override, and showing a stale one in the meantime would
     // be worse than showing nothing.
     this.modelOverride = null;
+    // The pin goes with it, and for the same reason: the record's own answer is
+    // on its way, and a conversation being relaunched may well come back on a
+    // different model — naming the old one in the meantime would be the exact
+    // claim this field exists to stop the chip making.
+    this.modelPinned = null;
     // The default deliberately survives: it is a fact about the account and the
     // runtime, not about the conversation being restarted, and the picker would
     // otherwise lose the only sentence that explains what the restart will open

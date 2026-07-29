@@ -7895,11 +7895,15 @@ async function checkTheModelPickerSaysWhereTheDefaultCameFrom(): Promise<void> {
     onChange: () => redraw(),
   } as never);
   // A conversation that has run no turn, so the runtime has named no model —
-  // which is exactly the state in which the pin used to be invisible.
+  // which is exactly the state in which the pin used to be invisible. Launched
+  // on the profile's model, which is what `modelPinned` records: the *default*
+  // is not evidence that this conversation is on it, and using it as such was
+  // the review's third finding.
   controller.handle({
     type: 'chat_snapshot',
     sessionId: 'model-source',
     modelOverride: null,
+    modelPinned: 'grok-4.5',
     modelDefault: { model: 'grok-4.5', source: 'profile', profileName: 'House' },
     snapshot: {
       sessionId: 'model-source', runtime: 'grok', state: 'idle', capabilities,
@@ -7931,6 +7935,46 @@ async function checkTheModelPickerSaysWhereTheDefaultCameFrom(): Promise<void> {
     (chip()?.textContent ?? '').includes('grok-4.5'),
     (chip()?.textContent ?? '').trim() || 'empty',
   );
+
+  // The other half, and the one the chip got wrong: a standing choice that was
+  // never applied to this conversation is a fact about the *next* new chat, so
+  // naming it here would put a model on the chip that this conversation is not
+  // running and never will be. Sent as a rejoin, because that is how it reaches
+  // an open tab — the account picked a model somewhere else.
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'model-source',
+    modelOverride: null,
+    // This conversation launched with no model flag at all.
+    modelPinned: null,
+    modelDefault: { model: 'grok-4.5', source: 'personal' },
+    snapshot: {
+      sessionId: 'model-source', runtime: 'grok', state: 'idle', capabilities,
+      messages: [], pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 0,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+  await wait(250);
+  check(
+    'a standing choice this conversation was never launched on stays off the chip',
+    (chip()?.textContent ?? '').trim() === 'model',
+    (chip()?.textContent ?? '').trim() || 'empty',
+  );
+
+  // Back to the profile-launched conversation the rest of this check is about.
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'model-source',
+    modelOverride: null,
+    modelPinned: 'grok-4.5',
+    modelDefault: { model: 'grok-4.5', source: 'profile', profileName: 'House' },
+    snapshot: {
+      sessionId: 'model-source', runtime: 'grok', state: 'idle', capabilities,
+      messages: [], pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 0,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+  await wait(250);
 
   const sourceLine = (): HTMLElement | null => host.querySelector('[data-model-source]');
   chip()?.click();

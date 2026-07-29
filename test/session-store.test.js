@@ -162,6 +162,46 @@ describe('SessionStore', function() {
       assert.strictEqual(loaded.get('default').chatModelOverride, undefined);
     });
 
+    // Three states, and all three have to survive: a name, "launched with no
+    // model flag at all", and "nothing recorded". A restart is precisely when
+    // this is read — it is the moment every open conversation gets relaunched —
+    // so a pin held only in memory would be gone exactly when it is needed
+    // (#135). The middle one is why the column is not just nullable text: a
+    // conversation that ran bare must not be re-modelled by a profile added
+    // afterwards.
+    it('remembers the model a conversation was launched on, including “none”', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['pinned', createSessionRecord({
+          id: 'pinned',
+          ownerUserId,
+          surface: 'chat',
+          chatModelPinned: 'claude-opus-4-6',
+        })],
+        ['bare', createSessionRecord({
+          id: 'bare',
+          ownerUserId,
+          surface: 'chat',
+          chatModelPinned: null,
+        })],
+        ['unlaunched', createSessionRecord({ id: 'unlaunched', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('pinned').chatModelPinned, 'claude-opus-4-6');
+      assert.strictEqual(
+        loaded.get('bare').chatModelPinned,
+        null,
+        'it ran with no flag, which is an answer and not an absence',
+      );
+      assert.strictEqual(
+        loaded.get('unlaunched').chatModelPinned,
+        undefined,
+        'and nothing recorded still reads as nothing recorded',
+      );
+    });
+
     it('remembers the name the user gave a session', async function () {
       // The one moment a chosen name matters most is coming back to a set of
       // long-running sessions after a restart, which is exactly the moment it
@@ -216,6 +256,24 @@ describe('SessionStore', function() {
       sessionStore.database.close();
       sessionStore = new SessionStore({ dataDir: tempDir });
       assert.strictEqual((await sessionStore.loadSessions()).size, 1);
+    });
+
+    it('adds the launched-model column to a database that predates it', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['old', createSessionRecord({ id: 'old', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.raw.exec(
+        'ALTER TABLE runtime_sessions DROP COLUMN chat_model_pinned',
+      );
+      sessionStore.database.close();
+
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      const loaded = await sessionStore.loadSessions();
+
+      assert.strictEqual(loaded.size, 1, 'the upgrade must not cost the user their sessions');
+      // Absent, not null: a row from before the column existed recorded no
+      // launch, so it still falls to the profile exactly as it did then.
+      assert.strictEqual(loaded.get('old').chatModelPinned, undefined);
     });
 
     it('adds the approval-mode column to a database that predates it', async function () {

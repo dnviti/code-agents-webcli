@@ -123,10 +123,37 @@ export interface SessionRecord {
    * conversation already under way is never re-modelled by a preference
    * changed somewhere else.
    *
-   * Absent means "no override", which reads as the account default and then the
-   * profile default, exactly like every row written before this existed.
+   * Absent means "no override", which reads as the model this conversation is
+   * already pinned to (below), then the account default, then the profile
+   * default, exactly like every row written before this existed.
    */
   chatModelOverride?: string;
+  /**
+   * The model this conversation is fixed to, as opposed to the one chosen in it.
+   *
+   * Written from whatever a launch actually resolved — an account default, a
+   * profile's model, or nothing at all — and read back ahead of both of them
+   * the next time this conversation starts. That is what makes the promise the
+   * picker states true: a relaunch, a resume from the launcher and the recovery
+   * banner's restart all come back on the model this conversation was already
+   * using, even though the account default or the profile behind it may have
+   * changed in between. Without it a conversation seeded from a standing choice
+   * silently dropped to the profile on its second launch (#135).
+   *
+   * Three states, and the third is the reason this is `string | null` rather
+   * than `string`: a name is the model it is fixed to, `null` is "fixed to no
+   * flag at all — the runtime's own default", and absent is "nothing recorded",
+   * which every row written before this existed carries and which still reads
+   * as the profile. Collapsing `null` into absent would let a profile added
+   * mid-conversation retcon a conversation that had deliberately launched bare.
+   *
+   * Not the same field as the override above, and deliberately so: this one is
+   * never something the user said, so the picker must not describe it as a
+   * choice, and clearing the override drops it rather than falling back to it.
+   * A branch sets it from its source, which is how a branch launches on the
+   * model the history it carries was measured against.
+   */
+  chatModelPinned?: string | null;
   /**
    * The reasoning-effort level this conversation runs at, in the runtime's own
    * vocabulary.

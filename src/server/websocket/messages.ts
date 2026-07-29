@@ -1209,13 +1209,20 @@ export class MessageProcessor {
     // Read before `surface` is set below, because that is half of what it reads.
     //
     // A standing preference is for opening the *next* conversation, never for
-    // reaching back into one already under way: without this gate a relaunch, a
-    // resume from the launcher, or the unavailable banner's restart would all
-    // re-model a conversation underneath the user, on a choice they made
-    // somewhere else afterwards. Below the profile for the same reason — a
-    // conversation that has run is continuing, and continuing is not a moment
-    // to apply anybody's default.
+    // reaching back into one already under way. The pin below is what enforces
+    // that for every conversation launched since #135; this remains the answer
+    // for the ones that predate it, whose records carry no pin at all and which
+    // must keep falling to the profile rather than picking up a default they
+    // were never launched on.
     const seedFromAccount = this.hasNeverChatted(session);
+
+    // A model name is only ever the vocabulary of the runtime that took it, so
+    // a pin left by another runtime is not a fact about this launch. Keyed on
+    // `lastAgent`, not `agent`: `agent` is null on every record restored from
+    // disk, and a server restart is precisely when conversations are relaunched.
+    if (session.lastAgent && session.lastAgent !== agentKind) {
+      session.chatModelPinned = undefined;
+    }
 
     session.surface = 'chat';
     // A level is only ever a word one runtime published, so it means nothing to
@@ -1236,16 +1243,41 @@ export class MessageProcessor {
     session.runtimeLabel = this.getRuntimeLabel(agentKind as AgentKind, session);
     session.lastActivity = new Date();
 
+    /**
+     * Which model this launch actually uses — resolved once, because the record
+     * has to be told what it was.
+     *
+     * The conversation's own choice first. Then whatever it is already fixed to,
+     * which is the whole guarantee: a relaunch, a resume from the launcher and
+     * the recovery banner's restart are continuations, and a continuation must
+     * not be re-modelled by a standing choice or a profile that changed
+     * somewhere else since. A branch arrives here already pinned to its source's
+     * model, so it opens on the model its carried history was measured against.
+     *
+     * Only a conversation with no pin at all reaches a default: the account's
+     * standing choice if it has never chatted, and otherwise — a record written
+     * before pins existed — the profile, exactly as before #135.
+     *
+     * `pinned === undefined` is "nothing recorded"; a recorded `null` is the
+     * answer "it launched with no flag", and it has to outrank the profile or a
+     * profile configured mid-conversation would retcon a conversation that had
+     * deliberately run bare. That is why this is not a chain of `||`.
+     */
+    const pinned = session.chatModelPinned;
+    const launchModel =
+      session.chatModelOverride
+      || (pinned !== undefined
+        ? pinned || undefined
+        : seedFromAccount
+          ? modelDefault.model || undefined
+          : profile?.model)
+      || undefined;
+
     try {
       const chat = await manager.start(session, {
         runtime: agentKind,
         workingDir: session.workingDir,
-        // Conversation-scoped override first, then — only for a conversation
-        // that has never chatted — this account's standing choice, then the
-        // profile. See modelDefaultFor for why the account beats the profile.
-        model:
-          session.chatModelOverride
-          || (seedFromAccount ? modelDefault.model ?? undefined : profile?.model),
+        model: launchModel,
         // No profile fallback behind it: profiles are server-wide and keyed by
         // runtime, and an effort level is a per-conversation decision that has
         // never had a profile default to fall back to. Absent means the runtime
@@ -1269,6 +1301,13 @@ export class MessageProcessor {
       // Absent rather than false so the whole stack has one representation of
       // "asks first" and a manual relaunch cannot read as a recorded choice.
       session.chatBypassPermissions = chat.bypassing ? true : undefined;
+      // And what it launched on, for the same reason and on the same terms: the
+      // answer has to survive the process that is about to hold it. After the
+      // launch, so a model that never actually started does not become the one
+      // this conversation is fixed to. `null` rather than absent when there was
+      // no flag — "the runtime's own default" is an answer, and it is the one a
+      // profile added later must not be allowed to overwrite.
+      session.chatModelPinned = launchModel ?? null;
 
       // Before the broadcast, so the socket that asked for the launch is
       // already a watcher when the very first event goes out.
@@ -1288,6 +1327,13 @@ export class MessageProcessor {
           capabilities: chat.currentCapabilities,
           bypassPermissions: chat.bypassing,
           modelOverride: session.chatModelOverride || null,
+          // What this conversation is actually running on, when nothing the user
+          // chose and nothing the runtime says can answer that. On claude the
+          // runtime never reports a model at all, so without this the chip has
+          // only the *default* to fall back on — and a default is not a fact
+          // about this conversation, which is how the chip came to name a
+          // standing choice that had never been applied to it (#135).
+          modelPinned: launchModel ?? null,
           // What a new conversation on this runtime would open on, so the
           // picker can say where the model came from instead of leaving a
           // profile-pinned default indistinguishable from no default at all.
@@ -1340,6 +1386,14 @@ export class MessageProcessor {
         sessionId,
         snapshot,
         modelOverride: session.chatModelOverride || null,
+        // The model this conversation is fixed to, from the record rather than
+        // from the process: a reload is exactly the case where the runtime has
+        // reported nothing to this browser yet, and it is the case in which the
+        // chip used to fall through to a default it was never launched on.
+        // `undefined` — a conversation that has not launched since pins existed
+        // — goes out as null, so the client reads it as "unsaid" and degrades to
+        // the wording that shipped before rather than asserting a model.
+        modelPinned: session.chatModelPinned ?? null,
         // Re-sent on every join, because it is the only thing on the wire that
         // can tell the picker why a model is in force. Resolved through the
         // read-only profile accessor — see the dep — since a join must not
@@ -1517,6 +1571,14 @@ export class MessageProcessor {
     const raw = typeof data.model === 'string' ? data.model.trim() : '';
     const model = raw ? normaliseModelName(raw) : undefined;
     session.chatModelOverride = model;
+    // Clearing drops the pin as well, and that is what makes "Use the default
+    // for this runtime" mean what it says: the pin is the model this
+    // conversation happened to be launched on, so leaving it would make the
+    // clear fall back to that instead of to the profile and then the runtime's
+    // own default. Unlike the seeding above, this is the user asking, in this
+    // conversation, for the defaults to decide again — the one case where
+    // re-reading them is not a retcon.
+    if (!model) session.chatModelPinned = undefined;
     await this.deps.saveSessionsToDisk();
 
     // A live session keeps the options it was launched with so that `/clear`
