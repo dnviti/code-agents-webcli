@@ -98,8 +98,21 @@ export interface ChatSessionDeps {
    */
   onLifecycle?: (
     sessionId: string,
-    change: { nativeSessionId?: string | null; exited?: boolean },
+    change: { nativeSessionId?: string | null; exited?: boolean; bypassing?: boolean },
   ) => void;
+  /**
+   * The approval mode a conversation started from inside this one should run in.
+   *
+   * `/clear` and the composer's New chat button end a conversation and begin
+   * another, and a conversation that is beginning takes the owner's preference
+   * — the same rule the launcher goes through. Asked here rather than replayed
+   * out of the previous launch's options, which is what used to carry one
+   * conversation's bypass into every later one in the same tab (#134).
+   *
+   * Optional: absent means nothing could be asked, and the restart asks for
+   * approvals, in line with every other unreadable answer in this rule.
+   */
+  resolveBypass?: () => boolean;
   /**
    * Where finished work is filed.
    *
@@ -257,6 +270,22 @@ export class ChatNotRunningError extends Error {
     super('this chat session is not running');
     this.name = 'ChatNotRunningError';
   }
+}
+
+/**
+ * The approval mode of a conversation, in one phrase, for the line drawn at the
+ * top of it.
+ *
+ * A runtime with no approval channel is named rather than glossed over. pi's
+ * chat adapter publishes `permissions: false` — no approval channel exists in
+ * its CLI — so its tools run unattended whichever mode the rule computed, and
+ * printing "you are asked before each tool call" over one of its conversations
+ * would be this app claiming a boundary that is not there.
+ */
+function approvalNoticeDetail(bypassing: boolean, canAsk: boolean): string {
+  if (bypassing) return 'bypassed — tools run without asking';
+  if (!canAsk) return 'this runtime cannot ask — tools run without asking';
+  return 'on — you are asked before each tool call';
 }
 
 /** Thrown by `send` when the line is already as long as it may get. */
@@ -739,6 +768,42 @@ export class ChatSession {
       this.capabilities = { ...this.capabilities, questions: true };
       this.ingest({ t: 'capabilities', capabilities: { questions: true } });
     }
+
+    // Which approval mode this conversation is running in, said in the
+    // conversation itself.
+    //
+    // The mode is decided at the moment a conversation begins, out of a
+    // preference that lives in Settings and may well have changed since the
+    // last one — so a conversation that comes up bypassing, or that no longer
+    // does, must not do it in silence (#134). Only when one is beginning: a
+    // resume returns to a transcript that already carries the line from the day
+    // it started, and repeating it on every relaunch would be noise.
+    //
+    // After the adapter has started, so the phrase can be honest about what
+    // this runtime can actually enforce rather than about what was asked for.
+    if (!options.resumeSessionId) {
+      this.ingest({
+        t: 'marker',
+        kind: 'approvals',
+        detail: approvalNoticeDetail(
+          this.bypass,
+          // Whether anything can actually stop a tool call in this session:
+          // claude asks through the PreToolUse hook rather than through the
+          // adapter protocol, so its `permissions` capability is false while it
+          // asks perfectly well. Reading that flag alone would print "this
+          // runtime cannot ask" over every claude conversation.
+          wantsHook || this.capabilities?.permissions === true,
+        ),
+        // And the same fact structurally, because the phrase is for the reader
+        // and this is for the pane. A conversation that begins from *inside*
+        // itself — the composer's New chat, `/clear` — never touches the launch
+        // path, so `chat_started` is not broadcast and this marker is the only
+        // thing that reaches the browser with the mode the restart re-decided
+        // (#134).
+        bypassing: this.bypass,
+      });
+    }
+
     this.setState('idle');
   }
 
@@ -1748,7 +1813,19 @@ export class ChatSession {
       // The record hears it too, but from inside `start`, once the log this
       // one lived in has actually been dropped (#43).
       this.nativeSessionId = null;
-      await this.start({ ...options, resumeSessionId: undefined, startFresh: true });
+      // The mode is re-decided rather than replayed. A conversation started
+      // from inside this one is a conversation that is *beginning*, so it takes
+      // the owner's preference exactly as the launcher's would — which is what
+      // makes the composer's New chat and the recovery notice's Start a new
+      // chat land in the same place. Replaying `options.bypassPermissions` is
+      // what used to carry one conversation's standing permission into every
+      // later one in the tab, whatever the preference had since been set to.
+      await this.start({
+        ...options,
+        bypassPermissions: this.deps.resolveBypass?.() === true,
+        resumeSessionId: undefined,
+        startFresh: true,
+      });
     } catch (error: unknown) {
       // Nothing replaced the conversation that was stopped. `start()` has
       // already written the failure into the transcript and moved the state to
@@ -1765,7 +1842,12 @@ export class ChatSession {
     // keeps the tab a running tab: without it the session lists report a
     // conversation that is answering as finished, and the next launch in this
     // tab is refused because a process it no longer has is still claimed.
-    this.deps.onLifecycle?.(this.ref.id, { exited: false });
+    //
+    // And the mode with it, because this restart may well have changed it: left
+    // out, a conversation cleared down to asking would still be *recorded* as
+    // bypassing, and the next resume would hand it back a permission it no
+    // longer had.
+    this.deps.onLifecycle?.(this.ref.id, { exited: false, bypassing: this.bypass });
   }
 
   async interrupt(): Promise<void> {

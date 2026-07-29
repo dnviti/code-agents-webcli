@@ -13,6 +13,7 @@ import { HistoryStoreLike } from '../services/history-store.js';
 import { ScrollbackRecorder } from '../services/scrollback.js';
 import { sendToWebSocket, broadcastChat, broadcastToSession } from './handler.js';
 import { chatUnavailableReason, isChatRuntime } from '../../shared/chat-runtimes.js';
+import { UserPreferences, resolveApprovalMode } from '../../shared/user-preferences.js';
 import { ChatNotRunningError } from '../chat/session.js';
 
 /**
@@ -84,6 +85,15 @@ export interface MessageProcessorDeps {
     extraArgs?: string[];
     env?: Record<string, string>;
   } | null;
+  /**
+   * The owner's standing preferences, for the one decision that reads them: the
+   * approval mode a conversation begins in.
+   *
+   * Optional so a server — or a test — built without it keeps working; absent
+   * means no preference could be read, which the rule treats as "ask", the same
+   * as every other unreadable answer.
+   */
+  getUserPreferences?(userId: number): UserPreferences;
   transcriptStore: TranscriptStoreLike;
   historyStore: HistoryStoreLike;
   /**
@@ -1038,10 +1048,13 @@ export class MessageProcessor {
       return;
     }
 
-    // Only the bypass flag is taken from the browser. Everything else that
-    // shapes the launch — model, arguments, environment — comes from the
-    // server-side profile below, for the same reason it does on the terminal
-    // path: the client must not be able to forge a launch configuration.
+    // Nothing that shapes the launch is taken from the browser any more. Model,
+    // arguments and environment come from the server-side profile below, for the
+    // same reason they do on the terminal path — a client must not be able to
+    // forge a launch configuration — and since #134 the approval mode comes from
+    // the owner's stored preference rather than from a flag the page sends. The
+    // one thing still honoured from the browser is a `false`, because narrowing
+    // is safe from anywhere.
     //
     // Two ways to relaunch a chat whose process is gone, and the difference is
     // the whole point of the choice the user is offered: resume hands the agent
@@ -1052,23 +1065,25 @@ export class MessageProcessor {
     // Only when the browser said so: see ChatSessionStartOptions.startFresh.
     const startFresh = options.resume === false;
 
-    // Absent means "whatever this conversation was already running in", which is
-    // what makes a relaunch or a resume from the launcher come back in the mode
-    // the user left it in instead of quietly dropping to manual. The fallback
-    // reads the record — this conversation's own, already checked to belong to
-    // this user — so it can restore a mode but never widen or borrow one.
+    // The rule, and it is decided by the route rather than by what happens to be
+    // on the record: only `resume: true` continues a conversation, and every
+    // other way in — a first launch, a branch, a start-over — begins one. A
+    // conversation that is beginning takes the owner's preference; one that is
+    // continuing replays its own recorded grant and re-reads nothing.
     //
-    // Not for a fresh start, though: that deliberately leaves the conversation
-    // behind, and a bypass is a standing permission granted to the conversation
-    // that asked for it rather than to the session it was held in. Inheriting it
-    // would let one choice carry into every later conversation in the same tab,
-    // which is the one direction it must not travel. The browser can still ask
-    // for a bypass outright, and the header states whichever mode is in force.
-    const requestedBypass = options.dangerouslySkipPermissions;
-    const bypassPermissions =
-      typeof requestedBypass === 'boolean'
-        ? requestedBypass
-        : !startFresh && session.chatBypassPermissions === true;
+    // Keying on the record instead ("has this ever been granted anything?") is
+    // the trap: every launched conversation carries a grant, so *Start a new
+    // chat* would inherit the bypass of the conversation it had just abandoned.
+    //
+    // The preference is read for the record's owner, which is also the socket's
+    // user — the ownership check above refuses anything else — so one account's
+    // preference can never decide another's conversation.
+    const bypassPermissions = resolveApprovalMode({
+      beginning: options.resume !== true,
+      granted: session.chatBypassPermissions,
+      preference: this.deps.getUserPreferences?.(session.ownerUserId).chatBypassPermissions,
+      explicit: options.dangerouslySkipPermissions === false ? false : undefined,
+    });
 
     const profile = this.deps.resolveRuntimeProfile(
       agentKind as AgentKind,
@@ -1121,9 +1136,12 @@ export class MessageProcessor {
       // the launch rather than before it, so a bypass that never actually ran
       // does not become the standing answer for the next attempt — persisting a
       // permission has to follow from a conversation that really started in it.
-      // Absent rather than false so the whole stack has one representation of
-      // "asks first" and a manual relaunch cannot read as a recorded choice.
-      session.chatBypassPermissions = chat.bypassing ? true : undefined;
+      //
+      // A real boolean either way, never `undefined`: "this conversation was
+      // granted approvals" is a decision the record has to be able to hold, or
+      // a preference switched on afterwards would silently widen a conversation
+      // that had already chosen to ask.
+      session.chatBypassPermissions = chat.bypassing === true;
 
       // Before the broadcast, so the socket that asked for the launch is
       // already a watcher when the very first event goes out.

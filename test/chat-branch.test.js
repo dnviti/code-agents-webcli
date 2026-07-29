@@ -8,6 +8,7 @@ const path = require('path');
 const { ChatStore } = require('../dist/server/chat/store.js');
 const { ChatSession } = require('../dist/server/chat/session.js');
 const { createSessionRoutes } = require('../dist/server/routes/sessions.js');
+const { MessageProcessor } = require('../dist/server/websocket/messages.js');
 
 // Issue #34 asked for copy-a-turn and branch-from-a-turn together. Copy
 // shipped; branch was announced in the changelog and never built — the hooks
@@ -19,6 +20,69 @@ const { createSessionRoutes } = require('../dist/server/routes/sessions.js');
 // there is no route to call.
 
 const USER = { id: 7, githubLogin: 'dev' };
+
+/**
+ * A message processor over these records, with the chat process faked.
+ *
+ * Only used to launch a branch the route has really created: the approval mode
+ * is decided at the launch, so a test that stops at the record proves nothing
+ * about what the user gets.
+ */
+function launcherFor(sessions, sessionId, preference) {
+  const chatManager = {
+    calls: { start: [] },
+    has: () => false,
+    async start(record, options) {
+      chatManager.calls.start.push({ record, options });
+      return {
+        runtimeKind: options.runtime,
+        currentCapabilities: {},
+        bypassing: Boolean(options.bypassPermissions),
+      };
+    },
+    async snapshot() { return { sessionId, runtime: 'claude', messages: [] }; },
+    async stop() {},
+  };
+
+  const processor = new MessageProcessor({
+    dev: false,
+    claudeSessions: sessions,
+    webSocketConnections: new Map([['ws-1', {
+      id: 'ws-1',
+      ws: { readyState: 1, send() {} },
+      userId: USER.id,
+      githubLogin: USER.githubLogin,
+      claudeSessionId: sessionId,
+      chatSessionIds: new Set([sessionId]),
+      created: new Date(),
+    }]]),
+    baseFolder: '/projects',
+    sessionDurationHours: 5,
+    aliases: { claude: 'Claude' },
+    validatePath: () => ({ valid: true, path: '/projects' }),
+    getSelectedWorkingDir: () => null,
+    createSessionRecord: (params) => chatRecord(params.id, params.name, params.workingDir),
+    getRuntimeBridge: () => null,
+    saveSessionsToDisk: async () => {},
+    resolveRuntimeProfile: () => null,
+    getUserPreferences: () => ({ chatBypassPermissions: preference === true }),
+    transcriptStore: {
+      appendOutput() {},
+      ensureTranscript: async () => {},
+      readTranscriptChunks: async () => [],
+    },
+    historyStore: {
+      append() {},
+      stat: async () => ({ firstLine: 0, totalLines: 0 }),
+      read: async () => ({ fromLine: 0, lines: [], firstLine: 0, totalLines: 0 }),
+    },
+    chatManager,
+    usageReader: {},
+    usageAnalytics: {},
+  });
+
+  return { processor, chatManager };
+}
 
 /**
  * A conversation with `turns` turns, each with a tool call and an answer.
@@ -318,6 +382,39 @@ describe('branching a conversation from one of its turns', function () {
       'a standing permission belongs to the conversation that granted it',
     );
     assert.ok(saves > 0, 'and the new record is persisted');
+  });
+
+  // What the record holds is only half of it. A branch used to *always* ask,
+  // whatever the source was doing and whatever the preference said, because
+  // nothing consulted the preference at the launch either (#134). Proved here at
+  // the launch rather than at the record, because that is where the mode is
+  // decided and where the user meets it.
+  it('opens in the mode the preference names, whichever the source was in', async function () {
+    await record('source', conversation({ turns: 2 }), 'Refactoring the parser');
+    sessions.get('source').chatBypassPermissions = true;
+
+    const made = await branch('source', 'turn-1');
+    const branched = sessions.get(made.body.sessionId);
+
+    // The launch the browser sends for a branch: it names no mode at all, and
+    // deliberately no resume either — see mount.tsx's openBranch.
+    const asking = launcherFor(sessions, branched.id, false);
+    await asking.processor.startChat('ws-1', 'claude', {}, branched.id);
+    assert.strictEqual(
+      asking.chatManager.calls.start[0].options.bypassPermissions,
+      false,
+      'the source conversation’s bypass must not travel with a branch',
+    );
+
+    branched.active = false;
+    branched.chatBypassPermissions = undefined;
+    const bypassing = launcherFor(sessions, branched.id, true);
+    await bypassing.processor.startChat('ws-1', 'claude', {}, branched.id);
+    assert.strictEqual(
+      bypassing.chatManager.calls.start[0].options.bypassPermissions,
+      true,
+      'a branch is a conversation beginning, so the preference reaches it',
+    );
   });
 
   it('closes a turn the source never finished, so the branch’s own first ask opens one', async function () {

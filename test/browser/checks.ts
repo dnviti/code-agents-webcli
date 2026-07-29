@@ -346,6 +346,7 @@ async function run(): Promise<void> {
   await checkAnExpandedReasoningRowIsNeverEmpty();
   await checkAWaitingConversationIsVisibleWithoutOpeningIt();
   await checkEveryConversationCanBeFoundAndReopened();
+  await checkAConversationSaysWhichApprovalModeItIsIn();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -6086,6 +6087,294 @@ async function checkAReadOnlyFileStaysReadOnly(): Promise<void> {
  * Rendered rather than asserted on props: what matters is that it is on screen
  * over a live conversation and that pressing it sends the same command.
  */
+/**
+ * A conversation says which approval mode it is in, where the user is looking.
+ *
+ * Here rather than in a unit test because the whole complaint in #134 is that
+ * the mode was decided invisibly. "The component was passed the right value" is
+ * not the claim — the claim is that a person sitting in front of the pane can
+ * read it, so this measures the rendered line and the two recovery buttons: on
+ * screen, not transparent, and set in type big enough to be read.
+ *
+ * The two buttons are the heart of it. They sat side by side doing opposite
+ * things about approvals with nothing on screen saying which was which, so the
+ * check asserts they say different things and that each says the right one.
+ */
+async function checkAConversationSaysWhichApprovalModeItIsIn(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('browser-check', { send: () => {} } as never);
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check',
+      runtime: 'claude',
+      state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: false, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: false,
+      },
+      messages: [],
+      pendingPermissions: [],
+      queued: [],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 0,
+      live: true,
+      bypassPermissions: true,
+    },
+  } as never);
+
+  // The line the server draws at the top of a conversation that is beginning,
+  // in the words ChatSession emits — see approvalNoticeDetail.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: {
+      t: 'marker',
+      kind: 'approvals',
+      seq: 1,
+      ts: 1,
+      detail: 'bypassed — tools run without asking',
+      bypassing: true,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  const paint = (preference: boolean): void => {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/tmp/project',
+        approvalPreference: preference,
+        view: DEFAULT_CHAT_VIEW,
+        onViewChange: () => {},
+      } as never),
+    );
+  };
+  paint(false);
+  await wait(250);
+
+  const notice = Array.from(host.querySelectorAll<HTMLElement>('[role="separator"]')).find((node) =>
+    /tool approvals/i.test(node.textContent || ''),
+  );
+  check('a conversation states its approval mode in the conversation', Boolean(notice));
+  if (notice) {
+    check(
+      'and the statement is on screen rather than merely present',
+      isPainted(notice),
+      `${Math.round(notice.getBoundingClientRect().width)}x${Math.round(notice.getBoundingClientRect().height)}`,
+    );
+    const size = parseFloat(window.getComputedStyle(notice).fontSize) || 0;
+    check(
+      'and it is set in type that can be read',
+      size >= 11 - 0.01,
+      `${size}px`,
+    );
+    check(
+      'and it says which mode, not just that there is one',
+      /bypassed/.test(notice.textContent || ''),
+      (notice.textContent || '').trim(),
+    );
+  }
+
+  const chipNamed = (label: string): HTMLElement | null =>
+    host.querySelector<HTMLElement>(`[aria-label="${label}"]`);
+
+  check(
+    'the chip beside the input box says the same thing as the line',
+    Boolean(chipNamed('Approvals bypassed')) && !chipNamed('Approvals asked for'),
+  );
+
+  // And now a `/clear`, which starts the conversation over in whatever mode the
+  // account's preference names — here, back to asking.
+  //
+  // This is the interval the whole feature turns on. A restart from inside a
+  // conversation never goes through the launch path, so no `chat_started` and
+  // no snapshot arrive: the opening line of the replacement conversation is the
+  // only thing that reaches the browser with the new mode. Measured on the
+  // persistent indicators rather than on that line, because a one-off sentence
+  // scrolling up the transcript while the chip beside the input box still reads
+  // "Approvals asked for" over an agent running unattended — or the reverse —
+  // is exactly the standing false claim #134 exists to remove.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: { t: 'marker', kind: 'cleared', seq: 2, ts: 2, detail: 'started a new conversation' },
+  } as never);
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: {
+      t: 'marker',
+      kind: 'approvals',
+      seq: 3,
+      ts: 3,
+      detail: 'on — you are asked before each tool call',
+      bypassing: false,
+    },
+  } as never);
+  paint(false);
+  await wait(250);
+
+  check(
+    'a clear that changes the mode moves the chip with it',
+    Boolean(chipNamed('Approvals asked for')) && !chipNamed('Approvals bypassed'),
+    chipNamed('Approvals bypassed') ? 'still claiming bypassed' : 'asks first',
+  );
+
+  // Back the other way, so the chip is following the marker rather than simply
+  // decaying to the safe answer once anything at all arrives.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: { t: 'marker', kind: 'cleared', seq: 4, ts: 4, detail: 'started a new conversation' },
+  } as never);
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: {
+      t: 'marker',
+      kind: 'approvals',
+      seq: 5,
+      ts: 5,
+      detail: 'bypassed — tools run without asking',
+      bypassing: true,
+    },
+  } as never);
+  paint(false);
+  await wait(250);
+
+  check(
+    'and a clear that turns the bypass back on moves it back',
+    Boolean(chipNamed('Approvals bypassed')) && !chipNamed('Approvals asked for'),
+    chipNamed('Approvals asked for') ? 'still claiming it asks' : 'bypassed',
+  );
+
+  // Now the conversation's process goes away, which is the recovery notice the
+  // issue was reported against.
+  controller.handle({
+    type: 'chat_unavailable',
+    sessionId: 'browser-check',
+    runtime: 'claude',
+    runtimeLabel: 'Claude Code',
+    canResume: true,
+    message: 'this chat session is not running',
+  } as never);
+  paint(false);
+  await wait(250);
+
+  const buttonNamed = (needle: RegExp): HTMLButtonElement | undefined =>
+    Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find((node) =>
+      needle.test(node.textContent || ''),
+    );
+
+  const resume = buttonNamed(/Resume this conversation/);
+  const fresh = buttonNamed(/Start a new chat/);
+  check('both ways back are offered', Boolean(resume) && Boolean(fresh));
+  if (resume && fresh) {
+    check(
+      'resuming says it brings the conversation back bypassing',
+      /approvals bypassed/.test(resume.textContent || ''),
+      (resume.textContent || '').trim(),
+    );
+    check(
+      'starting over says it will ask, which is the other answer',
+      /asks first/.test(fresh.textContent || ''),
+      (fresh.textContent || '').trim(),
+    );
+    for (const [label, node] of [['resume', resume], ['start over', fresh]] as const) {
+      check(
+        `the ${label} button is on screen and pressable`,
+        isPainted(node) && !node.disabled && node.tabIndex >= 0,
+        `${Math.round(node.getBoundingClientRect().width)}x${Math.round(node.getBoundingClientRect().height)} disabled=${node.disabled} tabIndex=${node.tabIndex}`,
+      );
+      const size = parseFloat(window.getComputedStyle(node).fontSize) || 0;
+      check(`the ${label} button’s label is legible`, size >= 12 - 0.01, `${size}px`);
+    }
+  }
+
+  // And with the preference the other way round, the two swap over — which is
+  // what proves the labels are the rule and not two hard-coded strings.
+  paint(true);
+  await wait(200);
+  const resumeAgain = buttonNamed(/Resume this conversation/);
+  const freshAgain = buttonNamed(/Start a new chat/);
+  check(
+    'the preference decides what starting over says, not the conversation',
+    /approvals bypassed/.test(freshAgain?.textContent || ''),
+    (freshAgain?.textContent || '').trim(),
+  );
+  check(
+    'while resuming still reports the conversation’s own mode',
+    /approvals bypassed/.test(resumeAgain?.textContent || ''),
+    (resumeAgain?.textContent || '').trim(),
+  );
+
+  // The one screen where starting over is the *only* route back, and the reason
+  // the sentence under the notice exists at all: with no Resume beside it there
+  // is nothing to compare the button's label against. Nothing recorded which
+  // conversation the agent was having, so `canResume` is false.
+  //
+  // Measured at a phone's width rather than the 900px above, because a sentence
+  // appended to a paragraph in a narrow column is exactly the thing that clips
+  // or overflows, and a string match on the markup would pass over either.
+  host.style.width = '390px';
+  controller.handle({
+    type: 'chat_unavailable',
+    sessionId: 'browser-check',
+    runtime: 'claude',
+    runtimeLabel: 'Claude Code',
+    canResume: false,
+    message: 'this chat session is not running',
+  } as never);
+  paint(true);
+  await wait(250);
+
+  const only = buttonNamed(/Start a new chat/);
+  check(
+    'starting over is the only button when the conversation cannot be resumed',
+    Boolean(only) && !buttonNamed(/Resume this conversation/),
+  );
+  const said = Array.from(host.querySelectorAll<HTMLElement>('p')).find((node) =>
+    /A new conversation runs with/.test(node.textContent || ''),
+  );
+  check('states the mode even when starting over is the only button', Boolean(said));
+  if (said) {
+    const box = said.getBoundingClientRect();
+    check(
+      'and the sentence is painted rather than merely present',
+      isPainted(said),
+      `${Math.round(box.width)}x${Math.round(box.height)}`,
+    );
+    const size = parseFloat(window.getComputedStyle(said).fontSize) || 0;
+    check('and it is set in type that can be read on a phone', size >= 12 - 0.01, `${size}px`);
+    // Not clipped and not off to one side: `overflow: hidden` on an ancestor
+    // and a paragraph wider than the column both read as "present" to a string
+    // match, and both mean the user never sees the mode they are about to get.
+    const column = host.getBoundingClientRect();
+    check(
+      'and it fits the column it is in rather than running off the side',
+      box.left >= column.left - 0.5 && box.right <= column.right + 0.5,
+      `notice ${Math.round(box.left)}–${Math.round(box.right)} in ${Math.round(column.left)}–${Math.round(column.right)}`,
+    );
+    check(
+      'and it names the mode the preference will give it',
+      /approvals bypassed/.test(said.textContent || ''),
+      (said.textContent || '').replace(/\s+/g, ' ').trim().slice(-80),
+    );
+  }
+
+  root.unmount();
+  host.remove();
+}
+
 async function checkANewConversationCanBeStartedFromTheComposer(): Promise<void> {
   const host = document.createElement('div');
   host.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;display:flex';

@@ -364,6 +364,22 @@ export class ChatController {
           this.turnIndexComplete = true;
           this.requestTurnIndex();
         }
+        // A conversation that begins states the mode it begins in, and this is
+        // the only place that statement reaches a pane whose conversation was
+        // restarted from inside itself. `chat_started` is broadcast from the
+        // launch path only; `/clear` re-decides the mode against the account's
+        // preference and never goes near it, so without this the chip beside
+        // the composer and the header badge would go on naming the mode of the
+        // conversation the clear replaced — "asks first" over an agent now
+        // running unattended, until the tab was reloaded (#134).
+        //
+        // Live events only. Replayed history reaches the transcript through
+        // `hydrate` and `chat_page`, neither of which comes through here, so an
+        // old conversation's opening line cannot overwrite the current mode.
+        if (event && event.t === 'marker' && event.kind === 'approvals') {
+          this.transcript.setBypassing(event.bypassing === true);
+          this.options.onChange?.();
+        }
         return true;
       }
 
@@ -797,13 +813,33 @@ export class ChatController {
     this.options.send({ ...message, sessionId: this.sessionId });
   }
 
+  /**
+   * Show the mode a list row already knew, before this pane has heard anything.
+   *
+   * Display only — see ChatTranscript.seedBypass. Never echoed back in a
+   * launch: the browser does not assert approval modes, it reports them.
+   */
+  seedBypass(bypassing: boolean): void {
+    this.transcript.seedBypass(bypassing);
+    this.options.onChange?.();
+  }
+
   /** Release timers, e.g. when the session's tab is closed. */
   dispose(): void {
     this.cancelSeek();
     this.settlePage();
   }
 
-  /** Drop everything, e.g. when the session is being restarted. */
+  /**
+   * Drop everything, e.g. when the session is being restarted.
+   *
+   * Nothing in the client calls this today — the registry drops a closed tab
+   * through `drop()` -> `dispose()`, and a restart in place keeps the pane. It
+   * is kept correct rather than deleted because it is the one entry point that
+   * would wipe a live pane, but nothing here is load-bearing for any user-facing
+   * guarantee: what a restarted conversation shows is decided by the mode its
+   * opening `approvals` marker carries (see `chat_event` above), not by this.
+   */
   reset(): void {
     this.cancelSeek();
     this.settlePage();
@@ -834,10 +870,13 @@ export class ChatController {
       replayFrom: 0,
       cursor: 0,
       live: false,
-      // Not a claim about the session: this is a wipe, and the next snapshot or
-      // `chat_started` carries the real mode. Manual is the direction to be
-      // wrong in for the moment in between.
-      bypassPermissions: false,
+      // Carried across the wipe rather than asserted as manual. The next
+      // snapshot or `chat_started` still has the last word, but until it lands
+      // the honest answer is the one the server last stated — and dropping a
+      // known bypass to "asks first" for that interval is the one direction of
+      // wrongness that matters, a user relaxing because the badge says the
+      // agent will stop and ask (#134).
+      bypassPermissions: this.transcript.bypassing,
     });
     this.options.onChange?.();
   }

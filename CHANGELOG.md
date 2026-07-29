@@ -3,6 +3,61 @@
 ## [Unreleased]
 
 ### Fixed
+- **The Web chat approvals switch now reaches every way of starting a
+  conversation, and holds for you rather than for the browser you set it in**
+  (#134). It reached exactly one: the chat button on the runtime launcher.
+  Everything else ignored it. A branch cut from a turn always asked. *Start a
+  new chat* on the recovery notice after a server restart always asked — and
+  when nothing had recorded which conversation the agent was having, that button
+  was the only one offered, so those conversations had no route back to the mode
+  you had chosen at all. Meanwhile **New chat** inside a live conversation did
+  the opposite: it carried the old conversation's bypass forward even if you had
+  since switched the preference back to asking. Two actions with nearly the same
+  name doing opposite things, with nothing on screen saying which you had got.
+
+  There is one rule now, and it is decided by *how you got there* rather than by
+  what happens to be on the record. A conversation that is **beginning** takes
+  your preference: the launcher, a branch, starting over after a restart, and
+  `/clear` are all beginnings. A conversation that is **continuing** — resumed
+  from the launcher, opened from the conversations list, or picked back up with
+  *Resume this conversation* — comes back in the mode it was already running in,
+  and the preference is not re-read in either direction. Turning the preference
+  on later cannot widen a conversation that had already chosen to ask; turning
+  it off cannot take the mode away from one that is running without prompts.
+  Anything missing or unreadable means ask.
+
+  The mode is stated where you are looking. Every conversation opens with a line
+  saying which mode it is in, including the one that replaces it after a
+  `/clear`, and the two buttons on the recovery notice each name the mode they
+  land in — so a bypass is never restored, or dropped, in silence. The chip
+  beside the input box and the header badge move with that line rather than
+  going on naming the mode of the conversation the `/clear` replaced, which is
+  the difference between reading the mode once and being able to check it.
+
+  The preference has moved off the browser and onto your account. It is stored
+  on the server, arrives with the page, and is the same answer on your phone as
+  on your desktop. One consequence of that move: **a preference set before this
+  release does not carry over.** It had never been attached to an account, only
+  to a browser profile, and quietly turning approvals off for an account on the
+  strength of a value one device happened to be holding is not a thing to do
+  with a standing permission. Set it once more and it follows you.
+
+  A chat launch no longer carries an approval flag from the page at all. The
+  button reports what the server is going to do instead of asking for it, which
+  removes the one place in this feature where a page could have asked for a
+  permission the account had never been granted. An explicit *narrowing* from
+  the browser is still honoured, because asking more often is always safe.
+
+  A conversation also shows its real mode from its first paint now, rather than
+  claiming it asks first until the server answers — the session list already
+  knew, and the tab simply was not told.
+
+  Two things deliberately left alone. The terminal surface's own **No prompts**
+  button is a per-launch choice on a different surface and is not covered by
+  this preference. And **pi** is named rather than papered over: its chat
+  adapter has no approval channel, so a pi conversation runs its tools without
+  asking whichever mode the rule works out — its opening line says so instead of
+  promising prompts that were never going to come.
 - **On a phone the message is the largest text in the conversation again**
   (#92). It had become the smallest. Everything around it — the turn header, the
   tool and reasoning summary, the model and token line, the timestamps — was
