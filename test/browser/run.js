@@ -67,6 +67,79 @@ if (!fs.existsSync(path.join(dir, '..', '..', 'dist', 'public', 'css', 'componen
     path.join(dir, 'workflow-failed-events.json'),
     JSON.stringify(replay('claude-workflow-failed.jsonl')),
   );
+  // The same run with everything the runtime said *about the run* left out,
+  // which is what a runtime going quiet looks like (#139): the call is opened
+  // and never mentioned again, and the turn ends anyway.
+  //
+  // Its own artefact rather than a filter applied in the browser, because the
+  // reducer stores a `block_start`'s block by reference and writes into it — so
+  // by the time a later check filtered the shared import, an earlier one had
+  // already left its own results on those objects.
+  fs.writeFileSync(
+    path.join(dir, 'workflow-quiet-events.json'),
+    JSON.stringify(
+      replay('claude-workflow.jsonl').filter(
+        (event) => !['agent_progress', 'agent_step', 'workflow_progress', 'tool'].includes(event.t),
+      ),
+    ),
+  );
+}
+
+// A real Oh My Pi conversation, at the level the browser receives it (#132).
+//
+// Already a ChatEvent log — these are the app's own recordings, not a runtime's
+// wire format — so there is no adapter to replay it through: parsed and handed
+// straight over. Five steps whose whole reply was a space, and the one that
+// finally said something.
+fs.writeFileSync(
+  path.join(dir, 'empty-rows-events.json'),
+  JSON.stringify(
+    fs
+      .readFileSync(path.join(dir, '..', 'fixtures', 'chat', 'omp-empty-rows.jsonl'), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line)),
+  ),
+);
+
+// One turn of a real Oh My Pi conversation, in the form the browser receives it
+// (#129).
+//
+// Generated for the same reason as the two above: the claim is "one prompt
+// draws one bubble", and a hand-written event stream would only prove that the
+// component agrees with whoever wrote it. This drives the real ACP adapter with
+// a real `send()` — which is where the second copy of the prompt used to come
+// from — and hands the browser exactly what a browser would have got.
+{
+  const { AcpChatAdapter } = require('../../dist/server/chat/adapters/acp.js');
+  const events = [];
+  const adapter = new AcpChatAdapter({
+    sessionId: 'browser-check',
+    workingDir: '/tmp',
+    command: '/nonexistent',
+    runtime: 'omp',
+    acpArgs: ['acp'],
+    emit: (event) => events.push(event),
+  });
+  adapter.writeLine = () => {};
+  const lines = fs
+    .readFileSync(path.join(dir, '..', 'fixtures', 'chat', 'acp-omp.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  adapter.handshake();
+  for (const line of lines.slice(0, 2)) adapter.handleMessage(line);
+  // The handshake settles on a microtask and this file is synchronous, so the
+  // one thing it would have left behind is put there by hand — read off the
+  // same line of the same capture the handshake reads it from. Without it
+  // `send` bails on "no ACP session" and writes nothing, which would leave this
+  // check quietly passing against the very code it exists to catch.
+  adapter.nativeSessionId = lines[1].result.sessionId;
+  // Synchronous as far as the transcript is concerned: the RPC is fired with
+  // `.then`, so everything this writes has been written by the time it returns.
+  adapter.send({ text: 'What is the magic word?' });
+  for (const line of lines.slice(2)) adapter.handleMessage(line);
+  fs.writeFileSync(path.join(dir, 'omp-turn-events.json'), JSON.stringify(events));
 }
 
 // The esbuild `bin` entry is a native executable, not a script: use the API.

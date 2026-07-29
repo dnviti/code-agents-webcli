@@ -30,10 +30,13 @@ import {
   TextBlock,
   ThinkingBlock,
   ToolBlock,
+  ToolStatus,
+  isSessionMintedMessageId,
   mergeUsage,
 } from './chat-events.js';
 import { turnOutcomeOf } from './turn-outcome.js';
 import { openTurnAfter } from './turn-boundaries.js';
+import { TERMINAL_TOOL as TERMINAL_STATUS, isWorkflowLaunch } from './agent-activity.js';
 
 export interface TranscriptState {
   messages: ChatMessage[];
@@ -383,6 +386,80 @@ function locateAgentRun(
   return [messageIndex, block.agent];
 }
 
+
+/** The statuses that mean a call is over, whatever happened to it. */
+const SETTLED_TOOL: ReadonlySet<ToolStatus> = new Set<ToolStatus>([
+  'completed',
+  'failed',
+  'denied',
+  'canceled',
+  'unknown',
+]);
+
+/**
+ * Calls left open inside a turn that has ended, settled honestly (#139).
+ *
+ * Nothing in this pipeline ever closed a tool block on a turn-level event. The
+ * runtimes routinely stop reporting on a call before the turn is over — an ACP
+ * agent that backgrounds a task never sends a terminal update at all, and
+ * Claude ends a turn with an unresolved block whenever a tool errors during
+ * execution — so a delegation would spin as "running" for ever, on its row, in
+ * its badge, on the trace rail and in the panel's running count, beside a
+ * conversation that had plainly finished and a trace showing no activity at
+ * all. `unknown` is the honest word: nobody stopped it and nothing is known to
+ * have broken; the runtime simply went quiet and its turn is over.
+ *
+ * One exemption, and it is the whole reason this is not a blunt sweep. A run
+ * that is still reporting about *itself* — a background workflow, whose own
+ * report says it is running — outlives the turn that started it by design.
+ * Those are left alone here and settle when they say so. `force` removes the
+ * exemption, for the one case where nothing can report again: the runtime is
+ * gone.
+ */
+function settleUnreportedTools(state: TranscriptState, turnId: string | null, force: boolean): boolean {
+  if (!turnId) return false;
+  let touched = false;
+  for (const message of state.messages) {
+    if (message.turnId !== turnId) continue;
+    for (const block of message.blocks) {
+      if (block.kind !== 'tool') continue;
+      if (SETTLED_TOOL.has(block.status)) continue;
+      const runStatus = block.agent?.status;
+      if (!force && runStatus !== undefined && !SETTLED_TOOL.has(runStatus)) continue;
+      block.status = 'unknown';
+      touched = true;
+    }
+  }
+  return touched;
+}
+
+/**
+ * A workflow left running when the app stopped being able to watch it.
+ *
+ * The runtime has exited, or errored fatally. A background workflow outlives
+ * the turn that started it by design, and it may well outlive the process that
+ * launched it too — but this app has no way of hearing how it ended any more,
+ * and a spinner that never stops is a worse answer than an honest one. So the
+ * call is settled as cancelled and says, in its own words, that it is our
+ * observation that ended, not necessarily the run (#116).
+ *
+ * Only workflows. An ordinary tool call left open by a dead runtime is a
+ * different question with a different answer, and changing it is out of scope.
+ */
+function settleUnobservableWorkflows(state: TranscriptState): void {
+  for (const located of Object.values(state.toolIndex)) {
+    const [messageIndex, blockIndex] = located;
+    const block = state.messages[messageIndex]?.blocks[blockIndex];
+    if (!block || block.kind !== 'tool') continue;
+    if (TERMINAL_STATUS.has(block.status)) continue;
+    if (!isWorkflowLaunch(block.name, block.agent?.workflow !== undefined)) continue;
+    block.status = 'canceled';
+    block.error =
+      block.error
+      ?? 'The app stopped watching before this run reported an ending, so how it finished is not known.';
+  }
+}
+
 /**
  * Apply one event.
  *
@@ -423,6 +500,35 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
     case 'msg_start': {
       // Idempotent: a replayed start must not fork the message in two.
       if (messageFor(state, event.id) !== null) {
+        return NO_CHANGE;
+      }
+      // A prompt the runtime handed back, in a conversation recorded before the
+      // adapters stopped doing it (#129).
+      //
+      // Every ACP runtime and both codex modes used to write the user's message
+      // into the transcript a second time, under a turn id of their own, right
+      // after the session had written it — one prompt, two identical bubbles.
+      // The adapters no longer do it and the session now refuses it, but the
+      // logs already on disk still hold both, and they are replayed through
+      // this reducer every time one of those conversations is opened. Drawing
+      // them is not something a migration should have to fix.
+      //
+      // The test is what the echo *is*, not what it looks like: only
+      // `ChatSession.deliver` ever writes a user message in this app, and it
+      // always mints `user-<uuid>`. So a message claiming to be the user, with
+      // an id nothing in this app would have minted, arriving inside a turn
+      // that already carries the user's own — that is a runtime repeating the
+      // prompt. A real second prompt cannot be caught by it: a real one comes
+      // from `deliver`, and is therefore session-minted. `steer` is excluded
+      // because a steer is also `deliver`'s and shares the open turn on purpose.
+      if (
+        event.role === 'user'
+        && !event.steer
+        && state.currentTurnId
+        && event.turnId !== state.currentTurnId
+        && !isSessionMintedMessageId(event.id)
+        && state.messages.some((m) => m.turnId === state.currentTurnId && m.role === 'user')
+      ) {
         return NO_CHANGE;
       }
       // Everything said while a turn is open belongs to that turn, whatever id
@@ -577,7 +683,16 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       const [messageIndex, blockIndex] = located;
       const block = state.messages[messageIndex]?.blocks[blockIndex];
       if (!block || block.kind !== 'tool') return NO_CHANGE;
+      // A completion that arrives after the turn ended still lands: the whole
+      // point of settling a call as `unknown` is that it is the answer until a
+      // better one turns up. What must not land is a patch that puts it back to
+      // running — a progress report from a runtime that has already gone quiet
+      // once would restart a spinner nothing will ever stop (#139).
+      const reopens =
+        block.status === 'unknown'
+        && (event.patch.status === undefined || !SETTLED_TOOL.has(event.patch.status));
       Object.assign(block, event.patch);
+      if (reopens) block.status = 'unknown';
       return { messageIndex, structural: false, meta: false, applied: true };
     }
 
@@ -761,7 +876,16 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // open, the next thing the user typed would be folded into a turn whose
       // process is gone — the mirror of the `turn_end` case, and the same rule
       // the accountant applies when it closes a job on an exit (#86).
+      const wasOpen = state.currentTurnId;
       state.currentTurnId = openTurnAfter(event, state.currentTurnId);
+      if (event.state === 'exited' || event.state === 'error') {
+        // Workflows first: a run left watching nothing gets its own honest
+        // ending (#116), and only then is the rest of the dead turn swept —
+        // nothing can report once the child is gone, so the exemption for a
+        // run still reporting about itself does not apply here (#139).
+        settleUnobservableWorkflows(state);
+        settleUnreportedTools(state, wasOpen, true);
+      }
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
@@ -895,6 +1019,11 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
             message.turnOutcome = outcome;
           }
         }
+        // And the calls inside it that never reported an ending (#139). Inside
+        // `!event.stale` on purpose: an interrupt-to-redirect acknowledges the
+        // half it abandoned and the turn is still running, so nothing in it has
+        // stopped reporting yet.
+        settleUnreportedTools(state, ended, false);
         state.currentTurnId = null;
       }
       if (event.usage) {

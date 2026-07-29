@@ -132,6 +132,58 @@ describe('acp chat adapter', function () {
   });
 
   describe('streaming messages', function () {
+    it('never opens a reply for a chunk that is only whitespace (#132)', async function () {
+      // Oh My Pi sends one of these beside the tool activity on almost every
+      // step. Recorded as content it made the step "a step that said something"
+      // and earned it the bordered row #46 exists to remove — a model name, a
+      // clock, a work counter, and nothing to read. Driven on a real capture:
+      // the blank chunks are in the recording, not in this file.
+      const h = harness({ readFile: async () => 'The magic word is BANANAPHONE.\n' });
+      await feed(h, await boot(h, fixture('acp-kimi-tools')));
+
+      const blanks = only(h.events, 'block_start').filter(
+        (event) => event.block.kind === 'text' && !event.block.text.trim(),
+      );
+      assert.deepStrictEqual(
+        blanks.map((event) => JSON.stringify(event.block.text)),
+        [],
+        'a blank reply is not a reply and must not be written down as one',
+      );
+      // The real answer is untouched.
+      const texts = only(h.events, 'block_start')
+        .filter((event) => event.block.kind === 'text')
+        .map((event) => event.block.text);
+      assert.ok(texts.length > 0, 'the agent did answer, and that answer is still recorded');
+    });
+
+    it('still keeps the space between two words (#132)', async function () {
+      // The regression the obvious version of the fix causes: a chunk that is
+      // only a space, arriving *inside* an open reply, is the space between two
+      // words. Dropping those records "Helloworld".
+      const h = harness();
+      await boot(h, fixture('acp-omp'));
+      h.events.length = 0;
+      for (const text of ['Hello', ' ', 'world']) {
+        h.adapter.handleMessage({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'x',
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+          },
+        });
+        await flush();
+      }
+      const opened = only(h.events, 'block_start').filter((event) => event.block.kind === 'text');
+      const deltas = only(h.events, 'block_delta').map((event) => event.text);
+      assert.strictEqual(opened.length, 1, 'one reply, opened once');
+      assert.strictEqual(
+        opened[0].block.text + deltas.join(''),
+        'Hello world',
+        'the space between the words survives',
+      );
+    });
+
     it('folds thought chunks into one thinking block and starts a new message on a new id', async function () {
       const h = harness({ readFile: async () => 'The magic word is BANANAPHONE.\n' });
       await feed(h, await boot(h, fixture('acp-omp')));
@@ -178,21 +230,40 @@ describe('acp chat adapter', function () {
       assert.strictEqual(answer + rest, 'BANANAPHONE');
     });
 
-    it('writes the user turn into the transcript itself', async function () {
+    it('leaves the user’s own turn to the session, and writes none of its own (#129)', async function () {
+      // It used to write one, on top of the one `ChatSession.deliver` had
+      // already written — one prompt, two identical bubbles in the same turn.
+      // `deliver` is the only place that knows what the user actually typed: a
+      // branched conversation hands this adapter the carried briefing glued in
+      // front of the prompt, and a steer arrives with a flag this side never
+      // sees. So the adapter's job here is the prompt on the wire, and nothing
+      // in the transcript.
       const h = harness();
       await boot(h, fixture('acp-omp'));
       h.events.length = 0;
 
-      await h.adapter.send({ text: 'hello there' });
-
-      const start = only(h.events, 'msg_start')[0];
-      assert.strictEqual(start.role, 'user');
-      assert.deepStrictEqual(only(h.events, 'block_start')[0].block, {
-        kind: 'text',
+      await h.adapter.send({
         text: 'hello there',
+        attachments: [{ url: '/files/a.png', path: '/tmp/a.png', mime: 'image/png', name: 'a.png', size: 1 }],
       });
+
+      assert.deepStrictEqual(
+        only(h.events, 'msg_start').filter((event) => event.role === 'user'),
+        [],
+        'the adapter must not open a user message of its own',
+      );
+      assert.deepStrictEqual(
+        only(h.events, 'block_start').filter((event) => JSON.stringify(event.block).includes('hello there')),
+        [],
+        'nor write the prompt into the transcript a second time',
+      );
+
+      // What it does still do, all of it.
       const prompt = h.sent.find((message) => message.method === 'session/prompt');
-      assert.deepStrictEqual(prompt.params.prompt, [{ type: 'text', text: 'hello there' }]);
+      assert.deepStrictEqual(prompt.params.prompt, [
+        { type: 'text', text: 'hello there' },
+        { type: 'resource_link', uri: 'file:///tmp/a.png', name: 'a.png', mimeType: 'image/png' },
+      ], 'the prompt and its attachments still reach the agent');
       assert.strictEqual(only(h.events, 'state')[0].state, 'thinking');
     });
   });
@@ -499,11 +570,19 @@ describe('acp chat adapter', function () {
       // that says the conversation actually reads correctly at the far end.
       const h = harness({ readFile: async () => 'The magic word is BANANAPHONE.\n' });
       const rest = await boot(h, fixture('acp-omp'));
+      // The user's message as the session writes it, because the session writes
+      // it and the adapter no longer does (#129). Folding the capture without
+      // it would be folding half a conversation.
+      const asked = [
+        { t: 'msg_start', id: `user-${'0'.repeat(8)}-0000-0000-0000-${'0'.repeat(12)}`, role: 'user', turnId: 'turn-1' },
+        { t: 'block_start', msgId: `user-${'0'.repeat(8)}-0000-0000-0000-${'0'.repeat(12)}`, index: 0, block: { kind: 'text', text: 'What is the magic word?' } },
+        { t: 'msg_end', msgId: `user-${'0'.repeat(8)}-0000-0000-0000-${'0'.repeat(12)}` },
+      ];
       await h.adapter.send({ text: 'What is the magic word?' });
       await feed(h, rest);
 
       const state = createTranscript(only(h.events, 'session')[0].capabilities);
-      h.events.forEach((event, index) => applyChatEvent(state, { ...event, seq: index + 1 }));
+      [...asked, ...h.events].forEach((event, index) => applyChatEvent(state, { ...event, seq: index + 1 }));
 
       assert.deepStrictEqual(
         state.messages.map((message) => message.role),
