@@ -104,6 +104,30 @@ Deliberately — convert it, or set the phone's camera to "Most Compatible".
 The proxy is not forwarding WebSocket upgrades. See
 [reverse proxies](running-as-a-service.md#behind-a-reverse-proxy).
 
+**A file opens in the plainer editor, with "the full editor could not be
+loaded".**
+The code editor is a separate chunk fetched the first time you open a file, and
+either its script or its stylesheet did not arrive — a restart under an open
+page, or a moment with no route to the server. Opening a file again fetches it
+again. The editor you get meanwhile is the app's own: it highlights, edits and
+saves, it is simply plainer. It is offered deliberately in preference to the
+full editor without its stylesheet, which would draw the file in the wrong
+order rather than say anything was wrong.
+**A turn is marked failed and the work looks fine.**
+The badge says how the turn *ended*, not whether anything inside it went wrong.
+A search with no matches, a test run that reported failures or a command that
+came back non-zero leaves the turn marked done, and the step itself stays marked
+failed where the step is shown. Red means the turn did not finish: the agent
+stopped on an error it could not get past, the runtime went away mid-turn, or it
+ended with no answer. A turn you interrupted yourself reads as done.
+
+**A typed-ahead message says "Not sent".**
+It is still there, with its text, on the row above the composer — press **Try
+again**, or the ✕ to discard it. The rest of the line waits behind it on
+purpose: those messages were typed expecting this one to have been asked first.
+Messages are only ever taken out of the queue once the agent has really been
+handed them, so a message shown in the conversation was genuinely sent.
+
 **A session came back "ended" after a restart.**
 Expected. The record, history and transcript persist; the live process does not.
 

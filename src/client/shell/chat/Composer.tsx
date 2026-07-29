@@ -3,18 +3,21 @@ import {
   ChatAttachment,
   ChatCapabilities,
   ChatUsage,
+  EffortChoice,
   ModelChoice,
   QueuedTurn,
   SlashCommand,
 } from '../../../shared/chat-events.js';
 import { compactCount } from '../../chat/tool-meta.js';
 import { mentionAtCaret } from '../../../shared/file-match.js';
+import { tokenTotal } from '../../../shared/usage-records.js';
 import { classifyPaste, MAX_IMAGES_PER_PASTE, PasteCandidate } from '../../../shared/paste-classify.js';
 import { MAX_IMAGE_BYTES } from '../../terminal/paste.js';
 import { detectMobile } from '../../ui/mobile.js';
 import { PHONE_TEXT, PhoneContext, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { showNotification } from '../../ui/notifications.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { Button } from '../../ui/relay/Button.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
 import { Kbd } from '../../ui/relay/Kbd.js';
 
@@ -49,6 +52,16 @@ export interface ComposerProps {
   /** Turns already accepted and waiting their place in line. */
   queued?: QueuedTurn[];
   onCancelQueued?: (id: string) => void;
+  /** Try a queued turn that could not be handed over again (#89). */
+  onRetryQueued?: (id: string) => void;
+  /**
+   * Deliver one waiting turn now, ahead of the turn in flight.
+   *
+   * Absent when there is nothing to interrupt — a session that has ended, or an
+   * agent already working through the line — so the row does not offer a
+   * control that would do nothing to press.
+   */
+  onSendQueuedNow?: (id: string) => void;
   /**
    * Rank the working tree against what was typed after `@`.
    *
@@ -81,6 +94,15 @@ export interface ComposerProps {
    */
   model?: string;
   /**
+   * Every model the last turn was billed to, when it was more than one.
+   *
+   * A subagent on another model, or a fallback after a failure. The chip shows
+   * the count rather than the names — one line cannot hold three model ids —
+   * and the full list is on the hover title, where it is a record rather than
+   * a guess at which one mattered.
+   */
+  alsoRan?: string[];
+  /**
    * Change this conversation's model, independent of the runtime's own
    * default. Always available — see ModelChip — regardless of whether the
    * runtime advertises a model list or a live switch.
@@ -88,8 +110,37 @@ export interface ComposerProps {
   onSetModel?: (model: string) => void;
   /** What the server reported about the last `onSetModel` call, for the chip. */
   modelFeedback?: { applied: 'live' | 'sent' | 'pending' | 'cleared'; message: string } | null;
+  /**
+   * The reasoning-effort level this conversation is running at.
+   *
+   * Distinct from `capabilities.efforts`, which is the ladder — and distinct in
+   * a way that matters more here than it does for the model, because a level's
+   * whole meaning is its position on that ladder. `high` names the top of grok's
+   * and the middle of pi's.
+   */
+  effort?: string;
+  /**
+   * Change how hard the agent thinks. Unlike the model this is only offered
+   * where the runtime published a ladder to choose from; see EffortChip.
+   */
+  onSetEffort?: (effort: string) => void;
+  /** What the server reported about the last `onSetEffort` call, for the chip. */
+  effortFeedback?: {
+    applied: 'live' | 'sent' | 'pending' | 'cleared' | 'refused';
+    message: string;
+  } | null;
   /** Drives what the permission chip reports. */
   bypassPermissions?: boolean;
+  /**
+   * Start a new conversation in this tab, the same thing typing `/clear` does.
+   *
+   * Absent means no control: a surface that cannot clear must not offer a
+   * button that does nothing. Present, it is offered while the conversation is
+   * healthy — which is the whole point of it, the recovery banner having been
+   * the only place this choice lived and appearing only once the session was
+   * already broken.
+   */
+  onNewChat?: () => void;
   /** Changes what the hint row says about who owns Return. */
   terminalOpen?: boolean;
 }
@@ -162,6 +213,8 @@ export function Composer({
   onDraftChange,
   queued = [],
   onCancelQueued,
+  onSendQueuedNow,
+  onRetryQueued,
   onFindFiles,
   seedKey = 0,
   seedDraft = '',
@@ -169,10 +222,15 @@ export function Composer({
   turnLabel,
   usage,
   model,
+  alsoRan,
   onSetModel,
   modelFeedback,
+  effort,
+  onSetEffort,
+  effortFeedback,
   bypassPermissions = false,
   terminalOpen = false,
+  onNewChat,
 }: ComposerProps) {
   const baseId = React.useId();
   const listboxId = `${baseId}-picker`;
@@ -669,20 +727,12 @@ export function Composer({
       {dragActive ? <DropVeil /> : null}
 
       {queued.length > 0 ? (
-        <div
-          role="list"
-          aria-label="Messages waiting to be sent"
-          style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-1)' }}
-        >
-          {queued.map((turn, index) => (
-            <QueuedChip
-              key={turn.id}
-              turn={turn}
-              position={index + 1}
-              onCancel={onCancelQueued ? () => onCancelQueued(turn.id) : undefined}
-            />
-          ))}
-        </div>
+        <QueuedList
+          queued={queued}
+          onCancelQueued={onCancelQueued}
+          onSendQueuedNow={onSendQueuedNow}
+          onRetryQueued={onRetryQueued}
+        />
       ) : null}
 
       {entries.length > 0 ? (
@@ -848,6 +898,28 @@ export function Composer({
           </ChipButton>
         ) : null}
 
+        {/* Not gated on `busy`: clearing mid-answer is allowed and acts at
+            once — the process the turn is running in is the one being replaced,
+            so waiting for it to finish would only postpone the same
+            interruption. Gated on `disabled` like the rest of the row, because
+            a session with nothing running it has the recovery offer instead,
+            which is where starting again belongs when it is a recovery.
+
+            No confirmation. The typed command does not ask either, and the
+            conversation is not deleted by this — the log keeps it for history,
+            search and export. A dialog in front of something done many times a
+            day costs more than the press it guards. */}
+        {onNewChat && (!isMobile || toolsOpen) ? (
+          <ChipButton
+            label="Start a new conversation — this one is kept, the agent forgets it"
+            text="New chat"
+            onClick={onNewChat}
+            disabled={disabled}
+          >
+            <Icon name="message-square" size={isMobile ? 16 : 12} />
+          </ChipButton>
+        ) : null}
+
         {/* `display: contents` on a phone: the right-hand group stops being a
             group at all and its controls join the row above, so they wrap into
             whatever space is left instead of starting a line of their own —
@@ -880,9 +952,22 @@ export function Composer({
             <>
               <ModelChip
                 current={model}
+                alsoRan={alsoRan}
                 models={capabilities.models}
                 feedback={modelFeedback}
                 onPick={(value) => onSetModel?.(value)}
+              />
+
+              {/* Next to the model because they are the same kind of decision
+                  — which brain, and how hard it works — and because this one
+                  removes itself entirely when the runtime publishes no ladder,
+                  so the row does not gain a permanent gap for a control that
+                  half the runtimes cannot offer. */}
+              <EffortChip
+                current={effort}
+                efforts={capabilities.efforts}
+                feedback={effortFeedback}
+                onPick={(value) => onSetEffort?.(value)}
               />
 
               <PermissionChip bypassPermissions={bypassPermissions} />
@@ -1053,12 +1138,13 @@ function sessionReadout(turnLabel: string | undefined, usage: ChatUsage | undefi
   const bits: string[] = [];
   if (turnLabel) bits.push(turnLabel);
   if (usage) {
-    const total = usage.totalTokens
-      ?? [usage.inputTokens, usage.outputTokens].reduce<number | undefined>(
-        (sum, value) => (value === undefined ? sum : (sum ?? 0) + value),
-        undefined,
-      );
-    if (total !== undefined) bits.push(`${compactCount(total)} tok`);
+    // `tokenTotal`, not a sum of its own: this used to add the input to the
+    // output and stop there, which on a runtime that reports no total of its
+    // own — Claude — left out the cache buckets, most of the bill. So the
+    // session line, the meter above it and the historical record were three
+    // different answers about one conversation (#80).
+    const total = tokenTotal(usage);
+    if (total !== null) bits.push(`${compactCount(total)} tok`);
     if (usage.costUsd !== undefined) bits.push(`$${usage.costUsd.toFixed(4)}`);
   }
   return bits.join(' · ');
@@ -1193,12 +1279,15 @@ function Chip({
  */
 function ModelChip({
   current,
+  alsoRan,
   models,
   onPick,
   feedback,
 }: {
   /** What the session reported it is running, when it reported anything. */
   current: string | undefined;
+  /** Every model the last turn ran on, when the runtime reported more than one. */
+  alsoRan?: string[];
   models: ModelChoice[] | undefined;
   onPick: (value: string) => void;
   /** What the server said happened to the last pick made here. */
@@ -1212,7 +1301,11 @@ function ModelChip({
   // The session's own model wins. `models` is a menu in whatever order the
   // runtime listed it, and its first entry is the current one only by accident.
   const matched = models?.find((m) => m.value === current || m.name === current);
-  const label = matched?.name ?? current ?? 'model';
+  const named = matched?.name ?? current ?? 'model';
+  // The others are counted, not named: three model ids do not fit on a chip,
+  // and picking one of them to show would undo the point of reporting a split.
+  const others = (alsoRan ?? []).filter((model) => model !== current);
+  const label = others.length > 0 ? `${named} +${others.length}` : named;
 
   React.useEffect(() => {
     if (!open) return;
@@ -1237,6 +1330,26 @@ function ModelChip({
     onPick(value);
   };
 
+  /**
+   * The list, narrowed by what has been typed.
+   *
+   * The same field does both jobs. A runtime that publishes hundreds of models
+   * — pi lists 277 — turns an unfiltered menu into a scroll nobody reads, and
+   * adding a second input beside a box already labelled "type a model name"
+   * would be two ways to say the same thing. Typing narrows; `Use` still sends
+   * whatever was typed, so a model the runtime did not list stays reachable
+   * even when it matches nothing.
+   */
+  const query = customValue.trim().toLowerCase();
+  const shown = query
+    ? (models ?? []).filter(
+        (choice) =>
+          choice.value.toLowerCase().includes(query)
+          || choice.name.toLowerCase().includes(query)
+          || (choice.description ?? '').toLowerCase().includes(query),
+      )
+    : models ?? [];
+
   const submitCustom = (): void => {
     const value = customValue.trim();
     if (!value) return;
@@ -1259,7 +1372,12 @@ function ModelChip({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label="Change model"
-        title={feedback?.message || `Model: ${label}`}
+        title={
+          feedback?.message
+          || (others.length > 0
+            ? `This turn ran on: ${[named, ...others].join(', ')}`
+            : `Model: ${label}`)
+        }
         onClick={() => setOpen((value) => !value)}
         style={{
           display: 'inline-flex',
@@ -1317,7 +1435,7 @@ function ModelChip({
                   submitCustom();
                 }
               }}
-              placeholder="Type any model name…"
+              placeholder={models?.length ? 'Filter, or type any model name…' : 'Type any model name…'}
               aria-label="Custom model name"
               style={{
                 flex: 1,
@@ -1356,7 +1474,7 @@ function ModelChip({
             </button>
           </div>
 
-          {(models ?? []).map((choice) => (
+          {shown.map((choice) => (
             <button
               key={choice.value}
               type="button"
@@ -1396,6 +1514,18 @@ function ModelChip({
               }}
             >
               This runtime hasn&apos;t listed models — type one above.
+            </div>
+          ) : null}
+
+          {models?.length && shown.length === 0 ? (
+            <div
+              style={{
+                padding: '4px 8px 2px',
+                color: 'var(--muted-foreground)',
+                fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-2xs)',
+              }}
+            >
+              No listed model matches — Use sends it anyway.
             </div>
           ) : null}
 
@@ -1455,6 +1585,387 @@ function ModelChip({
         </div>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * Where a level sits on its runtime's ladder, as a colour.
+ *
+ * The five stops are CSS custom properties (see `--effort-0..4` in relay.css),
+ * so the ramp themes itself and this only has to say where between two of them
+ * a rank falls. Interpolating rather than snapping to the nearest stop matters
+ * for the longer ladders: pi has seven levels, and rounding each to one of five
+ * colours would give two pairs of neighbours the same one — which is precisely
+ * the comparison the colour exists to make.
+ *
+ * `in oklab` because the alternative interpolates through sRGB and takes the
+ * green-to-amber leg through a muddy olive that reads as neither.
+ */
+function effortTone(rank: number): string {
+  const clamped = Math.min(1, Math.max(0, rank));
+  const position = clamped * 4;
+  const stop = Math.min(3, Math.floor(position));
+  const mix = Math.round((position - stop) * 100);
+  if (mix === 0) return `var(--effort-${stop})`;
+  return `color-mix(in oklab, var(--effort-${stop + 1}) ${mix}%, var(--effort-${stop}))`;
+}
+
+/** Bars in the little meter drawn on the chip. Four reads at 26px; five does not. */
+const EFFORT_BARS = 4;
+
+/**
+ * How hard the agent thinks, and the one place to change it.
+ *
+ * Every runtime here has a reasoning-effort knob and no two spell it the same
+ * way — claude runs low through max, kimi is off or on, codex goes as far as
+ * `ultra`, omp has an `auto` that decides per prompt. So this control offers
+ * exactly what the running runtime published and nothing else. There is no free
+ * text and no unified vocabulary: unlike a model name, a level this app invented
+ * would either be refused mid-turn or, on pi, warned about on a stderr nobody
+ * reads and then silently ignored while the chip claimed it was live.
+ *
+ * Three things say the level at once, and that redundancy is the design rather
+ * than decoration. The **text** names it. The **meter** fills in proportion to
+ * where it sits on its own runtime's ladder, which is the only honest way to
+ * compare `on` against `xhigh`. The **colour** runs from the same grey as every
+ * other chip on the row up to the loudest thing in the palette, so a glance
+ * costs nothing. Colour alone would fail a colourblind reader; the meter alone
+ * would not catch the eye; the animation — which scales with the level too —
+ * would fail anyone who has asked for less motion, and does, deliberately.
+ */
+function EffortChip({
+  current,
+  efforts,
+  onPick,
+  feedback,
+}: {
+  /** The level in force, as the record or the runtime reported it, if either did. */
+  current: string | undefined;
+  /** What this runtime says it accepts, cheapest first, or undefined if it says nothing. */
+  efforts: EffortChoice[] | undefined;
+  onPick: (value: string) => void;
+  /** What the server said happened to the last pick made here. */
+  feedback?: {
+    applied: 'live' | 'sent' | 'pending' | 'cleared' | 'refused';
+    message: string;
+  } | null;
+}): React.JSX.Element | null {
+  const [open, setOpen] = React.useState(false);
+  const ref = React.useRef<HTMLDivElement | null>(null);
+  const isPhone = usePhone();
+
+  /**
+   * Only the outcomes this control cannot say for itself (issue #119).
+   *
+   * A change that took effect needs no announcement. The chip redraws the
+   * instant it lands — the level named, metered and coloured — so a box beside
+   * it reading "Now thinking at high" spends the user's attention repeating
+   * what their eye has already reached, and on a phone, where it resolves
+   * against the composer rather than against this chip, it repeats it on top of
+   * the field they were about to type into.
+   *
+   * The other four outcomes are precisely the ones the chip gets wrong on its
+   * own, so they are still said out loud: a `refused` level was never stored
+   * and the conversation is still running at the old one; `sent` is waiting on
+   * the runtime's own word in the transcript; and `pending` and `cleared` do
+   * not reach the conversation in progress at all — `cleared` least visibly of
+   * the three, because the chip has already dropped back to the default it will
+   * not actually run at until the next session. Silently swallowing any of
+   * those would leave a change looking made that was not.
+   */
+  const notice = feedback && feedback.applied !== 'live' ? feedback : null;
+
+  /**
+   * The answer goes away on its own, after long enough to read it.
+   *
+   * It used to sit there until the conversation was reset, which made it a
+   * permanent fixture rather than a reply: two of these — this one and the model
+   * picker's, anchored at the same height — overlap into a pile of opaque boxes,
+   * and on a phone, where both resolve against the composer instead of against
+   * their own chip, they land on exactly the same coordinates and the older one
+   * is simply invisible underneath.
+   *
+   * Keyed on the message so a second answer restarts the clock rather than
+   * inheriting the remains of the first one's.
+   */
+  const [showFeedback, setShowFeedback] = React.useState(false);
+  const message = notice?.message;
+  React.useEffect(() => {
+    if (!message) return;
+    setShowFeedback(true);
+    const timer = setTimeout(() => setShowFeedback(false), 7000);
+    return () => clearTimeout(timer);
+  }, [message]);
+
+  React.useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent): void => {
+      if (!ref.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown, true);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown, true);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  // Nothing at all rather than a disabled control, and this is the one place
+  // this file departs from how the model picker behaves. A model can always be
+  // typed at a runtime and tried, so offering it is never wrong. An effort level
+  // cannot: with no published ladder there is no value that would be accepted,
+  // and a control that can only ever refuse is worse than the space it occupies
+  // — especially on a phone, where it would push Send onto its own line to do it.
+  if (!efforts?.length) return null;
+
+  const matched = efforts.find((level) => level.value === current);
+  // Only what the runtime named. An unrecognised `current` is a level from
+  // before a model switch narrowed the ladder, and calling it by its old name
+  // would attach this runtime's meter and colour to a level it no longer has.
+  const rank = matched?.rank ?? 0;
+  const label = matched?.name ?? 'effort';
+  const tone = matched ? effortTone(rank) : 'var(--muted-foreground)';
+  const filled = matched ? Math.max(1, Math.round(rank * EFFORT_BARS)) : 0;
+
+  // Both scale with the level, so the chip is still at the bottom of the ladder
+  // and unmistakable at the top. `rank === 0` gets no animation whatsoever: the
+  // least thinking on offer should look like the quietest thing on the row.
+  const pulsing = rank > 0;
+  const pulse: React.CSSProperties = pulsing
+    ? {
+        animation: `relay-effort-pulse ${(3.4 - rank * 2.1).toFixed(2)}s var(--ease-in-out) infinite`,
+        // Read by the keyframe. Kept as custom properties because a keyframe
+        // cannot see a component's props, and hand-writing five keyframes to
+        // cover five intensities would fix the ramp to whichever ladder was
+        // longest.
+        ['--effort-glow-on' as string]: `color-mix(in oklab, ${tone} ${Math.round(24 + rank * 46)}%, transparent)`,
+        ['--effort-glow-size' as string]: `${(3 + rank * 6).toFixed(1)}px`,
+      }
+    : {};
+
+  const pick = (value: string): void => {
+    setOpen(false);
+    onPick(value);
+  };
+
+  return (
+    <div style={{ position: isPhone ? 'static' : 'relative', flex: '0 0 auto' }} ref={ref}>
+      <button
+        type="button"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label="Change how hard the agent thinks"
+        title={
+          // The same rule as the box, and for the same reason: a hover that
+          // reads "Now thinking at high" would have displaced the description
+          // of what this control *does* for the rest of the conversation, in
+          // favour of a sentence the chip beneath the pointer already spells
+          // out. An outcome the chip cannot show still takes the slot, so a
+          // refusal stays findable after its box has timed out.
+          notice?.message
+          || (matched
+            ? `Effort: ${matched.name}${matched.description ? ` — ${matched.description}` : ''}`
+            : 'Effort: whatever this runtime does by default')
+        }
+        onClick={() => setOpen((value) => !value)}
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 5,
+          height: isPhone ? TOUCH_TARGET : 26,
+          padding: isPhone ? '0 10px' : '0 8px',
+          whiteSpace: 'nowrap',
+          background: open ? 'var(--accent)' : 'transparent',
+          // The border carries the colour too, at a fraction of it. The same
+          // idiom the branch and permission chips use, so a coloured chip on
+          // this row looks like the others rather than like a new species.
+          border: `1px solid ${matched ? `color-mix(in oklab, ${tone} 42%, var(--border))` : 'var(--border)'}`,
+          borderRadius: 'var(--radius)',
+          fontFamily: 'var(--font-mono)',
+          fontSize: isPhone ? PHONE_TEXT.label : 'var(--text-2xs)',
+          color: tone,
+          cursor: 'pointer',
+          ...pulse,
+        }}
+      >
+        <EffortMeter filled={filled} tone={tone} />
+        {label}
+        <Icon name="chevron-down" size={9} />
+      </button>
+
+      {open ? (
+        <div
+          role="listbox"
+          aria-label="Effort levels"
+          style={{
+            position: 'absolute',
+            right: 0,
+            left: isPhone ? 0 : undefined,
+            bottom: '100%',
+            marginBottom: 6,
+            minWidth: isPhone ? 0 : 220,
+            maxHeight: isPhone ? '50vh' : 300,
+            overflowY: 'auto',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 1,
+            padding: 'var(--space-1)',
+            background: 'var(--popover)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius)',
+            boxShadow: 'var(--shadow-popover)',
+            animation: 'relay-rise var(--duration-fast) var(--ease-out)',
+            zIndex: 'var(--z-dropdown)' as unknown as number,
+          }}
+        >
+          {efforts.map((level) => {
+            const selected = level.value === current;
+            const levelTone = effortTone(level.rank);
+            return (
+              <button
+                key={level.value}
+                type="button"
+                role="option"
+                aria-selected={selected}
+                onClick={() => pick(level.value)}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  width: '100%',
+                  minHeight: isPhone ? TOUCH_TARGET : undefined,
+                  padding: isPhone ? '8px 12px' : '5px 8px',
+                  background: selected ? 'var(--accent)' : 'transparent',
+                  border: 0,
+                  borderRadius: 'var(--radius)',
+                  color: selected ? 'var(--foreground)' : 'var(--muted-foreground)',
+                  font: 'inherit',
+                  fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
+                  textAlign: 'left',
+                  cursor: 'pointer',
+                }}
+              >
+                {/* The same meter as the chip, so the menu is a ladder you can
+                    see rather than a list of words whose order you have to
+                    take on trust. */}
+                <EffortMeter
+                  filled={Math.max(1, Math.round(level.rank * EFFORT_BARS))}
+                  tone={levelTone}
+                />
+                <span style={{ flex: 1, minWidth: 0 }}>
+                  <span style={{ color: levelTone }}>{level.name}</span>
+                  {level.description ? (
+                    <span
+                      style={{
+                        display: 'block',
+                        color: 'var(--muted-foreground)',
+                        fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
+                        whiteSpace: 'normal',
+                      }}
+                    >
+                      {level.description}
+                    </span>
+                  ) : null}
+                </span>
+                {selected ? <Icon name="check" size={11} /> : null}
+              </button>
+            );
+          })}
+
+          {/* The way back, for the same reason the model picker has one: every
+              row above names a level, so without this a conversation could be
+              moved off the runtime's own default and never returned to it. */}
+          <button
+            type="button"
+            role="option"
+            aria-selected={!matched}
+            onClick={() => pick('')}
+            style={{
+              width: '100%',
+              marginTop: 2,
+              minHeight: isPhone ? TOUCH_TARGET : undefined,
+              padding: isPhone ? '8px 12px' : '5px 8px',
+              background: 'transparent',
+              border: 0,
+              borderTop: '1px solid var(--border)',
+              borderRadius: 0,
+              color: 'var(--muted-foreground)',
+              font: 'inherit',
+              fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
+              textAlign: 'left',
+              cursor: 'pointer',
+            }}
+          >
+            Use the default for this runtime
+          </button>
+        </div>
+      ) : null}
+
+      {!open && notice && showFeedback ? (
+        <div
+          role="status"
+          style={{
+            position: 'absolute',
+            right: 0,
+            // Upward on a phone, and the reason is that `top: 100%` resolves
+            // against the composer there rather than against this chip — the
+            // wrapper is `static` so the popover can have the composer's width.
+            // Below the composer is the bottom navigation bar, which this would
+            // cover: an opaque box at `--z-dropdown` sitting on the buttons, or
+            // off the screen entirely once the safe-area inset is counted.
+            ...(isPhone ? { bottom: '100%', marginBottom: 6 } : { top: '100%', marginTop: 4 }),
+            maxWidth: 240,
+            padding: '4px 6px',
+            background: 'var(--popover)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius)',
+            // A refusal is the one outcome worth colouring: it means the level
+            // was not stored and nothing changed, which a grey note reading like
+            // every other grey note would let slide past. The rest are "saved,
+            // but not yet" — true, worth reading once, and not worth alarm.
+            color: notice.applied === 'refused' ? 'var(--warning)' : 'var(--muted-foreground)',
+            fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-2xs)',
+            zIndex: 'var(--z-dropdown)' as unknown as number,
+          }}
+        >
+          {notice.message}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The level as bars, for everyone the colour does not reach.
+ *
+ * `aria-hidden` because the level is already named in text beside it and the
+ * button carries its own label; a screen reader announcing four decorative
+ * spans would be reading out the picture of the word it just read.
+ */
+function EffortMeter({ filled, tone }: { filled: number; tone: string }): React.JSX.Element {
+  return (
+    <span
+      aria-hidden="true"
+      style={{ display: 'inline-flex', alignItems: 'flex-end', gap: 1, height: 9, flex: '0 0 auto' }}
+    >
+      {Array.from({ length: EFFORT_BARS }, (_, index) => (
+        <span
+          key={index}
+          style={{
+            width: 2,
+            // Rising bars rather than equal ones: the shape says "a scale" on
+            // its own, before the fill does, which is what makes an unfilled
+            // meter still legible as the bottom of a ladder.
+            height: 3 + index * 2,
+            background: index < filled ? tone : 'var(--border)',
+            transition: 'background var(--duration-base) var(--ease-out)',
+          }}
+        />
+      ))}
+    </span>
   );
 }
 
@@ -1777,6 +2288,138 @@ function Trailing({ children, mono }: { children: React.ReactNode; mono?: boolea
 }
 
 /**
+ * The line of messages waiting to be sent.
+ *
+ * One waiting message is drawn as it always was. Past that the list collapses
+ * to the newest message alone, with the rest behind a count — because the list
+ * grows to twenty, each row is full width, and twenty rows push the
+ * conversation off the top of the screen and, on a phone, the composer itself
+ * off the bottom. A queue you cannot see past is worse than a queue you cannot
+ * read all of at once.
+ *
+ * The newest is the one on show, not the one about to be sent: it is what you
+ * just typed and are still deciding about, and the one you are most likely to
+ * withdraw.
+ *
+ * The disclosure control lives *on that row* rather than on a line of its own,
+ * which is what keeps a collapsed queue of twenty exactly as tall as a queue of
+ * one. It stays on that row when the list is open, so it is the same mounted
+ * button either way and the keyboard does not lose its place on toggling.
+ */
+function QueuedList({
+  queued,
+  onCancelQueued,
+  onSendQueuedNow,
+  onRetryQueued,
+}: {
+  queued: QueuedTurn[];
+  onCancelQueued?: (id: string) => void;
+  onSendQueuedNow?: (id: string) => void;
+  onRetryQueued?: (id: string) => void;
+}): React.JSX.Element {
+  // Held here, above the rows, so a message arriving or leaving re-renders the
+  // list without deciding for the user whether it is open. Nothing reaches in
+  // to set it: an open list stays open as the queue grows, a closed one stays
+  // closed, and neither springs on the user mid-sentence.
+  const [open, setOpen] = React.useState(false);
+  const isPhone = usePhone();
+  const listId = React.useId();
+  const listRef = React.useRef<HTMLDivElement | null>(null);
+
+  // Opening scrolls to the end, so the list appears to grow *upwards* out of
+  // the row that was already there. Without this the box opens at the top of a
+  // queue of twenty and the newest message — the one being looked at, and the
+  // one carrying the control that closes the list again — is off the bottom of
+  // its own scrolling space with nothing saying where it went.
+  //
+  // On the open itself only: re-running it as messages arrive would yank the
+  // list back down under someone reading their way up it.
+  React.useEffect(() => {
+    if (!open) return;
+    const node = listRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [open]);
+
+  // A message that could not be handed over is never folded away (#89).
+  // Staying silent about it is the one thing the queue must not do, and a
+  // failed row hidden behind a "+3" is silence with an extra step.
+  const foldable = queued.filter(
+    (turn, index) => !turn.error && index !== queued.length - 1,
+  ).length;
+  const collapsible = foldable > 0;
+  const collapsed = collapsible && !open;
+  const hidden = foldable;
+  const rows = collapsed
+    ? queued.filter((turn, index) => Boolean(turn.error) || index === queued.length - 1)
+    : queued;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+      <div
+        id={listId}
+        ref={listRef}
+        role="list"
+        aria-label="Messages waiting to be sent"
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 'var(--space-1)',
+          // Opened, the list is bounded and scrolls inside its own space. Left
+          // to grow it would do exactly what collapsing exists to prevent —
+          // twenty rows is taller than a phone screen, so the composer and the
+          // conversation would both be gone.
+          ...(collapsible && open
+            ? { maxHeight: isPhone ? '30vh' : 260, overflowY: 'auto', overscrollBehavior: 'contain' }
+            : null),
+        }}
+      >
+        {rows.map((turn) => {
+          const position = queued.indexOf(turn) + 1;
+          return (
+            <QueuedChip
+              key={turn.id}
+              turn={turn}
+              position={position}
+              onCancel={onCancelQueued ? () => onCancelQueued(turn.id) : undefined}
+              onSendNow={onSendQueuedNow ? () => onSendQueuedNow(turn.id) : undefined}
+              onRetry={onRetryQueued ? () => onRetryQueued(turn.id) : undefined}
+              disclosure={
+                collapsible && position === queued.length
+                  ? { open, hidden, listId, onToggle: () => setOpen((was) => !was) }
+                  : undefined
+              }
+            />
+          );
+        })}
+      </div>
+      {/* The count changes as the agent works through the line and as you add
+          to it, and a number that only exists as a glyph on a button changes
+          silently. Announced politely, so it waits its turn rather than cutting
+          across what is being read. */}
+      <span role="status" aria-live="polite" style={queueCountStyle}>
+        {collapsible
+          ? collapsed
+            ? `${queued.length} messages waiting to be sent, ${hidden} hidden`
+            : `${queued.length} messages waiting to be sent, all shown`
+          : ''}
+      </span>
+    </div>
+  );
+}
+
+const queueCountStyle: React.CSSProperties = {
+  position: 'absolute',
+  width: 1,
+  height: 1,
+  padding: 0,
+  margin: -1,
+  overflow: 'hidden',
+  clip: 'rect(0 0 0 0)',
+  whiteSpace: 'nowrap',
+  border: 0,
+};
+
+/**
  * One turn waiting in line.
  *
  * A full-width row rather than a pill: the point is to be able to read what you
@@ -1787,29 +2430,101 @@ function QueuedChip({
   turn,
   position,
   onCancel,
+  onSendNow,
+  onRetry,
+  disclosure,
 }: {
   turn: QueuedTurn;
   position: number;
   onCancel?: () => void;
+  onSendNow?: () => void;
+  onRetry?: () => void;
+  disclosure?: { open: boolean; hidden: number; listId: string; onToggle: () => void };
 }): React.JSX.Element {
   const attachments = turn.attachments?.length ?? 0;
+  // One press, whatever the click count: the server settles a double click on
+  // its own — the id leaves the queue before anything is interrupted — but this
+  // saves the second round trip and stops the row flashing twice.
+  //
+  // Released again after a moment rather than latched: a promotion the server
+  // declines (it was already delivering something else) leaves this row on
+  // screen, and a control that is dead for the rest of the conversation is a
+  // worse outcome than the double click it was guarding against.
+  const [sending, setSending] = React.useState(false);
+  React.useEffect(() => {
+    if (!sending) return undefined;
+    const timer = setTimeout(() => setSending(false), 2500);
+    return () => clearTimeout(timer);
+  }, [sending]);
+  const isPhone = usePhone();
+  // A message that could not be handed over is still here, with its text, and
+  // says so where it sits — the alternative the queue used to offer was
+  // silence, which is the one thing a queue must never do (#89).
+  const failed = Boolean(turn.error);
   return (
     <div
       role="listitem"
       style={{
         display: 'flex',
         alignItems: 'center',
-        gap: 7,
+        flexWrap: 'wrap',
+        // The row carries two controls that do opposite things to the same
+        // message, and on a phone they are 44px targets side by side: below the
+        // touch floor the seam between them is invisible and "send this now"
+        // and "throw this away" become one strip.
+        gap: isPhone ? TOUCH_GAP : 7,
         minHeight: 26,
         padding: '2px 4px 2px 7px',
         background: 'var(--muted)',
-        border: '1px solid var(--border)',
+        border: `1px solid ${failed ? 'var(--destructive)' : 'var(--border)'}`,
         borderRadius: 'var(--radius)',
         color: 'var(--muted-foreground)',
         fontSize: 'var(--text-2xs)',
         animation: 'relay-chip-in var(--duration-base) var(--ease-out)',
       }}
     >
+      {disclosure ? (
+        // Not an IconButton: the count is the point, and a number is not
+        // legible inside an 18px square. Kept at the far left, as far from the
+        // control that throws the message away as the row allows.
+        <button
+          type="button"
+          onClick={disclosure.onToggle}
+          aria-expanded={disclosure.open}
+          aria-controls={disclosure.listId}
+          aria-label={
+            disclosure.open
+              ? `Hide the ${disclosure.hidden} other waiting messages`
+              : `Show ${disclosure.hidden} more waiting ${disclosure.hidden === 1 ? 'message' : 'messages'}`
+          }
+          title={
+            disclosure.open
+              ? `Hide the ${disclosure.hidden} other waiting messages`
+              : `Show ${disclosure.hidden} more waiting ${disclosure.hidden === 1 ? 'message' : 'messages'}`
+          }
+          style={{
+            flex: '0 0 auto',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 2,
+            minWidth: isPhone ? TOUCH_TARGET : 30,
+            minHeight: isPhone ? TOUCH_TARGET : 20,
+            padding: '0 4px',
+            borderRadius: 'var(--radius)',
+            border: '1px solid var(--border)',
+            background: 'transparent',
+            color: 'var(--muted-foreground)',
+            font: 'inherit',
+            fontFamily: 'var(--font-mono)',
+            fontVariantNumeric: 'tabular-nums',
+            cursor: 'pointer',
+          }}
+        >
+          <Icon name={disclosure.open ? 'chevron-down' : 'chevron-right'} size={10} />
+          {disclosure.open ? null : `+${disclosure.hidden}`}
+        </button>
+      ) : null}
       <span
         aria-hidden="true"
         style={{
@@ -1818,7 +2533,7 @@ function QueuedChip({
           fontVariantNumeric: 'tabular-nums',
         }}
       >
-        {position}
+        {failed ? <Icon name="circle-alert" size={11} /> : position}
       </span>
       <span
         style={{
@@ -1839,10 +2554,56 @@ function QueuedChip({
           {attachments}
         </span>
       ) : null}
+      {onSendNow ? (
+        // Deliberately said in full rather than "Send now": the two controls on
+        // this row do opposite things to the same message, and a screen reader
+        // moving between them has only these two labels to tell them apart.
+        <IconButton
+          type="button"
+          size="sm"
+          label={`Send queued message ${position} now, interrupting the agent`}
+          disabled={sending}
+          onClick={() => {
+            setSending(true);
+            onSendNow();
+          }}
+        >
+          <Icon name="arrow-up" size={11} />
+        </IconButton>
+      ) : null}
+      {failed && onRetry ? (
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          iconLeft={<Icon name="rotate-cw" size={11} />}
+          onClick={onRetry}
+          style={{ flex: '0 0 auto', fontSize: 'var(--text-2xs)' }}
+        >
+          Try again
+        </Button>
+      ) : null}
       {onCancel ? (
-        <IconButton type="button" size="sm" label={`Remove queued message ${position}`} onClick={onCancel}>
+        <IconButton
+          type="button"
+          size="sm"
+          label={failed ? `Discard the message that could not be sent` : `Remove queued message ${position}`}
+          onClick={onCancel}
+        >
           <Icon name="x" size={11} />
         </IconButton>
+      ) : null}
+      {failed ? (
+        // Its own line, full width: the reason is a sentence, and squeezing it
+        // beside a message that is already being ellipsised would leave
+        // neither readable. `alert` so it is announced when it appears —
+        // nobody is looking at the composer while a queue works through.
+        <span
+          role="alert"
+          style={{ flex: '1 0 100%', color: 'var(--destructive)', whiteSpace: 'normal' }}
+        >
+          Not sent: {turn.error}
+        </span>
       ) : null}
     </div>
   );

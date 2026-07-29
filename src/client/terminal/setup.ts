@@ -31,7 +31,6 @@ export function setupTerminal(app: App): void {
     const pasteTarget: ImagePasteTarget = {
       element: terminalEl,
       getSessionId: () => app.currentClaudeSessionId,
-      sendText: (text) => app.send({ type: 'input', data: text }),
       pasteText: (text) => app.terminal?.paste(text),
       isConnected: () => app.socket?.readyState === WebSocket.OPEN,
     };

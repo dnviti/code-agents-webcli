@@ -38,7 +38,7 @@ function job(overrides = {}) {
     endedAt: '2024-01-15T02:00:00.000Z',
     durationMs: 60_000,
     outcome: 'completed',
-    turns: 2,
+    modelTurns: 2,
     toolCalls: 3,
     inputTokens: 100,
     outputTokens: 50,
@@ -250,9 +250,9 @@ describe('the project a job ran in', function () {
     it('breaks the range down by project', function () {
       const rows = dashboard().byProject;
       const byKey = Object.fromEntries(rows.map((r) => [r.key, r.totals]));
-      assert.strictEqual(byKey.api.jobs, 2);
-      assert.strictEqual(byKey.web.jobs, 1);
-      assert.strictEqual(byKey[UNATTRIBUTED].jobs, 1);
+      assert.strictEqual(byKey.api.turns, 2);
+      assert.strictEqual(byKey.web.turns, 1);
+      assert.strictEqual(byKey[UNATTRIBUTED].turns, 1);
     });
 
     it('groups work with no project under a key that is not blank', function () {
@@ -265,29 +265,29 @@ describe('the project a job ran in', function () {
 
     it('adds up: the per-project totals are the overall total', function () {
       const body = dashboard();
-      const summed = body.byProject.reduce((sum, row) => sum + row.totals.jobs, 0);
+      const summed = body.byProject.reduce((sum, row) => sum + row.totals.turns, 0);
       const cost = body.byProject.reduce((sum, row) => sum + row.totals.costUsd, 0);
-      assert.strictEqual(summed, body.totals.jobs);
+      assert.strictEqual(summed, body.totals.turns);
       assert.strictEqual(Math.round(cost * 100), Math.round(body.totals.costUsd * 100));
     });
 
     it('narrows every panel to one project, not merely the breakdown', function () {
       const body = dashboard({ project: 'api' });
-      assert.strictEqual(body.totals.jobs, 2);
+      assert.strictEqual(body.totals.turns, 2);
       assert.strictEqual(body.totals.costUsd, 2);
       assert.strictEqual(body.byProject.length, 1);
       // The panels that would look right regardless, and so are the ones a
       // half-applied filter hides in.
       assert.deepStrictEqual(body.byAgent.map((r) => r.key).sort(), ['claude', 'codex']);
       assert.strictEqual(body.byUser.length, 1);
-      assert.strictEqual(body.series.reduce((n, b) => n + b.totals.jobs, 0), 2);
-      assert.strictEqual(body.effortByAgent.reduce((n, r) => n + r.jobs, 0), 2);
+      assert.strictEqual(body.series.reduce((n, b) => n + b.totals.turns, 0), 2);
+      assert.strictEqual(body.effortByAgent.reduce((n, r) => n + r.turns, 0), 2);
       assert.deepStrictEqual(body.topTools.map((t) => t.tool).sort(), ['bash', 'exec']);
     });
 
     it('narrows to the work nobody recorded a project for', function () {
       const body = dashboard({ project: UNATTRIBUTED });
-      assert.strictEqual(body.totals.jobs, 1);
+      assert.strictEqual(body.totals.turns, 1);
       assert.strictEqual(body.totals.costUsd, 0.25);
       assert.deepStrictEqual(body.topTools.map((t) => t.tool), ['read']);
     });
@@ -299,7 +299,7 @@ describe('the project a job ran in', function () {
 
     it('combines a project with another dimension rather than replacing it', function () {
       const body = dashboard({ project: 'api', agent: 'codex' });
-      assert.strictEqual(body.totals.jobs, 1);
+      assert.strictEqual(body.totals.turns, 1);
       assert.strictEqual(body.totals.costUsd, 0.5);
     });
 
@@ -310,7 +310,7 @@ describe('the project a job ran in', function () {
         { userId: installerId, scope: 'self', period: 'day', anchor: ANCHOR, tzOffsetMinutes: 0, project: 'web' },
         false,
       );
-      assert.strictEqual(body.totals.jobs, 0);
+      assert.strictEqual(body.totals.turns, 0);
     });
 
     it('offers only the projects the viewer may see in the filter menu', function () {
@@ -360,21 +360,21 @@ describe('the project a job ran in', function () {
       const body = dashboard();
       assert.strictEqual(body.bucket, 'day');
       assert.strictEqual(body.series.length, 31);
-      assert.strictEqual(body.totals.jobs, 3);
+      assert.strictEqual(body.totals.turns, 3);
     });
 
     it('re-buckets a day-wide window into hours, so a selection can be drilled again', function () {
       const body = dashboard({ from: '2024-01-15T00:00:00.000Z', to: '2024-01-16T00:00:00.000Z' });
       assert.strictEqual(body.bucket, 'hour');
       assert.strictEqual(body.series.length, 24);
-      assert.strictEqual(body.totals.jobs, 2);
+      assert.strictEqual(body.totals.turns, 2);
       assert.strictEqual(body.totals.costUsd, 3);
     });
 
     it('narrows to a single hour', function () {
       const body = dashboard({ from: '2024-01-15T09:00:00.000Z', to: '2024-01-15T10:00:00.000Z' });
       assert.strictEqual(body.series.length, 1);
-      assert.strictEqual(body.totals.jobs, 1);
+      assert.strictEqual(body.totals.turns, 1);
       assert.strictEqual(body.totals.costUsd, 2);
     });
 
@@ -383,12 +383,12 @@ describe('the project a job ran in', function () {
       // which reads correctly right up until a month boundary.
       const body = dashboard({ from: '2024-01-15T00:00:00.000Z' });
       assert.strictEqual(body.series.length, 31);
-      assert.strictEqual(body.totals.jobs, 3);
+      assert.strictEqual(body.totals.turns, 3);
     });
 
     it('ignores a window that ends before it starts', function () {
       const body = dashboard({ from: '2024-01-16T00:00:00.000Z', to: '2024-01-15T00:00:00.000Z' });
-      assert.strictEqual(body.totals.jobs, 3);
+      assert.strictEqual(body.totals.turns, 3);
     });
 
     it('reports the window it actually used, not the one it was handed', function () {
@@ -523,12 +523,12 @@ describe('the project a job ran in', function () {
         false,
       );
       const billing = body.byProject.find((r) => r.key === 'billing');
-      assert.strictEqual(billing.totals.jobs, 2);
+      assert.strictEqual(billing.totals.turns, 2);
       assert.ok(!body.byProject.some((r) => r.key === UNATTRIBUTED), 'nothing left unattributed');
       // And the whole thing still adds up.
       assert.strictEqual(
-        body.byProject.reduce((n, r) => n + r.totals.jobs, 0),
-        body.totals.jobs,
+        body.byProject.reduce((n, r) => n + r.totals.turns, 0),
+        body.totals.turns,
       );
     });
 
@@ -704,7 +704,7 @@ describe('the project a job ran in', function () {
       const body = await (
         await get('/api/usage/dashboard?period=day&anchor=2024-01-15T12:00:00.000Z&project=api')
       ).json();
-      assert.strictEqual(body.totals.jobs, 1);
+      assert.strictEqual(body.totals.turns, 1);
       assert.strictEqual(body.filters.project, 'api');
     });
 
@@ -768,7 +768,7 @@ describe('the project a job ran in', function () {
             + '&from=2024-01-15T03:00:00.000Z&to=2024-01-15T04:00:00.000Z',
         )
       ).json();
-      assert.strictEqual(body.totals.jobs, 1);
+      assert.strictEqual(body.totals.turns, 1);
       assert.strictEqual(body.totals.costUsd, 2);
     });
   });

@@ -25,12 +25,15 @@ import {
   ChatUsage,
   PermissionRequest,
   PlanItem,
+  NoticeBlock,
   QuestionRequest,
   TextBlock,
   ThinkingBlock,
   ToolBlock,
   mergeUsage,
 } from './chat-events.js';
+import { turnOutcomeOf } from './turn-outcome.js';
+import { openTurnAfter } from './turn-boundaries.js';
 
 export interface TranscriptState {
   messages: ChatMessage[];
@@ -78,6 +81,23 @@ export interface TranscriptState {
   currentTurnId: string | null;
   nativeSessionId?: string;
   model?: string;
+  /**
+   * Every model the last turn was billed to, when the runtime broke it down.
+   *
+   * Beside `model` rather than replacing it: `model` is what to call the
+   * conversation, and stays the model that answered. This is the honest
+   * remainder — a subagent on another model, a fallback — which the header
+   * shows as a count rather than pretending the turn ran on one thing.
+   */
+  turnModels?: string[];
+  /**
+   * The reasoning-effort level the runtime last said it was running.
+   *
+   * Only ever set from an `effort` event, which only ever carries something a
+   * runtime reported. Absent means nobody has said — which is not the same as
+   * "the default", and the control is careful to show the difference.
+   */
+  effort?: string;
   lastError?: string;
 }
 
@@ -143,6 +163,164 @@ function messageFor(state: TranscriptState, msgId: string): number | null {
 }
 
 /**
+ * The turn this conversation was last working on, or undefined for one that has
+ * said nothing yet. See `openTurnAfter` for what goes back to it.
+ */
+function lastTurnId(state: TranscriptState): string | undefined {
+  return state.messages[state.messages.length - 1]?.turnId;
+}
+
+/**
+ * The reply still arriving, or -1.
+ *
+ * Searched from the end rather than read off it, because the end is not always
+ * the reply: a rule drawn across the conversation is pushed there while one is
+ * still streaming. Bounded because the answer is always within a message or two
+ * of the end — a scan of an hour-long transcript on every error is not.
+ */
+function lastStreamingIndex(state: TranscriptState): number {
+  const floor = Math.max(0, state.messages.length - 8);
+  for (let i = state.messages.length - 1; i >= floor; i -= 1) {
+    if (state.messages[i].streaming) return i;
+  }
+  return -1;
+}
+
+/**
+ * Fold one event's word about the runtime into what is known so far.
+ *
+ * Split out for the same reason as the usage fold below, and with the same
+ * hazard behind it: a snapshot replays only the tail, but what a runtime can do
+ * is announced once at the head, so the server has to read this from the whole
+ * log without building a transcript. Two implementations would be two answers
+ * to "is there a command menu" for the same conversation.
+ *
+ * An introduction replaces — a process that has just started is describing
+ * itself, not adding to whatever the last one said — while a later report
+ * merges into it.
+ */
+export function foldCapabilities(
+  capabilities: ChatCapabilities,
+  event: ChatEvent,
+): ChatCapabilities {
+  if (event.t === 'session') return { ...event.capabilities };
+  if (event.t === 'capabilities') return { ...capabilities, ...event.capabilities };
+  return capabilities;
+}
+
+/**
+ * What a conversation has spent, folded one event at a time.
+ *
+ * Split out of the reducer's own cases so there is exactly one answer to it.
+ * The server needs this reading of the log *without* building a transcript —
+ * a snapshot replays only the tail, and a session's cost is a property of the
+ * whole conversation, not of the last forty messages — and two implementations
+ * of "how much has this cost" would be two numbers for the browser to show
+ * alternately, which is precisely the bug that made a live meter appear to
+ * reset on every rejoin.
+ *
+ * Returns the new running total rather than mutating the one it was given: the
+ * browser hands this object straight to the meter, which re-renders on the
+ * object changing, so folding in place would leave the number on screen stale.
+ */
+export function foldSessionUsage(usage: ChatUsage, event: ChatEvent): ChatUsage {
+  switch (event.t) {
+    // A clear ends the conversation the figures were about, so they go back to
+    // nothing along with it. Handled here rather than only in the reducer
+    // because the server folds the log without building a transcript, and the
+    // two answers to "what has this cost" have to be the same one.
+    case 'marker':
+      return event.kind === 'cleared' ? clearedUsage(usage) : usage;
+    // Per-message and per-turn reports are deltas, so they sum.
+    case 'msg_end':
+    case 'turn_end':
+      return event.usage ? mergeUsage(usage, event.usage) : usage;
+    case 'usage': {
+      // A standalone report is a running total — summing it would count the
+      // same tokens once per report — so its fields replace. Only the ones it
+      // actually carries: a runtime that reports a context window and no money
+      // (or money in a currency this cannot show) would otherwise write cost
+      // back as `undefined` and blank a figure it never spoke about.
+      const next = { ...usage };
+      assignDefined(next, event.usage);
+      // The one thing `assignDefined` has no way to express, and must not
+      // learn: a report that names no window because nobody could size the
+      // model is asking for the ceiling to come down, where every other report
+      // that leaves the field out is simply not talking about it.
+      if (event.usage.contextWindowSource === 'unknown') next.contextWindow = undefined;
+      return next;
+    }
+    default:
+      return usage;
+  }
+}
+
+/**
+ * What each rule drawn across a conversation says.
+ *
+ * A table rather than a chain of ternaries because there are four of them now
+ * and the words are the whole of what a rule communicates: a reader sees one
+ * short phrase and has to understand from it that the transcript above is no
+ * longer what the agent can see, or was said somewhere else entirely. `cleared`
+ * is here for completeness — it empties the window rather than drawing a line,
+ * and is handled before this is reached.
+ */
+const NOTICES: Record<
+  NoticeBlock['notice'],
+  { notice: NoticeBlock['notice']; text: string }
+> = {
+  compacted: { notice: 'compacted', text: 'Context compacted' },
+  interrupted: { notice: 'interrupted', text: 'Interrupted to send' },
+  branched: { notice: 'branched', text: 'Branched from an earlier conversation' },
+  cleared: { notice: 'cleared', text: 'New conversation' },
+};
+
+/** Every token field a runtime can report, so a reset covers all of them. */
+const TOKEN_FIELDS = [
+  'inputTokens',
+  'outputTokens',
+  'cacheReadTokens',
+  'cacheWriteTokens',
+  'reasoningTokens',
+  'totalTokens',
+  'contextUsed',
+] as const;
+
+/**
+ * What the meter reads after a clear: nothing spent, nothing occupied.
+ *
+ * Zeroed rather than emptied. An empty object renders no meter at all, and a
+ * header that goes blank the moment somebody clears looks like a readout that
+ * broke rather than one that reset — where zero is the true and useful answer:
+ * this conversation has spent nothing yet. Every field the runtime had been
+ * reporting is set to zero and no field it had not is invented, so a runtime
+ * that reports no money still shows no money.
+ *
+ * The context *window* survives, because it is a fact about the model rather
+ * than about the conversation — a new conversation on the same model has the
+ * same capacity, and dropping it would replace "0%" with "size unknown" for a
+ * size that is perfectly well known.
+ */
+function clearedUsage(usage: ChatUsage): ChatUsage {
+  const next: ChatUsage = {};
+  for (const field of TOKEN_FIELDS) {
+    if (usage[field] !== undefined) next[field] = 0;
+  }
+  if (usage.costUsd !== undefined) next.costUsd = 0;
+  if (usage.contextWindow !== undefined) {
+    next.contextWindow = usage.contextWindow;
+    next.contextWindowSource = usage.contextWindowSource;
+  } else if (usage.contextWindowSource === 'unknown') {
+    // And so does the absence of one, for the same reason: clearing changes
+    // the conversation, not the model, and the model nobody could size is
+    // still that model. Carried rather than dropped so a clear cannot quietly
+    // turn "we asked and nobody knew" back into "nobody has asked yet".
+    next.contextWindowSource = 'unknown';
+  }
+  return next;
+}
+
+/**
  * Merge only the keys that carry a value.
  *
  * A progress report names one thing at a time — the activity now, the tool
@@ -153,6 +331,24 @@ function messageFor(state: TranscriptState, msgId: string): number | null {
 function assignDefined<T extends object>(target: T, patch: Partial<T>): void {
   for (const [key, value] of Object.entries(patch)) {
     if (value !== undefined) (target as Record<string, unknown>)[key] = value;
+  }
+}
+
+/**
+ * Fold a reported list into the one already held, keyed by `index`.
+ *
+ * The runtime sends a complete snapshot on some reports and nothing at all on
+ * others, so an absent list leaves what is known standing rather than emptying
+ * it. Rows arrive in the order they were started and keep it: an agent that
+ * reports again is written back in place, so watching a run does not shuffle
+ * the list under the reader.
+ */
+function upsertByIndex<T extends { index: number }>(target: T[], incoming: T[] | undefined): void {
+  if (!incoming) return;
+  for (const entry of incoming) {
+    const at = target.findIndex((held) => held.index === entry.index);
+    if (at >= 0) target[at] = entry;
+    else target.push(entry);
   }
 }
 
@@ -205,14 +401,22 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
 
   switch (event.t) {
     case 'session': {
-      state.capabilities = event.capabilities;
+      state.capabilities = foldCapabilities(state.capabilities, event);
       if (event.nativeSessionId) state.nativeSessionId = event.nativeSessionId;
       if (event.model) state.model = event.model;
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
     case 'capabilities': {
-      state.capabilities = { ...state.capabilities, ...event.capabilities };
+      state.capabilities = foldCapabilities(state.capabilities, event);
+      return { messageIndex: null, structural: false, meta: true, applied: true };
+    }
+
+    case 'effort': {
+      // Cleared rather than left standing when the runtime reports null: it has
+      // gone back to its own default, and a stale level on the chip would keep
+      // claiming a choice nobody is running any more.
+      state.effort = event.effort ?? undefined;
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
@@ -221,19 +425,44 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       if (messageFor(state, event.id) !== null) {
         return NO_CHANGE;
       }
+      // Everything said while a turn is open belongs to that turn, whatever id
+      // it arrived with — the accountant's rule, word for word (#86).
+      //
+      // It has to be that strong, because **no adapter reuses the id this app
+      // minted**: the session stamps the user's message `turn-<uuid>` and the
+      // runtime answers under a name of its own (`omp-turn-3`, its own uuid),
+      // with codex and the ACP agents echoing the prompt back under that name
+      // first. Checked against every conversation on this machine: in 46 of 46,
+      // the agent's messages share no id with the request that caused them. So
+      // grouping on the id as it arrives splits every single turn in two — the
+      // ask in one, the answer in another with no prompt to name it by.
+      //
+      // A turn is open from the user's message to `turn_end`, and `turn_end`,
+      // an exit and a `/clear` are the three things that close one — and an
+      // agent that speaks again with no request in front of it goes back to the
+      // turn it was last working on rather than opening one nobody asked for.
+      // See `openTurnAfter`, which is that whole rule and is also what the
+      // server's turn index and its windowed reads apply.
+      const turnId = openTurnAfter(event, state.currentTurnId, lastTurnId(state)) as string;
+
+      // A new turn's models are not known yet, and last turn's are not this
+      // turn's: leaving them would keep a "+1" on the chip for a turn that ran
+      // on one model, which is a claim about work that has not happened.
+      if (turnId !== state.currentTurnId) state.turnModels = undefined;
       const message: ChatMessage = {
         id: event.id,
         seq: event.seq,
-        turnId: event.turnId,
+        turnId,
         role: event.role,
         ts: event.ts,
         blocks: [],
         streaming: true,
         model: event.model,
+        ...(event.steer ? { steer: true as const } : {}),
       };
       state.index[event.id] = state.messages.length;
       state.messages.push(message);
-      state.currentTurnId = event.turnId;
+      state.currentTurnId = turnId;
       return {
         messageIndex: state.messages.length - 1,
         structural: true,
@@ -282,6 +511,14 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         const tool = block as ToolBlock;
         tool.inputPartial = (tool.inputPartial || '') + event.json;
       }
+      // Additive, like the text beside it: a runtime that will not show its
+      // reasoning still counts it out loud as it goes, and the row's size
+      // figure should climb while the model is still thinking rather than
+      // appearing all at once when the block closes.
+      if (event.tokens !== undefined && block.kind === 'thinking') {
+        const thinking = block as ThinkingBlock;
+        thinking.tokens = (thinking.tokens ?? 0) + event.tokens;
+      }
       return { messageIndex: at, structural: false, meta: false, applied: true };
     }
 
@@ -318,7 +555,7 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       if (event.stopReason) message.stopReason = event.stopReason;
       if (event.usage) {
         message.usage = mergeUsage(message.usage, event.usage);
-        state.usage = mergeUsage(state.usage, event.usage);
+        state.usage = foldSessionUsage(state.usage, event);
       }
       return {
         messageIndex: at,
@@ -374,6 +611,85 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       return { messageIndex, structural: false, meta: false, applied: true };
     }
 
+    case 'workflow_progress': {
+      const found = locateAgentRun(state, event.parentToolId);
+      if (!found) return NO_CHANGE;
+      const [messageIndex, run] = found;
+      if (!run.workflow) run.workflow = { phases: [], agents: [] };
+      // Replaced by index, not merged into: each entry the runtime sends is
+      // that agent's whole current state, and a retry clears fields — the
+      // `error` of a first attempt above all — by omitting them. Merging would
+      // leave a row reading "failed" while its second attempt was working.
+      upsertByIndex(run.workflow.phases, event.phases);
+      upsertByIndex(run.workflow.agents, event.agents);
+      return { messageIndex, structural: false, meta: false, applied: true };
+    }
+
+    case 'workflow_failed': {
+      // The call that launched the run stops claiming success. Written onto the
+      // block rather than derived beside it, so every surface that reads a tool
+      // call's status — the Agents row, the popup title, the card on the trace
+      // rail — agrees without any of them having to know what a workflow is.
+      //
+      // `output` is left alone: for a workflow it holds the "launched in
+      // background" acknowledgement, and the popup tells the failure from the
+      // log by comparing the two (see `Header` in WorkflowPopup.tsx).
+      const patch: Partial<ToolBlock> = event.reason
+        ? { status: 'failed', error: event.reason }
+        : { status: 'failed' };
+      const located = state.toolIndex[event.parentToolId];
+      if (located) {
+        const block = state.messages[located[0]]?.blocks[located[1]];
+        if (block && block.kind === 'tool') Object.assign(block, patch);
+      } else {
+        // Held for a block that has not arrived, exactly as a `tool` patch is.
+        // A snapshot replays only the tail of the log, and a workflow that runs
+        // for half an hour can outlive its own launching call's place in that
+        // window — the failure would otherwise be dropped for the one runs that
+        // take longest, which are the runs this is for.
+        state.orphanToolPatches[event.parentToolId] = {
+          ...(state.orphanToolPatches[event.parentToolId] || {}),
+          ...patch,
+        };
+      }
+
+      // And the conversation says so, in a message of its own.
+      //
+      // A message of its own because of when this arrives. A workflow outlives
+      // the turn that started it — that is what launching it in the background
+      // means — so by the time it fails there is usually nothing streaming to
+      // append to, and the `error` event's own rule (see above) drops a block
+      // it cannot find a home for. That drop is the whole second half of #140:
+      // the failure reached `lastError`, the header pill, and nowhere a person
+      // scrolling the conversation would ever find it.
+      //
+      // Filed under the turn in progress, or the last one there was, exactly as
+      // a marker is: only the newest turn is open (`isTurnOpen`), so a synthetic
+      // turn of its own would fold itself shut the moment the conversation
+      // carried on. Under the last turn it is where the reader is looking — and
+      // in the case this is written for, a run that outlived its turn, that is
+      // the open one.
+      const text = event.name
+        ? `Workflow "${event.name}" failed`
+        : 'A workflow failed';
+      const message: ChatMessage = {
+        id: `workflow-failed-${event.seq}`,
+        seq: event.seq,
+        turnId: state.currentTurnId ?? lastTurnId(state) ?? `workflow-failed-${event.seq}`,
+        role: 'system',
+        ts: event.ts,
+        blocks: [{ kind: 'error', text: event.reason ? `${text}: ${event.reason}` : `${text}.` }],
+      };
+      state.messages.push(message);
+      state.index[message.id] = state.messages.length - 1;
+      return {
+        messageIndex: state.messages.length - 1,
+        structural: true,
+        meta: true,
+        applied: true,
+      };
+    }
+
     case 'plan': {
       state.plan = event.items;
       return { messageIndex: null, structural: false, meta: true, applied: true };
@@ -381,8 +697,9 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
 
     case 'usage': {
       // Runtimes that report a running total would double-count if summed, so
-      // absolute fields overwrite and only cost accumulates across turns.
-      state.usage = { ...state.usage, ...event.usage };
+      // absolute fields overwrite. See `foldSessionUsage` for why only the
+      // fields the report actually carries are written.
+      state.usage = foldSessionUsage(state.usage, event);
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
@@ -440,6 +757,11 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
 
     case 'state': {
       state.state = event.state;
+      // A runtime that died did not end its turn, and nothing else will. Left
+      // open, the next thing the user typed would be folded into a turn whose
+      // process is gone — the mirror of the `turn_end` case, and the same rule
+      // the accountant applies when it closes a job on an exit (#86).
+      state.currentTurnId = openTurnAfter(event, state.currentTurnId);
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
@@ -448,15 +770,21 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       if (event.fatal) state.state = 'error';
       // Surfaced in the transcript as well as the header: an error that only
       // lives in a status pill is an error the user scrolls past and misses.
-      const last = state.messages[state.messages.length - 1];
+      //
+      // The last message that is *streaming*, not simply the last one. A rule
+      // drawn across a conversation — a compaction, an interruption, a workflow
+      // that failed in the background (#140) — is pushed onto the end while a
+      // reply is still arriving, and answering "is the last message open?" with
+      // that rule dropped every error for the rest of the turn.
+      const openIndex = lastStreamingIndex(state);
+      const last = openIndex === -1 ? undefined : state.messages[openIndex];
       if (last && last.streaming) {
-        last.blocks.push({ kind: 'error', text: event.message });
-        return {
-          messageIndex: state.messages.length - 1,
-          structural: false,
-          meta: true,
-          applied: true,
-        };
+        // `fatal` carried through rather than flattened away: it is the
+        // difference between an error the agent read and moved past and the one
+        // it stopped on, and a turn cut short by the second never reaches a
+        // `turn_end` that could say so.
+        last.blocks.push({ kind: 'error', text: event.message, ...(event.fatal ? { fatal: true } : {}) });
+        return { messageIndex: openIndex, structural: false, meta: true, applied: true };
       }
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
@@ -470,12 +798,29 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         state.index = {};
         state.plan = [];
         state.lastError = undefined;
+        // And the figures above it go back to nothing: the tokens, the money
+        // and the context bar were all statements about the conversation that
+        // has just ended. Left running, the new conversation opens carrying the
+        // last one's bill — and a context bar reading 80% full of a window that
+        // is now empty, which is the reading somebody clears in order to fix.
+        state.usage = foldSessionUsage(state.usage, event);
+        // Including the turn that was open: `/clear` is taken the moment it is
+        // typed, mid-turn if need be, and the conversation it interrupted is
+        // gone. Anything typed after it starts a turn of its own.
+        state.currentTurnId = null;
         // The cards go with the conversation they were asked in. A question
         // card left behind would be drawn against a tool block that is no
         // longer on screen, and answering it would reach a turn that no longer
         // exists — the session resolves them at the same moment on its side.
         state.pendingQuestions = [];
         state.answeredQuestions = {};
+        // And the approvals with them, for the same reason and one more: an
+        // approval card is drawn above the composer rather than inside the
+        // conversation, so it is the one piece of the old conversation that
+        // would still be on screen — asking whether a tool may run in a
+        // process that has already been replaced. The session drops its side
+        // as it stops.
+        state.pendingPermissions = [];
         // And no paging back past it. The log still holds what was said — this
         // is a view, not a delete — but offering "load earlier messages" right
         // after someone asked for a clean window would undo the thing they
@@ -484,23 +829,35 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         return { messageIndex: null, structural: true, meta: true, applied: true };
       }
 
-      // Compaction keeps the transcript and draws a line across it. What was
-      // said still happened and is still worth scrolling back to; the marker
-      // is there because everything above it is no longer in the agent's
-      // context, and an agent that quietly forgets the first hour is a
-      // confusing one.
+      // The ones that leave a line rather than empty the window. Compaction is
+      // there because everything above it is no longer in the agent's context,
+      // and an agent that quietly forgets the first hour is a confusing one.
+      // An interruption is there because the turn above it stopped for a
+      // reason — the message immediately below — and a transcript that showed
+      // the stop without the reason would read as an agent that gave up. A
+      // branch is there because everything above it happened in another
+      // conversation, and a copied history presented as this one's own would
+      // be the same lie in the other direction.
+      const notice = NOTICES[event.kind];
       const message: ChatMessage = {
         id: `marker-${event.seq}`,
         seq: event.seq,
-        turnId: state.currentTurnId ?? `marker-${event.seq}`,
+        // The turn it was drawn in, or the one it was drawn under: a line
+        // marking what happened to the conversation is not a turn of its own,
+        // and numbering it as one puts a row in the index nobody asked for.
+        //
+        // Except the one that says where this conversation came from. Joined to
+        // the last carried turn it disappears the moment that turn folds, which
+        // is the moment the branch is used — so the only statement that the
+        // history above belongs to another conversation is the one thing a
+        // reader cannot find. It stands on its own instead.
+        turnId:
+          event.kind === 'branched'
+            ? `marker-${event.seq}`
+            : state.currentTurnId ?? lastTurnId(state) ?? `marker-${event.seq}`,
         role: 'system',
         ts: event.ts,
-        blocks: [{
-          kind: 'notice',
-          notice: 'compacted',
-          text: 'Context compacted',
-          detail: event.detail,
-        }],
+        blocks: [{ kind: 'notice', ...notice, detail: event.detail }],
       };
       state.messages.push(message);
       state.index[message.id] = state.messages.length - 1;
@@ -513,15 +870,58 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
     }
 
     case 'turn_end': {
-      state.currentTurnId = null;
-      if (state.state !== 'error' && state.state !== 'exited') {
-        state.state = 'idle';
-      }
-      for (const message of state.messages) {
-        if (message.turnId === event.turnId) message.streaming = false;
+      // A turn interrupted to redirect it is not a turn that ended: the
+      // message that cut it short was delivered into it and the agent is
+      // already working on it again. What the runtime is acknowledging here is
+      // the half it abandoned, so this takes the spend and leaves the turn
+      // open, running, and unstamped — see `stale` on the event.
+      if (!event.stale) {
+        if (state.state !== 'error' && state.state !== 'exited') {
+          state.state = 'idle';
+        }
+        // The runtime's own word for how the turn concluded, kept rather than
+        // dropped: it is the only statement any of them makes about the turn as
+        // a whole, and without it the badge is left inferring one from whichever
+        // steps inside it went wrong (issue #74).
+        const outcome = turnOutcomeOf(event.stopReason);
+        // Against the turn the messages are actually filed under, which is the
+        // one this app opened rather than the name the runtime ends it by — see
+        // `msg_start`. Comparing the runtime's own id here stamped the outcome
+        // onto nothing at all.
+        const ended = state.currentTurnId ?? event.turnId;
+        for (const message of state.messages) {
+          if (message.turnId === ended) {
+            message.streaming = false;
+            message.turnOutcome = outcome;
+          }
+        }
+        state.currentTurnId = null;
       }
       if (event.usage) {
         state.usage = mergeUsage(state.usage, event.usage);
+      }
+      if (event.models && event.models.length > 0) {
+        state.turnModels = event.models.map((entry) => entry.model);
+        // The header takes the model that answered — the one the messages of
+        // this turn already carry — and only falls back to the busiest of the
+        // reported models when nothing said. Preferring the report outright
+        // would rename a claude conversation from what its messages say to the
+        // billing alias beside it, which is the same name twice and reads as a
+        // model switch nobody made.
+        const answered = state.messages.find(
+          (message) => message.turnId === event.turnId && message.role === 'assistant' && message.model,
+        );
+        state.model = answered?.model
+          ?? [...event.models].sort((a, b) => (b.calls ?? 0) - (a.calls ?? 0))[0].model;
+        // A message that never carried one gets the answer this turn produced,
+        // so scrolling back does not show a blank where the record has a name.
+        if (state.turnModels.length === 1) {
+          for (const message of state.messages) {
+            if (message.turnId === event.turnId && message.role === 'assistant' && !message.model) {
+              message.model = state.turnModels[0];
+            }
+          }
+        }
       }
       return { messageIndex: null, structural: true, meta: true, applied: true };
     }

@@ -44,6 +44,11 @@ export class WebSocketConnection {
 
   connect(sessionId: string | null = null): Promise<void> {
     if (this.app.socket?.readyState === WebSocket.OPEN) {
+      // Nothing to reconnect, but the caller asked because its view of the
+      // session just changed — closing a split is the case that hurts. The pane
+      // shared this PTY and left it half a screen wide, and since this socket
+      // never dropped there is no session_joined to put the geometry back.
+      this.app.messageHandler?.reclaimTerminalGeometry();
       return Promise.resolve();
     }
 
@@ -106,6 +111,11 @@ export class WebSocketConnection {
           // starts with none. Without this every background conversation goes
           // quiet after a dropped connection and only the joined one recovers.
           this.app.sessionTabManager?.resubscribeChats();
+          // Whoever stayed attached while we were away owns the PTY's size now,
+          // and this end has no way of knowing what they set it to. Drop the
+          // record of what we last sent so the rejoin genuinely re-sends ours
+          // instead of deciding nothing has changed.
+          this.app.messageHandler?.forgetSentGeometry();
 
           if (
             !this.app.currentClaudeSessionId &&

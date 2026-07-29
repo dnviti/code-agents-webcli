@@ -74,6 +74,14 @@ describe('paging back through a conversation', function () {
     const c = controller({ firstSeq: 1, replayFrom: 1, cursor: 12 });
     assert.strictEqual(c.transcript.hasMore, false);
 
+    // Opening a conversation asks for its turn index, which is not a page and
+    // is sent however little there is to page (#86).
+    assert.deepStrictEqual(
+      c.sent.map((m) => m.type),
+      ['chat_turn_index_request'],
+    );
+    c.sent.length = 0;
+
     c.loadMore();
     assert.deepStrictEqual(c.sent, [], 'nothing to fetch, so nothing was asked for');
     assert.strictEqual(c.transcript.loadingMore, false);
@@ -83,6 +91,7 @@ describe('paging back through a conversation', function () {
     const c = controller({ firstSeq: 40, replayFrom: 900, cursor: 1200 });
     assert.strictEqual(c.transcript.hasMore, true);
 
+    c.sent.length = 0;
     c.loadMore();
     assert.strictEqual(c.transcript.loadingMore, true);
     assert.strictEqual(c.sent.length, 1);
@@ -148,6 +157,7 @@ describe('paging back through a conversation', function () {
 
   it('does not stack requests while one is in flight', function () {
     const c = controller({ firstSeq: 40, replayFrom: 900, cursor: 1200 });
+    c.sent.length = 0;
     c.loadMore();
     c.loadMore();
     c.loadMore();

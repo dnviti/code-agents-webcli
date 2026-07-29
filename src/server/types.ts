@@ -120,6 +120,20 @@ export interface SessionRecord {
    */
   chatModelOverride?: string;
   /**
+   * The reasoning-effort level this conversation runs at, in the runtime's own
+   * vocabulary.
+   *
+   * Stored as the runtime spells it — `xhigh`, `on`, `ultra` — because that is
+   * what will be handed back to it. Nothing here translates between runtimes'
+   * ladders: a level is only ever offered by the runtime that published it, so
+   * a value recorded here is meaningless against any other agent and is
+   * deliberately not carried across when a conversation changes runtime.
+   *
+   * Absent means "no override", which reads as the runtime's own default
+   * exactly like every row written before this existed.
+   */
+  chatEffortOverride?: string;
+  /**
    * The label the user chose for this session, when they have chosen one.
    *
    * Deliberately not `name`: `name` is the name the session was *created* with,

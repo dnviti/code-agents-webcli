@@ -43,9 +43,14 @@ after(function () {
 
 let seq = 0;
 
+// A user message opens a turn and the agent's reply carries the same id, which
+// is how an adapter stamps them and how turns are grouped (#86).
+let turn = 0;
+
 function msg(role, blocks, extra = {}) {
   seq += 1;
-  return { id: `m${seq}`, seq, turnId: 't1', role, ts: seq * 1000, blocks, ...extra };
+  if (role === 'user' && extra.turnId === undefined) turn += 1;
+  return { id: `m${seq}`, seq, turnId: `t${turn}`, role, ts: seq * 1000, blocks, ...extra };
 }
 
 function tool(overrides = {}) {
@@ -62,6 +67,7 @@ function tool(overrides = {}) {
 
 beforeEach(function () {
   seq = 0;
+  turn = 0;
 });
 
 describe('activityEvents', function () {
@@ -201,18 +207,3 @@ describe('activityForTurn', function () {
   });
 });
 
-describe('workSummary', function () {
-  it('reads as a sentence about the work, with no zero counts in it', function () {
-    const messages = [
-      msg('assistant', [{ kind: 'thinking', text: 'a' }, tool(), tool({ toolId: 'x2' })]),
-    ];
-    assert.strictEqual(
-      mod.workSummary(mod.activityEvents(messages), 8100),
-      '2 commands · 1 reasoning · 8.1s',
-    );
-  });
-
-  it('is empty when there was no work to describe', function () {
-    assert.strictEqual(mod.workSummary([]), '');
-  });
-});

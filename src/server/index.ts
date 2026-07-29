@@ -59,6 +59,39 @@ import { AuthService } from './services/auth.js';
 import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
 
+/**
+ * Fold what a chat session learned about itself into the record that outlives it.
+ *
+ * Free-standing so the rule it encodes can be checked without a server: an
+ * absent `nativeSessionId` is "nothing to say about the id", and a null one is
+ * "this conversation no longer has one". The distinction is the whole of #43 —
+ * while only a truthy id could be written here, a cleared conversation kept the
+ * id of the conversation it replaced, and the resume banner offered to take the
+ * user back into the memory the clear had just destroyed.
+ */
+export function applyChatLifecycle(
+  record: SessionRecord,
+  change: { nativeSessionId?: string | null; exited?: boolean },
+): void {
+  if (change.nativeSessionId !== undefined) {
+    record.nativeChatSessionId = change.nativeSessionId || undefined;
+  }
+  if (change.exited === true) {
+    // Frees the session for a relaunch in the same tab. Without it the
+    // record still claims a process that is gone, and `start_chat`
+    // refuses with "A process is already running in this session".
+    record.active = false;
+  }
+  if (change.exited === false) {
+    // A conversation replaced in place — `/clear` and the composer's New
+    // chat button — never passes through the launcher, so this is the
+    // only thing that puts the record back. Without it a tab you are
+    // sitting in, with an agent answering, is listed as finished.
+    record.active = true;
+    record.lastActivity = new Date();
+  }
+}
+
 export class ClaudeCodeWebServer {
   private port: number;
   private dev: boolean;
@@ -182,6 +215,7 @@ export class ClaudeCodeWebServer {
         consumedFor: (nativeSessionId) => this.usageStore.consumedFor(nativeSessionId),
         costBaselineFor: (nativeSessionId) => this.usageStore.costBaselineFor(nativeSessionId),
         loginFor: (userId) => this.database.getUserById(userId)?.githubLogin ?? String(userId),
+        spendByTurn: (sessionId, userId) => this.usageStore.spendByTurn(sessionId, userId),
       },
       storageDir: this.database.storageDir,
       broadcast: (sessionId, message) =>
@@ -204,15 +238,14 @@ export class ClaudeCodeWebServer {
       onLifecycle: (sessionId, change) => {
         const record = this.claudeSessions.get(sessionId);
         if (!record) return;
-        if (change.nativeSessionId) {
-          record.nativeChatSessionId = change.nativeSessionId;
-        }
-        if (change.exited) {
-          // Frees the session for a relaunch in the same tab. Without it the
-          // record still claims a process that is gone, and `start_chat`
-          // refuses with "A process is already running in this session".
-          record.active = false;
-        }
+        applyChatLifecycle(record, change);
+        // Written through rather than left to the thirty-second autosave: the
+        // conversation this is about is one that was cleared and then left
+        // alone, and what it is protected from is the process going away. The
+        // record is only half of it — a record with no id sends the manager to
+        // the head of the log for one — but the session has already truncated
+        // that log by the time it says this, so the two agree (#43).
+        if (change.nativeSessionId === null) void this.saveSessionsToDisk();
       },
     });
     this.runtimeProfiles = new RuntimeProfileStore({ database: this.database });

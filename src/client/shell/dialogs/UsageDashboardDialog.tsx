@@ -4,6 +4,7 @@ import type {
   UsageBreakdown,
   UsageBucket,
   UsageBucketUnit,
+  UsageConversationSummary,
   UsageDashboard,
   UsageEffort,
   UsageFilters,
@@ -19,6 +20,7 @@ import { UNATTRIBUTED } from '../../../shared/usage-records.js';
 import {
   attributeUsageProject,
   exportUsage,
+  fetchUsageConversations,
   fetchUsageDashboard,
   fetchUsageJob,
   fetchUsageJobs,
@@ -26,10 +28,11 @@ import {
 import { Button } from '../../ui/relay/Button';
 import { Dialog } from '../../ui/relay/Dialog';
 import { Icon } from '../../ui/relay/Icon';
+import { IconButton } from '../../ui/relay/IconButton';
 import { Input } from '../../ui/relay/Input';
 import { Tabs } from '../../ui/relay/Tabs';
 import { Tooltip } from '../../ui/relay/Tooltip';
-import { usePhone } from '../../ui/touch';
+import { PHONE_TEXT, usePhone } from '../../ui/touch';
 
 export interface UsageDashboardDialogProps {
   open: boolean;
@@ -44,6 +47,88 @@ const PERIODS: Array<{ value: UsagePeriod; label: string }> = [
 ];
 
 const JOBS_PAGE_SIZE = 20;
+
+/**
+ * The first instant of the period a moment falls in, in the viewer's own
+ * calendar.
+ *
+ * Deliberately the same rule as the server's `rangeFor` — Monday-first weeks
+ * included — because the two have to name the same windows. This one is only
+ * ever used to describe and to bound the anchor; the range the figures are
+ * actually computed over is still the server's, and arrives in `from`/`to`.
+ */
+export function periodStart(at: Date, period: UsagePeriod): Date {
+  const y = at.getFullYear();
+  const m = at.getMonth();
+  const d = at.getDate();
+  if (period === 'day') return new Date(y, m, d);
+  if (period === 'week') return new Date(y, m, d - ((at.getDay() + 6) % 7));
+  if (period === 'month') return new Date(y, m, 1);
+  return new Date(y, 0, 1);
+}
+
+/**
+ * One period forward or back, as an instant inside the period arrived at.
+ *
+ * Midday, and mid-month for the wider periods, rather than the boundary itself:
+ * the server bounds every window with one fixed offset — the viewer's offset at
+ * the moment of asking — so an anchor sitting exactly on a local midnight lands
+ * an hour the wrong side of that boundary for half the year, and the arrows
+ * would walk over the same day twice and never reach the one between.
+ *
+ * Stepping from the anchor rather than from the range that came back also means
+ * two quick presses move two periods: a second press while the first answer is
+ * still in flight would otherwise recompute the same step from the range still
+ * on screen.
+ */
+export function stepAnchor(anchor: Date, period: UsagePeriod, direction: 1 | -1): Date {
+  const y = anchor.getFullYear();
+  const m = anchor.getMonth();
+  const d = anchor.getDate();
+  if (period === 'day') return new Date(y, m, d + direction, 12);
+  if (period === 'week') return new Date(y, m, d + 7 * direction, 12);
+  if (period === 'month') return new Date(y, m + direction, 15, 12);
+  return new Date(y + direction, 6, 15, 12);
+}
+
+/** `2026-07-27`, the only shape an `<input type="date">` reads or writes. */
+function dateValue(at: Date): string {
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`;
+}
+
+/**
+ * A typed date back into an anchor, or null.
+ *
+ * A date field reports every intermediate value as the user types into it, so
+ * `0002-07-27` arrives on the way to `2026-07-27`. Rejected rather than
+ * honoured: jumping the dashboard to the year 2 and back is a worse experience
+ * than a keystroke that does nothing.
+ */
+function parseDateValue(value: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return null;
+  const [, y, m, d] = match;
+  if (Number(y) < 2000) return null;
+  return new Date(Number(y), Number(m) - 1, Number(d), 12);
+}
+
+/** The window a period covers, named the way somebody would say it out loud. */
+function periodLabel(at: Date, period: UsagePeriod): string {
+  const start = periodStart(at, period);
+  if (period === 'year') return String(start.getFullYear());
+  if (period === 'month') return start.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+  if (period === 'week') {
+    // The last instant inside the window, not the first outside it: a week
+    // labelled up to the Monday after it reads as eight days.
+    const last = new Date(periodStart(stepAnchor(at, 'week', 1), 'week').getTime() - 1);
+    return `${start.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })} – ${last.toLocaleDateString(
+      undefined,
+      { day: 'numeric', month: 'short', year: 'numeric' },
+    )}`;
+  }
+  return start.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+}
 
 /**
  * A bucket key back into the instant it names, in the viewer's own clock.
@@ -145,36 +230,62 @@ interface Figure {
 }
 
 /**
- * The honesty rule for a total: `costUsd` of zero across zero reporting jobs
- * and `costUsd` of zero across every job are opposite facts, and this is the
+ * The honesty rule for a total: `costUsd` of zero across zero reporting turns
+ * and `costUsd` of zero across every turn are opposite facts, and this is the
  * one place that turns `UsageTotals` into the sentence a viewer should read.
  */
 function costFigure(totals: UsageTotals): Figure {
-  if (totals.jobs === 0) return { text: '—', muted: true, title: 'No jobs in this range' };
-  if (totals.costReportedJobs === 0) {
-    return { text: 'not reported', muted: true, title: 'None of these jobs reported a cost' };
+  if (totals.turns === 0) return { text: '—', muted: true, title: 'No turns in this range' };
+  if (totals.costReportedTurns === 0) {
+    return { text: 'not reported', muted: true, title: 'None of these turns reported a cost' };
   }
-  if (totals.costReportedJobs < totals.jobs) {
+  if (totals.costReportedTurns < totals.turns) {
     return {
-      text: `${formatCost(totals.costUsd)} across ${totals.costReportedJobs} of ${totals.jobs} jobs`,
-      title: `${totals.jobs - totals.costReportedJobs} job(s) did not report a cost and are excluded from this figure`,
+      text: `${formatCost(totals.costUsd)} across ${totals.costReportedTurns} of ${totals.turns} turns`,
+      title: `${totals.turns - totals.costReportedTurns} turn(s) did not report a cost and are excluded from this figure`,
     };
   }
   return { text: formatCost(totals.costUsd) };
 }
 
 function tokensFigure(totals: UsageTotals): Figure {
-  if (totals.jobs === 0) return { text: '—', muted: true, title: 'No jobs in this range' };
-  if (totals.tokensReportedJobs === 0) {
-    return { text: 'not reported', muted: true, title: 'None of these jobs reported token counts' };
+  if (totals.turns === 0) return { text: '—', muted: true, title: 'No turns in this range' };
+  if (totals.tokensReportedTurns === 0) {
+    return { text: 'not reported', muted: true, title: 'None of these turns reported token counts' };
   }
-  if (totals.tokensReportedJobs < totals.jobs) {
+  if (totals.tokensReportedTurns < totals.turns) {
     return {
-      text: `${formatTokens(totals.totalTokens)} across ${totals.tokensReportedJobs} of ${totals.jobs} jobs`,
-      title: `${totals.jobs - totals.tokensReportedJobs} job(s) did not report token counts and are excluded from this figure`,
+      text: `${formatTokens(totals.totalTokens)} across ${totals.tokensReportedTurns} of ${totals.turns} turns`,
+      title: `${totals.turns - totals.tokensReportedTurns} turn(s) did not report token counts and are excluded from this figure`,
     };
   }
   return { text: formatTokens(totals.totalTokens) };
+}
+
+/**
+ * Model turns, which most runtimes never report — so the absence has to be said
+ * rather than drawn as a zero.
+ *
+ * The figure beside it is the number of turns that had one to contribute, for
+ * the same reason cost carries one: a sum over an unknown fraction of the range
+ * is not a total, and this is the quantity where the fraction is usually small.
+ */
+function modelTurnsFigure(totals: UsageTotals): Figure {
+  if (totals.turns === 0) return { text: '—', muted: true, title: 'No turns in this range' };
+  if (totals.modelTurnsReportedTurns === 0) {
+    return {
+      text: 'not reported',
+      muted: true,
+      title: 'None of these turns ran on an agent that reports its round trips to the model',
+    };
+  }
+  if (totals.modelTurnsReportedTurns < totals.turns) {
+    return {
+      text: `${totals.modelTurns} across ${totals.modelTurnsReportedTurns} of ${totals.turns} turns`,
+      title: `${totals.turns - totals.modelTurnsReportedTurns} turn(s) ran on an agent that does not report round trips and are excluded from this figure`,
+    };
+  }
+  return { text: String(totals.modelTurns) };
 }
 
 function countFigure(n: number): Figure {
@@ -186,10 +297,10 @@ function countFigure(n: number): Figure {
  *
  * The distinction between a measure the *runtime* reports and one this app
  * counts for itself is carried in `reported`, and it is why this is a table
- * rather than a switch on a string. Cost and tokens can be absent — nobody
- * said — where jobs, turns and tool calls are counted from the transcript and
- * are therefore always known. A chart that drew all five the same way would
- * invent measurements for the first two.
+ * rather than a switch on a string. Cost, tokens and model turns can be absent
+ * — nobody said — where turns and tool calls are measured here and are
+ * therefore always known. A chart that drew all five the same way would invent
+ * measurements for the three that can be missing.
  */
 interface Measure {
   value: UsageMeasure;
@@ -204,35 +315,40 @@ const MEASURES: Measure[] = [
     value: 'costUsd',
     label: 'Cost',
     amount: (t) => t.costUsd,
-    reported: (t) => t.costReportedJobs > 0,
+    reported: (t) => t.costReportedTurns > 0,
     figure: costFigure,
   },
   {
     value: 'totalTokens',
     label: 'Tokens',
     amount: (t) => t.totalTokens,
-    reported: (t) => t.tokensReportedJobs > 0,
+    reported: (t) => t.tokensReportedTurns > 0,
     figure: tokensFigure,
   },
   {
-    value: 'jobs',
-    label: 'Jobs',
-    amount: (t) => t.jobs,
-    reported: (t) => t.jobs > 0,
-    figure: (t) => countFigure(t.jobs),
-  },
-  {
+    // One per request the user made — the same turns the conversation shows,
+    // counted where the work ran rather than from what a browser has loaded.
     value: 'turns',
     label: 'Turns',
     amount: (t) => t.turns,
-    reported: (t) => t.jobs > 0,
+    reported: (t) => t.turns > 0,
     figure: (t) => countFigure(t.turns),
+  },
+  {
+    // Round trips to the model *inside* those turns, and a different quantity:
+    // only the runtimes that count their own report it, so it plots as absent
+    // rather than as zero for the rest.
+    value: 'modelTurns',
+    label: 'Model turns',
+    amount: (t) => t.modelTurns,
+    reported: (t) => t.modelTurnsReportedTurns > 0,
+    figure: modelTurnsFigure,
   },
   {
     value: 'toolCalls',
     label: 'Tool calls',
     amount: (t) => t.toolCalls,
-    reported: (t) => t.jobs > 0,
+    reported: (t) => t.turns > 0,
     figure: (t) => countFigure(t.toolCalls),
   },
 ];
@@ -449,6 +565,129 @@ function FilterChips({
   );
 }
 
+/**
+ * Which window the figures are for, and the only way out of the one the clock
+ * is standing in.
+ *
+ * Everything downstream reads its range out of the answer this asks for — the
+ * history list and the export both take `from`/`to` from the dashboard — so
+ * moving the anchor moves the whole page rather than the charts alone.
+ *
+ * The window is named from the anchor rather than from the range that came
+ * back, because that range is the *narrowed* one whenever a bar has been
+ * pressed: an hour of Monday morning is still a day of July, and a control
+ * that renamed itself "27 Jul, 09:00" would be describing the drill-down the
+ * chips already describe.
+ */
+function PeriodNavigator({
+  period,
+  anchor,
+  empty,
+  narrowed,
+  onAnchor,
+}: {
+  period: UsagePeriod;
+  /** Null while the window is wherever now is — which is where it starts. */
+  anchor: Date | null;
+  /** Whether the window that came back holds no turns at all. */
+  empty: boolean;
+  narrowed: boolean;
+  onAnchor(next: Date | null): void;
+}): React.JSX.Element {
+  const phone = usePhone();
+  const now = new Date();
+  const at = anchor ?? now;
+  // Nothing has happened after now, so there is nothing ahead to walk into.
+  // Compared period-start to period-start rather than instant to instant: the
+  // window holding this moment is the last one there is, and half of it is
+  // still in the future.
+  const latest = periodStart(at, period).getTime() >= periodStart(now, period).getTime();
+
+  const pick = (value: string): void => {
+    const picked = parseDateValue(value);
+    if (!picked) return;
+    if (periodStart(picked, period).getTime() > periodStart(now, period).getTime()) return;
+    onAnchor(picked);
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <div
+        style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}
+        role="group"
+        aria-label="The period on screen"
+      >
+        {/* IconButton, not an icon-only Button: only this one is a square at
+            the touch floor, and the dashboard is one of the phone's own
+            destinations. */}
+        <IconButton
+          variant="outline"
+          size={phone ? 'lg' : 'md'}
+          aria-label={`Previous ${period}`}
+          onClick={() => onAnchor(stepAnchor(at, period, -1))}
+        >
+          <Icon name="arrow-left" size={phone ? 18 : 12} />
+        </IconButton>
+        <span
+          // The whole page has just been re-asked for a different range, and
+          // the name of that range is the one thing on screen that says which.
+          aria-live="polite"
+          style={{
+            fontSize: phone ? PHONE_TEXT.body : 'var(--text-ui)',
+            minWidth: 150,
+            textAlign: 'center',
+          }}
+        >
+          {periodLabel(at, period)}
+        </span>
+        <IconButton
+          variant="outline"
+          size={phone ? 'lg' : 'md'}
+          aria-label={`Next ${period}`}
+          disabled={latest}
+          onClick={() => onAnchor(stepAnchor(at, period, 1))}
+        >
+          <Icon name="arrow-right" size={phone ? 18 : 12} />
+        </IconButton>
+        <div style={{ width: 150 }}>
+          <Input
+            size="sm"
+            type="date"
+            value={dateValue(periodStart(at, period))}
+            // Belt as well as braces: the arrow is already disabled at the
+            // present, and a date field that offers next March is an interface
+            // promising a record that cannot exist.
+            max={dateValue(now)}
+            aria-label={`Show the ${period} containing a date`}
+            onChange={(e) => pick(e.currentTarget.value)}
+          />
+        </div>
+        {/* Disabled only when the window is already the live one — which is
+            not the same as its being the current period. Step back and forward
+            again and the anchor is a fixed instant inside today; keyed on
+            `latest`, the only control that unpins it would be unavailable, and
+            a dialog left open across midnight would go on answering for the
+            day that ended. */}
+        <Button variant="ghost" size="sm" disabled={anchor === null} onClick={() => onAnchor(null)}>
+          Now
+        </Button>
+      </div>
+      {empty ? (
+        <span
+          style={{
+            fontSize: phone ? PHONE_TEXT.meta : 'var(--text-2xs)',
+            color: 'var(--muted-foreground)',
+          }}
+        >
+          {narrowed
+            ? `Nothing in this ${period} matches the selection above.`
+            : `Nothing was recorded in this ${period}. Step back, or pick a date, to look further into the past.`}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 // --------------------------------------------------------------------- trend
 
 /**
@@ -501,7 +740,7 @@ function TrendChart({
             <span style={{ color: 'var(--foreground)' }}>{bucketLabel(shown.key, unit)}</span>
             {` · ${measure.label} `}
             <FigureText figure={measure.figure(shown.totals)} />
-            {` · ${shown.totals.jobs} job(s)`}
+            {` · ${shown.totals.turns} turn(s)`}
           </>
         ) : (
           `${measure.label} over time — select a point for its figures`
@@ -525,7 +764,7 @@ function TrendChart({
               key={bucket.key}
               type="button"
               aria-pressed={selected}
-              aria-label={`${bucketLabel(bucket.key, unit)}: ${measure.label} ${figure.text}, ${bucket.totals.jobs} job(s)`}
+              aria-label={`${bucketLabel(bucket.key, unit)}: ${measure.label} ${figure.text}, ${bucket.totals.turns} turn(s)`}
               title={`${bucketLabel(bucket.key, unit)} · ${measure.label} ${figure.text}`}
               onMouseEnter={() => setActive(bucket.key)}
               onFocus={() => setActive(bucket.key)}
@@ -585,37 +824,102 @@ function TrendChart({
   );
 }
 
-/** The five fixed buckets a `UsageEffort` histogram carries, turns or tool calls. */
+/**
+ * The five fixed buckets a `UsageEffort` histogram carries, turns or tool calls.
+ *
+ * Built the way `TrendChart` above is built, and for the reason it was: these
+ * were bare `<div>`s inside a `Tooltip`, which mounts on mouseenter or on focus
+ * from a focusable descendant — and there was none. So the counts existed in no
+ * place a keyboard or a screen reader could reach, and "Effort by agent" read
+ * as an agent, a turn count, and then five loose numbers with no quantity
+ * attached to any of them (#66). The distribution is the entire question this
+ * panel answers.
+ *
+ * Nothing is selected by pressing a bar, so pressing one does what hovering it
+ * does: says what it counts. That is not a control with no action — it is the
+ * only action a touch screen has, where there is no hover to reveal a tooltip
+ * with.
+ */
 function EffortHistogram({
+  label,
   histogram,
   labels,
 }: {
+  /** What the distribution is *of* — the panel heading is too far away to carry it. */
+  label: string;
   histogram: readonly [number, number, number, number, number];
   labels: readonly [string, string, string, string, string];
 }): React.JSX.Element {
+  const phone = usePhone();
+  const [active, setActive] = React.useState<number | null>(null);
   const max = Math.max(1, ...histogram);
+  const total = histogram.reduce((sum, count) => sum + count, 0);
+
   return (
-    <div style={{ display: 'flex', alignItems: 'flex-end', gap: 4, height: 44 }}>
-      {histogram.map((count, i) => (
-        <Tooltip key={labels[i]} label={`${labels[i]}: ${count} job(s)`}>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, width: 22 }}>
-            <div
+    <div>
+      <div
+        style={{ display: 'flex', alignItems: 'flex-end', gap: phone ? 8 : 4, height: 44 }}
+        role="group"
+        aria-label={label}
+        onMouseLeave={() => setActive(null)}
+      >
+        {histogram.map((count, i) => (
+          <button
+            key={labels[i]}
+            type="button"
+            aria-label={`${labels[i]}: ${count} of ${total} turn(s)`}
+            title={`${labels[i]}: ${count} of ${total} turn(s)`}
+            onMouseEnter={() => setActive(i)}
+            onFocus={() => setActive(i)}
+            onBlur={() => setActive(null)}
+            // Set, never toggled: a real press arrives after mouseenter and
+            // after focus, so a toggle finds the bar already active and clears
+            // the readout the press was for. On a keyboard the same — Tab
+            // shows the figure and Enter took it away again.
+            onClick={() => setActive(i)}
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'flex-end',
+              gap: 2,
+              // Wider on a phone: this is the affordance the change adds for
+              // touch, and a 22px target with 4px between them is not one.
+              width: phone ? 40 : 22,
+              height: '100%',
+              padding: 0,
+              border: 'none',
+              background: 'transparent',
+              cursor: 'pointer',
+            }}
+          >
+            <span
               style={{
                 width: '100%',
                 height: Math.max(2, (count / max) * 32),
                 background: count > 0 ? 'var(--primary)' : 'var(--border)',
+                opacity: active !== null && active !== i ? 0.6 : 1,
                 borderRadius: 1,
               }}
             />
             <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>{labels[i]}</span>
-          </div>
-        </Tooltip>
-      ))}
+          </button>
+        ))}
+      </div>
+      <div
+        // Always mounted, same as the trend's readout: a region that appears
+        // when a bar is reached is announced as new content rather than as the
+        // answer to what was just reached.
+        aria-live="polite"
+        style={{ minHeight: 14, fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}
+      >
+        {active === null ? '' : `${labels[active]} · ${histogram[active]} of ${total} turn(s)`}
+      </div>
     </div>
   );
 }
 
-const TURNS_LABELS = ['1', '2', '3-5', '6-10', '11+'] as const;
+const MODEL_TURNS_LABELS = ['1', '2', '3-5', '6-10', '11+'] as const;
 const TOOLS_LABELS = ['0', '1-2', '3-5', '6-10', '11+'] as const;
 
 function BreakdownKey({ value, unknown }: { value: string; unknown: string }): React.JSX.Element {
@@ -626,7 +930,7 @@ function BreakdownKey({ value, unknown }: { value: string; unknown: string }): R
       title={
         unknown === 'unattributed'
           ? 'Recorded before this app knew which project a job ran in'
-          : 'These jobs ran without a reported model'
+          : 'These turns ran without a reported model'
       }
     >
       {unknown}
@@ -685,8 +989,8 @@ function Table({
 // ---------------------------------------------------------------- breakdowns
 
 const BREAKDOWN_COLUMNS: Array<{ label: string; measure: UsageMeasure }> = [
-  { label: 'Jobs', measure: 'jobs' },
   { label: 'Turns', measure: 'turns' },
+  { label: 'Model turns', measure: 'modelTurns' },
   { label: 'Tools', measure: 'toolCalls' },
   { label: 'Tokens', measure: 'totalTokens' },
   { label: 'Cost', measure: 'costUsd' },
@@ -807,8 +1111,10 @@ function BreakdownTable({
                       <BreakdownKey value={row.key} unknown={unknown} />
                     </button>
                   </td>
-                  <td style={bodyCellStyle}>{row.totals.jobs}</td>
                   <td style={bodyCellStyle}>{row.totals.turns}</td>
+                  <td style={bodyCellStyle}>
+                    <FigureText figure={modelTurnsFigure(row.totals)} />
+                  </td>
                   <td style={bodyCellStyle}>{row.totals.toolCalls}</td>
                   <td style={bodyCellStyle}>
                     <FigureText figure={tokensFigure(row.totals)} />
@@ -838,19 +1144,38 @@ function EffortTable({ rows, unknown }: { rows: UsageEffort[]; unknown: string }
               <div style={{ fontSize: 'var(--text-ui)' }}>
                 <BreakdownKey value={row.key} unknown={unknown} />
               </div>
-              <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>{row.jobs} jobs</div>
+              <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>{row.turns} turns</div>
+            </div>
+            <div>
+              {/* Said out loud rather than drawn as an empty chart: an agent
+                  that never reports its round trips has no shape here, and a
+                  bar chart of nothing reads as a measurement of little. */}
+              <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
+                {row.modelTurnsReportedTurns === 0
+                  ? 'model turns/turn · not reported'
+                  : `model turns/turn · avg ${formatAvg(row.modelTurnsAvg)} · max ${row.modelTurnsMax}${
+                      row.modelTurnsReportedTurns < row.turns
+                        ? ` · of ${row.modelTurnsReportedTurns} of ${row.turns} turns`
+                        : ''
+                    }`}
+              </div>
+              {row.modelTurnsReportedTurns > 0 ? (
+                <EffortHistogram
+                  label={`${keyLabel(row.key, unknown)} · model turns per turn`}
+                  histogram={row.modelTurnsHistogram}
+                  labels={MODEL_TURNS_LABELS}
+                />
+              ) : null}
             </div>
             <div>
               <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
-                turns/job · avg {formatAvg(row.turnsAvg)} · max {row.turnsMax}
+                tool calls/turn · avg {formatAvg(row.toolCallsAvg)} · max {row.toolCallsMax}
               </div>
-              <EffortHistogram histogram={row.turnsHistogram} labels={TURNS_LABELS} />
-            </div>
-            <div>
-              <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
-                tool calls/job · avg {formatAvg(row.toolCallsAvg)} · max {row.toolCallsMax}
-              </div>
-              <EffortHistogram histogram={row.toolCallsHistogram} labels={TOOLS_LABELS} />
+              <EffortHistogram
+                label={`${keyLabel(row.key, unknown)} · tool calls per turn`}
+                histogram={row.toolCallsHistogram}
+                labels={TOOLS_LABELS}
+              />
             </div>
           </div>
         ))
@@ -862,8 +1187,8 @@ function EffortTable({ rows, unknown }: { rows: UsageEffort[]; unknown: string }
 function ToolsTable({ tools }: { tools: UsageToolUse[] }): React.JSX.Element {
   return (
     <Table
-      columns={tools.some((t) => t.agent) ? ['Tool', 'Agent', 'Calls', 'Jobs'] : ['Tool', 'Calls', 'Jobs']}
-      rows={tools.map((t) => (t.agent ? [t.tool, t.agent, t.calls, t.jobs] : [t.tool, t.calls, t.jobs]))}
+      columns={tools.some((t) => t.agent) ? ['Tool', 'Agent', 'Calls', 'Turns'] : ['Tool', 'Calls', 'Turns']}
+      rows={tools.map((t) => (t.agent ? [t.tool, t.agent, t.calls, t.turns] : [t.tool, t.calls, t.turns]))}
     />
   );
 }
@@ -1095,8 +1420,16 @@ function JobDetail({
               <div>{job.durationMs !== null ? `${(job.durationMs / 1000).toFixed(1)}s` : '—'}</div>
             </div>
             <div>
-              <div style={{ color: 'var(--muted-foreground)', fontSize: 'var(--text-2xs)' }}>Turns</div>
-              <div>{job.turns}</div>
+              <div style={{ color: 'var(--muted-foreground)', fontSize: 'var(--text-2xs)' }}>Model turns</div>
+              <div>
+                {job.modelTurns === null ? (
+                  <span style={{ color: 'var(--muted-foreground)' }} title={`${job.agent} does not report round trips to the model`}>
+                    not reported
+                  </span>
+                ) : (
+                  job.modelTurns
+                )}
+              </div>
             </div>
             <div>
               <div style={{ color: 'var(--muted-foreground)', fontSize: 'var(--text-2xs)' }}>Tool calls</div>
@@ -1111,6 +1444,32 @@ function JobDetail({
               <div>{costFig ? <FigureText figure={costFig} /> : null}</div>
             </div>
           </div>
+
+          {/* Defended rather than assumed: this dialog is served to whatever
+              server answers, and one older than this page returns a job record
+              with no split at all. Reading `.length` off that is a blank
+              dialog where a job used to open. */}
+          {(job.models ?? []).length > 0 ? (
+            <div>
+              {/* Only for a turn that genuinely ran on more than one model. A
+                  job with one is fully described by the Model field above, and
+                  a one-row table under it would suggest a split that is not
+                  there. Tokens and cost are the runtime's own per-model
+                  figures; there is no tool column because no runtime says
+                  which model asked for which tool. (#75) */}
+              <h3 style={sectionTitleStyle}>Models this turn ran on</h3>
+              <Table
+                columns={['Model', 'Calls', 'Input', 'Output', 'Cost']}
+                rows={(job.models ?? []).map((split) => [
+                  split.model,
+                  split.calls ?? '—',
+                  split.inputTokens === null ? '—' : formatTokens(split.inputTokens),
+                  split.outputTokens === null ? '—' : formatTokens(split.outputTokens),
+                  split.costUsd === null ? '—' : formatCost(split.costUsd),
+                ])}
+              />
+            </div>
+          ) : null}
 
           <div>
             <h3 style={sectionTitleStyle}>Tools called</h3>
@@ -1127,6 +1486,248 @@ function JobDetail({
 }
 
 /**
+ * A conversation's totals, as one figure each.
+ *
+ * The same honesty rule as everywhere else: `costUsd` of zero across zero
+ * reporting jobs is not a conversation that cost nothing.
+ */
+function conversationLabel(conversation: UsageConversationSummary): string {
+  if (conversation.name) return conversation.name;
+  // No name means the tab has been deleted; the id is what is left, and the
+  // leading segment of it is enough to tell two entries apart without turning
+  // the column into a wall of uuid.
+  return `Conversation ${conversation.sessionId.slice(0, 8)}`;
+}
+
+/** A list of values as one cell: one name, or "first +2". */
+function ListCell({ values, empty }: { values: string[]; empty: string }): React.JSX.Element {
+  if (values.length === 0) {
+    return <span style={{ color: 'var(--muted-foreground)' }}>{empty}</span>;
+  }
+  if (values.length === 1) return <>{values[0]}</>;
+  // A conversation that used two agents says so rather than claiming one of
+  // them — the whole list is in the tooltip, and the count is on screen.
+  return (
+    <Tooltip label={values.join(', ')}>
+      <span>
+        {values[0]}
+        <span style={{ color: 'var(--muted-foreground)' }}>{` +${values.length - 1}`}</span>
+      </span>
+    </Tooltip>
+  );
+}
+
+/**
+ * The conversations behind the figures above — one row per chat tab (#88).
+ *
+ * The unit is the tab, not the request: everything spent in it is one entry,
+ * for as long as it exists, across compaction and clearing and starting fresh.
+ * What happened inside is detail about how the work went, and it is one click
+ * away rather than spread over forty rows of this list.
+ *
+ * Narrowed by the same `UsageFilters` as everything above it, for the same
+ * reason the job list is.
+ */
+function ConversationHistory({
+  scope,
+  filters,
+  reloads,
+  onOpen,
+}: {
+  scope: UsageScope;
+  filters: UsageFilters;
+  /** Bumped when something below changes a figure, so the list is re-asked. */
+  reloads: number;
+  onOpen(conversation: UsageConversationSummary): void;
+}): React.JSX.Element {
+  const [offset, setOffset] = React.useState(0);
+  const [page, setPage] = React.useState<{
+    conversations: UsageConversationSummary[];
+    total: number;
+  } | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const filterKey = JSON.stringify(filters);
+
+  React.useEffect(() => {
+    setOffset(0);
+  }, [scope, filterKey]);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    setError(null);
+    fetchUsageConversations({ scope, limit: JOBS_PAGE_SIZE, offset, ...filters })
+      .then((result) => { if (!cancelled) setPage(result); })
+      .catch((err: Error) => { if (!cancelled) setError(err.message); });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope, offset, filterKey, reloads]);
+
+  const total = page?.total ?? 0;
+  const conversations = page?.conversations ?? [];
+  const from = total === 0 ? 0 : offset + 1;
+  const to = Math.min(total, offset + JOBS_PAGE_SIZE);
+
+  if (error) {
+    return <div style={{ color: 'var(--destructive)', fontSize: 'var(--text-xs)' }}>{error}</div>;
+  }
+
+  return (
+    <div>
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 'var(--text-xs)' }}>
+          <thead>
+            <tr>
+              {['Conversation', 'Project', 'Agent', 'Model', 'Started', 'Last active', 'Requests', 'Tokens', 'Cost'].map(
+                (c, i) => (
+                  <th key={c} style={{ ...headCellStyle, textAlign: i === 0 ? 'left' : 'right' }}>
+                    {c}
+                  </th>
+                ),
+              )}
+            </tr>
+          </thead>
+          <tbody>
+            {conversations.length === 0 ? (
+              <tr>
+                <td colSpan={9} style={{ padding: '10px 8px', color: 'var(--muted-foreground)' }}>
+                  No conversations in this range
+                </td>
+              </tr>
+            ) : (
+              conversations.map((conversation) => (
+                <tr
+                  key={conversation.sessionId}
+                  onClick={() => onOpen(conversation)}
+                  style={{ cursor: 'pointer' }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--accent)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                >
+                  <td style={{ ...bodyCellStyle, textAlign: 'left' }}>{conversationLabel(conversation)}</td>
+                  <td style={bodyCellStyle}>
+                    <ListCell values={conversation.projects} empty="unattributed" />
+                  </td>
+                  <td style={bodyCellStyle}>
+                    <ListCell values={conversation.agents} empty="—" />
+                  </td>
+                  <td style={bodyCellStyle}>
+                    <ListCell values={conversation.models} empty="—" />
+                  </td>
+                  <td style={bodyCellStyle}>{new Date(conversation.startedAt).toLocaleString()}</td>
+                  <td style={bodyCellStyle}>{new Date(conversation.lastActiveAt).toLocaleString()}</td>
+                  <td style={bodyCellStyle}>{conversation.totals.turns}</td>
+                  <td style={bodyCellStyle}>
+                    <FigureText figure={tokensFigure(conversation.totals)} />
+                  </td>
+                  <td style={bodyCellStyle}>
+                    <FigureText figure={costFigure(conversation.totals)} />
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 }}>
+        <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
+          {total === 0 ? 'No conversations' : `${from}-${to} of ${total}`}
+        </span>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={offset === 0}
+            onClick={() => setOffset(Math.max(0, offset - JOBS_PAGE_SIZE))}
+          >
+            Previous
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={to >= total}
+            onClick={() => setOffset(offset + JOBS_PAGE_SIZE)}
+          >
+            Next
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The history section: conversations, one of them opened, or every request.
+ *
+ * Three states rather than two, because the list of conversations and the list
+ * of every request answer different questions — "what did this piece of work
+ * cost" and "which single request cost that much" — and neither one is the
+ * other with a filter applied. The conversation list is what opens first: it is
+ * the unit anybody thinks in, and the flat list of fragments is the thing #88
+ * is about not showing by default.
+ */
+function History({
+  scope,
+  filters,
+  knownProjects,
+  onChanged,
+}: {
+  scope: UsageScope;
+  filters: UsageFilters;
+  knownProjects: string[];
+  onChanged(): void;
+}): React.JSX.Element {
+  const [mode, setMode] = React.useState<'conversations' | 'requests'>('conversations');
+  const [open, setOpen] = React.useState<UsageConversationSummary | null>(null);
+  const [reloads, setReloads] = React.useState(0);
+  const changed = (): void => {
+    setReloads((n) => n + 1);
+    onChanged();
+  };
+
+  if (open) {
+    return (
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
+          <Button variant="outline" size="sm" onClick={() => setOpen(null)} iconLeft={<Icon name="arrow-left" size={12} />}>
+            All conversations
+          </Button>
+          <span style={{ fontSize: 'var(--text-xs)', fontWeight: 600 }}>{conversationLabel(open)}</span>
+          <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
+            {`${open.totals.turns} request(s) · ${costFigure(open.totals).text}`}
+          </span>
+        </div>
+        <JobHistory
+          scope={scope}
+          filters={filters}
+          knownProjects={knownProjects}
+          sessionId={open.sessionId}
+          onChanged={changed}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{ marginBottom: 8 }}>
+        <Tabs
+          tabs={[
+            { value: 'conversations', label: 'Conversations' },
+            { value: 'requests', label: 'Requests' },
+          ]}
+          value={mode}
+          onChange={(value) => setMode(value as 'conversations' | 'requests')}
+        />
+      </div>
+      {mode === 'conversations' ? (
+        <ConversationHistory scope={scope} filters={filters} reloads={reloads} onOpen={setOpen} />
+      ) : (
+        <JobHistory scope={scope} filters={filters} knownProjects={knownProjects} onChanged={changed} />
+      )}
+    </div>
+  );
+}
+
+/**
  * The jobs behind the figures above, narrowed by whatever the charts are
  * narrowed by.
  *
@@ -1139,11 +1740,14 @@ function JobHistory({
   scope,
   filters,
   knownProjects,
+  sessionId,
   onChanged,
 }: {
   scope: UsageScope;
   filters: UsageFilters;
   knownProjects: string[];
+  /** Narrow to one conversation — how an entry opens onto its own requests. */
+  sessionId?: string;
   onChanged(): void;
 }): React.JSX.Element {
   const [offset, setOffset] = React.useState(0);
@@ -1161,17 +1765,17 @@ function JobHistory({
     // while deep in the pages otherwise left an empty table, which reads as
     // "this project did no work".
     setOffset(0);
-  }, [scope, filterKey]);
+  }, [scope, filterKey, sessionId]);
 
   React.useEffect(() => {
     let cancelled = false;
     setError(null);
-    fetchUsageJobs({ scope, limit: JOBS_PAGE_SIZE, offset, ...filters })
+    fetchUsageJobs({ scope, limit: JOBS_PAGE_SIZE, offset, sessionId, ...filters })
       .then((result) => { if (!cancelled) setPage(result); })
       .catch((err: Error) => { if (!cancelled) setError(err.message); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope, offset, filterKey, reloads]);
+  }, [scope, offset, filterKey, reloads, sessionId]);
 
   const total = page?.total ?? 0;
   const jobs = page?.jobs ?? [];
@@ -1188,7 +1792,7 @@ function JobHistory({
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 'var(--text-xs)' }}>
               <thead>
                 <tr>
-                  {['When', 'Project', 'Agent', 'Model', 'Turns', 'Tools', 'Tokens', 'Cost'].map((c, i) => (
+                  {['When', 'Project', 'Agent', 'Model', 'Model turns', 'Tools', 'Tokens', 'Cost'].map((c, i) => (
                     <th key={c} style={{ ...headCellStyle, textAlign: i === 0 ? 'left' : 'right' }}>
                       {c}
                     </th>
@@ -1199,7 +1803,7 @@ function JobHistory({
                 {jobs.length === 0 ? (
                   <tr>
                     <td colSpan={8} style={{ padding: '10px 8px', color: 'var(--muted-foreground)' }}>
-                      No jobs in this range
+                      No turns in this range
                     </td>
                   </tr>
                 ) : (
@@ -1232,7 +1836,9 @@ function JobHistory({
                       <td style={bodyCellStyle}>
                         {job.model ?? <span style={{ color: 'var(--muted-foreground)' }}>—</span>}
                       </td>
-                      <td style={bodyCellStyle}>{job.turns}</td>
+                      <td style={bodyCellStyle}>
+                        {job.modelTurns ?? <span style={{ color: 'var(--muted-foreground)' }}>—</span>}
+                      </td>
                       <td style={bodyCellStyle}>{job.toolCalls}</td>
                       <td style={bodyCellStyle}>
                         <FigureText figure={jobTokensFigure(job)} />
@@ -1248,7 +1854,7 @@ function JobHistory({
           </div>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 8 }}>
             <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
-              {total === 0 ? 'No jobs' : `${from}-${to} of ${total}`}
+              {total === 0 ? 'No turns' : `${from}-${to} of ${total}`}
             </span>
             <div style={{ display: 'flex', gap: 6 }}>
               <Button
@@ -1304,6 +1910,8 @@ function JobHistory({
  */
 export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProps): React.JSX.Element | null {
   const [period, setPeriod] = React.useState<UsagePeriod>('day');
+  /** Null means "wherever now is", which is what the server assumes anyway. */
+  const [anchor, setAnchor] = React.useState<Date | null>(null);
   const [scope, setScope] = React.useState<UsageScope>('self');
   const [measure, setMeasure] = React.useState<UsageMeasure>('costUsd');
   const [filters, setFilters] = React.useState<UsageFilters>({});
@@ -1312,19 +1920,24 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
   const [reloads, setReloads] = React.useState(0);
   const isPhone = usePhone();
   const filterKey = JSON.stringify(filters);
+  const anchorKey = anchor ? anchor.toISOString() : '';
 
   React.useEffect(() => {
     // A dashboard reopened is a question asked afresh. Carrying the last
     // visit's narrowing back in would show a total that is not the total, with
-    // the reason for it several screens further down.
-    if (open) setFilters({});
+    // the reason for it several screens further down. The window it was left
+    // parked on is the same kind of stale: "Usage" should mean this week's.
+    if (open) {
+      setFilters({});
+      setAnchor(null);
+    }
   }, [open]);
 
   React.useEffect(() => {
     if (!open) return;
     let cancelled = false;
     setError(null);
-    fetchUsageDashboard(period, scope, filters)
+    fetchUsageDashboard(period, scope, filters, anchor ?? undefined)
       .then((result) => {
         if (cancelled) return;
         setDashboard(result);
@@ -1337,7 +1950,7 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
       .catch((err: Error) => { if (!cancelled) setError(err.message); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, period, scope, filterKey, reloads]);
+  }, [open, period, scope, filterKey, anchorKey, reloads]);
 
   const active = measureBy(measure);
   const bucketUnit: UsageBucketUnit = dashboard?.bucket ?? 'hour';
@@ -1356,6 +1969,17 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
    */
   const changePeriod = (next: UsagePeriod): void => {
     setPeriod(next);
+    setFilters(({ from: _from, to: _to, ...rest }) => rest);
+  };
+
+  /**
+   * Moving the window drops the selection made inside the old one, for the same
+   * reason changing the period does: an hour of last Tuesday is not a slice of
+   * this week, and carried across it would leave every figure on screen
+   * answering for a range no control on the page names.
+   */
+  const changeAnchor = (next: Date | null): void => {
+    setAnchor(next);
     setFilters(({ from: _from, to: _to, ...rest }) => rest);
   };
 
@@ -1431,19 +2055,31 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
       }
     >
       <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'center', justifyContent: 'space-between' }}>
-          <Tabs
-            tabs={PERIODS.map((p) => ({ value: p.value, label: p.label }))}
-            value={period}
-            onChange={(v) => changePeriod(v as UsagePeriod)}
-          />
-          {dashboard?.canSeeEveryone ? (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, alignItems: 'center', justifyContent: 'space-between' }}>
             <Tabs
-              tabs={[{ value: 'self', label: 'Just me' }, { value: 'everyone', label: 'Everyone' }]}
-              value={scope}
-              onChange={(v) => setScope(v as UsageScope)}
+              tabs={PERIODS.map((p) => ({ value: p.value, label: p.label }))}
+              value={period}
+              onChange={(v) => changePeriod(v as UsagePeriod)}
             />
-          ) : null}
+            {dashboard?.canSeeEveryone ? (
+              <Tabs
+                tabs={[{ value: 'self', label: 'Just me' }, { value: 'everyone', label: 'Everyone' }]}
+                value={scope}
+                onChange={(v) => setScope(v as UsageScope)}
+              />
+            ) : null}
+          </div>
+          <PeriodNavigator
+            period={period}
+            anchor={anchor}
+            // An empty window is only worth remarking on once the answer is in;
+            // while it is loading there is nothing to say and a line saying
+            // "nothing recorded" would be a guess.
+            empty={Boolean(dashboard) && dashboard?.totals.turns === 0}
+            narrowed={hasFilters(filters)}
+            onAnchor={changeAnchor}
+          />
         </div>
 
         <FilterChips filters={filters} onChange={setFilters} />
@@ -1463,8 +2099,8 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
             >
               <Headline label="Cost" figure={costFigure(dashboard.totals)} />
               <Headline label="Tokens" figure={tokensFigure(dashboard.totals)} />
-              <Headline label="Jobs" figure={{ text: String(dashboard.totals.jobs) }} />
               <Headline label="Turns" figure={{ text: String(dashboard.totals.turns) }} />
+              <Headline label="Model turns" figure={modelTurnsFigure(dashboard.totals)} />
               <Headline label="Tool calls" figure={{ text: String(dashboard.totals.toolCalls) }} />
             </div>
 
@@ -1576,7 +2212,7 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
 
             <div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'space-between' }}>
-                <h3 style={{ ...sectionTitleStyle, margin: 0 }}>Job history</h3>
+                <h3 style={{ ...sectionTitleStyle, margin: 0 }}>History</h3>
                 {hasFilters(filters) ? (
                   <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--muted-foreground)' }}>
                     narrowed to the same selection
@@ -1584,9 +2220,15 @@ export function UsageDashboardDialog({ open, onClose }: UsageDashboardDialogProp
                 ) : null}
               </div>
               <div style={{ marginTop: 8 }}>
-                <JobHistory
+                <History
                   scope={scope}
-                  filters={filters}
+                  // The range the figures above were actually computed over,
+                  // not the filter state — a period button sets no `from`/`to`
+                  // of its own, so a list built from `filters` alone covered
+                  // all time while the headline covered a day. The two have to
+                  // add up (#88), and this is the one place both readings of
+                  // the range come from.
+                  filters={{ ...filters, from: dashboard.from, to: dashboard.to }}
                   knownProjects={knownProjects}
                   // Attributing work changes the figures above it, so the whole
                   // view is re-asked rather than left showing a breakdown that

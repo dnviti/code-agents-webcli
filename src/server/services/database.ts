@@ -383,6 +383,11 @@ export class AppDatabase {
         ended_at TEXT NOT NULL,
         duration_ms INTEGER,
         outcome TEXT NOT NULL,
+        /* Superseded by model_turns, and read by nothing here — see the
+           migration below. Still declared, still written, because it is NOT NULL
+           and a build from before #86 opening this same file inserts into it. A
+           downgrade is a normal part of how this app is updated, so the column
+           an older build needs outlives the meaning this one gave up. */
         turns INTEGER NOT NULL,
         tool_calls INTEGER NOT NULL,
         input_tokens INTEGER,
@@ -394,6 +399,29 @@ export class AppDatabase {
         cost_usd REAL,
         reports_usage INTEGER NOT NULL,
         reports_cost INTEGER NOT NULL
+      );
+
+      /* How one job's spend divided between models, for the runtimes that say.
+         Rows exist only where a turn genuinely used more than one — a subagent
+         on another model, a fallback after a failure — because a single-model
+         job is already fully described by usage_jobs.model.
+
+         The figures are the runtime's own, not a share worked out here: claude
+         and grok both publish a per-model breakdown of the same turn they
+         publish a total for. The calls column is that runtime's own count of
+         round trips to the model. There is deliberately no tool_calls: no runtime
+         attributes a tool call to a model, and a column nobody can fill
+         honestly invites somebody to fill it dishonestly. */
+      CREATE TABLE IF NOT EXISTS usage_job_models (
+        job_id TEXT NOT NULL REFERENCES usage_jobs(id) ON DELETE CASCADE,
+        model TEXT NOT NULL,
+        calls INTEGER,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cache_read_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        cost_usd REAL,
+        PRIMARY KEY (job_id, model)
       );
 
       /* Which tools a job called, and how often. Cascades: a tool count with no
@@ -413,6 +441,9 @@ export class AppDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_usage_jobs_native
         ON usage_jobs(native_session_id);
+
+      CREATE INDEX IF NOT EXISTS idx_usage_job_models_model
+        ON usage_job_models(model);
 
       CREATE INDEX IF NOT EXISTS idx_runtime_sessions_owner
         ON runtime_sessions(owner_user_id);
@@ -458,6 +489,12 @@ export class AppDatabase {
     // existed has no override recorded, which is exactly what a null means.
     this.addColumnIfMissing('runtime_sessions', 'chat_model_override', 'TEXT');
 
+    // The reasoning-effort level this conversation overrides its runtime's
+    // default with. Nullable and null-by-default for the same reason as the
+    // model above: a row written before this column existed chose no level, and
+    // null is what "chose no level" has always meant.
+    this.addColumnIfMissing('runtime_sessions', 'chat_effort_override', 'TEXT');
+
     // The label the user chose for this session. Nullable and null-by-default:
     // a null is "never renamed", which is true of every row written before
     // renaming outlived the page that did it.
@@ -483,11 +520,60 @@ export class AppDatabase {
         WHERE project IS NOT NULL AND project_source IS NULL;
     `);
 
+    // How many round trips to the model a turn took, where the runtime says.
+    //
+    // The column beside it, `turns`, held a different quantity under the same
+    // name: the number of assistant messages the transcript happened to show,
+    // which is how an agent chops up its output rather than how much work it
+    // did (#86). A turn is now one row of this table — see `UsageJobRecord` —
+    // so the count nobody can disagree about is `COUNT(*)`, and this column
+    // holds the other quantity under a name that says which one it is.
+    //
+    // The old column is left where it is and read by nothing. Dropping it would
+    // rewrite the whole table, and an older build reading the same file still
+    // expects it to be there — a downgrade is a normal part of updating here.
+    // The old values are *not* copied across: they were derived, this column is
+    // reported-only, and moving one into the other would make an inference
+    // indistinguishable from a measurement in the one place built to keep those
+    // apart. Rows from before this change read "not reported", which is what
+    // they are.
+    this.addColumnIfMissing('usage_jobs', 'model_turns', 'INTEGER');
+
     // Declared here rather than with the other indexes above, because the
     // column it covers is only guaranteed to exist by the line before it.
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_usage_jobs_project
         ON usage_jobs(project, ended_at);
+    `);
+
+    // A total for the jobs filed before one was derived from the parts.
+    //
+    // Until #80 a job's total was whatever the runtime volunteered, and Claude
+    // volunteers none — so most of the history read "not reported" for work
+    // whose tokens were on screen while it ran, and every dashboard figure
+    // built on the column skipped those rows. The parts were always recorded,
+    // so this adds up what is already in the row rather than estimating
+    // anything, and it matches `tokenTotal` exactly: the cache buckets count,
+    // reasoning does not (it is a slice of the output, not an addition to it).
+    //
+    // Idempotent, and safe to run on every boot: the WHERE clause excludes
+    // every row it has already written, and a row where the runtime reported
+    // nothing at all has nothing to add up and is left as the null it is.
+    this.db.exec(`
+      UPDATE usage_jobs
+         SET total_tokens = COALESCE(input_tokens, 0)
+                          + COALESCE(output_tokens, 0)
+                          + COALESCE(cache_read_tokens, 0)
+                          + COALESCE(cache_write_tokens, 0)
+       WHERE total_tokens IS NULL
+         AND (input_tokens IS NOT NULL
+           OR output_tokens IS NOT NULL
+           OR cache_read_tokens IS NOT NULL
+           OR cache_write_tokens IS NOT NULL);
+
+      UPDATE usage_jobs
+         SET total_tokens = reasoning_tokens
+       WHERE total_tokens IS NULL AND reasoning_tokens IS NOT NULL;
     `);
   }
 

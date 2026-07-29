@@ -107,18 +107,26 @@ export function leaveSession(app: App): void {
   app.send({ type: 'leave_session' });
 }
 
+/**
+ * Delete a session for good.
+ *
+ * Reports whether it went, because a caller that has drawn a row for it needs to
+ * know: the conversation list removes the row it just deleted rather than
+ * re-reading the whole list, and removing one the server refused to delete would
+ * hide a conversation that is still there.
+ */
 export async function deleteSession(
   app: App,
   sessionId: string,
   options: { confirm?: boolean } = {},
-): Promise<void> {
+): Promise<boolean> {
   const { confirm: requireConfirm = true } = options;
 
   if (
     requireConfirm &&
     !confirm('Are you sure you want to delete this session? This will stop any running Claude process.')
   ) {
-    return;
+    return false;
   }
 
   try {
@@ -133,9 +141,11 @@ export async function deleteSession(
       app.terminal?.reset();
       hideOverlay();
     }
+    return true;
   } catch (error) {
     console.error('Failed to delete session:', error);
     showError('Failed to delete session');
+    return false;
   }
 }
 

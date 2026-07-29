@@ -100,17 +100,27 @@ function render(props) {
   );
 }
 
+// Turn ids as an adapter stamps them: a user message opens a turn and the reply
+// carries the same id. Turns are grouped on it (#86), so a fixture that gave
+// every message the same id would render one turn for a whole conversation.
+let fixtureTurn = 0;
+
 function message(id, seq, role, text, extra) {
+  if (role === 'user' && !(extra && extra.turnId)) fixtureTurn += 1;
   return {
     id,
     seq,
-    turnId: 't1',
+    turnId: `t${fixtureTurn || 1}`,
     role,
     ts: 1,
     blocks: [{ kind: 'text', text }],
     ...extra,
   };
 }
+
+beforeEach(function () {
+  fixtureTurn = 0;
+});
 
 describe('ChatView', function () {
   it('renders an empty transcript as a quiet prompt, not a blank pane', function () {
@@ -294,7 +304,10 @@ describe('ChatView', function () {
     // …and not in the prose, which keeps its answer.
     assert.ok(html.includes('all green'));
     assert.ok(!html.includes('68 passing'), 'tool output must not be back in the transcript');
-    assert.ok(html.includes('show work'), 'the transcript keeps a pointer to it');
+    assert.ok(
+      /aria-label="Show work: 1 command, 1 reasoning step"/.test(html),
+      'the transcript keeps a pointer to it',
+    );
   });
 
   it('states plainly that an exited session is over', function () {
@@ -466,6 +479,49 @@ describe('ChatView', function () {
     assert.ok(html.includes('stdio closed unexpectedly'), 'lastError must be shown verbatim');
     assert.ok(html.includes('role="alert"'), 'a fatal error must be announced immediately');
     assert.ok(html.includes('>error<'), 'header indicator must follow the state');
+  });
+
+  /**
+   * The way into the conversation list, at the top of the chat surface (#127).
+   *
+   * Beside the transcript search on purpose: the two are the same gesture at two
+   * scales, and someone who has just failed at finding something in *this*
+   * conversation is about to want to find another one.
+   */
+  it('offers a way to all conversations beside the transcript search', function () {
+    const html = render({
+      controller: controllerWith({}),
+      onOpenConversations() {},
+    });
+
+    assert.ok(html.includes('aria-label="Search this conversation"'), 'the search trigger is the anchor');
+    assert.ok(html.includes('aria-label="All conversations"'), html.slice(0, 800));
+  });
+
+  it('leaves the control out entirely when the shell offers no list', function () {
+    // A control that does nothing reads as a broken control. Rendered only when
+    // there is a shell to host the dialog.
+    const html = render({ controller: controllerWith({}) });
+    assert.ok(!html.includes('All conversations'));
+  });
+
+  it('keeps that way in reach once the header has shed its search field', function () {
+    // Below ~1100px the bar drops the field for a glyph on the right. Both go
+    // together: the pairing is the point, and a control that survives only at
+    // full width is a control most windows never see.
+    const html = render({
+      controller: controllerWith({}),
+      onOpenConversations() {},
+      isMobile: true,
+    });
+    // On a phone the header carries no controls at all — the route is the
+    // actions sheet, asserted in the browser checks where the sheet can be
+    // opened. What must hold here is that nothing was drawn twice.
+    assert.strictEqual(
+      html.split('aria-label="All conversations"').length - 1,
+      0,
+      'the phone header carries no controls; the sheet is its route',
+    );
   });
 
   it('collapses the rails and keeps touch targets on mobile', function () {
@@ -652,6 +708,30 @@ describe('ChatView', function () {
     );
   });
 
+  it('repeats the server’s word that the older history was trimmed away', function () {
+    // `complete: false` has been on the wire and stored on the controller since
+    // the index was written, and no surface read it: the index listed the turns
+    // that survived the retention cap as though they were the conversation
+    // (#86). Driven through the real message so the whole path is under test —
+    // a prop passed by hand would prove nothing about the wiring.
+    const controller = controllerWith({
+      messages: [message('u1', 1, 'user', 'the surviving ask')],
+      cursor: 1,
+    });
+    controller.handle({
+      type: 'chat_turn_index',
+      sessionId: 's1',
+      complete: false,
+      turns: [
+        { id: 'u1', turnId: 't1', index: 4001, label: 'the surviving ask', startedAt: 1, outcome: 'done' },
+      ],
+    });
+
+    const html = render({ controller });
+    assert.ok(/earlier turns trimmed/.test(html), 'the index has to admit what it cannot show');
+    assert.ok(/4001/.test(html), 'and keep the numbers the recording gave the survivors');
+  });
+
   it('wires the composer and the approval buttons to the controller', function () {
     // The rendered markup cannot prove a callback landed, so the wiring is
     // checked against the messages the controller would put on the socket.
@@ -661,7 +741,9 @@ describe('ChatView', function () {
     controller.interrupt();
 
     assert.deepStrictEqual(
-      controller.sent.map((m) => m.type),
+      // The index request is sent when the conversation is hydrated, before any
+      // of this — see the turn index (#86).
+      controller.sent.map((m) => m.type).filter((type) => type !== 'chat_turn_index_request'),
       ['chat_send', 'chat_permission_response', 'chat_interrupt'],
     );
   });

@@ -1,0 +1,4 @@
+provider    model                                               context  max-out  thinking  images
+openrouter  ~anthropic/claude-opus-latest                       1M       128K     yes       yes   
+openrouter  anthropic/claude-opus-4.1                           200K     32K      yes       yes   
+openrouter  moonshotai/kimi-k3                                  1.0M     131.1K   yes       yes   

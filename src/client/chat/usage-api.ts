@@ -1,4 +1,5 @@
 import type {
+  UsageConversationSummary,
   UsageDashboard,
   UsageFilters,
   UsageJobRecord,
@@ -67,12 +68,26 @@ export async function fetchUsageDashboard(
   period: UsagePeriod,
   scope: UsageScope,
   filters?: UsageFilters,
+  anchor?: Date,
 ): Promise<UsageDashboard> {
   const params = new URLSearchParams({
     period,
     scope,
-    tz: String(localTzOffsetMinutes()),
+    // The offset that belongs to the moment being asked about, not to now. They
+    // differ by an hour across a daylight-saving line, and the server builds the
+    // window from this — so a January asked about from July was named January
+    // and covered 31 December 23:00 to 31 January 23:00.
+    tz: String(anchor ? -anchor.getTimezoneOffset() : localTzOffsetMinutes()),
   });
+  // Which period, not just how wide it is. The server has always taken this and
+  // nothing here ever sent one, so every request resolved against `new Date()`
+  // and `year` meant the calendar year the viewer happens to be standing in —
+  // on the first of January the whole of the previous year's record left the
+  // dashboard, the trend, the history and the export while staying in the
+  // database (#56). Left off when the viewer has not moved the window, so the
+  // request still means "wherever now is" rather than pinning it to the instant
+  // this page was loaded.
+  if (anchor) params.set('anchor', anchor.toISOString());
   appendFilters(params, filters);
   const dashboard = await getJson<UsageDashboard>(`/api/usage/dashboard?${params.toString()}`);
 
@@ -106,6 +121,12 @@ export interface UsageJobsQuery extends UsageFilters {
   scope: UsageScope;
   limit?: number;
   offset?: number;
+  /**
+   * Narrow to one conversation. Not one of the dashboard's filters — there is
+   * no breakdown by conversation to click — it is how a conversation entry
+   * opens onto the requests inside it.
+   */
+  sessionId?: string;
 }
 
 export interface UsageJobsPage {
@@ -113,12 +134,34 @@ export interface UsageJobsPage {
   total: number;
 }
 
-export function fetchUsageJobs(query: UsageJobsQuery): Promise<UsageJobsPage> {
+/** The shared half of a `/jobs` and a `/conversations` request. */
+function historyParams(query: UsageJobsQuery): URLSearchParams {
   const params = new URLSearchParams({ scope: query.scope });
   if (query.limit !== undefined) params.set('limit', String(query.limit));
   if (query.offset !== undefined) params.set('offset', String(query.offset));
+  if (query.sessionId) params.set('sessionId', query.sessionId);
   appendFilters(params, query);
-  return getJson<UsageJobsPage>(`/api/usage/jobs?${params.toString()}`);
+  return params;
+}
+
+export function fetchUsageJobs(query: UsageJobsQuery): Promise<UsageJobsPage> {
+  return getJson<UsageJobsPage>(`/api/usage/jobs?${historyParams(query).toString()}`);
+}
+
+export interface UsageConversationsPage {
+  conversations: UsageConversationSummary[];
+  total: number;
+}
+
+/**
+ * The conversations behind the figures, one entry per chat tab.
+ *
+ * Takes the same query as `fetchUsageJobs` on purpose: the two are one list at
+ * two levels of detail, and building the narrowing twice is how they come to
+ * disagree about what is on screen.
+ */
+export function fetchUsageConversations(query: UsageJobsQuery): Promise<UsageConversationsPage> {
+  return getJson<UsageConversationsPage>(`/api/usage/conversations?${historyParams(query).toString()}`);
 }
 
 /**

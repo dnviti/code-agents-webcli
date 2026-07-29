@@ -12,9 +12,10 @@ import { formatTurnMeta, turnTime, STATUS_GLYPH, type TurnSummary } from '../../
  * sticky bar with a code block sliding under it is unreadable at exactly the
  * moment it is meant to be helping.
  *
- * The meta group is where a 28px bar gets broken. Counts may ellipsise; the
- * duration and the money may not — they are the two figures someone came here
- * to read, and half of a cost is worse than none.
+ * The meta group is where a 28px bar gets broken, and nothing in it is allowed
+ * to break: every figure there is a measurement, and half of one is worse than
+ * none. The label is what gives the room up — cut to whatever is left, with the
+ * whole prompt on hover — because a label cut short is still a label.
  */
 
 export interface TurnStripProps {
@@ -155,7 +156,28 @@ export function TurnStrip({
           >
             <Icon name={glyph.icon} size={isPhone ? 14 : 11} />
           </span>
-          <Shrinkable fontSize={isPhone ? PHONE_TEXT.body : 'var(--text-xs)'}>{turn.label}</Shrinkable>
+          <span
+            // The whole prompt on hover. What is on the bar is a first line cut
+            // to whatever room is left, and the rest of it is a keystroke away
+            // rather than gone.
+            title={turn.label}
+            style={{
+              // Takes the room that is left and gives it all back before
+              // anything else in the bar gives up any: the figures beside it are
+              // why the bar exists, and a long first line used to push them into
+              // ellipsis — "16 too…", "9 rea…" — which is a measurement nobody
+              // can read. A label cut short is still a label; half a tool count
+              // is nothing at all.
+              flex: '1 1 0',
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
+            }}
+          >
+            {turn.label}
+          </span>
         </>
       ) : null}
 
@@ -165,8 +187,10 @@ export function TurnStrip({
           display: 'flex',
           alignItems: 'center',
           gap: 10,
-          minWidth: 0,
-          overflow: 'hidden',
+          // Fixed, and every figure in it fixed too. These are measurements —
+          // a truncated one is worse than none, and there is always something
+          // beside them that can give the room up instead: the label.
+          flex: '0 0 auto',
           whiteSpace: 'nowrap',
           fontFamily: 'var(--font-mono)',
           // The duration and the cost are in here — session figures, so they
@@ -175,8 +199,8 @@ export function TurnStrip({
           color: 'var(--muted-foreground)',
         }}
       >
-        {meta.tools ? <Shrinkable>{meta.tools}</Shrinkable> : null}
-        {meta.reasoning ? <Shrinkable>{meta.reasoning}</Shrinkable> : null}
+        {meta.tools ? <span style={{ flex: '0 0 auto' }}>{meta.tools}</span> : null}
+        {meta.reasoning ? <span style={{ flex: '0 0 auto' }}>{meta.reasoning}</span> : null}
         {meta.duration ? <span style={{ flex: '0 0 auto' }}>{meta.duration}</span> : null}
         {meta.cost ? (
           <span style={{ flex: '0 0 auto', color: past ? 'var(--muted-foreground)' : 'var(--foreground)' }}>
@@ -195,37 +219,6 @@ export function TurnStrip({
         <StripButton label="Branch a new session from this turn" icon="git-branch" onClick={onBranch} />
       ) : null}
     </div>
-  );
-}
-
-/**
- * Text that gives up its width before anything else in the bar does.
- *
- * `nowrap` is what makes the ellipsis work at all: without it the text wraps
- * instead of being cut, and since the bar is a fixed height the second line
- * simply leaves it. The other users of this sit inside a span that already
- * sets both that and a size; the turn label does not, so it says so itself.
- */
-function Shrinkable({
-  children,
-  fontSize,
-}: {
-  children: React.ReactNode;
-  fontSize?: string | number;
-}): React.JSX.Element {
-  return (
-    <span
-      style={{
-        flex: '0 1 auto',
-        minWidth: 0,
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap',
-        fontSize,
-      }}
-    >
-      {children}
-    </span>
   );
 }
 
