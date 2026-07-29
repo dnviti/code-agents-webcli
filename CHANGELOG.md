@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed
+- **A chat that has just opened is empty, and the first prompt is turn 1.** The
+  approval mode a conversation begins in was announced as a rule written across
+  the transcript, and in a conversation nobody had spoken in yet that rule was
+  the whole of it: a line, a turn strip and a row in the index for a turn that
+  had not happened, so the empty state never showed and the first question the
+  user actually asked opened turn 2 — with both strips reading "turn 1" until the
+  recorded index arrived to disagree. The mode is a standing fact about the
+  session rather than something that happened in the conversation, and the two
+  surfaces that state standing facts already carry it permanently: the badge in
+  the header and the chip beside the composer. The marker still travels, because
+  a conversation restarted from inside itself re-decides the mode and nothing
+  else tells the pane (#134), and it is still written to the log. It simply draws
+  nothing.
+
 ## [5.3.3] - 2026-07-29
 
 ### Fixed

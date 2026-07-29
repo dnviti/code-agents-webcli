@@ -406,11 +406,13 @@ holds on a second device and in a second browser. It is stored on the server and
 is never taken from the page at launch time: the launcher's chat button reports
 what the server is going to do rather than requesting it.
 
-Every conversation says which mode it is in as it starts, on a line at the top of
-the conversation itself, and a conversation running with approvals bypassed keeps
-saying so in its header for as long as it is on screen — including while nothing
-is running it. The two buttons on the recovery notice name the mode each of them
-lands in, so a bypass is never restored, or dropped, in silence.
+Every conversation says which mode it is in, on the chip beside the input box and
+in its header, for as long as it is on screen — including while nothing is running
+it. It is said there rather than in the transcript: the mode is a standing fact
+about the session and not something that happened in the conversation, so a chat
+that has just opened is empty and the first prompt is turn 1. The two buttons on
+the recovery notice name the mode each of them lands in, so a bypass is never
+restored, or dropped, in silence.
 
 **pi is the exception, and the app says so rather than pretending.** pi's chat
 adapter has no approval channel at all — its `--approve` trusts project-local

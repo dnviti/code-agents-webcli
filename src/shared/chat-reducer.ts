@@ -281,12 +281,16 @@ export function foldSessionUsage(usage: ChatUsage, event: ChatEvent): ChatUsage 
 /**
  * What each rule drawn across a conversation says.
  *
- * A table rather than a chain of ternaries because there are four of them now
- * and the words are the whole of what a rule communicates: a reader sees one
- * short phrase and has to understand from it that the transcript above is no
- * longer what the agent can see, or was said somewhere else entirely. `cleared`
- * is here for completeness — it empties the window rather than drawing a line,
- * and is handled before this is reached.
+ * A table rather than a chain of ternaries because the words are the whole of
+ * what a rule communicates: a reader sees one short phrase and has to
+ * understand from it that the transcript above is no longer what the agent can
+ * see, or was said somewhere else entirely. `cleared` is here for completeness —
+ * it empties the window rather than drawing a line, and is handled before this
+ * is reached.
+ *
+ * Keyed by `NoticeBlock['notice']` rather than by marker kind, which is what
+ * leaves `approvals` out: it is a marker that draws nothing, and the type says
+ * so instead of a comment having to.
  */
 const NOTICES: Record<
   NoticeBlock['notice'],
@@ -296,7 +300,6 @@ const NOTICES: Record<
   interrupted: { notice: 'interrupted', text: 'Interrupted to send' },
   branched: { notice: 'branched', text: 'Branched from an earlier conversation' },
   cleared: { notice: 'cleared', text: 'New conversation' },
-  approvals: { notice: 'approvals', text: 'Tool approvals' },
 };
 
 /** Every token field a runtime can report, so a reset covers all of them. */
@@ -990,6 +993,31 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         return { messageIndex: null, structural: true, meta: true, applied: true };
       }
 
+      // And the one that leaves nothing at all.
+      //
+      // The approval mode has to travel as an event — a conversation restarted
+      // from inside itself re-decides it, and this marker is the only thing that
+      // reaches the browser with the answer (#134) — but it is a standing fact
+      // about the session rather than something that happened in the
+      // conversation, and the surfaces that state standing facts say it
+      // permanently: the badge in the header and the chip beside the composer,
+      // both off `bypassing`.
+      //
+      // Written into the transcript as well, it was the whole of a conversation
+      // nobody had spoken in yet. A chat opened and sat there showing a rule, a
+      // turn strip and a row in the index for a turn that had not happened —
+      // numbered 1, so the first question the user actually asked opened turn 2,
+      // and both rows read "turn 1" until the recorded index arrived to
+      // disagree. A conversation starts empty and the user's first prompt starts
+      // turn 1.
+      //
+      // The event itself is untouched: it is still written to the log, so the
+      // recording still says which mode each conversation ran in and when that
+      // was decided. Only the row it used to draw is gone.
+      if (event.kind === 'approvals') {
+        return { messageIndex: null, structural: false, meta: false, applied: true };
+      }
+
       // The ones that leave a line rather than empty the window. Compaction is
       // there because everything above it is no longer in the agent's context,
       // and an agent that quietly forgets the first hour is a confusing one.
@@ -998,10 +1026,11 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // the stop without the reason would read as an agent that gave up. A
       // branch is there because everything above it happened in another
       // conversation, and a copied history presented as this one's own would
-      // be the same lie in the other direction. And the approval mode is there
-      // because it is decided as the conversation begins, from a preference set
-      // somewhere else entirely — a conversation running tools unattended has
-      // to say so where the tools are running (#134).
+      // be the same lie in the other direction.
+      //
+      // What they have in common, and what `approvals` above does not, is that
+      // each of them is an event in the conversation's own history: it happened
+      // at a point in the transcript and means nothing anywhere else.
       const notice = NOTICES[event.kind];
       const message: ChatMessage = {
         id: `marker-${event.seq}`,

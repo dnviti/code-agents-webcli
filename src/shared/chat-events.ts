@@ -388,7 +388,7 @@ export interface ErrorBlock {
  */
 export interface NoticeBlock {
   kind: 'notice';
-  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals';
+  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched';
   text: string;
   /** Optional detail — how much was reclaimed, what the summary covers. */
   detail?: string;
@@ -1144,12 +1144,15 @@ export type ChatEvent =
    * looked like an ordinary transcript would be claiming the agent lived
    * through it (#34).
    *
-   * `approvals` opens a conversation by saying which mode it is running in.
-   * The mode is decided when a conversation begins, from a preference that
-   * lives in Settings and may have been changed since the last one — so a
-   * conversation that starts, or is started over, without approval prompts says
-   * so in the conversation itself rather than only in a dialog the user may
-   * never open (#134). `detail` carries which mode.
+   * `approvals` is the one that draws nothing. The mode is decided when a
+   * conversation begins, from a preference that lives in Settings and may have
+   * been changed since the last one, so it has to travel — but it is a standing
+   * fact about the session rather than something that happened in it, and the
+   * two indicators that state standing facts (the header badge and the chip
+   * beside the composer) both read it off `bypassing` (#134). Drawn in the
+   * transcript as well, it was the only thing on screen in a conversation
+   * nobody had spoken in yet, and it took turn 1 from the user's first question.
+   * `detail` carries the phrase those indicators do not need.
    */
   | {
       t: 'marker';

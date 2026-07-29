@@ -6092,13 +6092,21 @@ async function checkAReadOnlyFileStaysReadOnly(): Promise<void> {
  * over a live conversation and that pressing it sends the same command.
  */
 /**
- * A conversation says which approval mode it is in, where the user is looking.
+ * A conversation says which approval mode it is in, where the user is looking —
+ * and says nothing at all until the user has spoken.
  *
  * Here rather than in a unit test because the whole complaint in #134 is that
  * the mode was decided invisibly. "The component was passed the right value" is
  * not the claim — the claim is that a person sitting in front of the pane can
- * read it, so this measures the rendered line and the two recovery buttons: on
+ * read it, so this measures the rendered chip and the two recovery buttons: on
  * screen, not transparent, and set in type big enough to be read.
+ *
+ * It also measures where the mode may *not* be said. A rule written across the
+ * transcript as the conversation opened was the only thing in a chat nobody had
+ * spoken in yet: a line, a turn strip numbering a turn that never happened, and
+ * no empty state, so the first question the user asked opened turn 2. The mode
+ * is a standing fact and the standing indicators carry it; the transcript starts
+ * empty and the first prompt starts turn 1.
  *
  * The two buttons are the heart of it. They sat side by side doing opposite
  * things about approvals with nothing on screen saying which was which, so the
@@ -6133,8 +6141,10 @@ async function checkAConversationSaysWhichApprovalModeItIsIn(): Promise<void> {
     },
   } as never);
 
-  // The line the server draws at the top of a conversation that is beginning,
-  // in the words ChatSession emits — see approvalNoticeDetail.
+  // The marker the server sends as a conversation begins, in the words
+  // ChatSession emits — see approvalNoticeDetail. It carries the mode and draws
+  // nothing: what it used to draw was a rule and a turn strip in a conversation
+  // nobody had spoken in yet.
   controller.handle({
     type: 'chat_event',
     sessionId: 'browser-check',
@@ -6165,35 +6175,88 @@ async function checkAConversationSaysWhichApprovalModeItIsIn(): Promise<void> {
   paint(false);
   await wait(250);
 
-  const notice = Array.from(host.querySelectorAll<HTMLElement>('[role="separator"]')).find((node) =>
-    /tool approvals/i.test(node.textContent || ''),
+  // Nothing in the transcript, because nothing has been said in it. Measured
+  // three ways because each one is a different way the old behaviour showed
+  // itself: a rule with the mode written across it, a turn strip numbering a
+  // turn that had not happened, and the empty state suppressed by the single
+  // message behind both of them.
+  const noticed = Array.from(host.querySelectorAll<HTMLElement>('[role="separator"]')).find((node) =>
+    /approvals/i.test(node.textContent || ''),
   );
-  check('a conversation states its approval mode in the conversation', Boolean(notice));
-  if (notice) {
-    check(
-      'and the statement is on screen rather than merely present',
-      isPainted(notice),
-      `${Math.round(notice.getBoundingClientRect().width)}x${Math.round(notice.getBoundingClientRect().height)}`,
-    );
-    const size = parseFloat(window.getComputedStyle(notice).fontSize) || 0;
-    check(
-      'and it is set in type that can be read',
-      size >= 11 - 0.01,
-      `${size}px`,
-    );
-    check(
-      'and it says which mode, not just that there is one',
-      /bypassed/.test(notice.textContent || ''),
-      (notice.textContent || '').trim(),
-    );
-  }
+  check(
+    'a conversation nobody has spoken in yet draws no line about approvals',
+    !noticed,
+    (noticed?.textContent || '').trim(),
+  );
+  const strips = Array.from(host.querySelectorAll<HTMLElement>('[data-turn-id]'));
+  check(
+    'and no turn strip, because the first prompt has not opened a turn yet',
+    strips.length === 0,
+    strips.map((node) => (node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60)).join(' | '),
+  );
+  const empty = Array.from(host.querySelectorAll<HTMLElement>('p')).find((node) =>
+    /Nothing here yet/.test(node.textContent || ''),
+  );
+  check(
+    'and the empty conversation says so, which the marker used to suppress',
+    Boolean(empty) && isPainted(empty as HTMLElement),
+    empty ? 'painted' : 'no empty state',
+  );
 
   const chipNamed = (label: string): HTMLElement | null =>
     host.querySelector<HTMLElement>(`[aria-label="${label}"]`);
 
+  // Where the mode is stated instead: permanently, beside the input box and in
+  // the header, rather than once at a top the reader scrolls away from.
+  const chip = chipNamed('Approvals bypassed');
   check(
-    'the chip beside the input box says the same thing as the line',
-    Boolean(chipNamed('Approvals bypassed')) && !chipNamed('Approvals asked for'),
+    'the mode is stated on the chip beside the input box',
+    Boolean(chip) && !chipNamed('Approvals asked for'),
+  );
+  if (chip) {
+    check(
+      'and the chip is on screen rather than merely present',
+      isPainted(chip),
+      `${Math.round(chip.getBoundingClientRect().width)}x${Math.round(chip.getBoundingClientRect().height)}`,
+    );
+    const size = parseFloat(window.getComputedStyle(chip).fontSize) || 0;
+    check('and it is set in type that can be read', size >= 10 - 0.01, `${size}px`);
+  }
+
+  // And the first thing the user says is turn 1 — which it was not while the
+  // marker held a turn of its own above it.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: { t: 'msg_start', id: 'u1', seq: 6, ts: 6, turnId: 'first-turn', role: 'user' },
+  } as never);
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: { t: 'block_start', msgId: 'u1', index: 0, block: { kind: 'text', text: '' } },
+  } as never);
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: { t: 'block_delta', msgId: 'u1', index: 0, text: 'the first thing anyone asked' },
+  } as never);
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: { t: 'msg_end', msgId: 'u1' },
+  } as never);
+  paint(false);
+  await wait(250);
+
+  // Off the fold button's label rather than the strip's text, which runs the
+  // number straight into the clock beside it — "turn 101:00:00".
+  const numbered = Array.from(host.querySelectorAll<HTMLElement>('[data-turn-id] button'))
+    .map((node) => node.getAttribute('aria-label') || '')
+    .filter((label) => /turn \d+$/.test(label));
+  check(
+    'the user’s first prompt is turn 1, and the only turn',
+    numbered.length === 1 && /turn 1$/.test(numbered[0]),
+    numbered.join(' | ') || 'no turn strip at all',
   );
 
   // And now a `/clear`, which starts the conversation over in whatever mode the
@@ -6210,7 +6273,7 @@ async function checkAConversationSaysWhichApprovalModeItIsIn(): Promise<void> {
   controller.handle({
     type: 'chat_event',
     sessionId: 'browser-check',
-    event: { t: 'marker', kind: 'cleared', seq: 2, ts: 2, detail: 'started a new conversation' },
+    event: { t: 'marker', kind: 'cleared', seq: 7, ts: 7, detail: 'started a new conversation' },
   } as never);
   controller.handle({
     type: 'chat_event',
@@ -6218,8 +6281,8 @@ async function checkAConversationSaysWhichApprovalModeItIsIn(): Promise<void> {
     event: {
       t: 'marker',
       kind: 'approvals',
-      seq: 3,
-      ts: 3,
+      seq: 8,
+      ts: 8,
       detail: 'on — you are asked before each tool call',
       bypassing: false,
     },
@@ -6238,7 +6301,7 @@ async function checkAConversationSaysWhichApprovalModeItIsIn(): Promise<void> {
   controller.handle({
     type: 'chat_event',
     sessionId: 'browser-check',
-    event: { t: 'marker', kind: 'cleared', seq: 4, ts: 4, detail: 'started a new conversation' },
+    event: { t: 'marker', kind: 'cleared', seq: 9, ts: 9, detail: 'started a new conversation' },
   } as never);
   controller.handle({
     type: 'chat_event',
@@ -6246,8 +6309,8 @@ async function checkAConversationSaysWhichApprovalModeItIsIn(): Promise<void> {
     event: {
       t: 'marker',
       kind: 'approvals',
-      seq: 5,
-      ts: 5,
+      seq: 10,
+      ts: 10,
       detail: 'bypassed — tools run without asking',
       bypassing: true,
     },

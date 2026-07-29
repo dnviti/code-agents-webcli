@@ -39,6 +39,10 @@ function ensureBundle() {
   if (mod) return mod;
   const contents = [
     `export { ChatController } from ${JSON.stringify(path.join(ROOT, 'src/client/chat/controller'))};`,
+    // The turn grouping the transcript is read through, so "the first prompt is
+    // turn 1" is asked of the same function the strips and the index are drawn
+    // from rather than of this file's idea of it.
+    `export { groupTurns } from ${JSON.stringify(path.join(ROOT, 'src/client/chat/turns'))};`,
   ].join('\n');
 
   bundle = path.join(os.tmpdir(), `chat-approval-mode-live-${process.pid}.js`);
@@ -169,6 +173,51 @@ describe('the approval mode a live pane is showing', function () {
       controller.handle({ type: 'chat_event', sessionId: 's1', event });
     }
   }
+
+  it('opens the conversation with nothing in it, and gives turn 1 to the first prompt', async function () {
+    // What a pane that joins a conversation as it launches actually holds. The
+    // mode has to travel — every test below turns on it — and it used to travel
+    // as a rule written across the transcript, which was then the whole of a
+    // conversation nobody had spoken in yet: a line, a turn strip and an index
+    // row for a turn that had not happened, numbered 1, so the user's first
+    // question opened turn 2.
+    const { s, store } = liveSession();
+    s.deps.resolveBypass = () => true;
+    await s.start({ runtime: 'claude', workingDir: os.tmpdir(), bypassPermissions: true });
+
+    const joined = pane(true);
+    deliver(joined, store.events, 0);
+
+    assert.deepStrictEqual(
+      joined.transcript.messages,
+      [],
+      'a chat that has just opened is empty — anything here is on screen above the composer '
+      + 'before the user has said a word',
+    );
+    assert.deepStrictEqual(
+      mod.groupTurns(joined.transcript.messages, 'idle'),
+      [],
+      'and no turn, because no turn has happened',
+    );
+    assert.strictEqual(
+      joined.transcript.bypassing,
+      true,
+      'the mode still reached the pane — it is stated on the header badge and the chip beside '
+      + 'the composer, permanently, which is what the rule was standing in for',
+    );
+
+    // And now the first thing anyone says. The session mints the user message
+    // itself, so this is the real opening turn of a real conversation.
+    const before = store.events.length;
+    await s.send({ text: 'the first thing anyone asked' });
+    deliver(joined, store.events, before);
+
+    const turns = mod.groupTurns(joined.transcript.messages, 'running');
+    assert.strictEqual(turns.length, 1, 'one turn, not a second one under a marker');
+    assert.strictEqual(turns[0].index, 1, 'and it is turn 1');
+    assert.strictEqual(turns[0].label, 'the first thing anyone asked');
+    await s.stop();
+  });
 
   it('drops the bypass on screen when a clear starts the conversation over asking', async function () {
     const { s, store } = liveSession();
