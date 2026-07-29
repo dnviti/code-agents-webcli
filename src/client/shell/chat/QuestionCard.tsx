@@ -262,17 +262,25 @@ function Answered({
   }
 
   const chosen = picked ?? [];
+  // "Nobody answered" and "we no longer know what was answered" are different
+  // facts and used to be drawn as the same sentence (#113): a card whose
+  // answer had been lost read as one the user had skipped, next to an agent
+  // that had plainly acted on an answer. A real skip is an empty array; not
+  // knowing is `undefined`.
+  const outcome = !picked ? 'unknown' : chosen.length === 0 ? 'skipped' : 'chosen';
   return (
-    <div style={{ display: 'grid', gap: 6 }}>
+    <div style={{ display: 'grid', gap: 6 }} data-question-answer={outcome}>
       {options.map((option) => (
         <PlainOption key={option.optionId} option={option} chosen={chosen.includes(option.optionId)} />
       ))}
-      {chosen.length === 0 ? (
+      {outcome !== 'chosen' ? (
         <span
           role="status"
           style={{ fontSize: 'var(--text-sm)', color: 'var(--muted-foreground)' }}
         >
-          Skipped without answering.
+          {outcome === 'skipped'
+            ? 'Skipped without answering.'
+            : 'What was picked is no longer in this conversation’s record.'}
         </span>
       ) : null}
     </div>

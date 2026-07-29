@@ -458,7 +458,10 @@ export class ChatController {
     // that have no prompt to name them.
     scratch.seedOpenTurn(openTurnId);
     scratch.applyAll(events);
-    this.transcript.prepend(scratch.messages, firstSeq, from);
+    // The scratch folded any `question_resolved` in this page correctly; hand
+    // those over too, or a question scrolled in from history comes back with
+    // every option unticked (#113).
+    this.transcript.prepend(scratch.messages, firstSeq, from, scratch.answeredQuestions);
   }
 
   /**

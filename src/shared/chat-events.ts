@@ -185,6 +185,16 @@ export interface ToolBlock {
   durationMs?: number;
   /** Set on a delegation: what the agent behind this call did. See `AgentRun`. */
   agent?: AgentRun;
+  /**
+   * Set when `output` is a launch acknowledgement rather than a result.
+   *
+   * A workflow started in the background answers its caller in seconds with
+   * "Workflow launched in background. Task ID: …" and then works for minutes.
+   * That sentence is a receipt, and captioning it as the run's final output
+   * offers it as the answer to a question that has not been answered yet
+   * (#116). The run's real result replaces it when it arrives.
+   */
+  launchReceipt?: boolean;
 }
 
 /**
@@ -1089,6 +1099,22 @@ export interface ChatSnapshot {
    */
   pendingQuestions?: QuestionRequest[];
   /**
+   * Answers already given, keyed by the tool call that asked — falling back to
+   * the request id when there was no call to pair with, exactly as the reducer
+   * keys them.
+   *
+   * An answered question is left in the conversation precisely so that
+   * scrolling back past a decision shows the decision, and the card can only
+   * draw the marks if the snapshot carries them. Without this the answer
+   * survived in the log and was thrown away at the join, so every rejoin —
+   * a tab switch, a reload, a reconnect, a second browser — redrew every
+   * answered question as one nobody had ever answered (#113).
+   *
+   * Optional for the same reason `pendingQuestions` is: a snapshot from a
+   * server that predates this should read as "none known", not as malformed.
+   */
+  answeredQuestions?: Record<string, string[]>;
+  /**
    * Turns typed ahead, still waiting. Optional so a snapshot replayed from the
    * store — which knows nothing about a live process — is not obliged to
    * invent one; the session fills it in.
@@ -1172,6 +1198,22 @@ export const NO_CHAT_CAPABILITIES: ChatCapabilities = {
 
 /** The MCP server this app exposes to the runtimes it launches. */
 export const ASK_MCP_SERVER = 'ccweb';
+
+/**
+ * Whether a message id is one this app minted for the user's own turn.
+ *
+ * `ChatSession.deliver` is the only writer of a user message, and it always
+ * mints `user-<uuid>`. Everything else claiming to be the user came from a
+ * runtime — the prompt handed straight back, which is what put two identical
+ * bubbles in one turn for every ACP runtime and both codex modes (#129).
+ *
+ * A shape test rather than a list of the ids those runtimes used, because the
+ * question is "did this app write it", and the answer for anything this app did
+ * not write is no, whatever the runtime chose to call it.
+ */
+export function isSessionMintedMessageId(id: string): boolean {
+  return /^user-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+}
 
 /** The one tool that server offers: put a multiple-choice question to the user. */
 export const ASK_QUESTION_TOOL = 'ask_user_question';

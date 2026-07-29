@@ -229,10 +229,20 @@ describe('a delegation nothing will report on again (#139)', function () {
       { t: 'state', state: 'exited' },
     ]);
     const orphan = toolBlocks(reopened).find((block) => block.name === 'Workflow');
+    // A workflow launch is the one call #116 settled first: a run the app can
+    // no longer watch is interrupted — `canceled`, saying in its own words
+    // that it is our observation that ended — rather than merely quiet. Either
+    // way it is terminal: a run left behind by a dead runtime does not sit as
+    // running indefinitely.
     assert.strictEqual(
       orphan.status,
-      'unknown',
+      'canceled',
       'a run left behind by a dead runtime does not sit as running indefinitely',
+    );
+    assert.match(
+      orphan.error,
+      /stopped watching/i,
+      'and it says it is our observation that ended, not necessarily the run',
     );
   });
 

@@ -169,13 +169,21 @@ export function WorkflowPopup({
   return (
     <Dialog
       open
+      titleText={name}
       title={
-        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span>{name}</span>
+        // The status is the last thing that should be dropped when the name is
+        // long: it is the one word in the title bar that changes (#114). So the
+        // name is the item that shrinks and the badge is pinned.
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+          <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {name}
+          </span>
           {meta ? (
-            <Badge variant={meta.variant} dot={running}>
-              {meta.label}
-            </Badge>
+            <span style={{ display: 'inline-flex', flexShrink: 0 }}>
+              <Badge variant={meta.variant} dot={running}>
+                {meta.label}
+              </Badge>
+            </span>
           ) : null}
         </span>
       }
@@ -233,7 +241,14 @@ export function WorkflowPopup({
                       // launch acknowledgement and its reason reported
                       // separately, above — captioning that "Failed with" would
                       // point at the wrong text (#140).
-                      block.status === 'failed' && !run?.error ? 'Failed with' : 'Final output'
+                      // And never "Final output" over the launch
+                      // acknowledgement, which is a receipt for a run that has
+                      // not answered yet (#116).
+                      block.launchReceipt
+                        ? 'How it was launched'
+                        : block.status === 'failed' && !run?.error
+                          ? 'Failed with'
+                          : 'Final output'
                     }
                   />
                 ) : null}

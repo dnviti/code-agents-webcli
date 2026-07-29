@@ -77,13 +77,19 @@ export function AgentPopup({
   return (
     <Dialog
       open
+      titleText={name}
       title={
-        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span>{name}</span>
+        // As in the workflow popup: the name gives way, the status stays (#114).
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+          <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {name}
+          </span>
           {meta ? (
-            <Badge variant={meta.variant} dot={running}>
-              {meta.label}
-            </Badge>
+            <span style={{ display: 'inline-flex', flexShrink: 0 }}>
+              <Badge variant={meta.variant} dot={running}>
+                {meta.label}
+              </Badge>
+            </span>
           ) : null}
         </span>
       }

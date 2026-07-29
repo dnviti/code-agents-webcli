@@ -37,6 +37,205 @@
 
   The popup stops saying it is waiting for a stage to report in, which was the
   trace claiming something was waiting when nothing was.
+- **An answered question comes back marked** (#113). A question the agent asked
+  is left in the conversation after it is answered for exactly one reason:
+  scrolling back past a decision should show the decision. It only survived as
+  long as you stayed put. Switching to another conversation tab and back redrew
+  every answered card blank — all the options faded, none marked, sometimes a
+  grey sentence naming the labels underneath and sometimes nothing at all. A
+  card reading as one nobody had ever answered, sitting beside an agent that had
+  plainly acted on an answer.
+
+  The answer was never lost. It was sent, the agent got it, the turn carried on,
+  and the conversation's own record still held every option that was picked. It
+  was dropped at the join: the snapshot a rejoining browser is sent had nowhere
+  to put it. What was on screen until then was not the record at all — it was
+  the card's own memory of the click, and that does not survive the surface
+  being taken down and built again, which is what switching tabs does.
+
+  So the snapshot carries it now, and it survives a tab switch, a reload, a
+  reconnect, a second browser, a conversation whose agent has since stopped, and
+  a question far enough back that it arrives by scrolling rather than with the
+  opening view — that last one had a second leak of its own, where the page was
+  replayed through a scratch transcript that worked the answer out correctly and
+  was then thrown away with it.
+
+  Questions answered before this ships come back marked too. Nothing needs
+  migrating: the answer has always been written to the log, and the snapshot is
+  built by replaying that log.
+
+  One thing the card used to say that it should not: "Skipped without
+  answering" was drawn both when the user really had skipped and when the app
+  simply did not know. Those are different facts and now read differently — a
+  skip is an answer, and claiming one nobody gave is the same misreport this
+  issue is about, in miniature.
+- **A row appears in the conversation only when it has something to say** (#132).
+  #46 set the rule: a step that produced only tool activity and no written reply
+  gets no row of its own, its work is counted on the next reply that does speak,
+  and the detail stays on the trace. What it decided from was the *kind* of a
+  step's blocks — a reply block meant "this one spoke" — never from whether
+  anything would actually appear on the screen.
+
+  Oh My Pi sends a reply that is a single space beside the tool activity on
+  almost every step. Each of those counted as having spoken and got the row #46
+  exists to remove: a bordered strip holding a model name, a clock and a work
+  counter, with no sentence anywhere in it. In the recorded conversation this
+  was reported from, 22 of 29 rows. The other agents on that protocol send the
+  same blank replies and escaped only because they group a whole turn into one
+  step, so the blank lands in the same row as the real answer — lucky, not safe.
+  Claude had its own trigger: a command whose arguments merely mention the name
+  of the question tool was taken for a question the agent had asked, and a
+  question card with no question in it paints nothing.
+
+  Both are gone, and the fix is in two halves on purpose. A blank reply is no
+  longer *recorded* as content — by the ACP adapters, by Claude's snapshots, by
+  codex — so it never reaches a transcript in the first place. And the rule that
+  decides whether to draw a row now asks the only question that matters: would
+  this paint? A reply that is empty or only spaces, a plan with nothing in it, a
+  step mistaken for a question — none of them earns a row, whichever agent
+  produced it.
+
+  The work counter and the trace of every folded step land on the next reply
+  that does speak, in the order they happened, exactly as #46 requires. And a
+  command that mentions the question tool is now counted as the command it is,
+  which it was not before — it was being skipped as a question already on
+  screen.
+
+  Two things deliberately left alone. A stream that opens an empty block before
+  its first token still opens it: pi and Claude address their deltas by index,
+  so the block has to exist before they arrive, and the display rule is the
+  backstop for whatever ends up in it. And conversations already on disk are not
+  rewritten — they simply stop drawing the empty rows when they are reopened.
+
+  Checked against real recordings rather than constructed ones: the Oh My Pi
+  session the issue was reported from, and a Claude one containing the grep that
+  was mistaken for a question.
+
+- **One prompt makes one turn again** (#129). Sending a single message from the
+  composer put two identical user turns in the conversation, side by side. The
+  browser was never involved: there is one submit path, one frame on the wire,
+  and nothing optimistic anywhere in it. Both copies were written by the server.
+  `ChatSession` writes the user's message, because it is the same in every
+  protocol and a transcript missing what was asked is useless for resuming,
+  exporting or searching — and then every ACP runtime (Oh My Pi, Kimi, Grok,
+  opencode) and both codex modes wrote it *again* from inside their own send,
+  under a turn id of their own. Anything arriving inside an open turn joins that
+  turn, so the two landed together. Claude and pi never did it, which is why the
+  report came from an Oh My Pi conversation.
+
+  Those adapters no longer write one. The session now also refuses a user
+  message it did not mint itself, so this cannot come back from a new runtime:
+  only the session knows what the user actually typed — a branched conversation
+  hands the adapter the carried briefing glued in front of the prompt, and the
+  echo filed all of it as something the user had said — and only the session
+  knows whether the turn was a steer.
+
+  **Conversations recorded before this are not rewritten, and stop drawing the
+  double anyway.** The logs on disk still hold both messages and are replayed
+  every time one of those conversations is opened, so the fold happens where
+  they are read. What identifies the echo is not that it repeats — people
+  repeat themselves — but that this app did not write it: a message claiming to
+  be the user, with an id nothing here would have minted, inside a turn that
+  already carries the user's own. A real second prompt cannot be caught by that,
+  because a real one comes from the session.
+
+  The accounting has defended itself against these echoes since #86 and is
+  untouched: old logs still contain them.
+
+- **Changing the model is quiet now, like changing the effort** (#128). Every
+  pick raised a box beside the composer reading "Switched to claude-sonnet for
+  this conversation." It is the answer #119 deliberately left as an open
+  question, and it is the same one: a change that took effect needs no
+  announcement, because the control has already made it by redrawing. The chip
+  wears the new model's name the instant the switch lands, so the box was the
+  one thing on screen saying nothing new — while overlapping the controls around
+  it, and on a phone landing on the field the user was about to type into.
+
+  Three outcomes still speak, because each is one the chip gets wrong on its
+  own: a choice the runtime has to be *asked* about mid-session is waiting on
+  its reply in the transcript; one that will only apply from the next session
+  does not reach this conversation at all; and clearing the override is the
+  least visible of the three, because the chip has already fallen back to
+  whatever the session last reported, which is not what the next one will run.
+  Unlike the effort ladder there is no refusal to report — a model name is free
+  text and nothing here can pre-judge it.
+
+  Two things the effort chip fixed and this one had not. The hover now describes
+  the control again instead of holding the last confirmation for the rest of the
+  conversation. And the notice that does appear times out and, on a phone, opens
+  upward: this wrapper is `static` there so the menu can have the composer's
+  width, which means `top: 100%` resolved against the composer and put the box
+  on the bottom navigation bar. Measured before the fix, a deferred choice was
+  drawn at 686–756px on a 740px-tall phone — over the bar and past the bottom of
+  the screen.
+
+- **A long popup title is cut, and the window's controls stay where they are**
+  (#114). Every popup in this app is the same panel, and its title was the one
+  thing in the title bar with no permission to shrink. A flex item's automatic
+  minimum size is its own content, so a title carrying a `white-space: nowrap`
+  span — the issue reader's, the file editor's — made the row wider than the
+  panel and pushed the controls block, which is deliberately unshrinkable,
+  bodily out of it. Measured at a phone width, the Close button ended up 341px
+  past the right edge of the screen: not hard to aim at, gone, with the title
+  painted across the strip it should have occupied. A plain-string title failed
+  the other way and wrapped, taking the bar from one line to five.
+
+  The title is now the side that yields. It ends in an ellipsis when it has to,
+  it never wraps, and the controls keep their full size — including the 44px
+  touch targets a phone gets. Nothing is actually lost: the whole title stays in
+  the element, so the accessible name is unchanged, and it is on hover too. A
+  title made of nodes rather than a string has no text a browser could put in a
+  tooltip, so those four popups hand theirs over explicitly.
+
+  Clamping the title is not enough on its own, and that is the half that is easy
+  to miss. Inside a title that may not wrap, an inline-level wrapper is laid out
+  at its maximum width and then chopped with no ellipsis to say so, and anything
+  after it — the workflow popup's status badge, the file editor's view switch —
+  is clipped away entirely rather than shortened. So each of the four now says
+  which part gives way: the sentence, never the icon, the issue number or the
+  status. The file editor's view switch moved out of the title and in with the
+  other controls, because it is a control and a cut title would have taken it.
+
+  Checked in a browser, since none of this is visible to static markup: four
+  shapes of title, each at a desktop width, dragged 300px narrower, maximised,
+  and in a real 390px phone frame with the app's own stylesheets — 224
+  assertions that the title stops before the controls, stays on one line, is
+  ellipsised rather than chopped, and that every control is inside the panel,
+  full size, and returns itself from a hit test at its own centre. Run against
+  the code before the fix, 44 of them fail.
+- **A background workflow reads as running until the run itself ends** (#116).
+  Starting one is a quick, separate step: the request comes back almost
+  immediately with "Workflow launched in background", and the actual work — often
+  several agents across several phases — keeps going for many minutes. The app
+  took that acknowledgement for the end of the work. Within a second of a
+  workflow starting it wore a green **done** badge on its row and in its popup
+  title, no spinner, below the Finished divider, and missing from the panel's
+  running count. In a recorded run the badge flipped about a minute in and the
+  workflow then kept going for another nine, counting up through hundreds of
+  tool calls underneath it.
+
+  The receipt is a receipt now, not a result. The launching call stays running
+  and is settled by the run's own report — done, failed, or cancelled, on either
+  of the two channels the runtime uses, whichever arrives — so the row, the
+  badge, the popup title, the spinner, the trace rail and the running count all
+  say the same true thing. Cancellation was simply unreachable before; it is the
+  outcome that had no path to the screen at all.
+
+  The acknowledgement is no longer captioned as the run's final output either.
+  It says how the run was launched, which is what it is.
+
+  And a run this app can no longer watch — the process exited, the app
+  restarted — settles as interrupted rather than spinning for ever, saying in
+  its own words that it is our observation that ended and not necessarily the
+  run. That mattered less before, because the run already claimed to be
+  finished; it is load-bearing now.
+
+  The Agents row also takes its elapsed time from the run when the run reports
+  one. It used to show nothing while the popup two inches away counted up
+  through nine minutes.
+
+  Only workflows. How an ordinary delegation reports its status is untouched,
+  and there is a test that says so.
 
 - **A workflow that failed no longer reads as done** (#140). The Workflow tool
   returns the moment a run is launched — "Workflow launched in background", no

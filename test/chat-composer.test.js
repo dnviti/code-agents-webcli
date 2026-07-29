@@ -259,15 +259,38 @@ describe('Composer', function () {
       assert.ok(html.includes('>a-custom-name<'), 'a free-typed override with no matching menu entry is still the label');
     });
 
-    it('surfaces the server’s feedback after a pick, in each of the three shapes', function () {
-      const live = render({ model: 'grok-3-fast', modelFeedback: { applied: 'live', message: 'Switched to grok-3-fast for this conversation.' } });
-      assert.ok(live.includes('Switched to grok-3-fast for this conversation.'));
+    // Issue #128, the answer to the question #119 deliberately left open. The
+    // box itself is raised by an effect and so never renders in a static pass —
+    // the browser check owns that half. What is visible here is the other half
+    // of the same rule: the hover, which a live confirmation used to hold for
+    // the rest of the conversation, displacing the description of what the
+    // control does with a sentence the chip underneath the pointer already says.
+    it('lets a model change that took effect pass in silence, and reports the ones the chip cannot show', function () {
+      const live = render({
+        model: 'grok-3-fast',
+        capabilities: caps({ models: [{ value: 'grok-3-fast', name: 'grok-3-fast' }] }),
+        modelFeedback: { applied: 'live', message: 'Switched to grok-3-fast for this conversation.' },
+      });
+      assert.ok(
+        !live.includes('Switched to grok-3-fast for this conversation.'),
+        'a model that landed is announced by the chip relabelling itself, not by a second copy of the news',
+      );
+      assert.ok(
+        live.includes('title="Model: grok-3-fast"'),
+        'so the hover goes back to describing the control',
+      );
+      assert.ok(live.includes('>grok-3-fast<'), 'and the chip is the thing carrying the change');
 
-      const sent = render({ model: 'claude-opus', modelFeedback: { applied: 'sent', message: 'Sent "/model claude-opus" to the session — check the transcript to confirm it took.' } });
-      assert.ok(sent.includes('check the transcript to confirm it took'));
-
-      const pending = render({ model: 'some-model', modelFeedback: { applied: 'pending', message: 'Saved. some-model will be used the next time a new session starts for this conversation.' } });
-      assert.ok(pending.includes('will be used the next time a new session starts'));
+      // Every other outcome means the conversation is not running on what was
+      // picked. Dropping these would leave a change looking made that was not.
+      for (const applied of ['sent', 'pending', 'cleared']) {
+        const message = `an outcome the chip cannot show for itself: ${applied}`;
+        const html = render({ model: 'grok-3-fast', capabilities: caps({}), modelFeedback: { applied, message } });
+        assert.ok(
+          html.includes(message),
+          `${applied} is not a change that simply took effect, so it still has to reach the user`,
+        );
+      }
     });
 
     it('shows nothing extra when there is no feedback yet', function () {

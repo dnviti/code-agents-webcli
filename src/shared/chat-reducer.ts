@@ -31,10 +31,12 @@ import {
   ThinkingBlock,
   ToolBlock,
   ToolStatus,
+  isSessionMintedMessageId,
   mergeUsage,
 } from './chat-events.js';
 import { turnOutcomeOf } from './turn-outcome.js';
 import { openTurnAfter } from './turn-boundaries.js';
+import { TERMINAL_TOOL as TERMINAL_STATUS, isWorkflowLaunch } from './agent-activity.js';
 
 export interface TranscriptState {
   messages: ChatMessage[];
@@ -432,6 +434,33 @@ function settleUnreportedTools(state: TranscriptState, turnId: string | null, fo
 }
 
 /**
+ * A workflow left running when the app stopped being able to watch it.
+ *
+ * The runtime has exited, or errored fatally. A background workflow outlives
+ * the turn that started it by design, and it may well outlive the process that
+ * launched it too — but this app has no way of hearing how it ended any more,
+ * and a spinner that never stops is a worse answer than an honest one. So the
+ * call is settled as cancelled and says, in its own words, that it is our
+ * observation that ended, not necessarily the run (#116).
+ *
+ * Only workflows. An ordinary tool call left open by a dead runtime is a
+ * different question with a different answer, and changing it is out of scope.
+ */
+function settleUnobservableWorkflows(state: TranscriptState): void {
+  for (const located of Object.values(state.toolIndex)) {
+    const [messageIndex, blockIndex] = located;
+    const block = state.messages[messageIndex]?.blocks[blockIndex];
+    if (!block || block.kind !== 'tool') continue;
+    if (TERMINAL_STATUS.has(block.status)) continue;
+    if (!isWorkflowLaunch(block.name, block.agent?.workflow !== undefined)) continue;
+    block.status = 'canceled';
+    block.error =
+      block.error
+      ?? 'The app stopped watching before this run reported an ending, so how it finished is not known.';
+  }
+}
+
+/**
  * Apply one event.
  *
  * Events at or below the cursor are dropped rather than reapplied: a browser
@@ -471,6 +500,35 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
     case 'msg_start': {
       // Idempotent: a replayed start must not fork the message in two.
       if (messageFor(state, event.id) !== null) {
+        return NO_CHANGE;
+      }
+      // A prompt the runtime handed back, in a conversation recorded before the
+      // adapters stopped doing it (#129).
+      //
+      // Every ACP runtime and both codex modes used to write the user's message
+      // into the transcript a second time, under a turn id of their own, right
+      // after the session had written it — one prompt, two identical bubbles.
+      // The adapters no longer do it and the session now refuses it, but the
+      // logs already on disk still hold both, and they are replayed through
+      // this reducer every time one of those conversations is opened. Drawing
+      // them is not something a migration should have to fix.
+      //
+      // The test is what the echo *is*, not what it looks like: only
+      // `ChatSession.deliver` ever writes a user message in this app, and it
+      // always mints `user-<uuid>`. So a message claiming to be the user, with
+      // an id nothing in this app would have minted, arriving inside a turn
+      // that already carries the user's own — that is a runtime repeating the
+      // prompt. A real second prompt cannot be caught by it: a real one comes
+      // from `deliver`, and is therefore session-minted. `steer` is excluded
+      // because a steer is also `deliver`'s and shares the open turn on purpose.
+      if (
+        event.role === 'user'
+        && !event.steer
+        && state.currentTurnId
+        && event.turnId !== state.currentTurnId
+        && !isSessionMintedMessageId(event.id)
+        && state.messages.some((m) => m.turnId === state.currentTurnId && m.role === 'user')
+      ) {
         return NO_CHANGE;
       }
       // Everything said while a turn is open belongs to that turn, whatever id
@@ -821,8 +879,11 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       const wasOpen = state.currentTurnId;
       state.currentTurnId = openTurnAfter(event, state.currentTurnId);
       if (event.state === 'exited' || event.state === 'error') {
-        // Nothing can report once the child is gone, so the exemption for a run
-        // still reporting about itself does not apply here (#139).
+        // Workflows first: a run left watching nothing gets its own honest
+        // ending (#116), and only then is the rest of the dead turn swept —
+        // nothing can report once the child is gone, so the exemption for a
+        // run still reporting about itself does not apply here (#139).
+        settleUnobservableWorkflows(state);
         settleUnreportedTools(state, wasOpen, true);
       }
       return { messageIndex: null, structural: false, meta: true, applied: true };
