@@ -99,10 +99,16 @@ export interface SessionRecord {
    * has to come back in the mode it was in, and the header has to be able to
    * say so while nothing is running at all.
    *
-   * Absent on every session that predates this and on every terminal session,
-   * so `undefined` reads as "asks first" — the safe direction — without a
-   * backfill. Only ever set from an explicit choice made for *this* record, so a
-   * standing permission can never be inherited by another conversation.
+   * Three states, and the third one carries weight. `true` is "granted a
+   * bypass", `false` is "granted approvals", and `undefined` is "nothing was
+   * ever granted" — every session that predates this, every terminal session,
+   * and every conversation that has not launched yet. The distinction is what
+   * lets a conversation that chose to ask keep asking after the owner turns the
+   * preference on: only `undefined` is open to a preference at all, and only
+   * when the conversation is beginning. See shared/user-preferences.ts.
+   *
+   * Only ever set from a launch of *this* record, so a standing permission can
+   * never be inherited by another conversation.
    */
   chatBypassPermissions?: boolean;
   /**

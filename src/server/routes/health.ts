@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { SessionRecord, Aliases, WebSocketInfo, AuthContext } from '../types.js';
+import { UserPreferences } from '../../shared/user-preferences.js';
 
 export interface HealthRoutesDeps {
   claudeSessions: Map<string, SessionRecord>;
@@ -8,6 +9,7 @@ export interface HealthRoutesDeps {
   baseFolder: string;
   aliases: Aliases;
   getSelectedWorkingDir(userId: number): string | null;
+  getUserPreferences(userId: number): UserPreferences;
 }
 
 export function createHealthRoutes(deps: HealthRoutesDeps): Router {
@@ -51,6 +53,11 @@ export function createHealthRoutes(deps: HealthRoutesDeps): Router {
       aliases: deps.aliases,
       currentUser: authContext.user,
       logoutUrl: '/auth/logout',
+      // On the boot request rather than a second one of its own, so the first
+      // paint of the launcher already knows which mode its chat button is about
+      // to produce. A preference fetched afterwards would leave an interval in
+      // which the control states the opposite of what it does.
+      preferences: deps.getUserPreferences(authContext.user.id),
     });
   });
 

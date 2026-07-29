@@ -288,6 +288,11 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         lastActivity: session.lastActivity,
         surface: session.surface || 'terminal',
         customName: session.customName,
+        // So a tab restored on page load can show the mode it is really in from
+        // its first paint. `summarise` already does this for the conversations
+        // dialog; the tab strip was the one place the fact was known and not
+        // carried.
+        bypassPermissions: session.chatBypassPermissions === true,
       }));
 
     res.json({ sessions: sessionList });
@@ -531,10 +536,11 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       // The model and the effort level travel with it, because they are how
       // this line of work was being done and the branch is a continuation of
       // it — and because the window the history was just measured against is
-      // that model's. The bypass flag deliberately does not: it is a standing
-      // permission granted to the conversation that asked for it, and a
-      // conversation that inherited one would be acting without being asked on
-      // the strength of somebody else's answer.
+      // that model's. The bypass flag deliberately does not, and now the reason
+      // is complete: a branch is a conversation that is *beginning*, so it takes
+      // the owner's preference at launch like every other beginning (#134).
+      // Copying the source's grant would instead let one old answer spread from
+      // conversation to conversation, outliving the preference that produced it.
       branch.chatModelOverride = source.chatModelOverride;
       // A source with no override of its own still has to arrive fixed, not
       // blank: a blank branch is a conversation that has never chatted, so its

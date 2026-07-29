@@ -151,6 +151,21 @@ export class ChatTranscript {
     return this.bypass;
   }
 
+  /**
+   * Show the mode a list row already stated, until the server states it here.
+   *
+   * A display seed and nothing more: it is never sent back in a launch, and the
+   * two authorities — `hydrate` from a snapshot and `setBypassing` from a
+   * `chat_started` — overwrite it without consulting it. It exists because the
+   * session list and the conversations dialog both know the mode before the
+   * pane does, and a pane that opened claiming "asks first" over a conversation
+   * the row had just labelled "approvals bypassed" was the wrong answer in the
+   * dangerous direction (#134).
+   */
+  seedBypass(bypassing: boolean): void {
+    this.setBypassing(bypassing);
+  }
+
   /** Take the mode from a `chat_started`, which announces the launch's own. */
   setBypassing(bypassing: boolean): void {
     if (this.bypass === bypassing) return;

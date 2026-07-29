@@ -100,6 +100,10 @@ function ChatLaunchButton({
   label: string;
   kind: AgentKind;
   compact?: boolean;
+  /**
+   * What the account's preference is, for the label and nothing else — the
+   * launch itself names no mode. See the click handler.
+   */
   bypass?: boolean;
   onStart(kind: AgentKind, options?: RuntimeStartOptions): void;
 }): React.JSX.Element {
@@ -139,7 +143,12 @@ function ChatLaunchButton({
       onClick={(event: React.MouseEvent<HTMLButtonElement>) => {
         event.stopPropagation();
         if (unavailable) return;
-        onStart(kind, { surface: 'chat', dangerouslySkipPermissions: bypass === true });
+        // No mode is asked for. The server decides it from the preference it
+        // holds for this account, which is the whole point of #134: the button
+        // *reports* what is about to happen rather than requesting it, the same
+        // discipline a relaunch already follows. A page left open across a
+        // change of the preference elsewhere would otherwise send a stale one.
+        onStart(kind, { surface: 'chat' });
       }}
     >
       {compact ? (

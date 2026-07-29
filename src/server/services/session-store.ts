@@ -165,10 +165,21 @@ export class SessionStore {
         // Which conversation owns this shell, so a restart can tell a session
         // the user can reach from one that nothing on screen refers to any more.
         owner_session_id: session.ownerSessionId || null,
-        // The approval mode the user chose for this conversation. Persisted so a
+        // The approval mode this conversation was granted. Persisted so a
         // restart brings it back rather than quietly dropping to manual — and so
         // the header can state the mode of a conversation with nothing running.
-        chat_bypass_permissions: session.chatBypassPermissions === true ? 1 : null,
+        //
+        // Three values, not two, and the third is what stops the rule in
+        // shared/user-preferences.ts from widening a conversation behind the
+        // user's back: 0 means "this conversation was granted approvals", which
+        // is a decision to keep, while NULL means "nothing was ever granted",
+        // which is every row written before the column existed.
+        chat_bypass_permissions:
+          session.chatBypassPermissions === true
+            ? 1
+            : session.chatBypassPermissions === false
+              ? 0
+              : null,
         // The conversation-scoped model override, if the user has set one.
         // Persisted so a restart still prefers it over the profile default the
         // next time a session starts for this conversation.
@@ -275,9 +286,16 @@ export class SessionStore {
           nativeChatSessionId: row.native_chat_session_id || undefined,
           ownerSessionId: row.owner_session_id || undefined,
           // Only a stored 1 restores the bypass. A null — the value every row
-          // written before this column existed carries — reads as "asks first",
-          // so a missing answer can never grant a standing permission.
-          chatBypassPermissions: row.chat_bypass_permissions === 1 ? true : undefined,
+          // written before this column existed carries — reads as "nothing was
+          // granted", so a missing answer can never grant a standing permission.
+          // A stored 0 is the conversation's own answer of "ask", which is a
+          // grant like any other and outranks a preference set afterwards.
+          chatBypassPermissions:
+            row.chat_bypass_permissions === 1
+              ? true
+              : row.chat_bypass_permissions === 0
+                ? false
+                : undefined,
           // A stored empty string never happens — the write side always writes
           // null for "no override" — but an empty string reading as "no
           // override" rather than a call to switch to nothing is the safe

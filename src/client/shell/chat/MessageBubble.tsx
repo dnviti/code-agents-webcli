@@ -708,8 +708,16 @@ function NoticeRule({ block }: { block: NoticeBlock }): React.JSX.Element {
         padding: '2px 0',
         color: 'var(--muted-foreground)',
         fontFamily: 'var(--font-sans)',
-        // 10px is below the 12px a phone can be read at (#92).
-        fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-2xs)',
+        // 10px is below the 12px a phone can be read at (#92). And the
+        // approvals line is set a step above the rest on a desktop too: the
+        // others annotate the conversation, that one states whether tools are
+        // running unattended, and 10px grey is how a statement like that goes
+        // unread (#134).
+        fontSize: isPhone
+          ? PHONE_TEXT.detail
+          : block.notice === 'approvals'
+            ? 'var(--text-sm)'
+            : 'var(--text-2xs)',
         letterSpacing: 'var(--tracking-wide)',
       }}
     >

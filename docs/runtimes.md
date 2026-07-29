@@ -383,6 +383,45 @@ conversation recorded one.
 
 Past 400 conversations the list describes the most recent ones and says so.
 
+### Approval mode
+
+Whether a web chat asks before each tool call is settled by one rule, and every
+way into a conversation follows it:
+
+- A conversation that is **beginning** takes your **Web chat approvals**
+  preference from Settings. That covers a launch from the runtime launcher, a
+  branch cut from a turn, *Start a new chat* on the recovery notice after a
+  server restart, and `/clear` inside a live conversation.
+- A conversation that is **continuing** — resumed from the launcher, opened from
+  the conversations list, or brought back with *Resume this conversation* —
+  comes back in the mode it was already running in. The preference is not
+  re-read in either direction, so switching it on later cannot widen a
+  conversation that chose to ask, and switching it off cannot take the mode away
+  from one that is running without prompts.
+- Anything missing or unreadable means **ask**. That includes a conversation
+  resumed with nothing recorded about its mode.
+
+The preference belongs to your account, not to the browser you set it in, so it
+holds on a second device and in a second browser. It is stored on the server and
+is never taken from the page at launch time: the launcher's chat button reports
+what the server is going to do rather than requesting it.
+
+Every conversation says which mode it is in as it starts, on a line at the top of
+the conversation itself, and a conversation running with approvals bypassed keeps
+saying so in its header for as long as it is on screen — including while nothing
+is running it. The two buttons on the recovery notice name the mode each of them
+lands in, so a bypass is never restored, or dropped, in silence.
+
+**pi is the exception, and the app says so rather than pretending.** pi's chat
+adapter has no approval channel at all — its `--approve` trusts project-local
+files for the whole run instead of gating individual tool calls — so a pi
+conversation runs its tools without asking whichever mode the rule computes.
+Its opening line says `this runtime cannot ask` instead of claiming a boundary
+that is not there.
+
+The terminal surface's own **No prompts** button is a separate, per-launch
+choice on a different surface, and is not covered by this preference.
+
 ### Closing a conversation, and deleting one
 
 **Closing** a conversation takes it off your screen. The record, the transcript,
@@ -411,9 +450,11 @@ id, so the first message afterwards is answered by a process that has never
 seen what came before, and the window does not page back into it.
 
 What is *not* carried across: anything queued behind the conversation you left
-(those turns were for a process that no longer exists), and any standing
-permission granted to it — a bypass belongs to the conversation that asked for
-it, and the new one asks for itself.
+(those turns were for a process that no longer exists), and the approval mode
+the conversation you left was running in. The new one is a conversation that is
+*beginning*, so it takes your **Web chat approvals** preference — the same
+answer the launcher's chat button and the recovery notice's *Start a new chat*
+would give it. See [Approval mode](#approval-mode) above.
 
 Nothing is deleted. The previous conversation stays in the session's log for
 history, search and export; this changes what the window shows and what the

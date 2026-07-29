@@ -9,10 +9,15 @@ export interface AppSettings {
   /**
    * Launch web chats with tool approvals bypassed.
    *
-   * A launch-time property of the session, not a live switch: the runtime is
-   * told once, on the command line, and a session that started asking keeps
-   * asking. Stored here so the choice survives a reload rather than having to
-   * be re-made for every conversation.
+   * A launch-time property of the conversation, not a live switch: the runtime
+   * is told once, on the command line, and a conversation that started asking
+   * keeps asking until it is started over.
+   *
+   * The odd one out in this interface — it is the only field here that is *not*
+   * stored in this browser. It belongs to the account, so it is held on the
+   * server, arrives with `/api/config` and is written through `/api/preferences`
+   * (#134). It stays on this type because the Settings dialog edits it beside
+   * the rest; see `loadSettings`.
    */
   chatBypassPermissions: boolean;
   /** When a conversation is allowed to interrupt the user. */
@@ -157,6 +162,15 @@ export interface SessionListItem {
   surface?: 'terminal' | 'chat';
   /** The user's chosen label, when there is one. Absent means "never renamed". */
   customName?: string;
+  /**
+   * Whether this conversation runs with tool approvals bypassed.
+   *
+   * Carried on the list so a tab restored on page load can paint its real mode
+   * before any socket traffic arrives, instead of claiming "asks first" until
+   * the first snapshot lands. Absent — an older server — reads as false, which
+   * is the same direction every other unknown in this rule takes.
+   */
+  bypassPermissions?: boolean;
 }
 
 export interface FolderData {

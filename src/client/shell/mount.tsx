@@ -132,6 +132,10 @@ async function resumeConversation(app: App, conversation: ResumableConversation)
       );
       // See `openStoredConversation`: until the server confirms the surface, this
       // tab's close button would delete the conversation rather than detach it.
+      // And the mode the row the user just clicked was labelled with, so the
+      // pane does not open saying "asks first" over a conversation the list had
+      // just called bypassed — a display seed, overwritten by the snapshot.
+      app.chats.ensure(conversation.id).seedBypass(conversation.bypassPermissions === true);
       app.sessionTabManager.setTabSurface(conversation.id, 'chat');
       await app.sessionTabManager.switchToTab(conversation.id);
     } else {
@@ -232,7 +236,9 @@ async function openStoredConversation(
       // Said here rather than waited for. The server reports the surface on
       // `session_joined`, which is a round trip away, and a tab that reads as a
       // terminal in the meantime is a tab whose close button would delete the
-      // conversation that was just reopened.
+      // conversation that was just reopened. Same for the approval mode the row
+      // was labelled with — see `resumeConversation`.
+      app.chats.ensure(conversation.id).seedBypass(conversation.bypassPermissions === true);
       tabs.setTabSurface(conversation.id, 'chat');
       await tabs.switchToTab(conversation.id);
     } else {

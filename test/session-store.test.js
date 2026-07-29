@@ -134,10 +134,33 @@ describe('SessionStore', function() {
 
       const loaded = await sessionStore.loadSessions();
       assert.strictEqual(loaded.get('bypass').chatBypassPermissions, true);
-      // Absent rather than false: a conversation that never chose the bypass
-      // must never be restored into it, and `undefined` is what reads as
-      // "asks first" everywhere downstream.
+      // Absent, not false: this record has never been launched at all, so
+      // nothing has been granted to it either way.
       assert.strictEqual(loaded.get('manual').chatBypassPermissions, undefined);
+    });
+
+    it('keeps “granted approvals” apart from “nothing granted”', async function () {
+      // Three states, not two, since #134. A conversation that launched and
+      // asked is recorded as `false`, which is a decision the rule replays on
+      // every resume; a record that has never launched is `undefined`, and is
+      // the only one a preference may ever decide for. Stored as the same
+      // value they used to share, a preference switched on afterwards would
+      // widen a conversation that had already chosen to ask.
+      await sessionStore.saveSessions(new Map([
+        ['asked', createSessionRecord({
+          id: 'asked',
+          ownerUserId,
+          surface: 'chat',
+          chatBypassPermissions: false,
+        })],
+        ['never', createSessionRecord({ id: 'never', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('asked').chatBypassPermissions, false);
+      assert.strictEqual(loaded.get('never').chatBypassPermissions, undefined);
     });
 
     it('remembers a conversation-scoped model override', async function () {
