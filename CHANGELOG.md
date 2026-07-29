@@ -68,6 +68,7 @@
 ## [5.3.2] - 2026-07-29
 
 ### Fixed
+- **A workflow that failed no longer reads as done** (#140). The Workflow tool
   returns the moment a run is launched — "Workflow launched in background", no
   error, four seconds before anything has happened — and that acknowledgement
   was the only thing the app ever heard about how the run went. So a workflow
