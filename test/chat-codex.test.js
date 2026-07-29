@@ -486,6 +486,62 @@ describe('codex app-server adapter', function () {
     });
   });
 
+  /**
+   * An item that arrives already finished, with no `item/started` before it.
+   *
+   * The one place this adapter opens and closes a block in the same breath, and
+   * therefore the one place #132's record-time refusal happens: the text is final
+   * here, so a reply that says nothing can be turned away rather than written
+   * down. What must *not* be turned away is a block that simply earns no row of
+   * its own — reasoning and tool calls both draw nothing on their own and both
+   * belong to the trace, and a record-time refusal is permanent.
+   */
+  describe('an item that arrives already finished', function () {
+    async function completedOnly(item) {
+      const h = harness();
+      await boot(h);
+      h.events.length = 0;
+      await feed(h, [{ jsonrpc: '2.0', method: 'turn/started', params: { turnId: 'turn_9' } }]);
+      h.events.length = 0;
+      await feed(h, [{ jsonrpc: '2.0', method: 'item/completed', params: { turnId: 'turn_9', item } }]);
+      return only(h.events, 'block_start').map((event) => event.block);
+    }
+
+    it('refuses a reply that says nothing', async function () {
+      assert.deepStrictEqual(
+        await completedOnly({ id: 'i1', type: 'agentMessage', text: '  \n ' }),
+        [],
+        'a blank reply was written into the conversation',
+      );
+    });
+
+    it('records a reply that says something', async function () {
+      const blocks = await completedOnly({ id: 'i1', type: 'agentMessage', text: 'done' });
+      assert.deepStrictEqual(blocks.map((block) => block.kind), ['text']);
+      assert.strictEqual(blocks[0].text, 'done');
+    });
+
+    it('records reasoning, which earns no row but is not nothing', async function () {
+      const blocks = await completedOnly({ id: 'i1', type: 'reasoning', content: ['I should read the file first'] });
+      assert.deepStrictEqual(blocks.map((block) => block.kind), ['thinking']);
+      assert.strictEqual(blocks[0].text, 'I should read the file first');
+    });
+
+    // A tool item is not covered here on purpose: a completed tool item is
+    // routed by `isToolItemType` to the patch-by-toolId path instead, which
+    // never reaches this gate, so one arriving with no `item/started` before it
+    // is dropped by that path for reasons that predate #132. Every real capture
+    // pairs the two. What the record-time rule owes a tool call is pinned
+    // directly on the predicate, in test/chat-empty-rows.test.js.
+    it('refuses a plan the runtime announced and never filled in', async function () {
+      assert.deepStrictEqual(
+        await completedOnly({ id: 'i1', type: 'plan', text: '   ' }),
+        [],
+        'an empty plan was written into the conversation',
+      );
+    });
+  });
+
   describe('a failed turn', function () {
     it('surfaces the error and closes with stopReason failed', async function () {
       const h = harness();

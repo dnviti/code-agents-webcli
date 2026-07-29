@@ -88,6 +88,43 @@ export function blockDraws(block: ChatBlock): boolean {
 }
 
 /**
+ * Whether a block is worth writing down, which is not the same question as
+ * whether it would be drawn.
+ *
+ * `blockDraws` answers "would this paint a row", so it is false for a `thinking`
+ * block and for every tool call that is not a question — correctly, because
+ * neither earns a step a row of its own. Asked at *record* time that answer
+ * stops being a layout decision: a block refused there is not written down, so
+ * it is gone from the trace and the work counter too, and no later fold can put
+ * it back. The two codex adapters were asking it there, which is safe only for
+ * as long as `itemToBlock` keeps failing to recognise the items in question —
+ * today real `codex exec --json` sends `command_execution` where that mapper
+ * reads `commandExecution`, so a shell call arrives as unmapped text and is kept
+ * by accident rather than on purpose. The first person to teach the mapper
+ * codex's real spelling would have silently deleted every command and diff on
+ * that path.
+ *
+ * So the record path asks this instead, and refuses only content that is blank
+ * on its own terms: the blank reply #132 was filed for, and a plan a runtime
+ * announced and never filled in. Reasoning and tool calls are always written
+ * down — an empty reasoning block is a real state the surface has its own words
+ * for (#120), and a tool call belongs to the trace whether or not it earns a
+ * row. Deciding the row is the display fold's job, and it does it from the
+ * record.
+ */
+export function blockHasContent(block: ChatBlock): boolean {
+  switch (block.kind) {
+    case 'text':
+    case 'notice':
+      return block.text.trim().length > 0;
+    case 'plan':
+      return block.items.some((item) => item.text.trim().length > 0);
+    default:
+      return true;
+  }
+}
+
+/**
  * A message drawn as a line across the conversation rather than as a turn: no
  * surface, no glyph, no controls, the full width of the column.
  *

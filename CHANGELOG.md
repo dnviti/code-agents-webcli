@@ -3,6 +3,21 @@
 ## [Unreleased]
 
 ### Fixed
+- **A conversation's record stops being edited by a question about layout.** The
+  rule added for #132 — does this block put anything on the screen — is the right
+  question for whether a step earns a row and the wrong one to ask before writing
+  the step down. It says no to reasoning and to every tool call that is not a
+  question, correctly, because neither earns a row on its own; asked at record
+  time that verdict is permanent, taking the block off the trace and out of the
+  work counter with no fold able to bring it back. Both codex adapters were
+  asking it there. Nothing was lost in practice, and only because `itemToBlock`
+  does not yet recognise the spelling real `codex exec --json` uses for those
+  items — the first person to teach it would have silently deleted every command,
+  diff and thought on that path. The record now asks whether the block has
+  anything *in* it, and refuses only what is blank on its own terms: the blank
+  reply #132 was filed for, and a plan a runtime announced and never filled in.
+  Deciding the row stays where it belongs, on the display, working from a record
+  that still holds everything.
 - **The Status panel stops making up your subscription** (#137). It used to
   open on a plan badge reading `max20`, a meter reading "Tokens 0 of 220.0k"
   and a "Left 220.0k" underneath it. None of that was a fact about anybody's
