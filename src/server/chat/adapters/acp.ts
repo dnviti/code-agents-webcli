@@ -820,7 +820,11 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     const turnId = `${this.runtime}-turn-${++this.counter}`;
     this.turnId = turnId;
     this.turnStartedAt = Date.now();
-    this.emitUserMessage(turn, turnId);
+    // Not the user's message: `ChatSession.deliver` has already written it, and
+    // a second copy here is a second bubble in the same turn (#129). The close
+    // stays, and is the only thing this call was still doing that mattered — it
+    // ends an assistant message left streaming by the previous turn.
+    this.closeMessage();
 
     const prompt: unknown[] = [{ type: 'text', text: turn.text }];
     for (const attachment of turn.attachments || []) {
@@ -841,30 +845,6 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     this.call('session/prompt', { sessionId: this.nativeSessionId, prompt })
       .then((result) => this.finishTurn(turnId, result))
       .catch((error: unknown) => this.failTurn(turnId, error));
-  }
-
-  /**
-   * The user's own turn, written into the transcript by the adapter.
-   *
-   * The log is the only record of a conversation once the process is gone, and
-   * a log holding only the agent's half is not a conversation.
-   */
-  private emitUserMessage(turn: UserTurn, turnId: string): void {
-    this.closeMessage();
-    const id = `${this.runtime}-user-${++this.counter}`;
-    this.emit({ t: 'msg_start', id, role: 'user', turnId });
-    let index = 0;
-    this.emit({ t: 'block_start', msgId: id, index, block: { kind: 'text', text: turn.text } });
-    for (const attachment of turn.attachments || []) {
-      index += 1;
-      this.emit({
-        t: 'block_start',
-        msgId: id,
-        index,
-        block: { kind: 'image', mime: attachment.mime, url: attachment.url, alt: attachment.name },
-      });
-    }
-    this.emit({ t: 'msg_end', msgId: id });
   }
 
   /**

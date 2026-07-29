@@ -64,13 +64,21 @@ export function GitHubItemDialog({
       open
       movable
       width="min(880px, 94vw)"
+      titleText={item?.title || label}
       title={
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-          <Icon name={kind === 'pr' ? 'git-pull-request' : 'circle-dot'} size={14} />
-          <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--muted-foreground)' }}>
+        // `flex`, not `inline-flex`: an inline-level box inside the title's own
+        // `white-space: nowrap` is laid out at max-content and is then chopped
+        // by the clip with no ellipsis to say so (#114). The icon and the number
+        // never shrink — they are two glyphs wide and they are what identifies
+        // the thing — so the sentence is the part that gives way.
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+          <span style={{ display: 'inline-flex', flexShrink: 0 }}>
+            <Icon name={kind === 'pr' ? 'git-pull-request' : 'circle-dot'} size={14} />
+          </span>
+          <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--muted-foreground)', flexShrink: 0 }}>
             #{number}
           </span>
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {item?.title || label}
           </span>
         </span>

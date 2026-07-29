@@ -728,10 +728,11 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     this.planText.clear();
     this.reasoningChannel.clear();
 
-    const userMsgId = `u_${turnId}`;
-    this.emit({ t: 'msg_start', id: userMsgId, role: 'user', turnId });
-    this.emit({ t: 'block_start', msgId: userMsgId, index: 0, block: { kind: 'text', text: turn.text } });
-    this.emit({ t: 'msg_end', msgId: userMsgId });
+    // The user's own message is not written here. `ChatSession.deliver` has
+    // already put it in the transcript, with the turn id it minted and the text
+    // the user actually typed — a copy from this side is a second bubble in the
+    // same turn (#129), and on a branched conversation it is the briefing glued
+    // in front of the prompt rather than the prompt.
     this.emit({ t: 'state', state: 'thinking' });
   }
 
@@ -1175,10 +1176,11 @@ export class CodexExecAdapter extends BaseChatAdapter {
     this.blockIndex = 0;
     this.sawTerminalEvent = false;
 
-    const userMsgId = `u_${turnId}`;
-    this.emit({ t: 'msg_start', id: userMsgId, role: 'user', turnId });
-    this.emit({ t: 'block_start', msgId: userMsgId, index: 0, block: { kind: 'text', text: turn.text } });
-    this.emit({ t: 'msg_end', msgId: userMsgId });
+    // The user's own message is not written here. `ChatSession.deliver` has
+    // already put it in the transcript, with the turn id it minted and the text
+    // the user actually typed — a copy from this side is a second bubble in the
+    // same turn (#129), and on a branched conversation it is the briefing glued
+    // in front of the prompt rather than the prompt.
     this.emit({ t: 'state', state: 'thinking' });
 
     // Every call is independent: nothing in the confirmed fixture shows a
