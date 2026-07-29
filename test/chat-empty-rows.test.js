@@ -6,6 +6,7 @@ const { applyChatEvent, createTranscript } = require('../dist/shared/chat-reduce
 const { looksLikeAskCall } = require('../dist/shared/chat-events.js');
 const {
   blockDraws,
+  blockHasContent,
   drawsQuestion,
   foldRows,
   hasVisibleContent,
@@ -166,6 +167,53 @@ describe('a row is drawn only when it would say something (#132)', function () {
         assert.strictEqual(blockDraws(block), expected);
       });
     }
+
+    /**
+     * The record path asks a different question, and has to.
+     *
+     * Refusing a block at record time does not merely leave it out of a row: it
+     * is never written down, so it is gone from the trace and the work counter
+     * too, and no later fold can put it back. `blockDraws` says no to reasoning
+     * and to every tool call that is not a question — right for a row, ruinous
+     * for a record. The two codex adapters were asking `blockDraws` there, which
+     * stayed harmless only because `itemToBlock` does not yet recognise the
+     * spelling real `codex exec --json` uses for those items.
+     */
+    describe('and separately, whether it is worth writing down', function () {
+      const recorded = [
+        ['a reply with words in it', { kind: 'text', text: 'hi' }, true],
+        ['a reply that is only spaces', { kind: 'text', text: '   ' }, false],
+        ['a reply that is only newlines', { kind: 'text', text: '\n\n' }, false],
+        ['reasoning, which the trace and #120 both want', { kind: 'thinking', text: 'a long thought' }, true],
+        ['reasoning a runtime reported without the words', { kind: 'thinking', text: '' }, true],
+        ['an ordinary tool call, which belongs to the trace', { kind: 'tool', toolId: 't', name: 'Bash', toolKind: 'execute', status: 'completed', input: {} }, true],
+        ['a shell command', { kind: 'tool', toolId: 't', name: 'shell', toolKind: 'execute', status: 'completed', input: { command: 'ls -la' } }, true],
+        ['a patch', { kind: 'tool', toolId: 't', name: 'apply_patch', toolKind: 'edit', status: 'completed', diffs: [] }, true],
+        ['a question the agent really asked', ASK, true],
+        ['a plan with nothing in it', { kind: 'plan', items: [] }, false],
+        ['a plan whose only step is blank', { kind: 'plan', items: [{ text: '  ', status: 'pending' }] }, false],
+        ['a plan with a step in it', { kind: 'plan', items: [{ text: 'do the thing', status: 'pending' }] }, true],
+        ['an image', { kind: 'image', mime: 'image/png', url: '/x.png' }, true],
+        ['an error', { kind: 'error', text: 'it broke' }, true],
+        ['a notice with nothing in it', { kind: 'notice', text: ' ' }, false],
+      ];
+
+      for (const [what, block, expected] of recorded) {
+        it(`${expected ? 'writes down' : 'refuses'} ${what}`, function () {
+          assert.strictEqual(blockHasContent(block), expected);
+        });
+      }
+
+      it('never refuses more than the display rule would fold away', function () {
+        // The one invariant that matters between the two: anything the record
+        // turns away must be something the fold would have hidden anyway, or the
+        // record is losing content the screen wanted.
+        for (const [what, block] of recorded) {
+          if (blockHasContent(block)) continue;
+          assert.strictEqual(blockDraws(block), false, `${what} is refused by the record but drawn on screen`);
+        }
+      });
+    });
   });
 
   describe('the caret', function () {

@@ -16,7 +16,7 @@ import {
   defaultPermissionOptions,
   rankedEfforts,
 } from '../../../shared/chat-events.js';
-import { blockDraws } from '../../../shared/chat-visibility.js';
+import { blockHasContent } from '../../../shared/chat-visibility.js';
 import { AccountLimitTracker, resetIsoFromEpochSeconds } from '../account-limits.js';
 import {
   AdapterChild,
@@ -1017,7 +1017,13 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
       // where a reply that says nothing is refused rather than recorded — a
       // blank one would make the step "a step that spoke" and earn it a
       // bordered row with nothing to read (#132).
-      if (!blockDraws(block)) return;
+      //
+      // `blockHasContent` and not `blockDraws`: what is refused here is a block
+      // with nothing in it, never a block that merely earns no row. A tool call
+      // and a reasoning block both draw nothing on their own and both have to be
+      // written down anyway — the display fold takes the row away afterwards,
+      // from the record, and the trace keeps them either way.
+      if (!blockHasContent(block)) return;
       const fresh = this.blockIndex++;
       this.itemBlockIndex.set(itemId, fresh);
       this.emit({ t: 'block_start', msgId, index: fresh, block });
@@ -1398,8 +1404,12 @@ export class CodexExecAdapter extends BaseChatAdapter {
         const block = itemToBlock(item);
         if (!block) return;
         // Exec mode reports each item once, already finished, so this is the
-        // only chance to refuse one that would paint nothing (#132).
-        if (!blockDraws(block)) return;
+        // only chance to refuse one that is empty (#132) — and, being the only
+        // gate, the only place where refusing too much cannot be undone later.
+        // `blockHasContent` and not `blockDraws`: a blank reply is still turned
+        // away, while a command, a diff or a reasoning block is written down
+        // whether or not it would earn a row of its own.
+        if (!blockHasContent(block)) return;
         if (!this.assistantMsgId) {
           this.assistantMsgId = `a_${this.turnId}`;
           this.emit({ t: 'msg_start', id: this.assistantMsgId, role: 'assistant', turnId: this.turnId || '' });
