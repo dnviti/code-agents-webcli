@@ -59,6 +59,7 @@ import { AuthService } from './services/auth.js';
 import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
 import { readCachedClaudeAccount } from './services/claude-account.js';
+import { UserPreferenceStore } from './services/user-preferences.js';
 
 /**
  * Fold what a chat session learned about itself into the record that outlives it.
@@ -72,10 +73,18 @@ import { readCachedClaudeAccount } from './services/claude-account.js';
  */
 export function applyChatLifecycle(
   record: SessionRecord,
-  change: { nativeSessionId?: string | null; exited?: boolean },
+  change: { nativeSessionId?: string | null; exited?: boolean; bypassing?: boolean },
 ): void {
   if (change.nativeSessionId !== undefined) {
     record.nativeChatSessionId = change.nativeSessionId || undefined;
+  }
+  if (change.bypassing !== undefined) {
+    // A conversation replaced in place decides its own approval mode again, so
+    // the grant on the record has to be corrected to the one actually running.
+    // Without it, a conversation cleared down to asking would still be recorded
+    // as bypassing, and the next resume would restore a permission it no longer
+    // had — the exact silent widening this rule exists to prevent (#134).
+    record.chatBypassPermissions = change.bypassing;
   }
   if (change.exited === true) {
     // Frees the session for a relaunch in the same tab. Without it the
@@ -134,6 +143,7 @@ export class ClaudeCodeWebServer {
   private pasteStore: PasteStore;
   private attachmentStore: AttachmentStore;
   private runtimeProfiles: RuntimeProfileStore;
+  private userPreferences: UserPreferenceStore;
   private tierContext: TierWriterContext;
   private sessionTeardown: SessionTeardownRegistry;
   private authService: AuthService;
@@ -206,6 +216,9 @@ export class ClaudeCodeWebServer {
     // to keep. See services/attachment-store.ts.
     this.attachmentStore = new AttachmentStore();
     this.chatStore = new ChatStore({ storageDir: this.database.storageDir });
+    // Before the chat manager, which reads it: `/clear` starts a new
+    // conversation and has to resolve the approval mode for itself.
+    this.userPreferences = new UserPreferenceStore({ database: this.database });
     this.chatManager = new ChatSessionManager({
       store: this.chatStore,
       // The seam between a conversation and the ledger it is billed to. The
@@ -226,6 +239,10 @@ export class ClaudeCodeWebServer {
           this.claudeSessions,
           this.webSocketConnections,
         ),
+      // Whose preference decides the mode of a conversation restarted from
+      // inside itself. The chat subsystem has no idea who owns anything.
+      chatBypassPreference: (userId) =>
+        this.userPreferences.get(userId).chatBypassPermissions,
       // Chat mode spawns the same binary the terminal mode would; the bridges
       // already own that lookup and it must not be duplicated here, where it
       // would drift the first time a CLI moved.
@@ -246,7 +263,12 @@ export class ClaudeCodeWebServer {
         // record is only half of it — a record with no id sends the manager to
         // the head of the log for one — but the session has already truncated
         // that log by the time it says this, so the two agree (#43).
-        if (change.nativeSessionId === null) void this.saveSessionsToDisk();
+        // Likewise a mode that changed under a `/clear`: it is a standing
+        // permission, and one that only exists in memory is one a restart
+        // silently rewrites.
+        if (change.nativeSessionId === null || change.bypassing !== undefined) {
+          void this.saveSessionsToDisk();
+        }
       },
     });
     this.runtimeProfiles = new RuntimeProfileStore({ database: this.database });
@@ -352,6 +374,14 @@ export class ClaudeCodeWebServer {
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
       resolveRuntimeProfile: (agentKind: AgentKind, workingDir: string) =>
         this.resolveRuntimeProfile(agentKind, workingDir),
+      activeProfileFor: (runtime: string) => this.activeProfileFor(runtime),
+      getUserModelDefault: (userId: number, runtime: string) =>
+        this.database.getUserSetting(userId, `chatModel:${runtime}`),
+      setUserModelDefault: (userId: number, runtime: string, model: string | null) => {
+        if (model) this.database.setUserSetting(userId, `chatModel:${runtime}`, model);
+        else this.database.deleteUserSetting(userId, `chatModel:${runtime}`);
+      },
+      getUserPreferences: (userId: number) => this.userPreferences.get(userId),
       transcriptStore: this.transcriptStore,
       historyStore: this.historyStore,
       chatManager: this.chatManager,
@@ -501,6 +531,20 @@ export class ClaudeCodeWebServer {
       extraArgs: extraArgs.length ? extraArgs : undefined,
       env: profile.env,
     };
+  }
+
+  /**
+   * The active profile for a runtime, and nothing written down.
+   *
+   * The read-only half of `resolveRuntimeProfile` above, which cannot serve
+   * this: it writes the profile's tier files every time it is called, and the
+   * callers here are questions — a browser joining a conversation, a branch
+   * being cut — not launches. Answering them through the other one would
+   * rewrite a runtime's config on every tab that opened.
+   */
+  private activeProfileFor(runtime: string): { profileName: string; model?: string } | null {
+    const profile = this.runtimeProfiles.activeFor(runtime);
+    return profile ? { profileName: profile.name, model: profile.model } : null;
   }
 
   /**
@@ -698,6 +742,7 @@ export class ClaudeCodeWebServer {
       getSelectedWorkingDir: (userId: number) => this.getSelectedWorkingDir(userId),
       setSelectedWorkingDir: (userId: number, value: string | null) =>
         this.setSelectedWorkingDir(userId, value),
+      activeProfileFor: (runtime: string) => this.activeProfileFor(runtime),
       createSessionRecord: (params) => this.createSessionRecord(params),
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
@@ -707,6 +752,8 @@ export class ClaudeCodeWebServer {
       pasteStore: this.pasteStore,
       attachmentStore: this.attachmentStore,
       runtimeProfiles: this.runtimeProfiles,
+      userPreferences: this.userPreferences,
+      getUserPreferences: (userId: number) => this.userPreferences.get(userId),
       tierContext: this.tierContext,
       updateChecker: this.updateChecker,
       selfUpdate: this.selfUpdate,

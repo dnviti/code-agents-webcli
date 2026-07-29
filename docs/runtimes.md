@@ -223,6 +223,71 @@ and its own list is what settles the question. And it is scoped to the session:
 where sessions run in per-user environments each one reads its own home, so the
 menu never becomes a window onto what someone else has installed.
 
+### Which model runs
+
+The chip beside the composer both names the model in force and changes it. It
+always accepts a typed name as well as offering whatever the runtime published,
+because a model name can only be judged by trying it.
+
+Three things can decide the model a conversation opens on, and they are consulted
+in this order:
+
+| Layer | Set from | Applies to |
+| --- | --- | --- |
+| **This conversation** | picking a model in the chip, or typing `/model <name>` | this conversation only, until it is cleared |
+| **Your standing choice** | the same pick — a model you choose is remembered for that agent | every **new** chat you open on that agent |
+| **The active runtime profile** | Settings → Runtime profiles, installer-only | every new chat on that agent, for everybody |
+
+Below all three, the CLI is launched with no model flag at all and uses its own
+default.
+
+**The picker says which of them is in force**, in a line above the list and on
+the chip's hover, so a model pinned by a profile is visible as a pin rather than
+appearing out of nowhere. Choosing **Use the default for this runtime** clears
+the conversation's own choice *and* forgets your standing one for that agent, so
+the next new chat falls back to the profile and then to the CLI's own default.
+That is the only way back, which is why it is the one thing in the menu that
+does more than set a name — an id typed with a typo would otherwise stay in
+force for every new chat on that runtime.
+
+**Your standing choice is per account and per agent**, stored on the server
+rather than in the browser, so it travels between your phone and your desk.
+Effort works the other way round — it is kept per browser — and the difference is
+not taste: Claude, Codex and pi fix the model when the process starts, so a
+preference held in the browser could only be applied *after* the launch, which
+on Claude means a visible `/model` turn pushed into a conversation you have not
+typed in yet. It is scoped to your account and never readable from another.
+
+**A conversation already under way is never re-modelled.** Every chat records
+the model its launch actually used, and that is what it comes back on: a
+relaunch, a resume from the launcher and the recovery banner's restart all return
+to the model that conversation was already using — including across a server
+restart, which is the moment every open conversation gets relaunched. Changing
+your standing choice, or the active profile, affects the next new chat and
+nothing that is open, and a conversation that launched with no model flag at all
+keeps that answer too.
+
+The chip names that recorded model rather than the default, which is the
+difference between describing this conversation and describing the next one. When
+the two differ the line above the list says which model the conversation is
+staying on, and then what a new chat would open on instead.
+
+A **branch** opens on the model its source was actually running, for the same
+reason: the context estimate that decided whether the branch fits was measured
+against that model's window.
+
+Two deliberate omissions. A **terminal** session is unaffected: it runs the CLI's
+own interface, where the model is yours to change inside the tool and nothing
+here could keep a preference in step with it. And the **launcher screen** — the
+one before a chat has started — has no model control, so the source line is only
+readable once the conversation is open.
+
+A standing choice is only recorded from a name the runtime is known to take:
+either the switch applied live, or the name is on the list the runtime published.
+A runtime that publishes no list at all (Claude is one) has nothing to check
+against, so a name typed there is taken at face value — the same rule the effort
+control applies to a runtime that publishes no ladder.
+
 ### How hard the agent thinks
 
 Every runtime the WebUI drives has a reasoning-effort knob, and no two spell it
@@ -266,7 +331,9 @@ so it survives a reload, a rejoin, and a `/clear` — which restarts the process
 in place and would otherwise put it back where it started. The level to open the
 *next* conversation at is kept in your browser, per runtime, so somebody who
 runs Claude at `max` and Kimi at `on` gets both back rather than one setting
-fighting over two ladders that have nothing in common.
+fighting over two ladders that have nothing in common. (The model above is
+remembered the same way but on the *server*, per account — see
+[Which model runs](#which-model-runs) for why the two differ.)
 
 Typing `/effort high` into the composer reaches the same place as the button:
 the runtime runs its own command, and the choice is recorded so a later `/clear`
@@ -316,6 +383,45 @@ conversation recorded one.
 
 Past 400 conversations the list describes the most recent ones and says so.
 
+### Approval mode
+
+Whether a web chat asks before each tool call is settled by one rule, and every
+way into a conversation follows it:
+
+- A conversation that is **beginning** takes your **Web chat approvals**
+  preference from Settings. That covers a launch from the runtime launcher, a
+  branch cut from a turn, *Start a new chat* on the recovery notice after a
+  server restart, and `/clear` inside a live conversation.
+- A conversation that is **continuing** — resumed from the launcher, opened from
+  the conversations list, or brought back with *Resume this conversation* —
+  comes back in the mode it was already running in. The preference is not
+  re-read in either direction, so switching it on later cannot widen a
+  conversation that chose to ask, and switching it off cannot take the mode away
+  from one that is running without prompts.
+- Anything missing or unreadable means **ask**. That includes a conversation
+  resumed with nothing recorded about its mode.
+
+The preference belongs to your account, not to the browser you set it in, so it
+holds on a second device and in a second browser. It is stored on the server and
+is never taken from the page at launch time: the launcher's chat button reports
+what the server is going to do rather than requesting it.
+
+Every conversation says which mode it is in as it starts, on a line at the top of
+the conversation itself, and a conversation running with approvals bypassed keeps
+saying so in its header for as long as it is on screen — including while nothing
+is running it. The two buttons on the recovery notice name the mode each of them
+lands in, so a bypass is never restored, or dropped, in silence.
+
+**pi is the exception, and the app says so rather than pretending.** pi's chat
+adapter has no approval channel at all — its `--approve` trusts project-local
+files for the whole run instead of gating individual tool calls — so a pi
+conversation runs its tools without asking whichever mode the rule computes.
+Its opening line says `this runtime cannot ask` instead of claiming a boundary
+that is not there.
+
+The terminal surface's own **No prompts** button is a separate, per-launch
+choice on a different surface, and is not covered by this preference.
+
 ### Closing a conversation, and deleting one
 
 **Closing** a conversation takes it off your screen. The record, the transcript,
@@ -344,9 +450,11 @@ id, so the first message afterwards is answered by a process that has never
 seen what came before, and the window does not page back into it.
 
 What is *not* carried across: anything queued behind the conversation you left
-(those turns were for a process that no longer exists), and any standing
-permission granted to it — a bypass belongs to the conversation that asked for
-it, and the new one asks for itself.
+(those turns were for a process that no longer exists), and the approval mode
+the conversation you left was running in. The new one is a conversation that is
+*beginning*, so it takes your **Web chat approvals** preference — the same
+answer the launcher's chat button and the recovery notice's *Start a new chat*
+would give it. See [Approval mode](#approval-mode) above.
 
 Nothing is deleted. The previous conversation stays in the session's log for
 history, search and export; this changes what the window shows and what the
@@ -458,6 +566,41 @@ Reaching a phone whose screen is off needs a push subscription and is not part
 of this yet; today a notification reaches another tab, another window, another
 application, and the installed app while it is open in the background.
 
+### What each runtime tells you about tokens, cost and the context window
+
+The header strip, the line under the composer and the **Status** panel all read
+the same four figures, and every one of them is a figure a runtime actually
+sent. Nothing here is estimated, averaged or priced from a table this app keeps:
+if a runtime does not report something, the interface says **"not reported"**
+rather than drawing a zero that looks like an answer.
+
+The table below is an audit, not a promise. Each row was read off a capture in
+`test/fixtures/chat/` or a live probe, and the captures are what the tests
+replay.
+
+| Runtime | Context window | How full it is | Tokens per turn | Cost | Read from |
+| --- | --- | --- | --- | --- | --- |
+| Claude | reported, per model | reported, from the last round trip | reported, four buckets | reported | `claude-model-usage.jsonl`, `claude-multi-turn-result.jsonl` |
+| Codex (app-server) | reported | reported | reported | **not reported** — nothing in the schema prices a turn | `codex-appserver-text-turn.jsonl` |
+| Oh My Pi | reported | reported | reported | reported, as a session running total | `acp-omp.jsonl` |
+| opencode | reported | reported | reported | reported | `acp-opencode.jsonl` |
+| Grok | reported, on `session/new` | reported, off the update envelope | reported | reported, per turn, in ticks | `acp-grok.jsonl`, `acp-grok-session-new.json` |
+| pi | **not reported** — the provider is asked instead | reported | reported | reported | `pi-final-turn.jsonl` |
+| Kimi | **not reported** — the provider is asked instead | **not reported** | **not reported** | **not reported** | `acp-kimi-tools.jsonl`, probe of 0.29.1 |
+
+Two things follow from it that are worth knowing before you read a header:
+
+- **A window can come from somewhere other than the agent.** Where a runtime
+  publishes no window, the model's provider is asked for one, once per model,
+  and the panel says which of the two you are looking at. An agent's own figure
+  always wins — grok reports 512,000 tokens for `grok-build` where the nearest
+  catalogue entry says half that. With no network, or with the catalogue turned
+  off, a runtime in that position simply has no window and says so.
+- **"Not reported" is only ever said after a turn has finished.** A conversation
+  that has not run yet shows nothing, because nothing is known about it yet, and
+  the two states are deliberately different: one means *this agent will never
+  tell you*, the other means *hold on*.
+
 ## Runtime profiles
 
 **Settings → Runtime profiles** controls how each CLI is launched. Nothing here
@@ -469,7 +612,7 @@ A profile targets one runtime and carries four things, all optional:
 
 | Field | What it does |
 | --- | --- |
-| **Model** | Passed as `--model <value>` to the CLIs that have the flag (all but Cursor Agent and Qwen Code). A chat conversation on an ACP agent — Grok Build, Kimi Code, Oh My Pi — has no flag to pass it on, so the value is applied over the protocol the moment the session opens, and again after anything that restarts it: `/clear`, a server restart, the unavailable banner |
+| **Model** | Passed as `--model <value>` to the CLIs that have the flag (all but Cursor Agent and Qwen Code). A chat conversation on an ACP agent — Grok Build, Kimi Code, Oh My Pi — has no flag to pass it on, so the value is applied over the protocol the moment the session opens, and again after anything that restarts it: `/clear`, a server restart, the unavailable banner. This is a **default, not a pin**: a conversation's own choice has always outranked it, and since 5.3.3 a user's standing choice does too — see [Which model runs](#which-model-runs) |
 | **Extra arguments** | Appended after the app's own flags, so they win on CLIs where the last flag wins |
 | **Environment** | Injected into the spawned process |
 | **Capability tiers** | `floor` / `mid` / `high` / `top`, written into the runtime's own config |

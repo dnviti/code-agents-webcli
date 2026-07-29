@@ -64,7 +64,27 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
 
   const hasTotal = showTokens && usage.totalTokens !== undefined;
   const hasCost = showCost && usage.costUsd !== undefined;
-  const hasContext = showTokens && usage.contextWindow !== undefined && usage.contextUsed !== undefined;
+  /**
+   * Said out loud, once a turn has finished having reported nothing.
+   *
+   * Not `capabilities.usage === false`, which is also every transcript before
+   * its handshake lands and would put "not reported" on every chat against
+   * every agent for the first second of its life. `usageSource: 'none'` is a
+   * measurement the session only makes after watching a turn end (see
+   * `noteSpend`), and it is deliberately outside the capability gates above:
+   * a runtime honest enough to say it reports nothing is exactly the one whose
+   * capability is false, and hiding the sentence with the figures would leave
+   * the strip as blank as it was before.
+   */
+  const tokensSilent = usage.usageSource === 'none' && !hasTotal && fields.length === 0;
+  const costSilent = usage.costSource === 'none' && !hasCost;
+  /**
+   * The context reading answers a different question from the spend, and comes
+   * from somewhere else — often the model's provider rather than the agent at
+   * all. Gating it on `capabilities.usage` hid kimi's whole window the moment
+   * that flag became honest about kimi's tokens.
+   */
+  const hasContext = usage.contextWindow !== undefined && usage.contextUsed !== undefined;
   /**
    * Occupied, but against a ceiling nobody could establish.
    *
@@ -73,8 +93,7 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
    * whole reason capacity is never guessed here is that a confidently wrong
    * ceiling invites someone to keep going up to a limit that is not there.
    */
-  const capacityUnknown =
-    showTokens && usage.contextWindow === undefined && usage.contextUsed !== undefined;
+  const capacityUnknown = usage.contextWindow === undefined && usage.contextUsed !== undefined;
   /**
    * A window whose occupancy nobody reports — kimi's whole conversation.
    *
@@ -83,10 +102,22 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
    * context reading goes is read as "not full yet", which is the one thing
    * nobody here knows.
    */
-  const fillUnknown =
-    showTokens && usage.contextWindow !== undefined && usage.contextUsed === undefined;
+  const fillUnknown = usage.contextWindow !== undefined && usage.contextUsed === undefined;
 
-  if (fields.length === 0 && !hasTotal && !hasCost && !hasContext && !capacityUnknown && !fillUnknown) {
+  if (
+    fields.length === 0 &&
+    !hasTotal &&
+    !hasCost &&
+    !hasContext &&
+    !capacityUnknown &&
+    !fillUnknown &&
+    // Without these two the rows below are unreachable in the only case they
+    // exist for: a runtime that reports nothing and whose window nobody could
+    // size has an empty reading in every other clause, and the meter went on
+    // rendering the blank it was meant to replace.
+    !tokensSilent &&
+    !costSilent
+  ) {
     return null;
   }
 
@@ -115,6 +146,32 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
     if (total !== null) parts.push(`${formatTokens(total)} tok`);
     if (hasCost) parts.push(formatCost(usage.costUsd!));
 
+    // One phrase at most, and the shorter one when both halves are silent. This
+    // strip is fixed-width — the reason the context warning is a percentage
+    // here and a sentence in the panel — and "tokens not reported · cost not
+    // reported" is two phrases where there is barely room for one. The tooltip
+    // carries the whole of it, and so does the status panel.
+    //
+    // `costOnly` drops the noun for the same reason the figure beside it does.
+    // That form is the phone's collapsed header: one 390px row carrying a state
+    // word, this slot, the bypass shield and the chevron, none of which may
+    // shrink. Measured — "asked you a question" is 20 characters of it, and
+    // "cost not reported" put 22px of the strip off the side of the screen
+    // (test/browser/checks.ts). The slot only ever holds the cost there, which
+    // is why the money is rendered bare as `$0.12` with no label of its own, so
+    // the absence of it is said the same way and the title carries the noun.
+    const silence = costOnly
+      ? costSilent
+        ? 'not reported'
+        : null
+      : tokensSilent && costSilent
+        ? 'usage not reported'
+        : tokensSilent
+          ? 'tokens not reported'
+          : costSilent
+            ? 'cost not reported'
+            : null;
+
     return (
       <div
         // Named, because it is one of the readouts a phone layout has to keep
@@ -135,6 +192,7 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
         }}
       >
         {parts.length ? <span>{costOnly && hasCost ? formatCost(usage.costUsd!) : parts.join(' · ')}</span> : null}
+        {silence ? <span title={silenceTitle(tokensSilent, costSilent)}>{silence}</span> : null}
         {hasContext && !costOnly ? (
           <span
             style={{
@@ -249,6 +307,30 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
           </span>
         </div>
       ) : null}
+
+      {/* Beside the two context rows above and in the same voice, because they
+          are the same kind of answer: a figure nobody gave, said rather than
+          left out. Here there is room for words, so both halves get their own
+          row even when both are silent. */}
+      {tokensSilent ? (
+        <div
+          style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}
+          title={silenceTitle(true, false)}
+        >
+          <span>tokens</span>
+          <span style={{ color: 'var(--foreground)' }}>not reported</span>
+        </div>
+      ) : null}
+
+      {costSilent ? (
+        <div
+          style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}
+          title={silenceTitle(false, true)}
+        >
+          <span>cost</span>
+          <span style={{ color: 'var(--foreground)' }}>not reported</span>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -318,6 +400,19 @@ function fillTitle(window: number): string {
 /** And of an occupancy with no window to measure it against. */
 function sizeTitle(used: number): string {
   return `${used.toLocaleString()} tokens in the context · nobody could say how large the window is`;
+}
+
+/**
+ * The long form of a runtime that finished a turn and reported no spend.
+ *
+ * "This turn" and "so far" are both wrong: the statement is about the runtime,
+ * made from having watched it finish work in silence, and it does not become
+ * truer or less true as the conversation goes on. Nothing here is estimated —
+ * this app buys no price list and will not guess a figure a runtime withheld.
+ */
+function silenceTitle(tokens: boolean, cost: boolean): string {
+  const what = tokens && cost ? 'token counts or costs' : tokens ? 'token counts' : 'costs';
+  return `This runtime does not report ${what}, so there is no honest figure to show. Nothing here is estimated.`;
 }
 
 /** 1234 -> "1.2k", 12421 -> "12.4k", 984123 -> "984k", 1_400_000 -> "1.4M". */

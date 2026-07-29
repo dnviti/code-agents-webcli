@@ -2,6 +2,7 @@ import * as React from 'react';
 import {
   ChatAttachment,
   ChatCapabilities,
+  ChatModelDefault,
   ChatUsage,
   EffortChoice,
   ModelChoice,
@@ -110,6 +111,35 @@ export interface ComposerProps {
   onSetModel?: (model: string) => void;
   /** What the server reported about the last `onSetModel` call, for the chip. */
   modelFeedback?: { applied: 'live' | 'sent' | 'pending' | 'cleared'; message: string } | null;
+  /**
+   * Which model a *new* conversation on this runtime would open on, and why.
+   *
+   * Separate from `model` above, which is what this conversation is running.
+   * The picker shows both because they answer different questions, and the
+   * second one had no answer at all before #135: a model pinned by a runtime
+   * profile was in force and invisible, and a model the user had picked in the
+   * last chat was neither.
+   */
+  modelDefault?: ChatModelDefault | null;
+  /**
+   * This conversation's own model choice, when it has one.
+   *
+   * Passed apart from `model` because that one cannot tell the two apart — it
+   * is the override *or* whatever the runtime last reported — and the picker
+   * has to, or it would describe a model the runtime happened to name as
+   * something the user chose.
+   */
+  modelOverride?: string | null;
+  /**
+   * The model this conversation was launched on, when the server says.
+   *
+   * The third of three, and none of them is a substitute for another: `model`
+   * is the override or whatever the runtime last reported, `modelDefault` is
+   * what a *new* conversation would open on, and this is what the process
+   * actually started with. Claude reports no model at all, so on that runtime
+   * this is the only truthful answer the chip has (#135).
+   */
+  modelPinned?: string | null;
   /**
    * The reasoning-effort level this conversation is running at.
    *
@@ -225,6 +255,9 @@ export function Composer({
   alsoRan,
   onSetModel,
   modelFeedback,
+  modelDefault,
+  modelOverride,
+  modelPinned,
   effort,
   onSetEffort,
   effortFeedback,
@@ -955,6 +988,9 @@ export function Composer({
                 alsoRan={alsoRan}
                 models={capabilities.models}
                 feedback={modelFeedback}
+                fallback={modelDefault}
+                override={modelOverride}
+                pinned={modelPinned}
                 onPick={(value) => onSetModel?.(value)}
               />
 
@@ -1146,6 +1182,22 @@ function sessionReadout(turnLabel: string | undefined, usage: ChatUsage | undefi
     const total = tokenTotal(usage);
     if (total !== null) bits.push(`${compactCount(total)} tok`);
     if (usage.costUsd !== undefined) bits.push(`$${usage.costUsd.toFixed(4)}`);
+    // Otherwise this line degrades to a bare `turn 3` against a runtime that
+    // reports nothing, which reads as a session that has spent nothing. Only
+    // ever off a spoken absence — the session states it after watching a turn
+    // finish, and a transcript that has simply not heard yet says nothing here,
+    // as it should.
+    //
+    // One phrase when both halves are silent, the same rule the compact meter
+    // follows and for the same reason: this line is one nowrap span that
+    // neither shrinks nor wraps, and "tokens not reported · cost not reported"
+    // measured 445px against a 390px phone — 55px of it off the side of the
+    // screen (test/browser/checks.ts).
+    const noTokens = total === null && usage.usageSource === 'none';
+    const noCost = usage.costUsd === undefined && usage.costSource === 'none';
+    if (noTokens && noCost) bits.push('usage not reported');
+    else if (noTokens) bits.push('tokens not reported');
+    else if (noCost) bits.push('cost not reported');
   }
   return bits.join(' · ');
 }
@@ -1277,12 +1329,56 @@ function Chip({
  * user to start a new session was a worse answer than trying and being honest
  * about the result.
  */
+/**
+ * Where a new conversation on this runtime would get its model.
+ *
+ * Deliberately phrased as the *default*, never as the running model: on a
+ * runtime that fixes the model when the process is spawned the two are
+ * routinely different, and a line that read like a status would be wrong every
+ * time somebody picked a model mid-conversation.
+ */
+function describeModelDefault(fallback: ChatModelDefault): string {
+  if (fallback.source === 'personal' && fallback.model) {
+    return `Your standing choice for this runtime: ${fallback.model}.`;
+  }
+  if (fallback.source === 'profile' && fallback.model) {
+    return fallback.profileName
+      ? `From the "${fallback.profileName}" runtime profile: ${fallback.model}.`
+      : `From the active runtime profile: ${fallback.model}.`;
+  }
+  return 'No default set — this runtime picks for itself.';
+}
+
+/**
+ * What clearing the override would actually do.
+ *
+ * Two different answers, and conflating them was the trap: clearing does not
+ * fall back to a standing choice, it *forgets* it. That is what makes this
+ * entry the only way to undo a model that has become the default for every new
+ * chat on this runtime, and saying "falls back to your last choice" would
+ * describe the opposite of what the click does.
+ */
+function describeModelClear(fallback: ChatModelDefault): string {
+  if (fallback.source === 'personal' && fallback.model) {
+    return `Clearing drops it, and forgets ${fallback.model} as your standing choice for this runtime.`;
+  }
+  if (fallback.source === 'profile' && fallback.model) {
+    return fallback.profileName
+      ? `Clearing falls back to the "${fallback.profileName}" runtime profile: ${fallback.model}.`
+      : `Clearing falls back to the active runtime profile: ${fallback.model}.`;
+  }
+  return 'Clearing leaves the model to this runtime.';
+}
+
 function ModelChip({
   current,
   alsoRan,
   models,
   onPick,
   feedback,
+  fallback,
+  override,
+  pinned,
 }: {
   /** What the session reported it is running, when it reported anything. */
   current: string | undefined;
@@ -1292,6 +1388,18 @@ function ModelChip({
   onPick: (value: string) => void;
   /** What the server said happened to the last pick made here. */
   feedback?: { applied: 'live' | 'sent' | 'pending' | 'cleared'; message: string } | null;
+  /** Where a new conversation's model would come from; null when unsaid. */
+  fallback?: ChatModelDefault | null;
+  /** This conversation's own choice, as distinct from what the runtime reported. */
+  override?: string | null;
+  /**
+   * The model this conversation was actually launched on; null when unsaid.
+   *
+   * Apart from `fallback` because they answer different questions, and the chip
+   * would be lying if it used one for the other: this is what the process is
+   * running, that is what the next new chat would open on.
+   */
+  pinned?: string | null;
 }): React.JSX.Element {
   const [open, setOpen] = React.useState(false);
   const [customValue, setCustomValue] = React.useState('');
@@ -1343,14 +1451,53 @@ function ModelChip({
     return () => clearTimeout(timer);
   }, [feedbackMessage]);
 
+  /**
+   * What the chip names when the session has reported nothing.
+   *
+   * The word "model" used to sit here for the whole of a conversation whose
+   * runtime never emits a session event — which on a profile-pinned install
+   * meant the pin was genuinely in force and nowhere on screen (#135).
+   *
+   * The pin, and never the default. They are routinely different and the
+   * difference is the whole point: the default is what the *next* new chat
+   * would open on, so naming it here would put a model on the chip that this
+   * conversation was never launched on and never will be — and it would change
+   * under an open conversation the moment the same account picked a model
+   * anywhere else. The pin is what the launch actually used, so naming it is a
+   * statement about this conversation and nothing else.
+   */
+  const effective = current ?? pinned ?? undefined;
   // The session's own model wins. `models` is a menu in whatever order the
   // runtime listed it, and its first entry is the current one only by accident.
-  const matched = models?.find((m) => m.value === current || m.name === current);
-  const named = matched?.name ?? current ?? 'model';
+  const matched = models?.find((m) => m.value === effective || m.name === effective);
+  const named = matched?.name ?? effective ?? 'model';
   // The others are counted, not named: three model ids do not fit on a chip,
   // and picking one of them to show would undo the point of reporting a split.
   const others = (alsoRan ?? []).filter((model) => model !== current);
   const label = others.length > 0 ? `${named} +${others.length}` : named;
+
+  /**
+   * Why this model and not another — the question the picker could not answer.
+   *
+   * Two sentences at most, because there are only ever two facts: what fixed
+   * this conversation's model, and what the default is. A server that said
+   * nothing about the default produces nothing here rather than a guess, so an
+   * older one degrades to the wording that shipped before.
+   *
+   * The middle case is the one that has to be said out loud rather than implied:
+   * a conversation pinned to a model the default no longer names is *staying*
+   * on it, and a line that only described the default would read as a claim
+   * about what is running.
+   */
+  const clearPhrase = fallback ? describeModelClear(fallback) : null;
+  const staysOn = pinned && pinned !== fallback?.model ? `Staying on ${pinned}.` : null;
+  const sourceLine = !fallback
+    ? null
+    : override
+      ? `Chosen for this conversation only. ${clearPhrase}`
+      : staysOn
+        ? `${staysOn} ${describeModelDefault(fallback)}`
+        : describeModelDefault(fallback);
 
   React.useEffect(() => {
     if (!open) return;
@@ -1424,10 +1571,14 @@ function ModelChip({
           // of the conversation, in favour of a sentence the chip beneath the
           // pointer already spells out. An outcome the chip cannot show still
           // takes the slot, so it stays findable after its box has timed out.
+          // The source rides on the end of the resting title rather than
+          // replacing it, because a hover is also the only route to it on a
+          // desktop without opening the menu — and the menu is a click that
+          // covers the composer.
           notice?.message
           || (others.length > 0
             ? `This turn ran on: ${[named, ...others].join(', ')}`
-            : `Model: ${label}`)
+            : `Model: ${label}${sourceLine ? ` — ${sourceLine}` : ''}`)
         }
         onClick={() => setOpen((value) => !value)}
         style={{
@@ -1475,6 +1626,26 @@ function ModelChip({
             zIndex: 'var(--z-dropdown)' as unknown as number,
           }}
         >
+          {/* Above the field rather than below the list, because it is context
+              for every choice underneath it — including the clear entry at the
+              bottom, which is the one the sentence's second half is about. */}
+          {sourceLine ? (
+            <div
+              data-model-source=""
+              style={{
+                padding: '2px 4px 6px',
+                color: 'var(--muted-foreground)',
+                // The list's own size, not the 10px the hints below it use: it
+                // is a sentence rather than a caption, and it is the thing that
+                // explains every entry underneath it.
+                fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
+                lineHeight: 1.4,
+              }}
+            >
+              {sourceLine}
+            </div>
+          ) : null}
+
           <div style={{ display: 'flex', gap: isPhone ? TOUCH_GAP : 4, padding: '2px 2px 6px' }}>
             <input
               ref={inputRef}
@@ -1590,6 +1761,7 @@ function ModelChip({
             role="option"
             aria-selected={false}
             onClick={() => pick('')}
+            title={clearPhrase ?? undefined}
             style={{
               width: '100%',
               marginTop: 2,

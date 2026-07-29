@@ -50,8 +50,12 @@ function record(id, over = {}) {
 /**
  * A message processor over real session records, with only the chat *process*
  * faked — the launch is what cannot be run in a test, not the bookkeeping.
+ *
+ * `preference` is the owner's standing approval preference, which is where a
+ * conversation that is beginning takes its mode from since #134. It stands in
+ * for the server-side store, which has its own tests.
  */
-function processorOver(sessions) {
+function processorOver(sessions, preference = false) {
   const sent = [];
   const ws = { readyState: 1, send: (payload) => sent.push(JSON.parse(payload)) };
   const first = sessions.values().next().value;
@@ -75,6 +79,7 @@ function processorOver(sessions) {
     getRuntimeBridge: () => null,
     saveSessionsToDisk: () => Promise.resolve(),
     resolveRuntimeProfile: () => null,
+    getUserPreferences: () => ({ chatBypassPermissions: preference === true }),
     chatManager: {
       has: () => false,
       async start(_record, options) {
@@ -144,9 +149,12 @@ describe('the approval mode across a restart', function () {
   }
 
   it('brings a bypassed conversation back bypassed, with nothing running it', async function () {
+    // Restated for #134: the bypass is established by the owner's preference
+    // rather than by a flag from the browser, which the server now ignores.
+    // What is being asserted — that the mode survives the disk — is unchanged.
     const live = new Map([['s1', record('s1')]]);
-    const { processor } = processorOver(live);
-    await processor.startChat('ws-1', 'claude', { dangerouslySkipPermissions: true });
+    const { processor } = processorOver(live, true);
+    await processor.startChat('ws-1', 'claude', {});
     await sessionStore.saveSessions(live);
 
     const restored = await restart();
@@ -162,16 +170,16 @@ describe('the approval mode across a restart', function () {
 
   it('relaunches it in the mode it was in, without the browser asking', async function () {
     const live = new Map([['s1', record('s1')]]);
-    await processorOver(live).processor.startChat('ws-1', 'claude', {
-      dangerouslySkipPermissions: true,
-    });
+    await processorOver(live, true).processor.startChat('ws-1', 'claude', {});
     await sessionStore.saveSessions(live);
 
     // The relaunch a resume from the launcher sends: a session id, `resume`, and
-    // nothing about permissions.
+    // nothing about permissions. The preference is off on the way back, which is
+    // the point: a conversation being continued replays its own grant and does
+    // not re-read the preference in either direction.
     const restored = await restart();
     restored.get('s1').active = false;
-    const after = processorOver(restored);
+    const after = processorOver(restored, false);
     await after.processor.startChat('ws-1', 'claude', { resume: true });
 
     const started = after.sent.filter((m) => m.type === 'chat_started').pop();
@@ -188,8 +196,11 @@ describe('the approval mode across a restart', function () {
     const snapshot = await manager().snapshot(restored.get('s1'));
     assert.strictEqual(snapshot.bypassPermissions, false);
 
+    // And the preference turned on in the meantime, which is the case the
+    // tri-state record exists for: a conversation that was granted approvals
+    // keeps them, because it is being continued rather than begun (#134).
     restored.get('s1').active = false;
-    const after = processorOver(restored);
+    const after = processorOver(restored, true);
     await after.processor.startChat('ws-1', 'claude', { resume: true });
     assert.strictEqual(
       after.sent.filter((m) => m.type === 'chat_started').pop().bypassPermissions,
@@ -203,13 +214,16 @@ describe('the approval mode across a restart', function () {
     // mode is a standing permission: it may travel with its own conversation and
     // nowhere else.
     const live = new Map([['yolo', record('yolo')], ['careful', record('careful')]]);
-    const { processor } = processorOver(live);
-    processor.deps.webSocketConnections.get('ws-1').chatSessionIds.add('yolo');
-    processor.deps.webSocketConnections.get('ws-1').chatSessionIds.add('careful');
+    const bypassing = processorOver(live, true);
+    bypassing.processor.deps.webSocketConnections.get('ws-1').chatSessionIds.add('yolo');
+    await bypassing.processor.startChat('ws-1', 'claude', {}, 'yolo');
 
-    await processor.startChat('ws-1', 'claude', { dangerouslySkipPermissions: true }, 'yolo');
+    // The second one launched with the preference back off — the same user
+    // having changed their mind between two conversations.
     live.get('careful').active = false;
-    await processor.startChat('ws-1', 'claude', {}, 'careful');
+    const careful = processorOver(live, false);
+    careful.processor.deps.webSocketConnections.get('ws-1').chatSessionIds.add('careful');
+    await careful.processor.startChat('ws-1', 'claude', {}, 'careful');
     await sessionStore.saveSessions(live);
 
     const restored = await restart();
@@ -223,13 +237,40 @@ describe('the approval mode across a restart', function () {
     // different user cannot read the mode written for this one. Asserted because
     // a standing permission crossing users is the worst thing this could do.
     const live = new Map([['s1', record('s1')]]);
-    await processorOver(live).processor.startChat('ws-1', 'claude', {
-      dangerouslySkipPermissions: true,
-    });
+    await processorOver(live, true).processor.startChat('ws-1', 'claude', {});
     await sessionStore.saveSessions(live);
 
     const restored = await restart();
     const theirs = { ...restored.get('s1'), ownerUserId: OWNER + 92, chatBypassPermissions: undefined };
     assert.strictEqual((await manager().snapshot(theirs)).bypassPermissions, false);
+  });
+
+  it('keeps “granted approvals” apart from “never launched” across the disk', async function () {
+    // The distinction the whole rule rests on. A conversation that ran and
+    // asked comes back recorded as `false` and is therefore continued as it
+    // was; a record nothing ever launched comes back as `undefined` and is open
+    // to the preference the next time it begins. Collapsing the two — which is
+    // what storing `undefined` for both used to do — is how a preference
+    // switched on afterwards would widen a conversation that already chose.
+    const live = new Map([['asked', record('asked')], ['never', record('never')]]);
+    const { processor } = processorOver(live, false);
+    await processor.startChat('ws-1', 'claude', {});
+    await sessionStore.saveSessions(live);
+
+    const restored = await restart();
+    assert.strictEqual(restored.get('asked').chatBypassPermissions, false);
+    assert.strictEqual(restored.get('never').chatBypassPermissions, undefined);
+
+    // And with the preference now on: the one that asked is continued as it
+    // was, while the one that never ran begins in the mode the user chose.
+    restored.get('asked').active = false;
+    const after = processorOver(restored, true);
+    after.processor.deps.webSocketConnections.get('ws-1').chatSessionIds.add('never');
+    await after.processor.startChat('ws-1', 'claude', { resume: true }, 'asked');
+    await after.processor.startChat('ws-1', 'claude', {}, 'never');
+
+    const started = after.sent.filter((m) => m.type === 'chat_started');
+    assert.strictEqual(started[0].bypassPermissions, false, 'a conversation that asked keeps asking');
+    assert.strictEqual(started[1].bypassPermissions, true, 'one that never ran takes the preference');
   });
 });

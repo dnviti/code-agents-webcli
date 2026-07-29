@@ -73,6 +73,17 @@ export interface ChatViewProps {
   workingDir: string;
   isMobile?: boolean;
   /**
+   * The account's approval preference, which is what a conversation *started*
+   * from here would run in.
+   *
+   * Only the recovery notice reads it, and only to label its buttons. The
+   * conversation's own mode comes off the transcript — the two are different
+   * facts, and telling them apart on screen is the whole of #134: "Resume this
+   * conversation" restores the mode this conversation had, while "Start a new
+   * chat" begins one in the mode the preference names.
+   */
+  approvalPreference?: boolean;
+  /**
    * Opens the chat's own display settings — not the app's.
    *
    * The two were the same dialog, which meant the gear inside a conversation
@@ -152,6 +163,7 @@ export function ChatView({
   runtimeLabel,
   workingDir,
   isMobile = false,
+  approvalPreference = false,
   onOpenSettings,
   onOpenConversations,
   view = DEFAULT_CHAT_VIEW,
@@ -1061,6 +1073,8 @@ export function ChatView({
               <UnavailableNotice
                 reason={unavailable}
                 runtimeLabel={runtimeLabel}
+                bypassPermissions={bypassPermissions}
+                preferenceBypasses={approvalPreference}
                 onResume={() => relaunch(true)}
                 onFresh={() => relaunch(false)}
               />
@@ -1189,6 +1203,25 @@ export function ChatView({
               alsoRan={controller.modelOverrideValue ? undefined : transcript.turnModels}
               onSetModel={setModel}
               modelFeedback={controller.modelFeedback}
+              // Where a *new* conversation on this runtime would get its model,
+              // which is a different question from the one above and had no
+              // answer on screen at all before #135. No effect on the launch:
+              // the server resolves that itself, and nothing here seeds a model
+              // the way the effort preference seeds a level — only ACP can take
+              // a model without a restart, so a post-launch seed would push a
+              // visible `/model` turn into a brand new claude conversation.
+              modelDefault={controller.modelDefaultValue}
+              // What this conversation was actually launched on, which is the
+              // only truthful thing to name when the user chose nothing and the
+              // runtime reports nothing — claude reports nothing, ever. The
+              // default above cannot stand in for it: it is what the *next* new
+              // chat would open on, and it changes under an open conversation
+              // every time the account's standing choice does.
+              modelPinned={controller.modelPinnedValue}
+              // Apart from `model` above, because that one is the override *or*
+              // whatever the runtime last reported and the picker has to tell
+              // those two apart to say which it is describing.
+              modelOverride={controller.modelOverrideValue}
               // Same precedence as the model above, and for the same reason:
               // the record's chosen level wins once the server has confirmed
               // it, and otherwise the transcript carries whatever the runtime
@@ -1429,16 +1462,29 @@ function useElementWidth(ref: React.RefObject<HTMLElement | null>): number {
 function UnavailableNotice({
   reason,
   runtimeLabel,
+  bypassPermissions,
+  preferenceBypasses,
   onResume,
   onFresh,
 }: {
   reason: ChatUnavailable;
   /** What this pane calls the runtime, used when the server named none. */
   runtimeLabel: string;
+  /** The mode this conversation was running in, which resuming restores. */
+  bypassPermissions: boolean;
+  /** The mode the account's preference names, which starting over produces. */
+  preferenceBypasses: boolean;
   onResume: () => void;
   onFresh: () => void;
 }) {
   const label = reason.runtimeLabel || runtimeLabel || 'The agent';
+  // The two buttons answer to different rules, and used to disagree in silence:
+  // one came back in the conversation's own mode and the other always dropped
+  // to asking. They now follow the one rule — continue replays the grant, begin
+  // takes the preference — and each says which mode it lands in, so a bypass is
+  // never restored, or dropped, without the user seeing it happen (#134).
+  const resumeMode = bypassPermissions ? 'approvals bypassed' : 'asks first';
+  const freshMode = preferenceBypasses ? 'approvals bypassed' : 'asks first';
   return (
     <div
       role="alert"
@@ -1464,6 +1510,11 @@ function UnavailableNotice({
         {reason.canResume
           ? 'This conversation is safe — it is stored on disk. Pick it up where it left off, or start a new one in this tab.'
           : 'This conversation is safe — it is stored on disk. Nothing recorded which conversation the agent had, so it cannot be given its context back; a new one starts with this transcript closed.'}
+        {' '}
+        {/* Spelled out for the case where starting over is the only button
+            there is: without a Resume beside it to compare against, the label
+            alone leaves nothing to say what changed. */}
+        {`A new conversation runs with ${freshMode}, from your Settings.`}
       </p>
 
       <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
@@ -1472,11 +1523,11 @@ function UnavailableNotice({
             the most expensive kind of wrong: it looks like it worked. */}
         {reason.canResume ? (
           <Button variant="primary" onClick={onResume}>
-            Resume this conversation
+            {`Resume this conversation · ${resumeMode}`}
           </Button>
         ) : null}
         <Button variant={reason.canResume ? 'ghost' : 'primary'} onClick={onFresh}>
-          Start a new chat
+          {`Start a new chat · ${freshMode}`}
         </Button>
       </div>
     </div>

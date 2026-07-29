@@ -282,8 +282,8 @@ export function SettingsDialog({
         label="Web chat approvals"
         description={
           draft.chatBypassPermissions
-            ? 'New web chats will run every tool without asking — including shell commands and file writes. Conversations already running keep the setting they started with.'
-            : 'New web chats ask before each tool call. Turn this off to let them read, write and run commands unattended.'
+            ? 'Every new web chat runs tools without asking — including shell commands and file writes — on all your devices. That covers a chat from the launcher, a branch, and starting over. A conversation already running keeps the mode it began in; start a new one to change it.'
+            : 'New web chats ask before each tool call, on all your devices. A conversation already running keeps the mode it began in.'
         }
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>

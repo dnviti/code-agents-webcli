@@ -16,6 +16,8 @@ import {
   QuestionRequest,
   SlashCommand,
   UserTurn,
+  carriesCost,
+  carriesTokens,
   classifyTool,
   defaultPermissionOptions,
   isAllowOption,
@@ -99,8 +101,21 @@ export interface ChatSessionDeps {
    */
   onLifecycle?: (
     sessionId: string,
-    change: { nativeSessionId?: string | null; exited?: boolean },
+    change: { nativeSessionId?: string | null; exited?: boolean; bypassing?: boolean },
   ) => void;
+  /**
+   * The approval mode a conversation started from inside this one should run in.
+   *
+   * `/clear` and the composer's New chat button end a conversation and begin
+   * another, and a conversation that is beginning takes the owner's preference
+   * — the same rule the launcher goes through. Asked here rather than replayed
+   * out of the previous launch's options, which is what used to carry one
+   * conversation's bypass into every later one in the same tab (#134).
+   *
+   * Optional: absent means nothing could be asked, and the restart asks for
+   * approvals, in line with every other unreadable answer in this rule.
+   */
+  resolveBypass?: () => boolean;
   /**
    * Where finished work is filed.
    *
@@ -248,6 +263,50 @@ const QUEUE_READY_TIMEOUT_MS = 15_000;
 const INTERRUPT_ACK_WINDOW_MS = 5_000;
 
 /**
+ * Turn endings that are the turn being cut short rather than finishing.
+ *
+ * Only used by `noteSpend`, and only to *decline* to conclude anything. A
+ * runtime that was stopped mid-sentence, or that fell over, or that was killed
+ * with the process, never reached the point where it reports what the turn
+ * spent — Claude prices a turn in its final `result`, an ACP agent in the reply
+ * to `session/prompt` — so the absence of a figure says nothing about whether
+ * the runtime reports figures. Recording "reports nothing" from one of these
+ * would put a permanent, wrong statement about the *runtime* on the log of a
+ * conversation the *user* interrupted.
+ *
+ * Matched on the runtime's own word, lower-cased with separators removed
+ * because the vocabulary is not shared: the adapters here emit `error`,
+ * `exited`, `failed` and `interrupted` of their own accord, ACP adds
+ * `cancelled` and `refusal`, and Claude's subtypes arrive as `error_max_turns`
+ * and `error_during_execution` — hence the prefix test rather than a lookup for
+ * those. Anything unrecognised is taken as a normal ending, which is the only
+ * choice that keeps the feature working for a runtime nobody here has met:
+ * `end_turn`, `EndTurn`, `completed`, `success`, `max_tokens` and no stop
+ * reason at all are all ordinary endings, and no list could hold them all.
+ */
+const CUT_SHORT_TURN: ReadonlySet<string> = new Set([
+  'aborted',
+  'cancel',
+  'canceled',
+  'cancelled',
+  'exited',
+  'failed',
+  'interrupted',
+  'killed',
+  'refusal',
+  'refused',
+  'timedout',
+  'timeout',
+]);
+
+/** Whether a `turn_end`'s stop reason means the turn never got to finish. */
+function wasCutShort(stopReason: string | undefined): boolean {
+  if (!stopReason) return false;
+  const word = stopReason.toLowerCase().replace(/[_\-\s]/g, '');
+  return word.startsWith('error') || CUT_SHORT_TURN.has(word);
+}
+
+/**
  * Thrown when the session id is known but nothing is running under it.
  *
  * A distinct type rather than a message to match on, because the recovery for
@@ -260,6 +319,22 @@ export class ChatNotRunningError extends Error {
     super('this chat session is not running');
     this.name = 'ChatNotRunningError';
   }
+}
+
+/**
+ * The approval mode of a conversation, in one phrase, for the line drawn at the
+ * top of it.
+ *
+ * A runtime with no approval channel is named rather than glossed over. pi's
+ * chat adapter publishes `permissions: false` — no approval channel exists in
+ * its CLI — so its tools run unattended whichever mode the rule computed, and
+ * printing "you are asked before each tool call" over one of its conversations
+ * would be this app claiming a boundary that is not there.
+ */
+function approvalNoticeDetail(bypassing: boolean, canAsk: boolean): string {
+  if (bypassing) return 'bypassed — tools run without asking';
+  if (!canAsk) return 'this runtime cannot ask — tools run without asking';
+  return 'on — you are asked before each tool call';
 }
 
 /** Thrown by `send` when the line is already as long as it may get. */
@@ -339,6 +414,33 @@ export class ChatSession {
   private contextWindowStated = false;
   /** The model the standing agent-reported ceiling was stated for, when named. */
   private agentWindowModel?: string;
+
+  /**
+   * Whether this conversation has ever been told what it spent.
+   *
+   * The four booleans behind the "not reported" the header shows for a runtime
+   * that reports nothing. `spoke*` is the observation — any report carrying a
+   * token count or a price, on any channel. `stated*` is the answer already
+   * being on the log, so it is said once rather than on the end of every turn.
+   *
+   * Kept here rather than worked out in the browser because the transcript
+   * cannot tell an agent that will never speak from one that has not spoken
+   * yet, and the difference is only knowable from having watched a turn finish.
+   * See `noteSpend`.
+   */
+  private spokeTokens = false;
+  private spokeCost = false;
+  private statedTokenSilence = false;
+  private statedCostSilence = false;
+  /**
+   * Whether the runtime has done anything at all in the turn now open.
+   *
+   * A `/clear` opens and closes a turn before it is recognised as a command,
+   * and an empty turn is not evidence about what a runtime reports — filing one
+   * as "reports nothing" would put the label on a conversation whose agent had
+   * not yet been asked for anything.
+   */
+  private turnDidWork = false;
 
   /**
    * The history this conversation was branched with, until the first turn takes it.
@@ -744,6 +846,42 @@ export class ChatSession {
       this.capabilities = { ...this.capabilities, questions: true };
       this.ingest({ t: 'capabilities', capabilities: { questions: true } });
     }
+
+    // Which approval mode this conversation is running in, said in the
+    // conversation itself.
+    //
+    // The mode is decided at the moment a conversation begins, out of a
+    // preference that lives in Settings and may well have changed since the
+    // last one — so a conversation that comes up bypassing, or that no longer
+    // does, must not do it in silence (#134). Only when one is beginning: a
+    // resume returns to a transcript that already carries the line from the day
+    // it started, and repeating it on every relaunch would be noise.
+    //
+    // After the adapter has started, so the phrase can be honest about what
+    // this runtime can actually enforce rather than about what was asked for.
+    if (!options.resumeSessionId) {
+      this.ingest({
+        t: 'marker',
+        kind: 'approvals',
+        detail: approvalNoticeDetail(
+          this.bypass,
+          // Whether anything can actually stop a tool call in this session:
+          // claude asks through the PreToolUse hook rather than through the
+          // adapter protocol, so its `permissions` capability is false while it
+          // asks perfectly well. Reading that flag alone would print "this
+          // runtime cannot ask" over every claude conversation.
+          wantsHook || this.capabilities?.permissions === true,
+        ),
+        // And the same fact structurally, because the phrase is for the reader
+        // and this is for the pane. A conversation that begins from *inside*
+        // itself — the composer's New chat, `/clear` — never touches the launch
+        // path, so `chat_started` is not broadcast and this marker is the only
+        // thing that reaches the browser with the mode the restart re-decided
+        // (#134).
+        bypassing: this.bypass,
+      });
+    }
+
     this.setState('idle');
   }
 
@@ -981,6 +1119,7 @@ export class ChatSession {
       this.pending.delete(stamped.requestId);
     }
     this.noteContext(stamped);
+    this.noteSpend(stamped);
 
     try {
       this.deps.store.append(this.ref, [stamped]);
@@ -1128,6 +1267,73 @@ export class ChatSession {
   private retractContextWindow(): void {
     if (!this.contextWindowStated) return;
     this.ingest({ t: 'usage', usage: { contextWindowSource: 'unknown' } });
+  }
+
+  /**
+   * Say, once, that this runtime reports no tokens and/or no money.
+   *
+   * Every surface that shows spend had exactly two things to draw: a figure, or
+   * nothing. Nothing is what a conversation looks like in its first second, so
+   * the header stayed blank for kimi — which reports no `usage_update`, no
+   * usage on its prompt reply and no `_meta` at all — and a user could not tell
+   * that from a session that simply had not spent anything yet.
+   *
+   * The statement is a measurement and is made where the measurement finishes:
+   * a turn in which the runtime actually did something *ran to its own end*,
+   * and nothing on any channel carried a count or a price. Done once per
+   * conversation, because the log is a record of what changed.
+   *
+   * "Ran to its own end" is doing real work there, and it is why the two gates
+   * below exist. Three kinds of `turn_end` are not a turn finishing: the
+   * acknowledgement of an interrupt sent to steer (`stale`, which the comment
+   * on the field calls "not a turn ending" — the turn is still running on the
+   * correction), a stop-button cancel, and an ending the adapter wrote because
+   * the runtime errored or went away. In all three the runtime was cut off
+   * before the moment it would have priced the turn, so its silence is about
+   * the interruption and not about the runtime. Concluding from one of them
+   * told a user that Claude reports neither tokens nor cost because they had
+   * pressed stop, and the statement outlives the turn: it is folded into the
+   * transcript, carried through `/clear` and re-read on every rejoin, so it
+   * stands until some later turn happens to report a figure. Skipping is free
+   * by comparison — the next turn that does finish states it.
+   *
+   * Written onto the `turn_end` that proves it rather than ingested as its own
+   * event. `ingest` is what calls this, so a second `ingest` from in here would
+   * number and broadcast the new event *ahead* of the turn_end that caused it —
+   * the same re-entrancy the capacity lookup above defers a promise to avoid.
+   * Patching the event in hand needs no ordering at all, and it lands on the
+   * one event a reader would look at to ask the question.
+   */
+  private noteSpend(event: ChatEvent): void {
+    if (event.t === 'msg_start' && event.role !== 'user') this.turnDidWork = true;
+    if (event.t === 'block_start' && event.block.kind === 'tool') this.turnDidWork = true;
+
+    if (event.t === 'usage' || event.t === 'msg_end' || event.t === 'turn_end') {
+      if (carriesTokens(event.usage)) this.spokeTokens = true;
+      if (carriesCost(event.usage)) this.spokeCost = true;
+    }
+
+    if (event.t !== 'turn_end') return;
+    // Before the reset, deliberately: the turn this acknowledges is still
+    // running, so the work it has already done still belongs to the ending
+    // that is yet to come.
+    if (event.stale) return;
+    const worked = this.turnDidWork;
+    this.turnDidWork = false;
+    if (!worked) return;
+    if (wasCutShort(event.stopReason)) return;
+
+    const silence: ChatUsage = {};
+    if (!this.spokeTokens && !this.statedTokenSilence) {
+      this.statedTokenSilence = true;
+      silence.usageSource = 'none';
+    }
+    if (!this.spokeCost && !this.statedCostSilence) {
+      this.statedCostSilence = true;
+      silence.costSource = 'none';
+    }
+    if (silence.usageSource === undefined && silence.costSource === undefined) return;
+    event.usage = { ...event.usage, ...silence };
   }
 
   /**
@@ -1760,7 +1966,19 @@ export class ChatSession {
       // The record hears it too, but from inside `start`, once the log this
       // one lived in has actually been dropped (#43).
       this.nativeSessionId = null;
-      await this.start({ ...options, resumeSessionId: undefined, startFresh: true });
+      // The mode is re-decided rather than replayed. A conversation started
+      // from inside this one is a conversation that is *beginning*, so it takes
+      // the owner's preference exactly as the launcher's would — which is what
+      // makes the composer's New chat and the recovery notice's Start a new
+      // chat land in the same place. Replaying `options.bypassPermissions` is
+      // what used to carry one conversation's standing permission into every
+      // later one in the tab, whatever the preference had since been set to.
+      await this.start({
+        ...options,
+        bypassPermissions: this.deps.resolveBypass?.() === true,
+        resumeSessionId: undefined,
+        startFresh: true,
+      });
     } catch (error: unknown) {
       // Nothing replaced the conversation that was stopped. `start()` has
       // already written the failure into the transcript and moved the state to
@@ -1777,7 +1995,12 @@ export class ChatSession {
     // keeps the tab a running tab: without it the session lists report a
     // conversation that is answering as finished, and the next launch in this
     // tab is refused because a process it no longer has is still claimed.
-    this.deps.onLifecycle?.(this.ref.id, { exited: false });
+    //
+    // And the mode with it, because this restart may well have changed it: left
+    // out, a conversation cleared down to asking would still be *recorded* as
+    // bypassing, and the next resume would hand it back a permission it no
+    // longer had.
+    this.deps.onLifecycle?.(this.ref.id, { exited: false, bypassing: this.bypass });
   }
 
   async interrupt(): Promise<void> {

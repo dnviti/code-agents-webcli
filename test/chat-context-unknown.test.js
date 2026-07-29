@@ -508,9 +508,23 @@ describe('what the meter says when half the reading is missing', function () {
     assert.ok(!/progressbar/.test(html), html.slice(0, 300));
   });
 
-  it('still says nothing when the runtime reports nothing', function () {
+  // Restated for #136 rather than dropped: the rule it encodes is the one the
+  // "not reported" label is most likely to break. An empty reading is what
+  // every conversation looks like for its first second, against every agent,
+  // and the meter has to stay quiet about it. What changed is that a *spoken*
+  // silence is no longer an empty reading — see the two cases below it.
+  it('still says nothing when nobody has reported anything yet', function () {
     assert.strictEqual(render({}, { compact: true }).html, '');
     assert.strictEqual(render({}).html, '');
+  });
+
+  it('and says nothing on a capability flag alone, which is every chat pre-handshake', function () {
+    // NO_CHAT_CAPABILITIES is `usage: false, cost: false`, and createTranscript
+    // seeds a transcript with whatever it was handed — so a label driven off
+    // the flag would print "not reported" on every chat before it starts.
+    const caps = { usage: false, cost: false };
+    assert.strictEqual(render({}, { compact: true, capabilities: caps }).html, '');
+    assert.strictEqual(render({}, { capabilities: caps }).html, '');
   });
 
   it('reads a retracted ceiling as unknown rather than as the model that is gone', function () {

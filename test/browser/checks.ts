@@ -335,18 +335,22 @@ async function run(): Promise<void> {
   await checkATurnCanBeBranchedFromItsHeader();
   await checkAConversationTellsOneStoryAboutItsTokens();
   await checkTheModelShownIsTheModelThatRan();
+  await checkTheModelPickerSaysWhereTheDefaultCameFrom();
   await checkTheEffortChipSaysAndSetsHowHardTheAgentThinks();
   await checkARememberedLevelSeedsOnlyFreshWorkAndSurvivesAReload();
   await checkTheContextReadingIsHonestAboutItsCeiling();
   await checkTheAccountReadingIsOnlyEverWhatAProviderSaid();
   await checkTheTurnIndexListsTheWholeConversation();
   await checkClearingResetsTheFiguresAboveTheChat();
+  await checkASilentRuntimeSaysSoRatherThanGoingBlank();
+  await checkTheSilenceFitsThePhonesCollapsedHeader();
   await checkTheUsageWindowReachesBeforeThisYear();
   await checkTheEffortHistogramsAreReadableWithoutAMouse();
   await checkTheFileTreeAndTheShellAreSizedForAThumb();
   await checkAnExpandedReasoningRowIsNeverEmpty();
   await checkAWaitingConversationIsVisibleWithoutOpeningIt();
   await checkEveryConversationCanBeFoundAndReopened();
+  await checkAConversationSaysWhichApprovalModeItIsIn();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -6087,6 +6091,294 @@ async function checkAReadOnlyFileStaysReadOnly(): Promise<void> {
  * Rendered rather than asserted on props: what matters is that it is on screen
  * over a live conversation and that pressing it sends the same command.
  */
+/**
+ * A conversation says which approval mode it is in, where the user is looking.
+ *
+ * Here rather than in a unit test because the whole complaint in #134 is that
+ * the mode was decided invisibly. "The component was passed the right value" is
+ * not the claim — the claim is that a person sitting in front of the pane can
+ * read it, so this measures the rendered line and the two recovery buttons: on
+ * screen, not transparent, and set in type big enough to be read.
+ *
+ * The two buttons are the heart of it. They sat side by side doing opposite
+ * things about approvals with nothing on screen saying which was which, so the
+ * check asserts they say different things and that each says the right one.
+ */
+async function checkAConversationSaysWhichApprovalModeItIsIn(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('browser-check', { send: () => {} } as never);
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check',
+      runtime: 'claude',
+      state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: false, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: false,
+      },
+      messages: [],
+      pendingPermissions: [],
+      queued: [],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 0,
+      live: true,
+      bypassPermissions: true,
+    },
+  } as never);
+
+  // The line the server draws at the top of a conversation that is beginning,
+  // in the words ChatSession emits — see approvalNoticeDetail.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: {
+      t: 'marker',
+      kind: 'approvals',
+      seq: 1,
+      ts: 1,
+      detail: 'bypassed — tools run without asking',
+      bypassing: true,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  const paint = (preference: boolean): void => {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/tmp/project',
+        approvalPreference: preference,
+        view: DEFAULT_CHAT_VIEW,
+        onViewChange: () => {},
+      } as never),
+    );
+  };
+  paint(false);
+  await wait(250);
+
+  const notice = Array.from(host.querySelectorAll<HTMLElement>('[role="separator"]')).find((node) =>
+    /tool approvals/i.test(node.textContent || ''),
+  );
+  check('a conversation states its approval mode in the conversation', Boolean(notice));
+  if (notice) {
+    check(
+      'and the statement is on screen rather than merely present',
+      isPainted(notice),
+      `${Math.round(notice.getBoundingClientRect().width)}x${Math.round(notice.getBoundingClientRect().height)}`,
+    );
+    const size = parseFloat(window.getComputedStyle(notice).fontSize) || 0;
+    check(
+      'and it is set in type that can be read',
+      size >= 11 - 0.01,
+      `${size}px`,
+    );
+    check(
+      'and it says which mode, not just that there is one',
+      /bypassed/.test(notice.textContent || ''),
+      (notice.textContent || '').trim(),
+    );
+  }
+
+  const chipNamed = (label: string): HTMLElement | null =>
+    host.querySelector<HTMLElement>(`[aria-label="${label}"]`);
+
+  check(
+    'the chip beside the input box says the same thing as the line',
+    Boolean(chipNamed('Approvals bypassed')) && !chipNamed('Approvals asked for'),
+  );
+
+  // And now a `/clear`, which starts the conversation over in whatever mode the
+  // account's preference names — here, back to asking.
+  //
+  // This is the interval the whole feature turns on. A restart from inside a
+  // conversation never goes through the launch path, so no `chat_started` and
+  // no snapshot arrive: the opening line of the replacement conversation is the
+  // only thing that reaches the browser with the new mode. Measured on the
+  // persistent indicators rather than on that line, because a one-off sentence
+  // scrolling up the transcript while the chip beside the input box still reads
+  // "Approvals asked for" over an agent running unattended — or the reverse —
+  // is exactly the standing false claim #134 exists to remove.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: { t: 'marker', kind: 'cleared', seq: 2, ts: 2, detail: 'started a new conversation' },
+  } as never);
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: {
+      t: 'marker',
+      kind: 'approvals',
+      seq: 3,
+      ts: 3,
+      detail: 'on — you are asked before each tool call',
+      bypassing: false,
+    },
+  } as never);
+  paint(false);
+  await wait(250);
+
+  check(
+    'a clear that changes the mode moves the chip with it',
+    Boolean(chipNamed('Approvals asked for')) && !chipNamed('Approvals bypassed'),
+    chipNamed('Approvals bypassed') ? 'still claiming bypassed' : 'asks first',
+  );
+
+  // Back the other way, so the chip is following the marker rather than simply
+  // decaying to the safe answer once anything at all arrives.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: { t: 'marker', kind: 'cleared', seq: 4, ts: 4, detail: 'started a new conversation' },
+  } as never);
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: {
+      t: 'marker',
+      kind: 'approvals',
+      seq: 5,
+      ts: 5,
+      detail: 'bypassed — tools run without asking',
+      bypassing: true,
+    },
+  } as never);
+  paint(false);
+  await wait(250);
+
+  check(
+    'and a clear that turns the bypass back on moves it back',
+    Boolean(chipNamed('Approvals bypassed')) && !chipNamed('Approvals asked for'),
+    chipNamed('Approvals asked for') ? 'still claiming it asks' : 'bypassed',
+  );
+
+  // Now the conversation's process goes away, which is the recovery notice the
+  // issue was reported against.
+  controller.handle({
+    type: 'chat_unavailable',
+    sessionId: 'browser-check',
+    runtime: 'claude',
+    runtimeLabel: 'Claude Code',
+    canResume: true,
+    message: 'this chat session is not running',
+  } as never);
+  paint(false);
+  await wait(250);
+
+  const buttonNamed = (needle: RegExp): HTMLButtonElement | undefined =>
+    Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find((node) =>
+      needle.test(node.textContent || ''),
+    );
+
+  const resume = buttonNamed(/Resume this conversation/);
+  const fresh = buttonNamed(/Start a new chat/);
+  check('both ways back are offered', Boolean(resume) && Boolean(fresh));
+  if (resume && fresh) {
+    check(
+      'resuming says it brings the conversation back bypassing',
+      /approvals bypassed/.test(resume.textContent || ''),
+      (resume.textContent || '').trim(),
+    );
+    check(
+      'starting over says it will ask, which is the other answer',
+      /asks first/.test(fresh.textContent || ''),
+      (fresh.textContent || '').trim(),
+    );
+    for (const [label, node] of [['resume', resume], ['start over', fresh]] as const) {
+      check(
+        `the ${label} button is on screen and pressable`,
+        isPainted(node) && !node.disabled && node.tabIndex >= 0,
+        `${Math.round(node.getBoundingClientRect().width)}x${Math.round(node.getBoundingClientRect().height)} disabled=${node.disabled} tabIndex=${node.tabIndex}`,
+      );
+      const size = parseFloat(window.getComputedStyle(node).fontSize) || 0;
+      check(`the ${label} button’s label is legible`, size >= 12 - 0.01, `${size}px`);
+    }
+  }
+
+  // And with the preference the other way round, the two swap over — which is
+  // what proves the labels are the rule and not two hard-coded strings.
+  paint(true);
+  await wait(200);
+  const resumeAgain = buttonNamed(/Resume this conversation/);
+  const freshAgain = buttonNamed(/Start a new chat/);
+  check(
+    'the preference decides what starting over says, not the conversation',
+    /approvals bypassed/.test(freshAgain?.textContent || ''),
+    (freshAgain?.textContent || '').trim(),
+  );
+  check(
+    'while resuming still reports the conversation’s own mode',
+    /approvals bypassed/.test(resumeAgain?.textContent || ''),
+    (resumeAgain?.textContent || '').trim(),
+  );
+
+  // The one screen where starting over is the *only* route back, and the reason
+  // the sentence under the notice exists at all: with no Resume beside it there
+  // is nothing to compare the button's label against. Nothing recorded which
+  // conversation the agent was having, so `canResume` is false.
+  //
+  // Measured at a phone's width rather than the 900px above, because a sentence
+  // appended to a paragraph in a narrow column is exactly the thing that clips
+  // or overflows, and a string match on the markup would pass over either.
+  host.style.width = '390px';
+  controller.handle({
+    type: 'chat_unavailable',
+    sessionId: 'browser-check',
+    runtime: 'claude',
+    runtimeLabel: 'Claude Code',
+    canResume: false,
+    message: 'this chat session is not running',
+  } as never);
+  paint(true);
+  await wait(250);
+
+  const only = buttonNamed(/Start a new chat/);
+  check(
+    'starting over is the only button when the conversation cannot be resumed',
+    Boolean(only) && !buttonNamed(/Resume this conversation/),
+  );
+  const said = Array.from(host.querySelectorAll<HTMLElement>('p')).find((node) =>
+    /A new conversation runs with/.test(node.textContent || ''),
+  );
+  check('states the mode even when starting over is the only button', Boolean(said));
+  if (said) {
+    const box = said.getBoundingClientRect();
+    check(
+      'and the sentence is painted rather than merely present',
+      isPainted(said),
+      `${Math.round(box.width)}x${Math.round(box.height)}`,
+    );
+    const size = parseFloat(window.getComputedStyle(said).fontSize) || 0;
+    check('and it is set in type that can be read on a phone', size >= 12 - 0.01, `${size}px`);
+    // Not clipped and not off to one side: `overflow: hidden` on an ancestor
+    // and a paragraph wider than the column both read as "present" to a string
+    // match, and both mean the user never sees the mode they are about to get.
+    const column = host.getBoundingClientRect();
+    check(
+      'and it fits the column it is in rather than running off the side',
+      box.left >= column.left - 0.5 && box.right <= column.right + 0.5,
+      `notice ${Math.round(box.left)}–${Math.round(box.right)} in ${Math.round(column.left)}–${Math.round(column.right)}`,
+    );
+    check(
+      'and it names the mode the preference will give it',
+      /approvals bypassed/.test(said.textContent || ''),
+      (said.textContent || '').replace(/\s+/g, ' ').trim().slice(-80),
+    );
+  }
+
+  root.unmount();
+  host.remove();
+}
+
 async function checkANewConversationCanBeStartedFromTheComposer(): Promise<void> {
   const host = document.createElement('div');
   host.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;display:flex';
@@ -7860,6 +8152,215 @@ async function checkTheModelShownIsTheModelThatRan(): Promise<void> {
 }
 
 /**
+ * The picker says which of the three defaults put this model in force.
+ *
+ * A model reaches a conversation three ways — this chat's own pick, the
+ * account's standing choice, and the active runtime profile — and until #135
+ * the control said nothing about which. The profile case was the worst of them:
+ * the pin was genuinely applied to every launch and the chip read the literal
+ * word "model", so a user could neither see it nor tell why their agent was on
+ * a model they had not chosen.
+ *
+ * Here rather than in the unit tests because the sentence lives inside a menu
+ * that only exists after a click, and because "rendered" is not the claim — a
+ * line at `opacity: 0` drops silently out of every geometry sweep instead of
+ * failing one. The box, the paint and the type size are all measured.
+ */
+async function checkTheModelPickerSaysWhereTheDefaultCameFrom(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const capabilities = {
+    streaming: true, thinking: false, toolCalls: false, diffs: false, permissions: false,
+    interrupt: true, resume: true, fork: false, attachments: false, usage: true,
+    cost: true, plan: false,
+    models: [
+      { value: 'grok-build', name: 'grok-build' },
+      { value: 'grok-4.5', name: 'grok-4.5' },
+    ],
+  };
+
+  let redraw = (): void => {};
+  const controller = new ChatController('model-source', {
+    send: () => {},
+    onChange: () => redraw(),
+  } as never);
+  // A conversation that has run no turn, so the runtime has named no model —
+  // which is exactly the state in which the pin used to be invisible. Launched
+  // on the profile's model, which is what `modelPinned` records: the *default*
+  // is not evidence that this conversation is on it, and using it as such was
+  // the review's third finding.
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'model-source',
+    modelOverride: null,
+    modelPinned: 'grok-4.5',
+    modelDefault: { model: 'grok-4.5', source: 'profile', profileName: 'House' },
+    snapshot: {
+      sessionId: 'model-source', runtime: 'grok', state: 'idle', capabilities,
+      messages: [], pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 0,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  const paint = (): void => {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'grok',
+        runtimeLabel: 'Grok',
+        workingDir: '/tmp/project',
+        view: DEFAULT_CHAT_VIEW,
+        onViewChange: () => {},
+      } as never),
+    );
+  };
+  paint();
+  redraw = paint;
+  await wait(300);
+
+  const chip = (): HTMLElement | null => host.querySelector('[aria-label="Change model"]');
+  check(
+    'a model pinned by a profile is named on the chip instead of the word “model”',
+    (chip()?.textContent ?? '').includes('grok-4.5'),
+    (chip()?.textContent ?? '').trim() || 'empty',
+  );
+
+  // The other half, and the one the chip got wrong: a standing choice that was
+  // never applied to this conversation is a fact about the *next* new chat, so
+  // naming it here would put a model on the chip that this conversation is not
+  // running and never will be. Sent as a rejoin, because that is how it reaches
+  // an open tab — the account picked a model somewhere else.
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'model-source',
+    modelOverride: null,
+    // This conversation launched with no model flag at all.
+    modelPinned: null,
+    modelDefault: { model: 'grok-4.5', source: 'personal' },
+    snapshot: {
+      sessionId: 'model-source', runtime: 'grok', state: 'idle', capabilities,
+      messages: [], pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 0,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+  await wait(250);
+  check(
+    'a standing choice this conversation was never launched on stays off the chip',
+    (chip()?.textContent ?? '').trim() === 'model',
+    (chip()?.textContent ?? '').trim() || 'empty',
+  );
+
+  // Back to the profile-launched conversation the rest of this check is about.
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'model-source',
+    modelOverride: null,
+    modelPinned: 'grok-4.5',
+    modelDefault: { model: 'grok-4.5', source: 'profile', profileName: 'House' },
+    snapshot: {
+      sessionId: 'model-source', runtime: 'grok', state: 'idle', capabilities,
+      messages: [], pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 0,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+  await wait(250);
+
+  const sourceLine = (): HTMLElement | null => host.querySelector('[data-model-source]');
+  chip()?.click();
+  await wait(250);
+  settle(host.ownerDocument);
+
+  const line = sourceLine();
+  check(
+    'and the menu says where it came from',
+    (line?.textContent ?? '').includes('House') && (line?.textContent ?? '').includes('grok-4.5'),
+    (line?.textContent ?? '').trim() || 'no source line in the open menu',
+  );
+  // Not `isPainted` alone: it answers false for a line that is not there and
+  // false for one that is invisible, and those want different words.
+  const lineBox = line?.getBoundingClientRect();
+  const hostBox = host.getBoundingClientRect();
+  check(
+    'the source line is actually on screen, not merely in the markup',
+    Boolean(line)
+      && isPainted(line!)
+      && lineBox!.top >= hostBox.top - 1
+      && lineBox!.bottom <= hostBox.bottom + 1,
+    line
+      ? `${Math.round(lineBox!.width)}x${Math.round(lineBox!.height)} at ${Math.round(lineBox!.top)}–${Math.round(lineBox!.bottom)}, surface ${Math.round(hostBox.top)}–${Math.round(hostBox.bottom)}, opacity ${window.getComputedStyle(line).opacity}, visibility ${window.getComputedStyle(line).visibility}`
+      : 'no source line',
+  );
+  // Measured against the list it explains rather than against a number picked
+  // here: the desktop scale in this menu bottoms out at 10px for captions, and
+  // a sentence that explains every entry underneath it must not be set smaller
+  // than those entries. The phone floor is swept separately, by the type-scale
+  // rules that walk the whole composer.
+  const optionSize = (): number => {
+    const option = host.querySelector('[role="listbox"][aria-label="Models"] [role="option"]');
+    return option ? parseFloat(window.getComputedStyle(option).fontSize) || 0 : 0;
+  };
+  const lineSize = line ? parseFloat(window.getComputedStyle(line).fontSize) || 0 : 0;
+  check(
+    'and set no smaller than the models it is explaining',
+    lineSize > 0 && lineSize >= optionSize() - 0.01,
+    `${lineSize}px against the list's ${optionSize()}px`,
+  );
+
+  // The way back has to say what it will do, because what it does to a standing
+  // choice is forget it rather than fall back to it.
+  const clearEntry = Array.from(
+    host.querySelectorAll<HTMLElement>('[role="listbox"][aria-label="Models"] [role="option"]'),
+  ).find((row) => (row.textContent ?? '').includes('Use the default for this runtime'));
+  check(
+    'the clear entry says what clearing would land on',
+    (clearEntry?.getAttribute('title') ?? '').includes('House'),
+    clearEntry?.getAttribute('title') ?? 'no clear entry',
+  );
+
+  document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+  await wait(150);
+
+  // Now the account's own choice, arriving the way a pick answers rather than
+  // on a rejoin: the line has to follow the click, or it spends the rest of the
+  // conversation describing the state before it.
+  controller.handle({
+    type: 'chat_model_result',
+    sessionId: 'model-source',
+    model: 'grok-build',
+    applied: 'live',
+    message: 'Switched to grok-build for this conversation.',
+    modelDefault: { model: 'grok-build', source: 'personal' },
+  } as never);
+  await wait(250);
+
+  chip()?.click();
+  await wait(250);
+  settle(host.ownerDocument);
+  const picked = sourceLine();
+  check(
+    'after a pick the menu describes the state the click produced, not the launch',
+    (picked?.textContent ?? '').includes('Chosen for this conversation only')
+      && (picked?.textContent ?? '').includes('forgets grok-build'),
+    (picked?.textContent ?? '').trim() || 'no source line after the pick',
+  );
+  check(
+    'and it is still painted, at a readable size, in the state it changed into',
+    Boolean(picked)
+      && isPainted(picked!)
+      && (parseFloat(window.getComputedStyle(picked!).fontSize) || 0) >= optionSize() - 0.01,
+    picked
+      ? `${Math.round(picked.getBoundingClientRect().width)}x${Math.round(picked.getBoundingClientRect().height)} at ${window.getComputedStyle(picked).fontSize}`
+      : 'no source line',
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
  * How hard the agent thinks: shown, changed, and absent when it cannot be.
  *
  * Four things here need a layout engine and get one nowhere else. The colour
@@ -9089,6 +9590,293 @@ async function checkClearingResetsTheFiguresAboveTheChat(): Promise<void> {
     'and the meter is still there to be read, rather than gone',
     Boolean(host.querySelector('[role="group"][aria-label="Session usage"]')),
     after || 'the header went blank',
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * Issue #136: a runtime that reports nothing says so, where a person looks.
+ *
+ * kimi sends no token counts and no prices — probed, and the same in the
+ * capture under `test/fixtures/chat/acp-kimi-tools.jsonl` — and the header used
+ * to render nothing at all for it. Nothing is also what a conversation that has
+ * simply not spent anything yet looks like, so a user could not tell "this
+ * agent will never tell you" from "hold on".
+ *
+ * Driven through the real controller, the real header and the real composer,
+ * because the claim is about what is on screen: the folded state holding
+ * `usageSource: 'none'` proves only that the layer that was changed changed.
+ * And measured rather than merely found — an opacity-0 span is present in every
+ * `querySelector` and readable by nobody.
+ *
+ * The events are the ones a kimi session produces: an answer, a turn that ends
+ * carrying no figures but the spoken silence the session writes onto it, and a
+ * window that came from the model's provider rather than from kimi.
+ *
+ * Two mounts, because the surface is two surfaces: the desktop strip below and
+ * the phone's collapsed header after it, which is a different component with a
+ * different budget for words.
+ */
+function silentRuntimeController(
+  id: string,
+  options: { bypassPermissions?: boolean; state?: string } = {},
+): ChatController {
+  const controller = new ChatController(id, { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: id,
+    snapshot: {
+      sessionId: id,
+      runtime: 'kimi',
+      state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: false, fork: false, attachments: false,
+        // Honest, as of #136, and the reason the label must not sit behind them.
+        usage: false, cost: false, plan: true,
+      },
+      messages: [],
+      pendingPermissions: [],
+      queued: [],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 1,
+      live: true,
+      bypassPermissions: options.bypassPermissions ?? false,
+    },
+  } as never);
+
+  const push = (event: Record<string, unknown>, seq: number): void => {
+    controller.handle({
+      type: 'chat_event',
+      sessionId: id,
+      event: { seq, ts: 1_700_000_000_000 + seq, ...event },
+    } as never);
+  };
+
+  push({ t: 'msg_start', id: 'u1', role: 'user', turnId: 'turn-1' }, 1);
+  push({ t: 'block_start', msgId: 'u1', index: 0, block: { kind: 'text', text: 'go' } }, 2);
+  push({ t: 'msg_end', msgId: 'u1' }, 3);
+  push({ t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'turn-1' }, 4);
+  push({ t: 'block_start', msgId: 'a1', index: 0, block: { kind: 'text', text: 'DONE' } }, 5);
+  push({ t: 'msg_end', msgId: 'a1' }, 6);
+  push({ t: 'turn_end', turnId: 'turn-1', usage: { usageSource: 'none', costSource: 'none' } }, 7);
+  push({
+    t: 'usage',
+    usage: { contextWindow: 1048576, contextWindowSource: 'provider' },
+  }, 8);
+  if (options.state) push({ t: 'state', state: options.state }, 9);
+
+  return controller;
+}
+
+/** The desktop strip, at the width the header actually gets on a laptop. */
+async function checkASilentRuntimeSaysSoRatherThanGoingBlank(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1000px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = silentRuntimeController('silent-check');
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'kimi',
+      runtimeLabel: 'Kimi',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(300);
+
+  const meter = host.querySelector('[role="group"][aria-label="Session usage"]') as HTMLElement | null;
+  const meterText = (meter?.textContent ?? '').replace(/\s+/g, ' ');
+  check(
+    'a runtime that reports nothing says so in the header instead of leaving it blank',
+    /not reported/i.test(meterText),
+    meterText || 'the header showed nothing at all',
+  );
+  check(
+    'and does not manufacture a zero out of a measurement nobody took',
+    !/\$0\.00/.test(meterText) && !/\b0 tok/.test(meterText),
+    meterText,
+  );
+  check(
+    'and still shows the window the model’s provider could size',
+    /\? of 1\.0M/.test(meterText),
+    meterText,
+  );
+
+  // Visible, not merely in the DOM. Everything below is measured off the leaf
+  // that carries the words.
+  const label = Array.from(host.querySelectorAll('*')).find(
+    (node) => node.children.length === 0 && /not reported/i.test(node.textContent || ''),
+  ) as HTMLElement | undefined;
+  const style = label ? getComputedStyle(label) : null;
+  const box = label ? label.getBoundingClientRect() : null;
+  check(
+    'the words are painted rather than present',
+    Boolean(
+      box && box.width > 0 && box.height > 0
+      && style && style.visibility !== 'hidden' && style.display !== 'none'
+      && Number(style.opacity) > 0.5,
+    ),
+    label
+      ? `${Math.round(box!.width)}x${Math.round(box!.height)} opacity=${style!.opacity} visibility=${style!.visibility}`
+      : 'no element carries the words',
+  );
+  const fontSize = style ? parseFloat(style.fontSize) : 0;
+  check(
+    'and set at the size the rest of the header strip is, not shrunk away',
+    fontSize >= 10,
+    `${fontSize}px`,
+  );
+
+  // The composer's status line, the other place the figures live. It used to
+  // degrade to a bare turn number for a runtime like this.
+  const readout = (host.textContent ?? '').replace(/\s+/g, ' ');
+  check(
+    'the composer says it too, rather than leaving a bare turn number',
+    /turn 1 · usage not reported/.test(readout),
+    readout.slice(-200) || 'nothing rendered',
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * The same sentence on the surface with the least room for it (#136, AC4).
+ *
+ * The phone's header is collapsed by default and is one fixed-height row: a
+ * status word, then the cost, the bypass shield and the chevron pushed to the
+ * right edge. Before this the cost was `$0.12` or nothing at all; it is now up
+ * to seventeen characters of "cost not reported" in the same strip, at 15px,
+ * against 390px of screen — and the two spans either side of it are
+ * `flex: 0 0 auto`, so anything that does not fit does not shrink, it leaves
+ * the header. The desktop mount above can never see that: it has 1000px.
+ *
+ * So this measures the strip rather than reading it. The words have to be on
+ * one line, the chevron has to still be inside the header, and the row has to
+ * still be one row — with the widest state label the header has ("asked you a
+ * question") and the shield showing, which is the tightest this strip ever
+ * gets. Text metrics are the reason it is a browser check and not a string
+ * match on `renderToStaticMarkup`, which has no layout at all.
+ */
+async function checkTheSilenceFitsThePhonesCollapsedHeader(): Promise<void> {
+  const host = document.createElement('div');
+  // No `overflow:hidden`: hiding the overflow is exactly what would stop this
+  // check seeing the chevron leave the strip.
+  host.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = silentRuntimeController('silent-phone', {
+    bypassPermissions: true,
+    state: 'awaiting_answer',
+  });
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'kimi',
+      runtimeLabel: 'Kimi',
+      workingDir: '/tmp/project',
+      // ChatView publishes `PhoneContext` from this itself, so a provider
+      // wrapped around it would be overwritten and the header would render at
+      // desktop sizing while agreeing that it is a phone.
+      isMobile: true,
+      view: { ...DEFAULT_CHAT_VIEW, panelOpen: false },
+      onViewChange: () => {},
+      onOpenConversations: () => {},
+    } as never),
+  );
+  await wait(300);
+
+  const strip = host.querySelector('[aria-expanded][aria-controls]') as HTMLElement | null;
+  const stripText = (strip?.textContent ?? '').replace(/\s+/g, ' ');
+  check(
+    'the phone’s collapsed header says the cost is not reported, rather than nothing',
+    /not reported/i.test(stripText) && !/\$0\.00/.test(stripText),
+    stripText || 'no collapsed header strip on screen',
+  );
+
+  const label = strip
+    ? (Array.from(strip.querySelectorAll('*')).find(
+        (node) => node.children.length === 0 && /not reported/i.test(node.textContent || ''),
+      ) as HTMLElement | undefined)
+    : undefined;
+  const style = label ? getComputedStyle(label) : null;
+  const box = label ? label.getBoundingClientRect() : null;
+  const fontSize = style ? parseFloat(style.fontSize) : 0;
+  check(
+    'and paints the words at the size the rest of the strip is',
+    Boolean(
+      box && box.width > 0 && box.height > 0
+      && style && style.visibility !== 'hidden' && style.display !== 'none'
+      && Number(style.opacity) > 0.5,
+    ) && fontSize >= 15,
+    label
+      ? `${Math.round(box!.width)}x${Math.round(box!.height)} ${fontSize}px opacity=${style!.opacity}`
+      : 'no element carries the words',
+  );
+  // One line: a phrase that wrapped would double the leaf's height, and this
+  // row is fixed at 44px with a status word and three icons already on it.
+  check(
+    'without wrapping onto a second line inside a one-line strip',
+    Boolean(box && fontSize && box.height <= fontSize * 1.8),
+    box ? `${Math.round(box.height)}px tall at ${fontSize}px` : 'no element carries the words',
+  );
+
+  // The two things the strip exists to carry, both of which live to the right
+  // of the new words and neither of which may shrink.
+  const stripBox = strip?.getBoundingClientRect();
+  const chevron = strip?.querySelector('svg:last-of-type') as SVGElement | null;
+  const chevronBox = chevron?.getBoundingClientRect();
+  check(
+    'the chevron that opens the header is still inside it',
+    Boolean(stripBox && chevronBox && chevronBox.width > 0 && chevronBox.right <= stripBox.right + 0.5),
+    chevronBox && stripBox
+      ? `chevron right ${Math.round(chevronBox.right)} vs strip right ${Math.round(stripBox.right)}`
+      : 'no chevron in the strip',
+  );
+  const header = strip?.closest('header') as HTMLElement | null;
+  const headerBox = header?.getBoundingClientRect();
+  check(
+    'and the collapsed header is still one row of the height it was',
+    Boolean(headerBox && headerBox.height <= 56),
+    headerBox ? `${Math.round(headerBox.height)}px tall` : 'no header',
+  );
+  check(
+    'and nothing on the strip is pushed off the side of the phone',
+    Boolean(strip && strip.scrollWidth <= strip.clientWidth + 1),
+    strip ? `content ${strip.scrollWidth}px in a ${strip.clientWidth}px strip` : 'no strip',
+  );
+
+  // The other surface this change lengthened, and the other one with no room:
+  // the composer's status line, which on a phone lives behind the tools row and
+  // holds its figures in one unshrinkable nowrap span.
+  (host.querySelector('[aria-label="Show the other controls"]') as HTMLElement | null)?.click();
+  await wait(200);
+  const readout = Array.from(host.querySelectorAll('span')).find(
+    (node) => /usage not reported/.test(node.textContent || ''),
+  ) as HTMLElement | undefined;
+  const readoutBox = readout?.getBoundingClientRect();
+  check(
+    'the composer’s status line says it on a phone as well',
+    Boolean(readoutBox && readoutBox.width > 0),
+    readout ? (readout.textContent ?? '').replace(/\s+/g, ' ') : 'no status line on the phone composer',
+  );
+  check(
+    'and says it inside the width of the phone rather than off the edge',
+    Boolean(readoutBox && readoutBox.left >= -0.5 && readoutBox.right <= 390.5),
+    readoutBox
+      ? `${Math.round(readoutBox.left)}–${Math.round(readoutBox.right)} of 0–390`
+      : 'no status line on the phone composer',
   );
 
   root.unmount();

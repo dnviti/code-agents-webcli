@@ -165,6 +165,47 @@ describe('WebUI (Beta) launch button', function () {
       }
     });
 
+    it('asks for no approval mode, even with the preference showing on it', function () {
+      // The button labels itself from the preference and requests nothing: the
+      // server holds the preference and decides. A page left open across a
+      // change made on another device would otherwise send a stale answer, and
+      // a page is not where a standing permission should be decided at all.
+      const { React, RuntimeLauncher } = mod;
+      const started = [];
+      const tree = React.createElement(RuntimeLauncher, {
+        aliases: ALIASES,
+        chatBypass: true,
+        onStart: (kind, options) => started.push({ kind, options }),
+        onTerminal: () => {},
+        onCancel: () => {},
+      });
+
+      const rendered = tree.type(tree.props);
+      const chatButtons = collect(
+        rendered,
+        (node) =>
+          typeof node.type === 'function' &&
+          node.props &&
+          typeof node.props.kind === 'string' &&
+          typeof node.props.onStart === 'function',
+      );
+
+      const stop = { stopPropagation() {} };
+      for (const element of chatButtons) {
+        const button = element.type(element.props);
+        if (button.props.disabled) continue;
+        button.props.onClick(stop);
+      }
+
+      assert.ok(started.length > 0, 'clicking produced no start at all');
+      for (const call of started) {
+        assert.ok(
+          !('dangerouslySkipPermissions' in call.options),
+          `${call.kind} must not request a mode from the browser`,
+        );
+      }
+    });
+
     it('does nothing at all for a runtime with no adapter', function () {
       // The disabled button must also refuse on click: a disabled attribute is
       // a rendering detail, and the handler is what actually protects the user
@@ -215,14 +256,21 @@ describe('WebUI (Beta) launch button', function () {
       assert.strictEqual(start.type, 'start_claude');
     });
 
-    it('carries the bypass flag on the chat path too', async function () {
+    // Restated for #134. This used to assert that the page could hand the
+    // server a bypass on the chat path. It no longer may: the preference is
+    // held per account on the server, so a chat launch names no mode at all and
+    // the button reports what will happen rather than requesting it. The
+    // transport still carries the flag for the terminal path, which is a
+    // different surface and a per-launch choice.
+    it('names no approval mode on the chat path', async function () {
       const app = fakeApp();
-      await mod.startRuntimeSession(app, 'claude', {
-        surface: 'chat',
-        dangerouslySkipPermissions: true,
-      });
+      await mod.startRuntimeSession(app, 'claude', { surface: 'chat' });
+
       const start = app.sent.find((m) => m.type === 'start_chat');
-      assert.strictEqual(start.options.dangerouslySkipPermissions, true);
+      assert.ok(
+        !('dangerouslySkipPermissions' in (start.options || {})),
+        'a standing permission is not the browser’s to assert',
+      );
     });
   });
 });

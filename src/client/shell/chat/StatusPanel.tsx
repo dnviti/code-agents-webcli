@@ -6,9 +6,10 @@ import type { ChatTranscript } from '../../chat/transcript.js';
 import type {
   AccountLimits,
   AccountLimitWindow,
+  ChatUsage,
   ContextWindowSource,
 } from '../../../shared/chat-events.js';
-import type { UsageBurn } from '../../../shared/usage-records.js';
+import { tokenTotal, type UsageBurn } from '../../../shared/usage-records.js';
 import { PanelBody, PanelHeader, PanelNote, useWorkspaceData } from './PanelShell.js';
 
 /**
@@ -81,6 +82,14 @@ export function StatusPanel({
             total={usage.totalTokens}
             source={usage.contextWindowSource}
           />
+        </Group>
+
+        {/* The surface with room for sentences, which is why the spend belongs
+            here as well as in the header strip. The header can only be terse;
+            "not reported" beside a number is ambiguous until somebody says
+            whose silence it is. */}
+        <Group title="Usage this conversation">
+          <UsageSection usage={usage} />
         </Group>
 
         {/* Two sections, deliberately apart. One is what the provider said
@@ -296,6 +305,53 @@ function windowLabel(window: AccountLimitWindow): string {
   }
   const spelled = window.kind.replace(/_/g, ' ');
   return /^\d/.test(spelled) ? `${spelled} limit` : spelled;
+}
+
+/**
+ * What this conversation has spent, and who would not say.
+ *
+ * Same four-way honesty as the context section above, applied to the other two
+ * figures the header shows. The distinction that earns the words is between a
+ * runtime that will never report tokens or money — kimi reports neither, codex
+ * prices nothing — and a conversation that simply has not finished a turn yet.
+ * They look identical in the numbers, so only the first one gets a sentence,
+ * and it is drawn from a statement the session makes after watching a turn end
+ * in silence rather than from anything a capability flag claims in advance.
+ *
+ * Nothing here is ever estimated. The runtime's figure or no figure.
+ */
+function UsageSection({ usage }: { usage: ChatUsage }): React.JSX.Element {
+  const total = tokenTotal(usage);
+  const tokensSilent = total === null && usage.usageSource === 'none';
+  const costSilent = usage.costUsd === undefined && usage.costSource === 'none';
+
+  return (
+    <>
+      {total !== null ? <Row label="Tokens" value={formatTokens(total)} /> : null}
+      {usage.costUsd !== undefined ? <Row label="Cost" value={formatCost(usage.costUsd)} /> : null}
+      {tokensSilent && costSilent ? (
+        <Quiet>
+          This runtime reports neither token counts nor costs, so there is nothing honest to show
+          here. Nothing on this screen is estimated.
+        </Quiet>
+      ) : tokensSilent ? (
+        <Quiet>This runtime reports what a turn costs but not how many tokens it used.</Quiet>
+      ) : costSilent ? (
+        <Quiet>
+          This runtime reports token counts but never a price, and this app does not price a turn
+          itself.
+        </Quiet>
+      ) : total === null && usage.costUsd === undefined ? (
+        <Quiet>Nothing has been reported yet in this conversation.</Quiet>
+      ) : null}
+    </>
+  );
+}
+
+/** Money at whatever precision keeps it meaningful, the same rule the meter uses. */
+function formatCost(value: number): string {
+  if (value === 0) return '$0.00';
+  return value >= 1 ? `$${value.toFixed(2)}` : `$${value.toFixed(4)}`;
 }
 
 /** Only the words a provider uses that a person should be warned by. */

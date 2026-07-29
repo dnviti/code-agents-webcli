@@ -1696,11 +1696,16 @@ function contextReading(raw: Record<string, unknown>): ChatUsage {
 
   const modelUsage = record(raw.model_usage) ?? record(raw.modelUsage);
   if (modelUsage) {
-    for (const value of Object.values(modelUsage)) {
+    for (const [model, value] of Object.entries(modelUsage)) {
       const window = num(record(value)?.contextWindow);
       if (window !== undefined && window > 0) {
         reading.contextWindow = window;
         reading.contextWindowSource = 'agent';
+        // The key, verbatim, for the same reason the capacity above is read off
+        // it: `claude-opus-5[1m]` is a different window from `claude-opus-5`,
+        // and a ceiling that does not say which model it is about is one the
+        // session cannot tell from the previous model's on the next switch.
+        reading.contextWindowModel = model;
         break;
       }
     }

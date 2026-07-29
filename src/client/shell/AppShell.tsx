@@ -641,6 +641,9 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
             runtimeLabel={state.chat.runtimeLabel || state.chat.runtime}
             workingDir={state.chat.workingDir || active?.workingDir || ''}
             isMobile={state.isMobile}
+            // For the recovery notice's labels only. The conversation's own
+            // mode is on the transcript; this is what a *new* one would get.
+            approvalPreference={state.chatBypassPermissions}
             view={view}
             onViewChange={setView}
             onOpenSettings={() => closeDialogs({ chatSettings: true })}

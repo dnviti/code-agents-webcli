@@ -182,8 +182,12 @@ const AGENTS = [
   { runtime: 'grok', label: 'grok, over ACP', run: acpRun('acp-grok', 'grok') },
   { runtime: 'pi', label: 'pi', run: piRun },
   { runtime: 'codex', label: 'codex, which reports a running total', run: codexRun },
-  { runtime: 'kimi', label: 'an ACP agent (omp)', run: acpRun('acp-omp') },
-  { runtime: 'kimi', label: 'an ACP agent (opencode)', run: acpRun('acp-opencode') },
+  // Named for the CLI whose capture is being replayed. These two said `kimi`,
+  // which was wrong twice over now that kimi is on record as reporting no
+  // tokens and no money at all (#136): the row would have claimed a runtime
+  // reported the very figures it never sends.
+  { runtime: 'omp', label: 'an ACP agent (omp)', run: acpRun('acp-omp') },
+  { runtime: 'opencode', label: 'an ACP agent (opencode)', run: acpRun('acp-opencode') },
 ];
 
 describe('a job’s tokens: what the chat showed against what was filed', function () {
