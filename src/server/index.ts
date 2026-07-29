@@ -58,6 +58,7 @@ import { ChatSessionManager } from './chat/manager.js';
 import { AuthService } from './services/auth.js';
 import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
+import { readCachedClaudeAccount } from './services/claude-account.js';
 import { UserPreferenceStore } from './services/user-preferences.js';
 
 /**
@@ -773,12 +774,12 @@ export class ClaudeCodeWebServer {
       sessionStore: this.sessionStore,
       // For listing past conversations in a folder.
       chatStore: this.chatStore,
-      // For the status panel. Passed rather than reached for so a build that
-      // does not track usage simply has no plan section, instead of a section
-      // full of zeros that reads as "nothing left".
-      usageAnalytics: this.usageAnalytics,
-      usageReader: this.usageReader,
+      // For the status panel's "measured here" half. Passed rather than reached
+      // for so a build that does not track usage simply omits the figure,
+      // instead of showing a zero that reads as "you have spent nothing".
       usageStore: this.usageStore,
+      usageBurn: (userId, agent, hours) => this.usageStore.burn(userId, agent, hours),
+      readCachedClaudeAccount: () => readCachedClaudeAccount(),
     });
 
   }

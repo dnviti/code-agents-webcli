@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import {
+  AccountLimits,
   ChatAttachment,
   ChatCapabilities,
   ChatEvent,
@@ -217,8 +218,10 @@ interface PendingQuestion {
  * Deliberately excluded: `session`, `capabilities`, `state`, `usage`, `error`
  * and `permission` describe the process that just started rather than the
  * conversation it was handed, and suppressing them would leave the browser
- * looking at a session whose runtime it could not name. `plan` replaces rather
- * than appends, so re-reporting it costs nothing.
+ * looking at a session whose runtime it could not name. `plan` and `limits`
+ * replace rather than append, so re-reporting either costs nothing — and a
+ * resumed runtime restating its rate-limit window is a fresh reading of it,
+ * which is the one thing that turns a level into a rate.
  */
 const REPLAYABLE = new Set([
   'msg_start',
@@ -348,6 +351,8 @@ export class ChatSession {
   private seq = 0;
   private state: ChatState = 'starting';
   private capabilities: ChatCapabilities | null = null;
+  /** The last account reading the runtime published. See the `limits` overlay in `snapshot()`. */
+  private limits: AccountLimits | null = null;
   private readonly pending = new Map<string, PendingApproval>();
   private readonly questions = new Map<string, PendingQuestion>();
   /**
@@ -1059,6 +1064,13 @@ export class ChatSession {
     }
     if (stamped.t === 'capabilities' && this.capabilities) {
       this.capabilities = { ...this.capabilities, ...stamped.capabilities };
+    }
+    if (stamped.t === 'limits') {
+      // Held for the same reason `capabilities` is: the snapshot replays only a
+      // window of the log, and a rate-limit window announced at the top of a
+      // long conversation would fall off the back of it. This is a latest
+      // value, not an append, so keeping it here costs one object.
+      this.limits = stamped.limits;
     }
     // A question tool call opening is the only chance to learn its id: by the
     // time the MCP server relays the question itself, the arguments are all it
@@ -2311,6 +2323,7 @@ export class ChatSession {
       live: this.live,
       nativeSessionId: this.nativeSessionId || undefined,
       bypassPermissions: this.bypass,
+      limits: this.limits || snapshot.limits,
     }));
   }
 

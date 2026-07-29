@@ -15,6 +15,11 @@ const { NO_CHAT_CAPABILITIES } = require('../dist/shared/chat-events.js');
 // see the class doc comment in codex.ts for exactly what that means for
 // confidence in field names and event ordering.
 //
+//
+// codex-appserver-ratelimits.jsonl is the exception and IS a live capture:
+// `account/rateLimits/read` was probed against codex-cli 0.146.0 on 2026-07-29
+// and the reply is stored verbatim (#137).
+//
 // codex-exec-usage-limit.jsonl is copied verbatim from the one live probe
 // that exists (`.work/probes/raw/codex-exec.jsonl`); it hit the account's
 // usage limit before any item was produced. codex-exec-item.jsonl is
@@ -181,6 +186,66 @@ describe('codex app-server adapter', function () {
         { value: 'gpt-5.6-luna', name: 'GPT-5.6-Luna' },
       ]);
       assert.strictEqual(h.adapter.capabilities.models.length, 2);
+    });
+
+    it('reads the account rate limits codex volunteers (#137)', async function () {
+      const h = harness({});
+      await boot(h);
+
+      const asked = h.sent.find((m) => m.method === 'account/rateLimits/read');
+      assert.ok(asked, 'codex publishes its rate limits over the protocol');
+      // Asked for without waiting, like the model list: a status readout is not
+      // worth delaying a conversation for.
+      assert.strictEqual(only(h.events, 'session').length, 1);
+
+      const captured = fixture('codex-appserver-ratelimits')[0];
+      h.adapter.handleMessage({ jsonrpc: '2.0', id: asked.id, result: captured.result });
+      await flush();
+
+      const limits = only(h.events, 'limits').pop();
+      assert.ok(limits, 'expected a limits event');
+      // The plan name codex states about itself. It is also inside the id_token
+      // in ~/.codex/auth.json, and this app deliberately does not read that
+      // file -- it holds access and refresh tokens.
+      assert.strictEqual(limits.limits.planName, 'free');
+      assert.deepStrictEqual(limits.limits.windows, [
+        {
+          kind: 'primary',
+          // usedPercent 100 in the capture; the event carries fractions.
+          utilization: 1,
+          durationMinutes: 43200,
+          resetsAt: new Date(1786182229 * 1000).toISOString(),
+        },
+      ]);
+      // `secondary` is null in the capture, and null is not a window.
+      assert.strictEqual(limits.limits.windows.length, 1);
+    });
+
+    it('starts fine against a build with no account/rateLimits/read (#137)', async function () {
+      const h = harness({});
+      await boot(h);
+      const asked = h.sent.find((m) => m.method === 'account/rateLimits/read');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: asked.id,
+        error: { code: -32600, message: 'unknown variant `account/rateLimits/read`' },
+      });
+      await flush();
+
+      assert.strictEqual(only(h.events, 'limits').length, 0);
+      assert.strictEqual(only(h.events, 'error').length, 0);
+      assert.strictEqual(only(h.events, 'session').length, 1);
+    });
+
+    it('takes the same reading from the update notification (#137)', async function () {
+      const h = harness({});
+      await boot(h);
+      const captured = fixture('codex-appserver-ratelimits')[0];
+      h.adapter.handleNotification('account/rateLimits/updated', captured.result);
+      await flush();
+
+      const limits = only(h.events, 'limits').pop();
+      assert.strictEqual(limits.limits.windows[0].kind, 'primary');
     });
 
     it('starts fine against a build that has no model/list at all (#75)', async function () {

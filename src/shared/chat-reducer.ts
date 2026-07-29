@@ -15,6 +15,7 @@
  */
 
 import {
+  AccountLimits,
   AgentRun,
   AgentStep,
   ChatBlock,
@@ -103,6 +104,15 @@ export interface TranscriptState {
    * "the default", and the control is careful to show the difference.
    */
   effort?: string;
+  /**
+   * Where the provider last said this account stands.
+   *
+   * Only ever set from a `limits` event, which only ever carries something a
+   * runtime reported about itself. Absent means nobody has said — which the
+   * status panel states in a sentence rather than drawing a bar against a
+   * number it made up, the way it used to (#137).
+   */
+  limits?: AccountLimits;
   lastError?: string;
 }
 
@@ -512,6 +522,15 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // gone back to its own default, and a stale level on the chip would keep
       // claiming a choice nobody is running any more.
       state.effort = event.effort ?? undefined;
+      return { messageIndex: null, structural: false, meta: true, applied: true };
+    }
+
+    case 'limits': {
+      // Replaced whole, not merged: the adapter accumulates the account picture
+      // across a conversation and re-sends all of it, so the newest event is
+      // always the complete answer. Merging here would keep a window alive
+      // after the provider stopped reporting it.
+      state.limits = event.limits;
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 

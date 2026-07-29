@@ -159,6 +159,22 @@ describe('capabilities of a conversation whose process is gone', function () {
     return store.snapshot(session, { runtime: 'claude' });
   }
 
+  it('recovers the account reading the provider stated above the window (#137)', async function () {
+    const limits = {
+      billing: 'subscription',
+      windows: [{ kind: 'five_hour', status: 'allowed', resetsAt: '2026-07-29T16:00:00.000Z' }],
+    };
+    const snapshot = await snapshotOf('acct', recordedChat(200, {
+      extras: [{ t: 'limits', limits }],
+    }));
+
+    // Claude states its rate-limit window on the first turn and then only when
+    // it changes, so on a long conversation the statement is hundreds of events
+    // above a window measured in messages. Lost, the panel would come back from
+    // every rejoin claiming the runtime had never reported one.
+    assert.deepStrictEqual(snapshot.limits, limits);
+  });
+
   it('recovers what the runtime reported from above the replay window', async function () {
     const snapshot = await snapshotOf('long', recordedChat(200));
 

@@ -10,6 +10,9 @@ import { ATTACHMENT_DIR } from '../services/attachment-store.js';
 import { PathValidation, SessionRecord } from '../types.js';
 import { parseGitStatus, parseUnifiedDiff } from '../../shared/git-status.js';
 import { getOwnedSession, requireUser } from './helpers.js';
+import { accountReportingNote } from '../../shared/account-reporting.js';
+import type { UsageBurn } from '../../shared/usage-records.js';
+import type { CachedClaudeAccount } from '../services/claude-account.js';
 
 /**
  * The workspace a chat session is working in: its files, its git state, and —
@@ -52,21 +55,37 @@ export interface WorkspaceRoutesDeps {
    */
   validatePath(targetPath: string): PathValidation;
   /**
-   * The subscription picture, when this server tracks one.
+   * What this app itself measured, for the "measured here" half of the status
+   * panel.
    *
-   * Optional because it is genuinely optional: a server pointed at a runtime
-   * with no plan attached has nothing true to say here, and the panel would
-   * rather show one honest sentence than a meter of invented numbers.
+   * Optional because a build without a usage database has nothing to divide,
+   * and the panel says so in a sentence rather than reporting a rate of zero.
+   * It used to be `usageAnalytics`/`usageReader` here instead — a plan lookup
+   * table and a scan of Claude Code's transcripts for the whole host — and both
+   * are gone from this route: neither described the person asking, and one of
+   * them described no account at all (#137).
    */
-  usageAnalytics?: {
-    currentPlan: string;
-    planLimits: Record<string, unknown>;
-    getAnalytics(): unknown;
-  };
-  usageReader?: {
-    getCurrentSessionStats(): Promise<unknown>;
-  };
+  usageBurn?: (userId: number, agent: string, hours: number) => UsageBurn;
+  /**
+   * The Claude CLI's own cached account reading, for a claude conversation that
+   * has not yet been told anything by its own runtime.
+   *
+   * Injected rather than imported so a test can drive it, and so a deployment
+   * that would rather not read the file simply leaves it out.
+   */
+  readCachedClaudeAccount?: () => CachedClaudeAccount | null;
 }
+
+/**
+ * How far back the "measured here" figure looks.
+ *
+ * Long enough that an ordinary working session is inside it, short enough that
+ * the rate describes today rather than the week. It is a window on this app's
+ * own record, not on any provider's window — the two are shown separately and
+ * never combined, because one is priced at list rates by this app and the other
+ * is the account's real meter.
+ */
+const MEASURED_BURN_HOURS = 24;
 
 const EXEC_TIMEOUT_MS = 10_000;
 /** Enough for a large `git diff`; past it the panel says so rather than truncating silently. */
@@ -1167,20 +1186,31 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         ? parseGitStatus(status.stdout)
         : null;
 
-      let plan: Record<string, unknown> | null = null;
-      if (deps.usageAnalytics) {
-        const analytics = deps.usageAnalytics.getAnalytics() as Record<string, unknown>;
-        const sessionStats = await deps.usageReader
-          ?.getCurrentSessionStats()
-          .catch(() => null);
-        plan = {
-          type: deps.usageAnalytics.currentPlan,
-          limits: deps.usageAnalytics.planLimits[deps.usageAnalytics.currentPlan] ?? null,
-          predictions: analytics?.predictions ?? null,
-          windows: analytics?.windows ?? null,
-          sessionStats: sessionStats ?? null,
-        };
-      }
+      const user = requireUser(res);
+      const runtime = session.agent ?? session.lastAgent ?? null;
+      // Everything the panel says about an account, and not one figure more.
+      //
+      // What the *provider* said travels on the conversation's own `limits`
+      // event and reaches the panel through the transcript, not through here —
+      // it is a fact about that conversation's work, and this route knows
+      // nothing about it. What this route can add is two things the transcript
+      // cannot: a sentence naming what this runtime reports at all, and this
+      // app's own measurement of what the person asking has spent on it.
+      const account = {
+        runtime,
+        reporting: accountReportingNote(runtime),
+        // Claude Code caches its last account reading in its own config file,
+        // and it is the only thing that can fill the gap before a conversation's
+        // first turn. It describes the account the *server's* CLI is signed in
+        // as — which is why it is labelled that way on screen and why nothing
+        // identifying comes back with it. See `readCachedClaudeAccount`.
+        cached: runtime === 'claude'
+          ? (deps.readCachedClaudeAccount?.() ?? null)
+          : null,
+        measured: user && runtime && deps.usageBurn
+          ? deps.usageBurn(user.id, runtime, MEASURED_BURN_HOURS)
+          : null,
+      };
 
       res.json({
         git: branch
@@ -1194,7 +1224,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
               changed: branch.changes.length,
             }
           : { repo: false },
-        plan,
+        account,
         // The working directory is part of "where am I", and the header shows
         // only its last segment.
         workingDir: session.workingDir,

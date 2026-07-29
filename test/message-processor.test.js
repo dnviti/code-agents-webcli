@@ -93,8 +93,6 @@ describe('MessageProcessor', function() {
         getAnalytics() {
           return {};
         },
-        currentPlan: 'max20',
-        planLimits: {},
       },
     });
 

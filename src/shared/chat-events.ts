@@ -525,6 +525,65 @@ export type ContextWindowSource = 'agent' | 'provider' | 'unknown';
  */
 export type SpendSource = 'agent' | 'none';
 
+/**
+ * One rate-limit window, exactly as the provider stated it.
+ *
+ * Every field but `kind` is optional because the providers are miserly and
+ * inconsistent about this: four of the five recorded Claude `rate_limit_event`
+ * lines carry a reset time and a status and no percentage at all, and the fifth
+ * carries a percentage only because a threshold had been crossed. A window with
+ * no `utilization` is the ordinary case, and the surface draws no bar for it —
+ * a meter defaulting to 0% would be the same invented figure this replaced.
+ */
+export interface AccountLimitWindow {
+  /** The provider's own name for it: `five_hour`, `seven_day`, `primary`. */
+  kind: string;
+  /** How long the window runs, when the provider says. Codex does; Claude does not. */
+  durationMinutes?: number;
+  /** 0..1 of the window spent. Absent means nobody said, not zero. */
+  utilization?: number;
+  /** When the window refills, as ISO. */
+  resetsAt?: string;
+  /** The provider's own word for the state: `allowed`, `allowed_warning`. */
+  status?: string;
+  /**
+   * How fast the window is filling, in fraction per hour.
+   *
+   * Only ever from two readings of the *same* window — same kind, same reset
+   * time — taken during this conversation. One reading is a level, not a rate,
+   * and a "time left" drawn from a level is a guess dressed as a measurement.
+   * Absent means fewer than two readings so far, which the surface says in
+   * words rather than leaving blank.
+   */
+  utilizationPerHour?: number;
+}
+
+/**
+ * What the provider said about the account behind this conversation.
+ *
+ * Only ever populated from something a runtime actually reported on its own
+ * channel. Nothing here is inferred from a plan flag, a lookup table or a
+ * transcript file, which is what this replaced (#137): every figure that used
+ * to appear in the status panel was a build-time constant.
+ *
+ * `windows` is empty rather than absent when a runtime has spoken but has no
+ * window to report — that is a different thing from never having spoken, and
+ * the surface tells them apart.
+ */
+export interface AccountLimits {
+  /** The plan as the provider named it. Codex reports `planType`; Claude does not. */
+  planName?: string;
+  /**
+   * How this work is being billed, when the runtime said.
+   *
+   * `unknown` is load-bearing: half the recorded Claude handshakes carry no
+   * `apiKeySource` at all, and reading that absence as "subscription" would be
+   * a claim about someone's billing that nobody made.
+   */
+  billing?: 'subscription' | 'api-key' | 'unknown';
+  windows: AccountLimitWindow[];
+}
+
 /** A message as the reducer assembles it. */
 /**
  * One turn as the recorded conversation has it, for the index beside it.
@@ -1053,6 +1112,19 @@ export type ChatEvent =
    */
   | { t: 'effort'; seq: number; ts: number; effort: string | null }
   /**
+   * The provider stated where this account stands against its rate limits.
+   *
+   * Named `limits` and not `plan` because `plan` is already taken by plan
+   * *mode* — the checklist an agent publishes while it thinks — and the two
+   * would be indistinguishable in a log.
+   *
+   * Carries the whole picture every time rather than a patch: the adapter that
+   * emits it is the thing accumulating windows across a conversation, so the
+   * reducer can replace wholesale and a browser that joined late is not left
+   * assembling a half-window out of events it never saw.
+   */
+  | { t: 'limits'; seq: number; ts: number; limits: AccountLimits }
+  /**
    * Something happened to the conversation itself.
    *
    * `compacted` leaves a marker in place and keeps the transcript: what was
@@ -1170,6 +1242,16 @@ export interface ChatSnapshot {
   capabilities: ChatCapabilities;
   usage?: ChatUsage;
   plan?: PlanItem[];
+  /**
+   * Where the account stood the last time the provider said anything about it.
+   *
+   * Optional so a snapshot from a server that predates this reads as "nobody
+   * has said", which is exactly what the status panel then shows. A latest
+   * value rather than a history, so it survives a rejoin the way the
+   * capabilities do — the log's replay window is short and a five-hour window
+   * announced at the top of a long conversation would otherwise fall off it.
+   */
+  limits?: AccountLimits;
   pendingPermissions: PermissionRequest[];
   /**
    * Questions still waiting on an answer.

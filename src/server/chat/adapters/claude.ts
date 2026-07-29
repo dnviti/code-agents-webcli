@@ -9,6 +9,7 @@ import {
 import { describeFrom } from '../installed-commands.js';
 import { TERMINAL_TOOL } from '../../../shared/agent-activity.js';
 import { mapModelUsage } from './model-usage.js';
+import { AccountLimitTracker, resetIsoFromEpochSeconds } from '../account-limits.js';
 import {
   ChatAttachment,
   ChatBlock,
@@ -40,6 +41,17 @@ import {
  * a single user prompt, and all of that belongs to one turn from the UI's
  * point of view. It is retired when `result` arrives.
  */
+
+/**
+ * The `apiKeySource` values that mean a key the *user* put there.
+ *
+ * These two, and only these two, are a statement that the work is billed to an
+ * API key: an environment variable the user exported, and a helper command the
+ * user configured. Every other source the CLI can name is something else, and
+ * is reported as `unknown` rather than folded in here — see `handleInit`.
+ */
+const CONFIGURED_KEY_SOURCES = new Set(['ANTHROPIC_API_KEY', 'apiKeyHelper']);
+
 export class ClaudeChatAdapter extends BaseChatAdapter {
   readonly runtime = 'claude';
 
@@ -106,6 +118,15 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       { value: 'ultracode', name: 'Ultracode', description: 'xhigh reasoning plus dynamic workflow orchestration' },
     ]),
   };
+
+  /**
+   * What Claude has said about the account this conversation is spending from.
+   *
+   * The two halves arrive on different lines — the billing mode on `init`, the
+   * windows on `rate_limit_event` — and the panel needs both at once, so they
+   * are accumulated here and re-published whole.
+   */
+  private readonly account = new AccountLimitTracker();
 
   /** Session id we generated for a fresh launch, before init echoes it back. */
   private freshSessionId?: string;
@@ -512,9 +533,7 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
         this.handleResult(raw);
         return;
       case 'rate_limit_event':
-        // Quota telemetry with nothing in the chat model to hold it; treating
-        // it as an error would alarm the user over something that has not
-        // actually failed.
+        this.handleRateLimit(raw);
         return;
       default:
         return;
@@ -767,6 +786,43 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     this.emit({ t: 'workflow_progress', parentToolId, phases, agents });
   }
 
+  /**
+   * The only account figures Anthropic gives a client, and the app used to drop
+   * them on the floor while drawing a meter against a table of guesses (#137).
+   *
+   * What arrives is a status word, a reset time and a window name; `utilization`
+   * turns up only once a warning threshold has been passed — four of the five
+   * recorded events carry no percentage at all. So the percentage is copied
+   * when present and left out otherwise, and the surface shows a reset time on
+   * its own rather than a bar that reads 0%.
+   *
+   * Never an error, whatever the status says: `allowed_warning` is a warning
+   * about the account, not a failure of this turn, and the turn carries on.
+   */
+  private handleRateLimit(raw: Record<string, unknown>): void {
+    const info = record(raw.rate_limit_info);
+    if (!info) return;
+    const kind = str(info.rateLimitType);
+    if (!kind) return;
+
+    // Claude reports this as a fraction — `utilization: 0.96` alongside
+    // `surpassedThreshold: 0.75`, both of them fractions in the same line — and
+    // that is what `AccountLimitWindow.utilization` means. Anything outside 0..1
+    // is a units change nobody has verified, and is dropped rather than drawn.
+    const utilization = Number(info.utilization);
+    const changed = this.account.noteWindow({
+      kind,
+      ...(Number.isFinite(utilization) && utilization >= 0 && utilization <= 1
+        ? { utilization }
+        : {}),
+      ...(str(info.status) ? { status: str(info.status) as string } : {}),
+      ...(resetIsoFromEpochSeconds(info.resetsAt)
+        ? { resetsAt: resetIsoFromEpochSeconds(info.resetsAt) as string }
+        : {}),
+    });
+    if (changed) this.emit({ t: 'limits', limits: this.account.snapshot() });
+  }
+
   private handleInit(raw: Record<string, unknown>): void {
     const sessionId = str(raw.session_id) ?? this.freshSessionId ?? this.options.resumeSessionId;
     this.nativeSessionId = sessionId;
@@ -815,6 +871,34 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     // us which of its five that is, so naming one would be a guess — and the
     // chip renders what arrives here as the agent's own word for what it is
     // doing.
+    // How this conversation is billed, in Claude's own words. `apiKeySource` is
+    // `'none'` when the CLI is running on a signed-in subscription and names
+    // the variable or helper when it is running on a key.
+    //
+    // Absent is its own answer and the common one — half the recorded init
+    // lines have no such field — so it becomes `unknown` rather than
+    // `subscription`. Guessing here would put a claim about somebody's billing
+    // on screen that nobody ever made (#137).
+    //
+    // An allow-list rather than "anything that is not `none`", because the CLI
+    // has a fourth answer that is neither. Read off 2.1.220's own resolver:
+    // `ZO()` returns `ANTHROPIC_API_KEY`, `apiKeyHelper`, `none`, or the
+    // `eRt()` fallback `{key: config.primaryApiKey, source: "/login managed
+    // key"}` — a key `/login` provisioned into `~/.claude.json`, which the same
+    // build groups with a claude.ai login rather than with a configured key
+    // (`if (t === "claude.ai" || o === "/login managed key")` when it looks up
+    // the organisation and the email address). That is an ambiguous source, and
+    // this change's whole rule is that an ambiguous source reads `unknown`
+    // instead of becoming a confident claim (#137).
+    const apiKeySource = str(raw.apiKeySource);
+    const billing = apiKeySource === undefined
+      ? 'unknown'
+      : apiKeySource === 'none'
+        ? 'subscription'
+        : CONFIGURED_KEY_SOURCES.has(apiKeySource) ? 'api-key' : 'unknown';
+    if (this.account.noteBilling(billing)) {
+      this.emit({ t: 'limits', limits: this.account.snapshot() });
+    }
     this.emit({ t: 'effort', effort: this.options.effort ?? null });
     // Nothing is running yet; the first `system/status: requesting` (sent
     // once a prompt actually lands) is what moves this on to `thinking`.

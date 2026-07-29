@@ -396,6 +396,23 @@ export interface UsageDashboard {
 }
 
 /**
+ * What this client measured for one user on one agent, over a recent window.
+ *
+ * The honest half of the status panel. The other half is what the provider says
+ * about the account, and the two are shown apart on purpose: this one counts
+ * only the turns that ran through this app, prices them at list rates, and says
+ * so — it is not, and cannot be, the account's bill.
+ */
+export interface UsageBurn {
+  /** Inclusive start and exclusive end of the window, ISO. */
+  from: string;
+  to: string;
+  /** Width of the window in hours, so a rate can be derived without parsing dates. */
+  hours: number;
+  totals: UsageTotals;
+}
+
+/**
  * The project a working directory belongs to: its last path segment.
  *
  * Trailing separators are dropped first, so `/srv/work/api/` and `/srv/work/api`

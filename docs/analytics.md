@@ -4,10 +4,11 @@
 > server and works, but nothing in the current UI displays it. The client
 > handler for usage updates is an explicit no-op, and nothing asks for one.
 >
-> This page documents what exists so the `--plan` flag and the environment
-> variables are not a mystery, and so whoever builds the screen back has the
-> model written down. If you are looking for a token meter in the app, there
-> isn't one yet.
+> It used to have one indirectly: the status panel drew a plan meter on top of
+> it. That meter is gone, because the ceiling it was drawn against was invented
+> — see [what the status panel knows](usage-accounting.md#what-the-status-panel-knows).
+> What is left here is a measurement with no ceiling and no consumer, kept
+> because it is a real read of real files.
 
 ## What it reads
 
@@ -30,37 +31,35 @@ overlap, and boundaries are inferred from usage rather than declared.
 windows so a brief spike does not dominate, with a trend (rising, falling,
 steady) and a confidence score.
 
-**Depletion estimate.** When the current window's allowance would run out at the
-present rate. Only produced when confidence passes 50% — an estimate from three
-data points is worse than no estimate.
-
 **Cost.** Estimated from per-model input, output and cache token prices compiled
 into the reader. Those prices go stale: they are a rough guide, not a bill.
 
-## Plans
+## No plan limits
 
-Selected with [`--plan`](configuration.md#usage-accounting).
+There used to be a table here: token, dollar and message allowances for `pro`,
+`max5`, `max20` and a `custom` tier, selected with a `--plan` flag whose default
+was `max20` on every install. None of those figures came from Anthropic. They
+were written into this repository, and an unrecognised plan fell through to a
+bare `188026` tokens.
 
-| Plan | Tokens | Cost | Messages |
-| --- | --- | --- | --- |
-| `pro` | 19,000 | $18 | 250 |
-| `max5` | 88,000 | $35 | 1,000 |
-| `max20` *(default)* | 220,000 | $140 | 2,000 |
-| custom | derived from your own p90 usage | `CLAUDE_COST_LIMIT`, default $50 | 250+ |
+They are gone, along with the flag, the `CLAUDE_COST_LIMIT` variable that set
+the custom tier's ceiling, and everything derived from them: remaining tokens,
+percent used and time to depletion. What this service measures — tokens, cost
+and a burn rate, from files Claude Code wrote — has no ceiling to be measured
+against, and says so.
 
-Two knobs have no CLI flag and are environment-only:
+One knob is left, and it is environment-only:
 
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `CLAUDE_SESSION_HOURS` | `5` | Length of the rolling window |
-| `CLAUDE_COST_LIMIT` | `50.00` | Ceiling for the custom plan |
 
 ## Where it lives in the code
 
 | File | Role |
 | --- | --- |
 | `src/server/services/usage-reader.ts` | Reads and deduplicates the transcripts, computes tokens, cost, windows and burn rate |
-| `src/server/services/usage-analytics.ts` | Applies plan limits and projections on top |
+| `src/server/services/usage-analytics.ts` | Rolling windows and a burn rate on top |
 | `src/server/websocket/messages.ts` | Answers a `get_usage` message with a `usage_update` |
 
 The wire protocol is intact, so a client that sends `get_usage` gets a real
