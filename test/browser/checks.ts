@@ -536,7 +536,120 @@ async function checkAQuestionIsAnsweredByClicking(): Promise<void> {
   check('the answered card still shows what was asked', (after[0].textContent || '').includes('Which approach'));
   check('the answered card shows what was chosen', (after[0].textContent || '').includes('Patch it'));
 
+  /**
+   * Which options a card has marked, by label.
+   *
+   * Found by the mark itself — the screen-reader word every chosen option
+   * carries — rather than by anything the fix introduced, so this reads the
+   * same on the code before it. The label is the option row's text with that
+   * word taken back off; matched by substring below, because an option's
+   * description runs straight into its label in `textContent`.
+   */
+  const markedIn = (card: HTMLElement): string[] =>
+    Array.from(card.querySelectorAll<HTMLElement>('span'))
+      .filter((node) => node.textContent === 'chosen')
+      .map((node) => (node.parentElement?.textContent || '').replace('chosen', '').trim());
+  const marks = (card: HTMLElement | undefined, labels: string[]): boolean => {
+    if (!card) return false;
+    const found = markedIn(card);
+    return found.length === labels.length && labels.every((label, at) => found[at].includes(label));
+  };
+
+  const singleCard = after.find((card) => (card.textContent || '').includes('Which approach'));
+  const multiCard = after.find((card) => (card.textContent || '').includes('Which rules'));
+  check(
+    'the marks are on the options themselves, not only in a sentence underneath',
+    marks(multiCard, ['semicolons', 'single quotes']) && marks(singleCard, ['Patch it']),
+    `${JSON.stringify(multiCard ? markedIn(multiCard) : null)} / ${JSON.stringify(singleCard ? markedIn(singleCard) : null)}`,
+  );
+
+  // Issue #113: leaving the conversation and coming back.
+  //
+  // A tab switch takes the whole surface down and builds it again from the
+  // snapshot the server sends on rejoin — which is why the marks went. They
+  // were never in the record the card was drawn from; they were in the card's
+  // own memory of the click, and that memory does not survive being unmounted.
+  //
+  // So this tears the surface down and stands a *fresh* controller up on the
+  // snapshot, which is the only fixture that reproduces it. Answering in place
+  // and re-hydrating the same tree passes on the broken code.
+  // What the server sends back when an answer lands, which nothing in this
+  // fixture had been doing: the conversation's own record of the decision.
+  // Without it the marks on screen are only the card's memory of the click,
+  // which is exactly the state the issue is about.
+  for (const answer of answers) {
+    controller.transcript.apply({
+      t: 'question_resolved',
+      seq: 900 + answers.indexOf(answer),
+      ts: Date.now(),
+      requestId: answer.requestId,
+      toolId: answer.requestId === 'q-multi' ? 'tool-multi' : 'tool-single',
+      optionIds: answer.optionIds,
+      skipped: false,
+    } as never);
+  }
+  await wait(150);
+
+  const rejoinSnapshot = {
+    sessionId: 'browser-check',
+    runtime: 'claude',
+    state: 'idle',
+    capabilities: { questions: true, streaming: true },
+    messages: JSON.parse(JSON.stringify(controller.transcript.messages)),
+    pendingPermissions: [],
+    queued: [],
+    firstSeq: 1,
+    replayFrom: 1,
+    cursor: 99,
+    live: true,
+    bypassPermissions: false,
+    // What the server now carries, and the whole point of the fix. Taken from
+    // the transcript this browser built rather than typed out, so it is the
+    // same answer the reducer folded out of the events above.
+    answeredQuestions: {
+      'tool-multi': controller.transcript.answerFor('tool-multi'),
+      'tool-single': controller.transcript.answerFor('tool-single'),
+    },
+  };
   root.unmount();
+  await wait(50);
+
+  const rejoined = new ChatController('browser-check', { send: () => {} } as never);
+  rejoined.handle({ type: 'chat_snapshot', sessionId: 'browser-check', snapshot: rejoinSnapshot } as never);
+  const backRoot = createRoot(host);
+  backRoot.render(
+    React.createElement(ChatView, {
+      controller: rejoined,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(300);
+  settle(document);
+
+  const back = Array.from(host.querySelectorAll('[data-question-card]')) as HTMLElement[];
+  const backMulti = back.find((card) => (card.textContent || '').includes('Which rules'));
+  const backSingle = back.find((card) => (card.textContent || '').includes('Which approach'));
+  check(
+    'an answered question comes back marked after leaving the conversation',
+    marks(backSingle, ['Patch it']),
+    backSingle ? JSON.stringify(markedIn(backSingle)) : 'the card is gone',
+  );
+  check(
+    'and a pick-several answer comes back with every option that was picked',
+    marks(backMulti, ['semicolons', 'single quotes']),
+    backMulti ? JSON.stringify(markedIn(backMulti)) : 'the card is gone',
+  );
+  check(
+    'and never reads as a question nobody answered',
+    back.every((card) => !(card.textContent || '').includes('Skipped without answering')),
+    back.map((card) => (card.textContent || '').slice(-40)).join(' | ') || 'no cards',
+  );
+
+  backRoot.unmount();
   host.remove();
 }
 

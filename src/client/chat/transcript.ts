@@ -167,6 +167,14 @@ export class ChatTranscript {
       plan: snapshot.plan || [],
       pendingPermissions: snapshot.pendingPermissions || [],
       pendingQuestions: snapshot.pendingQuestions || [],
+      // What was picked, for the questions already answered (#113). Falling
+      // back to what is already held rather than to nothing: a server that
+      // predates this field must not take the marks off a card this browser
+      // watched being answered a moment ago. Copied because the snapshot is
+      // wire data and the reducer writes into this map in place.
+      answeredQuestions: snapshot.answeredQuestions
+        ? { ...snapshot.answeredQuestions }
+        : { ...this.state.answeredQuestions },
       firstSeq: snapshot.firstSeq,
       cursor: snapshot.cursor,
       // The turn the server's replay was still inside. Live events arriving
@@ -209,10 +217,25 @@ export class ChatTranscript {
    * already hold), and not moving the floor for that case is what turned a
    * finished request into a spinner nobody could clear.
    */
-  prepend(messages: ChatMessage[], firstSeq: number, from?: number): void {
+  prepend(
+    messages: ChatMessage[],
+    firstSeq: number,
+    from?: number,
+    answers?: Record<string, string[]>,
+  ): void {
     this.state.firstSeq = firstSeq;
     if (from !== undefined) {
       this.oldest = Math.max(firstSeq, Math.min(this.oldest || from, from));
+    }
+
+    // A question far enough back that it arrives by scrolling brings its answer
+    // with it (#113). The page is replayed through a scratch transcript that
+    // folds `question_resolved` correctly; without this, that answer was
+    // computed and then thrown away with the scratch. What is already held
+    // wins: these are keyed by tool call, so a collision is the same answer,
+    // and the live map is the newer knowledge.
+    if (answers) {
+      this.state.answeredQuestions = { ...answers, ...this.state.answeredQuestions };
     }
 
     if (!messages.length) {
@@ -487,6 +510,16 @@ export class ChatTranscript {
   /** Which options were picked for the question that call asked, once answered. */
   answerFor(toolId: string): string[] | undefined {
     return this.state.answeredQuestions[toolId];
+  }
+
+  /**
+   * Every answer this transcript holds, keyed the way the reducer keys them.
+   *
+   * Read off a scratch transcript when a page of history is folded in, so the
+   * answers it computed reach the real one rather than being dropped with it.
+   */
+  get answeredQuestions(): Record<string, string[]> {
+    return this.state.answeredQuestions;
   }
 
   get cursor(): number {

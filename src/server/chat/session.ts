@@ -2079,6 +2079,11 @@ export class ChatSession {
       capabilities: this.capabilities || snapshot.capabilities,
       pendingPermissions: Array.from(this.pending.values()).map((entry) => entry.request),
       pendingQuestions: Array.from(this.questions.values()).map((entry) => entry.request),
+      // `answeredQuestions` is deliberately NOT overridden here. This map holds
+      // only the questions still waiting; what was picked for the ones already
+      // answered is in the log, and the store's replay of it is the authority
+      // (#113). Overlaying anything from here would narrow it to this process's
+      // lifetime, which is exactly the conversation this has to survive.
       queued: this.queuedTurns,
       live: this.live,
       nativeSessionId: this.nativeSessionId || undefined,

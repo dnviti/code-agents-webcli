@@ -1541,6 +1541,11 @@ export class ChatStore implements ChatStoreLike {
         usage: await this.sessionUsage(base, state, stats),
         plan: transcript.plan,
         pendingPermissions: transcript.pendingPermissions,
+        // What was picked, for the questions that have been answered (#113).
+        // The replay above folds `question_resolved` the same way a browser
+        // does, and the answer sits between the same two message starts as the
+        // call that asked — so any window holding the card holds its answer.
+        answeredQuestions: transcript.answeredQuestions,
         firstSeq: stats.firstSeq,
         replayFrom: windowStart,
         cursor: stats.cursor,
