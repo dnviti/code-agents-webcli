@@ -1028,6 +1028,22 @@ export type ChatEvent =
       ts: number;
       kind: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals';
       detail?: string;
+      /**
+       * On an `approvals` marker: the mode the conversation actually started
+       * in, as a fact rather than as the phrase `detail` renders.
+       *
+       * This is the *only* thing that tells a browser the mode changed under an
+       * in-conversation `/clear`. `chat_started` is broadcast from the launch
+       * path alone, and a restart from inside a conversation never goes through
+       * it — so without this field a pane goes on drawing the mode the
+       * conversation had before the clear, indefinitely, and a chip reading
+       * "asks first" over an agent now running unattended is the one direction
+       * of wrongness this feature exists to remove (#134).
+       *
+       * Optional because every other marker kind has no mode, and because a
+       * transcript recorded before this field existed must still replay.
+       */
+      bypassing?: boolean;
     };
 
 /** An attachment on an outgoing user turn. */

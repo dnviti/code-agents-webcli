@@ -374,6 +374,11 @@ describe('clearing leaves the tab live', function () {
     const notice = store.events.find((e) => e.t === 'marker' && e.kind === 'approvals');
     assert.ok(notice, 'a new conversation has to say which mode it is in');
     assert.match(notice.detail, /bypassed/);
+    assert.strictEqual(
+      notice.bypassing,
+      true,
+      'and carry it as a fact as well as a phrase, or the pane has only prose to read',
+    );
     await s.stop();
   });
 
@@ -396,6 +401,12 @@ describe('clearing leaves the tab live', function () {
       /asked before each tool call/,
       'a bypass that has just been dropped must not be dropped silently',
     );
+    // And structurally, because this is the only thing that reaches the browser
+    // with the new mode: a restart from inside a conversation never touches the
+    // launch path, so no `chat_started` is broadcast and no snapshot is asked
+    // for. Without this field the pane's chip and header badge would go on
+    // naming the mode of the conversation the clear replaced (#134).
+    assert.strictEqual(after[0].bypassing, false);
     await s.stop();
   });
 

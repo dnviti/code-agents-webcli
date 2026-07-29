@@ -794,6 +794,13 @@ export class ChatSession {
           // runtime cannot ask" over every claude conversation.
           wantsHook || this.capabilities?.permissions === true,
         ),
+        // And the same fact structurally, because the phrase is for the reader
+        // and this is for the pane. A conversation that begins from *inside*
+        // itself — the composer's New chat, `/clear` — never touches the launch
+        // path, so `chat_started` is not broadcast and this marker is the only
+        // thing that reaches the browser with the mode the restart re-decided
+        // (#134).
+        bypassing: this.bypass,
       });
     }
 

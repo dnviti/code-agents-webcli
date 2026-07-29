@@ -6140,6 +6140,7 @@ async function checkAConversationSaysWhichApprovalModeItIsIn(): Promise<void> {
       seq: 1,
       ts: 1,
       detail: 'bypassed — tools run without asking',
+      bypassing: true,
     },
   } as never);
 
@@ -6182,6 +6183,79 @@ async function checkAConversationSaysWhichApprovalModeItIsIn(): Promise<void> {
       (notice.textContent || '').trim(),
     );
   }
+
+  const chipNamed = (label: string): HTMLElement | null =>
+    host.querySelector<HTMLElement>(`[aria-label="${label}"]`);
+
+  check(
+    'the chip beside the input box says the same thing as the line',
+    Boolean(chipNamed('Approvals bypassed')) && !chipNamed('Approvals asked for'),
+  );
+
+  // And now a `/clear`, which starts the conversation over in whatever mode the
+  // account's preference names — here, back to asking.
+  //
+  // This is the interval the whole feature turns on. A restart from inside a
+  // conversation never goes through the launch path, so no `chat_started` and
+  // no snapshot arrive: the opening line of the replacement conversation is the
+  // only thing that reaches the browser with the new mode. Measured on the
+  // persistent indicators rather than on that line, because a one-off sentence
+  // scrolling up the transcript while the chip beside the input box still reads
+  // "Approvals asked for" over an agent running unattended — or the reverse —
+  // is exactly the standing false claim #134 exists to remove.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: { t: 'marker', kind: 'cleared', seq: 2, ts: 2, detail: 'started a new conversation' },
+  } as never);
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: {
+      t: 'marker',
+      kind: 'approvals',
+      seq: 3,
+      ts: 3,
+      detail: 'on — you are asked before each tool call',
+      bypassing: false,
+    },
+  } as never);
+  paint(false);
+  await wait(250);
+
+  check(
+    'a clear that changes the mode moves the chip with it',
+    Boolean(chipNamed('Approvals asked for')) && !chipNamed('Approvals bypassed'),
+    chipNamed('Approvals bypassed') ? 'still claiming bypassed' : 'asks first',
+  );
+
+  // Back the other way, so the chip is following the marker rather than simply
+  // decaying to the safe answer once anything at all arrives.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: { t: 'marker', kind: 'cleared', seq: 4, ts: 4, detail: 'started a new conversation' },
+  } as never);
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'browser-check',
+    event: {
+      t: 'marker',
+      kind: 'approvals',
+      seq: 5,
+      ts: 5,
+      detail: 'bypassed — tools run without asking',
+      bypassing: true,
+    },
+  } as never);
+  paint(false);
+  await wait(250);
+
+  check(
+    'and a clear that turns the bypass back on moves it back',
+    Boolean(chipNamed('Approvals bypassed')) && !chipNamed('Approvals asked for'),
+    chipNamed('Approvals asked for') ? 'still claiming it asks' : 'bypassed',
+  );
 
   // Now the conversation's process goes away, which is the recovery notice the
   // issue was reported against.
@@ -6242,6 +6316,60 @@ async function checkAConversationSaysWhichApprovalModeItIsIn(): Promise<void> {
     /approvals bypassed/.test(resumeAgain?.textContent || ''),
     (resumeAgain?.textContent || '').trim(),
   );
+
+  // The one screen where starting over is the *only* route back, and the reason
+  // the sentence under the notice exists at all: with no Resume beside it there
+  // is nothing to compare the button's label against. Nothing recorded which
+  // conversation the agent was having, so `canResume` is false.
+  //
+  // Measured at a phone's width rather than the 900px above, because a sentence
+  // appended to a paragraph in a narrow column is exactly the thing that clips
+  // or overflows, and a string match on the markup would pass over either.
+  host.style.width = '390px';
+  controller.handle({
+    type: 'chat_unavailable',
+    sessionId: 'browser-check',
+    runtime: 'claude',
+    runtimeLabel: 'Claude Code',
+    canResume: false,
+    message: 'this chat session is not running',
+  } as never);
+  paint(true);
+  await wait(250);
+
+  const only = buttonNamed(/Start a new chat/);
+  check(
+    'starting over is the only button when the conversation cannot be resumed',
+    Boolean(only) && !buttonNamed(/Resume this conversation/),
+  );
+  const said = Array.from(host.querySelectorAll<HTMLElement>('p')).find((node) =>
+    /A new conversation runs with/.test(node.textContent || ''),
+  );
+  check('states the mode even when starting over is the only button', Boolean(said));
+  if (said) {
+    const box = said.getBoundingClientRect();
+    check(
+      'and the sentence is painted rather than merely present',
+      isPainted(said),
+      `${Math.round(box.width)}x${Math.round(box.height)}`,
+    );
+    const size = parseFloat(window.getComputedStyle(said).fontSize) || 0;
+    check('and it is set in type that can be read on a phone', size >= 12 - 0.01, `${size}px`);
+    // Not clipped and not off to one side: `overflow: hidden` on an ancestor
+    // and a paragraph wider than the column both read as "present" to a string
+    // match, and both mean the user never sees the mode they are about to get.
+    const column = host.getBoundingClientRect();
+    check(
+      'and it fits the column it is in rather than running off the side',
+      box.left >= column.left - 0.5 && box.right <= column.right + 0.5,
+      `notice ${Math.round(box.left)}–${Math.round(box.right)} in ${Math.round(column.left)}–${Math.round(column.right)}`,
+    );
+    check(
+      'and it names the mode the preference will give it',
+      /approvals bypassed/.test(said.textContent || ''),
+      (said.textContent || '').replace(/\s+/g, ' ').trim().slice(-80),
+    );
+  }
 
   root.unmount();
   host.remove();

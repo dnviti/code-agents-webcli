@@ -29,8 +29,10 @@
   The mode is stated where you are looking. Every conversation opens with a line
   saying which mode it is in, including the one that replaces it after a
   `/clear`, and the two buttons on the recovery notice each name the mode they
-  land in — so a bypass is never restored, or dropped, in silence. The header
-  badge over a bypassing conversation is unchanged.
+  land in — so a bypass is never restored, or dropped, in silence. The chip
+  beside the input box and the header badge move with that line rather than
+  going on naming the mode of the conversation the `/clear` replaced, which is
+  the difference between reading the mode once and being able to check it.
 
   The preference has moved off the browser and onto your account. It is stored
   on the server, arrives with the page, and is the same answer on your phone as
