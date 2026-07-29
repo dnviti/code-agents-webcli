@@ -191,12 +191,39 @@ describe('the turn ids a real conversation actually carries', function () {
     return { turns, state };
   }
 
-  it('shows one turn per request, not one for the ask and one for the answer', function () {
+  it('shows one turn per request, and draws the echo not at all (#129)', function () {
+    // Two things at once, and they are separate claims. The turn is one turn
+    // whatever id its parts arrived under (#86, the grouping) — and the echo is
+    // not a message anybody should see (#129, the drawing): it is the prompt
+    // handed back, byte for byte, and drawing it puts two identical bubbles
+    // side by side. The logs already on disk still hold both, so this is what
+    // reopening one of those conversations has to produce.
     const { turns } = shown([...realTurn(1, 'first ask'), ...realTurn(2, 'second ask')]);
     assert.strictEqual(turns.length, 2);
     assert.deepStrictEqual(
       turns.map((group) => group.map((message) => message.id)),
-      [['u1', 'echo1', 'a1'], ['u2', 'echo2', 'a2']],
+      [['u1', 'a1'], ['u2', 'a2']],
+    );
+  });
+
+  it('keeps a second prompt that really is a second prompt', function () {
+    // The guard above must not be able to eat a real one. A turn whose
+    // `turn_end` never arrived — the runtime died mid-answer — is still open
+    // when the user types again, and that prompt comes from this app, under an
+    // id this app minted. It stays.
+    const crashed = [
+      { t: 'msg_start', id: 'user-11111111-2222-3333-4444-555555555555', role: 'user', turnId: 'turn-a' },
+      { t: 'block_start', msgId: 'user-11111111-2222-3333-4444-555555555555', index: 0, block: { kind: 'text', text: 'are you there' } },
+      { t: 'msg_end', msgId: 'user-11111111-2222-3333-4444-555555555555' },
+      { t: 'msg_start', id: 'user-66666666-7777-8888-9999-aaaaaaaaaaaa', role: 'user', turnId: 'turn-b' },
+      { t: 'block_start', msgId: 'user-66666666-7777-8888-9999-aaaaaaaaaaaa', index: 0, block: { kind: 'text', text: 'hello?' } },
+      { t: 'msg_end', msgId: 'user-66666666-7777-8888-9999-aaaaaaaaaaaa' },
+    ];
+    const { state } = shown(crashed);
+    assert.strictEqual(
+      state.messages.filter((message) => message.role === 'user').length,
+      2,
+      'a prompt this app minted is never an echo, however open the turn in front of it is',
     );
   });
 
@@ -206,7 +233,7 @@ describe('the turn ids a real conversation actually carries', function () {
     const { state } = shown(realTurn(1, 'first ask'));
     assert.deepStrictEqual(
       state.messages.map((message) => message.turnOutcome),
-      ['done', 'done', 'done'],
+      ['done', 'done'],
     );
   });
 

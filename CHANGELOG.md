@@ -3,6 +3,37 @@
 ## [Unreleased]
 
 ### Fixed
+- **One prompt makes one turn again** (#129). Sending a single message from the
+  composer put two identical user turns in the conversation, side by side. The
+  browser was never involved: there is one submit path, one frame on the wire,
+  and nothing optimistic anywhere in it. Both copies were written by the server.
+  `ChatSession` writes the user's message, because it is the same in every
+  protocol and a transcript missing what was asked is useless for resuming,
+  exporting or searching — and then every ACP runtime (Oh My Pi, Kimi, Grok,
+  opencode) and both codex modes wrote it *again* from inside their own send,
+  under a turn id of their own. Anything arriving inside an open turn joins that
+  turn, so the two landed together. Claude and pi never did it, which is why the
+  report came from an Oh My Pi conversation.
+
+  Those adapters no longer write one. The session now also refuses a user
+  message it did not mint itself, so this cannot come back from a new runtime:
+  only the session knows what the user actually typed — a branched conversation
+  hands the adapter the carried briefing glued in front of the prompt, and the
+  echo filed all of it as something the user had said — and only the session
+  knows whether the turn was a steer.
+
+  **Conversations recorded before this are not rewritten, and stop drawing the
+  double anyway.** The logs on disk still hold both messages and are replayed
+  every time one of those conversations is opened, so the fold happens where
+  they are read. What identifies the echo is not that it repeats — people
+  repeat themselves — but that this app did not write it: a message claiming to
+  be the user, with an id nothing here would have minted, inside a turn that
+  already carries the user's own. A real second prompt cannot be caught by that,
+  because a real one comes from the session.
+
+  The accounting has defended itself against these echoes since #86 and is
+  untouched: old logs still contain them.
+
 - **Changing the model is quiet now, like changing the effort** (#128). Every
   pick raised a box beside the composer reading "Switched to claude-sonnet for
   this conversation." It is the answer #119 deliberately left as an open
@@ -65,9 +96,6 @@
   full size, and returns itself from a hit test at its own centre. Run against
   the code before the fix, 44 of them fail.
 
-## [5.3.2] - 2026-07-29
-
-### Fixed
 - **A workflow that failed no longer reads as done** (#140). The Workflow tool
   returns the moment a run is launched — "Workflow launched in background", no
   error, four seconds before anything has happened — and that acknowledgement

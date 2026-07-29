@@ -168,6 +168,12 @@ for (const entry of RUNTIMES) {
       await flush();
     }
     await done;
+    // The user's message as the *session* writes it, because the session is the
+    // only thing that writes one — the ACP adapters used to echo it back and
+    // put a second identical bubble in the turn (#129). The codex and pi
+    // entries above have always modelled it this way; this one relied on the
+    // echo, so it is spelled out here too.
+    userTurn(emit, 'turn-1');
     // A real turn, not just a replay: `session/prompt` has to be outstanding
     // for its reply — the line carrying the turn's spend — to be delivered to
     // anything at all. Feeding the capture without it drops the one message

@@ -379,6 +379,19 @@ export class ChatSession {
    */
   private turnInFlightId: string | null = null;
   /**
+   * The user message this session wrote for the turn in flight, by id.
+   *
+   * Held so a second one, minted by the adapter, can be recognised for what it
+   * is — see `isForeignUserEcho`.
+   */
+  private ownUserMessageId: string | null = null;
+  /**
+   * Message ids an adapter tried to file a user turn under, which this session
+   * dropped. Their blocks and their end have to go the same way, or the
+   * transcript keeps orphan events pointing at a message that was never opened.
+   */
+  private readonly droppedUserEchoes = new Set<string>();
+  /**
    * Until when a `turn_end` is the runtime letting go of interrupted work
    * rather than the turn ending. Null when nothing has been interrupted.
    */
@@ -730,6 +743,47 @@ export class ChatSession {
   }
 
   /**
+   * Whether this event is an adapter writing the user's turn a second time.
+   *
+   * Every ACP runtime and both codex modes used to echo the prompt back into
+   * the transcript as a user message of their own, on top of the one `deliver`
+   * had already written — one prompt, two identical bubbles in the same turn
+   * (#129). The adapters no longer do it, and this is what stops it coming
+   * back: only `deliver` knows what the user actually typed, because a branched
+   * conversation hands the adapter the carried briefing glued in front of the
+   * prompt, and only `deliver` knows whether the turn was a steer.
+   *
+   * Narrow on purpose. It fires only while this session has a turn in flight
+   * that it has already written a user message for, and only for a message it
+   * did not mint itself — so a runtime that legitimately reports something as
+   * the user (a resumed conversation replaying its own history) is untouched.
+   * Those arrive while `replaying` is true and are dropped above anyway.
+   */
+  private isForeignUserEcho(event: AdapterEvent): boolean {
+    if (event.t === 'msg_start') {
+      if (
+        event.role !== 'user'
+        || this.turnInFlightId === null
+        || this.ownUserMessageId === null
+        || event.id === this.ownUserMessageId
+      ) {
+        return false;
+      }
+      this.droppedUserEchoes.add(event.id);
+      return true;
+    }
+    // The blocks and the end of a message that was never opened. Left in, they
+    // are events pointing at nothing, which every reader has to shrug off.
+    if (event.t === 'block_start' || event.t === 'block_delta' || event.t === 'block_end') {
+      return this.droppedUserEchoes.has(event.msgId);
+    }
+    if (event.t === 'msg_end') {
+      return this.droppedUserEchoes.has(event.msgId);
+    }
+    return false;
+  }
+
+  /**
    * Stamp, persist, broadcast.
    *
    * Ordering matters and is deliberate: the log is written before the socket
@@ -742,6 +796,10 @@ export class ChatSession {
     // does not leave a hole in its own numbering for events that were never
     // written. See `replaying`.
     if (this.replaying && REPLAYABLE.has(event.t)) {
+      return;
+    }
+
+    if (this.isForeignUserEcho(event)) {
       return;
     }
 
@@ -816,6 +874,8 @@ export class ChatSession {
         // continuation of work that had already finished — which is the count
         // going wrong in the other direction.
         this.turnInFlightId = null;
+        this.ownUserMessageId = null;
+        this.droppedUserEchoes.clear();
       }
     }
 
@@ -1576,6 +1636,10 @@ export class ChatSession {
     const messageId = `user-${crypto.randomUUID()}`;
     const turnId = continuesTurnId ?? `turn-${crypto.randomUUID()}`;
     this.turnInFlightId = turnId;
+    // Set before the ingest, because the gate that recognises an adapter's copy
+    // of this message compares against it — see `isForeignUserEcho`.
+    this.ownUserMessageId = messageId;
+    this.droppedUserEchoes.clear();
     this.ingest({
       t: 'msg_start',
       id: messageId,
