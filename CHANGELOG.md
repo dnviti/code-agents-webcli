@@ -3,6 +3,40 @@
 ## [Unreleased]
 
 ### Fixed
+- **A background workflow reads as running until the run itself ends** (#116).
+  Starting one is a quick, separate step: the request comes back almost
+  immediately with "Workflow launched in background", and the actual work — often
+  several agents across several phases — keeps going for many minutes. The app
+  took that acknowledgement for the end of the work. Within a second of a
+  workflow starting it wore a green **done** badge on its row and in its popup
+  title, no spinner, below the Finished divider, and missing from the panel's
+  running count. In a recorded run the badge flipped about a minute in and the
+  workflow then kept going for another nine, counting up through hundreds of
+  tool calls underneath it.
+
+  The receipt is a receipt now, not a result. The launching call stays running
+  and is settled by the run's own report — done, failed, or cancelled, on either
+  of the two channels the runtime uses, whichever arrives — so the row, the
+  badge, the popup title, the spinner, the trace rail and the running count all
+  say the same true thing. Cancellation was simply unreachable before; it is the
+  outcome that had no path to the screen at all.
+
+  The acknowledgement is no longer captioned as the run's final output either.
+  It says how the run was launched, which is what it is.
+
+  And a run this app can no longer watch — the process exited, the app
+  restarted — settles as interrupted rather than spinning for ever, saying in
+  its own words that it is our observation that ended and not necessarily the
+  run. That mattered less before, because the run already claimed to be
+  finished; it is load-bearing now.
+
+  The Agents row also takes its elapsed time from the run when the run reports
+  one. It used to show nothing while the popup two inches away counted up
+  through nine minutes.
+
+  Only workflows. How an ordinary delegation reports its status is untouched,
+  and there is a test that says so.
+
 - **A workflow that failed no longer reads as done** (#140). The Workflow tool
   returns the moment a run is launched — "Workflow launched in background", no
   error, four seconds before anything has happened — and that acknowledgement
