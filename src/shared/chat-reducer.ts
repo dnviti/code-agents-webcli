@@ -609,6 +609,61 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       return { messageIndex, structural: false, meta: false, applied: true };
     }
 
+    case 'workflow_failed': {
+      // The call that launched the run stops claiming success. Written onto the
+      // block rather than derived beside it, so every surface that reads a tool
+      // call's status — the Agents row, the popup title, the card on the trace
+      // rail — agrees without any of them having to know what a workflow is.
+      //
+      // `output` is left alone: for a workflow it holds the "launched in
+      // background" acknowledgement, and the popup tells the failure from the
+      // log by comparing the two (see `Header` in WorkflowPopup.tsx).
+      const located = state.toolIndex[event.parentToolId];
+      if (located) {
+        const block = state.messages[located[0]]?.blocks[located[1]];
+        if (block && block.kind === 'tool') {
+          block.status = 'failed';
+          if (event.reason) block.error = event.reason;
+        }
+      }
+
+      // And the conversation says so, in a message of its own.
+      //
+      // A message of its own because of when this arrives. A workflow outlives
+      // the turn that started it — that is what launching it in the background
+      // means — so by the time it fails there is usually nothing streaming to
+      // append to, and the `error` event's own rule (see above) drops a block
+      // it cannot find a home for. That drop is the whole second half of #140:
+      // the failure reached `lastError`, the header pill, and nowhere a person
+      // scrolling the conversation would ever find it.
+      //
+      // Filed under the turn in progress, or the last one there was, exactly as
+      // a marker is: only the newest turn is open (`isTurnOpen`), so a synthetic
+      // turn of its own would fold itself shut the moment the conversation
+      // carried on. Under the last turn it is where the reader is looking — and
+      // in the case this is written for, a run that outlived its turn, that is
+      // the open one.
+      const text = event.name
+        ? `Workflow "${event.name}" failed`
+        : 'A workflow failed';
+      const message: ChatMessage = {
+        id: `workflow-failed-${event.seq}`,
+        seq: event.seq,
+        turnId: state.currentTurnId ?? lastTurnId(state) ?? `workflow-failed-${event.seq}`,
+        role: 'system',
+        ts: event.ts,
+        blocks: [{ kind: 'error', text: event.reason ? `${text}: ${event.reason}` : `${text}.` }],
+      };
+      state.messages.push(message);
+      state.index[message.id] = state.messages.length - 1;
+      return {
+        messageIndex: state.messages.length - 1,
+        structural: true,
+        meta: true,
+        applied: true,
+      };
+    }
+
     case 'plan': {
       state.plan = event.items;
       return { messageIndex: null, structural: false, meta: true, applied: true };

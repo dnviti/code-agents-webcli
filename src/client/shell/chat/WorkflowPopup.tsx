@@ -438,11 +438,14 @@ function Progress({ summary }: { summary: WorkflowSummary }): React.JSX.Element 
 
 const PHASE_STATE: Record<
   WorkflowPhaseView['state'],
-  { label: string; variant: 'outline' | 'warning' | 'success'; color: string }
+  { label: string; variant: 'outline' | 'warning' | 'success' | 'destructive'; color: string }
 > = {
   waiting: { label: 'not started', variant: 'outline', color: 'var(--muted-foreground)' },
   running: { label: 'running', variant: 'warning', color: 'var(--warning)' },
   finished: { label: 'finished', variant: 'success', color: 'var(--success)' },
+  // A phase nothing came out of. Green "finished" over a row of red agents was
+  // the popup contradicting itself one level down from #140's own complaint.
+  failed: { label: 'failed', variant: 'destructive', color: 'var(--destructive)' },
 };
 
 /**

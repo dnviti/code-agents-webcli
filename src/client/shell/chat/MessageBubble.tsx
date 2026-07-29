@@ -140,10 +140,16 @@ export const MessageBubble = React.memo(function MessageBubble({
   const isUser = current.role === 'user';
   // A marker is not a turn: no surface, no glyph, no controls, and the full
   // width of the column — it is a line drawn across the conversation.
+  //
+  // Errors count as well as notices, because the conversation now writes one of
+  // its own: a workflow that failed after its turn was over has nothing to be
+  // appended to and gets a message to itself (#140). Given the assistant's
+  // chrome it would be an avatar and a copy button around a failure nobody
+  // said — the same misattribution the compaction rule is drawn to avoid.
   const isMarker =
     current.role === 'system'
     && current.blocks.length > 0
-    && current.blocks.every((block) => block.kind === 'notice');
+    && current.blocks.every((block) => block.kind === 'notice' || block.kind === 'error');
 
   // Derived from blocks, not from a list handed down. An events array as a prop
   // would be a new object identity every render and would defeat React.memo for
@@ -199,9 +205,13 @@ export const MessageBubble = React.memo(function MessageBubble({
   if (isMarker) {
     return (
       <div data-message-id={id} style={{ padding: '10px 14px' }}>
-        {current.blocks.map((block, i) => (
-          <NoticeRule key={i} block={block as NoticeBlock} />
-        ))}
+        {current.blocks.map((block, i) =>
+          block.kind === 'error' ? (
+            <ErrorCallout key={i} block={block} />
+          ) : (
+            <NoticeRule key={i} block={block as NoticeBlock} />
+          ),
+        )}
       </div>
     );
   }

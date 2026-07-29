@@ -59,6 +59,17 @@ export interface AgentActivity {
    */
   agentCount?: number;
   agentsRunning?: number;
+  /**
+   * How many of them failed.
+   *
+   * Kept apart from the row's own `status`, and deliberately: agents inside a
+   * workflow fail routinely and by design — `parallel()` resolves a thrown
+   * agent to `null` rather than rejecting, and a script that probes for
+   * failures expects some — so the run's own verdict owns the badge and this
+   * says what happened underneath it (#140). The same separation the transcript
+   * already makes between a step that failed and the run that survived it.
+   */
+  agentsFailed?: number;
 }
 
 /** One phase of a workflow, with the agents the run put inside it. */
@@ -69,8 +80,13 @@ export interface WorkflowPhaseView {
   /**
    * Derived from the agents, because the runtime reports a phase once and
    * never says how it ended. A phase with nothing in it has not started.
+   *
+   * `failed` is for a phase where *every* agent failed, which is the one
+   * reading of "this phase did not work" that cannot be argued with. A phase
+   * that lost two of eight is `finished` and carries the count instead — the
+   * same rule the run itself is judged by (#140).
    */
-  state: 'waiting' | 'running' | 'finished';
+  state: 'waiting' | 'running' | 'finished' | 'failed';
   failed: number;
 }
 
@@ -184,6 +200,9 @@ export function collectAgentActivity(messages: ChatMessage[]): AgentActivity[] {
         agentsRunning: inside
           ? inside.agents.filter((agent) => !SETTLED.has(agent.state)).length
           : undefined,
+        agentsFailed: inside
+          ? inside.agents.filter((agent) => agent.state === 'failed').length
+          : undefined,
       });
     }
   }
@@ -250,7 +269,13 @@ export function summarizeWorkflow(run: AgentRun | null | undefined): WorkflowSum
       if (agent.state === 'failed') view.failed += 1;
       if (!SETTLED.has(agent.state)) live = true;
     }
-    view.state = live ? 'running' : view.agents.length > 0 ? 'finished' : 'waiting';
+    view.state = live
+      ? 'running'
+      : view.agents.length === 0
+        ? 'waiting'
+        : view.failed === view.agents.length
+          ? 'failed'
+          : 'finished';
   }
 
   const ordered = order.map((key) => groups.get(key) as WorkflowPhaseView);

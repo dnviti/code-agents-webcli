@@ -851,6 +851,31 @@ export type ChatEvent =
       phases?: WorkflowPhase[];
       agents?: WorkflowAgent[];
     }
+  /**
+   * A workflow run ended badly, addressed to the call that started it.
+   *
+   * Its own event rather than an `error` or a `tool` patch, because it is one
+   * fact with three consequences and they have to happen together: the call
+   * that launched the run is no longer a success, the conversation has to say
+   * so where the person will read it, and somebody who is not looking has to be
+   * told. Sending three events would let a replay apply two of them.
+   *
+   * Raised only for the run's *own* verdict. Agents inside a workflow fail
+   * routinely and by design — `parallel()` resolves a thrown agent to `null`
+   * rather than rejecting — so a failed agent is counted (see
+   * `summarizeWorkflow`) and never announced as the run failing (#140).
+   */
+  | {
+      t: 'workflow_failed';
+      seq: number;
+      ts: number;
+      /** The tool call that launched the run. */
+      parentToolId: string;
+      /** The run's own name, when it has one. */
+      name?: string;
+      /** Why it ended, in the runtime's own words. */
+      reason?: string;
+    }
   | { t: 'plan'; seq: number; ts: number; items: PlanItem[] }
   | { t: 'usage'; seq: number; ts: number; usage: ChatUsage }
   | { t: 'permission'; seq: number; ts: number; request: PermissionRequest }

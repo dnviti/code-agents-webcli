@@ -24,16 +24,27 @@ const { collectAgentActivity, summarizeWorkflow } = require('../dist/shared/agen
 
 const FIXTURE = path.join(__dirname, 'fixtures', 'chat', 'claude-workflow.jsonl');
 
-function readFixture() {
+/**
+ * A second recording, of a run that failed outright (#140).
+ *
+ * Captured the same way, by `.work/probes/workflow-failure-probe.mjs`: two
+ * agents on a model that does not exist, and then a `throw` in the script
+ * itself, so one run holds both "everything inside it broke" and "it broke".
+ * The run it records reported `task_updated {status:"failed"}` — and its
+ * launching tool call still reported success, which is the bug.
+ */
+const FAILED_FIXTURE = path.join(__dirname, 'fixtures', 'chat', 'claude-workflow-failed.jsonl');
+
+function readFixture(file = FIXTURE) {
   return fs
-    .readFileSync(FIXTURE, 'utf8')
+    .readFileSync(file, 'utf8')
     .split('\n')
     .filter(Boolean)
     .map((line) => JSON.parse(line));
 }
 
 /** Replay the recording through the adapter, stopping after `lines` of it. */
-function replay(lines = Infinity) {
+function replay(lines = Infinity, file = FIXTURE) {
   const events = [];
   const adapter = new ClaudeChatAdapter({
     sessionId: 'app-session-1',
@@ -41,7 +52,7 @@ function replay(lines = Infinity) {
     command: 'claude',
     emit: (event) => events.push(event),
   });
-  readFixture()
+  readFixture(file)
     .slice(0, lines === Infinity ? undefined : lines)
     .forEach((message) => adapter.handleMessage(message));
   return events;
@@ -49,7 +60,9 @@ function replay(lines = Infinity) {
 
 function transcriptOf(events) {
   const state = createTranscript({});
-  events.forEach((event, index) => applyChatEvent(state, { ...event, seq: index + 1 }));
+  events.forEach((event, index) =>
+    applyChatEvent(state, { ts: 1_000 + index, ...event, seq: index + 1 }),
+  );
   return state;
 }
 
@@ -372,6 +385,262 @@ describe('a workflow reports its phases and its agents (#117)', function () {
       const [entry] = collectAgentActivity(state.messages);
       assert.strictEqual(entry.agentCount, undefined, 'a sub-agent was given a count of its contents');
       assert.strictEqual(entry.agentsRunning, undefined, 'a sub-agent was given a running count');
+    });
+  });
+});
+
+/**
+ * Issue #140: a workflow that failed reads as failed, and says so in the chat.
+ *
+ * Driven by the two recordings together, because the bug is only visible in the
+ * difference between them. Both runs end with the *same* launching tool result
+ * — "Workflow launched in background", no error, four seconds before anything
+ * happened — so nothing about the call that started them can tell them apart.
+ * One went on to report `task_updated {status:"failed"}` and one did not, and
+ * that is the only place the outcome is written down.
+ *
+ * The second recording is also the control the first one needs: a run that
+ * *succeeded* with one of its five agents dead. Agents inside a workflow fail
+ * by design — `parallel()` resolves a thrown agent to `null` rather than
+ * rejecting — so that run must still read as done, or the fix has traded a
+ * missed failure for an invented one.
+ */
+describe('a workflow that failed reads as failed (#140)', function () {
+  const failedEvents = () => replay(Infinity, FAILED_FIXTURE);
+
+  describe('the adapter, against a recorded failure', function () {
+    it('announces the failure the run reported', function () {
+      const announced = failedEvents().filter((event) => event.t === 'workflow_failed');
+
+      assert.strictEqual(announced.length, 1, 'the run failing was announced once, or not at all');
+      assert.strictEqual(
+        announced[0].name,
+        'probe-workflow-failure',
+        'the failure does not name the run it belongs to',
+      );
+      assert.match(
+        announced[0].reason || '',
+        /forced workflow failure/,
+        'the runtime’s own reason did not survive',
+      );
+    });
+
+    it('announces it once, though the runtime says it twice', function () {
+      // The capture carries the verdict on both `task_updated` (with the raw
+      // error) and `task_notification` (with a sentence). One failure.
+      const raw = readFixture(FAILED_FIXTURE);
+      const said = raw.filter(
+        (line) =>
+          (line.subtype === 'task_updated' && line.patch && line.patch.status === 'failed')
+          || (line.subtype === 'task_notification' && line.status === 'failed'),
+      );
+
+      assert.strictEqual(said.length, 2, 'the recording no longer reports the failure twice');
+      assert.strictEqual(
+        failedEvents().filter((event) => event.t === 'workflow_failed').length,
+        1,
+        'two reports of one failure became two failures',
+      );
+    });
+
+    it('says nothing about a run that finished, whatever happened inside it', function () {
+      assert.deepStrictEqual(
+        replay().filter((event) => event.t === 'workflow_failed'),
+        [],
+        'a run that reported success was announced as failed',
+      );
+    });
+
+    it('leaves an ordinary delegation alone', function () {
+      // A plain sub-agent reports on the same channel and can fail the same
+      // way. How it reports is #140's explicit non-goal, so nothing here may
+      // reach it — the guard is `task_type`, said once at `task_started`.
+      const events = [];
+      const adapter = new ClaudeChatAdapter({
+        sessionId: 'app-session-1',
+        workingDir: '/tmp',
+        command: 'claude',
+        emit: (event) => events.push(event),
+      });
+      adapter.handleMessage({
+        type: 'system',
+        subtype: 'task_started',
+        task_id: 'k1',
+        tool_use_id: 'toolu_sub',
+        task_type: 'local_agent',
+        prompt: 'look around',
+      });
+      adapter.handleMessage({
+        type: 'system',
+        subtype: 'task_updated',
+        task_id: 'k1',
+        patch: { status: 'failed', error: 'the sub-agent broke' },
+      });
+
+      assert.deepStrictEqual(
+        events.filter((event) => event.t === 'workflow_failed'),
+        [],
+        'a sub-agent failing was announced as a workflow failure',
+      );
+      const progress = events.filter((event) => event.t === 'agent_progress');
+      assert.strictEqual(
+        progress[progress.length - 1].patch.status,
+        'failed',
+        'the sub-agent’s own run no longer records that it failed',
+      );
+    });
+  });
+
+  describe('the transcript', function () {
+    it('stops the launching call claiming success', function () {
+      const block = workflowBlock(transcriptOf(failedEvents()));
+
+      assert.strictEqual(block.status, 'failed', 'the failed run’s tool call still reads as done');
+      assert.match(
+        block.error || '',
+        /forced workflow failure/,
+        'the tool call does not carry the reason it failed',
+      );
+      assert.match(
+        block.output || '',
+        /launched in background/,
+        'the launch acknowledgement was overwritten; the popup tells them apart',
+      );
+    });
+
+    it('tells the conversation, in a message of its own', function () {
+      const state = transcriptOf(failedEvents());
+      const notices = state.messages.filter(
+        (message) =>
+          message.role === 'system' && message.blocks.some((block) => block.kind === 'error'),
+      );
+
+      assert.strictEqual(notices.length, 1, 'the chat was not told the workflow failed');
+      const [notice] = notices;
+      assert.match(
+        notice.blocks[0].text,
+        /Workflow "probe-workflow-failure" failed/,
+        'the notice does not say which workflow failed',
+      );
+      assert.match(
+        notice.blocks[0].text,
+        /forced workflow failure/,
+        'the notice does not say why it failed',
+      );
+      // Filed under a real turn rather than one of its own: only the newest
+      // turn is open, so a synthetic turn would fold itself shut behind the
+      // next thing anybody said.
+      assert.ok(
+        state.messages.some((message) => message !== notice && message.turnId === notice.turnId),
+        'the failure was filed under a turn of its own, which folds itself shut',
+      );
+    });
+
+    it('lands even when no message is streaming', function () {
+      // The case the issue is actually about: a long background workflow that
+      // fails after its turn is over. Nothing is open to append to.
+      const state = createTranscript({});
+      applyChatEvent(state, { t: 'msg_start', seq: 1, ts: 1, id: 'm1', role: 'assistant', turnId: 't1' });
+      applyChatEvent(state, {
+        t: 'block_start',
+        seq: 2,
+        ts: 2,
+        msgId: 'm1',
+        index: 0,
+        block: { kind: 'tool', toolId: 'w1', name: 'Workflow', toolKind: 'task', status: 'completed' },
+      });
+      applyChatEvent(state, { t: 'msg_end', seq: 3, ts: 3, msgId: 'm1' });
+      applyChatEvent(state, { t: 'turn_end', seq: 4, ts: 4, turnId: 't1', stopReason: 'end_turn' });
+      applyChatEvent(state, {
+        t: 'workflow_failed',
+        seq: 5,
+        ts: 5,
+        parentToolId: 'w1',
+        name: 'nightly-audit',
+        reason: 'usage limit reached',
+      });
+
+      const last = state.messages[state.messages.length - 1];
+      assert.strictEqual(last.role, 'system', 'nothing was added to the transcript');
+      assert.strictEqual(
+        last.blocks[0].text,
+        'Workflow "nightly-audit" failed: usage limit reached',
+        'the failure reason did not reach the conversation',
+      );
+      // Under the turn that has ended, which is the one still open on screen —
+      // a turn of its own would fold itself shut.
+      assert.strictEqual(
+        last.turnId,
+        't1',
+        'the failure was not filed under the last turn, so nothing shows it',
+      );
+      assert.strictEqual(
+        workflowBlock(state).status,
+        'failed',
+        'the tool call was left reading as done',
+      );
+    });
+  });
+
+  describe('the Agents list', function () {
+    it('shows a failed run as failed', function () {
+      const [entry] = collectAgentActivity(transcriptOf(failedEvents()).messages);
+
+      assert.strictEqual(entry.status, 'failed', 'the row still reads done');
+      assert.strictEqual(entry.running, false, 'a finished run is still counted as work in flight');
+      assert.strictEqual(entry.agentsFailed, 2, 'the row does not say how many agents failed');
+    });
+
+    it('still shows a run that finished as done, and counts what died inside it', function () {
+      const [entry] = collectAgentActivity(transcriptOf(replay()).messages);
+
+      assert.strictEqual(entry.status, 'completed', 'a run that succeeded was marked failed');
+      assert.strictEqual(entry.agentsFailed, 1, 'the agent that failed inside it was not counted');
+    });
+
+    it('leaves a plain sub-agent without a failure count', function () {
+      const state = createTranscript({});
+      applyChatEvent(state, { t: 'msg_start', seq: 1, ts: 1, id: 'm1', role: 'assistant', turnId: 't1' });
+      applyChatEvent(state, {
+        t: 'block_start',
+        seq: 2,
+        ts: 2,
+        msgId: 'm1',
+        index: 0,
+        block: {
+          kind: 'tool',
+          toolId: 'a1',
+          name: 'Agent',
+          toolKind: 'task',
+          status: 'failed',
+          input: { subagent_type: 'Explore' },
+        },
+      });
+
+      const [entry] = collectAgentActivity(state.messages);
+      assert.strictEqual(entry.agentsFailed, undefined, 'a sub-agent was given a count of failures');
+    });
+  });
+
+  describe('the phases inside it', function () {
+    it('marks a phase nothing came out of as failed', function () {
+      const summary = summarizeWorkflow(workflowBlock(transcriptOf(failedEvents())).agent);
+
+      assert.deepStrictEqual(
+        summary.phases.map((view) => [view.phase && view.phase.title, view.state, view.failed]),
+        [['Fail', 'failed', 2]],
+        'a phase whose every agent failed did not read as failed',
+      );
+    });
+
+    it('leaves a phase that lost one of two as finished', function () {
+      const summary = summarizeWorkflow(workflowBlock(transcriptOf(replay())).agent);
+
+      assert.deepStrictEqual(
+        summary.phases.map((view) => [view.phase && view.phase.title, view.state, view.failed]),
+        [['Collect', 'finished', 0], ['Check', 'finished', 1]],
+        'a phase that produced a result was marked failed for losing an agent',
+      );
     });
   });
 });

@@ -52,6 +52,15 @@ import { TerminalSplit } from '../../src/client/shell/chat/TerminalSplit';
  */
 import RECORDED_WORKFLOW from './workflow-events.json';
 
+/**
+ * A real workflow run that failed, likewise.
+ *
+ * Generated from test/fixtures/chat/claude-workflow-failed.jsonl by the same
+ * replay in test/browser/run.js. Its counterpart above is the control: that run
+ * finished, with one of its five agents dead, and must go on reading as done.
+ */
+import RECORDED_FAILED_WORKFLOW from './workflow-failed-events.json';
+
 const results: string[] = [];
 const check = (name: string, ok: boolean, detail = ''): void => {
   results.push(`${ok ? 'PASS' : 'FAIL'} :: ${name}${detail ? ` :: ${detail}` : ''}`);
@@ -255,6 +264,7 @@ async function run(): Promise<void> {
   await checkAWorkflowPopupBehavesLikeTheFilePopup();
   await checkARunningWorkflowSaysWhatItIsDoing();
   await checkAWorkflowShowsItsPhasesAndItsAgents();
+  await checkAFailedWorkflowReadsAsFailedEverywhere();
   await checkAnAgentPopupShowsWhatTheAgentIsDoing();
   await checkATallDialogStaysOnScreen();
   await checkTheComposerShrinksWithTheWorkspaceRail();
@@ -1055,6 +1065,171 @@ async function checkAWorkflowShowsItsPhasesAndItsAgents(): Promise<void> {
 
   phoneRoot.unmount();
   frame.remove();
+}
+
+/**
+ * Issue #140: a workflow that failed looks failed everywhere it appears, and
+ * the conversation says so without anybody opening anything.
+ *
+ * Both recordings are replayed, because the whole bug lives in the difference
+ * between them and a check driven by one alone would pass on code that painted
+ * every workflow red. They end with the same launching tool result — "Workflow
+ * launched in background", no error — and differ only in what the run said
+ * about itself afterwards.
+ *
+ * The colours are read off the layout engine rather than assumed from the
+ * label: "failed" written in `var(--success)` would satisfy a textContent check
+ * and still be a green badge on a broken run.
+ */
+async function checkAFailedWorkflowReadsAsFailedEverywhere(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1100px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const mount = (
+    id: string,
+    events: Array<Record<string, unknown>>,
+  ): { root: ReturnType<typeof createRoot>; play: (rest: Array<Record<string, unknown>>) => void } => {
+    const controller = new ChatController(id, { send: () => {} });
+    let seq = 1;
+    const play = (batch: Array<Record<string, unknown>>): void => {
+      for (const event of batch) {
+        controller.transcript.apply({ ts: seq, ...event, seq: seq++ } as never);
+      }
+    };
+    play(events);
+    const root = createRoot(host);
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/tmp/project',
+        view: { ...DEFAULT_CHAT_VIEW, panelOpen: true, panelTab: 'agents', panelWidth: 420 },
+        onViewChange: () => {},
+      } as never),
+    );
+    return { root, play };
+  };
+
+  // Cut where the run reported that it had failed, and mount there: that is the
+  // moment somebody watching the conversation is being told, and the turn it
+  // lands in is the one still open. Everything after it is played in below,
+  // with the view already on screen.
+  const failedAt = RECORDED_FAILED_WORKFLOW.findIndex(
+    (event) => (event as { t?: string }).t === 'workflow_failed',
+  );
+  check('the recording still holds a run that failed', failedAt >= 0);
+  const { root, play } = mount(
+    'workflow-failed-check',
+    RECORDED_FAILED_WORKFLOW.slice(0, failedAt + 1),
+  );
+  await wait(220);
+  settle(document);
+
+  const rail = host.querySelector('aside[aria-label="Workspace"]') as HTMLElement | null;
+  const railText = rail?.textContent ?? '';
+  check(
+    'the agents list says the failed workflow failed',
+    /failed/.test(railText) && !/\bdone\b/.test(railText),
+    railText.slice(0, 160),
+  );
+  check(
+    'the row says how many of its agents died',
+    /2 failed/.test(railText),
+    railText.slice(0, 160),
+  );
+
+  // The badge's colour, from the engine. `--destructive` and `--success` are
+  // different variables and this is the one thing a label cannot prove.
+  const badge = [...(rail?.querySelectorAll('span') ?? [])].find(
+    (el) => el.textContent?.trim() === 'failed' && isPainted(el),
+  ) as HTMLElement | undefined;
+  check('the failed badge is painted', !!badge);
+  const badgeColour = badge ? getComputedStyle(badge).color : '';
+  // Resolved by the engine rather than read off the custom property: the token
+  // is authored in oklch and computes to rgb, so comparing the two as strings
+  // would fail against a badge that is exactly right.
+  const swatch = (token: string): string => {
+    const probe = document.createElement('span');
+    probe.style.color = `var(${token})`;
+    document.body.appendChild(probe);
+    const resolved = getComputedStyle(probe).color;
+    probe.remove();
+    return resolved;
+  };
+  const destructive = swatch('--destructive');
+  const success = swatch('--success');
+  check(
+    'the failed badge is drawn in the destructive colour, not the success one',
+    !!badgeColour && badgeColour === destructive && badgeColour !== success,
+    `${badgeColour} — destructive ${destructive}, success ${success}`,
+  );
+
+  // The chat itself, which is the half of #140 that had no surface at all.
+  const transcriptText = host.querySelector('[role="log"]')?.textContent ?? '';
+  check(
+    'the conversation says the workflow failed, without opening anything',
+    /Workflow "probe-workflow-failure" failed/.test(transcriptText),
+    transcriptText.replace(/\s+/g, ' ').slice(0, 220),
+  );
+  check(
+    'the conversation says why it failed',
+    /forced workflow failure/.test(transcriptText),
+  );
+
+  // The rest of the run, so what follows is judged on a settled conversation
+  // rather than on one caught mid-report.
+  play(RECORDED_FAILED_WORKFLOW.slice(failedAt + 1));
+  await wait(120);
+  settle(document);
+
+  // And the popup's title, which read "done" over a run that had died.
+  (rail?.querySelector('[role="button"]') as HTMLElement | null)?.click();
+  await wait(80);
+  const panel = document.querySelector('[role="dialog"]') as HTMLElement | null;
+  check('the failed workflow still opens', !!panel);
+  const title = panel?.querySelector('h2, [role="heading"]') ?? panel;
+  check(
+    'the popup title badge reads failed',
+    /failed/.test(title?.textContent ?? '') && !/\bdone\b/.test(title?.textContent ?? ''),
+    (title?.textContent ?? '').slice(0, 120),
+  );
+  check(
+    'a phase whose every agent died does not read as finished',
+    !/finished/.test(panel?.textContent ?? ''),
+    (panel?.textContent ?? '').slice(0, 160),
+  );
+
+  root.unmount();
+  host.innerHTML = '';
+
+  // The control: a run that finished, with one of its five agents dead. It must
+  // still read as done, or the fix has traded a missed failure for an invented
+  // one — agents inside a workflow fail by design.
+  const control = mount('workflow-done-check', RECORDED_WORKFLOW);
+  await wait(220);
+  settle(document);
+  const controlRail = host.querySelector('aside[aria-label="Workspace"]') as HTMLElement | null;
+  const controlText = controlRail?.textContent ?? '';
+  check(
+    'a workflow that finished still reads as done',
+    /done/.test(controlText),
+    controlText.slice(0, 160),
+  );
+  check(
+    'and still says the one agent that died inside it did',
+    /1 failed/.test(controlText),
+    controlText.slice(0, 160),
+  );
+  const controlTranscript = host.querySelector('[role="log"]')?.textContent ?? '';
+  check(
+    'a workflow that finished raises no failure in the chat',
+    !/Workflow ".*" failed/.test(controlTranscript),
+  );
+
+  control.root.unmount();
+  host.remove();
 }
 
 /**

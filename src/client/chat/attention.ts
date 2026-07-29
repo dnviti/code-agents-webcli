@@ -40,7 +40,7 @@ export function noteChatEvent(app: App, sessionId: string, event: ChatEvent): vo
   const alert = alertForEvent(event);
 
   if (alert) {
-    announce(app, sessionId, alert.kind, alert.detail);
+    announce(app, sessionId, alert.kind, alert.detail, alert.subject);
   } else if (endsAlert(event)) {
     // The conversation is moving again, or somebody answered it — possibly on
     // another device. A notification still sitting in the tray is now a lie.
@@ -120,6 +120,7 @@ function announce(
   sessionId: string,
   kind: 'finished' | 'failed' | 'approval' | 'question',
   detail: string | undefined,
+  subject?: string,
 ): void {
   // A conversation with no tab cannot be opened by the notification, and
   // nothing will ever arrive to end it — its events stopped when the tab
@@ -143,6 +144,7 @@ function announce(
       kind,
       name: app.sessionTabManager?.conversationLabel(sessionId) ?? 'Conversation',
       detail,
+      subject,
     },
     settings.details,
   );

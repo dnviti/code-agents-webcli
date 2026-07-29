@@ -168,6 +168,19 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
    */
   private readonly tasksByTaskId = new Map<string, string>();
   /**
+   * The `tool_use_id` of every task that is a *workflow*, and the run's name.
+   *
+   * A workflow and a plain sub-agent arrive on the same channel and differ only
+   * by the `task_type` on the report that opens them, which is why this is
+   * remembered rather than looked for later: the report that says the run
+   * failed does not say what kind of run it was. Only workflows settle their
+   * launching tool call from this channel — how an ordinary delegation reports
+   * its status is deliberately untouched (#140).
+   */
+  private readonly workflowTasks = new Map<string, string | undefined>();
+  /** Workflows already announced as failed, so a second report is not a second failure. */
+  private readonly failedWorkflows = new Set<string>();
+  /**
    * The `/effort` turn in flight, or null when none is.
    *
    * Set for the few milliseconds between writing the command and the `result`
@@ -532,7 +545,12 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       });
       return;
     }
-    if (subtype === 'task_started' || subtype === 'task_progress' || subtype === 'task_updated') {
+    if (
+      subtype === 'task_started'
+      || subtype === 'task_progress'
+      || subtype === 'task_updated'
+      || subtype === 'task_notification'
+    ) {
       this.handleTask(subtype, raw);
       return;
     }
@@ -572,6 +590,11 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
    * `task_updated` carries only its own `task_id`, so the id seen at start is
    * remembered to route the closing patch. Without that the run would never be
    * marked finished and its detail view would claim it was still working.
+   *
+   * `task_notification` is the run's last word — a status and a sentence about
+   * how it went, on the same `tool_use_id`. It used to be dropped with the
+   * hooks and the other session plumbing, which is why a workflow could fail
+   * and say so nowhere (#140).
    */
   private handleTask(subtype: string, raw: Record<string, unknown>): void {
     const taskId = str(raw.task_id);
@@ -579,6 +602,25 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     if (direct && taskId) this.tasksByTaskId.set(taskId, direct);
     const parentToolId = direct ?? (taskId ? this.tasksByTaskId.get(taskId) : undefined);
     if (!parentToolId) return;
+
+    // `local_workflow` is the only thing that separates a workflow from an
+    // ordinary delegation here, and it is said once, on the report that opens
+    // the run. See `workflowTasks`.
+    if (subtype === 'task_started' && str(raw.task_type) === 'local_workflow') {
+      this.workflowTasks.set(parentToolId, str(raw.workflow_name));
+    }
+
+    if (subtype === 'task_notification') {
+      // The summary is the runtime's own sentence about the run — "Dynamic
+      // workflow "x" failed: ..." — and it is the better of the two failure
+      // texts on offer, so it wins where both arrive. Announced from here as
+      // well as from `task_updated` because either can be the one that lands:
+      // `announceWorkflowFailure` keeps the second from being a second failure.
+      if (str(raw.status) === 'failed') {
+        this.announceWorkflowFailure(parentToolId, str(raw.summary));
+      }
+      return;
+    }
 
     if (subtype === 'task_updated') {
       const patch = record(raw.patch);
@@ -588,6 +630,9 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
         parentToolId,
         patch: { status: status ? toolStatus(status) : undefined, error: str(patch?.error) },
       });
+      if (status && toolStatus(status) === 'failed') {
+        this.announceWorkflowFailure(parentToolId, str(patch?.error));
+      }
       return;
     }
 
@@ -614,6 +659,32 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     });
 
     this.emitWorkflowProgress(parentToolId, raw.workflow_progress);
+  }
+
+  /**
+   * A workflow run failed, said once and out loud.
+   *
+   * Only for a workflow. An ordinary delegation that fails is already reported
+   * by the tool result that closes it, and how it reports is out of #140's
+   * scope — where a workflow's launching call closes on the *launch*, four
+   * seconds and an entire run before there is anything to be right about.
+   *
+   * Both halves of the runtime's terminal report can reach here — the
+   * `task_updated` patch, which carries the raw error, and the
+   * `task_notification`, which carries a sentence — and in the captured run
+   * both do. The first one wins and the second is dropped: they describe one
+   * failure, and two would read as two.
+   */
+  private announceWorkflowFailure(parentToolId: string, reason: string | undefined): void {
+    if (!this.workflowTasks.has(parentToolId)) return;
+    if (this.failedWorkflows.has(parentToolId)) return;
+    this.failedWorkflows.add(parentToolId);
+    this.emit({
+      t: 'workflow_failed',
+      parentToolId,
+      name: this.workflowTasks.get(parentToolId),
+      reason,
+    });
   }
 
   /**
@@ -1349,6 +1420,11 @@ function toolStatus(value: string): ToolStatus {
       return 'failed';
     case 'canceled':
     case 'cancelled':
+    // A background task's own two words for being stopped. Without them a run
+    // the user killed maps to the `running` default below and its detail view
+    // waits for it forever.
+    case 'killed':
+    case 'stopped':
       return 'canceled';
     case 'denied':
       return 'denied';

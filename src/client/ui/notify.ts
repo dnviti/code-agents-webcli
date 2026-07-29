@@ -60,6 +60,8 @@ export interface RaisedAlert {
   name: string;
   /** The command being approved, the question asked, the error. */
   detail?: string;
+  /** What failed, when it was not the turn itself. See `ChatAlert.subject`. */
+  subject?: string;
 }
 
 /** Alerts raised and not yet acted on, oldest first — `Map` keeps insertion order. */
@@ -287,8 +289,13 @@ function describe(alert: RaisedAlert): string {
       return detail ? `Waiting for approval — ${detail}` : 'Waiting for approval.';
     case 'question':
       return detail ? `Asked you: ${detail}` : 'Asked you a question.';
-    case 'failed':
-      return detail ? `The turn failed — ${detail}` : 'The turn failed.';
+    case 'failed': {
+      // Named where the thing that failed is not the turn: a background
+      // workflow's turn ended cleanly and some time ago, and telling somebody
+      // "the turn failed" would send them looking at the wrong thing (#140).
+      const what = alert.subject ? `${alert.subject} failed` : 'The turn failed';
+      return detail ? `${what} — ${detail}` : `${what}.`;
+    }
     default:
       return 'Finished, and ready for what is next.';
   }

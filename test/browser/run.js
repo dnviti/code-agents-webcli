@@ -33,25 +33,40 @@ if (!fs.existsSync(path.join(dir, '..', '..', 'dist', 'public', 'css', 'componen
 //
 // Derived here rather than written into checks.ts, because a check driven by
 // events someone typed out proves the component agrees with that person. The
-// recording is test/fixtures/chat/claude-workflow.jsonl — a real two-phase run
-// captured off the wire — and this replays it through the adapter that would
-// have carried it, so the browser gets exactly what a browser would have got.
-// Generated on every run, so it can never drift from either end.
+// recordings are real runs captured off the wire, and this replays each one
+// through the adapter that would have carried it, so the browser gets exactly
+// what a browser would have got. Generated on every run, so they can never
+// drift from either end.
+//
+// Two of them. `claude-workflow.jsonl` is a run that finished, with one agent
+// inside it failing; `claude-workflow-failed.jsonl` is a run that failed
+// outright after every agent inside it failed. Both were reported to the user
+// as a green "done" before #140.
 {
   const { ClaudeChatAdapter } = require('../../dist/server/chat/adapters/claude.js');
-  const events = [];
-  const adapter = new ClaudeChatAdapter({
-    sessionId: 'browser-check',
-    workingDir: '/tmp',
-    command: 'claude',
-    emit: (event) => events.push(event),
-  });
-  fs.readFileSync(path.join(dir, '..', 'fixtures', 'chat', 'claude-workflow.jsonl'), 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line))
-    .forEach((message) => adapter.handleMessage(message));
-  fs.writeFileSync(path.join(dir, 'workflow-events.json'), JSON.stringify(events));
+  const replay = (fixture) => {
+    const events = [];
+    const adapter = new ClaudeChatAdapter({
+      sessionId: 'browser-check',
+      workingDir: '/tmp',
+      command: 'claude',
+      emit: (event) => events.push(event),
+    });
+    fs.readFileSync(path.join(dir, '..', 'fixtures', 'chat', fixture), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .forEach((message) => adapter.handleMessage(message));
+    return events;
+  };
+  fs.writeFileSync(
+    path.join(dir, 'workflow-events.json'),
+    JSON.stringify(replay('claude-workflow.jsonl')),
+  );
+  fs.writeFileSync(
+    path.join(dir, 'workflow-failed-events.json'),
+    JSON.stringify(replay('claude-workflow-failed.jsonl')),
+  );
 }
 
 // The esbuild `bin` entry is a native executable, not a script: use the API.

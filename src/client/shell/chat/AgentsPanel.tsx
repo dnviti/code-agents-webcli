@@ -181,6 +181,21 @@ function ActivityRow({
                 : `${entry.agentCount} agents`}
             </span>
           ) : null}
+          {/* What went wrong underneath, which the badge above deliberately does
+              not say: a run can return a perfectly good result with two of its
+              twelve agents dead, and a red badge over that would be crying wolf
+              (#140). Its own span so the count is red while the rest is not. */}
+          {entry.agentsFailed ? (
+            <span
+              style={{
+                fontFamily: 'var(--font-mono)',
+                fontSize: 'var(--text-2xs)',
+                color: 'var(--destructive)',
+              }}
+            >
+              {`${entry.agentsFailed} failed`}
+            </span>
+          ) : null}
           {entry.durationMs !== undefined ? (
             <span
               style={{
