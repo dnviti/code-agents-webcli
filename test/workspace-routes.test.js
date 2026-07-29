@@ -17,6 +17,15 @@ let repo;
 let server;
 let base;
 let sessions;
+/**
+ * The two account inputs the status route takes, swapped per test.
+ *
+ * Held here rather than passed per-request because the app is built once in
+ * `before`; the route reads them through the closures below on every call.
+ */
+let cachedClaudeAccount = null;
+let burnResult = null;
+let burnCalls = [];
 
 const USER = { id: 7, githubId: '1', githubLogin: 'tester', githubName: null, avatarUrl: null, email: null };
 
@@ -96,6 +105,11 @@ before(function () {
         const ok = resolved === base || resolved.startsWith(base + path.sep);
         return ok ? { valid: true, path: resolved } : { valid: false, error: 'outside' };
       },
+      readCachedClaudeAccount: () => cachedClaudeAccount,
+      usageBurn: (userId, agent, hours) => {
+        burnCalls.push({ userId, agent, hours });
+        return burnResult;
+      },
     }),
   );
 
@@ -115,6 +129,86 @@ after(function () {
 
 describe('workspace routes', function () {
   this.timeout(20000);
+
+  /**
+   * Issue #137. What this route must NOT answer with is as much of the point as
+   * what it does: it used to serve a plan name that was a CLI flag's default, a
+   * token/cost/message allowance out of a table written into this repository,
+   * and a "session stats" figure scanned from every Claude Code transcript on
+   * the host.
+   */
+  describe('status', function () {
+    beforeEach(function () {
+      cachedClaudeAccount = null;
+      burnResult = null;
+      burnCalls = [];
+      sessions.get('session-1').agent = null;
+      sessions.get('session-1').lastAgent = null;
+    });
+
+    it('serves no plan, no limits table and no predictions', async function () {
+      const { status, body } = await get('/api/workspace/session-1/status');
+      assert.strictEqual(status, 200);
+      assert.ok(!('plan' in body), JSON.stringify(body));
+      const serialised = JSON.stringify(body);
+      for (const invented of ['max20', '220000', '188026', 'minutesToDepletion', 'sessionStats']) {
+        assert.ok(!serialised.includes(invented), `${invented} is still being served`);
+      }
+    });
+
+    it('names what the runtime will report, per runtime', async function () {
+      sessions.get('session-1').agent = 'kimi';
+      const kimi = (await get('/api/workspace/session-1/status')).body;
+      assert.strictEqual(kimi.account.runtime, 'kimi');
+      assert.match(kimi.account.reporting, /reports nothing about an account/i);
+
+      sessions.get('session-1').agent = 'claude';
+      const claude = (await get('/api/workspace/session-1/status')).body;
+      assert.match(claude.account.reporting, /never states a token, message or dollar allowance/i);
+      assert.notStrictEqual(claude.account.reporting, kimi.account.reporting);
+    });
+
+    it('offers the CLI cache for claude only', async function () {
+      cachedClaudeAccount = {
+        planName: 'claude max 20x',
+        windows: [{ kind: 'five_hour', utilization: 0.46, resetsAt: '2026-07-29T16:00:00.000Z' }],
+        asOf: '2026-07-29T09:00:00.000Z',
+      };
+
+      sessions.get('session-1').agent = 'claude';
+      const claude = (await get('/api/workspace/session-1/status')).body;
+      assert.strictEqual(claude.account.cached.planName, 'claude max 20x');
+
+      // Codex has its own account and its own protocol channel; handing it
+      // Claude's numbers is exactly the confusion this issue is about.
+      sessions.get('session-1').agent = 'codex';
+      const codex = (await get('/api/workspace/session-1/status')).body;
+      assert.strictEqual(codex.account.cached, null);
+    });
+
+    it('measures burn for the signed-in user on this agent alone', async function () {
+      sessions.get('session-1').agent = 'codex';
+      burnResult = { from: 'a', to: 'b', hours: 24, totals: { turns: 3 } };
+      const body = (await get('/api/workspace/session-1/status')).body;
+
+      assert.deepStrictEqual(burnCalls, [{ userId: 7, agent: 'codex', hours: 24 }]);
+      assert.strictEqual(body.account.measured.totals.turns, 3);
+    });
+
+    it('reports nothing measured rather than zero when no store is wired', async function () {
+      sessions.get('session-1').agent = 'claude';
+      burnResult = null;
+      const body = (await get('/api/workspace/session-1/status')).body;
+      assert.strictEqual(body.account.measured, null);
+    });
+
+    it('still answers for a session that has never run anything', async function () {
+      const body = (await get('/api/workspace/session-1/status')).body;
+      assert.strictEqual(body.account.runtime, null);
+      assert.ok(body.account.reporting.length > 0);
+      assert.strictEqual(body.account.cached, null);
+    });
+  });
 
   describe('raw', function () {
     const PNG = Buffer.from(

@@ -107,6 +107,17 @@ export interface WorkflowSummary {
 }
 
 const WORKFLOW_PATTERN = /workflow/i;
+
+/**
+ * Whether this call launched a workflow run.
+ *
+ * Exported so the reducer can find the runs left in flight when the app stops
+ * being able to observe them (#116). Two ways of knowing, and either is
+ * enough: the tool's name, and the run having reported phases of its own.
+ */
+export function isWorkflowLaunch(name: string, hasWorkflowRun: boolean): boolean {
+  return hasWorkflowRun || WORKFLOW_PATTERN.test(String(name || '').trim());
+}
 /**
  * `Agent` and `Task` are the two names the CLIs in this app use for "run a
  * subagent". Anchored rather than substring-matched: `TaskList`, `TodoWrite`
@@ -115,12 +126,24 @@ const WORKFLOW_PATTERN = /workflow/i;
  */
 const AGENT_PATTERN = /^(agent|task|subagent|dispatch_agent|run_agent)$/i;
 
-const TERMINAL: ReadonlySet<ToolStatus> = new Set<ToolStatus>([
+/**
+ * The statuses that mean a call is over.
+ *
+ * Exported because the adapters need the same answer: a workflow's launching
+ * call is settled by the run's own report, and "is this report a terminal one"
+ * has to be the same question there as it is here (#116).
+ */
+export const TERMINAL_TOOL: ReadonlySet<ToolStatus> = new Set<ToolStatus>([
   'completed',
   'failed',
   'denied',
   'canceled',
+  // Over, whatever happened to it. A call nothing will ever report on again is
+  // not still working, so it leaves the running group and the count (#139).
+  'unknown',
 ]);
+
+const TERMINAL = TERMINAL_TOOL;
 
 function classify(name: string): AgentActivityKind | null {
   const trimmed = String(name || '').trim();
@@ -196,7 +219,11 @@ export function collectAgentActivity(messages: ChatMessage[]): AgentActivity[] {
         description: describe(block, input),
         status: block.status,
         startedAt: message.ts,
-        durationMs: block.durationMs,
+        // The run's own elapsed time when it reports one. A workflow's
+        // launching call has no duration of its own — it returned in seconds —
+        // so the row showed nothing while its popup counted up through nine
+        // minutes, which is two answers to one question (#116).
+        durationMs: block.agent?.durationMs ?? block.durationMs,
         running: !TERMINAL.has(block.status),
         agentCount: inside ? inside.agents.length : undefined,
         agentsRunning: inside

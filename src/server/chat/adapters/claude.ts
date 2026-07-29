@@ -7,7 +7,9 @@ import {
   mergeSlashCommands,
 } from '../../../shared/slash-commands.js';
 import { describeFrom } from '../installed-commands.js';
+import { TERMINAL_TOOL } from '../../../shared/agent-activity.js';
 import { mapModelUsage } from './model-usage.js';
+import { AccountLimitTracker, resetIsoFromEpochSeconds } from '../account-limits.js';
 import {
   ChatAttachment,
   ChatBlock,
@@ -39,6 +41,17 @@ import {
  * a single user prompt, and all of that belongs to one turn from the UI's
  * point of view. It is retired when `result` arrives.
  */
+
+/**
+ * The `apiKeySource` values that mean a key the *user* put there.
+ *
+ * These two, and only these two, are a statement that the work is billed to an
+ * API key: an environment variable the user exported, and a helper command the
+ * user configured. Every other source the CLI can name is something else, and
+ * is reported as `unknown` rather than folded in here — see `handleInit`.
+ */
+const CONFIGURED_KEY_SOURCES = new Set(['ANTHROPIC_API_KEY', 'apiKeyHelper']);
+
 export class ClaudeChatAdapter extends BaseChatAdapter {
   readonly runtime = 'claude';
 
@@ -105,6 +118,15 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       { value: 'ultracode', name: 'Ultracode', description: 'xhigh reasoning plus dynamic workflow orchestration' },
     ]),
   };
+
+  /**
+   * What Claude has said about the account this conversation is spending from.
+   *
+   * The two halves arrive on different lines — the billing mode on `init`, the
+   * windows on `rate_limit_event` — and the panel needs both at once, so they
+   * are accumulated here and re-published whole.
+   */
+  private readonly account = new AccountLimitTracker();
 
   /** Session id we generated for a fresh launch, before init echoes it back. */
   private freshSessionId?: string;
@@ -180,6 +202,8 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
   private readonly workflowTasks = new Map<string, string | undefined>();
   /** Workflows already announced as failed, so a second report is not a second failure. */
   private readonly failedWorkflows = new Set<string>();
+  /** Workflows whose launching call has already been settled, for the same reason. */
+  private readonly settledWorkflows = new Set<string>();
   /**
    * The `/effort` turn in flight, or null when none is.
    *
@@ -509,9 +533,7 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
         this.handleResult(raw);
         return;
       case 'rate_limit_event':
-        // Quota telemetry with nothing in the chat model to hold it; treating
-        // it as an error would alarm the user over something that has not
-        // actually failed.
+        this.handleRateLimit(raw);
         return;
       default:
         return;
@@ -617,8 +639,13 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       // itself, where this wraps it in the run's own description sentence —
       // which names the workflow by something no other surface calls it.
       // `announceWorkflowFailure` is first-wins, so whichever lands is the one.
-      if (str(raw.status) === 'failed') {
+      const reported = str(raw.status);
+      if (reported === 'failed') {
         this.announceWorkflowFailure(parentToolId, str(raw.summary));
+      } else if (reported && TERMINAL_TOOL.has(toolStatus(reported))) {
+        // The fallback channel for the ending, as it is for the failure: this
+        // is the one that arrives when `task_updated` does not (#116).
+        this.settleWorkflow(parentToolId, toolStatus(reported));
       }
       return;
     }
@@ -633,6 +660,10 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       });
       if (status && toolStatus(status) === 'failed') {
         this.announceWorkflowFailure(parentToolId, str(patch?.error));
+      } else if (status && TERMINAL_TOOL.has(toolStatus(status))) {
+        // How the run itself ended — done, or cancelled. Until this, the only
+        // ending that ever reached the launching call was the launch (#116).
+        this.settleWorkflow(parentToolId, toolStatus(status), str(patch?.error));
       }
       return;
     }
@@ -755,6 +786,43 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     this.emit({ t: 'workflow_progress', parentToolId, phases, agents });
   }
 
+  /**
+   * The only account figures Anthropic gives a client, and the app used to drop
+   * them on the floor while drawing a meter against a table of guesses (#137).
+   *
+   * What arrives is a status word, a reset time and a window name; `utilization`
+   * turns up only once a warning threshold has been passed — four of the five
+   * recorded events carry no percentage at all. So the percentage is copied
+   * when present and left out otherwise, and the surface shows a reset time on
+   * its own rather than a bar that reads 0%.
+   *
+   * Never an error, whatever the status says: `allowed_warning` is a warning
+   * about the account, not a failure of this turn, and the turn carries on.
+   */
+  private handleRateLimit(raw: Record<string, unknown>): void {
+    const info = record(raw.rate_limit_info);
+    if (!info) return;
+    const kind = str(info.rateLimitType);
+    if (!kind) return;
+
+    // Claude reports this as a fraction — `utilization: 0.96` alongside
+    // `surpassedThreshold: 0.75`, both of them fractions in the same line — and
+    // that is what `AccountLimitWindow.utilization` means. Anything outside 0..1
+    // is a units change nobody has verified, and is dropped rather than drawn.
+    const utilization = Number(info.utilization);
+    const changed = this.account.noteWindow({
+      kind,
+      ...(Number.isFinite(utilization) && utilization >= 0 && utilization <= 1
+        ? { utilization }
+        : {}),
+      ...(str(info.status) ? { status: str(info.status) as string } : {}),
+      ...(resetIsoFromEpochSeconds(info.resetsAt)
+        ? { resetsAt: resetIsoFromEpochSeconds(info.resetsAt) as string }
+        : {}),
+    });
+    if (changed) this.emit({ t: 'limits', limits: this.account.snapshot() });
+  }
+
   private handleInit(raw: Record<string, unknown>): void {
     const sessionId = str(raw.session_id) ?? this.freshSessionId ?? this.options.resumeSessionId;
     this.nativeSessionId = sessionId;
@@ -803,6 +871,34 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
     // us which of its five that is, so naming one would be a guess — and the
     // chip renders what arrives here as the agent's own word for what it is
     // doing.
+    // How this conversation is billed, in Claude's own words. `apiKeySource` is
+    // `'none'` when the CLI is running on a signed-in subscription and names
+    // the variable or helper when it is running on a key.
+    //
+    // Absent is its own answer and the common one — half the recorded init
+    // lines have no such field — so it becomes `unknown` rather than
+    // `subscription`. Guessing here would put a claim about somebody's billing
+    // on screen that nobody ever made (#137).
+    //
+    // An allow-list rather than "anything that is not `none`", because the CLI
+    // has a fourth answer that is neither. Read off 2.1.220's own resolver:
+    // `ZO()` returns `ANTHROPIC_API_KEY`, `apiKeyHelper`, `none`, or the
+    // `eRt()` fallback `{key: config.primaryApiKey, source: "/login managed
+    // key"}` — a key `/login` provisioned into `~/.claude.json`, which the same
+    // build groups with a claude.ai login rather than with a configured key
+    // (`if (t === "claude.ai" || o === "/login managed key")` when it looks up
+    // the organisation and the email address). That is an ambiguous source, and
+    // this change's whole rule is that an ambiguous source reads `unknown`
+    // instead of becoming a confident claim (#137).
+    const apiKeySource = str(raw.apiKeySource);
+    const billing = apiKeySource === undefined
+      ? 'unknown'
+      : apiKeySource === 'none'
+        ? 'subscription'
+        : CONFIGURED_KEY_SOURCES.has(apiKeySource) ? 'api-key' : 'unknown';
+    if (this.account.noteBilling(billing)) {
+      this.emit({ t: 'limits', limits: this.account.snapshot() });
+    }
     this.emit({ t: 'effort', effort: this.options.effort ?? null });
     // Nothing is running yet; the first `system/status: requesting` (sent
     // once a prompt actually lands) is what moves this on to `thinking`.
@@ -1036,7 +1132,11 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       .filter((block): block is Record<string, unknown> => Boolean(block) && str(block!.type) === 'text')
       .map((block) => str(block.text) ?? '')
       .join('');
-    if (!text) return;
+    // Not `!text`: a reply that is only whitespace is a reply that says
+    // nothing, and recorded as content it earns the step a bordered row with
+    // nothing to read in it (#132). This is a whole snapshot rather than a
+    // stream, so there is no open block for a lone space to belong to.
+    if (!text.trim()) return;
 
     this.streamedThisTurn = true;
     if (!this.activeTurnId) this.activeTurnId = randomUUID();
@@ -1136,12 +1236,71 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
         continue;
       }
 
+      // A background workflow's `tool_result` is a receipt, not a result (#116).
+      //
+      // It comes back seconds after the launch — "Workflow launched in
+      // background. Task ID: …" — while the run itself goes on for minutes, and
+      // filing it as the call's completion is what put a green **done** badge on
+      // a workflow that was still working, took it out of the Agents panel's
+      // running count, and captioned the acknowledgement as the run's final
+      // output. The call stays running and is settled by the run's own report
+      // instead; see `settleWorkflow`.
+      //
+      // A refusal is left alone: `failed` here means the launch itself did not
+      // happen, which really is how that call ended.
+      if (!failed && this.isWorkflowLaunch(toolId, output)) {
+        this.emit({
+          t: 'tool',
+          toolId,
+          patch: { status: 'running', output, launchReceipt: true },
+        });
+        continue;
+      }
+
       this.emit({
         t: 'tool',
         toolId,
         patch: failed ? { status: 'failed', output, error: output } : { status: 'completed', output },
       });
     }
+  }
+
+  /**
+   * Whether this tool result is a background workflow's launch acknowledgement.
+   *
+   * Two ways of knowing, because either alone has a hole. `task_started` names
+   * the run a workflow and arrives before the result in both recordings — but
+   * only if that line was seen at all, which a reconnect mid-turn does not
+   * guarantee. The acknowledgement also says what it is, in the sentence the
+   * issue quotes, so a run whose opening report was missed is still recognised.
+   */
+  private isWorkflowLaunch(toolId: string, output: string): boolean {
+    if (this.workflowTasks.has(toolId)) return true;
+    return /^Workflow launched in background\b/.test(output.trimStart());
+  }
+
+  /**
+   * The run itself ended, so the call that launched it ends with it (#116).
+   *
+   * Said once, first report wins, in the same shape as `announceWorkflowFailure`
+   * and for the same reason: both of the runtime's terminal channels can reach
+   * here and in the captured run both do.
+   *
+   * Only for a workflow. An ordinary delegation's launching call already closes
+   * on its own result, and changing that is explicitly not what this is for.
+   * Failure is left to `workflow_failed`, which does more than set a status —
+   * it also puts the reason in the conversation.
+   */
+  private settleWorkflow(parentToolId: string, status: ToolStatus, error?: string): void {
+    if (status === 'failed') return;
+    if (!this.workflowTasks.has(parentToolId)) return;
+    if (this.settledWorkflows.has(parentToolId)) return;
+    this.settledWorkflows.add(parentToolId);
+    this.emit({
+      t: 'tool',
+      toolId: parentToolId,
+      patch: { status, ...(error ? { error } : {}) },
+    });
   }
 
   /**
@@ -1537,11 +1696,16 @@ function contextReading(raw: Record<string, unknown>): ChatUsage {
 
   const modelUsage = record(raw.model_usage) ?? record(raw.modelUsage);
   if (modelUsage) {
-    for (const value of Object.values(modelUsage)) {
+    for (const [model, value] of Object.entries(modelUsage)) {
       const window = num(record(value)?.contextWindow);
       if (window !== undefined && window > 0) {
         reading.contextWindow = window;
         reading.contextWindowSource = 'agent';
+        // The key, verbatim, for the same reason the capacity above is read off
+        // it: `claude-opus-5[1m]` is a different window from `claude-opus-5`,
+        // and a ceiling that does not say which model it is about is one the
+        // session cannot tell from the previous model's on the next switch.
+        reading.contextWindowModel = model;
         break;
       }
     }

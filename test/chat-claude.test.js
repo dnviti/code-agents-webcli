@@ -132,16 +132,20 @@ describe('claude chat adapter', function () {
       const lines = loadFixture('claude-oneshot.jsonl').filter((l) => l.type === 'system');
       for (const line of lines) adapter.handleMessage(line);
 
-      // Only the init (-> session, effort, state) and the two status:requesting
-      // (-> state) lines should have produced anything; the two hook lines are
-      // noise. The `effort` event rides with init because that is the one moment
-      // the level is knowable: it is the flag this adapter passed, and claude's
-      // init line never mentions one.
+      // Only the init (-> session, limits, effort, state) and the two
+      // status:requesting (-> state) lines should have produced anything; the
+      // two hook lines are noise. The `effort` event rides with init because
+      // that is the one moment the level is knowable: it is the flag this
+      // adapter passed, and claude's init line never mentions one.
+      //
+      // `limits` rides with it for the same reason: `apiKeySource` is on the
+      // init line and nowhere else, and it is the only thing that says how this
+      // conversation is billed (#137).
       assert.strictEqual(events.filter((e) => e.t === 'session').length, 1);
       assert.strictEqual(events.filter((e) => e.t === 'state').length, 3); // idle (init) + 2x thinking
       assert.deepStrictEqual(
         events.map((e) => e.t),
-        ['session', 'effort', 'state', 'state', 'state'],
+        ['session', 'limits', 'effort', 'state', 'state', 'state'],
       );
       // Null, not a level: this fixture was launched without `--effort`, and
       // that means "whatever claude's own default is" rather than the bottom of
@@ -305,12 +309,155 @@ describe('claude chat adapter', function () {
       assert.strictEqual(blockEnds[1].block, undefined); // the plain text block
     });
 
-    it('ignores rate_limit_event without throwing or emitting anything', function () {
+    // Restated for #137: this used to assert that a rate_limit_event produced
+    // nothing at all, which pinned in place the discarding of the only account
+    // telemetry Anthropic gives a client. What still has to hold is the half of
+    // it that was actually a safety property — an event with nothing usable in
+    // it must not throw and must not manufacture a window.
+    it('ignores a rate_limit_event that names no window, without throwing', function () {
       const { adapter, events } = makeAdapter();
       assert.doesNotThrow(() => {
         adapter.handleMessage({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed' } });
       });
       assert.strictEqual(events.length, 0);
+    });
+  });
+
+  /**
+   * Issue #137. Everything here is driven off real captures, because the whole
+   * point of the change is that the app stopped making these figures up.
+   */
+  describe('account limits', function () {
+    function rateLimitLine(fixture) {
+      return loadFixture(fixture).find((l) => l.type === 'rate_limit_event');
+    }
+
+    it('turns a five-hour window into a limits event with the reset time', function () {
+      const { adapter, events } = makeAdapter();
+      adapter.handleMessage(rateLimitLine('claude-oneshot.jsonl'));
+
+      const limits = events.filter((e) => e.t === 'limits');
+      assert.strictEqual(limits.length, 1);
+      assert.deepStrictEqual(limits[0].limits.windows, [
+        {
+          kind: 'five_hour',
+          status: 'allowed',
+          // 1784990400 seconds, not milliseconds. Read as ms this lands in 1970.
+          resetsAt: '2026-07-25T14:40:00.000Z',
+        },
+      ]);
+    });
+
+    it('leaves out a utilization the provider did not state', function () {
+      const { adapter, events } = makeAdapter();
+      adapter.handleMessage(rateLimitLine('claude-workflow.jsonl'));
+
+      const window = events.find((e) => e.t === 'limits').limits.windows[0];
+      // Not 0. Four of the five recorded events carry no percentage at all, and
+      // a meter drawn at 0% is the bug this replaced.
+      assert.ok(!('utilization' in window), JSON.stringify(window));
+    });
+
+    it('carries the utilization when the provider does state one', function () {
+      const { adapter, events } = makeAdapter();
+      adapter.handleMessage(rateLimitLine('claude-subagent.jsonl'));
+
+      const window = events.find((e) => e.t === 'limits').limits.windows[0];
+      assert.strictEqual(window.kind, 'seven_day');
+      assert.strictEqual(window.status, 'allowed_warning');
+      assert.strictEqual(window.utilization, 0.96);
+      assert.strictEqual(window.resetsAt, '2026-07-26T23:00:00.000Z');
+      // One reading is a level, not a rate.
+      assert.ok(!('utilizationPerHour' in window));
+    });
+
+    it('keeps both windows when both are reported', function () {
+      const { adapter, events } = makeAdapter();
+      adapter.handleMessage(rateLimitLine('claude-oneshot.jsonl'));
+      adapter.handleMessage(rateLimitLine('claude-subagent.jsonl'));
+
+      const last = events.filter((e) => e.t === 'limits').pop();
+      assert.deepStrictEqual(
+        last.limits.windows.map((w) => w.kind).sort(),
+        ['five_hour', 'seven_day'],
+      );
+    });
+
+    it('turns two readings of one window into a rate', function () {
+      const { adapter, events } = makeAdapter();
+      const line = rateLimitLine('claude-subagent.jsonl');
+      adapter.handleMessage(line);
+      // The same window an hour later, further along. Only the clock and the
+      // percentage move; the reset time is what makes it the same window.
+      const later = JSON.parse(JSON.stringify(line));
+      later.rate_limit_info.utilization = 0.98;
+      const realNow = Date.now;
+      Date.now = () => realNow() + 3_600_000;
+      try {
+        adapter.handleMessage(later);
+      } finally {
+        Date.now = realNow;
+      }
+
+      const window = events.filter((e) => e.t === 'limits').pop().limits.windows[0];
+      assert.ok(
+        Math.abs(window.utilizationPerHour - 0.02) < 0.001,
+        String(window.utilizationPerHour),
+      );
+    });
+
+    it('reads apiKeySource "none" as a subscription', function () {
+      const { adapter, events } = makeAdapter();
+      const init = loadFixture('claude-oneshot.jsonl').find((l) => l.subtype === 'init');
+      assert.strictEqual(init.apiKeySource, 'none', 'fixture precondition');
+      adapter.handleMessage(init);
+
+      assert.strictEqual(events.find((e) => e.t === 'limits').limits.billing, 'subscription');
+    });
+
+    it('reads a named key source as an API key', function () {
+      const { adapter, events } = makeAdapter();
+      const init = loadFixture('claude-oneshot.jsonl').find((l) => l.subtype === 'init');
+      adapter.handleMessage({ ...init, apiKeySource: 'ANTHROPIC_API_KEY' });
+
+      assert.strictEqual(events.find((e) => e.t === 'limits').limits.billing, 'api-key');
+    });
+
+    it('reads the login-provisioned key source as unknown, not as an API key', function () {
+      const { adapter, events } = makeAdapter();
+      const init = loadFixture('claude-oneshot.jsonl').find((l) => l.subtype === 'init');
+      // Not an invented string. `/login managed key` is the literal source
+      // 2.1.220's own resolver returns for the key `/login` writes into
+      // `~/.claude.json` as `primaryApiKey`, and the same build groups it with
+      // a claude.ai login — it looks up the organisation name and the email
+      // address for it exactly as it does for `claude.ai`. So it is neither a
+      // subscription anybody stated nor a key the user configured, and the rule
+      // for an ambiguous source is `unknown` rather than a confident claim.
+      adapter.handleMessage({ ...init, apiKeySource: '/login managed key' });
+
+      assert.strictEqual(events.find((e) => e.t === 'limits').limits.billing, 'unknown');
+    });
+
+    it('reads a missing apiKeySource as unknown, never as a subscription', function () {
+      const { adapter, events } = makeAdapter();
+      // Not a hand-written line: claude-thinking-twice.jsonl was captured from a
+      // CLI whose init carries no apiKeySource at all, which is the common case
+      // rather than the edge one.
+      const init = loadFixture('claude-thinking-twice.jsonl').find((l) => l.subtype === 'init');
+      assert.ok(!('apiKeySource' in init), 'fixture precondition');
+      adapter.handleMessage(init);
+
+      assert.strictEqual(events.find((e) => e.t === 'limits').limits.billing, 'unknown');
+    });
+
+    it('lands on the transcript, so a panel can read it', function () {
+      const { adapter, events } = makeAdapter();
+      adapter.handleMessage(loadFixture('claude-subagent.jsonl').find((l) => l.subtype === 'init'));
+      adapter.handleMessage(rateLimitLine('claude-subagent.jsonl'));
+
+      const state = applyAll(events);
+      assert.strictEqual(state.limits.billing, 'subscription');
+      assert.strictEqual(state.limits.windows[0].utilization, 0.96);
     });
   });
 

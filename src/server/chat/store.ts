@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { SessionRecord } from '../types.js';
 import {
+  AccountLimits,
   ChatCapabilities,
   ChatEvent,
   ChatSnapshot,
@@ -244,7 +245,16 @@ interface SessionState {
    * Undefined means "not read yet".
    */
   capabilities?: ChatCapabilities;
-  /** Highest seq already folded into `capabilities`. */
+  /**
+   * The last account reading the provider stated, from the same full pass.
+   *
+   * Here for exactly the reason `capabilities` is: Claude states its rate-limit
+   * window on the first turn and then only when it changes, so on a long
+   * conversation the statement sits hundreds of events above the replayed tail
+   * (#137). Null once read and nothing was ever said.
+   */
+  limits?: AccountLimits | null;
+  /** Highest seq already folded into `capabilities` and `limits`. */
   capabilitySeq: number;
 }
 
@@ -744,6 +754,7 @@ export class ChatStore implements ChatStoreLike {
       for (const event of events) {
         if (event.seq <= state.capabilitySeq) continue;
         state.capabilities = foldCapabilities(state.capabilities, event);
+        if (event.t === 'limits') state.limits = event.limits;
         state.capabilitySeq = event.seq;
       }
     }
@@ -785,6 +796,7 @@ export class ChatStore implements ChatStoreLike {
       // `dropOldest` and does not want this — nothing about the runtime changed
       // there — so it is forgotten here rather than down inside the drop.
       state.capabilities = undefined;
+      state.limits = undefined;
       state.capabilitySeq = 0;
     });
   }
@@ -1409,23 +1421,31 @@ export class ChatStore implements ChatStoreLike {
    * conversation first opened after its own head was dropped has only what it
    * said since.
    */
-  private async sessionCapabilities(
+  private async sessionRuntimeReports(
     base: string,
     state: SessionState,
     stats: ChatStats,
-  ): Promise<ChatCapabilities> {
-    if (state.capabilities && state.capabilitySeq >= stats.cursor) return state.capabilities;
+  ): Promise<{ capabilities: ChatCapabilities; limits?: AccountLimits }> {
+    if (state.capabilities && state.capabilitySeq >= stats.cursor) {
+      return { capabilities: state.capabilities, limits: state.limits ?? undefined };
+    }
 
     let capabilities: ChatCapabilities = { ...NO_CHAT_CAPABILITIES };
+    // Gathered in the same pass rather than in one of its own: the scan is a
+    // streamed read of the whole log, and a third of them for one field would
+    // be a third read of every conversation that is opened.
+    let limits: AccountLimits | null = null;
     let seq = 0;
     await this.scanLog(base, state, (event) => {
       capabilities = foldCapabilities(capabilities, event);
+      if (event.t === 'limits') limits = event.limits;
       if (event.seq > seq) seq = event.seq;
     });
 
     state.capabilities = capabilities;
+    state.limits = limits;
     state.capabilitySeq = Math.max(seq, stats.cursor);
-    return capabilities;
+    return { capabilities, limits: limits ?? undefined };
   }
 
   /**
@@ -1511,9 +1531,8 @@ export class ChatStore implements ChatStoreLike {
       // for the same reason its usage is taken from the log: the window cannot
       // be a basis for a fact about the session. Anything the window does carry
       // is applied over this and lands on the same answer.
-      const transcript = createTranscript({
-        ...(await this.sessionCapabilities(base, state, stats)),
-      });
+      const reports = await this.sessionRuntimeReports(base, state, stats);
+      const transcript = createTranscript({ ...reports.capabilities }, { limits: reports.limits });
       let at = 0;
       let open: string | null = null;
       for (const event of events) {
@@ -1541,6 +1560,11 @@ export class ChatStore implements ChatStoreLike {
         usage: await this.sessionUsage(base, state, stats),
         plan: transcript.plan,
         pendingPermissions: transcript.pendingPermissions,
+        // What was picked, for the questions that have been answered (#113).
+        // The replay above folds `question_resolved` the same way a browser
+        // does, and the answer sits between the same two message starts as the
+        // call that asked — so any window holding the card holds its answer.
+        answeredQuestions: transcript.answeredQuestions,
         firstSeq: stats.firstSeq,
         replayFrom: windowStart,
         cursor: stats.cursor,
@@ -1552,6 +1576,12 @@ export class ChatStore implements ChatStoreLike {
         // what the runtime said it was thinking at even when nobody ever chose
         // a level for this conversation.
         effort: transcript.effort,
+        // Same reasoning as `usage` and `capabilities`: read from the whole
+        // log, not from the replayed tail. A five-hour window stated at the top
+        // of a long conversation is hundreds of events above the window, and
+        // taken from the tail alone every rejoin came back claiming the runtime
+        // had never reported one (#137).
+        limits: transcript.limits,
         live: options.live ?? false,
         bypassPermissions: options.bypassPermissions ?? false,
       };

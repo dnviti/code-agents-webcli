@@ -116,9 +116,13 @@ export function TurnStrip({
         style={{
           flex: '0 0 auto',
           fontFamily: 'var(--font-mono)',
-          fontSize: isPhone ? PHONE_TEXT.meta : 10,
-          letterSpacing: '0.06em',
-          textTransform: 'uppercase',
+          fontSize: isPhone ? PHONE_TEXT.detail : 10,
+          // Capitals and wide tracking read as louder than their size, which is
+          // most of why this row competed with the message it sits above. On a
+          // phone it says what it says and stops shouting it (#92); the mono
+          // face stays, because the figures beside it want to line up.
+          letterSpacing: isPhone ? 'normal' : '0.06em',
+          textTransform: isPhone ? 'none' : 'uppercase',
           whiteSpace: 'nowrap',
           color: past ? 'var(--muted-foreground)' : 'var(--foreground)',
         }}
@@ -131,7 +135,7 @@ export function TurnStrip({
           style={{
             flex: '0 0 auto',
             fontFamily: 'var(--font-mono)',
-            fontSize: isPhone ? PHONE_TEXT.meta : 10,
+            fontSize: isPhone ? PHONE_TEXT.detail : 10,
             whiteSpace: 'nowrap',
             color: 'var(--muted-foreground)',
           }}
@@ -173,6 +177,9 @@ export function TurnStrip({
               overflow: 'hidden',
               textOverflow: 'ellipsis',
               whiteSpace: 'nowrap',
+              // Left at `body`, deliberately. This is the only line a folded
+              // turn shows and it stands in for the message inside it, so it
+              // sits above the detail — and still below the prose (#92).
               fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
             }}
           >
@@ -193,9 +200,10 @@ export function TurnStrip({
           flex: '0 0 auto',
           whiteSpace: 'nowrap',
           fontFamily: 'var(--font-mono)',
-          // The duration and the cost are in here — session figures, so they
-          // follow the same rule as the ones in the header.
-          fontSize: isPhone ? PHONE_TEXT.label : 10,
+          // Per-turn accounting, not the session's: "83 tools 31 reasoning" is
+          // about this turn, and reading it at the size of the live figures in
+          // the header put it above the message it describes (#92).
+          fontSize: isPhone ? PHONE_TEXT.detail : 10,
           color: 'var(--muted-foreground)',
         }}
       >

@@ -259,20 +259,191 @@ describe('Composer', function () {
       assert.ok(html.includes('>a-custom-name<'), 'a free-typed override with no matching menu entry is still the label');
     });
 
-    it('surfaces the server’s feedback after a pick, in each of the three shapes', function () {
-      const live = render({ model: 'grok-3-fast', modelFeedback: { applied: 'live', message: 'Switched to grok-3-fast for this conversation.' } });
-      assert.ok(live.includes('Switched to grok-3-fast for this conversation.'));
+    // Issue #128, the answer to the question #119 deliberately left open. The
+    // box itself is raised by an effect and so never renders in a static pass —
+    // the browser check owns that half. What is visible here is the other half
+    // of the same rule: the hover, which a live confirmation used to hold for
+    // the rest of the conversation, displacing the description of what the
+    // control does with a sentence the chip underneath the pointer already says.
+    it('lets a model change that took effect pass in silence, and reports the ones the chip cannot show', function () {
+      const live = render({
+        model: 'grok-3-fast',
+        capabilities: caps({ models: [{ value: 'grok-3-fast', name: 'grok-3-fast' }] }),
+        modelFeedback: { applied: 'live', message: 'Switched to grok-3-fast for this conversation.' },
+      });
+      assert.ok(
+        !live.includes('Switched to grok-3-fast for this conversation.'),
+        'a model that landed is announced by the chip relabelling itself, not by a second copy of the news',
+      );
+      assert.ok(
+        live.includes('title="Model: grok-3-fast"'),
+        'so the hover goes back to describing the control',
+      );
+      assert.ok(live.includes('>grok-3-fast<'), 'and the chip is the thing carrying the change');
 
-      const sent = render({ model: 'claude-opus', modelFeedback: { applied: 'sent', message: 'Sent "/model claude-opus" to the session — check the transcript to confirm it took.' } });
-      assert.ok(sent.includes('check the transcript to confirm it took'));
-
-      const pending = render({ model: 'some-model', modelFeedback: { applied: 'pending', message: 'Saved. some-model will be used the next time a new session starts for this conversation.' } });
-      assert.ok(pending.includes('will be used the next time a new session starts'));
+      // Every other outcome means the conversation is not running on what was
+      // picked. Dropping these would leave a change looking made that was not.
+      for (const applied of ['sent', 'pending', 'cleared']) {
+        const message = `an outcome the chip cannot show for itself: ${applied}`;
+        const html = render({ model: 'grok-3-fast', capabilities: caps({}), modelFeedback: { applied, message } });
+        assert.ok(
+          html.includes(message),
+          `${applied} is not a change that simply took effect, so it still has to reach the user`,
+        );
+      }
     });
 
     it('shows nothing extra when there is no feedback yet', function () {
       const html = render({ capabilities: caps({}) });
       assert.ok(!html.includes('role="status"'), 'no stray feedback region before anything has been picked');
+    });
+
+    // Issue #135. A model reaches a conversation three ways — this chat's own
+    // pick, the account's standing choice, the active runtime profile — and
+    // until now the control said nothing about which. On a profile-pinned
+    // install that was the worst case: the pin was genuinely in force and the
+    // chip read the literal word "model". The menu is click-toggled state, so
+    // the browser check owns the open sheet; what a static pass reaches is the
+    // resting hover, which is also the only route to this on a desktop without
+    // covering the composer.
+    describe('where the model came from', function () {
+      it('names the account’s standing choice', function () {
+        const html = render({
+          model: 'claude-opus-4-6',
+          capabilities: caps({}),
+          modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+        });
+        assert.ok(
+          html.includes('Your standing choice for this runtime: claude-opus-4-6.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      it('names the profile that pinned it', function () {
+        const html = render({
+          model: 'profile-model',
+          capabilities: caps({}),
+          modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(
+          html.includes('From the &quot;House&quot; runtime profile: profile-model.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      it('says plainly when nobody has chosen', function () {
+        const html = render({
+          model: 'grok-build',
+          capabilities: caps({}),
+          modelDefault: { model: null, source: 'runtime' },
+        });
+        assert.ok(
+          html.includes('No default set — this runtime picks for itself.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      // Clearing does not fall back to a standing choice, it forgets one — and
+      // saying "falls back to your last choice" would describe the opposite of
+      // what the click does.
+      it('says a conversation-only pick is exactly that, and what clearing it costs', function () {
+        const html = render({
+          model: 'claude-haiku',
+          modelOverride: 'claude-haiku',
+          capabilities: caps({}),
+          modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+        });
+        assert.ok(html.includes('Chosen for this conversation only.'), 'the override is named as one');
+        assert.ok(
+          html.includes('forgets claude-opus-4-6 as your standing choice for this runtime'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      it('falls back to the profile when this conversation is the only thing overriding it', function () {
+        const html = render({
+          model: 'claude-haiku',
+          modelOverride: 'claude-haiku',
+          capabilities: caps({}),
+          modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(
+          html.includes('Clearing falls back to the &quot;House&quot; runtime profile: profile-model.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      // The word "model" used to sit on the chip for the whole of a
+      // conversation whose runtime never emits a session event, which is every
+      // conversation before its first turn.
+      //
+      // Restated: this asserted the *default* was what the chip named, which was
+      // the defect the adversarial review caught. A default is what the next new
+      // chat would open on — it changes under an open conversation every time
+      // the same account picks a model in another tab, and it may never have
+      // been applied to this one at all. What the chip names is the model the
+      // launch actually used, which the server now sends as `modelPinned`.
+      it('names the model this conversation launched on, not the word “model”', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'profile-model',
+          modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(html.includes('>profile-model<'), 'what the launch used is what the chip names');
+      });
+
+      // The half of the same defect that the restatement above cannot show: a
+      // default the conversation was never launched on must not reach the chip.
+      it('never names a default this conversation was not launched on', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: null,
+          modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+        });
+        assert.ok(
+          !html.includes('>claude-opus-4-6<'),
+          'this conversation launched with no model flag; the standing choice is for the next one',
+        );
+        assert.ok(html.includes('>model<'), 'so the chip claims nothing, as it always did');
+      });
+
+      // And says so, rather than leaving a sentence about the default to be read
+      // as a statement about what is running.
+      it('says a pinned conversation is staying on its model when the default has moved', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'claude-sonnet-4-5',
+          modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+        });
+        assert.ok(
+          html.includes('Staying on claude-sonnet-4-5.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+        assert.ok(
+          html.includes('Your standing choice for this runtime: claude-opus-4-6.'),
+          'and the default is still named, as the answer for the next new chat',
+        );
+      });
+
+      // The pin and the default agreeing is the ordinary case, and it must not
+      // produce a sentence telling the user something is staying put.
+      it('says nothing about staying when the pin is the default', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'profile-model',
+          modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(!html.includes('Staying on'), html.match(/title="Model[^"]*"/)?.[0] || 'no title');
+      });
+
+      // Version skew: a server that predates this says nothing, and the control
+      // has to read exactly as it shipped rather than assert a source.
+      it('renders exactly as before against a server that says nothing', function () {
+        const before = render({ model: 'grok-build', capabilities: caps({}) });
+        const after = render({ model: 'grok-build', capabilities: caps({}), modelDefault: null });
+        assert.strictEqual(after, before);
+        assert.ok(before.includes('title="Model: grok-build"'), 'and the hover is the old one');
+      });
     });
   });
 

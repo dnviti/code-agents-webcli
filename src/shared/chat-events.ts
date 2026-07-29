@@ -51,7 +51,18 @@ export type ToolStatus =
   | 'completed'
   | 'failed'
   | 'denied'
-  | 'canceled';
+  | 'canceled'
+  /**
+   * The call never reported an ending and nothing can report one any more.
+   *
+   * Distinct from `canceled`, which says somebody stopped it, and from
+   * `failed`, which says it broke: nobody stopped this and nothing is known to
+   * have gone wrong — the runtime simply stopped talking about it and the turn
+   * it belonged to is over. No adapter ever emits it; the reducer sets it when
+   * it reconciles a finished turn against the calls still open inside it
+   * (#139). A spinner that will never stop is a worse answer than this one.
+   */
+  | 'unknown';
 
 /**
  * Coarse tool category, used only to pick an icon and a verb.
@@ -174,6 +185,16 @@ export interface ToolBlock {
   durationMs?: number;
   /** Set on a delegation: what the agent behind this call did. See `AgentRun`. */
   agent?: AgentRun;
+  /**
+   * Set when `output` is a launch acknowledgement rather than a result.
+   *
+   * A workflow started in the background answers its caller in seconds with
+   * "Workflow launched in background. Task ID: …" and then works for minutes.
+   * That sentence is a receipt, and captioning it as the run's final output
+   * offers it as the answer to a question that has not been answered yet
+   * (#116). The run's real result replaces it when it arrives.
+   */
+  launchReceipt?: boolean;
 }
 
 /**
@@ -367,7 +388,7 @@ export interface ErrorBlock {
  */
 export interface NoticeBlock {
   kind: 'notice';
-  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched';
+  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals';
   text: string;
   /** Optional detail — how much was reclaimed, what the summary covers. */
   detail?: string;
@@ -397,6 +418,30 @@ export interface ChatUsage {
   reasoningTokens?: number;
   totalTokens?: number;
   costUsd?: number;
+  /**
+   * Whether anybody has reported tokens for this conversation at all.
+   *
+   * The same spoken-absence trick `contextWindowSource: 'unknown'` plays below,
+   * and it exists for the same reason: an omitted field means "no news" all
+   * through this merge, so a runtime that will never report anything and a
+   * conversation whose first turn has not finished yet are otherwise the same
+   * empty object. The UI has to stay silent about the second, and kimi — which
+   * sends no `usage_update`, no usage on its prompt reply, and no `_meta`
+   * anywhere — is the whole of the first.
+   *
+   * `none` is a measurement, not a guess: the session states it only after a
+   * turn has actually completed with the runtime having done work in it. `agent`
+   * is set by any report that carries a figure, which is what stops an earlier
+   * `none` from standing over money that has since arrived. Absent still means
+   * nobody has said, which is every conversation for its first few seconds.
+   *
+   * Deliberately *not* derived from `capabilities.usage === false`: that is also
+   * the state of every transcript before its handshake lands, so a label driven
+   * off it would print "not reported" on every chat against every agent.
+   */
+  usageSource?: SpendSource;
+  /** The same, for money. Codex reports tokens and prices nothing. */
+  costSource?: SpendSource;
   /** Context window size, when known, so the UI can show how full it is. */
   contextWindow?: number;
   /** Context currently occupied, when the runtime reports it directly. */
@@ -471,6 +516,73 @@ export interface TurnModelUsage {
 }
 
 export type ContextWindowSource = 'agent' | 'provider' | 'unknown';
+
+/**
+ * Who gave a spend figure, or that nobody will.
+ *
+ * There is no `provider` here on purpose: nothing outside the runtime can say
+ * what a turn cost, and this app deliberately buys no price list to guess with.
+ */
+export type SpendSource = 'agent' | 'none';
+
+/**
+ * One rate-limit window, exactly as the provider stated it.
+ *
+ * Every field but `kind` is optional because the providers are miserly and
+ * inconsistent about this: four of the five recorded Claude `rate_limit_event`
+ * lines carry a reset time and a status and no percentage at all, and the fifth
+ * carries a percentage only because a threshold had been crossed. A window with
+ * no `utilization` is the ordinary case, and the surface draws no bar for it —
+ * a meter defaulting to 0% would be the same invented figure this replaced.
+ */
+export interface AccountLimitWindow {
+  /** The provider's own name for it: `five_hour`, `seven_day`, `primary`. */
+  kind: string;
+  /** How long the window runs, when the provider says. Codex does; Claude does not. */
+  durationMinutes?: number;
+  /** 0..1 of the window spent. Absent means nobody said, not zero. */
+  utilization?: number;
+  /** When the window refills, as ISO. */
+  resetsAt?: string;
+  /** The provider's own word for the state: `allowed`, `allowed_warning`. */
+  status?: string;
+  /**
+   * How fast the window is filling, in fraction per hour.
+   *
+   * Only ever from two readings of the *same* window — same kind, same reset
+   * time — taken during this conversation. One reading is a level, not a rate,
+   * and a "time left" drawn from a level is a guess dressed as a measurement.
+   * Absent means fewer than two readings so far, which the surface says in
+   * words rather than leaving blank.
+   */
+  utilizationPerHour?: number;
+}
+
+/**
+ * What the provider said about the account behind this conversation.
+ *
+ * Only ever populated from something a runtime actually reported on its own
+ * channel. Nothing here is inferred from a plan flag, a lookup table or a
+ * transcript file, which is what this replaced (#137): every figure that used
+ * to appear in the status panel was a build-time constant.
+ *
+ * `windows` is empty rather than absent when a runtime has spoken but has no
+ * window to report — that is a different thing from never having spoken, and
+ * the surface tells them apart.
+ */
+export interface AccountLimits {
+  /** The plan as the provider named it. Codex reports `planType`; Claude does not. */
+  planName?: string;
+  /**
+   * How this work is being billed, when the runtime said.
+   *
+   * `unknown` is load-bearing: half the recorded Claude handshakes carry no
+   * `apiKeySource` at all, and reading that absence as "subscription" would be
+   * a claim about someone's billing that nobody made.
+   */
+  billing?: 'subscription' | 'api-key' | 'unknown';
+  windows: AccountLimitWindow[];
+}
 
 /** A message as the reducer assembles it. */
 /**
@@ -706,6 +818,31 @@ export interface ModelChoice {
   value: string;
   name: string;
   description?: string;
+}
+
+/**
+ * Which model a *new* conversation on this runtime would open on, and why.
+ *
+ * A statement about the default, never about the process that happens to be
+ * running: a conversation with an override of its own is running that instead,
+ * and one with neither is running whatever its launch resolved — which travels
+ * separately, as `modelPinned`. The picker pairs them rather than letting one
+ * stand in for another; using this as the model in force was how the chip came
+ * to name a standing choice that had never been applied to the conversation
+ * showing it. Said
+ * out loud because a model picked out of a menu used to be invisible the moment
+ * it was in force — the chip fell back to the literal word "model", and nothing
+ * anywhere named the profile that had pinned it (issue #135).
+ *
+ * `model` is null only for `runtime`, which means nobody has chosen and the CLI
+ * will use whatever it considers normal. Nothing here is validated against a
+ * catalogue: a model name is free text because only the runtime knows its own.
+ */
+export interface ChatModelDefault {
+  model: string | null;
+  source: 'personal' | 'profile' | 'runtime';
+  /** Only ever set for `profile`, and only so the picker can name it. */
+  profileName?: string;
 }
 
 /**
@@ -975,6 +1112,19 @@ export type ChatEvent =
    */
   | { t: 'effort'; seq: number; ts: number; effort: string | null }
   /**
+   * The provider stated where this account stands against its rate limits.
+   *
+   * Named `limits` and not `plan` because `plan` is already taken by plan
+   * *mode* — the checklist an agent publishes while it thinks — and the two
+   * would be indistinguishable in a log.
+   *
+   * Carries the whole picture every time rather than a patch: the adapter that
+   * emits it is the thing accumulating windows across a conversation, so the
+   * reducer can replace wholesale and a browser that joined late is not left
+   * assembling a half-window out of events it never saw.
+   */
+  | { t: 'limits'; seq: number; ts: number; limits: AccountLimits }
+  /**
    * Something happened to the conversation itself.
    *
    * `compacted` leaves a marker in place and keeps the transcript: what was
@@ -993,13 +1143,36 @@ export type ChatEvent =
    * opening context, and the line is where a reader is told so — a branch that
    * looked like an ordinary transcript would be claiming the agent lived
    * through it (#34).
+   *
+   * `approvals` opens a conversation by saying which mode it is running in.
+   * The mode is decided when a conversation begins, from a preference that
+   * lives in Settings and may have been changed since the last one — so a
+   * conversation that starts, or is started over, without approval prompts says
+   * so in the conversation itself rather than only in a dialog the user may
+   * never open (#134). `detail` carries which mode.
    */
   | {
       t: 'marker';
       seq: number;
       ts: number;
-      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched';
+      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals';
       detail?: string;
+      /**
+       * On an `approvals` marker: the mode the conversation actually started
+       * in, as a fact rather than as the phrase `detail` renders.
+       *
+       * This is the *only* thing that tells a browser the mode changed under an
+       * in-conversation `/clear`. `chat_started` is broadcast from the launch
+       * path alone, and a restart from inside a conversation never goes through
+       * it — so without this field a pane goes on drawing the mode the
+       * conversation had before the clear, indefinitely, and a chip reading
+       * "asks first" over an agent now running unattended is the one direction
+       * of wrongness this feature exists to remove (#134).
+       *
+       * Optional because every other marker kind has no mode, and because a
+       * transcript recorded before this field existed must still replay.
+       */
+      bypassing?: boolean;
     };
 
 /** An attachment on an outgoing user turn. */
@@ -1069,6 +1242,16 @@ export interface ChatSnapshot {
   capabilities: ChatCapabilities;
   usage?: ChatUsage;
   plan?: PlanItem[];
+  /**
+   * Where the account stood the last time the provider said anything about it.
+   *
+   * Optional so a snapshot from a server that predates this reads as "nobody
+   * has said", which is exactly what the status panel then shows. A latest
+   * value rather than a history, so it survives a rejoin the way the
+   * capabilities do — the log's replay window is short and a five-hour window
+   * announced at the top of a long conversation would otherwise fall off it.
+   */
+  limits?: AccountLimits;
   pendingPermissions: PermissionRequest[];
   /**
    * Questions still waiting on an answer.
@@ -1077,6 +1260,22 @@ export interface ChatSnapshot {
    * that predates this should read as "none pending", not as malformed.
    */
   pendingQuestions?: QuestionRequest[];
+  /**
+   * Answers already given, keyed by the tool call that asked — falling back to
+   * the request id when there was no call to pair with, exactly as the reducer
+   * keys them.
+   *
+   * An answered question is left in the conversation precisely so that
+   * scrolling back past a decision shows the decision, and the card can only
+   * draw the marks if the snapshot carries them. Without this the answer
+   * survived in the log and was thrown away at the join, so every rejoin —
+   * a tab switch, a reload, a reconnect, a second browser — redrew every
+   * answered question as one nobody had ever answered (#113).
+   *
+   * Optional for the same reason `pendingQuestions` is: a snapshot from a
+   * server that predates this should read as "none known", not as malformed.
+   */
+  answeredQuestions?: Record<string, string[]>;
   /**
    * Turns typed ahead, still waiting. Optional so a snapshot replayed from the
    * store — which knows nothing about a live process — is not obliged to
@@ -1161,6 +1360,22 @@ export const NO_CHAT_CAPABILITIES: ChatCapabilities = {
 
 /** The MCP server this app exposes to the runtimes it launches. */
 export const ASK_MCP_SERVER = 'ccweb';
+
+/**
+ * Whether a message id is one this app minted for the user's own turn.
+ *
+ * `ChatSession.deliver` is the only writer of a user message, and it always
+ * mints `user-<uuid>`. Everything else claiming to be the user came from a
+ * runtime — the prompt handed straight back, which is what put two identical
+ * bubbles in one turn for every ACP runtime and both codex modes (#129).
+ *
+ * A shape test rather than a list of the ids those runtimes used, because the
+ * question is "did this app write it", and the answer for anything this app did
+ * not write is no, whatever the runtime chose to call it.
+ */
+export function isSessionMintedMessageId(id: string): boolean {
+  return /^user-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+}
 
 /** The one tool that server offers: put a multiple-choice question to the user. */
 export const ASK_QUESTION_TOOL = 'ask_user_question';
@@ -1360,6 +1575,32 @@ export function isAllowOption(option: PermissionOption | undefined): boolean {
   return option?.kind === 'allow_once' || option?.kind === 'allow_always';
 }
 
+/**
+ * The token fields that mean "this cost something", for the silence test.
+ *
+ * `contextUsed` is not one of them. It answers how full the window is, which
+ * the context reading already states in its own words; a runtime that reports
+ * occupancy and no spend has genuinely reported no spend.
+ */
+const SPEND_TOKEN_FIELDS = [
+  'inputTokens',
+  'outputTokens',
+  'cacheReadTokens',
+  'cacheWriteTokens',
+  'reasoningTokens',
+  'totalTokens',
+] as const;
+
+/** Whether a reading carries any token count at all. */
+export function carriesTokens(usage: ChatUsage | undefined): boolean {
+  return usage !== undefined && SPEND_TOKEN_FIELDS.some((field) => usage[field] !== undefined);
+}
+
+/** And whether it carries money. */
+export function carriesCost(usage: ChatUsage | undefined): boolean {
+  return usage?.costUsd !== undefined;
+}
+
 /** Sum two usage records, tolerating the many fields runtimes omit. */
 export function mergeUsage(base: ChatUsage | undefined, next: ChatUsage | undefined): ChatUsage {
   const a = base || {};
@@ -1374,7 +1615,7 @@ export function mergeUsage(base: ChatUsage | undefined, next: ChatUsage | undefi
   // would otherwise keep the old number — an omitted field means "no news"
   // everywhere else here, and has to go on meaning that.
   const retracted = b.contextWindowSource === 'unknown';
-  return {
+  const merged: ChatUsage = {
     inputTokens: add(a.inputTokens, b.inputTokens),
     outputTokens: add(a.outputTokens, b.outputTokens),
     cacheReadTokens: add(a.cacheReadTokens, b.cacheReadTokens),
@@ -1393,4 +1634,12 @@ export function mergeUsage(base: ChatUsage | undefined, next: ChatUsage | undefi
     contextWindowModel:
       retracted || b.contextWindow !== undefined ? b.contextWindowModel : a.contextWindowModel,
   };
+  // Not additive either, and read off the sum rather than off `b`: a reading
+  // that has figures in it answers the question by having them, so a `none`
+  // stated on a turn that spent nothing cannot go on standing over money that
+  // arrived afterwards. Otherwise the last thing anybody said carries, which is
+  // how a spoken silence survives the turns that follow it.
+  merged.usageSource = carriesTokens(merged) ? 'agent' : (b.usageSource ?? a.usageSource);
+  merged.costSource = carriesCost(merged) ? 'agent' : (b.costSource ?? a.costSource);
+  return merged;
 }

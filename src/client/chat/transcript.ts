@@ -19,6 +19,7 @@
  */
 
 import {
+  AccountLimits,
   ChatCapabilities,
   ChatEvent,
   ChatMessage,
@@ -31,6 +32,7 @@ import {
   QueuedTurn,
   QuestionRequest,
   NO_CHAT_CAPABILITIES,
+  isSessionMintedMessageId,
 } from '../../shared/chat-events.js';
 import {
   TranscriptState,
@@ -40,6 +42,42 @@ import {
 } from '../../shared/chat-reducer.js';
 
 type Listener = () => void;
+
+/**
+ * Drop a runtime's echo of the prompt once the page carrying this app's own copy
+ * has arrived.
+ *
+ * The reducer already refuses these as they stream in (#129), on the same test:
+ * only `ChatSession.deliver` ever writes a user message and it always mints
+ * `user-<uuid>`, so a second user message in a turn that already holds this app's
+ * own, under a name this app would not have minted, is the runtime repeating the
+ * prompt back. That guard has to see both halves at once, and scrolling back is
+ * exactly where they arrive apart: `absorbPage` folds every history page through
+ * a scratch transcript of its own, so a page boundary landing in the handful of
+ * events between the app's message and the echo hides each from the other and
+ * both survive into the merge — two identical bubbles, side by side, in a turn
+ * eleven pages back. This is the same rule at the one point where the pair is
+ * finally whole.
+ *
+ * Only conversations recorded before the adapters stopped echoing carry a pair at
+ * all, and nothing rewrites them: this decides what is drawn, each time one is
+ * opened.
+ */
+function withoutRuntimeUserEchoes(messages: ChatMessage[]): ChatMessage[] {
+  const ownTurns = new Set<string>();
+  for (const message of messages) {
+    if (message.role === 'user' && message.turnId && isSessionMintedMessageId(message.id)) {
+      ownTurns.add(message.turnId);
+    }
+  }
+  if (!ownTurns.size) return messages;
+  return messages.filter(
+    (message) =>
+      message.role !== 'user'
+      || isSessionMintedMessageId(message.id)
+      || !ownTurns.has(message.turnId),
+  );
+}
 
 export class ChatTranscript {
   private state: TranscriptState;
@@ -151,6 +189,21 @@ export class ChatTranscript {
     return this.bypass;
   }
 
+  /**
+   * Show the mode a list row already stated, until the server states it here.
+   *
+   * A display seed and nothing more: it is never sent back in a launch, and the
+   * two authorities — `hydrate` from a snapshot and `setBypassing` from a
+   * `chat_started` — overwrite it without consulting it. It exists because the
+   * session list and the conversations dialog both know the mode before the
+   * pane does, and a pane that opened claiming "asks first" over a conversation
+   * the row had just labelled "approvals bypassed" was the wrong answer in the
+   * dangerous direction (#134).
+   */
+  seedBypass(bypassing: boolean): void {
+    this.setBypassing(bypassing);
+  }
+
   /** Take the mode from a `chat_started`, which announces the launch's own. */
   setBypassing(bypassing: boolean): void {
     if (this.bypass === bypassing) return;
@@ -167,6 +220,14 @@ export class ChatTranscript {
       plan: snapshot.plan || [],
       pendingPermissions: snapshot.pendingPermissions || [],
       pendingQuestions: snapshot.pendingQuestions || [],
+      // What was picked, for the questions already answered (#113). Falling
+      // back to what is already held rather than to nothing: a server that
+      // predates this field must not take the marks off a card this browser
+      // watched being answered a moment ago. Copied because the snapshot is
+      // wire data and the reducer writes into this map in place.
+      answeredQuestions: snapshot.answeredQuestions
+        ? { ...snapshot.answeredQuestions }
+        : { ...this.state.answeredQuestions },
       firstSeq: snapshot.firstSeq,
       cursor: snapshot.cursor,
       // The turn the server's replay was still inside. Live events arriving
@@ -177,6 +238,10 @@ export class ChatTranscript {
       // drop — leaving the control blank over a live session that is still
       // thinking at whatever it opened on.
       effort: snapshot.effort,
+      // The provider's own account reading, which `createTranscript` would
+      // otherwise drop — leaving a rejoined conversation saying its runtime had
+      // never reported a rate-limit window when it had reported one an hour ago.
+      limits: snapshot.limits,
     });
     // A server that does not report its replay floor gets `firstSeq`, which
     // reads as "nothing older" — no paging offered rather than paging that can
@@ -209,10 +274,25 @@ export class ChatTranscript {
    * already hold), and not moving the floor for that case is what turned a
    * finished request into a spinner nobody could clear.
    */
-  prepend(messages: ChatMessage[], firstSeq: number, from?: number): void {
+  prepend(
+    messages: ChatMessage[],
+    firstSeq: number,
+    from?: number,
+    answers?: Record<string, string[]>,
+  ): void {
     this.state.firstSeq = firstSeq;
     if (from !== undefined) {
       this.oldest = Math.max(firstSeq, Math.min(this.oldest || from, from));
+    }
+
+    // A question far enough back that it arrives by scrolling brings its answer
+    // with it (#113). The page is replayed through a scratch transcript that
+    // folds `question_resolved` correctly; without this, that answer was
+    // computed and then thrown away with the scratch. What is already held
+    // wins: these are keyed by tool call, so a collision is the same answer,
+    // and the live map is the newer knowledge.
+    if (answers) {
+      this.state.answeredQuestions = { ...answers, ...this.state.answeredQuestions };
     }
 
     if (!messages.length) {
@@ -222,7 +302,7 @@ export class ChatTranscript {
 
     const known = new Set(this.state.messages.map((message) => message.id));
     const fresh = messages.filter((message) => !known.has(message.id));
-    this.state.messages = [...fresh, ...this.state.messages];
+    this.state.messages = withoutRuntimeUserEchoes([...fresh, ...this.state.messages]);
     reindexTranscript(this.state);
     this.bumpAll();
   }
@@ -489,6 +569,16 @@ export class ChatTranscript {
     return this.state.answeredQuestions[toolId];
   }
 
+  /**
+   * Every answer this transcript holds, keyed the way the reducer keys them.
+   *
+   * Read off a scratch transcript when a page of history is folded in, so the
+   * answers it computed reach the real one rather than being dropped with it.
+   */
+  get answeredQuestions(): Record<string, string[]> {
+    return this.state.answeredQuestions;
+  }
+
   get cursor(): number {
     return this.state.cursor;
   }
@@ -532,6 +622,17 @@ export class ChatTranscript {
    */
   get effort(): string | undefined {
     return this.state.effort;
+  }
+
+  /**
+   * Where the provider last said this account stands, or undefined.
+   *
+   * Undefined is the ordinary case and means "no runtime has said anything
+   * about an account", not "nothing is left". The status panel is careful about
+   * the difference.
+   */
+  get limits(): AccountLimits | undefined {
+    return this.state.limits;
   }
 
   get lastError(): string | undefined {

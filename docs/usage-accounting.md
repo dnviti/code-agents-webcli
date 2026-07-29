@@ -118,7 +118,21 @@ own figure or nothing at all, which is why they have a column of their own.
 | Codex (app-server) | counted here | **not reported** | reported | **not reported** — nothing in the schema prices a turn | reported, per session |
 | Codex (`exec` fallback) | counted here | **not reported** | **not reported** | **not reported** | **not reported** |
 | pi | counted here | **not reported** | reported | reported | reported, per message |
-| ACP agents (Grok, omp, kimi, and others behind the ACP bridge) | counted here | only where a per-model call count arrives | reported | reported — Grok's in ticks, see below | the runtime's current selection |
+| Grok (ACP) | counted here | only where a per-model call count arrives | reported | reported, in ticks — see below | the runtime's current selection |
+| Oh My Pi / opencode (ACP) | counted here | only where a per-model call count arrives | reported | reported, as a session running total | the runtime's current selection |
+| Kimi (ACP) | counted here | **not reported** | **not reported** | **not reported** | the runtime's current selection |
+
+Kimi is the exception the rest of that block used to hide. Probed against
+kimi 0.29.1 over two prompts: not one `usage_update` notification, prompt
+replies of `{"stopReason":"end_turn"}` with no `usage` key, and no `_meta` on
+any `session/update`. `test/fixtures/chat/acp-kimi-tools.jsonl` is one of those
+turns — a reply, a read and a write — and there is no figure in it anywhere.
+This is protocol-legal: `usage_update` is a vendor extension that omp, opencode
+and grok implement and kimi does not, so a silent ACP agent is a thing the app
+has to be able to describe rather than a bug to fix in the adapter. Its
+`capabilities.usage` and `capabilities.cost` are therefore `false`, and its jobs
+file as **"n/a"** in the dashboard rather than "not reported" — see the
+distinction below.
 
 A figure a runtime never reports is stored as `null` and shown as
 **"not reported"** — never as zero. Those are different facts: a job that
@@ -133,6 +147,44 @@ the turns that reported one, never over all of them — reading a silent runtime
 as zero would have put it at the top of every efficiency comparison on the page
 for having reported nothing.
 
+### Which surface says "n/a" and which says "not reported"
+
+Two surfaces, two vocabularies, and they are not in disagreement — they are
+answering different questions, so it is worth being explicit about which is
+which.
+
+**The usage dashboard reads history**, and every job in it was filed with the
+capability flags of the runtime that ran it. It can therefore separate the two
+facts and does: `n/a` means *this agent cannot report that figure at all* (kimi
+for both, Codex for cost), and **"not reported"** means *this job, from an agent
+that can report, carried no figure*. Both are shown in preference to a zero.
+
+**A live conversation reads one turn at a time**, and has only ever made one
+claim: this runtime has now finished a turn and said nothing about tokens
+and/or money. That is an observation, not a capability lookup — deliberately,
+because `capabilities.usage === false` is also what every transcript looks like
+in the second before its handshake lands, and drawing the words from it would
+put "not reported" on every conversation with every agent for that second. So
+the header strip, the composer's status line and the Status panel all say
+**"not reported"**, which is what an observation of silence is called
+everywhere else in this document. Each of those says as much as its width
+allows, and no more: the Status panel has room for a sentence and names the
+runtime and which of the two figures it withholds; the header strip and the
+composer's status line say "usage not reported" once rather than naming both
+halves; and the phone's collapsed header, which has room for about fourteen
+characters, drops the noun and says "not reported" beside where the money would
+have been. Every one of the header's short forms carries the whole sentence as
+a tooltip, and the Status panel writes it out for anyone who cannot hover.
+
+The statement is only ever made from a turn that ran to its own end. An
+interrupt sent to steer, a stop-button cancel and a turn the adapter ended
+because the runtime broke all stop the runtime before the point where it would
+have priced the turn — Claude prices a turn in its final `result`, an ACP agent
+in the reply to `session/prompt` — so nothing is concluded from any of them.
+Otherwise pressing stop would have taught the app that Claude reports neither
+tokens nor cost, and it would have gone on saying so for the rest of that
+conversation.
+
 ### Figures recorded before this rule
 
 The turn count needs no correction and older periods are directly comparable:
@@ -141,6 +193,92 @@ recount of nothing. The model-turn column is empty for everything recorded
 before it existed — the old figure was the discarded meaning, and copying it
 across would make an inference indistinguishable from a measurement in the one
 place built to keep those apart.
+
+## What the status panel knows
+
+The Status panel answers two different questions and keeps them apart, because
+they are in different currencies and adding them together produces a figure that
+is neither.
+
+**Your account, as the provider states it.** Only what a runtime says about
+itself, on its own channel, during this conversation. Nothing here is derived
+from a flag, a table or a file this app scanned.
+
+**Measured in this app.** What actually ran through this client, for the
+person signed in, on the agent they are looking at, over the last 24 hours.
+Priced at published list rates — a guide, not a bill — and carrying the same
+"reported / not reported" counters as the rest of this page.
+
+### What each agent reports about an account
+
+Probed against the CLIs installed on the development machine, on 2026-07-29.
+A row that says "nothing" means nothing was found on the wire, not that nothing
+exists.
+
+| Agent | Plan name | Windows | Percentage | Probed |
+| --- | --- | --- | --- | --- |
+| Claude | **not reported** | `five_hour` / `seven_day`, with a reset time, every turn | only once a warning threshold is crossed — four of five captured events have none | `rate_limit_event` on the stream-json wire, CLI 2.1.220 |
+| Codex | reported (`planType`) | one or two, with a duration and a reset | reported (`usedPercent`) | `account/rateLimits/read` over app-server, CLI 0.146.0 |
+| Cursor | — | — | — | terminal-only here, and not installed on the probe machine |
+| Qwen | — | — | — | terminal-only here |
+| Kimi | **not reported** | **not reported** | **not reported** | `/status` and `/usage` run over ACP against Kimi Code CLI 0.29.1 — see below |
+| pi, Grok, Oh My Pi | **not reported** | **not reported** | **not reported** | no captured session carries a quota, limit, plan or reset field |
+
+Kimi is the one of those four that had to be asked rather than observed. Its
+handshake advertises two account-shaped slash commands, `status` ("Show current
+session status") and `usage` ("Show session token usage"), and an unrun command
+is not evidence of anything. Both were driven over the same ACP connection this
+app already speaks — no key read off disk, no outbound call on anyone's behalf —
+and both answer about the session rather than the account:
+
+```
+/status → Session status:
+          - Model: openrouter/moonshotai/kimi-k2.7-code
+          - Thinking: on
+          - Permission: manual
+          - Plan mode: off
+          - Context: 0 / 262,144 (0.0%)
+/usage  → Session usage:
+          - Context: 0 / 262,144 (0.0%)
+```
+
+"Plan mode" there is the planning mode, not a subscription. Nothing in either
+reply names a membership, a quota, a window or a reset, which is why the panel
+says so in as many words. pi is a different case and is declined rather than
+unprobed: the only account endpoint it has is OpenRouter's `GET /api/v1/key`,
+which would mean this server reading a user's provider key off disk and making
+an authenticated call as them.
+
+Claude never states a token, message or dollar allowance, so there is no ceiling
+to draw a meter against and none is drawn. When it does state a percentage, a
+meter appears; when it does not, the reset time is shown on its own. A bar at 0%
+would say "nothing spent" where the truth is "nobody said".
+
+A "time until this window runs out" needs **two** readings of the same window
+during the same conversation — a level is not a rate. Until a second one
+arrives, the panel says so instead of extrapolating.
+
+### Which files this app will open
+
+**This app reads a CLI's configuration file, and never a credentials file.**
+
+`~/.claude.json` is configuration. It carries a rate-limit tier and Claude
+Code's own cached utilization percentages, and those are read as a fallback for
+a Claude conversation that has not yet been told anything by its own runtime.
+Only the tier and the percentages come back: never the email address, the
+display name, the organisation name or any of the three uuids sitting beside
+them, because the server runs as one OS user while the browser may have several
+people on it. The reading is dropped entirely once it is older than the shortest
+window it describes, and any window whose reset time has passed is dropped with
+it; whatever survives is labelled with the time the CLI wrote it and with whose
+account it describes.
+
+`~/.claude/.credentials.json` and `~/.codex/auth.json` are credentials, and
+nothing on a status panel is worth teaching this server to open them. That is
+the whole reason Codex's plan name comes over the protocol instead: the same
+`chatgpt_plan_type` is inside the id_token in `auth.json`, next to an access
+token and a refresh token, and `account/rateLimits/read` volunteers it without
+anyone going near the file.
 
 ## A job's token total
 

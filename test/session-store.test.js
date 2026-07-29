@@ -134,10 +134,33 @@ describe('SessionStore', function() {
 
       const loaded = await sessionStore.loadSessions();
       assert.strictEqual(loaded.get('bypass').chatBypassPermissions, true);
-      // Absent rather than false: a conversation that never chose the bypass
-      // must never be restored into it, and `undefined` is what reads as
-      // "asks first" everywhere downstream.
+      // Absent, not false: this record has never been launched at all, so
+      // nothing has been granted to it either way.
       assert.strictEqual(loaded.get('manual').chatBypassPermissions, undefined);
+    });
+
+    it('keeps “granted approvals” apart from “nothing granted”', async function () {
+      // Three states, not two, since #134. A conversation that launched and
+      // asked is recorded as `false`, which is a decision the rule replays on
+      // every resume; a record that has never launched is `undefined`, and is
+      // the only one a preference may ever decide for. Stored as the same
+      // value they used to share, a preference switched on afterwards would
+      // widen a conversation that had already chosen to ask.
+      await sessionStore.saveSessions(new Map([
+        ['asked', createSessionRecord({
+          id: 'asked',
+          ownerUserId,
+          surface: 'chat',
+          chatBypassPermissions: false,
+        })],
+        ['never', createSessionRecord({ id: 'never', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('asked').chatBypassPermissions, false);
+      assert.strictEqual(loaded.get('never').chatBypassPermissions, undefined);
     });
 
     it('remembers a conversation-scoped model override', async function () {
@@ -160,6 +183,46 @@ describe('SessionStore', function() {
       const loaded = await sessionStore.loadSessions();
       assert.strictEqual(loaded.get('custom').chatModelOverride, 'grok-3-fast');
       assert.strictEqual(loaded.get('default').chatModelOverride, undefined);
+    });
+
+    // Three states, and all three have to survive: a name, "launched with no
+    // model flag at all", and "nothing recorded". A restart is precisely when
+    // this is read — it is the moment every open conversation gets relaunched —
+    // so a pin held only in memory would be gone exactly when it is needed
+    // (#135). The middle one is why the column is not just nullable text: a
+    // conversation that ran bare must not be re-modelled by a profile added
+    // afterwards.
+    it('remembers the model a conversation was launched on, including “none”', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['pinned', createSessionRecord({
+          id: 'pinned',
+          ownerUserId,
+          surface: 'chat',
+          chatModelPinned: 'claude-opus-4-6',
+        })],
+        ['bare', createSessionRecord({
+          id: 'bare',
+          ownerUserId,
+          surface: 'chat',
+          chatModelPinned: null,
+        })],
+        ['unlaunched', createSessionRecord({ id: 'unlaunched', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('pinned').chatModelPinned, 'claude-opus-4-6');
+      assert.strictEqual(
+        loaded.get('bare').chatModelPinned,
+        null,
+        'it ran with no flag, which is an answer and not an absence',
+      );
+      assert.strictEqual(
+        loaded.get('unlaunched').chatModelPinned,
+        undefined,
+        'and nothing recorded still reads as nothing recorded',
+      );
     });
 
     it('remembers the name the user gave a session', async function () {
@@ -216,6 +279,24 @@ describe('SessionStore', function() {
       sessionStore.database.close();
       sessionStore = new SessionStore({ dataDir: tempDir });
       assert.strictEqual((await sessionStore.loadSessions()).size, 1);
+    });
+
+    it('adds the launched-model column to a database that predates it', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['old', createSessionRecord({ id: 'old', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.raw.exec(
+        'ALTER TABLE runtime_sessions DROP COLUMN chat_model_pinned',
+      );
+      sessionStore.database.close();
+
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      const loaded = await sessionStore.loadSessions();
+
+      assert.strictEqual(loaded.size, 1, 'the upgrade must not cost the user their sessions');
+      // Absent, not null: a row from before the column existed recorded no
+      // launch, so it still falls to the profile exactly as it did then.
+      assert.strictEqual(loaded.get('old').chatModelPinned, undefined);
     });
 
     it('adds the approval-mode column to a database that predates it', async function () {

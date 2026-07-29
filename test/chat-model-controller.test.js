@@ -68,3 +68,100 @@ describe('the model override label', function () {
     assert.strictEqual(c.modelOverrideValue, null);
   });
 });
+
+// The other half of the same control: which model a *new* conversation on this
+// runtime would open on, and why. A different question from the one above, and
+// one nothing on the wire could answer before #135 — a profile-pinned model was
+// genuinely in force with nothing anywhere naming it.
+describe('where the model default came from', function () {
+  const snapshot = (modelDefault) => ({
+    type: 'chat_snapshot',
+    sessionId: 's1',
+    snapshot: {
+      sessionId: 's1',
+      runtime: 'claude',
+      state: 'idle',
+      capabilities: {},
+      messages: [],
+      pendingPermissions: [],
+      firstSeq: 0,
+      cursor: 0,
+      live: true,
+      bypassPermissions: false,
+    },
+    ...(modelDefault === undefined ? {} : { modelDefault }),
+  });
+
+  it('is taken from the join', function () {
+    const c = controller();
+    c.handle(snapshot({ model: 'profile-model', source: 'profile', profileName: 'House' }));
+    assert.deepStrictEqual(c.modelDefaultValue, {
+      model: 'profile-model',
+      source: 'profile',
+      profileName: 'House',
+    });
+  });
+
+  it('is taken from the launch', function () {
+    const c = controller();
+    c.handle({
+      type: 'chat_started',
+      sessionId: 's1',
+      agent: 'claude',
+      modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+    });
+    assert.deepStrictEqual(c.modelDefaultValue, {
+      model: 'claude-opus-4-6',
+      source: 'personal',
+    });
+  });
+
+  // A pick the running session could not take still changed what the next new
+  // conversation opens on, and a clear still forgot the standing choice. Left
+  // to the next join, the picker would describe the state before the click for
+  // the rest of the conversation.
+  it('is refreshed by the answer to a pick, not only by a rejoin', function () {
+    const c = controller();
+    c.handle(snapshot({ model: null, source: 'runtime' }));
+    c.handle({
+      type: 'chat_model_result',
+      sessionId: 's1',
+      model: 'claude-opus-4-6',
+      applied: 'pending',
+      message: 'saved',
+      modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+    });
+    assert.deepStrictEqual(c.modelDefaultValue, {
+      model: 'claude-opus-4-6',
+      source: 'personal',
+    });
+    assert.strictEqual(c.modelOverrideValue, null, 'and still no claim that it is running');
+  });
+
+  it('stays null when the server said nothing, so an older one reads as it always did', function () {
+    const c = controller();
+    c.handle(snapshot(undefined));
+    assert.strictEqual(c.modelDefaultValue, null);
+  });
+
+  // Half an answer to "why is this model selected" is worse than none.
+  it('refuses a half-answer rather than showing a source it was not told', function () {
+    const c = controller();
+    c.handle(snapshot({ model: 'claude-opus-4-6' }));
+    assert.strictEqual(c.modelDefaultValue, null);
+    c.handle(snapshot({ model: 'claude-opus-4-6', source: 'whatever' }));
+    assert.strictEqual(c.modelDefaultValue, null);
+  });
+
+  // It describes the account and the runtime, not the conversation being
+  // restarted, and the picker would otherwise have nothing to say about what
+  // the restart will open on.
+  it('survives a reset, unlike the conversation’s own override', function () {
+    const c = controller();
+    c.handle(snapshot({ model: 'profile-model', source: 'profile', profileName: 'House' }));
+    c.handle({ type: 'chat_model_result', sessionId: 's1', model: 'x', applied: 'live', message: 'ok' });
+    c.reset();
+    assert.strictEqual(c.modelOverrideValue, null);
+    assert.strictEqual(c.modelDefaultValue?.model, 'profile-model');
+  });
+});

@@ -30,6 +30,9 @@ export const STATUS_META: Record<ToolStatus, { label: string; variant: BadgeVari
   failed: { label: 'failed', variant: 'destructive' },
   denied: { label: 'denied', variant: 'destructive' },
   canceled: { label: 'canceled', variant: 'outline' },
+  // Not "done" and not "failed": nobody stopped it and nothing is known to have
+  // broken — the runtime stopped talking about it and its turn is over (#139).
+  unknown: { label: 'no longer reporting', variant: 'outline' },
 };
 
 export interface AgentsPanelProps {

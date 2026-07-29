@@ -39,6 +39,7 @@ import {
   UsageProjectSource,
   UsageScope,
   UsageToolUse,
+  UsageBurn,
   UsageTotals,
 } from '../../shared/usage-records.js';
 
@@ -696,6 +697,40 @@ export class UsageStore {
       effortByModel: this.effort('model', where, params),
       topTools: this.tools(joined, params, false),
       topToolsByAgent: this.tools(joined, params, true),
+    };
+  }
+
+  /**
+   * What this app measured for one user on one agent over a recent window.
+   *
+   * The only burn rate this app can honestly offer. The one it used to draw was
+   * a projection against a hand-written plan ceiling; this is the app's own
+   * record of turns that actually ran — scoped to the person asking and to the
+   * agent they are looking at, so a status panel over a Codex conversation does
+   * not report what somebody's Claude sessions spent.
+   *
+   * `UsageTotals` is returned whole rather than pre-divided because it carries
+   * the `*ReportedTurns` counters, and a rate computed over turns that reported
+   * nothing is the same "zero means silence" bug in a new place. The caller
+   * divides once it knows how many turns stood behind the figure.
+   *
+   * Always this user's own rows: there is no `everyone` scope here. A burn rate
+   * is a personal question.
+   */
+  burn(userId: number, agent: string, hours: number, now = new Date()): UsageBurn {
+    const span = Math.max(1, Math.trunc(hours));
+    const from = new Date(now.getTime() - span * 3_600_000);
+    const row = this.database.raw
+      .prepare(`
+        SELECT ${TOTALS_COLUMNS} FROM usage_jobs
+        WHERE ended_at >= ? AND ended_at < ? AND user_id = ? AND agent = ?
+      `)
+      .get(from.toISOString(), now.toISOString(), userId, agent) as TotalsRow;
+    return {
+      from: from.toISOString(),
+      to: now.toISOString(),
+      hours: span,
+      totals: mapTotals(row),
     };
   }
 

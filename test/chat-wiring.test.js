@@ -127,7 +127,7 @@ function createChatManager(overrides = {}) {
   };
 }
 
-function build(sessionOverrides = {}, managerOverrides = {}) {
+function build(sessionOverrides = {}, managerOverrides = {}, deps = {}) {
   const sent = [];
   const ws = {
     readyState: WebSocket.OPEN,
@@ -180,6 +180,10 @@ function build(sessionOverrides = {}, managerOverrides = {}) {
       stat: () => Promise.resolve({ firstLine: 0, totalLines: 0 }),
       read: () => Promise.resolve({ fromLine: 0, lines: [], firstLine: 0, totalLines: 0 }),
     },
+    // The owner's standing preference, which is where a conversation that is
+    // *beginning* now takes its approval mode from. Off unless a test says
+    // otherwise, which is what a user who has never opened Settings has.
+    getUserPreferences: () => ({ chatBypassPermissions: deps.preference === true }),
     usageReader: {},
     usageAnalytics: {},
   });
@@ -234,10 +238,17 @@ describe('chat wiring', function () {
       assert.match(lastOfType(sent, 'error').message, /already running/i);
     });
 
-    it('passes the bypass flag through, and only that, from the browser', async function () {
+    // Restated for #134. This used to assert that the bypass flag *was* taken
+    // from the browser — the one launch input that crossed the boundary. It no
+    // longer is: the preference lives on the server, so the only forgeable
+    // widening in the feature is gone, and the rest of the launch configuration
+    // is refused exactly as before.
+    it('takes nothing that shapes the launch from the browser', async function () {
       const { processor, chatManager } = build();
 
       await processor.startChat('ws-1', 'claude', {
+        // With the preference off — a browser asking for a standing permission
+        // its account was never granted.
         dangerouslySkipPermissions: true,
         // A forged launch configuration must not survive the boundary.
         model: 'attacker/model',
@@ -247,7 +258,11 @@ describe('chat wiring', function () {
       });
 
       const { options } = chatManager.calls.start[0];
-      assert.strictEqual(options.bypassPermissions, true);
+      assert.strictEqual(
+        options.bypassPermissions,
+        false,
+        'a bypass the account was never granted must not be forgeable from a page',
+      );
       assert.strictEqual(options.model, undefined, 'model must come from the server profile');
       assert.strictEqual(options.extraArgs, undefined, 'args must come from the server profile');
       assert.strictEqual(options.env, undefined, 'env must come from the server profile');
@@ -298,13 +313,43 @@ describe('chat wiring', function () {
   // the server, or resuming from the launcher all brought it back in manual mode
   // without saying so — and the user was then interrupted by prompts they had
   // opted out of, or trusted prompts that were no longer coming.
+  //
+  // Since #134 there is one rule and it is keyed on the route, not on the
+  // record: only `resume: true` continues a conversation and replays its own
+  // grant; every other way in begins one and takes the owner's preference. The
+  // cases below are that rule, both directions, at the launch rather than at the
+  // record — a grant nobody launches on proves nothing.
   describe('the approval mode', function () {
-    it('records the chosen mode on the session, where a restart can find it', async function () {
-      const { processor, session } = build();
+    it('records the mode it launched in, where a restart can find it', async function () {
+      const { processor, session } = build({}, {}, { preference: true });
 
-      await processor.startChat('ws-1', 'claude', { dangerouslySkipPermissions: true });
+      await processor.startChat('ws-1', 'claude', {});
 
       assert.strictEqual(session.chatBypassPermissions, true);
+    });
+
+    it('gives a first launch the preference, from the launcher’s plain start', async function () {
+      // The launcher names no mode at all now. With the preference on, this is
+      // the route that always worked; it has to keep working without the flag.
+      const { processor, chatManager, sent } = build({}, {}, { preference: true });
+
+      await processor.startChat('ws-1', 'claude', { surface: 'chat' });
+
+      assert.strictEqual(chatManager.calls.start[0].options.bypassPermissions, true);
+      assert.strictEqual(lastOfType(sent, 'chat_started').bypassPermissions, true);
+    });
+
+    it('gives a record with no grant the preference, which is what a branch is', async function () {
+      // A branch is created with no mode recorded and opened with `options: {}`.
+      // It is a conversation that is beginning, so it takes the preference —
+      // and with the preference off it must not bypass.
+      const off = build({}, {}, { preference: false });
+      await off.processor.startChat('ws-1', 'claude', {});
+      assert.strictEqual(off.chatManager.calls.start[0].options.bypassPermissions, false);
+
+      const on = build({}, {}, { preference: true });
+      await on.processor.startChat('ws-1', 'claude', {});
+      assert.strictEqual(on.chatManager.calls.start[0].options.bypassPermissions, true);
     });
 
     it('restores the remembered mode when the browser names none', async function () {
@@ -323,42 +368,76 @@ describe('chat wiring', function () {
       );
     });
 
-    it('never restores a conversation that asked first into a bypass', async function () {
+    it('does not re-read the preference for a conversation being continued', async function () {
+      // Both directions of the same rule. A resume replays the conversation's
+      // own grant: a preference switched on afterwards must not widen a
+      // conversation that chose to ask, and one switched off must not take
+      // approvals off a conversation running without them.
+      const widen = build({ chatBypassPermissions: false }, {}, { preference: true });
+      await widen.processor.startChat('ws-1', 'claude', { resume: true });
+      assert.strictEqual(
+        widen.chatManager.calls.start[0].options.bypassPermissions,
+        false,
+        'a conversation that was granted approvals keeps them',
+      );
+
+      const narrow = build({ chatBypassPermissions: true }, {}, { preference: false });
+      await narrow.processor.startChat('ws-1', 'claude', { resume: true });
+      assert.strictEqual(narrow.chatManager.calls.start[0].options.bypassPermissions, true);
+    });
+
+    it('never restores a conversation with nothing recorded into a bypass', async function () {
+      // Restated for #134: the record now says `false` rather than `undefined`
+      // once a launch has happened, because "this conversation was granted
+      // approvals" is a decision to keep. A resume of a record that was never
+      // granted anything still asks.
       const { processor, chatManager, session, sent } = build();
 
       await processor.startChat('ws-1', 'claude', { resume: true });
 
       assert.strictEqual(chatManager.calls.start[0].options.bypassPermissions, false);
-      assert.strictEqual(session.chatBypassPermissions, undefined);
+      assert.strictEqual(session.chatBypassPermissions, false);
       assert.strictEqual(lastOfType(sent, 'chat_started').bypassPermissions, false);
     });
 
-    it('does not carry a bypass into a conversation started fresh', async function () {
-      // "Start again" leaves the old conversation behind. The bypass was granted
-      // to that conversation, and letting it cross would make one choice the
-      // standing answer for every later conversation in the same tab.
-      const { processor, chatManager, session, sent } = build({ chatBypassPermissions: true });
-
-      await processor.startChat('ws-1', 'claude', { resume: false });
-
-      assert.strictEqual(chatManager.calls.start[0].options.bypassPermissions, false);
-      assert.strictEqual(session.chatBypassPermissions, undefined);
+    it('starts a conversation over in the mode the preference names', async function () {
+      // Restated for #134. This used to assert that "start again" always
+      // dropped to asking, which is the defect the issue is about: the recovery
+      // notice's Start a new chat and the composer's New chat sat side by side
+      // doing opposite things. Starting over begins a conversation, so it takes
+      // the preference — and the abandoned conversation's own grant is not
+      // consulted in either direction.
+      const off = build({ chatBypassPermissions: true }, {}, { preference: false });
+      await off.processor.startChat('ws-1', 'claude', { resume: false });
       assert.strictEqual(
-        lastOfType(sent, 'chat_started').bypassPermissions,
+        off.chatManager.calls.start[0].options.bypassPermissions,
+        false,
+        'the abandoned conversation’s bypass must not cross into the new one',
+      );
+      assert.strictEqual(
+        lastOfType(off.sent, 'chat_started').bypassPermissions,
         false,
         'and the header has to say the mode actually changed',
+      );
+
+      const on = build({ chatBypassPermissions: false }, {}, { preference: true });
+      await on.processor.startChat('ws-1', 'claude', { resume: false });
+      assert.strictEqual(
+        on.chatManager.calls.start[0].options.bypassPermissions,
+        true,
+        'starting over is a conversation beginning, so the preference applies',
       );
     });
 
     it('lets an explicit choice turn the bypass back off', async function () {
-      // The remembered mode is a default for a launch that names none, not an
-      // override: a mode the user is standing in front of choosing wins.
-      const { processor, chatManager, session } = build({ chatBypassPermissions: true });
+      // A narrowing the user is standing in front of always wins, whatever the
+      // preference says. It is the only thing still honoured from the browser.
+      const { processor, chatManager, session } = build({}, {}, { preference: true });
 
       await processor.startChat('ws-1', 'claude', { dangerouslySkipPermissions: false });
 
       assert.strictEqual(chatManager.calls.start[0].options.bypassPermissions, false);
-      assert.strictEqual(session.chatBypassPermissions, undefined);
+      assert.strictEqual(session.chatBypassPermissions, false);
     });
 
     it('does not remember a bypass from a launch that never ran', async function () {
@@ -367,9 +446,10 @@ describe('chat wiring', function () {
       const { processor, session } = build(
         {},
         { start: () => Promise.reject(new Error('claude is not installed')) },
+        { preference: true },
       );
 
-      await processor.startChat('ws-1', 'claude', { dangerouslySkipPermissions: true });
+      await processor.startChat('ws-1', 'claude', {});
 
       assert.strictEqual(session.chatBypassPermissions, undefined);
     });
@@ -384,11 +464,22 @@ describe('chat wiring', function () {
       processor.deps.claudeSessions.set(other.id, other);
       processor.deps.webSocketConnections.get('ws-1').chatSessionIds.add(other.id);
 
-      await processor.startChat('ws-1', 'claude', {}, other.id);
+      await processor.startChat('ws-1', 'claude', { resume: true }, other.id);
 
       assert.strictEqual(chatManager.calls.start[0].options.bypassPermissions, false);
-      assert.strictEqual(other.chatBypassPermissions, undefined);
+      assert.strictEqual(other.chatBypassPermissions, false);
       assert.strictEqual(session.chatBypassPermissions, true, 'the other record is untouched');
+    });
+
+    it('asks when no preference can be read at all', async function () {
+      // A server built without the preference store, or one whose read failed.
+      // Every unknown in this rule lands on asking.
+      const { processor, chatManager } = build();
+      processor.deps.getUserPreferences = undefined;
+
+      await processor.startChat('ws-1', 'claude', {});
+
+      assert.strictEqual(chatManager.calls.start[0].options.bypassPermissions, false);
     });
   });
 
@@ -639,11 +730,17 @@ describe('chat wiring', function () {
 
     it('will not set a model override for a session belonging to another user', async function () {
       const { processor, chatManager, session } = build({ surface: 'chat', ownerUserId: 999 });
+      // Restated for #135: a pick now also writes an account-wide default, so
+      // the refusal has to cover that write too and not only the record.
+      const written = [];
+      processor.deps.setUserModelDefault = (userId, runtime, model) =>
+        written.push({ userId, runtime, model });
 
       await processor.handleMessage('ws-1', { type: 'chat_set_model', model: 'sneaky-model' });
 
       assert.strictEqual(chatManager.calls.setModel.length, 0);
       assert.strictEqual(session.chatModelOverride, undefined);
+      assert.deepStrictEqual(written, [], 'and nothing was remembered for anybody');
     });
 
     it('reports pending rather than live when the adapter’s live switch throws', async function () {

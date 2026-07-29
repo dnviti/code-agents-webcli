@@ -27,15 +27,50 @@ import * as React from 'react';
  * readable, and several things set at it — cost, model, the state word — are
  * exactly what somebody looks at mid-session.
  *
- * The rule the acceptance criteria state: nothing carrying live session
- * information is smaller than the body text. `label` is therefore equal to
- * `body`, not one step below it, and that is the point of the pair.
+ * The rule #51 stated: nothing carrying live session information is smaller
+ * than the body text. That rule survives, but it belongs to the *session*
+ * chrome — the header and the live ribbon — and not to the conversation, where
+ * applying it made the message the smallest text on screen with the accounting
+ * around it set larger and in capitals (#92).
+ *
+ * The order inside a conversation, on a phone:
+ *
+ *   17 (18 comfortable)  the message — the largest text there is
+ *   16                   anything typed into, the iOS no-zoom floor
+ *   15                   a collapsed turn's label, which stands in for a
+ *                        message, and the live session figures in the chrome
+ *   13                   supporting detail: the turn header, the tool and
+ *                        reasoning summaries, the model and token line, clocks
+ *   12                   the floor; nothing readable goes below it
+ *
+ * Size is not the whole of it. Capitals and a wide monospace face read as
+ * louder than their size, which is why the per-turn label drops both on a
+ * phone — a 13px shout is still a shout.
  */
 export const PHONE_TEXT = {
+  /**
+   * The message itself: the largest text in the conversation.
+   *
+   * Deliberately above `input` and `label`. The thing the user came to read
+   * has to win, and 17 is where it stops competing with the accounting around
+   * it at arm's length.
+   */
+  prose: 17,
+  /** The message at comfortable density. */
+  proseComfortable: 18,
   /** Conversation prose and anything read as a sentence. */
   body: 15,
   /** Live session information: cost, tokens, model, state, approvals, branch. */
   label: 15,
+  /**
+   * Per-message and per-turn supporting detail.
+   *
+   * The turn header, the tool and reasoning summary, the model and token line,
+   * the timestamps. Legible at arm's length and visibly below the message,
+   * which is the whole of #92. Same number as `meta`, and named separately so
+   * that raising one does not silently raise the other.
+   */
+  detail: 13,
   /**
    * Anything the user types into.
    *

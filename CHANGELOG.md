@@ -2,6 +2,578 @@
 
 ## [Unreleased]
 
+## [5.3.3] - 2026-07-29
+
+### Fixed
+- **A conversation's record stops being edited by a question about layout.** The
+  rule added for #132 — does this block put anything on the screen — is the right
+  question for whether a step earns a row and the wrong one to ask before writing
+  the step down. It says no to reasoning and to every tool call that is not a
+  question, correctly, because neither earns a row on its own; asked at record
+  time that verdict is permanent, taking the block off the trace and out of the
+  work counter with no fold able to bring it back. Both codex adapters were
+  asking it there. Nothing was lost in practice, and only because `itemToBlock`
+  does not yet recognise the spelling real `codex exec --json` uses for those
+  items — the first person to teach it would have silently deleted every command,
+  diff and thought on that path. The record now asks whether the block has
+  anything *in* it, and refuses only what is blank on its own terms: the blank
+  reply #132 was filed for, and a plan a runtime announced and never filled in.
+  Deciding the row stays where it belongs, on the display, working from a record
+  that still holds everything.
+- **The same answer twice is answered twice** (#128). The box that reports an
+  outcome the control cannot show for itself now leaves after seven seconds,
+  which was the fix for it piling up with the effort chip's. It was raised by an
+  effect keyed on the message's *text*, so an outcome repeated word for word —
+  the same model picked again on a runtime that cannot switch mid-session, or
+  "use the default for this runtime" clicked twice — left that key unchanged once
+  the box had gone, and the second click was answered with nothing at all. On a
+  phone, where the chip can show neither a pending model nor a clear, that was
+  the entire response to a deliberate action. Keyed on the answer itself now, so
+  two identical ones are still two. The seven-second dismissal had no check
+  either way; both halves have one now.
+- **A delegation that stopped reporting reads that way in its own window too**
+  (#139). The status for a call nothing will ever report on again reached the
+  tool-status table, the Agents panel and the workflow popup, and missed the
+  agent popup, which keeps a fourth copy of the list. So the row and the window
+  it opens disagreed: the row said "no longer reporting" while the popup put a
+  live dot on that very badge, drew the in-flight glyph beside the last thing the
+  agent said, and offered "Waiting for this agent to report its first step…"
+  about a wait that had already ended.
+- **A prompt scrolled back to is drawn once, like every other one** (#129). The
+  double bubble was fixed for live sending and for reopening a conversation, and
+  survived in the one place left: scrolling back far enough that the turn arrives
+  by paging. The rule that catches an echo needs this app's own copy of the
+  prompt and the runtime's copy in front of it together — only
+  `ChatSession.deliver` writes a user message, and it always mints
+  `user-<uuid>`, so a second one in the same turn under a name this app would not
+  have minted is the runtime repeating itself. Every history page is folded on
+  its own, so a page boundary landing in the handful of events between the two
+  hid each from the other and both survived: on a real Oh My Pi conversation the
+  session wrote its message at seq 2485, a `state` event sat at 2488, the echo
+  followed at 2489, and the client's 200-event walk put the boundary on exactly
+  2488. Eleven pages back, the prompt was drawn twice. The same rule is now
+  applied where the pair is finally whole, as pages are merged. Nothing on disk
+  is rewritten — a turn that holds no message this app minted keeps what it has,
+  rather than losing the only prompt it has.
+- **The Status panel stops making up your subscription** (#137). It used to
+  open on a plan badge reading `max20`, a meter reading "Tokens 0 of 220.0k"
+  and a "Left 220.0k" underneath it. None of that was a fact about anybody's
+  account. The plan name was a command-line flag whose default was `max20` on
+  every install, so every user of every agent saw the same one. The allowances
+  were a table written into this repository — 19,000 tokens and $18 for `pro`,
+  220,000 and $140 for `max20`, and a bare 188,026 for anything it did not
+  recognise — and no provider publishes those figures to a client. And the
+  "used" number came from scanning every Claude Code transcript on the host
+  machine, so it described the whole computer rather than you, and when it found
+  no window containing the present moment it reported zero. A meter reading "0
+  of 220.0k" therefore meant "nobody measured anything", while looking exactly
+  like "you have spent nothing".
+
+  Every one of those figures is gone, and so is the `--plan` flag that chose
+  between them. The flag is still accepted and now does nothing, so an existing
+  service unit keeps starting.
+
+  What replaced them is only ever what a provider said about itself. Claude has
+  been reporting its rate-limit window and reset time on every turn all along —
+  the app was reading that line and throwing it away — and Codex will answer
+  with its plan name and how full each of its windows is if you ask it, which
+  this app now does when a conversation opens. Where the provider states a
+  percentage there is a meter; where it does not, and four of five recorded
+  Claude events do not, there is the reset time on its own and the words "not
+  reported". A bar drawn at 0% would be the same lie in a new place.
+
+  A "time until this runs out" now requires two readings of the same window
+  during the same conversation, because one reading is a level and not a rate.
+  Until the second arrives the panel says there are not enough readings yet.
+
+  The section is titled after the agent you are actually talking to, and every
+  runtime that reports nothing says so in a sentence naming what it does and
+  does not tell us — Cursor and Qwen because they run in a terminal here with no
+  protocol to ask over, and pi, Grok and Oh My Pi because no captured session of
+  theirs has ever carried a quota, a limit or a reset. Kimi was asked rather
+  than observed, because its handshake advertises `status` and `usage` commands
+  and an unrun command proves nothing: both were driven over the ACP connection
+  this app already speaks, and both answer with the model and the context
+  window and nothing about a membership or a quota. The transcript of that probe
+  is in `docs/usage-accounting.md`.
+
+  Claude's billing line is stated only for the two sources that mean one: an
+  `ANTHROPIC_API_KEY` the user exported, or an `apiKeyHelper` they configured.
+  The CLI has a third answer — `/login managed key`, the key `/login` provisions
+  into `~/.claude.json`, which the CLI itself groups with a claude.ai login
+  rather than with a configured key — and that reads "not stated" rather than
+  being turned into a confident "Billed as: API key".
+
+  Beside it there is now a second, clearly separate section for what this app
+  measured itself: the turns that ran through this client, for you, on that
+  agent, over the last day. Those are priced at published list rates rather than
+  billed, and a turn whose runtime reported nothing contributes nothing rather
+  than a zero — the same rule the rest of the usage accounting already follows.
+  It is kept apart from the provider's own meter on purpose; the two are in
+  different currencies and adding them together would produce a figure that is
+  neither. A conversation that has never been launched has no agent to scope a
+  measurement to, and says that rather than reporting that this server keeps no
+  usage record.
+
+  There is one file this app will now open that it did not before, and one rule
+  about which: **it reads a CLI's configuration file and never a credentials
+  file.** `~/.claude.json` supplies a cached tier and percentage for whichever
+  figure the conversation has not stated for itself — which for the tier is
+  every conversation, since Claude states a window every turn and a plan name
+  never — and each one it supplies is labelled: with the time the CLI wrote it,
+  with a note that it describes the account this *server* is signed in as, and
+  naming which figure on screen came from there rather than from the runtime.
+  Nothing identifying comes back with it, and it is discarded once it is older
+  than the shortest window it describes; a window it declines to measure at all
+  is dropped rather than shown as 0%. `~/.codex/auth.json` is not read and will not be, which
+  is why Codex's plan name comes over the protocol instead: the same fact is
+  sitting in that file next to an access token and a refresh token, and a status
+  readout is not worth going near them for.
+
+  What was deliberately not changed: the Usage dashboard, which was already
+  honest and is where the per-agent spend history lives; the local
+  transcript-reading analytics service, which still measures what it always
+  measured now that it has no invented ceiling to measure it against; and the
+  billing question the issue also asks — what your account has actually spent
+  with the provider this period. That needs an admin API key this app does not
+  hold and should not, so it is not shown, rather than approximated.
+- **An agent that reports no tokens and no cost now says so, instead of leaving
+  the header blank** (#136). The report that started this said Oh My Pi showed
+  no context window, no token counts and no cost. It turned out not to
+  reproduce: omp reports all four, the app reads all four, and a session on it
+  gets `85.7k tok · $0.1253` and a context bar in the header exactly as Claude
+  does. That is now covered by a test driven off omp's own recording, so it
+  cannot quietly stop being true.
+
+  What the report was really about is what an empty header *means*, and the app
+  had only one way to draw two very different things. A conversation whose first
+  turn has not finished has no figures. A conversation with Kimi will never have
+  any — probed, and confirmed in the recording the tests replay: Kimi sends no
+  usage notifications, no token counts on its replies, and no cost anywhere.
+  Both looked identical: nothing where the numbers go, which reads as "you have
+  not spent anything yet".
+
+  The rule now is that silence has to be *spoken*, and only a finished turn can
+  speak it. Once a turn has actually done work and ended having reported no
+  tokens or no money, the conversation records that fact once, and the header
+  strip, the line under the composer and the Status panel all say **not
+  reported** in place of the blank. Before that point they stay quiet, because
+  nothing is known yet — and a runtime that goes quiet for one turn and reports
+  on the next reads as having reported, not as silent.
+
+  A turn that was *stopped* teaches it nothing. Pressing stop, correcting the
+  agent mid-sentence, or a runtime that falls over all end a turn before the
+  moment it would have said what the turn cost, so none of them is evidence
+  about the runtime and none of them writes the label. Otherwise stopping Claude
+  once would have left "reports neither tokens nor cost" standing over a Claude
+  conversation for the rest of its life.
+
+  Kimi also stops claiming it can report tokens and money. Every agent behind
+  the protocol bridge advertised both, which was optimism for most of them and
+  simply wrong for Kimi — and it was durable, because that claim is what the
+  permanent usage history files against every job. Kimi's jobs read as "n/a" in
+  the usage dashboard now — the label that view uses for a runtime that cannot
+  report, as against "not reported" for a job from an agent that could have and
+  did not. The other bridge agents keep the optimistic default: their handshake
+  corrects it upward, and a silent turn corrects it downward from evidence.
+
+  Those two labels belong to the history view, which has a capability recorded
+  beside every job it draws. A live conversation has no such record and makes no
+  such claim: it says "not reported" for what it watched happen, which is why
+  the two surfaces word the same silence differently. `docs/usage-accounting.md`
+  now says which is which.
+
+  One quieter fix rides along. A runtime that publishes how big its context
+  window is did not always say which model the window was about, so a model
+  change mid-conversation could make the app read the agent's own figure as the
+  previous model's, throw it away, and go asking a model catalogue for a worse
+  one. Oh My Pi, Codex and Claude all name the model now.
+
+  Two things it deliberately does not do. It does not price a turn the app was
+  not told the price of — there is no price table here and there will not be
+  one, so "cost not reported" for Codex means exactly that. And it does not work
+  out what a runtime can report by watching it: the usage dashboard keeps "this
+  agent cannot report" and "this agent could have and did not" apart on purpose,
+  and those stay two different answers.
+- **The model you pick is remembered for that agent, and the picker says where
+  it came from** (#135). Choosing a model in a chat used to last exactly as long
+  as that conversation. Open a new one on the same agent and you were back on
+  whatever the CLI does by default, picking again — while the effort control
+  right beside it had been remembering its setting per runtime for two releases.
+
+  A model chosen in a chat is now your standing choice for that agent, and the
+  next new chat opens on it. Three things can decide the model, and they are
+  consulted in this order: whatever *this conversation* was set to, then your
+  standing choice for the agent, then the active runtime profile. Below all
+  three the CLI is launched with no model flag at all and uses its own default.
+
+  A conversation already under way is never re-modelled. Every chat records the
+  model its launch actually used, and that recorded model is what it comes back
+  on — so a relaunch, a resume from the launcher and the recovery banner's
+  restart all return to the model that conversation was already using, including
+  after a server restart, which is the moment every open conversation gets
+  relaunched. Changing your standing choice, or the active profile, affects the
+  next new chat and nothing that is open. A conversation that launched with no
+  model flag at all keeps that too: a profile added afterwards does not reach
+  back into it.
+
+  **The picker now says which of the three is in force**, in a line above the
+  list and on the chip's hover. Before this, a model pinned by a runtime profile
+  was genuinely applied to every launch and nowhere on screen: until the agent
+  reported a model of its own, the chip read the literal word "model". It now
+  names the model *this conversation was launched on* — never a default it was
+  not launched on, which would change under an open chat every time you picked a
+  model in another tab — and says where the default came from: a profile, by
+  name; your own last choice; or nobody, in which case the runtime picks. When
+  the two differ the line says which model the conversation is staying on.
+
+  **Use the default for this runtime** clears the conversation's choice *and*
+  forgets your standing one, so the next new chat falls back to the profile and
+  then to the CLI's own default. That is deliberate, and it is what makes the
+  entry worth having: nothing else in the app can undo a standing choice, and a
+  model id typed with a typo would otherwise ride into every new chat on that
+  runtime. For the same reason, a name is only promoted to a standing choice
+  when the runtime is known to take it — the switch applied live, or the name is
+  on the list the runtime published. A runtime that publishes no list at all
+  (Claude is one) has nothing to check against, so a name typed there is taken
+  at face value.
+
+  Your standing choice lives on the server, scoped to your account, so it
+  travels between your phone and your desk and is not readable from anyone
+  else's. Effort is kept per browser instead, and the difference is not taste:
+  Claude, Codex and pi fix the model when the process starts, so a preference
+  held in the browser could only be applied after the launch — which on Claude
+  means a visible `/model` turn pushed into a conversation nobody has typed in
+  yet.
+
+  Runtime profiles are not weakened by this and not going anywhere. They were
+  never a pin a user could not escape — a conversation's own choice has
+  outranked them since the picker existed — and they remain the shared default
+  for everybody who has not chosen. Two things deliberately did not change:
+  terminal sessions, which run the CLI's own interface where the model is yours
+  to change inside the tool, and the launcher screen before a chat starts, which
+  has no model control for the new line to sit in. Branching is unaffected: a
+  branch opens on the model its source was actually running — the one the
+  carried history was just measured against — whether that came from a choice,
+  from your standing one, from the profile, or from nothing at all.
+- **The Web chat approvals switch now reaches every way of starting a
+  conversation, and holds for you rather than for the browser you set it in**
+  (#134). It reached exactly one: the chat button on the runtime launcher.
+  Everything else ignored it. A branch cut from a turn always asked. *Start a
+  new chat* on the recovery notice after a server restart always asked — and
+  when nothing had recorded which conversation the agent was having, that button
+  was the only one offered, so those conversations had no route back to the mode
+  you had chosen at all. Meanwhile **New chat** inside a live conversation did
+  the opposite: it carried the old conversation's bypass forward even if you had
+  since switched the preference back to asking. Two actions with nearly the same
+  name doing opposite things, with nothing on screen saying which you had got.
+
+  There is one rule now, and it is decided by *how you got there* rather than by
+  what happens to be on the record. A conversation that is **beginning** takes
+  your preference: the launcher, a branch, starting over after a restart, and
+  `/clear` are all beginnings. A conversation that is **continuing** — resumed
+  from the launcher, opened from the conversations list, or picked back up with
+  *Resume this conversation* — comes back in the mode it was already running in,
+  and the preference is not re-read in either direction. Turning the preference
+  on later cannot widen a conversation that had already chosen to ask; turning
+  it off cannot take the mode away from one that is running without prompts.
+  Anything missing or unreadable means ask.
+
+  The mode is stated where you are looking. Every conversation opens with a line
+  saying which mode it is in, including the one that replaces it after a
+  `/clear`, and the two buttons on the recovery notice each name the mode they
+  land in — so a bypass is never restored, or dropped, in silence. The chip
+  beside the input box and the header badge move with that line rather than
+  going on naming the mode of the conversation the `/clear` replaced, which is
+  the difference between reading the mode once and being able to check it.
+
+  The preference has moved off the browser and onto your account. It is stored
+  on the server, arrives with the page, and is the same answer on your phone as
+  on your desktop. One consequence of that move: **a preference set before this
+  release does not carry over.** It had never been attached to an account, only
+  to a browser profile, and quietly turning approvals off for an account on the
+  strength of a value one device happened to be holding is not a thing to do
+  with a standing permission. Set it once more and it follows you.
+
+  A chat launch no longer carries an approval flag from the page at all. The
+  button reports what the server is going to do instead of asking for it, which
+  removes the one place in this feature where a page could have asked for a
+  permission the account had never been granted. An explicit *narrowing* from
+  the browser is still honoured, because asking more often is always safe.
+
+  A conversation also shows its real mode from its first paint now, rather than
+  claiming it asks first until the server answers — the session list already
+  knew, and the tab simply was not told.
+
+  Two things deliberately left alone. The terminal surface's own **No prompts**
+  button is a per-launch choice on a different surface and is not covered by
+  this preference. And **pi** is named rather than papered over: its chat
+  adapter has no approval channel, so a pi conversation runs its tools without
+  asking whichever mode the rule works out — its opening line says so instead of
+  promising prompts that were never going to come.
+- **On a phone the message is the largest text in the conversation again**
+  (#92). It had become the smallest. Everything around it — the turn header, the
+  tool and reasoning summary, the model and token line, the timestamps — was
+  made phone-aware and raised to 15px to fix an earlier complaint about
+  captions nobody could read, and the message itself never was: it stayed at
+  13px while the accounting around it sat at 15 in a wide monospace face and in
+  capitals, which reads larger still. The eye landed on "83 tools 31 reasoning"
+  and on a string of token counts before it found what had actually been said.
+
+  There is an order now, and it is written down in one place: 17px for the
+  message (18 at comfortable density), 16 for anything typed into, 15 for a
+  collapsed turn's label and for the live session figures in the header, 13 for
+  the per-message and per-turn detail, and nothing readable below 12. The rule
+  the earlier fix encoded — nothing carrying live session information is smaller
+  than the body text — survives where it belongs, in the session chrome, and no
+  longer governs the conversation.
+
+  Size is not all of it. The per-turn label drops its capitals and its wide
+  tracking on a phone, and a tool call's title drops its extra weight: a 13px
+  shout is still a shout. Two search fields that were below 16px now clear it,
+  because iOS Safari magnifies the page when a smaller field takes focus and
+  never magnifies back.
+
+  Desktop sizing is untouched, and there is now a check that measures the
+  *order* rather than a floor. Every phone type rule this app had was "nothing
+  smaller than N", and a floor cannot catch an inversion — which is exactly how
+  this shipped.
+- **A delegation nothing will report on again stops reading as running** (#139).
+  After a chat turn finished and the agent had delivered its answer, a workflow
+  started during that turn could still appear as running — a spinning badge on
+  its row, a non-zero count on the Agents panel, a turning dot on the trace —
+  with no waits and no activity anywhere in the trace to explain it. The
+  conversation said the work was over and the panel said it was not, and nothing
+  on screen said which was true.
+
+  Nothing in the pipeline ever closed a call on a turn-level event. Ending a
+  turn stamped the outcome onto every message in it and never looked inside
+  their blocks. And the runtimes routinely stop reporting on a call before the
+  turn is over: an Oh My Pi task moved to the background never sends a terminal
+  update at all, and Claude ends a turn with an unresolved call whenever a tool
+  errors during execution. So the call sat non-terminal for ever.
+
+  A call left open when its turn ends now reads **no longer reporting**. It is a
+  new word on purpose: nobody stopped it, which is what *cancelled* says, and
+  nothing is known to have broken, which is what *failed* says — the runtime
+  went quiet and its turn is over. A spinner that will never stop is the worse
+  answer.
+
+  Two things it deliberately does not do. A run that is still reporting about
+  *itself* — a background workflow saying it is working — outlives its turn by
+  design and is left alone; it settles when it says so, or when the runtime it
+  belongs to is gone, since nothing can report after that. And a turn
+  interrupted to redirect it has not ended, so nothing in it is settled.
+
+  An ending that turns up late still lands: this is the answer until a better
+  one arrives, and a real completion replaces it. What cannot land is a progress
+  report that would put the spinner back on a runtime that has already gone
+  quiet once.
+
+  The popup stops saying it is waiting for a stage to report in, which was the
+  trace claiming something was waiting when nothing was.
+- **An answered question comes back marked** (#113). A question the agent asked
+  is left in the conversation after it is answered for exactly one reason:
+  scrolling back past a decision should show the decision. It only survived as
+  long as you stayed put. Switching to another conversation tab and back redrew
+  every answered card blank — all the options faded, none marked, sometimes a
+  grey sentence naming the labels underneath and sometimes nothing at all. A
+  card reading as one nobody had ever answered, sitting beside an agent that had
+  plainly acted on an answer.
+
+  The answer was never lost. It was sent, the agent got it, the turn carried on,
+  and the conversation's own record still held every option that was picked. It
+  was dropped at the join: the snapshot a rejoining browser is sent had nowhere
+  to put it. What was on screen until then was not the record at all — it was
+  the card's own memory of the click, and that does not survive the surface
+  being taken down and built again, which is what switching tabs does.
+
+  So the snapshot carries it now, and it survives a tab switch, a reload, a
+  reconnect, a second browser, a conversation whose agent has since stopped, and
+  a question far enough back that it arrives by scrolling rather than with the
+  opening view — that last one had a second leak of its own, where the page was
+  replayed through a scratch transcript that worked the answer out correctly and
+  was then thrown away with it.
+
+  Questions answered before this ships come back marked too. Nothing needs
+  migrating: the answer has always been written to the log, and the snapshot is
+  built by replaying that log.
+
+  One thing the card used to say that it should not: "Skipped without
+  answering" was drawn both when the user really had skipped and when the app
+  simply did not know. Those are different facts and now read differently — a
+  skip is an answer, and claiming one nobody gave is the same misreport this
+  issue is about, in miniature.
+- **A row appears in the conversation only when it has something to say** (#132).
+  #46 set the rule: a step that produced only tool activity and no written reply
+  gets no row of its own, its work is counted on the next reply that does speak,
+  and the detail stays on the trace. What it decided from was the *kind* of a
+  step's blocks — a reply block meant "this one spoke" — never from whether
+  anything would actually appear on the screen.
+
+  Oh My Pi sends a reply that is a single space beside the tool activity on
+  almost every step. Each of those counted as having spoken and got the row #46
+  exists to remove: a bordered strip holding a model name, a clock and a work
+  counter, with no sentence anywhere in it. In the recorded conversation this
+  was reported from, 22 of 29 rows. The other agents on that protocol send the
+  same blank replies and escaped only because they group a whole turn into one
+  step, so the blank lands in the same row as the real answer — lucky, not safe.
+  Claude had its own trigger: a command whose arguments merely mention the name
+  of the question tool was taken for a question the agent had asked, and a
+  question card with no question in it paints nothing.
+
+  Both are gone, and the fix is in two halves on purpose. A blank reply is no
+  longer *recorded* as content — by the ACP adapters, by Claude's snapshots, by
+  codex — so it never reaches a transcript in the first place. And the rule that
+  decides whether to draw a row now asks the only question that matters: would
+  this paint? A reply that is empty or only spaces, a plan with nothing in it, a
+  step mistaken for a question — none of them earns a row, whichever agent
+  produced it.
+
+  The work counter and the trace of every folded step land on the next reply
+  that does speak, in the order they happened, exactly as #46 requires. And a
+  command that mentions the question tool is now counted as the command it is,
+  which it was not before — it was being skipped as a question already on
+  screen.
+
+  Two things deliberately left alone. A stream that opens an empty block before
+  its first token still opens it: pi and Claude address their deltas by index,
+  so the block has to exist before they arrive, and the display rule is the
+  backstop for whatever ends up in it. And conversations already on disk are not
+  rewritten — they simply stop drawing the empty rows when they are reopened.
+
+  Checked against real recordings rather than constructed ones: the Oh My Pi
+  session the issue was reported from, and a Claude one containing the grep that
+  was mistaken for a question.
+
+- **One prompt makes one turn again** (#129). Sending a single message from the
+  composer put two identical user turns in the conversation, side by side. The
+  browser was never involved: there is one submit path, one frame on the wire,
+  and nothing optimistic anywhere in it. Both copies were written by the server.
+  `ChatSession` writes the user's message, because it is the same in every
+  protocol and a transcript missing what was asked is useless for resuming,
+  exporting or searching — and then every ACP runtime (Oh My Pi, Kimi, Grok,
+  opencode) and both codex modes wrote it *again* from inside their own send,
+  under a turn id of their own. Anything arriving inside an open turn joins that
+  turn, so the two landed together. Claude and pi never did it, which is why the
+  report came from an Oh My Pi conversation.
+
+  Those adapters no longer write one. The session now also refuses a user
+  message it did not mint itself, so this cannot come back from a new runtime:
+  only the session knows what the user actually typed — a branched conversation
+  hands the adapter the carried briefing glued in front of the prompt, and the
+  echo filed all of it as something the user had said — and only the session
+  knows whether the turn was a steer.
+
+  **Conversations recorded before this are not rewritten, and stop drawing the
+  double anyway.** The logs on disk still hold both messages and are replayed
+  every time one of those conversations is opened, so the fold happens where
+  they are read. What identifies the echo is not that it repeats — people
+  repeat themselves — but that this app did not write it: a message claiming to
+  be the user, with an id nothing here would have minted, inside a turn that
+  already carries the user's own. A real second prompt cannot be caught by that,
+  because a real one comes from the session.
+
+  The accounting has defended itself against these echoes since #86 and is
+  untouched: old logs still contain them.
+
+- **Changing the model is quiet now, like changing the effort** (#128). Every
+  pick raised a box beside the composer reading "Switched to claude-sonnet for
+  this conversation." It is the answer #119 deliberately left as an open
+  question, and it is the same one: a change that took effect needs no
+  announcement, because the control has already made it by redrawing. The chip
+  wears the new model's name the instant the switch lands, so the box was the
+  one thing on screen saying nothing new — while overlapping the controls around
+  it, and on a phone landing on the field the user was about to type into.
+
+  Three outcomes still speak, because each is one the chip gets wrong on its
+  own: a choice the runtime has to be *asked* about mid-session is waiting on
+  its reply in the transcript; one that will only apply from the next session
+  does not reach this conversation at all; and clearing the override is the
+  least visible of the three, because the chip has already fallen back to
+  whatever the session last reported, which is not what the next one will run.
+  Unlike the effort ladder there is no refusal to report — a model name is free
+  text and nothing here can pre-judge it.
+
+  Two things the effort chip fixed and this one had not. The hover now describes
+  the control again instead of holding the last confirmation for the rest of the
+  conversation. And the notice that does appear times out and, on a phone, opens
+  upward: this wrapper is `static` there so the menu can have the composer's
+  width, which means `top: 100%` resolved against the composer and put the box
+  on the bottom navigation bar. Measured before the fix, a deferred choice was
+  drawn at 686–756px on a 740px-tall phone — over the bar and past the bottom of
+  the screen.
+
+- **A long popup title is cut, and the window's controls stay where they are**
+  (#114). Every popup in this app is the same panel, and its title was the one
+  thing in the title bar with no permission to shrink. A flex item's automatic
+  minimum size is its own content, so a title carrying a `white-space: nowrap`
+  span — the issue reader's, the file editor's — made the row wider than the
+  panel and pushed the controls block, which is deliberately unshrinkable,
+  bodily out of it. Measured at a phone width, the Close button ended up 341px
+  past the right edge of the screen: not hard to aim at, gone, with the title
+  painted across the strip it should have occupied. A plain-string title failed
+  the other way and wrapped, taking the bar from one line to five.
+
+  The title is now the side that yields. It ends in an ellipsis when it has to,
+  it never wraps, and the controls keep their full size — including the 44px
+  touch targets a phone gets. Nothing is actually lost: the whole title stays in
+  the element, so the accessible name is unchanged, and it is on hover too. A
+  title made of nodes rather than a string has no text a browser could put in a
+  tooltip, so those four popups hand theirs over explicitly.
+
+  Clamping the title is not enough on its own, and that is the half that is easy
+  to miss. Inside a title that may not wrap, an inline-level wrapper is laid out
+  at its maximum width and then chopped with no ellipsis to say so, and anything
+  after it — the workflow popup's status badge, the file editor's view switch —
+  is clipped away entirely rather than shortened. So each of the four now says
+  which part gives way: the sentence, never the icon, the issue number or the
+  status. The file editor's view switch moved out of the title and in with the
+  other controls, because it is a control and a cut title would have taken it.
+
+  Checked in a browser, since none of this is visible to static markup: four
+  shapes of title, each at a desktop width, dragged 300px narrower, maximised,
+  and in a real 390px phone frame with the app's own stylesheets — 224
+  assertions that the title stops before the controls, stays on one line, is
+  ellipsised rather than chopped, and that every control is inside the panel,
+  full size, and returns itself from a hit test at its own centre. Run against
+  the code before the fix, 44 of them fail.
+- **A background workflow reads as running until the run itself ends** (#116).
+  Starting one is a quick, separate step: the request comes back almost
+  immediately with "Workflow launched in background", and the actual work — often
+  several agents across several phases — keeps going for many minutes. The app
+  took that acknowledgement for the end of the work. Within a second of a
+  workflow starting it wore a green **done** badge on its row and in its popup
+  title, no spinner, below the Finished divider, and missing from the panel's
+  running count. In a recorded run the badge flipped about a minute in and the
+  workflow then kept going for another nine, counting up through hundreds of
+  tool calls underneath it.
+
+  The receipt is a receipt now, not a result. The launching call stays running
+  and is settled by the run's own report — done, failed, or cancelled, on either
+  of the two channels the runtime uses, whichever arrives — so the row, the
+  badge, the popup title, the spinner, the trace rail and the running count all
+  say the same true thing. Cancellation was simply unreachable before; it is the
+  outcome that had no path to the screen at all.
+
+  The acknowledgement is no longer captioned as the run's final output either.
+  It says how the run was launched, which is what it is.
+
+  And a run this app can no longer watch — the process exited, the app
+  restarted — settles as interrupted rather than spinning for ever, saying in
+  its own words that it is our observation that ended and not necessarily the
+  run. That mattered less before, because the run already claimed to be
+  finished; it is load-bearing now.
+
+  The Agents row also takes its elapsed time from the run when the run reports
+  one. It used to show nothing while the popup two inches away counted up
+  through nine minutes.
+
+  Only workflows. How an ordinary delegation reports its status is untouched,
+  and there is a test that says so.
+
+## [5.3.2] - 2026-07-29
+
 ### Fixed
 - **A workflow that failed no longer reads as done** (#140). The Workflow tool
   returns the moment a run is launched — "Workflow launched in background", no
