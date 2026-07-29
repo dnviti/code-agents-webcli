@@ -310,6 +310,7 @@ async function run(): Promise<void> {
   await checkNoRowIsDrawnWithNothingToRead();
   await checkAQuestionIsAnsweredByClicking();
   await checkThePhoneLayoutIsUsable();
+  await checkThePhoneReadsTheMessageFirst();
   await checkThePhoneShellSurfacesAreUsable();
   await checkTheConversationsTerminalCanBeDrivenFromAPhone();
   await checkALongTabNameStaysInsideTheStrip();
@@ -3712,6 +3713,147 @@ function assertPhoneSurface(host: HTMLElement, where: string, atRest = false): v
     );
   }
 
+}
+
+/**
+ * On a phone the message is the loudest thing in the conversation (#92).
+ *
+ * It was the quietest. Every piece of chrome around it — the turn header, the
+ * tool and reasoning summary, the model and token line, the timestamps — had
+ * been made phone-aware and raised to 15px to satisfy an earlier issue about
+ * illegible captions, and the prose itself never was: it stayed at 13px,
+ * sans-serif, while the accounting around it sat at 15 in a wide monospace
+ * face and in capitals, which reads larger still. A screenful gave more space
+ * to the figures between two sentences than to the sentences.
+ *
+ * So this measures the order rather than a floor. Every rule the app has about
+ * phone type until now has been "nothing smaller than N", and a floor cannot
+ * catch an inversion — that is exactly how this shipped.
+ */
+async function checkThePhoneReadsTheMessageFirst(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;display:flex;overflow:hidden';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('phone-type-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'phone-type-check',
+    snapshot: {
+      sessionId: 'phone-type-check', runtime: 'claude', state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: false, permissions: false,
+        interrupt: true, resume: true, fork: false, attachments: false, usage: true,
+        cost: true, plan: false, commands: [],
+      },
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'why did the release script tag the wrong commit' }],
+        },
+        {
+          id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: Date.now(),
+          model: 'claude-opus-4-6',
+          usage: { inputTokens: 18422, outputTokens: 1203, costUsd: 0.1286 },
+          blocks: [
+            {
+              kind: 'tool', toolId: 'x1', name: 'bash', toolKind: 'execute', status: 'completed',
+              input: { command: 'git log --oneline -20' }, output: 'a1b2c3d chore: release', durationMs: 1200,
+            },
+            { kind: 'text', text: 'Because it reads the version before the bump commit lands, so it tags the parent.' },
+          ],
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(React.createElement(PhoneSurface, { controller }));
+  await wait(400);
+  settle(document);
+
+  const log = host.querySelector('[role="log"]') as HTMLElement | null;
+  if (!log) {
+    check('the phone draws a conversation to measure', false);
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  const painted = paintedText(log);
+  const find = (needle: string): { size: number; text: string; node: HTMLElement } | undefined =>
+    painted.find((entry) => entry.text.includes(needle));
+
+  const prose = find('Because it reads the version');
+  check(
+    'the message is drawn at all',
+    Boolean(prose),
+    painted.map((entry) => `${entry.text.slice(0, 18)}@${entry.size}`).slice(0, 10).join(' | '),
+  );
+  if (!prose) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  // Everything else in the conversation is supporting detail, and every piece
+  // of it has to be below the message. Named individually so a failure says
+  // which one inverted, rather than "something did".
+  const detail: Array<[string, string]> = [
+    ['the turn header', 'turn 1'],
+    ['the model and token line', 'claude-opus-4-6'],
+    ['the token count', 'in'],
+    ['the tool and reasoning summary', 'tool'],
+    ['the timestamp', ':'],
+  ];
+  for (const [what, needle] of detail) {
+    const found = painted.find((entry) => entry.text.toLowerCase().includes(needle.toLowerCase()));
+    // Asserted rather than skipped: a needle that stops matching would take
+    // its own assertion off the sweep and leave this reporting all clear.
+    check(`${what} is on the screen to be measured`, Boolean(found), needle);
+    if (!found) continue;
+    check(
+      `${what} is smaller than the message`,
+      found.size < prose.size - 0.01,
+      `${found.size}px against the message's ${prose.size}px`,
+    );
+    check(
+      `${what} is still large enough to read at arm's length`,
+      found.size >= PHONE_MIN_TEXT - 0.01,
+      `${found.size}px, floor ${PHONE_MIN_TEXT}px`,
+    );
+  }
+
+  // And the sweep, because naming four is not the same as covering the row: no
+  // text in the conversation may reach the message's size except the message.
+  const louder = painted.filter(
+    (entry) => entry.size > prose.size + 0.01 && !entry.text.includes('Because it reads the version'),
+  );
+  check(
+    'nothing in the conversation is drawn larger than the message',
+    louder.length === 0,
+    louder.map((entry) => `${entry.text.slice(0, 20)}@${entry.size}`).join(' | ') || 'the message wins',
+  );
+
+  check(
+    'and the message is comfortably above the floor for reading at arm’s length',
+    prose.size >= 16,
+    `${prose.size}px`,
+  );
+
+  // The composer, which must not make the page zoom when it takes focus.
+  const field = composerField(host);
+  const fieldSize = field ? parseFloat(getComputedStyle(field).fontSize) : 0;
+  check(
+    'focusing the composer cannot make the page zoom',
+    fieldSize >= 16 - 0.01,
+    `${fieldSize}px, iOS zooms below 16px`,
+  );
+
+  root.unmount();
+  host.remove();
 }
 
 async function checkThePhoneLayoutIsUsable(): Promise<void> {

@@ -866,7 +866,7 @@ export function ChatView({
         background: 'var(--background)',
         color: 'var(--foreground)',
         fontFamily: 'var(--font-sans)',
-        ...(proseVariables(view) as React.CSSProperties),
+        ...(proseVariables(view, isMobile) as React.CSSProperties),
       }}
     >
       <SessionHeader
