@@ -46,9 +46,16 @@ export interface AgentsPanelProps {
 }
 
 export function AgentsPanel({ transcript, onOpenDelegation }: AgentsPanelProps): React.JSX.Element {
+  // The live tier, not `subscribe`. What a workflow is doing arrives as
+  // `workflow_progress`, which the reducer marks neither structural nor meta —
+  // so it reaches `subscribeContent` and nothing else (see transcript.ts). On
+  // the coarse tier this panel showed the counts a run reported at the moment
+  // some *unrelated* structural event last fired: "3 agents · 3 running" under
+  // a workflow that had finished, and no sign of one that had lost an agent
+  // (#140). Every other delegation surface is already here.
   const version = React.useSyncExternalStore(
-    transcript.subscribe,
-    transcript.getVersion,
+    transcript.subscribeContent,
+    transcript.getContentVersion,
     ZERO,
   );
 

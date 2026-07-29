@@ -1121,11 +1121,31 @@ async function checkAFailedWorkflowReadsAsFailedEverywhere(): Promise<void> {
     (event) => (event as { t?: string }).t === 'workflow_failed',
   );
   check('the recording still holds a run that failed', failedAt >= 0);
+  // Mounted *before* the agents inside it start dying, so what follows is
+  // judged on a panel that had to redraw rather than one built from the
+  // finished article. The counts arrive on `workflow_progress`, which the
+  // reducer marks neither structural nor meta — a panel on the coarse
+  // subscription tier renders the right thing here and then never moves.
+  const firstReport = RECORDED_FAILED_WORKFLOW.findIndex(
+    (event) => (event as { t?: string }).t === 'workflow_progress',
+  );
   const { root, play } = mount(
     'workflow-failed-check',
-    RECORDED_FAILED_WORKFLOW.slice(0, failedAt + 1),
+    RECORDED_FAILED_WORKFLOW.slice(0, firstReport + 1),
   );
   await wait(220);
+  settle(document);
+
+  const early = host.querySelector('aside[aria-label="Workspace"]')?.textContent ?? '';
+  check(
+    'the agents list shows the run before anything has failed',
+    /agents/.test(early) && !/failed/.test(early),
+    early.replace(/\s+/g, ' ').slice(0, 120),
+  );
+
+  // The rest of the reports, and the failure, into a panel already on screen.
+  play(RECORDED_FAILED_WORKFLOW.slice(firstReport + 1, failedAt + 1));
+  await wait(160);
   settle(document);
 
   const rail = host.querySelector('aside[aria-label="Workspace"]') as HTMLElement | null;
@@ -1208,8 +1228,45 @@ async function checkAFailedWorkflowReadsAsFailedEverywhere(): Promise<void> {
   // The control: a run that finished, with one of its five agents dead. It must
   // still read as done, or the fix has traded a missed failure for an invented
   // one — agents inside a workflow fail by design.
-  const control = mount('workflow-done-check', RECORDED_WORKFLOW);
+  //
+  // Mounted before that agent dies, and the rest played in afterwards, because
+  // this is the case that has nothing else to lean on: a run that fails raises
+  // an event the whole panel redraws for, and a run that merely loses an agent
+  // reports it only as `workflow_progress` — which reaches the live
+  // subscription tier and no other. Built from the finished recording this
+  // passed on a panel that could never have redrawn.
+  // Cut at the last report before the agent dies, whichever that is: the run
+  // reports its whole roster each time, and the first report of all already
+  // carries several agents.
+  const deathAt = RECORDED_WORKFLOW.findIndex(
+    (event) =>
+      (event as { t?: string }).t === 'workflow_progress'
+      && ((event as { agents?: Array<{ state?: string }> }).agents ?? []).some(
+        (agent) => agent.state === 'failed',
+      ),
+  );
+  const controlFirst = deathAt - 1;
+  const control = mount('workflow-done-check', RECORDED_WORKFLOW.slice(0, controlFirst + 1));
   await wait(220);
+  settle(document);
+  const beforeDeath = host.querySelector('aside[aria-label="Workspace"]')?.textContent ?? '';
+  check(
+    'the finished run’s panel starts with nothing failed',
+    /agents/.test(beforeDeath) && !/failed/.test(beforeDeath),
+    beforeDeath.replace(/\s+/g, ' ').slice(0, 120),
+  );
+
+  // Only the run's own reports, which is the window this is about. Between two
+  // structural events a run can report a dozen times, and on the coarse
+  // subscription tier the panel shows none of it until something unrelated
+  // happens to fire — so a check that replayed the whole tail would be proved
+  // right by the next `msg_start` rather than by the panel.
+  control.play(
+    RECORDED_WORKFLOW.slice(controlFirst + 1).filter(
+      (event) => (event as { t?: string }).t === 'workflow_progress',
+    ),
+  );
+  await wait(200);
   settle(document);
   const controlRail = host.querySelector('aside[aria-label="Workspace"]') as HTMLElement | null;
   const controlText = controlRail?.textContent ?? '';
@@ -1219,9 +1276,9 @@ async function checkAFailedWorkflowReadsAsFailedEverywhere(): Promise<void> {
     controlText.slice(0, 160),
   );
   check(
-    'and still says the one agent that died inside it did',
+    'and says, without being remounted, that one agent died inside it',
     /1 failed/.test(controlText),
-    controlText.slice(0, 160),
+    controlText.replace(/\s+/g, ' ').slice(0, 160),
   );
   const controlTranscript = host.querySelector('[role="log"]')?.textContent ?? '';
   check(
