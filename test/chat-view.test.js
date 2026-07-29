@@ -481,6 +481,49 @@ describe('ChatView', function () {
     assert.ok(html.includes('>error<'), 'header indicator must follow the state');
   });
 
+  /**
+   * The way into the conversation list, at the top of the chat surface (#127).
+   *
+   * Beside the transcript search on purpose: the two are the same gesture at two
+   * scales, and someone who has just failed at finding something in *this*
+   * conversation is about to want to find another one.
+   */
+  it('offers a way to all conversations beside the transcript search', function () {
+    const html = render({
+      controller: controllerWith({}),
+      onOpenConversations() {},
+    });
+
+    assert.ok(html.includes('aria-label="Search this conversation"'), 'the search trigger is the anchor');
+    assert.ok(html.includes('aria-label="All conversations"'), html.slice(0, 800));
+  });
+
+  it('leaves the control out entirely when the shell offers no list', function () {
+    // A control that does nothing reads as a broken control. Rendered only when
+    // there is a shell to host the dialog.
+    const html = render({ controller: controllerWith({}) });
+    assert.ok(!html.includes('All conversations'));
+  });
+
+  it('keeps that way in reach once the header has shed its search field', function () {
+    // Below ~1100px the bar drops the field for a glyph on the right. Both go
+    // together: the pairing is the point, and a control that survives only at
+    // full width is a control most windows never see.
+    const html = render({
+      controller: controllerWith({}),
+      onOpenConversations() {},
+      isMobile: true,
+    });
+    // On a phone the header carries no controls at all — the route is the
+    // actions sheet, asserted in the browser checks where the sheet can be
+    // opened. What must hold here is that nothing was drawn twice.
+    assert.strictEqual(
+      html.split('aria-label="All conversations"').length - 1,
+      0,
+      'the phone header carries no controls; the sheet is its route',
+    );
+  });
+
   it('collapses the rails and keeps touch targets on mobile', function () {
     const controller = controllerWith({
       plan: [{ text: 'Wire the view', status: 'in_progress' }],

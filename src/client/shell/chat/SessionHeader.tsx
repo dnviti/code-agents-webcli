@@ -57,6 +57,15 @@ export interface SessionHeaderProps {
   onToggleRail(): void;
   onToggleIndex(): void;
   onOpenSearch(): void;
+  /**
+   * Open the list of every conversation this user has.
+   *
+   * Beside the transcript search on purpose: the two are the same gesture at two
+   * scales — find something in this conversation, find the conversation — and a
+   * person who has just failed at the first is about to want the second (#127).
+   * Absent on a surface with no shell to host the list.
+   */
+  onOpenConversations?: () => void;
   onOpenSettings(): void;
   onToggleTheme?: () => void;
 }
@@ -127,6 +136,7 @@ export function SessionHeader({
   onToggleRail,
   onToggleIndex,
   onOpenSearch,
+  onOpenConversations,
   onOpenSettings,
   onToggleTheme,
 }: SessionHeaderProps): React.JSX.Element {
@@ -224,6 +234,22 @@ export function SessionHeader({
       {compact ? null : <Badge variant="outline">Beta</Badge>}
 
       {tight ? null : <SearchTrigger onClick={onOpenSearch} />}
+
+      {/* Beside the search field, at both widths: here while there is room for
+          the field, and next to the search glyph on the right once the bar has
+          shed it. The pairing is the point — a control for finding a
+          conversation belongs where the control for searching one is. */}
+      {onOpenConversations && !tight ? (
+        <IconButton
+          type="button"
+          size="md"
+          label="All conversations"
+          style={{ flex: '0 0 auto' }}
+          onClick={onOpenConversations}
+        >
+          <Icon name="message-square" />
+        </IconButton>
+      ) : null}
 
       {/* Everything from here right is the readout, and none of it shrinks. */}
       <span
@@ -324,6 +350,17 @@ export function SessionHeader({
             onClick={onOpenSearch}
           >
             <Icon name="search" />
+          </IconButton>
+        ) : null}
+
+        {tight && onOpenConversations ? (
+          <IconButton
+            type="button"
+            size="md"
+            label="All conversations"
+            onClick={onOpenConversations}
+          >
+            <Icon name="message-square" />
           </IconButton>
         ) : null}
 

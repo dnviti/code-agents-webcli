@@ -500,9 +500,26 @@ export function terminalsFor(chatSessionId: string): ChatTerminal[] {
  * to rejoin ptys that no longer exist.
  */
 export function forgetTerminals(chatSessionId: string): void {
+  releaseTerminals(chatSessionId);
+  rememberTerminals(chatSessionId, []);
+}
+
+/**
+ * Let go of this page's copy of a conversation's shells, keeping the shells.
+ *
+ * The other half of `forgetTerminals`, and the difference between them is the
+ * whole distinction: this releases the xterms and their sockets and leaves the
+ * note of which ptys they were attached to, so reopening the conversation rejoins
+ * the same shells instead of starting a second set beside them.
+ *
+ * Called when a conversation goes off screen but carries on existing — its tab
+ * was closed (#127), or it was the least recently touched of more conversations
+ * than this page keeps terminals for. `forgetTerminals` is for the case where the
+ * server has genuinely ended them.
+ */
+export function releaseTerminals(chatSessionId: string): void {
   for (const pane of BY_CHAT.get(chatSessionId) ?? []) pane.dispose();
   BY_CHAT.delete(chatSessionId);
-  rememberTerminals(chatSessionId, []);
 }
 
 /** Drop a pane from its conversation's list, ending the session behind it. */

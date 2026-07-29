@@ -419,7 +419,8 @@ export class App {
     sessionsLeaveSession(this);
   }
 
-  deleteSession(sessionId: string, options?: { confirm?: boolean }): Promise<void> {
+  /** Resolves true when the session was actually deleted. */
+  deleteSession(sessionId: string, options?: { confirm?: boolean }): Promise<boolean> {
     return sessionsDeleteSession(this, sessionId, options);
   }
 

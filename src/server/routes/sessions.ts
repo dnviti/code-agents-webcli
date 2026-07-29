@@ -16,6 +16,11 @@ import { HistoryStoreLike } from '../services/history-store.js';
 import { SessionTeardownLike } from '../services/session-teardown.js';
 import { stripAnsi } from '../services/ansi.js';
 import { ChatEvent } from '../../shared/chat-events.js';
+import {
+  ConversationProject,
+  ConversationSummary,
+  projectName,
+} from '../../shared/conversations.js';
 import { planBranch, tooLargeMessage } from '../chat/branch.js';
 import { TurnCut } from '../chat/store.js';
 import { getOwnedSession, requireUser } from './helpers.js';
@@ -27,6 +32,29 @@ import { getOwnedSession, requireUser } from './helpers.js';
  * one is not findable by scrolling anyway, and every entry costs a read.
  */
 const MAX_RESUMABLE = 25;
+
+/**
+ * How many conversations one full listing describes.
+ *
+ * Far above the "hundreds across a dozen projects" this is built for, and it is
+ * a backstop rather than a design: every described conversation costs a bounded
+ * read of its log, and an account with ten thousand of them must not be able to
+ * turn opening a list into a minute of disk. What is dropped is always the least
+ * recently active, and the answer says it was dropped.
+ */
+const MAX_LISTED_CONVERSATIONS = 400;
+
+/**
+ * How many logs are read at once while describing a list.
+ *
+ * Unbounded `Promise.all` over four hundred conversations opens four hundred
+ * logs, four hundred indexes and four hundred stats at the same instant, which
+ * on a default 1024-descriptor limit is how a listing turns into EMFILE — and
+ * EMFILE does not fail only this request, it fails whatever else the server was
+ * doing. Sixteen at a time keeps the whole listing well inside a hundred
+ * milliseconds without ever holding more than a few dozen handles.
+ */
+const DESCRIBE_CONCURRENCY = 16;
 
 /** Long enough for any label worth reading on a tab, short enough to store freely. */
 const MAX_NAME_LENGTH = 200;
@@ -141,48 +169,75 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       return;
     }
 
-    const candidates = Array.from(deps.claudeSessions.values())
-      .filter((session) => session.ownerUserId === user.id)
-      .filter((session) => session.surface === 'chat')
+    const candidates = chatRecords(deps, user.id)
       .filter((session) => session.workingDir === validation.path)
-      .sort((a, b) => b.lastActivity.getTime() - a.lastActivity.getTime())
       .slice(0, MAX_RESUMABLE);
 
-    const store = deps.chatStore;
-    const conversations = await Promise.all(
-      candidates.map(async (session) => {
-        const ref = { id: session.id, ownerUserId: session.ownerUserId };
-        const [stats, description] = await Promise.all([
-          store?.stat(ref).catch(() => null) ?? null,
-          store?.describe(ref).catch(() => null) ?? null,
-        ]);
-
-        return {
-          id: session.id,
-          name: displayName(session),
-          runtime: session.lastAgent,
-          runtimeLabel: session.runtimeLabel,
-          lastActivity: session.lastActivity.toISOString(),
-          workingDir: session.workingDir,
-          events: stats?.cursor ?? 0,
-          firstMessage: description?.firstMessage ?? null,
-          // The record first, then the log: the record is authoritative and the
-          // head scan is the backfill for conversations that predate it.
-          canResume: Boolean(session.nativeChatSessionId || description?.nativeSessionId),
-          // Reported so the row can say which approval mode picking it will put
-          // back. A restored bypass is a standing permission, and one that
-          // arrives silently is no better than one that is silently dropped.
-          bypassPermissions: session.chatBypassPermissions === true,
-          // A conversation that is already running is not one to resume; the
-          // list says so rather than offering an action that would be refused.
-          running: session.active === true,
-        };
-      }),
-    );
+    const conversations = await describeAll(deps, candidates);
 
     res.json({
       dir: validation.path,
       conversations: conversations.filter((entry) => entry.events > 0),
+    });
+  });
+
+  /**
+   * Every conversation this user has, grouped by the project it belongs to.
+   *
+   * The answer to "what conversations do I have?", which until now the app had
+   * nowhere to put. The resume list above answers a narrower question — "in this
+   * folder, is there one to carry on with" — and it is reachable only on the way
+   * to starting a new session in a folder already chosen. That makes it useless
+   * for the two things people actually ask: where the conversation about the
+   * release script was, and how to get back into the one closed yesterday (#127).
+   *
+   * Grouped here rather than in the browser because the ordering is a decision,
+   * not a rendering: conversations run newest-first inside a project, and the
+   * projects themselves run by their own newest conversation, so the folder
+   * somebody was working in this morning is at the top whichever folder it is.
+   * Both orders fall out of one sort, which is why there is only one.
+   *
+   * Not grouped by anything the filesystem says, either: a project with no
+   * conversations does not appear, because this is a list of conversations that
+   * happen to be filed under folders rather than a folder browser.
+   */
+  router.get('/api/sessions/conversations', async (_req: Request, res: Response): Promise<void> => {
+    const user = requireUser(res);
+    if (!user) {
+      res.status(401).json({ error: 'authentication_required' });
+      return;
+    }
+
+    const owned = chatRecords(deps, user.id);
+    const described = await describeAll(deps, owned.slice(0, MAX_LISTED_CONVERSATIONS));
+    // A record with an empty log is a folder somebody opened and walked away
+    // from. It is not a conversation, and listing it would put a row with nothing
+    // to read in front of the ones that matter — the same rule the resume list
+    // applies, for the same reason.
+    const conversations = described.filter((entry) => entry.events > 0);
+
+    // Insertion order carries the grouping: `owned` is already newest-first, so
+    // the first time a directory is seen is at its most recent conversation, and
+    // every group's contents arrive in order behind it.
+    const groups = new Map<string, ConversationProject>();
+    for (const conversation of conversations) {
+      const existing = groups.get(conversation.workingDir);
+      if (existing) {
+        existing.conversations.push(conversation);
+        continue;
+      }
+      groups.set(conversation.workingDir, {
+        dir: conversation.workingDir,
+        name: projectName(conversation.workingDir),
+        lastActivity: conversation.lastActivity,
+        conversations: [conversation],
+      });
+    }
+
+    res.json({
+      projects: Array.from(groups.values()),
+      total: conversations.length,
+      truncated: owned.length > MAX_LISTED_CONVERSATIONS,
     });
   });
 
@@ -684,6 +739,108 @@ function destroySession(deps: SessionRoutesDeps, session: SessionRecord): void {
   // Subsystems that registered their own cleanup (pasted images, and
   // whatever comes next) rather than each appending a line here.
   deps.sessionTeardown?.dispose(session);
+}
+
+/**
+ * Every chat conversation a user owns, most recently active first.
+ *
+ * The one definition of what a listable conversation is, so the resume list and
+ * the full list cannot disagree about it. Three conditions, and each rules
+ * something out that is not a conversation the user can open:
+ *
+ *   - not another user's, obviously.
+ *   - not a terminal session, which has no transcript to come back to.
+ *   - not a shell opened *inside* a conversation. It is a real session, but it is
+ *     reached through the conversation that owns it and only there; a row of its
+ *     own would offer a pty as though it were a chat.
+ *
+ * Sorting here rather than at each call site is what makes the grouping below
+ * work: one order, read two ways.
+ */
+function chatRecords(deps: SessionRoutesDeps, userId: number): SessionRecord[] {
+  return Array.from(deps.claudeSessions.values())
+    .filter((session) => session.ownerUserId === userId)
+    .filter((session) => session.surface === 'chat')
+    .filter((session) => !session.ownerSessionId)
+    .sort((a, b) => activityMs(b) - activityMs(a));
+}
+
+/**
+ * Describe a run of conversations, a few logs at a time.
+ *
+ * The bounded concurrency is the whole point — see DESCRIBE_CONCURRENCY. A failed
+ * read of one log costs that row its opening line and nothing else: a
+ * conversation that cannot be described is still a conversation, and dropping it
+ * from the list would be the one outcome the user cannot diagnose.
+ */
+async function describeAll(
+  deps: SessionRoutesDeps,
+  sessions: SessionRecord[],
+): Promise<ConversationSummary[]> {
+  const summaries: ConversationSummary[] = new Array(sessions.length);
+  let next = 0;
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const at = next++;
+      if (at >= sessions.length) return;
+      summaries[at] = await summarise(deps, sessions[at]);
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(DESCRIBE_CONCURRENCY, sessions.length) }, worker),
+  );
+  return summaries;
+}
+
+/** One conversation, as every list of them describes it. */
+async function summarise(
+  deps: SessionRoutesDeps,
+  session: SessionRecord,
+): Promise<ConversationSummary> {
+  const store = deps.chatStore;
+  const ref = { id: session.id, ownerUserId: session.ownerUserId };
+  const [stats, description] = await Promise.all([
+    store?.stat(ref).catch(() => null) ?? null,
+    store?.describe(ref).catch(() => null) ?? null,
+  ]);
+
+  return {
+    id: session.id,
+    name: displayName(session),
+    runtime: session.lastAgent,
+    runtimeLabel: session.runtimeLabel,
+    lastActivity: new Date(activityMs(session)).toISOString(),
+    workingDir: session.workingDir,
+    events: stats?.cursor ?? 0,
+    firstMessage: description?.firstMessage ?? null,
+    // The record first, then the log: the record is authoritative and the head
+    // scan is the backfill for conversations that predate it.
+    canResume: Boolean(session.nativeChatSessionId || description?.nativeSessionId),
+    // Reported so the row can say which approval mode picking it will put back.
+    // A restored bypass is a standing permission, and one that arrives silently
+    // is no better than one that is silently dropped.
+    bypassPermissions: session.chatBypassPermissions === true,
+    // A conversation that is already running is not one to resume; the list says
+    // so rather than offering an action that would be refused.
+    running: session.active === true,
+  };
+}
+
+/**
+ * When a session was last active, in milliseconds.
+ *
+ * Tolerant of a string because the field crosses SQLite: `loadSessions` revives
+ * it as a Date, but a record hand-built by a caller — or one revived by an older
+ * build — can carry the ISO string it was stored as, and `.getTime()` on a string
+ * is a TypeError that would take the whole listing down rather than one row's
+ * timestamp.
+ */
+function activityMs(session: SessionRecord): number {
+  const value = session.lastActivity as Date | string | undefined;
+  const at = value instanceof Date ? value.getTime() : new Date(value ?? 0).getTime();
+  return Number.isFinite(at) ? at : 0;
 }
 
 const EXPORT_PAGE_LINES = 500;

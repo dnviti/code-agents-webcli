@@ -744,6 +744,131 @@ describe('ChatStore', function () {
     });
   });
 
+  /**
+   * How a conversation is described in a list of them, and why that answer is
+   * allowed to be remembered.
+   *
+   * The opening of an append-only log cannot change, which is what makes a
+   * conversation list cost one bounded read per conversation once rather than
+   * every time it opens (#127). The two operations that genuinely rewrite the head
+   * — a `/clear` and a retention trim — have to be seen to drop it, because a
+   * remembered opening line after a clear is the previous conversation's question
+   * standing in for the new one's.
+   */
+  describe('describe', function () {
+    /** A conversation that opens with a question, then says more. */
+    function openingWith(startSeq, text, nativeSessionId) {
+      const id = `u-${startSeq}`;
+      const events = [
+        { t: 'msg_start', seq: startSeq, ts: startSeq, id, role: 'user', turnId: `t-${startSeq}` },
+        {
+          t: 'block_start',
+          seq: startSeq + 1,
+          ts: startSeq + 1,
+          msgId: id,
+          index: 0,
+          block: { kind: 'text', text },
+        },
+        { t: 'msg_end', seq: startSeq + 2, ts: startSeq + 2, msgId: id },
+      ];
+      if (nativeSessionId) {
+        events.push({
+          t: 'session',
+          seq: startSeq + 3,
+          ts: startSeq + 3,
+          nativeSessionId,
+          capabilities: {},
+        });
+      }
+      return events;
+    }
+
+    it('reads the opening question and the runtime’s own id', async function () {
+      const session = { id: 's1', ownerUserId: 1 };
+      store.append(session, openingWith(1, 'che file ho caricato?', 'native-1'));
+
+      const found = await store.describe(session);
+      assert.strictEqual(found.firstMessage, 'che file ho caricato?');
+      assert.strictEqual(found.nativeSessionId, 'native-1');
+    });
+
+    it('gives the same answer however many times it is asked', async function () {
+      const session = { id: 's1', ownerUserId: 1 };
+      store.append(session, openingWith(1, 'prima domanda', 'native-1'));
+      await store.describe(session);
+      // More is said afterwards, which is the ordinary case: the opening of an
+      // append-only log is settled, so the answer must not drift.
+      store.append(session, openingWith(5, 'seconda domanda'));
+
+      const found = await store.describe(session);
+      assert.strictEqual(found.firstMessage, 'prima domanda');
+    });
+
+    it('finds an opening it could not see the first time it looked', async function () {
+      // A conversation asked about before anybody had said anything in it. The
+      // answer then was "nothing yet", and that is not something to remember.
+      const session = { id: 's1', ownerUserId: 1 };
+      store.append(session, [{ t: 'state', seq: 1, ts: 1, state: 'starting' }]);
+      assert.strictEqual((await store.describe(session)).firstMessage, null);
+
+      store.append(session, openingWith(2, 'arrivata dopo', 'native-1'));
+      assert.strictEqual((await store.describe(session)).firstMessage, 'arrivata dopo');
+    });
+
+    it('re-reads the opening after a /clear, which is a new conversation', async function () {
+      const session = { id: 's1', ownerUserId: 1 };
+      store.append(session, openingWith(1, 'la vecchia conversazione', 'native-1'));
+      await store.describe(session);
+
+      const marker = { t: 'marker', seq: 5, ts: 5, kind: 'cleared', detail: 'started a new conversation' };
+      store.append(session, [marker, ...openingWith(6, 'la nuova conversazione', 'native-2')]);
+      await store.truncateBefore(session, marker.seq);
+
+      const found = await store.describe(session);
+      assert.strictEqual(
+        found.firstMessage,
+        'la nuova conversazione',
+        'a cleared conversation must not be listed under the question that ended it',
+      );
+      assert.strictEqual(found.nativeSessionId, 'native-2');
+    });
+
+    it('re-reads the opening after the head of the log is trimmed', async function () {
+      // Past the retention cap the oldest events go, opening question included.
+      // A remembered answer would keep listing a conversation by a line that is
+      // no longer in it.
+      const small = new ChatStore({ storageDir: dir, maxEvents: 12, trimChunkEvents: 6 });
+      const session = { id: 'trimmed', ownerUserId: 1 };
+      small.append(session, openingWith(1, 'la prima domanda', 'native-1'));
+      assert.strictEqual((await small.describe(session)).firstMessage, 'la prima domanda');
+
+      small.append(session, makeEvents(5, 6));
+      small.append(session, openingWith(11, 'una domanda più tarda', 'native-2'));
+      await small.stat(session);
+
+      const found = await small.describe(session);
+      assert.notStrictEqual(
+        found.firstMessage,
+        'la prima domanda',
+        'the trimmed opening is no longer in the log and must not be reported from it',
+      );
+    });
+
+    it('forgets a description when the conversation is deleted', async function () {
+      // The ids are UUIDs, so this cannot happen in the app — but a remembered
+      // answer keyed on a path that a later conversation could reuse is exactly
+      // the sort of cache that outlives what it described.
+      const session = { id: 'reused', ownerUserId: 1 };
+      store.append(session, openingWith(1, 'la prima vita', 'native-1'));
+      await store.describe(session);
+
+      await store.deleteChat(session);
+      store.append(session, openingWith(1, 'la seconda vita', 'native-2'));
+
+      assert.strictEqual((await store.describe(session)).firstMessage, 'la seconda vita');
+    });
+  });
+
   describe('deleteChat', function () {
     it('removes the log and index for that session only', async function () {
       store.append({ id: 'gone', ownerUserId: 1 }, makeEvents(1, 1));

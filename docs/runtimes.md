@@ -272,6 +272,51 @@ it really does change the session you are in, but a level that cannot be passed
 at launch would be silently dropped by every session after this one while the
 control went on claiming it. Only levels the runtime published are remembered.
 
+### Finding a conversation again
+
+The button beside **Search transcript** at the top of the chat surface opens
+**every conversation you have** — on a phone it is in the actions sheet, beside
+the same search. It lists conversations, not sessions: the ones with no tab open
+and the ones nothing is running are in it too.
+
+Conversations are grouped under the project folder each belongs to, newest first
+inside a group, with the groups ordered by their own newest conversation — so the
+folder you were working in this morning is at the top. A project with no
+conversations does not appear; this is a list of conversations that happen to be
+filed under folders, not a folder browser.
+
+Each row is **what was asked** — the first thing you said in it, which is what
+you actually recognise a conversation by — with the agent it ran, when it was
+last active, and whether it is running now. Two things are said before you pick
+one rather than discovered afterwards: whether it comes back with **approvals
+bypassed**, and whether its agent can carry on from where it left off or is
+meeting the transcript for the first time (`transcript only`).
+
+Typing narrows the list on what was asked, the conversation's name and its
+folder. A group with no match drops out, so a search across a dozen projects
+stays a short list. Groups fold, and searching opens them all.
+
+Picking a conversation **joins** it if something is running it, and otherwise
+brings it back with its transcript — handing the agent its own context where the
+conversation recorded one.
+
+Past 400 conversations the list describes the most recent ones and says so.
+
+### Closing a conversation, and deleting one
+
+**Closing** a conversation takes it off your screen. The record, the transcript,
+whatever is running it and whatever shells were opened inside it all stay, and it
+is still in the list above to be reopened — on this device or another one. A
+conversation you closed stays closed here across a reload.
+
+Closing a **terminal** still ends it. A shell is reached through its tab and
+nowhere else, so one closed without being ended would hold a working directory
+open with nothing in the app able to reach it again.
+
+**Deleting** is the only way to lose a conversation. It is a separate action, it
+asks first, and it takes the transcript, the usage record and any shells the
+conversation owned with it.
+
 ### Starting a new conversation
 
 `/clear`, `/new` and `/reset` — or the **New chat** button beside the composer

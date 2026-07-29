@@ -9,6 +9,12 @@ import { createNewSession, runTerminalCommand, startTerminalShell } from '../ui/
 import { loadSettings, applySettings, saveSettings } from '../ui/settings';
 import { loadChatView, saveChatView, type ChatViewSettings } from '../chat/view-settings';
 import type { BranchedConversation } from '../chat/branch-api';
+import {
+  conversationLabel,
+  type ConversationList,
+  type ConversationSummary,
+} from '../../shared/conversations';
+import { showConfirm } from '../ui/confirm';
 import { onBannerAction, onBannerDismiss, onBannerToggleLog } from '../ui/update-banner';
 import { showNotification } from '../ui/notifications';
 import { hideOverlay, showError } from '../ui/overlay';
@@ -121,9 +127,12 @@ async function resumeConversation(app: App, conversation: ResumableConversation)
         conversation.id,
         conversation.name,
         'idle',
-        undefined,
+        conversation.workingDir,
         false,
       );
+      // See `openStoredConversation`: until the server confirms the surface, this
+      // tab's close button would delete the conversation rather than detach it.
+      app.sessionTabManager.setTabSurface(conversation.id, 'chat');
       await app.sessionTabManager.switchToTab(conversation.id);
     } else {
       await app.joinSession(conversation.id);
@@ -152,6 +161,131 @@ async function resumeConversation(app: App, conversation: ResumableConversation)
   } catch (error: unknown) {
     showError(error instanceof Error ? error.message : 'That conversation could not be opened');
   }
+}
+
+/**
+ * Every conversation this user has, for the conversation list.
+ *
+ * Normalised on the way in rather than trusted: this answer is rendered as a
+ * grouped, searchable list, and a missing `projects` array would be a TypeError
+ * inside a dialog the user opened to find something.
+ */
+async function fetchConversations(app: App): Promise<ConversationList> {
+  const response = await app.authFetch('/api/sessions/conversations');
+  if (!response.ok) {
+    // The server is a version behind this page more often than it is broken, and
+    // that is worth saying: the endpoint is new, and the process loads its code
+    // once, at boot.
+    throw new Error(
+      response.status === 404
+        ? 'This server does not offer a conversation list yet — restart it and reload.'
+        : 'Your conversations could not be listed.',
+    );
+  }
+  const data = (await response.json()) as Partial<ConversationList>;
+  return {
+    projects: Array.isArray(data.projects) ? data.projects : [],
+    total: typeof data.total === 'number' ? data.total : 0,
+    truncated: data.truncated === true,
+  };
+}
+
+/**
+ * Put a stored conversation back on screen.
+ *
+ * Three cases, and the difference between them is the whole of what "open it"
+ * means.
+ *
+ * It already has a tab: switch to it. Opening a second view of a conversation
+ * this browser is already watching would be two transcripts of one conversation.
+ *
+ * It is running: joining it is all that is needed — the process is alive and the
+ * join hands over its transcript. Starting it again would be refused, and rightly.
+ *
+ * Nothing is running it: bring it back. `resume: true` is what makes the agent
+ * pick up its own context where the conversation recorded one; where it did not,
+ * the same request still opens the conversation with its transcript intact and an
+ * agent meeting it for the first time — which is what the row said would happen
+ * before it was picked. Deliberately not `resume: false`: that means *start
+ * fresh*, which draws a line under the transcript and truncates everything above
+ * it, so reopening a conversation would begin by deleting it.
+ */
+async function openStoredConversation(
+  app: App,
+  conversation: ConversationSummary,
+): Promise<void> {
+  try {
+    const tabs = app.sessionTabManager;
+    if (tabs?.tabs.has(conversation.id)) {
+      await tabs.switchToTab(conversation.id);
+      return;
+    }
+
+    if (tabs) {
+      tabs.addTab(
+        conversation.id,
+        conversation.name,
+        conversation.running ? 'active' : 'idle',
+        conversation.workingDir,
+        false,
+      );
+      // Said here rather than waited for. The server reports the surface on
+      // `session_joined`, which is a round trip away, and a tab that reads as a
+      // terminal in the meantime is a tab whose close button would delete the
+      // conversation that was just reopened.
+      tabs.setTabSurface(conversation.id, 'chat');
+      await tabs.switchToTab(conversation.id);
+    } else {
+      await app.joinSession(conversation.id);
+    }
+
+    app.startPromptRequested = false;
+    hideOverlay();
+
+    if (!conversation.running) {
+      app.send({
+        type: 'start_chat',
+        agentKind: (conversation.runtime || 'claude') as AgentKind,
+        sessionId: conversation.id,
+        options: { resume: true },
+      });
+    }
+  } catch (error: unknown) {
+    showError(error instanceof Error ? error.message : 'That conversation could not be opened');
+  }
+}
+
+/**
+ * Delete a conversation, having asked.
+ *
+ * The only way to lose one, and it stays that way: closing a tab is now a detach
+ * (see SessionTabManager.closeSession), so this is the single irreversible action
+ * in the feature and it is the one that asks. The app's own confirm dialog rather
+ * than `window.confirm`, because on a phone-shaped install the native one reads as
+ * a page hijack.
+ */
+async function removeConversation(
+  app: App,
+  conversation: ConversationSummary,
+): Promise<boolean> {
+  const confirmed = await showConfirm({
+    title: 'Delete this conversation?',
+    description:
+      `“${conversationLabel(conversation)}” and its transcript are removed for good, `
+      + 'along with anything still running it. This cannot be undone.',
+    confirmLabel: 'Delete',
+    tone: 'danger',
+  });
+  if (!confirmed) return false;
+
+  const gone = await app.deleteSession(conversation.id, { confirm: false });
+  // And take its tab with it, if this browser has one. The server announces a
+  // delete to the sockets that *joined* the session, which is not every tab: a
+  // tab restored from the session list and never switched to has never joined,
+  // so nothing would arrive to close it and the strip would keep a tab pointing
+  // at a conversation that no longer exists. Closing an absent tab is a no-op.
+  if (gone) app.sessionTabManager?.closeSession(conversation.id, { skipServerRequest: true });
+  return gone;
 }
 
 /**
@@ -378,6 +512,10 @@ function buildActions(app: App): ShellActions {
     // The dialog does not confirm; deleting another user's session in a shared
     // deployment is not something to do on a single tap.
     deleteSession: (id) => void app.deleteSession(id),
+
+    loadConversations: () => fetchConversations(app),
+    openStoredConversation: (conversation) => void openStoredConversation(app, conversation),
+    deleteConversation: (conversation) => removeConversation(app, conversation),
 
     acceptPlan: () => app.acceptPlan(),
     rejectPlan: () => app.rejectPlan(),

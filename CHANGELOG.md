@@ -262,6 +262,80 @@
   clearing one left the previous answer frozen on screen.
 
 ### Added
+- **Every conversation, by project, in a searchable list — and closing one no
+  longer ends it** (#127). Nothing in the app answered "what conversations do I
+  have?". Every conversation ever started came back as an open tab, so the strip
+  grew until it was unreadable, and the only way to shorten it was to close a
+  tab — which deleted the conversation. Nothing in the app could reach it again
+  afterwards, however much you might have wanted to pick it up next week.
+
+  The one list of past conversations was inside the launcher, and it is reachable
+  only on the way to starting a *new* session in a folder that has already been
+  chosen: you had to know which project a conversation belonged to before you
+  could look for it, you saw the most recent handful for that folder alone, and
+  there was nothing to type into. Search, meanwhile, only ever looked inside the
+  conversation on screen. So the two questions people actually ask — where the
+  conversation about the release script went, and whether yesterday's closed one
+  is recoverable — had no answer.
+
+  **Closing a conversation now means what the word means.** The tab goes; the
+  record, the transcript, whatever is running and whatever shells were opened
+  inside it all stay. Closing a *terminal* still ends it, and that is not an
+  oversight: a pty is reached through its tab and nowhere else, so one closed
+  without being ended is a shell holding a working directory open that nothing in
+  the app could ever reach again — the very failure this removes for
+  conversations, in the one place it would create. Deleting is unchanged: still a
+  separate action, still confirmed, and now the only way to lose a conversation.
+  A closed conversation is remembered as closed in the browser, because the strip
+  is rebuilt from the session list on every page load — without that, closing
+  would have lasted until the next reload and the strip would still grow forever.
+
+  **The list is reached from the top of the chat surface, beside the transcript
+  search**, and on a phone from the actions sheet, which is where that search
+  lives there. It shows every conversation the signed-in user owns — not only the
+  ones with a tab open, and not only the ones still running — grouped under the
+  project folder each belongs to, newest first inside a group, with the groups
+  themselves ordered by their own newest conversation. So the folder you were
+  working in this morning is at the top, whichever folder that is.
+
+  A row is **what was asked**, not when it happened: "che file ho caricato?"
+  identifies a conversation on sight, where "Session 25/07/2026, 21:35"
+  identifies nothing — which is the whole reason a column of timestamps was never
+  worth showing. Beside it: the agent it ran, when it was last active, whether it
+  is running right now, whether it comes back with approvals bypassed, and
+  whether its agent can carry on from where it left off or is meeting the
+  transcript for the first time. That last one is said **before** the choice is
+  made, exactly as the launcher's resume list already does, because the two are
+  very different things to walk into.
+
+  Typing narrows the list on what was asked, the conversation's name and the
+  folder it lives in, and a group with no match drops out entirely — so a search
+  across a dozen projects reads as a short list rather than a page of empty folder
+  headings. Groups fold; searching opens them all, because a match hidden inside a
+  folded group is a search that answered nothing. Picking a conversation joins it
+  if something is running it, and otherwise brings it back with its transcript,
+  handing the agent its own context where the conversation recorded one.
+
+  Two things the implementation is careful about. The opening line of a
+  conversation is read from the head of its log, and a log is append-only — so
+  once found it cannot change, and the answer is kept rather than re-read on every
+  look. The two operations that genuinely rewrite a log's head, a `/clear` and a
+  retention trim, drop it; otherwise listing three hundred conversations would
+  cost three hundred bounded reads every time the list opened rather than once.
+  And those reads run a few at a time: four hundred logs, indexes and stats opened
+  at one instant is how a listing turns into `EMFILE`, which fails not just the
+  request but whatever else the server was doing. Past four hundred conversations
+  the list describes the most recent ones and *says* it stopped there — a list
+  that silently ends at a ceiling reads as "this is everything", which is the one
+  thing it must not say when the question is where a conversation went.
+
+  Also fixed along the way, in a shared primitive the list happened to expose:
+  a text field's touch target was the frame around it rather than the field. The
+  wrapper took the 44px floor and `align-items: center` left the input itself at
+  its content height — 22px inside a 44px box — so a tap in the top or bottom
+  quarter of what looks like the field focused nothing. Every phone-width text
+  field in the app is affected.
+
 - **A workflow shows the whole shape of the run** (#117). A workflow is a
   structure — named phases in order, and several agents working at once inside
   each — and none of that reached the screen. Opening one showed a single line

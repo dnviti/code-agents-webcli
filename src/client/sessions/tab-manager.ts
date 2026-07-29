@@ -12,7 +12,7 @@ import type { SessionInfo } from '../types';
 import type { ConversationAttention } from '../../shared/chat-alerts';
 import { clearChatSurface } from '../chat/surface';
 import { noteConversationClosed, noteConversationOpened } from '../chat/attention';
-import { forgetTerminals } from '../chat/chat-terminal';
+import { releaseTerminals } from '../chat/chat-terminal';
 import { shellStore, type ShellTab } from '../shell/store';
 import { playNotificationSound, showNotification } from '../ui/notifications';
 import { takeRequestedConversation } from '../ui/notify';
@@ -78,6 +78,48 @@ function recallActiveTab(): string | null {
     }
   }
   return null;
+}
+
+/**
+ * Which conversations this browser has been told to take off the screen.
+ *
+ * Closing a conversation no longer deletes it (#127), which on its own would
+ * have made closing useless: the strip is rebuilt from `/api/sessions/list` on
+ * every page load, so every conversation ever started would come back on the
+ * next reload and the strip would still grow forever — the exact complaint, with
+ * the one remedy removed.
+ *
+ * In the browser rather than on the server because it is a fact about a screen,
+ * not about a conversation: another device's strip is not this one's. Browser-wide
+ * rather than per-window so a reload keeps what was closed, which is the whole
+ * point of storing it at all.
+ *
+ * Only ever conversations. A terminal is still ended when its tab closes, so
+ * there is nothing to remember about it — and remembering one would hide a
+ * session that is genuinely still there from the only list that offers it.
+ */
+const CLOSED_TABS_KEY = 'cc-web-closed-conversations';
+
+function readClosed(): Set<string> {
+  try {
+    const raw = localStorage.getItem(CLOSED_TABS_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return new Set(Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string') : []);
+  } catch {
+    // No storage, or something else wrote nonsense here. Showing every
+    // conversation is the honest fallback: it is what the app did before this.
+    return new Set();
+  }
+}
+
+function writeClosed(ids: Set<string>): void {
+  try {
+    if (ids.size === 0) localStorage.removeItem(CLOSED_TABS_KEY);
+    else localStorage.setItem(CLOSED_TABS_KEY, JSON.stringify(Array.from(ids)));
+  } catch {
+    // Private mode, a full quota, storage switched off. The tab closes either
+    // way; it simply comes back on the next reload.
+  }
 }
 
 /** This window's memory first, then the browser-wide one. */
@@ -300,7 +342,19 @@ export class SessionTabManager {
     try {
       const response = await fetch('/api/sessions/list');
       const data = await response.json();
-      const sessions: Array<Record<string, never>> = data.sessions || [];
+      const all: Array<Record<string, never>> = data.sessions || [];
+
+      // A conversation this browser closed stays closed. Pruned against what the
+      // server actually reported at the same time, so the memory cannot outlive
+      // the conversations it is about and grow without limit.
+      const closed = readClosed();
+      const sessions = all.filter((raw) => {
+        const session = raw as unknown as { id: string; surface?: 'terminal' | 'chat' };
+        return !(session.surface === 'chat' && closed.has(session.id));
+      });
+      const live = new Set(all.map((raw) => (raw as unknown as { id: string }).id));
+      const kept = new Set(Array.from(closed).filter((id) => live.has(id)));
+      if (kept.size !== closed.size) writeClosed(kept);
 
       sessions.forEach((raw, index: number) => {
         const session = raw as unknown as {
@@ -348,6 +402,13 @@ export class SessionTabManager {
     customName?: string,
   ): void {
     if (this.tabs.has(sessionId)) return;
+
+    // Whatever the reason for a tab appearing — a fresh session, a branch, or a
+    // conversation picked out of the list — it is now on the screen, so the note
+    // that it was taken off has to go. Left behind, reopening a conversation
+    // would work until the next reload and then quietly vanish again.
+    const closed = readClosed();
+    if (closed.delete(sessionId)) writeClosed(closed);
 
     const isDefaultSessionName = sessionName.startsWith('Session ') && sessionName.includes(':');
     const folderName = workingDir ? workingDir.split('/').pop() || '/' : null;
@@ -459,7 +520,31 @@ export class SessionTabManager {
   }
 
   closeSession(sessionId: string, { skipServerRequest = false } = {}): void {
-    if (!this.tabs.has(sessionId)) return;
+    const record = this.tabs.get(sessionId);
+    if (!record) return;
+
+    /**
+     * Closing a conversation takes it off this screen, and no more.
+     *
+     * It used to delete it: the tab was the only route back to a conversation,
+     * so the one way to shorten a strip that grows forever was to destroy
+     * something you might want next week (#127). Now the conversation list is
+     * the route back, so closing can mean what the word means — the record, the
+     * transcript, whatever is running and whatever shells it opened all stay
+     * exactly where they are.
+     *
+     * Still a delete for a terminal, and that is not an oversight. A pty is
+     * reached through its tab and nowhere else, so a terminal closed without
+     * being ended is a shell holding a working directory open that nothing in
+     * the app can ever reach again — the very failure this change removes for
+     * conversations, in the one place it would create.
+     */
+    const detachOnly = record.surface === 'chat';
+    if (detachOnly) {
+      const closed = readClosed();
+      closed.add(sessionId);
+      writeClosed(closed);
+    }
 
     const orderedIds = this.getOrderedTabIds();
     const closedIndex = orderedIds.indexOf(sessionId);
@@ -477,11 +562,13 @@ export class SessionTabManager {
     // delivered — so a closed conversation would go on being counted in the
     // summary for the rest of the session.
     noteConversationClosed(sessionId);
-    // A conversation owns the shells opened inside it, and the server ends them
-    // with it. What is left here is this page's half of them — live xterms, open
-    // sockets, and a note that would have a reopened split trying to rejoin ptys
-    // that no longer exist. A session with no shells is a no-op.
-    forgetTerminals(sessionId);
+    // This page's half of the conversation's shells: live xterms and open
+    // sockets, released because nothing is drawing them any more. The note of
+    // *which* ptys they were attached to is deliberately kept — those sessions
+    // are still running on the server, and reopening this conversation rejoins
+    // them rather than opening a second shell beside each one. A conversation
+    // with no shells is a no-op.
+    releaseTerminals(sessionId);
 
     // And take it off the screen. The surface is only ever *replaced* by
     // joining another session, so closing the last tab — or closing a chat
@@ -494,7 +581,7 @@ export class SessionTabManager {
 
     this.syncShell();
 
-    if (!skipServerRequest) {
+    if (!skipServerRequest && !detachOnly) {
       fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' }).catch(
         (err) => console.error('Failed to delete session:', err),
       );
@@ -508,11 +595,39 @@ export class SessionTabManager {
         fallbackId = this.tabOrder[nextIndex];
       }
       if (fallbackId) {
+        // Joining the fallback detaches from this one on the way, so there is
+        // nothing further to do: the server leaves the previous session before
+        // it joins the next.
         this.switchToTab(fallbackId);
       } else {
+        // Only for a conversation. A terminal has just been deleted, and the
+        // server's own `session_deleted` is what tidies up after that — a
+        // richer teardown than this, and one that would race with a
+        // `leave_session` sent alongside it.
+        if (detachOnly) this.detachFrom(sessionId);
         this.syncShell();
       }
     }
+  }
+
+  /**
+   * Let go of a conversation this socket is still attached to.
+   *
+   * Only reached when the closed tab was the one in focus and there is no other
+   * tab to join — because a join is what would otherwise have detached us. A
+   * delete used to do this from the other end: the server answered with
+   * `session_deleted` and the client forgot which session it was on.
+   *
+   * Without it the socket stays joined to a conversation that has left the
+   * screen, and `ensureSessionForStart` reads exactly that field to decide where
+   * the next runtime goes — so picking an agent from the launcher would have
+   * launched it into the conversation the user had just closed.
+   */
+  private detachFrom(sessionId: string): void {
+    if (this.app.currentClaudeSessionId !== sessionId) return;
+    this.app.currentClaudeSessionId = null;
+    this.app.currentClaudeSessionName = null;
+    this.app.leaveSession();
   }
 
   /**

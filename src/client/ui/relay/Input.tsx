@@ -35,6 +35,19 @@ export function Input({ size = 'md', invalid = false, mono = false, prefix, disa
         disabled={disabled} onFocus={() => setFocus(true)} onBlur={() => setFocus(false)}
         style={{
           flex: 1, minWidth: 0, border: 'none', outline: 'none', background: 'transparent',
+          // The field is the target, not the frame around it. The wrapper takes
+          // the touch floor above, but `alignItems: center` left the input itself
+          // at its content height — 22px inside a 44px box — so a tap in the top
+          // or bottom quarter of what looks like the field landed on the div and
+          // focused nothing. The frame has no vertical padding, so filling it is
+          // visually identical at every size.
+          height: '100%',
+          // And on a phone the floor is the *field's*, not the frame's. `100%`
+          // resolves against the wrapper's content box, which its own 1px border
+          // makes 42px — two pixels short, and those two pixels are the top and
+          // bottom edge of what looks like the field. The overflow lands on a
+          // transparent element over a border, so nothing moves.
+          minHeight: phone ? TOUCH_TARGET : undefined,
           color: 'var(--foreground)', fontFamily: mono ? 'var(--font-mono)' : 'var(--font-sans)',
           fontSize: phone ? PHONE_TEXT.input : 'var(--text-ui)', ...style,
         }}

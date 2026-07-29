@@ -274,6 +274,21 @@ export class ChatStore implements ChatStoreLike {
 
   private readonly states = new Map<string, SessionState>();
   private readonly queues = new Map<string, Promise<unknown>>();
+  /**
+   * Openings already read, so listing every conversation is not a scan per row.
+   *
+   * A log is append-only, so once both facts in a `ChatDescription` have been
+   * found they cannot change: the first `session` event stays first and the first
+   * user message stays first however much is written after them. That makes this
+   * a cache with no staleness to manage in the ordinary case — and it is the
+   * difference between a conversation list costing one bounded read per
+   * conversation every time it opens and costing it once per process.
+   *
+   * Only a *settled* answer is kept — see `describe` — and the two operations
+   * that genuinely rewrite the head of a log, a `/clear` and a retention trim,
+   * both drop the entry.
+   */
+  private readonly descriptions = new Map<string, ChatDescription>();
 
   constructor(options: ChatStoreOptions) {
     this.storageDir = path.resolve(options.storageDir);
@@ -334,10 +349,24 @@ export class ChatStore implements ChatStoreLike {
    * a column of "Session 25/07/2026, 21:35" tells a person nothing about which
    * one they were looking for, and the question they asked tells them
    * immediately.
+   *
+   * Queued like every other read of a log, and it has to be for two reasons that
+   * only show up under load. `append` is fire-and-forget by contract, so an
+   * unqueued read can land between "the session emitted the opening message" and
+   * "the opening message is on disk" — and report the conversation as having no
+   * opening at all. And a trim rewrites the head through a rename: it drops the
+   * remembered description first, so an unqueued reader could slip in behind that
+   * and re-remember the head that is about to be replaced.
    */
   async describe(session: ChatSessionRef): Promise<ChatDescription> {
-    const found: ChatDescription = { nativeSessionId: null, firstMessage: null };
     const base = this.basePath(session);
+    return this.enqueue(base, () => this.describeNow(base));
+  }
+
+  private async describeNow(base: string): Promise<ChatDescription> {
+    const found: ChatDescription = { nativeSessionId: null, firstMessage: null };
+    const cached = this.descriptions.get(base);
+    if (cached) return cached;
     const handle = await fs.promises.open(`${base}.jsonl`, 'r').catch(() => null);
     if (!handle) return found;
 
@@ -390,6 +419,15 @@ export class ChatStore implements ChatStoreLike {
           if (line) take(line);
           if (found.nativeSessionId && found.firstMessage) break;
         }
+      }
+
+      // Kept only when nothing more could change the answer: either both facts
+      // are in hand, or the scan reached its ceiling and a longer read is not
+      // going to be attempted next time either. The remaining case — the whole
+      // log was read and one of them is simply not in it yet — is a conversation
+      // that has barely started, and the very next event may supply it.
+      if ((found.nativeSessionId && found.firstMessage) || offset >= HEAD_SCAN_LIMIT) {
+        this.descriptions.set(base, found);
       }
 
       return found;
@@ -760,6 +798,13 @@ export class ChatStore implements ChatStoreLike {
     if (drop <= 0) {
       return;
     }
+
+    // The head of the log is about to be a different head. This is the one thing
+    // that invalidates a description — the opening message may be among the
+    // events going away — and it covers both callers: a `/clear`, where the
+    // conversation genuinely opens somewhere else now, and a retention trim,
+    // where the opening is simply gone.
+    this.descriptions.delete(base);
 
     // Counted before the log loses them, because afterwards nothing can. A turn
     // is numbered by how many came before it in the conversation, and reading
@@ -1551,6 +1596,7 @@ export class ChatStore implements ChatStoreLike {
     const base = this.basePath(session);
     await this.enqueue(base, async () => {
       this.states.delete(base);
+      this.descriptions.delete(base);
       await Promise.all(
         ['.jsonl', '.idx', '.jsonl.tmp', '.idx.tmp', CONTEXT_SUFFIX].map((suffix) =>
           fs.promises.rm(`${base}${suffix}`, { force: true }).catch(() => undefined),

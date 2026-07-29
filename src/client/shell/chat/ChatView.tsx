@@ -80,6 +80,14 @@ export interface ChatViewProps {
    * could not change anything on the surface they were reached from.
    */
   onOpenSettings?: () => void;
+  /**
+   * Open the list of every conversation this user has.
+   *
+   * Owned by the shell, which is where the dialog is rendered — a conversation
+   * cannot host the list of conversations it is one of. Absent leaves the control
+   * out entirely rather than drawing one that does nothing.
+   */
+  onOpenConversations?: () => void;
   /** What this surface shows. Zones, panels, reasoning, tool calls, usage. */
   view?: ChatViewSettings;
   /** Persist a change made from inside the surface, e.g. closing the rail. */
@@ -145,6 +153,7 @@ export function ChatView({
   workingDir,
   isMobile = false,
   onOpenSettings,
+  onOpenConversations,
   view = DEFAULT_CHAT_VIEW,
   onViewChange,
   theme,
@@ -797,6 +806,19 @@ export function ChatView({
       // trace, the files, the shell, the other sessions — is the bottom bar's
       // job, and repeating those here would be two answers to one question.
       { id: 'chat-search', label: 'Search this conversation', icon: 'search', expands: true, group: 'surface', onPress: () => setSearchOpen(true) },
+      // Immediately after it, which is where the header puts it too: on a phone
+      // the transcript search lives in this sheet rather than in the bar, so this
+      // sheet is where "beside the search control" is (#127).
+      ...(onOpenConversations
+        ? [{
+            id: 'chat-conversations',
+            label: 'All conversations',
+            icon: 'message-square',
+            expands: true,
+            group: 'surface',
+            onPress: onOpenConversations,
+          } as SurfaceAction]
+        : []),
       { id: 'chat-turns', label: 'Jump to a turn', icon: 'panel-left', active: indexVisible || indexSheet, expands: true, group: 'surface', onPress: openIndex },
       // Folding is a thing you do to the conversation, so it belongs with the
       // things you do to the conversation. This is the phone's route to it —
@@ -808,7 +830,16 @@ export function ChatView({
       { id: 'chat-display', label: 'Display settings', icon: 'settings', expands: true, group: 'surface', onPress: () => onOpenSettings?.() },
       ...(menuActions ?? []).map((action) => ({ ...action, group: 'session' })),
     ],
-    [indexVisible, indexSheet, openIndex, expandAllTurns, collapseAllTurns, onOpenSettings, menuActions],
+    [
+      indexVisible,
+      indexSheet,
+      openIndex,
+      expandAllTurns,
+      collapseAllTurns,
+      onOpenSettings,
+      onOpenConversations,
+      menuActions,
+    ],
   );
 
   return (
@@ -862,6 +893,7 @@ export function ChatView({
         // setting whose effect nothing on screen would show.
         onToggleIndex={openIndex}
         onOpenSearch={() => setSearchOpen(true)}
+        onOpenConversations={onOpenConversations}
         onOpenSettings={() => onOpenSettings?.()}
         onToggleTheme={onToggleTheme}
       />

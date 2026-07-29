@@ -32,6 +32,7 @@ import { ChatSettingsDialog } from '../../src/client/shell/dialogs/ChatSettingsD
 import { SettingsDialog } from '../../src/client/shell/dialogs/SettingsDialog';
 import { DEFAULT_NOTIFICATIONS } from '../../src/client/ui/settings';
 import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
+import { ConversationsDialog } from '../../src/client/shell/dialogs/ConversationsDialog';
 import { UsageDashboardDialog } from '../../src/client/shell/dialogs/UsageDashboardDialog';
 import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
 import { TabBar } from '../../src/client/ui/relay/TabBar';
@@ -293,6 +294,7 @@ async function run(): Promise<void> {
   await checkTheFileTreeAndTheShellAreSizedForAThumb();
   await checkAnExpandedReasoningRowIsNeverEmpty();
   await checkAWaitingConversationIsVisibleWithoutOpeningIt();
+  await checkEveryConversationCanBeFoundAndReopened();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -2225,6 +2227,11 @@ function PhoneSurface({ controller }: { controller: ChatController }): React.Rea
         isMobile: true,
         view,
         onViewChange,
+        // The phone's route to the conversation list. On a phone the header
+        // carries no controls at all, so the actions sheet is where "beside the
+        // transcript search" is — and a fixture that leaves this out is a
+        // fixture in which the route does not exist to be found (#127).
+        onOpenConversations: () => {},
         // What the shell contributes. The surface adds its own inside.
         menuActions: [
           { id: 'new', label: 'New session', icon: 'plus', onPress: () => {} },
@@ -2655,6 +2662,26 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
           `the menu is actually on screen in ${name}`,
           Boolean(panel) && styles!.opacity === '1' && !/rgba\(.*,\s*0\)/.test(styles!.backgroundColor),
           panel ? `opacity=${styles!.opacity} background=${styles!.backgroundColor}` : 'no panel',
+        );
+
+        // The route to every conversation, in the sheet the phone keeps the
+        // transcript search in. Asserted beside it rather than merely present:
+        // the two are one pairing, and a row that drifted to the bottom of a
+        // list of session verbs is a route nobody finds.
+        const rows = Array.from(host.querySelectorAll<HTMLElement>('[role="menu"] [role="menuitem"], [role="menu"] button'))
+          .filter(isPainted)
+          .map((node) => (node.getAttribute('aria-label') || node.textContent || '').trim());
+        const atSearch = rows.findIndex((label) => label.includes('Search this conversation'));
+        const atList = rows.findIndex((label) => label.includes('All conversations'));
+        check(
+          `the phone's menu offers every conversation in ${name}`,
+          atList >= 0,
+          rows.slice(0, 8).join(' | ') || 'no rows',
+        );
+        check(
+          `and offers it beside the transcript search in ${name}`,
+          atSearch >= 0 && Math.abs(atList - atSearch) === 1,
+          `search at ${atSearch}, list at ${atList}`,
         );
 
         // And the button that dismisses it is still the thing under the finger.
@@ -3165,6 +3192,63 @@ async function checkThePhoneShellSurfacesAreUsable(): Promise<void> {
           { id: 's2', title: 'another one', runtime: 'codex', workingDir: '/tmp/b' },
         ],
         activeId: 's1', onJoin: noop, onLeave: noop, onDelete: noop, onNew: noop, onClose: noop,
+      } as never)],
+    // The conversation list, which on a phone is the surface the whole feature
+    // is reached through: several projects, several conversations each, and the
+    // badges that carry the live facts — so the sweeps below measure the row at
+    // its widest rather than an empty list.
+    ['the conversations dialog', () =>
+      React.createElement(ConversationsDialog, {
+        open: true,
+        load: async () => ({
+          projects: [
+            {
+              dir: '/home/dev/projects/a-rather-deeply-nested-working-directory',
+              name: 'a-rather-deeply-nested-working-directory',
+              lastActivity: '2026-07-25T21:35:00.000Z',
+              conversations: [
+                {
+                  id: 'p1', name: 'Session 25/07/2026, 21:35',
+                  firstMessage: 'rework the mobile layout so every control is reachable with a thumb',
+                  runtime: 'claude', runtimeLabel: 'Claude',
+                  lastActivity: '2026-07-25T21:35:00.000Z',
+                  workingDir: '/home/dev/projects/a-rather-deeply-nested-working-directory',
+                  events: 40, canResume: true, running: true, bypassPermissions: true,
+                },
+                {
+                  id: 'p2', name: 'Session 24/07/2026, 09:12',
+                  firstMessage: 'why is the terminal blank after a reload?',
+                  runtime: 'codex', runtimeLabel: 'Codex',
+                  lastActivity: '2026-07-24T09:12:00.000Z',
+                  workingDir: '/home/dev/projects/a-rather-deeply-nested-working-directory',
+                  events: 12, canResume: false, running: false, bypassPermissions: false,
+                },
+              ],
+            },
+            {
+              dir: '/srv/infra',
+              name: 'infra',
+              lastActivity: '2026-07-20T10:00:00.000Z',
+              conversations: [
+                {
+                  id: 'p3', name: 'Session 20/07/2026, 10:00',
+                  firstMessage: 'roll the certificates',
+                  runtime: 'claude', runtimeLabel: 'Claude',
+                  lastActivity: '2026-07-20T10:00:00.000Z',
+                  workingDir: '/srv/infra',
+                  events: 90, canResume: true, running: false, bypassPermissions: false,
+                },
+              ],
+            },
+          ],
+          total: 3,
+          truncated: false,
+        }),
+        openIds: ['p1'],
+        activeId: 'p1',
+        onOpen: noop,
+        onDelete: async () => false,
+        onClose: noop,
       } as never)],
     ['the tab switcher', () =>
       React.createElement(TabSwitcherSheet, {
@@ -8233,6 +8317,374 @@ async function checkAnExpandedReasoningRowIsNeverEmpty(): Promise<void> {
 
   root.unmount();
   host.remove();
+}
+
+/**
+ * The list of every conversation, driven the way a person drives it (#127).
+ *
+ * None of this can be a unit test. The list arrives through an effect, so
+ * `renderToStaticMarkup` — which runs no effects — can only ever see the
+ * placeholder it starts on; the narrowing, the folding, the reopening and the
+ * delete are all things that happen *after* a real React root has mounted and
+ * something has been clicked. And the one criterion with a number in it ("with
+ * hundreds of conversations across many folders, the list still opens promptly
+ * and scrolls smoothly") is a question about a layout engine, which is exactly
+ * what this file is for.
+ *
+ * Three hundred conversations across twelve folders, because that is the size
+ * the feature is written for and the size at which a per-row cost that is not
+ * bounded stops being invisible.
+ */
+async function checkEveryConversationCanBeFoundAndReopened(): Promise<void> {
+  const FOLDERS = 12;
+  const EACH = 25;
+
+  /** A list shaped exactly as `/api/sessions/conversations` answers. */
+  const listing = (): {
+    projects: Array<{
+      dir: string;
+      name: string;
+      lastActivity: string;
+      conversations: Array<Record<string, unknown>>;
+    }>;
+    total: number;
+    truncated: boolean;
+  } => {
+    const projects = [];
+    for (let folder = 0; folder < FOLDERS; folder++) {
+      const dir = `/home/dev/projects/service-${folder}`;
+      const conversations = [];
+      for (let index = 0; index < EACH; index++) {
+        conversations.push({
+          id: `c-${folder}-${index}`,
+          name: `Session ${folder}/${index}`,
+          // One folder's conversations are about the release script, so a search
+          // has something to find that the others do not have.
+          firstMessage:
+            folder === 3 && index === 0
+              ? 'fix the release script so it tags the right commit'
+              : `question ${folder}/${index} about the parser`,
+          runtime: 'claude',
+          runtimeLabel: 'Claude',
+          lastActivity: new Date(Date.UTC(2026, 6, 20, 12, folder, EACH - index)).toISOString(),
+          workingDir: dir,
+          events: 40,
+          // The first of each folder is still running, the second cannot be
+          // resumed, the third came back with approvals bypassed.
+          canResume: index !== 1,
+          running: index === 0,
+          bypassPermissions: index === 2,
+        });
+      }
+      projects.push({
+        dir,
+        name: `service-${folder}`,
+        lastActivity: conversations[0].lastActivity as string,
+        conversations,
+      });
+    }
+    // Newest project first, which is the order the server sends.
+    projects.reverse();
+    return { projects, total: FOLDERS * EACH, truncated: false };
+  };
+
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+
+  const opened: string[] = [];
+  const deleted: string[] = [];
+  /** What the confirmation answers. Flipped mid-check to cover both outcomes. */
+  let allowDelete = false;
+
+  const root = createRoot(host);
+  const started = performance.now();
+  root.render(
+    React.createElement(ConversationsDialog, {
+      open: true,
+      load: async () => listing(),
+      openIds: ['c-11-0'],
+      activeId: 'c-11-0',
+      onOpen: (conversation: { id: string }) => opened.push(conversation.id),
+      onDelete: async (conversation: { id: string }) => {
+        deleted.push(conversation.id);
+        return allowDelete;
+      },
+      onClose: () => {},
+    } as never),
+  );
+  await wait(600);
+  settle(document);
+  const drawn = performance.now() - started;
+
+  const panel = document.querySelector('[role="dialog"]') as HTMLElement | null;
+  if (!panel) {
+    check('the conversation list opens', false, 'no dialog rendered');
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  /**
+   * An element's words, with the whitespace taken out.
+   *
+   * `textContent` here is not what it looks like: every `Icon` inlines a
+   * pretty-printed SVG, and the newlines and indentation inside it are text nodes
+   * of the element that holds it. Read raw, the first sixty characters of a
+   * heading are the whitespace inside two icons — which is why the failure detail
+   * for this check was blank while the check itself was working.
+   */
+  const words = (node: Element | null): string =>
+    (node?.textContent || '').replace(/\s+/g, ' ').trim();
+
+  const headings = (): HTMLElement[] =>
+    Array.from(panel.querySelectorAll<HTMLElement>('section > button[aria-expanded]')).filter(isPainted);
+  const rowsIn = (section: Element): HTMLElement[] =>
+    Array.from(section.querySelectorAll<HTMLElement>('button[aria-label^="Delete"]'))
+      .map((button) => button.parentElement as HTMLElement)
+      .filter(Boolean);
+  const openers = (): HTMLElement[] =>
+    Array.from(panel.querySelectorAll<HTMLElement>('section button[aria-label]')).filter(
+      (node) => !(node.getAttribute('aria-label') || '').startsWith('Delete'),
+    );
+
+  check(
+    'the list opens promptly with hundreds of conversations across a dozen folders',
+    drawn < 4000,
+    `${Math.round(drawn)}ms for ${FOLDERS * EACH} conversations`,
+  );
+
+  check(
+    'every project the user has conversations in is a group',
+    headings().length === FOLDERS,
+    `${headings().length} groups, expected ${FOLDERS}`,
+  );
+
+  check(
+    'the most recently active project comes first',
+    words(headings()[0]).startsWith('service-11'),
+    words(headings()[0]).slice(0, 70),
+  );
+
+  // A row is what was asked, not when it happened. This is the whole reason the
+  // launcher's list of timestamps was not worth showing.
+  const firstRowLabel = openers()[0]?.getAttribute('aria-label') || '';
+  check(
+    'a row is identified by what was asked',
+    firstRowLabel.startsWith('question 11/0 about the parser'),
+    firstRowLabel.slice(0, 90),
+  );
+  check(
+    'and carries the agent, when it was last active, and whether it is running',
+    /Claude/.test(firstRowLabel) && /last active/.test(firstRowLabel) && /running now/.test(firstRowLabel),
+    firstRowLabel.slice(0, 140),
+  );
+
+  const labels = openers().map((node) => node.getAttribute('aria-label') || '');
+  check(
+    'a conversation whose agent cannot carry on says so before it is picked',
+    labels.some((label) => /cannot carry on from where it left off/.test(label)),
+    labels.find((label) => /cannot carry on/.test(label))?.slice(0, 120) || 'nothing said',
+  );
+  check(
+    'and one that comes back with approvals bypassed says that too',
+    labels.some((label) => /approvals bypassed/.test(label)),
+    labels.find((label) => /approvals bypassed/.test(label))?.slice(0, 120) || 'nothing said',
+  );
+  check(
+    'a conversation that already has a tab is marked rather than hidden',
+    labels.some((label) => /already open/.test(label)),
+    labels.find((label) => /already open/.test(label))?.slice(0, 120) || 'nothing said',
+  );
+
+  // The scroller is what makes hundreds of rows usable rather than a page that
+  // pushes the dialog past the window.
+  const scroller = openers()[0]?.closest('[style*="overflow"]') as HTMLElement | null;
+  check(
+    'the list scrolls inside the dialog rather than growing past the window',
+    Boolean(scroller)
+      && scroller!.scrollHeight > scroller!.clientHeight
+      && panel.getBoundingClientRect().bottom <= window.innerHeight + 1,
+    scroller
+      ? `${scroller.scrollHeight}px of rows in ${scroller.clientHeight}px, panel bottom ${Math.round(panel.getBoundingClientRect().bottom)}`
+      : 'no scroller',
+  );
+  if (scroller) {
+    scroller.scrollTop = 4000;
+    scroller.dispatchEvent(new Event('scroll'));
+    await wait(150);
+    check(
+      'and it actually scrolls',
+      scroller.scrollTop > 0,
+      `scrollTop=${Math.round(scroller.scrollTop)}`,
+    );
+    scroller.scrollTop = 0;
+  }
+
+  // Folding a group. The rows go; the heading stays, so the map of the list
+  // survives being shortened.
+  const before = openers().length;
+  headings()[0].click();
+  await wait(200);
+  check(
+    'a project group can be folded away',
+    openers().length === before - EACH && headings().length === FOLDERS,
+    `${openers().length} rows after folding one group of ${EACH} (was ${before})`,
+  );
+  headings()[0].click();
+  await wait(200);
+
+  // Typing narrows it, and a group with no match leaves entirely.
+  const field = panel.querySelector('input[aria-label="Search conversations"]') as HTMLInputElement | null;
+  if (!field) {
+    check('the list can be narrowed by typing', false, 'no search field');
+  } else {
+    setInputValue(field, 'release script');
+    await wait(250);
+    const matched = openers().map((node) => node.getAttribute('aria-label') || '');
+    check(
+      'typing narrows the list to what matches',
+      matched.length === 1 && /release script/.test(matched[0]),
+      `${matched.length} rows: ${matched.map((l) => l.slice(0, 40)).join(' | ').slice(0, 120)}`,
+    );
+    check(
+      'and every group with no match drops out',
+      headings().length === 1,
+      `${headings().length} groups left`,
+    );
+    check(
+      'and the count says how much of the list is being shown',
+      /1 of 300 in 1 project/.test(words(panel)),
+      words(panel).slice(0, 120),
+    );
+
+    // The folder is one of the things people remember about a conversation.
+    setInputValue(field, 'service-4');
+    await wait(250);
+    check(
+      'searching by folder finds the conversations in it',
+      headings().length === 1 && openers().length === EACH,
+      `${headings().length} groups, ${openers().length} rows`,
+    );
+
+    setInputValue(field, 'nothing like this exists');
+    await wait(250);
+    check(
+      'and a search with no answer says so rather than looking empty',
+      /Nothing matches/.test(words(panel)) && headings().length === 0,
+      words(panel).slice(0, 140),
+    );
+
+    setInputValue(field, '');
+    await wait(250);
+    check(
+      'clearing the search brings the whole list back',
+      headings().length === FOLDERS,
+      `${headings().length} groups`,
+    );
+  }
+
+  // Picking one opens it. The row is a control, and this is what it is for.
+  openers()[0].click();
+  await wait(150);
+  check(
+    'picking a conversation opens that conversation',
+    opened.length === 1 && opened[0] === 'c-11-0',
+    opened.join(',') || 'nothing opened',
+  );
+
+  // Deleting asks first, and a declined answer changes nothing.
+  const deleteButtons = (): HTMLElement[] =>
+    Array.from(panel.querySelectorAll<HTMLElement>('button[aria-label^="Delete"]')).filter(isPainted);
+  const rowsBefore = openers().length;
+  allowDelete = false;
+  deleteButtons()[0].click();
+  await wait(200);
+  check(
+    'deleting a conversation asks before anything happens',
+    deleted.length === 1,
+    `${deleted.length} confirmations requested`,
+  );
+  check(
+    'and a declined confirmation leaves the conversation exactly where it was',
+    openers().length === rowsBefore,
+    `${openers().length} rows, was ${rowsBefore}`,
+  );
+
+  allowDelete = true;
+  deleteButtons()[0].click();
+  await wait(250);
+  check(
+    'and a confirmed one takes the row away',
+    openers().length === rowsBefore - 1,
+    `${openers().length} rows, was ${rowsBefore}`,
+  );
+  check(
+    'and says so in the count',
+    /299 conversations in 12 projects/.test(words(panel)),
+    words(panel).slice(0, 120),
+  );
+
+  root.unmount();
+  host.remove();
+
+  // The two states with no list in them, where the honest word matters most: a
+  // failed read must not read as "you have no conversations".
+  const errorHost = document.createElement('div');
+  document.body.appendChild(errorHost);
+  let attempts = 0;
+  const errorRoot = createRoot(errorHost);
+  errorRoot.render(
+    React.createElement(ConversationsDialog, {
+      open: true,
+      load: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('The list could not be read just now.');
+        return { projects: [], total: 0, truncated: false };
+      },
+      onOpen: () => {},
+      onDelete: async () => false,
+      onClose: () => {},
+    } as never),
+  );
+  await wait(400);
+  const errorPanel = document.querySelector('[role="dialog"]') as HTMLElement | null;
+  const errorWords = (): string => (errorPanel?.textContent || '').replace(/\s+/g, ' ').trim();
+  check(
+    'a list that could not be read says so instead of claiming there are none',
+    Boolean(errorPanel)
+      && /could not be read just now/.test(errorWords())
+      && !/No conversations yet/.test(errorWords()),
+    errorWords().slice(0, 140),
+  );
+  const retry = Array.from(errorPanel?.querySelectorAll<HTMLElement>('button') || []).find((node) =>
+    /Try again/.test(node.textContent || ''),
+  );
+  if (retry) {
+    retry.click();
+    await wait(400);
+    check(
+      'and offers a way to try again that actually re-reads it',
+      attempts === 2 && /No conversations yet/.test(errorWords()),
+      `${attempts} attempts — ${errorWords().slice(0, 110)}`,
+    );
+  } else {
+    check('and offers a way to try again', false, 'no retry control');
+  }
+  errorRoot.unmount();
+  errorHost.remove();
+}
+
+/**
+ * Set a controlled input the way a keystroke does.
+ *
+ * Assigning `.value` alone does not notify React: it tracks the previous value
+ * on the DOM node and skips the change it cannot see. Every check below that
+ * types into a field would silently measure the unfiltered list.
+ */
+function setInputValue(field: HTMLInputElement, value: string): void {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+  setter?.call(field, value);
+  field.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
 /**

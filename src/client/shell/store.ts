@@ -119,6 +119,15 @@ export interface ShellDialogs {
   terminalOptions: boolean;
   /** The session list, reachable from the mobile bar and the palette. */
   sessions: boolean;
+  /**
+   * Every conversation this user has, grouped by project and searchable.
+   *
+   * Separate from `sessions` because they answer different questions: that one
+   * lists what is running on the server right now and offers to join or delete
+   * it, this one lists conversations — including the ones nothing is running and
+   * the ones whose tab was closed — and offers to reopen them.
+   */
+  conversations: boolean;
   /** The mobile tab switcher sheet. */
   tabs: boolean;
   /** The mobile "More" sheet. */
@@ -278,6 +287,7 @@ const INITIAL: ShellState = {
     newSession: false,
     terminalOptions: false,
     sessions: false,
+    conversations: false,
     tabs: false,
     more: false,
     rename: null,
