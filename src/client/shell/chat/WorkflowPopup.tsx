@@ -169,13 +169,21 @@ export function WorkflowPopup({
   return (
     <Dialog
       open
+      titleText={name}
       title={
-        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span>{name}</span>
+        // The status is the last thing that should be dropped when the name is
+        // long: it is the one word in the title bar that changes (#114). So the
+        // name is the item that shrinks and the badge is pinned.
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+          <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {name}
+          </span>
           {meta ? (
-            <Badge variant={meta.variant} dot={running}>
-              {meta.label}
-            </Badge>
+            <span style={{ display: 'inline-flex', flexShrink: 0 }}>
+              <Badge variant={meta.variant} dot={running}>
+                {meta.label}
+              </Badge>
+            </span>
           ) : null}
         </span>
       }
