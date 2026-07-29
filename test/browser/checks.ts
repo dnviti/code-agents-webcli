@@ -62,6 +62,15 @@ import RECORDED_WORKFLOW from './workflow-events.json';
  */
 import RECORDED_FAILED_WORKFLOW from './workflow-failed-events.json';
 
+/**
+ * One turn of a real Oh My Pi conversation, likewise.
+ *
+ * Generated from test/fixtures/chat/acp-omp.jsonl by test/browser/run.js,
+ * including a real `send()` — which is where the duplicate prompt came from
+ * (#129).
+ */
+import RECORDED_OMP_TURN from './omp-turn-events.json';
+
 const results: string[] = [];
 const check = (name: string, ok: boolean, detail = ''): void => {
   results.push(`${ok ? 'PASS' : 'FAIL'} :: ${name}${detail ? ` :: ${detail}` : ''}`);
@@ -266,6 +275,7 @@ async function run(): Promise<void> {
   await checkARunningWorkflowSaysWhatItIsDoing();
   await checkAWorkflowShowsItsPhasesAndItsAgents();
   await checkAFailedWorkflowReadsAsFailedEverywhere();
+  await checkOnePromptDrawsOneUserBubble();
   await checkAnAgentPopupShowsWhatTheAgentIsDoing();
   await checkATallDialogStaysOnScreen();
   await checkTheComposerShrinksWithTheWorkspaceRail();
@@ -1082,6 +1092,94 @@ async function checkAWorkflowShowsItsPhasesAndItsAgents(): Promise<void> {
  * label: "failed" written in `var(--success)` would satisfy a textContent check
  * and still be a green badge on a broken run.
  */
+/**
+ * One prompt draws one bubble (#129).
+ *
+ * Sending a single message put two identical user turns on the screen, side by
+ * side, on Oh My Pi and every other ACP runtime and both codex modes. Both were
+ * written by the server — `ChatSession.deliver` writes the user's message, and
+ * the adapter used to write it again from inside its own `send` under a turn id
+ * of its own — and the reducer folds anything arriving inside an open turn into
+ * that turn, so the two landed together.
+ *
+ * Here rather than only in a unit test because the claim the issue makes is
+ * about what is on the screen: a transcript holding two messages is one thing,
+ * two bordered bubbles carrying the same sentence is the thing that was
+ * reported. Driven by a real recording replayed through the real adapter,
+ * including the `send()` that used to produce the second copy.
+ */
+async function checkOnePromptDrawsOneUserBubble(): Promise<void> {
+  const PROMPT = 'What is the magic word?';
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1100px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('omp-1', { send: () => {} });
+  let seq = 1;
+  // The user's own message, as the session writes it. Its id shape is not
+  // decoration: it is what tells the reducer this app minted the message, and
+  // therefore what tells it that anything else claiming to be the user in the
+  // same turn is a runtime handing the prompt back.
+  const asked = 'user-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  for (const event of [
+    { t: 'msg_start', id: asked, role: 'user', turnId: 'turn-11111111-2222-3333-4444-555555555555' },
+    { t: 'block_start', msgId: asked, index: 0, block: { kind: 'text', text: PROMPT } },
+    { t: 'msg_end', msgId: asked },
+    ...RECORDED_OMP_TURN,
+  ]) {
+    controller.transcript.apply({ ts: seq, ...(event as Record<string, unknown>), seq: seq++ } as never);
+  }
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'omp',
+      runtimeLabel: 'Oh My Pi',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(250);
+  settle(document);
+
+  // Counted as bubbles, not as strings: the prompt appears in more than one
+  // place on this surface (the turn strip's label, a search field's value), and
+  // what was reported is two rows in the conversation carrying it.
+  const bubbles = Array.from(host.querySelectorAll<HTMLElement>('article')).filter(
+    (node) => isPainted(node) && (node.textContent || '').includes(PROMPT),
+  );
+  check(
+    'one prompt draws one user bubble',
+    bubbles.length === 1,
+    `${bubbles.length} rows carry the prompt: ${bubbles.map((node) => describe(node)).join(' | ') || 'none'}`,
+  );
+  check(
+    'and the conversation holds one user message, not two',
+    controller.transcript.messages.filter((message) => message.role === 'user').length === 1,
+    controller.transcript.messages
+      .filter((message) => message.role === 'user')
+      .map((message) => message.id)
+      .join(', ') || 'none',
+  );
+  // The answer is still there. A fix that dropped the wrong message would
+  // satisfy both counts above and leave the conversation with no reply in it.
+  // `abacus` is what this recording's agent actually replied.
+  check(
+    'and the agent’s answer is still on the screen',
+    Array.from(host.querySelectorAll<HTMLElement>('article')).some(
+      (node) => isPainted(node) && /abacus/i.test(node.textContent || ''),
+    ),
+    Array.from(host.querySelectorAll<HTMLElement>('article'))
+      .map((node) => (node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40))
+      .join(' | ') || 'no rows at all',
+  );
+
+  root.unmount();
+  host.remove();
+}
+
 async function checkAFailedWorkflowReadsAsFailedEverywhere(): Promise<void> {
   const host = document.createElement('div');
   host.style.cssText = 'width:1100px;height:700px;position:absolute;top:0;left:0;display:flex';
