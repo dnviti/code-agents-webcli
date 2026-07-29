@@ -388,7 +388,7 @@ export interface ErrorBlock {
  */
 export interface NoticeBlock {
   kind: 'notice';
-  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched';
+  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals';
   text: string;
   /** Optional detail — how much was reclaimed, what the summary covers. */
   detail?: string;
@@ -1014,12 +1014,19 @@ export type ChatEvent =
    * opening context, and the line is where a reader is told so — a branch that
    * looked like an ordinary transcript would be claiming the agent lived
    * through it (#34).
+   *
+   * `approvals` opens a conversation by saying which mode it is running in.
+   * The mode is decided when a conversation begins, from a preference that
+   * lives in Settings and may have been changed since the last one — so a
+   * conversation that starts, or is started over, without approval prompts says
+   * so in the conversation itself rather than only in a dialog the user may
+   * never open (#134). `detail` carries which mode.
    */
   | {
       t: 'marker';
       seq: number;
       ts: number;
-      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched';
+      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals';
       detail?: string;
     };
 

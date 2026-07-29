@@ -797,6 +797,17 @@ export class ChatController {
     this.options.send({ ...message, sessionId: this.sessionId });
   }
 
+  /**
+   * Show the mode a list row already knew, before this pane has heard anything.
+   *
+   * Display only — see ChatTranscript.seedBypass. Never echoed back in a
+   * launch: the browser does not assert approval modes, it reports them.
+   */
+  seedBypass(bypassing: boolean): void {
+    this.transcript.seedBypass(bypassing);
+    this.options.onChange?.();
+  }
+
   /** Release timers, e.g. when the session's tab is closed. */
   dispose(): void {
     this.cancelSeek();
@@ -834,10 +845,13 @@ export class ChatController {
       replayFrom: 0,
       cursor: 0,
       live: false,
-      // Not a claim about the session: this is a wipe, and the next snapshot or
-      // `chat_started` carries the real mode. Manual is the direction to be
-      // wrong in for the moment in between.
-      bypassPermissions: false,
+      // Carried across the wipe rather than asserted as manual. The next
+      // snapshot or `chat_started` still has the last word, but until it lands
+      // the honest answer is the one the server last stated — and dropping a
+      // known bypass to "asks first" for that interval is the one direction of
+      // wrongness that matters, a user relaxing because the badge says the
+      // agent will stop and ask (#134).
+      bypassPermissions: this.transcript.bypassing,
     });
     this.options.onChange?.();
   }

@@ -25,8 +25,15 @@ export interface ChatManagerDeps {
   /** Passed through to every session; see ChatSessionDeps.onLifecycle. */
   onLifecycle?: (
     sessionId: string,
-    change: { nativeSessionId?: string | null; exited?: boolean },
+    change: { nativeSessionId?: string | null; exited?: boolean; bypassing?: boolean },
   ) => void;
+  /**
+   * The approval preference of a given user; see ChatSessionDeps.resolveBypass.
+   *
+   * Taken per user rather than per session because a `/clear` is answered for
+   * the conversation's *owner*, never for whichever socket happened to type it.
+   */
+  chatBypassPreference?: (userId: number) => boolean;
   /** Passed through to every session; see ChatSessionDeps.usage. */
   usage?: ChatUsageSink;
 }
@@ -94,6 +101,11 @@ export class ChatSessionManager {
         writeFile: (sessionId, filePath, contents) =>
           this.writeFile(sessionId, filePath, contents),
         onLifecycle: this.deps.onLifecycle,
+        // Closed over this record's owner, so a conversation restarted from
+        // inside itself resolves against the preference of the person whose
+        // conversation it is.
+        resolveBypass: () =>
+          this.deps.chatBypassPreference?.(record.ownerUserId) === true,
         usage: this.deps.usage,
         capacity: this.capacity,
       },

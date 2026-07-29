@@ -192,6 +192,91 @@ describe('/clear and /new actually reset the conversation', function () {
     );
   });
 
+  // The approval mode is the other thing in those options that can be wrong by
+  // the time a clear replays them — and the only one that decides whether shell
+  // commands run unattended. `/clear` starts a *new* conversation, so it takes
+  // the preference exactly as the launcher would, instead of replaying whatever
+  // the conversation being abandoned was granted (#134).
+  it('restarts in the mode the preference names, not the one it was launched in', async function () {
+    const { s } = session();
+    s.lastStartOptions = { runtime: 'claude', workingDir: '/tmp', bypassPermissions: true };
+    s.deps.resolveBypass = () => false;
+
+    let startedWith = null;
+    s.start = async (options) => {
+      startedWith = options;
+      s.adapter = fakeAdapter([]);
+      s.state = 'idle';
+    };
+
+    await s.send({ text: '/clear' });
+
+    assert.strictEqual(
+      startedWith.bypassPermissions,
+      false,
+      'a preference switched back to asking must reach the next conversation',
+    );
+  });
+
+  it('restarts into a bypass when that is what the preference says', async function () {
+    // The other direction, and the one that makes the composer's New chat agree
+    // with the recovery notice's Start a new chat: both begin a conversation, so
+    // both land in the mode the user chose.
+    const { s } = session();
+    s.lastStartOptions = { runtime: 'claude', workingDir: '/tmp', bypassPermissions: false };
+    s.deps.resolveBypass = () => true;
+
+    let startedWith = null;
+    s.start = async (options) => {
+      startedWith = options;
+      s.adapter = fakeAdapter([]);
+      s.state = 'idle';
+    };
+
+    await s.send({ text: '/clear' });
+
+    assert.strictEqual(startedWith.bypassPermissions, true);
+  });
+
+  it('asks when nothing can answer what the mode should be', async function () {
+    const { s } = session();
+    s.lastStartOptions = { runtime: 'claude', workingDir: '/tmp', bypassPermissions: true };
+
+    let startedWith = null;
+    s.start = async (options) => {
+      startedWith = options;
+      s.adapter = fakeAdapter([]);
+      s.state = 'idle';
+    };
+
+    await s.send({ text: '/clear' });
+
+    assert.strictEqual(startedWith.bypassPermissions, false);
+  });
+
+  it('tells the record the mode the restart actually landed in', async function () {
+    // Without this the record still says "bypassing" for a conversation that was
+    // just cleared down to asking, and the next resume — which replays the
+    // record — hands back a standing permission it no longer had.
+    const { s } = session();
+    const lifecycle = [];
+    s.lastStartOptions = { runtime: 'claude', workingDir: '/tmp', bypassPermissions: true };
+    s.deps.resolveBypass = () => false;
+    s.deps.onLifecycle = (id, change) => lifecycle.push(change);
+    s.start = async (options) => {
+      s.bypass = Boolean(options.bypassPermissions);
+      s.adapter = fakeAdapter([]);
+      s.state = 'idle';
+    };
+
+    await s.send({ text: '/clear' });
+
+    const reported = lifecycle.filter((change) => change.bypassing !== undefined).pop();
+    assert.ok(reported, 'the record has to hear about a mode that changed');
+    assert.strictEqual(reported.bypassing, false);
+    assert.strictEqual(reported.exited, false, 'and still that the conversation is running');
+  });
+
   it('restarts on the profile default once the override is cleared', async function () {
     const { s } = session();
     s.lastStartOptions = { runtime: 'claude', workingDir: '/tmp', model: 'an-override' };
@@ -251,7 +336,11 @@ describe('clearing leaves the tab live', function () {
       {
         store,
         socketDir,
-        hookScript: path.join(__dirname, '..', 'does-not-exist.js'),
+        // The real one. Claude asks through this hook rather than through the
+        // adapter protocol, so a session pointed at a script that is not there
+        // is a session that genuinely cannot ask — which is a different thing
+        // from the mode it is in, and the approvals notice says which.
+        hookScript: path.join(__dirname, '..', 'dist', 'server', 'chat', 'permission-hook.js'),
         broadcast: () => {},
         resolveCommand: () => command,
         onLifecycle: (_id, change) => lifecycle.push(change),
@@ -272,6 +361,75 @@ describe('clearing leaves the tab live', function () {
   afterEach(function () {
     for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
     dirs = [];
+  });
+
+  it('opens a conversation by saying which approval mode it is in', async function () {
+    // Not the badge, which only appears for a bypass, and not a settings dialog
+    // the user may never open: a line in the conversation, where the tools are
+    // running. The mode is chosen as a conversation begins, so this is the one
+    // moment it can be stated for both of them (#134).
+    const { s, store } = liveSession();
+    await s.start({ runtime: 'claude', workingDir: os.tmpdir(), bypassPermissions: true });
+
+    const notice = store.events.find((e) => e.t === 'marker' && e.kind === 'approvals');
+    assert.ok(notice, 'a new conversation has to say which mode it is in');
+    assert.match(notice.detail, /bypassed/);
+    await s.stop();
+  });
+
+  it('says so again when a clear starts the conversation over in another mode', async function () {
+    const { s, store } = liveSession();
+    s.deps.resolveBypass = () => false;
+    await s.start({ runtime: 'claude', workingDir: os.tmpdir(), bypassPermissions: true });
+    const old = s.adapter;
+
+    await s.send({ text: '/clear' });
+    await died(old);
+
+    const cleared = store.events.findIndex((e) => e.t === 'marker' && e.kind === 'cleared');
+    const after = store.events
+      .slice(cleared)
+      .filter((e) => e.t === 'marker' && e.kind === 'approvals');
+    assert.strictEqual(after.length, 1, 'the replacement conversation states its own mode');
+    assert.match(
+      after[0].detail,
+      /asked before each tool call/,
+      'a bypass that has just been dropped must not be dropped silently',
+    );
+    await s.stop();
+  });
+
+  it('says plainly that a runtime with no approval channel cannot ask', async function () {
+    // pi's chat adapter publishes no approval channel — its --approve trusts
+    // project files for the whole run rather than gating tool calls — so "ask"
+    // cannot be enforced for it whatever the rule computes. Saying "you are
+    // asked before each tool call" over one of its conversations would be this
+    // app claiming a boundary that is not there.
+    const { s, store } = liveSession();
+    await s.start({ runtime: 'pi', workingDir: os.tmpdir() });
+
+    const notice = store.events.find((e) => e.t === 'marker' && e.kind === 'approvals');
+    assert.ok(notice, 'the line is drawn for every runtime');
+    assert.match(notice.detail, /cannot ask/);
+    await s.stop();
+  });
+
+  it('says nothing about the mode when a conversation is only resumed', async function () {
+    // A resume comes back to a transcript that already carries the line from the
+    // day it started. Repeating it on every relaunch would be noise, and noise
+    // is how a line that matters stops being read.
+    const { s, store } = liveSession();
+    await s.start({
+      runtime: 'claude',
+      workingDir: os.tmpdir(),
+      resumeSessionId: 'native-old',
+    });
+
+    assert.ok(
+      !store.events.some((e) => e.t === 'marker' && e.kind === 'approvals'),
+      'a continued conversation is not a conversation beginning',
+    );
+    await s.stop();
   });
 
   it('does not let the process it replaced report the new conversation exited', async function () {
