@@ -38,6 +38,7 @@ import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
 import { TabBar } from '../../src/client/ui/relay/TabBar';
 import { MonacoEditor } from '../../src/client/shell/chat/MonacoEditor';
 import { WorkflowPopup } from '../../src/client/shell/chat/WorkflowPopup';
+import { MessageBubble } from '../../src/client/shell/chat/MessageBubble';
 import { monacoStylesApplied } from '../../src/client/chat/monaco';
 import { Toasts } from '../../src/client/shell/Toasts';
 import { shellStore } from '../../src/client/shell/store';
@@ -1230,6 +1231,90 @@ async function checkAFailedWorkflowReadsAsFailedEverywhere(): Promise<void> {
 
   control.root.unmount();
   host.remove();
+
+  // At a phone's width, where none of this can be reached by a media query.
+  // The failure the conversation now carries is a runtime error verbatim —
+  // three lines of stack trace in the recording — inside an inline-styled
+  // callout, on the narrowest column this app has.
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  // The bubble on its own, at the width it would have, rather than the whole
+  // ChatView: the shell needs a tab strip and a session around it to lay itself
+  // out, and dropped into a bare frame it collapses the transcript column to a
+  // third of the screen — where every measurement below would pass by being too
+  // small to spill rather than by fitting.
+  const phoneHost = doc.createElement('div');
+  phoneHost.style.cssText = 'width:390px;display:flex;flex-direction:column';
+  doc.body.appendChild(phoneHost);
+
+  const narrow = new ChatController('workflow-failed-phone-check', { send: () => {} });
+  let phoneSeq = 1;
+  for (const event of RECORDED_FAILED_WORKFLOW.slice(0, failedAt + 1)) {
+    narrow.transcript.apply({ ts: phoneSeq, ...event, seq: phoneSeq++ } as never);
+  }
+  const failure = narrow.transcript.messages.find(
+    (message) => message.role === 'system' && message.blocks.some((block) => block.kind === 'error'),
+  );
+  check('the failure is a message in the transcript', !!failure);
+  const phoneRoot = createRoot(phoneHost);
+  phoneRoot.render(
+    React.createElement(
+      PhoneContext.Provider,
+      { value: true },
+      React.createElement(MessageBubble, {
+        message: failure,
+        transcript: narrow.transcript,
+      } as never),
+    ),
+  );
+  await wait(200);
+  settle(doc);
+
+  // The innermost match, not the first: every ancestor up to the app root also
+  // contains the text, and measuring one of those would be measuring the
+  // column rather than the callout drawn inside it.
+  const matches = [...doc.querySelectorAll('div')].filter(
+    (el) => /Workflow "probe-workflow-failure" failed/.test(el.textContent ?? '') && isPainted(el),
+  );
+  const callout = matches.find(
+    (el) => !matches.some((other) => other !== el && el.contains(other)),
+  ) as HTMLElement | undefined;
+  check('the failure reaches the phone’s transcript too', !!callout);
+  if (callout) {
+    const spilled = [...callout.querySelectorAll('*')].filter(
+      (el) => isPainted(el) && el.getBoundingClientRect().right > 391,
+    );
+    check(
+      'and a stack trace inside it does not run off the screen',
+      spilled.length === 0 && callout.getBoundingClientRect().right <= 391,
+      spilled.length
+        ? spilled.slice(0, 2).map((el) => `${(el.textContent ?? '').slice(0, 24)} → ${Math.round(el.getBoundingClientRect().right)}px`).join(' | ')
+        : `${Math.round(callout.getBoundingClientRect().width)}x${Math.round(callout.getBoundingClientRect().height)} inside ${Math.round(phoneHost.getBoundingClientRect().width)}px`,
+    );
+    const small = paintedText(callout).filter((entry) => entry.size < PHONE_MIN_TEXT - 0.01);
+    check(
+      'and it is written above the phone’s type floor',
+      small.length === 0,
+      small.length
+        ? small.slice(0, 2).map((entry) => `${entry.text.slice(0, 24)} @ ${entry.size}px`).join(' | ')
+        : 'measured',
+    );
+  }
+
+  phoneRoot.unmount();
+  frame.remove();
 }
 
 /**
