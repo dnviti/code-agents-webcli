@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Fixed
+- **A delegation that stopped reporting reads that way in its own window too**
+  (#139). The status for a call nothing will ever report on again reached the
+  tool-status table, the Agents panel and the workflow popup, and missed the
+  agent popup, which keeps a fourth copy of the list. So the row and the window
+  it opens disagreed: the row said "no longer reporting" while the popup put a
+  live dot on that very badge, drew the in-flight glyph beside the last thing the
+  agent said, and offered "Waiting for this agent to report its first step…"
+  about a wait that had already ended.
 - **The Status panel stops making up your subscription** (#137). It used to
   open on a plan badge reading `max20`, a meter reading "Tokens 0 of 220.0k"
   and a "Left 220.0k" underneath it. None of that was a fact about anybody's
