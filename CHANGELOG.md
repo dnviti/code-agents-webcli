@@ -3,6 +3,41 @@
 ## [Unreleased]
 
 ### Fixed
+- **A long popup title is cut, and the window's controls stay where they are**
+  (#114). Every popup in this app is the same panel, and its title was the one
+  thing in the title bar with no permission to shrink. A flex item's automatic
+  minimum size is its own content, so a title carrying a `white-space: nowrap`
+  span — the issue reader's, the file editor's — made the row wider than the
+  panel and pushed the controls block, which is deliberately unshrinkable,
+  bodily out of it. Measured at a phone width, the Close button ended up 341px
+  past the right edge of the screen: not hard to aim at, gone, with the title
+  painted across the strip it should have occupied. A plain-string title failed
+  the other way and wrapped, taking the bar from one line to five.
+
+  The title is now the side that yields. It ends in an ellipsis when it has to,
+  it never wraps, and the controls keep their full size — including the 44px
+  touch targets a phone gets. Nothing is actually lost: the whole title stays in
+  the element, so the accessible name is unchanged, and it is on hover too. A
+  title made of nodes rather than a string has no text a browser could put in a
+  tooltip, so those four popups hand theirs over explicitly.
+
+  Clamping the title is not enough on its own, and that is the half that is easy
+  to miss. Inside a title that may not wrap, an inline-level wrapper is laid out
+  at its maximum width and then chopped with no ellipsis to say so, and anything
+  after it — the workflow popup's status badge, the file editor's view switch —
+  is clipped away entirely rather than shortened. So each of the four now says
+  which part gives way: the sentence, never the icon, the issue number or the
+  status. The file editor's view switch moved out of the title and in with the
+  other controls, because it is a control and a cut title would have taken it.
+
+  Checked in a browser, since none of this is visible to static markup: four
+  shapes of title, each at a desktop width, dragged 300px narrower, maximised,
+  and in a real 390px phone frame with the app's own stylesheets — 224
+  assertions that the title stops before the controls, stays on one line, is
+  ellipsised rather than chopped, and that every control is inside the panel,
+  full size, and returns itself from a hit test at its own centre. Run against
+  the code before the fix, 44 of them fail.
+
 - **A workflow that failed no longer reads as done** (#140). The Workflow tool
   returns the moment a run is launched — "Workflow launched in background", no
   error, four seconds before anything has happened — and that acknowledgement
