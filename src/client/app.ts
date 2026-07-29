@@ -22,6 +22,7 @@ import { WebSocketConnection } from './terminal/connection';
 import { MessageHandler } from './terminal/message-handler';
 import { ChatRegistry } from './chat/registry';
 import { syncChatSurface } from './chat/surface';
+import { noteChatEvent, syncConversationAttention, watchAttention } from './chat/attention';
 import { SessionTabManager } from './sessions/tab-manager';
 import {
   loadSessions as sessionsLoadSessions,
@@ -43,6 +44,7 @@ import {
 import { FolderBrowser } from './ui/folder-browser';
 import { PlanDetector } from './ui/plan-detector';
 import { showOverlay, hideOverlay } from './ui/overlay';
+import { setConversationOpener, startNotifyRouting } from './ui/notify';
 import {
   showSettings as settingsShow,
   loadSettings,
@@ -189,7 +191,15 @@ export class App {
     this.messageHandler = new MessageHandler(this);
     this.chats = new ChatRegistry({
       send: (message) => this.send(message),
-      onChange: () => syncChatSurface(this),
+      onChange: (sessionId) => {
+        syncChatSurface(this);
+        // The id was being dropped here, which is what kept every conversation
+        // this browser is not looking at invisible to the rest of the app. A
+        // snapshot arriving for a background chat is how a reloaded page learns
+        // that one of its conversations has been sitting blocked all along.
+        syncConversationAttention(this, sessionId);
+      },
+      onEvent: (sessionId, event) => noteChatEvent(this, sessionId, event),
     });
     this.folderBrowser = new FolderBrowser(this);
     this.planDetector = new PlanDetector();
@@ -228,6 +238,11 @@ export class App {
     // replayed, so a listener attached after a network round trip is a listener
     // that can miss it outright.
     setupInstallPrompt();
+    // Same reason: a notification outlives the page that raised it, so one can
+    // be clicked while this window is still fetching its session list. The
+    // worker posts once and does not retry — the id is held until the tab
+    // manager exists to act on it.
+    startNotifyRouting();
 
     await loadConfig(this);
     setupTerminal(this);
@@ -261,17 +276,43 @@ export class App {
     if (this.sessionTabManager.tabs.size > 0) {
       // The tab this browser was last on, or the first one if that session is
       // gone — not always the first one, which sent every reload back to the
-      // start of the strip.
+      // start of the strip. A notification acted on during startup outranks
+      // both, and is consumed here rather than switching twice.
       const initialTabId = this.sessionTabManager.initialTabId();
       if (initialTabId) await this.sessionTabManager.switchToTab(initialTabId);
       hideOverlay();
+      // After the initial switch, so a click that landed mid-boot is the tab
+      // this window opens on rather than one it moves off a moment later. A
+      // click after this point goes straight through.
+      this.wireConversationOpener();
     } else {
       hideOverlay();
+      this.wireConversationOpener();
       void this.folderBrowser.show();
     }
 
     window.addEventListener('resize', () => this.fitTerminal());
     window.addEventListener('beforeunload', () => this.wsConnection.disconnect());
+  }
+
+  /**
+   * Where acting on a conversation notification lands.
+   *
+   * Wired once the opening tab has been decided, because setting it is what
+   * delivers a click the service worker made while this window was still
+   * starting up — and a switch delivered before the initial tab is chosen would
+   * be immediately overridden by it.
+   */
+  private wireConversationOpener(): void {
+    setConversationOpener((sessionId) => {
+      try {
+        window.focus();
+      } catch {
+        // Focusing is a courtesy; switching is the part that matters.
+      }
+      void this.sessionTabManager.switchToTab(sessionId);
+    });
+    watchAttention(this);
   }
 
   // ---------------------------------------------------------------------------
@@ -378,7 +419,8 @@ export class App {
     sessionsLeaveSession(this);
   }
 
-  deleteSession(sessionId: string, options?: { confirm?: boolean }): Promise<void> {
+  /** Resolves true when the session was actually deleted. */
+  deleteSession(sessionId: string, options?: { confirm?: boolean }): Promise<boolean> {
     return sessionsDeleteSession(this, sessionId, options);
   }
 

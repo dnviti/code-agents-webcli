@@ -3,8 +3,17 @@ import * as React from 'react';
 import { Icon } from '../ui/relay/Icon';
 import type { MobileKey } from '../ui/mobile';
 
-/** Published for the toast stack, which has to clear the strip when it shows. */
-export const KEY_STRIP_HEIGHT = 44;
+/**
+ * Published for the toast stack, which has to clear the strip when it shows.
+ *
+ * Tall enough that a key is a full touch target from top to bottom. Nine keys
+ * cannot also be 44px *wide* on a 390px screen — that is 460px of keys before
+ * any gaps — and the platforms' own on-screen keyboards do not try: this is a
+ * keyboard row, and the aim a thumb needs from it is vertical. Width is
+ * whatever nine equal shares of the screen come to, which is where the phone
+ * checks exempt it by name.
+ */
+export const KEY_STRIP_HEIGHT = 56;
 
 export interface KeyStripProps {
   /** Paints Ctrl as engaged; the next input goes out as a control code. */
@@ -73,6 +82,11 @@ export function KeyStrip({ ctrlLatched, onKey, onToggleCtrl, onShowKeyboard }: K
         gap: 6,
         height: KEY_STRIP_HEIGHT,
         padding: '5px 8px',
+        // Each key fills the strip's own height, so the target is the band the
+        // thumb sees rather than something inset inside it. The strip is the
+        // floor plus its own padding and border, or the keys come out a pixel
+        // short of it.
+        alignContent: 'stretch',
         boxSizing: 'border-box',
         borderTop: '1px solid var(--border)',
         background: 'var(--card)',
@@ -137,7 +151,9 @@ function StripKey({ button }: { button: StripButton }): React.JSX.Element {
         background: button.active ? 'var(--accent)' : 'var(--secondary)',
         color: button.active ? 'var(--foreground)' : 'var(--muted-foreground)',
         fontFamily: 'var(--font-sans)',
-        fontSize: 'var(--text-xs)',
+        // Not the 10px this used to be: the phone layout's own floor is 12,
+        // and `Ctrl` on a key you are aiming at in a hurry has to be readable.
+        fontSize: 'var(--text-sm)',
         fontWeight: 'var(--font-medium)' as React.CSSProperties['fontWeight'],
         letterSpacing: 'var(--tracking-wide)',
         cursor: 'pointer',

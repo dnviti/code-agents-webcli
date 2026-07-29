@@ -1,18 +1,23 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import {
+  AccountLimits,
   ChatAttachment,
   ChatCapabilities,
   ChatEvent,
   ChatSnapshot,
   ChatState,
+  ChatUsage,
   MAX_QUEUED_TURNS,
   PermissionOption,
   PermissionRequest,
   QueuedTurn,
   QuestionOption,
   QuestionRequest,
+  SlashCommand,
   UserTurn,
+  carriesCost,
+  carriesTokens,
   classifyTool,
   defaultPermissionOptions,
   isAllowOption,
@@ -23,7 +28,9 @@ import {
   ASK_MCP_SERVER,
   ASK_QUESTION_TOOL_NAME,
 } from '../../shared/chat-events.js';
-import { isClearingCommand } from '../../shared/slash-commands.js';
+import { isClearingCommand, isSlashCommand, mergeSlashCommands } from '../../shared/slash-commands.js';
+import { installedModels } from './installed-models.js';
+import { enumeratesInstalledCommands, listInstalledCommands } from './installed-commands.js';
 import { AdapterEvent, ChatAdapter, ChatAdapterOptions } from './adapter.js';
 import {
   PermissionAsk,
@@ -36,6 +43,9 @@ import {
 import { ASK_SOCKET_ENV, askMcpConfig } from './ask-mcp.js';
 import { ChatStoreLike, ChatSessionRef } from './store.js';
 import { askChannelFor, createChatAdapter, supportsChat } from './registry.js';
+import { FinishedJob, UsageAccountant } from './usage-accounting.js';
+import { UsageJobInput } from '../services/usage-store.js';
+import { projectNameFor, tokenTotal } from '../../shared/usage-records.js';
 
 /**
  * One chat conversation, owned by the server.
@@ -81,18 +91,95 @@ export interface ChatSessionDeps {
    * The session record is the only thing that outlives this process, so a fact
    * that has to survive a restart has to be handed to it while there still is
    * one. `exited` is what lets a browser be told the difference between a chat
-   * that is thinking and a chat that is gone.
+   * that is thinking and a chat that is gone. True when the process ends;
+   * false when a conversation replaced in place has one running again, which
+   * is the only way a record that has been marked finished comes back.
+   *
+   * `nativeSessionId` is null for a conversation that no longer has one, which
+   * is a fact the record has to be able to hold: leaving out the field says
+   * "nothing to report about the id", and a clear has something to report (#43).
    */
   onLifecycle?: (
     sessionId: string,
-    change: { nativeSessionId?: string; exited?: boolean },
+    change: { nativeSessionId?: string | null; exited?: boolean; bypassing?: boolean },
   ) => void;
+  /**
+   * The approval mode a conversation started from inside this one should run in.
+   *
+   * `/clear` and the composer's New chat button end a conversation and begin
+   * another, and a conversation that is beginning takes the owner's preference
+   * — the same rule the launcher goes through. Asked here rather than replayed
+   * out of the previous launch's options, which is what used to carry one
+   * conversation's bypass into every later one in the same tab (#134).
+   *
+   * Optional: absent means nothing could be asked, and the restart asks for
+   * approvals, in line with every other unreadable answer in this rule.
+   */
+  resolveBypass?: () => boolean;
+  /**
+   * Where finished work is filed.
+   *
+   * Optional, and every call site tolerates its absence: accounting is a
+   * bystander here, and a session must be able to run without one. Every test
+   * fixture that predates it constructs a session with no sink at all.
+   */
+  usage?: ChatUsageSink;
+  /**
+   * Who to ask how large a model's context window is, when the agent won't say.
+   *
+   * Optional in the same spirit as `usage`: a session runs perfectly well
+   * without one, and simply reports that capacity is unknown for the agents
+   * that publish none.
+   */
+  capacity?: ModelCapacitySource;
+}
+
+/** Asked only for models no agent described; see `model-capacity.ts`. */
+export interface ModelCapacitySource {
+  contextWindowFor(model: string | undefined): Promise<number | null>;
+}
+
+/**
+ * The accounting side of a session, as this file needs it.
+ *
+ * A narrow interface rather than the store itself so the session depends on
+ * what it uses — file a job, ask what a conversation has been billed — and not
+ * on SQLite.
+ */
+export interface ChatUsageSink {
+  record(job: UsageJobInput): void;
+  /**
+   * What this conversation has already been recorded as consuming.
+   *
+   * The baseline for every runtime that reports a running total rather than a
+   * per-turn figure — tokens here, and cost through `costBaselineFor` for the
+   * one runtime whose cost works that way.
+   */
+  consumedFor(nativeSessionId: string): ChatUsage;
+  /**
+   * What this conversation has already been billed, or null when nothing is
+   * recorded for it at all. See `costBaselineUsd` on the adapter options.
+   */
+  costBaselineFor(nativeSessionId: string): number | null;
+  /** The login to file the work under, resolved once per job. */
+  loginFor(userId: number): string;
+  /** What each turn of this conversation cost, for the index beside it. */
+  spendByTurn(sessionId: string, userId: number): Map<string, ChatUsage>;
 }
 
 export interface ChatSessionStartOptions {
   runtime: string;
   workingDir: string;
   model?: string;
+  /**
+   * Reasoning-effort level to launch at, spelled the way this runtime spells it.
+   *
+   * Only ever a value the runtime itself published, because it is passed
+   * straight through to the CLI: pi warns and then runs at its default when the
+   * level is wrong, which is the quietest possible way to get the opposite of
+   * what was asked for.
+   */
+  effort?: string;
   extraArgs?: string[];
   env?: Record<string, string>;
   bypassPermissions?: boolean;
@@ -131,8 +218,10 @@ interface PendingQuestion {
  * Deliberately excluded: `session`, `capabilities`, `state`, `usage`, `error`
  * and `permission` describe the process that just started rather than the
  * conversation it was handed, and suppressing them would leave the browser
- * looking at a session whose runtime it could not name. `plan` replaces rather
- * than appends, so re-reporting it costs nothing.
+ * looking at a session whose runtime it could not name. `plan` and `limits`
+ * replace rather than append, so re-reporting either costs nothing — and a
+ * resumed runtime restating its rate-limit window is a fresh reading of it,
+ * which is the one thing that turns a level into a rate.
  */
 const REPLAYABLE = new Set([
   'msg_start',
@@ -143,6 +232,79 @@ const REPLAYABLE = new Set([
   'tool',
   'turn_end',
 ]);
+
+/**
+ * How often to re-ask an adapter whether it can take the next queued turn.
+ *
+ * Short enough to be indistinguishable from immediate — the thing being waited
+ * on is a child process finishing its exit, measured in single milliseconds —
+ * and the wait only ever happens for adapters that spawn one process per turn.
+ */
+const QUEUE_READY_POLL_MS = 25;
+
+/**
+ * How long to keep waiting before calling a queued message undeliverable.
+ *
+ * Generous on purpose: overshooting costs a message that arrives late, and
+ * undershooting costs one reported as failed while it would still have gone.
+ */
+const QUEUE_READY_TIMEOUT_MS = 15_000;
+
+/**
+ * How long after an interrupt a `turn_end` still counts as the answer to it.
+ *
+ * The runtimes here acknowledge in milliseconds, so this is already generous
+ * by orders of magnitude, and it is deliberately not more. This window applies
+ * to the interrupt path alone — a message that waited its turn in the queue is
+ * delivered after the turn ended and starts its own — and the failure it has to
+ * stay away from is swallowing a real ending: a turn left open would fold the
+ * next queued message into work it has nothing to do with.
+ */
+const INTERRUPT_ACK_WINDOW_MS = 5_000;
+
+/**
+ * Turn endings that are the turn being cut short rather than finishing.
+ *
+ * Only used by `noteSpend`, and only to *decline* to conclude anything. A
+ * runtime that was stopped mid-sentence, or that fell over, or that was killed
+ * with the process, never reached the point where it reports what the turn
+ * spent — Claude prices a turn in its final `result`, an ACP agent in the reply
+ * to `session/prompt` — so the absence of a figure says nothing about whether
+ * the runtime reports figures. Recording "reports nothing" from one of these
+ * would put a permanent, wrong statement about the *runtime* on the log of a
+ * conversation the *user* interrupted.
+ *
+ * Matched on the runtime's own word, lower-cased with separators removed
+ * because the vocabulary is not shared: the adapters here emit `error`,
+ * `exited`, `failed` and `interrupted` of their own accord, ACP adds
+ * `cancelled` and `refusal`, and Claude's subtypes arrive as `error_max_turns`
+ * and `error_during_execution` — hence the prefix test rather than a lookup for
+ * those. Anything unrecognised is taken as a normal ending, which is the only
+ * choice that keeps the feature working for a runtime nobody here has met:
+ * `end_turn`, `EndTurn`, `completed`, `success`, `max_tokens` and no stop
+ * reason at all are all ordinary endings, and no list could hold them all.
+ */
+const CUT_SHORT_TURN: ReadonlySet<string> = new Set([
+  'aborted',
+  'cancel',
+  'canceled',
+  'cancelled',
+  'exited',
+  'failed',
+  'interrupted',
+  'killed',
+  'refusal',
+  'refused',
+  'timedout',
+  'timeout',
+]);
+
+/** Whether a `turn_end`'s stop reason means the turn never got to finish. */
+function wasCutShort(stopReason: string | undefined): boolean {
+  if (!stopReason) return false;
+  const word = stopReason.toLowerCase().replace(/[_\-\s]/g, '');
+  return word.startsWith('error') || CUT_SHORT_TURN.has(word);
+}
 
 /**
  * Thrown when the session id is known but nothing is running under it.
@@ -159,6 +321,22 @@ export class ChatNotRunningError extends Error {
   }
 }
 
+/**
+ * The approval mode of a conversation, in one phrase, for the line drawn at the
+ * top of it.
+ *
+ * A runtime with no approval channel is named rather than glossed over. pi's
+ * chat adapter publishes `permissions: false` — no approval channel exists in
+ * its CLI — so its tools run unattended whichever mode the rule computed, and
+ * printing "you are asked before each tool call" over one of its conversations
+ * would be this app claiming a boundary that is not there.
+ */
+function approvalNoticeDetail(bypassing: boolean, canAsk: boolean): string {
+  if (bypassing) return 'bypassed — tools run without asking';
+  if (!canAsk) return 'this runtime cannot ask — tools run without asking';
+  return 'on — you are asked before each tool call';
+}
+
 /** Thrown by `send` when the line is already as long as it may get. */
 export class QueueFullError extends Error {
   constructor() {
@@ -173,6 +351,8 @@ export class ChatSession {
   private seq = 0;
   private state: ChatState = 'starting';
   private capabilities: ChatCapabilities | null = null;
+  /** The last account reading the runtime published. See the `limits` overlay in `snapshot()`. */
+  private limits: AccountLimits | null = null;
   private readonly pending = new Map<string, PendingApproval>();
   private readonly questions = new Map<string, PendingQuestion>();
   /**
@@ -196,6 +376,13 @@ export class ChatSession {
   private askCalls: Array<{ toolId: string; question?: string }> = [];
   /** True once this session actually handed a runtime the question tool. */
   private questionsEnabled = false;
+  /**
+   * Skills and project commands found on disk when this session launched.
+   *
+   * Kept so a runtime that reports its own command list cannot drop them; see
+   * the merge in `ingest`.
+   */
+  private installedCommands: SlashCommand[] = [];
   private runtime = '';
   private bypass = false;
   private nativeSessionId: string | null = null;
@@ -203,6 +390,67 @@ export class ChatSession {
   private cwd = '';
   /** The options this session was last launched with, kept for `/clear` and `/new`. */
   private lastStartOptions: ChatSessionStartOptions | null = null;
+
+  /**
+   * The model whose context window is being reported, and where it came from.
+   *
+   * Four of the agents here publish their own window and this never asks
+   * anyone; pi and kimi publish none, and for those the model's provider is
+   * asked instead — once per model, not once per turn. `askedFor` is what
+   * stops a conversation from re-asking a question that already came back
+   * empty on every single message.
+   *
+   * All three reset when the model changes, because the whole point is that a
+   * switch to a smaller model must not carry the larger one's ceiling forward.
+   *
+   * `windowStated` is what makes that true of a switch nobody can answer:
+   * dropping what this object knows is not enough when the figure is already
+   * written into the log and being read off the screen, so it has to be taken
+   * down out loud. See `retractContextWindow`.
+   */
+  private contextModel?: string;
+  private contextWindowFromAgent = false;
+  private capacityAskedFor?: string;
+  private contextWindowStated = false;
+  /** The model the standing agent-reported ceiling was stated for, when named. */
+  private agentWindowModel?: string;
+
+  /**
+   * Whether this conversation has ever been told what it spent.
+   *
+   * The four booleans behind the "not reported" the header shows for a runtime
+   * that reports nothing. `spoke*` is the observation — any report carrying a
+   * token count or a price, on any channel. `stated*` is the answer already
+   * being on the log, so it is said once rather than on the end of every turn.
+   *
+   * Kept here rather than worked out in the browser because the transcript
+   * cannot tell an agent that will never speak from one that has not spoken
+   * yet, and the difference is only knowable from having watched a turn finish.
+   * See `noteSpend`.
+   */
+  private spokeTokens = false;
+  private spokeCost = false;
+  private statedTokenSilence = false;
+  private statedCostSilence = false;
+  /**
+   * Whether the runtime has done anything at all in the turn now open.
+   *
+   * A `/clear` opens and closes a turn before it is recognised as a command,
+   * and an empty turn is not evidence about what a runtime reports — filing one
+   * as "reports nothing" would put the label on a conversation whose agent had
+   * not yet been asked for anything.
+   */
+  private turnDidWork = false;
+
+  /**
+   * The history this conversation was branched with, until the first turn takes it.
+   *
+   * `undefined` means the store has not been asked yet; `null` means it was and
+   * there is nothing — which is every conversation that was not branched. Read
+   * once and remembered either way, because it is asked for on every delivery
+   * and almost every answer is "no".
+   */
+  private carried: string | null | undefined;
 
   /**
    * True between resuming a conversation and the first thing the user says in it.
@@ -229,6 +477,71 @@ export class ChatSession {
   private queue: QueuedTurn[] = [];
   /** Guards the drain against re-entering itself through `send` -> `ingest`. */
   private draining = false;
+  /**
+   * The turn currently running, by id, or null between turns.
+   *
+   * Only one thing reads it: a message promoted past the queue while the agent
+   * is working continues *this* turn instead of starting one, because it is
+   * being delivered into the work rather than waiting for its own (#86).
+   */
+  private turnInFlightId: string | null = null;
+  /**
+   * The user message this session wrote for the turn in flight, by id.
+   *
+   * Held so a second one, minted by the adapter, can be recognised for what it
+   * is — see `isForeignUserEcho`.
+   */
+  private ownUserMessageId: string | null = null;
+  /**
+   * Message ids an adapter tried to file a user turn under, which this session
+   * dropped. Their blocks and their end have to go the same way, or the
+   * transcript keeps orphan events pointing at a message that was never opened.
+   */
+  private readonly droppedUserEchoes = new Set<string>();
+  /**
+   * Until when a `turn_end` is the runtime letting go of interrupted work
+   * rather than the turn ending. Null when nothing has been interrupted.
+   */
+  private staleTurnEndUntil: number | null = null;
+  /** Runs the drain again once the adapter has finished letting go of the last turn. */
+  private drainRetry: ReturnType<typeof setTimeout> | null = null;
+  /** When the current wait for a ready adapter began; null when not waiting. */
+  private readySince: number | null = null;
+
+  /**
+   * Which process the events arriving here belong to.
+   *
+   * `stop()` signals the child and returns without waiting for it, so a
+   * replaced adapter goes on emitting for as long as its process takes to die
+   * — and what it emits last is `state: exited`. Landing that in the log after
+   * the replacement is already running told every browser, and the session
+   * record, that a live conversation had ended: the pane went read-only over a
+   * working agent and only a relaunch could talk it round.
+   *
+   * Bumped by `start()` and again by `restart()` before the old process is
+   * signalled, so each adapter's `emit` closure carries the number it was born
+   * with and anything from an older one is dropped rather than believed.
+   */
+  private adapterGeneration = 0;
+
+  /**
+   * True while a conversation is being replaced by a new one in place.
+   *
+   * Only the queue reads it, and only to stay quiet: a turn already in flight
+   * when the clear lands will fail against the process being torn down, and
+   * "could not be sent" written into the fresh window would be a complaint
+   * about the conversation the user just asked to leave.
+   */
+  private restarting = false;
+
+  /**
+   * Watches this session's own events and files what each job cost.
+   *
+   * Rebuilt on every `start()` because the two things it has to know — whether
+   * this process resumed a conversation, and what that conversation had already
+   * been billed — are properties of the launch, not of the session.
+   */
+  private accountant: UsageAccountant | null = null;
 
   constructor(
     private readonly ref: ChatSessionRef,
@@ -288,6 +601,30 @@ export class ChatSession {
     // a resumed session does not renumber events a browser already holds.
     const stats = await this.deps.store.stat(this.ref);
     this.seq = Math.max(this.seq, stats.cursor);
+    // A ceiling can only be taken down if something knows one is up, and this
+    // object learns that by watching events go past — which a process that has
+    // just started has not done. The browser, meanwhile, folds the whole log
+    // and is showing whatever it says. So a conversation with a log behind it
+    // is assumed to be stating something: at worst the retraction is a log
+    // entry that changes nothing on screen, where the other way round is issue
+    // #82 surviving every server restart.
+    this.contextWindowStated = stats.cursor > 0;
+
+    // Anything still open belongs to the process that just went away, not to
+    // the one about to start, and a relaunch is exactly where an interrupted
+    // job would otherwise be lost.
+    this.accountant?.flush();
+    this.accountant = this.deps.usage
+      ? new UsageAccountant(
+          (job) => this.fileJob(job),
+          // Only when resuming, and it is what this conversation has already
+          // been recorded as using — the evidence the accountant needs to tell
+          // a counter that carried its history from one that restarted.
+          options.resumeSessionId
+            ? this.deps.usage.consumedFor(options.resumeSessionId)
+            : undefined,
+        )
+      : null;
 
     const env = { ...(options.env || {}) };
     const extraArgs = [...(options.extraArgs || [])];
@@ -345,17 +682,48 @@ export class ChatSession {
       }
     }
 
+    // What this session could run, read off disk before the runtime is even
+    // spawned, so the command menu has something true in it from the moment the
+    // conversation opens rather than after a first message has been sent.
+    //
+    // The home directory comes from the session's own environment where it has
+    // one. That is the whole of the isolation this needs: a session lists what
+    // is installed for the person it belongs to, and never what is installed
+    // for anybody else on the machine.
+    const installedCommands = listInstalledCommands(options.runtime, {
+      home: env.HOME || process.env.HOME,
+      workingDir: options.workingDir,
+    });
+
+    // Claimed before the adapter exists, so its `emit` closure below can be
+    // told apart from the one belonging to a process this replaces.
+    const generation = ++this.adapterGeneration;
+
     const adapter = createChatAdapter(options.runtime, {
       sessionId: this.ref.id,
       workingDir: options.workingDir,
+      installedCommands,
       command: this.deps.resolveCommand(options.runtime),
       model: options.model,
+      effort: options.effort,
       extraArgs,
       env,
       bypassPermissions: this.bypass,
       resumeSessionId: options.resumeSessionId,
+      // Only when resuming: a conversation the runtime is starting fresh has a
+      // counter that starts at zero, and handing it a baseline would suppress
+      // the whole first turn's cost.
+      costBaselineUsd: options.resumeSessionId
+        ? this.deps.usage?.costBaselineFor(options.resumeSessionId)
+        : undefined,
       askMcpServer,
-      emit: (event) => this.ingest(event),
+      // A dying predecessor is not a witness to the conversation that replaced
+      // it. See `adapterGeneration`: everything it still has to say — its own
+      // exit above all — is about a process nobody is talking to any more.
+      emit: (event) => {
+        if (generation !== this.adapterGeneration) return;
+        this.ingest(event);
+      },
       readFile: this.deps.readFile
         ? (filePath) => this.deps.readFile!(this.ref.id, filePath)
         : undefined,
@@ -370,11 +738,86 @@ export class ChatSession {
 
     this.adapter = adapter;
 
+    // Every runtime that has not already accounted for what is installed gets
+    // it here — codex and pi never report a command list at all, so without
+    // this their menu stays empty for the whole session. Kept on the session as
+    // well, because a runtime reporting its own list later must not be able to
+    // drop what is installed on disk; see the merge in `ingest`.
+    this.installedCommands = installedCommands;
+    if (installedCommands.length > 0) {
+      adapter.capabilities.commands = mergeSlashCommands(
+        adapter.capabilities.commands,
+        installedCommands,
+      );
+    }
+
+    // And the same for the model picker's menu, for the runtimes that publish
+    // one only through a command of their own. Not awaited: this spawns a
+    // process, the session has nothing to do with its answer, and a menu is
+    // not worth delaying a conversation for. It arrives as a `capabilities`
+    // event whenever it arrives, which is what that event is for.
+    //
+    // It never overwrites a list a runtime published itself. Only grok and pi
+    // are probed at all — everybody else either says so over their protocol or
+    // has no list to give — but the check makes the precedence explicit rather
+    // than incidental: what the runtime says always wins.
+    void installedModels(options.runtime, this.deps.resolveCommand(options.runtime), env)
+      .then((models) => {
+        if (models.length === 0) return;
+        if (this.adapter !== adapter) return; // restarted since; that session owns its own menu
+        if (adapter.capabilities.models?.length) return;
+        adapter.capabilities.models = models;
+        this.ingest({ t: 'capabilities', capabilities: { models } });
+      })
+      .catch(() => {
+        // installedModels does not reject; this is belt and braces so a chat
+        // session can never be taken down by its own picker.
+      });
+
     // Before the first event of the new conversation, so the line lands above
     // it rather than in the middle of it. Only when there is something to draw
     // a line under.
     if (options.startFresh && this.seq > 0) {
       this.ingest({ t: 'marker', kind: 'cleared', detail: 'started a new conversation' });
+      // And the conversation it draws a line under is dropped from the log, so
+      // the line is where this one begins rather than a marker in the middle
+      // of a longer record. Emptying the browser's window was never enough: a
+      // reload replays the tail from disk, and the tail still held everything
+      // said before the clear — so the conversation the user had just ended
+      // came straight back, and paging up walked into the rest of it.
+      //
+      // Awaited before the new process starts talking, and enqueued behind the
+      // marker's own append: the truncation and the events either side of it
+      // are ordered by the store's per-log queue, so nothing lands in a log
+      // that is being rewritten. Never fatal — a conversation must not fail to
+      // start because its predecessor could not be cleaned up.
+      try {
+        await this.deps.store.truncateBefore(this.ref, this.seq);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`chat ${this.ref.id}: could not truncate the cleared conversation: ${message}`);
+      }
+      // And the branch history goes with it, if this conversation had one
+      // waiting. `/clear` promises an agent that has never seen any of it, and
+      // handing over the very history just dropped from the transcript would be
+      // that promise broken in the most confusing possible way.
+      this.carried = null;
+      void this.deps.store.clearOpeningContext?.(this.ref);
+
+      // Nor does anything go on naming the conversation that was just dropped. The
+      // replacement announces an id of its own on its first turn and not
+      // before, so a conversation cleared and then left alone kept the pre-clear
+      // id: reopening it after a server restart showed the emptied transcript
+      // over a banner offering to resume, and taking that offer spawned the
+      // runtime against the very memory the clear had destroyed (#43).
+      //
+      // Said *after* the truncation on purpose. The record is not the only
+      // place that answers this question — a record with no id sends the
+      // manager and the sessions route to the head of the log for one — so
+      // clearing the record while the old `session` event was still readable
+      // would have the id put straight back on the next rejoin.
+      this.nativeSessionId = null;
+      this.deps.onLifecycle?.(this.ref.id, { nativeSessionId: null });
     }
 
     this.setState('starting');
@@ -403,7 +846,84 @@ export class ChatSession {
       this.capabilities = { ...this.capabilities, questions: true };
       this.ingest({ t: 'capabilities', capabilities: { questions: true } });
     }
+
+    // Which approval mode this conversation is running in, said in the
+    // conversation itself.
+    //
+    // The mode is decided at the moment a conversation begins, out of a
+    // preference that lives in Settings and may well have changed since the
+    // last one — so a conversation that comes up bypassing, or that no longer
+    // does, must not do it in silence (#134). Only when one is beginning: a
+    // resume returns to a transcript that already carries the line from the day
+    // it started, and repeating it on every relaunch would be noise.
+    //
+    // After the adapter has started, so the phrase can be honest about what
+    // this runtime can actually enforce rather than about what was asked for.
+    if (!options.resumeSessionId) {
+      this.ingest({
+        t: 'marker',
+        kind: 'approvals',
+        detail: approvalNoticeDetail(
+          this.bypass,
+          // Whether anything can actually stop a tool call in this session:
+          // claude asks through the PreToolUse hook rather than through the
+          // adapter protocol, so its `permissions` capability is false while it
+          // asks perfectly well. Reading that flag alone would print "this
+          // runtime cannot ask" over every claude conversation.
+          wantsHook || this.capabilities?.permissions === true,
+        ),
+        // And the same fact structurally, because the phrase is for the reader
+        // and this is for the pane. A conversation that begins from *inside*
+        // itself — the composer's New chat, `/clear` — never touches the launch
+        // path, so `chat_started` is not broadcast and this marker is the only
+        // thing that reaches the browser with the mode the restart re-decided
+        // (#134).
+        bypassing: this.bypass,
+      });
+    }
+
     this.setState('idle');
+  }
+
+  /**
+   * Whether this event is an adapter writing the user's turn a second time.
+   *
+   * Every ACP runtime and both codex modes used to echo the prompt back into
+   * the transcript as a user message of their own, on top of the one `deliver`
+   * had already written — one prompt, two identical bubbles in the same turn
+   * (#129). The adapters no longer do it, and this is what stops it coming
+   * back: only `deliver` knows what the user actually typed, because a branched
+   * conversation hands the adapter the carried briefing glued in front of the
+   * prompt, and only `deliver` knows whether the turn was a steer.
+   *
+   * Narrow on purpose. It fires only while this session has a turn in flight
+   * that it has already written a user message for, and only for a message it
+   * did not mint itself — so a runtime that legitimately reports something as
+   * the user (a resumed conversation replaying its own history) is untouched.
+   * Those arrive while `replaying` is true and are dropped above anyway.
+   */
+  private isForeignUserEcho(event: AdapterEvent): boolean {
+    if (event.t === 'msg_start') {
+      if (
+        event.role !== 'user'
+        || this.turnInFlightId === null
+        || this.ownUserMessageId === null
+        || event.id === this.ownUserMessageId
+      ) {
+        return false;
+      }
+      this.droppedUserEchoes.add(event.id);
+      return true;
+    }
+    // The blocks and the end of a message that was never opened. Left in, they
+    // are events pointing at nothing, which every reader has to shrug off.
+    if (event.t === 'block_start' || event.t === 'block_delta' || event.t === 'block_end') {
+      return this.droppedUserEchoes.has(event.msgId);
+    }
+    if (event.t === 'msg_end') {
+      return this.droppedUserEchoes.has(event.msgId);
+    }
+    return false;
   }
 
   /**
@@ -422,12 +942,85 @@ export class ChatSession {
       return;
     }
 
+    if (this.isForeignUserEcho(event)) {
+      return;
+    }
+
     this.seq += 1;
     const stamped = {
       ...event,
       seq: this.seq,
       ts: (event as { ts?: number }).ts ?? Date.now(),
     } as ChatEvent;
+
+    // What is installed on disk is not the runtime's to forget — unless the
+    // runtime is one that lists it itself.
+    //
+    // A runtime that reports its own command list replaces whatever was there,
+    // which is right for the runtimes that report everything they accept — and
+    // wrong for the one that does not. Grok on ACP announces seven built-ins
+    // (`compact`, `context`, ...) and nothing about the skills and project
+    // commands sitting in `.grok/skills`, so a wholesale replacement dropped
+    // every one of them from the menu the moment the handshake finished (#73).
+    // Claude names every skill and plugin command it accepts, so putting the
+    // scan back on top of that could only add names Claude has no command for
+    // — picking one sent it as prose and nothing ran (#71). Which of the two a
+    // runtime is, is knowledge about the runtime and is kept with the rest of
+    // it, in `installed-commands.ts`.
+    //
+    // Merged on the event itself for the same reason the `questions` flag above
+    // is: this list is read from the log by the browser and by any snapshot
+    // replayed later, so a merge applied only to the local copy would be a menu
+    // that differs between the server and every client reading it.
+    if (this.installedCommands.length > 0 && !enumeratesInstalledCommands(this.runtime)) {
+      if (stamped.t === 'session' && stamped.capabilities.commands) {
+        stamped.capabilities = {
+          ...stamped.capabilities,
+          commands: mergeSlashCommands(stamped.capabilities.commands, this.installedCommands),
+        };
+      }
+      if (stamped.t === 'capabilities' && stamped.capabilities.commands) {
+        stamped.capabilities = {
+          ...stamped.capabilities,
+          commands: mergeSlashCommands(stamped.capabilities.commands, this.installedCommands),
+        };
+      }
+    }
+
+    if (stamped.t === 'turn_end') {
+      // The first `turn_end` after an interrupt sent to make room for a message
+      // is the runtime letting go of the half it was told to abandon — not this
+      // turn ending. The turn is running again, on the correction that caused
+      // the interrupt, and every reader downstream is told so on the event
+      // itself rather than left to work it out (#86).
+      //
+      // One deep, time-bounded, and only while a turn is actually open: the
+      // runtimes here answer in milliseconds, and a `turn_end` arriving after
+      // that window is the redirected work finishing, which really does end the
+      // turn. Every one of those bounds is there to fail in the same safe
+      // direction — an ending taken for an acknowledgement would leave the turn
+      // open and fold the next queued message into it, and a queued message is
+      // its own turn by definition, delivered only once this one is over.
+      const acknowledging =
+        this.staleTurnEndUntil !== null
+        && Date.now() <= this.staleTurnEndUntil
+        && this.turnInFlightId !== null;
+      if (acknowledging) {
+        this.staleTurnEndUntil = null;
+        stamped.stale = true;
+      } else {
+        this.staleTurnEndUntil = null;
+        // The turn a steer would join, and only for as long as there is one to
+        // join. Cleared here rather than where the state changes because
+        // `turn_end` is the one event every runtime agrees means "that turn is
+        // over", and a stale id would make the next message look like a
+        // continuation of work that had already finished — which is the count
+        // going wrong in the other direction.
+        this.turnInFlightId = null;
+        this.ownUserMessageId = null;
+        this.droppedUserEchoes.clear();
+      }
+    }
 
     if (stamped.t === 'session') {
       // Patched on the event itself, not just on the copy kept here. Every
@@ -471,6 +1064,13 @@ export class ChatSession {
     }
     if (stamped.t === 'capabilities' && this.capabilities) {
       this.capabilities = { ...this.capabilities, ...stamped.capabilities };
+    }
+    if (stamped.t === 'limits') {
+      // Held for the same reason `capabilities` is: the snapshot replays only a
+      // window of the log, and a rate-limit window announced at the top of a
+      // long conversation would fall off the back of it. This is a latest
+      // value, not an append, so keeping it here costs one object.
+      this.limits = stamped.limits;
     }
     // A question tool call opening is the only chance to learn its id: by the
     // time the MCP server relays the question itself, the arguments are all it
@@ -518,6 +1118,8 @@ export class ChatSession {
     if (stamped.t === 'permission_resolved') {
       this.pending.delete(stamped.requestId);
     }
+    this.noteContext(stamped);
+    this.noteSpend(stamped);
 
     try {
       this.deps.store.append(this.ref, [stamped]);
@@ -527,6 +1129,16 @@ export class ChatSession {
     }
 
     this.deps.broadcast(this.ref.id, { type: 'chat_event', sessionId: this.ref.id, event: stamped });
+
+    // After the log and the socket, and wrapped: accounting is a bystander to
+    // this conversation and must never be able to stop one. A dropped record is
+    // a hole in a report; a throw here would be a chat that stops mid-turn.
+    try {
+      this.accountant?.observe(stamped);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`chat ${this.ref.id}: could not account for an event: ${message}`);
+    }
 
     // Last, and only after the event is on the wire: this is where a turn that
     // ended hands the runtime to whatever was typed while it ran. Doing it here
@@ -539,6 +1151,272 @@ export class ChatSession {
   private setState(state: ChatState): void {
     if (this.state === state) return;
     this.ingest({ t: 'state', state });
+  }
+
+  /**
+   * Keep the context reading pointed at the model that is actually running.
+   *
+   * Two jobs. The first is noticing when the model changes: a conversation
+   * that switches from a million-token model to a two-hundred-thousand one and
+   * keeps the old ceiling would show a bar that is comfortably under a quarter
+   * full while the real window is nearly gone. Everything learned about the
+   * old model is dropped on the switch rather than adjusted.
+   *
+   * The second is filling the gap for the agents that publish no capacity at
+   * all, by asking the provider whose model they named. That is a network call,
+   * so it happens once per model and never blocks the conversation: the answer
+   * arrives as an ordinary `usage` event whenever it arrives, and if it never
+   * does, the reading says capacity is unknown and means it — including when it
+   * had been saying something else a moment earlier.
+   */
+  private noteContext(event: ChatEvent): void {
+    if (event.t === 'session' || event.t === 'msg_start') {
+      const model = event.model;
+      if (model && model !== this.contextModel) {
+        // Only a *change* discards what is known. Learning the model for the
+        // first time must not: an ACP agent announces its window during the
+        // handshake and names the model a beat later, and treating that as a
+        // switch would throw away the agent's own figure and go asking a
+        // catalogue for a worse one.
+        //
+        // Nor does a change the agent has already answered. It states the new
+        // model's ceiling the moment the switch is accepted, which is before
+        // any message names that model, so this event is the *second* thing to
+        // arrive about it. Discarding here would send us asking a catalogue
+        // about an id it has never heard of — grok's are internal — and take
+        // down a figure grok had just published.
+        if (this.contextModel !== undefined && this.agentWindowModel !== model) {
+          this.contextWindowFromAgent = false;
+          this.capacityAskedFor = undefined;
+        }
+        this.contextModel = model;
+      }
+    }
+
+    if (event.t === 'usage') {
+      if (event.usage.contextWindow !== undefined) {
+        // Only an agent's own figure closes the question. A window this session
+        // resolved itself must not mark the agent as having answered, or a
+        // later switch back to a model the agent *does* describe would never
+        // re-ask.
+        if (event.usage.contextWindowSource !== 'provider') {
+          this.contextWindowFromAgent = true;
+          this.agentWindowModel = event.usage.contextWindowModel;
+        }
+        this.contextWindowStated = true;
+      } else if (event.usage.contextWindowSource === 'unknown') {
+        this.contextWindowStated = false;
+        this.agentWindowModel = undefined;
+      }
+    }
+
+    if (this.contextWindowFromAgent || !this.contextModel) return;
+    if (this.capacityAskedFor === this.contextModel) return;
+
+    const model = this.contextModel;
+    this.capacityAskedFor = model;
+    // A lookup that answers null and no lookup at all are the same answer about
+    // this model; a lookup that *threw* is not an answer and is kept apart
+    // below. All of them travel the same deferred path: this runs inside
+    // `ingest`, so emitting from here and now would number an event after the
+    // one being handled and put it on the wire ahead of it.
+    const asked: Promise<number | null | undefined> = this.deps.capacity
+      ? this.deps.capacity.contextWindowFor(model).catch(() => undefined)
+      : Promise.resolve(null);
+    void asked
+      .then((window) => {
+        // The conversation may have moved on to another model while this was
+        // in flight, and a stale ceiling is the exact failure this guards.
+        if (this.contextModel !== model || this.contextWindowFromAgent) return;
+        if (window === undefined) {
+          // Not reachable is not an answer. Retracting on it would let one bad
+          // moment on the network leave a knowable model reading "size unknown"
+          // for the rest of the conversation, because nothing re-asks once a
+          // model has been asked about. Forget having asked instead.
+          if (this.capacityAskedFor === model) this.capacityAskedFor = undefined;
+          return;
+        }
+        if (window === null) {
+          // Nobody can size this one — not the agent, and not the catalogue.
+          // What is on screen is the model the conversation left, so it comes
+          // down rather than being left there to be read as this model's.
+          this.retractContextWindow();
+          return;
+        }
+        this.ingest({
+          t: 'usage',
+          usage: { contextWindow: window, contextWindowSource: 'provider' },
+        });
+      })
+      .catch(() => {
+        // Accounting for capacity is a bystander to the conversation, like the
+        // accountant above: there is nothing here a person could act on.
+      });
+  }
+
+  /**
+   * Take the ceiling down, and say so.
+   *
+   * A `usage` report with a source and no window, because leaving the number
+   * out is how every other report says "I am not talking about that field" —
+   * the rule that keeps a streaming patch from blanking the figures beside it.
+   * Only sent when there is something to retract: a conversation whose window
+   * was never established already reads as unknown, and an event saying so
+   * again would be a log entry that changes nothing.
+   */
+  private retractContextWindow(): void {
+    if (!this.contextWindowStated) return;
+    this.ingest({ t: 'usage', usage: { contextWindowSource: 'unknown' } });
+  }
+
+  /**
+   * Say, once, that this runtime reports no tokens and/or no money.
+   *
+   * Every surface that shows spend had exactly two things to draw: a figure, or
+   * nothing. Nothing is what a conversation looks like in its first second, so
+   * the header stayed blank for kimi — which reports no `usage_update`, no
+   * usage on its prompt reply and no `_meta` at all — and a user could not tell
+   * that from a session that simply had not spent anything yet.
+   *
+   * The statement is a measurement and is made where the measurement finishes:
+   * a turn in which the runtime actually did something *ran to its own end*,
+   * and nothing on any channel carried a count or a price. Done once per
+   * conversation, because the log is a record of what changed.
+   *
+   * "Ran to its own end" is doing real work there, and it is why the two gates
+   * below exist. Three kinds of `turn_end` are not a turn finishing: the
+   * acknowledgement of an interrupt sent to steer (`stale`, which the comment
+   * on the field calls "not a turn ending" — the turn is still running on the
+   * correction), a stop-button cancel, and an ending the adapter wrote because
+   * the runtime errored or went away. In all three the runtime was cut off
+   * before the moment it would have priced the turn, so its silence is about
+   * the interruption and not about the runtime. Concluding from one of them
+   * told a user that Claude reports neither tokens nor cost because they had
+   * pressed stop, and the statement outlives the turn: it is folded into the
+   * transcript, carried through `/clear` and re-read on every rejoin, so it
+   * stands until some later turn happens to report a figure. Skipping is free
+   * by comparison — the next turn that does finish states it.
+   *
+   * Written onto the `turn_end` that proves it rather than ingested as its own
+   * event. `ingest` is what calls this, so a second `ingest` from in here would
+   * number and broadcast the new event *ahead* of the turn_end that caused it —
+   * the same re-entrancy the capacity lookup above defers a promise to avoid.
+   * Patching the event in hand needs no ordering at all, and it lands on the
+   * one event a reader would look at to ask the question.
+   */
+  private noteSpend(event: ChatEvent): void {
+    if (event.t === 'msg_start' && event.role !== 'user') this.turnDidWork = true;
+    if (event.t === 'block_start' && event.block.kind === 'tool') this.turnDidWork = true;
+
+    if (event.t === 'usage' || event.t === 'msg_end' || event.t === 'turn_end') {
+      if (carriesTokens(event.usage)) this.spokeTokens = true;
+      if (carriesCost(event.usage)) this.spokeCost = true;
+    }
+
+    if (event.t !== 'turn_end') return;
+    // Before the reset, deliberately: the turn this acknowledges is still
+    // running, so the work it has already done still belongs to the ending
+    // that is yet to come.
+    if (event.stale) return;
+    const worked = this.turnDidWork;
+    this.turnDidWork = false;
+    if (!worked) return;
+    if (wasCutShort(event.stopReason)) return;
+
+    const silence: ChatUsage = {};
+    if (!this.spokeTokens && !this.statedTokenSilence) {
+      this.statedTokenSilence = true;
+      silence.usageSource = 'none';
+    }
+    if (!this.spokeCost && !this.statedCostSilence) {
+      this.statedCostSilence = true;
+      silence.costSource = 'none';
+    }
+    if (silence.usageSource === undefined && silence.costSource === undefined) return;
+    event.usage = { ...event.usage, ...silence };
+  }
+
+  /**
+   * File a finished job.
+   *
+   * Note what is *not* here: nothing the user typed, nothing the agent said,
+   * no tool arguments. The record is measurements and identifiers, which is
+   * what lets it be kept forever under rules the transcript could never meet.
+   *
+   * A figure the runtime never reported stays null rather than becoming zero —
+   * the capability flags recorded alongside are what let a reader tell "this
+   * agent cannot report cost" from "this job cost nothing".
+   */
+  private fileJob(job: FinishedJob): void {
+    const usage = this.deps.usage;
+    if (!usage) return;
+    const numeric = (value: number | undefined): number | null =>
+      typeof value === 'number' && Number.isFinite(value) ? value : null;
+    try {
+      usage.record({
+        sessionId: this.ref.id,
+        nativeSessionId: job.nativeSessionId ?? this.nativeSessionId,
+        turnId: job.turnId,
+        userId: this.ref.ownerUserId,
+        userLogin: usage.loginFor(this.ref.ownerUserId),
+        agent: this.runtime,
+        model: job.model,
+        // Read now, from the folder this session is pointed at now. A session
+        // that is re-pointed mid-flight leaves the work it already did filed
+        // under the project it actually ran in — the alternative, resolving it
+        // when the dashboard asks, would rewrite last month's figures every
+        // time somebody moved a folder.
+        project: projectNameFor(this.cwd),
+        startedAt: new Date(job.startedAt).toISOString(),
+        endedAt: new Date(job.endedAt).toISOString(),
+        durationMs: job.durationMs,
+        outcome: job.outcome,
+        modelTurns: job.modelTurns,
+        toolCalls: job.toolCalls,
+        inputTokens: numeric(job.usage.inputTokens),
+        outputTokens: numeric(job.usage.outputTokens),
+        cacheReadTokens: numeric(job.usage.cacheReadTokens),
+        cacheWriteTokens: numeric(job.usage.cacheWriteTokens),
+        reasoningTokens: numeric(job.usage.reasoningTokens),
+        // Derived when the runtime gave no total of its own, from the parts it
+        // did give — see `tokenTotal`. The alternative, filing the runtime's
+        // total or nothing, is what made the history say "not reported" for
+        // every job Claude ever ran while the same job's tokens were on screen
+        // the whole time it ran (#80). The parts are still filed beside it
+        // unchanged, so nothing here invents a figure: it adds one up.
+        totalTokens: numeric(tokenTotal(job.usage) ?? undefined),
+        costUsd: numeric(job.usage.costUsd),
+        reportsUsage: this.capabilities?.usage === true,
+        reportsCost: this.capabilities?.cost === true,
+        tools: job.tools,
+        models: job.models.map((split) => ({
+          model: split.model,
+          calls: numeric(split.calls),
+          inputTokens: numeric(split.usage?.inputTokens),
+          outputTokens: numeric(split.usage?.outputTokens),
+          cacheReadTokens: numeric(split.usage?.cacheReadTokens),
+          cacheWriteTokens: numeric(split.usage?.cacheWriteTokens),
+          costUsd: numeric(split.usage?.costUsd),
+        })),
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`chat ${this.ref.id}: could not record usage for a job: ${message}`);
+      return;
+    }
+
+    // Said out loud as well as filed, so the figure beside the turn appears the
+    // moment the turn ends rather than the next time the conversation is
+    // opened. It is the filed figure, not a second reading of the events: a
+    // browser cannot work out what a turn cost on the runtimes that report a
+    // running total, and two answers to "what did this cost" is the disagreement
+    // #86 exists to remove.
+    this.deps.broadcast(this.ref.id, {
+      type: 'chat_turn_spend',
+      sessionId: this.ref.id,
+      turnId: job.turnId,
+      usage: job.usage,
+    });
   }
 
   // -------------------------------------------------------------- the queue
@@ -561,16 +1439,70 @@ export class ChatSession {
    * overtake the ones already waiting.
    */
   async send(turn: UserTurn): Promise<void> {
-    if (!this.adapter || !this.adapter.alive) {
-      throw new ChatNotRunningError();
-    }
-
-    if (this.state !== 'idle' || this.queue.length > 0) {
+    // A conversation being replaced has no adapter for a moment, and refusing
+    // here is what put the "this chat is not running" recovery offer in front
+    // of someone who had just cleared and started typing. It is starting, not
+    // gone: the turn waits the way it would for any other busy session and
+    // goes out when the new process reports idle.
+    if (this.restarting) {
       this.enqueue(turn);
       return;
     }
 
-    await this.deliver(turn);
+    if (!this.adapter || !this.adapter.alive) {
+      throw new ChatNotRunningError();
+    }
+
+    // Never queued. Clearing is not another thing to say to the agent, it is
+    // the end of saying things to *this* agent — a `/clear` waiting behind the
+    // answer it was meant to cut short would sit there for as long as that
+    // answer ran, and anything queued behind it goes to a process that is
+    // about to be replaced. Taking it now is also what makes the button and
+    // the three spellings one behaviour rather than four.
+    if (isClearingCommand(turn.text)) {
+      await this.deliver(turn);
+      return;
+    }
+
+    // `adapterReady` matters here as much as in the drain: pressing Enter the
+    // instant a turn ends puts a message through this path, not the queue's,
+    // and the adapter is no readier for it (#89). Queued rather than refused —
+    // the line is drained the moment it can be.
+    const ready = this.adapterReady;
+    if (this.state !== 'idle' || this.queue.length > 0 || !ready) {
+      this.enqueue(turn);
+      // Only this case needs a push. Everything else is waiting on an event
+      // that is certain to come — the running turn's end — but a session that
+      // is *already* idle has had its last event, and a turn parked here for
+      // an adapter still letting go of the previous process would wait for a
+      // drain that nothing was ever going to trigger.
+      if (this.state === 'idle' && !ready) this.drainQueue();
+      return;
+    }
+
+    try {
+      await this.deliver(turn);
+    } catch (error: unknown) {
+      // Kept, not thrown back at a browser that has already cleared the box it
+      // was typed in. A message that could not be handed over goes into the
+      // line with the reason on it, exactly like one that failed on its way out
+      // of the queue — same failure, same recovery, whichever path it took.
+      const message = error instanceof Error ? error.message : String(error);
+      this.failQueuedTurn(
+        { id: `queued-${crypto.randomUUID()}`, text: turn.text, attachments: turn.attachments, ts: Date.now() },
+        message,
+      );
+    }
+  }
+
+  /**
+   * Whether the adapter would accept a turn right now.
+   *
+   * Adapters that do not answer are always ready, which is true of every one
+   * driving a single long-lived process.
+   */
+  private get adapterReady(): boolean {
+    return this.adapter?.readyForTurn !== false;
   }
 
   private enqueue(turn: UserTurn): void {
@@ -595,13 +1527,155 @@ export class ChatSession {
     return true;
   }
 
+  /**
+   * Take one waiting turn out of the line and give it to the agent now.
+   *
+   * The queue is the right default — most of what you type while an agent works
+   * is worth waiting its turn — but some of it is the reason you are typing at
+   * all: the wrong file, the wrong database, a test that already exists. Those
+   * are worth the interruption, and until this existed the only way to deliver
+   * one was the stop button, which discards everything else that was waiting.
+   *
+   * So: whatever is in flight is cut short, the chosen turn is handed over —
+   * or, when the runtime has not let go of the work yet, put back at the head
+   * of the line so it is the next thing delivered — and **the rest of the queue
+   * stays exactly as it was**, in order, behind it.
+   *
+   * False when the runtime was not handed the turn on this call — nothing to
+   * promote (an unknown id: already delivered, already withdrawn, or a second
+   * click on the same row), a session that is no longer running, a delivery
+   * already under way, or a runtime that has not finished letting go of the
+   * turn it was just told to abandon. Only the last of those leaves the message
+   * on its way out, at the head of the line. Silent rather than loud either
+   * way: every one of them is a race the user cannot lose in a way that
+   * matters, and the queue broadcast that follows tells every browser what is
+   * true now.
+   */
+  async sendQueuedNow(id: string): Promise<boolean> {
+    if (!this.adapter?.alive || this.state === 'exited' || this.state === 'error') return false;
+    // A drain in progress owns the runtime for the length of one `deliver`.
+    // Cutting in here would interrupt a turn that has not finished starting.
+    if (this.draining) return false;
+    // A runtime that cannot be interrupted cannot be cut in front of either:
+    // the interrupt would not end the turn, and the promoted message would
+    // reach a process already working on another one — two turns at once, which
+    // is the one thing the queue exists to prevent. Checked before the message
+    // leaves the line, and here rather than only in the browser, because the
+    // browser is not the only thing that can ask.
+    const inFlight = this.state !== 'idle';
+    if (inFlight && !this.adapter.capabilities.interrupt) return false;
+
+    const index = this.queue.findIndex((turn) => turn.id === id);
+    if (index < 0) return false;
+    const [turn] = this.queue.splice(index, 1);
+    this.publishQueue();
+
+    // Held across the interrupt *and* the delivery, because going idle is what
+    // releases the queue: `interrupt` ends in `setState('idle')`, `ingest` runs
+    // `drainQueue` after every event, and without this the first message still
+    // waiting would overtake the one the user actually chose.
+    // Read before the interrupt, because the interrupt is what ends the runtime's
+    // own run and ending it is what clears this. A promoted message delivered
+    // into work that was running continues that work's turn; one promoted while
+    // the session was idle has no work to join and starts its own (#86).
+    const steering = inFlight ? this.turnInFlightId : null;
+
+    this.draining = true;
+    try {
+      if (inFlight) {
+        // Every runtime here answers an interrupt by ending its run, and that
+        // acknowledgement is not this turn ending — the turn is about to carry
+        // on with the correction. Said before the interrupt because the answer
+        // to it can arrive during the await.
+        this.staleTurnEndUntil = Date.now() + INTERRUPT_ACK_WINDOW_MS;
+        await this.cancelTurnInFlight();
+        // The record has to say the turn stopped because of this message, not
+        // that the agent simply gave up. `marker` rather than an error: being
+        // corrected mid-turn is not a failure, and it belongs to the
+        // conversation rather than to the turn that was stopped.
+        this.ingest({ t: 'marker', kind: 'interrupted', detail: quoteTurn(turn.text) });
+      }
+
+      // The gate `send` and the drain have had since #89, missing from the one
+      // path that hands a turn over without ever having asked. On pi it is not
+      // a race but the rule: `interrupt()` signals the child and returns, and
+      // `readyForTurn` stays false until that child's `exit` — a macrotask
+      // away, so nothing between here and the send could change the answer and
+      // the send threw every single time, taking the promoted message with it
+      // (#70). Parked at the head instead, the way `send` parks a turn the
+      // adapter cannot take yet: the drain's poll hands it over the moment the
+      // process lets go, milliseconds later.
+      //
+      // The interrupt stands. The work is already dead and the marker above
+      // already quotes this message, so the one outcome that is not acceptable
+      // here is the message going away with the turn it stopped.
+      if (!this.adapterReady) {
+        // And it arrives as its own turn rather than as a steer: the work it
+        // was going to redirect is over by the time the runtime can take it, so
+        // the `turn_end` that closes that work really does close it.
+        this.staleTurnEndUntil = null;
+        this.queue = [turn, ...this.queue];
+        this.publishQueue();
+        // Armed here rather than left to the drain, which returns before it
+        // reaches this on a session that is not idle yet. Without it a child
+        // that ignores the signal and never exits leaves the message sitting at
+        // the head with no error on it — and a turn with no error is not one
+        // the retry control will touch, so it would be kept and unreachable.
+        this.waitForReady();
+        return false;
+      }
+
+      await this.deliver({ text: turn.text, attachments: turn.attachments }, steering ?? undefined);
+      return true;
+    } catch (error: unknown) {
+      // Back in the line with the reason on it, exactly like a turn that failed
+      // on its way out of the queue — same failure, same recovery. Writing the
+      // error and stopping there lost the message outright: it had left the
+      // queue before the interrupt, so nothing on screen still held what the
+      // user had typed and there was nothing to retry (#70). The ack window
+      // goes for the same reason it does above — nothing is going to carry on
+      // the turn this stopped.
+      this.staleTurnEndUntil = null;
+      const message = error instanceof Error ? error.message : String(error);
+      this.failQueuedTurn(turn, message, { putBack: true });
+      return false;
+    } finally {
+      this.draining = false;
+      // A delivery that threw leaves the state where it was, which may be idle
+      // with messages still waiting — and nothing else would come along to
+      // notice. Harmless in the ordinary case: the agent is working on the
+      // promoted turn, so the guard inside returns immediately.
+      this.drainQueue();
+    }
+  }
+
   /** Drop the whole line. Returns how many turns were discarded. */
   clearQueue(): number {
+    this.stopWaitingForReady();
     const dropped = this.queue.length;
     if (!dropped) return 0;
     this.queue = [];
     this.publishQueue();
     return dropped;
+  }
+
+  /**
+   * Try a turn that failed to be delivered again, now.
+   *
+   * The failure stopped the line (see `drainQueue`), so this both clears the
+   * mark and restarts it. Unknown ids are a no-op rather than an error: the
+   * click races the queue's own broadcast, and losing that race costs nothing.
+   */
+  retryQueued(id: string): boolean {
+    const turn = this.queue.find((entry) => entry.id === id);
+    if (!turn || !turn.error) return false;
+    delete turn.error;
+    // To the head, because it was already at the head when it failed and the
+    // ones behind it were typed expecting it to have gone first.
+    this.queue = [turn, ...this.queue.filter((entry) => entry.id !== id)];
+    this.publishQueue();
+    this.drainQueue();
+    return true;
   }
 
   /**
@@ -628,6 +1702,26 @@ export class ChatSession {
 
     if (this.state !== 'idle') return;
 
+    // A turn that could not be delivered holds the line rather than being
+    // skipped past. Everything behind it was typed on the assumption that it
+    // had been asked, and asking those against an agent that never saw it is a
+    // worse outcome than a queue that visibly stopped and said why (#89). The
+    // user's two ways out — retry and remove — are both on the row itself.
+    if (this.queue[0].error) return;
+
+    // Before anything is shifted off the line and before a word of it reaches
+    // the transcript: the one-shot adapters call a turn over from a line of
+    // stdout while the process that ran it is still exiting, and `send` in that
+    // window throws. It used to throw *after* `deliver` had already written the
+    // user's message into the conversation and moved the state to `thinking`,
+    // so the message sat there unanswered forever with the rest of the queue
+    // stuck behind it. Asking first costs a tick or two of waiting (#89).
+    if (!this.adapterReady) {
+      this.waitForReady();
+      return;
+    }
+    this.stopWaitingForReady();
+
     this.draining = true;
     const next = this.queue.shift()!;
     this.publishQueue();
@@ -636,12 +1730,92 @@ export class ChatSession {
     // the time this promise is pending the guard above already holds on its own.
     this.deliver({ text: next.text, attachments: next.attachments })
       .catch((error: unknown) => {
+        // Silent when a clear is under way: the turn failed because the
+        // process it was for is being replaced, which is what the user asked
+        // for. See `restarting`.
+        if (this.restarting) return;
         const message = error instanceof Error ? error.message : String(error);
-        this.ingest({ t: 'error', message: `could not send a queued message: ${message}` });
+        this.failQueuedTurn(next, message);
       })
       .finally(() => {
         this.draining = false;
+        // One more look, because a delivery does not always leave an event
+        // behind to trigger the next one. `/clear` is the case: it replaces the
+        // process instead of running a turn, and every event that replacement
+        // emits arrives while this drain still holds the guard — so whatever
+        // was queued behind the clear waited on an event that had already been
+        // and gone. Cheap and terminal: a session that is busy or a line that
+        // is empty returns immediately, and each pass takes one turn off.
+        this.drainQueue();
       });
+  }
+
+  /**
+   * Poll until the adapter can take a turn, then drain.
+   *
+   * A poll rather than a fixed settling delay because the wait is a process
+   * exiting, not a duration: any delay long enough to be safe would be long
+   * enough to feel like throttling, and any delay short enough to feel instant
+   * would still be a guess. In the measured case this fires once or twice.
+   */
+  private waitForReady(): void {
+    if (this.drainRetry) return;
+    if (this.readySince === null) this.readySince = Date.now();
+
+    if (Date.now() - this.readySince >= QUEUE_READY_TIMEOUT_MS) {
+      const head = this.queue[0];
+      this.readySince = null;
+      if (head) {
+        this.failQueuedTurn(
+          head,
+          `the ${this.runtime || 'agent'} process was still busy ${Math.round(QUEUE_READY_TIMEOUT_MS / 1000)}s after the last turn ended`,
+          { putBack: false },
+        );
+      }
+      return;
+    }
+
+    this.drainRetry = setTimeout(() => {
+      this.drainRetry = null;
+      this.drainQueue();
+    }, QUEUE_READY_POLL_MS);
+    // Nothing here should hold the process open: a session waiting on a child
+    // that will never come back must not be the reason the server cannot exit.
+    this.drainRetry.unref?.();
+  }
+
+  private stopWaitingForReady(): void {
+    if (this.drainRetry) {
+      clearTimeout(this.drainRetry);
+      this.drainRetry = null;
+    }
+    this.readySince = null;
+  }
+
+  /**
+   * Put a turn that could not be delivered back, with the reason on it.
+   *
+   * Kept rather than dropped, and kept *with its text*, so it is recoverable
+   * without retyping — the queue exists to be trusted while nobody is
+   * watching, and a queue that discards work silently is worse than none.
+   *
+   * `putBack` is false when the turn never left the line in the first place.
+   */
+  private failQueuedTurn(turn: QueuedTurn, reason: string, { putBack = true } = {}): void {
+    const marked: QueuedTurn = { ...turn, error: reason, attempts: (turn.attempts ?? 0) + 1 };
+    if (putBack) {
+      this.queue = [marked, ...this.queue];
+    } else {
+      this.queue = this.queue.map((entry) => (entry.id === turn.id ? marked : entry));
+    }
+    this.publishQueue();
+    this.ingest({ t: 'error', message: `could not send a queued message: ${reason}` });
+    // Only the delivery failed, so a session left saying "working" would be
+    // claiming a turn that never started — and would never drain again, since
+    // a drain needs an idle session.
+    if (this.state === 'thinking' || this.state === 'running') {
+      this.setState('idle');
+    }
   }
 
   private publishQueue(): void {
@@ -652,7 +1826,19 @@ export class ChatSession {
     });
   }
 
-  private async deliver(turn: UserTurn): Promise<void> {
+  /**
+   * Hand one turn to the runtime, recording the user's own message first.
+   *
+   * @param continuesTurnId The turn this message is being delivered *into*, when
+   *   it is a steer — see `sendQueuedNow`. Sharing that turn's id is what makes
+   *   the transcript group the two together and the accounting file them as one
+   *   turn, which is the definition #86 settled: steering the current work is
+   *   part of that work, not a new request. What made that come apart was not
+   *   the id but the runtime's acknowledgement of the interrupt arriving as a
+   *   `turn_end` — see `staleTurnEndUntil`, which is what keeps the turn open
+   *   across it.
+   */
+  private async deliver(turn: UserTurn, continuesTurnId?: string): Promise<void> {
     if (!this.adapter || !this.adapter.alive) {
       throw new ChatNotRunningError();
     }
@@ -666,8 +1852,19 @@ export class ChatSession {
     // it is the same in every protocol, and a transcript missing what the user
     // asked is useless for resuming, exporting or searching.
     const messageId = `user-${crypto.randomUUID()}`;
-    const turnId = `turn-${crypto.randomUUID()}`;
-    this.ingest({ t: 'msg_start', id: messageId, role: 'user', turnId });
+    const turnId = continuesTurnId ?? `turn-${crypto.randomUUID()}`;
+    this.turnInFlightId = turnId;
+    // Set before the ingest, because the gate that recognises an adapter's copy
+    // of this message compares against it — see `isForeignUserEcho`.
+    this.ownUserMessageId = messageId;
+    this.droppedUserEchoes.clear();
+    this.ingest({
+      t: 'msg_start',
+      id: messageId,
+      role: 'user',
+      turnId,
+      ...(continuesTurnId ? { steer: true as const } : {}),
+    });
     this.ingest({
       t: 'block_start',
       msgId: messageId,
@@ -698,7 +1895,44 @@ export class ChatSession {
     }
 
     this.setState('thinking');
-    await this.adapter.send(turn);
+
+    // A branched conversation opens with the history it was cut from, and this
+    // is the only place it can reach the agent: it rides *with* the first thing
+    // the user says rather than as a turn of its own, so the transcript above
+    // holds the user's own words and nothing else. What the runtime receives and
+    // what the record shows are deliberately different here, and that difference
+    // is the whole point — see chat/branch.ts.
+    //
+    // Read after the state has moved, never before: `retryQueued` relies on
+    // `deliver` reaching `thinking` before it awaits anything, and a disk read
+    // in front of that would open a window where a second turn saw an idle
+    // session and overtook this one.
+    //
+    // Never in front of a command. Everything except `/clear` and `/new`
+    // reaches the runtime as ordinary turn text, so a briefing glued to
+    // `/review` is not a command any more — it runs as prose, and the history
+    // is spent on a turn that was never going to read it. It waits for
+    // something the model is actually being asked.
+    const carried = isSlashCommand(turn.text) ? null : await this.openingContext();
+    await this.adapter.send(carried ? { ...turn, text: `${carried}\n\n${turn.text}` } : turn);
+
+    // Only once it has actually gone. A delivery that threw is put back in the
+    // line and tried again, and the retry has to carry what this attempt never
+    // handed over. Awaited rather than left to finish on its own: the send has
+    // already succeeded, so the cost is nothing, and a process that exits in
+    // that gap would come back and hand a whole conversation's history to some
+    // later, unrelated turn.
+    if (carried) {
+      this.carried = null;
+      await this.deps.store.clearOpeningContext?.(this.ref);
+    }
+  }
+
+  /** The branch history still waiting to be handed over, or null. */
+  private async openingContext(): Promise<string | null> {
+    if (this.carried !== undefined) return this.carried;
+    this.carried = (await this.deps.store.openingContext?.(this.ref)) ?? null;
+    return this.carried;
   }
 
   /**
@@ -714,11 +1948,59 @@ export class ChatSession {
   private async restart(): Promise<void> {
     const options = this.lastStartOptions;
     if (!options) return;
-    await this.stop();
-    // Stale until the new process's own `init` event reports its id — cleared
-    // up front so nothing reads the old conversation's id in the meantime.
-    this.nativeSessionId = null;
-    await this.start({ ...options, resumeSessionId: undefined, startFresh: true });
+    this.restarting = true;
+    // Before the old process is signalled, not after: whatever it emits from
+    // here on belongs to a conversation that is over. See `adapterGeneration`.
+    this.adapterGeneration++;
+    // The line is *not* carried across, and that is the whole difference #69
+    // made: a clear is taken the moment it is typed rather than waiting its
+    // turn, so whatever is queued here was typed for the process being
+    // replaced and belongs to the conversation the user just left (#69).
+    // Anything typed *after* the clear still arrives — `restarting` parks it
+    // and the fresh process is handed it as soon as it reports idle — which is
+    // the case #89 exists to protect.
+    try {
+      await this.stop();
+      // Stale until the new process's own `init` event reports its id — cleared
+      // up front so nothing reads the old conversation's id in the meantime.
+      // The record hears it too, but from inside `start`, once the log this
+      // one lived in has actually been dropped (#43).
+      this.nativeSessionId = null;
+      // The mode is re-decided rather than replayed. A conversation started
+      // from inside this one is a conversation that is *beginning*, so it takes
+      // the owner's preference exactly as the launcher's would — which is what
+      // makes the composer's New chat and the recovery notice's Start a new
+      // chat land in the same place. Replaying `options.bypassPermissions` is
+      // what used to carry one conversation's standing permission into every
+      // later one in the tab, whatever the preference had since been set to.
+      await this.start({
+        ...options,
+        bypassPermissions: this.deps.resolveBypass?.() === true,
+        resumeSessionId: undefined,
+        startFresh: true,
+      });
+    } catch (error: unknown) {
+      // Nothing replaced the conversation that was stopped. `start()` has
+      // already written the failure into the transcript and moved the state to
+      // `error`; the record has to hear it too, or the tab goes on claiming a
+      // process that never started and refuses the relaunch that would fix it.
+      this.deps.onLifecycle?.(this.ref.id, { exited: true });
+      throw error;
+    } finally {
+      this.restarting = false;
+    }
+
+    // The record outlives every process this session runs, and `stop()` above
+    // told it one had gone. Saying so again in the other direction is what
+    // keeps the tab a running tab: without it the session lists report a
+    // conversation that is answering as finished, and the next launch in this
+    // tab is refused because a process it no longer has is still claimed.
+    //
+    // And the mode with it, because this restart may well have changed it: left
+    // out, a conversation cleared down to asking would still be *recorded* as
+    // bypassing, and the next resume would hand it back a permission it no
+    // longer had.
+    this.deps.onLifecycle?.(this.ref.id, { exited: false, bypassing: this.bypass });
   }
 
   async interrupt(): Promise<void> {
@@ -727,6 +2009,27 @@ export class ChatSession {
     // stop that then fired the three messages waiting behind it would be the
     // opposite of what the button says. Someone who wants them can send them.
     const dropped = this.clearQueue();
+    await this.cancelTurnInFlight();
+    if (dropped) {
+      this.ingest({
+        t: 'error',
+        message: `Stopped. ${dropped} queued message${dropped === 1 ? ' was' : 's were'} discarded.`,
+      });
+    }
+  }
+
+  /**
+   * End the turn in flight, leaving the queue alone.
+   *
+   * Everything `interrupt` does *except* discarding what was typed ahead —
+   * which is the whole difference between the stop button and promoting one
+   * waiting message. Kept as one method rather than duplicated, because the
+   * part that matters here is not the adapter call: it is that a cancelled
+   * turn must not leave a permission card or a question on screen waiting for
+   * an answer that can no longer reach anything.
+   */
+  private async cancelTurnInFlight(): Promise<void> {
+    if (!this.adapter) return;
     await this.adapter.interrupt();
     // Anything still waiting on a person is moot once the turn is cancelled,
     // and leaving the cards on screen would invite answers that go nowhere.
@@ -748,12 +2051,6 @@ export class ChatSession {
       });
     }
     this.questions.clear();
-    if (dropped) {
-      this.ingest({
-        t: 'error',
-        message: `Stopped. ${dropped} queued message${dropped === 1 ? ' was' : 's were'} discarded.`,
-      });
-    }
     this.setState('idle');
   }
 
@@ -970,6 +2267,37 @@ export class ChatSession {
     this.lastStartOptions = { ...this.lastStartOptions, model };
   }
 
+  /**
+   * Switch the live process to a different reasoning-effort level.
+   *
+   * Unlike the model, most runtimes can do this: claude answers its own
+   * `/effort` command for free, kimi and omp expose it as an ACP config option,
+   * grok carries it on a model change, and codex and pi apply it to the next
+   * turn they start. What they have in common is that the adapter only resolves
+   * once its runtime has taken the level — so `true` here means the session is
+   * genuinely running at it, and anything else falls through to the caller's
+   * saved-for-next-launch answer rather than claiming a change nobody made.
+   */
+  async setEffort(effort: string): Promise<boolean> {
+    if (!this.adapter?.alive || !this.adapter.setEffort) return false;
+    await this.adapter.setEffort(effort);
+    return true;
+  }
+
+  /**
+   * Record the effort level an in-place restart must launch with.
+   *
+   * The same trap `rememberModel` exists for, and a worse one here: an effort
+   * change is confirmed by the runtime and shown as live, so a `/clear` that
+   * replayed the launch options verbatim would put the conversation back on the
+   * level it opened with while the control went on reporting the level the user
+   * chose — a disagreement nothing on screen would explain.
+   */
+  rememberEffort(effort: string | undefined): void {
+    if (!this.lastStartOptions) return;
+    this.lastStartOptions = { ...this.lastStartOptions, effort };
+  }
+
   snapshot(): Promise<ChatSnapshot> {
     return this.deps.store.snapshot(this.ref).then((snapshot) => ({
       ...snapshot,
@@ -986,10 +2314,16 @@ export class ChatSession {
       capabilities: this.capabilities || snapshot.capabilities,
       pendingPermissions: Array.from(this.pending.values()).map((entry) => entry.request),
       pendingQuestions: Array.from(this.questions.values()).map((entry) => entry.request),
+      // `answeredQuestions` is deliberately NOT overridden here. This map holds
+      // only the questions still waiting; what was picked for the ones already
+      // answered is in the log, and the store's replay of it is the authority
+      // (#113). Overlaying anything from here would narrow it to this process's
+      // lifetime, which is exactly the conversation this has to survive.
       queued: this.queuedTurns,
       live: this.live,
       nativeSessionId: this.nativeSessionId || undefined,
       bypassPermissions: this.bypass,
+      limits: this.limits || snapshot.limits,
     }));
   }
 
@@ -1008,6 +2342,12 @@ export class ChatSession {
     this.questions.clear();
     this.clearQueue();
 
+    // Before the adapter goes: a turn that was still running when someone hit
+    // stop is work that happened, and losing it would make every deliberate
+    // interruption invisible in the record.
+    this.accountant?.flush();
+    this.accountant = null;
+
     const adapter = this.adapter;
     this.adapter = null;
     if (adapter) {
@@ -1017,6 +2357,20 @@ export class ChatSession {
     this.broker?.close();
     this.broker = null;
   }
+}
+
+/**
+ * The promoted message, short enough to sit on a rule drawn across the column.
+ *
+ * Enough of it to recognise which message this was, which is what the marker is
+ * for — the message itself is directly below, so this is a label, not a copy.
+ * Whitespace is collapsed because a queued turn can be many lines, and a line
+ * break in a one-line marker breaks the line.
+ */
+function quoteTurn(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  if (!flat) return 'an attachment';
+  return flat.length > 60 ? `“${flat.slice(0, 57)}…”` : `“${flat}”`;
 }
 
 /** One line describing what is being approved, for the card's heading. */

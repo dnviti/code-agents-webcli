@@ -82,7 +82,9 @@ export function ToolCallCard({
           color: 'var(--foreground)',
           font: 'inherit',
           fontFamily: 'var(--font-sans)',
-          fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-sm)',
+          // Supporting detail about a step, not the step's own answer: below
+          // the message it belongs to rather than level with it (#92).
+          fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-sm)',
           textAlign: 'left',
           cursor: 'pointer',
         }}
@@ -115,7 +117,9 @@ export function ToolCallCard({
           style={{
             flex: '0 1 auto',
             minWidth: 0,
-            fontWeight: 'var(--font-medium)',
+            // Not bolded on a phone: weight reads as loudly as size, and this
+            // row already sits above the message in the eye's order (#92).
+            fontWeight: isPhone ? 'var(--font-normal)' : 'var(--font-medium)',
             overflow: 'hidden',
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
@@ -130,7 +134,7 @@ export function ToolCallCard({
               flex: '1 1 auto',
               minWidth: 0,
               fontFamily: 'var(--font-mono)',
-              fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-xs)',
+              fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-xs)',
               color: 'var(--muted-foreground)',
               overflow: 'hidden',
               textOverflow: 'ellipsis',
@@ -152,7 +156,7 @@ export function ToolCallCard({
             style={{
               flex: '0 0 auto',
               fontFamily: 'var(--font-mono)',
-              fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
+              fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-2xs)',
               color: 'var(--muted-foreground)',
             }}
           >
@@ -178,7 +182,7 @@ export function ToolCallCard({
                   background: 'color-mix(in oklab, var(--destructive) 10%, transparent)',
                   color: 'var(--destructive)',
                   fontFamily: 'var(--font-mono)',
-                  fontSize: 'var(--text-xs)',
+                  fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-xs)',
                   whiteSpace: 'pre-wrap',
                   wordBreak: 'break-word',
                 }}
@@ -212,7 +216,7 @@ export function ToolCallCard({
             <p
               style={{
                 margin: '0 0 10px',
-                fontSize: 'var(--text-xs)',
+                fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-xs)',
                 color: 'var(--muted-foreground)',
               }}
             >
@@ -226,14 +230,17 @@ export function ToolCallCard({
 }
 
 function Section({ label, children }: { label: string; children: React.ReactNode }) {
+  const isPhone = usePhone();
   return (
     <section>
       <h4
         style={{
           margin: '0 0 4px',
-          fontSize: 'var(--text-2xs)',
+          // 10px in capitals is both below the phone floor and louder than
+          // its size, on a heading for a detail nobody came to read (#92).
+          fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-2xs)',
           fontWeight: 'var(--font-medium)',
-          textTransform: 'uppercase',
+          textTransform: isPhone ? 'none' : 'uppercase',
           letterSpacing: 'var(--tracking-caps)',
           color: 'var(--muted-foreground)',
         }}
@@ -292,6 +299,7 @@ function InputSection({ block }: { block: ToolBlock }) {
 }
 
 function Output({ text }: { text: string }) {
+  const isPhone = usePhone();
   const [expanded, setExpanded] = React.useState(false);
   const lines = React.useMemo(() => text.split('\n'), [text]);
   const clamped = !expanded && lines.length > OUTPUT_LINES;
@@ -319,7 +327,7 @@ function Output({ text }: { text: string }) {
           padding: '8px 10px',
           overflowX: 'auto',
           fontFamily: 'var(--font-mono)',
-          fontSize: 'var(--text-xs)',
+          fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-xs)',
           lineHeight: 'var(--leading-terminal)',
           color: 'var(--terminal-fg)',
         }}
@@ -342,7 +350,7 @@ function Output({ text }: { text: string }) {
             borderTop: '1px solid var(--border)',
             color: 'var(--muted-foreground)',
             font: 'inherit',
-            fontSize: 'var(--text-2xs)',
+            fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-2xs)',
             letterSpacing: 'var(--tracking-wide)',
             cursor: 'pointer',
           }}

@@ -2,14 +2,16 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <!-- The app's own stylesheets, in the order index.html loads them.
-         Without these, every `var(--text-2xs)` in an inline style resolves to
-         nothing and the element silently inherits the browser's 16px default —
-         so a check that measures type size would have read 16px for text that
-         ships at 10px, and passed. -->
-    <link rel="stylesheet" href="../../dist/public/css/relay/relay.css" />
-    <link rel="stylesheet" href="../../dist/public/css/main.css" />
-    <link rel="stylesheet" href="../../dist/public/css/vendor/xterm.css" />
+    <!-- The app's own stylesheets, in the order index.html loads them, and by
+         the same absolute paths — this page is served over HTTP out of the
+         built dist/public (see run.js), so what the checks load is what the app
+         loads. Without these, every `var(--text-2xs)` in an inline style
+         resolves to nothing and the element silently inherits the browser's
+         16px default — so a check that measures type size would have read 16px
+         for text that ships at 10px, and passed. -->
+    <link rel="stylesheet" href="/css/relay/relay.css" />
+    <link rel="stylesheet" href="/css/main.css" />
+    <link rel="stylesheet" href="/css/vendor/xterm.css" />
   </head>
-  <body><script src="./bundle.js"></script></body>
+  <body><script src="/bundle.js"></script></body>
 </html>

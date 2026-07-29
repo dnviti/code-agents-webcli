@@ -6,9 +6,11 @@ import {
   TextBlock,
   ThinkingBlock,
   ToolBlock,
+  TurnModelUsage,
   UserTurn,
   classifyTool,
   mergeUsage,
+  rankedEfforts,
 } from '../../../shared/chat-events.js';
 
 /**
@@ -77,6 +79,38 @@ export class PiChatAdapter extends BaseChatAdapter {
     // No plan/todo tool in pi's built-in tool list (read, bash, edit, write,
     // grep, find, ls).
     plan: false,
+    // pi's thinking ladder, in the order its own `--help` prints it:
+    // `--thinking <level>   Set thinking level: off, minimal, low, medium,
+    // high, xhigh, max`. That order is the ranking, so `rankedEfforts` spaces
+    // the seven evenly from `off` at 0 to `max` at 1.
+    //
+    // Confirmed a second time, and more strongly, by handing pi a level it does
+    // not have: `--thinking bogus_xyz` put `Warning: Invalid thinking level
+    // "bogus_xyz". Valid values: off, minimal, low, medium, high, xhigh, max`
+    // on stderr. That is pi enumerating its own vocabulary while refusing a
+    // word — the set it will actually accept, rather than the set someone wrote
+    // down once and may not have kept up with.
+    //
+    // Getting the spelling exactly right matters more than it looks, because
+    // that message is only a *warning*: pi carried on and answered the prompt
+    // at its default level. A level this app gets wrong does not fail loudly,
+    // it quietly thinks at an amount nobody chose while the UI reports the
+    // level as live. Nothing outside this list ever reaches the command line
+    // (see `knownLevel`).
+    //
+    // `off` is one of the seven, not a way of spelling "no override". Asking pi
+    // for `off` is asking it not to think, which is a decision someone made;
+    // leaving the level alone entirely is a different thing, and the control's
+    // own "use the runtime default" row is where that one lives.
+    efforts: rankedEfforts([
+      { value: 'off', name: 'Off', description: 'No thinking at all — a level in its own right.' },
+      { value: 'minimal', name: 'Minimal', description: 'The least that is still thinking.' },
+      { value: 'low', name: 'Low', description: 'A little, for work that barely needs it.' },
+      { value: 'medium', name: 'Medium', description: 'The middle of the seven.' },
+      { value: 'high', name: 'High', description: 'Enough for work with steps in it.' },
+      { value: 'xhigh', name: 'Extra high', description: 'Past high, short of the ceiling.' },
+      { value: 'max', name: 'Max', description: 'Everything pi will spend on thinking.' },
+    ]),
   };
 
   private turnCounter = 0;
@@ -90,10 +124,63 @@ export class PiChatAdapter extends BaseChatAdapter {
   private currentAssistantMsgId: string | null = null;
   private blockState: BlockTrack[] | null = null;
   private readonly toolStartedAt = new Map<string, number>();
+  /**
+   * What each model did this turn, accumulated from the messages themselves.
+   *
+   * pi has no `modelUsage` summary the way claude and grok do — but it names
+   * the model on every assistant message and carries that message's own usage
+   * beside it, which is the same fact arriving in instalments. One turn can
+   * hold several messages, and pi will switch model between them (a fallback
+   * after a provider error is the case seen in practice), so this is a map
+   * rather than a field.
+   */
+  private readonly turnModels = new Map<string, { calls: number; usage: ChatUsage }>();
+  /** The last model pi said it used, for the session line. Never the requested one. */
+  private reportedModel: string | undefined;
+  /**
+   * The thinking level every future spawn is launched at.
+   *
+   * Seeded from the launch option and then owned here, rather than written back
+   * into `this.options.effort`, for two reasons. `options` is the caller's
+   * object — the session built it and still reads it to decide what a relaunch
+   * would look like — so mutating it would quietly rewrite the request the
+   * session believes it made. And keeping the two apart preserves a distinction
+   * the rest of this class is careful about: `options.effort` is what this
+   * conversation was started with, this is what the next `pi` will actually be
+   * handed. `buildArgs()` reads this one.
+   *
+   * Seeded through the same membership check `setEffort` uses, so a launch
+   * option pi has no such level for is dropped here rather than reported as
+   * running. Declared after `capabilities` because it reads that list; class
+   * fields initialise top to bottom.
+   */
+  private effort: string | undefined = this.knownLevel(this.options.effort);
 
   /** The adapter stays usable across turns even with no child running between them. */
   override get alive(): boolean {
     return !this.stopped;
+  }
+
+  /**
+   * This turn's models, or nothing at all if pi named none.
+   *
+   * Spread into the event rather than assigned, so a turn pi named no model
+   * for carries no `models` key at all — an explicit `undefined` is a
+   * different object to anything comparing events, and these are compared.
+   *
+   * Nothing rather than an empty list, and never the requested model: a turn
+   * that died before pi produced a message reached no model that anybody can
+   * name, and `--model` is a request this app made, not an observation it took.
+   */
+  private reportedTurnModels(): { models?: TurnModelUsage[] } {
+    if (this.turnModels.size === 0) return {};
+    return {
+      models: [...this.turnModels].map(([model, seen]) => ({
+        model,
+        calls: seen.calls,
+        ...(Object.keys(seen.usage).length > 0 ? { usage: seen.usage } : {}),
+      })),
+    };
   }
 
   /**
@@ -105,6 +192,20 @@ export class PiChatAdapter extends BaseChatAdapter {
     const args = ['--mode', 'json'];
     if (this.options.model) {
       args.push('--model', this.options.model);
+    }
+    if (this.effort) {
+      // The whole of the effort mechanism, for this runtime. One turn is one
+      // process (see the class comment) and this builder runs fresh inside
+      // every `send()`, so a level changed between turns is simply on the
+      // command line of the next child: nothing to restart, no protocol to
+      // speak, and no running pi to be out of step with.
+      //
+      // Never a value this app invented: an unrecognised level does not fail
+      // the turn, it warns on stderr and runs at pi's default (the capture is
+      // quoted beside `capabilities.efforts`), so a wrong word here reads to
+      // the user as a level that is live and is not. Both ways in — the launch
+      // option and `setEffort` — go through `knownLevel` first.
+      args.push('--thinking', this.effort);
     }
     if (this.options.extraArgs) {
       args.push(...this.options.extraArgs);
@@ -118,13 +219,92 @@ export class PiChatAdapter extends BaseChatAdapter {
       this.sessionEventEmitted = true;
       this.emit({
         t: 'session',
+        // Deliberately not `options.model`: resuming a session says nothing
+        // about which model answered in it, and the flag is only a request.
+        // pi names the model on its first message and the turn's report
+        // confirms it; until then the conversation shows none.
+        model: this.reportedModel,
         nativeSessionId: this.nativeSessionId,
-        model: this.options.model,
         cwd: this.options.workingDir,
         capabilities: this.capabilities,
       });
     }
+    // The level the next turn will spawn at — and, unlike the model just above,
+    // this genuinely is the flag we are about to pass rather than something pi
+    // said. The difference is worth being blunt about. The `session` event
+    // reports `reportedModel` because pi names its model on every message, so
+    // there a request and an observation are two separate facts and only the
+    // second is worth showing. Thinking has no second fact: pi never names its
+    // level on the wire — not on the `session` line, not on a message, not in
+    // the usage — so the argv is the only place the level exists at all.
+    // Reporting it is reporting the one thing anybody knows, not dressing a
+    // request up as an answer.
+    //
+    // What makes that safe enough to show is that nothing off pi's own ladder
+    // ever reaches the command line (`knownLevel` gates both ways in), so the
+    // one way this could be a lie — pi warning about an unknown level and
+    // running at its default — cannot arise.
+    //
+    // Emitted whether or not there is a session to resume: the level belongs to
+    // the next spawn rather than to the session being resumed, and pi's own
+    // `session` line carries nothing about thinking to hang it off instead.
+    this.emit({ t: 'effort', effort: this.effort ?? null });
     this.emit({ t: 'state', state: 'idle' });
+  }
+
+  /**
+   * The level, when pi is known to have one by that name.
+   *
+   * Membership is checked against `capabilities.efforts`, which is the set pi
+   * itself named while refusing a bad value, so this answers the question with
+   * pi's own vocabulary rather than a second copy of the ladder kept in step by
+   * hand. Anything else comes back as nothing, because the alternative is
+   * passing a word pi warns about and then ignores — thinking at a level nobody
+   * chose while the app displays one it never got.
+   */
+  private knownLevel(effort: string | undefined): string | undefined {
+    if (!effort) return undefined;
+    return this.capabilities.efforts?.some((level) => level.value === effort) ? effort : undefined;
+  }
+
+  /**
+   * Switch thinking level, which for a spawn-per-turn adapter costs nothing.
+   *
+   * There is no live process to convince. `buildArgs()` runs inside every
+   * `send()`, so setting the field *is* the change: the next pi is spawned with
+   * `--thinking <level>` and starts there, with no relaunch, no protocol
+   * message and nothing to acknowledge. That is why this resolves at once and
+   * still honours what the contract asks of it — resolving means the runtime
+   * took the level, and the only window in which pi has not taken it is the
+   * window in which no pi is running. A turn already in flight keeps the level
+   * it was spawned with, which is the only thing it could do.
+   *
+   * The event is emitted here because nothing else ever will: no later line of
+   * pi's output mentions the level (see `start()`), so a caller waiting for the
+   * runtime to confirm would wait for the life of the session.
+   *
+   * A level pi does not have is rejected rather than stored, and it has to be:
+   * accepting one would put a `--thinking` pi warns about and ignores on the
+   * next command line while this event told the user it was live. The caller's
+   * failure path — reporting that the level could not be switched — is a far
+   * better outcome than a chip that quietly means nothing.
+   */
+  async setEffort(effort: string): Promise<void> {
+    if (!this.knownLevel(effort)) {
+      throw new Error(`pi: no thinking level called "${effort}"`);
+    }
+    this.effort = effort;
+    this.emit({ t: 'effort', effort });
+  }
+
+  /**
+   * The same condition `send()` throws on, asked in advance (#89).
+   *
+   * `turnInFlight` is cleared by the child's `exit`, but the turn is declared
+   * over by `onAgentSettled` — a line of stdout that arrives first.
+   */
+  get readyForTurn(): boolean {
+    return !this.turnInFlight;
   }
 
   async send(turn: UserTurn): Promise<void> {
@@ -139,6 +319,7 @@ export class PiChatAdapter extends BaseChatAdapter {
     this.turnInterrupted = false;
     this.currentTurnId = `t${++this.turnCounter}`;
     this.currentTurnUsage = {};
+    this.turnModels.clear();
     this.emit({ t: 'state', state: 'running' });
 
     const args = this.buildTurnArgs(turn);
@@ -254,6 +435,7 @@ export class PiChatAdapter extends BaseChatAdapter {
         turnId: this.currentTurnId,
         stopReason: 'error',
         usage: this.currentTurnUsage,
+        ...this.reportedTurnModels(),
       });
       this.currentTurnId = null;
       this.emit({ t: 'state', state: 'idle' });
@@ -350,7 +532,8 @@ export class PiChatAdapter extends BaseChatAdapter {
     this.emit({
       t: 'session',
       nativeSessionId: this.nativeSessionId,
-      model: this.options.model,
+      // Same as in `start()`: what pi reported, which at this point is nothing.
+      model: this.reportedModel,
       cwd: typeof event.cwd === 'string' ? event.cwd : this.options.workingDir,
       capabilities: this.capabilities,
     });
@@ -398,6 +581,15 @@ export class PiChatAdapter extends BaseChatAdapter {
     if (usage) {
       this.currentTurnUsage = mergeUsage(this.currentTurnUsage, usage);
     }
+    if (message.model) {
+      // One message is one round trip to the model, which makes counting them
+      // the same measure grok reports as `modelCalls`.
+      const seen = this.turnModels.get(message.model) ?? { calls: 0, usage: {} };
+      seen.calls += 1;
+      if (usage) seen.usage = mergeUsage(seen.usage, usage);
+      this.turnModels.set(message.model, seen);
+      this.reportedModel = message.model;
+    }
     this.currentAssistantMsgId = null;
     this.blockState = null;
   }
@@ -421,6 +613,7 @@ export class PiChatAdapter extends BaseChatAdapter {
       t: 'turn_end',
       turnId: this.currentTurnId,
       usage: this.currentTurnUsage,
+      ...this.reportedTurnModels(),
     });
     this.emit({ t: 'state', state: 'idle' });
     this.currentTurnId = null;
@@ -471,6 +664,17 @@ export class PiChatAdapter extends BaseChatAdapter {
     }
   }
 
+  /**
+   * The empty block a stream opens before its first delta.
+   *
+   * Deliberately still emitted, unlike the whole-message paths in the ACP,
+   * claude-snapshot and codex adapters, which now refuse to record a reply that
+   * is only whitespace (#132). This protocol addresses its deltas by index, so
+   * the block has to exist before they arrive; there is no text to judge yet,
+   * and refusing to open it would drop the reply, not tidy it. A block that
+   * ends up with nothing in it draws nothing — that is the display rule's job,
+   * and this is the correct division between the two.
+   */
   private openBlock(msgId: string, index: number, item: PiContentItem): BlockTrack {
     if (item.type === 'thinking') {
       const block: ThinkingBlock = { kind: 'thinking', text: '', signature: item.thinkingSignature };
@@ -611,6 +815,13 @@ function translateUsage(usage: PiUsage | undefined): ChatUsage | undefined {
     reasoningTokens: usage.reasoning,
     totalTokens: usage.totalTokens,
     costUsd: usage.cost?.total,
+    // One pi message is one request, so its own total is what sat in the
+    // window for it. `mergeUsage` keeps the latest rather than adding these
+    // up, which is what makes a per-message figure usable as an occupancy.
+    //
+    // pi says nothing about how large the window is; it does report the
+    // provider and the model id, and the session asks that provider.
+    contextUsed: usage.totalTokens,
   };
 }
 

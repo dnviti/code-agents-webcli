@@ -15,6 +15,11 @@ const { NO_CHAT_CAPABILITIES } = require('../dist/shared/chat-events.js');
 // see the class doc comment in codex.ts for exactly what that means for
 // confidence in field names and event ordering.
 //
+//
+// codex-appserver-ratelimits.jsonl is the exception and IS a live capture:
+// `account/rateLimits/read` was probed against codex-cli 0.146.0 on 2026-07-29
+// and the reply is stored verbatim (#137).
+//
 // codex-exec-usage-limit.jsonl is copied verbatim from the one live probe
 // that exists (`.work/probes/raw/codex-exec.jsonl`); it hit the account's
 // usage limit before any item was produced. codex-exec-item.jsonl is
@@ -130,7 +135,133 @@ describe('codex app-server adapter', function () {
       assert.strictEqual(session.nativeSessionId, 'th_123');
       assert.strictEqual(session.model, 'gpt-5-codex');
       assert.strictEqual(session.cwd, '/work');
-      assert.deepStrictEqual(only(h.events, 'state')[0], { t: 'state', state: 'idle', ts: session.ts });
+      // Not `ts: session.ts`: the two events are stamped by separate Date.now()
+      // calls, so they differ by a millisecond whenever the clock ticks between
+      // them — which CI hit. What matters is that idle is announced, and at the
+      // same moment as the session, not on the same integer.
+      const state = only(h.events, 'state')[0];
+      assert.strictEqual(state.t, 'state');
+      assert.strictEqual(state.state, 'idle');
+      assert.ok(Math.abs(state.ts - session.ts) <= 50, `state ts ${state.ts} vs session ts ${session.ts}`);
+    });
+
+    it('offers the models codex says it accepts, without waiting for them (#75)', async function () {
+      const h = harness({});
+      await boot(h);
+
+      // Asked for, but the session was announced without waiting on the answer:
+      // a picker menu is not worth delaying a conversation for.
+      const asked = h.sent.find((message) => message.method === 'model/list');
+      assert.ok(asked, 'codex publishes its models over the protocol');
+      assert.ok(only(h.events, 'session').length === 1);
+
+      // The shape is the running app-server's own, captured from it.
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: asked.id,
+        result: {
+          data: [
+            {
+              id: 'gpt-5.6-terra',
+              model: 'gpt-5.6-terra',
+              displayName: 'GPT-5.6-Terra',
+              description: 'Balanced agentic coding model for everyday work.',
+              hidden: false,
+              isDefault: true,
+            },
+            { id: 'gpt-5.6-luna', displayName: 'GPT-5.6-Luna', hidden: false },
+            { id: 'retired-internal', displayName: 'Retired', hidden: true },
+          ],
+        },
+      });
+      await flush();
+
+      const revised = only(h.events, 'capabilities').pop();
+      assert.deepStrictEqual(revised.capabilities.models, [
+        {
+          value: 'gpt-5.6-terra',
+          name: 'GPT-5.6-Terra',
+          description: 'Balanced agentic coding model for everyday work.',
+        },
+        { value: 'gpt-5.6-luna', name: 'GPT-5.6-Luna' },
+      ]);
+      assert.strictEqual(h.adapter.capabilities.models.length, 2);
+    });
+
+    it('reads the account rate limits codex volunteers (#137)', async function () {
+      const h = harness({});
+      await boot(h);
+
+      const asked = h.sent.find((m) => m.method === 'account/rateLimits/read');
+      assert.ok(asked, 'codex publishes its rate limits over the protocol');
+      // Asked for without waiting, like the model list: a status readout is not
+      // worth delaying a conversation for.
+      assert.strictEqual(only(h.events, 'session').length, 1);
+
+      const captured = fixture('codex-appserver-ratelimits')[0];
+      h.adapter.handleMessage({ jsonrpc: '2.0', id: asked.id, result: captured.result });
+      await flush();
+
+      const limits = only(h.events, 'limits').pop();
+      assert.ok(limits, 'expected a limits event');
+      // The plan name codex states about itself. It is also inside the id_token
+      // in ~/.codex/auth.json, and this app deliberately does not read that
+      // file -- it holds access and refresh tokens.
+      assert.strictEqual(limits.limits.planName, 'free');
+      assert.deepStrictEqual(limits.limits.windows, [
+        {
+          kind: 'primary',
+          // usedPercent 100 in the capture; the event carries fractions.
+          utilization: 1,
+          durationMinutes: 43200,
+          resetsAt: new Date(1786182229 * 1000).toISOString(),
+        },
+      ]);
+      // `secondary` is null in the capture, and null is not a window.
+      assert.strictEqual(limits.limits.windows.length, 1);
+    });
+
+    it('starts fine against a build with no account/rateLimits/read (#137)', async function () {
+      const h = harness({});
+      await boot(h);
+      const asked = h.sent.find((m) => m.method === 'account/rateLimits/read');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: asked.id,
+        error: { code: -32600, message: 'unknown variant `account/rateLimits/read`' },
+      });
+      await flush();
+
+      assert.strictEqual(only(h.events, 'limits').length, 0);
+      assert.strictEqual(only(h.events, 'error').length, 0);
+      assert.strictEqual(only(h.events, 'session').length, 1);
+    });
+
+    it('takes the same reading from the update notification (#137)', async function () {
+      const h = harness({});
+      await boot(h);
+      const captured = fixture('codex-appserver-ratelimits')[0];
+      h.adapter.handleNotification('account/rateLimits/updated', captured.result);
+      await flush();
+
+      const limits = only(h.events, 'limits').pop();
+      assert.strictEqual(limits.limits.windows[0].kind, 'primary');
+    });
+
+    it('starts fine against a build that has no model/list at all (#75)', async function () {
+      const h = harness({});
+      await boot(h);
+      const asked = h.sent.find((message) => message.method === 'model/list');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: asked.id,
+        error: { code: -32600, message: 'unknown variant `model/list`' },
+      });
+      await flush();
+
+      assert.strictEqual(h.adapter.capabilities.models, undefined);
+      assert.strictEqual(only(h.events, 'error').length, 0);
+      assert.strictEqual(only(h.events, 'session').length, 1);
     });
 
     it('resumes by threadId instead of starting fresh when asked to', async function () {
@@ -168,7 +299,9 @@ describe('codex app-server adapter', function () {
   });
 
   describe('sending a turn', function () {
-    it('writes the user message into the transcript and starts the turn', async function () {
+    it('starts the turn and leaves the user’s own message to the session (#129)', async function () {
+      // It used to write one of its own, on top of the one `ChatSession.deliver`
+      // had already written — one prompt, two identical bubbles in one turn.
       const h = harness();
       await boot(h);
       h.events.length = 0;
@@ -181,10 +314,16 @@ describe('codex app-server adapter', function () {
       h.adapter.handleMessage({ jsonrpc: '2.0', id: started.id, result: { turn: { id: 'turn_1' } } });
       await sendPromise;
 
-      const start = only(h.events, 'msg_start')[0];
-      assert.strictEqual(start.role, 'user');
-      assert.strictEqual(start.turnId, 'turn_1');
-      assert.deepStrictEqual(only(h.events, 'block_start')[0].block, { kind: 'text', text: 'Hello?' });
+      assert.deepStrictEqual(
+        only(h.events, 'msg_start').filter((event) => event.role === 'user'),
+        [],
+        'the adapter must not open a user message of its own',
+      );
+      assert.deepStrictEqual(
+        only(h.events, 'block_start').filter((event) => JSON.stringify(event.block).includes('Hello?')),
+        [],
+        'nor write the prompt into the transcript a second time',
+      );
       assert.strictEqual(only(h.events, 'state').pop().state, 'thinking');
     });
 
@@ -239,6 +378,17 @@ describe('codex app-server adapter', function () {
             reasoningTokens: 0,
             totalTokens: 150,
             contextWindow: 128000,
+            // Whose figure it is, and how much of the window the *last*
+            // request filled — codex reports both, and `last` is what was in
+            // the window rather than what the whole turn spent (issue #82).
+            contextWindowSource: 'agent',
+            // And which model it is about. `thread/tokenUsage/updated` never
+            // says, so it comes off the thread codex opened — without it a
+            // model switch mid-thread makes the session read codex's own
+            // ceiling as the previous model's and go asking a catalogue for a
+            // worse one (#136).
+            contextWindowModel: 'gpt-5-codex',
+            contextUsed: 150,
           },
         },
         { t: 'msg_end', msgId: 'a_turn_1', stopReason: 'completed' },
@@ -333,6 +483,62 @@ describe('codex app-server adapter', function () {
       assert.strictEqual(turn.turnId, 'turn_2');
       assert.strictEqual(turn.stopReason, 'completed');
       assert.strictEqual(turn.durationMs, 500);
+    });
+  });
+
+  /**
+   * An item that arrives already finished, with no `item/started` before it.
+   *
+   * The one place this adapter opens and closes a block in the same breath, and
+   * therefore the one place #132's record-time refusal happens: the text is final
+   * here, so a reply that says nothing can be turned away rather than written
+   * down. What must *not* be turned away is a block that simply earns no row of
+   * its own — reasoning and tool calls both draw nothing on their own and both
+   * belong to the trace, and a record-time refusal is permanent.
+   */
+  describe('an item that arrives already finished', function () {
+    async function completedOnly(item) {
+      const h = harness();
+      await boot(h);
+      h.events.length = 0;
+      await feed(h, [{ jsonrpc: '2.0', method: 'turn/started', params: { turnId: 'turn_9' } }]);
+      h.events.length = 0;
+      await feed(h, [{ jsonrpc: '2.0', method: 'item/completed', params: { turnId: 'turn_9', item } }]);
+      return only(h.events, 'block_start').map((event) => event.block);
+    }
+
+    it('refuses a reply that says nothing', async function () {
+      assert.deepStrictEqual(
+        await completedOnly({ id: 'i1', type: 'agentMessage', text: '  \n ' }),
+        [],
+        'a blank reply was written into the conversation',
+      );
+    });
+
+    it('records a reply that says something', async function () {
+      const blocks = await completedOnly({ id: 'i1', type: 'agentMessage', text: 'done' });
+      assert.deepStrictEqual(blocks.map((block) => block.kind), ['text']);
+      assert.strictEqual(blocks[0].text, 'done');
+    });
+
+    it('records reasoning, which earns no row but is not nothing', async function () {
+      const blocks = await completedOnly({ id: 'i1', type: 'reasoning', content: ['I should read the file first'] });
+      assert.deepStrictEqual(blocks.map((block) => block.kind), ['thinking']);
+      assert.strictEqual(blocks[0].text, 'I should read the file first');
+    });
+
+    // A tool item is not covered here on purpose: a completed tool item is
+    // routed by `isToolItemType` to the patch-by-toolId path instead, which
+    // never reaches this gate, so one arriving with no `item/started` before it
+    // is dropped by that path for reasons that predate #132. Every real capture
+    // pairs the two. What the record-time rule owes a tool call is pinned
+    // directly on the predicate, in test/chat-empty-rows.test.js.
+    it('refuses a plan the runtime announced and never filled in', async function () {
+      assert.deepStrictEqual(
+        await completedOnly({ id: 'i1', type: 'plan', text: '   ' }),
+        [],
+        'an empty plan was written into the conversation',
+      );
     });
   });
 

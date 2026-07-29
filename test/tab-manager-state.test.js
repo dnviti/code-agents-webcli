@@ -54,12 +54,18 @@ function storage(map) {
 /** The narrowest App the manager actually reaches for. */
 function fakeApp() {
   const joined = [];
-  return {
+  const app = {
     joined,
+    /** How many times the manager gave up its attachment to a session. */
+    left: 0,
     isMobile: false,
     currentClaudeSessionId: null,
+    currentClaudeSessionName: null,
     getAlias: () => 'Claude',
-    joinSession: async (id) => { joined.push(id); },
+    joinSession: async (id) => { joined.push(id); app.currentClaudeSessionId = id; },
+    // Closing the last conversation's tab has to let go of it: the socket is
+    // otherwise still attached to a conversation that has left the screen.
+    leaveSession() { app.left += 1; },
     folderBrowser: { show() {} },
     isCreatingNewSession: false,
     // The manager subscribes a chat tab when it learns its surface, and drops
@@ -67,10 +73,31 @@ function fakeApp() {
     chats: {
       subscribed: [],
       dropped: [],
-      subscribe(id) { this.subscribed.push(id); },
+      // What the pane was told to show before any socket traffic: the session
+      // list already knows each conversation's approval mode, and a pane that
+      // opened claiming "asks first" over a bypassing one was #134.
+      seeded: [],
+      // One log across both calls, because the ordering *between* them is the
+      // load-bearing part and two independent arrays cannot express it: each
+      // pins its own order and neither says which came first.
+      calls: [],
+      subscribe(id) {
+        this.subscribed.push(id);
+        this.calls.push(`subscribe:${id}`);
+      },
       drop(id) { this.dropped.push(id); },
+      ensure(id) {
+        const chats = this;
+        return {
+          seedBypass(value) {
+            chats.seeded.push({ id, value });
+            chats.calls.push(`seed:${id}=${value}`);
+          },
+        };
+      },
     },
   };
+  return app;
 }
 
 function manager() {
@@ -276,6 +303,177 @@ describe('session tab state', function () {
     assert.strictEqual(mod.shellStore.getSnapshot().chat.sessionId, 'keep');
   });
 
+  /**
+   * Closing a conversation takes it off the screen; it does not end it (#127).
+   *
+   * These are the phase that had to land first, because everything else in the
+   * conversation list is built on it: while closing a tab deleted the session,
+   * the only way to shorten a strip that grows forever was to destroy something
+   * you might want next week.
+   */
+  it('does not delete a conversation when its tab is closed', function () {
+    const { m } = manager();
+    m.addTab('chat', 'chat', 'idle', '/repos/thing', false);
+    m.setTabSurface('chat', 'chat');
+
+    m.closeSession('chat');
+
+    assert.ok(!m.tabs.has('chat'), 'the tab is gone from this screen');
+    assert.deepStrictEqual(
+      requests.filter((request) => request.init && request.init.method === 'DELETE'),
+      [],
+      'closing a conversation must not delete it: the list is how it is reached again',
+    );
+  });
+
+  it('still ends a terminal when its tab is closed', function () {
+    // Not an oversight. A pty is reached through its tab and nowhere else, so a
+    // terminal closed without being ended is a shell holding a working directory
+    // open that nothing in the app can ever reach again.
+    const { m } = manager();
+    m.addTab('term', 'term', 'idle', '/repos/thing', false);
+
+    m.closeSession('term');
+
+    const deletes = requests.filter((request) => request.init && request.init.method === 'DELETE');
+    assert.strictEqual(deletes.length, 1);
+    assert.ok(deletes[0].url.endsWith('/api/sessions/term'), deletes[0].url);
+  });
+
+  it('stops following a closed conversation without ending it', function () {
+    const { m, app } = manager();
+    m.addTab('chat', 'chat', 'idle', '/repos/thing', false);
+    m.setTabSurface('chat', 'chat');
+
+    m.closeSession('chat');
+
+    assert.deepStrictEqual(
+      app.chats.dropped,
+      ['chat'],
+      'nothing is drawing it, so the browser stops receiving its events',
+    );
+  });
+
+  it('lets go of the last closed conversation, so the next launch is not aimed at it', async function () {
+    const { m, app } = manager();
+    m.addTab('only', 'only', 'idle', '/repos/thing', false);
+    m.setTabSurface('only', 'chat');
+    await m.switchToTab('only');
+    assert.strictEqual(app.currentClaudeSessionId, 'only');
+
+    m.closeSession('only');
+
+    // `ensureSessionForStart` reads exactly this field to decide where the next
+    // runtime goes. Left set, picking an agent from the launcher would have
+    // started it inside the conversation just closed.
+    assert.strictEqual(app.currentClaudeSessionId, null);
+    assert.strictEqual(app.left, 1, 'and the socket is told, so the server detaches too');
+  });
+
+  /**
+   * A closed conversation stays closed across a reload.
+   *
+   * On its own, "closing no longer deletes" would have made closing useless: the
+   * strip is rebuilt from `/api/sessions/list` on every page load, so every
+   * conversation ever started would come back on the next reload — the original
+   * complaint with its one remedy removed.
+   */
+  it('leaves a closed conversation off the strip after a reload', async function () {
+    const sessions = [
+      { id: 'kept', name: 'kept', active: false, workingDir: '/a', surface: 'chat' },
+      { id: 'closed', name: 'closed', active: false, workingDir: '/b', surface: 'chat' },
+    ];
+    respondTo = () => ({ ok: true, json: async () => ({ sessions }) });
+
+    const first = manager();
+    await first.m.loadSessions();
+    first.m.closeSession('closed');
+    assert.ok(!first.m.tabs.has('closed'));
+
+    // A second manager is what a reload is: fresh state, same storage, the same
+    // answer from the server.
+    const reloaded = manager();
+    await reloaded.m.loadSessions();
+    assert.deepStrictEqual(
+      reloaded.m.getOrderedTabIds(),
+      ['kept'],
+      'a conversation taken off the screen must not come back by reloading',
+    );
+  });
+
+  it('brings it back the moment it is reopened, and keeps it back', async function () {
+    const sessions = [{ id: 'chat', name: 'chat', active: false, workingDir: '/a', surface: 'chat' }];
+    respondTo = () => ({ ok: true, json: async () => ({ sessions }) });
+
+    const first = manager();
+    await first.m.loadSessions();
+    first.m.closeSession('chat');
+
+    // What opening it from the conversation list does.
+    const reopening = manager();
+    reopening.m.addTab('chat', 'chat', 'idle', '/a', false);
+    assert.ok(reopening.m.tabs.has('chat'));
+
+    const reloaded = manager();
+    await reloaded.m.loadSessions();
+    assert.deepStrictEqual(
+      reloaded.m.getOrderedTabIds(),
+      ['chat'],
+      'reopening must outlive the reload too, or it vanishes again',
+    );
+  });
+
+  it('forgets a closed conversation the server no longer has', async function () {
+    // Otherwise the note outlives what it is about, and the list of ids this
+    // browser is hiding grows for as long as the browser profile lives.
+    let sessions = [{ id: 'gone', name: 'gone', active: false, workingDir: '/a', surface: 'chat' }];
+    respondTo = () => ({ ok: true, json: async () => ({ sessions }) });
+
+    const first = manager();
+    await first.m.loadSessions();
+    first.m.closeSession('gone');
+    assert.ok(stored.get('cc-web-closed-conversations'), 'the id is remembered while it exists');
+
+    sessions = [];
+    const reloaded = manager();
+    await reloaded.m.loadSessions();
+    assert.strictEqual(
+      stored.get('cc-web-closed-conversations'),
+      undefined,
+      'a deleted conversation leaves nothing behind to hide',
+    );
+  });
+
+  it('still shows a terminal whose tab was closed, because closing ended it', async function () {
+    // Remembering a terminal would hide a session that is genuinely still there
+    // from the only list that offers it. Closing one deletes it instead.
+    const sessions = [{ id: 'term', name: 'term', active: false, workingDir: '/a' }];
+    respondTo = () => ({ ok: true, json: async () => ({ sessions }) });
+
+    const first = manager();
+    await first.m.loadSessions();
+    first.m.closeSession('term');
+
+    const reloaded = manager();
+    await reloaded.m.loadSessions();
+    assert.deepStrictEqual(reloaded.m.getOrderedTabIds(), ['term']);
+  });
+
+  it('does not let go when another tab takes over, because joining it detaches', async function () {
+    const { m, app } = manager();
+    m.addTab('a', 'a', 'idle', null, false);
+    m.addTab('b', 'b', 'idle', null, false);
+    m.setTabSurface('a', 'chat');
+    m.setTabSurface('b', 'chat');
+    await m.switchToTab('a');
+    await m.switchToTab('b');
+
+    m.closeSession('b');
+
+    assert.strictEqual(m.activeTabId, 'a');
+    assert.strictEqual(app.left, 0, 'the join onto the fallback is what detaches');
+  });
+
   it('subscribes to a session once it learns the session is a chat', function () {
     const { m, app } = manager();
     m.addTab('s1', 'One', 'idle', '/tmp/one', false);
@@ -287,6 +485,42 @@ describe('session tab state', function () {
     // session_joined and from chat_started.
     assert.deepStrictEqual(app.chats.subscribed, ['s1']);
     assert.strictEqual(shellTab('s1').surface, 'chat');
+  });
+
+  it('tells a restored chat tab its approval mode before it subscribes', async function () {
+    // A tab restored on page load used to open claiming "asks first" until the
+    // first snapshot came back over the socket, over a conversation the server
+    // already knew was bypassing (#134). The list carries the mode; this is
+    // where it reaches the pane, and it has to happen before the subscribe or
+    // the snapshot could land in front of it.
+    respondTo = () => ({
+      ok: true,
+      json: async () => ({
+        sessions: [
+          { id: 'yolo', name: 'yolo', active: false, workingDir: '/a', surface: 'chat', bypassPermissions: true },
+          { id: 'careful', name: 'careful', active: false, workingDir: '/a', surface: 'chat', bypassPermissions: false },
+        ],
+      }),
+    });
+
+    const { m, app } = manager();
+    await m.loadSessions();
+
+    assert.deepStrictEqual(app.chats.seeded, [
+      { id: 'yolo', value: true },
+      { id: 'careful', value: false },
+    ]);
+    assert.deepStrictEqual(app.chats.subscribed, ['yolo', 'careful']);
+    // The two lists above pin the order *within* each of them and say nothing
+    // about the interleaving, which is the invariant that actually matters:
+    // move the seed after the subscribe and both would still pass while the
+    // snapshot got a clear run at landing first. One log, one assertion.
+    assert.deepStrictEqual(app.chats.calls, [
+      'seed:yolo=true',
+      'subscribe:yolo',
+      'seed:careful=false',
+      'subscribe:careful',
+    ]);
   });
 
   it('applies a dragged order and keeps a tab that arrived mid-drag', function () {

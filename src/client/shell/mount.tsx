@@ -8,7 +8,15 @@ import { summonKeyboard } from '../terminal/keyboard';
 import { createNewSession, runTerminalCommand, startTerminalShell } from '../ui/modals';
 import { loadSettings, applySettings, saveSettings } from '../ui/settings';
 import { loadChatView, saveChatView, type ChatViewSettings } from '../chat/view-settings';
+import type { BranchedConversation } from '../chat/branch-api';
+import {
+  conversationLabel,
+  type ConversationList,
+  type ConversationSummary,
+} from '../../shared/conversations';
+import { showConfirm } from '../ui/confirm';
 import { onBannerAction, onBannerDismiss, onBannerToggleLog } from '../ui/update-banner';
+import { showNotification } from '../ui/notifications';
 import { hideOverlay, showError } from '../ui/overlay';
 import { AppShell, type ShellActions } from './AppShell';
 import { RuntimeLauncher, type ResumableConversation } from './RuntimeLauncher';
@@ -119,9 +127,16 @@ async function resumeConversation(app: App, conversation: ResumableConversation)
         conversation.id,
         conversation.name,
         'idle',
-        undefined,
+        conversation.workingDir,
         false,
       );
+      // See `openStoredConversation`: until the server confirms the surface, this
+      // tab's close button would delete the conversation rather than detach it.
+      // And the mode the row the user just clicked was labelled with, so the
+      // pane does not open saying "asks first" over a conversation the list had
+      // just called bypassed — a display seed, overwritten by the snapshot.
+      app.chats.ensure(conversation.id).seedBypass(conversation.bypassPermissions === true);
+      app.sessionTabManager.setTabSurface(conversation.id, 'chat');
       await app.sessionTabManager.switchToTab(conversation.id);
     } else {
       await app.joinSession(conversation.id);
@@ -149,6 +164,196 @@ async function resumeConversation(app: App, conversation: ResumableConversation)
     }
   } catch (error: unknown) {
     showError(error instanceof Error ? error.message : 'That conversation could not be opened');
+  }
+}
+
+/**
+ * Every conversation this user has, for the conversation list.
+ *
+ * Normalised on the way in rather than trusted: this answer is rendered as a
+ * grouped, searchable list, and a missing `projects` array would be a TypeError
+ * inside a dialog the user opened to find something.
+ */
+async function fetchConversations(app: App): Promise<ConversationList> {
+  const response = await app.authFetch('/api/sessions/conversations');
+  if (!response.ok) {
+    // The server is a version behind this page more often than it is broken, and
+    // that is worth saying: the endpoint is new, and the process loads its code
+    // once, at boot.
+    throw new Error(
+      response.status === 404
+        ? 'This server does not offer a conversation list yet — restart it and reload.'
+        : 'Your conversations could not be listed.',
+    );
+  }
+  const data = (await response.json()) as Partial<ConversationList>;
+  return {
+    projects: Array.isArray(data.projects) ? data.projects : [],
+    total: typeof data.total === 'number' ? data.total : 0,
+    truncated: data.truncated === true,
+  };
+}
+
+/**
+ * Put a stored conversation back on screen.
+ *
+ * Three cases, and the difference between them is the whole of what "open it"
+ * means.
+ *
+ * It already has a tab: switch to it. Opening a second view of a conversation
+ * this browser is already watching would be two transcripts of one conversation.
+ *
+ * It is running: joining it is all that is needed — the process is alive and the
+ * join hands over its transcript. Starting it again would be refused, and rightly.
+ *
+ * Nothing is running it: bring it back. `resume: true` is what makes the agent
+ * pick up its own context where the conversation recorded one; where it did not,
+ * the same request still opens the conversation with its transcript intact and an
+ * agent meeting it for the first time — which is what the row said would happen
+ * before it was picked. Deliberately not `resume: false`: that means *start
+ * fresh*, which draws a line under the transcript and truncates everything above
+ * it, so reopening a conversation would begin by deleting it.
+ */
+async function openStoredConversation(
+  app: App,
+  conversation: ConversationSummary,
+): Promise<void> {
+  try {
+    const tabs = app.sessionTabManager;
+    if (tabs?.tabs.has(conversation.id)) {
+      await tabs.switchToTab(conversation.id);
+      return;
+    }
+
+    if (tabs) {
+      tabs.addTab(
+        conversation.id,
+        conversation.name,
+        conversation.running ? 'active' : 'idle',
+        conversation.workingDir,
+        false,
+      );
+      // Said here rather than waited for. The server reports the surface on
+      // `session_joined`, which is a round trip away, and a tab that reads as a
+      // terminal in the meantime is a tab whose close button would delete the
+      // conversation that was just reopened. Same for the approval mode the row
+      // was labelled with — see `resumeConversation`.
+      app.chats.ensure(conversation.id).seedBypass(conversation.bypassPermissions === true);
+      tabs.setTabSurface(conversation.id, 'chat');
+      await tabs.switchToTab(conversation.id);
+    } else {
+      await app.joinSession(conversation.id);
+    }
+
+    app.startPromptRequested = false;
+    hideOverlay();
+
+    if (!conversation.running) {
+      app.send({
+        type: 'start_chat',
+        agentKind: (conversation.runtime || 'claude') as AgentKind,
+        sessionId: conversation.id,
+        options: { resume: true },
+      });
+    }
+  } catch (error: unknown) {
+    showError(error instanceof Error ? error.message : 'That conversation could not be opened');
+  }
+}
+
+/**
+ * Delete a conversation, having asked.
+ *
+ * The only way to lose one, and it stays that way: closing a tab is now a detach
+ * (see SessionTabManager.closeSession), so this is the single irreversible action
+ * in the feature and it is the one that asks. The app's own confirm dialog rather
+ * than `window.confirm`, because on a phone-shaped install the native one reads as
+ * a page hijack.
+ */
+async function removeConversation(
+  app: App,
+  conversation: ConversationSummary,
+): Promise<boolean> {
+  const confirmed = await showConfirm({
+    title: 'Delete this conversation?',
+    description:
+      `“${conversationLabel(conversation)}” and its transcript are removed for good, `
+      + 'along with anything still running it. This cannot be undone.',
+    confirmLabel: 'Delete',
+    tone: 'danger',
+  });
+  if (!confirmed) return false;
+
+  const gone = await app.deleteSession(conversation.id, { confirm: false });
+  // And take its tab with it, if this browser has one. The server announces a
+  // delete to the sockets that *joined* the session, which is not every tab: a
+  // tab restored from the session list and never switched to has never joined,
+  // so nothing would arrive to close it and the strip would keep a tab pointing
+  // at a conversation that no longer exists. Closing an absent tab is a no-op.
+  if (gone) app.sessionTabManager?.closeSession(conversation.id, { skipServerRequest: true });
+  return gone;
+}
+
+/**
+ * Open the conversation a branch just created, in a tab of its own.
+ *
+ * The server has already made it: the record exists, the carried history is on
+ * disk, and the opening context is waiting for the first message. All that is
+ * left is what only a browser can do — put it on screen and start its agent.
+ *
+ * A tab beside the original rather than in place of it, which is the whole
+ * shape of the feature: the conversation branched from is still running, still
+ * has its own agent, and is one tab away.
+ *
+ * The launch names no mode at all, and that is load-bearing in both directions.
+ * `resume: true` would hand the agent a runtime conversation this branch does
+ * not have — it is meeting the history for the first time, out of the opening
+ * context, which is the honest version of what a fork would have done had any
+ * of these CLIs offered one. And `resume: false` is worse: it means *start
+ * fresh*, which draws a line under the transcript and truncates everything
+ * above it, so the branch would open by deleting the history it was made of.
+ */
+async function openBranch(app: App, conversation: BranchedConversation): Promise<void> {
+  const runtime = (conversation.runtime || 'claude') as AgentKind;
+  try {
+    if (app.sessionTabManager) {
+      app.sessionTabManager.addTab(
+        conversation.sessionId,
+        conversation.name,
+        'idle',
+        conversation.workingDir,
+        false,
+      );
+      await app.sessionTabManager.switchToTab(conversation.sessionId);
+    } else {
+      await app.joinSession(conversation.sessionId);
+    }
+
+    app.send({
+      type: 'start_chat',
+      agentKind: runtime,
+      sessionId: conversation.sessionId,
+      options: {},
+    });
+
+    // What was carried, and — where no window size was on record — that nothing
+    // was measured against it. Said once, here, rather than left for the user to
+    // discover when the agent answers as though the history were shorter than it
+    // is.
+    //
+    // "on record" and not "never reported": the size is read from the source
+    // conversation's own log, and a long enough conversation has had the event
+    // carrying it trimmed off the head. The runtime may well have said; this
+    // process cannot see that it did, and saying so would be a guess dressed as
+    // a fact — on exactly the conversations most likely to overflow.
+    showNotification(
+      conversation.sizeChecked
+        ? `Branched at turn ${conversation.turnIndex}, carrying ${conversation.turns} turn${conversation.turns === 1 ? '' : 's'}.`
+        : `Branched at turn ${conversation.turnIndex}, carrying ${conversation.turns} turn${conversation.turns === 1 ? '' : 's'}. `
+          + 'No window size was on record for this conversation, so the history was not checked against one.',
+    );
+  } catch (error: unknown) {
+    showError(error instanceof Error ? error.message : 'That branch could not be opened');
   }
 }
 
@@ -274,6 +479,7 @@ function buildActions(app: App): ShellActions {
       // the store can never hold a setting that would not survive a reload.
       shellStore.setState({ chatView: saveChatView(next) });
     },
+    openConversation: (conversation) => void openBranch(app, conversation),
 
     setTheme: applyTheme,
     readSettings: () => loadSettings(),
@@ -312,6 +518,10 @@ function buildActions(app: App): ShellActions {
     // The dialog does not confirm; deleting another user's session in a shared
     // deployment is not something to do on a single tap.
     deleteSession: (id) => void app.deleteSession(id),
+
+    loadConversations: () => fetchConversations(app),
+    openStoredConversation: (conversation) => void openStoredConversation(app, conversation),
+    deleteConversation: (conversation) => removeConversation(app, conversation),
 
     acceptPlan: () => app.acceptPlan(),
     rejectPlan: () => app.rejectPlan(),

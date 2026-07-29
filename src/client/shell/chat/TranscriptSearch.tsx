@@ -2,6 +2,7 @@ import * as React from 'react';
 import type { ChatMessage } from '../../../shared/chat-events.js';
 import { messageText } from '../../../shared/chat-reducer.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { PHONE_TEXT, usePhone } from '../../ui/touch.js';
 
 /**
  * Find something in this conversation.
@@ -32,6 +33,7 @@ export function TranscriptSearch({
   onJump,
   onClose,
 }: TranscriptSearchProps): React.JSX.Element {
+  const isPhone = usePhone();
   const [query, setQuery] = React.useState('');
   const [at, setAt] = React.useState(0);
   const input = React.useRef<HTMLInputElement | null>(null);
@@ -128,7 +130,10 @@ export function TranscriptSearch({
           background: 'transparent',
           color: 'var(--foreground)',
           fontFamily: 'var(--font-sans)',
-          fontSize: 'var(--text-sm)',
+          // A field the user types into, so it clears the iOS no-zoom floor:
+          // below 16px Safari magnifies the page on focus and never undoes it
+          // (#92).
+          fontSize: isPhone ? PHONE_TEXT.input : 'var(--text-sm)',
         }}
       />
       <span
@@ -167,6 +172,7 @@ function SearchButton({
   icon: string;
   onClick: () => void;
 }): React.JSX.Element {
+  const isPhone = usePhone();
   const [hover, setHover] = React.useState(false);
   return (
     <button

@@ -64,6 +64,31 @@ export function defaultSlashCommands(): { name: string; description: string }[] 
 }
 
 /**
+ * One menu out of several lists, first mention of a name winning.
+ *
+ * Used only to assemble the stand-in menu a session shows before its runtime
+ * has spoken: this app's knowledge of the built-ins, plus the skills and
+ * project commands found installed. Both halves are fallback, so joining them
+ * is not the merging the runtime's own list must never be subjected to — when
+ * that arrives it replaces all of this outright.
+ */
+export function mergeSlashCommands(
+  ...lists: ({ name: string; description?: string }[] | undefined)[]
+): { name: string; description?: string }[] {
+  const seen = new Set<string>();
+  const merged: { name: string; description?: string }[] = [];
+  for (const list of lists) {
+    for (const command of list ?? []) {
+      const name = String(command?.name ?? '').trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      merged.push(command);
+    }
+  }
+  return merged;
+}
+
+/**
  * Commands that empty the conversation.
  *
  * The runtime clears its own context when it sees one of these; the transcript
@@ -77,6 +102,18 @@ export function isClearingCommand(text: string): boolean {
   const first = String(text || '').trim().split(/\s+/, 1)[0] ?? '';
   if (!first.startsWith('/')) return false;
   return CLEARING.has(first.slice(1).toLowerCase());
+}
+
+/**
+ * Whether a message is a command rather than something to say to the model.
+ *
+ * The first word only, and a leading slash: everything a runtime treats as a
+ * command arrives as ordinary turn text, so this is the only thing that tells
+ * `/review` from a sentence beginning with a slash.
+ */
+export function isSlashCommand(text: string): boolean {
+  const first = String(text || '').trim().split(/\s+/, 1)[0] ?? '';
+  return first.length > 1 && first.startsWith('/');
 }
 
 /** Commands that summarise the conversation to reclaim context. */

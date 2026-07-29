@@ -214,17 +214,25 @@ export function FileEditorDialog({
   return (
     <Dialog
       open={open}
+      titleText={file?.relativePath ?? filePath}
       title={
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-          <Icon name={titleIcon} size={14} />
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
-          {dirty ? <Badge variant="warning" dot>unsaved</Badge> : null}
-          {file && !editable ? <Badge variant="outline">read-only</Badge> : null}
-          {previewable && file ? (
-            <ViewToggle value={view} onChange={setView} />
-          ) : null}
+        // `flex`, not `inline-flex`, and every fixed-width part pinned: inside
+        // the title's `white-space: nowrap` an inline-level box is laid out at
+        // max-content and then clipped without an ellipsis (#114). Only the
+        // file name gives way.
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+          <span style={{ display: 'inline-flex', flexShrink: 0 }}>
+            <Icon name={titleIcon} size={14} />
+          </span>
+          <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+          {dirty ? <span style={{ display: 'inline-flex', flexShrink: 0 }}><Badge variant="warning" dot>unsaved</Badge></span> : null}
+          {file && !editable ? <span style={{ display: 'inline-flex', flexShrink: 0 }}><Badge variant="outline">read-only</Badge></span> : null}
         </span>
       }
+      // The view switch is a control, not a label, so it belongs with the other
+      // controls rather than inside a title that is now allowed to be cut: a
+      // clipped title would take it away entirely at a phone width (#114).
+      headerActions={previewable && file ? <ViewToggle value={view} onChange={setView} /> : null}
       description={file?.relativePath ?? filePath}
       width="min(1100px, 92vw)"
       // On a phone a centred panel puts its footer under the on-screen keyboard

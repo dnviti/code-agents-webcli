@@ -49,6 +49,15 @@ export interface DialogProps {
   bodyFill?: boolean;
   /** Extra controls for the title row, left of maximise and close. */
   headerActions?: React.ReactNode;
+  /**
+   * The plain-text form of a rich title, for the hover tooltip.
+   *
+   * A `title` that is a node — an icon, a number, a name, a badge — has no
+   * string the browser could put in a tooltip, and the one thing a cut title
+   * owes the reader is a way to see the rest of it. A plain-string `title`
+   * needs nothing here; it becomes its own tooltip.
+   */
+  titleText?: string;
   children?: React.ReactNode;
 }
 
@@ -126,6 +135,7 @@ export function Dialog({
   height,
   bodyFill = false,
   headerActions,
+  titleText,
   children,
 }: DialogProps): React.JSX.Element | null {
   // Hooks run on every render, so the `open` bail-out has to come after them.
@@ -136,6 +146,10 @@ export function Dialog({
   const panelRef = React.useRef<HTMLDivElement | null>(null);
   const closeRef = React.useRef<HTMLButtonElement | null>(null);
   const [closeFocusVisible, setCloseFocusVisible] = React.useState(false);
+  // Up here with the rest of them, not down beside its first use: below the
+  // `open` bail-out it is a conditional hook, and the first caller to render a
+  // closed Dialog without remounting takes "rendered fewer hooks than expected".
+  const isPhone = usePhone();
 
   // Null until the user moves or resizes it: the panel stays centred by the
   // overlay's flex until then, so the ordinary case involves no measurement and
@@ -258,7 +272,6 @@ export function Dialog({
   if (!open) return null;
 
   const bottom = placement === 'bottom';
-  const isPhone = usePhone();
   const windowed = movable && !bottom;
   // Placed only once the user has actually moved or maximised it. Until then
   // the overlay's flex centring is left alone.
@@ -322,7 +335,21 @@ export function Dialog({
   // of letting the body scroll. `flexShrink: 0` keeps them whole.
   const headerStyle: React.CSSProperties = { padding: '16px 18px', borderBottom: '1px solid var(--border)', flexShrink: 0 };
   const headerRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 };
-  const titleStyle: React.CSSProperties = { margin: 0, fontFamily: 'var(--font-sans)', fontSize: 'var(--text-body)', fontWeight: 'var(--font-semibold)' as React.CSSProperties['fontWeight'], color: 'var(--foreground)' };
+  // The title is the side that yields (#114). The controls beside it are
+  // `flexShrink: 0` — they are the same size whatever the window is doing, and
+  // a close button that has been squeezed to nothing is worse than a title that
+  // has been cut. But a flex item's `min-width` is `auto`, so without these four
+  // the h2 refuses to shrink past its own content: a title with a `nowrap` span
+  // in it shoves the controls bodily out of the panel, and a plain string one
+  // wraps and grows the title bar from one line to five. `overflow: hidden`
+  // resolves the automatic minimum to zero, and the ellipsis says the cut
+  // happened. The full string stays in `textContent`, so `aria-labelledby` and
+  // the hover below both still have all of it.
+  const titleStyle: React.CSSProperties = {
+    margin: 0, fontFamily: 'var(--font-sans)', fontSize: 'var(--text-body)',
+    fontWeight: 'var(--font-semibold)' as React.CSSProperties['fontWeight'], color: 'var(--foreground)',
+    minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  };
   const closeStyle: React.CSSProperties = {
     border: 'none', background: 'transparent', color: 'var(--muted-foreground)', cursor: 'pointer', fontSize: bottom || isPhone ? 20 : 15, lineHeight: 1, padding: 2,
     borderRadius: 'var(--radius)',
@@ -381,7 +408,13 @@ export function Dialog({
           onPointerDown={windowed && !maximised ? (e) => startGesture(e, 'move') : undefined}
         >
           <div style={headerRowStyle}>
-            <h2 id={titleId} style={titleStyle}>{title}</h2>
+            <h2
+              id={titleId}
+              title={titleText ?? (typeof title === 'string' ? title : undefined)}
+              style={titleStyle}
+            >
+              {title}
+            </h2>
             <div
               style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}
               onPointerDown={(e) => e.stopPropagation()}

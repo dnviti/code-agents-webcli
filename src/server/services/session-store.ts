@@ -36,6 +36,8 @@ interface RuntimeSessionRow {
   owner_session_id: string | null;
   chat_bypass_permissions: number | null;
   chat_model_override: string | null;
+  chat_model_pinned: string | null;
+  chat_effort_override: string | null;
   custom_name: string | null;
 }
 
@@ -76,6 +78,8 @@ export class SessionStore {
           owner_session_id,
           chat_bypass_permissions,
           chat_model_override,
+          chat_model_pinned,
+          chat_effort_override,
           custom_name
         )
         VALUES (
@@ -100,6 +104,8 @@ export class SessionStore {
           @owner_session_id,
           @chat_bypass_permissions,
           @chat_model_override,
+          @chat_model_pinned,
+          @chat_effort_override,
           @custom_name
         )
       `);
@@ -159,14 +165,41 @@ export class SessionStore {
         // Which conversation owns this shell, so a restart can tell a session
         // the user can reach from one that nothing on screen refers to any more.
         owner_session_id: session.ownerSessionId || null,
-        // The approval mode the user chose for this conversation. Persisted so a
+        // The approval mode this conversation was granted. Persisted so a
         // restart brings it back rather than quietly dropping to manual — and so
         // the header can state the mode of a conversation with nothing running.
-        chat_bypass_permissions: session.chatBypassPermissions === true ? 1 : null,
+        //
+        // Three values, not two, and the third is what stops the rule in
+        // shared/user-preferences.ts from widening a conversation behind the
+        // user's back: 0 means "this conversation was granted approvals", which
+        // is a decision to keep, while NULL means "nothing was ever granted",
+        // which is every row written before the column existed.
+        chat_bypass_permissions:
+          session.chatBypassPermissions === true
+            ? 1
+            : session.chatBypassPermissions === false
+              ? 0
+              : null,
         // The conversation-scoped model override, if the user has set one.
         // Persisted so a restart still prefers it over the profile default the
         // next time a session starts for this conversation.
         chat_model_override: session.chatModelOverride || null,
+        // The model this conversation is fixed to, from what its last launch
+        // actually used. This is the half that has to survive a restart or the
+        // guarantee is empty: a server restart is precisely the moment every
+        // conversation gets relaunched, and a pin held only in memory would be
+        // gone exactly when it is needed (#135).
+        //
+        // An empty string, not a null, for "launched with no flag at all": null
+        // is reserved for "nothing recorded", which is what a row written before
+        // this column existed carries and which still reads as the profile.
+        chat_model_pinned:
+          session.chatModelPinned === undefined ? null : session.chatModelPinned ?? '',
+        // The conversation-scoped effort level, if one was chosen. Persisted for
+        // the same reason and read back the same way: without it, a rejoin after
+        // a server restart shows the chip at the runtime default while the
+        // process it describes is still running at the level the user picked.
+        chat_effort_override: session.chatEffortOverride || null,
         // The label the user chose. Without this a restart brings a session back
         // under the name it was created with, which is the one thing the user
         // renamed it to get away from.
@@ -209,6 +242,8 @@ export class SessionStore {
             owner_session_id,
             chat_bypass_permissions,
             chat_model_override,
+            chat_model_pinned,
+            chat_effort_override,
             custom_name
           FROM runtime_sessions
           ORDER BY created_at ASC
@@ -251,14 +286,34 @@ export class SessionStore {
           nativeChatSessionId: row.native_chat_session_id || undefined,
           ownerSessionId: row.owner_session_id || undefined,
           // Only a stored 1 restores the bypass. A null — the value every row
-          // written before this column existed carries — reads as "asks first",
-          // so a missing answer can never grant a standing permission.
-          chatBypassPermissions: row.chat_bypass_permissions === 1 ? true : undefined,
+          // written before this column existed carries — reads as "nothing was
+          // granted", so a missing answer can never grant a standing permission.
+          // A stored 0 is the conversation's own answer of "ask", which is a
+          // grant like any other and outranks a preference set afterwards.
+          chatBypassPermissions:
+            row.chat_bypass_permissions === 1
+              ? true
+              : row.chat_bypass_permissions === 0
+                ? false
+                : undefined,
           // A stored empty string never happens — the write side always writes
           // null for "no override" — but an empty string reading as "no
           // override" rather than a call to switch to nothing is the safe
           // direction regardless.
           chatModelOverride: row.chat_model_override || undefined,
+          // The opposite treatment, deliberately: here an empty string is a
+          // recorded fact — "this conversation launched with no model flag" —
+          // and only a null means nothing was ever written down. Reading the
+          // empty string as absent would let a profile configured after the
+          // launch re-model a conversation that had run bare.
+          chatModelPinned:
+            row.chat_model_pinned === null || row.chat_model_pinned === undefined
+              ? undefined
+              : row.chat_model_pinned || null,
+          // Same treatment, same reason: an empty string reads as "no level
+          // chosen" rather than as an instruction to pass the runtime an empty
+          // `--effort`, which every one of them would refuse.
+          chatEffortOverride: row.chat_effort_override || undefined,
           // An empty string reads as "never renamed" for the same reason: the
           // write side only ever stores a trimmed non-empty name or null.
           customName: row.custom_name || undefined,

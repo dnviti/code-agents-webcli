@@ -29,6 +29,11 @@ export async function loadConfig(app: App): Promise<void> {
       shellStore.setState({
         user: cfg?.currentUser?.githubLogin ?? null,
         logoutUrl: cfg?.logoutUrl ?? null,
+        // The approval preference belongs to the account, so this — the boot
+        // request every page already makes — is where it arrives. Anything
+        // other than a literal `true` is "ask", which covers an older server
+        // that sends no preferences at all as well as a corrupt one.
+        chatBypassPermissions: cfg?.preferences?.chatBypassPermissions === true,
       });
     }
   } catch {

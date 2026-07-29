@@ -71,7 +71,7 @@ program
   .option('--allow-any-github-user', 'allow ANY GitHub account to sign in (dangerous: signed-in users can run commands on this host)')
   .option('--data-dir <path>', 'directory for the SQLite database and local state')
   .option('--dev', 'development mode with additional logging')
-  .option('--plan <type>', 'subscription plan (pro, max5, max20)', 'max20')
+  .option('--plan <type>', 'accepted and ignored: plan limits are no longer guessed')
   .option('--claude-alias <name>', 'display alias for Claude (default: env CLAUDE_ALIAS or "Claude")')
   .option('--codex-alias <name>', 'display alias for Codex (default: env CODEX_ALIAS or "Codex")')
   .option('--agent-alias <name>', 'display alias for Agent (default: env AGENT_ALIAS or "Cursor")')
@@ -107,7 +107,6 @@ async function main() {
       key: options.key,
       setup: options.setup,
       dev: options.dev,
-      plan: options.plan,
       publicBaseUrl: options.publicBaseUrl,
       githubClientId: options.githubClientId,
       githubClientSecret: options.githubClientSecret,
@@ -140,7 +139,6 @@ async function main() {
     console.log('Starting Code Agents Web CLI...');
     console.log(`Port: ${port}`);
     console.log('Mode: Folder selection mode');
-    console.log(`Plan: ${options.plan}`);
     // Built from a table rather than one template string: the line grew past
     // terminal width every time a runtime was added, and each addition meant
     // editing a 200-character literal.

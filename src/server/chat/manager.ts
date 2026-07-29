@@ -1,9 +1,11 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { ChatSnapshot, UserTurn } from '../../shared/chat-events.js';
 import { SessionRecord } from '../types.js';
-import { ChatNotRunningError, ChatSession, ChatSessionStartOptions } from './session.js';
-import { ChatStore } from './store.js';
+import { ChatNotRunningError, ChatSession, ChatSessionStartOptions, ChatUsageSink } from './session.js';
+import { ModelCapacityLookup } from './model-capacity.js';
+import { ChatStore, ChatTurnIndex } from './store.js';
 
 /**
  * Owns the live chat sessions.
@@ -23,14 +25,28 @@ export interface ChatManagerDeps {
   /** Passed through to every session; see ChatSessionDeps.onLifecycle. */
   onLifecycle?: (
     sessionId: string,
-    change: { nativeSessionId?: string; exited?: boolean },
+    change: { nativeSessionId?: string | null; exited?: boolean; bypassing?: boolean },
   ) => void;
+  /**
+   * The approval preference of a given user; see ChatSessionDeps.resolveBypass.
+   *
+   * Taken per user rather than per session because a `/clear` is answered for
+   * the conversation's *owner*, never for whichever socket happened to type it.
+   */
+  chatBypassPreference?: (userId: number) => boolean;
+  /** Passed through to every session; see ChatSessionDeps.usage. */
+  usage?: ChatUsageSink;
 }
 
 export class ChatSessionManager {
   private readonly sessions = new Map<string, ChatSession>();
   private readonly hookScript: string;
   private readonly askScript: string;
+  /**
+   * One lookup for the whole process, so its catalogue is fetched once rather
+   * than once per conversation. Only consulted for models no agent described.
+   */
+  private readonly capacity = new ModelCapacityLookup();
 
   constructor(private readonly deps: ChatManagerDeps) {
     // Resolved from this module's own location rather than cwd: the server is
@@ -85,6 +101,13 @@ export class ChatSessionManager {
         writeFile: (sessionId, filePath, contents) =>
           this.writeFile(sessionId, filePath, contents),
         onLifecycle: this.deps.onLifecycle,
+        // Closed over this record's owner, so a conversation restarted from
+        // inside itself resolves against the preference of the person whose
+        // conversation it is.
+        resolveBypass: () =>
+          this.deps.chatBypassPreference?.(record.ownerUserId) === true,
+        usage: this.deps.usage,
+        capacity: this.capacity,
       },
     );
 
@@ -134,14 +157,35 @@ export class ChatSessionManager {
    * `path.resolve` collapses `..` before the comparison, and the separator on
    * the prefix check stops `/home/u/project-secrets` passing as a child of
    * `/home/u/project`.
+   *
+   * The OS temp directory is the one other allowed root. An agent's write
+   * tool and its own shell share the real filesystem, so a handoff like
+   * `gh issue create --body-file /tmp/notes.md` only works when the file the
+   * agent was told to write lands where its shell will look for it — and
+   * scratch space is what a temp dir is for.
    */
   private confine(workingDir: string, filePath: string): string {
     const root = path.resolve(workingDir);
     const resolved = path.resolve(root, filePath);
-    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-      throw new Error(`refusing to touch ${filePath}: outside the session directory`);
+    if (resolved === root || resolved.startsWith(root + path.sep)) return resolved;
+    if (this.insideTempDir(resolved)) return resolved;
+    throw new Error(`refusing to touch ${filePath}: outside the session directory`);
+  }
+
+  private insideTempDir(resolved: string): boolean {
+    const tmp = os.tmpdir();
+    const roots = new Set<string>([path.resolve(tmp)]);
+    try {
+      // macOS reports the temp dir through a symlink; an agent that hands us
+      // the real path is still asking for scratch space, not escaping.
+      roots.add(fs.realpathSync(tmp));
+    } catch {
+      // No temp dir at all is odd but not fatal: the check simply fails.
     }
-    return resolved;
+    for (const root of roots) {
+      if (resolved === root || resolved.startsWith(root + path.sep)) return true;
+    }
+    return false;
   }
 
   async snapshot(record: SessionRecord): Promise<ChatSnapshot> {
@@ -186,11 +230,44 @@ export class ChatSessionManager {
   }
 
   /** One page of older events, for a browser scrolling back through a long chat. */
+  /**
+   * The conversation's whole run of turns, for the index beside it.
+   *
+   * Read from the log rather than assembled from what a browser holds, which is
+   * the point: an index that starts where the last page happened to stop is
+   * useless in exactly the conversations long enough to need one (#86).
+   */
+  async turnIndex(record: SessionRecord): Promise<ChatTurnIndex> {
+    const index = await this.deps.store.turnIndex({
+      id: record.id,
+      ownerUserId: record.ownerUserId,
+    });
+    // What each turn cost, joined on from the accounting. Not read from the log
+    // beside it: the money on a `turn_end` is a per-turn figure for some
+    // runtimes and a running total for others, and the one place that
+    // difference has already been worked out is the row the accountant filed.
+    const spend = this.deps.usage?.spendByTurn(record.id, record.ownerUserId);
+    if (!spend || spend.size === 0) return index;
+    return {
+      ...index,
+      turns: index.turns.map((turn) => {
+        const usage = spend.get(turn.turnId);
+        return usage ? { ...turn, usage } : turn;
+      }),
+    };
+  }
+
   readPage(
     record: SessionRecord,
     fromSeq: number,
     count: number,
-  ): Promise<{ events: unknown[]; firstSeq: number; from: number; cursor: number }> {
+  ): Promise<{
+    events: unknown[];
+    firstSeq: number;
+    from: number;
+    cursor: number;
+    openTurnId: string | null;
+  }> {
     return this.deps.store
       .read({ id: record.id, ownerUserId: record.ownerUserId }, fromSeq, count)
       .then((page) => ({
@@ -198,6 +275,9 @@ export class ChatSessionManager {
         firstSeq: page.firstSeq,
         from: page.from,
         cursor: page.cursor,
+        // The turn the page starts inside, so the browser replays the slice
+        // into the turn the conversation recorded rather than a new one.
+        openTurnId: page.openTurnId ?? null,
       }));
   }
 
@@ -222,9 +302,37 @@ export class ChatSessionManager {
     this.sessions.get(sessionId)?.rememberModel(model);
   }
 
+  /** Switch a live session's reasoning effort. False when nothing is running, or the adapter cannot. */
+  async setEffort(sessionId: string, effort: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    return session.setEffort(effort);
+  }
+
+  /** Carry a new effort level into the options an in-place `/clear` restart replays. */
+  rememberEffort(sessionId: string, effort: string | undefined): void {
+    this.sessions.get(sessionId)?.rememberEffort(effort);
+  }
+
   /** Drop a turn that was typed ahead and has not run yet. */
   cancelQueued(sessionId: string, queuedId: string): boolean {
     return this.sessions.get(sessionId)?.cancelQueued(queuedId) ?? false;
+  }
+
+  /**
+   * Cut the turn in flight short and give the agent one waiting turn now.
+   *
+   * False when there was nothing to promote — an unknown id, a session that is
+   * not running, a delivery already under way.
+   */
+  async sendQueuedNow(sessionId: string, queuedId: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    return session.sendQueuedNow(queuedId);
+  }
+
+  retryQueued(sessionId: string, queuedId: string): boolean {
+    return this.sessions.get(sessionId)?.retryQueued(queuedId) ?? false;
   }
 
   respondPermission(sessionId: string, requestId: string, optionId: string): boolean {

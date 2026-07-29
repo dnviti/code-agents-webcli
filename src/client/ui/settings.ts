@@ -6,6 +6,7 @@ import { shellStore } from '../shell/store';
 import { setThemeMode } from '../shell/theme';
 import type {
   AppSettings,
+  NotifySettings,
   TerminalFontFamilyId,
   ThemePresetId,
 } from '../types';
@@ -173,6 +174,22 @@ const TERMINAL_THEMES: Record<ThemePresetId, NonNullable<ITerminalOptions['theme
   },
 };
 
+/**
+ * Everything on.
+ *
+ * A notification still needs the browser's own permission, which this app asks
+ * for from a click in the settings dialog and nowhere else — so "on" here means
+ * "as soon as you allow it", not "the moment the page loads".
+ */
+export const DEFAULT_NOTIFICATIONS: NotifySettings = {
+  enabled: true,
+  finished: true,
+  failed: true,
+  approval: true,
+  question: true,
+  details: true,
+};
+
 const DEFAULTS: AppSettings = {
   fontSize: 14,
   theme: 'github-dark',
@@ -180,6 +197,7 @@ const DEFAULTS: AppSettings = {
   // Off. Every other default in this file is a matter of taste; this one
   // decides whether an agent can act on this machine without being asked.
   chatBypassPermissions: false,
+  notifications: DEFAULT_NOTIFICATIONS,
 };
 
 const THEME_ALIASES: Record<string, ThemePresetId> = {
@@ -203,11 +221,25 @@ export function hideSettings(): void {
   shellStore.patchSlice('dialogs', { settings: false });
 }
 
+/**
+ * The approval preference, which is not this browser's to remember.
+ *
+ * It belongs to the person, so it is stored on the server and arrives with
+ * `/api/config` at boot (see loadConfig). The store is where that answer lands,
+ * and reading it back through here keeps `AppSettings` one shape for the dialog
+ * without letting a stale localStorage blob overwrite the server's answer —
+ * `applySettings(app, loadSettings())` runs *after* the config fetch on boot,
+ * and used to publish whatever this device happened to have written (#134).
+ */
+function serverApprovalPreference(): boolean {
+  return shellStore.getSnapshot().chatBypassPermissions === true;
+}
+
 export function loadSettings(): AppSettings {
   try {
     const saved = localStorage.getItem('cc-web-settings');
     if (!saved) {
-      return { ...DEFAULTS };
+      return { ...DEFAULTS, chatBypassPermissions: serverApprovalPreference() };
     }
 
     const parsed = JSON.parse(saved) as Partial<AppSettings> & {
@@ -221,14 +253,38 @@ export function loadSettings(): AppSettings {
       ...parsed,
       theme: normalizedTheme,
       terminalFontFamily: normalizeTerminalFontFamily(parsed.terminalFontFamily),
-      // Strict equality, not truthiness: anything in storage that is not
-      // literally `true` leaves approvals on.
-      chatBypassPermissions: parsed.chatBypassPermissions === true,
+      // Never from storage, whatever a blob written by an older build says: a
+      // standing permission that has only ever been seen by one browser has
+      // never been attached to a user, and honouring it here would put a
+      // device-local grant back in front of the server's answer.
+      chatBypassPermissions: serverApprovalPreference(),
+      notifications: normalizeNotifications(parsed.notifications),
     };
   } catch (error) {
     console.error('Failed to load settings:', error);
-    return { ...DEFAULTS };
+    return { ...DEFAULTS, chatBypassPermissions: serverApprovalPreference() };
   }
+}
+
+/**
+ * Coerce whatever storage hands back into a complete set of choices.
+ *
+ * `!== false` rather than `=== true`, the opposite of the approval bypass above
+ * and for the same reason read the other way: the safe side of a notification
+ * toggle is on. A blob written before this feature existed has no `notifications`
+ * key at all, and reading its absence as silence would ship a feature that is
+ * off for everybody who has ever opened the app.
+ */
+function normalizeNotifications(value: unknown): NotifySettings {
+  const input = (value && typeof value === 'object' ? value : {}) as Partial<NotifySettings>;
+  return {
+    enabled: input.enabled !== false,
+    finished: input.finished !== false,
+    failed: input.failed !== false,
+    approval: input.approval !== false,
+    question: input.question !== false,
+    details: input.details !== false,
+  };
 }
 
 function normalizeTerminalFontFamily(value: unknown): TerminalFontFamilyId {
@@ -252,15 +308,26 @@ function normalizeTerminalFontFamily(value: unknown): TerminalFontFamilyId {
  * it should not trust its input to be a valid preset id.
  */
 export function saveSettings(app: App, next: AppSettings): void {
+  // Every field is named here on purpose, and every field has to be: this
+  // literal is what gets written, so a setting added to the type and to
+  // `loadSettings` but forgotten here reads back correctly until the first save
+  // and then reverts for good.
   const settings: AppSettings = {
     fontSize: clampFontSize(next.fontSize),
     theme: normalizeThemePreset(next.theme),
     terminalFontFamily: normalizeTerminalFontFamily(next.terminalFontFamily),
     chatBypassPermissions: next.chatBypassPermissions === true,
+    notifications: normalizeNotifications(next.notifications),
   };
 
+  // Everything except the approval preference, which belongs to the person and
+  // not to the device: it goes to the server below. Dropped from the blob
+  // rather than written and ignored on read, so a grant can never sit in one
+  // browser's storage waiting for a build that trusts it again.
+  const { chatBypassPermissions: _approvals, ...deviceSettings } = settings;
+
   try {
-    localStorage.setItem('cc-web-settings', JSON.stringify(settings));
+    localStorage.setItem('cc-web-settings', JSON.stringify(deviceSettings));
   } catch (error) {
     // Private browsing refuses writes. Applying anyway is right: the change
     // works for this session, it just will not survive a reload.
@@ -269,6 +336,48 @@ export function saveSettings(app: App, next: AppSettings): void {
 
   applySettings(app, settings);
   hideSettings();
+  void saveApprovalPreference(app, settings.chatBypassPermissions === true);
+}
+
+/**
+ * Send the approval preference to the account it belongs to.
+ *
+ * Applied optimistically by `applySettings` above and reconciled here against
+ * what the server actually kept. That order is safe now and would not have been
+ * before: the launch carries no approval flag from the browser any more, so
+ * this value only *labels* what the server will do. A page holding a value the
+ * server refused is a wrong label, and the fix for a wrong label is to go and
+ * ask — never to assume, in either direction, since guessing "off" after a
+ * failed switch-off would be the app promising prompts it is not going to give.
+ */
+async function saveApprovalPreference(app: App, value: boolean): Promise<void> {
+  try {
+    const response = await app.authFetch('/api/preferences', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preferences: { chatBypassPermissions: value } }),
+    });
+    if (!response.ok) throw new Error(`the server answered ${response.status}`);
+    const data = await response.json();
+    shellStore.setState({
+      chatBypassPermissions: data?.preferences?.chatBypassPermissions === true,
+    });
+  } catch (error) {
+    console.error('Failed to save the approval preference:', error);
+    shellStore.setState({ chatBypassPermissions: await readApprovalPreference(app) });
+  }
+}
+
+/** What the server holds, or `false` if it cannot be asked. */
+async function readApprovalPreference(app: App): Promise<boolean> {
+  try {
+    const response = await app.authFetch('/api/preferences');
+    if (!response.ok) return false;
+    const data = await response.json();
+    return data?.preferences?.chatBypassPermissions === true;
+  } catch {
+    return false;
+  }
 }
 
 /** Matches the dialog's slider bounds; a stored value outside them is junk. */
@@ -282,6 +391,12 @@ export function applySettings(app: App, settings: AppSettings): void {
   // button that acts on it, instead of the two reading storage separately and
   // disagreeing about what is about to happen.
   shellStore.setState({ chatBypassPermissions: settings.chatBypassPermissions === true });
+
+  // Same reason, and one more: the code that decides whether a finished
+  // conversation may interrupt somebody runs on a socket message, nowhere near
+  // React, and reading localStorage on every chat event of every conversation
+  // would be a parse per token.
+  shellStore.setState({ notifications: normalizeNotifications(settings.notifications) });
 
   document.documentElement.setAttribute('data-theme', settings.theme);
   document.documentElement.setAttribute('data-color-mode', getThemeMode(settings.theme));

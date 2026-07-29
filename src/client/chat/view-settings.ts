@@ -16,6 +16,8 @@
  * back would make that a cycle. The caller publishes the value.
  */
 
+import { PHONE_TEXT } from '../ui/touch.js';
+
 export type ChatPanelId = 'trace' | 'files' | 'changes' | 'github' | 'agents' | 'links' | 'status';
 
 export const CHAT_PANEL_IDS: ChatPanelId[] = [
@@ -262,11 +264,22 @@ export function enabledPanels(settings: ChatViewSettings): ChatPanelId[] {
  * which keeps `MessageBubble` out of the re-render path when the reading width
  * changes, and lets a code block opt out of the measure with plain CSS.
  */
-export function proseVariables(settings: ChatViewSettings): Record<string, string> {
+export function proseVariables(
+  settings: ChatViewSettings,
+  phone = false,
+): Record<string, string> {
   const comfortable = settings.density === 'comfortable';
   return {
     '--chat-prose-width': settings.proseWidth === 'full' ? 'none' : '74ch',
-    '--chat-prose-size': comfortable ? '14px' : 'var(--text-ui)',
-    '--chat-prose-leading': comfortable ? '1.62' : '1.55',
+    // The one thing this never took account of, which is how the message ended
+    // up the smallest text on a phone (#92): every piece of chrome around it
+    // was made phone-aware and raised, and the prose itself was not. See the
+    // scale in `PHONE_TEXT`.
+    '--chat-prose-size': phone
+      ? `${comfortable ? PHONE_TEXT.proseComfortable : PHONE_TEXT.prose}px`
+      : comfortable
+        ? '14px'
+        : 'var(--text-ui)',
+    '--chat-prose-leading': comfortable ? '1.62' : phone ? '1.5' : '1.55',
   };
 }

@@ -105,7 +105,7 @@ export function PanelNote({
   icon,
 }: {
   children: React.ReactNode;
-  tone?: 'muted' | 'destructive';
+  tone?: 'muted' | 'warning' | 'destructive';
   icon?: string;
 }): React.JSX.Element {
   return (
@@ -118,7 +118,12 @@ export function PanelNote({
         fontFamily: 'var(--font-sans)',
         fontSize: 'var(--text-sm)',
         lineHeight: 'var(--leading-snug)',
-        color: tone === 'destructive' ? 'var(--destructive)' : 'var(--muted-foreground)',
+        color:
+          tone === 'destructive'
+            ? 'var(--destructive)'
+            : tone === 'warning'
+              ? 'var(--warning)'
+              : 'var(--muted-foreground)',
       }}
     >
       {icon ? (

@@ -1,0 +1,47 @@
+{
+  "sessionId": "019fa521-db8c-7872-87da-316ce4cf3a83",
+  "models": {
+    "currentModelId": "grok-build",
+    "availableModels": [
+      {
+        "modelId": "grok-build",
+        "name": "Grok Build",
+        "description": "Best for advanced coding tasks",
+        "_meta": {
+          "totalContextTokens": 512000
+        }
+      },
+      {
+        "modelId": "sxs-claude-opus-4-6",
+        "name": "Tutor Claude Opus 4.6",
+        "_meta": {
+          "totalContextTokens": 200000
+        }
+      },
+      {
+        "modelId": "grok-experimental-0609-lp-fix-s80",
+        "name": "grok-experimental-0609-lp-fix-s80",
+        "description": "LP Fix 0609 s80",
+        "_meta": {
+          "totalContextTokens": 512000
+        }
+      },
+      {
+        "modelId": "grok-experimental-0610-lp-fix-s140",
+        "name": "grok-experimental-0610-lp-fix-s140",
+        "description": "LP Fix 0610 s140",
+        "_meta": {
+          "totalContextTokens": 512000
+        }
+      },
+      {
+        "modelId": "grok-4.5",
+        "name": "Grok 4.5",
+        "description": "SpaceXAI's new frontier model",
+        "_meta": {
+          "totalContextTokens": 500000
+        }
+      }
+    ]
+  }
+}
