@@ -38,6 +38,8 @@ import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
 import { TabBar } from '../../src/client/ui/relay/TabBar';
 import { MonacoEditor } from '../../src/client/shell/chat/MonacoEditor';
 import { WorkflowPopup } from '../../src/client/shell/chat/WorkflowPopup';
+import { GitHubItemDialog } from '../../src/client/shell/chat/GitHubItemDialog';
+import { FileEditorDialog } from '../../src/client/shell/chat/FileEditorDialog';
 import { MessageBubble } from '../../src/client/shell/chat/MessageBubble';
 import { monacoStylesApplied } from '../../src/client/chat/monaco';
 import { Toasts } from '../../src/client/shell/Toasts';
@@ -297,6 +299,10 @@ async function run(): Promise<void> {
   await checkANewConversationCanBeStartedFromTheComposer();
   await checkTheFileEditorShowsTheFile();
   await checkAReadOnlyFileStaysReadOnly();
+  // After the two editor checks on purpose: this one opens a FileEditorDialog,
+  // and Monaco is a module-level singleton that does not survive being mounted
+  // and torn down before they get to it.
+  await checkALongPopupTitleStaysInsideItsWindow();
   await checkATurnsBadgeSaysHowItEnded();
   await checkATurnsFiguresAreNeverCutShort();
   await checkAWaitingMessageCanBeSentNow();
@@ -1752,6 +1758,294 @@ async function checkATallDialogStaysOnScreen(): Promise<void> {
   host.remove();
 }
 
+
+/**
+ * A popup title is cut to fit, and the window's controls keep their place (#114).
+ *
+ * Only a layout engine can answer this one. The title row is a flex line, and
+ * the failure is entirely about what a flex item's automatic minimum size does
+ * to it: the title had no permission to shrink, so a title carrying a `nowrap`
+ * span made the line wider than the panel and pushed the `flex-shrink: 0`
+ * controls block out of it — 341px past the right edge of a phone screen in the
+ * measurement that opened the issue, which is not "hard to aim at" but gone. A
+ * plain-string title failed the other way and wrapped, tripling the height of
+ * the bar. Static markup renders both as fine.
+ *
+ * Four shapes of title, because the two failures need different ones: a plain
+ * string, the issue reader's icon + number + sentence, the workflow popup's
+ * name + status badge, and the file editor's icon + name + badges. Each is
+ * measured at a desktop width, then narrowed, then maximised, then again inside
+ * a real 390px phone frame — the AC asks for all four states.
+ */
+async function checkALongPopupTitleStaysInsideItsWindow(): Promise<void> {
+  const LONG = 'Answered questions come back blank after switching tabs — the choices must stay marked exactly as they were sent';
+  const LONG_PATH = `src/client/shell/chat/${LONG.replace(/[^a-z]+/gi, '-')}.tsx`;
+
+  // The two panels that read something have to have read it: an issue reader
+  // showing its "Issue" placeholder and a file editor with no file are the two
+  // shortest titles in the app, and would check nothing.
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+    if (url.includes('/github/issue/')) {
+      return new Response(
+        JSON.stringify({ kind: 'issue', item: { number: 114, title: LONG, url: 'https://github.com/dnviti/code-agents-webcli/issues/114', state: 'open', author: { login: 'dnviti' }, body: 'A long title must be truncated, never overflow.', comments: [] } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (url.includes('/workspace/') && url.includes('/file?')) {
+      return new Response(
+        JSON.stringify({
+          path: `/home/dev/projects/webcli/${LONG_PATH}`,
+          name: LONG_PATH.split('/').pop(),
+          relativePath: LONG_PATH,
+          size: 12, mtimeMs: 0, language: 'typescript',
+          content: 'const a = 1;\n', binary: false, tooLarge: false, writable: true,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    return realFetch(input as RequestInfo);
+  }) as typeof window.fetch;
+
+  /**
+   * Every assertion the AC makes about one open panel.
+   *
+   * Named per case so a failure says which shape of title broke, and asserted
+   * rather than swept: `isPainted` DROPS a node it cannot see, so a control
+   * pushed off the screen would quietly leave a sweep with nothing to report.
+   */
+  const measure = (doc: Document, label: string, expectTitle?: string, expectText = expectTitle): boolean => {
+    const view = doc.defaultView as Window;
+    const panel = doc.querySelector('[role="dialog"]') as HTMLElement | null;
+    if (!panel) {
+      check(`${label}: the popup is on screen`, false);
+      return false;
+    }
+    const h2 = panel.querySelector('h2[id$="-title"]') as HTMLElement | null;
+    const row = h2?.parentElement as HTMLElement | null;
+    const header = panel.children[0] as HTMLElement;
+    if (!h2 || !row) {
+      check(`${label}: the popup has a title`, false);
+      return false;
+    }
+
+    // The reported failure, stated exactly: the title reaches the strip the
+    // window's own controls occupy. Not "the row overflows" — on a phone the
+    // 44px touch targets deliberately bleed into the header's padding, which is
+    // inside the panel and is not this defect.
+    const controlsBox = (row.lastElementChild as HTMLElement).getBoundingClientRect();
+    const h2Box = h2.getBoundingClientRect();
+    check(
+      `${label}: the title stops before the window controls`,
+      h2Box.right <= controlsBox.left + 1,
+      `title ends ${Math.round(h2Box.right)}, controls start ${Math.round(controlsBox.left)}`,
+    );
+    // One line: `white-space: nowrap` cannot wrap, so this is really asking
+    // whether the clamp is in effect at all. Measured against the title's own
+    // line box rather than the header, which is legitimately two rows tall when
+    // a dialog passes a description and 76px tall on a phone, where the close
+    // control is a 44px touch target.
+    const lineHeight = parseFloat(view.getComputedStyle(h2).lineHeight)
+      || parseFloat(view.getComputedStyle(h2).fontSize) * 1.5;
+    check(
+      `${label}: the title stays on one line`,
+      h2Box.height <= lineHeight * 1.6,
+      `${Math.round(h2Box.height)}px against a ${Math.round(lineHeight)}px line`,
+    );
+
+    // The cut has to be an ellipsis, not a clip: an inline-level wrapper inside
+    // the title is laid out at max-content and chopped with nothing to say so.
+    const spilled = Array.from(h2.querySelectorAll<HTMLElement>('*')).filter(
+      (node) => node.getBoundingClientRect().right > h2Box.right + 1,
+    );
+    check(
+      `${label}: nothing inside the title is chopped without an ellipsis`,
+      spilled.length === 0,
+      spilled.map((node) => `${(node.textContent || '').slice(0, 12)}@${Math.round(node.getBoundingClientRect().right)}`).join(', ')
+        || `h2 right=${Math.round(h2Box.right)}`,
+    );
+
+    // A title with more text than room is cut *with an ellipsis*, not merely
+    // clipped. Conditional on there being something to cut: maximised, this
+    // title fits, and demanding truncation there would be demanding a defect.
+    const inTitle = [h2, ...Array.from(h2.querySelectorAll<HTMLElement>('*'))];
+    const overflowing = inTitle.filter((node) => node.scrollWidth > node.clientWidth + 1);
+    const clippers = overflowing.filter((node) => {
+      const styles = view.getComputedStyle(node);
+      return styles.textOverflow === 'ellipsis' && styles.whiteSpace === 'nowrap';
+    });
+    check(
+      `${label}: a title too long for the bar is cut with an ellipsis`,
+      overflowing.length === 0 || clippers.length > 0,
+      overflowing.length
+        ? `${clippers.length}/${overflowing.length} truncating, ${overflowing[0].scrollWidth} into ${overflowing[0].clientWidth}`
+        : 'it fits as it is',
+    );
+
+    // Every control in the bar: inside the panel, full size, and hit-testable.
+    const panelBox = panel.getBoundingClientRect();
+    const controls = Array.from(header.querySelectorAll<HTMLElement>('button, a[href]'));
+    check(`${label}: the title bar still has its controls`, controls.length > 0, `${controls.length}`);
+    for (const control of controls) {
+      const box = control.getBoundingClientRect();
+      const name = control.getAttribute('aria-label') || control.getAttribute('title') || control.tagName;
+      check(
+        `${label}: “${name}” is inside the panel`,
+        box.right <= panelBox.right + 1 && box.left >= panelBox.left - 1
+          && box.top >= panelBox.top - 1 && box.bottom <= panelBox.bottom + 1,
+        `control=[${Math.round(box.left)},${Math.round(box.right)}] panel=[${Math.round(panelBox.left)},${Math.round(panelBox.right)}]`,
+      );
+      const size = laidOutSize(control);
+      check(
+        `${label}: “${name}” keeps its full size`,
+        size.width > 8 && size.height > 8,
+        `${size.width}x${size.height}`,
+      );
+      const hit = doc.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+      check(
+        `${label}: “${name}” can actually be clicked`,
+        !!hit && (hit === control || control.contains(hit)),
+        hit ? `${hit.tagName}${hit === control ? '' : ' (not the control)'}` : 'nothing at that point',
+      );
+    }
+
+    if (expectTitle !== undefined) {
+      check(
+        `${label}: the whole title is on hover`,
+        h2.getAttribute('title') === expectTitle,
+        JSON.stringify(h2.getAttribute('title')),
+      );
+    }
+    if (expectText !== undefined) {
+      check(
+        `${label}: and nothing was actually taken away`,
+        (h2.textContent || '').includes(expectText),
+        (h2.textContent || '').slice(0, 40),
+      );
+    }
+    return clippers.length > 0;
+  };
+
+  // A workflow whose run name is far longer than any title bar, hydrated the
+  // real way so the popup draws its status badge beside it.
+  const workflowController = (): ChatController => {
+    const controller = new ChatController('browser-check', { send: () => {} });
+    controller.transcript.apply({ t: 'msg_start', seq: 1, ts: 1, id: 'm1', role: 'assistant', turnId: 't1' } as never);
+    controller.transcript.apply({
+      t: 'block_start', seq: 2, ts: 2, msgId: 'm1', index: 0,
+      block: { kind: 'tool', toolId: 'wf1', name: 'Workflow', toolKind: 'task', status: 'running', input: { name: LONG } },
+    } as never);
+    return controller;
+  };
+
+  const cases: Array<{ label: string; node: () => React.ReactElement; hover?: string; text?: string }> = [
+    {
+      label: 'a plain title',
+      hover: LONG,
+      node: () => React.createElement(
+        Dialog,
+        { open: true, movable: true, title: LONG, onClose: () => {}, width: 420 },
+        React.createElement('p', null, 'body'),
+      ),
+    },
+    {
+      label: 'an issue reader',
+      hover: LONG,
+      node: () => React.createElement(GitHubItemDialog, { sessionId: 's1', kind: 'issue', number: 114, onClose: () => {} } as never),
+    },
+    {
+      label: 'a workflow popup',
+      hover: LONG,
+      node: () => React.createElement(WorkflowPopup, { open: true, transcript: workflowController().transcript, toolId: 'wf1', onClose: () => {} } as never),
+    },
+    {
+      label: 'a file editor',
+      hover: LONG_PATH,
+      // The bar shows the file's name; the path it came from is the hover.
+      text: LONG_PATH.split('/').pop(),
+      node: () => React.createElement(FileEditorDialog, {
+        open: true,
+        sessionId: 's1',
+        filePath: `/home/dev/projects/webcli/${LONG_PATH}`,
+        onClose: () => {},
+      } as never),
+    },
+  ];
+
+  for (const one of cases) {
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const root = createRoot(host);
+    root.render(one.node());
+    await wait(250);
+    settle(document);
+    measure(document, one.label, one.hover, one.text ?? one.hover);
+
+    // Narrower re-cuts it immediately. The grip is only on the movable panels;
+    // the ones without it are measured in the phone frame below instead.
+    const panel = document.querySelector('[role="dialog"]') as HTMLElement | null;
+    const grip = panel?.querySelector('[title="Drag to resize"]') as HTMLElement | null;
+    if (panel && grip) {
+      const box = panel.getBoundingClientRect();
+      grip.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: box.right, clientY: box.bottom }));
+      window.dispatchEvent(new PointerEvent('pointermove', { clientX: box.right - 300, clientY: box.bottom }));
+      window.dispatchEvent(new PointerEvent('pointerup', {}));
+      await wait(80);
+      settle(document);
+      measure(document, `${one.label}, dragged 300px narrower`, one.hover, one.text ?? one.hover);
+    }
+
+    const maximise = panel?.querySelector('[aria-label="Fill the window"]') as HTMLElement | null;
+    if (maximise) {
+      maximise.click();
+      await wait(120);
+      settle(document);
+      measure(document, `${one.label}, filling the window`, one.hover, one.text ?? one.hover);
+    }
+
+    root.unmount();
+    host.remove();
+    await wait(30);
+  }
+
+  // And the width that started the issue. A real frame, with the real
+  // stylesheets: without them every var(--text-*) resolves to nothing and the
+  // header measures at the browser's own 16px default.
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  for (const one of cases) {
+    const mount = doc.createElement('div');
+    doc.body.appendChild(mount);
+    const root = createRoot(mount);
+    root.render(React.createElement(PhoneContext.Provider, { value: true }, one.node()));
+    await wait(300);
+    settle(doc);
+    const truncated = measure(doc, `${one.label} on a phone`, one.hover, one.text ?? one.hover);
+    // The width the issue was reported at. Every one of these titles is far
+    // wider than 390px, so if nothing is truncating here the mechanism is not
+    // engaged at all and every assertion above passed on a title that fitted.
+    check(`${one.label} on a phone: the title is actually being cut`, truncated);
+    root.unmount();
+    mount.remove();
+    await wait(30);
+  }
+
+  frame.remove();
+  window.fetch = realFetch;
+}
 
 /**
  * The composer belongs to the conversation column, and must shrink with it.
@@ -6630,7 +6924,19 @@ async function checkTheModelShownIsTheModelThatRan(): Promise<void> {
     ],
   };
 
-  const controller = new ChatController('model-check', { send: () => {} });
+  // Redrawn on `onChange`, because the app redraws on it (#128).
+  //
+  // A `chat_model_result` lands on the controller and nowhere else — not on the
+  // transcript, which is what this surface subscribes to — so the shell's store
+  // bumps a revision for exactly this case and re-renders ChatView. A fixture
+  // without it holds its first paint for ever, and every assertion below about
+  // what the server said would be measured against a screen that never heard
+  // it: a removed confirmation and a broken one look identical from there.
+  let redraw = (): void => {};
+  const controller = new ChatController('model-check', {
+    send: () => {},
+    onChange: () => redraw(),
+  } as never);
   controller.handle({
     type: 'chat_snapshot',
     sessionId: 'model-check',
@@ -6655,16 +6961,20 @@ async function checkTheModelShownIsTheModelThatRan(): Promise<void> {
   } as never);
 
   const root = createRoot(host);
-  root.render(
-    React.createElement(ChatView, {
-      controller,
-      runtime: 'grok',
-      runtimeLabel: 'Grok',
-      workingDir: '/tmp/project',
-      view: DEFAULT_CHAT_VIEW,
-      onViewChange: () => {},
-    } as never),
-  );
+  const paint = (): void => {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'grok',
+        runtimeLabel: 'Grok',
+        workingDir: '/tmp/project',
+        view: DEFAULT_CHAT_VIEW,
+        onViewChange: () => {},
+      } as never),
+    );
+  };
+  paint();
+  redraw = paint;
   await wait(250);
 
   const chip = (): HTMLElement | null => host.querySelector('[aria-label="Change model"]');
@@ -6769,8 +7079,170 @@ async function checkTheModelShownIsTheModelThatRan(): Promise<void> {
     );
   }
 
+  // What the control does *not* say (issue #128, the question #119 left open).
+  //
+  // The chip is the announcement: it wears the new model's name the moment one
+  // lands, so a box beside it reading "Switched to X for this conversation"
+  // spends a glance on news the eye has already had. The three outcomes the
+  // chip cannot show for itself still speak, and they are asserted here beside
+  // the silence — removing the confirmation and muting a deferral are one edit
+  // apart, and only a pair of checks tells them apart.
+  //
+  // Effects, not markup: the box is state a `useEffect` raises, so a rendered
+  // string is not evidence either way and only a real browser settles it.
+  document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+  await wait(150);
+
+  const noticeIn = (surface: HTMLElement): HTMLElement | null =>
+    (surface
+      .querySelector('[aria-label="Change model"]')
+      ?.parentElement?.querySelector('[role="status"]') ?? null) as HTMLElement | null;
+  const noticeText = (surface: HTMLElement): string => (noticeIn(surface)?.textContent ?? '').trim();
+  const answer = (
+    target: ChatController,
+    sessionId: string,
+    applied: string,
+    message: string,
+    model: string | null,
+  ): void =>
+    target.handle({ type: 'chat_model_result', sessionId, applied, model, message } as never);
+
+  answer(controller, 'model-check', 'live', 'Switched to sxs-claude-opus-4-6 for this conversation.', 'sxs-claude-opus-4-6');
+  await wait(200);
+  check(
+    'a model that took effect pops nothing up beside the composer',
+    !noticeIn(host),
+    noticeIn(host) ? `a box reading "${noticeText(host)}"` : 'nothing beside the chip',
+  );
+  check(
+    'because the chip is already wearing the new name — the news is dropped, not lost',
+    chipText().includes('sxs-claude-opus-4-6'),
+    chipText() || 'empty',
+  );
+  check(
+    'and the hover went back to describing the control instead of repeating the change',
+    /^(Model:|This turn ran on:)/.test(chip()?.getAttribute('title') ?? ''),
+    chip()?.getAttribute('title') ?? 'no title',
+  );
+
+  answer(controller, 'model-check', 'sent', 'Sent "/model grok-4.5" to the session — check the transcript to confirm it took.', 'grok-4.5');
+  await wait(200);
+  check(
+    'a runtime that has to be asked mid-session still says the answer is not in yet',
+    noticeText(host).includes('check the transcript'),
+    noticeText(host) || 'silence',
+  );
+
+  answer(controller, 'model-check', 'pending', 'Saved. grok-4.5 will be used the next time a session starts for this conversation.', 'grok-4.5');
+  await wait(200);
+  check(
+    'and so does a choice that will only reach a future session',
+    noticeText(host).includes('next time a session starts'),
+    noticeText(host) || 'silence',
+  );
+
+  answer(controller, 'model-check', 'cleared', 'Cleared the model override. The next session for this conversation will use the runtime default.', null);
+  await wait(200);
+  check(
+    'clearing the override says so too — the chip has already fallen back to a name it will not run at',
+    noticeText(host).includes('Cleared the model override'),
+    noticeText(host) || 'silence',
+  );
+
   root.unmount();
   host.remove();
+
+  // The phone, where the confirmation cost the most. The wrapper is `static`
+  // there so the menu can have the composer's width, which means this box
+  // resolves against the composer rather than against its own chip: it landed
+  // on the field the user was about to type into, with the navigation bar
+  // directly under it. So the silence is measured as geometry here rather than
+  // taken on trust from the desktop mount, and the message that must survive is
+  // measured for fit in the place it has the least room.
+  //
+  // The whole phone shell, not a `PhoneContext` wrapper around ChatView:
+  // ChatView publishes that context itself from its own `isMobile` prop, so a
+  // provider outside it is overwritten and the surface renders at desktop
+  // sizing while agreeing that it is a phone.
+  const phone = document.createElement('div');
+  phone.style.cssText =
+    'width:390px;height:740px;position:absolute;top:0;left:0;display:flex;overflow:hidden';
+  document.body.appendChild(phone);
+
+  let redrawPhone = (): void => {};
+  const phoneController = new ChatController('model-phone', {
+    send: () => {},
+    onChange: () => redrawPhone(),
+  } as never);
+  phoneController.handle({
+    type: 'chat_snapshot',
+    sessionId: 'model-phone',
+    snapshot: {
+      sessionId: 'model-phone', runtime: 'grok', state: 'idle', capabilities,
+      messages: [], pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 0,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const phoneRoot = createRoot(phone);
+  const paintPhone = (): void => {
+    phoneRoot.render(React.createElement(PhoneSurface, { controller: phoneController }));
+  };
+  paintPhone();
+  redrawPhone = paintPhone;
+  await wait(300);
+
+  // The chip lives behind "Show the other controls" on a phone: a fixture that
+  // measured the resting row would find no chip, no box, and agree with itself.
+  (phone.querySelector('[aria-label="Show the other controls"]') as HTMLElement | null)?.click();
+  await wait(300);
+
+  check(
+    'the model control is reachable on a phone at all, behind the other controls',
+    Boolean(phone.querySelector('[aria-label="Change model"]')),
+    phone.querySelector('[aria-label="Change model"]') ? 'on the expanded row' : 'no chip even once the other controls are open',
+  );
+
+  answer(phoneController, 'model-phone', 'live', 'Switched to grok-4.5 for this conversation.', 'grok-4.5');
+  await wait(300);
+  check(
+    'a successful change on a phone covers neither the composer nor the bar, because nothing appears',
+    !noticeIn(phone),
+    noticeIn(phone) ? `a box reading "${noticeText(phone)}"` : 'nothing over the composer',
+  );
+
+  answer(
+    phoneController, 'model-phone', 'pending',
+    'Saved. grok-build will be used the next time a session starts for this conversation.', 'grok-build',
+  );
+  await wait(300);
+  const deferredBox = noticeIn(phone)?.getBoundingClientRect();
+  const modelFieldBox = composerField(phone)?.getBoundingClientRect();
+  const modelNavBox = (
+    phone.querySelector('nav[aria-label="Go to"]') as HTMLElement | null
+  )?.getBoundingClientRect();
+  const phoneBox = phone.getBoundingClientRect();
+  /** True when the two boxes share no pixel — 1px of slack for a shared border. */
+  const clearOfBox = (a: DOMRect, b: DOMRect): boolean =>
+    a.bottom <= b.top + 1 || a.top >= b.bottom - 1 || a.right <= b.left + 1 || a.left >= b.right - 1;
+  check(
+    'a deferred model choice on a phone is on screen and clear of both the field and the bar',
+    Boolean(deferredBox && modelFieldBox)
+      && deferredBox!.height > 0
+      && deferredBox!.top >= phoneBox.top - 1
+      && deferredBox!.bottom <= phoneBox.bottom + 1
+      && clearOfBox(deferredBox!, modelFieldBox!)
+      && (!modelNavBox || clearOfBox(deferredBox!, modelNavBox)),
+    [
+      deferredBox ? `notice ${Math.round(deferredBox.top)}–${Math.round(deferredBox.bottom)}` : 'no deferral shown at all',
+      modelFieldBox ? `field ${Math.round(modelFieldBox.top)}–${Math.round(modelFieldBox.bottom)}` : 'no composer',
+      modelNavBox ? `bar ${Math.round(modelNavBox.top)}–${Math.round(modelNavBox.bottom)}` : 'no bottom bar',
+      `surface ${Math.round(phoneBox.top)}–${Math.round(phoneBox.bottom)}`,
+    ].join(', '),
+  );
+
+  phoneRoot.unmount();
+  phone.remove();
 }
 
 /**
