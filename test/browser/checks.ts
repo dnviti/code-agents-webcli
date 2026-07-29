@@ -341,6 +341,7 @@ async function run(): Promise<void> {
   await checkTheTurnIndexListsTheWholeConversation();
   await checkClearingResetsTheFiguresAboveTheChat();
   await checkASilentRuntimeSaysSoRatherThanGoingBlank();
+  await checkTheSilenceFitsThePhonesCollapsedHeader();
   await checkTheUsageWindowReachesBeforeThisYear();
   await checkTheEffortHistogramsAreReadableWithoutAMouse();
   await checkTheFileTreeAndTheShellAreSizedForAThumb();
@@ -8835,18 +8836,21 @@ async function checkClearingResetsTheFiguresAboveTheChat(): Promise<void> {
  * The events are the ones a kimi session produces: an answer, a turn that ends
  * carrying no figures but the spoken silence the session writes onto it, and a
  * window that came from the model's provider rather than from kimi.
+ *
+ * Two mounts, because the surface is two surfaces: the desktop strip below and
+ * the phone's collapsed header after it, which is a different component with a
+ * different budget for words.
  */
-async function checkASilentRuntimeSaysSoRatherThanGoingBlank(): Promise<void> {
-  const host = document.createElement('div');
-  host.style.cssText = 'width:1000px;height:700px;position:absolute;top:0;left:0;display:flex';
-  document.body.appendChild(host);
-
-  const controller = new ChatController('silent-check', { send: () => {} });
+function silentRuntimeController(
+  id: string,
+  options: { bypassPermissions?: boolean; state?: string } = {},
+): ChatController {
+  const controller = new ChatController(id, { send: () => {} });
   controller.handle({
     type: 'chat_snapshot',
-    sessionId: 'silent-check',
+    sessionId: id,
     snapshot: {
-      sessionId: 'silent-check',
+      sessionId: id,
       runtime: 'kimi',
       state: 'idle',
       capabilities: {
@@ -8862,14 +8866,14 @@ async function checkASilentRuntimeSaysSoRatherThanGoingBlank(): Promise<void> {
       replayFrom: 1,
       cursor: 1,
       live: true,
-      bypassPermissions: false,
+      bypassPermissions: options.bypassPermissions ?? false,
     },
   } as never);
 
   const push = (event: Record<string, unknown>, seq: number): void => {
     controller.handle({
       type: 'chat_event',
-      sessionId: 'silent-check',
+      sessionId: id,
       event: { seq, ts: 1_700_000_000_000 + seq, ...event },
     } as never);
   };
@@ -8885,6 +8889,18 @@ async function checkASilentRuntimeSaysSoRatherThanGoingBlank(): Promise<void> {
     t: 'usage',
     usage: { contextWindow: 1048576, contextWindowSource: 'provider' },
   }, 8);
+  if (options.state) push({ t: 'state', state: options.state }, 9);
+
+  return controller;
+}
+
+/** The desktop strip, at the width the header actually gets on a laptop. */
+async function checkASilentRuntimeSaysSoRatherThanGoingBlank(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1000px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = silentRuntimeController('silent-check');
 
   const root = createRoot(host);
   root.render(
@@ -8947,8 +8963,142 @@ async function checkASilentRuntimeSaysSoRatherThanGoingBlank(): Promise<void> {
   const readout = (host.textContent ?? '').replace(/\s+/g, ' ');
   check(
     'the composer says it too, rather than leaving a bare turn number',
-    /tokens not reported/.test(readout) && /cost not reported/.test(readout),
+    /turn 1 · usage not reported/.test(readout),
     readout.slice(-200) || 'nothing rendered',
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
+ * The same sentence on the surface with the least room for it (#136, AC4).
+ *
+ * The phone's header is collapsed by default and is one fixed-height row: a
+ * status word, then the cost, the bypass shield and the chevron pushed to the
+ * right edge. Before this the cost was `$0.12` or nothing at all; it is now up
+ * to seventeen characters of "cost not reported" in the same strip, at 15px,
+ * against 390px of screen — and the two spans either side of it are
+ * `flex: 0 0 auto`, so anything that does not fit does not shrink, it leaves
+ * the header. The desktop mount above can never see that: it has 1000px.
+ *
+ * So this measures the strip rather than reading it. The words have to be on
+ * one line, the chevron has to still be inside the header, and the row has to
+ * still be one row — with the widest state label the header has ("asked you a
+ * question") and the shield showing, which is the tightest this strip ever
+ * gets. Text metrics are the reason it is a browser check and not a string
+ * match on `renderToStaticMarkup`, which has no layout at all.
+ */
+async function checkTheSilenceFitsThePhonesCollapsedHeader(): Promise<void> {
+  const host = document.createElement('div');
+  // No `overflow:hidden`: hiding the overflow is exactly what would stop this
+  // check seeing the chevron leave the strip.
+  host.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = silentRuntimeController('silent-phone', {
+    bypassPermissions: true,
+    state: 'awaiting_answer',
+  });
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'kimi',
+      runtimeLabel: 'Kimi',
+      workingDir: '/tmp/project',
+      // ChatView publishes `PhoneContext` from this itself, so a provider
+      // wrapped around it would be overwritten and the header would render at
+      // desktop sizing while agreeing that it is a phone.
+      isMobile: true,
+      view: { ...DEFAULT_CHAT_VIEW, panelOpen: false },
+      onViewChange: () => {},
+      onOpenConversations: () => {},
+    } as never),
+  );
+  await wait(300);
+
+  const strip = host.querySelector('[aria-expanded][aria-controls]') as HTMLElement | null;
+  const stripText = (strip?.textContent ?? '').replace(/\s+/g, ' ');
+  check(
+    'the phone’s collapsed header says the cost is not reported, rather than nothing',
+    /not reported/i.test(stripText) && !/\$0\.00/.test(stripText),
+    stripText || 'no collapsed header strip on screen',
+  );
+
+  const label = strip
+    ? (Array.from(strip.querySelectorAll('*')).find(
+        (node) => node.children.length === 0 && /not reported/i.test(node.textContent || ''),
+      ) as HTMLElement | undefined)
+    : undefined;
+  const style = label ? getComputedStyle(label) : null;
+  const box = label ? label.getBoundingClientRect() : null;
+  const fontSize = style ? parseFloat(style.fontSize) : 0;
+  check(
+    'and paints the words at the size the rest of the strip is',
+    Boolean(
+      box && box.width > 0 && box.height > 0
+      && style && style.visibility !== 'hidden' && style.display !== 'none'
+      && Number(style.opacity) > 0.5,
+    ) && fontSize >= 15,
+    label
+      ? `${Math.round(box!.width)}x${Math.round(box!.height)} ${fontSize}px opacity=${style!.opacity}`
+      : 'no element carries the words',
+  );
+  // One line: a phrase that wrapped would double the leaf's height, and this
+  // row is fixed at 44px with a status word and three icons already on it.
+  check(
+    'without wrapping onto a second line inside a one-line strip',
+    Boolean(box && fontSize && box.height <= fontSize * 1.8),
+    box ? `${Math.round(box.height)}px tall at ${fontSize}px` : 'no element carries the words',
+  );
+
+  // The two things the strip exists to carry, both of which live to the right
+  // of the new words and neither of which may shrink.
+  const stripBox = strip?.getBoundingClientRect();
+  const chevron = strip?.querySelector('svg:last-of-type') as SVGElement | null;
+  const chevronBox = chevron?.getBoundingClientRect();
+  check(
+    'the chevron that opens the header is still inside it',
+    Boolean(stripBox && chevronBox && chevronBox.width > 0 && chevronBox.right <= stripBox.right + 0.5),
+    chevronBox && stripBox
+      ? `chevron right ${Math.round(chevronBox.right)} vs strip right ${Math.round(stripBox.right)}`
+      : 'no chevron in the strip',
+  );
+  const header = strip?.closest('header') as HTMLElement | null;
+  const headerBox = header?.getBoundingClientRect();
+  check(
+    'and the collapsed header is still one row of the height it was',
+    Boolean(headerBox && headerBox.height <= 56),
+    headerBox ? `${Math.round(headerBox.height)}px tall` : 'no header',
+  );
+  check(
+    'and nothing on the strip is pushed off the side of the phone',
+    Boolean(strip && strip.scrollWidth <= strip.clientWidth + 1),
+    strip ? `content ${strip.scrollWidth}px in a ${strip.clientWidth}px strip` : 'no strip',
+  );
+
+  // The other surface this change lengthened, and the other one with no room:
+  // the composer's status line, which on a phone lives behind the tools row and
+  // holds its figures in one unshrinkable nowrap span.
+  (host.querySelector('[aria-label="Show the other controls"]') as HTMLElement | null)?.click();
+  await wait(200);
+  const readout = Array.from(host.querySelectorAll('span')).find(
+    (node) => /usage not reported/.test(node.textContent || ''),
+  ) as HTMLElement | undefined;
+  const readoutBox = readout?.getBoundingClientRect();
+  check(
+    'the composer’s status line says it on a phone as well',
+    Boolean(readoutBox && readoutBox.width > 0),
+    readout ? (readout.textContent ?? '').replace(/\s+/g, ' ') : 'no status line on the phone composer',
+  );
+  check(
+    'and says it inside the width of the phone rather than off the edge',
+    Boolean(readoutBox && readoutBox.left >= -0.5 && readoutBox.right <= 390.5),
+    readoutBox
+      ? `${Math.round(readoutBox.left)}–${Math.round(readoutBox.right)} of 0–390`
+      : 'no status line on the phone composer',
   );
 
   root.unmount();

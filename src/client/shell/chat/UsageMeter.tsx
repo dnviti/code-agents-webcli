@@ -151,9 +151,18 @@ export function UsageMeter({ usage, capabilities, compact = false, phone = false
     // here and a sentence in the panel — and "tokens not reported · cost not
     // reported" is two phrases where there is barely room for one. The tooltip
     // carries the whole of it, and so does the status panel.
+    //
+    // `costOnly` drops the noun for the same reason the figure beside it does.
+    // That form is the phone's collapsed header: one 390px row carrying a state
+    // word, this slot, the bypass shield and the chevron, none of which may
+    // shrink. Measured — "asked you a question" is 20 characters of it, and
+    // "cost not reported" put 22px of the strip off the side of the screen
+    // (test/browser/checks.ts). The slot only ever holds the cost there, which
+    // is why the money is rendered bare as `$0.12` with no label of its own, so
+    // the absence of it is said the same way and the title carries the noun.
     const silence = costOnly
       ? costSilent
-        ? 'cost not reported'
+        ? 'not reported'
         : null
       : tokensSilent && costSilent
         ? 'usage not reported'

@@ -27,14 +27,27 @@
   nothing is known yet — and a runtime that goes quiet for one turn and reports
   on the next reads as having reported, not as silent.
 
+  A turn that was *stopped* teaches it nothing. Pressing stop, correcting the
+  agent mid-sentence, or a runtime that falls over all end a turn before the
+  moment it would have said what the turn cost, so none of them is evidence
+  about the runtime and none of them writes the label. Otherwise stopping Claude
+  once would have left "reports neither tokens nor cost" standing over a Claude
+  conversation for the rest of its life.
+
   Kimi also stops claiming it can report tokens and money. Every agent behind
   the protocol bridge advertised both, which was optimism for most of them and
   simply wrong for Kimi — and it was durable, because that claim is what the
   permanent usage history files against every job. Kimi's jobs read as "n/a" in
-  the usage dashboard now, the label for a runtime that cannot report, rather
-  than "not reported", which is reserved for one that could have and did not.
-  The other bridge agents keep the optimistic default: their handshake corrects
-  it upward, and a silent turn corrects it downward from evidence.
+  the usage dashboard now — the label that view uses for a runtime that cannot
+  report, as against "not reported" for a job from an agent that could have and
+  did not. The other bridge agents keep the optimistic default: their handshake
+  corrects it upward, and a silent turn corrects it downward from evidence.
+
+  Those two labels belong to the history view, which has a capability recorded
+  beside every job it draws. A live conversation has no such record and makes no
+  such claim: it says "not reported" for what it watched happen, which is why
+  the two surfaces word the same silence differently. `docs/usage-accounting.md`
+  now says which is which.
 
   One quieter fix rides along. A runtime that publishes how big its context
   window is did not always say which model the window was about, so a model

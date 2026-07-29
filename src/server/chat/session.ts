@@ -247,6 +247,50 @@ const QUEUE_READY_TIMEOUT_MS = 15_000;
 const INTERRUPT_ACK_WINDOW_MS = 5_000;
 
 /**
+ * Turn endings that are the turn being cut short rather than finishing.
+ *
+ * Only used by `noteSpend`, and only to *decline* to conclude anything. A
+ * runtime that was stopped mid-sentence, or that fell over, or that was killed
+ * with the process, never reached the point where it reports what the turn
+ * spent — Claude prices a turn in its final `result`, an ACP agent in the reply
+ * to `session/prompt` — so the absence of a figure says nothing about whether
+ * the runtime reports figures. Recording "reports nothing" from one of these
+ * would put a permanent, wrong statement about the *runtime* on the log of a
+ * conversation the *user* interrupted.
+ *
+ * Matched on the runtime's own word, lower-cased with separators removed
+ * because the vocabulary is not shared: the adapters here emit `error`,
+ * `exited`, `failed` and `interrupted` of their own accord, ACP adds
+ * `cancelled` and `refusal`, and Claude's subtypes arrive as `error_max_turns`
+ * and `error_during_execution` — hence the prefix test rather than a lookup for
+ * those. Anything unrecognised is taken as a normal ending, which is the only
+ * choice that keeps the feature working for a runtime nobody here has met:
+ * `end_turn`, `EndTurn`, `completed`, `success`, `max_tokens` and no stop
+ * reason at all are all ordinary endings, and no list could hold them all.
+ */
+const CUT_SHORT_TURN: ReadonlySet<string> = new Set([
+  'aborted',
+  'cancel',
+  'canceled',
+  'cancelled',
+  'exited',
+  'failed',
+  'interrupted',
+  'killed',
+  'refusal',
+  'refused',
+  'timedout',
+  'timeout',
+]);
+
+/** Whether a `turn_end`'s stop reason means the turn never got to finish. */
+function wasCutShort(stopReason: string | undefined): boolean {
+  if (!stopReason) return false;
+  const word = stopReason.toLowerCase().replace(/[_\-\s]/g, '');
+  return word.startsWith('error') || CUT_SHORT_TURN.has(word);
+}
+
+/**
  * Thrown when the session id is known but nothing is running under it.
  *
  * A distinct type rather than a message to match on, because the recovery for
@@ -1158,9 +1202,23 @@ export class ChatSession {
    * that from a session that simply had not spent anything yet.
    *
    * The statement is a measurement and is made where the measurement finishes:
-   * a turn in which the runtime actually did something has ended, and nothing
-   * on any channel carried a count or a price. Done once per conversation,
-   * because the log is a record of what changed.
+   * a turn in which the runtime actually did something *ran to its own end*,
+   * and nothing on any channel carried a count or a price. Done once per
+   * conversation, because the log is a record of what changed.
+   *
+   * "Ran to its own end" is doing real work there, and it is why the two gates
+   * below exist. Three kinds of `turn_end` are not a turn finishing: the
+   * acknowledgement of an interrupt sent to steer (`stale`, which the comment
+   * on the field calls "not a turn ending" — the turn is still running on the
+   * correction), a stop-button cancel, and an ending the adapter wrote because
+   * the runtime errored or went away. In all three the runtime was cut off
+   * before the moment it would have priced the turn, so its silence is about
+   * the interruption and not about the runtime. Concluding from one of them
+   * told a user that Claude reports neither tokens nor cost because they had
+   * pressed stop, and the statement outlives the turn: it is folded into the
+   * transcript, carried through `/clear` and re-read on every rejoin, so it
+   * stands until some later turn happens to report a figure. Skipping is free
+   * by comparison — the next turn that does finish states it.
    *
    * Written onto the `turn_end` that proves it rather than ingested as its own
    * event. `ingest` is what calls this, so a second `ingest` from in here would
@@ -1179,9 +1237,14 @@ export class ChatSession {
     }
 
     if (event.t !== 'turn_end') return;
+    // Before the reset, deliberately: the turn this acknowledges is still
+    // running, so the work it has already done still belongs to the ending
+    // that is yet to come.
+    if (event.stale) return;
     const worked = this.turnDidWork;
     this.turnDidWork = false;
     if (!worked) return;
+    if (wasCutShort(event.stopReason)) return;
 
     const silence: ChatUsage = {};
     if (!this.spokeTokens && !this.statedTokenSilence) {

@@ -333,6 +333,182 @@ describe('an agent that reports tokens and never money (#136 AC4)', function () 
   });
 });
 
+/**
+ * A turn that was cut short measured nothing, so it concludes nothing.
+ *
+ * The statement this feature writes is about the *runtime* and it is permanent
+ * in practice: the reducer folds it, `/clear` carries it, and a rejoin re-reads
+ * it off the log, so it stands until some later turn happens to report a
+ * figure. That is only ever safe to write from a turn that ran to its own end.
+ * Three kinds of `turn_end` did not:
+ *
+ *  - the acknowledgement of an interrupt sent to steer, which `chat-events.ts`
+ *    marks `stale` and calls "not a turn ending" — the turn carries on with the
+ *    correction, and the runtime prices a turn at the end of it;
+ *  - a stop-button cancel, where the runtime is killed before the reply that
+ *    would have carried the figures (`session/prompt` for ACP, the `result`
+ *    message for Claude);
+ *  - an ending the adapter wrote itself because the runtime errored or went
+ *    away (`acp.ts` `failTurn`, `codex.ts` `closeTurn('error'|'exited')`,
+ *    `pi.ts`'s crash path).
+ *
+ * Concluded from any of those, the app told a Claude user that Claude reports
+ * neither tokens nor cost — because they had pressed stop.
+ */
+describe('a turn that never finished is not a measurement (#136 AC5)', function () {
+  let dir;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-136-'));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * A runtime that holds one process open and answers an interrupt at once.
+   *
+   * Claude's shape: `interrupt()` makes the CLI end its run, which arrives as a
+   * `turn_end` — `claude.ts` stamps it `stopReason: str(raw.stop_reason) ??
+   * subtype`. The session is what decides that ending is an acknowledgement
+   * rather than an ending, so the flag under test is produced here rather than
+   * written by hand.
+   */
+  function steerableAdapter() {
+    return {
+      runtime: 'claude',
+      capabilities: { permissions: true, streaming: true, interrupt: true },
+      alive: true,
+      sent: [],
+      async start() {},
+      async send(turn) {
+        this.sent.push(turn.text);
+        this.emit({ t: 'msg_start', id: `a${this.sent.length}`, role: 'assistant', turnId: 'turn-1', model: 'claude-opus-5' });
+      },
+      async interrupt() {
+        this.emit({ t: 'turn_end', turnId: 'turn-1', stopReason: 'interrupted' });
+      },
+      respondPermission() {},
+      async stop() {
+        this.alive = false;
+      },
+    };
+  }
+
+  function liveSession(adapter) {
+    const sent = [];
+    const session = new ChatSession(
+      { id: 'sess-cut', ownerUserId: 7 },
+      {
+        store: memoryStore(),
+        socketDir: dir,
+        hookScript: path.join(ROOT, 'does-not-exist.js'),
+        broadcast: (_id, message) => {
+          if (message.type === 'chat_event') sent.push(message.event);
+        },
+        resolveCommand: () => adapter.runtime,
+      },
+    );
+    adapter.emit = (event) => session.ingest(event);
+    session.adapter = adapter;
+    session.runtime = adapter.runtime;
+    session.state = 'idle';
+    return { session, sent };
+  }
+
+  it('says nothing off an interrupt the runtime is only acknowledging', async function () {
+    const adapter = steerableAdapter();
+    const { session, sent } = liveSession(adapter);
+    await session.send({ text: 'refactor the auth module' });
+    await session.send({ text: 'stop — the other file' });
+    // The real steering path, which is what stamps `stale`.
+    await session.sendQueuedNow(session.queuedTurns[0].id);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const ends = sent.filter((event) => event.t === 'turn_end');
+    assert.strictEqual(ends.length, 1);
+    assert.strictEqual(ends[0].stale, true, 'the interrupt was acknowledged, not answered');
+    assert.strictEqual(ends[0].usage, undefined, 'and nothing was concluded from it');
+
+    const usage = replay(sent).usage;
+    assert.strictEqual(usage.usageSource, undefined);
+    assert.strictEqual(usage.costSource, undefined);
+  });
+
+  it('and still says it when the turn it interrupted really does end', async function () {
+    const adapter = steerableAdapter();
+    const { session, sent } = liveSession(adapter);
+    await session.send({ text: 'refactor the auth module' });
+    await session.send({ text: 'stop — the other file' });
+    await session.sendQueuedNow(session.queuedTurns[0].id);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // The redirected work finishing, reporting nothing. The work the stale
+    // acknowledgement saw is still this turn's, which is why the statement
+    // lands rather than being lost with the ending that was suppressed.
+    adapter.emit({ t: 'turn_end', turnId: 'turn-1' });
+
+    const usage = replay(sent).usage;
+    assert.strictEqual(usage.usageSource, 'none');
+    assert.strictEqual(usage.costSource, 'none');
+  });
+
+  it('says nothing when the user pressed stop before the runtime priced the turn', function () {
+    // Claude, mid-turn: the first message's tokens are in, the `result` that
+    // carries `total_cost_usd` never arrives because the run was cancelled.
+    const sent = throughSession(dir, 'claude', [
+      { t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'turn-1', model: 'claude-opus-5' },
+      { t: 'msg_end', msgId: 'a1', usage: { inputTokens: 2, outputTokens: 87 } },
+      { t: 'turn_end', turnId: 'turn-1', stopReason: 'aborted' },
+    ]);
+
+    const usage = replay(sent).usage;
+    assert.strictEqual(usage.costSource, undefined, 'a cancelled turn is not evidence about Claude');
+    assert.strictEqual(usage.usageSource, 'agent');
+    assert.strictEqual(usage.outputTokens, 87);
+  });
+
+  it('says nothing off a turn the adapter ended because the runtime broke', function () {
+    // `acp.ts` failTurn: an error event, then a turn_end nobody's runtime sent.
+    const sent = throughSession(dir, 'omp', [
+      { t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'turn-1' },
+      { t: 'error', message: 'omp: connection reset' },
+      { t: 'turn_end', turnId: 'turn-1', stopReason: 'error' },
+    ]);
+
+    const usage = replay(sent).usage;
+    assert.strictEqual(usage.usageSource, undefined);
+    assert.strictEqual(usage.costSource, undefined);
+  });
+
+  it('and not off Claude’s own error subtypes, which are spelled differently', function () {
+    // `claude.ts` falls back to the result's `subtype` when there is no
+    // `stop_reason`, and those read `error_during_execution` /
+    // `error_max_turns` rather than a bare "error".
+    for (const stopReason of ['error_during_execution', 'error_max_turns', 'exited', 'cancelled']) {
+      const sent = throughSession(dir, 'claude', [
+        { t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'turn-1', model: 'claude-opus-5' },
+        { t: 'turn_end', turnId: 'turn-1', stopReason },
+      ]);
+      assert.strictEqual(replay(sent).usage.usageSource, undefined, stopReason);
+    }
+  });
+
+  it('but still concludes from every ordinary ending, whatever the runtime calls it', function () {
+    // The other half of the rule, and the reason it is a short deny-list rather
+    // than a list of the endings that count: the runtimes here spell a normal
+    // ending `end_turn`, `EndTurn`, `completed`, `success` and nothing at all,
+    // and an unrecognised word has to mean the turn finished or a new agent
+    // would silently lose the label the feature exists to show.
+    for (const stopReason of [undefined, 'end_turn', 'EndTurn', 'completed', 'success', 'max_tokens']) {
+      const sent = throughSession(dir, 'kimi', [
+        { t: 'msg_start', id: 'a1', role: 'assistant', turnId: 'turn-1' },
+        { t: 'turn_end', turnId: 'turn-1', ...(stopReason ? { stopReason } : {}) },
+      ]);
+      assert.strictEqual(replay(sent).usage.usageSource, 'none', String(stopReason));
+    }
+  });
+});
+
 describe('what the live surfaces say about a silence (#136 AC2, AC4)', function () {
   let mod;
   let bundle;
@@ -402,6 +578,18 @@ describe('what the live surfaces say about a silence (#136 AC2, AC4)', function 
     );
   });
 
+  it('and on the collapsed phone strip, in the width that one leaves', function () {
+    // The tightest surface in the app: one 390px row already carrying a state
+    // word, the bypass shield and the chevron, none of which shrink. "cost not
+    // reported" put 22px of it off the side of the screen, measured in
+    // test/browser/checks.ts. The slot holds nothing but the money — which is
+    // why the figure is rendered bare, as `$0.12` — so the absence of it is
+    // said the same way, and the title carries the noun.
+    const line = meter({ costSource: 'none' }, { compact: true, phone: true, costOnly: true });
+    assert.match(line, /not reported/);
+    assert.doesNotMatch(line, /cost not reported/);
+  });
+
   it('keeps the window a provider sized, which is all kimi ever has', function () {
     // The regression the honest capability flags nearly caused: the whole token
     // half of the meter used to be gated on `capabilities.usage`, and the
@@ -438,19 +626,36 @@ describe('what the live surfaces say about a silence (#136 AC2, AC4)', function 
     assert.doesNotMatch(line, /not reported/);
   });
 
-  it('replaces the composer’s bare turn label instead of leaving it alone', function () {
+  function composer(usage, props) {
     const { renderToStaticMarkup, React, Composer } = mod;
-    const html = renderToStaticMarkup(
-      React.createElement(Composer, {
-        onSend() {},
-        onInterrupt() {},
-        busy: false,
-        capabilities: CAPS,
-        turnLabel: 'turn 3',
-        usage: { usageSource: 'none', costSource: 'none' },
-      }),
+    return text(
+      renderToStaticMarkup(
+        React.createElement(Composer, {
+          onSend() {},
+          onInterrupt() {},
+          busy: false,
+          capabilities: CAPS,
+          turnLabel: 'turn 3',
+          usage,
+          ...props,
+        }),
+      ),
     );
-    assert.match(text(html), /turn 3 · tokens not reported · cost not reported/);
+  }
+
+  it('replaces the composer’s bare turn label instead of leaving it alone', function () {
+    // One phrase, not two. Restated from "tokens not reported · cost not
+    // reported": this line is a single nowrap span that neither shrinks nor
+    // wraps, and both phrases together measured 445px against a 390px phone —
+    // the same rule the compact meter has always followed.
+    assert.match(composer({ usageSource: 'none', costSource: 'none' }), /turn 3 · usage not reported/);
+  });
+
+  it('and names the half that is missing when only one of them is', function () {
+    assert.match(
+      composer({ totalTokens: 150, usageSource: 'agent', costSource: 'none' }),
+      /turn 3 · 150 tok · cost not reported/,
+    );
   });
 
   it('explains it in the status panel, which is the surface with room', function () {
