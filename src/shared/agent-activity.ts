@@ -138,6 +138,9 @@ export const TERMINAL_TOOL: ReadonlySet<ToolStatus> = new Set<ToolStatus>([
   'failed',
   'denied',
   'canceled',
+  // Over, whatever happened to it. A call nothing will ever report on again is
+  // not still working, so it leaves the running group and the count (#139).
+  'unknown',
 ]);
 
 const TERMINAL = TERMINAL_TOOL;

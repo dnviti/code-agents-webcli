@@ -67,6 +67,22 @@ if (!fs.existsSync(path.join(dir, '..', '..', 'dist', 'public', 'css', 'componen
     path.join(dir, 'workflow-failed-events.json'),
     JSON.stringify(replay('claude-workflow-failed.jsonl')),
   );
+  // The same run with everything the runtime said *about the run* left out,
+  // which is what a runtime going quiet looks like (#139): the call is opened
+  // and never mentioned again, and the turn ends anyway.
+  //
+  // Its own artefact rather than a filter applied in the browser, because the
+  // reducer stores a `block_start`'s block by reference and writes into it — so
+  // by the time a later check filtered the shared import, an earlier one had
+  // already left its own results on those objects.
+  fs.writeFileSync(
+    path.join(dir, 'workflow-quiet-events.json'),
+    JSON.stringify(
+      replay('claude-workflow.jsonl').filter(
+        (event) => !['agent_progress', 'agent_step', 'workflow_progress', 'tool'].includes(event.t),
+      ),
+    ),
+  );
 }
 
 // A real Oh My Pi conversation, at the level the browser receives it (#132).

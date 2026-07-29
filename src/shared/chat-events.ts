@@ -51,7 +51,18 @@ export type ToolStatus =
   | 'completed'
   | 'failed'
   | 'denied'
-  | 'canceled';
+  | 'canceled'
+  /**
+   * The call never reported an ending and nothing can report one any more.
+   *
+   * Distinct from `canceled`, which says somebody stopped it, and from
+   * `failed`, which says it broke: nobody stopped this and nothing is known to
+   * have gone wrong — the runtime simply stopped talking about it and the turn
+   * it belonged to is over. No adapter ever emits it; the reducer sets it when
+   * it reconciles a finished turn against the calls still open inside it
+   * (#139). A spinner that will never stop is a worse answer than this one.
+   */
+  | 'unknown';
 
 /**
  * Coarse tool category, used only to pick an icon and a verb.

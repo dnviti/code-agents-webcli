@@ -3,6 +3,40 @@
 ## [Unreleased]
 
 ### Fixed
+- **A delegation nothing will report on again stops reading as running** (#139).
+  After a chat turn finished and the agent had delivered its answer, a workflow
+  started during that turn could still appear as running — a spinning badge on
+  its row, a non-zero count on the Agents panel, a turning dot on the trace —
+  with no waits and no activity anywhere in the trace to explain it. The
+  conversation said the work was over and the panel said it was not, and nothing
+  on screen said which was true.
+
+  Nothing in the pipeline ever closed a call on a turn-level event. Ending a
+  turn stamped the outcome onto every message in it and never looked inside
+  their blocks. And the runtimes routinely stop reporting on a call before the
+  turn is over: an Oh My Pi task moved to the background never sends a terminal
+  update at all, and Claude ends a turn with an unresolved call whenever a tool
+  errors during execution. So the call sat non-terminal for ever.
+
+  A call left open when its turn ends now reads **no longer reporting**. It is a
+  new word on purpose: nobody stopped it, which is what *cancelled* says, and
+  nothing is known to have broken, which is what *failed* says — the runtime
+  went quiet and its turn is over. A spinner that will never stop is the worse
+  answer.
+
+  Two things it deliberately does not do. A run that is still reporting about
+  *itself* — a background workflow saying it is working — outlives its turn by
+  design and is left alone; it settles when it says so, or when the runtime it
+  belongs to is gone, since nothing can report after that. And a turn
+  interrupted to redirect it has not ended, so nothing in it is settled.
+
+  An ending that turns up late still lands: this is the answer until a better
+  one arrives, and a real completion replaces it. What cannot land is a progress
+  report that would put the spinner back on a runtime that has already gone
+  quiet once.
+
+  The popup stops saying it is waiting for a stage to report in, which was the
+  trace claiming something was waiting when nothing was.
 - **An answered question comes back marked** (#113). A question the agent asked
   is left in the conversation after it is answered for exactly one reason:
   scrolling back past a decision should show the decision. It only survived as

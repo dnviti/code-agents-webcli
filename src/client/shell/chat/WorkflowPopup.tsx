@@ -77,7 +77,7 @@ export interface WorkflowPopupProps {
   isMobile?: boolean;
 }
 
-const TERMINAL = new Set(['completed', 'failed', 'denied', 'canceled']);
+const TERMINAL = new Set(['completed', 'failed', 'denied', 'canceled', 'unknown']);
 
 export function WorkflowPopup({
   open,
@@ -260,9 +260,14 @@ export function WorkflowPopup({
             {reported ? null : (
               <Empty
                 text={
-                  running
-                    ? 'Waiting for the first stage to report in…'
-                    : 'This workflow left no output.'
+                  block?.status === 'unknown'
+                    // Not "waiting": there is nothing left to wait for, and
+                    // saying so was the trace claiming a workflow was waiting
+                    // when nothing was (#139).
+                    ? 'This workflow never reported back, and its turn has ended.'
+                    : running
+                      ? 'Waiting for the first stage to report in…'
+                      : 'This workflow left no output.'
                 }
               />
             )}

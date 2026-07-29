@@ -19,6 +19,7 @@ test-*.js
 test/browser/bundle.js
 test/browser/workflow-events.json
 test/browser/workflow-failed-events.json
+test/browser/workflow-quiet-events.json
 test/browser/empty-rows-events.json
 test/browser/omp-turn-events.json
 .work/
