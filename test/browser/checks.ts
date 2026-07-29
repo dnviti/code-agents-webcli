@@ -6826,7 +6826,19 @@ async function checkTheModelShownIsTheModelThatRan(): Promise<void> {
     ],
   };
 
-  const controller = new ChatController('model-check', { send: () => {} });
+  // Redrawn on `onChange`, because the app redraws on it (#128).
+  //
+  // A `chat_model_result` lands on the controller and nowhere else — not on the
+  // transcript, which is what this surface subscribes to — so the shell's store
+  // bumps a revision for exactly this case and re-renders ChatView. A fixture
+  // without it holds its first paint for ever, and every assertion below about
+  // what the server said would be measured against a screen that never heard
+  // it: a removed confirmation and a broken one look identical from there.
+  let redraw = (): void => {};
+  const controller = new ChatController('model-check', {
+    send: () => {},
+    onChange: () => redraw(),
+  } as never);
   controller.handle({
     type: 'chat_snapshot',
     sessionId: 'model-check',
@@ -6851,16 +6863,20 @@ async function checkTheModelShownIsTheModelThatRan(): Promise<void> {
   } as never);
 
   const root = createRoot(host);
-  root.render(
-    React.createElement(ChatView, {
-      controller,
-      runtime: 'grok',
-      runtimeLabel: 'Grok',
-      workingDir: '/tmp/project',
-      view: DEFAULT_CHAT_VIEW,
-      onViewChange: () => {},
-    } as never),
-  );
+  const paint = (): void => {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'grok',
+        runtimeLabel: 'Grok',
+        workingDir: '/tmp/project',
+        view: DEFAULT_CHAT_VIEW,
+        onViewChange: () => {},
+      } as never),
+    );
+  };
+  paint();
+  redraw = paint;
   await wait(250);
 
   const chip = (): HTMLElement | null => host.querySelector('[aria-label="Change model"]');
@@ -6965,8 +6981,170 @@ async function checkTheModelShownIsTheModelThatRan(): Promise<void> {
     );
   }
 
+  // What the control does *not* say (issue #128, the question #119 left open).
+  //
+  // The chip is the announcement: it wears the new model's name the moment one
+  // lands, so a box beside it reading "Switched to X for this conversation"
+  // spends a glance on news the eye has already had. The three outcomes the
+  // chip cannot show for itself still speak, and they are asserted here beside
+  // the silence — removing the confirmation and muting a deferral are one edit
+  // apart, and only a pair of checks tells them apart.
+  //
+  // Effects, not markup: the box is state a `useEffect` raises, so a rendered
+  // string is not evidence either way and only a real browser settles it.
+  document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+  await wait(150);
+
+  const noticeIn = (surface: HTMLElement): HTMLElement | null =>
+    (surface
+      .querySelector('[aria-label="Change model"]')
+      ?.parentElement?.querySelector('[role="status"]') ?? null) as HTMLElement | null;
+  const noticeText = (surface: HTMLElement): string => (noticeIn(surface)?.textContent ?? '').trim();
+  const answer = (
+    target: ChatController,
+    sessionId: string,
+    applied: string,
+    message: string,
+    model: string | null,
+  ): void =>
+    target.handle({ type: 'chat_model_result', sessionId, applied, model, message } as never);
+
+  answer(controller, 'model-check', 'live', 'Switched to sxs-claude-opus-4-6 for this conversation.', 'sxs-claude-opus-4-6');
+  await wait(200);
+  check(
+    'a model that took effect pops nothing up beside the composer',
+    !noticeIn(host),
+    noticeIn(host) ? `a box reading "${noticeText(host)}"` : 'nothing beside the chip',
+  );
+  check(
+    'because the chip is already wearing the new name — the news is dropped, not lost',
+    chipText().includes('sxs-claude-opus-4-6'),
+    chipText() || 'empty',
+  );
+  check(
+    'and the hover went back to describing the control instead of repeating the change',
+    /^(Model:|This turn ran on:)/.test(chip()?.getAttribute('title') ?? ''),
+    chip()?.getAttribute('title') ?? 'no title',
+  );
+
+  answer(controller, 'model-check', 'sent', 'Sent "/model grok-4.5" to the session — check the transcript to confirm it took.', 'grok-4.5');
+  await wait(200);
+  check(
+    'a runtime that has to be asked mid-session still says the answer is not in yet',
+    noticeText(host).includes('check the transcript'),
+    noticeText(host) || 'silence',
+  );
+
+  answer(controller, 'model-check', 'pending', 'Saved. grok-4.5 will be used the next time a session starts for this conversation.', 'grok-4.5');
+  await wait(200);
+  check(
+    'and so does a choice that will only reach a future session',
+    noticeText(host).includes('next time a session starts'),
+    noticeText(host) || 'silence',
+  );
+
+  answer(controller, 'model-check', 'cleared', 'Cleared the model override. The next session for this conversation will use the runtime default.', null);
+  await wait(200);
+  check(
+    'clearing the override says so too — the chip has already fallen back to a name it will not run at',
+    noticeText(host).includes('Cleared the model override'),
+    noticeText(host) || 'silence',
+  );
+
   root.unmount();
   host.remove();
+
+  // The phone, where the confirmation cost the most. The wrapper is `static`
+  // there so the menu can have the composer's width, which means this box
+  // resolves against the composer rather than against its own chip: it landed
+  // on the field the user was about to type into, with the navigation bar
+  // directly under it. So the silence is measured as geometry here rather than
+  // taken on trust from the desktop mount, and the message that must survive is
+  // measured for fit in the place it has the least room.
+  //
+  // The whole phone shell, not a `PhoneContext` wrapper around ChatView:
+  // ChatView publishes that context itself from its own `isMobile` prop, so a
+  // provider outside it is overwritten and the surface renders at desktop
+  // sizing while agreeing that it is a phone.
+  const phone = document.createElement('div');
+  phone.style.cssText =
+    'width:390px;height:740px;position:absolute;top:0;left:0;display:flex;overflow:hidden';
+  document.body.appendChild(phone);
+
+  let redrawPhone = (): void => {};
+  const phoneController = new ChatController('model-phone', {
+    send: () => {},
+    onChange: () => redrawPhone(),
+  } as never);
+  phoneController.handle({
+    type: 'chat_snapshot',
+    sessionId: 'model-phone',
+    snapshot: {
+      sessionId: 'model-phone', runtime: 'grok', state: 'idle', capabilities,
+      messages: [], pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 0,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const phoneRoot = createRoot(phone);
+  const paintPhone = (): void => {
+    phoneRoot.render(React.createElement(PhoneSurface, { controller: phoneController }));
+  };
+  paintPhone();
+  redrawPhone = paintPhone;
+  await wait(300);
+
+  // The chip lives behind "Show the other controls" on a phone: a fixture that
+  // measured the resting row would find no chip, no box, and agree with itself.
+  (phone.querySelector('[aria-label="Show the other controls"]') as HTMLElement | null)?.click();
+  await wait(300);
+
+  check(
+    'the model control is reachable on a phone at all, behind the other controls',
+    Boolean(phone.querySelector('[aria-label="Change model"]')),
+    phone.querySelector('[aria-label="Change model"]') ? 'on the expanded row' : 'no chip even once the other controls are open',
+  );
+
+  answer(phoneController, 'model-phone', 'live', 'Switched to grok-4.5 for this conversation.', 'grok-4.5');
+  await wait(300);
+  check(
+    'a successful change on a phone covers neither the composer nor the bar, because nothing appears',
+    !noticeIn(phone),
+    noticeIn(phone) ? `a box reading "${noticeText(phone)}"` : 'nothing over the composer',
+  );
+
+  answer(
+    phoneController, 'model-phone', 'pending',
+    'Saved. grok-build will be used the next time a session starts for this conversation.', 'grok-build',
+  );
+  await wait(300);
+  const deferredBox = noticeIn(phone)?.getBoundingClientRect();
+  const modelFieldBox = composerField(phone)?.getBoundingClientRect();
+  const modelNavBox = (
+    phone.querySelector('nav[aria-label="Go to"]') as HTMLElement | null
+  )?.getBoundingClientRect();
+  const phoneBox = phone.getBoundingClientRect();
+  /** True when the two boxes share no pixel — 1px of slack for a shared border. */
+  const clearOfBox = (a: DOMRect, b: DOMRect): boolean =>
+    a.bottom <= b.top + 1 || a.top >= b.bottom - 1 || a.right <= b.left + 1 || a.left >= b.right - 1;
+  check(
+    'a deferred model choice on a phone is on screen and clear of both the field and the bar',
+    Boolean(deferredBox && modelFieldBox)
+      && deferredBox!.height > 0
+      && deferredBox!.top >= phoneBox.top - 1
+      && deferredBox!.bottom <= phoneBox.bottom + 1
+      && clearOfBox(deferredBox!, modelFieldBox!)
+      && (!modelNavBox || clearOfBox(deferredBox!, modelNavBox)),
+    [
+      deferredBox ? `notice ${Math.round(deferredBox.top)}–${Math.round(deferredBox.bottom)}` : 'no deferral shown at all',
+      modelFieldBox ? `field ${Math.round(modelFieldBox.top)}–${Math.round(modelFieldBox.bottom)}` : 'no composer',
+      modelNavBox ? `bar ${Math.round(modelNavBox.top)}–${Math.round(modelNavBox.bottom)}` : 'no bottom bar',
+      `surface ${Math.round(phoneBox.top)}–${Math.round(phoneBox.bottom)}`,
+    ].join(', '),
+  );
+
+  phoneRoot.unmount();
+  phone.remove();
 }
 
 /**

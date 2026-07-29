@@ -2,9 +2,34 @@
 
 ## [Unreleased]
 
-## [5.3.2] - 2026-07-29
-
 ### Fixed
+- **Changing the model is quiet now, like changing the effort** (#128). Every
+  pick raised a box beside the composer reading "Switched to claude-sonnet for
+  this conversation." It is the answer #119 deliberately left as an open
+  question, and it is the same one: a change that took effect needs no
+  announcement, because the control has already made it by redrawing. The chip
+  wears the new model's name the instant the switch lands, so the box was the
+  one thing on screen saying nothing new — while overlapping the controls around
+  it, and on a phone landing on the field the user was about to type into.
+
+  Three outcomes still speak, because each is one the chip gets wrong on its
+  own: a choice the runtime has to be *asked* about mid-session is waiting on
+  its reply in the transcript; one that will only apply from the next session
+  does not reach this conversation at all; and clearing the override is the
+  least visible of the three, because the chip has already fallen back to
+  whatever the session last reported, which is not what the next one will run.
+  Unlike the effort ladder there is no refusal to report — a model name is free
+  text and nothing here can pre-judge it.
+
+  Two things the effort chip fixed and this one had not. The hover now describes
+  the control again instead of holding the last confirmation for the rest of the
+  conversation. And the notice that does appear times out and, on a phone, opens
+  upward: this wrapper is `static` there so the menu can have the composer's
+  width, which means `top: 100%` resolved against the composer and put the box
+  on the bottom navigation bar. Measured before the fix, a deferred choice was
+  drawn at 686–756px on a 740px-tall phone — over the bar and past the bottom of
+  the screen.
+
 - **A long popup title is cut, and the window's controls stay where they are**
   (#114). Every popup in this app is the same panel, and its title was the one
   thing in the title bar with no permission to shrink. A flex item's automatic
@@ -40,6 +65,9 @@
   full size, and returns itself from a hit test at its own centre. Run against
   the code before the fix, 44 of them fail.
 
+## [5.3.2] - 2026-07-29
+
+### Fixed
 - **A workflow that failed no longer reads as done** (#140). The Workflow tool
   returns the moment a run is launched — "Workflow launched in background", no
   error, four seconds before anything has happened — and that acknowledgement
