@@ -16,13 +16,20 @@
   listening to and one it was not: `task_updated` carries the raw error, and
   `task_notification` — which used to be dropped with the hook plumbing —
   carries a sentence. Either now settles the call that launched the run, so the
-  row, the popup title and the tool call on the trace rail all read **failed**
-  with the runtime's own reason on them; and the conversation gets a message
-  saying so, with the reason in it, filed under the turn on screen rather than
-  behind a fold. Somebody in another conversation is told, in the same
-  notification a failed turn raises and under the same switch — now labelled "a
-  turn or workflow fails", because a background run's own turn ended cleanly
-  and some time ago.
+  row, the popup title and the tool call on the trace rail all read **failed**,
+  with the reason's first line on the row itself rather than a badge that makes
+  you open a popup to learn what broke. The conversation gets a message saying
+  so, filed under the turn on screen rather than behind a fold, carrying the
+  reason as a sentence — the stack frames stay on the run, where the popup
+  shows them.
+
+  Somebody in another conversation is told, in the same notification a failed
+  turn raises and under the same switch, now labelled "a turn or workflow
+  fails" — because a background run's own turn ended cleanly and some time ago.
+  That notification survives the conversation carrying on, which is the
+  ordinary case: a run that breaks mid-turn is followed within seconds by that
+  turn ending normally. The tab raises its unread mark too, for the browsers
+  where notification permission was never granted.
 
   **Agents inside a workflow are counted, not promoted.** A thrown agent
   resolves to `null` rather than failing the run — a script that probes for

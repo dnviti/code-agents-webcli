@@ -1349,6 +1349,26 @@ async function checkAFailedWorkflowReadsAsFailedEverywhere(): Promise<void> {
     (el) => !matches.some((other) => other !== el && el.contains(other)),
   ) as HTMLElement | undefined;
   check('the failure reaches the phone’s transcript too', !!callout);
+
+  // Drawn as a line across the conversation, not as a turn. The identical
+  // callout renders either way, so every text assertion above passes on a
+  // failure wrapped in the assistant's chrome — an avatar, a copy button and
+  // an "Assistant message" label around something the assistant never said.
+  check(
+    'and is not dressed up as something the agent said',
+    !doc.querySelector('article'),
+    doc.querySelector('article')?.getAttribute('aria-label') ?? 'no article',
+  );
+  check(
+    'and carries no message controls',
+    doc.querySelectorAll('button').length === 0,
+    `${doc.querySelectorAll('button').length} buttons`,
+  );
+  check(
+    'and says when it happened, unlike every other rule',
+    /\d{1,2}:\d{2}/.test(doc.body.textContent ?? ''),
+    (doc.body.textContent ?? '').replace(/\s+/g, ' ').slice(-40),
+  );
   if (callout) {
     const spilled = [...callout.querySelectorAll('*')].filter(
       (el) => isPainted(el) && el.getBoundingClientRect().right > 391,
