@@ -1202,6 +1202,25 @@ export function ChatView({
               alsoRan={controller.modelOverrideValue ? undefined : transcript.turnModels}
               onSetModel={setModel}
               modelFeedback={controller.modelFeedback}
+              // Where a *new* conversation on this runtime would get its model,
+              // which is a different question from the one above and had no
+              // answer on screen at all before #135. No effect on the launch:
+              // the server resolves that itself, and nothing here seeds a model
+              // the way the effort preference seeds a level — only ACP can take
+              // a model without a restart, so a post-launch seed would push a
+              // visible `/model` turn into a brand new claude conversation.
+              modelDefault={controller.modelDefaultValue}
+              // What this conversation was actually launched on, which is the
+              // only truthful thing to name when the user chose nothing and the
+              // runtime reports nothing — claude reports nothing, ever. The
+              // default above cannot stand in for it: it is what the *next* new
+              // chat would open on, and it changes under an open conversation
+              // every time the account's standing choice does.
+              modelPinned={controller.modelPinnedValue}
+              // Apart from `model` above, because that one is the override *or*
+              // whatever the runtime last reported and the picker has to tell
+              // those two apart to say which it is describing.
+              modelOverride={controller.modelOverrideValue}
               // Same precedence as the model above, and for the same reason:
               // the record's chosen level wins once the server has confirmed
               // it, and otherwise the transcript carries whatever the runtime

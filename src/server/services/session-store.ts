@@ -36,6 +36,7 @@ interface RuntimeSessionRow {
   owner_session_id: string | null;
   chat_bypass_permissions: number | null;
   chat_model_override: string | null;
+  chat_model_pinned: string | null;
   chat_effort_override: string | null;
   custom_name: string | null;
 }
@@ -77,6 +78,7 @@ export class SessionStore {
           owner_session_id,
           chat_bypass_permissions,
           chat_model_override,
+          chat_model_pinned,
           chat_effort_override,
           custom_name
         )
@@ -102,6 +104,7 @@ export class SessionStore {
           @owner_session_id,
           @chat_bypass_permissions,
           @chat_model_override,
+          @chat_model_pinned,
           @chat_effort_override,
           @custom_name
         )
@@ -181,6 +184,17 @@ export class SessionStore {
         // Persisted so a restart still prefers it over the profile default the
         // next time a session starts for this conversation.
         chat_model_override: session.chatModelOverride || null,
+        // The model this conversation is fixed to, from what its last launch
+        // actually used. This is the half that has to survive a restart or the
+        // guarantee is empty: a server restart is precisely the moment every
+        // conversation gets relaunched, and a pin held only in memory would be
+        // gone exactly when it is needed (#135).
+        //
+        // An empty string, not a null, for "launched with no flag at all": null
+        // is reserved for "nothing recorded", which is what a row written before
+        // this column existed carries and which still reads as the profile.
+        chat_model_pinned:
+          session.chatModelPinned === undefined ? null : session.chatModelPinned ?? '',
         // The conversation-scoped effort level, if one was chosen. Persisted for
         // the same reason and read back the same way: without it, a rejoin after
         // a server restart shows the chip at the runtime default while the
@@ -228,6 +242,7 @@ export class SessionStore {
             owner_session_id,
             chat_bypass_permissions,
             chat_model_override,
+            chat_model_pinned,
             chat_effort_override,
             custom_name
           FROM runtime_sessions
@@ -286,6 +301,15 @@ export class SessionStore {
           // override" rather than a call to switch to nothing is the safe
           // direction regardless.
           chatModelOverride: row.chat_model_override || undefined,
+          // The opposite treatment, deliberately: here an empty string is a
+          // recorded fact — "this conversation launched with no model flag" —
+          // and only a null means nothing was ever written down. Reading the
+          // empty string as absent would let a profile configured after the
+          // launch re-model a conversation that had run bare.
+          chatModelPinned:
+            row.chat_model_pinned === null || row.chat_model_pinned === undefined
+              ? undefined
+              : row.chat_model_pinned || null,
           // Same treatment, same reason: an empty string reads as "no level
           // chosen" rather than as an instruction to pass the runtime an empty
           // `--effort`, which every one of them would refuse.

@@ -118,13 +118,48 @@ export interface SessionRecord {
    * Set from a free-typed choice in the composer, not validated against
    * anything: the acceptance test for a model name is whether the runtime
    * accepts it, not whether it looks plausible before it is tried. Scoped to
-   * this record only — it is never written back as a profile or personal
-   * default, so it cannot leak into another conversation's launch.
+   * this record only — it is never written back as a profile, so it cannot leak
+   * into another conversation's launch.
    *
-   * Absent means "no override", which reads as the profile default exactly
-   * like every row written before this existed.
+   * The account's standing model for a runtime (#135) is deliberately *not*
+   * here. It lives in user settings, keyed by user and runtime, and the two
+   * mean different things: this field is "this conversation, whatever else
+   * changes", the setting is "the next new one". Keeping them apart is what
+   * lets the picker say which of the two a model came from, and it is why a
+   * conversation already under way is never re-modelled by a preference
+   * changed somewhere else.
+   *
+   * Absent means "no override", which reads as the model this conversation is
+   * already pinned to (below), then the account default, then the profile
+   * default, exactly like every row written before this existed.
    */
   chatModelOverride?: string;
+  /**
+   * The model this conversation is fixed to, as opposed to the one chosen in it.
+   *
+   * Written from whatever a launch actually resolved — an account default, a
+   * profile's model, or nothing at all — and read back ahead of both of them
+   * the next time this conversation starts. That is what makes the promise the
+   * picker states true: a relaunch, a resume from the launcher and the recovery
+   * banner's restart all come back on the model this conversation was already
+   * using, even though the account default or the profile behind it may have
+   * changed in between. Without it a conversation seeded from a standing choice
+   * silently dropped to the profile on its second launch (#135).
+   *
+   * Three states, and the third is the reason this is `string | null` rather
+   * than `string`: a name is the model it is fixed to, `null` is "fixed to no
+   * flag at all — the runtime's own default", and absent is "nothing recorded",
+   * which every row written before this existed carries and which still reads
+   * as the profile. Collapsing `null` into absent would let a profile added
+   * mid-conversation retcon a conversation that had deliberately launched bare.
+   *
+   * Not the same field as the override above, and deliberately so: this one is
+   * never something the user said, so the picker must not describe it as a
+   * choice, and clearing the override drops it rather than falling back to it.
+   * A branch sets it from its source, which is how a branch launches on the
+   * model the history it carries was measured against.
+   */
+  chatModelPinned?: string | null;
   /**
    * The reasoning-effort level this conversation runs at, in the runtime's own
    * vocabulary.

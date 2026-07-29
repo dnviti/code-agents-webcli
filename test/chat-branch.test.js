@@ -165,6 +165,7 @@ describe('branching a conversation from one of its turns', function () {
   this.timeout(20000);
 
   let storageDir;
+  let activeProfile;
   let store;
   let sessions;
   let server;
@@ -173,6 +174,7 @@ describe('branching a conversation from one of its turns', function () {
 
   beforeEach(async function () {
     storageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-branch-'));
+    activeProfile = null;
     store = new ChatStore({ storageDir });
     sessions = new Map();
     saves = 0;
@@ -201,6 +203,9 @@ describe('branching a conversation from one of its turns', function () {
         getScreenSnapshot: () => [],
         disposeRecorder: () => {},
         getSelectedWorkingDir: () => null,
+        // Read by the branch alone, and only to pin the model — see the test
+        // for it below. A test that wants no profile clears this.
+        activeProfileFor: () => activeProfile,
         sessionStore: { getSessionMetadata: async () => ({}) },
         chatStore: store,
       }),
@@ -375,6 +380,11 @@ describe('branching a conversation from one of its turns', function () {
     assert.strictEqual(branched.lastAgent, 'claude');
     assert.strictEqual(branched.surface, 'chat');
     assert.strictEqual(branched.chatModelOverride, 'claude-opus-4-6');
+    assert.strictEqual(
+      branched.sessionStartTime,
+      null,
+      'nothing is running in it yet — which is why the pin above matters (#135)',
+    );
     assert.ok(/branch at turn 1/.test(branched.name), branched.name);
     assert.strictEqual(
       branched.chatBypassPermissions,
@@ -382,6 +392,71 @@ describe('branching a conversation from one of its turns', function () {
       'a standing permission belongs to the conversation that granted it',
     );
     assert.ok(saves > 0, 'and the new record is persisted');
+  });
+
+  // The window the history above was just measured against is the source's
+  // model, and a source running on the profile's model carries no override to
+  // copy. Left blank the branch is a conversation that has never chatted, so
+  // its launch would take the brancher's *standing* model (#135) — a different
+  // model from the one the estimate was computed for.
+  //
+  // Restated: this asserted the pin landed on `chatModelOverride`, which the
+  // adversarial review caught as two defects in one. An override is something
+  // the *user* said, so the branch's picker would report a model nobody chose
+  // as "chosen for this conversation" and offer a clear that wipes the account's
+  // standing choice with it. And reading the profile is the wrong question
+  // anyway — see the test below, where the source never ran on the profile.
+  it('pins a branch of a profile-defaulted conversation to that profile’s model', async function () {
+    activeProfile = { profileName: 'House', model: 'profile-model' };
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+
+    const made = await branch('source', 'turn-1');
+    const branched = sessions.get(made.body.sessionId);
+
+    assert.strictEqual(branched.chatModelPinned, 'profile-model');
+    assert.strictEqual(
+      branched.chatModelOverride,
+      undefined,
+      'nobody chose this model, so the picker must not report it as a choice',
+    );
+  });
+
+  // The half the profile lookup could never answer. A source launched on the
+  // account's standing choice ran on *that*, not on the profile — and the
+  // profile is what the old code copied, so the branch opened on a different
+  // model from the one its carried history had just been measured against.
+  it('pins a branch to the model its source actually ran, not to the profile', async function () {
+    activeProfile = { profileName: 'House', model: 'profile-model' };
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+    // What a launch leaves behind: this source opened on the account's standing
+    // choice, which outranks the profile.
+    sessions.get('source').chatModelPinned = 'claude-opus-4-6';
+
+    const made = await branch('source', 'turn-1');
+
+    assert.strictEqual(sessions.get(made.body.sessionId).chatModelPinned, 'claude-opus-4-6');
+  });
+
+  // A source that ran bare is an answer too, and one the profile must not be
+  // allowed to overwrite: the branch inherits "no model flag at all".
+  it('carries a source that launched with no model flag as exactly that', async function () {
+    activeProfile = { profileName: 'House', model: 'profile-model' };
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+    sessions.get('source').chatModelPinned = null;
+
+    const made = await branch('source', 'turn-1');
+
+    assert.strictEqual(sessions.get(made.body.sessionId).chatModelPinned, null);
+  });
+
+  it('leaves a branch unpinned when there is no profile either, so the runtime still decides', async function () {
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+
+    const made = await branch('source', 'turn-1');
+    const branched = sessions.get(made.body.sessionId);
+
+    assert.strictEqual(branched.chatModelOverride, undefined);
+    assert.strictEqual(branched.chatModelPinned, undefined);
   });
 
   // What the record holds is only half of it. A branch used to *always* ask,

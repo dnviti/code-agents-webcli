@@ -82,6 +82,20 @@ export interface SessionRoutesDeps {
   /** Tear down the scrollback emulator held for a session. */
   disposeRecorder(sessionId: string): void;
   getSelectedWorkingDir(userId: number): string | null;
+  /**
+   * The active profile for a runtime, read without writing its tier files.
+   *
+   * Only the branch needs it, and only as the last resort behind the source's
+   * own recorded model — see there. Deliberately not paired with a reader for
+   * the account's standing choice: the source's record already says which model
+   * it ran, whichever layer decided it, and asking the layers again would answer
+   * a different question than "what was this history measured against".
+   *
+   * Optional so the hand-built deps literals in the existing tests keep
+   * compiling; a server without one simply pins nothing for a source recorded
+   * before pins existed, which is what branching did before.
+   */
+  activeProfileFor?(runtime: string): { profileName: string; model?: string } | null;
   sessionStore: {
     getSessionMetadata(): Promise<any>;
   };
@@ -528,6 +542,33 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       // Copying the source's grant would instead let one old answer spread from
       // conversation to conversation, outliving the preference that produced it.
       branch.chatModelOverride = source.chatModelOverride;
+      // A source with no override of its own still has to arrive fixed, not
+      // blank: a blank branch is a conversation that has never chatted, so its
+      // launch would take the brancher's *standing* model (#135) — a different
+      // model from the one the history above was just measured against, which
+      // is the one thing this route is not allowed to get wrong.
+      //
+      // What the source is fixed to, not what any default now says. The pin the
+      // source's own launch left is the only record of which model it actually
+      // ran, and it already accounts for every layer that decided it — a
+      // standing choice, a profile, or nothing at all. Asking the profile again
+      // here would answer a different question, and would answer it wrongly for
+      // every source that was launched on a standing choice instead.
+      //
+      // As a pin rather than as an override, because the user chose nothing:
+      // an override would make the branch's picker report a model as "chosen for
+      // this conversation" and offer a clear that wipes the account's standing
+      // choice along with it.
+      //
+      // The profile stays as the last resort, for a source recorded before pins
+      // existed: it has no pin to copy and the profile is what it launched on.
+      // Tested against `undefined` rather than with `??`, because a source
+      // pinned to `null` ran with no model flag at all and the branch has to
+      // inherit that answer instead of picking up a profile the source never had.
+      branch.chatModelPinned =
+        source.chatModelPinned !== undefined
+          ? source.chatModelPinned
+          : deps.activeProfileFor?.(source.lastAgent || '')?.model;
       branch.chatEffortOverride = source.chatEffortOverride;
 
       const ref = { id: sessionId, ownerUserId: user.id };

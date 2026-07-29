@@ -335,6 +335,7 @@ async function run(): Promise<void> {
   await checkATurnCanBeBranchedFromItsHeader();
   await checkAConversationTellsOneStoryAboutItsTokens();
   await checkTheModelShownIsTheModelThatRan();
+  await checkTheModelPickerSaysWhereTheDefaultCameFrom();
   await checkTheEffortChipSaysAndSetsHowHardTheAgentThinks();
   await checkARememberedLevelSeedsOnlyFreshWorkAndSurvivesAReload();
   await checkTheContextReadingIsHonestAboutItsCeiling();
@@ -8145,6 +8146,215 @@ async function checkTheModelShownIsTheModelThatRan(): Promise<void> {
 
   phoneRoot.unmount();
   phone.remove();
+}
+
+/**
+ * The picker says which of the three defaults put this model in force.
+ *
+ * A model reaches a conversation three ways — this chat's own pick, the
+ * account's standing choice, and the active runtime profile — and until #135
+ * the control said nothing about which. The profile case was the worst of them:
+ * the pin was genuinely applied to every launch and the chip read the literal
+ * word "model", so a user could neither see it nor tell why their agent was on
+ * a model they had not chosen.
+ *
+ * Here rather than in the unit tests because the sentence lives inside a menu
+ * that only exists after a click, and because "rendered" is not the claim — a
+ * line at `opacity: 0` drops silently out of every geometry sweep instead of
+ * failing one. The box, the paint and the type size are all measured.
+ */
+async function checkTheModelPickerSaysWhereTheDefaultCameFrom(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:600px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const capabilities = {
+    streaming: true, thinking: false, toolCalls: false, diffs: false, permissions: false,
+    interrupt: true, resume: true, fork: false, attachments: false, usage: true,
+    cost: true, plan: false,
+    models: [
+      { value: 'grok-build', name: 'grok-build' },
+      { value: 'grok-4.5', name: 'grok-4.5' },
+    ],
+  };
+
+  let redraw = (): void => {};
+  const controller = new ChatController('model-source', {
+    send: () => {},
+    onChange: () => redraw(),
+  } as never);
+  // A conversation that has run no turn, so the runtime has named no model —
+  // which is exactly the state in which the pin used to be invisible. Launched
+  // on the profile's model, which is what `modelPinned` records: the *default*
+  // is not evidence that this conversation is on it, and using it as such was
+  // the review's third finding.
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'model-source',
+    modelOverride: null,
+    modelPinned: 'grok-4.5',
+    modelDefault: { model: 'grok-4.5', source: 'profile', profileName: 'House' },
+    snapshot: {
+      sessionId: 'model-source', runtime: 'grok', state: 'idle', capabilities,
+      messages: [], pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 0,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  const paint = (): void => {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'grok',
+        runtimeLabel: 'Grok',
+        workingDir: '/tmp/project',
+        view: DEFAULT_CHAT_VIEW,
+        onViewChange: () => {},
+      } as never),
+    );
+  };
+  paint();
+  redraw = paint;
+  await wait(300);
+
+  const chip = (): HTMLElement | null => host.querySelector('[aria-label="Change model"]');
+  check(
+    'a model pinned by a profile is named on the chip instead of the word “model”',
+    (chip()?.textContent ?? '').includes('grok-4.5'),
+    (chip()?.textContent ?? '').trim() || 'empty',
+  );
+
+  // The other half, and the one the chip got wrong: a standing choice that was
+  // never applied to this conversation is a fact about the *next* new chat, so
+  // naming it here would put a model on the chip that this conversation is not
+  // running and never will be. Sent as a rejoin, because that is how it reaches
+  // an open tab — the account picked a model somewhere else.
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'model-source',
+    modelOverride: null,
+    // This conversation launched with no model flag at all.
+    modelPinned: null,
+    modelDefault: { model: 'grok-4.5', source: 'personal' },
+    snapshot: {
+      sessionId: 'model-source', runtime: 'grok', state: 'idle', capabilities,
+      messages: [], pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 0,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+  await wait(250);
+  check(
+    'a standing choice this conversation was never launched on stays off the chip',
+    (chip()?.textContent ?? '').trim() === 'model',
+    (chip()?.textContent ?? '').trim() || 'empty',
+  );
+
+  // Back to the profile-launched conversation the rest of this check is about.
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'model-source',
+    modelOverride: null,
+    modelPinned: 'grok-4.5',
+    modelDefault: { model: 'grok-4.5', source: 'profile', profileName: 'House' },
+    snapshot: {
+      sessionId: 'model-source', runtime: 'grok', state: 'idle', capabilities,
+      messages: [], pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 0,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+  await wait(250);
+
+  const sourceLine = (): HTMLElement | null => host.querySelector('[data-model-source]');
+  chip()?.click();
+  await wait(250);
+  settle(host.ownerDocument);
+
+  const line = sourceLine();
+  check(
+    'and the menu says where it came from',
+    (line?.textContent ?? '').includes('House') && (line?.textContent ?? '').includes('grok-4.5'),
+    (line?.textContent ?? '').trim() || 'no source line in the open menu',
+  );
+  // Not `isPainted` alone: it answers false for a line that is not there and
+  // false for one that is invisible, and those want different words.
+  const lineBox = line?.getBoundingClientRect();
+  const hostBox = host.getBoundingClientRect();
+  check(
+    'the source line is actually on screen, not merely in the markup',
+    Boolean(line)
+      && isPainted(line!)
+      && lineBox!.top >= hostBox.top - 1
+      && lineBox!.bottom <= hostBox.bottom + 1,
+    line
+      ? `${Math.round(lineBox!.width)}x${Math.round(lineBox!.height)} at ${Math.round(lineBox!.top)}–${Math.round(lineBox!.bottom)}, surface ${Math.round(hostBox.top)}–${Math.round(hostBox.bottom)}, opacity ${window.getComputedStyle(line).opacity}, visibility ${window.getComputedStyle(line).visibility}`
+      : 'no source line',
+  );
+  // Measured against the list it explains rather than against a number picked
+  // here: the desktop scale in this menu bottoms out at 10px for captions, and
+  // a sentence that explains every entry underneath it must not be set smaller
+  // than those entries. The phone floor is swept separately, by the type-scale
+  // rules that walk the whole composer.
+  const optionSize = (): number => {
+    const option = host.querySelector('[role="listbox"][aria-label="Models"] [role="option"]');
+    return option ? parseFloat(window.getComputedStyle(option).fontSize) || 0 : 0;
+  };
+  const lineSize = line ? parseFloat(window.getComputedStyle(line).fontSize) || 0 : 0;
+  check(
+    'and set no smaller than the models it is explaining',
+    lineSize > 0 && lineSize >= optionSize() - 0.01,
+    `${lineSize}px against the list's ${optionSize()}px`,
+  );
+
+  // The way back has to say what it will do, because what it does to a standing
+  // choice is forget it rather than fall back to it.
+  const clearEntry = Array.from(
+    host.querySelectorAll<HTMLElement>('[role="listbox"][aria-label="Models"] [role="option"]'),
+  ).find((row) => (row.textContent ?? '').includes('Use the default for this runtime'));
+  check(
+    'the clear entry says what clearing would land on',
+    (clearEntry?.getAttribute('title') ?? '').includes('House'),
+    clearEntry?.getAttribute('title') ?? 'no clear entry',
+  );
+
+  document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+  await wait(150);
+
+  // Now the account's own choice, arriving the way a pick answers rather than
+  // on a rejoin: the line has to follow the click, or it spends the rest of the
+  // conversation describing the state before it.
+  controller.handle({
+    type: 'chat_model_result',
+    sessionId: 'model-source',
+    model: 'grok-build',
+    applied: 'live',
+    message: 'Switched to grok-build for this conversation.',
+    modelDefault: { model: 'grok-build', source: 'personal' },
+  } as never);
+  await wait(250);
+
+  chip()?.click();
+  await wait(250);
+  settle(host.ownerDocument);
+  const picked = sourceLine();
+  check(
+    'after a pick the menu describes the state the click produced, not the launch',
+    (picked?.textContent ?? '').includes('Chosen for this conversation only')
+      && (picked?.textContent ?? '').includes('forgets grok-build'),
+    (picked?.textContent ?? '').trim() || 'no source line after the pick',
+  );
+  check(
+    'and it is still painted, at a readable size, in the state it changed into',
+    Boolean(picked)
+      && isPainted(picked!)
+      && (parseFloat(window.getComputedStyle(picked!).fontSize) || 0) >= optionSize() - 0.01,
+    picked
+      ? `${Math.round(picked.getBoundingClientRect().width)}x${Math.round(picked.getBoundingClientRect().height)} at ${window.getComputedStyle(picked).fontSize}`
+      : 'no source line',
+  );
+
+  root.unmount();
+  host.remove();
 }
 
 /**

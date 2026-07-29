@@ -373,6 +373,13 @@ export class ClaudeCodeWebServer {
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
       resolveRuntimeProfile: (agentKind: AgentKind, workingDir: string) =>
         this.resolveRuntimeProfile(agentKind, workingDir),
+      activeProfileFor: (runtime: string) => this.activeProfileFor(runtime),
+      getUserModelDefault: (userId: number, runtime: string) =>
+        this.database.getUserSetting(userId, `chatModel:${runtime}`),
+      setUserModelDefault: (userId: number, runtime: string, model: string | null) => {
+        if (model) this.database.setUserSetting(userId, `chatModel:${runtime}`, model);
+        else this.database.deleteUserSetting(userId, `chatModel:${runtime}`);
+      },
       getUserPreferences: (userId: number) => this.userPreferences.get(userId),
       transcriptStore: this.transcriptStore,
       historyStore: this.historyStore,
@@ -523,6 +530,20 @@ export class ClaudeCodeWebServer {
       extraArgs: extraArgs.length ? extraArgs : undefined,
       env: profile.env,
     };
+  }
+
+  /**
+   * The active profile for a runtime, and nothing written down.
+   *
+   * The read-only half of `resolveRuntimeProfile` above, which cannot serve
+   * this: it writes the profile's tier files every time it is called, and the
+   * callers here are questions — a browser joining a conversation, a branch
+   * being cut — not launches. Answering them through the other one would
+   * rewrite a runtime's config on every tab that opened.
+   */
+  private activeProfileFor(runtime: string): { profileName: string; model?: string } | null {
+    const profile = this.runtimeProfiles.activeFor(runtime);
+    return profile ? { profileName: profile.name, model: profile.model } : null;
   }
 
   /**
@@ -720,6 +741,7 @@ export class ClaudeCodeWebServer {
       getSelectedWorkingDir: (userId: number) => this.getSelectedWorkingDir(userId),
       setSelectedWorkingDir: (userId: number, value: string | null) =>
         this.setSelectedWorkingDir(userId, value),
+      activeProfileFor: (runtime: string) => this.activeProfileFor(runtime),
       createSessionRecord: (params) => this.createSessionRecord(params),
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
       saveSessionsToDisk: () => this.saveSessionsToDisk(),

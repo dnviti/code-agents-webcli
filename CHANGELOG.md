@@ -3,6 +3,67 @@
 ## [Unreleased]
 
 ### Fixed
+- **The model you pick is remembered for that agent, and the picker says where
+  it came from** (#135). Choosing a model in a chat used to last exactly as long
+  as that conversation. Open a new one on the same agent and you were back on
+  whatever the CLI does by default, picking again — while the effort control
+  right beside it had been remembering its setting per runtime for two releases.
+
+  A model chosen in a chat is now your standing choice for that agent, and the
+  next new chat opens on it. Three things can decide the model, and they are
+  consulted in this order: whatever *this conversation* was set to, then your
+  standing choice for the agent, then the active runtime profile. Below all
+  three the CLI is launched with no model flag at all and uses its own default.
+
+  A conversation already under way is never re-modelled. Every chat records the
+  model its launch actually used, and that recorded model is what it comes back
+  on — so a relaunch, a resume from the launcher and the recovery banner's
+  restart all return to the model that conversation was already using, including
+  after a server restart, which is the moment every open conversation gets
+  relaunched. Changing your standing choice, or the active profile, affects the
+  next new chat and nothing that is open. A conversation that launched with no
+  model flag at all keeps that too: a profile added afterwards does not reach
+  back into it.
+
+  **The picker now says which of the three is in force**, in a line above the
+  list and on the chip's hover. Before this, a model pinned by a runtime profile
+  was genuinely applied to every launch and nowhere on screen: until the agent
+  reported a model of its own, the chip read the literal word "model". It now
+  names the model *this conversation was launched on* — never a default it was
+  not launched on, which would change under an open chat every time you picked a
+  model in another tab — and says where the default came from: a profile, by
+  name; your own last choice; or nobody, in which case the runtime picks. When
+  the two differ the line says which model the conversation is staying on.
+
+  **Use the default for this runtime** clears the conversation's choice *and*
+  forgets your standing one, so the next new chat falls back to the profile and
+  then to the CLI's own default. That is deliberate, and it is what makes the
+  entry worth having: nothing else in the app can undo a standing choice, and a
+  model id typed with a typo would otherwise ride into every new chat on that
+  runtime. For the same reason, a name is only promoted to a standing choice
+  when the runtime is known to take it — the switch applied live, or the name is
+  on the list the runtime published. A runtime that publishes no list at all
+  (Claude is one) has nothing to check against, so a name typed there is taken
+  at face value.
+
+  Your standing choice lives on the server, scoped to your account, so it
+  travels between your phone and your desk and is not readable from anyone
+  else's. Effort is kept per browser instead, and the difference is not taste:
+  Claude, Codex and pi fix the model when the process starts, so a preference
+  held in the browser could only be applied after the launch — which on Claude
+  means a visible `/model` turn pushed into a conversation nobody has typed in
+  yet.
+
+  Runtime profiles are not weakened by this and not going anywhere. They were
+  never a pin a user could not escape — a conversation's own choice has
+  outranked them since the picker existed — and they remain the shared default
+  for everybody who has not chosen. Two things deliberately did not change:
+  terminal sessions, which run the CLI's own interface where the model is yours
+  to change inside the tool, and the launcher screen before a chat starts, which
+  has no model control for the new line to sit in. Branching is unaffected: a
+  branch opens on the model its source was actually running — the one the
+  carried history was just measured against — whether that came from a choice,
+  from your standing one, from the profile, or from nothing at all.
 - **The Web chat approvals switch now reaches every way of starting a
   conversation, and holds for you rather than for the browser you set it in**
   (#134). It reached exactly one: the chat button on the runtime launcher.
