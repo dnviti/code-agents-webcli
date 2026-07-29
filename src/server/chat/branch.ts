@@ -59,6 +59,7 @@ const CARRIED: ReadonlySet<string> = new Set([
   'tool',
   'agent_step',
   'agent_progress',
+  'workflow_progress',
   'turn_end',
   'marker',
 ]);

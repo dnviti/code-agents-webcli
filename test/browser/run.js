@@ -29,6 +29,31 @@ if (!fs.existsSync(path.join(dir, '..', '..', 'dist', 'public', 'css', 'componen
   process.exit(1);
 }
 
+// What a real workflow reports, in the form the browser receives it (#117).
+//
+// Derived here rather than written into checks.ts, because a check driven by
+// events someone typed out proves the component agrees with that person. The
+// recording is test/fixtures/chat/claude-workflow.jsonl — a real two-phase run
+// captured off the wire — and this replays it through the adapter that would
+// have carried it, so the browser gets exactly what a browser would have got.
+// Generated on every run, so it can never drift from either end.
+{
+  const { ClaudeChatAdapter } = require('../../dist/server/chat/adapters/claude.js');
+  const events = [];
+  const adapter = new ClaudeChatAdapter({
+    sessionId: 'browser-check',
+    workingDir: '/tmp',
+    command: 'claude',
+    emit: (event) => events.push(event),
+  });
+  fs.readFileSync(path.join(dir, '..', 'fixtures', 'chat', 'claude-workflow.jsonl'), 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .forEach((message) => adapter.handleMessage(message));
+  fs.writeFileSync(path.join(dir, 'workflow-events.json'), JSON.stringify(events));
+}
+
 // The esbuild `bin` entry is a native executable, not a script: use the API.
 //
 // Minified, at the shipped target: the settings are half of what is under test.

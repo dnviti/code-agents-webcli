@@ -14,7 +14,14 @@
  * before it is called one.
  */
 
-import type { ChatMessage, ToolBlock, ToolStatus } from './chat-events.js';
+import type {
+  AgentRun,
+  ChatMessage,
+  ToolBlock,
+  ToolStatus,
+  WorkflowAgent,
+  WorkflowPhase,
+} from './chat-events.js';
 
 /** One heading and the lines under it, as best a workflow's log can be read. */
 export interface WorkflowLogSection {
@@ -41,6 +48,44 @@ export interface AgentActivity {
   durationMs?: number;
   /** True while the call has not reported a terminal status. */
   running: boolean;
+  /**
+   * How many agents this holds, and how many are still going.
+   *
+   * Only a workflow that has reported its structure has these. Left undefined
+   * rather than zeroed for everything else, so the list can tell "a workflow
+   * with no agents left running" apart from "a sub-agent, which contains
+   * nothing by definition" — a row reading `0 running` for a plain delegation
+   * would be a count of something that was never there.
+   */
+  agentCount?: number;
+  agentsRunning?: number;
+}
+
+/** One phase of a workflow, with the agents the run put inside it. */
+export interface WorkflowPhaseView {
+  /** Null for agents the run started outside any phase. */
+  phase: WorkflowPhase | null;
+  agents: WorkflowAgent[];
+  /**
+   * Derived from the agents, because the runtime reports a phase once and
+   * never says how it ended. A phase with nothing in it has not started.
+   */
+  state: 'waiting' | 'running' | 'finished';
+  failed: number;
+}
+
+/** A workflow run, grouped and counted for display. */
+export interface WorkflowSummary {
+  phases: WorkflowPhaseView[];
+  total: number;
+  queued: number;
+  running: number;
+  done: number;
+  failed: number;
+  /** The phase the run is working in now, or null between and after them. */
+  current: WorkflowPhaseView | null;
+  /** True when the run has reported no phases and no agents. */
+  empty: boolean;
 }
 
 const WORKFLOW_PATTERN = /workflow/i;
@@ -119,16 +164,26 @@ export function collectAgentActivity(messages: ChatMessage[]): AgentActivity[] {
       seen.add(block.toolId);
 
       const input = readInput(block);
+      const inside = block.agent?.workflow;
       activity.push({
         toolId: block.toolId,
         kind,
         tool: block.name,
-        name: firstString(input, ['subagent_type', 'agent_type', 'name', 'workflow', 'agentType']),
+        name:
+          firstString(input, ['subagent_type', 'agent_type', 'name', 'workflow', 'agentType'])
+          // The run's own name, for the ordinary case where the call carries an
+          // inline script and no name at all.
+          ?? block.agent?.workflowName
+          ?? null,
         description: describe(block, input),
         status: block.status,
         startedAt: message.ts,
         durationMs: block.durationMs,
         running: !TERMINAL.has(block.status),
+        agentCount: inside ? inside.agents.length : undefined,
+        agentsRunning: inside
+          ? inside.agents.filter((agent) => !SETTLED.has(agent.state)).length
+          : undefined,
       });
     }
   }
@@ -139,6 +194,76 @@ export function collectAgentActivity(messages: ChatMessage[]): AgentActivity[] {
 /** How many are still going, for the panel's badge. */
 export function countRunning(activity: AgentActivity[]): number {
   return activity.reduce((total, entry) => total + (entry.running ? 1 : 0), 0);
+}
+
+const SETTLED: ReadonlySet<string> = new Set(['done', 'failed']);
+
+/**
+ * A workflow run, grouped into its phases and counted.
+ *
+ * Every declared phase appears, in the run's own order, whether or not it has
+ * started anything — the point of the list is to show what the run is going to
+ * do as much as what it has done. Agents keep the order the run started them
+ * in, which is the order the reader watched them appear.
+ *
+ * An agent whose phase is not among the reported ones still gets a row: a
+ * `phase()` called from inside a stage names itself on the agent before the
+ * phase list catches up, and dropping it would hide a working agent because
+ * its heading was late.
+ */
+export function summarizeWorkflow(run: AgentRun | null | undefined): WorkflowSummary {
+  const phases = run?.workflow?.phases ?? [];
+  const agents = run?.workflow?.agents ?? [];
+
+  const groups = new Map<number | null, WorkflowPhaseView>();
+  const order: (number | null)[] = [];
+  const group = (key: number | null, phase: WorkflowPhase | null): WorkflowPhaseView => {
+    let found = groups.get(key);
+    if (!found) {
+      found = { phase, agents: [], state: 'waiting', failed: 0 };
+      groups.set(key, found);
+      order.push(key);
+    }
+    // A phase reported after one of its agents fills in the heading that agent
+    // could only guess at from `phaseTitle`.
+    if (phase && !found.phase) found.phase = phase;
+    return found;
+  };
+
+  for (const phase of phases) group(phase.index, phase);
+  for (const agent of agents) {
+    const key = agent.phaseIndex ?? null;
+    const view = group(
+      key,
+      key === null
+        ? null
+        : { index: key, title: agent.phaseTitle || `Phase ${key}` },
+    );
+    view.agents.push(agent);
+  }
+
+  const counts = { queued: 0, running: 0, done: 0, failed: 0 };
+  for (const view of groups.values()) {
+    let live = false;
+    for (const agent of view.agents) {
+      counts[agent.state] += 1;
+      if (agent.state === 'failed') view.failed += 1;
+      if (!SETTLED.has(agent.state)) live = true;
+    }
+    view.state = live ? 'running' : view.agents.length > 0 ? 'finished' : 'waiting';
+  }
+
+  const ordered = order.map((key) => groups.get(key) as WorkflowPhaseView);
+  return {
+    phases: ordered,
+    total: agents.length,
+    ...counts,
+    // The last one working, not the first: a pipeline keeps an earlier phase
+    // open while a later one starts, and the run is further along than the
+    // earliest thing still in flight.
+    current: [...ordered].reverse().find((view) => view.state === 'running') ?? null,
+    empty: phases.length === 0 && agents.length === 0,
+  };
 }
 
 /**

@@ -318,6 +318,24 @@ function assignDefined<T extends object>(target: T, patch: Partial<T>): void {
   }
 }
 
+/**
+ * Fold a reported list into the one already held, keyed by `index`.
+ *
+ * The runtime sends a complete snapshot on some reports and nothing at all on
+ * others, so an absent list leaves what is known standing rather than emptying
+ * it. Rows arrive in the order they were started and keep it: an agent that
+ * reports again is written back in place, so watching a run does not shuffle
+ * the list under the reader.
+ */
+function upsertByIndex<T extends { index: number }>(target: T[], incoming: T[] | undefined): void {
+  if (!incoming) return;
+  for (const entry of incoming) {
+    const at = target.findIndex((held) => held.index === entry.index);
+    if (at >= 0) target[at] = entry;
+    else target.push(entry);
+  }
+}
+
 function omitUndefined<T extends object>(value: T): Partial<T> {
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value)) {
@@ -574,6 +592,20 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       if (!found) return NO_CHANGE;
       const [messageIndex, run] = found;
       assignDefined(run, event.patch);
+      return { messageIndex, structural: false, meta: false, applied: true };
+    }
+
+    case 'workflow_progress': {
+      const found = locateAgentRun(state, event.parentToolId);
+      if (!found) return NO_CHANGE;
+      const [messageIndex, run] = found;
+      if (!run.workflow) run.workflow = { phases: [], agents: [] };
+      // Replaced by index, not merged into: each entry the runtime sends is
+      // that agent's whole current state, and a retry clears fields — the
+      // `error` of a first attempt above all — by omitting them. Merging would
+      // leave a row reading "failed" while its second attempt was working.
+      upsertByIndex(run.workflow.phases, event.phases);
+      upsertByIndex(run.workflow.agents, event.agents);
       return { messageIndex, structural: false, meta: false, applied: true };
     }
 

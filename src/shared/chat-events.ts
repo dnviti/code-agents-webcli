@@ -231,6 +231,99 @@ export interface AgentRun {
   /** What it was asked to do. */
   prompt?: string;
   subagentType?: string;
+  /** The run's own name, when it has one of its own. See `WorkflowRun`. */
+  workflowName?: string;
+  /** The phases and agents inside a workflow. Absent for a plain delegation. */
+  workflow?: WorkflowRun;
+}
+
+/**
+ * One named phase of a workflow run.
+ *
+ * `index` is the run's own numbering, one-based and assigned in the order the
+ * phases were declared or first entered; it is the phase's identity, and how a
+ * later report finds the row it belongs to.
+ *
+ * No state of its own, deliberately. The runtime reports a phase once, when it
+ * is registered, and never again — whether it is waiting, working or finished
+ * is a fact about the agents inside it, and deriving it from them is the only
+ * reading that cannot disagree with the rows underneath.
+ */
+export interface WorkflowPhase {
+  index: number;
+  title: string;
+  /** Carried rather than interpreted: the runtime does not populate it yet. */
+  kind?: string;
+}
+
+/**
+ * How far one agent inside a workflow has got.
+ *
+ * Four words, mapped from the runtime's own (`start` / `progress` / `done` /
+ * `error`), because a fifth spelling of "running" across this codebase is a
+ * fifth thing to keep in step with `ToolStatus`.
+ */
+export type WorkflowAgentState = 'queued' | 'running' | 'done' | 'failed';
+
+/**
+ * One agent a workflow started, as the run reports it while it works.
+ *
+ * Keyed by `index` — the run's own agent number, one-based and stable across
+ * every report about that agent, including a retry. `agentId` changes when an
+ * agent is respawned, so it identifies an attempt rather than a row.
+ */
+export interface WorkflowAgent {
+  index: number;
+  /** The label the script gave it, e.g. `review:bugs`. */
+  label: string;
+  state: WorkflowAgentState;
+  /** Which phase it belongs to. Absent for an agent started outside any. */
+  phaseIndex?: number;
+  phaseTitle?: string;
+  /** The runtime's id for this attempt, not for the row. */
+  agentId?: string;
+  /** A named subagent type, when the script asked for one. */
+  agentType?: string;
+  model?: string;
+  /** Set when the runtime answered on a different model than it was asked for. */
+  fallbackModel?: string;
+  /** `worktree` or `remote`, when the agent runs somewhere of its own. */
+  isolation?: string;
+  /** The opening of what it was asked to do; the run truncates this itself. */
+  prompt?: string;
+  /** The tool it last reached for, and that call in one line. */
+  lastTool?: string;
+  lastToolDetail?: string;
+  tokens?: number;
+  toolCalls?: number;
+  durationMs?: number;
+  startedAt?: number;
+  queuedAt?: number;
+  /** Which try this is; above 1 the run retried it. */
+  attempt?: number;
+  /** Why the last attempt ended, when it ended in a retry. */
+  lastAttemptReason?: string;
+  /** True when the result came from the run's journal, not a fresh agent. */
+  cached?: boolean;
+  /** True when a safety classifier refused to start it. */
+  blocked?: boolean;
+  /** The opening of what it returned. */
+  result?: string;
+  error?: string;
+}
+
+/**
+ * The shape of a workflow run: its phases, and the agents inside them.
+ *
+ * Reported continuously on the same channel as `AgentRun` (see above), as a
+ * complete snapshot each time rather than a delta — which is why the reducer
+ * upserts by index instead of appending. The runtime sends it on some progress
+ * reports and not others, so an absent list means "nothing new to say", never
+ * "the run has no phases".
+ */
+export interface WorkflowRun {
+  phases: WorkflowPhase[];
+  agents: WorkflowAgent[];
 }
 
 export interface ImageBlock {
@@ -742,6 +835,21 @@ export type ChatEvent =
       ts: number;
       parentToolId: string;
       patch: Partial<Omit<AgentRun, 'steps'>>;
+    }
+  /**
+   * The structure of a workflow run, addressed to the call that started it.
+   *
+   * Separate from `agent_progress` because the merge is different: that patch
+   * is a shallow assign over the run, and these are lists whose rows have to
+   * survive a report that does not mention them. See `WorkflowRun`.
+   */
+  | {
+      t: 'workflow_progress';
+      seq: number;
+      ts: number;
+      parentToolId: string;
+      phases?: WorkflowPhase[];
+      agents?: WorkflowAgent[];
     }
   | { t: 'plan'; seq: number; ts: number; items: PlanItem[] }
   | { t: 'usage'; seq: number; ts: number; usage: ChatUsage }

@@ -164,6 +164,23 @@ function ActivityRow({
           <Badge variant={meta.variant} dot={entry.running}>
             {meta.label}
           </Badge>
+          {/* What a workflow holds, which is the thing that made it a different
+              kind of row from a sub-agent in the first place (#117). Only when
+              the run has said — a workflow that reports nothing keeps the row
+              it has always had rather than gaining a hollow "0 agents". */}
+          {entry.agentCount ? (
+            <span
+              style={{
+                fontFamily: 'var(--font-mono)',
+                fontSize: 'var(--text-2xs)',
+                color: entry.agentsRunning ? 'var(--warning)' : 'var(--muted-foreground)',
+              }}
+            >
+              {entry.agentsRunning
+                ? `${entry.agentCount} agents · ${entry.agentsRunning} running`
+                : `${entry.agentCount} agents`}
+            </span>
+          ) : null}
           {entry.durationMs !== undefined ? (
             <span
               style={{

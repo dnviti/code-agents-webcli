@@ -15,6 +15,9 @@ import {
   ChatUsage,
   ToolStatus,
   UserTurn,
+  WorkflowAgent,
+  WorkflowAgentState,
+  WorkflowPhase,
   classifyTool,
   rankedEfforts,
 } from '../../../shared/chat-events.js';
@@ -598,6 +601,10 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
         activity: str(raw.description),
         lastTool: str(raw.last_tool_name),
         subagentType: str(raw.subagent_type),
+        // The workflow's own name, which the tool call itself need not carry:
+        // a run started from an inline `{script}` has no name anywhere in its
+        // arguments, and every one of them was titled "Workflow".
+        workflowName: str(raw.workflow_name),
         prompt: subtype === 'task_started' ? str(raw.prompt) : undefined,
         toolUses: num(usage?.tool_uses),
         totalTokens: num(usage?.total_tokens),
@@ -605,6 +612,75 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
         status: subtype === 'task_started' ? 'running' : undefined,
       },
     });
+
+    this.emitWorkflowProgress(parentToolId, raw.workflow_progress);
+  }
+
+  /**
+   * The phases and agents a workflow reports about itself, forwarded.
+   *
+   * This is the channel issue #45 left unwired for want of a recorded run.
+   * What a run actually sends (captured in test/fixtures/chat/claude-workflow
+   * .jsonl) is a complete snapshot of every phase and agent so far, on *some*
+   * `task_progress` reports and not others — four of ten in that capture carry
+   * no `workflow_progress` key at all. So an absent list is passed on as
+   * absent, and never as an empty one: the reducer would otherwise be asked to
+   * choose between "no phases" and "nothing new", which are opposite facts.
+   */
+  private emitWorkflowProgress(parentToolId: string, reported: unknown): void {
+    if (!Array.isArray(reported)) return;
+
+    const phases: WorkflowPhase[] = [];
+    const agents: WorkflowAgent[] = [];
+
+    for (const raw of reported) {
+      const entry = record(raw);
+      const index = num(entry?.index);
+      if (!entry || index === undefined) continue;
+
+      if (entry.type === 'workflow_phase') {
+        phases.push({ index, title: str(entry.title) ?? `Phase ${index}`, kind: str(entry.kind) });
+        continue;
+      }
+      if (entry.type !== 'workflow_agent') continue;
+
+      agents.push({
+        index,
+        // A label is what the agent is called everywhere it appears; a run
+        // that omitted one would otherwise put a nameless row on the screen.
+        label: str(entry.label) ?? `Agent ${index}`,
+        state: agentState(str(entry.state)),
+        phaseIndex: num(entry.phaseIndex),
+        phaseTitle: str(entry.phaseTitle),
+        agentId: str(entry.agentId),
+        agentType: str(entry.agentType),
+        model: str(entry.model),
+        fallbackModel: str(entry.fallbackModel),
+        isolation: str(entry.isolation),
+        prompt: str(entry.promptPreview),
+        lastTool: str(entry.lastToolName),
+        lastToolDetail: str(entry.lastToolSummary),
+        tokens: num(entry.tokens),
+        toolCalls: num(entry.toolCalls),
+        durationMs: num(entry.durationMs),
+        startedAt: num(entry.startedAt),
+        queuedAt: num(entry.queuedAt),
+        attempt: num(entry.attempt),
+        lastAttemptReason: str(entry.lastAttemptReason),
+        cached: entry.cached === true ? true : undefined,
+        blocked: entry.blocked === true ? true : undefined,
+        result: str(entry.resultPreview),
+        error: str(entry.error),
+      });
+    }
+
+    // `workflow_log` entries travel in the same array and are dropped: they are
+    // the run narrating to itself ("throttled response, sleeping 45s"), the
+    // runtime trims the oldest of them away as the list grows, and the popup
+    // already has the run's own log underneath. Nothing here needs a fourth
+    // list that silently loses its head.
+    if (phases.length === 0 && agents.length === 0) return;
+    this.emit({ t: 'workflow_progress', parentToolId, phases, agents });
   }
 
   private handleInit(raw: Record<string, unknown>): void {
@@ -1279,6 +1355,27 @@ function toolStatus(value: string): ToolStatus {
     case 'pending':
     case 'queued':
       return 'pending';
+    default:
+      return 'running';
+  }
+}
+
+/**
+ * A workflow agent's reported state, in this app's words.
+ *
+ * The runtime's four are `start` (queued or just spawned), `progress`, `done`
+ * and `error`. Anything else becomes `running` for the same reason `toolStatus`
+ * does: an unknown word that settled a row would stop it ever updating again,
+ * while one that leaves it working is corrected by the next report.
+ */
+function agentState(value: string | undefined): WorkflowAgentState {
+  switch (value) {
+    case 'start':
+      return 'queued';
+    case 'done':
+      return 'done';
+    case 'error':
+      return 'failed';
     default:
       return 'running';
   }
