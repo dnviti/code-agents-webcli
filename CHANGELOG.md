@@ -3,6 +3,22 @@
 ## [Unreleased]
 
 ### Fixed
+- **A prompt scrolled back to is drawn once, like every other one** (#129). The
+  double bubble was fixed for live sending and for reopening a conversation, and
+  survived in the one place left: scrolling back far enough that the turn arrives
+  by paging. The rule that catches an echo needs this app's own copy of the
+  prompt and the runtime's copy in front of it together — only
+  `ChatSession.deliver` writes a user message, and it always mints
+  `user-<uuid>`, so a second one in the same turn under a name this app would not
+  have minted is the runtime repeating itself. Every history page is folded on
+  its own, so a page boundary landing in the handful of events between the two
+  hid each from the other and both survived: on a real Oh My Pi conversation the
+  session wrote its message at seq 2485, a `state` event sat at 2488, the echo
+  followed at 2489, and the client's 200-event walk put the boundary on exactly
+  2488. Eleven pages back, the prompt was drawn twice. The same rule is now
+  applied where the pair is finally whole, as pages are merged. Nothing on disk
+  is rewritten — a turn that holds no message this app minted keeps what it has,
+  rather than losing the only prompt it has.
 - **The Status panel stops making up your subscription** (#137). It used to
   open on a plan badge reading `max20`, a meter reading "Tokens 0 of 220.0k"
   and a "Left 220.0k" underneath it. None of that was a fact about anybody's
