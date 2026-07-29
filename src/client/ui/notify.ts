@@ -60,6 +60,8 @@ export interface RaisedAlert {
   name: string;
   /** The command being approved, the question asked, the error. */
   detail?: string;
+  /** What failed, when it was not the turn itself. See `ChatAlert.subject`. */
+  subject?: string;
 }
 
 /** Alerts raised and not yet acted on, oldest first — `Map` keeps insertion order. */
@@ -154,6 +156,15 @@ export function setConversationOpener(handler: (sessionId: string) => void): voi
  */
 export function raiseAlert(alert: RaisedAlert, details: boolean): void {
   quoteDetails = details;
+  // With one exception: a bare "finished" never replaces a failure.
+  //
+  // A workflow that fails while its conversation is still working is followed
+  // by that turn ending normally, seconds later — so the notification saying
+  // something broke was replaced by one saying the conversation was done, which
+  // is true and is not the thing the user needed to hear (#140). The reverse
+  // still replaces: a failure after a finish is news.
+  const standing = outstanding.get(alert.sessionId);
+  if (standing?.kind === 'failed' && alert.kind === 'finished') return;
   // Deleted first so a re-raise moves to the back of the queue: the summary
   // names the conversation that has waited longest, and "longest" should mean
   // since it last had something to say.
@@ -162,8 +173,16 @@ export function raiseAlert(alert: RaisedAlert, details: boolean): void {
   void paint();
 }
 
-/** The user has dealt with this conversation, or it no longer needs them. */
-export function clearAlert(sessionId: string): void {
+/**
+ * The user has dealt with this conversation, or it no longer needs them.
+ *
+ * `keep` spares one kind. Only the conversation going back to work uses it, and
+ * only for `failed`: an approval that started running again was plainly
+ * answered, but a workflow that broke is not un-broken by the agent carrying on
+ * afterwards — which it does, seconds later, in the ordinary case (#140).
+ */
+export function clearAlert(sessionId: string, keep?: ChatAlertKind): void {
+  if (keep && outstanding.get(sessionId)?.kind === keep) return;
   if (!outstanding.delete(sessionId)) return;
   void paint();
 }
@@ -287,8 +306,13 @@ function describe(alert: RaisedAlert): string {
       return detail ? `Waiting for approval — ${detail}` : 'Waiting for approval.';
     case 'question':
       return detail ? `Asked you: ${detail}` : 'Asked you a question.';
-    case 'failed':
-      return detail ? `The turn failed — ${detail}` : 'The turn failed.';
+    case 'failed': {
+      // Named where the thing that failed is not the turn: a background
+      // workflow's turn ended cleanly and some time ago, and telling somebody
+      // "the turn failed" would send them looking at the wrong thing (#140).
+      const what = alert.subject ? `${alert.subject} failed` : 'The turn failed';
+      return detail ? `${what} — ${detail}` : `${what}.`;
+    }
     default:
       return 'Finished, and ready for what is next.';
   }

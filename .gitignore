@@ -18,6 +18,7 @@ dist/
 test-*.js
 test/browser/bundle.js
 test/browser/workflow-events.json
+test/browser/workflow-failed-events.json
 .work/
 .work/
 

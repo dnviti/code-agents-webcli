@@ -7,7 +7,7 @@ import type { TurnSummary } from '../../chat/turns.js';
 import { Button } from '../../ui/relay/Button.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import { usePhone } from '../../ui/touch.js';
-import { MessageBubble, hasVisibleContent } from './MessageBubble.js';
+import { MessageBubble, hasVisibleContent, isRule } from './MessageBubble.js';
 import { TurnStrip } from './TurnStrip.js';
 
 /**
@@ -552,6 +552,15 @@ function rowsOf(messageIds: string[], byId: Map<string, ChatMessage>): Row[] {
     if (!message) continue;
     if (!hasVisibleContent(message)) {
       silent.push(message.id);
+      continue;
+    }
+    // A rule across the conversation cannot speak for the work before it: it
+    // has no action row to put the counter in, so anything handed to it is
+    // dropped rather than carried. The steps go on waiting for the next message
+    // that can. Without this a workflow failing mid-turn took the trace entry
+    // point for its own tool call off the transcript (#140).
+    if (isRule(message)) {
+      rows.push({ message, carriedIds: '' });
       continue;
     }
     rows.push({ message, carriedIds: silent.join(',') });

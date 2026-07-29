@@ -222,6 +222,50 @@ describe('branching a conversation from one of its turns', function () {
     assert.ok(/turn 2/.test(last.detail), last.detail);
   });
 
+  it('carries a workflow that failed, so a branch does not show it as done', async function () {
+    // The launch acknowledgement is what the tool call carries — "Workflow
+    // launched in background", no error — so a branch that replayed only that
+    // would show a run that broke as a green "done" all over again, which is
+    // the bug #140 was about, one conversation along.
+    const events = conversation({ turns: 2 });
+    let seq = events.length;
+    events.push(
+      {
+        t: 'block_start',
+        seq: ++seq,
+        ts: seq,
+        msgId: 'a1',
+        index: 3,
+        block: {
+          kind: 'tool',
+          toolId: 'wf1',
+          name: 'Workflow',
+          toolKind: 'task',
+          status: 'completed',
+          output: 'Workflow launched in background. Task ID: k1',
+        },
+      },
+      {
+        t: 'workflow_failed',
+        seq: ++seq,
+        ts: seq,
+        parentToolId: 'wf1',
+        name: 'nightly-audit',
+        reason: 'usage limit reached',
+      },
+    );
+    await record('source-wf', events);
+
+    const made = await branch('source-wf', 'turn-2');
+    assert.strictEqual(made.status, 200, JSON.stringify(made.body));
+    const carried = await eventsOf(made.body.sessionId);
+
+    const failure = carried.find((event) => event.t === 'workflow_failed');
+    assert.ok(failure, 'the branch dropped the failure and kept only the launch');
+    assert.strictEqual(failure.name, 'nightly-audit');
+    assert.strictEqual(failure.reason, 'usage limit reached');
+  });
+
   it('leaves the conversation it came from untouched', async function () {
     await record('source', conversation({ turns: 4, contextWindow: 200_000 }));
     const before = fs.readFileSync(logPath('source'));

@@ -38,6 +38,7 @@ import { TabSwitcherSheet } from '../../src/client/shell/TabSwitcherSheet';
 import { TabBar } from '../../src/client/ui/relay/TabBar';
 import { MonacoEditor } from '../../src/client/shell/chat/MonacoEditor';
 import { WorkflowPopup } from '../../src/client/shell/chat/WorkflowPopup';
+import { MessageBubble } from '../../src/client/shell/chat/MessageBubble';
 import { monacoStylesApplied } from '../../src/client/chat/monaco';
 import { Toasts } from '../../src/client/shell/Toasts';
 import { shellStore } from '../../src/client/shell/store';
@@ -51,6 +52,15 @@ import { TerminalSplit } from '../../src/client/shell/chat/TerminalSplit';
  * .jsonl on every run — see the note there for why it is not written by hand.
  */
 import RECORDED_WORKFLOW from './workflow-events.json';
+
+/**
+ * A real workflow run that failed, likewise.
+ *
+ * Generated from test/fixtures/chat/claude-workflow-failed.jsonl by the same
+ * replay in test/browser/run.js. Its counterpart above is the control: that run
+ * finished, with one of its five agents dead, and must go on reading as done.
+ */
+import RECORDED_FAILED_WORKFLOW from './workflow-failed-events.json';
 
 const results: string[] = [];
 const check = (name: string, ok: boolean, detail = ''): void => {
@@ -255,6 +265,7 @@ async function run(): Promise<void> {
   await checkAWorkflowPopupBehavesLikeTheFilePopup();
   await checkARunningWorkflowSaysWhatItIsDoing();
   await checkAWorkflowShowsItsPhasesAndItsAgents();
+  await checkAFailedWorkflowReadsAsFailedEverywhere();
   await checkAnAgentPopupShowsWhatTheAgentIsDoing();
   await checkATallDialogStaysOnScreen();
   await checkTheComposerShrinksWithTheWorkspaceRail();
@@ -1050,6 +1061,332 @@ async function checkAWorkflowShowsItsPhasesAndItsAgents(): Promise<void> {
       small.length
         ? small.slice(0, 3).map((entry) => `${entry.text.slice(0, 24)} @ ${entry.size}px`).join(' | ')
         : `${words.length} lines measured`,
+    );
+  }
+
+  phoneRoot.unmount();
+  frame.remove();
+}
+
+/**
+ * Issue #140: a workflow that failed looks failed everywhere it appears, and
+ * the conversation says so without anybody opening anything.
+ *
+ * Both recordings are replayed, because the whole bug lives in the difference
+ * between them and a check driven by one alone would pass on code that painted
+ * every workflow red. They end with the same launching tool result — "Workflow
+ * launched in background", no error — and differ only in what the run said
+ * about itself afterwards.
+ *
+ * The colours are read off the layout engine rather than assumed from the
+ * label: "failed" written in `var(--success)` would satisfy a textContent check
+ * and still be a green badge on a broken run.
+ */
+async function checkAFailedWorkflowReadsAsFailedEverywhere(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1100px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const mount = (
+    id: string,
+    events: Array<Record<string, unknown>>,
+  ): { root: ReturnType<typeof createRoot>; play: (rest: Array<Record<string, unknown>>) => void } => {
+    const controller = new ChatController(id, { send: () => {} });
+    let seq = 1;
+    const play = (batch: Array<Record<string, unknown>>): void => {
+      for (const event of batch) {
+        controller.transcript.apply({ ts: seq, ...event, seq: seq++ } as never);
+      }
+    };
+    play(events);
+    const root = createRoot(host);
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/tmp/project',
+        view: { ...DEFAULT_CHAT_VIEW, panelOpen: true, panelTab: 'agents', panelWidth: 420 },
+        onViewChange: () => {},
+      } as never),
+    );
+    return { root, play };
+  };
+
+  // Cut where the run reported that it had failed, and mount there: that is the
+  // moment somebody watching the conversation is being told, and the turn it
+  // lands in is the one still open. Everything after it is played in below,
+  // with the view already on screen.
+  const failedAt = RECORDED_FAILED_WORKFLOW.findIndex(
+    (event) => (event as { t?: string }).t === 'workflow_failed',
+  );
+  check('the recording still holds a run that failed', failedAt >= 0);
+  // Mounted *before* the agents inside it start dying, so what follows is
+  // judged on a panel that had to redraw rather than one built from the
+  // finished article. The counts arrive on `workflow_progress`, which the
+  // reducer marks neither structural nor meta — a panel on the coarse
+  // subscription tier renders the right thing here and then never moves.
+  const firstReport = RECORDED_FAILED_WORKFLOW.findIndex(
+    (event) => (event as { t?: string }).t === 'workflow_progress',
+  );
+  const { root, play } = mount(
+    'workflow-failed-check',
+    RECORDED_FAILED_WORKFLOW.slice(0, firstReport + 1),
+  );
+  await wait(220);
+  settle(document);
+
+  const early = host.querySelector('aside[aria-label="Workspace"]')?.textContent ?? '';
+  check(
+    'the agents list shows the run before anything has failed',
+    /agents/.test(early) && !/failed/.test(early),
+    early.replace(/\s+/g, ' ').slice(0, 120),
+  );
+
+  // The rest of the reports, and the failure, into a panel already on screen.
+  play(RECORDED_FAILED_WORKFLOW.slice(firstReport + 1, failedAt + 1));
+  await wait(160);
+  settle(document);
+
+  const rail = host.querySelector('aside[aria-label="Workspace"]') as HTMLElement | null;
+  const railText = rail?.textContent ?? '';
+  check(
+    'the agents list says the failed workflow failed',
+    /failed/.test(railText) && !/\bdone\b/.test(railText),
+    railText.slice(0, 160),
+  );
+  check(
+    'the row says how many of its agents died',
+    /2 failed/.test(railText),
+    railText.slice(0, 160),
+  );
+
+  // The badge's colour, from the engine. `--destructive` and `--success` are
+  // different variables and this is the one thing a label cannot prove.
+  const badge = [...(rail?.querySelectorAll('span') ?? [])].find(
+    (el) => el.textContent?.trim() === 'failed' && isPainted(el),
+  ) as HTMLElement | undefined;
+  check('the failed badge is painted', !!badge);
+  const badgeColour = badge ? getComputedStyle(badge).color : '';
+  // Resolved by the engine rather than read off the custom property: the token
+  // is authored in oklch and computes to rgb, so comparing the two as strings
+  // would fail against a badge that is exactly right.
+  const swatch = (token: string): string => {
+    const probe = document.createElement('span');
+    probe.style.color = `var(${token})`;
+    document.body.appendChild(probe);
+    const resolved = getComputedStyle(probe).color;
+    probe.remove();
+    return resolved;
+  };
+  const destructive = swatch('--destructive');
+  const success = swatch('--success');
+  check(
+    'the failed badge is drawn in the destructive colour, not the success one',
+    !!badgeColour && badgeColour === destructive && badgeColour !== success,
+    `${badgeColour} — destructive ${destructive}, success ${success}`,
+  );
+
+  // The chat itself, which is the half of #140 that had no surface at all.
+  const transcriptText = host.querySelector('[role="log"]')?.textContent ?? '';
+  check(
+    'the conversation says the workflow failed, without opening anything',
+    /Workflow "probe-workflow-failure" failed/.test(transcriptText),
+    transcriptText.replace(/\s+/g, ' ').slice(0, 220),
+  );
+  check(
+    'the conversation says why it failed',
+    /forced workflow failure/.test(transcriptText),
+  );
+
+  // The rest of the run, so what follows is judged on a settled conversation
+  // rather than on one caught mid-report.
+  play(RECORDED_FAILED_WORKFLOW.slice(failedAt + 1));
+  await wait(120);
+  settle(document);
+
+  // And the popup's title, which read "done" over a run that had died.
+  (rail?.querySelector('[role="button"]') as HTMLElement | null)?.click();
+  await wait(80);
+  const panel = document.querySelector('[role="dialog"]') as HTMLElement | null;
+  check('the failed workflow still opens', !!panel);
+  const title = panel?.querySelector('h2, [role="heading"]') ?? panel;
+  check(
+    'the popup title badge reads failed',
+    /failed/.test(title?.textContent ?? '') && !/\bdone\b/.test(title?.textContent ?? ''),
+    (title?.textContent ?? '').slice(0, 120),
+  );
+  check(
+    'a phase whose every agent died does not read as finished',
+    !/finished/.test(panel?.textContent ?? ''),
+    (panel?.textContent ?? '').slice(0, 160),
+  );
+
+  root.unmount();
+  host.innerHTML = '';
+
+  // The control: a run that finished, with one of its five agents dead. It must
+  // still read as done, or the fix has traded a missed failure for an invented
+  // one — agents inside a workflow fail by design.
+  //
+  // Mounted before that agent dies, and the rest played in afterwards, because
+  // this is the case that has nothing else to lean on: a run that fails raises
+  // an event the whole panel redraws for, and a run that merely loses an agent
+  // reports it only as `workflow_progress` — which reaches the live
+  // subscription tier and no other. Built from the finished recording this
+  // passed on a panel that could never have redrawn.
+  // Cut at the last report before the agent dies, whichever that is: the run
+  // reports its whole roster each time, and the first report of all already
+  // carries several agents.
+  const deathAt = RECORDED_WORKFLOW.findIndex(
+    (event) =>
+      (event as { t?: string }).t === 'workflow_progress'
+      && ((event as { agents?: Array<{ state?: string }> }).agents ?? []).some(
+        (agent) => agent.state === 'failed',
+      ),
+  );
+  const controlFirst = deathAt - 1;
+  const control = mount('workflow-done-check', RECORDED_WORKFLOW.slice(0, controlFirst + 1));
+  await wait(220);
+  settle(document);
+  const beforeDeath = host.querySelector('aside[aria-label="Workspace"]')?.textContent ?? '';
+  check(
+    'the finished run’s panel starts with nothing failed',
+    /agents/.test(beforeDeath) && !/failed/.test(beforeDeath),
+    beforeDeath.replace(/\s+/g, ' ').slice(0, 120),
+  );
+
+  // Only the run's own reports, which is the window this is about. Between two
+  // structural events a run can report a dozen times, and on the coarse
+  // subscription tier the panel shows none of it until something unrelated
+  // happens to fire — so a check that replayed the whole tail would be proved
+  // right by the next `msg_start` rather than by the panel.
+  control.play(
+    RECORDED_WORKFLOW.slice(controlFirst + 1).filter(
+      (event) => (event as { t?: string }).t === 'workflow_progress',
+    ),
+  );
+  await wait(200);
+  settle(document);
+  const controlRail = host.querySelector('aside[aria-label="Workspace"]') as HTMLElement | null;
+  const controlText = controlRail?.textContent ?? '';
+  check(
+    'a workflow that finished still reads as done',
+    /done/.test(controlText),
+    controlText.slice(0, 160),
+  );
+  check(
+    'and says, without being remounted, that one agent died inside it',
+    /1 failed/.test(controlText),
+    controlText.replace(/\s+/g, ' ').slice(0, 160),
+  );
+  const controlTranscript = host.querySelector('[role="log"]')?.textContent ?? '';
+  check(
+    'a workflow that finished raises no failure in the chat',
+    !/Workflow ".*" failed/.test(controlTranscript),
+  );
+
+  control.root.unmount();
+  host.remove();
+
+  // At a phone's width, where none of this can be reached by a media query.
+  // The failure the conversation now carries is a runtime error verbatim —
+  // three lines of stack trace in the recording — inside an inline-styled
+  // callout, on the narrowest column this app has.
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  // The bubble on its own, at the width it would have, rather than the whole
+  // ChatView: the shell needs a tab strip and a session around it to lay itself
+  // out, and dropped into a bare frame it collapses the transcript column to a
+  // third of the screen — where every measurement below would pass by being too
+  // small to spill rather than by fitting.
+  const phoneHost = doc.createElement('div');
+  phoneHost.style.cssText = 'width:390px;display:flex;flex-direction:column';
+  doc.body.appendChild(phoneHost);
+
+  const narrow = new ChatController('workflow-failed-phone-check', { send: () => {} });
+  let phoneSeq = 1;
+  for (const event of RECORDED_FAILED_WORKFLOW.slice(0, failedAt + 1)) {
+    narrow.transcript.apply({ ts: phoneSeq, ...event, seq: phoneSeq++ } as never);
+  }
+  const failure = narrow.transcript.messages.find(
+    (message) => message.role === 'system' && message.blocks.some((block) => block.kind === 'error'),
+  );
+  check('the failure is a message in the transcript', !!failure);
+  const phoneRoot = createRoot(phoneHost);
+  phoneRoot.render(
+    React.createElement(
+      PhoneContext.Provider,
+      { value: true },
+      React.createElement(MessageBubble, {
+        message: failure,
+        transcript: narrow.transcript,
+      } as never),
+    ),
+  );
+  await wait(200);
+  settle(doc);
+
+  // The innermost match, not the first: every ancestor up to the app root also
+  // contains the text, and measuring one of those would be measuring the
+  // column rather than the callout drawn inside it.
+  const matches = [...doc.querySelectorAll('div')].filter(
+    (el) => /Workflow "probe-workflow-failure" failed/.test(el.textContent ?? '') && isPainted(el),
+  );
+  const callout = matches.find(
+    (el) => !matches.some((other) => other !== el && el.contains(other)),
+  ) as HTMLElement | undefined;
+  check('the failure reaches the phone’s transcript too', !!callout);
+
+  // Drawn as a line across the conversation, not as a turn. The identical
+  // callout renders either way, so every text assertion above passes on a
+  // failure wrapped in the assistant's chrome — an avatar, a copy button and
+  // an "Assistant message" label around something the assistant never said.
+  check(
+    'and is not dressed up as something the agent said',
+    !doc.querySelector('article'),
+    doc.querySelector('article')?.getAttribute('aria-label') ?? 'no article',
+  );
+  check(
+    'and carries no message controls',
+    doc.querySelectorAll('button').length === 0,
+    `${doc.querySelectorAll('button').length} buttons`,
+  );
+  check(
+    'and says when it happened, unlike every other rule',
+    /\d{1,2}:\d{2}/.test(doc.body.textContent ?? ''),
+    (doc.body.textContent ?? '').replace(/\s+/g, ' ').slice(-40),
+  );
+  if (callout) {
+    const spilled = [...callout.querySelectorAll('*')].filter(
+      (el) => isPainted(el) && el.getBoundingClientRect().right > 391,
+    );
+    check(
+      'and a stack trace inside it does not run off the screen',
+      spilled.length === 0 && callout.getBoundingClientRect().right <= 391,
+      spilled.length
+        ? spilled.slice(0, 2).map((el) => `${(el.textContent ?? '').slice(0, 24)} → ${Math.round(el.getBoundingClientRect().right)}px`).join(' | ')
+        : `${Math.round(callout.getBoundingClientRect().width)}x${Math.round(callout.getBoundingClientRect().height)} inside ${Math.round(phoneHost.getBoundingClientRect().width)}px`,
+    );
+    const small = paintedText(callout).filter((entry) => entry.size < PHONE_MIN_TEXT - 0.01);
+    check(
+      'and it is written above the phone’s type floor',
+      small.length === 0,
+      small.length
+        ? small.slice(0, 2).map((entry) => `${entry.text.slice(0, 24)} @ ${entry.size}px`).join(' | ')
+        : 'measured',
     );
   }
 

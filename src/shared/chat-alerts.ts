@@ -56,6 +56,14 @@ export interface ChatAlert {
    */
   detail?: string;
   /**
+   * What failed, when it was not the turn.
+   *
+   * A workflow outlives the turn that launched it, so "the turn failed" is the
+   * wrong sentence for one: the turn it came from finished, cleanly, minutes
+   * ago. Left unset everywhere else, where the turn is exactly what failed.
+   */
+  subject?: string;
+  /**
    * True when the conversation is stopped until somebody answers.
    *
    * The difference matters after the notification: a blocked conversation goes
@@ -103,6 +111,19 @@ export function alertForEvent(event: ChatEvent): ChatAlert | null {
       // user most wants to hear about. Non-fatal errors are left alone: they
       // are things the agent says and then carries on past.
       return event.fatal ? { kind: 'failed', detail: event.message, blocking: false } : null;
+
+    case 'workflow_failed':
+      // The case the turn-ending rules above cannot cover. A background
+      // workflow's turn ends `end_turn`, successfully, while the run goes on
+      // for another twenty minutes — so nothing about how the turn concluded
+      // will ever say the work failed, and somebody in another conversation
+      // would never find out (#140).
+      return {
+        kind: 'failed',
+        detail: event.reason,
+        subject: event.name ? `The workflow "${event.name}"` : 'A workflow',
+        blocking: false,
+      };
 
     default:
       return null;

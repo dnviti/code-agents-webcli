@@ -342,7 +342,7 @@ export function SettingsDialog({
             onChange={(checked) => updateNotify({ finished: checked })}
           />
           <Switch
-            label="A turn fails"
+            label="A turn or workflow fails"
             checked={draft.notifications.failed}
             disabled={!draft.notifications.enabled}
             onChange={(checked) => updateNotify({ failed: checked })}

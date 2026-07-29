@@ -3,6 +3,53 @@
 ## [Unreleased]
 
 ### Fixed
+- **A workflow that failed no longer reads as done** (#140). The Workflow tool
+  returns the moment a run is launched — "Workflow launched in background", no
+  error, four seconds before anything has happened — and that acknowledgement
+  was the only thing the app ever heard about how the run went. So a workflow
+  that hit a usage limit, lost its runtime, or threw halfway through wore a
+  green **done** badge on its row and in its popup title, and the conversation
+  said nothing at all. In a run that takes twenty minutes in the background,
+  that is a task you believe finished.
+
+  The run does say how it ended. It says it twice, on a channel this app was
+  listening to and one it was not: `task_updated` carries the raw error, and
+  `task_notification` — which used to be dropped with the hook plumbing —
+  carries a sentence. Either now settles the call that launched the run, so the
+  row, the popup title and the tool call on the trace rail all read **failed**,
+  with the reason's first line on the row itself rather than a badge that makes
+  you open a popup to learn what broke. The conversation gets a message saying
+  so, filed under the turn on screen rather than behind a fold, carrying the
+  reason as a sentence — the stack frames stay on the run, where the popup
+  shows them.
+
+  Somebody in another conversation is told, in the same notification a failed
+  turn raises and under the same switch, now labelled "a turn or workflow
+  fails" — because a background run's own turn ended cleanly and some time ago.
+  That notification survives the conversation carrying on, which is the
+  ordinary case: a run that breaks mid-turn is followed within seconds by that
+  turn ending normally. The tab raises its unread mark too, for the browsers
+  where notification permission was never granted.
+
+  **Agents inside a workflow are counted, not promoted.** A thrown agent
+  resolves to `null` rather than failing the run — a script that probes for
+  failures expects some — so a run that returned a result still reads as done,
+  with `2 failed` beside it in red and the phase they died in marked failed.
+  Only a run that reports its own failure is a failed run. The same rule the
+  transcript already applies to a step that failed inside a turn that did not.
+
+  Verified against two recordings of real runs rather than a hand-written
+  example of one: `claude-workflow-failed.jsonl`, captured for this by
+  `.work/probes/workflow-failure-probe.mjs`, and the existing
+  `claude-workflow.jsonl`, which turned out to be the control it needed — a run
+  that succeeded with one of its five agents dead.
+
+  Two neighbouring bugs are untouched and still open: a workflow reads **done**
+  for as long as it is *running* (#116), and one whose ending never arrives
+  reads **running** forever (#139). Both come from the same launch
+  acknowledgement, and both need the run's whole lifecycle rather than only its
+  failures.
+
 - **Changing the effort level no longer announces itself** (#119). Every pick
   raised a box beside the composer reading "Now thinking at high" — an opaque
   panel that overlapped the controls around it and, on a phone, landed on the

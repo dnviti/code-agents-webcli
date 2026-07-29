@@ -130,6 +130,20 @@ was asked to do, its model, what it spent in tools, tokens and time, and what it
 came back with. Phases are open by default and fold shut one click at a time,
 for a run large enough to want that.
 
+**A run that fails says so everywhere, and tells the conversation.** The row
+reads *failed*, the popup title reads *failed*, and the chat gets a message with
+whatever reason the runtime gave — a usage limit, a runtime error, a throw
+inside the script. You are told rather than left to find it: a workflow can run
+for twenty minutes after the turn that started it is over, and the notification
+a failed turn raises is raised for this too.
+
+A failed *agent* is not a failed run. A workflow that returned a result still
+reads as done however many of its agents died, because agents inside one fail by
+design — a thrown agent resolves to nothing rather than stopping the run, and a
+script that probes for failures expects some. What their failure gets is a count
+in red beside the run, and the phase they died in marked failed. Only the run's
+own verdict turns the badge red.
+
 **Only Claude Code reports workflows**, and only Claude Code has the concept.
 The phase and agent states here are derived from what the agents themselves
 report rather than from the tool call that launched the run — that call returns

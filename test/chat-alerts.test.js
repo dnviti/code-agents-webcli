@@ -314,4 +314,65 @@ describe('what a conversation event means to somebody not watching it', function
       assert.ok(!endsAlert({ t: 'msg_start', seq: 7, ts: 0, id: 'm2', role: 'assistant', turnId: 't2' }));
     });
   });
+  describe('a workflow that failed in the background (#140)', function () {
+    // Driven by the real capture rather than a hand-written event, because the
+    // shape that matters here is the *order*: the run fails while its own turn
+    // is still going, and everything the turn does afterwards used to take the
+    // notification away again.
+    function claudeEvents(name) {
+      const emitted = [];
+      const adapter = new ClaudeChatAdapter({
+        sessionId: 'app-session-1',
+        workingDir: '/tmp',
+        command: 'claude',
+        emit: (event) => emitted.push(event),
+      });
+      fixture(name).forEach((message) => adapter.handleMessage(message));
+      return emitted.map((event, index) => ({ ts: index, ...event, seq: index + 1 }));
+    }
+
+    it('is worth telling somebody about, named for what actually failed', function () {
+      const events = claudeEvents('claude-workflow-failed');
+      const failed = events.find((event) => event.t === 'workflow_failed');
+      const alert = alertForEvent(failed);
+
+      assert.strictEqual(alert.kind, 'failed');
+      assert.strictEqual(alert.blocking, false);
+      assert.strictEqual(
+        alert.subject,
+        'The workflow "probe-workflow-failure"',
+        'the notification would have said the turn failed, which it did not',
+      );
+      assert.match(alert.detail || '', /forced workflow failure/);
+    });
+
+    it('raises nothing for a run that finished, whatever died inside it', function () {
+      assert.deepStrictEqual(
+        claudeEvents('claude-workflow').filter((event) => event.t === 'workflow_failed'),
+        [],
+      );
+    });
+
+    it('is not taken back by the conversation carrying on', function () {
+      // The run fails, its turn ends normally seconds later, and the agent goes
+      // back to work. None of that un-fails the workflow.
+      const events = claudeEvents('claude-workflow-failed');
+      const at = events.findIndex((event) => event.t === 'workflow_failed');
+      assert.ok(at >= 0, 'the recording no longer contains a failure');
+
+      const after = events.slice(at + 1);
+      assert.ok(
+        after.some((event) => event.t === 'state' || event.t === 'turn_end'),
+        'the recording no longer carries the aftermath this is about',
+      );
+      // `endsAlert` still says the conversation is moving — that is its job.
+      // What must not happen is the failure being cleared by it, which is
+      // `attention.ts`'s decision and is asserted in chat-attention.test.js.
+      const raised = after.map(alertForEvent).filter(Boolean);
+      assert.ok(
+        !raised.some((alert) => alert.kind === 'failed'),
+        'the aftermath raised a second failure, so this proves nothing',
+      );
+    });
+  });
 });

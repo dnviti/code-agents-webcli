@@ -171,6 +171,22 @@ function lastTurnId(state: TranscriptState): string | undefined {
 }
 
 /**
+ * The reply still arriving, or -1.
+ *
+ * Searched from the end rather than read off it, because the end is not always
+ * the reply: a rule drawn across the conversation is pushed there while one is
+ * still streaming. Bounded because the answer is always within a message or two
+ * of the end — a scan of an hour-long transcript on every error is not.
+ */
+function lastStreamingIndex(state: TranscriptState): number {
+  const floor = Math.max(0, state.messages.length - 8);
+  for (let i = state.messages.length - 1; i >= floor; i -= 1) {
+    if (state.messages[i].streaming) return i;
+  }
+  return -1;
+}
+
+/**
  * Fold one event's word about the runtime into what is known so far.
  *
  * Split out for the same reason as the usage fold below, and with the same
@@ -609,6 +625,71 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       return { messageIndex, structural: false, meta: false, applied: true };
     }
 
+    case 'workflow_failed': {
+      // The call that launched the run stops claiming success. Written onto the
+      // block rather than derived beside it, so every surface that reads a tool
+      // call's status — the Agents row, the popup title, the card on the trace
+      // rail — agrees without any of them having to know what a workflow is.
+      //
+      // `output` is left alone: for a workflow it holds the "launched in
+      // background" acknowledgement, and the popup tells the failure from the
+      // log by comparing the two (see `Header` in WorkflowPopup.tsx).
+      const patch: Partial<ToolBlock> = event.reason
+        ? { status: 'failed', error: event.reason }
+        : { status: 'failed' };
+      const located = state.toolIndex[event.parentToolId];
+      if (located) {
+        const block = state.messages[located[0]]?.blocks[located[1]];
+        if (block && block.kind === 'tool') Object.assign(block, patch);
+      } else {
+        // Held for a block that has not arrived, exactly as a `tool` patch is.
+        // A snapshot replays only the tail of the log, and a workflow that runs
+        // for half an hour can outlive its own launching call's place in that
+        // window — the failure would otherwise be dropped for the one runs that
+        // take longest, which are the runs this is for.
+        state.orphanToolPatches[event.parentToolId] = {
+          ...(state.orphanToolPatches[event.parentToolId] || {}),
+          ...patch,
+        };
+      }
+
+      // And the conversation says so, in a message of its own.
+      //
+      // A message of its own because of when this arrives. A workflow outlives
+      // the turn that started it — that is what launching it in the background
+      // means — so by the time it fails there is usually nothing streaming to
+      // append to, and the `error` event's own rule (see above) drops a block
+      // it cannot find a home for. That drop is the whole second half of #140:
+      // the failure reached `lastError`, the header pill, and nowhere a person
+      // scrolling the conversation would ever find it.
+      //
+      // Filed under the turn in progress, or the last one there was, exactly as
+      // a marker is: only the newest turn is open (`isTurnOpen`), so a synthetic
+      // turn of its own would fold itself shut the moment the conversation
+      // carried on. Under the last turn it is where the reader is looking — and
+      // in the case this is written for, a run that outlived its turn, that is
+      // the open one.
+      const text = event.name
+        ? `Workflow "${event.name}" failed`
+        : 'A workflow failed';
+      const message: ChatMessage = {
+        id: `workflow-failed-${event.seq}`,
+        seq: event.seq,
+        turnId: state.currentTurnId ?? lastTurnId(state) ?? `workflow-failed-${event.seq}`,
+        role: 'system',
+        ts: event.ts,
+        blocks: [{ kind: 'error', text: event.reason ? `${text}: ${event.reason}` : `${text}.` }],
+      };
+      state.messages.push(message);
+      state.index[message.id] = state.messages.length - 1;
+      return {
+        messageIndex: state.messages.length - 1,
+        structural: true,
+        meta: true,
+        applied: true,
+      };
+    }
+
     case 'plan': {
       state.plan = event.items;
       return { messageIndex: null, structural: false, meta: true, applied: true };
@@ -689,19 +770,21 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       if (event.fatal) state.state = 'error';
       // Surfaced in the transcript as well as the header: an error that only
       // lives in a status pill is an error the user scrolls past and misses.
-      const last = state.messages[state.messages.length - 1];
+      //
+      // The last message that is *streaming*, not simply the last one. A rule
+      // drawn across a conversation — a compaction, an interruption, a workflow
+      // that failed in the background (#140) — is pushed onto the end while a
+      // reply is still arriving, and answering "is the last message open?" with
+      // that rule dropped every error for the rest of the turn.
+      const openIndex = lastStreamingIndex(state);
+      const last = openIndex === -1 ? undefined : state.messages[openIndex];
       if (last && last.streaming) {
         // `fatal` carried through rather than flattened away: it is the
         // difference between an error the agent read and moved past and the one
         // it stopped on, and a turn cut short by the second never reaches a
         // `turn_end` that could say so.
         last.blocks.push({ kind: 'error', text: event.message, ...(event.fatal ? { fatal: true } : {}) });
-        return {
-          messageIndex: state.messages.length - 1,
-          structural: false,
-          meta: true,
-          applied: true,
-        };
+        return { messageIndex: openIndex, structural: false, meta: true, applied: true };
       }
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }

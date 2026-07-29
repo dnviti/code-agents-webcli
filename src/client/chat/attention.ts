@@ -40,11 +40,17 @@ export function noteChatEvent(app: App, sessionId: string, event: ChatEvent): vo
   const alert = alertForEvent(event);
 
   if (alert) {
-    announce(app, sessionId, alert.kind, alert.detail);
+    announce(app, sessionId, alert.kind, alert.detail, alert.subject);
   } else if (endsAlert(event)) {
     // The conversation is moving again, or somebody answered it — possibly on
     // another device. A notification still sitting in the tray is now a lie.
-    clearAlert(sessionId);
+    //
+    // Except a failure, when all that happened is the conversation going back
+    // to work. A background workflow fails while its own turn is still running
+    // — that is the ordinary shape — and the `state` event a second later used
+    // to take the notification away again before anybody read it (#140). What
+    // failed still failed; only somebody arriving clears that.
+    clearAlert(sessionId, event.t === 'state' ? 'failed' : undefined);
   }
 
   syncConversationAttention(app, sessionId);
@@ -120,6 +126,7 @@ function announce(
   sessionId: string,
   kind: 'finished' | 'failed' | 'approval' | 'question',
   detail: string | undefined,
+  subject?: string,
 ): void {
   // A conversation with no tab cannot be opened by the notification, and
   // nothing will ever arrive to end it — its events stopped when the tab
@@ -143,6 +150,7 @@ function announce(
       kind,
       name: app.sessionTabManager?.conversationLabel(sessionId) ?? 'Conversation',
       detail,
+      subject,
     },
     settings.details,
   );

@@ -224,7 +224,18 @@ export function WorkflowPopup({
                     log is the whole body, and a label over the only thing there
                     is says nothing the popup's own title has not. */}
                 {run?.activity || !workflow.empty || steps.length > 0 ? (
-                  <Caption text={block.status === 'failed' ? 'Failed with' : 'Final output'} />
+                  <Caption
+                    text={
+                      // "Failed with" only when the log *is* the failure, which
+                      // is the shape a workflow refused outright arrives in:
+                      // the tool call errors and its output is the message. A
+                      // run that failed after it launched has a log holding the
+                      // launch acknowledgement and its reason reported
+                      // separately, above — captioning that "Failed with" would
+                      // point at the wrong text (#140).
+                      block.status === 'failed' && !run?.error ? 'Failed with' : 'Final output'
+                    }
+                  />
                 ) : null}
                 {sections.map((section, index) => (
                   <Section key={index} section={section} />
@@ -438,11 +449,14 @@ function Progress({ summary }: { summary: WorkflowSummary }): React.JSX.Element 
 
 const PHASE_STATE: Record<
   WorkflowPhaseView['state'],
-  { label: string; variant: 'outline' | 'warning' | 'success'; color: string }
+  { label: string; variant: 'outline' | 'warning' | 'success' | 'destructive'; color: string }
 > = {
   waiting: { label: 'not started', variant: 'outline', color: 'var(--muted-foreground)' },
   running: { label: 'running', variant: 'warning', color: 'var(--warning)' },
   finished: { label: 'finished', variant: 'success', color: 'var(--success)' },
+  // A phase nothing came out of. Green "finished" over a row of red agents was
+  // the popup contradicting itself one level down from #140's own complaint.
+  failed: { label: 'failed', variant: 'destructive', color: 'var(--destructive)' },
 };
 
 /**
@@ -524,7 +538,10 @@ function PhaseSection({
         >
           {title}
         </span>
-        {view.failed > 0 ? (
+        {/* The count, unless the state badge beside it is already the word:
+            a phase where everything died read "Fail  2 failed  failed", which
+            is one badge saying what the next one says (#140). */}
+        {view.failed > 0 && view.state !== 'failed' ? (
           <Badge variant="destructive">
             {view.failed} failed
           </Badge>

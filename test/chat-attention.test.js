@@ -311,6 +311,71 @@ describe('telling the user a conversation needs them', function () {
     assert.strictEqual(mod.outstandingAlerts().length, 1);
   });
 
+  it('tells the user a background workflow failed, and says which', async function () {
+    const { app, registry } = conversation();
+    app.names.set('s1', 'webcli');
+
+    await deliver(registry, 's1', {
+      t: 'workflow_failed',
+      seq: 1,
+      ts: 1,
+      parentToolId: 'w1',
+      name: 'nightly-audit',
+      reason: 'usage limit reached',
+    });
+
+    assert.strictEqual(shown.length, 1, 'nothing was raised for a workflow that broke');
+    assert.strictEqual(shown[0].title, 'webcli');
+    assert.strictEqual(
+      shown[0].options.body,
+      'The workflow "nightly-audit" failed — usage limit reached',
+      'the notification blamed the turn, which ended perfectly well',
+    );
+  });
+
+  it('does not take that back when the conversation carries on working', async function () {
+    // The shape the recording actually has: the run fails while its own turn is
+    // still going, the turn ends, and the agent starts the next thing. All of
+    // that used to remove the notification before anybody read it (#140).
+    const { app, registry } = conversation();
+    app.names.set('s1', 'webcli');
+
+    await deliver(registry, 's1', {
+      t: 'workflow_failed',
+      seq: 1,
+      ts: 1,
+      parentToolId: 'w1',
+      name: 'nightly-audit',
+      reason: 'usage limit reached',
+    });
+    await deliver(registry, 's1', finished(2));
+    await deliver(registry, 's1', { t: 'state', seq: 3, ts: 1, state: 'thinking' });
+
+    assert.strictEqual(mod.outstandingAlerts().length, 1, 'the failure was withdrawn');
+    assert.strictEqual(
+      mod.outstandingAlerts()[0].kind,
+      'failed',
+      'a plain "finished" replaced the failure it followed',
+    );
+  });
+
+  it('still clears a failure once the user is plainly there', async function () {
+    const { app, registry } = conversation();
+    app.names.set('s1', 'webcli');
+
+    await deliver(registry, 's1', {
+      t: 'workflow_failed',
+      seq: 1,
+      ts: 1,
+      parentToolId: 'w1',
+      name: 'nightly-audit',
+      reason: 'usage limit reached',
+    });
+    await deliver(registry, 's1', { t: 'msg_start', seq: 2, ts: 1, id: 'u1', role: 'user', turnId: 't2' });
+
+    assert.strictEqual(mod.outstandingAlerts().length, 0, 'a dealt-with failure is still outstanding');
+  });
+
   it('says a conversation needs you and nothing else when details are off', async function () {
     const { app, registry } = conversation();
     app.names.set('s1', 'a-private-project');
