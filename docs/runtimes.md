@@ -126,8 +126,8 @@ checked one at a time, because one of them working says nothing about the rest.
 **An entry never expands onto an empty panel.** Where the text is missing the
 entry says which of the three silences it is: still reasoning, reasoning the
 agent measured but withheld — with the size it reported — or reasoning it said
-nothing about beyond that it happened. The count on a turn's work pill (`2
-reasoning`) counts the thinking that happened, whether or not its text came
+nothing about beyond that it happened. The number beside the brain on a reply's
+work counter counts the thinking that happened, whether or not its text came
 with it.
 
 The size shown beside a withheld block is the runtime's own live estimate and

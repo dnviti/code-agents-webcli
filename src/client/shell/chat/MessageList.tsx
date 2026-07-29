@@ -536,8 +536,8 @@ interface Row {
  *
  * A step that produced only tool calls and reasoning has no row (see
  * MessageBubble). Its id is held here until a message that does speak comes
- * along, and handed to that message so its pill counts the whole stretch and
- * opens the trace at the start of it.
+ * along, and handed to that message so its work counter counts the whole
+ * stretch and opens the trace at the start of it.
  *
  * Silent steps still pending at the end of a turn are simply dropped: there is
  * no reply to hang them on, and inventing a row for them is the thing this

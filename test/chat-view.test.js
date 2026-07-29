@@ -304,7 +304,10 @@ describe('ChatView', function () {
     // …and not in the prose, which keeps its answer.
     assert.ok(html.includes('all green'));
     assert.ok(!html.includes('68 passing'), 'tool output must not be back in the transcript');
-    assert.ok(html.includes('show work'), 'the transcript keeps a pointer to it');
+    assert.ok(
+      /aria-label="Show work: 1 command, 1 reasoning step"/.test(html),
+      'the transcript keeps a pointer to it',
+    );
   });
 
   it('states plainly that an exited session is over', function () {
