@@ -1644,10 +1644,43 @@ async function checkSilentStepsLeaveNoRowButKeepTheirTrace(): Promise<void> {
 
   const reply = rows()[0];
   const replyText = reply ? reply.textContent || '' : '';
+  const counter = reply
+    ? reply.querySelector<HTMLElement>('button[aria-label^="Show work"]')
+    : null;
   check(
     'the reply that follows them counts the whole stretch',
-    replyText.includes('all green') && replyText.includes('3 commands'),
-    replyText.slice(0, 160),
+    replyText.includes('all green')
+      && Boolean(counter)
+      && (counter?.getAttribute('aria-label') || '').includes('3 commands'),
+    `${replyText.slice(0, 80)} — ${counter?.getAttribute('aria-label') || 'no work counter'}`,
+  );
+
+  // Issue #118: the counter is one of the message actions now, sized like them
+  // and on the same line, not a banner of its own under the prose.
+  const actions = reply
+    ? Array.from(reply.querySelectorAll<HTMLElement>('button[aria-label]'))
+    : [];
+  const labels = actions.map((node) => node.getAttribute('aria-label') || '');
+  check(
+    'the counter sits in the action row, right after retry',
+    labels.findIndex((each) => each.startsWith('Show work')) === labels.indexOf('Retry this turn') + 1
+      && labels.indexOf('Retry this turn') >= 0,
+    labels.join(' | ') || 'no labelled actions on the reply',
+  );
+  const rowTop = (node: HTMLElement): number => Math.round(node.getBoundingClientRect().top);
+  const retryButton = actions.find((node) => node.getAttribute('aria-label') === 'Retry this turn');
+  check(
+    'and on the same line as them',
+    Boolean(counter && retryButton && rowTop(counter) === rowTop(retryButton)),
+    counter && retryButton
+      ? `counter at ${rowTop(counter)}, retry at ${rowTop(retryButton)}`
+      : 'one of the two controls is missing',
+  );
+  // It draws numbers, not the sentence the wide button spelled out.
+  check(
+    'it says it in glyphs and numbers rather than words',
+    (counter?.textContent || '').trim() === '3' && !/show work/i.test(replyText),
+    `visible text: ${JSON.stringify((counter?.textContent || '').trim())}`,
   );
 
   // The trace never lost any of it — the rail is the record, and it is open.
@@ -1658,21 +1691,24 @@ async function checkSilentStepsLeaveNoRowButKeepTheirTrace(): Promise<void> {
     'looked for both suppressed commands on the rail',
   );
 
-  const pill = Array.from(host.querySelectorAll<HTMLElement>('button'))
-    .find((node) => (node.textContent || '').includes('show work'));
-  check('the reply carries a way into the trace', Boolean(pill), pill ? 'work pill found' : 'no work pill on the reply');
-  pill?.click();
+  check(
+    'the reply carries a way into the trace',
+    Boolean(counter),
+    counter ? 'work counter found' : 'no work counter on the reply',
+  );
+  counter?.click();
   await wait(300);
 
   // Focusing a row expands it, so the first silent step's output is the proof
-  // that the pill landed at the start of the stretch rather than on its own call.
+  // that the counter landed at the start of the stretch rather than on its own
+  // call.
   check(
     'it opens the trace at the first silent step, not at the reply’s own call',
     railText().includes('THE-FIRST-SILENT-STEP'),
     railText().includes('THE-FIRST-SILENT-STEP')
       ? 'the first silent step is expanded'
       : railText().includes('ITS-OWN-STEP')
-        ? 'the pill focused the reply’s own call'
+        ? 'the counter focused the reply’s own call'
         : 'nothing was expanded',
   );
 
@@ -1704,10 +1740,16 @@ async function checkSilentStepsLeaveNoRowButKeepTheirTrace(): Promise<void> {
 
   const live = rows()[1];
   const liveText = live ? live.textContent || '' : '';
+  const liveCounter = live
+    ? live.querySelector<HTMLElement>('button[aria-label^="Show work"]')
+    : null;
   check(
     'the reply appears with the live step already counted on it',
-    liveText.includes('built') && liveText.includes('1 command'),
-    liveText.slice(0, 160) || 'the streamed reply never rendered',
+    liveText.includes('built')
+      && (liveCounter?.getAttribute('aria-label') || '').includes('1 command'),
+    `${liveText.slice(0, 80) || 'the streamed reply never rendered'} — ${
+      liveCounter?.getAttribute('aria-label') || 'no work counter'
+    }`,
   );
 
   root.unmount();
@@ -2276,6 +2318,10 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
           id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: Date.now(),
           blocks: [
             { kind: 'text', text: 'here is what I changed' },
+            // Both kinds of hidden work, so the reply's work counter is drawn in
+            // its widest form — two glyphs and two numbers — where every rule
+            // below can measure it (issue #118).
+            { kind: 'thinking', text: 'which of these actually needs changing' },
             {
               kind: 'tool', toolId: 'x1', name: 'bash', toolKind: 'execute',
               status: 'completed', input: { command: 'npm test' }, durationMs: 4321,
@@ -2407,6 +2453,56 @@ async function checkThePhoneLayoutIsUsable(): Promise<void> {
           Boolean(button) && Boolean(hit) && button!.contains(hit as Node),
           hit ? `${(hit as HTMLElement).tagName.toLowerCase()}:${(hit as HTMLElement).getAttribute('aria-label') || '?'}` : 'nothing there',
         );
+      }
+      // Issue #118 — the work counter is one of the message actions now, so
+      // the sweep below covers it only for as long as this fixture keeps
+      // producing hidden work. Named here so that stops being silent: a
+      // transcript with nothing to count would leave every rule above passing
+      // over a control that is no longer on screen.
+      if (!state) {
+        const counter = host.querySelector<HTMLElement>('button[aria-label^="Show work"]');
+        const box = counter ? laidOutSize(counter) : { width: 0, height: 0 };
+        const label = counter?.getAttribute('aria-label') || '';
+        check(
+          `the reply’s work counter is hittable and says what it counts in ${name}`,
+          box.width >= PHONE_TARGET
+            && box.height >= PHONE_TARGET
+            && label.includes('1 command')
+            && label.includes('1 reasoning step'),
+          counter ? `${box.width}x${box.height} — ${label}` : 'no work counter on screen',
+        );
+
+        // …and *drawn*, which the rules above cannot see: `laidOutSize` reads
+        // offsetWidth, and `isPainted` drops a faded node from the sweep rather
+        // than failing it — so a counter at `opacity: 0` measures 78x44 and
+        // vanishes from every other check at once. Its two glyphs are asserted
+        // by count for the same reason: the label would still read "1 command,
+        // 1 reasoning step" over a control drawing two bare numbers.
+        const glyphs = counter ? counter.querySelectorAll('svg').length : 0;
+        const opacity = counter
+          ? Number(viewOf(counter).getComputedStyle(counter).opacity)
+          : 0;
+        check(
+          `and it is actually painted, with both its glyphs, in ${name}`,
+          Boolean(counter) && isPainted(counter as Element) && opacity >= 0.9 && glyphs === 2,
+          counter ? `opacity=${opacity} glyphs=${glyphs}` : 'no work counter on screen',
+        );
+
+        // Reachable by keyboard "on the same terms as the other message
+        // actions" (issue #118). Both halves are needed: `.focus()` succeeds on
+        // a `tabIndex={-1}` element — programmatic focus is not tab order — so
+        // the index is what says a Tab key can ever arrive here, and the focus
+        // call is what says the element accepts it once it does.
+        counter?.focus();
+        const focused = Boolean(counter) && host.ownerDocument.activeElement === counter;
+        check(
+          `and it is in the tab order and takes focus in ${name}`,
+          focused && (counter?.tabIndex ?? -1) >= 0,
+          counter
+            ? `tabIndex=${counter.tabIndex} focused=${focused}`
+            : 'no work counter on screen',
+        );
+        (host.ownerDocument.activeElement as HTMLElement | null)?.blur();
       }
       assertPhoneSurface(host, where, opens.length === 0);
       root.unmount();

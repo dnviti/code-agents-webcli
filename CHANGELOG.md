@@ -593,6 +593,39 @@
   sized for a finger.
 
 ### Changed
+- **The pointer into a turn's hidden work is a counter, not a banner** (#118).
+  Every assistant reply that ran a command or thought about anything carried a
+  full-width button under its text spelling out what had happened — "3 commands
+  · 2 reasoning · 12s — show work". It was wider and louder than the message
+  controls beside it, it repeated in a sentence what two icons say, and it cost
+  a line of the conversation on nearly every turn, so a long exchange read as a
+  stack of banners with prose between them.
+
+  The pointer moved into the row of per-message actions, directly right of
+  retry: a terminal glyph with the number of commands and a brain with the
+  number of reasoning steps. A count of zero is left out entirely, so a turn
+  that only thought shows a brain and nothing else. It appears on exactly the
+  turns the button appeared on — including a reply that speaks for the silent
+  steps before it, which still counts the whole stretch and still opens the
+  trace at the *first* of them rather than at its own call. Turning off the
+  display of reasoning or of commands still takes those steps out of the count,
+  and takes the control away when nothing is left to point at.
+
+  The elapsed time the wide button reported has no room in two glyphs, so it
+  survives where the words it dropped went: the control's hover and its
+  accessible description read "Show work: 3 commands, 2 reasoning steps, 12s",
+  which is also what answers the icons for anyone who cannot see them. On a
+  phone it is a full 44px target on the same line as copy, retry and branch.
+
+  It is quiet but not faded. The actions either side of it sit at reduced
+  opacity at rest, which is right for a glyph that stands for a verb and is
+  recognised rather than read; a two-digit number at the same treatment
+  composites too close to the background to resolve, and the button it replaces
+  never dimmed its counts. So the counter takes the muted colour and none of
+  the fade. The browser checks now assert that it is painted at all, that both
+  its glyphs are drawn, and that it is in the tab order — each of which a
+  plausible regression had been able to break with the whole suite still green.
+
 - **Folded history is not built until it is opened, and what is kept is
   bounded.** (#81) Entering a conversation rebuilt its entire backlog at once —
   text, code blocks, diagrams, tool output and file previews all at the same

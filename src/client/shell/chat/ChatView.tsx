@@ -303,7 +303,7 @@ export function ChatView({
   const [searchOpen, setSearchOpen] = React.useState(false);
   /** The index row whose turn is being paged in, or null. See `selectTurn`. */
   const [seeking, setSeeking] = React.useState<string | null>(null);
-  // Paired with a counter, not held as a bare id: clicking the same work pill
+  // Paired with a nonce, not held as a bare id: clicking the same work counter
   // twice has to scroll the rail twice, and a string that did not change would
   // leave the timeline's effect with nothing to react to.
   const [focus, setFocus] = React.useState<{ id?: string; nonce: number }>({ nonce: 0 });
@@ -1238,7 +1238,7 @@ const ZERO = (): number => 0;
  * The row that stands for a message on screen.
  *
  * Itself, unless it is a step that said nothing — then the next message in its
- * turn that did, because that is the one carrying its work pill. Failing that,
+ * turn that did, because that is the one carrying its work counter. Failing that,
  * the last one before it, so a turn whose tail is all machinery still lands
  * somewhere. Falls back to the id given, which scrolls nowhere and is exactly
  * what happened before this existed.

@@ -208,16 +208,9 @@ export function activityMeta(event: ActivityEvent): string {
   return event.durationMs === undefined ? '' : formatDuration(event.durationMs);
 }
 
-/** The one-line summary the work pill shows, e.g. "3 commands · 2 reasoning · 8.1s". */
-export function workSummary(events: ActivityEvent[], durationMs?: number): string {
-  const tools = events.filter((event) => event.kind === 'tool').length;
-  const reasoning = events.filter((event) => event.kind === 'reasoning').length;
-  const bits: string[] = [];
-  if (tools) bits.push(`${tools} command${tools === 1 ? '' : 's'}`);
-  if (reasoning) bits.push(`${reasoning} reasoning`);
-  if (durationMs !== undefined) {
-    const formatted = formatDuration(durationMs);
-    if (formatted) bits.push(formatted);
-  }
-  return bits.join(' · ');
-}
+// `workSummary` used to live here: the one-line sentence the wide work pill
+// spelled out under a reply. Nothing has called it since the counts moved onto
+// the message's own blocks, and issue #118 took the pill itself away — so what
+// was left was a function documented as describing a component that no longer
+// exists, kept alive by its own test. The counting the surfaces actually do is
+// in MessageBubble (`summariseWork`) and TurnStrip.

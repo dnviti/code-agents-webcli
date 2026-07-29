@@ -207,18 +207,3 @@ describe('activityForTurn', function () {
   });
 });
 
-describe('workSummary', function () {
-  it('reads as a sentence about the work, with no zero counts in it', function () {
-    const messages = [
-      msg('assistant', [{ kind: 'thinking', text: 'a' }, tool(), tool({ toolId: 'x2' })]),
-    ];
-    assert.strictEqual(
-      mod.workSummary(mod.activityEvents(messages), 8100),
-      '2 commands · 1 reasoning · 8.1s',
-    );
-  });
-
-  it('is empty when there was no work to describe', function () {
-    assert.strictEqual(mod.workSummary([]), '');
-  });
-});
