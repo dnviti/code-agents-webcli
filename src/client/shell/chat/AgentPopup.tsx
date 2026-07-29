@@ -31,7 +31,18 @@ export interface AgentPopupProps {
   isMobile?: boolean;
 }
 
-const TERMINAL = new Set(['completed', 'failed', 'denied', 'canceled']);
+/**
+ * The statuses that mean this delegation is over, one way or another.
+ *
+ * `unknown` belongs here: it is the status #139 added for a call nothing will
+ * ever report on again, and the row that opens this popup already says so in
+ * words — "no longer reporting". Left out, the popup that row opens disagreed
+ * with it, drawing the in-flight loader beside the last thing the agent said and
+ * offering "Waiting for this agent to report its first step…" for a wait that
+ * had already ended. #139 updated the other three tables and this fourth copy
+ * was missed.
+ */
+const TERMINAL = new Set(['completed', 'failed', 'denied', 'canceled', 'unknown']);
 
 export function AgentPopup({
   open,

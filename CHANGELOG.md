@@ -5,6 +5,14 @@
 ## [5.3.3] - 2026-07-29
 
 ### Fixed
+- **A delegation that stopped reporting reads that way in its own window too**
+  (#139). The status for a call nothing will ever report on again reached the
+  tool-status table, the Agents panel and the workflow popup, and missed the
+  agent popup, which keeps a fourth copy of the list. So the row and the window
+  it opens disagreed: the row said "no longer reporting" while the popup put a
+  live dot on that very badge, drew the in-flight glyph beside the last thing the
+  agent said, and offered "Waiting for this agent to report its first step…"
+  about a wait that had already ended.
 - **A prompt scrolled back to is drawn once, like every other one** (#129). The
   double bubble was fixed for live sending and for reopening a conversation, and
   survived in the one place left: scrolling back far enough that the turn arrives
