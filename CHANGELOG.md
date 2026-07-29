@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [5.3.3] - 2026-07-29
+
 ### Fixed
 - **The Status panel stops making up your subscription** (#137). It used to
   open on a plan badge reading `max20`, a meter reading "Tokens 0 of 220.0k"
@@ -520,6 +522,9 @@
   Only workflows. How an ordinary delegation reports its status is untouched,
   and there is a test that says so.
 
+## [5.3.2] - 2026-07-29
+
+### Fixed
 - **A workflow that failed no longer reads as done** (#140). The Workflow tool
   returns the moment a run is launched — "Workflow launched in background", no
   error, four seconds before anything has happened — and that acknowledgement
