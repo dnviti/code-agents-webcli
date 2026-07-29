@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [5.3.2] - 2026-07-29
+
 ### Fixed
 - **A workflow that failed no longer reads as done** (#140). The Workflow tool
   returns the moment a run is launched — "Workflow launched in background", no
