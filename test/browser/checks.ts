@@ -287,6 +287,7 @@ async function run(): Promise<void> {
   await checkAWorkflowShowsItsPhasesAndItsAgents();
   await checkAFailedWorkflowReadsAsFailedEverywhere();
   await checkOnePromptDrawsOneUserBubble();
+  await checkALaunchedWorkflowReadsAsRunningUntilItEnds();
   await checkAnAgentPopupShowsWhatTheAgentIsDoing();
   await checkATallDialogStaysOnScreen();
   await checkTheComposerShrinksWithTheWorkspaceRail();
@@ -1222,6 +1223,130 @@ async function checkAWorkflowShowsItsPhasesAndItsAgents(): Promise<void> {
  * and still be a green badge on a broken run.
  */
 /**
+ * A background workflow reads as running until the run itself ends (#116).
+ *
+ * Starting one is a quick, separate step: the request comes back in seconds
+ * with "Workflow launched in background", and the run keeps going for minutes.
+ * The app took that acknowledgement for the end of the work — a green **done**
+ * badge on the row and in the popup title, no spinner, below the Finished
+ * divider, and missing from the panel's running count — while the run
+ * underneath it counted up through hundreds of tool calls for another nine
+ * minutes.
+ *
+ * Cut at the receipt, on the real recording: that is the middle of the run, and
+ * it is where every one of those surfaces used to be wrong at once. Then the
+ * rest is played in with the view already on screen, so the settle is measured
+ * on the live path too.
+ */
+async function checkALaunchedWorkflowReadsAsRunningUntilItEnds(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1100px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const receiptAt = RECORDED_WORKFLOW.findIndex((event) => {
+    const patch = (event as { t?: string; patch?: { output?: unknown } }).patch;
+    return (event as { t?: string }).t === 'tool'
+      && typeof patch?.output === 'string'
+      && /launched in background/i.test(patch.output as string);
+  });
+
+  const controller = new ChatController('workflow-running-check', { send: () => {} });
+  let seq = 1;
+  const play = (batch: unknown[]): void => {
+    for (const event of batch) {
+      controller.transcript.apply({ ts: seq, ...(event as Record<string, unknown>), seq: seq++ } as never);
+    }
+  };
+  play(RECORDED_WORKFLOW.slice(0, receiptAt + 1));
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW, panelOpen: true, panelTab: 'agents', panelWidth: 420 },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(300);
+  settle(document);
+
+  /**
+   * The status word on the workflow's own row in the Agents panel.
+   *
+   * Read off the row rather than off the surface: the words "done" and
+   * "running" appear all over a conversation, and a check that greps the whole
+   * screen for them agrees with itself whatever the badge says.
+   */
+  const rowStatus = (): string => {
+    const rail = host.querySelector('aside[aria-label="Workspace"]');
+    const row = Array.from(rail?.querySelectorAll<HTMLElement>('[role="button"]') ?? []).find((node) =>
+      /review-changes|probe-workflow/i.test(node.textContent || ''),
+    );
+    // The first of them: the status badge sits immediately after the name, and
+    // the counts of the agents inside the run ("5 done", "1 failed") follow it.
+    const words = (row?.textContent || '').match(/queued|running|done|failed|denied|canceled/gi);
+    return words ? words[0].toLowerCase() : '';
+  };
+  const railText = (): string =>
+    (host.querySelector('aside[aria-label="Workspace"]')?.textContent || '').replace(/\s+/g, ' ');
+
+  check(
+    'a workflow that has only been launched does not read as done',
+    rowStatus() !== 'done',
+    `its row says "${rowStatus()}" — ${railText().slice(0, 90)}`,
+  );
+  check(
+    'it reads as running instead',
+    rowStatus() === 'running',
+    `its row says "${rowStatus()}" — ${railText().slice(0, 90)}`,
+  );
+
+  // The popup, where the acknowledgement was captioned as the run's result.
+  const rail = host.querySelector('aside[aria-label="Workspace"]') as HTMLElement | null;
+  (rail?.querySelector('[role="button"]') as HTMLElement | null)?.click();
+  await wait(300);
+  settle(document);
+
+  const popup = document.querySelector('[role="dialog"]') as HTMLElement | null;
+  check(
+    'its popup opens on the run',
+    Boolean(popup),
+    popup ? (popup.textContent || '').slice(0, 40) : `no dialog; rail is ${(rail?.textContent || '').slice(0, 60)}`,
+  );
+  if (popup) {
+    const popupTitle = (popup.querySelector('h2')?.textContent || '').toLowerCase();
+    check(
+      'and its title says running, not done',
+      popupTitle.includes('running') && !popupTitle.includes('done'),
+      popupTitle.slice(0, 60) || 'the popup has no title',
+    );
+    check(
+      'and never offers the launch acknowledgement as the run’s final output',
+      !/Final output/i.test(popup.textContent || ''),
+      /Final output/i.test(popup.textContent || '') ? 'captioned as a result' : 'not captioned as a result',
+    );
+    (popup.querySelector('[aria-label="Close"]') as HTMLElement | null)?.click();
+    await wait(150);
+  }
+
+  // And it settles, on the run's own word, with the view already on screen.
+  play(RECORDED_WORKFLOW.slice(receiptAt + 1));
+  await wait(300);
+  settle(document);
+  check(
+    'and it settles as done once the run itself says so',
+    rowStatus() === 'done',
+    `its row says "${rowStatus()}" — ${railText().slice(0, 90)}`,
+  );
+
+  root.unmount();
+  host.remove();
+}
+
+/**
  * One prompt draws one bubble (#129).
  *
  * Sending a single message put two identical user turns on the screen, side by
@@ -1489,9 +1614,15 @@ async function checkAFailedWorkflowReadsAsFailedEverywhere(): Promise<void> {
   // happens to fire — so a check that replayed the whole tail would be proved
   // right by the next `msg_start` rather than by the panel.
   control.play(
-    RECORDED_WORKFLOW.slice(controlFirst + 1).filter(
-      (event) => (event as { t?: string }).t === 'workflow_progress',
-    ),
+    RECORDED_WORKFLOW.slice(controlFirst + 1).filter((event) => {
+      const type = (event as { t?: string }).t;
+      // `tool` as well as `workflow_progress`, because since #116 that is how
+      // the run reports its own ending: the launching call is left running when
+      // the launch is acknowledged and settled when the run says it is over, so
+      // a replay that dropped those would be asserting "reads as done" against
+      // a run that has not finished.
+      return type === 'workflow_progress' || type === 'tool';
+    }),
   );
   await wait(200);
   settle(document);

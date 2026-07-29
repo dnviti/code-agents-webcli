@@ -7,6 +7,7 @@ import {
   mergeSlashCommands,
 } from '../../../shared/slash-commands.js';
 import { describeFrom } from '../installed-commands.js';
+import { TERMINAL_TOOL } from '../../../shared/agent-activity.js';
 import { mapModelUsage } from './model-usage.js';
 import {
   ChatAttachment,
@@ -180,6 +181,8 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
   private readonly workflowTasks = new Map<string, string | undefined>();
   /** Workflows already announced as failed, so a second report is not a second failure. */
   private readonly failedWorkflows = new Set<string>();
+  /** Workflows whose launching call has already been settled, for the same reason. */
+  private readonly settledWorkflows = new Set<string>();
   /**
    * The `/effort` turn in flight, or null when none is.
    *
@@ -617,8 +620,13 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       // itself, where this wraps it in the run's own description sentence —
       // which names the workflow by something no other surface calls it.
       // `announceWorkflowFailure` is first-wins, so whichever lands is the one.
-      if (str(raw.status) === 'failed') {
+      const reported = str(raw.status);
+      if (reported === 'failed') {
         this.announceWorkflowFailure(parentToolId, str(raw.summary));
+      } else if (reported && TERMINAL_TOOL.has(toolStatus(reported))) {
+        // The fallback channel for the ending, as it is for the failure: this
+        // is the one that arrives when `task_updated` does not (#116).
+        this.settleWorkflow(parentToolId, toolStatus(reported));
       }
       return;
     }
@@ -633,6 +641,10 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
       });
       if (status && toolStatus(status) === 'failed') {
         this.announceWorkflowFailure(parentToolId, str(patch?.error));
+      } else if (status && TERMINAL_TOOL.has(toolStatus(status))) {
+        // How the run itself ended — done, or cancelled. Until this, the only
+        // ending that ever reached the launching call was the launch (#116).
+        this.settleWorkflow(parentToolId, toolStatus(status), str(patch?.error));
       }
       return;
     }
@@ -1140,12 +1152,71 @@ export class ClaudeChatAdapter extends BaseChatAdapter {
         continue;
       }
 
+      // A background workflow's `tool_result` is a receipt, not a result (#116).
+      //
+      // It comes back seconds after the launch — "Workflow launched in
+      // background. Task ID: …" — while the run itself goes on for minutes, and
+      // filing it as the call's completion is what put a green **done** badge on
+      // a workflow that was still working, took it out of the Agents panel's
+      // running count, and captioned the acknowledgement as the run's final
+      // output. The call stays running and is settled by the run's own report
+      // instead; see `settleWorkflow`.
+      //
+      // A refusal is left alone: `failed` here means the launch itself did not
+      // happen, which really is how that call ended.
+      if (!failed && this.isWorkflowLaunch(toolId, output)) {
+        this.emit({
+          t: 'tool',
+          toolId,
+          patch: { status: 'running', output, launchReceipt: true },
+        });
+        continue;
+      }
+
       this.emit({
         t: 'tool',
         toolId,
         patch: failed ? { status: 'failed', output, error: output } : { status: 'completed', output },
       });
     }
+  }
+
+  /**
+   * Whether this tool result is a background workflow's launch acknowledgement.
+   *
+   * Two ways of knowing, because either alone has a hole. `task_started` names
+   * the run a workflow and arrives before the result in both recordings — but
+   * only if that line was seen at all, which a reconnect mid-turn does not
+   * guarantee. The acknowledgement also says what it is, in the sentence the
+   * issue quotes, so a run whose opening report was missed is still recognised.
+   */
+  private isWorkflowLaunch(toolId: string, output: string): boolean {
+    if (this.workflowTasks.has(toolId)) return true;
+    return /^Workflow launched in background\b/.test(output.trimStart());
+  }
+
+  /**
+   * The run itself ended, so the call that launched it ends with it (#116).
+   *
+   * Said once, first report wins, in the same shape as `announceWorkflowFailure`
+   * and for the same reason: both of the runtime's terminal channels can reach
+   * here and in the captured run both do.
+   *
+   * Only for a workflow. An ordinary delegation's launching call already closes
+   * on its own result, and changing that is explicitly not what this is for.
+   * Failure is left to `workflow_failed`, which does more than set a status —
+   * it also puts the reason in the conversation.
+   */
+  private settleWorkflow(parentToolId: string, status: ToolStatus, error?: string): void {
+    if (status === 'failed') return;
+    if (!this.workflowTasks.has(parentToolId)) return;
+    if (this.settledWorkflows.has(parentToolId)) return;
+    this.settledWorkflows.add(parentToolId);
+    this.emit({
+      t: 'tool',
+      toolId: parentToolId,
+      patch: { status, ...(error ? { error } : {}) },
+    });
   }
 
   /**

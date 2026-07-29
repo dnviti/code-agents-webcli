@@ -241,7 +241,14 @@ export function WorkflowPopup({
                       // launch acknowledgement and its reason reported
                       // separately, above — captioning that "Failed with" would
                       // point at the wrong text (#140).
-                      block.status === 'failed' && !run?.error ? 'Failed with' : 'Final output'
+                      // And never "Final output" over the launch
+                      // acknowledgement, which is a receipt for a run that has
+                      // not answered yet (#116).
+                      block.launchReceipt
+                        ? 'How it was launched'
+                        : block.status === 'failed' && !run?.error
+                          ? 'Failed with'
+                          : 'Final output'
                     }
                   />
                 ) : null}

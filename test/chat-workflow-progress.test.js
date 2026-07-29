@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { ClaudeChatAdapter } = require('../dist/server/chat/adapters/claude.js');
 const { createTranscript, applyChatEvent } = require('../dist/shared/chat-reducer.js');
-const { collectAgentActivity, summarizeWorkflow } = require('../dist/shared/agent-activity.js');
+const { collectAgentActivity, countRunning, summarizeWorkflow } = require('../dist/shared/agent-activity.js');
 
 /**
  * Issue #117: what a workflow reports about itself reaches the transcript.
@@ -869,5 +869,115 @@ describe('a workflow that failed reads as failed (#140)', function () {
         'a phase that produced a result was marked failed for losing an agent',
       );
     });
+  });
+});
+
+/**
+ * Issue #116: a background workflow reads as running until the run itself ends.
+ *
+ * Starting a workflow in the background is a quick, separate step: the request
+ * comes back in seconds with "Workflow launched in background", and the run
+ * keeps going for minutes afterwards. The app treated that acknowledgement as
+ * the end of the work — green **done** badge, no spinner, below the Finished
+ * divider — while in one recorded run the workflow went on for another nine
+ * minutes underneath it, counting up through hundreds of tool calls.
+ *
+ * Driven off the same two recordings as everything else in this file, cut at
+ * the moment the receipt lands so the middle of a run is a state that can be
+ * asserted rather than described.
+ */
+describe('a background workflow reads as running until the run ends (#116)', function () {
+  /** Everything up to and including the tool result that acknowledges the launch. */
+  function untilTheReceipt(file = FIXTURE) {
+    const all = replay(Infinity, file);
+    const at = all.findIndex(
+      (event) => event.t === 'tool' && typeof event.patch?.output === 'string'
+        && /launched in background/i.test(event.patch.output),
+    );
+    assert.ok(at >= 0, 'the recording should contain the launch acknowledgement');
+    return all.slice(0, at + 1);
+  }
+
+  const entryFor = (state) =>
+    collectAgentActivity(state.messages).find((each) => each.kind === 'workflow');
+
+  it('reads as running while the acknowledgement is the only thing that came back', function () {
+    const state = transcriptOf(untilTheReceipt());
+    const block = workflowBlock(state);
+    const entry = entryFor(state);
+
+    assert.strictEqual(block.status, 'running', 'the launch is not how the run ended');
+    assert.match(block.output, /launched in background/i, 'and the receipt is still readable');
+    assert.strictEqual(block.launchReceipt, true, 'marked as a receipt, so nothing captions it as a result');
+    assert.strictEqual(entry.running, true, 'the Agents panel should count it as in flight');
+    assert.strictEqual(countRunning([entry]), 1, 'and say so on its badge');
+  });
+
+  it('settles as done when the run says it is done', function () {
+    const state = transcriptOf(replay());
+    const entry = entryFor(state);
+    assert.strictEqual(workflowBlock(state).status, 'completed');
+    assert.strictEqual(entry.running, false, 'a finished run is not still working');
+  });
+
+  it('settles as failed on the run’s own verdict, and reads as running until then', function () {
+    const mid = transcriptOf(untilTheReceipt(FAILED_FIXTURE));
+    assert.strictEqual(entryFor(mid).running, true, 'it was still going when the receipt came back');
+
+    const end = transcriptOf(replay(Infinity, FAILED_FIXTURE));
+    assert.strictEqual(workflowBlock(end).status, 'failed', 'and it ended the way the run said it did');
+  });
+
+  it('settles as cancelled when the run is cancelled', function () {
+    // The recorded `task_updated` with its status swapped — the one outcome no
+    // capture in the tree contains, and the one the acceptance criteria name.
+    // A documented mutation of a real message, not an invented shape.
+    const lines = readFixture().map((message) => {
+      if (message.subtype !== 'task_updated') return message;
+      return { ...message, patch: { ...message.patch, status: 'cancelled' } };
+    });
+    const events = [];
+    const adapter = new ClaudeChatAdapter({
+      sessionId: 'app-session-1', workingDir: '/tmp', command: 'claude',
+      emit: (event) => events.push(event),
+    });
+    lines.forEach((message) => adapter.handleMessage(message));
+    assert.strictEqual(workflowBlock(transcriptOf(events)).status, 'canceled');
+  });
+
+  it('leaves an ordinary delegation’s own reporting alone', function () {
+    // The non-goal, pinned: only a workflow settles from this channel. A plain
+    // subagent's launching call closes on its own result, as it always has.
+    const state = transcriptOf(replay(Infinity, path.join(__dirname, 'fixtures', 'chat', 'claude-subagent.jsonl')));
+    const agents = collectAgentActivity(state.messages).filter((each) => each.kind !== 'workflow');
+    assert.ok(agents.length > 0, 'the recording should contain a delegation');
+    assert.ok(
+      agents.every((each) => !each.running),
+      `a finished subagent should not be left running: ${JSON.stringify(agents.map((a) => a.status))}`,
+    );
+  });
+
+  it('says a run the app stopped watching was interrupted, rather than done', function () {
+    const events = untilTheReceipt();
+    const state = transcriptOf(events);
+    applyChatEvent(state, { t: 'state', state: 'exited', seq: events.length + 1, ts: 9_999 });
+
+    const block = workflowBlock(state);
+    const entry = entryFor(state);
+    assert.strictEqual(block.status, 'canceled', 'a spinner nobody will ever stop is the worse answer');
+    assert.match(block.error, /stopped watching/i, 'and it says it is our observation that ended');
+    assert.strictEqual(entry.running, false, 'so it leaves the running group and the count');
+  });
+
+  it('keeps the row’s clock in step with the popup’s', function () {
+    const state = transcriptOf(untilTheReceipt());
+    const block = workflowBlock(state);
+    const entry = entryFor(state);
+    assert.ok(block.agent.durationMs > 0, 'the run reports its own elapsed time');
+    assert.strictEqual(
+      entry.durationMs,
+      block.agent.durationMs,
+      'the Agents row showed nothing while the popup counted up',
+    );
   });
 });

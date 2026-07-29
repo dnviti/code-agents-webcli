@@ -174,6 +174,16 @@ export interface ToolBlock {
   durationMs?: number;
   /** Set on a delegation: what the agent behind this call did. See `AgentRun`. */
   agent?: AgentRun;
+  /**
+   * Set when `output` is a launch acknowledgement rather than a result.
+   *
+   * A workflow started in the background answers its caller in seconds with
+   * "Workflow launched in background. Task ID: …" and then works for minutes.
+   * That sentence is a receipt, and captioning it as the run's final output
+   * offers it as the answer to a question that has not been answered yet
+   * (#116). The run's real result replaces it when it arrives.
+   */
+  launchReceipt?: boolean;
 }
 
 /**

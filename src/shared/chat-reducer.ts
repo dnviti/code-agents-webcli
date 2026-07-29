@@ -35,6 +35,7 @@ import {
 } from './chat-events.js';
 import { turnOutcomeOf } from './turn-outcome.js';
 import { openTurnAfter } from './turn-boundaries.js';
+import { TERMINAL_TOOL as TERMINAL_STATUS, isWorkflowLaunch } from './agent-activity.js';
 
 export interface TranscriptState {
   messages: ChatMessage[];
@@ -382,6 +383,33 @@ function locateAgentRun(
   if (!block || block.kind !== 'tool') return null;
   if (!block.agent) block.agent = { steps: [] };
   return [messageIndex, block.agent];
+}
+
+/**
+ * A workflow left running when the app stopped being able to watch it.
+ *
+ * The runtime has exited, or errored fatally. A background workflow outlives
+ * the turn that started it by design, and it may well outlive the process that
+ * launched it too — but this app has no way of hearing how it ended any more,
+ * and a spinner that never stops is a worse answer than an honest one. So the
+ * call is settled as cancelled and says, in its own words, that it is our
+ * observation that ended, not necessarily the run (#116).
+ *
+ * Only workflows. An ordinary tool call left open by a dead runtime is a
+ * different question with a different answer, and changing it is out of scope.
+ */
+function settleUnobservableWorkflows(state: TranscriptState): void {
+  for (const located of Object.values(state.toolIndex)) {
+    const [messageIndex, blockIndex] = located;
+    const block = state.messages[messageIndex]?.blocks[blockIndex];
+    if (!block || block.kind !== 'tool') continue;
+    if (TERMINAL_STATUS.has(block.status)) continue;
+    if (!isWorkflowLaunch(block.name, block.agent?.workflow !== undefined)) continue;
+    block.status = 'canceled';
+    block.error =
+      block.error
+      ?? 'The app stopped watching before this run reported an ending, so how it finished is not known.';
+  }
 }
 
 /**
@@ -792,6 +820,9 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // process is gone — the mirror of the `turn_end` case, and the same rule
       // the accountant applies when it closes a job on an exit (#86).
       state.currentTurnId = openTurnAfter(event, state.currentTurnId);
+      if (event.state === 'exited' || event.state === 'error') {
+        settleUnobservableWorkflows(state);
+      }
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
