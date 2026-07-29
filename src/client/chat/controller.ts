@@ -2,6 +2,7 @@ import {
   ChatAttachment,
   ChatCapabilities,
   ChatEvent,
+  ChatModelDefault,
   ChatSnapshot,
   ChatTurnIndexEntry,
   ChatUsage,
@@ -78,6 +79,29 @@ export interface ModelSwitchResult {
 export interface EffortSwitchResult {
   applied: 'live' | 'sent' | 'pending' | 'cleared' | 'refused';
   message: string;
+}
+
+/**
+ * Read a `modelDefault` off the wire, or nothing.
+ *
+ * Field-by-field rather than a cast, like every other payload this file reads.
+ * A server that predates #135 sends nothing at all, and a partial one has to
+ * read as nothing too: the picker's whole job here is to say *why* a model is
+ * in force, and half an answer to that is worse than admitting it does not
+ * know.
+ */
+function readModelDefault(raw: unknown): ChatModelDefault | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Record<string, unknown>;
+  const source = value.source;
+  if (source !== 'personal' && source !== 'profile' && source !== 'runtime') return null;
+  return {
+    model: typeof value.model === 'string' && value.model ? value.model : null,
+    source,
+    ...(typeof value.profileName === 'string' && value.profileName
+      ? { profileName: value.profileName }
+      : {}),
+  };
 }
 
 /**
@@ -164,6 +188,33 @@ export class ChatController {
    * as an event.
    */
   private modelOverride: string | null = null;
+  /**
+   * Where the model a *new* conversation on this runtime would come from.
+   *
+   * A statement about the default rather than about this conversation, which is
+   * why it sits beside the override instead of replacing it: the two are shown
+   * together, and "chosen here" versus "your standing choice" versus "the
+   * profile's" is the whole question the picker could not answer before (#135).
+   *
+   * Null when the server said nothing — an older one, or one built without the
+   * user-settings store. The surface then reads exactly as it did before this
+   * existed, rather than asserting a source it was never told.
+   */
+  private modelDefault: ChatModelDefault | null = null;
+  /**
+   * The model this conversation is fixed to, as its record holds it.
+   *
+   * A statement about *this* conversation, unlike the default above, and the
+   * reason the two cannot be collapsed: on claude the runtime never reports a
+   * model at all, so a chip with nothing else to show once fell back to the
+   * default — and a default the conversation was never launched on is a name it
+   * is not running (#135).
+   *
+   * Null both for "the runtime was given no flag" and for a server that said
+   * nothing, and the chip treats them the same way: it names no model. The
+   * distinction only matters on the server, where the launch is resolved.
+   */
+  private modelPinned: string | null = null;
   /** What the server reported happened to the last model change requested. */
   private modelResult: ModelSwitchResult | null = null;
 
@@ -242,6 +293,8 @@ export class ChatController {
         this.requestTurnIndex();
         this.modelOverride =
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
+        this.modelDefault = readModelDefault(message.modelDefault);
+        this.modelPinned = typeof message.modelPinned === 'string' ? message.modelPinned : null;
         this.effortOverride =
           typeof message.effortOverride === 'string' ? message.effortOverride : null;
         this.options.onChange?.();
@@ -292,6 +345,8 @@ export class ChatController {
         }
         this.modelOverride =
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
+        this.modelDefault = readModelDefault(message.modelDefault);
+        this.modelPinned = typeof message.modelPinned === 'string' ? message.modelPinned : null;
         this.effortOverride =
           typeof message.effortOverride === 'string' ? message.effortOverride : null;
         this.options.onChange?.();
@@ -307,6 +362,13 @@ export class ChatController {
         if (applied === 'live' || applied === 'cleared') {
           this.modelOverride = typeof message.model === 'string' ? message.model : null;
         }
+        // Unconditionally, unlike the label above, and that is the point: a
+        // pick the running session could not take still changed what the *next*
+        // new conversation opens on, and a clear still forgot the standing
+        // choice. Left to the next join, the picker would spend the rest of the
+        // conversation describing the state before the click.
+        const nextDefault = readModelDefault(message.modelDefault);
+        if (nextDefault) this.modelDefault = nextDefault;
         this.modelResult = {
           applied,
           message: String(message.message || ''),
@@ -363,6 +425,22 @@ export class ChatController {
           // exactly the false statement the flag exists to prevent.
           this.turnIndexComplete = true;
           this.requestTurnIndex();
+        }
+        // A conversation that begins states the mode it begins in, and this is
+        // the only place that statement reaches a pane whose conversation was
+        // restarted from inside itself. `chat_started` is broadcast from the
+        // launch path only; `/clear` re-decides the mode against the account's
+        // preference and never goes near it, so without this the chip beside
+        // the composer and the header badge would go on naming the mode of the
+        // conversation the clear replaced — "asks first" over an agent now
+        // running unattended, until the tab was reloaded (#134).
+        //
+        // Live events only. Replayed history reaches the transcript through
+        // `hydrate` and `chat_page`, neither of which comes through here, so an
+        // old conversation's opening line cannot overwrite the current mode.
+        if (event && event.t === 'marker' && event.kind === 'approvals') {
+          this.transcript.setBypassing(event.bypassing === true);
+          this.options.onChange?.();
         }
         return true;
       }
@@ -577,6 +655,21 @@ export class ChatController {
   /** The model override in force for this conversation, or null if there is none. */
   get modelOverrideValue(): string | null {
     return this.modelOverride;
+  }
+
+  /**
+   * Where a new conversation on this runtime would get its model, or null when
+   * the server did not say.
+   */
+  get modelDefaultValue(): ChatModelDefault | null {
+    return this.modelDefault;
+  }
+
+  /**
+   * The model this conversation is fixed to, or null when nothing says.
+   */
+  get modelPinnedValue(): string | null {
+    return this.modelPinned;
   }
 
   /** What happened the last time this browser asked to change the model. */
@@ -797,13 +890,33 @@ export class ChatController {
     this.options.send({ ...message, sessionId: this.sessionId });
   }
 
+  /**
+   * Show the mode a list row already knew, before this pane has heard anything.
+   *
+   * Display only — see ChatTranscript.seedBypass. Never echoed back in a
+   * launch: the browser does not assert approval modes, it reports them.
+   */
+  seedBypass(bypassing: boolean): void {
+    this.transcript.seedBypass(bypassing);
+    this.options.onChange?.();
+  }
+
   /** Release timers, e.g. when the session's tab is closed. */
   dispose(): void {
     this.cancelSeek();
     this.settlePage();
   }
 
-  /** Drop everything, e.g. when the session is being restarted. */
+  /**
+   * Drop everything, e.g. when the session is being restarted.
+   *
+   * Nothing in the client calls this today — the registry drops a closed tab
+   * through `drop()` -> `dispose()`, and a restart in place keeps the pane. It
+   * is kept correct rather than deleted because it is the one entry point that
+   * would wipe a live pane, but nothing here is load-bearing for any user-facing
+   * guarantee: what a restarted conversation shows is decided by the mode its
+   * opening `approvals` marker carries (see `chat_event` above), not by this.
+   */
   reset(): void {
     this.cancelSeek();
     this.settlePage();
@@ -811,6 +924,15 @@ export class ChatController {
     // record's real override, and showing a stale one in the meantime would
     // be worse than showing nothing.
     this.modelOverride = null;
+    // The pin goes with it, and for the same reason: the record's own answer is
+    // on its way, and a conversation being relaunched may well come back on a
+    // different model — naming the old one in the meantime would be the exact
+    // claim this field exists to stop the chip making.
+    this.modelPinned = null;
+    // The default deliberately survives: it is a fact about the account and the
+    // runtime, not about the conversation being restarted, and the picker would
+    // otherwise lose the only sentence that explains what the restart will open
+    // on until the next join answered.
     this.modelResult = null;
     // And the effort level with it, for the same reason: the record's own value
     // is on its way and a stale one on the chip in the meantime would claim the
@@ -834,10 +956,13 @@ export class ChatController {
       replayFrom: 0,
       cursor: 0,
       live: false,
-      // Not a claim about the session: this is a wipe, and the next snapshot or
-      // `chat_started` carries the real mode. Manual is the direction to be
-      // wrong in for the moment in between.
-      bypassPermissions: false,
+      // Carried across the wipe rather than asserted as manual. The next
+      // snapshot or `chat_started` still has the last word, but until it lands
+      // the honest answer is the one the server last stated — and dropping a
+      // known bypass to "asks first" for that interval is the one direction of
+      // wrongness that matters, a user relaxing because the badge says the
+      // agent will stop and ask (#134).
+      bypassPermissions: this.transcript.bypassing,
     });
     this.options.onChange?.();
   }

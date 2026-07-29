@@ -61,6 +61,122 @@
   out what a runtime can report by watching it: the usage dashboard keeps "this
   agent cannot report" and "this agent could have and did not" apart on purpose,
   and those stay two different answers.
+- **The model you pick is remembered for that agent, and the picker says where
+  it came from** (#135). Choosing a model in a chat used to last exactly as long
+  as that conversation. Open a new one on the same agent and you were back on
+  whatever the CLI does by default, picking again — while the effort control
+  right beside it had been remembering its setting per runtime for two releases.
+
+  A model chosen in a chat is now your standing choice for that agent, and the
+  next new chat opens on it. Three things can decide the model, and they are
+  consulted in this order: whatever *this conversation* was set to, then your
+  standing choice for the agent, then the active runtime profile. Below all
+  three the CLI is launched with no model flag at all and uses its own default.
+
+  A conversation already under way is never re-modelled. Every chat records the
+  model its launch actually used, and that recorded model is what it comes back
+  on — so a relaunch, a resume from the launcher and the recovery banner's
+  restart all return to the model that conversation was already using, including
+  after a server restart, which is the moment every open conversation gets
+  relaunched. Changing your standing choice, or the active profile, affects the
+  next new chat and nothing that is open. A conversation that launched with no
+  model flag at all keeps that too: a profile added afterwards does not reach
+  back into it.
+
+  **The picker now says which of the three is in force**, in a line above the
+  list and on the chip's hover. Before this, a model pinned by a runtime profile
+  was genuinely applied to every launch and nowhere on screen: until the agent
+  reported a model of its own, the chip read the literal word "model". It now
+  names the model *this conversation was launched on* — never a default it was
+  not launched on, which would change under an open chat every time you picked a
+  model in another tab — and says where the default came from: a profile, by
+  name; your own last choice; or nobody, in which case the runtime picks. When
+  the two differ the line says which model the conversation is staying on.
+
+  **Use the default for this runtime** clears the conversation's choice *and*
+  forgets your standing one, so the next new chat falls back to the profile and
+  then to the CLI's own default. That is deliberate, and it is what makes the
+  entry worth having: nothing else in the app can undo a standing choice, and a
+  model id typed with a typo would otherwise ride into every new chat on that
+  runtime. For the same reason, a name is only promoted to a standing choice
+  when the runtime is known to take it — the switch applied live, or the name is
+  on the list the runtime published. A runtime that publishes no list at all
+  (Claude is one) has nothing to check against, so a name typed there is taken
+  at face value.
+
+  Your standing choice lives on the server, scoped to your account, so it
+  travels between your phone and your desk and is not readable from anyone
+  else's. Effort is kept per browser instead, and the difference is not taste:
+  Claude, Codex and pi fix the model when the process starts, so a preference
+  held in the browser could only be applied after the launch — which on Claude
+  means a visible `/model` turn pushed into a conversation nobody has typed in
+  yet.
+
+  Runtime profiles are not weakened by this and not going anywhere. They were
+  never a pin a user could not escape — a conversation's own choice has
+  outranked them since the picker existed — and they remain the shared default
+  for everybody who has not chosen. Two things deliberately did not change:
+  terminal sessions, which run the CLI's own interface where the model is yours
+  to change inside the tool, and the launcher screen before a chat starts, which
+  has no model control for the new line to sit in. Branching is unaffected: a
+  branch opens on the model its source was actually running — the one the
+  carried history was just measured against — whether that came from a choice,
+  from your standing one, from the profile, or from nothing at all.
+- **The Web chat approvals switch now reaches every way of starting a
+  conversation, and holds for you rather than for the browser you set it in**
+  (#134). It reached exactly one: the chat button on the runtime launcher.
+  Everything else ignored it. A branch cut from a turn always asked. *Start a
+  new chat* on the recovery notice after a server restart always asked — and
+  when nothing had recorded which conversation the agent was having, that button
+  was the only one offered, so those conversations had no route back to the mode
+  you had chosen at all. Meanwhile **New chat** inside a live conversation did
+  the opposite: it carried the old conversation's bypass forward even if you had
+  since switched the preference back to asking. Two actions with nearly the same
+  name doing opposite things, with nothing on screen saying which you had got.
+
+  There is one rule now, and it is decided by *how you got there* rather than by
+  what happens to be on the record. A conversation that is **beginning** takes
+  your preference: the launcher, a branch, starting over after a restart, and
+  `/clear` are all beginnings. A conversation that is **continuing** — resumed
+  from the launcher, opened from the conversations list, or picked back up with
+  *Resume this conversation* — comes back in the mode it was already running in,
+  and the preference is not re-read in either direction. Turning the preference
+  on later cannot widen a conversation that had already chosen to ask; turning
+  it off cannot take the mode away from one that is running without prompts.
+  Anything missing or unreadable means ask.
+
+  The mode is stated where you are looking. Every conversation opens with a line
+  saying which mode it is in, including the one that replaces it after a
+  `/clear`, and the two buttons on the recovery notice each name the mode they
+  land in — so a bypass is never restored, or dropped, in silence. The chip
+  beside the input box and the header badge move with that line rather than
+  going on naming the mode of the conversation the `/clear` replaced, which is
+  the difference between reading the mode once and being able to check it.
+
+  The preference has moved off the browser and onto your account. It is stored
+  on the server, arrives with the page, and is the same answer on your phone as
+  on your desktop. One consequence of that move: **a preference set before this
+  release does not carry over.** It had never been attached to an account, only
+  to a browser profile, and quietly turning approvals off for an account on the
+  strength of a value one device happened to be holding is not a thing to do
+  with a standing permission. Set it once more and it follows you.
+
+  A chat launch no longer carries an approval flag from the page at all. The
+  button reports what the server is going to do instead of asking for it, which
+  removes the one place in this feature where a page could have asked for a
+  permission the account had never been granted. An explicit *narrowing* from
+  the browser is still honoured, because asking more often is always safe.
+
+  A conversation also shows its real mode from its first paint now, rather than
+  claiming it asks first until the server answers — the session list already
+  knew, and the tab simply was not told.
+
+  Two things deliberately left alone. The terminal surface's own **No prompts**
+  button is a per-launch choice on a different surface and is not covered by
+  this preference. And **pi** is named rather than papered over: its chat
+  adapter has no approval channel, so a pi conversation runs its tools without
+  asking whichever mode the rule works out — its opening line says so instead of
+  promising prompts that were never going to come.
 - **On a phone the message is the largest text in the conversation again**
   (#92). It had become the smallest. Everything around it — the turn header, the
   tool and reasoning summary, the model and token line, the timestamps — was

@@ -489,6 +489,14 @@ export class AppDatabase {
     // existed has no override recorded, which is exactly what a null means.
     this.addColumnIfMissing('runtime_sessions', 'chat_model_override', 'TEXT');
 
+    // The model this conversation is fixed to, written from what its last launch
+    // actually used. Nullable, and the null is doing real work: it is "nothing
+    // recorded", which is true of every row written before this column existed
+    // and reads as the profile, exactly as it did then. A conversation that
+    // launched with no model flag at all stores an empty string instead, so the
+    // two cases stay apart — see `chatModelPinned`.
+    this.addColumnIfMissing('runtime_sessions', 'chat_model_pinned', 'TEXT');
+
     // The reasoning-effort level this conversation overrides its runtime's
     // default with. Nullable and null-by-default for the same reason as the
     // model above: a row written before this column existed chose no level, and

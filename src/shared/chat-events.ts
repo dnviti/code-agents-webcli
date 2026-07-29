@@ -388,7 +388,7 @@ export interface ErrorBlock {
  */
 export interface NoticeBlock {
   kind: 'notice';
-  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched';
+  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals';
   text: string;
   /** Optional detail — how much was reclaimed, what the summary covers. */
   detail?: string;
@@ -762,6 +762,31 @@ export interface ModelChoice {
 }
 
 /**
+ * Which model a *new* conversation on this runtime would open on, and why.
+ *
+ * A statement about the default, never about the process that happens to be
+ * running: a conversation with an override of its own is running that instead,
+ * and one with neither is running whatever its launch resolved — which travels
+ * separately, as `modelPinned`. The picker pairs them rather than letting one
+ * stand in for another; using this as the model in force was how the chip came
+ * to name a standing choice that had never been applied to the conversation
+ * showing it. Said
+ * out loud because a model picked out of a menu used to be invisible the moment
+ * it was in force — the chip fell back to the literal word "model", and nothing
+ * anywhere named the profile that had pinned it (issue #135).
+ *
+ * `model` is null only for `runtime`, which means nobody has chosen and the CLI
+ * will use whatever it considers normal. Nothing here is validated against a
+ * catalogue: a model name is free text because only the runtime knows its own.
+ */
+export interface ChatModelDefault {
+  model: string | null;
+  source: 'personal' | 'profile' | 'runtime';
+  /** Only ever set for `profile`, and only so the picker can name it. */
+  profileName?: string;
+}
+
+/**
  * One reasoning-effort level, as the runtime that offers it named it.
  *
  * `value` is sent back to that runtime verbatim, so it is never a word this app
@@ -1046,13 +1071,36 @@ export type ChatEvent =
    * opening context, and the line is where a reader is told so — a branch that
    * looked like an ordinary transcript would be claiming the agent lived
    * through it (#34).
+   *
+   * `approvals` opens a conversation by saying which mode it is running in.
+   * The mode is decided when a conversation begins, from a preference that
+   * lives in Settings and may have been changed since the last one — so a
+   * conversation that starts, or is started over, without approval prompts says
+   * so in the conversation itself rather than only in a dialog the user may
+   * never open (#134). `detail` carries which mode.
    */
   | {
       t: 'marker';
       seq: number;
       ts: number;
-      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched';
+      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals';
       detail?: string;
+      /**
+       * On an `approvals` marker: the mode the conversation actually started
+       * in, as a fact rather than as the phrase `detail` renders.
+       *
+       * This is the *only* thing that tells a browser the mode changed under an
+       * in-conversation `/clear`. `chat_started` is broadcast from the launch
+       * path alone, and a restart from inside a conversation never goes through
+       * it — so without this field a pane goes on drawing the mode the
+       * conversation had before the clear, indefinitely, and a chip reading
+       * "asks first" over an agent now running unattended is the one direction
+       * of wrongness this feature exists to remove (#134).
+       *
+       * Optional because every other marker kind has no mode, and because a
+       * transcript recorded before this field existed must still replay.
+       */
+      bypassing?: boolean;
     };
 
 /** An attachment on an outgoing user turn. */

@@ -381,6 +381,54 @@ describe('ChatView', function () {
       assert.ok(html.includes('cannot be given its context back'), 'and the reason must be said');
     });
 
+    it('says which mode each of the two buttons lands in', function () {
+      // The heart of #134: these two sat side by side doing opposite things
+      // about approvals, and nothing on screen said which was which. Resume
+      // restores the conversation's own mode; Start a new chat begins one, so
+      // it takes the account's preference.
+      const controller = controllerWith({
+        ...DEAD,
+        nativeSessionId: 'native-7',
+        bypassPermissions: true,
+      });
+      const html = render({ controller, approvalPreference: false });
+
+      assert.ok(
+        html.includes('Resume this conversation · approvals bypassed'),
+        'a restored bypass must not be restored silently',
+      );
+      assert.ok(
+        html.includes('Start a new chat · asks first'),
+        'and a dropped one must not be dropped silently',
+      );
+    });
+
+    it('says so the other way round when the preference bypasses', function () {
+      const controller = controllerWith({
+        ...DEAD,
+        nativeSessionId: 'native-7',
+        bypassPermissions: false,
+      });
+      const html = render({ controller, approvalPreference: true });
+
+      assert.ok(html.includes('Resume this conversation · asks first'));
+      assert.ok(html.includes('Start a new chat · approvals bypassed'));
+    });
+
+    it('states the mode even when starting over is the only button', function () {
+      // The case with no resume beside it to compare against: the label alone
+      // leaves nothing to say what is about to change, so the paragraph says it.
+      const controller = controllerWith(DEAD);
+      const html = render({ controller, approvalPreference: true });
+
+      assert.ok(!html.includes('Resume this conversation'), 'resume must not be offered');
+      assert.ok(html.includes('Start a new chat · approvals bypassed'));
+      assert.ok(
+        html.includes('A new conversation runs with approvals bypassed'),
+        'the only route back to a mode has to say which mode it is',
+      );
+    });
+
     it('asks the server to resume this session, not to open another', function () {
       const controller = controllerWith({ ...DEAD, nativeSessionId: 'native-7' });
       controller.relaunch('claude', { resume: true });

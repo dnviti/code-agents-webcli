@@ -73,8 +73,28 @@ function fakeApp() {
     chats: {
       subscribed: [],
       dropped: [],
-      subscribe(id) { this.subscribed.push(id); },
+      // What the pane was told to show before any socket traffic: the session
+      // list already knows each conversation's approval mode, and a pane that
+      // opened claiming "asks first" over a bypassing one was #134.
+      seeded: [],
+      // One log across both calls, because the ordering *between* them is the
+      // load-bearing part and two independent arrays cannot express it: each
+      // pins its own order and neither says which came first.
+      calls: [],
+      subscribe(id) {
+        this.subscribed.push(id);
+        this.calls.push(`subscribe:${id}`);
+      },
       drop(id) { this.dropped.push(id); },
+      ensure(id) {
+        const chats = this;
+        return {
+          seedBypass(value) {
+            chats.seeded.push({ id, value });
+            chats.calls.push(`seed:${id}=${value}`);
+          },
+        };
+      },
     },
   };
   return app;
@@ -465,6 +485,42 @@ describe('session tab state', function () {
     // session_joined and from chat_started.
     assert.deepStrictEqual(app.chats.subscribed, ['s1']);
     assert.strictEqual(shellTab('s1').surface, 'chat');
+  });
+
+  it('tells a restored chat tab its approval mode before it subscribes', async function () {
+    // A tab restored on page load used to open claiming "asks first" until the
+    // first snapshot came back over the socket, over a conversation the server
+    // already knew was bypassing (#134). The list carries the mode; this is
+    // where it reaches the pane, and it has to happen before the subscribe or
+    // the snapshot could land in front of it.
+    respondTo = () => ({
+      ok: true,
+      json: async () => ({
+        sessions: [
+          { id: 'yolo', name: 'yolo', active: false, workingDir: '/a', surface: 'chat', bypassPermissions: true },
+          { id: 'careful', name: 'careful', active: false, workingDir: '/a', surface: 'chat', bypassPermissions: false },
+        ],
+      }),
+    });
+
+    const { m, app } = manager();
+    await m.loadSessions();
+
+    assert.deepStrictEqual(app.chats.seeded, [
+      { id: 'yolo', value: true },
+      { id: 'careful', value: false },
+    ]);
+    assert.deepStrictEqual(app.chats.subscribed, ['yolo', 'careful']);
+    // The two lists above pin the order *within* each of them and say nothing
+    // about the interleaving, which is the invariant that actually matters:
+    // move the seed after the subscribe and both would still pass while the
+    // snapshot got a clear run at landing first. One log, one assertion.
+    assert.deepStrictEqual(app.chats.calls, [
+      'seed:yolo=true',
+      'subscribe:yolo',
+      'seed:careful=false',
+      'subscribe:careful',
+    ]);
   });
 
   it('applies a dragged order and keeps a tab that arrived mid-drag', function () {

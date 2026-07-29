@@ -359,7 +359,7 @@ export class SessionTabManager {
       sessions.forEach((raw, index: number) => {
         const session = raw as unknown as {
           id: string; name: string; active: boolean; workingDir: string | null;
-          surface?: 'terminal' | 'chat'; customName?: string;
+          surface?: 'terminal' | 'chat'; customName?: string; bypassPermissions?: boolean;
         };
         this.addTab(
           session.id,
@@ -370,6 +370,10 @@ export class SessionTabManager {
           session.customName,
         );
         if (session.surface === 'chat') {
+          // Before the subscribe inside setTabSurface, so the pane's very first
+          // paint already states the mode this conversation is in rather than
+          // claiming "asks first" until a snapshot comes back over the socket.
+          this.app.chats.ensure(session.id).seedBypass(session.bypassPermissions === true);
           this.setTabSurface(session.id, 'chat');
         }
         const sessionData = this.activeSessions.get(session.id);

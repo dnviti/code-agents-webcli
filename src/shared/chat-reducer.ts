@@ -286,6 +286,7 @@ const NOTICES: Record<
   interrupted: { notice: 'interrupted', text: 'Interrupted to send' },
   branched: { notice: 'branched', text: 'Branched from an earlier conversation' },
   cleared: { notice: 'cleared', text: 'New conversation' },
+  approvals: { notice: 'approvals', text: 'Tool approvals' },
 };
 
 /** Every token field a runtime can report, so a reset covers all of them. */
@@ -978,7 +979,10 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // the stop without the reason would read as an agent that gave up. A
       // branch is there because everything above it happened in another
       // conversation, and a copied history presented as this one's own would
-      // be the same lie in the other direction.
+      // be the same lie in the other direction. And the approval mode is there
+      // because it is decided as the conversation begins, from a preference set
+      // somewhere else entirely — a conversation running tools unattended has
+      // to say so where the tools are running (#134).
       const notice = NOTICES[event.kind];
       const message: ChatMessage = {
         id: `marker-${event.seq}`,
