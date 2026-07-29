@@ -1298,6 +1298,51 @@ function ModelChip({
   const ref = React.useRef<HTMLDivElement | null>(null);
   const inputRef = React.useRef<HTMLInputElement | null>(null);
   const isPhone = usePhone();
+
+  /**
+   * Only the outcomes this control cannot say for itself (issue #128).
+   *
+   * The same rule the effort chip took in #119, and for the same reasons. A
+   * model that switched needs no announcement: the chip is relabelled with its
+   * name the instant the switch lands, so a box beside it reading "Switched to
+   * claude-sonnet for this conversation" spends the user's attention repeating
+   * what their eye has already reached — and on a phone, where this wrapper is
+   * `static` so the menu can have the composer's width, it repeats it on top of
+   * the field they were about to type into.
+   *
+   * Three outcomes survive, because each is one the chip gets wrong on its own:
+   * `sent` means the runtime was asked and has not answered yet, so the word is
+   * in the transcript rather than here; `pending` will not reach this
+   * conversation at all before it is relaunched; and `cleared` is the least
+   * visible of the three, because the chip has already fallen back to whatever
+   * the session last reported — which is not what the next one will run.
+   *
+   * Unlike the effort ladder there is no `refused`: a model name is free text
+   * and nothing here can pre-judge it.
+   */
+  const notice = feedback && feedback.applied !== 'live' ? feedback : null;
+
+  /**
+   * The answer goes away on its own, after long enough to read it.
+   *
+   * Left standing it becomes a fixture rather than a reply, and this box and the
+   * effort chip's are anchored at the same height — two of them overlap into a
+   * pile of opaque boxes, and on a phone, where both resolve against the
+   * composer instead of against their own chip, they land on identical
+   * coordinates and the older one is simply invisible underneath.
+   *
+   * Keyed on the message so a second answer restarts the clock rather than
+   * inheriting the remains of the first one's.
+   */
+  const [showFeedback, setShowFeedback] = React.useState(false);
+  const feedbackMessage = notice?.message;
+  React.useEffect(() => {
+    if (!feedbackMessage) return;
+    setShowFeedback(true);
+    const timer = setTimeout(() => setShowFeedback(false), 7000);
+    return () => clearTimeout(timer);
+  }, [feedbackMessage]);
+
   // The session's own model wins. `models` is a menu in whatever order the
   // runtime listed it, and its first entry is the current one only by accident.
   const matched = models?.find((m) => m.value === current || m.name === current);
@@ -1373,7 +1418,13 @@ function ModelChip({
         aria-expanded={open}
         aria-label="Change model"
         title={
-          feedback?.message
+          // The same rule as the box, and for the same reason: a hover reading
+          // "Switched to claude-sonnet for this conversation" would have
+          // displaced the description of what this control *does* for the rest
+          // of the conversation, in favour of a sentence the chip beneath the
+          // pointer already spells out. An outcome the chip cannot show still
+          // takes the slot, so it stays findable after its box has timed out.
+          notice?.message
           || (others.length > 0
             ? `This turn ran on: ${[named, ...others].join(', ')}`
             : `Model: ${label}`)
@@ -1560,28 +1611,34 @@ function ModelChip({
         </div>
       ) : null}
 
-      {!open && feedback ? (
+      {!open && notice && showFeedback ? (
         <div
           role="status"
           style={{
             position: 'absolute',
             right: 0,
-            top: '100%',
-            marginTop: 4,
+            // Upward on a phone, and the reason is that `top: 100%` resolves
+            // against the composer there rather than against this chip — the
+            // wrapper is `static` so the menu can have the composer's width.
+            // Below the composer is the bottom navigation bar, which this would
+            // cover: an opaque box at `--z-dropdown` sitting on the buttons, or
+            // off the screen entirely once the safe-area inset is counted.
+            ...(isPhone ? { bottom: '100%', marginBottom: 6 } : { top: '100%', marginTop: 4 }),
             maxWidth: 240,
             padding: '4px 6px',
             background: 'var(--popover)',
             border: '1px solid var(--border)',
             borderRadius: 'var(--radius)',
-            color:
-              feedback.applied === 'live'
-                ? 'var(--foreground)'
-                : 'var(--muted-foreground)',
+            // Every outcome that reaches here is "saved, but not yet" — true,
+            // worth reading once, and not worth alarm. The one that used to be
+            // drawn in full-strength foreground was the one that had already
+            // happened, which was the loudest thing on screen for the least news.
+            color: 'var(--muted-foreground)',
             fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-2xs)',
             zIndex: 'var(--z-dropdown)' as unknown as number,
           }}
         >
-          {feedback.message}
+          {notice.message}
         </div>
       ) : null}
     </div>
