@@ -32,6 +32,7 @@ import {
   QueuedTurn,
   QuestionRequest,
   NO_CHAT_CAPABILITIES,
+  isSessionMintedMessageId,
 } from '../../shared/chat-events.js';
 import {
   TranscriptState,
@@ -41,6 +42,42 @@ import {
 } from '../../shared/chat-reducer.js';
 
 type Listener = () => void;
+
+/**
+ * Drop a runtime's echo of the prompt once the page carrying this app's own copy
+ * has arrived.
+ *
+ * The reducer already refuses these as they stream in (#129), on the same test:
+ * only `ChatSession.deliver` ever writes a user message and it always mints
+ * `user-<uuid>`, so a second user message in a turn that already holds this app's
+ * own, under a name this app would not have minted, is the runtime repeating the
+ * prompt back. That guard has to see both halves at once, and scrolling back is
+ * exactly where they arrive apart: `absorbPage` folds every history page through
+ * a scratch transcript of its own, so a page boundary landing in the handful of
+ * events between the app's message and the echo hides each from the other and
+ * both survive into the merge — two identical bubbles, side by side, in a turn
+ * eleven pages back. This is the same rule at the one point where the pair is
+ * finally whole.
+ *
+ * Only conversations recorded before the adapters stopped echoing carry a pair at
+ * all, and nothing rewrites them: this decides what is drawn, each time one is
+ * opened.
+ */
+function withoutRuntimeUserEchoes(messages: ChatMessage[]): ChatMessage[] {
+  const ownTurns = new Set<string>();
+  for (const message of messages) {
+    if (message.role === 'user' && message.turnId && isSessionMintedMessageId(message.id)) {
+      ownTurns.add(message.turnId);
+    }
+  }
+  if (!ownTurns.size) return messages;
+  return messages.filter(
+    (message) =>
+      message.role !== 'user'
+      || isSessionMintedMessageId(message.id)
+      || !ownTurns.has(message.turnId),
+  );
+}
 
 export class ChatTranscript {
   private state: TranscriptState;
@@ -265,7 +302,7 @@ export class ChatTranscript {
 
     const known = new Set(this.state.messages.map((message) => message.id));
     const fresh = messages.filter((message) => !known.has(message.id));
-    this.state.messages = [...fresh, ...this.state.messages];
+    this.state.messages = withoutRuntimeUserEchoes([...fresh, ...this.state.messages]);
     reindexTranscript(this.state);
     this.bumpAll();
   }
