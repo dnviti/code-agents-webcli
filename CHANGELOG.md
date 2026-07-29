@@ -3,6 +3,34 @@
 ## [Unreleased]
 
 ### Fixed
+- **On a phone the message is the largest text in the conversation again**
+  (#92). It had become the smallest. Everything around it — the turn header, the
+  tool and reasoning summary, the model and token line, the timestamps — was
+  made phone-aware and raised to 15px to fix an earlier complaint about
+  captions nobody could read, and the message itself never was: it stayed at
+  13px while the accounting around it sat at 15 in a wide monospace face and in
+  capitals, which reads larger still. The eye landed on "83 tools 31 reasoning"
+  and on a string of token counts before it found what had actually been said.
+
+  There is an order now, and it is written down in one place: 17px for the
+  message (18 at comfortable density), 16 for anything typed into, 15 for a
+  collapsed turn's label and for the live session figures in the header, 13 for
+  the per-message and per-turn detail, and nothing readable below 12. The rule
+  the earlier fix encoded — nothing carrying live session information is smaller
+  than the body text — survives where it belongs, in the session chrome, and no
+  longer governs the conversation.
+
+  Size is not all of it. The per-turn label drops its capitals and its wide
+  tracking on a phone, and a tool call's title drops its extra weight: a 13px
+  shout is still a shout. Two search fields that were below 16px now clear it,
+  because iOS Safari magnifies the page when a smaller field takes focus and
+  never magnifies back.
+
+  Desktop sizing is untouched, and there is now a check that measures the
+  *order* rather than a floor. Every phone type rule this app had was "nothing
+  smaller than N", and a floor cannot catch an inversion — which is exactly how
+  this shipped.
+
 - **A workflow that failed no longer reads as done** (#140). The Workflow tool
   returns the moment a run is launched — "Workflow launched in background", no
   error, four seconds before anything has happened — and that acknowledgement

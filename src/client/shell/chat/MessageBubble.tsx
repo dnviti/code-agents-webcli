@@ -212,7 +212,7 @@ export const MessageBubble = React.memo(function MessageBubble({
             style={{
               marginTop: 4,
               fontFamily: 'var(--font-mono)',
-              fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
+              fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-2xs)',
               color: 'var(--muted-foreground)',
             }}
           >
@@ -302,7 +302,7 @@ export const MessageBubble = React.memo(function MessageBubble({
             paddingTop: isPhone ? 0 : 3,
             marginRight: isPhone ? 'auto' : 0,
             fontFamily: 'var(--font-mono)',
-            fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
+            fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-2xs)',
             color: 'var(--muted-foreground)',
             whiteSpace: 'nowrap',
           }}
@@ -541,7 +541,7 @@ function WorkCounter({ work, onClick }: { work: WorkSummary; onClick: () => void
         border: '1px solid transparent',
         borderRadius: 'var(--radius)',
         fontFamily: 'var(--font-mono)',
-        fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
+        fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-2xs)',
         lineHeight: 1,
         // Quiet, but not faded. The buttons either side of this one sit at 0.65
         // opacity at rest, and that is fine for them: they carry a verb, drawn
@@ -582,7 +582,7 @@ function Count({
 }): React.JSX.Element {
   return (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
-      <Icon name={icon} size={isPhone ? 15 : 11} />
+      <Icon name={icon} size={isPhone ? 13 : 11} />
       {value}
     </span>
   );
@@ -732,6 +732,7 @@ const NOTICE_GLYPH: Partial<Record<NoticeBlock['notice'], string>> = {
  * contradicts something from earlier is explained rather than baffling.
  */
 function NoticeRule({ block }: { block: NoticeBlock }): React.JSX.Element {
+  const isPhone = usePhone();
   return (
     <div
       role="separator"
@@ -744,7 +745,8 @@ function NoticeRule({ block }: { block: NoticeBlock }): React.JSX.Element {
         padding: '2px 0',
         color: 'var(--muted-foreground)',
         fontFamily: 'var(--font-sans)',
-        fontSize: 'var(--text-2xs)',
+        // 10px is below the 12px a phone can be read at (#92).
+        fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-2xs)',
         letterSpacing: 'var(--tracking-wide)',
       }}
     >
@@ -794,7 +796,10 @@ function ErrorCallout({ block, onRetry }: { block: ErrorBlock; onRetry?: () => v
         border: '1px solid color-mix(in oklab, var(--destructive) 38%, transparent)',
         background: 'color-mix(in oklab, var(--destructive) 8%, transparent)',
         color: 'var(--destructive)',
-        fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-sm)',
+        // An error *is* the message here, so it reads at the message's size
+        // rather than at a size of its own — which is also what keeps it above
+        // the accounting around it on a phone (#92).
+        fontSize: 'var(--chat-prose-size, var(--text-ui))',
         borderRadius: 'var(--radius)',
       }}
     >
@@ -914,9 +919,11 @@ function Footer({ model, usage }: { model?: string; usage?: ChatUsage }) {
         flexWrap: 'wrap',
         gap: 8,
         fontFamily: 'var(--font-mono)',
-        // The model this answer ran on, and what it cost: the same figures the
-        // header carries, so the same rule applies to them here.
-        fontSize: isPhone ? PHONE_TEXT.label : 'var(--text-2xs)',
+        // The model this answer ran on and what it cost: per-answer accounting,
+        // not the session's, so it sits below the message rather than beside
+        // the header's live figures. Raising it to match them is what made the
+        // message the smallest text on the screen (#92).
+        fontSize: isPhone ? PHONE_TEXT.detail : 'var(--text-2xs)',
         color: 'var(--muted-foreground)',
       }}
     >

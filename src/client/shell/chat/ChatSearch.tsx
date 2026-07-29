@@ -2,6 +2,7 @@ import * as React from 'react';
 
 import { ChatRole } from '../../../shared/chat-events.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { PHONE_TEXT, usePhone } from '../../ui/touch.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
 import { Badge } from '../../ui/relay/Badge.js';
 
@@ -243,6 +244,7 @@ export function ChatSearchResults({
 }
 
 export function ChatSearch({ onSearch, onOpen, autoFocus }: ChatSearchProps): React.JSX.Element {
+  const isPhone = usePhone();
   const [query, setQuery] = React.useState('');
   const [phase, setPhase] = React.useState<Phase>('idle');
   const [hits, setHits] = React.useState<ChatSearchHit[]>([]);
@@ -324,7 +326,10 @@ export function ChatSearch({ onSearch, onOpen, autoFocus }: ChatSearchProps): Re
           aria-activedescendant={activeHit ? `${listId}-opt-${activeIndex}` : undefined}
           style={{
             flex: 1, minWidth: 0, border: 'none', outline: 'none', background: 'transparent',
-            color: 'var(--foreground)', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-ui)',
+            color: 'var(--foreground)', fontFamily: 'var(--font-sans)',
+            // A field the user types into: below 16px iOS Safari magnifies the
+            // page on focus and never undoes it (#92).
+            fontSize: isPhone ? PHONE_TEXT.input : 'var(--text-ui)',
           }}
         />
         {query ? (
