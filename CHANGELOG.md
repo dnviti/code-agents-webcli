@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [5.3.3] - 2026-07-29
+
 ### Fixed
 - **A conversation's record stops being edited by a question about layout.** The
   rule added for #132 — does this block put anything on the screen — is the right
@@ -18,6 +20,41 @@
   reply #132 was filed for, and a plan a runtime announced and never filled in.
   Deciding the row stays where it belongs, on the display, working from a record
   that still holds everything.
+- **The same answer twice is answered twice** (#128). The box that reports an
+  outcome the control cannot show for itself now leaves after seven seconds,
+  which was the fix for it piling up with the effort chip's. It was raised by an
+  effect keyed on the message's *text*, so an outcome repeated word for word —
+  the same model picked again on a runtime that cannot switch mid-session, or
+  "use the default for this runtime" clicked twice — left that key unchanged once
+  the box had gone, and the second click was answered with nothing at all. On a
+  phone, where the chip can show neither a pending model nor a clear, that was
+  the entire response to a deliberate action. Keyed on the answer itself now, so
+  two identical ones are still two. The seven-second dismissal had no check
+  either way; both halves have one now.
+- **A delegation that stopped reporting reads that way in its own window too**
+  (#139). The status for a call nothing will ever report on again reached the
+  tool-status table, the Agents panel and the workflow popup, and missed the
+  agent popup, which keeps a fourth copy of the list. So the row and the window
+  it opens disagreed: the row said "no longer reporting" while the popup put a
+  live dot on that very badge, drew the in-flight glyph beside the last thing the
+  agent said, and offered "Waiting for this agent to report its first step…"
+  about a wait that had already ended.
+- **A prompt scrolled back to is drawn once, like every other one** (#129). The
+  double bubble was fixed for live sending and for reopening a conversation, and
+  survived in the one place left: scrolling back far enough that the turn arrives
+  by paging. The rule that catches an echo needs this app's own copy of the
+  prompt and the runtime's copy in front of it together — only
+  `ChatSession.deliver` writes a user message, and it always mints
+  `user-<uuid>`, so a second one in the same turn under a name this app would not
+  have minted is the runtime repeating itself. Every history page is folded on
+  its own, so a page boundary landing in the handful of events between the two
+  hid each from the other and both survived: on a real Oh My Pi conversation the
+  session wrote its message at seq 2485, a `state` event sat at 2488, the echo
+  followed at 2489, and the client's 200-event walk put the boundary on exactly
+  2488. Eleven pages back, the prompt was drawn twice. The same rule is now
+  applied where the pair is finally whole, as pages are merged. Nothing on disk
+  is rewritten — a turn that holds no message this app minted keeps what it has,
+  rather than losing the only prompt it has.
 - **The Status panel stops making up your subscription** (#137). It used to
   open on a plan badge reading `max20`, a meter reading "Tokens 0 of 220.0k"
   and a "Left 220.0k" underneath it. None of that was a fact about anybody's
@@ -535,6 +572,9 @@
   Only workflows. How an ordinary delegation reports its status is untouched,
   and there is a test that says so.
 
+## [5.3.2] - 2026-07-29
+
+### Fixed
 - **A workflow that failed no longer reads as done** (#140). The Workflow tool
   returns the moment a run is launched — "Workflow launched in background", no
   error, four seconds before anything has happened — and that acknowledgement

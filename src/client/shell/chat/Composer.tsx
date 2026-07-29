@@ -1439,17 +1439,23 @@ function ModelChip({
    * composer instead of against their own chip, they land on identical
    * coordinates and the older one is simply invisible underneath.
    *
-   * Keyed on the message so a second answer restarts the clock rather than
-   * inheriting the remains of the first one's.
+   * Keyed on the answer itself and not on its text, so a second answer restarts
+   * the clock rather than inheriting the remains of the first one's — including
+   * when the two read the same. The controller mints a fresh result object for
+   * every reply the server sends and hands back that same object until the next
+   * one, so this changes exactly once per answer and never on a redraw. Keyed on
+   * the string instead, an outcome repeated word for word — the same model picked
+   * twice on a runtime that cannot switch mid-session, or "use the default"
+   * clicked twice — left the dependency unchanged after the timeout had hidden
+   * the box, so the second click answered with nothing at all.
    */
   const [showFeedback, setShowFeedback] = React.useState(false);
-  const feedbackMessage = notice?.message;
   React.useEffect(() => {
-    if (!feedbackMessage) return;
+    if (!notice) return;
     setShowFeedback(true);
     const timer = setTimeout(() => setShowFeedback(false), 7000);
     return () => clearTimeout(timer);
-  }, [feedbackMessage]);
+  }, [notice]);
 
   /**
    * What the chip names when the session has reported nothing.
@@ -1914,17 +1920,17 @@ function EffortChip({
    * their own chip, they land on exactly the same coordinates and the older one
    * is simply invisible underneath.
    *
-   * Keyed on the message so a second answer restarts the clock rather than
-   * inheriting the remains of the first one's.
+   * Keyed on the answer itself and not on its text, for the reason the model
+   * picker's copy of this spells out: two identical outcomes in a row have to be
+   * announced twice, and a string dependency cannot tell them apart.
    */
   const [showFeedback, setShowFeedback] = React.useState(false);
-  const message = notice?.message;
   React.useEffect(() => {
-    if (!message) return;
+    if (!notice) return;
     setShowFeedback(true);
     const timer = setTimeout(() => setShowFeedback(false), 7000);
     return () => clearTimeout(timer);
-  }, [message]);
+  }, [notice]);
 
   React.useEffect(() => {
     if (!open) return;
