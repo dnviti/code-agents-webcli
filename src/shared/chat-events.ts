@@ -1078,6 +1078,22 @@ export interface ChatSnapshot {
    */
   pendingQuestions?: QuestionRequest[];
   /**
+   * Answers already given, keyed by the tool call that asked — falling back to
+   * the request id when there was no call to pair with, exactly as the reducer
+   * keys them.
+   *
+   * An answered question is left in the conversation precisely so that
+   * scrolling back past a decision shows the decision, and the card can only
+   * draw the marks if the snapshot carries them. Without this the answer
+   * survived in the log and was thrown away at the join, so every rejoin —
+   * a tab switch, a reload, a reconnect, a second browser — redrew every
+   * answered question as one nobody had ever answered (#113).
+   *
+   * Optional for the same reason `pendingQuestions` is: a snapshot from a
+   * server that predates this should read as "none known", not as malformed.
+   */
+  answeredQuestions?: Record<string, string[]>;
+  /**
    * Turns typed ahead, still waiting. Optional so a snapshot replayed from the
    * store — which knows nothing about a live process — is not obliged to
    * invent one; the session fills it in.

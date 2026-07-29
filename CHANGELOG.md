@@ -3,6 +3,39 @@
 ## [Unreleased]
 
 ### Fixed
+- **An answered question comes back marked** (#113). A question the agent asked
+  is left in the conversation after it is answered for exactly one reason:
+  scrolling back past a decision should show the decision. It only survived as
+  long as you stayed put. Switching to another conversation tab and back redrew
+  every answered card blank — all the options faded, none marked, sometimes a
+  grey sentence naming the labels underneath and sometimes nothing at all. A
+  card reading as one nobody had ever answered, sitting beside an agent that had
+  plainly acted on an answer.
+
+  The answer was never lost. It was sent, the agent got it, the turn carried on,
+  and the conversation's own record still held every option that was picked. It
+  was dropped at the join: the snapshot a rejoining browser is sent had nowhere
+  to put it. What was on screen until then was not the record at all — it was
+  the card's own memory of the click, and that does not survive the surface
+  being taken down and built again, which is what switching tabs does.
+
+  So the snapshot carries it now, and it survives a tab switch, a reload, a
+  reconnect, a second browser, a conversation whose agent has since stopped, and
+  a question far enough back that it arrives by scrolling rather than with the
+  opening view — that last one had a second leak of its own, where the page was
+  replayed through a scratch transcript that worked the answer out correctly and
+  was then thrown away with it.
+
+  Questions answered before this ships come back marked too. Nothing needs
+  migrating: the answer has always been written to the log, and the snapshot is
+  built by replaying that log.
+
+  One thing the card used to say that it should not: "Skipped without
+  answering" was drawn both when the user really had skipped and when the app
+  simply did not know. Those are different facts and now read differently — a
+  skip is an answer, and claiming one nobody gave is the same misreport this
+  issue is about, in miniature.
+
 - **A workflow that failed no longer reads as done** (#140). The Workflow tool
   returns the moment a run is launched — "Workflow launched in background", no
   error, four seconds before anything has happened — and that acknowledgement
