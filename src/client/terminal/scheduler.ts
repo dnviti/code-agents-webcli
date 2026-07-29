@@ -20,7 +20,11 @@ export function createFrameScheduler(fallbackDelayMs = FALLBACK_DELAY_MS): Frame
 
   const cancel = (): void => {
     if (frame !== null) {
-      cancelAnimationFrame(frame);
+      // Guarded because a host can have one half of the pair and not the other:
+      // the timer above is the whole reason this module exists, and it fires
+      // exactly where rAF was never going to. Crashing in the cleanup of a
+      // fallback that just did its job would be the worst place to be strict.
+      if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(frame);
       frame = null;
     }
     if (timer !== null) {

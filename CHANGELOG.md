@@ -2,6 +2,1264 @@
 
 ## [Unreleased]
 
+### Fixed
+- **A workflow that failed no longer reads as done** (#140). The Workflow tool
+  returns the moment a run is launched — "Workflow launched in background", no
+  error, four seconds before anything has happened — and that acknowledgement
+  was the only thing the app ever heard about how the run went. So a workflow
+  that hit a usage limit, lost its runtime, or threw halfway through wore a
+  green **done** badge on its row and in its popup title, and the conversation
+  said nothing at all. In a run that takes twenty minutes in the background,
+  that is a task you believe finished.
+
+  The run does say how it ended. It says it twice, on a channel this app was
+  listening to and one it was not: `task_updated` carries the raw error, and
+  `task_notification` — which used to be dropped with the hook plumbing —
+  carries a sentence. Either now settles the call that launched the run, so the
+  row, the popup title and the tool call on the trace rail all read **failed**,
+  with the reason's first line on the row itself rather than a badge that makes
+  you open a popup to learn what broke. The conversation gets a message saying
+  so, filed under the turn on screen rather than behind a fold, carrying the
+  reason as a sentence — the stack frames stay on the run, where the popup
+  shows them.
+
+  Somebody in another conversation is told, in the same notification a failed
+  turn raises and under the same switch, now labelled "a turn or workflow
+  fails" — because a background run's own turn ended cleanly and some time ago.
+  That notification survives the conversation carrying on, which is the
+  ordinary case: a run that breaks mid-turn is followed within seconds by that
+  turn ending normally. The tab raises its unread mark too, for the browsers
+  where notification permission was never granted.
+
+  **Agents inside a workflow are counted, not promoted.** A thrown agent
+  resolves to `null` rather than failing the run — a script that probes for
+  failures expects some — so a run that returned a result still reads as done,
+  with `2 failed` beside it in red and the phase they died in marked failed.
+  Only a run that reports its own failure is a failed run. The same rule the
+  transcript already applies to a step that failed inside a turn that did not.
+
+  Verified against two recordings of real runs rather than a hand-written
+  example of one: `claude-workflow-failed.jsonl`, captured for this by
+  `.work/probes/workflow-failure-probe.mjs`, and the existing
+  `claude-workflow.jsonl`, which turned out to be the control it needed — a run
+  that succeeded with one of its five agents dead.
+
+  Two neighbouring bugs are untouched and still open: a workflow reads **done**
+  for as long as it is *running* (#116), and one whose ending never arrives
+  reads **running** forever (#139). Both come from the same launch
+  acknowledgement, and both need the run's whole lifecycle rather than only its
+  failures.
+
+- **Changing the effort level no longer announces itself** (#119). Every pick
+  raised a box beside the composer reading "Now thinking at high" — an opaque
+  panel that overlapped the controls around it and, on a phone, landed on the
+  field the user was about to type into, because it resolves against the
+  composer there rather than against its own chip. It was also the one thing on
+  screen saying nothing new: the chip redraws to the new level the instant it
+  lands, spelling it out, filling its meter to where the level sits on that
+  runtime's own ladder, and colouring it.
+
+  So a change that took effect is now silent, and the four outcomes that are
+  *not* that still speak, because they are exactly the ones the chip gets wrong
+  on its own: a **refused** level was never stored and the conversation is still
+  running at the old one; **sent** is waiting on the runtime's own reply in the
+  transcript; and **pending** and **cleared** do not reach the conversation in
+  progress at all — `cleared` least visibly of the three, since the chip has
+  already dropped back to a default it will not actually run at until the next
+  session. Muting those would leave a change looking made that was not. The
+  hover went back to describing the control as well, instead of holding the
+  confirmation for the rest of the conversation.
+
+  The model picker's equivalent is left alone for now; it is raised as an open
+  question on the issue rather than decided here.
+
+- **A reasoning entry never opens onto an empty panel** (#120). The trace rail
+  showed "reasoning", and expanding it showed a blank box — three times on an
+  ordinary turn. Nothing said whether the agent had reasoned about nothing,
+  whether the app had dropped the text, or whether the agent had never handed it
+  over, which is the one thing the trace exists to answer.
+
+  All six runtimes were driven to find out, rather than assuming the agent it
+  was reported against was the only one. **pi, Kimi Code and Oh My Pi** hand
+  over their reasoning and always did; **Grok Build** does too, on the traffic it
+  has been recorded producing (its own API was erroring, eight retries deep,
+  while this was being written). **Claude Code does not.** Probed live against
+  2.1.220 at `--effort high`: every thinking block on the wire is
+  `"thinking": ""` with a signature beside it, every `thinking_delta` is empty,
+  and the only account of what was thought is a token estimate on a side
+  channel. **Codex** withholds it too wherever its trace is encrypted and it
+  summarised nothing — which is all 22,987 reasoning items in this machine's own
+  codex history.
+
+  So the entry now says which silence it is. Reasoning text where the agent
+  sends any; "still reasoning" while the block is open; and where an agent kept
+  it, a plain sentence saying so *with the size it did report* — Claude's own
+  running estimate, marked `~` because measured against the same turns' billed
+  thinking tokens it runs high. The collapsed row previews the same thing rather
+  than sitting blank, and the figure beside it now climbs as the agent thinks
+  instead of staying still. Codex's reasoning *summaries* were also being
+  dropped on the way in — the app read only its raw-trace channel, which for an
+  encrypted trace carries nothing — so a codex turn that summarised its thinking
+  showed an empty panel even though the words had arrived.
+
+  Covered per agent, so a runtime that stops sending reasoning is caught rather
+  than quietly rendering nothing: each one's own recorded traffic is replayed
+  through its adapter and asserted on, and a browser check expands all three
+  shapes of entry and fails if any of them paints an empty box.
+
+- **The settings dialog is usable on a phone.** Two things were wrong with it,
+  both found by putting the app's own settings dialog into the phone checks —
+  which had covered every other sheet and dialog but not the longest one in the
+  product. Its rows put the explanation and the control side by side, a shape
+  that only works with room for both: at 390px the control kept its width and
+  the sentence beside it was set one word to a line ("Sets / the / terminal /
+  palette / and / the"). Rows stack on a phone now, sentence first, control
+  under it. And the font-size slider was four pixels tall — a native range's hit
+  area is its own box — so changing the terminal's text size meant landing a
+  fingertip on a hairline. It is a touch target's height there now, with the
+  track still painted thin and the desktop row unchanged.
+
+- **The terminal takes its own size back, and asks for the screen again.** The
+  PTY is shared, so a split pane, a second browser tab or a phone joining the
+  same session resizes it to *their* screen. This client kept one record of the
+  size it had last sent, made once and never reset, so it saw nothing to send
+  and went on drawing a full-width screen over a half-width PTY — and since the
+  attached CLI paints only the cells it thinks changed, what was left was the
+  skeleton with the ticking values moving on it that issue #17 was reported for.
+  The record is now dropped whenever this client's claim on the PTY may be
+  stale: a socket opening, a session joined, a reattach over a socket that never
+  dropped (closing a split, which is the case that had no event at all), and
+  coming back to the tab — which is the only signal there is when the resize
+  happened in another window entirely. A join also dips the height a row and
+  puts it straight back, because re-sending a size the PTY already has asks for
+  no repaint: two real SIGWINCHes are what resizing the browser window was doing
+  by hand.
+
+- **A pasted image is attached again, not typed as a path.** The upload always
+  worked; how the resulting path was handed to the terminal did not. It went out
+  as a raw socket write, so it reached the program as characters typed at the
+  prompt with none of the markers that say a paste happened, and an agent that
+  attaches pasted image paths saw only a filename. It now leaves through the
+  same paste path as any other paste — the one-line change issue #18 asked for
+  in its own title, which had never been made — and the raw sender it used is
+  gone from the interface, so nothing can reach for it again.
+
+- **The shell inside a conversation can be driven from a phone.** It inherited
+  the on-screen-keyboard suppression that made terminals usable on touch, but
+  not the key strip that suppression depends on: no Escape, Tab, Enter, arrows
+  or Ctrl, and since a tap no longer summons the keyboard either, the pane was
+  something you could read and not use. The strip now sits inside the split,
+  wired to that pane's own session rather than to whichever session the shell
+  considers current — so an arrow follows the cursor-key mode of the terminal
+  you are looking at — and the conversation's floating menu steps up out of its
+  way instead of covering the key that summons the keyboard.
+- **A model chosen for a conversation survives a restart, on every runtime.** On
+  grok, kimi and Oh My Pi the switch was applied to the running process and
+  nowhere else: the adapter never carried the choice into a launch, so `/clear`
+  — which restarts the process in place — or any relaunch brought the agent up
+  on its own default, while the chip in the composer went on naming the model
+  the user picked. Every turn after that was answered and billed on a model
+  nobody chose, with nothing on screen to say so. The choice is now reapplied
+  over the protocol as soon as the session opens, down whichever road each agent
+  published; a model an agent refuses leaves an error in the conversation
+  instead of taking it down.
+
+- **Grok reports the context it is using, and what each model did.** It publishes
+  both — occupancy on the `_meta` of nearly every update it sends, the per-model
+  breakdown on the reply that ends a turn — and neither was being read, because
+  the adapter only knew the one channel the other ACP agents use. So a Grok
+  conversation had a 512,000-token ceiling with nothing measured against it: no
+  percentage, no bar, and no way to reach the warning that says the window is
+  filling up. It also read "not reported" in the dashboard's Model turns column
+  on every row. The occupancy taken is the last request's own figure, not the
+  turn's total — that turn totalled 65,943 tokens with 16,637 ever in the window
+  at once, and filing the larger number would have drawn a bar four times too
+  full.
+
+- **A ceiling nobody can vouch for comes down instead of standing there.**
+  Switch mid-conversation to a model the agent does not describe and no
+  catalogue lists, and the previous model's window stayed on screen — the bar,
+  the percentage, and the "N left, compact or start a new conversation" warning,
+  all describing the conversation you had just left, while occupancy went on
+  climbing against a model that may be far smaller. A context that was nearly
+  full read as comfortable. The reading now says the size is unknown and means
+  it. It says that only when nobody can answer: a window the agent itself
+  published for the model it just moved to is kept, and a lookup that could not
+  be reached is not mistaken for one that answered no.
+- **"Send this one now" keeps the message it is sending.** On a runtime that
+  spawns a process per turn, this cut the running work short and then lost what
+  the user had typed: the interrupt only signals the child, so the send that
+  followed was refused while it was still exiting, and the promoted message —
+  already out of the queue — was gone. What was left on screen was the turn cut
+  short, the message printed as though it had been asked, and one line of error;
+  then the *next* queued message was delivered, so the agent answered a
+  follow-up written on the assumption the correction had landed. The promotion
+  now waits for the runtime the way every other delivery does, and a delivery
+  that fails puts the message back at the head of the line with the reason on
+  it, which is what makes it retryable rather than retypable.
+
+- **A cleared conversation is no longer offered back with its old memory.** The
+  clear dropped the runtime's session id from the running session and nowhere
+  else. The record that outlives the process kept it — its writer could not
+  express "there is no id" — so a conversation cleared and then left alone came
+  back after a server restart showing the emptied transcript above an offer to
+  pick it up where it left off, and taking that offer handed the agent every
+  turn the user had cleared to be rid of. The record is told now, and told after
+  the log it lived in has actually been dropped: a record with no id sends the
+  server to the head of the log for one, so the other order would have been
+  undone by the very next rejoin.
+
+- **A resumed conversation has its commands, attachments and stop button
+  straight away.** A snapshot took what the runtime can do from the replayed
+  tail alone, and Claude announces that once, at the head of the log — so any
+  conversation past the replay window came back with none of it: no slash menu,
+  no attachment control, an inert stop button and empty model and effort menus,
+  until the user sent a throwaway message or switched tabs and back. The same
+  conversation a few messages shorter came back complete, so the failure looked
+  arbitrary. What the runtime said is now read from the whole log, and a
+  relaunch no longer throws away the capabilities it has been carrying all
+  along.
+
+- **The runtime's own command list is the command list.** A scan of what is
+  installed on disk was merged back over it for every runtime, so on Claude a
+  skill it does not accept — a disabled plugin's, a directory it rejects —
+  stayed in the `/` menu, and choosing it sent text no command matches. The
+  merge is kept exactly where it is needed: grok announces seven built-ins and
+  nothing about `.grok/skills`, and taking it literally there would empty a
+  user's own menu milliseconds after the handshake.
+- **Selecting an older turn takes you there.** Past about four thousand events
+  above what was loaded, clicking an entry in the turn index did nothing at all:
+  the row highlighted and stayed highlighted, the conversation did not move, and
+  nothing was said. The walk back gave up at a page ceiling while the history
+  was still on disk, and the caller ignored the answer. In the conversations an
+  index exists for, that was the ordinary case rather than the guard. A jump now
+  goes as far as it has to, says which turn it is fetching while it works, and
+  can be abandoned by doing anything else. The ceiling stays where it belongs:
+  ordinary scrolling still asks for one page at a time.
+
+- **The turn index no longer renumbers a trimmed conversation from 1.** Past the
+  retention cap the oldest events are dropped, and the turns that survived were
+  numbered by their position in what was left — so the index, the count in the
+  header and the dashboard's requests figure disagreed about the same turn. The
+  number of turns that went is now kept with the log, so the survivors keep the
+  numbers they had; and the index says out loud that the older history was
+  trimmed, which the server has been reporting all along to a UI that read it
+  nowhere.
+
+- **Expand-all and collapse-all can be reached at any width.** Between 1024 and
+  1280 pixels the index shrinks to a rail of icons and dropped both, with no
+  menu entry, shortcut or setting behind them — which is every maximised
+  1366x768 laptop and every half-screen on a large monitor. They are now in the
+  index's own menu at that width, and on **Ctrl+E** / **Ctrl+Shift+E**
+  (⌘E on a Mac) from anywhere in the conversation, composer included.
+
+- **A running workflow says what it is doing.** The popup read only the output
+  the tool writes when it finishes, so it showed "waiting for the first stage to
+  report in" for the whole run — which for a dynamic workflow is tens of
+  minutes. It now reads the same live channel a delegation's popup has always
+  read: the stage the run names for itself, the tool it last reached for, and
+  what it has spent, updating as it goes, with the finished log still landing
+  underneath. A run invoked by script path is titled with the script's own name
+  rather than the word "Workflow".
+- **The usage dashboard can look at a period that has ended.** Its window was
+  always anchored on "now" and the client never sent the anchor the API has
+  always accepted, so nothing before 1 January of the viewer's own year could be
+  reached — not the charts, not the history list, not the export, while the rows
+  sat in the database and could be had by typing a URL by hand. Today that costs
+  nothing, because accounting began in July; from the first of January it would
+  have taken the whole previous year off the screen. There are now arrows, a
+  date field and a way back to the present, and the window belongs to the whole
+  page: the history under the charts and the export follow it. Nothing offers to
+  walk into the future, and a window that holds nothing says so.
+
+- **The effort histograms can be read without a mouse.** Every bar was a plain
+  `div` inside a hover tooltip, so the keyboard never reached one and a screen
+  reader heard five orphan labels — "1", "2", "3-5", "6-10", "11+" — with no
+  numbers against them. The distribution is the whole question that panel
+  answers. Each bucket is now a real control that says how many turns fall in
+  it, announces itself when reached, and answers a tap. The dashboard's own
+  accessibility checks had been running against fixtures with the histograms
+  empty, which is how this stayed hidden through thirteen of them; they carry a
+  real distribution now.
+
+- **The phone layout reaches the file tree and the shell.** Two of the five
+  destinations in the bottom bar never received the touch scale: the file tree
+  drew 26px rows with 10px size figures and no gap between them, so a mistap
+  opened the wrong file, and the terminal's tab bar put 22px buttons two pixels
+  apart. Both are at the touch floor now, with type no smaller than the rest of
+  the phone layout. The phone checks were pressing "Files" and asserting only
+  that something appeared — they now open each destination and hold it to the
+  same rules as the conversation, including that nothing is pushed off the side.
+- **A slash command Claude answers itself now leaves an answer on screen.** Some
+  commands — `/effort`, `/model` — are handled by the CLI without going near the
+  model, and a locally-handled command emits no streaming events at all. This
+  app's transcript is built from streaming and treats the snapshot that follows
+  as a patch, so there was nothing for those replies to patch and they were
+  dropped: typing one showed the command, a turn, `$0`, and no answer, for a
+  command that had in fact worked. An answer nothing streamed is now a message
+  in its own right.
+
+- **The composer's own answers redraw when they arrive.** The store's
+  equality guard compared the six values the chat surface republishes and, since
+  a controller reporting its own change moves none of them, told no listener
+  anything had happened. Everything held on the controller rather than on the
+  transcript was affected — the model override and the line reporting what the
+  server actually did with a change. It looked fine wherever the runtime emitted
+  an event in the same moment, which is why switching a model looked right and
+  clearing one left the previous answer frozen on screen.
+
+### Added
+- **Every conversation, by project, in a searchable list — and closing one no
+  longer ends it** (#127). Nothing in the app answered "what conversations do I
+  have?". Every conversation ever started came back as an open tab, so the strip
+  grew until it was unreadable, and the only way to shorten it was to close a
+  tab — which deleted the conversation. Nothing in the app could reach it again
+  afterwards, however much you might have wanted to pick it up next week.
+
+  The one list of past conversations was inside the launcher, and it is reachable
+  only on the way to starting a *new* session in a folder that has already been
+  chosen: you had to know which project a conversation belonged to before you
+  could look for it, you saw the most recent handful for that folder alone, and
+  there was nothing to type into. Search, meanwhile, only ever looked inside the
+  conversation on screen. So the two questions people actually ask — where the
+  conversation about the release script went, and whether yesterday's closed one
+  is recoverable — had no answer.
+
+  **Closing a conversation now means what the word means.** The tab goes; the
+  record, the transcript, whatever is running and whatever shells were opened
+  inside it all stay. Closing a *terminal* still ends it, and that is not an
+  oversight: a pty is reached through its tab and nowhere else, so one closed
+  without being ended is a shell holding a working directory open that nothing in
+  the app could ever reach again — the very failure this removes for
+  conversations, in the one place it would create. Deleting is unchanged: still a
+  separate action, still confirmed, and now the only way to lose a conversation.
+  A closed conversation is remembered as closed in the browser, because the strip
+  is rebuilt from the session list on every page load — without that, closing
+  would have lasted until the next reload and the strip would still grow forever.
+
+  **The list is reached from the top of the chat surface, beside the transcript
+  search**, and on a phone from the actions sheet, which is where that search
+  lives there. It shows every conversation the signed-in user owns — not only the
+  ones with a tab open, and not only the ones still running — grouped under the
+  project folder each belongs to, newest first inside a group, with the groups
+  themselves ordered by their own newest conversation. So the folder you were
+  working in this morning is at the top, whichever folder that is.
+
+  A row is **what was asked**, not when it happened: "che file ho caricato?"
+  identifies a conversation on sight, where "Session 25/07/2026, 21:35"
+  identifies nothing — which is the whole reason a column of timestamps was never
+  worth showing. Beside it: the agent it ran, when it was last active, whether it
+  is running right now, whether it comes back with approvals bypassed, and
+  whether its agent can carry on from where it left off or is meeting the
+  transcript for the first time. That last one is said **before** the choice is
+  made, exactly as the launcher's resume list already does, because the two are
+  very different things to walk into.
+
+  Typing narrows the list on what was asked, the conversation's name and the
+  folder it lives in, and a group with no match drops out entirely — so a search
+  across a dozen projects reads as a short list rather than a page of empty folder
+  headings. Groups fold; searching opens them all, because a match hidden inside a
+  folded group is a search that answered nothing. Picking a conversation joins it
+  if something is running it, and otherwise brings it back with its transcript,
+  handing the agent its own context where the conversation recorded one.
+
+  Two things the implementation is careful about. The opening line of a
+  conversation is read from the head of its log, and a log is append-only — so
+  once found it cannot change, and the answer is kept rather than re-read on every
+  look. The two operations that genuinely rewrite a log's head, a `/clear` and a
+  retention trim, drop it; otherwise listing three hundred conversations would
+  cost three hundred bounded reads every time the list opened rather than once.
+  And those reads run a few at a time: four hundred logs, indexes and stats opened
+  at one instant is how a listing turns into `EMFILE`, which fails not just the
+  request but whatever else the server was doing. Past four hundred conversations
+  the list describes the most recent ones and *says* it stopped there — a list
+  that silently ends at a ceiling reads as "this is everything", which is the one
+  thing it must not say when the question is where a conversation went.
+
+  Also fixed along the way, in a shared primitive the list happened to expose:
+  a text field's touch target was the frame around it rather than the field. The
+  wrapper took the 44px floor and `align-items: center` left the input itself at
+  its content height — 22px inside a 44px box — so a tap in the top or bottom
+  quarter of what looks like the field focused nothing. Every phone-width text
+  field in the app is affected.
+
+- **A workflow shows the whole shape of the run** (#117). A workflow is a
+  structure — named phases in order, and several agents working at once inside
+  each — and none of that reached the screen. Opening one showed a single line
+  of text: the one thing the run last narrated about itself. That line is
+  genuinely useful and it is still there, but it can only ever describe one
+  agent, so watching a run with eight in flight meant watching seven of them be
+  invisible. This is the half of #45 that was left unwired for want of a
+  recorded run.
+
+  The run has been reporting all of it the whole time. `task_progress` carries a
+  complete snapshot of every phase and every agent — label, phase, state, model,
+  last tool, tokens, tool calls, duration, and a preview of what it returned —
+  and the app was keeping the one-line summary out of all of it. It is forwarded
+  now, and the popup lists the phases in order with their own state, the agents
+  inside each with theirs and what each one is doing, and counts across the top:
+  how many are running, queued, done and failed, out of how many, and which
+  phase the run is in. A failed agent is red on its own row with the failure
+  spelled out, without anything being opened. Opening one gives the rest — what
+  it was asked, what it cost, what it came back with. Everything moves as the
+  run moves, with no reopening. The Agents list says how many agents a workflow
+  holds and how many are still going, so a workflow no longer reads as the same
+  kind of row as a single subagent.
+
+  Two things a hand-written example would have got wrong, and a real recording
+  did not: the structure is **absent** from four of every ten progress reports
+  rather than empty, so a report that carries none now leaves the panel standing
+  instead of blanking it; and a run started from an inline script names itself
+  nowhere in its own tool call, which is why every workflow popup used to be
+  titled "Workflow". Both come from
+  `test/fixtures/chat/claude-workflow.jsonl` — a real two-phase, five-agent run
+  captured off the wire, one agent of which fails — which is what every test and
+  browser check here is driven by, rather than by a shape that would only have
+  agreed with the code under it.
+
+  Phase state is derived from the agents rather than read from the tool call, on
+  purpose: the Workflow tool returns the moment a run is launched (#116, still
+  open), so a workflow whose agents are working sits under a completed call.
+  Reading the agents means this view is right either way. A runtime that reports
+  no structure at all still gets the single-line view it has always had.
+
+- **A conversation tells you when it has finished, or when it is waiting for
+  you** (#93). Terminal sessions have been notifying for some time, and what
+  they do there is guesswork: nothing has been printed for ninety seconds, or a
+  line went past that looked like the end of something. A conversation never has
+  to guess. It knows when a turn ended and which word the runtime ended it with,
+  and it knows the difference between working and stopped — so notifications now
+  come from the events themselves, for work that **finished**, a turn that
+  **failed**, and the two that cost real time: an agent that has stopped for an
+  **approval** or a **question** and will do nothing at all until it is answered.
+
+  Reading the endings rather than the states is the whole of it. Claude, every
+  ACP agent — Grok Build, Kimi Code, Oh My Pi — and codex in app-server mode
+  emit no state at all when a turn ends, and codex never announces
+  `awaiting_permission` either, only the request that caused it. A watcher built
+  on the state stream would have been silent for most of the agents this app
+  supports; the tab strip's own dot had that bug and has it no longer, which is
+  why a background conversation used to stay green after it had finished.
+
+  Acting on a notification opens that conversation — bringing the window
+  forward, or starting one if the app is closed. The conversation on screen is
+  never announced, where "on screen" means its tab is showing *and* the window
+  has focus: a visible window sitting behind an editor is precisely the case
+  this exists for, and the terminal notifications suppress themselves for it to
+  this day. Several conversations do not become several notifications to dismiss
+  one by one — there is one at a time, and a second conversation turns it into a
+  summary of both.
+
+  They are shown through the service worker rather than by the page, because the
+  page's own constructor throws outright on Android Chrome — the phone this is
+  most useful on would otherwise have got nothing. Where notifications are
+  refused, unsupported, or never allowed, a waiting conversation is still marked
+  in the tab strip and in the phone's session sheet, in its own colour *and* in
+  words, and that mark lasts as long as the wait does: unlike the unread dot it
+  is not cleared by glancing at the tab, and it clears itself when the approval
+  is answered, from wherever it was answered.
+
+  **Settings → Conversation notifications** switches off any of the four events
+  or all of them, and remembers. The browser's own permission is asked from that
+  switch and nowhere else: asking on page load is refused outright by Firefox
+  and Safari, and once refused nothing in the page can ask again. **What
+  notifications say** reduces them to "a conversation needs you" — they are read
+  on lock screens and on shared devices, outside the boundary that signing in
+  protects, so how much leaves the app is the user's choice and not this app's.
+
+- **A turn can be branched into a conversation of its own.** The button was
+  promised in 5.1.2 beside copy-a-turn and never built — the changelog said it
+  had shipped, and the control existed in no state at all, folded or open, on
+  any screen size. It is there now, on every turn's header, and pressing it
+  opens a **new conversation in a new tab** that carries the history up to and
+  including that turn.
+
+  Not a fork in the runtime's sense, because no runtime here has one: not one of
+  the six CLIs can split a session at a point, every adapter says so, and none
+  of them has been made to claim otherwise. What happens instead is two things
+  this app can do for itself. The transcript up to that turn is copied into the
+  new conversation's own log, so the history is there to read. And the same
+  history is handed to the agent as the opening context of its first turn, so
+  the first thing you ask is answered by something that knows what came before —
+  a branch that only copied the transcript would leave you talking to an agent
+  reading over your shoulder.
+
+  What the agent is sent is a rendition and says so in its own opening words: it
+  is told plainly that this is a record of a conversation it was not in, that
+  nothing in it was said by it here, and that tool output and reasoning are not
+  carried. It arrives *with* your first message rather than as a turn of its
+  own, so the conversation on screen opens with your words and not with a wall
+  of quoted history standing in as though you had typed it. A rule across the
+  transcript marks where the carried history ends and this conversation begins.
+
+  **When the history does not fit the model's window, the branch is refused
+  rather than trimmed.** The reply names what it would have carried, what the
+  window is, and what that leaves — enough to branch from an earlier turn
+  instead. Where the runtime has never reported a window size, nothing is
+  measured and you are told that nothing was measured, in the notice and in the
+  transcript both; guessing at a ceiling would be the more confident answer and
+  the wrong one.
+
+  The conversation branched from is not touched — not one event — and goes on
+  running in its own tab. The branch opens in the same directory on the same
+  agent and carries the model and effort level that conversation was using. It
+  does not carry a bypass of tool approvals: that is a standing permission
+  granted to the conversation that asked for it.
+
+- **How hard the agent thinks, as a control in the composer.** Every runtime the
+  WebUI drives has a reasoning-effort setting and there was no way to reach any
+  of them: the conversation ran at whatever the CLI considered normal, and the
+  only way to change that was to close the tab and start the agent by hand in a
+  terminal. There is now a button beside the model, and it offers **exactly what
+  the runtime you are talking to published, in that runtime's own words** —
+  Claude's `low` through `max` and its undocumented `ultracode`, Codex's ladder
+  for the model actually in use as far as `ultra`, Grok's per-model levels,
+  Kimi's `off`/`on`, Oh My Pi's `auto`, pi's seven. Nothing is translated between
+  them and no level is invented.
+
+  Each road was probed against the installed CLI rather than written from a
+  schema, and two of them turned out not to be where they looked. Grok's
+  `--reasoning-effort` flag does nothing on the protocol this app drives it over
+  — launching at `low` and at `high` both left it reporting `high` — and the
+  setting actually travels on a model change. Claude has no control request for
+  it at all, but answers `/effort` as an ordinary turn, for free: no model call,
+  no money, and its own sentence back confirming the level. That confirmation is
+  what the button waits for, so the chip reports what the agent said it is doing
+  rather than what this app asked for. Where a runtime cannot be told until its
+  next turn, it says so instead of claiming otherwise.
+
+  The level is coloured on a scale — the same grey as every other control at the
+  bottom of a ladder, and the loudest thing on the row at the top, with a pulse
+  that quickens as it climbs. Maximum effort is the most expensive setting
+  available and a control that looked identical at both ends would hide that.
+  Colour is never the only carrier: the level is named, and a small meter fills
+  in proportion to where it sits on its own runtime's ladder, which is the only
+  honest way to put Kimi's `on` beside Claude's `xhigh`. Reduced motion turns
+  the pulse off and loses nothing.
+
+  Where a runtime publishes no ladder — Grok on its default model — no button
+  appears at all, rather than one that could only refuse. That is the one way
+  this differs from the model picker beside it, and the reason is pi: an
+  unrecognised level there is not an error, it is a warning on a stream nobody
+  reads followed by an answer at the default level, which would leave the
+  control reporting something that was never running.
+
+  What the conversation is running at is kept with the conversation, so it
+  survives a reload, a rejoin and a `/clear`. What to open the *next*
+  conversation at is kept per runtime in the browser, because the ladders are
+  not comparable and one remembered setting spread across all six would be
+  wrong five times — and a remembered level only ever opens a conversation that
+  has not started, never one you have merely gone back to look at.
+
+  Two of the runtimes do not refuse a level they do not have; they warn on a
+  stream nobody reads and answer at their own default, which is the quietest
+  possible way to get the opposite of what was asked for. So a level is checked
+  against what the runtime published at every point it could enter — the button,
+  a `/effort` typed by hand, a record carried over from when the conversation ran
+  on another agent — and Claude's own answer is read back rather than assumed,
+  because it reports a refusal as a *successful* result whose text happens to
+  say no.
+
+- **What each turn cost, beside the turn.** The conversation showed what the
+  whole chat had spent and nothing about where it went — so the expensive turn
+  and the cheap one looked identical, and the only way to find out which was
+  which was to leave the conversation for the statistics page. Every row of the
+  turn index now carries its own figure, and so does the strip over the turn
+  itself.
+
+  It is the accounting's figure, not a second calculation of it: the money can't
+  be added up from the messages on screen, because half the runtimes report a
+  running total rather than a per-turn one, and turning that into "what this
+  turn cost" means differencing it against where the turn began. Taking it from
+  the row the accountant filed is also the only way the number beside a turn and
+  the number on the dashboard can be relied on to agree. It appears the moment a
+  turn ends rather than on the next reload.
+
+  A turn nobody could price — one still running, or a runtime that reports no
+  money at all — shows nothing rather than `$0.00`, and a turn that cost less
+  than a cent keeps four decimals instead of being rounded away to nothing.
+
+  The strip over a turn also stopped letting a long prompt crowd its figures
+  out. Everything to the right of the label is a measurement, and a measurement
+  cut in half — `16 too…`, `9 rea…` — is not one; so the prompt is now the only
+  thing on the bar that gives its width up, cut to whatever room is left with
+  the whole of it on hover.
+
+- **The turn count is a real measurement of the work, and every surface agrees
+  about it.** (#86) The word meant two different things at once. In a
+  conversation a turn was something you asked for and everything the agent did
+  about it; in the statistics it was how many separate pieces the agent's answer
+  happened to arrive in — which depends on the agent's writing style, not on the
+  work. The same job filed 1 under an agent that answers in one stretch and 6
+  under one that separates its thinking from its answer, and that figure was the
+  headline number, appeared in every breakdown by project, agent and model, and
+  drove the averages and the distribution chart that exist specifically to
+  compare agents against each other.
+
+  A turn is now **one user request and everything the agent did about it**,
+  defined in one place and read by every surface. Nothing had to be recounted:
+  the accounting was already recording exactly that unit under the name "job",
+  so the corrected figure is the number of rows, every row ever written is
+  already one prompt, and older periods stay directly comparable.
+
+  What a message typed while the agent is working belongs to is now decided
+  where the work runs and recorded with it, because it cannot be reconstructed
+  afterwards: pushed into the running turn to redirect it, it continues that
+  turn; left in the queue until the turn finishes, it is a turn of its own. The
+  conversation groups on the same recorded turn, so a runtime that echoes your
+  prompt back under an id of its own — codex and the ACP agents both do — no
+  longer shows twice the turns that were actually recorded.
+
+  Round trips to the model survive as **model turns**, under their own name and
+  their own column, and only where a runtime counts its own: Claude's
+  `num_turns` was being discarded in favour of the derived figure and is now the
+  figure. Everywhere else it reads **"not reported"** rather than a number
+  somebody inferred, and the effort averages are taken over the turns that
+  reported one — reading a silent runtime as zero would have put it at the top
+  of every efficiency comparison on the page for having said nothing at all.
+
+- **A request and its answer are one turn, in conversations already recorded as
+  much as in new ones.** (#86) No adapter reuses the id this app mints: the
+  session stamps the user's message `turn-<uuid>` and the runtime answers under
+  a name of its own, with codex and the ACP agents echoing the prompt back under
+  that name first. Read literally, that splits every single turn in two — the
+  ask in one, the answer in another with no prompt to name it by, which is why
+  an index row could read "no prompt" next to a question that had been asked
+  perfectly clearly. Checked against all 69 conversations on the machine this
+  was written on: 33 of them read differently, 147 phantom turns in total, and
+  all 69 now agree with what the conversation shows.
+
+  Nothing needed migrating and nothing had been recorded wrongly. The events
+  were always right; it was the reading of them that split a request from its
+  answer, and the index is read from the log every time it is asked for — so an
+  old conversation is simply re-read under the settled rule. A turn is open from
+  the user's message until the runtime ends it, and everything in between
+  belongs to it.
+
+- **A turn is numbered by the conversation, not by what the browser has
+  loaded.** (#86) Reloading a page landed on the last turn of a long
+  conversation and called it "Turn 1", and it stayed 1 until enough history had
+  been paged back in for the count to come right by accident — so the number on
+  screen was a fact about the loading window rather than about the work. It now
+  reads 49 of 49 on the first paint, and counts back to 48, 47 as older turns
+  arrive. A turn the reload landed *inside* — its opening ask not in the window
+  at all — is named from the recording too, instead of reading "no prompt"
+  beside a question that was asked perfectly clearly and is still on file.
+
+- **The turn list runs newest first.** (#86) The turn you are looking for is
+  almost always the one that just happened, and it was at the bottom — so in a
+  long conversation you scrolled to the end of the index to reach the thing
+  already on screen. Only the order changed: a turn keeps the number the
+  conversation gave it, so the list opens on 49 and counts down. Arrow keys,
+  Home and End follow what is drawn, so "down" is down the list.
+
+- **The turn index lists the whole conversation, and every entry is named after
+  what you asked.** (#86) It was assembled from whatever the browser happened to
+  be holding, so a long conversation's index quietly started part way through —
+  the one case where an index is the only practical way to navigate. It is now
+  served from the recorded conversation, lists every turn from the first one,
+  and selecting an older entry fetches it and takes you there. Entries are
+  titled with the user's own prompt: an entry could previously end up carrying
+  model output, whatever text the turn happened to offer first, which made the
+  index unsearchable by the only thing anybody remembers — what they asked. A
+  turn with no prompt behind it now says so rather than borrowing a line from
+  the model.
+
+- **Every conversation shows how full the model's context is, against that
+  model's real capacity.** (#82) The reading was only there where a runtime
+  happened to volunteer it, and where it was missing there was nothing at all —
+  a raw token count with no ceiling to read it against, on agents used here
+  every day. The ceiling is the part that cannot be guessed: it differs by a
+  factor of five between models, and a bar drawn against an assumed number is
+  worse than no bar, because it invites you to keep going up to a limit that is
+  not there.
+
+  Nothing in the product now records how large any model is. Capacity comes
+  first from the agent, which is the most authoritative source there is — Claude
+  publishes it in `modelUsage`, Codex in `modelContextWindow`, Oh My Pi in its
+  usage updates, and Grok Build one per model in its handshake. For the two that
+  report none, pi and Kimi Code, the model's provider is asked instead: both
+  name an OpenRouter model id, so the catalogue they are already served from
+  answers for them, matched on the exact id and never on a neighbouring name.
+  That ordering is not academic — Grok reports 512,000 tokens for `grok-build`
+  where the nearest catalogue entry says 256,000, half the truth. Where neither
+  can answer, the display says **"size unknown"** and draws no bar, the same way
+  the product already tells "not reported" apart from a real zero.
+
+  How full it is now comes from the *last* request rather than the turn's
+  totals. A three-round-trip turn measured while building this spent 105,027
+  tokens across its requests while only 37,387 were ever in the window at once —
+  the old reading would have shown 10.5% full where the truth was 3.7%.
+  Switching model mid-conversation discards everything known about the previous
+  one, so a move to a smaller model reads against the smaller ceiling
+  immediately instead of carrying the old one forward. Past 80% the panel says
+  so and says how much is left; past 90% it says it more plainly, while there is
+  still room to compact or start fresh.
+
+- **A message waiting in line can be sent now, instead of only waiting its
+  turn.** (#70) The composer never refuses a message while the agent works — it
+  queues it — but queuing was the *only* thing that could happen to it. Some
+  messages are worth waiting their turn; others are the reason you are typing at
+  all: "stop, you're editing the wrong file", "no, use the staging database".
+  Those sat in the queue doing nothing while the agent spent another two minutes
+  going the wrong way, because the only way to get in front of a working agent
+  was the stop button — and stopping discards everything else you had queued, so
+  correcting one thing cost you the two messages already lined up.
+
+  Each waiting message now carries a second control, beside the one that removes
+  it, that sends it immediately: the turn in flight is cut short, that message is
+  handed over as a real turn of its own, and **the rest of the line survives** —
+  still waiting, still in the order it was typed, delivered afterwards as usual.
+  Nothing about the default changes: a message sent while the agent is busy still
+  queues.
+
+  The conversation says what happened. A turn cut short this way leaves a marker
+  across the transcript naming the message that did it, so the record does not
+  read as an agent that simply stopped, and a reader coming back later can see
+  why the answer above is half an answer. Anything the interrupted turn was
+  waiting on — an approval, a question — is cleared rather than left on screen
+  inviting an answer that can no longer reach anything.
+
+  The control is offered only where it can do something. Not on an idle agent,
+  which is already working through the line; not on `codex exec`, the one
+  supported runtime that cannot be interrupted at all, where cutting in would
+  hand the process a second turn rather than replacing the first. It *is*
+  offered while the agent waits on a person, which is exactly when a correction
+  gets typed. Pressing it twice sends once, a press that arrives after the
+  message has already gone is a no-op rather than a second delivery, and a
+  second browser open on the same conversation sees the line change.
+
+- **A queue of more than one message collapses to a single row, openable to
+  inspect.** (#79) Every waiting message was drawn as its own full-width row and
+  the list simply grew — so lining up a run of work, which is what the queue is
+  for, pushed the conversation off the top of the screen. On a phone it pushed
+  the composer off the bottom: with up to twenty messages queued the input and
+  the send control were unreachable and the agent's work invisible, which is not
+  a corner case but what the queue does when used as intended.
+
+  Past one message the line now shows the message you added last — the one you
+  are still deciding about — with a count of the rest beside it, so twenty
+  waiting messages take the room of one. The count opens to the full list in
+  order and closes again, and the opened list scrolls inside its own bounded
+  space rather than growing into the conversation. Opening lands on the row you
+  were already looking at, so the list appears to grow upwards out of it instead
+  of leaving you at the top of twenty with the way back off screen.
+
+  Everything a waiting message offers — removing it, and sending it now — is
+  offered on the rows on screen in either state. The list stays as you left it
+  while messages arrive and drain, opening or closing on nothing but your own
+  press, and returns to the plain single row by itself once one message is left.
+  The number waiting is announced to a screen reader as it changes rather than
+  only drawn on a button, and every part of it is reachable by keyboard and
+  sized for a finger.
+
+### Changed
+- **The pointer into a turn's hidden work is a counter, not a banner** (#118).
+  Every assistant reply that ran a command or thought about anything carried a
+  full-width button under its text spelling out what had happened — "3 commands
+  · 2 reasoning · 12s — show work". It was wider and louder than the message
+  controls beside it, it repeated in a sentence what two icons say, and it cost
+  a line of the conversation on nearly every turn, so a long exchange read as a
+  stack of banners with prose between them.
+
+  The pointer moved into the row of per-message actions, directly right of
+  retry: a terminal glyph with the number of commands and a brain with the
+  number of reasoning steps. A count of zero is left out entirely, so a turn
+  that only thought shows a brain and nothing else. It appears on exactly the
+  turns the button appeared on — including a reply that speaks for the silent
+  steps before it, which still counts the whole stretch and still opens the
+  trace at the *first* of them rather than at its own call. Turning off the
+  display of reasoning or of commands still takes those steps out of the count,
+  and takes the control away when nothing is left to point at.
+
+  The elapsed time the wide button reported has no room in two glyphs, so it
+  survives where the words it dropped went: the control's hover and its
+  accessible description read "Show work: 3 commands, 2 reasoning steps, 12s",
+  which is also what answers the icons for anyone who cannot see them. On a
+  phone it is a full 44px target on the same line as copy, retry and branch.
+
+  It is quiet but not faded. The actions either side of it sit at reduced
+  opacity at rest, which is right for a glyph that stands for a verb and is
+  recognised rather than read; a two-digit number at the same treatment
+  composites too close to the background to resolve, and the button it replaces
+  never dimmed its counts. So the counter takes the muted colour and none of
+  the fade. The browser checks now assert that it is painted at all, that both
+  its glyphs are drawn, and that it is in the tab order — each of which a
+  plausible regression had been able to break with the whole suite still green.
+
+- **Folded history is not built until it is opened, and what is kept is
+  bounded.** (#81) Entering a conversation rebuilt its entire backlog at once —
+  text, code blocks, diagrams, tool output and file previews all at the same
+  moment — which showed as a visible stutter, content popping in and the view
+  shifting under the pointer before the chat settled. It got worse the longer
+  the conversation was, and it was paid on every entry rather than the first,
+  because the chat surface is remounted per session. Almost all of that work
+  was wasted: every turn but the newest is folded shut, so what was being built
+  was not on screen. The old code rendered every turn and then hid the folded
+  ones.
+
+  A folded turn is now not built at all. Forty turns of history mount the two
+  message bubbles of the turn on screen rather than eighty, and cost a strip
+  and an index row each — twenty-eight DOM nodes, the same whether the turn
+  behind them holds two thousand characters or sixty thousand. Nothing is
+  hidden by it: every turn keeps its strip and its index row, opens on a click,
+  and opens on a jump from the turn index or from search.
+
+  What has been opened is kept, so re-folding and re-opening is immediate
+  rather than a second rebuild — the behaviour hiding-rather-than-unmounting
+  used to buy, kept deliberately. What is kept is bounded by the *content* it
+  holds rather than by a count of turns, since a conversation of one-line
+  exchanges and one full of large files are nothing alike at the same turn
+  count; past the bound the least recently opened material is released and
+  built again on demand, so a long conversation cannot grow the browser's
+  memory use without end.
+
+  The turn in progress is exempt: it is prepared whether folded or open, and a
+  turn that kept running while folded opens on its real current state rather
+  than a snapshot, because a bubble reads its message off the transcript when
+  it mounts.
+
+- **Usage is accounted per chat tab: one entry per conversation, not one per
+  request.** (#88) Statistics filed one row per request, so a morning's work in
+  a single tab landed as dozens of fragments, none of them answerable on its
+  own, and reading what a conversation cost meant adding rows up by hand.
+  Clearing the conversation or starting a new one in the same tab made it
+  worse: everything before the reset was accounted as if it belonged to
+  somewhere else, splitting the one total anybody actually wanted.
+
+  The history now lists conversations. Everything spent in a tab sums into one
+  entry, for as long as the tab exists — across compaction, clearing, starting
+  fresh, closing and reopening the tab, and a server restart. Each entry says
+  enough to recognise the work without opening it: its name, the project, the
+  agent, when it started and when it was last active. A conversation that
+  changed agent or model half way through is listed as having used both rather
+  than being filed under one of them. The requests are still there one level
+  down — open a conversation for its own, or take the Requests view to browse
+  them across conversations.
+
+  Nothing was migrated and no earlier period is counted differently: the tab's
+  id has been on every recorded row since the table existed, so this gathers the
+  whole history rather than dividing it. The headline totals and the
+  project/agent/model breakdowns go on summing jobs, which is the same rows
+  grouped another way, so they agree with the conversation entries by
+  construction. The list underneath now also covers the same range as the
+  figures above it, which it previously did not.
+
+### Fixed
+- **A slash command Claude answers itself left no answer on screen.** Anything
+  the model produces arrives token by token, and this app builds the message
+  from those tokens and uses the complete copy that follows only to fill in
+  details. A command the CLI handles without going near the model — `/effort`,
+  `/model` — has no tokens: it sends the finished reply and nothing else. There
+  was no message for that copy to fill in, so it was dropped, and typing one of
+  those commands produced a turn, a `$0`, and silence where the confirmation
+  should have been. The reply is now built into a message of its own, but only
+  for a turn in which nothing streamed at all — which is what stops an ordinary
+  answer being written into the transcript twice.
+
+- **The feedback under the model picker never went away.** It stayed until the
+  conversation was reset, so a second answer landed on top of the first; on a
+  phone, where both bubbles resolve against the composer rather than their own
+  chip, they shared coordinates exactly and the older one was invisible
+  underneath. It now clears itself after long enough to read, and on a phone it
+  opens upward rather than down over the navigation bar.
+
+- **The turn index and every per-turn cost were being thrown away before they
+  reached the screen.** The chat layer routes server messages by a list of the
+  types it owns, and that list had fallen three behind the messages the chat
+  controller actually answers: the recorded turn index, a turn's filed spend,
+  and the result of a model change. A type missing from it is not merely
+  unhandled — it goes to the terminal's handler, which has no idea what a chat
+  message is, and it is dropped in silence.
+
+  So the conversation numbered its turns by the browser's window instead of by
+  the recording — "turn 1" for turn 40, and no prompt to name a half-loaded turn
+  by — and no turn ever showed what it cost, however carefully the server filed
+  and announced it. Both figures were correct at every step but the last one.
+  The list is now the controller's own, kept beside the switch it mirrors, with
+  a test that fails if the two drift apart again.
+
+- **`/clear` now really does end the conversation.** It emptied the window and
+  started a new agent process, which was the half you could see — but the
+  conversation it replaced was still on the log, so reloading the page brought
+  the whole of it straight back. Worse without touching anything: a freshly
+  cleared pane is too short to scroll, so the browser asked for the page above
+  it unprompted and pulled the old conversation in on its own.
+
+  Clearing now cuts the log at the line it draws: the conversation begins where
+  the clear happened, so a reload opens on the new conversation, there is no
+  older page to fetch, and the turn index lists the new turns alone. This is a
+  delete, deliberately — "start again" is a promise about what is left behind,
+  not a view over it. What each turn cost is recorded separately and is not
+  touched, so the statistics page still shows the spend of the conversation you
+  cleared.
+
+  The figures over the chat go back to nothing with it: `$0.00`, `0 tok` and an
+  empty context bar. They are statements about the conversation on screen, and
+  the new one used to open carrying the last one's bill — under a bar reading
+  80% full of a window that was now empty, which is the reading people clear in
+  order to fix. Zeroed rather than blanked, because a header that empties looks
+  like a readout that broke instead of one that reset, and no figure is invented
+  for a runtime that reports none.
+
+- **An agent that picks its own work back up stays in the turn it was working
+  on — and what that work costs is finally counted.** (#86) An agent that leaves
+  something running in the background — a build, a check, a job it is waiting on
+  — ends its turn and starts again by itself when the thing it was waiting for
+  finishes. Nobody asked a second question, but a second turn appeared anyway:
+  numbered on its own, with no prompt in it to name it by, while the agent was
+  visibly still working on what you had asked a moment earlier.
+
+  Only a request opens a turn now. Work with nothing asked in front of it
+  continues the turn it belongs to, which is the definition #86 settled and is
+  what the conversation on screen already looked like.
+
+  The same fault was quietly costing far more than a row in an index. A job in
+  the accounting is opened by the user's message — so work that had none was
+  filed **nowhere at all**, and everything it spent was dropped. On the
+  conversation this was found in that was **$23 of $40, more than half**, and it
+  was missing from the totals, from every breakdown by project, agent and model,
+  and from the effort comparisons. Those stretches are now filed against the
+  request that caused them, and a conversation's recorded spend adds up to
+  exactly what its log reports.
+
+- **A turn stops spinning when the work is done, and the index says what was
+  asked instead of "no prompt".** (#86) Reopening or reloading a long
+  conversation gave you a turn list with an extra row on it: numbered on its
+  own, titled **"no prompt"**, and turning its working spinner over a chat that
+  had finished minutes earlier.
+
+  What a browser is given is the *tail* of a conversation, and a tail routinely
+  starts in the middle of a turn — the question that opened it is simply not in
+  the window. Replayed from a standing start, the first message in the window
+  opened a turn of its own under the runtime's private name for it. That name is
+  one the recorded conversation has never used, so the row could not be matched
+  against the recording that still holds the question, and nothing could repair
+  the title. The same thing happened again a message at a time as you scrolled
+  back through history, and once more the moment a browser joined a turn already
+  in progress. Which turn is open is now told to the replay rather than guessed
+  by it, at every edge: a half-loaded turn is filed under the turn it belongs to,
+  carries the number the conversation gave it, and is titled with what was
+  actually asked.
+
+  The spinner was a second fault behind the same symptom. A message carries a
+  "still streaming" flag that only an event can clear, and those events go
+  missing in ordinary ways — a window cut before the end of a message, a
+  reconnect, a runtime that dropped one. A turn read off that flag alone spun
+  forever. The session's own state decides now: when the session says it is
+  idle, the turn that was running has finished, whatever a stale flag says.
+
+- **Correcting the agent mid-turn stays in that turn, question and all.** (#86)
+  Sending a message ahead of the queue interrupts whatever is running, and every
+  runtime answers an interrupt by ending its own run. That acknowledgement was
+  being read as the turn ending — so the correction was recorded into a turn
+  that closed a moment later, and everything the agent then did about it arrived
+  in a fresh turn with nobody's question in it. That is where most of the "no
+  prompt" rows came from.
+
+  The runtime letting go of work it was told to abandon is now recorded as
+  exactly that, and the turn stays open across it: the correction, the work it
+  redirected and what both halves cost are one turn, which is what the number
+  beside the conversation has meant since #86. A message that simply waited its
+  place in the queue is unaffected — it is delivered after the turn ends and is
+  a turn of its own. Conversations already recorded are read back with the
+  stranded question restored to the work it produced.
+
+- **What a conversation has cost stops falling while you are still in it.** The
+  figure was never stored: it was re-added up from the log each time a browser
+  asked for the conversation, and what a browser is given is the *tail* of it —
+  the last forty messages, which is the right amount of transcript to open and
+  the wrong basis for a total. Claude reports the money at the end of a turn, so
+  every turn older than that window was not merely excluded, it was never read
+  from disk. The number the meter showed was therefore the cost of the recent
+  part of the conversation, and it was re-derived — and dropped — on every
+  reconnect, tab switch and reload. Nothing about it looked like an event you
+  could point at, which is why it read as resetting at random; scrolling back
+  through the history did not restore it either.
+
+  A conversation's spend is now read from the whole conversation, the way its
+  turn index already is: it is a property of what was recorded, so nothing that
+  happens to be in a browser's window may decide it. One streamed pass of the
+  log per conversation, and every event after it keeps the total current, so a
+  rejoin costs no more than it did. There is one honest limit, unchanged: a log
+  long enough to have had its head trimmed cannot say what the trimmed turns
+  cost.
+
+  Separately, on the ACP runtimes — grok, qwen, kimi, gemini — a report that
+  carried the context window and no money **erased the money already spent**.
+  Those runtimes report running totals, whose fields replace rather than sum,
+  and the absent cost was being sent as an explicit "no value" rather than left
+  out. A report now states only what it actually measured.
+
+- **Clearing a conversation starts a new one in the same tab, and is a button
+  on the composer.** (#69) `/clear`, `/new` and `/reset` did give the agent a
+  genuinely fresh memory, and left the tab looking closed: the process being
+  replaced is signalled and not waited for, so its own "I have exited" landed
+  *after* the replacement was already answering. The conversation you were
+  sitting in went read-only, every session list called it finished, and the
+  recovery offer — the one meant for an agent that really has gone away — was
+  what you were left looking at. The way out was a new tab, which left the old
+  one behind as a stale entry and lost its name, its place in the strip and the
+  folder it was pointed at.
+
+  A conversation now knows which process is speaking for it, and a superseded
+  one is not heard from again; the session record is told it is running rather
+  than left claiming a process that is gone. Clearing also acts at once when
+  the agent is mid-answer instead of queueing behind the turn it was meant to
+  cut short, and a message typed while the new process is still starting waits
+  for it rather than being refused as a dead session.
+
+  Starting a new conversation is also a **New chat** button in the composer,
+  next to the attach and command controls — available whenever the conversation
+  is healthy, which is exactly when the old "start a new chat" button was not:
+  it lived in the recovery notice and appeared only once the session had
+  already failed. The button, the three spellings and the menu entry are one
+  behaviour: the button sends the same command. Nothing is deleted — the
+  previous conversation stays in the log for history, search and export.
+
+- **The historical dashboard shows the tokens a job used, instead of "not
+  reported" for work whose tokens were on screen the whole time it ran.**
+  (#80) A job's token figure was whatever the runtime volunteered as a
+  pre-summed total — and Claude, the agent most people here run most, sends its
+  four buckets on every message and a total on none of them. So its rows read
+  "not reported" beside a cost that reported fine, and every figure built on
+  the column — the headline total, the breakdowns by project, agent and model,
+  the trend — silently skipped them. Anyone comparing agents or projects by
+  token consumption was comparing whichever handful of jobs happened to
+  survive.
+
+  A job's total is now derived when the runtime gives none, from the parts it
+  does give: the input, the output and the two cache buckets. Reasoning tokens
+  are deliberately left out — they are a slice of the output rather than an
+  addition to it — and a total the runtime did report is always used as it
+  stands, which is what keeps runtimes that count their cached input *inside*
+  their input from being billed for it twice. Both rules are read off what the
+  agents actually send rather than assumed, and there is a regression test per
+  agent, driven by captured wire logs, that compares what a job showed in chat
+  against what it was filed as having consumed.
+
+  **Existing history was corrected in place**, once, on the next start: the
+  parts were always recorded, so nothing was estimated to get there and no
+  period of the dashboard is built on a different rule from any other. Work
+  from an agent that reported nothing still reads "not reported", and an agent
+  that cannot report usage still reads as such — the two stay distinguishable.
+
+- **Claude's tokens were counted twice, everywhere.** Found while checking the
+  above. The `result` message that ends a Claude turn repeats the whole turn's
+  token counts, which the turn's own messages had already reported, and
+  everything downstream adds up what a turn reports — so the live meter, the
+  composer's session line and the recorded history all showed double. Claude's
+  cumulative *cost* was already corrected in the same adapter; its tokens now
+  are too.
+
+- **The composer's session line was leaving out the cache.** It added the input
+  to the output and stopped, which on Claude is a rounding error against the
+  real figure — 101 tokens where the meter beside it said 63.8k. Both readouts
+  and the historical record now come from one function, so they cannot answer
+  the same question three ways again.
+
+- **A message typed ahead is never lost between one turn and the next.** (#89)
+  Queued messages went missing, and did it in the worst way available: the
+  message left the queue, appeared in the conversation as though it had been
+  asked, and was never answered — with the rest of the line stuck behind it and
+  the session still showing as working. It happened precisely when the queue is
+  most useful, which is when nobody is watching.
+
+  The cause was a handover a few milliseconds too early. Three of the five
+  runtimes — pi, Grok Build and `codex exec` — run one process per turn and
+  announce the turn's end on a line of output, while the process that wrote it
+  is still exiting. The queue took that as its cue, and the adapter refused the
+  message it was handed, after the message had already been written into the
+  transcript.
+
+  The adapter is now *asked* whether it can take a turn instead of being assumed
+  able to, and nothing leaves the queue or reaches the conversation until it
+  says yes — a wait of a millisecond or two, only for those runtimes, invisible
+  in ordinary use. A message that still cannot be delivered is **kept**, with
+  its text and the reason it did not go, on a row that offers **Try again**; the
+  messages behind it wait rather than jumping it, since they were typed
+  expecting it to have been asked. The same guarantee covers a message sent
+  straight from the composer at that same moment, which took the identical
+  race.
+
+- **Every agent now reports the model it actually ran, and the picker offers
+  the models it accepts.** (#75) A model name in a spend record is only worth
+  having if the runtime said it, and two quite different claims were hiding
+  behind one: the model this app *asked for* and the model that *ran*. Grok
+  reported neither — its conversations showed no model at all, and every Grok
+  job was filed against nothing, so the by-model view built to answer "what are
+  we spending this on" had a nameless row absorbing the lot. Elsewhere the
+  request was being shown where a measurement belonged, which is worse than a
+  blank because it looks like a fact.
+
+  Every supported agent was probed against its installed binary, and the answer
+  turned out to be that all of them say so somewhere. Grok names its models at
+  the end of a turn, in `modelUsage`, in the one place nothing was reading;
+  Claude reports the same structure on the line that closes a turn; pi names
+  the model on every message it sends. Those are now what the conversation
+  shows and what the record files. A model that has only been requested is
+  shown nowhere until the runtime confirms it. Claude's billing alias
+  (`claude-opus-5[1m]`) is filed under the canonical name its messages carry,
+  so the conversation and the usage view cannot disagree about what ran.
+
+  A turn that ran on more than one model — a subagent, a fallback — is no
+  longer recorded as though one model did all of it. The job still names the
+  model that answered, and each model's own tokens, cost and round-trip count
+  are kept beside it, visible on the job and folded into the by-model
+  breakdown, which still adds up to exactly the headline total. Tool calls are
+  left unattributed there on purpose: no runtime says which model asked for
+  which tool. Claude's per-model cost is put on the same footing as the turn's
+  own before it is stored, so a cumulative counter can never make the models in
+  a turn cost more than the turn did. Filtering by a model now finds the work a
+  subagent did on it, not only the turns it answered.
+
+  Choosing a model is a menu wherever a runtime publishes one: Codex over its
+  protocol, the ACP agents in their model select, and Grok and pi through the
+  command each ships for it. Claude publishes nothing, so its picker keeps the
+  typed field and says so. The field doubles as a filter — pi lists several
+  hundred models — and a name that matches nothing listed can still be sent.
+
+  Nothing already recorded is reclassified, and no model name appears anywhere
+  that its agent did not report.
+
+  While confirming this, one documented open question was settled: Grok's
+  `total_cost_usd` is per-turn, not cumulative like Claude's. Two consecutive
+  turns in one conversation reported $0.0134 and then $0.0039, where a
+  cumulative counter would have said $0.0173. The app's existing treatment of
+  it was right.
+
+- **Grok Build shows what it actually does.** (#73) A conversation where Grok
+  rewrote four files looked exactly like one where it thought hard and wrote a
+  paragraph: the commands it ran and the files it edited never appeared as
+  activity of their own, only as its own narration folded into its reasoning.
+  You could not follow along, the record of the conversation had no account of
+  what happened to your working folder, and the spend figures were wrong in a
+  way nobody would suspect — tool counts read as zero for Grok next to agents
+  where the same work was counted properly.
+
+  The cause was not a mapping bug. Grok's headless mode has no tool channel at
+  all: asked to read a file and run a command, it emitted eighty-three thought
+  events, one line of text and a summary, while the file it wrote appeared on
+  disk. So Grok is now driven over ACP (`grok agent stdio`), which reports the
+  identical work as ordinary tool calls — with what each one touched and what
+  came back. That is a row in the runtime table rather than a new adapter,
+  since three other agents already speak the same protocol.
+
+  Everything else about Grok improves with it: permission prompts instead of
+  approve-everything-or-nothing, the model list published in the handshake
+  instead of typed from memory, and interruption that leaves the session
+  standing. **Conversations recorded before this still open** — Grok kept the
+  record all along, and loading one replays even the tool calls its headless
+  output was silent about.
+
+  The other five agents were checked the same way rather than assumed correct,
+  each against its own recorded output, and each shows, keeps and counts its
+  tool activity properly. That per-agent answer is written down in
+  `docs/runtimes.md`, and the tests behind it run every agent's real captured
+  output through its real adapter, so an agent whose activity silently stops
+  being captured fails the build.
+
+  Two things the check turned up on the way. The launcher advertised
+  `toolCalls` for Grok while the adapter it built said the opposite — the one
+  place the app promises to be honest about capability said the wrong thing.
+  And a skill installed in `.grok/skills` no longer disappears from the `/`
+  menu when a runtime announces its own built-in commands.
+
+- **Skills and project commands are in the `/` menu from the moment a
+  conversation opens, not after the first message.** (#71) Typing `/` in a new
+  chat listed a handful of the runtime's built-in commands and nothing else:
+  everything installed on top — skills, and the commands a project or plugin
+  brings — appeared only once a turn had run, because the app knows the
+  built-ins independently and waited on the runtime for the rest. Anyone who
+  knew a skill by name could still type it blind; anyone who did not had to
+  send a throwaway message, watch the menu fill in, and start over. The
+  composer's own button says it offers commands *and skills*, so the gap read
+  as a broken promise.
+
+  The menu now shows what the session can actually run, before a word is typed.
+  Where a runtime can be asked up front it is, and what it says wins: the ACP
+  agents (Kimi Code, Oh My Pi) volunteer their list as the session starts, and
+  Claude Code's arrives with the first turn and **replaces** whatever stood in
+  for it, entire — a fallback is a stand-in until the real answer arrives, never
+  something merged into it. Where a runtime never reports one — Codex and pi —
+  the menu lists what is installed for that session, read from the directories
+  each runtime's own installer writes into, including enabled plugins for
+  Claude. (Grok Build was in that group until #73 below moved it onto a
+  protocol where it does report one.)
+
+  Entries carry the description their author wrote in the skill's frontmatter,
+  which also fills in the column for Claude, whose own list is names and nothing
+  else. A skill whose author wrote no description is listed with none rather
+  than with an invented sentence. Each session reads the home of the person it
+  belongs to, so the menu never lists what someone else has installed, and a
+  machine with no skills installed shows the built-ins exactly as before.
+
+- **The file editor shows the file, in the file's own order.** (#77) Opening a
+  file in the code view could give an editor whose lines were drawn in an order
+  the file is not in — a run of lines from halfway down at the top, a block
+  split across the view — with a bare white box, drag handle and all, over the
+  first line. Everything was there and every line was coloured correctly, which
+  is the worst version of it: the first thing anyone concludes is that the file
+  on disk is broken.
+
+  Neither the editor nor the file was at fault. The editor is a chunk fetched
+  the first time a file is opened, and it arrives as two independent requests —
+  a script and a stylesheet. The loader took the stylesheet on trust: it treated
+  a `<link>` element being present as proof that it had loaded. So one failed
+  CSS fetch — a moment with no route to the server, or the service restarting
+  under an open page, both of which this app treats as routine — left a dead
+  link in the page that every later open read as success. The editor was then
+  built with none of its own rules: its lines lost the positioning that puts
+  them where they belong, leaving the recycling order of the underlying elements
+  as the order on screen, and its hidden input area became an ordinary resizable
+  textarea drawn over line one.
+
+  The loader now owns its stylesheet, discards a failed one so the next open
+  genuinely fetches it again, and — before handing the editor over — asks the
+  browser whether the rules are actually in effect. If they are not, the file
+  opens in the app's own editor with the notice that already existed for a chunk
+  that could not be fetched at all. A plainer editor that is correct beats a
+  full one that shows your source in an order you did not write it in.
+
+  The check that should have caught this exists now too. The browser checks ran
+  from a `file://` page, where a chunk the app fetches by absolute path can
+  never arrive — so every check around this editor could only ever confirm that
+  its *parts* had been built. They are served over HTTP out of the real build
+  now, and one of them opens a real file in the real editor and compares what is
+  on the screen, line by line, against the file — in both themes.
+- **A turn's badge says how the turn ended, and is right.** (#74) Turns were
+  regularly marked failed when they had succeeded. The mark was never a verdict
+  on the turn: a turn went red if *anything* inside it had gone wrong at any
+  point — a search that found no matches, a test run that reported failures, a
+  command that came back non-zero, a warning the agent read and moved past.
+  Those are ordinary moments in a working turn, and for a coding agent they are
+  most of the work, so the longer and more useful the turn the likelier it was
+  to be marked failed. The badge stopped meaning anything, which cost the one
+  thing it exists for: finding, in a long session, the turn that really did go
+  wrong.
+
+  The outcome now comes from the runtime's own word for how the turn concluded,
+  which every one of them already sends and the app used to discard. A turn that
+  finished and answered reads as done however many steps inside it errored, and
+  the steps stay marked failed where the steps themselves are shown. Red is
+  kept for a turn that did not complete: the agent stopped on an error it could
+  not get past, the runtime went away mid-turn, or the turn ended with no
+  answer. A turn the user interrupted reads as done — nothing went wrong — and
+  so does one whose answer is the agent saying it could not do the thing, since
+  anything else means reading what an answer meant. A word no runtime has used
+  before reads as done rather than as a guess at failure.
+
+  Each runtime says this differently — `end_turn`, `EndTurn`, `stop`,
+  `completed`, or nothing at all for a good turn on pi — so the reading of it is
+  covered per agent by tests over the conversations those agents really
+  produced. A conversation reopened later shows every turn with the outcome it
+  ended with, taken from the log it already recorded; nothing was migrated and
+  nothing already recorded was reclassified. One thing fixed along the way: a
+  turn left mid-stream by a runtime that died used to come back spinning
+  forever, on a process that had ended hours before.
+
+## [5.3.1] - 2026-07-27
+
 ### Added
 - **Usage broken down per project, so spend can be tracked per piece of
   work.** (#65) Until now every figure was pooled across every codebase people
@@ -290,8 +1548,10 @@
   under it, and a turn folds on its own once the next one begins, so a long
   session reads as a list of what was asked rather than an endless scroll. The
   turn index can open or close them all at once, and jumping to a turn from the
-  index opens it. A folded turn still says what it was about, and its copy and
-  branch actions keep working while it is shut.
+  index opens it. A folded turn still says what it was about, and its copy
+  action keeps working while it is shut. (This entry also claimed a branch
+  action. There was none: the control was never built, in this release or any
+  other before it. Branching from a turn is in Unreleased above.)
 
 ### Fixed
 - **The runtime's own slash commands are there from the moment a conversation

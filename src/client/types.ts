@@ -1,5 +1,7 @@
 // Client-side type definitions for Code Agents Web CLI
 
+import type { ConversationAttention } from '../shared/chat-alerts';
+
 export interface AppSettings {
   fontSize: number;
   theme: ThemePresetId;
@@ -13,6 +15,43 @@ export interface AppSettings {
    * be re-made for every conversation.
    */
   chatBypassPermissions: boolean;
+  /** When a conversation is allowed to interrupt the user. */
+  notifications: NotifySettings;
+}
+
+/**
+ * Which conversation events are worth a system notification.
+ *
+ * Flat booleans rather than a list of enabled kinds, so the shell store's
+ * one-level equality check can see that nothing changed — and so a settings
+ * blob written by an older build is completed field by field rather than being
+ * read as "the user switched everything off".
+ *
+ * Every field defaults to on. A conversation that has stopped to ask something
+ * is doing nothing at all until it is answered, and one that has finished is
+ * the moment the user can move; both are worth the interruption, and both are
+ * one switch away from silence.
+ */
+export interface NotifySettings {
+  /** The master switch. Off means nothing leaves the page, whatever else says. */
+  enabled: boolean;
+  /** A turn that ended, ready for the next request. */
+  finished: boolean;
+  /** A turn the runtime ended badly, or a runtime that died. */
+  failed: boolean;
+  /** The agent stopped for a tool approval. */
+  approval: boolean;
+  /** The agent asked the user a question and is waiting on the answer. */
+  question: boolean;
+  /**
+   * Whether a notification may name the conversation and quote what happened.
+   *
+   * Off reduces every notification to "a conversation needs you". A
+   * notification is read outside the boundary that signing in protects —
+   * on a lock screen, on a shared phone — so what it carries is the user's
+   * choice, not this app's.
+   */
+  details: boolean;
 }
 
 export type ThemePresetId =
@@ -41,6 +80,15 @@ export interface SessionInfo {
   lastActivity: number;
   unreadOutput: boolean;
   hasError: boolean;
+  /**
+   * Whether this conversation is stopped, waiting on a person.
+   *
+   * Beside `unreadOutput` rather than folded into it because the two mean
+   * different things and only one of them is still true tomorrow: unread is
+   * cleared the moment the tab is looked at, while an unanswered approval is
+   * unanswered until it is answered.
+   */
+  attention?: ConversationAttention | null;
   idleTimeout?: ReturnType<typeof setTimeout>;
   workCompleteTimeout?: ReturnType<typeof setTimeout>;
 }

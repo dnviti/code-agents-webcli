@@ -1,7 +1,7 @@
 # Usage accounting
 
 Durable, per-user history of what agent work has cost: tokens, dollars,
-turns and tool calls, filed as one row per job and kept forever. This is a
+round trips and tool calls, filed as one row per turn and kept forever. This is a
 different thing from [Usage analytics](analytics.md): that page reads
 Claude Code's own local transcripts to estimate a five-hour billing window for
 one CLI, and disappears with the file. This page is written by the server
@@ -10,10 +10,10 @@ even the deletion of the conversation the work happened in.
 
 ## What is recorded, and what is not
 
-Every job files: who ran it (user id and login, denormalised so the row
+Every turn files: who ran it (user id and login, denormalised so the row
 outlives the account), which agent and model, when it started and ended, how
-it ended, how many turns and tool calls it took, the token and cost figures
-the runtime reported, and which tool names were called how many times.
+it ended, how many tool calls it took, the token and cost figures the runtime
+reported, and which tool names were called how many times.
 
 What is never recorded: anything you or the agent said. No prompt text, no
 reply text, no file contents, no tool arguments, no tool output. The
@@ -22,26 +22,84 @@ things that happen to share some numbers — a record that quoted the
 conversation would just be a transcript wearing a different name, kept around
 after every rule protecting the real one had stopped applying to it.
 
-## What a "job" is
+## What a turn is
 
-A job is one prompt-to-settle unit: the span from a user's message to the
-point the runtime declares the turn over. Two counts are derived from the
-transcript rather than asked of the runtime, because almost none of them
-report either directly:
+**One user request and everything the agent did about it** — the span from a
+user's message to the point the runtime declares the turn over. One row of
+`usage_jobs` is one turn, which is why there is no turn count stored on the
+row: counting turns is counting rows, and every runtime here has that
+boundary, so the figure means the same thing whichever agent ran the work.
 
-- **Turns** — the number of times the model itself spoke inside that span.
-  This is the same quantity Claude Code reports as `num_turns`, generalised to
-  every runtime so "how many round trips did this take" is answerable for
-  agents that have no such field of their own.
+What a message typed *while the agent is working* belongs to is decided by
+where it was delivered, and it is recorded when the work runs because it
+cannot be reconstructed afterwards:
+
+- Sent into the turn already running, to redirect it (the "send now" control on
+  a queued message) → it **continues that turn**. Steering the current work is
+  part of that work, not a new request.
+- Left in the queue until the current turn finishes → it is **its own turn**,
+  counted when it starts. It was never part of the work that was running.
+
+Two counts sit inside a turn:
+
+- **Model turns** — round trips to the model, and *only* where the runtime
+  counts its own: Claude's `num_turns`, or a per-model call count. Where nobody
+  says, it is `null` and reads as "not reported". It used to be counted as the
+  number of assistant messages the transcript showed, which is a property of
+  how an agent chops up its output rather than of the work: identical work
+  filed 1 under an agent that answers in one stretch and 6 under one that
+  separates its thinking from its answer, and those were the figures the
+  dashboard compared agents by.
 - **Tool calls** — the number of tool blocks the transcript opened. A tool
   that is re-announced once its streamed arguments finish parsing (Claude does
   this) is counted once, not twice.
 
-A job that never got a reply — the process died, the session was stopped, the
+A turn that never got a reply — the process died, the session was stopped, the
 runtime reported an error — is still filed, with an outcome of `interrupted`
 or `error` rather than being dropped. A turn the process died in the middle of
 took exactly as many round trips as it got to; that is a fact about the crash,
 not an absence of one.
+
+The same definition drives the conversation: the turn strip, the index beside
+it and the accounting all group on the turn id the session stamps, so the
+count you read next to a conversation and the count in the statistics are the
+same number read twice. The index is served from the recorded log rather than
+assembled from whatever the browser has loaded, so it lists every turn from the
+first one still on disk however little of the conversation is on screen, and
+every entry is titled with the user's own ask — a turn with no prompt behind it
+says so rather than borrowing a line from the model.
+
+## The unit you read: the conversation
+
+A job is the unit that is *recorded*. It is not the unit anybody thinks in. A
+morning's work in one chat tab is one piece of work — "this conversation, about
+this thing, cost this much" — and filing it as forty rows makes the tab's own
+record less usable the more the tab is used.
+
+So the dashboard's history lists **conversations**, one row per chat tab, and
+everything spent in a tab sums into that one entry:
+
+- **Compacting the conversation does not start a new entry.** Neither does
+  clearing it, nor starting a new one inside the same tab. Those replace the
+  *runtime's* conversation — a new native session id — and the tab goes on
+  being the tab.
+- **Closing the tab and reopening it, or coming back after a server restart,
+  continues the same entry.** The id it is keyed on is the session's own,
+  which is durable; a job carries it whether the session row still exists or
+  not.
+- **A conversation that used more than one agent or model says so**, rather
+  than being filed under whichever one happened to be first.
+- **The requests are still there**, one level down: open a conversation for its
+  own jobs, or take the Requests view to browse them across conversations.
+
+Nothing was migrated to make this work, and no earlier period is counted
+differently. The tab's id has been on every job row since the table existed, so
+grouping on it reaches back over the whole history.
+
+Two tabs are never merged into one entry because they share a project — the
+by-project breakdown is what answers that question, and it goes on summing
+jobs. The headline totals and the breakdowns are the same rows grouped other
+ways, so they agree with the conversation entries by construction.
 
 ## The per-agent honesty table
 
@@ -50,23 +108,210 @@ otherwise. The figures below come from each adapter's own `capabilities`
 declaration under `src/server/chat/adapters/`, which is the same source the
 adapters use to decide what they can promise the rest of the UI.
 
-| Agent | Turns / tool calls | Tokens | Cost |
-| --- | --- | --- | --- |
-| Claude | counted from the transcript | reported | reported (see below) |
-| Codex (app-server) | counted from the transcript | reported | **not reported** — nothing in the schema prices a turn |
-| Codex (`exec` fallback) | counted from the transcript | **not reported** | **not reported** |
-| Grok | counted from the transcript | reported | reported, but see the open question below |
-| pi | counted from the transcript | reported | reported |
-| ACP agents (omp, kimi, and others behind the ACP bridge) | counted from the transcript | reported | reported |
+Turns and tool calls are always known — they are measured here, from the
+boundary and the blocks every runtime produces. Model turns are the runtime's
+own figure or nothing at all, which is why they have a column of their own.
+
+| Agent | Tool calls | Model turns | Tokens | Cost | Model |
+| --- | --- | --- | --- | --- | --- |
+| Claude | counted here | reported (`num_turns`) | reported | reported (see below) | reported, per message and per model |
+| Codex (app-server) | counted here | **not reported** | reported | **not reported** — nothing in the schema prices a turn | reported, per session |
+| Codex (`exec` fallback) | counted here | **not reported** | **not reported** | **not reported** | **not reported** |
+| pi | counted here | **not reported** | reported | reported | reported, per message |
+| ACP agents (Grok, omp, kimi, and others behind the ACP bridge) | counted here | only where a per-model call count arrives | reported | reported — Grok's in ticks, see below | the runtime's current selection |
 
 A figure a runtime never reports is stored as `null` and shown as
 **"not reported"** — never as zero. Those are different facts: a job that
 cost nothing and a job whose cost nobody measured look the same on a naive
 total, and this app keeps them apart all the way to the database. Every
 aggregate the store returns carries, alongside its totals, a count of how many
-of the jobs in it actually contributed a token figure or a cost figure
-(`tokensReportedJobs`, `costReportedJobs`), so "$4.10 across 28 of 40 jobs"
-is the shape of the answer, not "$4.10" on its own.
+of the turns in it actually contributed a token figure, a cost figure or a
+round-trip count (`tokensReportedTurns`, `costReportedTurns`,
+`modelTurnsReportedTurns`), so "$4.10 across 28 of 40 turns" is the shape of
+the answer, not "$4.10" on its own. The effort panel averages model turns over
+the turns that reported one, never over all of them — reading a silent runtime
+as zero would have put it at the top of every efficiency comparison on the page
+for having reported nothing.
+
+### Figures recorded before this rule
+
+The turn count needs no correction and older periods are directly comparable:
+every row ever written was already one prompt, so the corrected count is a
+recount of nothing. The model-turn column is empty for everything recorded
+before it existed — the old figure was the discarded meaning, and copying it
+across would make an inference indistinguishable from a measurement in the one
+place built to keep those apart.
+
+## A job's token total
+
+The Tokens column, the headline total and every breakdown read one number per
+job. Where it comes from is worth being precise about, because most runtimes
+do not hand one over.
+
+**A total the runtime reported is always used as it stands.** Only where there
+is none are the parts added, and only the input, the output and the two cache
+buckets — never the reasoning tokens, which are a slice of the output rather
+than an addition to it. Both halves of that rule are read off what the agents
+actually send: grok reports 7210 input, 1893 output, 41000 cache read and 412
+reasoning, and calls the total 50103, which is the first three and not the
+fourth. codex is the other way round — its cached input is counted *inside* its
+input — and it always reports a total, so the sum is never reached for it.
+
+This matters most for Claude, which reports its four buckets on every message
+and a total on none of them, and where the cache is routinely 99% of the
+figure. Until this rule existed the history filed nothing for those jobs and
+showed **"not reported"** beside a cost that had reported fine.
+
+A job where the runtime reported *nothing* still reads "not reported", and an
+agent that cannot report usage at all still reads as `n/a`. Adding up nothing
+gives nothing, not zero.
+
+**Old history was corrected in place.** The parts were always recorded, so
+jobs filed before this derived their totals from what was already in the row,
+once, on the next start — no period of the dashboard is built on a different
+rule from any other, and nothing was estimated to get there.
+
+## Which model actually ran
+
+A model name in a spend record is only worth having if the runtime said it.
+There are two quite different claims that can hide behind one: the model this
+app **asked for** (`--model`, a flag) and the model that **ran** (whatever the
+runtime reports back). Only the second is a measurement, and only the second
+is recorded. Where a runtime has not confirmed a model yet, the conversation
+shows none rather than showing the request — a request rendered plainly reads
+as a fact, which is worse than a blank.
+
+Each of these was established by running the installed binary, not by reading
+its documentation:
+
+| Agent | What it says the model was | When | Publishes its list? |
+| --- | --- | --- | --- |
+| Claude | `system/init.model`, every assistant `message.model`, and `result.modelUsage` keyed per model | start, per message, turn end | no — the picker keeps its typed box |
+| Codex (app-server) | `thread/start` → `model`, which it names even when nothing was requested | session start | **yes** — `model/list` over the protocol |
+| Grok | `models.currentModelId` when the session opens, and `_meta.usage.modelUsage` on the reply that ends a turn — keyed per model with tokens, `modelCalls` and a cost in ten-billionths of a dollar | session start, turn end | **yes** — in that same reply |
+| pi | every assistant `message.model`, with its provider | per message | **yes** — `pi --list-models` |
+| ACP agents (kimi, omp, …) | the model select's `currentValue` | session start, and on a switch | **yes** — in the select itself |
+
+Two consequences worth stating plainly:
+
+- **Claude's billing name is not its display name.** `modelUsage` is keyed
+  `claude-opus-5[1m]` — the same model with a context-window suffix — while the
+  messages say `claude-opus-5`. The canonical name wins, so the conversation
+  and the usage view cannot disagree about what ran.
+- **Grok used to report nothing at all.** Its model was neither on the session
+  line nor on a message, so every Grok job was filed against no model and the
+  by-model view had a nameless row absorbing all of it. The name was there the
+  whole time, at the end of the turn, in the one place nothing was reading.
+  That map is read now, and it brought the only round-trip count Grok publishes
+  anywhere with it — `modelCalls`, which is why the Model turns column stopped
+  saying "not reported" on every Grok row.
+
+### A turn that ran on more than one model
+
+A subagent runs on its own model; a runtime can fall back after a failure.
+Claude and Grok both report this, as extra keys in the same `modelUsage` map,
+and pi says it by naming a different model on a later message in the same turn.
+
+Where that happens the job is **not** filed as though one model did all of it.
+`usage_jobs.model` still names the model that answered — that is what to call
+the conversation — and a `usage_job_models` row is written per model carrying
+that model's own tokens, cost and round-trip count as the runtime reported
+them. The by-model breakdown reads those rows where they exist and the job's
+own figures where they do not, so it still adds up to exactly the headline
+total.
+
+Three things deliberately stay unattributed in that split:
+
+- **Tool calls.** No runtime says which model asked for which tool, so a split
+  job contributes no tool calls to any model rather than a made-up share.
+- **Reasoning tokens.** Reported for the turn, not per model.
+- **Effort by model.** That panel is about turns, and a turn is one prompt; it
+  groups by the model that answered.
+
+Claude's per-model cost gets one correction on the way in. Its `total_cost_usd`
+is cumulative (see below) and `modelUsage.costUSD` is a slice of that same
+counter, so the *shares* are taken from the report and the turn's own cost is
+what is divided by them. The models in a turn can therefore never add up to
+more than the turn did.
+
+### Choosing a model
+
+Where a runtime publishes the models it accepts, those are offered as a menu:
+Codex over its protocol, the ACP agents in their own model select, and Grok
+and pi through the command each of them ships for it (run once per process and
+cached, the same idea as the installed-commands fallback for the `/` menu).
+Where a runtime publishes nothing — Claude — the picker keeps its typed field
+and says the runtime listed nothing, rather than showing an empty menu.
+
+The field doubles as a filter, because pi lists several hundred models and an
+unfiltered menu that long is a scroll nobody reads. A name that matches
+nothing listed can still be sent: a runtime's list is what it advertises, not
+a promise about what it will refuse.
+
+## The context window
+
+The most useful thing to know mid-session is how much of the model's context is
+left, and it is the one figure a wrong answer is worse than no answer for: a bar
+that is confidently under-full invites you to keep going up to a limit that is
+not there. So nothing in this product writes down how big any model is.
+
+Capacity comes from one of two places, in this order:
+
+1. **The agent said so.** Claude reports it in `modelUsage[…].contextWindow`,
+   codex in `tokenUsage.modelContextWindow`, omp and the other ACP agents in
+   `usage_update.size`, and grok publishes one per model in its `session/new`
+   reply. An agent's own figure always wins — it is describing the model it will
+   actually run.
+2. **The provider says so.** pi and kimi report no capacity at all, but both
+   name an OpenRouter model id (kimi's are literally `openrouter/<id>`), so the
+   provider they are already talking to is asked what its own models are. The
+   catalogue is fetched once and matched on the exact id — never on a
+   neighbouring name.
+
+That second step is the one outbound request this feature makes. Nothing about
+the conversation goes with it: the whole catalogue is fetched and matched on
+this machine, so the provider is never told which model is being asked about.
+Set `CODE_AGENTS_WEBCLI_NO_MODEL_CATALOGUE=1` to switch it off — capacity is
+then whatever the agents report, and unknown otherwise.
+
+If neither can answer, the reading says **"size unknown"** and draws no bar.
+That is the same rule as everywhere else here: an absence is reported as an
+absence.
+
+Why the order matters, concretely: grok reports **512,000** tokens for
+`grok-build`, while the nearest catalogue entry (`x-ai/grok-build-0.1`) says
+**256,000**. Half. Matching loosely would have put that number in front of a
+user with no way to tell it was wrong.
+
+**Occupancy** is the *last* request's own figures — input + cache read + cache
+write + output — not the turn's totals. A three-round-trip turn measured today
+totalled 105,027 tokens across its requests while only 37,387 were ever in the
+window at once: a bar built on the totals would have read 10.5% full where the
+truth was 3.7%.
+
+Where that figure comes from differs per agent — Claude's own last `result`,
+codex's `tokenUsage.last`, `usage_update.used` from omp and opencode — and Grok
+is the one that puts it somewhere the protocol does not name: `_meta.totalTokens`,
+on nearly every `session/update` it sends — 287 of the 289 captured; the
+exceptions echo back what the user typed, which is why a reading that is absent
+is skipped rather than taken as zero. It sends no `usage_update` whatsoever, so until that was read a Grok
+conversation had a 512,000-token ceiling with nothing measured against it: no
+percentage, no bar, and no 80% warning it could ever reach. The reply that ends
+one of its turns carries both figures a line apart — `_meta.totalTokens` for the
+last request, `_meta.usage.totalTokens` for the turn — and on the turn measured
+here they are 16,637 and 65,943. Filing the second as occupancy would have been
+four times worse than the blank it replaced.
+
+The reading follows a mid-conversation model switch: everything known about the
+old model is discarded on the switch rather than carried forward, so moving from
+a million-token model to a 200,000-token one immediately reads against the
+smaller ceiling.
+
+Above 80% the display says so in words and says what is left; above 90% it says
+it more urgently. The header strip, which is a fixed width, carries the colour
+and the percentage only — the sentence is in the status panel and in the
+expanded meter, because a warning that overflows its own row at 95% is one
+nobody can read at the moment it matters.
 
 ## Cost is a list price, not a bill
 
@@ -90,8 +335,8 @@ should expect them not to be related at all.
 Runtimes disagree about what a usage figure even means, and treating them all
 the same way silently multiplies somebody's bill.
 
-Claude, Grok, pi and the ACP agents report a figure **for the message or the
-turn**. Those add up: sum every turn's tokens and cost, and the sum is the
+Claude, pi and the ACP agents — Grok among them — report a figure **for the
+message or the turn**. Those add up: sum every turn's tokens and cost, and the sum is the
 conversation's total.
 
 Codex and the ACP agents' `usage_update` instead report **a running total for
@@ -134,20 +379,38 @@ This was also a user-visible bug in its own right, independent of the
 accounting feature: before this correction, the live in-conversation cost
 meter over-counted on every turn after the first.
 
-### Grok's cost convention is an open question
+### Claude repeats a turn's tokens on the way out
 
-Grok's `total_cost_usd` has the same field name and the same shape as
-Claude's — which is exactly the pattern that turned out to be cumulative on
-Claude. It is currently treated as a **per-turn** figure that sums, on the
-strength of the CLI's own documentation describing `end` as carrying that
-turn's usage. But that has not been confirmed live: the probe run against the
-installed binary hit the account's rate limit before a second successful turn
-completed, so there is no captured pair of consecutive `total_cost_usd`
-values to check the way Claude's were checked. If Grok's figure turns out to
-also be cumulative, every Grok conversation's per-turn cost after the first
-turn is currently overstated in exactly the way Claude's was before its fix.
-Treat Grok's per-job cost figures with that caveat until someone re-probes it
-with working quota.
+The `result` message that ends a Claude turn carries a `usage` object, and that
+object is the whole turn's aggregate — every token in it has already been
+reported by the turn's own messages as they streamed. Everything downstream
+adds up what a turn reports, so passing it through counted each of those tokens
+twice: the live meter, the composer's session line and the recorded history all
+showed double, consistently enough that nothing looked wrong.
+
+The adapter now reports only the part the turn's messages did not: usually
+nothing, and the full aggregate for a turn that failed before its first message
+and so has nothing that could have been counted twice. The cost on the same
+event is cumulative in a different way and is corrected separately, just above.
+
+### Grok quotes cost in ticks, and it is per-turn
+
+Grok never sends a dollar figure. It sends **ticks** — an integer count of
+ten-billionths of a dollar, which is how you carry money without floating point.
+The ratio is not documented; it is read off a run that reported the same turn
+both ways, as `total_cost_usd: 0.02338` and `total_cost_usd_ticks: 233800000`.
+The app converts once, in the adapter, and stores dollars like everyone else.
+
+Whether that figure was per-turn or cumulative was an open question here for a
+while, and for good reason: Claude's has the same shape and turned out to be
+cumulative, which over-counted every turn after the first until it was fixed.
+Grok's is **per-turn**, confirmed by two consecutive turns in one session —
+163,726,000 ticks, then 34,682,000. A cumulative counter cannot go down. So the
+figures sum, which is how the app already treated them.
+
+The cost arrives in `_meta.usage` on the reply to `session/prompt`, not in the
+`usage` field the other ACP agents use. Reading only the field the others use
+filed every Grok turn as free.
 
 ### A resumed conversation, and where its counter starts
 
@@ -284,9 +547,10 @@ Everything one dashboard view draws: totals, a trend series, breakdowns by
 project/agent/model/user, effort histograms, and the most-called tools.
 
 Query parameters: `period` (`day` | `week` | `month` | `year`, default `day`),
-`anchor` (ISO instant the period is centred on, default now), `tz` (minutes to
-add to UTC to reach the viewer's own clock, so "today" means their today),
-`scope` (`self` | `everyone`).
+`anchor` (ISO instant the period is centred on, default now — this is what the
+dashboard's arrows and date field send, and the only way to ask about a period
+that has already ended), `tz` (minutes to add to UTC to reach the viewer's own
+clock, so "today" means their today), `scope` (`self` | `everyone`).
 
 It also takes the same narrowing the job history does — `project`, `agent`,
 `model`, `user`, and an explicit `from`/`to` window — and applies it to *every*
@@ -318,8 +582,8 @@ GET /api/usage/dashboard?period=week&tz=120
   "bucket": "day",
   "filters": {},
   "totals": {
-    "jobs": 42,
-    "turns": 96,
+    "turns": 42,
+    "modelTurns": 96,
     "toolCalls": 210,
     "inputTokens": 154200,
     "outputTokens": 38900,
@@ -338,18 +602,19 @@ GET /api/usage/dashboard?period=week&tz=120
   "effortByAgent": [
     {
       "key": "claude",
-      "jobs": 30,
-      "turnsAvg": 2.4,
-      "turnsMax": 11,
+      "turns": 30,
+      "modelTurnsReportedTurns": 30,
+      "modelTurnsAvg": 2.4,
+      "modelTurnsMax": 11,
       "toolCallsAvg": 3.1,
       "toolCallsMax": 22,
-      "turnsHistogram": [10, 8, 7, 4, 1],
+      "modelTurnsHistogram": [10, 8, 7, 4, 1],
       "toolCallsHistogram": [5, 9, 8, 6, 2]
     }
   ],
   "effortByModel": [{ "...": "..." }],
-  "topTools": [{ "tool": "Read", "agent": null, "calls": 88, "jobs": 40 }],
-  "topToolsByAgent": [{ "tool": "Read", "agent": "claude", "calls": 60, "jobs": 25 }]
+  "topTools": [{ "tool": "Read", "agent": null, "calls": 88, "turns": 40 }],
+  "topToolsByAgent": [{ "tool": "Read", "agent": "claude", "calls": 60, "turns": 25 }]
 }
 ```
 
@@ -361,6 +626,41 @@ under the key `" unattributed"` (with the leading space). It is a sentinel
 rather than an empty string precisely so it can be sent straight back as a
 filter value: an empty query parameter is indistinguishable from an absent one,
 and "show me only the unattributed work" is a real question.
+
+### `GET /api/usage/conversations`
+
+Paged history **one entry per chat tab**, most recently active first. Takes
+exactly the same query parameters as `/api/usage/jobs` below and means the same
+thing by them — the two are one list at two levels of detail.
+
+Each entry carries the tab's totals, when it started and when it was last
+active, and the agents, models and projects used over its life as *lists*: a
+conversation that changed agent half way through says so rather than being
+filed under one of them. `name` is the tab's own name, or `null` once the tab
+has been deleted — a job outlives its conversation, and the entry survives
+without a name rather than disappearing.
+
+```
+GET /api/usage/conversations?limit=20
+```
+
+```json
+{
+  "total": 2,
+  "conversations": [
+    {
+      "sessionId": "sess-abc",
+      "name": "Refactoring the parser",
+      "agents": ["claude", "codex"],
+      "models": ["claude-opus-5", "gpt-5"],
+      "projects": ["billing-api"],
+      "startedAt": "2026-07-27T09:00:00.000Z",
+      "lastActiveAt": "2026-07-27T12:30:00.000Z",
+      "totals": { "turns": 40, "costUsd": 7.25, "...": "..." }
+    }
+  ]
+}
+```
 
 ### `GET /api/usage/jobs`
 
@@ -424,9 +724,33 @@ response to probe for another user's job ids.
   "tools": [
     { "tool": "Read", "calls": 3 },
     { "tool": "Edit", "calls": 2 }
+  ],
+  "models": [
+    {
+      "model": "claude-opus-5",
+      "calls": 3,
+      "inputTokens": 800,
+      "outputTokens": 150,
+      "cacheReadTokens": null,
+      "cacheWriteTokens": null,
+      "costUsd": 0.75
+    },
+    {
+      "model": "claude-haiku-4-5",
+      "calls": 1,
+      "inputTokens": 200,
+      "outputTokens": 50,
+      "cacheReadTokens": null,
+      "cacheWriteTokens": null,
+      "costUsd": 0.25
+    }
   ]
 }
 ```
+
+`models` is empty for the ordinary case — a turn that ran on one model is
+already described by the `model` field — and non-empty only where the runtime
+reported a genuine split. See "A turn that ran on more than one model" above.
 
 ### `POST /api/usage/jobs/:id/project`
 
@@ -503,6 +827,19 @@ months within a year — computed against the viewer's own timezone offset so
 appears on the trend as a gap rather than disappearing and making the shape
 read as continuous when it was not.
 
+The arrows beside it move that window: a period back, a period forward, or
+straight to a date typed into the field between them, with **Now** returning to
+whichever window the clock is in. Nothing offers to walk past the present —
+there is no record ahead of it — and a window holding nothing says so rather
+than drawing an empty chart and leaving you to guess whether the arrows worked.
+Since jobs are [kept forever](#where-the-data-lives), this is how a year that
+has ended stays readable: without it the **Year** tab would mean the calendar
+year the viewer is standing in, and every job filed before the first of January
+would leave the dashboard, the trend, the history list and the export while
+sitting untouched in the database. The window is the whole page's, not the
+charts': moving it moves the history underneath and the file the export button
+downloads.
+
 ### Exploring it
 
 The charts are controls, not pictures.
@@ -558,7 +895,12 @@ much did this cost" but "does this agent usually finish in one round trip or
 does it flail". They are histograms of turns and tool calls per completed job,
 in fixed buckets (1 / 2 / 3-5 / 6-10 / 11+), rather than an average or a
 percentile — a shape says where an agent sits on that spectrum where a single
-number does not, and fixed buckets let two agents be read side by side.
+number does not, and fixed buckets let two agents be read side by side. Each
+bucket of them is a button, the same as a point on the trend: tab to one or tap
+it and its count appears under the bars, and a screen reader is told which
+distribution it is in and how many of the turns fell in that bucket. A shape is
+worth nothing to somebody who cannot see it, and a row of bare bars leaves the
+figures the panel exists for reachable by mouse alone.
 Interrupted and errored jobs are excluded from effort: a turn the process died
 inside of took exactly as many round trips as it got to before dying, which
 describes the crash rather than the agent's usual behaviour.

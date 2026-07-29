@@ -4,6 +4,7 @@ import {
   ChatCapabilities,
   ChatEvent,
   PermissionRequest,
+  SlashCommand,
   UserTurn,
 } from '../../shared/chat-events.js';
 
@@ -34,6 +35,15 @@ export interface ChatAdapterOptions {
   command: string;
   /** Model from the active runtime profile, if any. */
   model?: string;
+  /**
+   * Reasoning-effort level to launch at, when the conversation has chosen one.
+   *
+   * Spelled in the runtime's own vocabulary, because that is what it will be
+   * handed: `xhigh` for claude and pi, `on` for kimi, `ultra` for codex. The
+   * layers above never translate between ladders — a level chosen for one
+   * runtime is not offered to another.
+   */
+  effort?: string;
   /** Extra CLI arguments from the active runtime profile. */
   extraArgs?: string[];
   /** Environment from the active runtime profile. */
@@ -89,6 +99,17 @@ export interface ChatAdapterOptions {
    */
   readFile?: (path: string) => Promise<string>;
   writeFile?: (path: string, contents: string) => Promise<void>;
+  /**
+   * Skills and project commands found installed for this session, as a
+   * stand-in until the runtime says what it accepts.
+   *
+   * Scanned by the session, because where to look is a fact about the person
+   * the session belongs to rather than about the protocol an adapter speaks.
+   * An adapter uses it for two things and no more: showing something in the
+   * command menu before its runtime has volunteered a list, and filling in the
+   * descriptions for a runtime — Claude — that reports names bare.
+   */
+  installedCommands?: SlashCommand[];
 }
 
 export interface ChatAdapter {
@@ -98,12 +119,39 @@ export interface ChatAdapter {
   start(): Promise<void>;
   /** Queue a user turn. Resolves when the runtime has accepted it, not when it replies. */
   send(turn: UserTurn): Promise<void>;
+  /**
+   * False while a `send()` would be refused, even though the last turn is over.
+   *
+   * Absent means "always ready", which is true of every adapter driving one
+   * long-lived process. The one-shot adapters spawn a process per turn and
+   * announce the turn's end from a line of *stdout*, while that process is
+   * still exiting — so for a few milliseconds the session believes it is idle
+   * and the adapter would still throw. Delivering a queued turn in that window
+   * wrote the user's message into the transcript and then threw, leaving it
+   * asked-but-never-answered with the rest of the queue stuck behind it (#89).
+   *
+   * Each implementation returns exactly the condition its own `send()` throws
+   * on, so this is the same question, asked before the damage instead of after.
+   */
+  readonly readyForTurn?: boolean;
   /** Cancel the running turn, leaving the session alive. */
   interrupt(): Promise<void>;
   /** Answer a pending approval. */
   respondPermission(requestId: string, optionId: string): void;
   /** Switch model mid-session, for runtimes that allow it. */
   setModel?(model: string): Promise<void>;
+  /**
+   * Switch reasoning effort mid-session, for runtimes that allow it.
+   *
+   * Resolving means the runtime took it, and an implementation must not resolve
+   * on anything weaker than that — the caller reports `live` to the user on the
+   * strength of this promise. Where a runtime cannot be asked until the next
+   * turn (codex, pi), the implementation stores the level, resolves, and emits
+   * the `effort` event itself; where it answers immediately (grok, kimi, omp,
+   * claude) it waits for that answer. Absent means the runtime has no way to
+   * change level without a relaunch, and the caller says so instead of guessing.
+   */
+  setEffort?(effort: string): Promise<void>;
   /** Branch the conversation at an earlier point, for runtimes that support it. */
   fork?(atMessageId: string): Promise<string | null>;
   stop(): Promise<void>;

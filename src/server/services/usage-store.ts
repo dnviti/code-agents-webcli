@@ -3,8 +3,9 @@
  *
  * Sits on the app's own SQLite file next to the session store, and follows the
  * same shape — one class, one method per operation, positional parameters, rows
- * cast at the boundary. It owns two tables (`usage_jobs`, `usage_job_tools`)
- * whose schema is declared with all the others in `database.ts`.
+ * cast at the boundary. It owns three tables (`usage_jobs`, `usage_job_tools`
+ * and `usage_job_models`) whose schema is declared with all the others in
+ * `database.ts`.
  *
  * Two rules run through everything here:
  *
@@ -27,6 +28,7 @@ import {
   UsageBreakdown,
   UsageBucket,
   UsageBucketUnit,
+  UsageConversationSummary,
   UsageDashboard,
   UsageEffort,
   UsageFilters,
@@ -54,7 +56,8 @@ export interface UsageJobInput {
   endedAt: string;
   durationMs: number | null;
   outcome: UsageOutcome;
-  turns: number;
+  /** The runtime's own round-trip count, null where it does not report one. */
+  modelTurns: number | null;
   toolCalls: number;
   inputTokens: number | null;
   outputTokens: number | null;
@@ -66,6 +69,23 @@ export interface UsageJobInput {
   reportsUsage: boolean;
   reportsCost: boolean;
   tools: Array<{ tool: string; calls: number }>;
+  /**
+   * How the spend divided between models, where the runtime divided it.
+   *
+   * Empty for the ordinary case. `model` above still names the model that
+   * answered, so nothing that reads one row is affected; these exist so that a
+   * turn a subagent ran on another model is not filed as though the answering
+   * model did all of it.
+   */
+  models?: Array<{
+    model: string;
+    calls: number | null;
+    inputTokens: number | null;
+    outputTokens: number | null;
+    cacheReadTokens: number | null;
+    cacheWriteTokens: number | null;
+    costUsd: number | null;
+  }>;
 }
 
 /** Who is asking, and for whose figures. */
@@ -104,7 +124,9 @@ interface JobRow {
   ended_at: string;
   duration_ms: number | null;
   outcome: string;
+  /** The superseded column. Written for older builds, read by nothing. */
   turns: number;
+  model_turns: number | null;
   tool_calls: number;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -118,8 +140,8 @@ interface JobRow {
 }
 
 interface TotalsRow {
-  jobs: number;
-  turns: number | null;
+  turns: number;
+  model_turns: number | null;
   tool_calls: number | null;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -130,6 +152,7 @@ interface TotalsRow {
   cost_usd: number | null;
   tokens_reported_jobs: number | null;
   cost_reported_jobs: number | null;
+  model_turns_reported_jobs: number | null;
 }
 
 /**
@@ -139,10 +162,14 @@ interface TotalsRow {
  * input is null, and a null total would have to be defended against at every
  * call site. The `*_reported_jobs` counters are what keeps that COALESCE honest:
  * they say how many of the rows in the sum had anything to contribute.
+ *
+ * `turns` is `COUNT(*)`, not a sum of anything: one row is one turn (#86). It is
+ * the only figure here that cannot be under-reported, because no runtime has to
+ * volunteer it.
  */
 const TOTALS_COLUMNS = `
-  COUNT(*) AS jobs,
-  SUM(turns) AS turns,
+  COUNT(*) AS turns,
+  SUM(COALESCE(model_turns, 0)) AS model_turns,
   SUM(tool_calls) AS tool_calls,
   SUM(COALESCE(input_tokens, 0)) AS input_tokens,
   SUM(COALESCE(output_tokens, 0)) AS output_tokens,
@@ -158,7 +185,8 @@ const TOTALS_COLUMNS = `
              OR reasoning_tokens IS NOT NULL
              OR total_tokens IS NOT NULL
            THEN 1 ELSE 0 END) AS tokens_reported_jobs,
-  SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS cost_reported_jobs
+  SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS cost_reported_jobs,
+  SUM(CASE WHEN model_turns IS NOT NULL THEN 1 ELSE 0 END) AS model_turns_reported_jobs
 `;
 
 const HISTORY_PAGE = 50;
@@ -188,11 +216,11 @@ export class UsageStore {
         INSERT OR REPLACE INTO usage_jobs (
           id, session_id, native_session_id, turn_id, user_id, user_login,
           agent, model, project, project_source, started_at, ended_at, duration_ms, outcome,
-          turns, tool_calls,
+          turns, model_turns, tool_calls,
           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
           reasoning_tokens, total_tokens, cost_usd,
           reports_usage, reports_cost
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         job.sessionId,
@@ -209,7 +237,11 @@ export class UsageStore {
         job.endedAt,
         job.durationMs,
         job.outcome,
-        job.turns,
+        // The superseded column, kept satisfiable rather than meaningful: it is
+        // NOT NULL and a build from before #86 opening this file still reads it.
+        // The nearest honest thing to put there is the figure that replaced it.
+        job.modelTurns ?? 0,
+        job.modelTurns ?? null,
         job.toolCalls,
         job.inputTokens,
         job.outputTokens,
@@ -221,6 +253,27 @@ export class UsageStore {
         job.reportsUsage ? 1 : 0,
         job.reportsCost ? 1 : 0,
       );
+
+      db.prepare('DELETE FROM usage_job_models WHERE job_id = ?').run(id);
+      const insertModel = db.prepare(`
+        INSERT INTO usage_job_models (
+          job_id, model, calls, input_tokens, output_tokens,
+          cache_read_tokens, cache_write_tokens, cost_usd
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const split of job.models ?? []) {
+        if (!split.model) continue;
+        insertModel.run(
+          id,
+          split.model,
+          split.calls,
+          split.inputTokens,
+          split.outputTokens,
+          split.cacheReadTokens,
+          split.cacheWriteTokens,
+          split.costUsd,
+        );
+      }
 
       db.prepare('DELETE FROM usage_job_tools WHERE job_id = ?').run(id);
       const insertTool = db.prepare(
@@ -297,6 +350,48 @@ export class UsageStore {
   }
 
   /**
+   * What each turn of one conversation cost, by turn id.
+   *
+   * The figure the dashboard shows, read back beside the conversation it came
+   * from — deliberately the same number and not a second calculation of it. A
+   * browser can add up the tokens on the messages it holds, but not the money:
+   * the runtimes that report a running total rather than a per-turn one need
+   * the difference taken against where the turn started, which is exactly what
+   * the accountant did when it filed this row.
+   *
+   * Scoped to the owner like every other read here. A turn with no row is a
+   * turn that has not ended yet, or one whose runtime reported nothing.
+   */
+  spendByTurn(sessionId: string, userId: number): Map<string, ChatUsage> {
+    const rows = this.database.raw
+      .prepare(`
+        SELECT turn_id, input_tokens, output_tokens, cache_read_tokens,
+               cache_write_tokens, reasoning_tokens, total_tokens, cost_usd
+        FROM usage_jobs WHERE session_id = ? AND user_id = ?
+      `)
+      .all(sessionId, userId) as Array<Record<string, number | string | null>>;
+
+    const spend = new Map<string, ChatUsage>();
+    for (const row of rows) {
+      // A null is a fact here as everywhere else on this table: the runtime
+      // reported nothing on that channel, which is not the same as zero, and
+      // the surface showing it says "not reported" rather than "$0.00".
+      const figure = (value: number | string | null): number | undefined =>
+        typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+      spend.set(String(row.turn_id), {
+        inputTokens: figure(row.input_tokens),
+        outputTokens: figure(row.output_tokens),
+        cacheReadTokens: figure(row.cache_read_tokens),
+        cacheWriteTokens: figure(row.cache_write_tokens),
+        reasoningTokens: figure(row.reasoning_tokens),
+        totalTokens: figure(row.total_tokens),
+        costUsd: figure(row.cost_usd),
+      });
+    }
+    return spend;
+  }
+
+  /**
    * Attribute work by hand to a project, for jobs nobody recorded one for.
    *
    * The one write on this table that is not a measurement, and it is fenced
@@ -364,7 +459,26 @@ export class UsageStore {
     const tools = this.database.raw
       .prepare('SELECT tool, calls FROM usage_job_tools WHERE job_id = ? ORDER BY calls DESC, tool ASC')
       .all(id) as Array<{ tool: string; calls: number }>;
-    return { ...mapJob(row), tools };
+    const models = this.database.raw
+      .prepare(`
+        SELECT model, calls, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd
+        FROM usage_job_models WHERE job_id = ?
+        ORDER BY COALESCE(cost_usd, 0) DESC, model ASC
+      `)
+      .all(id) as Array<Record<string, string | number | null>>;
+    return {
+      ...mapJob(row),
+      tools,
+      models: models.map((split) => ({
+        model: String(split.model),
+        calls: split.calls as number | null,
+        inputTokens: split.input_tokens as number | null,
+        outputTokens: split.output_tokens as number | null,
+        cacheReadTokens: split.cache_read_tokens as number | null,
+        cacheWriteTokens: split.cache_write_tokens as number | null,
+        costUsd: split.cost_usd as number | null,
+      })),
+    };
   }
 
   /**
@@ -390,6 +504,125 @@ export class UsageStore {
       .all(...params, limit, offset) as JobRow[];
 
     return { jobs: rows.map(mapJob), total };
+  }
+
+  /**
+   * Past conversations, most recently active first — one row per chat tab.
+   *
+   * The unit of accounting (#88). Everything spent in a tab sums into one entry
+   * for as long as the tab exists, across compaction, clearing, and starting a
+   * new conversation inside it: those replace the *runtime's* conversation, and
+   * this groups on ours. `native_session_id` is the one that changes there, and
+   * `costBaselineFor` a few methods up is built on exactly that difference.
+   *
+   * Nothing is recorded to make this work and nothing is backfilled. The column
+   * has been written since the table existed, so grouping on it reaches back
+   * over the whole history rather than dividing it into a before and an after.
+   *
+   * Takes the same scope and the same filters as every other read, for the same
+   * reason: a conversation list narrowed differently from the charts above it
+   * is two views disagreeing about what is on screen. And because it is a
+   * grouping of the same rows under the same predicate, the entries add up to
+   * the headline totals by construction — there is no second tally to keep in
+   * step.
+   */
+  conversations(query: UsageHistoryQuery): {
+    conversations: UsageConversationSummary[];
+    total: number;
+  } {
+    const { clause, params } = this.historyClause(query);
+    const db = this.database.raw;
+
+    const total = (
+      db
+        .prepare(`SELECT COUNT(DISTINCT session_id) AS n FROM usage_jobs${clause}`)
+        .get(...params) as { n: number }
+    ).n;
+
+    const limit = clamp(query.limit ?? HISTORY_PAGE, 1, MAX_HISTORY_PAGE);
+    const offset = Math.max(0, Math.trunc(query.offset ?? 0));
+    const rows = db
+      .prepare(`
+        SELECT session_id,
+               MIN(started_at) AS started_at,
+               MAX(ended_at) AS last_active_at,
+               ${TOTALS_COLUMNS}
+        FROM usage_jobs${clause}
+        GROUP BY session_id
+        -- The id breaks ties, so paging is stable when a burst of conversations
+        -- shares a last-active instant: an unstable sort repeats one row on page
+        -- two and drops another entirely.
+        ORDER BY last_active_at DESC, session_id DESC
+        LIMIT ? OFFSET ?
+      `)
+      .all(...params, limit, offset) as Array<
+        TotalsRow & { session_id: string; started_at: string; last_active_at: string }
+      >;
+    if (rows.length === 0) return { conversations: [], total };
+
+    const ids = rows.map((row) => row.session_id);
+    const slots = ids.map(() => '?').join(', ');
+    // The same predicate the totals were computed under, extended to this page.
+    // Scope is a parameter here as everywhere else — narrowing an already
+    // narrowed set of ids would read as safe and would still be the one query
+    // in this file that could name another user's model. And the filters are
+    // here for a plainer reason: an entry whose figures are for one project
+    // must not list the agents it used on another.
+    const pageWhere = `${clause ? `${clause} AND` : ' WHERE'} session_id IN (${slots})`;
+    const pageParams = [...params, ...ids];
+
+    // Three lists per conversation, read as distinct rows rather than through
+    // GROUP_CONCAT(DISTINCT ...): that form takes no separator argument, so it
+    // would hide a conversation's models behind a comma — a character a model
+    // name is perfectly entitled to contain.
+    const distinct = (column: string): Map<string, string[]> => {
+      const found = db
+        .prepare(`
+          SELECT DISTINCT session_id, ${column} AS value FROM usage_jobs
+          ${pageWhere} AND ${column} IS NOT NULL
+          ORDER BY value ASC
+        `)
+        .all(...pageParams) as Array<{ session_id: string; value: string }>;
+      const bySession = new Map<string, string[]>();
+      for (const row of found) {
+        const list = bySession.get(row.session_id);
+        if (list) list.push(row.value);
+        else bySession.set(row.session_id, [row.value]);
+      }
+      return bySession;
+    };
+    const agents = distinct('agent');
+    const models = distinct('model');
+    const projects = distinct('project');
+
+    // The tab's own name, when the tab is still there. A separate read rather
+    // than a join, and a LEFT one in spirit: a job outlives its conversation —
+    // which is most of what a permanent history means here — so a missing row
+    // must leave the entry standing without a name, not remove it.
+    const named = new Map<string, string>();
+    const sessionRows = db
+      .prepare(`
+        SELECT id, name, custom_name FROM runtime_sessions WHERE id IN (${slots})
+      `)
+      .all(...ids) as Array<{ id: string; name: string | null; custom_name: string | null }>;
+    for (const row of sessionRows) {
+      const label = row.custom_name?.trim() || row.name?.trim();
+      if (label) named.set(row.id, label);
+    }
+
+    return {
+      total,
+      conversations: rows.map((row) => ({
+        sessionId: row.session_id,
+        name: named.get(row.session_id) ?? null,
+        agents: agents.get(row.session_id) ?? [],
+        models: models.get(row.session_id) ?? [],
+        projects: projects.get(row.session_id) ?? [],
+        startedAt: row.started_at,
+        lastActiveAt: row.last_active_at,
+        totals: mapTotals(row),
+      })),
+    };
   }
 
   /** Everything the dashboard draws for one range, one scope and one narrowing. */
@@ -456,7 +689,7 @@ export class UsageStore {
       totals: mapTotals(totalsRow),
       series,
       byAgent: this.breakdown('agent', where, params),
-      byModel: this.breakdown('model', where, params),
+      byModel: this.modelBreakdown(joined, params),
       byProject: this.breakdown('project', where, params),
       byUser: scope === 'everyone' ? this.breakdown('user_login', where, params) : undefined,
       effortByAgent: this.effort('agent', where, params),
@@ -508,7 +741,20 @@ export class UsageStore {
     // they are absent from the menu too. A filter list is a directory of what
     // exists, and one that named every project in the installation would leak
     // the shape of everyone else's work to a viewer scoped to their own.
-    return { agents: agents.map((r) => r.agent), models: distinct('model'), projects: distinct('project') };
+    // Models include the ones a turn was split across, not only the ones that
+    // answered. The breakdown shows those rows and the filter matches them, so
+    // leaving them out of the menu would offer a narrowing for every model
+    // except the ones only a subagent ever ran.
+    const splitModels = this.database.raw
+      .prepare(`
+        SELECT DISTINCT m.model AS value
+        FROM usage_job_models m
+        JOIN usage_jobs ON usage_jobs.id = m.job_id${clause ? `${clause.replace(' WHERE', ' AND')}` : ''}
+      `)
+      .all(...scope.params) as Array<{ value: string }>;
+    const models = [...new Set([...distinct('model'), ...splitModels.map((row) => row.value)])].sort();
+
+    return { agents: agents.map((r) => r.agent), models, projects: distinct('project') };
   }
 
   // ------------------------------------------------------------------ helpers
@@ -543,13 +789,85 @@ export class UsageStore {
     return { clause: where.length ? ` WHERE ${where.join(' AND ')}` : '', params };
   }
 
+  /**
+   * Spend per model, honouring a turn that ran on more than one.
+   *
+   * A LEFT JOIN rather than a `GROUP BY model`, and the whole method exists for
+   * the difference. A job with no split joins to one null row and contributes
+   * exactly what it always did, under its own model. A job with a split
+   * contributes one row per model, each carrying that model's own figures as
+   * the runtime reported them — so a turn where a subagent ran on something
+   * else stops being filed as though the answering model did all of it.
+   *
+   * What each column can honestly say differs, and the CASE expressions are
+   * where that is decided:
+   *
+   *   - `turns` counts distinct turns, so a split turn counts once against each
+   *     model it touched. It is "turns that used this model", which is the
+   *     reading the number is put to — and the one place a turn is deliberately
+   *     counted more than once, because the column it sits under is the model
+   *     rather than the work.
+   *   - `model_turns` takes the runtime's own per-model round-trip count where
+   *     there is one. That is a measurement, not a division of the job's total,
+   *     and a split row with no `calls` contributes nothing rather than a zero.
+   *   - `tool_calls` is left to the unsplit rows alone. No runtime says which
+   *     model asked for which tool, and spreading a job's count across its
+   *     models would invent the one figure nobody reported.
+   *   - tokens and cost come from the split row when it has them, and are zero
+   *     when it does not — never the job's own totals, which belong to the
+   *     whole turn and would be counted once per model. A split row's
+   *     `total_tokens` is added up from its own four fields, which is that
+   *     total's definition rather than an estimate of it; reasoning tokens
+   *     nobody breaks down stay at zero rather than being apportioned.
+   */
+  private modelBreakdown(joined: string, params: unknown[]): UsageBreakdown[] {
+    const split = (column: string): string =>
+      `SUM(CASE WHEN m.model IS NULL THEN COALESCE(j.${column}, 0) ELSE COALESCE(m.${column}, 0) END)`;
+    const reported = (column: string): string =>
+      `CASE WHEN m.model IS NULL THEN j.${column} ELSE m.${column} END`;
+
+    const rows = this.database.raw
+      .prepare(`
+        SELECT COALESCE(m.model, j.model) AS key,
+          COUNT(DISTINCT j.id) AS turns,
+          SUM(CASE WHEN m.model IS NULL THEN COALESCE(j.model_turns, 0)
+                   ELSE COALESCE(m.calls, 0) END) AS model_turns,
+          SUM(CASE WHEN (CASE WHEN m.model IS NULL THEN j.model_turns ELSE m.calls END)
+                        IS NOT NULL THEN 1 ELSE 0 END) AS model_turns_reported_jobs,
+          SUM(CASE WHEN m.model IS NULL THEN j.tool_calls ELSE 0 END) AS tool_calls,
+          ${split('input_tokens')} AS input_tokens,
+          ${split('output_tokens')} AS output_tokens,
+          ${split('cache_read_tokens')} AS cache_read_tokens,
+          ${split('cache_write_tokens')} AS cache_write_tokens,
+          SUM(CASE WHEN m.model IS NULL THEN COALESCE(j.reasoning_tokens, 0) ELSE 0 END) AS reasoning_tokens,
+          SUM(CASE WHEN m.model IS NULL THEN COALESCE(j.total_tokens, 0)
+                   ELSE COALESCE(m.input_tokens, 0) + COALESCE(m.output_tokens, 0)
+                        + COALESCE(m.cache_read_tokens, 0) + COALESCE(m.cache_write_tokens, 0)
+              END) AS total_tokens,
+          ${split('cost_usd')} AS cost_usd,
+          SUM(CASE WHEN ${reported('input_tokens')} IS NOT NULL
+                     OR ${reported('output_tokens')} IS NOT NULL
+                     OR ${reported('cache_read_tokens')} IS NOT NULL
+                     OR ${reported('cache_write_tokens')} IS NOT NULL
+                   THEN 1 ELSE 0 END) AS tokens_reported_jobs,
+          SUM(CASE WHEN ${reported('cost_usd')} IS NOT NULL THEN 1 ELSE 0 END) AS cost_reported_jobs
+        FROM usage_jobs j
+        LEFT JOIN usage_job_models m ON m.job_id = j.id
+        ${joined}
+        GROUP BY key
+        ORDER BY cost_usd DESC, total_tokens DESC, turns DESC
+      `)
+      .all(...params) as Array<TotalsRow & { key: string | null }>;
+    return rows.map((row) => ({ key: row.key ?? UNATTRIBUTED, totals: mapTotals(row) }));
+  }
+
   private breakdown(column: string, where: string, params: unknown[]): UsageBreakdown[] {
     const rows = this.database.raw
       .prepare(`
         SELECT ${column} AS key, ${TOTALS_COLUMNS}
         FROM usage_jobs ${where}
         GROUP BY key
-        ORDER BY cost_usd DESC, total_tokens DESC, jobs DESC
+        ORDER BY cost_usd DESC, total_tokens DESC, turns DESC
       `)
       .all(...params) as Array<TotalsRow & { key: string | null }>;
     // A null groups under the sentinel, not under `''`. Both would render the
@@ -561,24 +879,32 @@ export class UsageStore {
   /**
    * Effort per group, as counts rather than percentiles.
    *
-   * Only completed jobs count: a turn the process died in the middle of took
+   * Only completed turns count: a turn the process died in the middle of took
    * exactly as many round trips as it got to, which is a fact about the crash
    * and not about the agent.
+   *
+   * `AVG` and `MAX` over `model_turns` skip nulls, which is what makes this
+   * table honest now that most runtimes report nothing: the average is over the
+   * turns that answered, and `model_turns_reported` says how many those were.
+   * The histogram counts the same rows. Reading a silent runtime as zero would
+   * have put it at the top of every efficiency comparison on the page — for
+   * having reported nothing at all.
    */
   private effort(column: string, where: string, params: unknown[]): UsageEffort[] {
     const rows = this.database.raw
       .prepare(`
         SELECT ${column} AS key,
-          COUNT(*) AS jobs,
-          AVG(turns) AS turns_avg,
-          MAX(turns) AS turns_max,
+          COUNT(*) AS turns,
+          SUM(CASE WHEN model_turns IS NOT NULL THEN 1 ELSE 0 END) AS model_turns_reported,
+          AVG(model_turns) AS model_turns_avg,
+          MAX(model_turns) AS model_turns_max,
           AVG(tool_calls) AS tools_avg,
           MAX(tool_calls) AS tools_max,
-          SUM(CASE WHEN turns <= 1 THEN 1 ELSE 0 END) AS t0,
-          SUM(CASE WHEN turns = 2 THEN 1 ELSE 0 END) AS t1,
-          SUM(CASE WHEN turns BETWEEN 3 AND 5 THEN 1 ELSE 0 END) AS t2,
-          SUM(CASE WHEN turns BETWEEN 6 AND 10 THEN 1 ELSE 0 END) AS t3,
-          SUM(CASE WHEN turns > 10 THEN 1 ELSE 0 END) AS t4,
+          SUM(CASE WHEN model_turns <= 1 THEN 1 ELSE 0 END) AS t0,
+          SUM(CASE WHEN model_turns = 2 THEN 1 ELSE 0 END) AS t1,
+          SUM(CASE WHEN model_turns BETWEEN 3 AND 5 THEN 1 ELSE 0 END) AS t2,
+          SUM(CASE WHEN model_turns BETWEEN 6 AND 10 THEN 1 ELSE 0 END) AS t3,
+          SUM(CASE WHEN model_turns > 10 THEN 1 ELSE 0 END) AS t4,
           SUM(CASE WHEN tool_calls = 0 THEN 1 ELSE 0 END) AS c0,
           SUM(CASE WHEN tool_calls BETWEEN 1 AND 2 THEN 1 ELSE 0 END) AS c1,
           SUM(CASE WHEN tool_calls BETWEEN 3 AND 5 THEN 1 ELSE 0 END) AS c2,
@@ -586,18 +912,22 @@ export class UsageStore {
           SUM(CASE WHEN tool_calls > 10 THEN 1 ELSE 0 END) AS c4
         FROM usage_jobs ${where} AND outcome = 'completed'
         GROUP BY key
-        ORDER BY jobs DESC
+        ORDER BY turns DESC
       `)
       .all(...params) as Array<Record<string, number | string | null>>;
 
     return rows.map((row) => ({
       key: row.key === null || row.key === undefined ? UNATTRIBUTED : String(row.key),
-      jobs: Number(row.jobs ?? 0),
-      turnsAvg: round2(Number(row.turns_avg ?? 0)),
-      turnsMax: Number(row.turns_max ?? 0),
+      turns: Number(row.turns ?? 0),
+      modelTurnsReportedTurns: Number(row.model_turns_reported ?? 0),
+      // Null rather than 0 from SQLite when every row in the group was silent,
+      // and 0 is the right thing to send then: the count beside it is what says
+      // the average is of nothing, so the figure itself never has to.
+      modelTurnsAvg: round2(Number(row.model_turns_avg ?? 0)),
+      modelTurnsMax: Number(row.model_turns_max ?? 0),
       toolCallsAvg: round2(Number(row.tools_avg ?? 0)),
       toolCallsMax: Number(row.tools_max ?? 0),
-      turnsHistogram: [
+      modelTurnsHistogram: [
         Number(row.t0 ?? 0),
         Number(row.t1 ?? 0),
         Number(row.t2 ?? 0),
@@ -619,7 +949,7 @@ export class UsageStore {
     const rows = this.database.raw
       .prepare(`
         SELECT t.tool AS tool, ${key} AS agent_key,
-               SUM(t.calls) AS calls, COUNT(DISTINCT t.job_id) AS jobs
+               SUM(t.calls) AS calls, COUNT(DISTINCT t.job_id) AS turns
         FROM usage_job_tools t
         JOIN usage_jobs j ON j.id = t.job_id
         ${where}
@@ -631,12 +961,12 @@ export class UsageStore {
         ORDER BY calls DESC, tool ASC
         LIMIT 100
       `)
-      .all(...params) as Array<{ tool: string; agent_key: string; calls: number; jobs: number }>;
+      .all(...params) as Array<{ tool: string; agent_key: string; calls: number; turns: number }>;
     return rows.map((row) => ({
       tool: row.tool,
       agent: perAgent ? row.agent_key : null,
       calls: row.calls,
-      jobs: row.jobs,
+      turns: row.turns,
     }));
   }
 
@@ -686,7 +1016,22 @@ function filterClause(
     parts.push(`${prefix}agent = ?`);
     params.push(filters.agent);
   }
-  nullable('model', filters.model);
+  if (filters.model && filters.model !== UNATTRIBUTED) {
+    // Either the model that answered, or one the turn was split across. A job
+    // whose subagent ran on the model being asked about is a job that used it,
+    // and narrowing to only the answering model would hide exactly the work
+    // the per-model breakdown exists to make visible — click the row, and the
+    // spend it stands for is gone.
+    parts.push(
+      `(${prefix}model = ? OR EXISTS (`
+        + `SELECT 1 FROM usage_job_models mm WHERE mm.job_id = ${prefix}id AND mm.model = ?))`,
+    );
+    params.push(filters.model, filters.model);
+  } else {
+    // Unattributed stays literal: a job with no model at all, which no split
+    // row can rescue — a job that has split rows has models by definition.
+    nullable('model', filters.model);
+  }
   nullable('project', filters.project);
   if (filters.user) {
     parts.push(`${prefix}user_login = ?`);
@@ -722,7 +1067,8 @@ function mapJob(row: JobRow): UsageJobSummary {
     endedAt: row.ended_at,
     durationMs: row.duration_ms,
     outcome: row.outcome as UsageOutcome,
-    turns: row.turns,
+    // `row.turns` is deliberately not read: it holds the superseded quantity.
+    modelTurns: row.model_turns,
     toolCalls: row.tool_calls,
     inputTokens: row.input_tokens,
     outputTokens: row.output_tokens,
@@ -738,8 +1084,8 @@ function mapJob(row: JobRow): UsageJobSummary {
 
 function mapTotals(row: TotalsRow): UsageTotals {
   return {
-    jobs: row.jobs ?? 0,
     turns: row.turns ?? 0,
+    modelTurns: row.model_turns ?? 0,
     toolCalls: row.tool_calls ?? 0,
     inputTokens: row.input_tokens ?? 0,
     outputTokens: row.output_tokens ?? 0,
@@ -748,8 +1094,9 @@ function mapTotals(row: TotalsRow): UsageTotals {
     reasoningTokens: row.reasoning_tokens ?? 0,
     totalTokens: row.total_tokens ?? 0,
     costUsd: row.cost_usd ?? 0,
-    tokensReportedJobs: row.tokens_reported_jobs ?? 0,
-    costReportedJobs: row.cost_reported_jobs ?? 0,
+    tokensReportedTurns: row.tokens_reported_jobs ?? 0,
+    costReportedTurns: row.cost_reported_jobs ?? 0,
+    modelTurnsReportedTurns: row.model_turns_reported_jobs ?? 0,
   };
 }
 

@@ -1,11 +1,20 @@
 import * as React from 'react';
 import { ChatAttachment, ChatState } from '../../../shared/chat-events.js';
 import { uploadAttachment } from '../../chat/attachments-api.js';
+import { branchConversation, type BranchedConversation } from '../../chat/branch-api.js';
 import { ChatController, type ChatUnavailable } from '../../chat/controller.js';
 import { fetchStatus, findFiles } from '../../chat/workspace-api.js';
 import { activityEvents } from '../../chat/activity.js';
+import { loadEffortPreferences, rememberEffort } from '../../chat/effort-preference.js';
 import type { ChatTranscript } from '../../chat/transcript.js';
-import { groupTurns, isTurnOpen, turnOf, type TurnSummary } from '../../chat/turns.js';
+import {
+  groupTurns,
+  isTurnOpen,
+  reconcileTurns,
+  turnIndexRows,
+  turnOf,
+  type TurnSummary,
+} from '../../chat/turns.js';
 import type { ChatPanelId, ChatViewSettings } from '../../chat/view-settings.js';
 import {
   DEFAULT_CHAT_VIEW,
@@ -19,6 +28,7 @@ import { IconButton } from '../../ui/relay/IconButton.js';
 import { showNotification } from '../../ui/notifications.js';
 import { PhoneContext } from '../../ui/touch.js';
 import { FloatingMenu } from '../FloatingMenu.js';
+import { KEY_STRIP_HEIGHT } from '../KeyStrip.js';
 import { Composer } from './Composer.js';
 import { MessageList, type MessageListHandle } from './MessageList.js';
 import { hasVisibleContent, messageText } from './MessageBubble.js';
@@ -70,6 +80,14 @@ export interface ChatViewProps {
    * could not change anything on the surface they were reached from.
    */
   onOpenSettings?: () => void;
+  /**
+   * Open the list of every conversation this user has.
+   *
+   * Owned by the shell, which is where the dialog is rendered — a conversation
+   * cannot host the list of conversations it is one of. Absent leaves the control
+   * out entirely rather than drawing one that does nothing.
+   */
+  onOpenConversations?: () => void;
   /** What this surface shows. Zones, panels, reasoning, tool calls, usage. */
   view?: ChatViewSettings;
   /** Persist a change made from inside the surface, e.g. closing the rail. */
@@ -85,6 +103,16 @@ export interface ChatViewProps {
    * transcript it floats over the conversation and clears everything.
    */
   menuActions?: SurfaceAction[];
+  /**
+   * Put a conversation this surface created in front of the user.
+   *
+   * Branching makes a second conversation, and opening a tab on it is the
+   * shell's job rather than this component's — this one only knows about the
+   * conversation it is showing. Absent, a branch is still made and recorded and
+   * the user is told where to find it, which is a weaker outcome than a new tab
+   * but not a control that silently did nothing.
+   */
+  onOpenConversation?: (conversation: BranchedConversation) => void;
 }
 
 /** One control on the phone's floating menu. */
@@ -125,11 +153,13 @@ export function ChatView({
   workingDir,
   isMobile = false,
   onOpenSettings,
+  onOpenConversations,
   view = DEFAULT_CHAT_VIEW,
   onViewChange,
   theme,
   onToggleTheme,
   menuActions,
+  onOpenConversation,
 }: ChatViewProps) {
   const transcript = controller.transcript;
 
@@ -169,6 +199,15 @@ export function ChatView({
   const exited = chatState === 'exited';
   const unavailable = controller.unavailableReason;
   const busy = transcript.busy;
+  // Wider than `busy`, which is only what the send button needs to know: a turn
+  // that is waiting on an approval or a question is still a turn in flight, and
+  // it is the one a queued correction most often needs to get in front of.
+  // And narrower in one way: a runtime that cannot be interrupted cannot be cut
+  // in front of, so offering the control there would promise something the
+  // server is right to refuse.
+  const interruptible =
+    Boolean(transcript.capabilities.interrupt)
+    && (busy || chatState === 'awaiting_permission' || chatState === 'awaiting_answer');
 
   const messages = React.useMemo(
     () => transcript.messages,
@@ -179,18 +218,49 @@ export function ChatView({
   // Derived per render and memoised on the version counter, never stored.
   // Turn grouping is a view of the transcript, and a second copy of it in state
   // is a second thing that can be wrong about the conversation.
-  const turns = React.useMemo(
-    () => groupTurns(messages, chatState),
+  // The conversation's own turns, not the loaded window's. Grouping is what the
+  // window can answer; the number each turn carries and the words it is named
+  // by are facts about the conversation, and come from the recording (#86).
+  const recorded = transcript.recordedTurns;
+  // What each finished turn cost, as the accounting filed it — see `spendFor`.
+  // Read through the version counter like everything else here: it arrives with
+  // the index and then one turn at a time as they end.
+  const spend = React.useMemo(
+    () => transcript.turnSpend,
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [messages, version, chatState],
+    [transcript, version],
   );
+  const turns = React.useMemo(
+    () => reconcileTurns(groupTurns(messages, chatState), recorded, spend),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [messages, version, chatState, recorded, spend],
+  );
+  // The index lists the conversation, not the part of it this browser holds:
+  // the recorded run of turns with the live ones laid over it.
+  const indexRows = React.useMemo(
+    () => turnIndexRows(recorded, turns, spend),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [recorded, turns, version],
+  );
+  // Whether that list reaches the conversation's first turn. Past the retention
+  // cap the server trims the head of the log and says so — and nothing on
+  // screen has ever repeated it, so a list of the surviving turns has been
+  // presenting itself as the whole conversation (#86). Read on every render
+  // rather than memoised: it arrives with the index, which moves the version
+  // counter this whole component already redraws on.
+  const indexComplete = controller.recordedTurnsComplete;
   const [selectedTurnId, setSelectedTurnId] = React.useState<string | null>(null);
   const lastTurnId = turns.length ? turns[turns.length - 1].id : '';
   // A selection that no longer exists — the conversation was cleared, or the
   // turn scrolled out of the loaded window — falls back to the newest rather
   // than leaving the index highlighting nothing.
+  // Checked against the index rather than the loaded turns: choosing an entry
+  // from before what is held is the case the index exists for, and a guard that
+  // only knew the loaded ones dropped the highlight the instant it was set
+  // (#86). A selection that is in neither — the conversation was cleared —
+  // still falls back to the newest rather than highlighting nothing.
   const currentTurnId =
-    selectedTurnId && turns.some((turn) => turn.id === selectedTurnId)
+    selectedTurnId && indexRows.some((row) => row.id === selectedTurnId)
       ? selectedTurnId
       : lastTurnId;
 
@@ -240,7 +310,9 @@ export function ChatView({
   }, [turns]);
 
   const [searchOpen, setSearchOpen] = React.useState(false);
-  // Paired with a counter, not held as a bare id: clicking the same work pill
+  /** The index row whose turn is being paged in, or null. See `selectTurn`. */
+  const [seeking, setSeeking] = React.useState<string | null>(null);
+  // Paired with a nonce, not held as a bare id: clicking the same work counter
   // twice has to scroll the rail twice, and a string that did not change would
   // leave the timeline's effect with nothing to react to.
   const [focus, setFocus] = React.useState<{ id?: string; nonce: number }>({ nonce: 0 });
@@ -266,6 +338,51 @@ export function ChatView({
     (patch: Partial<ChatViewSettings>) => onViewChange?.({ ...view, ...patch }),
     [onViewChange, view],
   );
+
+  /**
+   * Open a fresh conversation at the level this runtime was last used at.
+   *
+   * The other half of `setEffort` below. That one records the choice; this one
+   * is what makes recording it worth anything — without it a preference would
+   * be written on every pick and read by nobody.
+   *
+   * Five conditions, and each rules out a way of being wrong.
+   *
+   * **It only touches a conversation that has not started.** This is the one
+   * that matters, and the one this was first written without. Every other guard
+   * is equally true of a conversation opened weeks ago and merely looked at
+   * again: the surface is keyed on the session id so this effect remounts on
+   * every tab switch, `live` and the published ladder both survive on the
+   * retained transcript, and a conversation whose chip was never touched carries
+   * no override — so clicking a tab silently re-levelled it, wrote the level to
+   * its record, and on claude pushed a hidden `/effort` turn into the running
+   * process. A preference is for opening the *next* conversation, never for
+   * reaching back into one already under way. An empty transcript is what says
+   * "this one has not begun".
+   *
+   * It waits for the runtime to publish a ladder, because until then there is
+   * nothing to check a remembered level against and the server would rightly
+   * refuse it. It only acts when the record carries no level of its own, so a
+   * conversation that has already been set is never quietly moved off it. It
+   * checks the level is still on the ladder, because a runtime can narrow one
+   * (codex publishes the ladder of the *current* model, and models differ) and a
+   * stale favourite must not become a refusal the user has to read. And it fires
+   * once per session, so this cannot become a loop with a server that answers
+   * `pending`.
+   */
+  const seededEffort = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (seededEffort.current === controller.sessionId) return;
+    if (!transcript.live) return;
+    if (transcript.messages.length > 0) return;
+    const ladder = transcript.capabilities.efforts;
+    if (!ladder?.length) return;
+    if (controller.effortOverrideValue) return;
+    const remembered = loadEffortPreferences()[runtime];
+    if (!remembered || !ladder.some((level) => level.value === remembered)) return;
+    seededEffort.current = controller.sessionId;
+    controller.setEffort(remembered);
+  }, [controller, runtime, transcript, version]);
 
   // ------------------------------------------------------------------ zones
 
@@ -302,6 +419,11 @@ export function ChatView({
   const send = React.useCallback(
     (text: string, attachments: ChatAttachment[]) => {
       controller.sendTurn(text, attachments);
+      // Asking for something new is the end of wherever you were going: the
+      // list pins to the bottom for the answer, and a jump landing afterwards
+      // would scroll the reply away.
+      controller.cancelSeek();
+      setSeeking(null);
       list.current?.pin();
       setSelectedTurnId(null);
     },
@@ -327,9 +449,39 @@ export function ChatView({
     (queuedId: string) => controller.cancelQueued(queuedId),
     [controller],
   );
+  const sendQueuedNow = React.useCallback(
+    (queuedId: string) => controller.sendQueuedNow(queuedId),
+    [controller],
+  );
+  const retryQueued = React.useCallback(
+    (queuedId: string) => controller.retryQueued(queuedId),
+    [controller],
+  );
   const setModel = React.useCallback(
     (model: string) => controller.setModel(model),
     [controller],
+  );
+  /**
+   * Send the level, and remember it for the next conversation on this runtime.
+   *
+   * Two different memories, written in the same breath. The server is told
+   * because this conversation has to actually run at the level; the browser is
+   * told because the next new conversation on this runtime should open there
+   * rather than back at the default, which is what "remember the last setting"
+   * means to somebody who has just set it.
+   *
+   * Stored on the way out rather than on the server's reply, and on purpose:
+   * `pending` and `sent` mean the running session did not take the level, but
+   * the *choice* was still made and a fresh session is exactly where it would
+   * apply. Waiting for `live` would drop the preference in precisely the case
+   * it is most useful — a runtime that can only take a level at launch.
+   */
+  const setEffort = React.useCallback(
+    (effort: string) => {
+      controller.setEffort(effort);
+      rememberEffort(runtime, effort || null);
+    },
+    [controller, runtime],
   );
   const upload = React.useCallback(
     (file: File) => uploadAttachment(controller.sessionId, file),
@@ -347,15 +499,50 @@ export function ChatView({
       // immediately — only a jump *inside* a turn's body needs to wait for it
       // to open first. See revealMessage.
       openTurn(id);
-      list.current?.scrollToTurn(id);
+      if (messages.some((message) => message.id === id)) {
+        controller.cancelSeek();
+        setSeeking(null);
+        list.current?.scrollToTurn(id);
+        return;
+      }
+      // An entry from before what is loaded. The index lists the whole
+      // conversation, so choosing one has to fetch it rather than quietly do
+      // nothing — the scroll waits until it is actually here.
+      //
+      // Held here as well as on the controller because this is what redraws:
+      // the transcript's version counter is what this surface subscribes to,
+      // and "a jump is in flight" is not something the transcript knows.
+      setSeeking(id);
+      void controller.seekTo(id).then((outcome) => {
+        setSeeking((current) => (current === id ? null : current));
+        if (outcome === 'arrived') {
+          list.current?.scrollToTurn(id);
+        } else if (outcome === 'exhausted') {
+          showNotification('That turn is no longer in this conversation’s history.', 'error');
+        } else if (outcome === 'unreachable') {
+          // Which is not the same thing, and must not be said as though it
+          // were: one read did not come back. `abandoned` says nothing at all —
+          // the user has already gone somewhere else and knows it.
+          showNotification('Could not read that far back just now. Try again.', 'error');
+        }
+      });
     },
-    [openTurn],
+    [openTurn, controller, messages],
   );
 
   const jumpLatest = React.useCallback(() => {
+    // Going to the newest turn is the plainest way of saying you are done going
+    // backwards, so a jump still walking the log is abandoned rather than left
+    // to land and scroll the conversation out from under the arrival.
+    controller.cancelSeek();
+    setSeeking(null);
     setSelectedTurnId(null);
     list.current?.pin();
-  }, []);
+  }, [controller]);
+
+  // Leaving the conversation — a tab switch remounts this surface — abandons a
+  // jump with it. Otherwise it goes on paging a transcript nobody is looking at.
+  React.useEffect(() => () => controller.cancelSeek(), [controller]);
 
   const stepTurn = React.useCallback(
     (delta: number) => {
@@ -417,6 +604,52 @@ export function ChatView({
         .catch(() => showNotification('That turn could not be copied', 'error'));
     },
     [turns, transcript],
+  );
+
+  // One at a time. The request creates a conversation, and a double-tap on a
+  // phone would create two of them a second apart.
+  const [branching, setBranching] = React.useState(false);
+  /**
+   * Carry on from this turn in a conversation of its own.
+   *
+   * The turn id goes to the server and everything that matters happens there:
+   * the history up to and including it is copied into a new conversation, and
+   * the same history is left waiting as that conversation's opening context so
+   * its agent knows what came before. Nothing here touches this conversation —
+   * a branch is a second thread, not an edit to the one it grew out of.
+   *
+   * A refusal is reported in the words the server chose: the only failure with
+   * an obvious next move is a history too large for the model's window, and
+   * that sentence carries the three figures needed to act on it.
+   */
+  const branchTurn = React.useCallback(
+    (anchorId: string) => {
+      // The strips are anchored on the opening *message*, like copy beside it,
+      // and the server cuts on the turn's own id — the one thing that stays
+      // stable when only half a turn is loaded and the message the window opens
+      // on is the agent's rather than the user's.
+      const turn = turns.find((item) => item.id === anchorId);
+      if (!turn || branching) return;
+      setBranching(true);
+      branchConversation(controller.sessionId, turn.turnId)
+        .then((conversation) => {
+          if (onOpenConversation) {
+            onOpenConversation(conversation);
+            return;
+          }
+          showNotification(
+            `Branched at turn ${conversation.turnIndex}. Open “${conversation.name}” from the session list.`,
+          );
+        })
+        .catch((error: unknown) => {
+          showNotification(
+            error instanceof Error ? error.message : 'That branch could not be made',
+            'error',
+          );
+        })
+        .finally(() => setBranching(false));
+    },
+    [branching, controller, onOpenConversation, turns],
   );
 
   /** Send the ask that opened *this message's* turn again, as a new turn. */
@@ -514,6 +747,12 @@ export function ChatView({
         case 'next-turn':
           stepTurn(1);
           break;
+        case 'expand-all-turns':
+          expandAllTurns();
+          break;
+        case 'collapse-all-turns':
+          collapseAllTurns();
+          break;
         default:
           break;
       }
@@ -521,7 +760,16 @@ export function ChatView({
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [busy, interrupt, jumpLatest, stepTurn, toggleRail, toggleTerminal]);
+  }, [
+    busy,
+    collapseAllTurns,
+    expandAllTurns,
+    interrupt,
+    jumpLatest,
+    stepTurn,
+    toggleRail,
+    toggleTerminal,
+  ]);
 
   // -------------------------------------------------------------- the pane
 
@@ -558,11 +806,40 @@ export function ChatView({
       // trace, the files, the shell, the other sessions — is the bottom bar's
       // job, and repeating those here would be two answers to one question.
       { id: 'chat-search', label: 'Search this conversation', icon: 'search', expands: true, group: 'surface', onPress: () => setSearchOpen(true) },
+      // Immediately after it, which is where the header puts it too: on a phone
+      // the transcript search lives in this sheet rather than in the bar, so this
+      // sheet is where "beside the search control" is (#127).
+      ...(onOpenConversations
+        ? [{
+            id: 'chat-conversations',
+            label: 'All conversations',
+            icon: 'message-square',
+            expands: true,
+            group: 'surface',
+            onPress: onOpenConversations,
+          } as SurfaceAction]
+        : []),
       { id: 'chat-turns', label: 'Jump to a turn', icon: 'panel-left', active: indexVisible || indexSheet, expands: true, group: 'surface', onPress: openIndex },
+      // Folding is a thing you do to the conversation, so it belongs with the
+      // things you do to the conversation. This is the phone's route to it —
+      // this menu is only ever drawn on a phone. The band the index's own
+      // header sheds them in, 1024 to 1280px, is answered by the rail's own
+      // menu and by the keyboard, which is where a laptop reaches them (#34).
+      { id: 'chat-expand-all', label: 'Expand every turn', icon: 'maximize-2', group: 'surface', onPress: expandAllTurns },
+      { id: 'chat-collapse-all', label: 'Collapse every turn', icon: 'fold-vertical', group: 'surface', onPress: collapseAllTurns },
       { id: 'chat-display', label: 'Display settings', icon: 'settings', expands: true, group: 'surface', onPress: () => onOpenSettings?.() },
       ...(menuActions ?? []).map((action) => ({ ...action, group: 'session' })),
     ],
-    [indexVisible, indexSheet, openIndex, onOpenSettings, menuActions],
+    [
+      indexVisible,
+      indexSheet,
+      openIndex,
+      expandAllTurns,
+      collapseAllTurns,
+      onOpenSettings,
+      onOpenConversations,
+      menuActions,
+    ],
   );
 
   return (
@@ -616,6 +893,7 @@ export function ChatView({
         // setting whose effect nothing on screen would show.
         onToggleIndex={openIndex}
         onOpenSearch={() => setSearchOpen(true)}
+        onOpenConversations={onOpenConversations}
         onOpenSettings={() => onOpenSettings?.()}
         onToggleTheme={onToggleTheme}
       />
@@ -626,13 +904,15 @@ export function ChatView({
             whole conversation would have to tab past every message in it. */}
         {indexVisible ? (
           <TurnIndex
-            turns={turns}
+            turns={indexRows}
             currentTurnId={currentTurnId}
             onSelect={selectTurn}
             onJumpLatest={jumpLatest}
             collapsed={indexCollapsed}
             onExpandAll={expandAllTurns}
             onCollapseAll={collapseAllTurns}
+            complete={indexComplete}
+            seekingId={seeking}
           />
         ) : null}
 
@@ -666,8 +946,16 @@ export function ChatView({
           >
           {/* Over the conversation, clear of everything else. Anchored to the
               transcript rather than to the shell: at the shell's bottom right
-              it sat exactly on the send button. */}
-          {isMobile ? <FloatingMenu actions={phoneMenu} /> : null}
+              it sat exactly on the send button. Lifted over the terminal's key
+              strip when that is open, or the button covers the right-hand keys
+              — including the one that summons the keyboard, which is the only
+              way left to type letters into that pane. */}
+          {isMobile ? (
+            <FloatingMenu
+              actions={phoneMenu}
+              bottomOffset={terminalOpen ? KEY_STRIP_HEIGHT : 0}
+            />
+          ) : null}
 
           {searchOpen ? (
             <TranscriptSearch
@@ -689,6 +977,7 @@ export function ChatView({
             onShowWork={showWork}
             onEditTurn={seedDraft}
             onCopyTurn={copyTurn}
+            onForkTurn={branchTurn}
             onRetry={retryTurn}
             showThinking={view.showThinking}
             showToolCalls={view.showToolCalls}
@@ -870,6 +1159,14 @@ export function ChatView({
               placeholder={placeholderFor(chatState, runtimeLabel, isMobile)}
               queued={transcript.queuedTurns}
               onCancelQueued={cancelQueued}
+              // Only offered when there is something to cut in front of. An
+              // idle agent is already working through the line, so "now" is
+              // what is happening anyway; a session that has ended can take
+              // nothing at all. Waiting on a person counts as busy: an approval
+              // on screen is exactly when "no, not that file" gets typed, and
+              // interrupting clears the card rather than stranding it.
+              onSendQueuedNow={interruptible ? sendQueuedNow : undefined}
+              onRetryQueued={retryQueued}
               onFindFiles={findProjectFiles}
               onUpload={upload}
               draft={draft}
@@ -885,8 +1182,24 @@ export function ChatView({
               // modelFeedback instead, so this label never claims a model the
               // session isn't actually on.
               model={controller.modelOverrideValue ?? transcript.model}
+              // Only where the runtime reported a genuine split. An override
+              // is what was asked for, and pairing it with what the last turn
+              // actually ran would read as one claim about one model.
+              alsoRan={controller.modelOverrideValue ? undefined : transcript.turnModels}
               onSetModel={setModel}
               modelFeedback={controller.modelFeedback}
+              // Same precedence as the model above, and for the same reason:
+              // the record's chosen level wins once the server has confirmed
+              // it, and otherwise the transcript carries whatever the runtime
+              // itself last reported. Both can be absent, which honestly means
+              // nobody has chosen and the runtime has not said.
+              effort={controller.effortOverrideValue ?? transcript.effort}
+              onSetEffort={setEffort}
+              effortFeedback={controller.effortFeedback}
+              // Deliberately the same path as typing it: the button and the
+              // three spellings have to end in one state, and the surest way
+              // to keep them that way is for the button to *be* the command.
+              onNewChat={() => send('/clear', [])}
               bypassPermissions={bypassPermissions}
               terminalOpen={terminalOpen}
             />
@@ -920,7 +1233,7 @@ export function ChatView({
           >
             <div style={{ display: 'flex', boxShadow: 'var(--shadow-lg)' }}>
               <TurnIndex
-                turns={turns}
+                turns={indexRows}
                 currentTurnId={currentTurnId}
                 onSelect={(id) => {
                   setIndexSheet(false);
@@ -932,6 +1245,8 @@ export function ChatView({
                 }}
                 onExpandAll={expandAllTurns}
                 onCollapseAll={collapseAllTurns}
+                complete={indexComplete}
+                seekingId={seeking}
               />
             </div>
             <button
@@ -955,7 +1270,7 @@ const ZERO = (): number => 0;
  * The row that stands for a message on screen.
  *
  * Itself, unless it is a step that said nothing — then the next message in its
- * turn that did, because that is the one carrying its work pill. Failing that,
+ * turn that did, because that is the one carrying its work counter. Failing that,
  * the last one before it, so a turn whose tail is all machinery still lands
  * somewhere. Falls back to the id given, which scrolls nowhere and is exactly
  * what happened before this existed.

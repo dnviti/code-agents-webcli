@@ -134,7 +134,10 @@ const EXPORT_COLUMNS = [
   'endedAt',
   'durationMs',
   'outcome',
-  'turns',
+  // One row is one turn, so there is no turn column to export — counting the
+  // rows is the count (#86). This is the other quantity, and it is empty for
+  // every runtime that does not report its own round trips.
+  'modelTurns',
   'toolCalls',
   'inputTokens',
   'outputTokens',
@@ -187,6 +190,31 @@ export function createUsageRoutes(deps: UsageRoutesDeps): Router {
       offset: Number.isFinite(offset) ? offset : undefined,
     });
     res.json({ jobs, total });
+  });
+
+  /**
+   * The conversations behind the figures — one entry per chat tab (#88).
+   *
+   * Same query string as `/jobs`, deliberately: the two are the same list at
+   * two levels of detail, and a viewer who opens one conversation from the
+   * other is looking at the same narrowing either way.
+   */
+  router.get('/api/usage/conversations', (req: Request, res: Response): void => {
+    const user = requireUser(res);
+    if (!user) {
+      res.status(401).json({ error: 'authentication_required' });
+      return;
+    }
+
+    const query = historyQueryFrom(deps, user, req);
+    const limit = req.query.limit ? Number(req.query.limit) : undefined;
+    const offset = req.query.offset ? Number(req.query.offset) : undefined;
+    const { conversations, total } = deps.usageStore.conversations({
+      ...query,
+      limit: Number.isFinite(limit) ? limit : undefined,
+      offset: Number.isFinite(offset) ? offset : undefined,
+    });
+    res.json({ conversations, total });
   });
 
   router.get('/api/usage/jobs/:id', (req: Request, res: Response): void => {

@@ -22,7 +22,9 @@ export type ChatCommand =
   | 'previous-turn'
   | 'next-turn'
   | 'toggle-rail'
-  | 'jump-latest';
+  | 'jump-latest'
+  | 'expand-all-turns'
+  | 'collapse-all-turns';
 
 export interface KeymapContext {
   /** True while focus is inside the terminal pane. */
@@ -96,6 +98,21 @@ export function chatCommandFor(
       return 'toggle-rail';
     case 'j':
       return 'jump-latest';
+    // Folding every turn at once, with Shift as the inverse — the way Shift is
+    // the inverse for undo. A letter and not a bracket or a punctuation key:
+    // those move around the keyboard by layout, and the ones that need AltGr to
+    // type are refused above as ctrl+alt anyway. It has to be a chord a field
+    // will not swallow, because the composer is where focus sits and the widths
+    // this exists for are the ones with no room for a button (#34).
+    //
+    // Ctrl+Shift+E is Firefox's own devtools chord and a page cannot take it
+    // back, so on Firefox the collapse half opens the network panel instead.
+    // Left as the pair anyway: the expand half — the one that gets you out of
+    // a folded conversation — works everywhere, and collapse also sits in the
+    // index's menu, which is reachable at every width. Nothing else here is
+    // claimable that is not already spoken for.
+    case 'e':
+      return event.shiftKey ? 'collapse-all-turns' : 'expand-all-turns';
     case 'arrowup':
       return 'previous-turn';
     case 'arrowdown':

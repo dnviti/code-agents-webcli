@@ -34,15 +34,22 @@ import { QuestionCard } from './QuestionCard.js';
  * Reasoning blocks and tool calls are deliberately not rendered here. They are
  * projected onto the trace rail's timeline instead (chat/activity.ts), where
  * they can be read as a sequence of work rather than as interruptions in the
- * middle of a sentence. What is left behind is a work pill: how much happened,
- * and one click to go and look at it. Moved, never hidden.
+ * middle of a sentence. What is left behind is a counter in the action row: how
+ * much happened, and one click to go and look at it. Moved, never hidden.
+ *
+ * That counter used to be a full-width button under the prose spelling the same
+ * thing out in words ("3 commands · 2 reasoning · 12s — show work"). It cost a
+ * line of the conversation on nearly every assistant turn, so a long exchange
+ * read as a stack of banners rather than as a conversation. It now sits with
+ * the other per-message actions as two glyphs and two numbers (issue #118); the
+ * words it dropped are still in its accessible description.
  *
  * A step that was *only* machinery therefore has nothing left to say, and gets
- * no row at all — a glyph, a clock and a pill with no sentence beside them is a
- * row the eye has to stop on to learn that nothing was said. Its work is not
- * lost: the list hands those ids to the next message that does speak (see
- * `carriedIds`), whose pill counts them and whose "show work" lands on the
- * first of them. The rail keeps every event either way.
+ * no row at all — a glyph, a clock and a counter with no sentence beside them
+ * is a row the eye has to stop on to learn that nothing was said. Its work is
+ * not lost: the list hands those ids to the next message that does speak (see
+ * `carriedIds`), whose counter counts them and whose click lands on the first
+ * of them. The rail keeps every event either way.
  */
 
 export interface MessageBubbleProps {
@@ -69,9 +76,9 @@ export interface MessageBubbleProps {
   carriedIds?: string;
   /** Put this turn's text back in the composer, unsent. */
   onEdit?: (text: string) => void;
-  /** Count reasoning blocks in the work pill, per the chat display settings. */
+  /** Count reasoning blocks in the work counter, per the chat display settings. */
   showThinking?: boolean;
-  /** Count tool calls in the work pill. */
+  /** Count tool calls in the work counter. */
   showToolCalls?: boolean;
   /**
    * Answer a question the model asked from its card in the conversation.
@@ -98,7 +105,7 @@ export const MessageBubble = React.memo(function MessageBubble({
 
   // This message, plus the silent steps it speaks for — a tool call can report
   // how long it took after the message it belongs to has closed and the next
-  // one has opened, and a pill that inherited that call has to hear about it.
+  // one has opened, and a counter that inherited that call has to hear about it.
   // Still one bubble per event rather than the whole list: nothing here widens
   // to the transcript.
   const watched = React.useMemo(() => [id, ...splitIds(carriedIds)], [id, carriedIds]);
@@ -131,12 +138,7 @@ export const MessageBubble = React.memo(function MessageBubble({
   const [copied, setCopied] = React.useState(false);
   const isPhone = usePhone();
   const isUser = current.role === 'user';
-  // A marker is not a turn: no surface, no glyph, no controls, and the full
-  // width of the column — it is a line drawn across the conversation.
-  const isMarker =
-    current.role === 'system'
-    && current.blocks.length > 0
-    && current.blocks.every((block) => block.kind === 'notice');
+  const isMarker = isRule(current);
 
   // Derived from blocks, not from a list handed down. An events array as a prop
   // would be a new object identity every render and would defeat React.memo for
@@ -190,11 +192,33 @@ export const MessageBubble = React.memo(function MessageBubble({
   if (!hasVisibleContent(current)) return null;
 
   if (isMarker) {
+    // A rule carries no clock, because a compaction or a branch happens *to*
+    // the turn it is drawn in and shares its moment. A failure filed this way
+    // does not: a background workflow is filed under the turn that launched it
+    // and can break half an hour after that turn ended, so this one row says
+    // when (#140).
+    const stamped = current.blocks.some((block) => block.kind === 'error');
     return (
       <div data-message-id={id} style={{ padding: '10px 14px' }}>
-        {current.blocks.map((block, i) => (
-          <NoticeRule key={i} block={block as NoticeBlock} />
-        ))}
+        {current.blocks.map((block, i) =>
+          block.kind === 'error' ? (
+            <ErrorCallout key={i} block={block} />
+          ) : (
+            <NoticeRule key={i} block={block as NoticeBlock} />
+          ),
+        )}
+        {stamped ? (
+          <div
+            style={{
+              marginTop: 4,
+              fontFamily: 'var(--font-mono)',
+              fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
+              color: 'var(--muted-foreground)',
+            }}
+          >
+            {clockTime(current.ts)}
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -256,13 +280,6 @@ export const MessageBubble = React.memo(function MessageBubble({
         ))}
         {current.streaming && visibleBlocks(current) === 0 ? <Caret /> : null}
 
-        {!isUser && work.total > 0 && onShowWork ? (
-          // Aimed at the earliest step it counts, not at this message: the point
-          // of the pill on a reply that follows silent work is to open the trace
-          // at the *start* of that stretch.
-          <WorkPill label={work.label} onClick={() => onShowWork(work.firstId || id)} />
-        ) : null}
-
         {isUser ? null : <Footer model={current.model} usage={current.usage} />}
       </div>
 
@@ -310,6 +327,12 @@ export const MessageBubble = React.memo(function MessageBubble({
         ) : null}
         {!isUser && onRetry ? (
           <ActionButton label="Retry this turn" icon="refresh-cw" onClick={() => onRetry(id)} />
+        ) : null}
+        {!isUser && work.total > 0 && onShowWork ? (
+          // Aimed at the earliest step it counts, not at this message: the point
+          // of the counter on a reply that follows silent work is to open the
+          // trace at the *start* of that stretch.
+          <WorkCounter work={work} onClick={() => onShowWork(work.firstId || id)} />
         ) : null}
         {onFork ? (
           <ActionButton label="Branch from here" icon="git-branch" onClick={() => onFork(id)} />
@@ -359,6 +382,28 @@ function visibleBlocks(message: ChatMessage): number {
  * duplicated: two copies of this rule drifting apart would silently either
  * double-count a step or drop it from every pill.
  */
+/**
+ * A message drawn as a line across the conversation rather than as a turn: no
+ * surface, no glyph, no controls, the full width of the column.
+ *
+ * Errors count as well as notices, because the conversation now writes one of
+ * its own — a workflow that failed after its turn was over has nothing to be
+ * appended to and gets a message to itself (#140). Given the assistant's chrome
+ * it would be an avatar and a copy button around a failure nobody said, which
+ * is the misattribution the compaction rule is drawn this way to avoid.
+ *
+ * Exported because `MessageList` has to reach the same answer: a rule has no
+ * action row, so the silent steps before it would be handed to something that
+ * drops them, and the tool calls they hold would leave the transcript.
+ */
+export function isRule(message: ChatMessage): boolean {
+  return (
+    message.role === 'system'
+    && message.blocks.length > 0
+    && message.blocks.every((block) => block.kind === 'notice' || block.kind === 'error')
+  );
+}
+
 export function hasVisibleContent(message: ChatMessage): boolean {
   if (message.role === 'user') return true;
   if (visibleBlocks(message) > 0) return true;
@@ -373,18 +418,27 @@ function splitIds(joined: string): string[] {
 
 interface WorkSummary {
   total: number;
-  label: string;
-  /** The earliest message that contributed, so the pill can point there. */
+  /** Tool calls counted, after the display settings had their say. */
+  tools: number;
+  /** Reasoning blocks counted, likewise. */
+  reasoning: number;
+  /** Summed from the calls that reported one; 0 when none did. */
+  durationMs: number;
+  /** The earliest message that contributed, so the counter can point there. */
   firstId?: string;
 }
 
 /**
- * What the pill says: how much machinery these messages carried.
+ * What the counter says: how much machinery these messages carried.
  *
  * Takes a list rather than one message because a reply speaks for the silent
  * steps before it as well as for itself — "3 commands" on a sentence that ran
- * one of them and inherited two is the honest figure, and a pill per step is
+ * one of them and inherited two is the honest figure, and a counter per step is
  * exactly the clutter that was removed.
+ *
+ * Returns the figures rather than a sentence built from them, because the two
+ * places they are needed want them differently: the control draws each beside
+ * its own glyph, and its accessible description spells all of them out.
  *
  * Duration is summed from the calls that reported one rather than measured
  * between timestamps — a message's `ts` is when it opened, and the gap to the
@@ -422,15 +476,26 @@ function summariseWork(
     }
   }
 
+  return { total: tools + reasoning, tools, reasoning, durationMs, firstId };
+}
+
+/**
+ * The words the glyphs and numbers stand for.
+ *
+ * Two icons and two integers are legible at a glance and meaningless to a
+ * screen reader, so the counts go in the label in full. The elapsed time comes
+ * with them: it is the one figure the old wide button carried that the compact
+ * control has no room to draw, and it is worth more here than nowhere.
+ */
+function workDescription({ tools, reasoning, durationMs }: WorkSummary): string {
   const bits: string[] = [];
   if (tools) bits.push(`${tools} command${tools === 1 ? '' : 's'}`);
-  if (reasoning) bits.push(`${reasoning} reasoning`);
+  if (reasoning) bits.push(`${reasoning} reasoning step${reasoning === 1 ? '' : 's'}`);
   if (durationMs > 0) {
     const formatted = formatDuration(durationMs);
     if (formatted) bits.push(formatted);
   }
-
-  return { total: tools + reasoning, label: bits.join(' · '), firstId };
+  return `Show work: ${bits.join(', ')}`;
 }
 
 /**
@@ -439,42 +504,87 @@ function summariseWork(
  * Not a disclosure: expanding it here would put the wall of tool output back in
  * the middle of the prose, which is the thing the redesign removed. It is a
  * pointer — it opens the rail and scrolls the timeline to this message.
+ *
+ * It sits in the action row rather than under the prose, and is sized like the
+ * buttons around it, because that row is where everything else you can do to a
+ * message already lives. A count of zero is left out entirely: a turn that only
+ * thought shows a brain and nothing else, and "0" beside a terminal is a fact
+ * nobody needed to be told.
  */
-function WorkPill({ label, onClick }: { label: string; onClick: () => void }): React.JSX.Element {
+function WorkCounter({ work, onClick }: { work: WorkSummary; onClick: () => void }): React.JSX.Element {
   const isPhone = usePhone();
-  const [hover, setHover] = React.useState(false);
+  const [hot, setHot] = React.useState(false);
+  const label = workDescription(work);
   return (
     <button
       type="button"
       onClick={onClick}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-      onFocus={() => setHover(true)}
-      onBlur={() => setHover(false)}
+      aria-label={label}
+      title={label}
+      onMouseEnter={() => setHot(true)}
+      onMouseLeave={() => setHot(false)}
+      onFocus={() => setHot(true)}
+      onBlur={() => setHot(false)}
       style={{
-        alignSelf: 'flex-start',
         display: 'inline-flex',
         alignItems: 'center',
-        gap: 8,
-        maxWidth: '100%',
-        height: isPhone ? TOUCH_TARGET : 24,
-        padding: isPhone ? '0 12px' : '0 8px',
-        background: 'var(--card)',
-        border: `1px solid ${hover ? 'var(--border-strong)' : 'var(--border)'}`,
+        // Between the pairs, not inside them: a number belongs to the glyph on
+        // its left, and equal spacing everywhere would read as four things.
+        gap: isPhone ? 8 : 5,
+        flex: '0 0 auto',
+        // Same hit area as its neighbours — it is one more message action, and
+        // a shorter one would be the odd target out under a fingertip.
+        minWidth: isPhone ? TOUCH_TARGET : 22,
+        height: isPhone ? TOUCH_TARGET : 22,
+        padding: isPhone ? '0 8px' : '0 4px',
+        background: hot ? 'var(--accent)' : 'transparent',
+        border: '1px solid transparent',
         borderRadius: 'var(--radius)',
         fontFamily: 'var(--font-mono)',
-        fontSize: isPhone ? PHONE_TEXT.body : 10.5,
-        color: hover ? 'var(--foreground)' : 'var(--muted-foreground)',
+        fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
+        lineHeight: 1,
+        // Quiet, but not faded. The buttons either side of this one sit at 0.65
+        // opacity at rest, and that is fine for them: they carry a verb, drawn
+        // as a glyph, that is recognised rather than read. This one carries a
+        // *number*, and a number at 0.65 over `--muted-foreground` composites
+        // below the contrast a small figure needs to be resolved at all — which
+        // the wide button it replaces never did to its counts. So it takes the
+        // muted colour and none of the fade, and brightens the whole way on
+        // hover and focus, exactly as that button did.
+        color: hot ? 'var(--foreground)' : 'var(--muted-foreground)',
+        whiteSpace: 'nowrap',
         cursor: 'pointer',
-        transition: 'border-color var(--duration-fast), color var(--duration-fast)',
+        transition: 'color var(--duration-fast), background var(--duration-fast)',
       }}
     >
-      <Icon name="terminal" size={isPhone ? 16 : 10} />
-      <span style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {label}
-      </span>
-      <span style={{ flex: '0 0 auto', color: 'var(--foreground)' }}>show work</span>
+      {work.tools ? <Count icon="terminal" value={work.tools} isPhone={isPhone} /> : null}
+      {work.reasoning ? <Count icon="brain" value={work.reasoning} isPhone={isPhone} /> : null}
     </button>
+  );
+}
+
+/**
+ * One glyph and the number beside it, kept together on a line.
+ *
+ * Not marked `aria-hidden`: the button's own `aria-label` already replaces
+ * everything inside it for assistive tech, and hiding the number as well would
+ * take it out of reach of anything that reads drawn text — including the checks
+ * that measure whether it is big enough to read on a phone.
+ */
+function Count({
+  icon,
+  value,
+  isPhone,
+}: {
+  icon: string;
+  value: number;
+  isPhone: boolean;
+}): React.JSX.Element {
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+      <Icon name={icon} size={isPhone ? 15 : 11} />
+      {value}
+    </span>
   );
 }
 
@@ -607,6 +717,12 @@ function QuestionBlock({
   );
 }
 
+/** The same glyph the action that caused each rule is drawn with elsewhere. */
+const NOTICE_GLYPH: Partial<Record<NoticeBlock['notice'], string>> = {
+  interrupted: 'square',
+  branched: 'git-branch',
+};
+
 /**
  * A rule across the conversation, marking something that happened to it.
  *
@@ -634,7 +750,7 @@ function NoticeRule({ block }: { block: NoticeBlock }): React.JSX.Element {
     >
       <span aria-hidden="true" style={{ flex: 1, height: 1, background: 'var(--border)' }} />
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
-        <Icon name="fold-vertical" size={11} />
+        <Icon name={NOTICE_GLYPH[block.notice] ?? 'fold-vertical'} size={11} />
         {block.text}
         {block.detail ? (
           <span style={{ fontFamily: 'var(--font-mono)', opacity: 0.75 }}>{block.detail}</span>
@@ -662,6 +778,11 @@ function ImageView({ block }: { block: ImageBlock }) {
 }
 
 function ErrorCallout({ block, onRetry }: { block: ErrorBlock; onRetry?: () => void }) {
+  // A sentence, so it is written at the size a sentence is written at. Left on
+  // `--text-sm` it sat 3px under the prose around it on a phone and exactly on
+  // the floor the browser checks measure to — the one message in the
+  // conversation that has to be read, in the smallest type on screen.
+  const isPhone = usePhone();
   return (
     <div
       style={{
@@ -673,7 +794,7 @@ function ErrorCallout({ block, onRetry }: { block: ErrorBlock; onRetry?: () => v
         border: '1px solid color-mix(in oklab, var(--destructive) 38%, transparent)',
         background: 'color-mix(in oklab, var(--destructive) 8%, transparent)',
         color: 'var(--destructive)',
-        fontSize: 'var(--text-sm)',
+        fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-sm)',
         borderRadius: 'var(--radius)',
       }}
     >

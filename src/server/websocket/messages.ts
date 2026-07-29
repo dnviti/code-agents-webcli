@@ -38,6 +38,23 @@ function normaliseModelName(raw: string): string | undefined {
   return cleaned || undefined;
 }
 
+/**
+ * Tidy a reasoning-effort level into something safe to keep.
+ *
+ * Far stricter than the model equivalent, and deliberately so. A model name is
+ * free text because only the runtime knows its own catalogue; an effort level is
+ * not — every one this app will ever send came out of a list the runtime
+ * published, and the whole set observed across the six runtimes is a handful of
+ * bare words: `off`, `on`, `auto`, `none`, `minimal`, `low`, `medium`, `high`,
+ * `xhigh`, `max`, `ultra`. So anything that is not a short lower-case token is
+ * not a level anybody offered, and is dropped rather than stored and then pushed
+ * onto the command line of every future launch of this conversation.
+ */
+function normaliseEffortLevel(raw: string): string | undefined {
+  const cleaned = raw.trim().toLowerCase();
+  return /^[a-z][a-z0-9_-]{0,31}$/.test(cleaned) ? cleaned : undefined;
+}
+
 export interface MessageProcessorDeps {
   dev: boolean;
   claudeSessions: Map<string, SessionRecord>;
@@ -101,6 +118,7 @@ export interface ChatManagerLike {
       runtime: string;
       workingDir: string;
       model?: string;
+      effort?: string;
       extraArgs?: string[];
       env?: Record<string, string>;
       bypassPermissions?: boolean;
@@ -115,7 +133,14 @@ export interface ChatManagerLike {
   setModel(sessionId: string, model: string): Promise<boolean>;
   /** Carry a new model into the options an in-place `/clear` restart replays. */
   rememberModel(sessionId: string, model: string | undefined): void;
+  /** Switch a live session's reasoning effort. False when nothing is running, or the adapter cannot. */
+  setEffort(sessionId: string, effort: string): Promise<boolean>;
+  /** Carry a new effort level into the options an in-place `/clear` restart replays. */
+  rememberEffort(sessionId: string, effort: string | undefined): void;
   cancelQueued(sessionId: string, queuedId: string): boolean;
+  /** Interrupt what is running and deliver one waiting turn immediately. */
+  sendQueuedNow(sessionId: string, queuedId: string): Promise<boolean>;
+  retryQueued(sessionId: string, queuedId: string): boolean;
   respondPermission(sessionId: string, requestId: string, optionId: string): boolean;
   answerQuestion(
     sessionId: string,
@@ -129,6 +154,11 @@ export interface ChatManagerLike {
     fromSeq: number,
     count: number,
   ): Promise<{ events: unknown[]; firstSeq: number; from?: number; cursor: number }>;
+  turnIndex(record: SessionRecord): Promise<{
+    turns: unknown[];
+    firstSeq: number;
+    complete: boolean;
+  }>;
 }
 
 interface IncomingMessage {
@@ -157,6 +187,15 @@ interface IncomingMessage {
   queuedId?: string;
   /** A conversation-scoped model to switch to, or null/empty to clear the override. */
   model?: string | null;
+  /**
+   * A conversation-scoped reasoning-effort level, or null/empty to clear it.
+   *
+   * Unlike the model this is never free text: the control only offers levels the
+   * running runtime published, so anything arriving here that the runtime does
+   * not know is a bug or a hand-crafted socket frame, and is refused rather than
+   * stored and replayed into every future launch.
+   */
+  effort?: string | null;
 }
 
 export class MessageProcessor {
@@ -242,8 +281,20 @@ export class MessageProcessor {
         await this.handleChatSetModel(wsInfo, data);
         break;
 
+      case 'chat_set_effort':
+        await this.handleChatSetEffort(wsInfo, data);
+        break;
+
       case 'chat_queue_cancel':
         this.handleChatQueueCancel(wsInfo, data);
+        break;
+
+      case 'chat_queue_send_now':
+        await this.handleChatQueueSendNow(wsInfo, data);
+        break;
+
+      case 'chat_queue_retry':
+        this.handleChatQueueRetry(wsInfo, data);
         break;
 
       case 'chat_permission_response':
@@ -256,6 +307,10 @@ export class MessageProcessor {
 
       case 'chat_history_request':
         await this.handleChatHistory(wsInfo, data);
+        break;
+
+      case 'chat_turn_index_request':
+        await this.handleChatTurnIndex(wsInfo, data);
         break;
 
       case 'chat_subscribe':
@@ -1021,6 +1076,19 @@ export class MessageProcessor {
     );
 
     session.surface = 'chat';
+    // A level is only ever a word one runtime published, so it means nothing to
+    // the next one — and worse than nothing, because the runtimes that take it
+    // as a flag do not refuse an unknown value. Both claude and pi print a
+    // warning to a stream nobody is reading and then run at their own default,
+    // so a codex `ultra` or a kimi `on` surviving into a claude launch would
+    // leave the control reporting a level the conversation was never on.
+    //
+    // Cleared here rather than filtered at the adapter because this is the one
+    // place the change of runtime is visible; the adapters guard themselves as
+    // well, for the records this misses.
+    if (session.agent && session.agent !== agentKind) {
+      session.chatEffortOverride = undefined;
+    }
     session.agent = agentKind as AgentKind;
     session.lastAgent = agentKind as AgentKind;
     session.runtimeLabel = this.getRuntimeLabel(agentKind as AgentKind, session);
@@ -1033,6 +1101,11 @@ export class MessageProcessor {
         // Conversation-scoped override beats the profile default, for this
         // launch only — see chat_set_model.
         model: session.chatModelOverride || profile?.model,
+        // No profile fallback behind it: profiles are server-wide and keyed by
+        // runtime, and an effort level is a per-conversation decision that has
+        // never had a profile default to fall back to. Absent means the runtime
+        // gets no flag at all and uses whatever it considers normal.
+        effort: session.chatEffortOverride,
         extraArgs: profile?.extraArgs,
         env: profile?.env,
         bypassPermissions,
@@ -1070,6 +1143,7 @@ export class MessageProcessor {
           capabilities: chat.currentCapabilities,
           bypassPermissions: chat.bypassing,
           modelOverride: session.chatModelOverride || null,
+          effortOverride: session.chatEffortOverride || null,
         },
         this.deps.claudeSessions,
         this.deps.webSocketConnections,
@@ -1117,6 +1191,11 @@ export class MessageProcessor {
         sessionId,
         snapshot,
         modelOverride: session.chatModelOverride || null,
+        // Rides on the join for the same reason the model does: the snapshot
+        // carries the runtime's own reported level only if it ever reported one,
+        // and a conversation whose process has since died reports nothing at
+        // all. The record is the only thing that still knows what was chosen.
+        effortOverride: session.chatEffortOverride || null,
       });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1174,6 +1253,38 @@ export class MessageProcessor {
         session.chatModelOverride = model;
         await this.deps.saveSessionsToDisk();
         manager.rememberModel(session.id, model);
+      }
+    }
+
+    // And the same for a typed `/effort`, which claude answers itself. Recorded
+    // for the same reason and forwarded just as unchanged: a level the user
+    // typed is still the runtime's to accept or refuse, but if it accepts, the
+    // next `/clear` must not put the conversation back where it started.
+    const typedEffort = /^\/effort[ \t]+(\S+)\s*$/.exec(text.trim());
+    if (typedEffort) {
+      const effort = normaliseEffortLevel(typedEffort[1]);
+      // Recorded only when the runtime published this level, which is a
+      // narrower test than the one the model equivalent above applies — and it
+      // has to be, because a runtime's slash command and its launch flag do not
+      // accept the same words. Claude's `/effort` takes `auto` as well as the
+      // six on its ladder, and `--effort auto` answers by warning on a stream
+      // nobody reads and running at its default. So typing `/effort auto`
+      // genuinely changes the running session, and storing it would have made
+      // every launch after that one silently ignore the level while the chip
+      // still claimed it. The published ladder is the only test that can tell
+      // that case from `/effort ultracode`, which the flag does accept.
+      //
+      // The turn is forwarded either way. What the runtime does with a command
+      // is the runtime's business; what this app is willing to *replay* is not.
+      const ladder = effort
+        ? ((await manager.snapshot(session).catch(() => null)) as {
+            capabilities?: { efforts?: { value: string }[] };
+          } | null)?.capabilities?.efforts
+        : undefined;
+      if (effort && ladder?.some((level) => level.value === effort)) {
+        session.chatEffortOverride = effort;
+        await this.deps.saveSessionsToDisk();
+        manager.rememberEffort(session.id, effort);
       }
     }
 
@@ -1335,6 +1446,139 @@ export class MessageProcessor {
   }
 
   /**
+   * Change how hard the agent thinks, for one conversation.
+   *
+   * Shaped like the model handler and different from it in one deciding way:
+   * this level *is* pre-validated. The control only ever offers what the running
+   * runtime published, so a level that is not on that list did not come from the
+   * control, and sending it on would be one of two bad outcomes — a runtime that
+   * refuses it mid-turn, or pi, which prints a warning nobody sees and then
+   * quietly runs at its default. Neither is a thing to find out about later.
+   *
+   * The ladder is only consulted when the session has actually published one.
+   * Choosing a level before anything has launched is legitimate and lands in the
+   * same saved-for-next-launch state a model choice does.
+   */
+  private async handleChatSetEffort(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!session) return;
+
+    const raw = typeof data.effort === 'string' ? data.effort.trim() : '';
+    const effort = raw ? normaliseEffortLevel(raw) : undefined;
+    const manager = this.deps.chatManager;
+
+    const reply = (
+      applied: 'live' | 'sent' | 'pending' | 'cleared' | 'refused',
+      message: string,
+      level: string | null,
+    ): void => {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_effort_result',
+        sessionId: session.id,
+        effort: level,
+        applied,
+        message,
+      });
+    };
+
+    // Nothing is stored on a refusal, so the conversation keeps running at
+    // whatever it was already on rather than being moved somewhere neither the
+    // user nor the runtime asked for.
+    if (raw && !effort) {
+      reply('refused', 'That is not a level any runtime here offers.', null);
+      return;
+    }
+
+    const snapshot = manager
+      ? ((await manager.snapshot(session).catch(() => null)) as {
+          live?: boolean;
+          capabilities?: { efforts?: { value: string }[]; commands?: { name: string }[] };
+        } | null)
+      : null;
+    const ladder = snapshot?.capabilities?.efforts;
+
+    if (effort && ladder?.length && !ladder.some((level) => level.value === effort)) {
+      reply(
+        'refused',
+        `${session.agent} does not offer "${effort}". It accepts: ${ladder
+          .map((level) => level.value)
+          .join(', ')}.`,
+        null,
+      );
+      return;
+    }
+
+    session.chatEffortOverride = effort;
+    await this.deps.saveSessionsToDisk();
+    // The same trap the model has, and the reason `rememberEffort` exists: a
+    // `/clear` restarts the process in place from the options it was launched
+    // with, so without this it would silently go back to the level the
+    // conversation opened at after the browser was told the change was live.
+    manager?.rememberEffort(session.id, effort);
+
+    if (!effort) {
+      reply(
+        'cleared',
+        'Back to the runtime’s own default. It applies from the next session for this conversation.',
+        null,
+      );
+      return;
+    }
+
+    if (!manager) {
+      reply('pending', `Saved. This conversation will run at ${effort} from its next session.`, effort);
+      return;
+    }
+
+    try {
+      if (await manager.setEffort(session.id, effort)) {
+        reply('live', `Now thinking at ${effort}.`, effort);
+        return;
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      reply(
+        'pending',
+        `Saved, but the running session would not take it (${message}). ${effort} applies from its next session.`,
+        effort,
+      );
+      return;
+    }
+
+    // The adapter cannot change it on a live process. Where the runtime
+    // advertises an `/effort` command of its own, send it as a turn and say so
+    // honestly — the CLI's own reply in the transcript is the confirmation, not
+    // this message. Claude is the one that answers this today, and it answers
+    // for free; its adapter takes the direct road above, so this is the path a
+    // future runtime with the command and no protocol for it will arrive on.
+    const hasEffortCommand =
+      snapshot?.capabilities?.commands?.some((command) => command.name === 'effort') ?? false;
+
+    if (snapshot?.live === true && hasEffortCommand) {
+      try {
+        await manager.send(session.id, { text: `/effort ${effort}` });
+        reply(
+          'sent',
+          `Sent "/effort ${effort}" to the session — the transcript will show whether it took.`,
+          effort,
+        );
+        return;
+      } catch {
+        // Falls through to the saved-for-next-time answer below.
+      }
+    }
+
+    reply(
+      'pending',
+      `Saved. This runtime cannot change how hard it thinks mid-session — ${effort} applies from its next session.`,
+      effort,
+    );
+  }
+
+  /**
    * Withdraw a turn the user typed ahead.
    *
    * Silent when the id is unknown: by the time a click arrives the turn may
@@ -1350,6 +1594,46 @@ export class MessageProcessor {
     const queuedId = typeof data.queuedId === 'string' ? data.queuedId : '';
     if (!queuedId) return;
     manager.cancelQueued(session.id, queuedId);
+  }
+
+  /**
+   * Send a turn the user typed ahead, now, in front of whatever is running.
+   *
+   * Silent for the same reason the withdrawal above is: by the time the click
+   * arrives that turn may already have started, and the session broadcasts the
+   * queue on every change, so both browsers already agree on what is true. The
+   * one thing that must not happen is a double delivery from a double click,
+   * and that is settled in the session — the id leaves the queue before
+   * anything is interrupted, so the second call finds nothing to promote.
+   */
+  private async handleChatQueueSendNow(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!manager || !session) return;
+
+    const queuedId = typeof data.queuedId === 'string' ? data.queuedId : '';
+    if (!queuedId) return;
+    await manager.sendQueuedNow(session.id, queuedId);
+  }
+
+  /**
+   * Try a queued turn that could not be delivered again.
+   *
+   * Silent on an unknown id for the same reason as cancelling: the click races
+   * the queue's own broadcast, and the session answers with the whole queue
+   * either way.
+   */
+  private handleChatQueueRetry(wsInfo: WebSocketInfo, data: IncomingMessage): void {
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!manager || !session) return;
+
+    const queuedId = typeof data.queuedId === 'string' ? data.queuedId : '';
+    if (!queuedId) return;
+    manager.retryQueued(session.id, queuedId);
   }
 
   private handleChatPermission(wsInfo: WebSocketInfo, data: IncomingMessage): void {
@@ -1417,6 +1701,41 @@ export class MessageProcessor {
         message,
       });
       sendToWebSocket(wsInfo.ws, { type: 'error', message });
+    }
+  }
+
+  /**
+   * The full turn index of one conversation.
+   *
+   * Answered from the recorded log, so the list is the same however much of the
+   * conversation the asking browser has loaded (#86). A failure is answered on
+   * the chat channel for the same reason a page failure is: the index shows a
+   * spinner while it waits, and silence leaves it spinning forever.
+   */
+  private async handleChatTurnIndex(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!manager || !session) return;
+
+    try {
+      const index = await manager.turnIndex(session);
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_turn_index',
+        sessionId: session.id,
+        requestId: data.requestId || null,
+        ...index,
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_turn_index_failed',
+        sessionId: session.id,
+        requestId: data.requestId || null,
+        message,
+      });
     }
   }
 

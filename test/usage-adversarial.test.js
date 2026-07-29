@@ -51,8 +51,10 @@ describe('accounting against what the adapters really emit', () => {
       { t: 'turn_end', turnId: 'codex-1' },
     ]);
 
-    assert.strictEqual(closed.length, 1, 'one prompt is one job');
-    assert.strictEqual(closed[0].turns, 2);
+    assert.strictEqual(closed.length, 1, 'one prompt is one turn');
+    // Two assistant messages, and no round-trip count from a runtime that does
+    // not report one — which is a null, never a 2 (#86).
+    assert.strictEqual(closed[0].modelTurns, null);
     assert.strictEqual(closed[0].toolCalls, 1);
   });
 

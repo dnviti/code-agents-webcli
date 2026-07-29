@@ -24,6 +24,7 @@ import {
   ChatMessage,
   ChatSnapshot,
   ChatState,
+  ChatTurnIndexEntry,
   ChatUsage,
   PermissionRequest,
   PlanItem,
@@ -92,6 +93,9 @@ export class ChatTranscript {
    * every component that needs both.
    */
   private queued: QueuedTurn[] = [];
+  private recorded: ChatTurnIndexEntry[] | null = null;
+  /** What each finished turn cost, by turn id. See `spendFor`. */
+  private readonly spend = new Map<string, ChatUsage>();
 
   /**
    * What the server last said about the process behind this conversation.
@@ -165,6 +169,14 @@ export class ChatTranscript {
       pendingQuestions: snapshot.pendingQuestions || [],
       firstSeq: snapshot.firstSeq,
       cursor: snapshot.cursor,
+      // The turn the server's replay was still inside. Live events arriving
+      // after this join belong to it, and without it the first of them opens a
+      // turn of its own named after nothing the user typed.
+      currentTurnId: snapshot.currentTurnId ?? null,
+      // The level the runtime reported, which `createTranscript` would otherwise
+      // drop — leaving the control blank over a live session that is still
+      // thinking at whatever it opened on.
+      effort: snapshot.effort,
     });
     // A server that does not report its replay floor gets `firstSeq`, which
     // reads as "nothing older" — no paging offered rather than paging that can
@@ -215,6 +227,18 @@ export class ChatTranscript {
     this.bumpAll();
   }
 
+  /**
+   * Start this transcript inside a turn that opened before its first event.
+   *
+   * For the scratch transcript a page is replayed through: the slice begins
+   * wherever the browser scrolled back to, which is routinely the middle of a
+   * turn, and the server says which one so the messages are filed under the
+   * turn the conversation recorded rather than the runtime's name for it.
+   */
+  seedOpenTurn(turnId: string | null | undefined): void {
+    this.state.currentTurnId = turnId ?? null;
+  }
+
   get loadingMore(): boolean {
     return this.loading;
   }
@@ -237,6 +261,52 @@ export class ChatTranscript {
   }
 
   /**
+   * Every turn of this conversation as recorded, or null until the server says.
+   *
+   * Held here rather than on the controller so it travels on the version
+   * counter every surface already subscribes to. It arrives once, well after
+   * the snapshot, and a view memoised on the transcript's version would
+   * otherwise never recompute for it — the index went on showing the one turn
+   * the browser happened to hold, which is the defect it exists to fix (#86).
+   *
+   * Null is not an empty list: it means nobody has answered yet, or the server
+   * is older than this page, and the turn strip falls back to numbering what it
+   * holds. An empty list is a conversation with no turns in it.
+   */
+  get recordedTurns(): ChatTurnIndexEntry[] | null {
+    return this.recorded;
+  }
+
+  /**
+   * What a turn that has ended cost, as the accounting filed it.
+   *
+   * Held beside the recorded index rather than inside it because it arrives
+   * from two directions: with the index when a conversation is opened, and one
+   * turn at a time as they finish. Both are the same figure from the same
+   * place — see `spendByTurn` — so a turn ending is a correction to this map
+   * and never a second opinion.
+   */
+  get turnSpend(): ReadonlyMap<string, ChatUsage> {
+    return this.spend;
+  }
+
+  /** One turn's recorded spend, as the session files it. */
+  setTurnSpend(turnId: string, usage: ChatUsage): void {
+    this.spend.set(turnId, usage);
+    this.notify();
+  }
+
+  setRecordedTurns(turns: ChatTurnIndexEntry[]): void {
+    this.recorded = turns;
+    for (const turn of turns) {
+      // A turn still running has no filed figure yet, and must not be given an
+      // empty one — the surfaces read "nothing recorded" off its absence.
+      if (turn.usage) this.spend.set(turn.turnId, turn.usage);
+    }
+    this.notify();
+  }
+
+  /**
    * A process appeared behind this conversation, or went away.
    *
    * Only a snapshot carried this before, which meant a session relaunched into
@@ -251,9 +321,33 @@ export class ChatTranscript {
     this.notify();
   }
 
-  apply(event: ChatEvent): void {
+  /**
+   * Fold in what a launch announced about the runtime behind this conversation.
+   *
+   * A merge, exactly as a `capabilities` event is one, and for a reason that
+   * only shows up on a relaunch: what a process can say about itself at the
+   * moment it starts is less than the conversation already knows — claude
+   * publishes its slash commands in the `init` of its first turn — so replacing
+   * the set wholesale would empty the picker at the moment the runtime came
+   * back.
+   */
+  setCapabilities(capabilities: Partial<ChatCapabilities>): void {
+    this.state.capabilities = { ...this.state.capabilities, ...capabilities };
+    this.notify();
+  }
+
+  /**
+   * Fold one event in, and say whether it was new.
+   *
+   * The answer is the reducer's own: an event at or below the cursor is a
+   * replay and changes nothing. Returned rather than kept private because it is
+   * the only honest edge in this client — a reconnect redelivers the tail of
+   * the log, and a caller that wants to act *once* per thing that happened has
+   * no other way to tell the difference.
+   */
+  apply(event: ChatEvent): boolean {
     const change = applyChatEvent(this.state, event);
-    if (!change.applied) return;
+    if (!change.applied) return false;
 
     this.version++;
 
@@ -262,11 +356,12 @@ export class ChatTranscript {
       const message = this.state.messages[change.messageIndex];
       if (message) {
         this.bumpMessage(message.id);
-        return;
+        return true;
       }
     }
 
     this.bumpAll();
+    return true;
   }
 
   applyAll(events: ChatEvent[]): void {
@@ -415,6 +510,28 @@ export class ChatTranscript {
    */
   get model(): string | undefined {
     return this.state.model;
+  }
+
+  /**
+   * Every model the last turn was billed to, when the runtime broke it down.
+   *
+   * One entry — the usual case — says nothing `model` does not already say.
+   * More than one is the fact the header has to carry: the turn did not run on
+   * one model, and a single name would be a claim about work that was split.
+   */
+  get turnModels(): string[] | undefined {
+    return this.state.turnModels;
+  }
+
+  /**
+   * The reasoning-effort level the runtime last reported running at.
+   *
+   * Undefined until a runtime says, which is the state most conversations spend
+   * their life in: an agent left on its own default reports nothing, and
+   * inventing a level for it would put a number on a decision nobody made.
+   */
+  get effort(): string | undefined {
+    return this.state.effort;
   }
 
   get lastError(): string | undefined {

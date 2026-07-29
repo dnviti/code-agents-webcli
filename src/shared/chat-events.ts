@@ -24,6 +24,10 @@
  * that goes stale the week it ships.
  */
 
+import { TurnOutcome } from './turn-outcome.js';
+
+export type { TurnOutcome };
+
 /**
  * Which surface a session is driven through.
  *
@@ -121,6 +125,23 @@ export interface ThinkingBlock {
   text: string;
   /** Some runtimes stream a signature alongside; kept for fidelity, unused in UI. */
   signature?: string;
+  /**
+   * How much reasoning the runtime said this block holds, in its own estimate.
+   *
+   * The field exists for the runtimes that report *that* the model reasoned
+   * without handing over a word of it. Claude Code is the one measured here: as
+   * of 2.1.220 every `thinking` block on the wire carries `"thinking": ""` and a
+   * signature, and the only description of what was thought is a running token
+   * estimate on the side. So a reasoning entry either has text or has this, and
+   * the UI renders whichever it was given rather than an empty box (#120).
+   *
+   * An estimate, and named as one: measured against the same turn's billed
+   * `thinking_tokens` it runs high (114 reported against 71 billed, 152 against
+   * 118), because it is a live count made while the block is still open. Shown
+   * with a `~` for that reason. It is never a substitute for the usage figures —
+   * those come from the runtime's own accounting and are what the meter reads.
+   */
+  tokens?: number;
 }
 
 export interface ToolBlock {
@@ -210,6 +231,99 @@ export interface AgentRun {
   /** What it was asked to do. */
   prompt?: string;
   subagentType?: string;
+  /** The run's own name, when it has one of its own. See `WorkflowRun`. */
+  workflowName?: string;
+  /** The phases and agents inside a workflow. Absent for a plain delegation. */
+  workflow?: WorkflowRun;
+}
+
+/**
+ * One named phase of a workflow run.
+ *
+ * `index` is the run's own numbering, one-based and assigned in the order the
+ * phases were declared or first entered; it is the phase's identity, and how a
+ * later report finds the row it belongs to.
+ *
+ * No state of its own, deliberately. The runtime reports a phase once, when it
+ * is registered, and never again — whether it is waiting, working or finished
+ * is a fact about the agents inside it, and deriving it from them is the only
+ * reading that cannot disagree with the rows underneath.
+ */
+export interface WorkflowPhase {
+  index: number;
+  title: string;
+  /** Carried rather than interpreted: the runtime does not populate it yet. */
+  kind?: string;
+}
+
+/**
+ * How far one agent inside a workflow has got.
+ *
+ * Four words, mapped from the runtime's own (`start` / `progress` / `done` /
+ * `error`), because a fifth spelling of "running" across this codebase is a
+ * fifth thing to keep in step with `ToolStatus`.
+ */
+export type WorkflowAgentState = 'queued' | 'running' | 'done' | 'failed';
+
+/**
+ * One agent a workflow started, as the run reports it while it works.
+ *
+ * Keyed by `index` — the run's own agent number, one-based and stable across
+ * every report about that agent, including a retry. `agentId` changes when an
+ * agent is respawned, so it identifies an attempt rather than a row.
+ */
+export interface WorkflowAgent {
+  index: number;
+  /** The label the script gave it, e.g. `review:bugs`. */
+  label: string;
+  state: WorkflowAgentState;
+  /** Which phase it belongs to. Absent for an agent started outside any. */
+  phaseIndex?: number;
+  phaseTitle?: string;
+  /** The runtime's id for this attempt, not for the row. */
+  agentId?: string;
+  /** A named subagent type, when the script asked for one. */
+  agentType?: string;
+  model?: string;
+  /** Set when the runtime answered on a different model than it was asked for. */
+  fallbackModel?: string;
+  /** `worktree` or `remote`, when the agent runs somewhere of its own. */
+  isolation?: string;
+  /** The opening of what it was asked to do; the run truncates this itself. */
+  prompt?: string;
+  /** The tool it last reached for, and that call in one line. */
+  lastTool?: string;
+  lastToolDetail?: string;
+  tokens?: number;
+  toolCalls?: number;
+  durationMs?: number;
+  startedAt?: number;
+  queuedAt?: number;
+  /** Which try this is; above 1 the run retried it. */
+  attempt?: number;
+  /** Why the last attempt ended, when it ended in a retry. */
+  lastAttemptReason?: string;
+  /** True when the result came from the run's journal, not a fresh agent. */
+  cached?: boolean;
+  /** True when a safety classifier refused to start it. */
+  blocked?: boolean;
+  /** The opening of what it returned. */
+  result?: string;
+  error?: string;
+}
+
+/**
+ * The shape of a workflow run: its phases, and the agents inside them.
+ *
+ * Reported continuously on the same channel as `AgentRun` (see above), as a
+ * complete snapshot each time rather than a delta — which is why the reducer
+ * upserts by index instead of appending. The runtime sends it on some progress
+ * reports and not others, so an absent list means "nothing new to say", never
+ * "the run has no phases".
+ */
+export interface WorkflowRun {
+  phases: WorkflowPhase[];
+  agents: WorkflowAgent[];
 }
 
 export interface ImageBlock {
@@ -228,6 +342,17 @@ export interface PlanBlock {
 export interface ErrorBlock {
   kind: 'error';
   text: string;
+  /**
+   * True when this is the error the turn died of, rather than one it read and
+   * moved past.
+   *
+   * The distinction is the whole of issue #74: a runtime that reports "could
+   * not read that file" mid-turn and carries on has not failed the turn, and a
+   * runtime whose process went away has. Recorded on the block because that is
+   * what survives into a snapshot — a turn cut short this way never reaches the
+   * `turn_end` that would otherwise say how it ended.
+   */
+  fatal?: boolean;
 }
 
 /**
@@ -242,7 +367,7 @@ export interface ErrorBlock {
  */
 export interface NoticeBlock {
   kind: 'notice';
-  notice: 'compacted' | 'cleared';
+  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched';
   text: string;
   /** Optional detail — how much was reclaimed, what the summary covers. */
   detail?: string;
@@ -276,9 +401,122 @@ export interface ChatUsage {
   contextWindow?: number;
   /** Context currently occupied, when the runtime reports it directly. */
   contextUsed?: number;
+  /**
+   * Who said the window is that big.
+   *
+   * `agent` — the runtime reported it about the model it is running.
+   * `provider` — the agent said nothing, so the model's provider was asked.
+   * `unknown` — nobody could, and the reading has no ceiling in it.
+   *
+   * The first two are kept because they are not equally authoritative and the
+   * difference is measurable: grok reports 512,000 tokens for `grok-build`,
+   * while the nearest entry in a provider catalogue says 256,000. Half. An
+   * agent's own figure always wins, and this field is what lets a reader see
+   * which one they got.
+   *
+   * The third exists because a ceiling sometimes has to come *down*. Switch to
+   * a model neither the agent nor the catalogue can size and the previous
+   * model's figure would otherwise stand there being read as this one's — the
+   * bar, the percentage, the "N left" warning, all describing a conversation
+   * the user has left. Leaving `contextWindow` out cannot say that: every merge
+   * here reads an absent number as "this report is silent about it", which is
+   * exactly what keeps a streaming patch from blanking the figures beside it.
+   * So the retraction is spoken, and `mergeUsage` is the one place that acts on
+   * it.
+   *
+   * Absent alongside a `contextWindow` should not happen; absent alongside no
+   * `contextWindow` is the ordinary "nobody has said yet" case, which the UI
+   * states in words rather than drawing a bar against a guess.
+   */
+  contextWindowSource?: ContextWindowSource;
+  /**
+   * Which model the window above is about.
+   *
+   * An agent states its ceiling for the model it is running, and that statement
+   * reaches the session *before* the first message that names the model — a
+   * switch is confirmed on its own channel and the naming message belongs to
+   * the next turn. Unattributed, the session reads the new model's figure as
+   * the old one's, then asks a catalogue about an id no catalogue has heard of
+   * and takes the agent's own answer down as unknown.
+   *
+   * Absent means nobody said, which is the ordinary case: a runtime whose model
+   * cannot change mid-conversation has nothing to disambiguate.
+   */
+  contextWindowModel?: string;
 }
 
+/**
+ * What one model did during a turn, as the runtime itself reported it.
+ *
+ * The distinction this exists to keep is between the model that was *asked
+ * for* and the model that *ran*. A requested model is a fact about this app; a
+ * reported one is a fact about the work, and only the second belongs in a spend
+ * record. Nothing here is ever filled in from `options.model`.
+ *
+ * A list rather than a field because a turn can legitimately involve more than
+ * one: a subagent runs on a different model, a runtime falls back after a
+ * failure. Claude and grok both report exactly this, keyed by model, and
+ * folding it back into one name would be the misattribution the whole record
+ * exists to avoid.
+ *
+ * `calls` is the runtime's own count of round trips to that model — grok's
+ * `modelCalls`. It is the only per-model measure of effort any of them give;
+ * tool calls are never attributed to a model by anybody, so they are not
+ * attributed here either.
+ */
+export interface TurnModelUsage {
+  model: string;
+  calls?: number;
+  usage?: ChatUsage;
+}
+
+export type ContextWindowSource = 'agent' | 'provider' | 'unknown';
+
 /** A message as the reducer assembles it. */
+/**
+ * One turn as the recorded conversation has it, for the index beside it.
+ *
+ * Sent whole rather than paged: it is the index of the conversation, and an
+ * index that begins where the last page happened to stop is not one (#86).
+ * Thin enough that "whole" stays cheap — a turn contributes one line of it.
+ */
+export interface ChatTurnIndexEntry {
+  /** The opening message's id, which is what a client scrolls to. */
+  id: string;
+  turnId: string;
+  /** 1-based over the whole conversation, not over what is loaded. */
+  index: number;
+  /**
+   * Where this turn opens in the log, so a reader can cut the conversation at
+   * it — which is what branching from a turn needs and nothing else has.
+   *
+   * Optional because it rides on the wire: a browser talking to a server that
+   * predates it must read "not stated" rather than zero, which would name the
+   * head of the log as every turn's start.
+   */
+  startSeq?: number;
+  /** The user's first line, or null for a turn nobody prompted. */
+  label: string | null;
+  startedAt: number;
+  /** How the turn ended, or null while it is still running. */
+  outcome: TurnOutcome | null;
+  /**
+   * What this one turn cost, as the accounting recorded it.
+   *
+   * From the accounting rather than added up from the messages, because the
+   * money cannot be added up from the messages: half the runtimes here report a
+   * running total rather than a per-turn figure, and turning that into "what
+   * this turn cost" means taking the difference against where the turn started
+   * — which is what the accountant did when it filed the row this reads back.
+   * Taking it from the same place is also the only way the figure beside a turn
+   * and the figure on the dashboard can be relied on to agree.
+   *
+   * Absent for a turn still running, and for one whose runtime reported
+   * nothing — which is a different thing from zero, and says so on screen.
+   */
+  usage?: ChatUsage;
+}
+
 export interface ChatMessage {
   id: string;
   /** Monotonic per session. Orders messages and anchors history paging. */
@@ -289,11 +527,29 @@ export interface ChatMessage {
   blocks: ChatBlock[];
   /** Set once the message completes. */
   stopReason?: string;
+  /**
+   * How the turn this message belongs to ended, stamped at `turn_end`.
+   *
+   * On the messages rather than beside the transcript because the messages are
+   * what survives: a browser rebuilds a conversation from `ChatSnapshot`, which
+   * carries the message list and the session's own fields and nothing else, and
+   * history paging prepends messages alone. Absent means the turn has not ended
+   * — which is a different thing from a turn that ended without saying why, and
+   * the reason this is an outcome and not a raw stop reason.
+   */
+  turnOutcome?: TurnOutcome;
   usage?: ChatUsage;
   /** Model that produced this message, when reported. */
   model?: string;
   /** True while the runtime is still appending to this message. */
   streaming?: boolean;
+  /**
+   * Set on a user message delivered into the turn that was already running.
+   *
+   * It shares that turn's `turnId`, so it is grouped into it rather than
+   * starting one — see the event of the same name.
+   */
+  steer?: true;
 }
 
 /**
@@ -424,6 +680,19 @@ export interface ChatCapabilities {
   commands?: SlashCommand[];
   /** Selectable models, when the runtime advertises a list. */
   models?: ModelChoice[];
+  /**
+   * Reasoning-effort levels this runtime will accept, cheapest first.
+   *
+   * Absent means the runtime has no effort knob anyone has watched working, and
+   * the control says so instead of offering levels that would be rejected. Every
+   * list here came from the runtime itself — either published in its handshake
+   * (codex, grok, kimi, omp) or read off its own `--help` and confirmed by
+   * feeding it a bad value and reading the complaint (claude, pi).
+   *
+   * The ladders are not comparable across runtimes: `high` is the top of grok's
+   * and the middle of pi's. That is what `rank` is for.
+   */
+  efforts?: EffortChoice[];
 }
 
 export interface SlashCommand {
@@ -437,6 +706,48 @@ export interface ModelChoice {
   value: string;
   name: string;
   description?: string;
+}
+
+/**
+ * One reasoning-effort level, as the runtime that offers it named it.
+ *
+ * `value` is sent back to that runtime verbatim, so it is never a word this app
+ * invented: kimi answers `on`/`off`, pi answers `xhigh`, codex answers `ultra`,
+ * and a level spelled any other way is refused by name.
+ */
+export interface EffortChoice {
+  value: string;
+  name: string;
+  description?: string;
+  /**
+   * Where this level sits on its own runtime's ladder — 0 is the least thinking
+   * on offer, 1 the most.
+   *
+   * Carried rather than derived from list order because the UI colours by it,
+   * and a colour derived from position in a list would make kimi's `on` (of two)
+   * a different weight from pi's `max` (of seven) when both are that runtime's
+   * ceiling. It also gives the levels that are not points on a ladder somewhere
+   * honest to sit: omp's `auto` picks per prompt, so it ranks mid.
+   */
+  rank: number;
+}
+
+/**
+ * Evenly-spaced ranks for a ladder given cheapest-first.
+ *
+ * The common case — a runtime whose levels really are a straight line — so the
+ * adapters that have one do not each write the same division out.
+ */
+export function rankedEfforts(
+  levels: Array<{ value: string; name?: string; description?: string }>,
+): EffortChoice[] {
+  const last = Math.max(1, levels.length - 1);
+  return levels.map((level, index) => ({
+    value: level.value,
+    name: level.name ?? level.value,
+    ...(level.description ? { description: level.description } : {}),
+    rank: index / last,
+  }));
 }
 
 /**
@@ -460,13 +771,45 @@ export type ChatEvent =
       cwd?: string;
       capabilities: ChatCapabilities;
     }
-  | { t: 'msg_start'; seq: number; ts: number; id: string; role: ChatRole; turnId: string; model?: string }
+  | {
+      t: 'msg_start';
+      seq: number;
+      ts: number;
+      id: string;
+      role: ChatRole;
+      turnId: string;
+      model?: string;
+      /**
+       * Set on a user message that was delivered *into* the turn already
+       * running, rather than waiting for its own (#86).
+       *
+       * Recorded rather than worked out later, because it cannot be worked out
+       * later: two messages typed while the agent was busy look identical
+       * afterwards, and which of them steered the running work and which waited
+       * its turn is the whole of what decides the turn count. A steer carries
+       * the running turn's own `turnId`, so the transcript and the accounting
+       * both fold it into the turn it belongs to; this flag is what says that
+       * was deliberate.
+       */
+      steer?: true;
+    }
   | { t: 'block_start'; seq: number; ts: number; msgId: string; index: number; block: ChatBlock }
   /**
    * Append to an open block. `text` extends a text/thinking block; `json`
-   * extends a tool block's streaming arguments.
+   * extends a tool block's streaming arguments; `tokens` adds to a thinking
+   * block's reported size, for a runtime that reports the size of reasoning it
+   * will not show (see `ThinkingBlock.tokens`).
    */
-  | { t: 'block_delta'; seq: number; ts: number; msgId: string; index: number; text?: string; json?: string }
+  | {
+      t: 'block_delta';
+      seq: number;
+      ts: number;
+      msgId: string;
+      index: number;
+      text?: string;
+      json?: string;
+      tokens?: number;
+    }
   | { t: 'block_end'; seq: number; ts: number; msgId: string; index: number; block?: Partial<ChatBlock> }
   | { t: 'msg_end'; seq: number; ts: number; msgId: string; stopReason?: string; usage?: ChatUsage }
   /**
@@ -492,6 +835,46 @@ export type ChatEvent =
       ts: number;
       parentToolId: string;
       patch: Partial<Omit<AgentRun, 'steps'>>;
+    }
+  /**
+   * The structure of a workflow run, addressed to the call that started it.
+   *
+   * Separate from `agent_progress` because the merge is different: that patch
+   * is a shallow assign over the run, and these are lists whose rows have to
+   * survive a report that does not mention them. See `WorkflowRun`.
+   */
+  | {
+      t: 'workflow_progress';
+      seq: number;
+      ts: number;
+      parentToolId: string;
+      phases?: WorkflowPhase[];
+      agents?: WorkflowAgent[];
+    }
+  /**
+   * A workflow run ended badly, addressed to the call that started it.
+   *
+   * Its own event rather than an `error` or a `tool` patch, because it is one
+   * fact with three consequences and they have to happen together: the call
+   * that launched the run is no longer a success, the conversation has to say
+   * so where the person will read it, and somebody who is not looking has to be
+   * told. Sending three events would let a replay apply two of them.
+   *
+   * Raised only for the run's *own* verdict. Agents inside a workflow fail
+   * routinely and by design — `parallel()` resolves a thrown agent to `null`
+   * rather than rejecting — so a failed agent is counted (see
+   * `summarizeWorkflow`) and never announced as the run failing (#140).
+   */
+  | {
+      t: 'workflow_failed';
+      seq: number;
+      ts: number;
+      /** The tool call that launched the run. */
+      parentToolId: string;
+      /** The run's own name, when it has one. */
+      name?: string;
+      /** Why it ended, in the runtime's own words. */
+      reason?: string;
     }
   | { t: 'plan'; seq: number; ts: number; items: PlanItem[] }
   | { t: 'usage'; seq: number; ts: number; usage: ChatUsage }
@@ -541,9 +924,56 @@ export type ChatEvent =
       stopReason?: string;
       usage?: ChatUsage;
       durationMs?: number;
+      /**
+       * How many round trips to the model the turn took, where the runtime
+       * counts them itself — Claude's `num_turns`.
+       *
+       * Only ever the runtime's own figure. Counting the messages that came out
+       * instead is what made this number mean a different thing per agent, so
+       * there is nowhere here for a derived one to go: a runtime that does not
+       * report it leaves this unset, and every surface downstream says "not
+       * reported" rather than showing a count it inferred (#86).
+       */
+      modelTurns?: number;
+      /**
+       * Which models actually ran this turn, when the runtime said.
+       *
+       * Late by nature: a runtime that breaks its spend down per model does it
+       * at the end, once it knows. So this is a correction as much as a
+       * report — it is what lets a conversation that opened with no model at
+       * all end the turn naming the one that answered.
+       */
+      models?: TurnModelUsage[];
+      /**
+       * The runtime letting go of work that was cut short, not a turn ending.
+       *
+       * Sending a message ahead of the queue interrupts the agent, and every
+       * runtime here answers an interrupt by ending its own run — but the turn
+       * is not over: the message was delivered *into* it and the agent carries
+       * straight on with it. Left unmarked, that acknowledgement closed the
+       * turn a moment before the redirected work began, so the answer to the
+       * correction arrived in a turn of its own with nobody's question in it.
+       *
+       * What it still carries is what the cut-short half spent, which is real
+       * money and stays on the turn's bill. Only the ending is suppressed.
+       */
+      stale?: true;
     }
   /** The runtime revised what it can do — new slash commands, a model switch. */
   | { t: 'capabilities'; seq: number; ts: number; capabilities: Partial<ChatCapabilities> }
+  /**
+   * The runtime said which reasoning-effort level it is now running.
+   *
+   * Emitted only where the runtime itself reported the level — at a handshake
+   * that names it, or after a change the runtime acknowledged. Nothing emits
+   * this on the strength of having *asked*: the whole point of a separate event
+   * is that the chip shows what the agent said it is doing, not what this app
+   * requested and hopes it got. A request that was accepted but not confirmed
+   * travels the same road a model switch does, as `applied: 'sent'`.
+   *
+   * `null` means the runtime is back on its own default.
+   */
+  | { t: 'effort'; seq: number; ts: number; effort: string | null }
   /**
    * Something happened to the conversation itself.
    *
@@ -552,12 +982,23 @@ export type ChatEvent =
    * agent can no longer see it. `cleared` empties the transcript, because that
    * is what the user asked for — `/clear` means "start again", and a window
    * still full of the previous conversation would be the opposite of that.
+   * `interrupted` records a turn cut short so the message waiting behind it
+   * could be answered first: without it the transcript reads as an agent that
+   * stopped for no reason, and the message that follows looks unrelated to the
+   * work that stopped. `detail` carries what that message was.
+   *
+   * `branched` closes the history a new conversation was started from. What is
+   * above it was said somewhere else and copied here to be read; what is below
+   * it is this conversation's own. The agent is handed the same history as its
+   * opening context, and the line is where a reader is told so — a branch that
+   * looked like an ordinary transcript would be claiming the agent lived
+   * through it (#34).
    */
   | {
       t: 'marker';
       seq: number;
       ts: number;
-      kind: 'compacted' | 'cleared';
+      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched';
       detail?: string;
     };
 
@@ -592,6 +1033,17 @@ export interface QueuedTurn {
   text: string;
   attachments?: ChatAttachment[];
   ts: number;
+  /**
+   * Why the last attempt to hand this turn over failed.
+   *
+   * A turn that could not be delivered stays in line with this set rather than
+   * being dropped: the whole point of queueing is to walk away and trust it,
+   * and a queue that discards work silently is worse than no queue (#89). The
+   * text is still here, so it is recoverable without retyping.
+   */
+  error?: string;
+  /** How many times delivery has been attempted. Absent means not yet tried. */
+  attempts?: number;
 }
 
 /**
@@ -646,6 +1098,19 @@ export interface ChatSnapshot {
    * reporting a fully-replayed session, and default to offering no paging.
    */
   replayFrom?: number;
+  /**
+   * The turn still open where the replay ended, or null when none is.
+   *
+   * A snapshot is a window, and a browser that joins mid-turn has to know which
+   * turn the next event belongs to. Without it the first message to arrive
+   * after the join opens a turn of its own under the runtime's id — a row in
+   * the index with no prompt to name it by, spinning next to the turn it is
+   * actually part of.
+   *
+   * Optional so a snapshot from a server that predates it reads as "nothing
+   * open", which is the behaviour this replaces rather than a wrong claim.
+   */
+  currentTurnId?: string | null;
   /** Highest seq written. */
   cursor: number;
   /** True when the runtime process is alive. */
@@ -659,6 +1124,21 @@ export interface ChatSnapshot {
    * without it a restart is a stranger reading someone else's transcript.
    */
   nativeSessionId?: string;
+  /**
+   * The reasoning-effort level the runtime last reported, when it reported one.
+   *
+   * Replayed like everything else here, and needed for the same reason the
+   * transcript keeps it at all: an `effort` event is the runtime describing
+   * itself, and a browser rejoining a live conversation has no other way to
+   * learn what it is thinking at. Without it, a reload of a codex session that
+   * opened at `xhigh` — and is still running at `xhigh` — showed the control
+   * blank, because the conversation had never *chosen* a level and so the record
+   * had nothing to send either.
+   *
+   * Optional so a snapshot written before this existed reads as "nobody said",
+   * which is exactly what it is.
+   */
+  effort?: string;
   bypassPermissions: boolean;
 }
 
@@ -888,6 +1368,12 @@ export function mergeUsage(base: ChatUsage | undefined, next: ChatUsage | undefi
     if (x === undefined && y === undefined) return undefined;
     return (x || 0) + (y || 0);
   };
+  // The one report that takes a figure away instead of contributing one: the
+  // conversation moved to a model nobody can size, and the ceiling that is up
+  // belongs to the model it left. Said out loud precisely because `??` below
+  // would otherwise keep the old number — an omitted field means "no news"
+  // everywhere else here, and has to go on meaning that.
+  const retracted = b.contextWindowSource === 'unknown';
   return {
     inputTokens: add(a.inputTokens, b.inputTokens),
     outputTokens: add(a.outputTokens, b.outputTokens),
@@ -897,7 +1383,14 @@ export function mergeUsage(base: ChatUsage | undefined, next: ChatUsage | undefi
     totalTokens: add(a.totalTokens, b.totalTokens),
     costUsd: add(a.costUsd, b.costUsd),
     // Not additive: these describe the window, not consumption within it.
-    contextWindow: b.contextWindow ?? a.contextWindow,
+    contextWindow: retracted ? undefined : (b.contextWindow ?? a.contextWindow),
     contextUsed: b.contextUsed ?? a.contextUsed,
+    // Travels with the window it describes rather than being picked
+    // independently, or a later turn that only refreshed the occupancy would
+    // leave an older window labelled with the newer one's provenance.
+    contextWindowSource:
+      retracted || b.contextWindow !== undefined ? b.contextWindowSource : a.contextWindowSource,
+    contextWindowModel:
+      retracted || b.contextWindow !== undefined ? b.contextWindowModel : a.contextWindowModel,
   };
 }

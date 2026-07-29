@@ -25,6 +25,9 @@ before(function () {
     `export { MessageBubble, messageText } from ${JSON.stringify(path.join(CHAT_DIR, 'MessageBubble'))};`,
     `export { ChatTranscript } from ${JSON.stringify(path.join(ROOT, 'src/client/chat/transcript'))};`,
     `export { groupTurns } from ${JSON.stringify(path.join(ROOT, 'src/client/chat/turns'))};`,
+    // The vendored glyph markup, so a test can ask which icon actually rendered
+    // rather than trusting a name it never sees in the output.
+    `export { RELAY_ICONS } from ${JSON.stringify(path.join(ROOT, 'src/client/ui/relay/Icon'))};`,
   ].join('\n');
 
   bundle = path.join(os.tmpdir(), `chat-messages-${process.pid}.js`);
@@ -118,6 +121,59 @@ function renderBubble(msg, props) {
   );
 }
 
+/** Everything a rendered tree says out loud, with the markup taken out. */
+function stripTags(html) {
+  return (html || '').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * The numbers some markup draws, in order.
+ *
+ * Split rather than joined: the glyphs are inline SVG, and the newlines inside
+ * that vendored markup survive having the tags taken off it.
+ */
+function countsIn(html) {
+  return stripTags(html).split(' ').filter(Boolean);
+}
+
+/**
+ * The work counter's own markup, or null when the reply has no hidden work.
+ *
+ * Sliced out rather than matched over the whole bubble, because the questions
+ * asked of it — which glyphs, which numbers, and nothing else — are only
+ * answerable about the control and not about the row it sits in.
+ */
+function workControl(html) {
+  const at = html.indexOf('aria-label="Show work');
+  if (at < 0) return null;
+  const open = html.lastIndexOf('<button', at);
+  const close = html.indexOf('</button>', at);
+  if (open < 0 || close < 0) return null;
+  return html.slice(open, close + '</button>'.length);
+}
+
+/** What the counter says to a screen reader. */
+function workLabel(html) {
+  const found = /aria-label="(Show work[^"]*)"/.exec(html);
+  return found ? found[1] : '';
+}
+
+/**
+ * The icons in some markup, named, in the order they appear.
+ *
+ * By their vendored SVG rather than by a name attribute, because the rendered
+ * glyph carries no name — and a test that read one back off a `data-` attribute
+ * added for it would pass just as happily on the wrong drawing.
+ */
+function iconsIn(html) {
+  const { RELAY_ICONS } = mod;
+  return Object.keys(RELAY_ICONS)
+    .map((name) => ({ name, at: (html || '').indexOf(RELAY_ICONS[name]) }))
+    .filter((each) => each.at >= 0)
+    .sort((a, b) => a.at - b.at)
+    .map((each) => each.name);
+}
+
 const EVERY_BLOCK = [
   { kind: 'text', text: '# Heading\n\nSome **bold** prose and `code`.' },
   { kind: 'thinking', text: 'first thought\nsecond thought\nthird thought' },
@@ -169,12 +225,72 @@ describe('MessageBubble', function () {
     assert.ok(!/aria-label="Reading hello.txt"/.test(html), 'no inline tool card');
   });
 
-  it('replaces them with a pill that says how much work there was', function () {
+  it('replaces them with a counter that says how much work there was', function () {
     const html = renderBubble(message({ blocks: EVERY_BLOCK }), { onShowWork: () => {} });
 
-    assert.ok(/1 command/.test(html), 'the pill must count the tool calls');
-    assert.ok(/1 reasoning/.test(html), 'the pill must count the reasoning blocks');
-    assert.ok(/show work/.test(html), 'and offer the way to look at them');
+    const label = workLabel(html);
+    assert.ok(label, 'the counter must be offered');
+    assert.ok(/1 command\b/.test(label), 'it must count the tool calls');
+    assert.ok(/1 reasoning step\b/.test(label), 'it must count the reasoning blocks');
+  });
+
+  // Issue #118. The pointer used to be a full-width button under the prose
+  // spelling all of this out in words — a line of the conversation given over
+  // to a banner on nearly every assistant turn.
+  it('draws it as glyphs and numbers rather than a wide sentence', function () {
+    const html = renderBubble(
+      message({ blocks: [EVERY_BLOCK[0], EVERY_BLOCK[1], EVERY_BLOCK[2], EVERY_BLOCK[2]] }),
+      { onShowWork: () => {} },
+    );
+
+    // Nothing on screen reads "show work" any more — not the prose, and not a
+    // banner under it. The words moved into the label the icons need.
+    assert.ok(!/show work/i.test(stripTags(html)), 'no wide summary button under the message');
+
+    const control = workControl(html);
+    assert.ok(control, 'the counter must be in the markup');
+    assert.deepStrictEqual(
+      countsIn(control),
+      ['2', '1'],
+      'two commands and one reasoning step, drawn as numbers and no prose',
+    );
+    assert.deepStrictEqual(iconsIn(control), ['terminal', 'brain'], 'a terminal then a brain');
+  });
+
+  it('leaves out a count of zero rather than drawing it', function () {
+    const thoughtOnly = renderBubble(
+      message({ blocks: [{ kind: 'text', text: 'done' }, EVERY_BLOCK[1]] }),
+      { onShowWork: () => {} },
+    );
+    assert.deepStrictEqual(iconsIn(workControl(thoughtOnly)), ['brain'], 'no terminal glyph');
+    assert.deepStrictEqual(countsIn(workControl(thoughtOnly)), ['1'], 'and no zero beside it');
+    assert.ok(!/command/.test(workLabel(thoughtOnly)), 'nor in the description');
+
+    const ranOnly = renderBubble(
+      message({ blocks: [{ kind: 'text', text: 'done' }, EVERY_BLOCK[2]] }),
+      { onShowWork: () => {} },
+    );
+    assert.deepStrictEqual(iconsIn(workControl(ranOnly)), ['terminal'], 'no brain glyph');
+    assert.deepStrictEqual(countsIn(workControl(ranOnly)), ['1'], 'and no zero beside it');
+    assert.ok(!/reasoning/.test(workLabel(ranOnly)), 'nor in the description');
+  });
+
+  // The icons say nothing to a screen reader, so the words the wide button
+  // carried have to survive in the label — the elapsed time with them.
+  it('spells the counts out in its accessible description', function () {
+    const html = renderBubble(message({ blocks: EVERY_BLOCK }), { onShowWork: () => {} });
+    assert.strictEqual(workLabel(html), 'Show work: 1 command, 1 reasoning step, 42ms');
+  });
+
+  it('sits in the action row, right of retry and left of branch', function () {
+    const html = renderBubble(message({ blocks: EVERY_BLOCK }), {
+      onShowWork: () => {},
+      onRetry: () => {},
+      onFork: () => {},
+    });
+    const order = (html.match(/aria-label="(Retry this turn|Show work[^"]*|Branch from here)"/g) || [])
+      .map((each) => each.split('"')[1].split(':')[0]);
+    assert.deepStrictEqual(order, ['Retry this turn', 'Show work', 'Branch from here']);
   });
 
   it('does not count what the display settings switched off', function () {
@@ -182,8 +298,21 @@ describe('MessageBubble', function () {
       onShowWork: () => {},
       showThinking: false,
     });
-    assert.ok(/1 command/.test(html));
+    assert.ok(/1 command\b/.test(workLabel(html)));
     assert.ok(!/reasoning/.test(html), 'hidden reasoning must not be counted either');
+    assert.deepStrictEqual(iconsIn(workControl(html)), ['terminal'], 'nor drawn');
+  });
+
+  it('drops the control entirely when the settings leave nothing to count', function () {
+    // The prose still has something to say, so the row survives — but there is
+    // no longer any hidden work for a pointer to point at.
+    const html = renderBubble(message({ blocks: EVERY_BLOCK }), {
+      onShowWork: () => {},
+      showThinking: false,
+      showToolCalls: false,
+    });
+    assert.ok(/Heading/.test(html), 'the reply itself is still drawn');
+    assert.strictEqual(workControl(html), null, 'no counter left');
   });
 
   it('renders nothing for a message the settings emptied, rather than a blank row', function () {
@@ -230,8 +359,8 @@ describe('MessageBubble', function () {
         carriedIds: silent.id,
       }),
     );
-    assert.ok(/3 commands/.test(html), 'the pill speaks for the whole stretch');
-    assert.ok(/show work/.test(html));
+    assert.ok(/3 commands/.test(workLabel(html)), 'the counter speaks for the whole stretch');
+    assert.deepStrictEqual(countsIn(workControl(html)), ['3']);
   });
 
   it('tells the retry handler which message it belongs to', function () {
@@ -251,11 +380,11 @@ describe('MessageBubble', function () {
     assert.strictEqual(got, null);
   });
 
-  it('shows no pill at all for a turn that only spoke', function () {
+  it('shows no counter at all for a turn that only spoke', function () {
     const html = renderBubble(message({ blocks: [{ kind: 'text', text: 'just prose' }] }), {
       onShowWork: () => {},
     });
-    assert.ok(!/show work/.test(html));
+    assert.strictEqual(workControl(html), null);
   });
 
   it('echoes the user\'s own text literally rather than through markdown', function () {
@@ -469,7 +598,10 @@ describe('MessageList', function () {
     const rows = html.match(/aria-label="Assistant message"/g) || [];
     assert.strictEqual(rows.length, 1, 'the silent step must not be a row of its own');
     assert.ok(/all green/.test(html), 'the reply is still there');
-    assert.ok(/3 commands/.test(html), 'and its pill counts the stretch that led to it');
+    assert.ok(
+      /3 commands/.test(workLabel(html)),
+      'and its counter counts the stretch that led to it',
+    );
   });
 
   it('drops silent steps a turn never followed with a reply', function () {
@@ -598,3 +730,56 @@ describe('MessageList', function () {
 function iconPaths(html) {
   return (html.match(/ d="[^"]+"/g) || []).join('|');
 }
+
+describe('a browser that joins in the middle of a turn', function () {
+  it('places what arrives next in the turn that was already open', function () {
+    const t = new mod.ChatTranscript();
+    // The snapshot a long conversation gives back: the tail of a turn whose
+    // question is outside the window, and the id of the turn it is part of.
+    t.hydrate({
+      sessionId: 's1',
+      runtime: 'claude',
+      messages: [message({ id: 'a1', turnId: 'turn-app', role: 'assistant' })],
+      state: 'thinking',
+      capabilities: t.capabilities,
+      pendingPermissions: [],
+      firstSeq: 40,
+      replayFrom: 40,
+      cursor: 60,
+      currentTurnId: 'turn-app',
+      live: true,
+      bypassPermissions: false,
+    });
+
+    // The runtime says the next message under a name of its own, as they all do.
+    t.apply({ t: 'msg_start', seq: 61, ts: 1, id: 'a2', role: 'assistant', turnId: 'claude-run-1' });
+
+    const turns = mod.groupTurns(t.messages, t.state.state);
+    assert.strictEqual(turns.length, 1, 'the answer must not open a turn of its own');
+    assert.strictEqual(turns[0].turnId, 'turn-app');
+  });
+
+  it('starts a fresh turn when the server said nothing was open', function () {
+    const t = new mod.ChatTranscript();
+    t.hydrate({
+      sessionId: 's1',
+      runtime: 'claude',
+      messages: [message({ id: 'a1', turnId: 'turn-app', role: 'assistant' })],
+      state: 'idle',
+      capabilities: t.capabilities,
+      pendingPermissions: [],
+      firstSeq: 40,
+      replayFrom: 40,
+      cursor: 60,
+      currentTurnId: null,
+      live: true,
+      bypassPermissions: false,
+    });
+
+    t.apply({ t: 'msg_start', seq: 61, ts: 1, id: 'u1', role: 'user', turnId: 'turn-next' });
+
+    const turns = mod.groupTurns(t.messages, t.state.state);
+    assert.strictEqual(turns.length, 2);
+    assert.strictEqual(turns[1].turnId, 'turn-next');
+  });
+});

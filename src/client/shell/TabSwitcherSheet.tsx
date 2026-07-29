@@ -3,7 +3,7 @@ import * as React from 'react';
 import { Button } from '../ui/relay/Button';
 import { Dialog } from '../ui/relay/Dialog';
 import { Icon } from '../ui/relay/Icon';
-import { TOUCH_TARGET } from '../ui/touch';
+import { PHONE_TEXT, TOUCH_TARGET, usePhone } from '../ui/touch';
 import { IconButton } from '../ui/relay/IconButton';
 import type { ShellTab } from './store';
 
@@ -19,13 +19,31 @@ export interface TabSwitcherSheetProps {
   onClose(): void;
 }
 
-function statusColor(status: ShellTab['status']): string {
-  switch (status) {
-    case 'running': return 'var(--ansi-green)';
-    case 'error': return 'var(--destructive)';
-    default: return 'var(--muted-foreground)';
-  }
+/**
+ * The row's leading dot.
+ *
+ * Waiting comes before running for the same reason it does in the tab strip:
+ * `status` is the server's "the process is alive", which stays true of an agent
+ * that stopped to ask something an hour ago. A green dot beside the words
+ * "Waiting for approval" is the row disagreeing with itself.
+ */
+function statusColor(tab: ShellTab): string {
+  if (tab.status === 'error') return 'var(--destructive)';
+  if (tab.attention) return ATTENTION[tab.attention].color;
+  return tab.status === 'running' ? 'var(--ansi-green)' : 'var(--muted-foreground)';
 }
+
+/**
+ * What a stopped conversation says here.
+ *
+ * The sheet is the whole of the cross-session view on a phone — there is no tab
+ * strip — so this is where "which of these is waiting for me" has to be
+ * answerable, and it is written out rather than left to a colour.
+ */
+const ATTENTION: Record<'approval' | 'question', { label: string; color: string }> = {
+  approval: { label: 'Waiting for approval', color: 'var(--warning)' },
+  question: { label: 'Asked you a question', color: 'var(--info)' },
+};
 
 /** Last path segment; `/` keeps a label when the session sits at the root. */
 function folderLabel(workingDir: string): string {
@@ -43,6 +61,13 @@ function TabRow({
   onSelect(): void;
   onCloseTab(): void;
 }): React.JSX.Element {
+  // Whether a conversation is waiting is live session information, and the
+  // phone rule for that is explicit: never below the body size. At the caption
+  // size the rest of this row uses it would be the smallest thing on the
+  // screen, on the one surface where it is the only thing that answers the
+  // question.
+  const isPhone = usePhone();
+
   return (
     <div
       style={{
@@ -64,7 +89,7 @@ function TabRow({
           height: 7,
           flex: '0 0 auto',
           borderRadius: 'var(--radius-full)',
-          background: statusColor(tab.status),
+          background: statusColor(tab),
         }}
       />
       {/* The row is the switch target, not just the text: on a phone the whole
@@ -105,7 +130,33 @@ function TabRow({
           <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {tab.title}
           </span>
-          {tab.unread ? (
+          {tab.attention ? (
+            // In place of the unread dot rather than beside it: a conversation
+            // that has stopped for an approval has unread output by
+            // construction, and two dots would be one fact drawn twice.
+            <span
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                flex: '0 0 auto',
+                fontSize: isPhone ? PHONE_TEXT.label : 'var(--text-sm)',
+                color: ATTENTION[tab.attention].color,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              <span
+                aria-hidden="true"
+                style={{
+                  width: 6,
+                  height: 6,
+                  borderRadius: 'var(--radius-full)',
+                  background: ATTENTION[tab.attention].color,
+                }}
+              />
+              {ATTENTION[tab.attention].label}
+            </span>
+          ) : tab.unread ? (
             <span
               role="img"
               aria-label="Unread output"
