@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { ChatSnapshot, UserTurn } from '../../shared/chat-events.js';
 import { SessionRecord } from '../types.js';
@@ -144,14 +145,35 @@ export class ChatSessionManager {
    * `path.resolve` collapses `..` before the comparison, and the separator on
    * the prefix check stops `/home/u/project-secrets` passing as a child of
    * `/home/u/project`.
+   *
+   * The OS temp directory is the one other allowed root. An agent's write
+   * tool and its own shell share the real filesystem, so a handoff like
+   * `gh issue create --body-file /tmp/notes.md` only works when the file the
+   * agent was told to write lands where its shell will look for it — and
+   * scratch space is what a temp dir is for.
    */
   private confine(workingDir: string, filePath: string): string {
     const root = path.resolve(workingDir);
     const resolved = path.resolve(root, filePath);
-    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
-      throw new Error(`refusing to touch ${filePath}: outside the session directory`);
+    if (resolved === root || resolved.startsWith(root + path.sep)) return resolved;
+    if (this.insideTempDir(resolved)) return resolved;
+    throw new Error(`refusing to touch ${filePath}: outside the session directory`);
+  }
+
+  private insideTempDir(resolved: string): boolean {
+    const tmp = os.tmpdir();
+    const roots = new Set<string>([path.resolve(tmp)]);
+    try {
+      // macOS reports the temp dir through a symlink; an agent that hands us
+      // the real path is still asking for scratch space, not escaping.
+      roots.add(fs.realpathSync(tmp));
+    } catch {
+      // No temp dir at all is odd but not fatal: the check simply fails.
     }
-    return resolved;
+    for (const root of roots) {
+      if (resolved === root || resolved.startsWith(root + path.sep)) return true;
+    }
+    return false;
   }
 
   async snapshot(record: SessionRecord): Promise<ChatSnapshot> {
