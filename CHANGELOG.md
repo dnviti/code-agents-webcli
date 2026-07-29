@@ -262,6 +262,46 @@
   clearing one left the previous answer frozen on screen.
 
 ### Added
+- **A workflow shows the whole shape of the run** (#117). A workflow is a
+  structure — named phases in order, and several agents working at once inside
+  each — and none of that reached the screen. Opening one showed a single line
+  of text: the one thing the run last narrated about itself. That line is
+  genuinely useful and it is still there, but it can only ever describe one
+  agent, so watching a run with eight in flight meant watching seven of them be
+  invisible. This is the half of #45 that was left unwired for want of a
+  recorded run.
+
+  The run has been reporting all of it the whole time. `task_progress` carries a
+  complete snapshot of every phase and every agent — label, phase, state, model,
+  last tool, tokens, tool calls, duration, and a preview of what it returned —
+  and the app was keeping the one-line summary out of all of it. It is forwarded
+  now, and the popup lists the phases in order with their own state, the agents
+  inside each with theirs and what each one is doing, and counts across the top:
+  how many are running, queued, done and failed, out of how many, and which
+  phase the run is in. A failed agent is red on its own row with the failure
+  spelled out, without anything being opened. Opening one gives the rest — what
+  it was asked, what it cost, what it came back with. Everything moves as the
+  run moves, with no reopening. The Agents list says how many agents a workflow
+  holds and how many are still going, so a workflow no longer reads as the same
+  kind of row as a single subagent.
+
+  Two things a hand-written example would have got wrong, and a real recording
+  did not: the structure is **absent** from four of every ten progress reports
+  rather than empty, so a report that carries none now leaves the panel standing
+  instead of blanking it; and a run started from an inline script names itself
+  nowhere in its own tool call, which is why every workflow popup used to be
+  titled "Workflow". Both come from
+  `test/fixtures/chat/claude-workflow.jsonl` — a real two-phase, five-agent run
+  captured off the wire, one agent of which fails — which is what every test and
+  browser check here is driven by, rather than by a shape that would only have
+  agreed with the code under it.
+
+  Phase state is derived from the agents rather than read from the tool call, on
+  purpose: the Workflow tool returns the moment a run is launched (#116, still
+  open), so a workflow whose agents are working sits under a completed call.
+  Reading the agents means this view is right either way. A runtime that reports
+  no structure at all still gets the single-line view it has always had.
+
 - **A conversation tells you when it has finished, or when it is waiting for
   you** (#93). Terminal sessions have been notifying for some time, and what
   they do there is guesswork: nothing has been printed for ninety seconds, or a

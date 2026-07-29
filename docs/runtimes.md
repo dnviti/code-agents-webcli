@@ -108,6 +108,35 @@ the app uses. It brings permission prompts, a model list and per-turn cost with
 it, and sessions recorded under the old mode still open — Grok kept the record
 all along; only its headless output was silent about it.
 
+### Watching a workflow
+
+The **Agents** panel lists everything a conversation has delegated: subagents,
+and workflows. A workflow row says how many agents the run holds and how many
+are still going, because a workflow is not one worker but a structure — named
+phases in order, with several agents running inside each.
+
+Opening one shows that structure. The phases in the order the run declared them,
+each marked *not started*, *running* or *finished*; under each, the agents it
+started, each with its own state and what it is doing right now — the tool it
+last reached for while it works, what it returned once it is done, and the
+failure if it broke. Across the top: how many agents are running, queued, done
+and failed, out of how many, and which phase the run is currently in. It all
+moves while the run moves; nothing needs reopening, and the whole structure
+stays readable afterwards, above the final output.
+
+A failed agent is red on its own row with its error spelled out — you do not
+have to open one to find out something went wrong. Opening an agent adds what it
+was asked to do, its model, what it spent in tools, tokens and time, and what it
+came back with. Phases are open by default and fold shut one click at a time,
+for a run large enough to want that.
+
+**Only Claude Code reports workflows**, and only Claude Code has the concept.
+The phase and agent states here are derived from what the agents themselves
+report rather than from the tool call that launched the run — that call returns
+as soon as the run is launched, long before it finishes. A runtime that reports
+no structure gets the single activity line and the run's output, as before;
+nothing is stubbed for a runtime that has no workflows to report.
+
 ### What the trace shows of the agent's thinking
 
 A reasoning entry sits on the trace rail beside the tool calls, and expanding it

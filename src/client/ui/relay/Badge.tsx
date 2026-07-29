@@ -36,7 +36,11 @@ export function Badge({ variant = 'neutral', dot = false, children, style, ...re
   // Fall back to `neutral` so an out-of-range variant still renders a valid badge.
   const v = V[variant] || V.neutral;
   return (
-    <span {...rest} style={{
+    // `data-badge` names the component in the DOM, so a check sweeping a
+    // surface for type sizes can say "everything except the badges" without
+    // having to recognise them by their words. The badge scale is an app-wide
+    // decision, taken here rather than by whichever view happens to be measured.
+    <span {...rest} data-badge="" style={{
       display: 'inline-flex', alignItems: 'center', gap: 5, height: 18, padding: '0 7px',
       fontFamily: 'var(--font-mono)', fontSize: 'var(--text-2xs)', fontWeight: 'var(--font-medium)',
       letterSpacing: '0.02em', borderRadius: 'var(--radius)', lineHeight: 1, ...v, ...style,

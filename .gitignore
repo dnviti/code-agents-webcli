@@ -17,6 +17,7 @@ dist/
 .claude/
 test-*.js
 test/browser/bundle.js
+test/browser/workflow-events.json
 .work/
 .work/
 
