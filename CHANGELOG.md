@@ -3,6 +3,48 @@
 ## [Unreleased]
 
 ### Fixed
+- **A row appears in the conversation only when it has something to say** (#132).
+  #46 set the rule: a step that produced only tool activity and no written reply
+  gets no row of its own, its work is counted on the next reply that does speak,
+  and the detail stays on the trace. What it decided from was the *kind* of a
+  step's blocks — a reply block meant "this one spoke" — never from whether
+  anything would actually appear on the screen.
+
+  Oh My Pi sends a reply that is a single space beside the tool activity on
+  almost every step. Each of those counted as having spoken and got the row #46
+  exists to remove: a bordered strip holding a model name, a clock and a work
+  counter, with no sentence anywhere in it. In the recorded conversation this
+  was reported from, 22 of 29 rows. The other agents on that protocol send the
+  same blank replies and escaped only because they group a whole turn into one
+  step, so the blank lands in the same row as the real answer — lucky, not safe.
+  Claude had its own trigger: a command whose arguments merely mention the name
+  of the question tool was taken for a question the agent had asked, and a
+  question card with no question in it paints nothing.
+
+  Both are gone, and the fix is in two halves on purpose. A blank reply is no
+  longer *recorded* as content — by the ACP adapters, by Claude's snapshots, by
+  codex — so it never reaches a transcript in the first place. And the rule that
+  decides whether to draw a row now asks the only question that matters: would
+  this paint? A reply that is empty or only spaces, a plan with nothing in it, a
+  step mistaken for a question — none of them earns a row, whichever agent
+  produced it.
+
+  The work counter and the trace of every folded step land on the next reply
+  that does speak, in the order they happened, exactly as #46 requires. And a
+  command that mentions the question tool is now counted as the command it is,
+  which it was not before — it was being skipped as a question already on
+  screen.
+
+  Two things deliberately left alone. A stream that opens an empty block before
+  its first token still opens it: pi and Claude address their deltas by index,
+  so the block has to exist before they arrive, and the display rule is the
+  backstop for whatever ends up in it. And conversations already on disk are not
+  rewritten — they simply stop drawing the empty rows when they are reopened.
+
+  Checked against real recordings rather than constructed ones: the Oh My Pi
+  session the issue was reported from, and a Claude one containing the grep that
+  was mistaken for a question.
+
 - **One prompt makes one turn again** (#129). Sending a single message from the
   composer put two identical user turns in the conversation, side by side. The
   browser was never involved: there is one submit path, one frame on the wire,

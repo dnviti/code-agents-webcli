@@ -1472,6 +1472,27 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     return message;
   }
 
+  /**
+   * Whether a chunk of this kind would land in a block that is already open.
+   *
+   * The same three conditions `openMessage` uses to decide it is continuing
+   * rather than starting, plus the block kind — asked here so a whitespace-only
+   * chunk can be told apart from one that would open something (#132).
+   */
+  private continuesOpenBlock(
+    kind: 'text' | 'thinking',
+    role: ChatRole,
+    nativeId: string | undefined,
+  ): boolean {
+    const current = this.current;
+    return Boolean(
+      current
+      && current.role === role
+      && (nativeId === undefined || current.nativeId === nativeId)
+      && current.open?.kind === kind,
+    );
+  }
+
   private appendChunk(
     kind: 'text' | 'thinking',
     role: ChatRole,
@@ -1479,6 +1500,18 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     text: string,
   ): void {
     if (!text) return;
+    // A blank reply is not a reply, and it must not be the thing that opens one
+    // (#132). Oh My Pi sends a single space alongside the tool activity on
+    // almost every step; recorded as content, it made each of those steps
+    // "a step that said something" and gave it the bordered row #46 exists to
+    // remove — a model name, a clock, a work counter, and nothing to read.
+    //
+    // Only refuses to *open*. A space arriving inside an already-open text
+    // block is the space between two words, and dropping those glues the
+    // sentence together: "Hello" + " " + "world" would be recorded as
+    // "Helloworld". `thinking` is exempt in full — an empty reasoning block is
+    // a real state that surface handles for itself (#120).
+    if (kind === 'text' && !text.trim() && !this.continuesOpenBlock(kind, role, nativeId)) return;
     const message = this.openMessage(nativeId, role);
     if (message.open && message.open.kind === kind) {
       this.emit({ t: 'block_delta', msgId: message.id, index: message.open.index, text });

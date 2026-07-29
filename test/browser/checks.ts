@@ -65,6 +65,15 @@ import RECORDED_WORKFLOW from './workflow-events.json';
 import RECORDED_FAILED_WORKFLOW from './workflow-failed-events.json';
 
 /**
+ * A real Oh My Pi conversation, at the level the browser receives it.
+ *
+ * Generated from test/fixtures/chat/omp-empty-rows.jsonl by test/browser/run.js.
+ * Five steps whose whole reply was a space, and the one that finally spoke —
+ * the recording the empty rows in #132 were reported from.
+ */
+import RECORDED_EMPTY_ROWS from './empty-rows-events.json';
+
+/**
  * One turn of a real Oh My Pi conversation, likewise.
  *
  * Generated from test/fixtures/chat/acp-omp.jsonl by test/browser/run.js,
@@ -285,6 +294,7 @@ async function run(): Promise<void> {
   await checkTheFixedBarsNeverWrap();
   await checkALiveAnswerAppearsAsItStreams();
   await checkSilentStepsLeaveNoRowButKeepTheirTrace();
+  await checkNoRowIsDrawnWithNothingToRead();
   await checkAQuestionIsAnsweredByClicking();
   await checkThePhoneLayoutIsUsable();
   await checkThePhoneShellSurfacesAreUsable();
@@ -2518,6 +2528,115 @@ async function checkALiveAnswerAppearsAsItStreams(): Promise<void> {
  * start* of the stretch it counts, not at its own first call. That is a real
  * event handler feeding real state into the rail, so it needs a real browser.
  */
+/**
+ * No row is drawn with nothing to read in it (#132).
+ *
+ * The check above proves the #46 rule on a conversation built for it. This one
+ * proves it on a real recorded one — the maintainer's own Oh My Pi session, the
+ * one in which the agent filed issue #129 — where the rule failed. Oh My Pi
+ * sends a reply that is a single space alongside the tool activity on almost
+ * every step, so almost every step counted as having spoken and got the row
+ * #46 exists to remove: a bordered strip with a model name, a clock and a work
+ * counter, and no sentence in it. 22 of that conversation's 29 rows.
+ *
+ * The last stretch is played in after the view is on screen, so the live path
+ * is covered as well as the replayed one — a fold that only happens on rehydrate
+ * would leave the strips appearing while the agent works and vanishing when the
+ * conversation is reopened.
+ */
+async function checkNoRowIsDrawnWithNothingToRead(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1280px;height:760px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const controller = new ChatController('empty-rows', { send: () => {} });
+  let seq = 1;
+  const play = (batch: unknown[]): void => {
+    for (const event of batch) {
+      controller.transcript.apply({ ts: seq, ...(event as Record<string, unknown>), seq: seq++ } as never);
+    }
+  };
+  // Everything but the last message, so the reply that finally speaks arrives
+  // live, into a conversation already on screen.
+  const lastStart = RECORDED_EMPTY_ROWS.map((event) => (event as { t?: string }).t)
+    .lastIndexOf('msg_start');
+  play(RECORDED_EMPTY_ROWS.slice(0, lastStart));
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'omp',
+      runtimeLabel: 'Oh My Pi',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(300);
+  settle(document);
+
+  /** Every row in the conversation, and what a reader would find in it. */
+  const rows = (): HTMLElement[] =>
+    Array.from(host.querySelectorAll<HTMLElement>('[aria-label="Assistant message"]')).filter(isPainted);
+  /**
+   * The readable part of a row: what the agent actually said.
+   *
+   * Everything else in the row is accounting — the model and token line in the
+   * `<footer>`, the clock, the work counter — so `textContent` says every row
+   * has something in it, which is precisely the complaint. Measured off the
+   * prose container with the footer taken out, since the footer lives inside it.
+   */
+  const readable = (row: HTMLElement): string =>
+    Array.from(row.querySelectorAll<HTMLElement>('.chat-prose'))
+      .map((node) => {
+        const copy = node.cloneNode(true) as HTMLElement;
+        copy.querySelectorAll('footer').forEach((each) => each.remove());
+        return (copy.textContent || '').trim();
+      })
+      .join(' ')
+      .trim();
+
+  const blankWhileRunning = rows().filter((row) => !readable(row));
+  check(
+    'while the agent works, no row is drawn with nothing to read in it',
+    blankWhileRunning.length === 0,
+    `${rows().length} rows, ${blankWhileRunning.length} of them blank`,
+  );
+
+  play(RECORDED_EMPTY_ROWS.slice(lastStart));
+  await wait(300);
+  settle(document);
+
+  const blank = rows().filter((row) => !readable(row));
+  check(
+    'and none once the reply that finally speaks has landed',
+    blank.length === 0,
+    `${rows().length} rows, ${blank.length} of them blank`,
+  );
+  check(
+    'the conversation is the one reply that said something',
+    rows().length === 1 && readable(rows()[0]).includes('Aperta la issue'),
+    rows().map((row) => readable(row).slice(0, 40) || '(nothing to read)').join(' | ') || 'no rows',
+  );
+
+  // And the folded stretch went to that reply, not to an empty strip.
+  const counter = rows()[0]?.querySelector<HTMLElement>('button[aria-label^="Show work"]');
+  check(
+    'and it carries the work of every step folded into it',
+    Boolean(counter) && /\d+ commands?/.test(counter?.getAttribute('aria-label') || ''),
+    counter?.getAttribute('aria-label') || 'no work counter on the reply',
+  );
+  check(
+    'while the trace still holds every one of them',
+    (host.textContent || '').includes('handleChatSend'),
+    'looked for a folded step’s own command on the rail',
+  );
+
+  root.unmount();
+  host.remove();
+}
+
 async function checkSilentStepsLeaveNoRowButKeepTheirTrace(): Promise<void> {
   const host = document.createElement('div');
   host.style.cssText = 'width:1280px;height:760px;position:absolute;top:0;left:0;display:flex';
