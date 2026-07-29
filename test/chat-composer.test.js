@@ -297,6 +297,102 @@ describe('Composer', function () {
       const html = render({ capabilities: caps({}) });
       assert.ok(!html.includes('role="status"'), 'no stray feedback region before anything has been picked');
     });
+
+    // Issue #135. A model reaches a conversation three ways — this chat's own
+    // pick, the account's standing choice, the active runtime profile — and
+    // until now the control said nothing about which. On a profile-pinned
+    // install that was the worst case: the pin was genuinely in force and the
+    // chip read the literal word "model". The menu is click-toggled state, so
+    // the browser check owns the open sheet; what a static pass reaches is the
+    // resting hover, which is also the only route to this on a desktop without
+    // covering the composer.
+    describe('where the model came from', function () {
+      it('names the account’s standing choice', function () {
+        const html = render({
+          model: 'claude-opus-4-6',
+          capabilities: caps({}),
+          modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+        });
+        assert.ok(
+          html.includes('Your standing choice for this runtime: claude-opus-4-6.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      it('names the profile that pinned it', function () {
+        const html = render({
+          model: 'profile-model',
+          capabilities: caps({}),
+          modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(
+          html.includes('From the &quot;House&quot; runtime profile: profile-model.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      it('says plainly when nobody has chosen', function () {
+        const html = render({
+          model: 'grok-build',
+          capabilities: caps({}),
+          modelDefault: { model: null, source: 'runtime' },
+        });
+        assert.ok(
+          html.includes('No default set — this runtime picks for itself.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      // Clearing does not fall back to a standing choice, it forgets one — and
+      // saying "falls back to your last choice" would describe the opposite of
+      // what the click does.
+      it('says a conversation-only pick is exactly that, and what clearing it costs', function () {
+        const html = render({
+          model: 'claude-haiku',
+          modelOverride: 'claude-haiku',
+          capabilities: caps({}),
+          modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+        });
+        assert.ok(html.includes('Chosen for this conversation only.'), 'the override is named as one');
+        assert.ok(
+          html.includes('forgets claude-opus-4-6 as your standing choice for this runtime'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      it('falls back to the profile when this conversation is the only thing overriding it', function () {
+        const html = render({
+          model: 'claude-haiku',
+          modelOverride: 'claude-haiku',
+          capabilities: caps({}),
+          modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(
+          html.includes('Clearing falls back to the &quot;House&quot; runtime profile: profile-model.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      // The word "model" used to sit on the chip for the whole of a
+      // conversation whose runtime never emits a session event, which is every
+      // conversation before its first turn.
+      it('names the default instead of the word “model” when nothing has reported one', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(html.includes('>profile-model<'), 'the default in force is what the chip names');
+      });
+
+      // Version skew: a server that predates this says nothing, and the control
+      // has to read exactly as it shipped rather than assert a source.
+      it('renders exactly as before against a server that says nothing', function () {
+        const before = render({ model: 'grok-build', capabilities: caps({}) });
+        const after = render({ model: 'grok-build', capabilities: caps({}), modelDefault: null });
+        assert.strictEqual(after, before);
+        assert.ok(before.includes('title="Model: grok-build"'), 'and the hover is the old one');
+      });
+    });
   });
 
   // The effort chip's popup is click-toggled state like the model chip's, so a

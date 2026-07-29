@@ -730,6 +730,27 @@ export interface ModelChoice {
 }
 
 /**
+ * Which model a *new* conversation on this runtime would open on, and why.
+ *
+ * A statement about the default, never about the process that happens to be
+ * running: a conversation with an override of its own is running that instead,
+ * and the picker pairs the two rather than replacing one with the other. Said
+ * out loud because a model picked out of a menu used to be invisible the moment
+ * it was in force — the chip fell back to the literal word "model", and nothing
+ * anywhere named the profile that had pinned it (issue #135).
+ *
+ * `model` is null only for `runtime`, which means nobody has chosen and the CLI
+ * will use whatever it considers normal. Nothing here is validated against a
+ * catalogue: a model name is free text because only the runtime knows its own.
+ */
+export interface ChatModelDefault {
+  model: string | null;
+  source: 'personal' | 'profile' | 'runtime';
+  /** Only ever set for `profile`, and only so the picker can name it. */
+  profileName?: string;
+}
+
+/**
  * One reasoning-effort level, as the runtime that offers it named it.
  *
  * `value` is sent back to that runtime verbatim, so it is never a word this app

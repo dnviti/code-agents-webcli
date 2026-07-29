@@ -223,6 +223,59 @@ and its own list is what settles the question. And it is scoped to the session:
 where sessions run in per-user environments each one reads its own home, so the
 menu never becomes a window onto what someone else has installed.
 
+### Which model runs
+
+The chip beside the composer both names the model in force and changes it. It
+always accepts a typed name as well as offering whatever the runtime published,
+because a model name can only be judged by trying it.
+
+Three things can decide the model a conversation opens on, and they are consulted
+in this order:
+
+| Layer | Set from | Applies to |
+| --- | --- | --- |
+| **This conversation** | picking a model in the chip, or typing `/model <name>` | this conversation only, until it is cleared |
+| **Your standing choice** | the same pick — a model you choose is remembered for that agent | every **new** chat you open on that agent |
+| **The active runtime profile** | Settings → Runtime profiles, installer-only | every new chat on that agent, for everybody |
+
+Below all three, the CLI is launched with no model flag at all and uses its own
+default.
+
+**The picker says which of them is in force**, in a line above the list and on
+the chip's hover, so a model pinned by a profile is visible as a pin rather than
+appearing out of nowhere. Choosing **Use the default for this runtime** clears
+the conversation's own choice *and* forgets your standing one for that agent, so
+the next new chat falls back to the profile and then to the CLI's own default.
+That is the only way back, which is why it is the one thing in the menu that
+does more than set a name — an id typed with a typo would otherwise stay in
+force for every new chat on that runtime.
+
+**Your standing choice is per account and per agent**, stored on the server
+rather than in the browser, so it travels between your phone and your desk.
+Effort works the other way round — it is kept per browser — and the difference is
+not taste: Claude, Codex and pi fix the model when the process starts, so a
+preference held in the browser could only be applied *after* the launch, which
+on Claude means a visible `/model` turn pushed into a conversation you have not
+typed in yet. It is scoped to your account and never readable from another.
+
+**A conversation already under way is never re-modelled.** The standing choice
+seeds a conversation that has not yet run; a relaunch, a resume from the launcher
+and the recovery banner's restart all come back on the model that conversation
+was already using. Changing your standing choice, or the active profile, affects
+the next new chat and nothing that is open.
+
+Two deliberate omissions. A **terminal** session is unaffected: it runs the CLI's
+own interface, where the model is yours to change inside the tool and nothing
+here could keep a preference in step with it. And the **launcher screen** — the
+one before a chat has started — has no model control, so the source line is only
+readable once the conversation is open.
+
+A standing choice is only recorded from a name the runtime is known to take:
+either the switch applied live, or the name is on the list the runtime published.
+A runtime that publishes no list at all (Claude is one) has nothing to check
+against, so a name typed there is taken at face value — the same rule the effort
+control applies to a runtime that publishes no ladder.
+
 ### How hard the agent thinks
 
 Every runtime the WebUI drives has a reasoning-effort knob, and no two spell it
@@ -266,7 +319,9 @@ so it survives a reload, a rejoin, and a `/clear` — which restarts the process
 in place and would otherwise put it back where it started. The level to open the
 *next* conversation at is kept in your browser, per runtime, so somebody who
 runs Claude at `max` and Kimi at `on` gets both back rather than one setting
-fighting over two ladders that have nothing in common.
+fighting over two ladders that have nothing in common. (The model above is
+remembered the same way but on the *server*, per account — see
+[Which model runs](#which-model-runs) for why the two differ.)
 
 Typing `/effort high` into the composer reaches the same place as the button:
 the runtime runs its own command, and the choice is recorded so a later `/clear`
@@ -469,7 +524,7 @@ A profile targets one runtime and carries four things, all optional:
 
 | Field | What it does |
 | --- | --- |
-| **Model** | Passed as `--model <value>` to the CLIs that have the flag (all but Cursor Agent and Qwen Code). A chat conversation on an ACP agent — Grok Build, Kimi Code, Oh My Pi — has no flag to pass it on, so the value is applied over the protocol the moment the session opens, and again after anything that restarts it: `/clear`, a server restart, the unavailable banner |
+| **Model** | Passed as `--model <value>` to the CLIs that have the flag (all but Cursor Agent and Qwen Code). A chat conversation on an ACP agent — Grok Build, Kimi Code, Oh My Pi — has no flag to pass it on, so the value is applied over the protocol the moment the session opens, and again after anything that restarts it: `/clear`, a server restart, the unavailable banner. This is a **default, not a pin**: a conversation's own choice has always outranked it, and since 5.3.3 a user's standing choice does too — see [Which model runs](#which-model-runs) |
 | **Extra arguments** | Appended after the app's own flags, so they win on CLIs where the last flag wins |
 | **Environment** | Injected into the spawned process |
 | **Capability tiers** | `floor` / `mid` / `high` / `top`, written into the runtime's own config |

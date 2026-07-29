@@ -101,6 +101,7 @@ describe('branching a conversation from one of its turns', function () {
   this.timeout(20000);
 
   let storageDir;
+  let activeProfile;
   let store;
   let sessions;
   let server;
@@ -109,6 +110,7 @@ describe('branching a conversation from one of its turns', function () {
 
   beforeEach(async function () {
     storageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-branch-'));
+    activeProfile = null;
     store = new ChatStore({ storageDir });
     sessions = new Map();
     saves = 0;
@@ -137,6 +139,9 @@ describe('branching a conversation from one of its turns', function () {
         getScreenSnapshot: () => [],
         disposeRecorder: () => {},
         getSelectedWorkingDir: () => null,
+        // Read by the branch alone, and only to pin the model — see the test
+        // for it below. A test that wants no profile clears this.
+        activeProfileFor: () => activeProfile,
         sessionStore: { getSessionMetadata: async () => ({}) },
         chatStore: store,
       }),
@@ -311,6 +316,11 @@ describe('branching a conversation from one of its turns', function () {
     assert.strictEqual(branched.lastAgent, 'claude');
     assert.strictEqual(branched.surface, 'chat');
     assert.strictEqual(branched.chatModelOverride, 'claude-opus-4-6');
+    assert.strictEqual(
+      branched.sessionStartTime,
+      null,
+      'nothing is running in it yet — which is why the pin above matters (#135)',
+    );
     assert.ok(/branch at turn 1/.test(branched.name), branched.name);
     assert.strictEqual(
       branched.chatBypassPermissions,
@@ -318,6 +328,28 @@ describe('branching a conversation from one of its turns', function () {
       'a standing permission belongs to the conversation that granted it',
     );
     assert.ok(saves > 0, 'and the new record is persisted');
+  });
+
+  // The window the history above was just measured against is the source's
+  // model, and a source running on the profile's model carries no override to
+  // copy. Left blank the branch is a conversation that has never chatted, so
+  // its launch would take the brancher's *standing* model (#135) — a different
+  // model from the one the estimate was computed for.
+  it('pins a branch of a profile-defaulted conversation to that profile’s model', async function () {
+    activeProfile = { profileName: 'House', model: 'profile-model' };
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+
+    const made = await branch('source', 'turn-1');
+
+    assert.strictEqual(sessions.get(made.body.sessionId).chatModelOverride, 'profile-model');
+  });
+
+  it('leaves a branch unpinned when there is no profile either, so the runtime still decides', async function () {
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+
+    const made = await branch('source', 'turn-1');
+
+    assert.strictEqual(sessions.get(made.body.sessionId).chatModelOverride, undefined);
   });
 
   it('closes a turn the source never finished, so the branch’s own first ask opens one', async function () {

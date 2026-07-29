@@ -13,6 +13,7 @@ import { HistoryStoreLike } from '../services/history-store.js';
 import { ScrollbackRecorder } from '../services/scrollback.js';
 import { sendToWebSocket, broadcastChat, broadcastToSession } from './handler.js';
 import { chatUnavailableReason, isChatRuntime } from '../../shared/chat-runtimes.js';
+import { ChatModelDefault } from '../../shared/chat-events.js';
 import { ChatNotRunningError } from '../chat/session.js';
 
 /**
@@ -84,6 +85,35 @@ export interface MessageProcessorDeps {
     extraArgs?: string[];
     env?: Record<string, string>;
   } | null;
+  /**
+   * The active profile for a runtime, read without writing anything.
+   *
+   * The read-only twin of `resolveRuntimeProfile`, which is not side-effect
+   * free: it writes the profile's tier files to disk so they exist before the
+   * process starts. Naming the profile on a *join* is a question, not a launch,
+   * and asking it through the other accessor would rewrite a runtime's config
+   * every time a browser opened a tab.
+   */
+  activeProfileFor?(runtime: string): { profileName: string; model?: string } | null;
+  /**
+   * This account's standing model choice for a runtime, and the write that
+   * records one. `null` from the setter forgets it.
+   *
+   * On the server rather than in the browser, which is where the effort
+   * preference lives, and the difference is not taste: claude, codex and pi fix
+   * the model when the process is spawned, so a browser-held default could only
+   * ever be sent *after* the launch — on claude that is a visible `/model` turn
+   * pushed into a conversation nobody has typed in yet, and on the other two a
+   * "will be used next time" that this conversation never reaches. The store
+   * namespaces its keys by user id, so isolation is a property of the key
+   * rather than of a filter someone has to remember to write.
+   *
+   * Optional, like `chatManager` above and for the same reason: without them
+   * the chain is exactly what it always was — the conversation's own override,
+   * then the profile, then the runtime's own default.
+   */
+  getUserModelDefault?(userId: number, runtime: string): string | null;
+  setUserModelDefault?(userId: number, runtime: string, model: string | null): void;
   transcriptStore: TranscriptStoreLike;
   historyStore: HistoryStoreLike;
   /**
@@ -579,8 +609,14 @@ export class MessageProcessor {
       console.log(`Applying runtime profile "${profile.profileName}" to ${agentKind}`);
     }
     // A model chosen for this conversation beats the profile default, but only
-    // for this one launch: it is never written back as a new profile or
-    // personal default.
+    // for this one launch: it is never written back as a new profile.
+    //
+    // No account default behind it, unlike the chat launch. A terminal runs the
+    // CLI's own interface, where the model is the user's to change in the tool
+    // itself and nothing here can see or record what they picked — so seeding
+    // one would be this app asserting a choice it has no way to keep in step
+    // with. Left deliberately out of #135; the chat surface is where the
+    // preference is both made and observable.
     if (session.chatModelOverride) {
       safeOptions.model = session.chatModelOverride;
     }
@@ -974,6 +1010,101 @@ export class MessageProcessor {
   // ----------------------------------------------------------------- chat mode
 
   /**
+   * Which model a *new* conversation on this runtime would open on, and why.
+   *
+   * Two layers, in this order: the account's own standing choice, then the
+   * active profile. The personal one wins because a per-conversation override
+   * has always outranked the profile (see the launch below), so a profile was
+   * never a pin an installer could stop a user escaping — and because the only
+   * ordering under which the picker's "Use the default for this runtime" entry
+   * does anything is one where the thing it clears is above the profile.
+   *
+   * Re-normalised on the way out. What comes back is a database row, and a
+   * hand-edited one must not become an argv on every future launch.
+   *
+   * `profile` is passed in rather than looked up: a launch has already resolved
+   * it (through the accessor that writes tier files, which it must), and a join
+   * resolves it through the read-only one. Same answer, two different costs.
+   */
+  private modelDefaultFor(
+    runtime: string | null,
+    userId: number,
+    profile: { profileName: string; model?: string } | null,
+  ): ChatModelDefault {
+    const stored = runtime ? this.deps.getUserModelDefault?.(userId, runtime) || '' : '';
+    const personal = stored ? normaliseModelName(stored) : undefined;
+    if (personal) return { model: personal, source: 'personal' };
+    if (profile?.model) {
+      return { model: profile.model, source: 'profile', profileName: profile.profileName };
+    }
+    return { model: null, source: 'runtime' };
+  }
+
+  /**
+   * Has this conversation ever actually been a conversation?
+   *
+   * `sessionStartTime` alone is not the test, and getting that wrong is a real
+   * failure rather than a nicety: the terminal launch path sets it too, so a
+   * session whose first run was a shell command would have its first *chat*
+   * treated as a continuation and silently skip the account's default. The
+   * surface is what says which kind of run it was, and it is only ever set to
+   * 'chat' by the launch below.
+   *
+   * Both halves are needed. A chat launch that failed leaves the surface on
+   * 'chat' with no start time behind it — the retry is still this
+   * conversation's first, and must still take the user's default.
+   */
+  private hasNeverChatted(session: SessionRecord): boolean {
+    return session.surface !== 'chat' || !session.sessionStartTime;
+  }
+
+  /**
+   * Remember, or forget, this account's standing model for a runtime.
+   *
+   * Only from a name the runtime is known to take. A model is free text —
+   * nothing here can pre-judge one, and that is deliberate — but the cost of a
+   * typo is different once the name outlives the conversation it was typed in:
+   * an override lasts until the next pick, a standing default becomes
+   * `--model <typo>` on every new chat for that runtime until somebody finds
+   * the entry that clears it. So the evidence has to be positive: either the
+   * adapter took the switch live, or the name is on the list the session
+   * published. A runtime that published no list at all is recorded from — there
+   * is nothing to check against, exactly as the effort handler treats a runtime
+   * that published no ladder, and claude publishes no model list at all.
+   *
+   * The clear is unconditional: forgetting takes no evidence.
+   */
+  private async rememberUserModel(
+    session: SessionRecord,
+    model: string | undefined,
+    appliedLive: boolean,
+  ): Promise<void> {
+    const write = this.deps.setUserModelDefault;
+    const runtime = session.agent || session.lastAgent;
+    if (!write || !runtime) return;
+
+    if (!model) {
+      // Clearing an override in one chat also drops the standing default, which
+      // is what makes "Use the default for this runtime" mean what it says: the
+      // conversation, and every new one after it, falls back to the profile and
+      // then to the runtime's own default. Nothing else in the app can undo a
+      // standing choice, so this entry has to be able to.
+      write(session.ownerUserId, runtime, null);
+      return;
+    }
+
+    if (!appliedLive) {
+      const published = (await this.deps.chatManager?.snapshot(session).catch(() => null)) as
+        | { capabilities?: { models?: { value: string; name: string }[] } }
+        | null;
+      const listed = published?.capabilities?.models;
+      if (listed?.length && !listed.some((m) => m.value === model || m.name === model)) return;
+    }
+
+    write(session.ownerUserId, runtime, model);
+  }
+
+  /**
    * Open this session as a chat instead of a terminal.
    *
    * The surface is fixed on the session record here and never changes: the two
@@ -1074,6 +1205,17 @@ export class MessageProcessor {
       agentKind as AgentKind,
       session.workingDir,
     );
+    const modelDefault = this.modelDefaultFor(agentKind, wsInfo.userId, profile);
+    // Read before `surface` is set below, because that is half of what it reads.
+    //
+    // A standing preference is for opening the *next* conversation, never for
+    // reaching back into one already under way: without this gate a relaunch, a
+    // resume from the launcher, or the unavailable banner's restart would all
+    // re-model a conversation underneath the user, on a choice they made
+    // somewhere else afterwards. Below the profile for the same reason — a
+    // conversation that has run is continuing, and continuing is not a moment
+    // to apply anybody's default.
+    const seedFromAccount = this.hasNeverChatted(session);
 
     session.surface = 'chat';
     // A level is only ever a word one runtime published, so it means nothing to
@@ -1098,9 +1240,12 @@ export class MessageProcessor {
       const chat = await manager.start(session, {
         runtime: agentKind,
         workingDir: session.workingDir,
-        // Conversation-scoped override beats the profile default, for this
-        // launch only — see chat_set_model.
-        model: session.chatModelOverride || profile?.model,
+        // Conversation-scoped override first, then — only for a conversation
+        // that has never chatted — this account's standing choice, then the
+        // profile. See modelDefaultFor for why the account beats the profile.
+        model:
+          session.chatModelOverride
+          || (seedFromAccount ? modelDefault.model ?? undefined : profile?.model),
         // No profile fallback behind it: profiles are server-wide and keyed by
         // runtime, and an effort level is a per-conversation decision that has
         // never had a profile default to fall back to. Absent means the runtime
@@ -1143,6 +1288,10 @@ export class MessageProcessor {
           capabilities: chat.currentCapabilities,
           bypassPermissions: chat.bypassing,
           modelOverride: session.chatModelOverride || null,
+          // What a new conversation on this runtime would open on, so the
+          // picker can say where the model came from instead of leaving a
+          // profile-pinned default indistinguishable from no default at all.
+          modelDefault,
           effortOverride: session.chatEffortOverride || null,
         },
         this.deps.claudeSessions,
@@ -1191,6 +1340,15 @@ export class MessageProcessor {
         sessionId,
         snapshot,
         modelOverride: session.chatModelOverride || null,
+        // Re-sent on every join, because it is the only thing on the wire that
+        // can tell the picker why a model is in force. Resolved through the
+        // read-only profile accessor — see the dep — since a join must not
+        // rewrite a runtime's tier files.
+        modelDefault: this.modelDefaultFor(
+          session.agent || session.lastAgent,
+          session.ownerUserId,
+          this.deps.activeProfileFor?.(session.agent || session.lastAgent || '') ?? null,
+        ),
         // Rides on the join for the same reason the model does: the snapshot
         // carries the runtime's own reported level only if it ever reported one,
         // and a conversation whose process has since died reports nothing at
@@ -1253,6 +1411,11 @@ export class MessageProcessor {
         session.chatModelOverride = model;
         await this.deps.saveSessionsToDisk();
         manager.rememberModel(session.id, model);
+        // And the standing default too, on the same terms the picker records
+        // one (#135): the two doors reach the same decision, so they have to
+        // leave the same trace, or which one the user happened to use would
+        // decide whether the next new chat remembered anything.
+        await this.rememberUserModel(session, model, false);
       }
     }
 
@@ -1335,9 +1498,14 @@ export class MessageProcessor {
    * Never pre-validated: what a typed name actually does is only known by
    * trying it, so this always persists the choice and then reports what
    * happened, in order of how good an answer it is — live, best-effort sent as
-   * a turn, or merely saved for the next launch. It is deliberately never
-   * written back as a profile or personal default; the override belongs to
-   * this conversation and nothing else.
+   * a turn, or merely saved for the next launch.
+   *
+   * It is also, since #135, where this account's standing model for the runtime
+   * is set — a pick made here is the only place in the app anybody says which
+   * model they want, and forgetting it the moment the conversation ended was
+   * the whole complaint. The override still belongs to this conversation alone;
+   * what travels is a *separate* preference that seeds the next new chat, and
+   * only when the runtime is known to take the name. See rememberUserModel.
    */
   private async handleChatSetModel(
     wsInfo: WebSocketInfo,
@@ -1363,50 +1531,68 @@ export class MessageProcessor {
     );
     this.deps.chatManager?.rememberModel(session.id, model || profile?.model);
 
-    if (!model) {
+    /**
+     * Every answer carries the default as it stands *after* this pick.
+     *
+     * Without it the picker's source line and its "use the default" entry go
+     * stale the moment they matter most: they would still be describing the
+     * state the conversation launched in, one click after the user changed it.
+     */
+    const answer = (
+      applied: 'live' | 'sent' | 'pending' | 'cleared',
+      value: string | null,
+      message: string,
+    ): void => {
       sendToWebSocket(wsInfo.ws, {
         type: 'chat_model_result',
         sessionId: session.id,
-        model: null,
-        applied: 'cleared',
-        message: 'Cleared the model override. The next session for this conversation will use the runtime default.',
+        model: value,
+        applied,
+        message,
+        modelDefault: this.modelDefaultFor(
+          session.agent || session.lastAgent,
+          session.ownerUserId,
+          profile,
+        ),
       });
+    };
+
+    if (!model) {
+      await this.rememberUserModel(session, undefined, false);
+      answer(
+        'cleared',
+        null,
+        'Cleared the model override. The next session for this conversation will use the runtime default.',
+      );
       return;
     }
 
     const manager = this.deps.chatManager;
     if (!manager) {
-      sendToWebSocket(wsInfo.ws, {
-        type: 'chat_model_result',
-        sessionId: session.id,
+      await this.rememberUserModel(session, model, false);
+      answer(
+        'pending',
         model,
-        applied: 'pending',
-        message: `Saved. ${model} will be used the next time a session starts for this conversation.`,
-      });
+        `Saved. ${model} will be used the next time a session starts for this conversation.`,
+      );
       return;
     }
 
     try {
       const applied = await manager.setModel(session.id, model);
       if (applied) {
-        sendToWebSocket(wsInfo.ws, {
-          type: 'chat_model_result',
-          sessionId: session.id,
-          model,
-          applied: 'live',
-          message: `Switched to ${model} for this conversation.`,
-        });
+        await this.rememberUserModel(session, model, true);
+        answer('live', model, `Switched to ${model} for this conversation.`);
         return;
       }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
-      sendToWebSocket(wsInfo.ws, {
-        type: 'chat_model_result',
-        sessionId: session.id,
+      await this.rememberUserModel(session, model, false);
+      answer(
+        'pending',
         model,
-        applied: 'pending',
-        message: `Saved, but switching live failed (${message}). ${model} will be used the next time a session starts.`,
-      });
+        `Saved, but switching live failed (${message}). ${model} will be used the next time a session starts.`,
+      );
       return;
     }
 
@@ -1423,26 +1609,24 @@ export class MessageProcessor {
     if (live && hasModelCommand) {
       try {
         await manager.send(session.id, { text: `/model ${model}` });
-        sendToWebSocket(wsInfo.ws, {
-          type: 'chat_model_result',
-          sessionId: session.id,
+        await this.rememberUserModel(session, model, false);
+        answer(
+          'sent',
           model,
-          applied: 'sent',
-          message: `Sent "/model ${model}" to the session — check the transcript to confirm it took.`,
-        });
+          `Sent "/model ${model}" to the session — check the transcript to confirm it took.`,
+        );
         return;
       } catch {
         // Falls through to the saved-for-next-time answer below.
       }
     }
 
-    sendToWebSocket(wsInfo.ws, {
-      type: 'chat_model_result',
-      sessionId: session.id,
+    await this.rememberUserModel(session, model, false);
+    answer(
+      'pending',
       model,
-      applied: 'pending',
-      message: `Saved. This runtime cannot change model mid-session — ${model} will be used the next time a new session starts for this conversation.`,
-    });
+      `Saved. This runtime cannot change model mid-session — ${model} will be used the next time a new session starts for this conversation.`,
+    );
   }
 
   /**

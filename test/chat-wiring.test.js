@@ -639,11 +639,17 @@ describe('chat wiring', function () {
 
     it('will not set a model override for a session belonging to another user', async function () {
       const { processor, chatManager, session } = build({ surface: 'chat', ownerUserId: 999 });
+      // Restated for #135: a pick now also writes an account-wide default, so
+      // the refusal has to cover that write too and not only the record.
+      const written = [];
+      processor.deps.setUserModelDefault = (userId, runtime, model) =>
+        written.push({ userId, runtime, model });
 
       await processor.handleMessage('ws-1', { type: 'chat_set_model', model: 'sneaky-model' });
 
       assert.strictEqual(chatManager.calls.setModel.length, 0);
       assert.strictEqual(session.chatModelOverride, undefined);
+      assert.deepStrictEqual(written, [], 'and nothing was remembered for anybody');
     });
 
     it('reports pending rather than live when the adapter’s live switch throws', async function () {

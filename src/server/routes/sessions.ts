@@ -82,6 +82,14 @@ export interface SessionRoutesDeps {
   /** Tear down the scrollback emulator held for a session. */
   disposeRecorder(sessionId: string): void;
   getSelectedWorkingDir(userId: number): string | null;
+  /**
+   * The active profile for a runtime, read without writing its tier files.
+   *
+   * Only the branch needs it, and only to pin the model — see there. Optional
+   * so the hand-built deps literals in the existing tests keep compiling; a
+   * server without one simply pins nothing, which is what branching did before.
+   */
+  activeProfileFor?(runtime: string): { profileName: string; model?: string } | null;
   sessionStore: {
     getSessionMetadata(): Promise<any>;
   };
@@ -521,7 +529,16 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       // permission granted to the conversation that asked for it, and a
       // conversation that inherited one would be acting without being asked on
       // the strength of somebody else's answer.
-      branch.chatModelOverride = source.chatModelOverride;
+      //
+      // A source running on the profile's model with no override of its own
+      // still has to arrive as a pin, not as a blank: a blank branch is a
+      // conversation that has never chatted, so its launch would take the
+      // brancher's *standing* model (#135) — a different model from the one the
+      // history above was just measured against, which is the one thing this
+      // route is not allowed to get wrong.
+      branch.chatModelOverride =
+        source.chatModelOverride
+        ?? deps.activeProfileFor?.(source.lastAgent || '')?.model;
       branch.chatEffortOverride = source.chatEffortOverride;
 
       const ref = { id: sessionId, ownerUserId: user.id };

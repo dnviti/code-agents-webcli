@@ -2,6 +2,7 @@ import {
   ChatAttachment,
   ChatCapabilities,
   ChatEvent,
+  ChatModelDefault,
   ChatSnapshot,
   ChatTurnIndexEntry,
   ChatUsage,
@@ -78,6 +79,29 @@ export interface ModelSwitchResult {
 export interface EffortSwitchResult {
   applied: 'live' | 'sent' | 'pending' | 'cleared' | 'refused';
   message: string;
+}
+
+/**
+ * Read a `modelDefault` off the wire, or nothing.
+ *
+ * Field-by-field rather than a cast, like every other payload this file reads.
+ * A server that predates #135 sends nothing at all, and a partial one has to
+ * read as nothing too: the picker's whole job here is to say *why* a model is
+ * in force, and half an answer to that is worse than admitting it does not
+ * know.
+ */
+function readModelDefault(raw: unknown): ChatModelDefault | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Record<string, unknown>;
+  const source = value.source;
+  if (source !== 'personal' && source !== 'profile' && source !== 'runtime') return null;
+  return {
+    model: typeof value.model === 'string' && value.model ? value.model : null,
+    source,
+    ...(typeof value.profileName === 'string' && value.profileName
+      ? { profileName: value.profileName }
+      : {}),
+  };
 }
 
 /**
@@ -164,6 +188,19 @@ export class ChatController {
    * as an event.
    */
   private modelOverride: string | null = null;
+  /**
+   * Where the model a *new* conversation on this runtime would come from.
+   *
+   * A statement about the default rather than about this conversation, which is
+   * why it sits beside the override instead of replacing it: the two are shown
+   * together, and "chosen here" versus "your standing choice" versus "the
+   * profile's" is the whole question the picker could not answer before (#135).
+   *
+   * Null when the server said nothing — an older one, or one built without the
+   * user-settings store. The surface then reads exactly as it did before this
+   * existed, rather than asserting a source it was never told.
+   */
+  private modelDefault: ChatModelDefault | null = null;
   /** What the server reported happened to the last model change requested. */
   private modelResult: ModelSwitchResult | null = null;
 
@@ -242,6 +279,7 @@ export class ChatController {
         this.requestTurnIndex();
         this.modelOverride =
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
+        this.modelDefault = readModelDefault(message.modelDefault);
         this.effortOverride =
           typeof message.effortOverride === 'string' ? message.effortOverride : null;
         this.options.onChange?.();
@@ -292,6 +330,7 @@ export class ChatController {
         }
         this.modelOverride =
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
+        this.modelDefault = readModelDefault(message.modelDefault);
         this.effortOverride =
           typeof message.effortOverride === 'string' ? message.effortOverride : null;
         this.options.onChange?.();
@@ -307,6 +346,13 @@ export class ChatController {
         if (applied === 'live' || applied === 'cleared') {
           this.modelOverride = typeof message.model === 'string' ? message.model : null;
         }
+        // Unconditionally, unlike the label above, and that is the point: a
+        // pick the running session could not take still changed what the *next*
+        // new conversation opens on, and a clear still forgot the standing
+        // choice. Left to the next join, the picker would spend the rest of the
+        // conversation describing the state before the click.
+        const nextDefault = readModelDefault(message.modelDefault);
+        if (nextDefault) this.modelDefault = nextDefault;
         this.modelResult = {
           applied,
           message: String(message.message || ''),
@@ -579,6 +625,14 @@ export class ChatController {
     return this.modelOverride;
   }
 
+  /**
+   * Where a new conversation on this runtime would get its model, or null when
+   * the server did not say.
+   */
+  get modelDefaultValue(): ChatModelDefault | null {
+    return this.modelDefault;
+  }
+
   /** What happened the last time this browser asked to change the model. */
   get modelFeedback(): ModelSwitchResult | null {
     return this.modelResult;
@@ -811,6 +865,10 @@ export class ChatController {
     // record's real override, and showing a stale one in the meantime would
     // be worse than showing nothing.
     this.modelOverride = null;
+    // The default deliberately survives: it is a fact about the account and the
+    // runtime, not about the conversation being restarted, and the picker would
+    // otherwise lose the only sentence that explains what the restart will open
+    // on until the next join answered.
     this.modelResult = null;
     // And the effort level with it, for the same reason: the record's own value
     // is on its way and a stale one on the chip in the meantime would claim the

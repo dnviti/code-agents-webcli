@@ -112,11 +112,19 @@ export interface SessionRecord {
    * Set from a free-typed choice in the composer, not validated against
    * anything: the acceptance test for a model name is whether the runtime
    * accepts it, not whether it looks plausible before it is tried. Scoped to
-   * this record only — it is never written back as a profile or personal
-   * default, so it cannot leak into another conversation's launch.
+   * this record only — it is never written back as a profile, so it cannot leak
+   * into another conversation's launch.
    *
-   * Absent means "no override", which reads as the profile default exactly
-   * like every row written before this existed.
+   * The account's standing model for a runtime (#135) is deliberately *not*
+   * here. It lives in user settings, keyed by user and runtime, and the two
+   * mean different things: this field is "this conversation, whatever else
+   * changes", the setting is "the next new one". Keeping them apart is what
+   * lets the picker say which of the two a model came from, and it is why a
+   * conversation already under way is never re-modelled by a preference
+   * changed somewhere else.
+   *
+   * Absent means "no override", which reads as the account default and then the
+   * profile default, exactly like every row written before this existed.
    */
   chatModelOverride?: string;
   /**

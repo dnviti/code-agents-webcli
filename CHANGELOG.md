@@ -3,6 +3,59 @@
 ## [Unreleased]
 
 ### Fixed
+- **The model you pick is remembered for that agent, and the picker says where
+  it came from** (#135). Choosing a model in a chat used to last exactly as long
+  as that conversation. Open a new one on the same agent and you were back on
+  whatever the CLI does by default, picking again — while the effort control
+  right beside it had been remembering its setting per runtime for two releases.
+
+  A model chosen in a chat is now your standing choice for that agent, and the
+  next new chat opens on it. Three things can decide the model, and they are
+  consulted in this order: whatever *this conversation* was set to, then your
+  standing choice for the agent, then the active runtime profile. Below all
+  three the CLI is launched with no model flag at all and uses its own default.
+
+  A conversation already under way is never re-modelled. The standing choice
+  only seeds a chat that has not yet run — a relaunch, a resume from the
+  launcher and the recovery banner's restart all come back on the model that
+  conversation was already using. Changing your standing choice, or the active
+  profile, affects the next new chat and nothing that is open.
+
+  **The picker now says which of the three is in force**, in a line above the
+  list and on the chip's hover. Before this, a model pinned by a runtime profile
+  was genuinely applied to every launch and nowhere on screen: until the agent
+  reported a model of its own, the chip read the literal word "model". It now
+  names the model that is going to run and says where it came from — a profile,
+  by name; your own last choice; or nobody, in which case the runtime picks.
+
+  **Use the default for this runtime** clears the conversation's choice *and*
+  forgets your standing one, so the next new chat falls back to the profile and
+  then to the CLI's own default. That is deliberate, and it is what makes the
+  entry worth having: nothing else in the app can undo a standing choice, and a
+  model id typed with a typo would otherwise ride into every new chat on that
+  runtime. For the same reason, a name is only promoted to a standing choice
+  when the runtime is known to take it — the switch applied live, or the name is
+  on the list the runtime published. A runtime that publishes no list at all
+  (Claude is one) has nothing to check against, so a name typed there is taken
+  at face value.
+
+  Your standing choice lives on the server, scoped to your account, so it
+  travels between your phone and your desk and is not readable from anyone
+  else's. Effort is kept per browser instead, and the difference is not taste:
+  Claude, Codex and pi fix the model when the process starts, so a preference
+  held in the browser could only be applied after the launch — which on Claude
+  means a visible `/model` turn pushed into a conversation nobody has typed in
+  yet.
+
+  Runtime profiles are not weakened by this and not going anywhere. They were
+  never a pin a user could not escape — a conversation's own choice has
+  outranked them since the picker existed — and they remain the shared default
+  for everybody who has not chosen. Two things deliberately did not change:
+  terminal sessions, which run the CLI's own interface where the model is yours
+  to change inside the tool, and the launcher screen before a chat starts, which
+  has no model control for the new line to sit in. Branching is unaffected: a
+  branch is still pinned to the model its source was measured against, including
+  when that model came from the profile rather than from a choice.
 - **On a phone the message is the largest text in the conversation again**
   (#92). It had become the smallest. Everything around it — the turn header, the
   tool and reasoning summary, the model and token line, the timestamps — was
