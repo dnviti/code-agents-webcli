@@ -60,6 +60,11 @@ const CARRIED: ReadonlySet<string> = new Set([
   'agent_step',
   'agent_progress',
   'workflow_progress',
+  // A workflow that failed, for the same reason its progress is carried: the
+  // run happened, and a branch that replayed only the launch would show it as
+  // done all over again — which is the bug #140 was about, reintroduced one
+  // conversation along.
+  'workflow_failed',
   'turn_end',
   'marker',
 ]);

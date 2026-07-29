@@ -70,6 +70,8 @@ export interface AgentActivity {
    * already makes between a step that failed and the run that survived it.
    */
   agentsFailed?: number;
+  /** Why it ended, when it ended badly and said why. */
+  error?: string;
 }
 
 /** One phase of a workflow, with the agents the run put inside it. */
@@ -203,6 +205,10 @@ export function collectAgentActivity(messages: ChatMessage[]): AgentActivity[] {
         agentsFailed: inside
           ? inside.agents.filter((agent) => agent.state === 'failed').length
           : undefined,
+        // The run's own word ahead of the block's: for a workflow the block
+        // holds whichever of the two the reducer wrote last, and the run is the
+        // one that knows why it stopped.
+        error: block.agent?.error ?? block.error,
       });
     }
   }

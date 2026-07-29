@@ -618,13 +618,23 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // `output` is left alone: for a workflow it holds the "launched in
       // background" acknowledgement, and the popup tells the failure from the
       // log by comparing the two (see `Header` in WorkflowPopup.tsx).
+      const patch: Partial<ToolBlock> = event.reason
+        ? { status: 'failed', error: event.reason }
+        : { status: 'failed' };
       const located = state.toolIndex[event.parentToolId];
       if (located) {
         const block = state.messages[located[0]]?.blocks[located[1]];
-        if (block && block.kind === 'tool') {
-          block.status = 'failed';
-          if (event.reason) block.error = event.reason;
-        }
+        if (block && block.kind === 'tool') Object.assign(block, patch);
+      } else {
+        // Held for a block that has not arrived, exactly as a `tool` patch is.
+        // A snapshot replays only the tail of the log, and a workflow that runs
+        // for half an hour can outlive its own launching call's place in that
+        // window — the failure would otherwise be dropped for the one runs that
+        // take longest, which are the runs this is for.
+        state.orphanToolPatches[event.parentToolId] = {
+          ...(state.orphanToolPatches[event.parentToolId] || {}),
+          ...patch,
+        };
       }
 
       // And the conversation says so, in a message of its own.

@@ -598,6 +598,40 @@ describe('a workflow that failed reads as failed (#140)', function () {
       assert.strictEqual(entry.agentsFailed, 1, 'the agent that failed inside it was not counted');
     });
 
+    it('puts the reason on the row, not only in the popup', function () {
+      const [entry] = collectAgentActivity(transcriptOf(failedEvents()).messages);
+
+      assert.match(
+        entry.error || '',
+        /forced workflow failure/,
+        'the row knows it failed and not why, which is half an answer',
+      );
+    });
+
+    it('un-fails a row when the run retries the agent that died', function () {
+      // The runtime replaces an agent's whole entry on a retry rather than
+      // merging into it, so a second attempt clears the first one's error. The
+      // count has to follow it back down or a run that recovered stays red.
+      const events = failedEvents();
+      const state = transcriptOf(events);
+      const parentToolId = events.find((event) => event.t === 'workflow_progress').parentToolId;
+      applyChatEvent(state, {
+        t: 'workflow_progress',
+        seq: 9_000,
+        ts: 9_000,
+        parentToolId,
+        phases: [],
+        agents: [
+          { index: 1, label: 'fail:a', state: 'running', phaseIndex: 1, attempt: 2 },
+          { index: 2, label: 'fail:b', state: 'done', phaseIndex: 1, attempt: 2 },
+        ],
+      });
+
+      const [entry] = collectAgentActivity(state.messages);
+      assert.strictEqual(entry.agentsFailed, 0, 'a retried agent is still counted as failed');
+      assert.strictEqual(entry.agentsRunning, 1, 'the retry is not counted as work in flight');
+    });
+
     it('leaves a plain sub-agent without a failure count', function () {
       const state = createTranscript({});
       applyChatEvent(state, { t: 'msg_start', seq: 1, ts: 1, id: 'm1', role: 'assistant', turnId: 't1' });
@@ -619,6 +653,58 @@ describe('a workflow that failed reads as failed (#140)', function () {
 
       const [entry] = collectAgentActivity(state.messages);
       assert.strictEqual(entry.agentsFailed, undefined, 'a sub-agent was given a count of failures');
+    });
+  });
+
+  describe('the awkward arrivals', function () {
+    it('holds the failure for a launching call the snapshot no longer carries', function () {
+      // A snapshot replays only the tail of the log, and a workflow that runs
+      // for half an hour outlives its own tool call's place in that window.
+      const state = createTranscript({});
+      applyChatEvent(state, {
+        t: 'workflow_failed',
+        seq: 1,
+        ts: 1,
+        parentToolId: 'w-late',
+        name: 'nightly-audit',
+        reason: 'usage limit reached',
+      });
+      applyChatEvent(state, { t: 'msg_start', seq: 2, ts: 2, id: 'm1', role: 'assistant', turnId: 't1' });
+      applyChatEvent(state, {
+        t: 'block_start',
+        seq: 3,
+        ts: 3,
+        msgId: 'm1',
+        index: 0,
+        block: { kind: 'tool', toolId: 'w-late', name: 'Workflow', toolKind: 'task', status: 'completed' },
+      });
+
+      assert.strictEqual(
+        workflowBlock(state).status,
+        'failed',
+        'the failure was dropped because its tool call had not arrived yet',
+      );
+    });
+
+    it('survives a reconnect redelivering the same events', function () {
+      // A rejoining browser is handed a snapshot and then the tail, and the two
+      // legitimately overlap.
+      const events = failedEvents().map((event, index) => ({
+        ts: 1_000 + index,
+        ...event,
+        seq: index + 1,
+      }));
+      const state = createTranscript({});
+      events.forEach((event) => applyChatEvent(state, event));
+      const noticesFirst = state.messages.filter((message) => message.role === 'system').length;
+      events.forEach((event) => applyChatEvent(state, event));
+
+      assert.strictEqual(noticesFirst, 1, 'the failure was not announced at all');
+      assert.strictEqual(
+        state.messages.filter((message) => message.role === 'system').length,
+        1,
+        'a redelivered failure was announced twice',
+      );
     });
   });
 

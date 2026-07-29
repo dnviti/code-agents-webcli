@@ -224,7 +224,18 @@ export function WorkflowPopup({
                     log is the whole body, and a label over the only thing there
                     is says nothing the popup's own title has not. */}
                 {run?.activity || !workflow.empty || steps.length > 0 ? (
-                  <Caption text={block.status === 'failed' ? 'Failed with' : 'Final output'} />
+                  <Caption
+                    text={
+                      // "Failed with" only when the log *is* the failure, which
+                      // is the shape a workflow refused outright arrives in:
+                      // the tool call errors and its output is the message. A
+                      // run that failed after it launched has a log holding the
+                      // launch acknowledgement and its reason reported
+                      // separately, above — captioning that "Failed with" would
+                      // point at the wrong text (#140).
+                      block.status === 'failed' && !run?.error ? 'Failed with' : 'Final output'
+                    }
+                  />
                 ) : null}
                 {sections.map((section, index) => (
                   <Section key={index} section={section} />

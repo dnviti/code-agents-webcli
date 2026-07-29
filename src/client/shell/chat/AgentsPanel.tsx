@@ -222,9 +222,37 @@ function ActivityRow({
             {entry.description}
           </div>
         ) : null}
+        {/* Why it broke, on the row. A red badge that told you *that* something
+            failed and made you open a popup to find out *what* is a row that
+            has answered the easier half of the question (#140). One line: the
+            whole of a runtime error is a stack trace, and the popup is a click
+            away for the rest of it. */}
+        {entry.status === 'failed' && entry.error ? (
+          <div
+            title={entry.error}
+            style={{
+              marginTop: 2,
+              fontFamily: 'var(--font-mono)',
+              fontSize: 'var(--text-2xs)',
+              lineHeight: 'var(--leading-snug)',
+              color: 'var(--destructive)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {firstLine(entry.error)}
+          </div>
+        ) : null}
       </div>
     </div>
   );
+}
+
+/** The headline of a runtime error, without the stack under it. */
+function firstLine(text: string): string {
+  const line = text.split('\n').find((candidate) => candidate.trim()) ?? '';
+  return line.trim();
 }
 
 function formatDuration(ms: number): string {

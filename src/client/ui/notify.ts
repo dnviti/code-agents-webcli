@@ -156,6 +156,15 @@ export function setConversationOpener(handler: (sessionId: string) => void): voi
  */
 export function raiseAlert(alert: RaisedAlert, details: boolean): void {
   quoteDetails = details;
+  // With one exception: a bare "finished" never replaces a failure.
+  //
+  // A workflow that fails while its conversation is still working is followed
+  // by that turn ending normally, seconds later — so the notification saying
+  // something broke was replaced by one saying the conversation was done, which
+  // is true and is not the thing the user needed to hear (#140). The reverse
+  // still replaces: a failure after a finish is news.
+  const standing = outstanding.get(alert.sessionId);
+  if (standing?.kind === 'failed' && alert.kind === 'finished') return;
   // Deleted first so a re-raise moves to the back of the queue: the summary
   // names the conversation that has waited longest, and "longest" should mean
   // since it last had something to say.

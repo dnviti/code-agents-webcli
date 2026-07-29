@@ -1420,11 +1420,6 @@ function toolStatus(value: string): ToolStatus {
       return 'failed';
     case 'canceled':
     case 'cancelled':
-    // A background task's own two words for being stopped. Without them a run
-    // the user killed maps to the `running` default below and its detail view
-    // waits for it forever.
-    case 'killed':
-    case 'stopped':
       return 'canceled';
     case 'denied':
       return 'denied';
