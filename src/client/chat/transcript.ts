@@ -19,6 +19,7 @@
  */
 
 import {
+  AccountLimits,
   ChatCapabilities,
   ChatEvent,
   ChatMessage,
@@ -185,6 +186,10 @@ export class ChatTranscript {
       // drop — leaving the control blank over a live session that is still
       // thinking at whatever it opened on.
       effort: snapshot.effort,
+      // The provider's own account reading, which `createTranscript` would
+      // otherwise drop — leaving a rejoined conversation saying its runtime had
+      // never reported a rate-limit window when it had reported one an hour ago.
+      limits: snapshot.limits,
     });
     // A server that does not report its replay floor gets `firstSeq`, which
     // reads as "nothing older" — no paging offered rather than paging that can
@@ -565,6 +570,17 @@ export class ChatTranscript {
    */
   get effort(): string | undefined {
     return this.state.effort;
+  }
+
+  /**
+   * Where the provider last said this account stands, or undefined.
+   *
+   * Undefined is the ordinary case and means "no runtime has said anything
+   * about an account", not "nothing is left". The status panel is careful about
+   * the difference.
+   */
+  get limits(): AccountLimits | undefined {
+    return this.state.limits;
   }
 
   get lastError(): string | undefined {

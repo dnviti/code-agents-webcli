@@ -44,6 +44,8 @@ export interface WorkspacePanelProps {
   sessionId: string;
   workingDir: string;
   transcript: ChatTranscript;
+  /** What to call the agent, so the status panel can name whose account it shows. */
+  runtimeLabel?: string;
   settings: ChatViewSettings;
   onSelectTab: (tab: ChatPanelId) => void;
   onClose: () => void;
@@ -66,6 +68,7 @@ export function WorkspacePanel({
   sessionId,
   workingDir,
   transcript,
+  runtimeLabel,
   settings,
   onSelectTab,
   onClose,
@@ -178,7 +181,12 @@ export function WorkspacePanel({
         ) : null}
         {active === 'links' ? <LinksPanel transcript={transcript} /> : null}
         {active === 'status' ? (
-          <StatusPanel sessionId={sessionId} transcript={transcript} revision={revision} />
+          <StatusPanel
+            sessionId={sessionId}
+            transcript={transcript}
+            runtimeLabel={runtimeLabel}
+            revision={revision}
+          />
         ) : null}
       </div>
       {editor}

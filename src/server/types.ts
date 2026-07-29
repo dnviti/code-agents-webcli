@@ -20,8 +20,6 @@ export interface ServerOptions {
   setup?: boolean;
   folderMode?: boolean;
   sessionHours?: number;
-  plan?: string;
-  customCostLimit?: number;
   claudeAlias?: string;
   codexAlias?: string;
   agentAlias?: string;

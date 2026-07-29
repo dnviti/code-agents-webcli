@@ -104,8 +104,6 @@ export interface MessageProcessorDeps {
     startSession(sessionId: string, startTime: Date): void;
     addUsageData(data: any): void;
     getAnalytics(): any;
-    currentPlan: string;
-    planLimits: Record<string, any>;
   };
 }
 
@@ -901,7 +899,6 @@ export class MessageProcessor {
           (remainingMs % (1000 * 60 * 60)) / (1000 * 60)
         );
 
-        const analyticsData = analytics as { predictions?: { depletionTime?: unknown; confidence?: unknown } };
         const burnRate = burnRateData as { rate?: unknown; confidence?: unknown };
 
         sessionTimer = {
@@ -919,8 +916,6 @@ export class MessageProcessor {
           isExpired: remainingMs === 0,
           burnRate: burnRate.rate,
           burnRateConfidence: burnRate.confidence,
-          depletionTime: analyticsData.predictions?.depletionTime,
-          depletionConfidence: analyticsData.predictions?.confidence,
         };
       }
 
@@ -937,9 +932,11 @@ export class MessageProcessor {
         analytics,
         burnRate: burnRateData,
         overlappingSessions: overlappingSessions.length,
-        plan: this.deps.usageAnalytics.currentPlan,
-        limits:
-          this.deps.usageAnalytics.planLimits[this.deps.usageAnalytics.currentPlan],
+        // No `plan` and no `limits`. This used to answer with the `--plan`
+        // flag's value and the row of the hand-written allowance table it
+        // selected, neither of which was ever a fact about anybody's account
+        // (#137). What a provider actually states about an account travels on
+        // the chat session's `limits` event instead.
       });
     } catch (error) {
       console.error('Error getting usage stats:', error);

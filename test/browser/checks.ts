@@ -338,6 +338,7 @@ async function run(): Promise<void> {
   await checkTheEffortChipSaysAndSetsHowHardTheAgentThinks();
   await checkARememberedLevelSeedsOnlyFreshWorkAndSurvivesAReload();
   await checkTheContextReadingIsHonestAboutItsCeiling();
+  await checkTheAccountReadingIsOnlyEverWhatAProviderSaid();
   await checkTheTurnIndexListsTheWholeConversation();
   await checkClearingResetsTheFiguresAboveTheChat();
   await checkTheUsageWindowReachesBeforeThisYear();
@@ -8657,6 +8658,284 @@ async function checkTheContextReadingIsHonestAboutItsCeiling(): Promise<void> {
   unknown.root.unmount();
   panelRoot.unmount();
   frame.remove();
+}
+
+/**
+ * Issue #137: what a person actually reads about their account.
+ *
+ * The panel used to draw a plan badge reading `max20`, a token meter reading
+ * "0 of 220.0k" and a "Left 220.0k" for every user of every agent — all of it
+ * from a CLI flag's default and a table written into this repository. So the
+ * claim under test is a negative as much as a positive: with nothing reported
+ * there must be no badge, no meter and no ceiling anywhere in the section, and
+ * with something reported the figure on screen must be the one the provider
+ * gave.
+ *
+ * Through the real stylesheets and asserted for visibility and computed size,
+ * because a control at `opacity: 0` drops silently out of every geometry sweep
+ * rather than failing one.
+ */
+async function checkTheAccountReadingIsOnlyEverWhatAProviderSaid(): Promise<void> {
+  const realFetch = window.fetch;
+  // What the status route answers with. Only the account half matters here; the
+  // git half is answered as "not a repository" so that section renders too.
+  let account: unknown = null;
+  window.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' ? input : (input as Request).url ?? input);
+    const body = url.includes('/status') ? { git: { repo: false }, account } : {};
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as typeof window.fetch;
+
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:520px;height:1000px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html><head>'
+    + '<link rel="stylesheet" href="../../dist/public/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="../../dist/public/css/main.css">'
+    + '</head><body style="margin:0"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const view = doc.defaultView as Window;
+  const mount = async (limits: unknown, runtimeLabel: string) => {
+    const host = doc.createElement('div');
+    doc.body.appendChild(host);
+    const transcript = {
+      subscribe: () => () => {},
+      getVersion: () => 0,
+      usage: {},
+      limits,
+    };
+    const root = createRoot(host);
+    root.render(
+      React.createElement(StatusPanel, {
+        sessionId: 'acct-check',
+        transcript: transcript as never,
+        runtimeLabel,
+      }),
+    );
+    await wait(300);
+    return { host, root, text: (host.textContent || '').replace(/\s+/g, ' ') };
+  };
+
+  // (a) A provider that stated a percentage and a reset.
+  account = {
+    runtime: 'claude',
+    reporting: 'Claude reports which rate-limit window it is in and when that window resets.',
+    cached: null,
+    measured: null,
+  };
+  const reported = await mount(
+    {
+      billing: 'subscription',
+      windows: [{
+        kind: 'seven_day',
+        status: 'allowed_warning',
+        utilization: 0.96,
+        resetsAt: new Date(Date.now() + 3 * 3600_000).toISOString(),
+      }],
+    },
+    'Claude',
+  );
+  check(
+    'a stated rate-limit window is shown as the percentage the provider gave',
+    reported.text.includes('96%') && /seven day/i.test(reported.text),
+    reported.text.slice(0, 400) || 'nothing rendered',
+  );
+  check(
+    'and the reset time is shown beside it',
+    /Resets/.test(reported.text),
+    reported.text.slice(0, 400),
+  );
+  const bar = reported.host.querySelector('[role="progressbar"]:not([aria-valuenow="0"])') as HTMLElement | null;
+  const barBox = bar?.getBoundingClientRect();
+  const barStyle = bar ? view.getComputedStyle(bar) : null;
+  check(
+    'and the meter beside it is really on screen, not a zero-opacity ghost',
+    Boolean(bar) && (barBox?.width ?? 0) > 50 && (barBox?.height ?? 0) > 0
+      && barStyle?.visibility !== 'hidden' && Number(barStyle?.opacity ?? '0') > 0.5,
+    `${barBox?.width ?? 0}x${barBox?.height ?? 0} opacity=${barStyle?.opacity}`,
+  );
+  check(
+    'and no fabricated allowance appears anywhere in the panel',
+    !/220\.0k|max20|188026/.test(reported.text),
+    reported.text.slice(0, 400),
+  );
+  check(
+    'one reading is a level, not a rate, so no time-to-empty is offered',
+    /Not enough readings/i.test(reported.text) && !/At this rate/.test(reported.text),
+    reported.text.slice(0, 400),
+  );
+  reported.root.unmount();
+
+  // (b) An agent that reports nothing about an account.
+  account = {
+    runtime: 'kimi',
+    reporting: 'Kimi Code reports nothing about an account over the protocol this app drives it on.',
+    cached: null,
+    measured: {
+      from: 'a',
+      to: 'b',
+      hours: 24,
+      // A window in which four turns ran and only two of them reported a cost:
+      // the totals are real, and the honesty counters are what stop the other
+      // two being averaged in as zeroes.
+      totals: {
+        turns: 4,
+        modelTurns: 0,
+        toolCalls: 3,
+        inputTokens: 1000,
+        outputTokens: 2000,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        totalTokens: 3000,
+        costUsd: 0,
+        tokensReportedTurns: 4,
+        costReportedTurns: 0,
+        modelTurnsReportedTurns: 0,
+      },
+    },
+  };
+  const silent = await mount(undefined, 'Kimi');
+  check(
+    'an agent that reports no account says so in words',
+    /reports nothing about an account/i.test(silent.text),
+    silent.text.slice(0, 400) || 'nothing rendered',
+  );
+  check(
+    'and the section it is in draws no meter at all',
+    !silent.host.querySelector('[role="progressbar"]'),
+    String(silent.host.innerHTML).slice(0, 300),
+  );
+  check(
+    'and the heading names that agent rather than Claude',
+    /Kimi account/i.test(silent.text) && !/Claude rate limit/i.test(silent.text),
+    silent.text.slice(0, 200),
+  );
+  check(
+    'a cost nobody reported reads as not reported, not as $0.00',
+    /Cost\s*not reported/i.test(silent.text) && !/\$0\.00/.test(silent.text),
+    silent.text.slice(0, 400),
+  );
+  check(
+    'while the tokens that were reported are still shown, with a rate',
+    /3\.0k/.test(silent.text) && /\/h/.test(silent.text),
+    silent.text.slice(0, 400),
+  );
+  const sentence = Array.from(silent.host.querySelectorAll('*')).find(
+    (node) => /reports nothing about an account/i.test(node.textContent || '')
+      && node.children.length === 0,
+  ) as HTMLElement | undefined;
+  const sentenceSize = sentence ? parseFloat(view.getComputedStyle(sentence).fontSize) : 0;
+  check(
+    'and that sentence is set large enough to read',
+    sentenceSize >= 10,
+    `${sentenceSize}px`,
+  );
+  silent.root.unmount();
+
+  // (c) A window with a reset and no percentage, which is four captures in five.
+  account = {
+    runtime: 'claude',
+    reporting: 'Claude reports which rate-limit window it is in and when that window resets.',
+    cached: null,
+    measured: null,
+  };
+  const noPercent = await mount(
+    {
+      billing: 'unknown',
+      windows: [{
+        kind: 'five_hour',
+        status: 'allowed',
+        resetsAt: new Date(Date.now() + 2 * 3600_000).toISOString(),
+      }],
+    },
+    'Claude',
+  );
+  check(
+    'a window with no percentage says "not reported" instead of 0%',
+    /not reported/i.test(noPercent.text) && !/\b0%/.test(noPercent.text),
+    noPercent.text.slice(0, 400) || 'nothing rendered',
+  );
+  check(
+    'and draws no bar against a number nobody gave',
+    !noPercent.host.querySelector('[role="progressbar"]'),
+    String(noPercent.host.innerHTML).slice(0, 300),
+  );
+  check(
+    'and does not claim a billing mode the runtime never stated',
+    /did not say whether/i.test(noPercent.text) && !/Billed as/.test(noPercent.text),
+    noPercent.text.slice(0, 400),
+  );
+  noPercent.root.unmount();
+
+  // (d) The state every Claude conversation is in from its first turn onwards:
+  // a window it stated itself, and a plan name it has never stated and never
+  // will, filled in from the CLI's cache on this server. The caveat has to
+  // survive that — it is the whole point of the caveat, and a section that
+  // labels itself only when *nothing* was spoken hides it exactly here.
+  account = {
+    runtime: 'claude',
+    reporting: 'Claude reports which rate-limit window it is in and when that window resets.',
+    cached: {
+      planName: 'claude max 20x',
+      windows: [],
+      asOf: new Date(Date.now() - 3 * 3600_000).toISOString(),
+    },
+    measured: null,
+  };
+  const cachedPlan = await mount(
+    {
+      billing: 'subscription',
+      windows: [{
+        kind: 'five_hour',
+        status: 'allowed',
+        resetsAt: new Date(Date.now() + 2 * 3600_000).toISOString(),
+      }],
+    },
+    'Claude',
+  );
+  check(
+    'a plan name that came from the server\'s CLI cache is labelled as such, even mid-conversation',
+    /claude max 20x/i.test(cachedPlan.text) && /as of/i.test(cachedPlan.text)
+      && /this server is signed in as/i.test(cachedPlan.text),
+    cachedPlan.text.slice(0, 500) || 'nothing rendered',
+  );
+  check(
+    'and the label names the plan alone, not the window this conversation reported itself',
+    /The plan above was/.test(cachedPlan.text) && !/figures above/.test(cachedPlan.text),
+    cachedPlan.text.slice(0, 500),
+  );
+  cachedPlan.root.unmount();
+
+  // (e) A conversation that has never been launched. The route cannot scope a
+  // measurement without an agent, so it answers `measured: null` — which says
+  // nothing at all about whether this server keeps a usage record.
+  account = {
+    runtime: null,
+    reporting: 'Nothing is running here yet, so nobody has been asked.',
+    cached: null,
+    measured: null,
+  };
+  const unlaunched = await mount(undefined, 'Agent');
+  check(
+    'a conversation that has never run says so, rather than blaming the server\'s record-keeping',
+    /Nothing has run in this conversation yet/i.test(unlaunched.text)
+      && !/not keeping a usage record/i.test(unlaunched.text),
+    unlaunched.text.slice(0, 500) || 'nothing rendered',
+  );
+  unlaunched.root.unmount();
+
+  frame.remove();
+  window.fetch = realFetch;
 }
 
 /**

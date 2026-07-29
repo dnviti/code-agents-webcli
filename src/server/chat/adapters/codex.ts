@@ -17,6 +17,7 @@ import {
   rankedEfforts,
 } from '../../../shared/chat-events.js';
 import { blockDraws } from '../../../shared/chat-visibility.js';
+import { AccountLimitTracker, resetIsoFromEpochSeconds } from '../account-limits.js';
 import {
   AdapterChild,
   AdapterEvent,
@@ -451,6 +452,14 @@ const INIT_TIMEOUT_MS = 8_000;
 const THREAD_START_TIMEOUT_MS = 15_000;
 /** Short on purpose: the picker is worth waiting for, but not worth a delayed session. */
 const MODEL_LIST_TIMEOUT_MS = 5_000;
+/**
+ * How long to wait for `account/rateLimits/read`.
+ *
+ * It has a timer of its own because `call()` has none: an app-server old enough
+ * not to implement the method may simply never answer, and an unanswered
+ * request sits in the pending map until the session stops.
+ */
+const RATE_LIMITS_TIMEOUT_MS = 5_000;
 
 // ------------------------------------------------------------- app-server
 
@@ -509,6 +518,8 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
   private readonly planText = new Map<string, string>();
   /** itemId -> which of a reasoning item's two channels is filling its block. */
   private readonly reasoningChannel = new Map<string, 'content' | 'summary'>();
+  /** What codex has said about the account behind this thread. See `loadRateLimits`. */
+  private readonly account = new AccountLimitTracker();
 
   protected buildArgs(): string[] {
     return ['app-server', ...(this.options.extraArgs || [])];
@@ -579,6 +590,10 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     // it arrives — `capabilities` exists for exactly this, a runtime revising
     // what it can do after it has introduced itself.
     void this.loadModelList();
+    // Same treatment, for the same reason: worth having, not worth holding a
+    // conversation open for. It is also the only account figure any runtime
+    // here reports at launch rather than mid-turn.
+    void this.loadRateLimits();
 
     this.emit({
       t: 'session',
@@ -674,6 +689,78 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
       // Deliberately silent: nothing about a missing menu is worth an error
       // event in a transcript, and the conversation is about to start fine.
     }
+  }
+
+  /**
+   * Ask codex where the account stands, which it will actually tell you.
+   *
+   * Probed live against codex-cli 0.146.0 on 2026-07-29: `account/rateLimits/read`
+   * (no params) answers with `rateLimits: { limitId, limitName, primary,
+   * secondary, credits, planType, spendControlReached, rateLimitReachedType }`,
+   * where each window is `{ usedPercent, windowDurationMins, resetsAt }` and
+   * `resetsAt` is epoch seconds. The captured reply is
+   * `test/fixtures/chat/codex-appserver-ratelimits.jsonl`.
+   *
+   * That `planType` is the reason this app never reads `~/.codex/auth.json`:
+   * the plan name is also inside the id_token there, but that file holds the
+   * access and refresh tokens beside it, and a status readout is not worth
+   * teaching this server to open a credentials file. Codex volunteers the same
+   * fact over a protocol it already speaks.
+   *
+   * Best-effort by construction, like `loadModelList`: a build without the
+   * method must not stop a conversation opening, and a silent one must not hold
+   * the pending map open — hence the timeout.
+   */
+  private async loadRateLimits(): Promise<void> {
+    try {
+      const response = record(
+        await this.withTimeout(
+          this.call('account/rateLimits/read', {}),
+          RATE_LIMITS_TIMEOUT_MS,
+          'account/rateLimits/read',
+        ),
+      );
+      this.onRateLimits(response);
+    } catch {
+      // Deliberately silent. "Codex would not say" is a state the panel already
+      // renders in words; an error event would put a protocol detail in a
+      // transcript over something nobody asked for.
+    }
+  }
+
+  /**
+   * Fold a rate-limit snapshot in, from either the request or the notification.
+   *
+   * Accepts the envelope or the snapshot itself because the two channels were
+   * not both captured: the request answers `{ rateLimits: {...} }` and the
+   * notification's shape is declared but unprobed, so the wrapper is unwrapped
+   * when it is there and the payload used as-is when it is not.
+   */
+  private onRateLimits(payload: Record<string, unknown>): void {
+    const snapshot = payload.rateLimits === undefined ? payload : record(payload.rateLimits);
+    let changed = this.account.notePlanName(str(snapshot.planType));
+    for (const [key, kind] of [['primary', 'primary'], ['secondary', 'secondary']] as const) {
+      // `secondary` is explicitly null in the captured reply, and null is not a
+      // window. `record()` answers `{}` for it, so the presence of the key has
+      // to be checked rather than the truthiness of what it maps to.
+      if (!snapshot[key]) continue;
+      const window = record(snapshot[key]);
+      // `usedPercent` is a percentage where Claude's `utilization` is a
+      // fraction, and the event carries fractions. Converted here rather than
+      // at the surface so one renderer can draw both.
+      const usedPercent = Number(window.usedPercent);
+      const duration = Number(window.windowDurationMins);
+      const resetsAt = resetIsoFromEpochSeconds(window.resetsAt);
+      changed = this.account.noteWindow({
+        kind,
+        ...(Number.isFinite(usedPercent) && usedPercent >= 0 && usedPercent <= 100
+          ? { utilization: usedPercent / 100 }
+          : {}),
+        ...(Number.isFinite(duration) && duration > 0 ? { durationMinutes: duration } : {}),
+        ...(resetsAt ? { resetsAt } : {}),
+      }) || changed;
+    }
+    if (changed) this.emit({ t: 'limits', limits: this.account.snapshot() });
   }
 
   private withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -840,6 +927,14 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
         return;
       case 'thread/tokenUsage/updated':
         this.onTokenUsage(params);
+        return;
+      case 'account/rateLimits/updated':
+        // Codex re-states the whole snapshot when it changes, so this is the
+        // same payload the request answers with and goes through the same
+        // mapper. Two readings of one window is also what turns a percentage
+        // into a burn rate, which is why the update is worth listening for
+        // rather than reading once at launch.
+        this.onRateLimits(params);
         return;
       case 'turn/completed':
         this.onTurnCompleted(params);

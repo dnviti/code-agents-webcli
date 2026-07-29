@@ -1,11 +1,21 @@
 import { EventEmitter } from 'events';
 
-export interface PlanLimit {
-  tokens: number | null;
-  cost: number;
-  messages: number;
-  algorithm: 'fixed' | 'p90';
-}
+/**
+ * What this service measures, and what it deliberately no longer claims.
+ *
+ * It reads Claude Code's own transcript files on this host and computes tokens,
+ * cost and a burn rate from them. That much is a measurement.
+ *
+ * What it used to do on top was draw those measurements against a plan ceiling
+ * — a hand-written table of token, dollar and message allowances per Claude
+ * subscription tier, selected by a `--plan` flag whose default was `max20`, with
+ * a bare `188026` for anything it did not recognise. None of those figures came
+ * from Anthropic; a "78% of your plan used" was arithmetic over a guess. So the
+ * table, the flag, the fallback and everything derived from them — remaining
+ * tokens, percent used, time to depletion — are gone (#137). Where the account
+ * actually stands is now only ever what the provider itself said, on the
+ * `limits` chat event.
+ */
 
 export interface UsageDataPoint {
   timestamp: Date;
@@ -46,7 +56,6 @@ export interface RollingWindow {
   sessions: string[];
   totalTokens: number;
   totalCost: number;
-  remainingTokens: number;
   burnRate: number;
 }
 
@@ -59,12 +68,6 @@ export interface BurnRateInfo {
   current: number;
   trend: VelocityTrend;
   history: BurnRateEntry[];
-}
-
-export interface PredictionInfo {
-  depletionTime: Date | null;
-  confidence: number;
-  minutesRemaining: number | null;
 }
 
 export interface SessionAnalytics {
@@ -81,22 +84,10 @@ export interface AnalyticsData {
     startTime: Date;
     endTime: Date;
     tokens: number;
-    remaining: number;
-    percentUsed: number;
   } | null;
   burnRate: BurnRateInfo;
-  predictions: PredictionInfo;
-  plan: {
-    type: string;
-    limits: PlanLimit;
-    p90Limit: number | null;
-  };
   windows: RollingWindow[];
   activeSessions: SessionAnalytics[];
-}
-
-export interface HistoricalSession {
-  totalTokens: number;
 }
 
 type VelocityTrend = 'increasing' | 'decreasing' | 'stable';
@@ -106,16 +97,11 @@ export interface UsageAnalyticsOptions {
   confidenceThreshold?: number;
   burnRateWindow?: number;
   updateInterval?: number;
-  plan?: string;
-  customCostLimit?: number;
 }
 
 export class UsageAnalytics extends EventEmitter {
   private sessionDurationHours: number;
   private burnRateWindow: number;
-
-  public planLimits: Record<string, PlanLimit>;
-  public currentPlan: string;
 
   private activeSessions: Map<string, AnalyticsSession> =
     new Map();
@@ -124,14 +110,10 @@ export class UsageAnalytics extends EventEmitter {
     new Map();
 
   private recentUsage: UsageDataPoint[] = [];
-  private p90Limit: number | null = null;
 
   private burnRateHistory: BurnRateEntry[] = [];
   private currentBurnRate: number = 0;
   private velocityTrend: VelocityTrend = 'stable';
-
-  private depletionTime: Date | null = null;
-  private depletionConfidence: number = 0;
 
   constructor(options: UsageAnalyticsOptions = {}) {
     super();
@@ -139,53 +121,6 @@ export class UsageAnalytics extends EventEmitter {
     this.sessionDurationHours =
       options.sessionDurationHours || 5;
     this.burnRateWindow = options.burnRateWindow || 60;
-
-    this.planLimits = {
-      pro: {
-        tokens: 19000,
-        cost: 18.0,
-        messages: 250,
-        algorithm: 'fixed',
-      },
-      'claude-pro': {
-        tokens: 19000,
-        cost: 18.0,
-        messages: 250,
-        algorithm: 'fixed',
-      },
-      max5: {
-        tokens: 88000,
-        cost: 35.0,
-        messages: 1000,
-        algorithm: 'fixed',
-      },
-      'claude-max5': {
-        tokens: 88000,
-        cost: 35.0,
-        messages: 1000,
-        algorithm: 'fixed',
-      },
-      max20: {
-        tokens: 220000,
-        cost: 140.0,
-        messages: 2000,
-        algorithm: 'fixed',
-      },
-      'claude-max20': {
-        tokens: 220000,
-        cost: 140.0,
-        messages: 2000,
-        algorithm: 'fixed',
-      },
-      custom: {
-        tokens: null,
-        cost: options.customCostLimit || 76.89,
-        messages: 1019,
-        algorithm: 'p90',
-      },
-    };
-
-    this.currentPlan = options.plan || 'custom';
   }
 
   addUsageData(data: AddUsageData): void {
@@ -212,7 +147,6 @@ export class UsageAnalytics extends EventEmitter {
     );
 
     this.calculateBurnRate();
-    this.updatePredictions();
 
     this.emit('usage-update', entry);
   }
@@ -262,7 +196,6 @@ export class UsageAnalytics extends EventEmitter {
             sessions: [],
             totalTokens: 0,
             totalCost: 0,
-            remainingTokens: this.getTokenLimit(),
             burnRate: 0,
           });
         }
@@ -390,56 +323,6 @@ export class UsageAnalytics extends EventEmitter {
     }
   }
 
-  private updatePredictions(): void {
-    const currentSession = this.getCurrentSession();
-    if (!currentSession || this.currentBurnRate === 0) {
-      this.depletionTime = null;
-      this.depletionConfidence = 0;
-      return;
-    }
-
-    const limit = this.getTokenLimit();
-    const used = this.getSessionTokens(currentSession.id);
-    const remaining = limit - used;
-
-    if (remaining <= 0) {
-      this.depletionTime = new Date();
-      this.depletionConfidence = 1;
-      return;
-    }
-
-    const minutesToDepletion =
-      remaining / this.currentBurnRate;
-    this.depletionTime = new Date(
-      Date.now() + minutesToDepletion * 60 * 1000,
-    );
-
-    this.depletionConfidence = this.calculateConfidence();
-
-    if (this.velocityTrend === 'increasing') {
-      const adjustment = 0.9;
-      const adjustedTime =
-        Date.now() +
-        (this.depletionTime.getTime() - Date.now()) *
-          adjustment;
-      this.depletionTime = new Date(adjustedTime);
-    } else if (this.velocityTrend === 'decreasing') {
-      const adjustment = 1.1;
-      const adjustedTime =
-        Date.now() +
-        (this.depletionTime.getTime() - Date.now()) *
-          adjustment;
-      this.depletionTime = new Date(adjustedTime);
-    }
-
-    this.emit('prediction-updated', {
-      depletionTime: this.depletionTime,
-      confidence: this.depletionConfidence,
-      remaining,
-      burnRate: this.currentBurnRate,
-    });
-  }
-
   private calculateConfidence(): number {
     let confidence = 0;
     let factors = 0;
@@ -490,56 +373,6 @@ export class UsageAnalytics extends EventEmitter {
     return null;
   }
 
-  getTokenLimit(): number {
-    // An unrecognised --plan / CLAUDE_PLAN value yields undefined here, and
-    // reading .algorithm off it threw on every usage request.
-    const plan = this.planLimits[this.currentPlan];
-    if (!plan) {
-      return this.p90Limit || 188026;
-    }
-
-    if (plan.algorithm === 'fixed' && plan.tokens !== null) {
-      return plan.tokens;
-    } else if (plan.algorithm === 'p90') {
-      return this.p90Limit || 188026;
-    }
-
-    return 188026;
-  }
-
-  calculateP90Limit(
-    historicalSessions: HistoricalSession[],
-  ): number | null {
-    if (
-      !historicalSessions ||
-      historicalSessions.length < 10
-    ) {
-      return null;
-    }
-
-    const tokenCounts = historicalSessions
-      .map((s) => s.totalTokens)
-      .filter((t) => t > 0)
-      .sort((a, b) => a - b);
-
-    if (tokenCounts.length === 0) {
-      return null;
-    }
-
-    const p90Index = Math.floor(
-      tokenCounts.length * 0.9,
-    );
-    this.p90Limit = tokenCounts[p90Index];
-
-    this.emit('p90-calculated', {
-      limit: this.p90Limit,
-      sampleSize: tokenCounts.length,
-      confidence: Math.min(tokenCounts.length / 100, 1),
-    });
-
-    return this.p90Limit;
-  }
-
   getSessionTokens(sessionId: string): number {
     const sessionData = this.recentUsage.filter(
       (e) => e.sessionId === sessionId,
@@ -562,13 +395,6 @@ export class UsageAnalytics extends EventEmitter {
             tokens: this.getSessionTokens(
               currentSession.id,
             ),
-            remaining:
-              this.getTokenLimit() -
-              this.getSessionTokens(currentSession.id),
-            percentUsed:
-              (this.getSessionTokens(currentSession.id) /
-                this.getTokenLimit()) *
-              100,
           }
         : null,
 
@@ -576,25 +402,6 @@ export class UsageAnalytics extends EventEmitter {
         current: this.currentBurnRate,
         trend: this.velocityTrend,
         history: this.burnRateHistory.slice(-10),
-      },
-
-      predictions: {
-        depletionTime: this.depletionTime,
-        confidence: this.depletionConfidence,
-        minutesRemaining: this.depletionTime
-          ? Math.max(
-              0,
-              (this.depletionTime.getTime() - Date.now()) /
-                1000 /
-                60,
-            )
-          : null,
-      },
-
-      plan: {
-        type: this.currentPlan,
-        limits: this.planLimits[this.currentPlan],
-        p90Limit: this.p90Limit,
       },
 
       windows: Array.from(this.rollingWindows.values()),
@@ -609,14 +416,6 @@ export class UsageAnalytics extends EventEmitter {
         tokens: this.getSessionTokens(s.id),
       })),
     };
-  }
-
-  setPlan(planType: string): void {
-    if (this.planLimits[planType]) {
-      this.currentPlan = planType;
-      this.updatePredictions();
-      this.emit('plan-changed', planType);
-    }
   }
 
   cleanup(): void {

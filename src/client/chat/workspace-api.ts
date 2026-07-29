@@ -1,4 +1,5 @@
-import type { FileDiff } from '../../shared/chat-events.js';
+import type { AccountLimits, FileDiff } from '../../shared/chat-events.js';
+import type { UsageBurn } from '../../shared/usage-records.js';
 import type { GitChange } from '../../shared/git-status.js';
 
 /**
@@ -191,7 +192,34 @@ export function fetchGitHub(sessionId: string, refresh = false): Promise<GitHubO
   );
 }
 
-/** What the status panel reads: the plan, and the branch. */
+/**
+ * What the account half of the status panel reads.
+ *
+ * Everything here is either a measurement this app took or a sentence about
+ * what a runtime will say. Nothing is a ceiling: this replaced a `plan` object
+ * carrying a token, dollar and message allowance selected out of a hand-written
+ * table by a CLI flag whose default was the same for every install (#137).
+ *
+ * What the *provider* said about the account does not come through here at all.
+ * It arrives on the conversation's own `limits` event and is read off the
+ * transcript, because it is a fact about that conversation's work.
+ */
+export interface AccountStatus {
+  /** The runtime this session runs, or null for one that has never started. */
+  runtime: string | null;
+  /** One sentence naming what this runtime reports about an account. */
+  reporting: string;
+  /**
+   * The Claude CLI's own cached reading on this host, when it is recent enough
+   * to stand behind. Describes the account the *server* is signed in as, never
+   * the browser user's, which is why the panel says so beside it.
+   */
+  cached: (AccountLimits & { asOf: string }) | null;
+  /** What this app measured for the signed-in user on this agent. */
+  measured: UsageBurn | null;
+}
+
+/** What the status panel reads: the account, and the branch. */
 export interface WorkspaceStatus {
   workingDir?: string;
   git: {
@@ -203,13 +231,7 @@ export interface WorkspaceStatus {
     detached?: boolean;
     changed?: number;
   } | null;
-  plan: {
-    type?: string;
-    limits?: { tokens?: number; cost?: number; messages?: number } | null;
-    predictions?: { minutesToDepletion?: number } | null;
-    windows?: Array<{ resetAt?: string }> | null;
-    sessionStats?: { totalTokens?: number; totalCost?: number } | null;
-  } | null;
+  account: AccountStatus | null;
 }
 
 export function fetchStatus(sessionId: string): Promise<WorkspaceStatus> {

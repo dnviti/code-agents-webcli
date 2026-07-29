@@ -1007,6 +1007,7 @@ export function ChatView({
               sessionId={controller.sessionId}
               workingDir={workingDir}
               transcript={transcript}
+              runtimeLabel={runtimeLabel}
               settings={view}
               trace={trace}
               onSelectTab={(panelTab: ChatPanelId) => setView({ panelTab })}
@@ -1211,6 +1212,7 @@ export function ChatView({
             sessionId={controller.sessionId}
             workingDir={workingDir}
             transcript={transcript}
+            runtimeLabel={runtimeLabel}
             settings={view}
             trace={trace}
             onSelectTab={(panelTab: ChatPanelId) => setView({ panelTab })}

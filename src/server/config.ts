@@ -50,16 +50,17 @@ export function createConfig(options: ServerOptions): ServerState {
   };
 }
 
-export function createUsageAnalyticsOptions(options: ServerOptions, sessionDurationHours: number): {
+/**
+ * What the usage analytics still take from configuration: the window length.
+ *
+ * It used to take a plan name and a cost ceiling too, which is what drew the
+ * status panel's meters. Both are gone: `--plan` defaulted to `max20` for
+ * everybody and selected a row of a hand-written allowance table that no
+ * provider publishes, so the ceilings were guesses and the percentages drawn
+ * against them were arithmetic over guesses (#137).
+ */
+export function createUsageAnalyticsOptions(_options: ServerOptions, sessionDurationHours: number): {
   sessionDurationHours: number;
-  plan: string;
-  customCostLimit: number;
 } {
-  return {
-    sessionDurationHours,
-    plan: options.plan || process.env.CLAUDE_PLAN || 'max20',
-    customCostLimit: parseFloat(
-      process.env.CLAUDE_COST_LIMIT || String(options.customCostLimit || 50.00)
-    ),
-  };
+  return { sessionDurationHours };
 }

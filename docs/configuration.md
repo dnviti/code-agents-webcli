@@ -116,9 +116,11 @@ variable.
 
 ### Usage accounting
 
-| Flag | Default | What it does |
-| --- | --- | --- |
-| `--plan <pro\|max5\|max20>` | `max20` | Plan limits used by the [usage accounting](analytics.md). |
+There is nothing to configure. `--plan` used to select a table of subscription
+allowances compiled into this app; it is still accepted and now does nothing,
+so an existing unit file or container command keeps starting. See
+[what the status panel knows](usage-accounting.md#what-the-status-panel-knows)
+for what replaced it.
 
 ## Environment variables
 
@@ -140,7 +142,7 @@ These have **no flag** and can only be set through the environment:
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `CLAUDE_SESSION_HOURS` | `5` | Length of the rolling usage window, in hours. |
-| `CLAUDE_COST_LIMIT` | `50.00` | Ceiling used by the custom usage plan. |
+| `CLAUDE_CONFIG_DIR` | `$HOME` | Where the Claude CLI keeps `.claude.json`. Read for a cached account reading, never for credentials. |
 | `DEBUG` | unset | If set, logs raw pseudo-terminal output per session. Extremely noisy, and independent of `--dev`. |
 
 Two more are read from the ambient environment rather than configured: `HOME`

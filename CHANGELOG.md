@@ -3,6 +3,88 @@
 ## [Unreleased]
 
 ### Fixed
+- **The Status panel stops making up your subscription** (#137). It used to
+  open on a plan badge reading `max20`, a meter reading "Tokens 0 of 220.0k"
+  and a "Left 220.0k" underneath it. None of that was a fact about anybody's
+  account. The plan name was a command-line flag whose default was `max20` on
+  every install, so every user of every agent saw the same one. The allowances
+  were a table written into this repository — 19,000 tokens and $18 for `pro`,
+  220,000 and $140 for `max20`, and a bare 188,026 for anything it did not
+  recognise — and no provider publishes those figures to a client. And the
+  "used" number came from scanning every Claude Code transcript on the host
+  machine, so it described the whole computer rather than you, and when it found
+  no window containing the present moment it reported zero. A meter reading "0
+  of 220.0k" therefore meant "nobody measured anything", while looking exactly
+  like "you have spent nothing".
+
+  Every one of those figures is gone, and so is the `--plan` flag that chose
+  between them. The flag is still accepted and now does nothing, so an existing
+  service unit keeps starting.
+
+  What replaced them is only ever what a provider said about itself. Claude has
+  been reporting its rate-limit window and reset time on every turn all along —
+  the app was reading that line and throwing it away — and Codex will answer
+  with its plan name and how full each of its windows is if you ask it, which
+  this app now does when a conversation opens. Where the provider states a
+  percentage there is a meter; where it does not, and four of five recorded
+  Claude events do not, there is the reset time on its own and the words "not
+  reported". A bar drawn at 0% would be the same lie in a new place.
+
+  A "time until this runs out" now requires two readings of the same window
+  during the same conversation, because one reading is a level and not a rate.
+  Until the second arrives the panel says there are not enough readings yet.
+
+  The section is titled after the agent you are actually talking to, and every
+  runtime that reports nothing says so in a sentence naming what it does and
+  does not tell us — Cursor and Qwen because they run in a terminal here with no
+  protocol to ask over, and pi, Grok and Oh My Pi because no captured session of
+  theirs has ever carried a quota, a limit or a reset. Kimi was asked rather
+  than observed, because its handshake advertises `status` and `usage` commands
+  and an unrun command proves nothing: both were driven over the ACP connection
+  this app already speaks, and both answer with the model and the context
+  window and nothing about a membership or a quota. The transcript of that probe
+  is in `docs/usage-accounting.md`.
+
+  Claude's billing line is stated only for the two sources that mean one: an
+  `ANTHROPIC_API_KEY` the user exported, or an `apiKeyHelper` they configured.
+  The CLI has a third answer — `/login managed key`, the key `/login` provisions
+  into `~/.claude.json`, which the CLI itself groups with a claude.ai login
+  rather than with a configured key — and that reads "not stated" rather than
+  being turned into a confident "Billed as: API key".
+
+  Beside it there is now a second, clearly separate section for what this app
+  measured itself: the turns that ran through this client, for you, on that
+  agent, over the last day. Those are priced at published list rates rather than
+  billed, and a turn whose runtime reported nothing contributes nothing rather
+  than a zero — the same rule the rest of the usage accounting already follows.
+  It is kept apart from the provider's own meter on purpose; the two are in
+  different currencies and adding them together would produce a figure that is
+  neither. A conversation that has never been launched has no agent to scope a
+  measurement to, and says that rather than reporting that this server keeps no
+  usage record.
+
+  There is one file this app will now open that it did not before, and one rule
+  about which: **it reads a CLI's configuration file and never a credentials
+  file.** `~/.claude.json` supplies a cached tier and percentage for whichever
+  figure the conversation has not stated for itself — which for the tier is
+  every conversation, since Claude states a window every turn and a plan name
+  never — and each one it supplies is labelled: with the time the CLI wrote it,
+  with a note that it describes the account this *server* is signed in as, and
+  naming which figure on screen came from there rather than from the runtime.
+  Nothing identifying comes back with it, and it is discarded once it is older
+  than the shortest window it describes; a window it declines to measure at all
+  is dropped rather than shown as 0%. `~/.codex/auth.json` is not read and will not be, which
+  is why Codex's plan name comes over the protocol instead: the same fact is
+  sitting in that file next to an access token and a refresh token, and a status
+  readout is not worth going near them for.
+
+  What was deliberately not changed: the Usage dashboard, which was already
+  honest and is where the per-agent spend history lives; the local
+  transcript-reading analytics service, which still measures what it always
+  measured now that it has no invented ceiling to measure it against; and the
+  billing question the issue also asks — what your account has actually spent
+  with the provider this period. That needs an admin API key this app does not
+  hold and should not, so it is not shown, rather than approximated.
 - **On a phone the message is the largest text in the conversation again**
   (#92). It had become the smallest. Everything around it — the turn header, the
   tool and reasoning summary, the model and token line, the timestamps — was
