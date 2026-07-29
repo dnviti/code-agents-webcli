@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [5.3.3] - 2026-07-29
+
 ### Fixed
 - **A prompt scrolled back to is drawn once, like every other one** (#129). The
   double bubble was fixed for live sending and for reopening a conversation, and
@@ -536,6 +538,9 @@
   Only workflows. How an ordinary delegation reports its status is untouched,
   and there is a test that says so.
 
+## [5.3.2] - 2026-07-29
+
+### Fixed
 - **A workflow that failed no longer reads as done** (#140). The Workflow tool
   returns the moment a run is launched — "Workflow launched in background", no
   error, four seconds before anything has happened — and that acknowledgement
