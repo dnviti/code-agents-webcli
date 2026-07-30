@@ -36,6 +36,15 @@ export interface SessionHeaderProps {
    */
   exited?: boolean;
   bypassPermissions?: boolean;
+  /**
+   * Why this conversation's capability ladder was not applied, when it was not.
+   *
+   * A standing fact about the session, so it belongs beside the approval badge
+   * rather than as a line in the transcript: a launch-time notice drawn in the
+   * conversation is the whole of an empty one, and numbers a turn that never
+   * happened — which is exactly what the approvals marker cost us (#134).
+   */
+  ladderError?: string | null;
   showUsage?: boolean;
   terminalOpen: boolean;
   railOpen: boolean;
@@ -125,6 +134,7 @@ export function SessionHeader({
   state,
   exited = false,
   bypassPermissions = false,
+  ladderError = null,
   showUsage = true,
   terminalOpen,
   railOpen,
@@ -154,6 +164,7 @@ export function SessionHeader({
         capabilities={capabilities}
         meta={meta}
         bypassPermissions={bypassPermissions}
+        ladderError={ladderError}
         showUsage={showUsage}
       />
     );
@@ -312,6 +323,21 @@ export function SessionHeader({
           </Badge>
         ) : null}
 
+        {ladderError ? (
+          <Badge variant="warning" style={{ flex: '0 0 auto' }}>
+            {/* The reason on the span rather than the Badge: `title` is the
+                only room a 34px bar has for a sentence, and Badge does not
+                forward it. */}
+            <span
+              title={ladderError}
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
+            >
+              <Icon name="circle-alert" size={10} />
+              Ladder not applied
+            </span>
+          </Badge>
+        ) : null}
+
         {tight ? null : (
           <button
             type="button"
@@ -441,6 +467,7 @@ function PhoneHeader({
   capabilities,
   meta,
   bypassPermissions,
+  ladderError,
   showUsage,
 }: {
   runtimeLabel: string;
@@ -450,6 +477,7 @@ function PhoneHeader({
   capabilities: ChatCapabilities;
   meta: StateMeta;
   bypassPermissions: boolean;
+  ladderError?: string | null;
   showUsage: boolean;
 }): React.JSX.Element {
   const [open, setOpen] = React.useState(false);
@@ -624,6 +652,23 @@ function PhoneHeader({
                 Approvals bypassed
               </span>
             </Badge>
+          ) : null}
+
+          {/* The reason in full rather than a tooltip: a phone has no hover, and
+              this is the one surface where the sentence has room to be read. */}
+          {ladderError ? (
+            <div
+              aria-label="Ladder not applied"
+              style={{
+                flex: '1 1 100%',
+                color: 'var(--destructive)',
+                fontFamily: 'var(--font-sans)',
+                fontSize: PHONE_TEXT.label,
+                lineHeight: 1.4,
+              }}
+            >
+              Ladder not applied — {ladderError}
+            </div>
           ) : null}
         </div>
       ) : null}

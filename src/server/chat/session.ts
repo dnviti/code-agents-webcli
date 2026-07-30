@@ -2398,6 +2398,62 @@ export class ChatSession {
   }
 
   /**
+   * Move this conversation onto an edited ladder, mid-conversation.
+   *
+   * Returns false — meaning "not mine" — for a conversation that is not running
+   * on a rung: one pinned by a model somebody typed, or by an account's standing
+   * choice, was never the ladder's to decide and must not be re-modelled by an
+   * edit to it.
+   *
+   * The turn in progress is interrupted, which #171 asks for outright. It is
+   * destructive and deliberately so: the alternative is a conversation that goes
+   * on answering from the model the profile no longer names, for as long as the
+   * turn runs, with the settings page reporting the change as applied.
+   */
+  async reapplyLadder(
+    ladder: { tier: ModelTier; tiers: Partial<Record<ModelTier, string>> } | null,
+  ): Promise<boolean> {
+    if (!this.ladder) return false;
+
+    if (!ladder) {
+      // The ladder is gone — the profile was deleted, deactivated, or had its
+      // rungs cleared. Nothing to switch *to*: this conversation keeps the model
+      // it is on until it is relaunched, which is when the runtime's own default
+      // takes over. Said out loud rather than left to be discovered.
+      this.ladder = null;
+      this.escalation = null;
+      this.ingest({
+        t: 'marker',
+        kind: 'model',
+        detail: 'the ladder this conversation was on is gone; it keeps this model until relaunched',
+      });
+      return true;
+    }
+
+    const model = ladder.tiers[ladder.tier];
+    const unchanged = model
+      && !this.escalation
+      && this.ladder.tier === ladder.tier
+      && this.ladder.tiers[this.ladder.tier] === model;
+    this.ladder = ladder;
+    // Nothing the user would see. Interrupting a turn to change nothing is the
+    // worst possible reading of "takes effect immediately".
+    if (unchanged) return false;
+    if (!model) return false;
+
+    if (this.state !== 'idle') await this.interrupt().catch(() => undefined);
+    // Any escalation belonged to the ladder that has just been replaced.
+    this.escalation = null;
+    await this.setModel(model).catch(() => false);
+    this.ingest({
+      t: 'marker',
+      kind: 'model',
+      detail: `the profile changed — now on the ${ladder.tier} rung, ${model}`,
+    });
+    return true;
+  }
+
+  /**
    * Put the conversation back on the rung it belongs to.
    *
    * Called when a turn ends, which is the whole lifetime of a grant. Failing to

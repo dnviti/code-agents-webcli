@@ -514,6 +514,69 @@ describe('Composer', function () {
         );
       });
 
+      // The ladder (#171). A conversation running on a rung has to say which
+      // rung, because the whole reason somebody builds one is to control what
+      // each turn costs — and "which model" without "how expensive" is half the
+      // answer they were after.
+      it('names the rung on the chip itself, not only in the menu', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'gateway/mid-model',
+          modelOrigin: {
+            model: 'gateway/mid-model',
+            source: 'ladder',
+            profileName: 'Economy',
+            tier: 'mid',
+          },
+        });
+        assert.ok(html.includes('gateway/mid-model · mid'), 'the rung belongs beside the model');
+      });
+
+      it('says the model came from the ladder, and from which rung', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'gateway/mid-model',
+          modelOrigin: {
+            model: 'gateway/mid-model',
+            source: 'ladder',
+            profileName: 'Economy',
+            tier: 'mid',
+          },
+        });
+        assert.ok(
+          html.includes('Running on the mid rung of the &quot;Economy&quot; ladder.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      it('explains a rung it fell to rather than reporting one nobody chose', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'h',
+          modelOrigin: {
+            model: 'h', source: 'ladder', profileName: 'Economy', tier: 'high', requestedTier: 'mid',
+          },
+        });
+        assert.ok(
+          html.includes('mid is blank, so the nearest filled rung answered'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      it('says when a standing choice is what is running, not the ladder', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'my/standing-choice',
+          modelOrigin: { model: 'my/standing-choice', source: 'personal' },
+          modelDefault: { model: 'my/standing-choice', source: 'personal' },
+        });
+        assert.ok(
+          html.includes('Running on your standing choice for this runtime.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+        assert.ok(!html.includes(' · mid'), 'no rung, because no rung decided this');
+      });
+
       // The pin and the default agreeing is the ordinary case, and it must not
       // produce a sentence telling the user something is staying put.
       it('says nothing about staying when the pin is the default', function () {

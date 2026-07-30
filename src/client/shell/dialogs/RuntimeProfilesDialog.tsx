@@ -1,11 +1,13 @@
 import * as React from 'react';
 
 import {
+  DEFAULT_CONVERSATION_TIER,
   MODEL_TIERS,
   ModelTier,
   RuntimeProfile,
   RuntimeProfilesConfig,
   isBlockedEnvKey,
+  resolveConversationRung,
 } from '../../../shared/runtime-profiles';
 import type { AgentKind } from '../../types';
 import { Button } from '../../ui/relay/Button';
@@ -39,10 +41,13 @@ const TIER_HINT: Record<ModelTier, string> = {
 
 export interface TierWriteReport {
   written: string[];
-  skipped: { file: string; reason: string }[];
+  /** Files that were the user's and were replaced anyway (#171). */
+  replaced: { file: string; reason: string }[];
   unsupported: boolean;
   /** Set when the files land per session rather than on save. */
   deferred?: string;
+  /** Set when the write-through failed outright. */
+  failed?: string;
 }
 
 export interface RuntimeProfilesDialogProps {
@@ -54,6 +59,14 @@ interface LoadState {
   config: RuntimeProfilesConfig;
   tierCapableRuntimes: string[];
   canEdit: boolean;
+  /**
+   * This reader's own standing model per runtime.
+   *
+   * A standing choice outranks the ladder, and a ladder that has been overridden
+   * looks exactly like a ladder that is working — which is the half of #171 the
+   * settings page is responsible for saying out loud.
+   */
+  standingModels: Record<string, string>;
 }
 
 function newId(): string {
@@ -102,6 +115,7 @@ export function RuntimeProfilesDialog({
           config: data.config ?? { profiles: [], active: {} },
           tierCapableRuntimes: data.tierCapableRuntimes ?? [],
           canEdit: data.canEdit === true,
+          standingModels: data.standingModels ?? {},
         });
       })
       .catch((err: Error) => {
@@ -219,6 +233,7 @@ export function RuntimeProfilesDialog({
               profile={profile}
               readOnly={readOnly}
               tierCapable={state.tierCapableRuntimes.includes(profile.runtime)}
+              standingModel={state.standingModels[profile.runtime]}
               report={report?.[profile.id]}
               onChange={(changes) => updateProfile(profile.id, changes)}
               onRemove={() => removeProfile(profile.id)}
@@ -292,6 +307,7 @@ function ProfileEditor({
   profile,
   readOnly,
   tierCapable,
+  standingModel,
   report,
   onChange,
   onRemove,
@@ -299,6 +315,8 @@ function ProfileEditor({
   profile: RuntimeProfile;
   readOnly: boolean;
   tierCapable: boolean;
+  /** This reader's standing model for the runtime, when they have one. */
+  standingModel?: string;
   report?: TierWriteReport;
   onChange(changes: Partial<RuntimeProfile>): void;
   onRemove(): void;
@@ -473,10 +491,34 @@ function ProfileEditor({
                 </div>
               </div>
             ))}
-            <div style={{ ...noteStyle, marginTop: 4 }}>
-              Written into this runtime&apos;s own config when you save. Files you wrote
-              yourself are never overwritten.
+            <div
+              style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10 }}
+            >
+              <div
+                style={{
+                  flex: '0 0 60px',
+                  fontFamily: 'var(--font-sans)',
+                  fontSize: 'var(--text-ui)',
+                }}
+              >
+                Runs on
+              </div>
+              <div style={{ flex: 1 }}>
+                <Select
+                  aria-label="Rung the conversation runs on"
+                  disabled={readOnly}
+                  value={profile.conversationTier ?? DEFAULT_CONVERSATION_TIER}
+                  onChange={(e) => onChange({ conversationTier: e.target.value as ModelTier })}
+                  options={MODEL_TIERS.map((tier) => ({ value: tier, label: tier }))}
+                />
+              </div>
             </div>
+            <div style={{ ...noteStyle, marginTop: 4 }}>
+              The rung the conversation itself answers from. The other three configure the
+              helpers the agent delegates to. Written into this runtime&apos;s own config when
+              you save — a file you wrote yourself is replaced, with a copy kept beside it.
+            </div>
+            <LadderOverride profile={profile} standingModel={standingModel} />
           </>
         ) : (
           <div style={noteStyle}>
@@ -491,6 +533,51 @@ function ProfileEditor({
   );
 }
 
+/**
+ * What is beating this ladder, when something is.
+ *
+ * The failure this exists for is silent by construction: the four boxes are
+ * filled in, the profile is active, the page says it saved — and every
+ * conversation opens on something else entirely, because a model was typed into
+ * the box above or because this account picked one in a chat six weeks ago
+ * (#171). Nothing on screen said so.
+ */
+function LadderOverride({
+  profile,
+  standingModel,
+}: {
+  profile: RuntimeProfile;
+  standingModel?: string;
+}): React.JSX.Element | null {
+  const rung = resolveConversationRung(profile);
+  if (!rung) return null;
+
+  // In precedence order, because only the first one is actually in force.
+  const beating = standingModel
+    ? `your standing choice for this runtime (${standingModel})`
+    : profile.model
+      ? `the model typed above (${profile.model})`
+      : null;
+
+  if (!beating) {
+    const fell = rung.requested
+      ? ` The ${rung.requested} rung is blank, so the nearest filled one answers.`
+      : '';
+    return (
+      <div style={{ ...noteStyle, marginTop: 6 }}>
+        Conversations open on <code>{rung.model}</code>.{fell}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ ...noteStyle, marginTop: 6, color: 'var(--destructive)' }}>
+      This ladder does not decide the conversation&apos;s model: {beating} outranks it.
+      Conversations still delegate to the rungs above.
+    </div>
+  );
+}
+
 function TierReport({ report }: { report: TierWriteReport }): React.JSX.Element | null {
   if (report.unsupported) {
     return (
@@ -502,25 +589,26 @@ function TierReport({ report }: { report: TierWriteReport }): React.JSX.Element 
   if (report.deferred) {
     return <div style={{ ...noteStyle, marginTop: 8 }}>{report.deferred}</div>;
   }
-  if (!report.written.length && !report.skipped.length) return null;
-
-  // Every tier skipped means the fields above are filled in, the profile can be
-  // made active, and none of it reaches the runtime — which looks like the app
-  // losing the settings rather than deferring to a file the user wrote.
-  const nothingApplied = report.written.length === 0 && report.skipped.length > 0;
+  if (report.failed) {
+    return (
+      <div style={{ ...noteStyle, marginTop: 8, color: 'var(--destructive)' }}>
+        {report.failed} Sessions still start, on the runtime&apos;s own model.
+      </div>
+    );
+  }
+  const replaced = report.replaced ?? [];
+  if (!report.written.length && !replaced.length) return null;
 
   return (
     <div style={{ ...noteStyle, marginTop: 8 }}>
-      {nothingApplied ? (
-        <div style={{ color: 'var(--destructive)', marginBottom: 4 }}>
-          None of these tiers is in effect: the files below are yours, and the app never
-          overwrites a file it did not write. Move or rename them to hand these tiers over.
-        </div>
-      ) : null}
       {report.written.length ? <div>Wrote {report.written.length} file(s).</div> : null}
-      {report.skipped.map((s) => (
+      {/* Reported rather than silent: this is the one operation here that
+          destroys something the user made. The profile winning over a
+          hand-written config is deliberate (#171), and being deliberate is not
+          the same as being invisible. */}
+      {replaced.map((s) => (
         <div key={s.file} style={{ color: 'var(--destructive)' }}>
-          Left <code>{s.file}</code> alone — {s.reason}
+          Replaced <code>{s.file}</code> — {s.reason}
         </div>
       ))}
     </div>

@@ -3,6 +3,7 @@ import {
   ChatAttachment,
   ChatCapabilities,
   ChatModelDefault,
+  ChatModelOrigin,
   ChatUsage,
   EffortChoice,
   ModelChoice,
@@ -155,6 +156,18 @@ export interface ComposerProps {
    * this is the only truthful answer the chip has (#135).
    */
   modelPinned?: string | null;
+  /**
+   * Where the model in force came from — the ladder and its rung, the profile,
+   * the account's standing choice, or the runtime's own default.
+   *
+   * The fourth, and the only one that answers *why*. The three above each name
+   * a model; this names the thing that chose it, which is what a person with a
+   * ladder configured needs in order to tell a ladder that is working from one
+   * something else has quietly overridden (#171).
+   */
+  modelOrigin?: ChatModelOrigin | null;
+  /** Why this conversation's ladder was not applied, when it was not. */
+  ladderError?: string | null;
   /**
    * The reasoning-effort level this conversation is running at.
    *
@@ -311,6 +324,8 @@ export function Composer({
   modelDefault,
   modelOverride,
   modelPinned,
+  modelOrigin,
+  ladderError,
   effort,
   onSetEffort,
   effortFeedback,
@@ -1190,6 +1205,8 @@ export function Composer({
                 fallback={modelDefault}
                 override={modelOverride}
                 pinned={modelPinned}
+                origin={modelOrigin}
+                ladderError={ladderError}
                 onPick={(value) => onSetModel?.(value)}
               />
 
@@ -1545,7 +1562,45 @@ function describeModelDefault(fallback: ChatModelDefault): string {
       ? `From the "${fallback.profileName}" runtime profile: ${fallback.model}.`
       : `From the active runtime profile: ${fallback.model}.`;
   }
+  if (fallback.source === 'ladder' && fallback.model) {
+    const ladder = fallback.profileName ? `the "${fallback.profileName}" ladder` : 'the active ladder';
+    return `The ${fallback.tier} rung of ${ladder}: ${fallback.model}.`;
+  }
   return 'No default set — this runtime picks for itself.';
+}
+
+/**
+ * What *this* conversation is running, and why it is on it.
+ *
+ * The question the chip could not answer before the ladder existed, and the one
+ * the issue asks for by name: the model in use, the rung it corresponds to, and
+ * which of four things chose it. Separate from the default above because the
+ * two are routinely different and stating either as the other is the whole of
+ * #135.
+ */
+function describeModelOriginLine(origin: ChatModelOrigin): string | null {
+  if (!origin.model) {
+    return origin.source === 'runtime' ? 'Running on this runtime’s own default.' : null;
+  }
+  switch (origin.source) {
+    case 'ladder': {
+      const ladder = origin.profileName ? `the "${origin.profileName}" ladder` : 'the active ladder';
+      const fell = origin.requestedTier
+        ? ` (${origin.requestedTier} is blank, so the nearest filled rung answered)`
+        : '';
+      return `Running on the ${origin.tier} rung of ${ladder}${fell}.`;
+    }
+    case 'profile':
+      return origin.profileName
+        ? `Running on the model set by the "${origin.profileName}" runtime profile.`
+        : 'Running on the model set by the active runtime profile.';
+    case 'personal':
+      return 'Running on your standing choice for this runtime.';
+    case 'override':
+      return 'Chosen for this conversation only.';
+    default:
+      return 'Running on this runtime’s own default.';
+  }
 }
 
 /**
@@ -1578,6 +1633,8 @@ function ModelChip({
   fallback,
   override,
   pinned,
+  origin,
+  ladderError,
 }: {
   /** What the session reported it is running, when it reported anything. */
   current: string | undefined;
@@ -1599,6 +1656,10 @@ function ModelChip({
    * running, that is what the next new chat would open on.
    */
   pinned?: string | null;
+  /** Where the model in force came from, and which rung it is; null when unsaid. */
+  origin?: ChatModelOrigin | null;
+  /** Why the ladder was not applied, when it was not. */
+  ladderError?: string | null;
 }): React.JSX.Element {
   const [open, setOpen] = React.useState(false);
   const [customValue, setCustomValue] = React.useState('');
@@ -1679,7 +1740,14 @@ function ModelChip({
   // The others are counted, not named: three model ids do not fit on a chip,
   // and picking one of them to show would undo the point of reporting a split.
   const others = (alsoRan ?? []).filter((model) => model !== current);
-  const label = others.length > 0 ? `${named} +${others.length}` : named;
+  // The rung rides on the chip rather than only in the menu, because "which
+  // model is this on" and "how expensive is that" are one glance for anybody
+  // who built a ladder — and the menu is two clicks away.
+  const rung = origin?.source === 'ladder' && origin.tier && origin.model === effective
+    ? origin.tier
+    : null;
+  const withRung = rung ? `${named} · ${rung}` : named;
+  const label = others.length > 0 ? `${withRung} +${others.length}` : withRung;
 
   /**
    * Why this model and not another — the question the picker could not answer.
@@ -1696,12 +1764,16 @@ function ModelChip({
    */
   const clearPhrase = fallback ? describeModelClear(fallback) : null;
   const staysOn = pinned && pinned !== fallback?.model ? `Staying on ${pinned}.` : null;
+  // The origin answers "why is this conversation on this model" outright, so it
+  // replaces the inference `staysOn` was making from a mismatch. A server that
+  // predates it sends nothing and the older wording still applies.
+  const inForce = origin ? describeModelOriginLine(origin) : staysOn;
   const sourceLine = !fallback
-    ? null
+    ? inForce
     : override
       ? `Chosen for this conversation only. ${clearPhrase}`
-      : staysOn
-        ? `${staysOn} ${describeModelDefault(fallback)}`
+      : inForce
+        ? `${inForce} ${describeModelDefault(fallback)}`
         : describeModelDefault(fallback);
 
   React.useEffect(() => {
@@ -1848,6 +1920,23 @@ function ModelChip({
               }}
             >
               {sourceLine}
+            </div>
+          ) : null}
+
+          {/* A ladder that could not be applied. Said here rather than swallowed:
+              the settings page reported it as saved, and without this the only
+              evidence is a model nobody chose. */}
+          {ladderError ? (
+            <div
+              data-ladder-error=""
+              style={{
+                padding: '2px 4px 6px',
+                color: 'var(--destructive)',
+                fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
+                lineHeight: 1.4,
+              }}
+            >
+              {ladderError}
             </div>
           ) : null}
 

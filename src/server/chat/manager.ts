@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { ChatSnapshot, UserTurn } from '../../shared/chat-events.js';
+import { ModelTier } from '../../shared/runtime-profiles.js';
 import { SessionRecord } from '../types.js';
 import { ChatNotRunningError, ChatSession, ChatSessionStartOptions, ChatUsageSink } from './session.js';
 import { ModelCapacityLookup } from './model-capacity.js';
@@ -303,6 +304,26 @@ export class ChatSessionManager {
   /** Carry a new model into the options an in-place `/clear` restart replays. */
   rememberModel(sessionId: string, model: string | undefined): void {
     this.sessions.get(sessionId)?.rememberModel(model);
+  }
+
+  /**
+   * Move a running conversation onto an edited ladder.
+   *
+   * Which sessions are on one is the session's own answer to give — the manager
+   * has no view of the profile a conversation launched under — so every live
+   * session on the runtime is offered the new ladder and the ones not running on
+   * a rung decline it.
+   */
+  async reapplyLadder(
+    runtime: string,
+    ladder: { tier: ModelTier; tiers: Partial<Record<ModelTier, string>> } | null,
+  ): Promise<string[]> {
+    const moved: string[] = [];
+    for (const [sessionId, session] of this.sessions) {
+      if (!session.live || session.runtimeKind !== runtime) continue;
+      if (await session.reapplyLadder(ladder)) moved.push(sessionId);
+    }
+    return moved;
   }
 
   /** Switch a live session's reasoning effort. False when nothing is running, or the adapter cannot. */

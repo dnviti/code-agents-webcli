@@ -23,7 +23,12 @@ import {
   resolveConversationRung,
 } from '../shared/runtime-profiles.js';
 import { RuntimeProfileStore } from './services/runtime-profiles.js';
-import { TierWriterContext, applyTiers, defaultTierContext } from './services/tier-writer.js';
+import {
+  TierWriterContext,
+  applyTiers,
+  defaultTierContext,
+  tierCapableRuntimes,
+} from './services/tier-writer.js';
 import { WebSocketHandler } from './websocket/handler.js';
 import { MessageProcessor } from './websocket/messages.js';
 import { PromptSession } from './setup/prompts.js';
@@ -701,6 +706,41 @@ export class ClaudeCodeWebServer {
   }
 
   /**
+   * Carry edited ladders into the conversations that are open right now.
+   *
+   * Every tier-capable runtime, not only the ones whose profile changed: a save
+   * rewrites the whole configuration at once, and working out which runtimes
+   * actually moved would mean diffing a config against itself. The sessions
+   * decide — one already on the rung it is being offered declines, so an
+   * unrelated save interrupts nobody.
+   */
+  private async applyProfilesToOpenChats(): Promise<void> {
+    for (const runtime of tierCapableRuntimes()) {
+      const profile = this.activeProfileFor(runtime);
+      // Only when the ladder is what decides: a model typed into the profile,
+      // like an account's standing choice, outranks it, and a conversation
+      // running on one of those was never the ladder's to move.
+      const ladder = profile && !profile.model && profile.ladder && profile.tiers
+        ? { tier: profile.ladder.tier, tiers: profile.tiers }
+        : null;
+      const moved = await this.chatManager.reapplyLadder(runtime, ladder);
+      if (moved.length) {
+        console.log(`Runtime profiles: moved ${moved.length} open ${runtime} conversation(s)`);
+      }
+    }
+  }
+
+  /** This account's standing model per runtime, for the profiles dialog. */
+  private getUserModelDefaults(userId: number): Record<string, string> {
+    const defaults: Record<string, string> = {};
+    for (const runtime of tierCapableRuntimes()) {
+      const model = this.database.getUserSetting(userId, `chatModel:${runtime}`);
+      if (model) defaults[runtime] = model;
+    }
+    return defaults;
+  }
+
+  /**
    * Cached: detection shells out to `npm root -g` and `systemctl is-active`,
    * and neither answer changes while the process is alive.
    */
@@ -998,6 +1038,8 @@ export class ClaudeCodeWebServer {
       userPreferences: this.userPreferences,
       getUserPreferences: (userId: number) => this.userPreferences.get(userId),
       tierContext: this.tierContext,
+      applyProfilesToOpenChats: () => this.applyProfilesToOpenChats(),
+      getUserModelDefaults: (userId: number) => this.getUserModelDefaults(userId),
       updateChecker: this.updateChecker,
       selfUpdate: this.selfUpdate,
       getUpdateMode: () => this.getUpdateMode(),

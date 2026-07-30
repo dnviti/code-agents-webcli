@@ -11,6 +11,18 @@ export interface ProfileRoutesDeps {
   runtimeProfiles: RuntimeProfileStore;
   tierContext: TierWriterContext;
   getInstallerUserId(): number | null;
+  /**
+   * Carry the edited ladders into conversations that are already open.
+   *
+   * A profile edited under a running chat used to reach it only on the next
+   * launch, which for a conversation somebody is sitting in means never (#171).
+   */
+  applyProfilesToOpenChats?(): Promise<void>;
+  /**
+   * This account's standing model per runtime, so the dialog can say when one
+   * is overriding a ladder somebody configured and cannot see working.
+   */
+  getUserModelDefaults?(userId: number): Record<string, string>;
 }
 
 /**
@@ -48,10 +60,15 @@ export function createProfileRoutes(deps: ProfileRoutesDeps): Router {
       // and the UI needs to know which it is so it can render read-only rather
       // than offering a Save that will 403.
       canEdit: installerUserId !== null && user.id === installerUserId,
+      // Per-runtime, for the reader's own account: a standing choice outranks
+      // the ladder, and a ladder that has been overridden looks exactly like a
+      // ladder that is working until something says otherwise. Only ever this
+      // reader's own — another account's model is not theirs to see.
+      standingModels: deps.getUserModelDefaults?.(user.id) ?? {},
     });
   });
 
-  router.put('/api/runtime-profiles', (req: Request, res: Response): void => {
+  router.put('/api/runtime-profiles', async (req: Request, res: Response): Promise<void> => {
     const user = requireUser(res);
     if (!user) {
       res.status(401).json({ error: 'Not signed in' });
@@ -91,6 +108,17 @@ export function createProfileRoutes(deps: ProfileRoutesDeps): Router {
         // sentence it hands back is what the dialog shows instead of silence.
         deferred: result.deferred,
       };
+    }
+
+    // Then into the conversations that are open right now. After the write, so
+    // a session that is moved is moved onto what was actually saved; never
+    // allowed to fail the request, because the profiles *are* saved by this
+    // point and reporting an error would invite the user to save them again.
+    try {
+      await deps.applyProfilesToOpenChats?.();
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`runtime profiles: saved, but open conversations were not moved: ${message}`);
     }
 
     res.json({ config, tierResults });

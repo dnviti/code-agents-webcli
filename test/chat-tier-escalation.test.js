@@ -264,3 +264,75 @@ describe('what the model is told', function () {
     assert.match(decision.detail, /takes effect on your next turn/);
   });
 });
+
+describe('a profile edited under a running conversation', function () {
+  it('moves it onto the new rung, interrupting the turn in progress', async function () {
+    const { s, store } = session();
+    let interrupted = false;
+    s.adapter.interrupt = async () => { interrupted = true; };
+    // Mid-turn, which is the case the issue names outright.
+    s.setState('thinking');
+
+    const moved = await s.reapplyLadder({ tier: 'top', tiers: LADDER });
+
+    assert.strictEqual(moved, true);
+    assert.ok(interrupted, 'the turn in progress has to be cut short');
+    assert.deepStrictEqual(s.adapter.models, ['t-model']);
+    assert.deepStrictEqual(markers(store), [
+      'the profile changed — now on the top rung, t-model',
+    ]);
+  });
+
+  it('interrupts nobody when the rung it is already on has not changed', async function () {
+    // An unrelated save rewrites the whole configuration, so every laddered
+    // session is offered the ladder. Cutting a turn short to change nothing is
+    // the worst possible reading of "takes effect immediately".
+    const { s, store } = session();
+    let interrupted = false;
+    s.adapter.interrupt = async () => { interrupted = true; };
+    s.setState('thinking');
+
+    const moved = await s.reapplyLadder({ tier: 'mid', tiers: LADDER });
+
+    assert.strictEqual(moved, false);
+    assert.ok(!interrupted);
+    assert.deepStrictEqual(s.adapter.models, []);
+    assert.deepStrictEqual(markers(store), []);
+  });
+
+  it('leaves a conversation that is not on the ladder alone', async function () {
+    // One pinned by a model somebody typed, or by an account's standing choice,
+    // was never the ladder's to decide.
+    const { s, store } = session({ ladder: false });
+
+    const moved = await s.reapplyLadder({ tier: 'top', tiers: LADDER });
+
+    assert.strictEqual(moved, false);
+    assert.deepStrictEqual(s.adapter.models, []);
+    assert.deepStrictEqual(markers(store), []);
+  });
+
+  it('says so when the ladder is taken away entirely', async function () {
+    const { s, store } = session();
+
+    const moved = await s.reapplyLadder(null);
+
+    assert.strictEqual(moved, true);
+    assert.deepStrictEqual(s.adapter.models, [], 'there is nothing to switch to');
+    assert.match(markers(store)[0], /the ladder this conversation was on is gone/);
+  });
+
+  it('drops an escalation that belonged to the ladder it replaced', async function () {
+    const { s, store } = session();
+    const decided = s.requestTier({ reason: 'hard' });
+    s.respondPermission(askedFor(store).request.requestId, 'allow_once');
+    await settles(decided, 'the escalation');
+
+    await s.reapplyLadder({ tier: 'floor', tiers: LADDER });
+
+    // And the turn ending now puts nothing back: the grant went with its ladder.
+    s.ingest({ t: 'turn_end' });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(s.adapter.models, ['h-model', 'f-model']);
+  });
+});
