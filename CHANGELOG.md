@@ -129,6 +129,48 @@
   working with fewer facts per row — and a list `gh` refuses outright now says
   so, where before an empty section read as a repository with nothing open.
 
+- **A capability ladder now decides which model does the work.** Filling in a
+  profile's four rungs read like a decision about which model handles which kind
+  of work, and the settings page reported it applied. It was not that decision: a
+  ladder only ever configured the helpers an agent delegates to, and the
+  conversation you were actually talking to went on running whatever model the
+  tool would have picked by itself — frequently the most expensive one in play,
+  sometimes one not on the ladder at all — with nothing on screen to say so.
+
+  A profile now names the rung the conversation itself answers from, defaulting
+  to *mid*, and that rung's model is what replies. A model typed into the profile
+  and your own standing choice still outrank it, and where one of them is
+  deciding the profile says so instead of leaving a filled-in ladder looking like
+  a working one. Every conversation names the model in force, the rung it sits
+  on, and which of those chose it. A blank rung falls to the nearest filled one,
+  downwards when two are equally near. A rung a provider refuses falls back to
+  the runtime's own default and carries on; a ladder that cannot be applied at
+  all still starts the session, and says so in the header.
+
+  Ladders you have already saved start deciding on the first launch after
+  upgrading — nothing to re-tick — and conversations older than this move onto
+  the ladder when they are next relaunched. Saving a profile also reaches
+  conversations that are already open, interrupting a turn in progress. Terminal
+  sessions started from the app run on the ladder the same way.
+
+- **And the agent can ask to move up a rung.** Work that turns out to be beyond
+  the model answering it is a real situation, and until now the only way through
+  it was to notice and switch by hand. The agent can now ask; the request reaches
+  you as an ordinary approval with its own one-line reason; nothing moves until
+  you allow it; and the conversation returns to its usual rung once that turn
+  ends. In a conversation with approvals bypassed it proceeds without asking,
+  along with everything else that mode stops asking about.
+
+- **A runtime's own configuration no longer wins over the app's.** This reverses
+  a rule the tier feature was built on. Until now a config file you wrote by hand
+  was never touched and the tier was reported as not applied; from this release
+  the profile is the single source of truth for the runtimes it covers, and such
+  a file is replaced. What was there is copied once to a `.bak` beside it and the
+  replacement is reported, but nothing in the app restores it — so a ladder you
+  maintain outside this app, for use outside it, wants to live somewhere the app
+  does not write. The trade was made knowingly, in favour of a ladder that
+  actually decides something.
+
 ### Fixed
 - **Stopping a turn no longer reads as the turn failing.** Claude reports a run
   it was told to abandon exactly the way it reports one that broke — `is_error`,

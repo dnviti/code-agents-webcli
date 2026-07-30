@@ -65,6 +65,12 @@ function build(options = {}) {
       return false;
     },
     rememberModel() {},
+    // What the real manager answers: the rung the *running* session is on. A
+    // snapshot must not read the profile's current rung instead — a
+    // conversation that launched bare carries the same null pin, and reporting
+    // the profile's rung for it draws the chip as running a model the process
+    // is not on (#135, again).
+    ladderOf: () => options.runningLadder ?? null,
     async setEffort() {
       return false;
     },
@@ -332,8 +338,31 @@ describe('a ladder that could not be written through', function () {
 });
 
 describe('a browser rejoining a laddered conversation', function () {
-  it('is told the rung, not just the model', async function () {
+  it('is told nothing about a rung when the conversation is not on one', async function () {
+    // A conversation that launched bare records the same null pin as one on a
+    // rung. Reading the profile's current rung for it would name a model the
+    // process is not running — the exact failure #135 introduced this field to
+    // remove.
     const { processor, session, sent, ws } = build({ profile: ladderProfile() });
+    session.surface = 'chat';
+    session.agent = 'pi';
+    session.chatModelPinned = null;
+
+    await processor.subscribeChat(
+      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
+      session.id,
+    );
+
+    const snapshot = lastOfType(sent, 'chat_snapshot');
+    assert.strictEqual(snapshot.modelOrigin.source, 'runtime');
+    assert.strictEqual(snapshot.modelOrigin.model, null);
+  });
+
+  it('is told the rung, not just the model', async function () {
+    const { processor, session, sent, ws } = build({
+      profile: ladderProfile(),
+      runningLadder: { tier: 'mid', model: 'gateway/mid-model' },
+    });
     session.surface = 'chat';
     session.agent = 'pi';
     session.chatModelPinned = null;

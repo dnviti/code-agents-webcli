@@ -30,6 +30,7 @@ import {
   TIER_TOOL_NAME,
 } from '../../shared/chat-events.js';
 import {
+  LadderRung,
   ModelTier,
   nextRungUp,
 } from '../../shared/runtime-profiles.js';
@@ -401,7 +402,23 @@ export class ChatSession {
    * approval is the only control on what this spends, and a grant that outlived
    * the work it was granted for would quietly become the conversation's model.
    */
-  private escalation: { from: ModelTier; to: ModelTier; model: string } | null = null;
+  private escalation: {
+    from: ModelTier;
+    to: ModelTier;
+    model: string;
+    /**
+     * True while the grant has been made but the turn it applies to has not
+     * started — either because the runtime cannot change model mid-turn (pi
+     * runs one process per turn) or because the user answered after the turn
+     * that asked had already ended.
+     *
+     * Without it the very next `turn_end` — the one closing the turn the grant
+     * was *not* for — cancelled the escalation before the promised turn began,
+     * so the model was told it had moved up and then answered from the rung it
+     * started on.
+     */
+    startsNextTurn: boolean;
+  } | null = null;
   /**
    * Question tool calls the transcript has opened and nothing has claimed yet.
    *
@@ -1224,12 +1241,21 @@ export class ChatSession {
       // the same fact in twice.
       this.state = 'idle';
     }
-    if (stamped.t === 'turn_end' && this.escalation) {
-      // The task that prompted the move up is over. Not awaited: `ingest` is
-      // synchronous for every one of its callers, and the switch back is a
-      // request to a runtime that may take its time answering. The marker it
-      // emits arrives after this event, which is the order it happened in.
-      void this.endEscalation();
+    // `stale` is the interrupt acknowledgement a steer produces, and it closes
+    // no turn — the reducer excludes it from turn accounting for the same
+    // reason. Ending an escalation on one cancels a grant the user has paid for
+    // while the redirected turn is still running.
+    if (stamped.t === 'turn_end' && !stamped.stale && this.escalation) {
+      if (this.escalation.startsNextTurn) {
+        // This is the turn the grant was *not* for. The promised one starts now.
+        this.escalation = { ...this.escalation, startsNextTurn: false };
+      } else {
+        // The task that prompted the move up is over. Not awaited: `ingest` is
+        // synchronous for every one of its callers, and the switch back is a
+        // request to a runtime that may take its time answering. The marker it
+        // emits arrives after this event, which is the order it happened in.
+        void this.endEscalation();
+      }
     }
     if (stamped.t === 'capabilities' && this.capabilities) {
       this.capabilities = { ...this.capabilities, ...stamped.capabilities };
@@ -2340,28 +2366,67 @@ export class ChatSession {
       };
     }
 
-    const live = await this.setModel(next.model);
-    this.escalation = { from, to: next.tier, model: next.model };
+    const applied = await this.applyModel(next.model);
+    if (applied === 'no') {
+      // Nothing was changed, so nothing is claimed. A model told it moved up
+      // when it did not will attempt work it cannot do, and the user will be
+      // shown a rung the process was never on.
+      return {
+        granted: false,
+        detail:
+          `The user approved moving up to the ${next.tier} rung, but this runtime cannot change `
+          + 'its model without being restarted, so nothing moved. Carry on with the model you '
+          + 'have and say that the stronger one could not be reached.',
+      };
+    }
+
+    // A grant made while nothing is running belongs to the turn that has not
+    // started yet — the same case as a runtime that can only switch between
+    // turns, and it arises whenever a blocked tool call is abandoned while the
+    // card is still up.
+    const startsNextTurn = applied === 'next-turn' || this.state === 'idle';
+    this.escalation = { from, to: next.tier, model: next.model, startsNextTurn };
     this.ingest({
       t: 'marker',
       kind: 'model',
-      detail: `moved up to the ${next.tier} rung — ${next.model}`,
+      detail: startsNextTurn
+        ? `moving up to the ${next.tier} rung for the next turn — ${next.model}`
+        : `moved up to the ${next.tier} rung — ${next.model}`,
     });
 
     return {
       granted: true,
       tier: next.tier,
       model: next.model,
-      detail: live
-        ? `Approved. You are now answering from the ${next.tier} rung (${next.model}). `
-          + `The conversation returns to ${from} when this turn ends.`
-        // pi is one process per turn, so the switch cannot reach the process
-        // already running. Said plainly rather than claimed: a model told it is
-        // on a stronger model when it is not would attempt work it cannot do.
-        : `Approved. The ${next.tier} rung (${next.model}) takes effect on your next turn — `
-          + 'the model you are on now cannot be changed mid-turn. Finish or stop here, and the '
-          + `stronger model picks it up. The conversation returns to ${from} afterwards.`,
+      detail: startsNextTurn
+        ? `Approved. The ${next.tier} rung (${next.model}) takes effect on your next turn — the `
+          + 'model answering right now cannot be changed mid-turn. Finish or stop here, and the '
+          + `stronger model picks it up. The conversation returns to ${from} after that turn.`
+        : `Approved. You are now answering from the ${next.tier} rung (${next.model}). `
+          + `The conversation returns to ${from} when this turn ends.`,
     };
+  }
+
+  /**
+   * Put a model in front of the agent, by whichever route its runtime has.
+   *
+   * Three answers, because there are three outcomes and collapsing them to a
+   * boolean is how the escalation came to promise a rung it never reached:
+   * `live` (the running process took it), `next-turn` (the runtime spawns per
+   * turn, so the next one will), and `no` (nothing changed).
+   */
+  private async applyModel(model: string): Promise<'live' | 'next-turn' | 'no'> {
+    const adapter = this.adapter;
+    if (!adapter?.alive) return 'no';
+    if (adapter.setModel) {
+      await adapter.setModel(model);
+      return 'live';
+    }
+    if (adapter.setModelNextTurn) {
+      adapter.setModelNextTurn(model);
+      return 'next-turn';
+    }
+    return 'no';
   }
 
   /**
@@ -2385,7 +2450,15 @@ export class ChatSession {
         toolKind: 'other',
         input: { rung: to, model },
         reason: reason || 'The agent gave no reason.',
-        options: defaultPermissionOptions(),
+        // Two options, not the usual three. The standing "Allow for this
+        // session" would be a lie on the one control in the app that governs
+        // spending: a grant lasts one turn by design, so a user who clicked it
+        // believing the expensive model was authorised session-wide would have
+        // been told the opposite of the truth.
+        options: [
+          { optionId: 'allow_once', kind: 'allow_once', name: 'Allow, for this turn' },
+          { optionId: 'reject_once', kind: 'reject_once', name: 'Stay on this rung' },
+        ],
         ts: Date.now(),
       };
       this.pending.set(requestId, {
@@ -2395,6 +2468,23 @@ export class ChatSession {
       this.ingest({ t: 'permission', request });
       this.setState('awaiting_permission');
     });
+  }
+
+  /**
+   * The rung this conversation is actually on, or null when it is not on one.
+   *
+   * The escalated rung while an escalation is in force: what a browser joining
+   * mid-turn has to be told is what the process is answering from, not what it
+   * will go back to.
+   */
+  get ladderRung(): LadderRung | null {
+    if (!this.ladder || !this.live) return null;
+    const escalation = this.escalation;
+    if (escalation && !escalation.startsNextTurn) {
+      return { tier: escalation.to, model: escalation.model };
+    }
+    const model = this.ladder.tiers[this.ladder.tier];
+    return model ? { tier: this.ladder.tier, model } : null;
   }
 
   /**
@@ -2444,13 +2534,20 @@ export class ChatSession {
     if (this.state !== 'idle') await this.interrupt().catch(() => undefined);
     // Any escalation belonged to the ladder that has just been replaced.
     this.escalation = null;
-    await this.setModel(model).catch(() => false);
+    const applied = await this.applyModel(model).catch(() => 'no' as const);
     this.ingest({
       t: 'marker',
       kind: 'model',
-      detail: `the profile changed — now on the ${ladder.tier} rung, ${model}`,
+      detail: applied === 'no'
+        // Said, not swallowed. The turn was cut short and the model did not
+        // change, which is the worst of both and the user is owed the reason.
+        ? `the profile changed to the ${ladder.tier} rung, ${model} — this runtime cannot take it `
+          + 'without a restart, so this conversation stays on its model until then'
+        : applied === 'next-turn'
+          ? `the profile changed — the next turn runs on the ${ladder.tier} rung, ${model}`
+          : `the profile changed — now on the ${ladder.tier} rung, ${model}`,
     });
-    return true;
+    return applied !== 'no';
   }
 
   /**
@@ -2468,11 +2565,13 @@ export class ChatSession {
     this.escalation = null;
 
     const back = ladder.tiers[escalation.from];
-    if (back) await this.setModel(back).catch(() => false);
+    const applied = back ? await this.applyModel(back).catch(() => 'no' as const) : 'no';
     this.ingest({
       t: 'marker',
       kind: 'model',
-      detail: `back on the ${escalation.from} rung${back ? ` — ${back}` : ''}`,
+      detail: applied === 'no'
+        ? `the ${escalation.to} rung ends here; the next launch resolves the ladder again`
+        : `back on the ${escalation.from} rung — ${back}`,
     });
   }
 

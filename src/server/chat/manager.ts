@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { ChatSnapshot, UserTurn } from '../../shared/chat-events.js';
-import { ModelTier } from '../../shared/runtime-profiles.js';
+import { LadderRung, ModelTier } from '../../shared/runtime-profiles.js';
 import { SessionRecord } from '../types.js';
 import { ChatNotRunningError, ChatSession, ChatSessionStartOptions, ChatUsageSink } from './session.js';
 import { ModelCapacityLookup } from './model-capacity.js';
@@ -304,6 +304,17 @@ export class ChatSessionManager {
   /** Carry a new model into the options an in-place `/clear` restart replays. */
   rememberModel(sessionId: string, model: string | undefined): void {
     this.sessions.get(sessionId)?.rememberModel(model);
+  }
+
+  /**
+   * The rung a running session is on, or null when it is not on one.
+   *
+   * Asked of the session rather than worked out from the profile, because the
+   * profile can have changed since the launch and a conversation that launched
+   * bare is indistinguishable from one on a rung by anything the record holds.
+   */
+  ladderOf(sessionId: string): LadderRung | null {
+    return this.sessions.get(sessionId)?.ladderRung ?? null;
   }
 
   /**

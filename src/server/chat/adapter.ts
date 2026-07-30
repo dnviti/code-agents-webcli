@@ -153,6 +153,18 @@ export interface ChatAdapter {
   /** Switch model mid-session, for runtimes that allow it. */
   setModel?(model: string): Promise<void>;
   /**
+   * Change the model the *next* turn runs on, for a runtime that cannot change
+   * the one already running.
+   *
+   * pi spawns one process per turn, so its model is an argv entry rather than
+   * anything a live session holds — there is nothing to ask, and the next
+   * `send()` simply builds a different command line. Separate from `setModel`
+   * because the difference is one the caller has to be able to state: an
+   * escalation that promised a stronger model *now* and delivered it next turn
+   * had the model attempting work it could not do (#171).
+   */
+  setModelNextTurn?(model: string): void;
+  /**
    * Switch reasoning effort mid-session, for runtimes that allow it.
    *
    * Resolving means the runtime took it, and an implementation must not resolve

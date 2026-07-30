@@ -27,6 +27,7 @@ import {
   TierWriterContext,
   applyTiers,
   defaultTierContext,
+  supportsTiers,
   tierCapableRuntimes,
 } from './services/tier-writer.js';
 import { WebSocketHandler } from './websocket/handler.js';
@@ -666,7 +667,12 @@ export class ClaudeCodeWebServer {
     // conversation's own model would be the only half of the ladder that landed
     // — so the launch says so and falls back rather than reporting a rung it
     // half applied.
-    const ladder = resolveConversationRung(profile);
+    // `unsupported` is a runtime with no way to express a ladder at all — the
+    // non-goal the issue states outright: those launch exactly as they do now.
+    // A rung applied anyway would put a `--model` on a claude session whose
+    // helper rungs were written nowhere, from a ladder saved for a different
+    // runtime and carried across by changing the Runtime dropdown.
+    const ladder = tierResult.unsupported ? null : resolveConversationRung(profile);
     const ladderError = ladder && tierResult.failed ? tierResult.failed : undefined;
 
     return {
@@ -696,12 +702,16 @@ export class ClaudeCodeWebServer {
     // The rung is resolved here too: reading a ladder is pure arithmetic over
     // four strings, and it is only *writing* it through that the caller of this
     // one must not trigger.
+    const laddered = supportsTiers(runtime);
     return {
       profileId: profile.id,
       profileName: profile.name,
       model: profile.model,
-      ladder: resolveConversationRung(profile),
-      tiers: profile.tiers,
+      // Same gate as the launch above, and it has to be: this answers the
+      // picker's "where did this model come from", and a rung reported for a
+      // runtime that cannot express one would name a model nothing applied.
+      ladder: laddered ? resolveConversationRung(profile) : null,
+      ...(laddered ? { tiers: profile.tiers } : {}),
     };
   }
 

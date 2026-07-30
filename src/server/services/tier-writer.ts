@@ -137,7 +137,14 @@ function writeManaged(file: string, contents: string, result: TierWriteResult): 
       // ladder from being applied — the overwrite is the behaviour that was
       // asked for, and the backup is the courtesy on top of it.
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-        reason = 'the profile is the source of truth now; your original is in the .bak beside it';
+        // A `.bak` already there is from an *earlier* replacement, or is the
+        // user's own file. Either way it is not a copy of what is being
+        // replaced now, and saying it was would be the one claim here that
+        // could cost somebody work: they would read "your original is safe"
+        // over a file that had just been destroyed without one.
+        reason =
+          'the profile is the source of truth now, so yours was replaced — the .bak beside it is '
+          + 'older and is not a copy of what was just replaced';
       }
     }
     result.replaced.push({ file, reason });

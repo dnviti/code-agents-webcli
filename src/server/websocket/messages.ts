@@ -22,10 +22,36 @@ import { chatUnavailableReason, isChatRuntime } from '../../shared/chat-runtimes
 import {
   ChatDraft,
   ChatModelDefault,
+  ChatModelOrigin,
   MAX_QUESTION_ANSWER_TEXT,
-  describeModelOrigin,
 } from '../../shared/chat-events.js';
-import { ModelTier, ResolvedProfile } from '../../shared/runtime-profiles.js';
+import { LadderRung, ModelTier, ResolvedProfile } from '../../shared/runtime-profiles.js';
+
+/**
+ * The rung a *running* session is actually on, told as an origin.
+ *
+ * Null when nothing is running, or when what is running is not on a rung. The
+ * profile is only consulted for the name to put on it.
+ */
+function ladderOf(
+  manager: ChatManagerLike,
+  sessionId: string,
+  profile: ResolvedProfile | null,
+): ChatModelOrigin | null {
+  const rung = manager.ladderOf?.(sessionId);
+  return rung ? ladderOrigin(rung, profile) : null;
+}
+
+/** One rung, told as an origin — the same three facts, said the way the UI reads them. */
+function ladderOrigin(rung: LadderRung, profile: ResolvedProfile | null): ChatModelOrigin {
+  return {
+    model: rung.model,
+    source: 'ladder',
+    ...(profile?.profileName ? { profileName: profile.profileName } : {}),
+    tier: rung.tier,
+    ...(rung.requested ? { requestedTier: rung.requested } : {}),
+  };
+}
 import { applyDraft, clearDraft, draftOf, readDraft } from '../chat/drafts.js';
 import { UserPreferences, resolveApprovalMode } from '../../shared/user-preferences.js';
 import { ChatNotRunningError } from '../chat/session.js';
@@ -206,6 +232,8 @@ export interface ChatManagerLike {
   setModel(sessionId: string, model: string): Promise<boolean>;
   /** Carry a new model into the options an in-place `/clear` restart replays. */
   rememberModel(sessionId: string, model: string | undefined): void;
+  /** The rung a running session is on, or null when it is not on one. */
+  ladderOf?(sessionId: string): LadderRung | null;
   /** Switch a live session's reasoning effort. False when nothing is running, or the adapter cannot. */
   setEffort(sessionId: string, effort: string): Promise<boolean>;
   /** Carry a new effort level into the options an in-place `/clear` restart replays. */
@@ -1501,29 +1529,41 @@ export class MessageProcessor {
      * only be recorded for a profile that has no ladder to fall to.
      */
     const pinned = session.chatModelPinned;
-    const ladderModel = profile?.ladder?.model;
+    const ladder = profile?.ladder ?? null;
+
+    // The chain, resolved to a model *and* the layer that supplied it in one
+    // pass. Deriving the layer afterwards by comparing the answer to each
+    // candidate reads well and is wrong twice over: a pin that happens to equal
+    // the current rung is credited to the ladder — and then not pinned, so a
+    // string coincidence quietly enrolls a conversation in every future ladder
+    // edit — and a pin that matches nothing is credited to an override the user
+    // never made, which the picker renders as "chosen for this conversation
+    // only" with no way to clear it.
+    let decided: ChatModelOrigin;
+    if (session.chatModelOverride) {
+      decided = { model: session.chatModelOverride, source: 'override' };
+    } else if (pinned) {
+      // A continuation. It is on this model because it launched on it, whatever
+      // the layers below would say today.
+      decided = { model: pinned, source: 'override' };
+    } else if (pinned === null && ladder) {
+      decided = ladderOrigin(ladder, profile);
+    } else if (pinned === null) {
+      decided = { model: null, source: 'runtime' };
+    } else if (seedFromAccount && modelDefault.model) {
+      decided = { ...modelDefault };
+    } else if (profile?.model) {
+      decided = { model: profile.model, source: 'profile', profileName: profile.profileName };
+    } else if (ladder) {
+      decided = ladderOrigin(ladder, profile);
+    } else {
+      decided = { model: null, source: 'runtime' };
+    }
+
     // Not const: a rung the provider refuses is retried bare below, and what
     // the record and the browser are told has to be what actually started.
-    let launchModel =
-      session.chatModelOverride
-      || (pinned
-        ? pinned
-        : pinned === null
-          ? ladderModel
-          : seedFromAccount
-            ? modelDefault.model || undefined
-            : profile?.model || ladderModel)
-      || undefined;
-
-    // Where that model came from, resolved once and reported twice: to the
-    // record, and to every browser watching. A conversation that names a model
-    // and cannot say why it is on it was the whole of #135, and a ladder adds
-    // one more place the answer can come from.
-    let modelOrigin = describeModelOrigin(launchModel, {
-      override: session.chatModelOverride,
-      personal: modelDefault.source === 'personal' ? modelDefault.model : null,
-      profile,
-    });
+    let launchModel = decided.model || undefined;
+    let modelOrigin = decided;
     let ladderError = profile?.ladderError ?? null;
 
     try {
@@ -1720,14 +1760,21 @@ export class MessageProcessor {
         // the launch records for one, so it can be re-read — and the origin has
         // to reach the same conclusion the next launch will, or a reload would
         // rename the model between one screen and the next.
-        modelOrigin: describeModelOrigin(
-          session.chatModelOverride || session.chatModelPinned || active?.ladder?.model,
-          {
-            override: session.chatModelOverride,
-            personal: modelDefault.source === 'personal' ? modelDefault.model : null,
-            profile: active,
-          },
-        ),
+        //
+        // The rung comes from the *running* session rather than from the
+        // profile, and that distinction is the whole of #135 said again: a
+        // conversation that launched bare also carries a null pin, so reading
+        // the profile's current rung here would draw the chip as running a model
+        // the process is not on. A session that is not running has no rung in
+        // force to report, and says nothing rather than guessing one.
+        modelOrigin: ladderOf(manager, sessionId, active)
+          ?? (session.chatModelOverride
+            ? { model: session.chatModelOverride, source: 'override' }
+            : session.chatModelPinned
+              ? { model: session.chatModelPinned, source: 'override' }
+              : session.chatModelPinned === null
+                ? { model: null, source: 'runtime' }
+                : null),
         // Rides on the join for the same reason the model does: the snapshot
         // carries the runtime's own reported level only if it ever reported one,
         // and a conversation whose process has since died reports nothing at
@@ -1990,11 +2037,16 @@ export class MessageProcessor {
     // the next `/clear` reinstates the model the conversation opened with,
     // after the browser has already been told the switch was applied. Resolved
     // the way a launch resolves it, so clearing lands on the profile default.
-    const profile = this.deps.resolveRuntimeProfile(
-      session.agent as AgentKind,
-      session.workingDir,
+    //
+    // Through the read-only accessor. The other one writes the profile's tier
+    // files to disk every time it is called, and picking a model from the chip
+    // is a question about this conversation, not a launch — asking it that way
+    // rewrote the project's `.pi/agents/*.md` on every click (#171).
+    const profile = this.deps.activeProfileFor?.(session.agent || '') ?? null;
+    this.deps.chatManager?.rememberModel(
+      session.id,
+      model || profile?.model || profile?.ladder?.model,
     );
-    this.deps.chatManager?.rememberModel(session.id, model || profile?.model);
 
     /**
      * Every answer carries the default as it stands *after* this pick.
@@ -2024,10 +2076,19 @@ export class MessageProcessor {
 
     if (!model) {
       await this.rememberUserModel(session, undefined, false);
+      // What it actually falls back to, which a ladder changes: the rung is the
+      // profile's standing answer for this runtime, so clearing lands there
+      // rather than on the CLI's own default.
+      const cleared = this.deps.activeProfileFor?.(session.agent || '') ?? null;
+      const under = cleared?.model
+        ? `the "${cleared.profileName}" profile’s model, ${cleared.model}`
+        : cleared?.ladder
+          ? `the ${cleared.ladder.tier} rung of the "${cleared.profileName}" ladder, ${cleared.ladder.model}`
+          : 'the runtime default';
       answer(
         'cleared',
         null,
-        'Cleared the model override. The next session for this conversation will use the runtime default.',
+        `Cleared the model override. The next session for this conversation will use ${under}.`,
       );
       return;
     }

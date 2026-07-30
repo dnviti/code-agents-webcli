@@ -249,12 +249,13 @@ describe('what the model is told', function () {
     assert.match((await settles(decided, 'the escalation')).detail, /You are now answering/);
   });
 
-  it('says it lands on the next turn when the adapter could not', async function () {
+  it('says it lands on the next turn when the runtime spawns per turn', async function () {
     // pi is one process per turn, so a switch cannot reach the process already
     // running. A model told it is on a stronger model when it is not would
     // attempt work it cannot do.
     const { s, store } = session();
     delete s.adapter.setModel;
+    s.adapter.setModelNextTurn = (model) => s.adapter.models.push(model);
 
     const decided = s.requestTier({ reason: 'hard' });
     s.respondPermission(askedFor(store).request.requestId, 'allow_once');
@@ -262,6 +263,85 @@ describe('what the model is told', function () {
 
     assert.strictEqual(decision.granted, true);
     assert.match(decision.detail, /takes effect on your next turn/);
+    assert.deepStrictEqual(s.adapter.models, ['h-model']);
+  });
+
+  it('survives the turn it was granted during, and ends after the one it was for', async function () {
+    // The defect the review caught: the grant was cancelled by the very next
+    // turn_end — the one closing the turn it was *not* for — so the promised
+    // turn ran on the rung it started on while the transcript said otherwise.
+    const { s, store } = session();
+    delete s.adapter.setModel;
+    s.adapter.setModelNextTurn = (model) => s.adapter.models.push(model);
+
+    const decided = s.requestTier({ reason: 'hard' });
+    s.respondPermission(askedFor(store).request.requestId, 'allow_once');
+    await settles(decided, 'the escalation');
+
+    s.ingest({ t: 'turn_end' });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(s.adapter.models, ['h-model'], 'the promised turn has not run yet');
+
+    s.ingest({ t: 'turn_end' });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(s.adapter.models, ['h-model', 'm-model'], 'and now it is over');
+  });
+
+  it('refuses rather than promising a rung the runtime cannot reach', async function () {
+    // An adapter with neither switch. Claiming a move here put the model on a
+    // rung it was never on, and drew a marker saying so.
+    const { s, store } = session();
+    delete s.adapter.setModel;
+
+    const decided = s.requestTier({ reason: 'hard' });
+    s.respondPermission(askedFor(store).request.requestId, 'allow_once');
+    const decision = await settles(decided, 'the escalation');
+
+    assert.strictEqual(decision.granted, false);
+    assert.match(decision.detail, /cannot change its model/);
+    assert.deepStrictEqual(markers(store), [], 'nothing happened, so nothing is drawn');
+  });
+
+  it('does not end on the interrupt acknowledgement a steer produces', async function () {
+    // `stale` closes no turn — the reducer excludes it from turn accounting for
+    // the same reason — so ending on one cancels a grant the user paid for
+    // while the redirected turn is still running.
+    const { s, store } = session();
+    const decided = s.requestTier({ reason: 'hard' });
+    s.respondPermission(askedFor(store).request.requestId, 'allow_once');
+    await settles(decided, 'the escalation');
+
+    s.ingest({ t: 'turn_end', stale: true });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepStrictEqual(s.adapter.models, ['h-model'], 'still up');
+  });
+
+  it('gives a late approval the next turn rather than the one that ended', async function () {
+    // Reachable whenever a runtime abandons the blocked tool call while the
+    // card is still up. Silently applying it to a turn nobody escalated spends
+    // the user's money on a request they made for something else.
+    const { s, store } = session();
+    const decided = s.requestTier({ reason: 'hard' });
+    s.setState('idle');
+    s.respondPermission(askedFor(store).request.requestId, 'allow_once');
+    const decision = await settles(decided, 'the late escalation');
+
+    assert.match(decision.detail, /takes effect on your next turn/);
+
+    s.ingest({ t: 'turn_end' });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(s.adapter.models, ['h-model'], 'the promised turn is still to come');
+  });
+
+  it('offers one turn, never a standing grant', async function () {
+    // "Allow for this session" would be a lie on the one control that governs
+    // spending: the grant lasts one turn by design.
+    const { s, store } = session();
+    void s.requestTier({ reason: 'hard' });
+
+    const options = askedFor(store).request.options.map((o) => o.optionId);
+    assert.deepStrictEqual(options, ['allow_once', 'reject_once']);
   });
 });
 
