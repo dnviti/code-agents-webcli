@@ -267,6 +267,14 @@ export interface ResolvedProfile {
   /** The rung this profile's conversations run on, if it has a ladder at all. */
   ladder?: LadderRung | null;
   /**
+   * The whole ladder behind that rung.
+   *
+   * Carried alongside because escalation has to find what is above the rung in
+   * force, and a running session cannot re-read server-wide configuration that
+   * may have changed under it.
+   */
+  tiers?: Partial<Record<ModelTier, string>>;
+  /**
    * Why the ladder was not applied, when it could not be.
    *
    * A session still starts — a ladder that cannot be written through is a

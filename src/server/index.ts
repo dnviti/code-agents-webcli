@@ -671,6 +671,7 @@ export class ClaudeCodeWebServer {
       extraArgs: extraArgs.length ? extraArgs : undefined,
       env: profile.env,
       ladder: ladderError ? null : ladder,
+      tiers: profile.tiers,
       ladderError,
     };
   }
@@ -695,6 +696,7 @@ export class ClaudeCodeWebServer {
       profileName: profile.name,
       model: profile.model,
       ladder: resolveConversationRung(profile),
+      tiers: profile.tiers,
     };
   }
 

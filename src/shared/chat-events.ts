@@ -1518,8 +1518,21 @@ export function isSessionMintedMessageId(id: string): boolean {
   return /^user-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
 }
 
-/** The one tool that server offers: put a multiple-choice question to the user. */
+/** Put a multiple-choice question to the user, and wait for the answer. */
 export const ASK_QUESTION_TOOL = 'ask_user_question';
+
+/**
+ * Ask to answer from the next model up the profile's capability ladder.
+ *
+ * Offered only to a session that is actually running on a rung — a runtime with
+ * no ladder never sees it, because a tool whose only possible answer is "there
+ * is nothing to escalate to" costs a round trip and reads to the model as the
+ * user having said no.
+ */
+export const TIER_TOOL = 'request_model_tier';
+
+/** What the ladder tool is called once a runtime has namespaced it. */
+export const TIER_TOOL_NAME = `mcp__${ASK_MCP_SERVER}__${TIER_TOOL}`;
 
 /**
  * What the tool is called once a runtime has namespaced it.

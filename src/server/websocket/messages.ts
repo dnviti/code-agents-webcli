@@ -25,7 +25,7 @@ import {
   MAX_QUESTION_ANSWER_TEXT,
   describeModelOrigin,
 } from '../../shared/chat-events.js';
-import { ResolvedProfile } from '../../shared/runtime-profiles.js';
+import { ModelTier, ResolvedProfile } from '../../shared/runtime-profiles.js';
 import { applyDraft, clearDraft, draftOf, readDraft } from '../chat/drafts.js';
 import { UserPreferences, resolveApprovalMode } from '../../shared/user-preferences.js';
 import { ChatNotRunningError } from '../chat/session.js';
@@ -195,6 +195,8 @@ export interface ChatManagerLike {
       startFresh?: boolean;
       /** Where the runtime runs; absent means this host. */
       environment?: UserEnvironment;
+      /** The rung this conversation runs on, and the ladder it can move up. */
+      ladder?: { tier: ModelTier; tiers: Partial<Record<ModelTier, string>> };
     },
   ): Promise<{ runtimeKind: string; currentCapabilities: unknown; bypassing: boolean }>;
   snapshot(record: SessionRecord): Promise<unknown>;
@@ -1537,6 +1539,14 @@ export class MessageProcessor {
         effort: session.chatEffortOverride,
         extraArgs: profile?.extraArgs,
         env: profile?.env,
+        // Only when the rung is what this conversation is actually running on.
+        // A profile-typed model or an account's standing choice outranks the
+        // ladder, and offering an escalation from a rung nobody is on would ask
+        // the user to approve a move that changes nothing they can see.
+        ladder:
+          modelOrigin.source === 'ladder' && profile?.ladder && profile.tiers
+            ? { tier: profile.ladder.tier, tiers: profile.tiers }
+            : undefined,
         bypassPermissions,
         resumeSessionId,
         startFresh,

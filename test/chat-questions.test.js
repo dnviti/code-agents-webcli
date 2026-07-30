@@ -100,7 +100,7 @@ function within(promise, what, ms = 1000) {
 describe('asking the user a choice-based question', function () {
   describe('the MCP tool the model actually calls', function () {
     /** Drive the real protocol over pipes, the way the runtime does. */
-    function drive(answers) {
+    function drive(answers, tier) {
       const input = new PassThrough();
       const output = new PassThrough();
       const lines = [];
@@ -122,13 +122,25 @@ describe('asking the user a choice-based question', function () {
       });
 
       const asked = [];
-      serveAsk(input, output, async (question) => {
-        asked.push(question);
-        return answers(question);
-      });
+      const tierAsked = [];
+      serveAsk(
+        input,
+        output,
+        async (question) => {
+          asked.push(question);
+          return answers(question);
+        },
+        tier
+          ? async (reason) => {
+            tierAsked.push(reason);
+            return tier(reason);
+          }
+          : undefined,
+      );
 
       return {
         asked,
+        tierAsked,
         lines,
         send(message) {
           input.write(`${JSON.stringify(message)}\n`);
@@ -150,6 +162,7 @@ describe('asking the user a choice-based question', function () {
       mcp.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
 
       const reply = await mcp.next();
+      // One, because this session is not on a capability ladder. See below.
       assert.strictEqual(reply.result.tools.length, 1);
       const [tool] = reply.result.tools;
       assert.ok(isAskQuestionTool(tool.name));
@@ -198,6 +211,76 @@ describe('asking the user a choice-based question', function () {
 
       const reply = await mcp.next();
       assert.ok(reply.error, 'an unknown tool should not come back as a result');
+    });
+
+    // The ladder tool rides this same server (#171), and is offered only to a
+    // conversation actually running on a rung.
+    it('offers the ladder tool as well when the session is on a rung', async function () {
+      const mcp = drive(() => ({ labels: [] }), () => ({ granted: false, detail: 'no' }));
+      mcp.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+
+      const reply = await mcp.next();
+      assert.deepStrictEqual(
+        reply.result.tools.map((t) => t.name).sort(),
+        ['ask_user_question', 'request_model_tier'],
+      );
+    });
+
+    it('hides the ladder tool from a session with no ladder', async function () {
+      // A tool whose one possible answer is "there is nothing to escalate to"
+      // costs a round trip and reads to the model as the user having said no.
+      const mcp = drive(() => ({ labels: [] }));
+      mcp.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+
+      const reply = await mcp.next();
+      assert.ok(!reply.result.tools.some((t) => t.name === 'request_model_tier'));
+    });
+
+    it('refuses the ladder tool rather than serving it unladdered', async function () {
+      const mcp = drive(() => ({ labels: [] }));
+      mcp.send({
+        jsonrpc: '2.0', id: 4, method: 'tools/call',
+        params: { name: 'request_model_tier', arguments: { reason: 'hard' } },
+      });
+
+      const reply = await mcp.next();
+      assert.ok(reply.error, 'a tool that was never advertised must not be served');
+    });
+
+    it('hands a refusal back as a result the model can act on, not an error', async function () {
+      // Marking it an error invites a retry of the one call whose entire cost
+      // is asking a person again.
+      const mcp = drive(
+        () => ({ labels: [] }),
+        () => ({ granted: false, detail: 'The user said no. Carry on.' }),
+      );
+      mcp.send({
+        jsonrpc: '2.0', id: 5, method: 'tools/call',
+        params: { name: 'request_model_tier', arguments: { reason: 'hard' } },
+      });
+
+      const reply = await mcp.next();
+      assert.strictEqual(reply.result.isError, false);
+      assert.match(reply.result.content[0].text, /said no/);
+    });
+
+    it('does not answer the ladder call until the user has', async function () {
+      let release;
+      const mcp = drive(
+        () => ({ labels: [] }),
+        () => new Promise((resolve) => { release = resolve; }),
+      );
+      mcp.send({
+        jsonrpc: '2.0', id: 6, method: 'tools/call',
+        params: { name: 'request_model_tier', arguments: { reason: 'hard' } },
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.strictEqual(mcp.lines.length, 0, 'the call must block on the decision');
+
+      release({ granted: true, tier: 'top', model: 't', detail: 'Approved.' });
+      const reply = await mcp.next();
+      assert.match(reply.result.content[0].text, /Approved/);
     });
   });
 

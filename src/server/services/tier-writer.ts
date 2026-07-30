@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { TIER_TOOL } from '../../shared/chat-events.js';
 import { MODEL_TIERS, ModelTier, RuntimeProfile } from '../../shared/runtime-profiles.js';
 
 /**
@@ -171,6 +172,99 @@ function ensureIgnored(dir: string): void {
 }
 
 /**
+ * pi's half of the escalation channel, as a pi extension.
+ *
+ * Every other laddered runtime is handed the tool as an MCP server. pi cannot
+ * take one — its dist tree has no MCP implementation whatsoever — but it does
+ * take extensions that register tools the model can call, which is the same
+ * capability by a different road. Verified against pi 0.60.x: `pi -e <file>`
+ * with a `pi.registerTool` call puts the tool in front of the model, the model
+ * calls it, and the result comes back as an ordinary tool result.
+ *
+ * Written as source rather than assembled from the session's values because it
+ * reads everything it needs from the environment at call time — which is what
+ * lets one static file serve every session, and lets a *terminal* launch load
+ * the same file harmlessly: with no socket in the environment there is nothing
+ * to register, so the tool never appears.
+ *
+ * `node:net` and the JSON line frame are the same client the MCP server uses;
+ * kept separate rather than shared because this file is read by pi's own
+ * TypeScript loader in pi's process, and importing anything of this app's into
+ * it would drag the app's module graph into the agent.
+ */
+const PI_TIER_EXTENSION = `// ${MANAGED_MARKER}
+// Generated. Registers the capability-ladder escalation tool for this session.
+import { Type } from "typebox";
+import * as net from "node:net";
+
+const SOCKET = process.env.CCWEB_ASK_SOCKET;
+const ENABLED = process.env.CCWEB_TIER_LADDER === "1";
+
+function requestTier(reason: string): Promise<{ detail: string }> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection(SOCKET as string);
+    const id = "tier-" + process.pid + "-" + Date.now();
+    let buffer = "";
+    const done = (detail: string) => {
+      socket.destroy();
+      resolve({ detail });
+    };
+    socket.setEncoding("utf8");
+    socket.on("connect", () => {
+      socket.write(JSON.stringify({ id, kind: "tier", tier: { reason } }) + "\\n");
+    });
+    socket.on("data", (chunk: string) => {
+      buffer += chunk;
+      let at: number;
+      while ((at = buffer.indexOf("\\n")) !== -1) {
+        const line = buffer.slice(0, at).trim();
+        buffer = buffer.slice(at + 1);
+        if (!line) continue;
+        try {
+          const reply = JSON.parse(line);
+          if (reply.id === id) {
+            done(typeof reply.detail === "string" ? reply.detail : "no answer was given");
+            return;
+          }
+        } catch {
+          // Not ours, or not JSON. The socket is shared.
+        }
+      }
+    });
+    socket.on("error", () => done("the request could not reach the app"));
+    socket.on("close", () => done("the conversation ended before this was decided"));
+  });
+}
+
+export default function (pi: any) {
+  if (!SOCKET || !ENABLED) return;
+  pi.registerTool({
+    name: "${TIER_TOOL}",
+    label: "Move up a rung",
+    description:
+      "Ask to answer this task from the next model up your capability ladder, and wait for " +
+      "the user to approve. Use it only when the work in front of you is genuinely beyond the " +
+      "model you are on - subtle debugging, ambiguous architecture, security-sensitive logic, " +
+      "review of code that matters - and not for work that is merely long or tedious. The " +
+      "stronger model costs the user real money, they are asked before it is used, and the " +
+      "conversation returns to its usual rung once this turn ends. This call blocks until they " +
+      "decide. If it is refused, carry on with the model you have rather than asking again.",
+    parameters: Type.Object({
+      reason: Type.String({
+        description:
+          "One sentence on what makes this task too hard for the model you are on. The user " +
+          "reads this and nothing else before deciding, so name the specific difficulty.",
+      }),
+    }),
+    async execute(_toolCallId: string, params: { reason: string }) {
+      const decision = await requestTier(params.reason);
+      return { content: [{ type: "text", text: decision.detail }], details: {} };
+    },
+  });
+}
+`;
+
+/**
  * pi.
  *
  * Written into the *session's* `.pi/agents/`, not `~/.pi/agent/agents/`.
@@ -243,6 +337,25 @@ const writePiTiers: Writer = (tiers, profile, ctx) => {
     ].join('\n');
 
     writeManaged(path.join(dir, `${tier}.md`), frontmatter, result);
+  }
+
+  // And the one thing pi cannot be handed any other way. pi has no MCP support
+  // at all — the whole of its dist tree has zero references to `mcpServers` or
+  // the protocol — so the escalation tool every other laddered runtime receives
+  // as an MCP server has to arrive as a pi extension instead. Same socket, same
+  // frame, same session on the other end.
+  const extensionDir = path.join(ctx.workingDir, '.pi', 'ccweb');
+  fs.mkdirSync(extensionDir, { recursive: true });
+  ensureIgnored(extensionDir);
+  const extension = path.join(extensionDir, 'tier-ladder.ts');
+  writeManaged(extension, PI_TIER_EXTENSION, result);
+  if (result.written.includes(extension)) {
+    // Relative, deliberately: an absolute host path is not the path this file
+    // has inside a per-user container, and the working directory is the one
+    // thing both sides agree on. `.pi/ccweb` rather than `.pi/extensions`
+    // because pi auto-discovers the latter for a trusted project, and a
+    // extension loaded twice registers its tool twice.
+    result.args.push('-e', path.join('.pi', 'ccweb', 'tier-ladder.ts'));
   }
 
   return result;

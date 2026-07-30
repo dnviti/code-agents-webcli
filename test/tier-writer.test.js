@@ -30,6 +30,11 @@ function profile(extra) {
   return Object.assign({ id: 'p1', name: 'Cheap', runtime: 'pi' }, extra);
 }
 
+/** The agent files in a directory, ignoring .gitignore and any .bak sidecars. */
+function agentFiles(dir) {
+  return fs.readdirSync(dir).filter((name) => name.endsWith('.md'));
+}
+
 describe('tier writer', function () {
   it('knows which runtimes can express tiers', function () {
     assert.ok(supportsTiers('pi'));
@@ -73,10 +78,8 @@ describe('tier writer', function () {
 
     it('writes into the session’s project, where pi looks last', function () {
       const result = applyTiers(profile({ tiers: { mid: 'm' } }), ctx);
-      assert.strictEqual(result.written.length, 1);
-      assert.strictEqual(
-        result.written[0],
-        path.join(ctx.workingDir, '.pi', 'agents', 'mid.md'),
+      assert.ok(
+        result.written.includes(path.join(ctx.workingDir, '.pi', 'agents', 'mid.md')),
       );
     });
 
@@ -115,8 +118,8 @@ describe('tier writer', function () {
         profile({ tiers: { floor: 'vendor/small', top: 'vendor/large' } }),
         ctx,
       );
-      assert.strictEqual(result.written.length, 2);
       const dir = path.join(ctx.workingDir, '.pi', 'agents');
+      assert.strictEqual(agentFiles(dir).length, 2);
       assert.ok(fs.existsSync(path.join(dir, 'floor.md')));
       assert.ok(fs.existsSync(path.join(dir, 'top.md')));
       // Tiers left blank must not produce a file.
@@ -166,7 +169,7 @@ describe('tier writer', function () {
       const result = applyTiers(profile({ tiers: { mid: 'x' } }), ctx);
 
       assert.ok(fs.readFileSync(mine, 'utf8').includes('model: x'));
-      assert.deepStrictEqual(result.written, [mine]);
+      assert.ok(result.written.includes(mine));
       assert.strictEqual(result.replaced.length, 1);
       assert.strictEqual(result.replaced[0].file, mine);
     });
@@ -225,7 +228,7 @@ describe('tier writer', function () {
         profile({ tiers: { floor: 'a', mid: 'b', high: 'c', top: 'd' } }),
         ctx,
       );
-      assert.strictEqual(result.written.length, 4);
+      assert.strictEqual(agentFiles(path.join(ctx.workingDir, '.pi', 'agents')).length, 4);
       assert.deepStrictEqual(
         result.replaced.map((s) => path.basename(s.file)).sort(),
         ['floor.md', 'high.md', 'mid.md', 'top.md'],
