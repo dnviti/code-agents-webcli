@@ -113,6 +113,7 @@ variable.
 | `--qwen-alias <name>` | `QWEN_ALIAS` | `Qwen` |
 | `--kimi-alias <name>` | `KIMI_ALIAS` | `Kimi` |
 | `--omp-alias <name>` | `OMP_ALIAS` | `Oh My Pi` |
+| `--antigravity-alias <name>` | `ANTIGRAVITY_ALIAS` | `Antigravity` |
 
 ### Usage accounting
 
@@ -135,7 +136,7 @@ Useful in a container or a unit file, where flags are awkward.
 | `GITHUB_ALLOWED_USER_IDS` | `--allowed-github-ids` | empty |
 | `GITHUB_ALLOW_ANY_USER` | `--allow-any-github-user` | `false` — only the exact string `true` enables it |
 | `CODE_AGENTS_WEBCLI_DATA_DIR` | `--data-dir` | `~/.code-agents-webcli` |
-| `CLAUDE_ALIAS` … `OMP_ALIAS` | `--*-alias` | see above |
+| `CLAUDE_ALIAS` … `ANTIGRAVITY_ALIAS` | `--*-alias` | see above |
 
 These have **no flag** and can only be set through the environment:
 

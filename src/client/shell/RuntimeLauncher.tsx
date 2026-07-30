@@ -76,6 +76,11 @@ const RUNTIMES: RuntimeEntry[] = [
   { kind: 'qwen', binary: 'qwen', dangerous: 'auto-accepts every action (--yolo)' },
   { kind: 'kimi', binary: 'kimi', dangerous: 'auto-approves every action (--yolo)' },
   { kind: 'omp', binary: 'omp', dangerous: 'auto-approves every tool call (--auto-approve)' },
+  {
+    kind: 'antigravity',
+    binary: 'agy',
+    dangerous: 'auto-approves every tool permission (--dangerously-skip-permissions)',
+  },
 ];
 
 /**

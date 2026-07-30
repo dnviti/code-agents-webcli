@@ -18,6 +18,7 @@ host, and a missing CLI only matters when you press its button.
 | Qwen Code | Qwen | `qwen` | `~/.local/bin/`, `/usr/local/bin/`, `/usr/bin/` |
 | Kimi Code | Kimi | `kimi` | `~/.kimi-code/bin/`, `~/.local/bin/`, `/usr/local/bin/`, `/usr/bin/` |
 | Oh My Pi | Oh My Pi | `omp` | `~/.local/bin/`, `~/.bun/bin/`, `/usr/local/bin/`, `/usr/bin/` |
+| Antigravity CLI | Antigravity | `agy` | `~/.local/bin/`, `~/.gemini/antigravity-cli/bin/`, `/usr/local/bin/`, `/usr/bin/` |
 | Terminal | Terminal | your `$SHELL` | falls back to `zsh`, `bash`, `sh` |
 
 Those explicit directories are searched **in addition to** `PATH`, and searched
@@ -39,6 +40,7 @@ CLI's own flag:
 | Grok Build | `--always-approve` |
 | Qwen Code, Kimi Code | `--yolo` |
 | Oh My Pi | `--auto-approve` |
+| Antigravity CLI | `--dangerously-skip-permissions` |
 | Cursor Agent, pi | *none* — neither CLI has a real equivalent, so the option is not offered |
 
 These do what they say. An agent launched this way edits files and runs commands
@@ -57,6 +59,19 @@ so the folder you picked is the folder the agent sees. It checks your `omp`
 actually has the flag first, because `omp` exits on an unrecognised one; on an
 older build you get a warning in the server log rather than a silent relocation.
 
+**Antigravity CLI** asks "Do you trust the contents of this project?" the first
+time it sees a folder, and does nothing at all until it is answered. The app
+answers it, the same way it answers Claude's.
+
+**Antigravity CLI in the WebUI** runs its shell tools in a scratch directory of
+its own — `~/.gemini/antigravity-cli/scratch` — rather than in the folder you
+picked, whatever directory the process itself was started in. Asked to read a
+file that was sitting right there, it reported that no such file existed. The
+app passes `--new-project`, which puts it back in the folder you chose; that
+project is scoped to the one invocation and does not appear in your
+`~/.gemini/projects.json`. The terminal surface does not have the problem and
+does not get the flag.
+
 ## The WebUI (beta)
 
 Alongside the terminal, most runtimes can open as a **chat** surface: the CLI is
@@ -68,7 +83,7 @@ Launch it with the **WebUI (Beta)** button on the runtime's card in the launcher
 
 | Runtime | WebUI |
 | --- | --- |
-| Claude Code, Codex, Grok Build, pi, Kimi Code, Oh My Pi | Available |
+| Claude Code, Codex, Grok Build, pi, Kimi Code, Oh My Pi, Antigravity CLI | Available |
 | Qwen Code, Cursor Agent | Not offered — no verified structured mode yet, so they open in the terminal only |
 | Terminal | Not applicable — a shell has no conversation to show |
 
@@ -92,6 +107,7 @@ CLIs is driven differently and describes its own work differently.
 | pi | `tool_execution_start` / `tool_execution_end` | a recorded turn |
 | Grok Build | ACP `tool_call` / `tool_call_update` | a live run against 0.2.112 |
 | Kimi Code, Oh My Pi | ACP `tool_call` / `tool_call_update` | live runs |
+| Antigravity CLI | `step_update` steps of type `tool` and `subagent` | a live run against 1.1.8 |
 
 Nothing is shown that the agent did not report doing. Where an agent reports a
 tool by name only, the card carries the name and its status and nothing else —
@@ -107,6 +123,49 @@ properly. Grok reports the identical work over ACP, so that is the entry point
 the app uses. It brings permission prompts, a model list and per-turn cost with
 it, and sessions recorded under the old mode still open — Grok kept the record
 all along; only its headless output was silent about it.
+
+### Antigravity CLI: what was checked, and what was not
+
+The whole runtime is driven through one entry point — `agy --print
+--output-format stream-json` — and everything the WebUI claims about it was read
+off live runs of agy 1.1.8 rather than from a schema. Each turn is its own
+process; `--conversation <id>` is what carries the conversation between them.
+
+Watched working:
+
+| Claim | How |
+| --- | --- |
+| Replies arrive as they are produced | a step arrives `ACTIVE` with the opening of the reply and `DONE` with the rest, and the two concatenate into the run's own final text |
+| Commands, edits and searches show as cards, with output, duration and errors | a turn that read a file, edited it and created another |
+| Work it hands to an agent of its own appears in **Agents** | a delegation reported as a `subagent` step, carrying the role and the prompt it was given |
+| Tokens per turn, thinking and cached input included | the run's own totals, checked against the sum of its steps line by line |
+| A refusal explains itself | the auto-denial, in the conversation, naming the command and the way to allow it |
+| The model list is the CLI's own | `agy models`, one id per line |
+| Reopening a conversation and carrying on in it | the app restarted, the conversation resumed, and the agent answered from history without going back to the file |
+| The folder you picked is the folder it works in | `pwd` and a file read, in a directory agy had never seen |
+| A first launch in an unseen folder reaches a usable session | the terminal surface, past the trust question, with the prompt drawn |
+
+Not offered, because the runtime does not provide it:
+
+| Not offered | Why |
+| --- | --- |
+| Diffs | `replace_file_content` reports its `TargetFile` and nothing else — no old text, no new text, no hunk. A diff here would be one this app computed, not one the agent reported. |
+| Cost | Nothing in `init`, in any step or in the result prices a turn. The meter says *cost not reported* rather than showing a zero. |
+| Approval prompts | Headless, it cannot stop and ask. See [Approval mode](#approval-mode). |
+| Attachments | `--print` takes one string; `--help` has no attachment flag. |
+| A plan or todo list | No step type carries one. |
+| Slash commands | Its own are terminal-UI commands and are not interpreted in this mode. |
+| An account or plan reading | Its terminal UI shows the plan in its header; none of that reaches the headless stream. |
+
+**Not verified: what a sign-in failure looks like.** The credentials on the
+machine this was built on could not be taken away for a test — clearing `HOME`
+was not enough, and the runs kept succeeding. A run that fails for any reason
+reports `status: "ERROR"` with the CLI's own sentence, and the app puts that
+sentence in the conversation verbatim (a bad model id, which *is* reproducible,
+comes through that way and reads *"model zzz is not recognized as a known model
+…"* followed by the list it does have). A sign-in failure is expected to arrive
+on the same channel, but nobody here has watched one, and this is the sentence
+saying so.
 
 ### Watching a workflow
 
@@ -165,6 +224,7 @@ checked one at a time, because one of them working says nothing about the rest.
 | Grok Build | the reasoning text, as ACP thought chunks | its recorded traffic — its own API was erroring when this was written |
 | Claude Code | **the size only** — every thinking block on the wire is empty, with a signature beside it and a running token estimate on a side channel | a live run at `--effort high`, 2.1.220 |
 | Codex | its reasoning summary, where the model produces one. Where the trace is encrypted and nothing was summarised, nothing | its own schema and 22,987 recorded reasoning items, all of them encrypted — the account was over its usage limit |
+| Antigravity CLI | **the size only** — every step's usage carries a `thinking_tokens` count and no event anywhere carries a word of the reasoning | a live run on `gemini-3.1-pro-low`, 1.1.8 |
 
 **An entry never expands onto an empty panel.** Where the text is missing the
 entry says which of the three silences it is: still reasoning, reasoning the
@@ -212,6 +272,7 @@ directories each runtime's own installer writes into:
 | pi | `.pi/skills` and `.agents/skills` in the project, `~/.pi/agent/skills` and `~/.agents/skills` in your home |
 | Codex | `~/.codex/skills` and `~/.codex/prompts`, and `.codex/skills` in the project |
 | Kimi Code, Oh My Pi | Nothing — both report their own list before the menu can be opened |
+| Antigravity CLI | Nothing. Its slash commands are its terminal UI's own and are not interpreted in the headless mode the WebUI drives — typed there, `/changelog` reaches the model as ordinary text. It has no user-authored commands to find either: its customisations are skills, rules, plugins, hooks and MCP servers, none of which are things a conversation runs by name |
 
 Each entry carries the description its author wrote in the skill's frontmatter.
 An entry whose author wrote none is shown with none: a sentence invented here
@@ -303,6 +364,19 @@ translated, and no level is offered that the agent would refuse.
 | Kimi Code | `off` `on` | an ACP config option | yes |
 | Oh My Pi | `off` `auto` `low` `high` `max` | an ACP config option | yes |
 | pi | `off` `minimal` `low` `medium` `high` `xhigh` `max` | `--thinking`, on the next turn's process | from the next turn |
+| Antigravity CLI | `low` `medium` `high`, and only the ones the model in use has an id for | usually the model id itself — see below | from the next turn |
+
+**Antigravity spells the level inside the model name, so the control switches
+models.** Its `--effort` flag exists and takes `low`, `medium` or `high` — but it
+is refused whenever a model is named: `--model gemini-3.6-flash-low --effort
+high` answers *"conflicts with --effort=high"*, and `--model claude-sonnet-4-6
+--effort high` answers *"--effort is not supported for model"*. What `agy models`
+publishes instead is one id per level — `gemini-3.6-flash-high`, `-medium`,
+`-low`. So the levels offered are exactly the sibling ids agy printed, and
+picking one moves the conversation onto that model for its next turn.
+`gemini-3.1-pro` has only `high` and `low` ids, so only those two are offered;
+`claude-sonnet-4-6` has none, so no control appears at all. A conversation that
+pins no model gets the flag itself, which is the one case agy accepts it in.
 
 **The button is not there when there is nothing to offer.** Grok on its default
 model publishes no ladder, so no control appears — rather than one that could
@@ -421,8 +495,29 @@ conversation runs its tools without asking whichever mode the rule computes.
 Its opening line says `this runtime cannot ask` instead of claiming a boundary
 that is not there.
 
+**Antigravity CLI is the other exception, and it is a sharper one.** Driven
+headlessly the CLI *cannot stop and ask*: a tool that needs the `command`
+permission is refused on the spot and the run continues around it. It is not
+that nobody answered — nobody was asked. So the choice has to be made when the
+conversation starts, and the two modes mean:
+
+- **Ask first** — shell commands are refused as they come up and the turn carries
+  on without them. Each refusal gets its own entry in the conversation naming
+  what was refused and how to allow it, so it never arrives as an unexplained
+  failure. File edits inside the workspace are *not* affected: they go through in
+  this mode, which was measured rather than assumed.
+- **Approvals bypassed** — `--dangerously-skip-permissions`, and nothing is
+  refused.
+
+`--mode accept-edits` and `--mode plan` are deliberately not wired to anything.
+Both parse and neither changes what actually happens: three runs of the same
+"write this file" prompt — no flag, `accept-edits`, `plan` — all reported
+`request-review` and all three wrote the file.
+
 The terminal surface's own **No prompts** button is a separate, per-launch
-choice on a different surface, and is not covered by this preference.
+choice on a different surface, and is not covered by this preference. In the
+terminal Antigravity *can* ask, and does: it shows its own four-way approval
+prompt inline, the way it does outside this app.
 
 ### Closing a conversation, and deleting one
 

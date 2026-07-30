@@ -15,7 +15,15 @@
  * guessed adapter — a protocol written from imagination fails in front of a
  * user, mid-turn, which is the worst place to discover it.
  */
-export const CHAT_RUNTIMES = ['claude', 'codex', 'grok', 'pi', 'kimi', 'omp'] as const;
+export const CHAT_RUNTIMES = [
+  'claude',
+  'codex',
+  'grok',
+  'pi',
+  'kimi',
+  'omp',
+  'antigravity',
+] as const;
 
 export type ChatRuntime = (typeof CHAT_RUNTIMES)[number];
 

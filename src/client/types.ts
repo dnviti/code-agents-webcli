@@ -107,6 +107,7 @@ export interface Aliases {
   qwen: string;
   kimi: string;
   omp: string;
+  antigravity: string;
   terminal: string;
 }
 
@@ -119,6 +120,7 @@ export type AgentKind =
   | 'qwen'
   | 'kimi'
   | 'omp'
+  | 'antigravity'
   | 'terminal';
 
 export interface PlanData {
@@ -295,6 +297,7 @@ export interface WsRuntimeStartedMessage {
     | 'qwen_started'
     | 'kimi_started'
     | 'omp_started'
+    | 'antigravity_started'
     | 'terminal_started';
   agent?: AgentKind;
 }
@@ -309,6 +312,7 @@ export interface WsRuntimeStoppedMessage {
     | 'qwen_stopped'
     | 'kimi_stopped'
     | 'omp_stopped'
+    | 'antigravity_stopped'
     | 'terminal_stopped';
   agent?: AgentKind;
   runtimeLabel?: string;

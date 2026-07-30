@@ -4,6 +4,7 @@ import {
 } from '../../shared/chat-events.js';
 import { ChatAdapter, ChatAdapterOptions } from './adapter.js';
 import { AcpChatAdapter } from './adapters/acp.js';
+import { AntigravityChatAdapter } from './adapters/antigravity.js';
 import { ClaudeChatAdapter } from './adapters/claude.js';
 import { CodexChatAdapter } from './adapters/codex.js';
 import { PiChatAdapter } from './adapters/pi.js';
@@ -181,6 +182,36 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
   // what the pre-session table says, and the two must not disagree.
   kimi: acp('kimi', ['acp'], { usage: false, cost: false }),
   omp: acp('omp', ['acp']),
+  /**
+   * Antigravity CLI, driven as `agy --print --output-format stream-json`.
+   *
+   * No ACP: `--experimental-acp` is rejected outright by 1.1.8's flag parser and
+   * there is no `acp` subcommand — `agy acp` falls through to the interactive
+   * TUI and dies looking for a `/dev/tty`. Its structured mode is the print one,
+   * and every row below was read off a live capture of it (see the adapter).
+   *
+   * `permissions: false` is the honest half of this entry and the one worth
+   * reading twice. Headless, agy *cannot* stop and ask: a tool needing approval
+   * is denied on the spot and the run carries on around it. There is no channel
+   * to offer a person, so nothing here pretends there is — the choice is made at
+   * launch, said on the card, and each refusal is explained in the conversation.
+   *
+   * `askChannel` stays unset for the same reason it is unset for grok: agy
+   * accepts MCP servers through a config file of its own, but nobody has watched
+   * a question from it reach this app's socket, and this table does not
+   * advertise what has not been seen working.
+   */
+  antigravity: {
+    factory: (options) => new AntigravityChatAdapter(options),
+    advertised: {
+      streaming: true,
+      thinking: true,
+      toolCalls: true,
+      interrupt: true,
+      resume: true,
+      usage: true,
+    },
+  },
 };
 
 /**

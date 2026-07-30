@@ -38,6 +38,7 @@ import {
   startQwenSession as sessionsStartQwen,
   startKimiSession as sessionsStartKimi,
   startOmpSession as sessionsStartOmp,
+  startAntigravitySession as sessionsStartAntigravity,
   startTerminalSession as sessionsStartTerminal,
   closeSession as sessionsCloseSession,
 } from './sessions/actions';
@@ -181,6 +182,7 @@ export class App {
       qwen: 'Qwen',
       kimi: 'Kimi',
       omp: 'Oh My Pi',
+      antigravity: 'Antigravity',
       terminal: 'Terminal',
     };
 
@@ -454,6 +456,10 @@ export class App {
 
   startOmpSession(options: RuntimeStartOptions = {}): Promise<void> {
     return sessionsStartOmp(this, options);
+  }
+
+  startAntigravitySession(options: RuntimeStartOptions = {}): Promise<void> {
+    return sessionsStartAntigravity(this, options);
   }
 
   startTerminalSession(options: RuntimeStartOptions = {}): Promise<void> {

@@ -294,6 +294,10 @@ export function startOmpSession(app: App, options: RuntimeStartOptions = {}): Pr
   return startRuntimeSession(app, 'omp', options);
 }
 
+export function startAntigravitySession(app: App, options: RuntimeStartOptions = {}): Promise<void> {
+  return startRuntimeSession(app, 'antigravity', options);
+}
+
 export function startTerminalSession(app: App, options: RuntimeStartOptions = {}): Promise<void> {
   return startRuntimeSession(app, 'terminal', options);
 }

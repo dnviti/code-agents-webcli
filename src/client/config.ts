@@ -19,6 +19,7 @@ export async function loadConfig(app: App): Promise<void> {
           qwen: cfg.aliases.qwen || 'Qwen',
           kimi: cfg.aliases.kimi || 'Kimi',
           omp: cfg.aliases.omp || 'Oh My Pi',
+          antigravity: cfg.aliases.antigravity || 'Antigravity',
           terminal: 'Terminal',
         };
       }
@@ -52,6 +53,7 @@ export function getAlias(app: App, kind: AgentKind | string): string {
   if (kind === 'qwen') return 'Qwen';
   if (kind === 'kimi') return 'Kimi';
   if (kind === 'omp') return 'Oh My Pi';
+  if (kind === 'antigravity') return 'Antigravity';
   if (kind === 'terminal') return 'Terminal';
   return 'Claude';
 }
@@ -108,6 +110,12 @@ export function getRuntimeStartMessage(
     return options.dangerouslySkipPermissions
       ? `Starting ${getAlias(app, 'omp')} (auto-approving every tool call)...`
       : `Starting ${getAlias(app, 'omp')}...`;
+  }
+
+  if (kind === 'antigravity') {
+    return options.dangerouslySkipPermissions
+      ? `Starting ${getAlias(app, 'antigravity')} (auto-approving every tool permission)...`
+      : `Starting ${getAlias(app, 'antigravity')}...`;
   }
 
   if (kind === 'terminal') {

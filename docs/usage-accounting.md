@@ -121,6 +121,7 @@ own figure or nothing at all, which is why they have a column of their own.
 | Grok (ACP) | counted here | only where a per-model call count arrives | reported | reported, in ticks — see below | the runtime's current selection |
 | Oh My Pi / opencode (ACP) | counted here | only where a per-model call count arrives | reported | reported, as a session running total | the runtime's current selection |
 | Kimi (ACP) | counted here | **not reported** | **not reported** | **not reported** | the runtime's current selection |
+| Antigravity | counted here | reported (`num_turns`) | reported, thinking and cached input included | **not reported** — no event anywhere prices a turn | reported, only when the conversation pinned one |
 
 Kimi is the exception the rest of that block used to hide. Probed against
 kimi 0.29.1 over two prompts: not one `usage_update` notification, prompt

@@ -27,6 +27,7 @@ const RUNTIMES: Array<{ value: AgentKind; label: string }> = [
   { value: 'qwen', label: 'Qwen Code' },
   { value: 'kimi', label: 'Kimi Code' },
   { value: 'omp', label: 'Oh My Pi' },
+  { value: 'antigravity', label: 'Antigravity CLI' },
 ];
 
 const TIER_HINT: Record<ModelTier, string> = {

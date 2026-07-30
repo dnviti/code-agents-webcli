@@ -377,6 +377,7 @@ function buildLauncher(app: App): React.ReactNode {
       case 'qwen': void app.startQwenSession(options); break;
       case 'kimi': void app.startKimiSession(options); break;
       case 'omp': void app.startOmpSession(options); break;
+      case 'antigravity': void app.startAntigravitySession(options); break;
       // The launcher routes the terminal through onTerminal, because it needs a
       // shell chosen first. Handled here anyway: leaving it to `default` made a
       // call with 'terminal' a silent no-op, and a later refactor that routed it
