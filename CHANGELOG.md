@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [5.3.4] - unreleased
 
 ### Fixed
 - **A chat that has just opened is empty, and the first prompt is turn 1.** The
