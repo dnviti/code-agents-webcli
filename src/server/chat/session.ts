@@ -517,6 +517,26 @@ export class ChatSession {
    * rather than the turn ending. Null when nothing has been interrupted.
    */
   private staleTurnEndUntil: number | null = null;
+  /**
+   * Until when an `error` is the runtime's account of work this session told it
+   * to drop, rather than something that went wrong. Null when nothing has been
+   * interrupted.
+   *
+   * Claude reports an interrupted run as `is_error` with the subtype
+   * `error_during_execution`, so stopping a turn — or correcting it by sending
+   * ahead of it — put a red card reading "claude ended the turn as
+   * error_during_execution" in the conversation, with a Retry button offering
+   * to run again the thing the user had just stopped. Nothing failed: the run
+   * ended because it was told to. The record of that is the `interrupted`
+   * marker and the turn's own stop reason, both of which say it in the user's
+   * terms.
+   *
+   * A sibling of `staleTurnEndUntil` and set at the same moment, but a
+   * separate field because the two answer different questions — whether the
+   * turn is over, and whether anything went wrong — and an interrupt from the
+   * stop button ends the turn while still owing no explanation.
+   */
+  private interruptedErrorUntil: number | null = null;
   /** Runs the drain again once the adapter has finished letting go of the last turn. */
   private drainRetry: ReturnType<typeof setTimeout> | null = null;
   /** When the current wait for a ready adapter began; null when not waiting. */
@@ -764,6 +784,7 @@ export class ChatSession {
       // exit above all — is about a process nobody is talking to any more.
       emit: (event) => {
         if (generation !== this.adapterGeneration) return;
+        if (this.isInterruptedRunReport(event)) return;
         this.ingest(event);
       },
       readFile: this.deps.readFile
@@ -928,6 +949,38 @@ export class ChatSession {
   }
 
   /**
+   * Whether this event is a runtime reporting the run this session stopped.
+   *
+   * Claude reports an interrupted run the same way it reports one that broke:
+   * `is_error`, subtype `error_during_execution`. So pressing stop — or
+   * correcting the agent by sending ahead of it — put a red card in the
+   * conversation reading "claude ended the turn as error_during_execution",
+   * with a Retry button offering to run again the very thing the user had just
+   * stopped. Nothing had gone wrong. The run ended because it was told to, and
+   * the honest record of that is the `interrupted` marker and the turn's own
+   * stop reason, both of which already say it in the user's terms.
+   *
+   * Asked of adapter events only — this is a filter on what a *runtime* says,
+   * and it must not touch what this session writes about the interrupt itself,
+   * which is written through `ingest` directly. Bounded twice over: by the same
+   * window `staleTurnEndUntil` uses, and by the `turn_end` that closes it, so
+   * at most one report is swallowed per interrupt and a failure that happens
+   * afterwards is a failure again.
+   *
+   * A fatal error is never dropped. That is the process itself going away,
+   * which is true whatever preceded it, and swallowing it would leave a dead
+   * conversation looking live.
+   */
+  private isInterruptedRunReport(event: AdapterEvent): boolean {
+    return (
+      event.t === 'error'
+      && event.fatal !== true
+      && this.interruptedErrorUntil !== null
+      && Date.now() <= this.interruptedErrorUntil
+    );
+  }
+
+  /**
    * Whether this event is an adapter writing the user's turn a second time.
    *
    * Every ACP runtime and both codex modes used to echo the prompt back into
@@ -1030,6 +1083,11 @@ export class ChatSession {
     }
 
     if (stamped.t === 'turn_end') {
+      // The run this session interrupted is over, so anything that goes wrong
+      // from here is a real failure again. Closed on the ending rather than
+      // only on the clock, so the window is no wider than the acknowledgement
+      // it exists for.
+      this.interruptedErrorUntil = null;
       // The first `turn_end` after an interrupt sent to make room for a message
       // is the runtime letting go of the half it was told to abandon — not this
       // turn ending. The turn is running again, on the correction that caused
@@ -2072,6 +2130,11 @@ export class ChatSession {
    */
   private async cancelTurnInFlight(): Promise<void> {
     if (!this.adapter) return;
+    // Said before the interrupt rather than after it, because the answer to it
+    // can arrive during the await — and on Claude the answer *is* the report
+    // this window exists to swallow. Same reasoning as `staleTurnEndUntil`,
+    // which `sendQueuedNow` sets one line before calling this.
+    this.interruptedErrorUntil = Date.now() + INTERRUPT_ACK_WINDOW_MS;
     await this.adapter.interrupt();
     // Anything still waiting on a person is moot once the turn is cancelled,
     // and leaving the cards on screen would invite answers that go nowhere.

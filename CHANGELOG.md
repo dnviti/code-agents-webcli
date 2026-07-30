@@ -105,6 +105,19 @@
   onto that model. A model with no level in its name offers no control at all.
 
 ### Fixed
+- **Stopping a turn no longer reads as the turn failing.** Claude reports a run
+  it was told to abandon exactly the way it reports one that broke — `is_error`,
+  subtype `error_during_execution` — so pressing stop, or correcting the agent by
+  sending ahead of it, left a red error card in the conversation reading "claude
+  ended the turn as error_during_execution", with a Retry button offering to run
+  again the very thing that had just been stopped.
+
+  A runtime's account of the run this app interrupted is no longer written down.
+  What stays is what the user did: the *Interrupted to send* line, and the turn's
+  own badge saying it did not get to finish. Only that one report is dropped, and
+  only while the interrupt is being acknowledged — a run that breaks on its own,
+  one that breaks after the interrupt has been answered, a message discarded with
+  the turn, and the process itself going away are all still reported.
 - **A question the model asks can be answered in your own words, and its text
   stays inside the card.** Two defects in the same card, both from the same
   conversation.
