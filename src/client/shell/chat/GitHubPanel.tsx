@@ -3,9 +3,12 @@ import { Badge } from '../../ui/relay/Badge.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import {
   fetchGitHub,
+  reviewDecisionLabel,
+  type GitHubActor,
   type GitHubIssue,
   type GitHubOverview,
   type GitHubPull,
+  type GitHubRef,
 } from '../../chat/workspace-api.js';
 import { PanelBody, PanelHeader, PanelNote, useWorkspaceData } from './PanelShell.js';
 import { GitHubItemDialog } from './GitHubItemDialog.js';
@@ -27,11 +30,20 @@ export interface GitHubPanelProps {
 
 export function GitHubPanel({ sessionId }: GitHubPanelProps): React.JSX.Element {
   const [refreshing, setRefreshing] = React.useState(false);
-  // Which issue or pull request is being read, or null. One at a time: this is
-  // a reader, and a stack of them over a 320px rail would be unusable.
-  const [openItem, setOpenItem] = React.useState<{ kind: 'issue' | 'pr'; number: number } | null>(
-    null,
-  );
+  // The trail of things being read, most recent last. One dialog at a time —
+  // a stack of windows over a 320px rail would be unusable — but following a
+  // reference out of an issue has to be undoable, so what it was followed from
+  // is kept rather than replaced.
+  const [trail, setTrail] = React.useState<Array<{ kind: 'issue' | 'pr'; number: number; repo?: string }>>([]);
+  const openItem = trail[trail.length - 1] || null;
+
+  const open = React.useCallback((kind: 'issue' | 'pr', number: number, repo?: string) => {
+    setTrail([{ kind, number, repo }]);
+  }, []);
+
+  const follow = React.useCallback((ref: GitHubRef) => {
+    setTrail((seen) => [...seen, { kind: ref.kind, number: ref.number, repo: ref.repo }]);
+  }, []);
 
   const { data, error, busy, reload } = useWorkspaceData<GitHubOverview>(
     () => fetchGitHub(sessionId, refreshing),
@@ -70,17 +82,23 @@ export function GitHubPanel({ sessionId }: GitHubPanelProps): React.JSX.Element 
               title="Pull requests"
               count={prs.length}
               empty="No open pull requests."
+              error={data.prsError}
             >
               {prs.map((pr) => (
-                <PullRow key={pr.number} pull={pr} onOpen={() => setOpenItem({ kind: 'pr', number: pr.number })} />
+                <PullRow key={pr.number} pull={pr} onOpen={() => open('pr', pr.number)} />
               ))}
             </Section>
-            <Section title="Issues" count={issues.length} empty="No open issues.">
+            <Section
+              title="Issues"
+              count={issues.length}
+              empty="No open issues."
+              error={data.issuesError}
+            >
               {issues.map((issue) => (
                 <IssueRow
                   key={issue.number}
                   issue={issue}
-                  onOpen={() => setOpenItem({ kind: 'issue', number: issue.number })}
+                  onOpen={() => open('issue', issue.number)}
                 />
               ))}
             </Section>
@@ -93,7 +111,10 @@ export function GitHubPanel({ sessionId }: GitHubPanelProps): React.JSX.Element 
           sessionId={sessionId}
           kind={openItem.kind}
           number={openItem.number}
-          onClose={() => setOpenItem(null)}
+          repo={openItem.repo}
+          onOpen={follow}
+          onBack={trail.length > 1 ? () => setTrail((seen) => seen.slice(0, -1)) : undefined}
+          onClose={() => setTrail([])}
         />
       ) : null}
     </>
@@ -104,11 +125,14 @@ function Section({
   title,
   count,
   empty,
+  error,
   children,
 }: {
   title: string;
   count: number;
   empty: string;
+  /** What `gh` said when it refused, which is not the same as nothing being open. */
+  error?: string;
   children: React.ReactNode;
 }): React.JSX.Element {
   return (
@@ -129,7 +153,15 @@ function Section({
         {title}
         <Badge variant="neutral">{count}</Badge>
       </div>
-      {count === 0 ? <PanelNote>{empty}</PanelNote> : children}
+      {/* A list `gh` refused to produce is not an empty list, and the two are
+          the same empty section on screen unless one of them says so. */}
+      {error ? (
+        <PanelNote tone="destructive" icon="circle-alert">
+          {`This could not be listed: ${error}`}
+        </PanelNote>
+      ) : null}
+      {!error && count === 0 ? <PanelNote>{empty}</PanelNote> : null}
+      {count > 0 ? children : null}
     </section>
   );
 }
@@ -218,17 +250,100 @@ function Meta({ children }: { children: React.ReactNode }): React.JSX.Element {
   );
 }
 
+/**
+ * One fact about a row, as an icon and a word.
+ *
+ * Every extra thing a row says competes for the same 320px, so each is one
+ * glyph and one short string, and each carries a `title` — the icon says which
+ * fact it is to someone who already knows the panel, and the hover says it to
+ * everyone else.
+ *
+ * The same sentence is the `aria-label`, which is what a reader that cannot see
+ * the icon gets instead: a row whose accessible name is "#134 … dnviti 1/2
+ * #151" says nothing about which number is which, and a descendant's label is
+ * used when the button's own name is computed from its contents.
+ */
+function Fact({
+  icon,
+  text,
+  hint,
+  tone,
+}: {
+  icon: string;
+  text: string;
+  hint: string;
+  tone?: string;
+}): React.JSX.Element {
+  return (
+    <span
+      title={hint}
+      aria-label={hint}
+      style={{ display: 'inline-flex', alignItems: 'center', gap: 3, color: tone || undefined }}
+    >
+      <Icon name={icon} size={10} />
+      {text}
+    </span>
+  );
+}
+
+/** Logins, short enough for a rail: the first two, then how many more. */
+function people(actors: GitHubActor[] | undefined): string {
+  const logins = (actors || []).map((one) => one.login).filter(Boolean);
+  if (logins.length <= 2) return logins.join(', ');
+  return `${logins.slice(0, 2).join(', ')} +${logins.length - 2}`;
+}
+
+/** The numbers a set of references names, shortest first: `#12, #34 +2`. */
+function numbers(refs: GitHubRef[]): string {
+  const shown = refs.slice(0, 2).map((ref) => `#${ref.number}`).join(', ');
+  return refs.length > 2 ? `${shown} +${refs.length - 2}` : shown;
+}
+
 function PullRow({ pull, onOpen }: { pull: GitHubPull; onOpen: () => void }): React.JSX.Element {
+  const assignees = pull.assignees || [];
+  const closes = (pull.references || []).filter((ref) => ref.relation === 'closes');
+  const review = reviewDecisionLabel(pull.reviewDecision);
+  const checks = pull.checks;
+
   return (
     <RowLink onOpen={onOpen} number={pull.number} title={pull.title}>
       <Meta>
         {pull.isDraft ? <Badge variant="outline">draft</Badge> : null}
-        {pull.author?.login ? <span>@{pull.author.login}</span> : null}
+        {pull.author?.login ? <span title={`Opened by ${pull.author.login}`}>@{pull.author.login}</span> : null}
+        {assignees.length ? (
+          <Fact
+            icon="user"
+            text={people(assignees)}
+            hint={`Assigned to ${assignees.map((one) => one.login).join(', ')}`}
+          />
+        ) : null}
         {pull.headRefName ? (
-          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+          <span title={pull.baseRefName ? `${pull.headRefName} → ${pull.baseRefName}` : pull.headRefName} style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
             <Icon name="git-branch" size={10} />
             {pull.headRefName}
           </span>
+        ) : null}
+        {closes.length ? (
+          <Fact
+            icon="circle-dot"
+            text={numbers(closes)}
+            hint={`Closes ${closes.map((ref) => `#${ref.number}`).join(', ')}`}
+          />
+        ) : null}
+        {checks ? (
+          <Fact
+            icon={checks.state === 'failing' ? 'circle-x' : checks.state === 'pending' ? 'clock' : 'check'}
+            text={`${checks.passed}/${checks.total}`}
+            hint={`Checks: ${checks.passed} passed, ${checks.failed} failed, ${checks.pending} running`}
+            tone={
+              checks.state === 'failing'
+                ? 'var(--destructive)'
+                : checks.state === 'passing' ? 'var(--success)' : undefined
+            }
+          />
+        ) : null}
+        {review ? (
+          <Badge variant={pull.reviewDecision === 'APPROVED' ? 'success' : 'warning'}>{review.toLowerCase()}</Badge>
         ) : null}
       </Meta>
     </RowLink>
@@ -237,10 +352,58 @@ function PullRow({ pull, onOpen }: { pull: GitHubPull; onOpen: () => void }): Re
 
 function IssueRow({ issue, onOpen }: { issue: GitHubIssue; onOpen: () => void }): React.JSX.Element {
   const labels = (issue.labels || []).map((label) => label.name).filter(Boolean) as string[];
+  const assignees = issue.assignees || [];
+  const pulls = (issue.references || []).filter((ref) => ref.kind === 'pr');
+  // Only what is still in the way. GitHub keeps the dependency after the
+  // blocker is closed — correctly, it is history — but a row that reads
+  // "blocked" forever is how ready work gets skipped. An unknown state counts
+  // as blocking, so a shape this does not recognise errs towards saying so.
+  const blocked = (issue.blockedBy || []).filter(
+    (ref) => (ref.state || 'OPEN').toUpperCase() === 'OPEN',
+  );
+  const children = issue.childrenTotal || 0;
+
   return (
     <RowLink onOpen={onOpen} number={issue.number} title={issue.title}>
       <Meta>
-        {issue.author?.login ? <span>@{issue.author.login}</span> : null}
+        {issue.author?.login ? <span title={`Opened by ${issue.author.login}`}>@{issue.author.login}</span> : null}
+        {assignees.length ? (
+          <Fact
+            icon="user"
+            text={people(assignees)}
+            hint={`Assigned to ${assignees.map((one) => one.login).join(', ')}`}
+          />
+        ) : null}
+        {issue.parent ? (
+          <Fact
+            icon="corner-up-left"
+            text={`#${issue.parent.number}`}
+            hint={`Part of #${issue.parent.number}${issue.parent.title ? ` — ${issue.parent.title}` : ''}`}
+          />
+        ) : null}
+        {children > 0 ? (
+          <Fact
+            icon="list-todo"
+            text={`${issue.childrenDone || 0}/${children}`}
+            hint={`${issue.childrenDone || 0} of ${children} sub-issues done`}
+            tone={(issue.childrenDone || 0) >= children ? 'var(--success)' : undefined}
+          />
+        ) : null}
+        {pulls.length ? (
+          <Fact
+            icon="git-pull-request"
+            text={numbers(pulls)}
+            hint={`Pull requests: ${pulls.map((ref) => `#${ref.number}`).join(', ')}`}
+          />
+        ) : null}
+        {blocked.length ? (
+          <Fact
+            icon="circle-alert"
+            text={numbers(blocked)}
+            hint={`Blocked by ${blocked.map((ref) => `#${ref.number}`).join(', ')}`}
+            tone="var(--warning)"
+          />
+        ) : null}
         {labels.slice(0, 3).map((label) => (
           <Badge key={label} variant="outline">
             {label}

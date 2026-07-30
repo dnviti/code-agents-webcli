@@ -9,6 +9,15 @@ import { looksLikeSvg, sniffMediaType } from '../../shared/media-sniff.js';
 import { ATTACHMENT_DIR } from '../services/attachment-store.js';
 import { PathValidation, SessionRecord } from '../types.js';
 import { parseGitStatus, parseUnifiedDiff } from '../../shared/git-status.js';
+import {
+  crossReferencesOf,
+  normalizeIssue,
+  normalizeItem,
+  normalizePull,
+  type GitHubIssue,
+  type GitHubPull,
+  type GitHubRef,
+} from '../../shared/github-items.js';
 import { getOwnedSession, requireUser } from './helpers.js';
 import { UserEnvironment } from '../services/environments/types.js';
 import { HostEnvironment } from '../services/environments/manager.js';
@@ -1385,7 +1394,12 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       }
 
       const payload = await readGitHub(session.workingDir, await environmentFor(deps, session));
-      ghCache.set(cacheKey, { at: Date.now(), payload });
+      // A failure is not worth half a minute. Rate limits, a dropped network
+      // and a `gh` that was mid-upgrade all clear on their own, and pinning the
+      // failure means the refresh control does nothing about it.
+      if (!payload.prsError && !payload.issuesError) {
+        ghCache.set(cacheKey, { at: Date.now(), payload });
+      }
       res.json(payload);
     },
   );
@@ -1413,16 +1427,28 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      const fields = kind === 'pr'
-        ? 'number,title,body,url,state,isDraft,author,createdAt,updatedAt,headRefName,baseRefName,additions,deletions,changedFiles,comments,labels'
-        : 'number,title,body,url,state,author,createdAt,updatedAt,comments,labels,assignees';
+      // References reach other repositories, and #5 over there is a different
+      // issue from #5 here. Rejected rather than ignored when it is malformed:
+      // quietly reading the wrong repository's #5 is the failure this exists to
+      // prevent, and it looks exactly like success.
+      const repo = typeof req.query.repo === 'string' ? req.query.repo : '';
+      if (repo && !REPO_NAME.test(repo)) {
+        res.status(400).json({ error: 'That is not a repository name' });
+        return;
+      }
+      const scope = repo ? ['-R', repo] : [];
 
-      const view = await run(
-        'gh',
-        [kind, 'view', String(number), '--json', fields],
-        session.workingDir,
-        await environmentFor(deps, session),
-      );
+      const environment = await environmentFor(deps, session);
+      const [view, timeline] = await Promise.all([
+        run(
+          'gh',
+          [kind, 'view', String(number), ...scope, '--json', kind === 'pr' ? PR_ITEM_FIELDS : ISSUE_ITEM_FIELDS],
+          session.workingDir,
+          environment,
+        ),
+        readCrossReferences(session.workingDir, number, repo, environment),
+      ]);
+
       if (!view.ok) {
         res.status(404).json({
           error: `That ${kind === 'pr' ? 'pull request' : 'issue'} could not be read`,
@@ -1431,12 +1457,127 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      res.json({ kind, item: parseJson(view.stdout, null) });
+      res.json({ kind, item: normalizeItem(kind, parseJson(view.stdout, null), timeline) });
     },
   );
 
   return router;
 }
+
+/** `owner/name`, and nothing that could be a flag or a path. */
+const REPO_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * What the panel asks `gh` for.
+ *
+ * Wider than the six fields this started with, because the questions the panel
+ * exists to answer are relational ones: who is on this, which pull request
+ * closes it, what is it a part of, is anything blocking it. They are all fields
+ * on the same query — the row already costs a round trip, and asking for the
+ * assignees while we are there costs no second one.
+ *
+ * `subIssuesSummary` rather than `subIssues` in the list: the count is what a
+ * 320px row can draw, and the children themselves are the detail view's job.
+ */
+const ISSUE_LIST_FIELDS = [
+  'number', 'title', 'url', 'state', 'author', 'assignees', 'labels', 'updatedAt',
+  'milestone', 'issueType', 'parent', 'subIssuesSummary', 'blockedBy',
+  'closedByPullRequestsReferences',
+].join(',');
+
+const PR_LIST_FIELDS = [
+  'number', 'title', 'url', 'state', 'isDraft', 'author', 'assignees', 'headRefName',
+  'baseRefName', 'updatedAt', 'labels', 'milestone', 'reviewDecision', 'statusCheckRollup',
+  'closingIssuesReferences',
+].join(',');
+
+/**
+ * What to ask for when the list above was refused.
+ *
+ * `gh` rejects the whole command over one field it does not know, and half of
+ * these are new: `parent`, `subIssues*` and `blockedBy` arrived in 2.94, which
+ * is newer than the `gh` most distributions ship. A server with an older one
+ * would otherwise be told "no open issues" about a repository with forty, which
+ * is worse than being told less about each of them.
+ */
+const ISSUE_LIST_FALLBACK = ['number', 'title', 'url', 'state', 'author', 'assignees', 'labels', 'updatedAt', 'milestone'].join(',');
+const PR_LIST_FALLBACK = ['number', 'title', 'url', 'state', 'isDraft', 'author', 'assignees', 'headRefName', 'baseRefName', 'updatedAt', 'labels'].join(',');
+
+const ISSUE_ITEM_FIELDS = [
+  'number', 'title', 'body', 'url', 'state', 'stateReason', 'author', 'assignees',
+  'createdAt', 'updatedAt', 'comments', 'labels', 'milestone', 'issueType', 'parent',
+  'subIssues', 'subIssuesSummary', 'blockedBy', 'blocking', 'closedByPullRequestsReferences',
+].join(',');
+
+const PR_ITEM_FIELDS = [
+  'number', 'title', 'body', 'url', 'state', 'isDraft', 'author', 'assignees', 'createdAt',
+  'updatedAt', 'headRefName', 'baseRefName', 'additions', 'deletions', 'changedFiles',
+  'comments', 'labels', 'milestone', 'reviewDecision', 'reviewRequests', 'latestReviews',
+  'statusCheckRollup', 'closingIssuesReferences',
+].join(',');
+
+/**
+ * Everything that mentions this issue or pull request, from its own timeline.
+ *
+ * `closedByPullRequestsReferences` only knows the links GitHub itself made from
+ * a closing keyword — and a pull request merged into a release branch rather
+ * than the default one does not get one, which in this repository is most of
+ * them. A pull request that says "part of #163" never gets one either, and it
+ * is still the pull request the person came to the panel to find. The timeline
+ * knows about both, and it carries titles and states, which the linked-pull
+ * field does not.
+ *
+ * Best effort, on purpose: this is the second call behind one panel, `gh api`
+ * needs a token with a scope `gh pr view` does not, and half an answer here is
+ * still a whole issue on screen.
+ */
+async function readCrossReferences(
+  workingDir: string,
+  number: number,
+  repo: string,
+  environment?: UserEnvironment,
+): Promise<GitHubRef[]> {
+  // `-F` reads its value as JSON — which is what expands `:owner` and `:repo`
+  // into this directory's repository, and what turns a repository actually
+  // called `2048` into the number 2048, against a `String!` variable. So the
+  // flag follows the branch: typed for the placeholders, literal for a name.
+  const [owner, name] = repo ? repo.split('/') : [':owner', ':repo'];
+  const field = repo ? '-f' : '-F';
+  const result = await run(
+    'gh',
+    [
+      'api', 'graphql',
+      field, `owner=${owner}`,
+      field, `name=${name}`,
+      // Always typed: `$number` is an `Int!`.
+      '-F', `number=${number}`,
+      '-f', `query=${CROSS_REFERENCE_QUERY}`,
+    ],
+    workingDir,
+    environment,
+  );
+  if (!result.ok) return [];
+  return crossReferencesOf(parseJson(result.stdout, null));
+}
+
+const CROSS_REFERENCE_QUERY = `
+query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    issueOrPullRequest(number:$number){
+      __typename
+      ... on Issue{timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],last:50){nodes{...event}}}
+      ... on PullRequest{timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],last:50){nodes{...event}}}
+    }
+  }
+}
+fragment event on CrossReferencedEvent{
+  willCloseTarget
+  source{
+    __typename
+    ... on Issue{number title url state repository{nameWithOwner}}
+    ... on PullRequest{number title url state isDraft repository{nameWithOwner}}
+  }
+}`;
 
 /**
  * Ask `gh` about this repository, and say plainly when it cannot be asked.
@@ -1481,32 +1622,61 @@ async function readGitHub(
   }
 
   const [prs, issues] = await Promise.all([
-    run(
-      'gh',
-      [
-        'pr', 'list', '--state', 'open', '--limit', '20',
-        '--json', 'number,title,url,state,isDraft,author,headRefName,updatedAt',
-      ],
-      workingDir,
-      environment,
-    ),
-    run(
-      'gh',
-      [
-        'issue', 'list', '--state', 'open', '--limit', '20',
-        '--json', 'number,title,url,state,author,labels,updatedAt',
-      ],
-      workingDir,
-      environment,
-    ),
+    list(['pr', 'list'], PR_LIST_FIELDS, PR_LIST_FALLBACK, workingDir, environment),
+    list(['issue', 'list'], ISSUE_LIST_FIELDS, ISSUE_LIST_FALLBACK, workingDir, environment),
   ]);
 
+  // Normalised here rather than passed through: the fields the panel now asks
+  // for come back as GraphQL connections wrapped in node ids and repository
+  // objects, and a rail 320px wide has no use for several kilobytes of them per
+  // row. One entry that `gh` reported in a shape this does not recognise drops
+  // out of the list rather than taking the panel with it.
   return {
     available: true,
     repo: parseJson(repo.stdout, null),
-    prs: parseJson(prs.stdout, []),
-    issues: parseJson(issues.stdout, []),
+    prs: prs.rows
+      .map((one) => normalizePull(one))
+      .filter((one): one is GitHubPull => one !== null),
+    issues: issues.rows
+      .map((one) => normalizeIssue(one))
+      .filter((one): one is GitHubIssue => one !== null),
+    prsError: prs.error,
+    issuesError: issues.error,
   };
+}
+
+/**
+ * One `gh ... list`, with the older field set as a second chance.
+ *
+ * A failure has to be reported as one. `gh` writes nothing to stdout when it
+ * refuses, so a discarded exit code turns "this command failed" into "there is
+ * nothing open here" — the same empty section, with nothing on screen to tell
+ * them apart.
+ */
+async function list(
+  command: string[],
+  fields: string,
+  fallback: string,
+  workingDir: string,
+  environment?: UserEnvironment,
+): Promise<{ rows: unknown[]; error?: string }> {
+  const argv = [...command, '--state', 'open', '--limit', '20', '--json'];
+  const full = await run('gh', [...argv, fields], workingDir, environment);
+  if (full.ok) return { rows: rows(full.stdout) };
+
+  const older = await run('gh', [...argv, fallback], workingDir, environment);
+  if (older.ok) return { rows: rows(older.stdout) };
+
+  return {
+    rows: [],
+    error: full.stderr.trim().slice(0, 200) || `\`gh ${command.join(' ')}\` exited ${full.code}`,
+  };
+}
+
+/** A `gh list` answer, which is an array unless the command failed. */
+function rows(stdout: string): unknown[] {
+  const parsed = parseJson<unknown>(stdout, []);
+  return Array.isArray(parsed) ? parsed : [];
 }
 
 /** Sizes as a person reads them, for the two limits the editor has to explain. */

@@ -45,38 +45,26 @@ export interface GitOverview {
   head?: GitHead | null;
 }
 
-export interface GitHubAuthor {
-  login?: string;
-}
-
-export interface GitHubPull {
-  number: number;
-  title: string;
-  url: string;
-  state: string;
-  isDraft?: boolean;
-  author?: GitHubAuthor;
-  headRefName?: string;
-  updatedAt?: string;
-}
-
-export interface GitHubIssue {
-  number: number;
-  title: string;
-  url: string;
-  state: string;
-  author?: GitHubAuthor;
-  labels?: Array<{ name?: string }>;
-  updatedAt?: string;
-}
-
-export interface GitHubOverview {
-  available: boolean;
-  reason?: string;
-  repo?: { nameWithOwner?: string; url?: string } | null;
-  prs?: GitHubPull[];
-  issues?: GitHubIssue[];
-}
+/**
+ * The GitHub shapes live in `shared` and are re-exported here.
+ *
+ * The server normalises `gh`'s JSON into them before it answers, so the
+ * definition the panel draws from and the definition the route produces are one
+ * file. They were declared twice while the panel showed a title and an author;
+ * they stopped being worth declaring twice the moment either side grew a field.
+ */
+export type {
+  GitHubActor,
+  GitHubChecks,
+  GitHubIssue,
+  GitHubLabel,
+  GitHubOverview,
+  GitHubPull,
+  GitHubRef,
+  GitHubRelation,
+  GitHubReview,
+} from '../../shared/github-items.js';
+export { relationLabel, repoFromUrl, reviewDecisionLabel } from '../../shared/github-items.js';
 
 export interface WorkspaceFile {
   path: string;
@@ -238,40 +226,25 @@ export function fetchStatus(sessionId: string): Promise<WorkspaceStatus> {
   return getJson<WorkspaceStatus>(`/api/workspace/${encodeURIComponent(sessionId)}/status`);
 }
 
-export interface GitHubComment {
-  author?: { login?: string };
-  body?: string;
-  createdAt?: string;
-}
+export type { GitHubComment, GitHubItem } from '../../shared/github-items.js';
 
-/** One issue or pull request, as `gh view` reports it. */
-export interface GitHubItem {
-  number: number;
-  title: string;
-  body?: string;
-  url: string;
-  state?: string;
-  isDraft?: boolean;
-  author?: { login?: string };
-  createdAt?: string;
-  updatedAt?: string;
-  headRefName?: string;
-  baseRefName?: string;
-  additions?: number;
-  deletions?: number;
-  changedFiles?: number;
-  labels?: Array<{ name?: string }>;
-  assignees?: Array<{ login?: string }>;
-  comments?: GitHubComment[];
-}
-
+/**
+ * One issue or pull request, in full.
+ *
+ * `repo` names which repository it belongs to, and is only passed when the
+ * reader followed a reference out of the session's own — where #5 is a
+ * different issue with the same number, which is a worse failure than a link
+ * that does not open.
+ */
 export function fetchGitHubItem(
   sessionId: string,
   kind: 'issue' | 'pr',
   number: number,
+  repo?: string,
 ): Promise<{ kind: string; item: GitHubItem }> {
+  const query = repo ? `?repo=${encodeURIComponent(repo)}` : '';
   return getJson(
-    `/api/workspace/${encodeURIComponent(sessionId)}/github/${kind}/${number}`,
+    `/api/workspace/${encodeURIComponent(sessionId)}/github/${kind}/${number}${query}`,
   );
 }
 

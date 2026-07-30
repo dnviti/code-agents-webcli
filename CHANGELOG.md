@@ -104,6 +104,31 @@
   exactly the sibling ids the CLI printed, and picking one moves the next turn
   onto that model. A model with no level in its name offers no control at all.
 
+- **The GitHub panel says who is on it and what it is attached to.** It listed
+  open pull requests and issues by title and author, which is the least of what
+  anyone opens it for. Every row now also says who it is **assigned to**, and
+  each kind carries the facts particular to it: an issue names the **pull
+  requests that reference it**, the issue it is **part of**, how many of its
+  **sub-issues** are done, and anything **blocking** it; a pull request names the
+  issues it closes, its review decision, and whether its checks passed.
+
+  Opening one shows the same relationships in full — the sub-issues themselves
+  with a progress bar, the parent, the linked pull requests, what is blocking it,
+  who has been asked to review and what they said — and every one of them is a
+  link that opens *here*, with a way back to what it was followed from. A
+  reference into another repository is opened against that repository rather than
+  against this one's issue with the same number.
+
+  Linked pull requests are not only the ones GitHub linked itself. It creates
+  those from a closing keyword against the default branch, so a fix merged into a
+  release branch, or a pull request that says "part of #163", was invisible to
+  the panel; the item's own timeline is read alongside, and the two are merged.
+
+  Two of these fields need a `gh` newer than most distributions ship. A server
+  with an older one is asked again for what it can answer, so the panel keeps
+  working with fewer facts per row — and a list `gh` refuses outright now says
+  so, where before an empty section read as a repository with nothing open.
+
 ### Fixed
 - **Stopping a turn no longer reads as the turn failing.** Claude reports a run
   it was told to abandon exactly the way it reports one that broke — `is_error`,
@@ -143,6 +168,20 @@
   A model that writes its own version of that option has it folded into this one
   row rather than offered twice, and the tool description now says not to write
   one at all.
+- **A question card no longer claims an answer the agent was never given.** The
+  card settles the moment it is clicked, without waiting for the round trip, and
+  it went on trusting that local copy for good. So when the answer did not land —
+  a sentence typed into a server that predated the free-text answer and dropped a
+  field it had never heard of, or a question a second window had already answered
+  — the card drew the words in green under *Answered in their own words* while
+  the agent, in the very next line, said it was taking the question as skipped.
+  Every layer under the card was right; the only thing that was wrong was the one
+  thing anybody could see.
+
+  The session's own record of an answer is what the model was handed, so it now
+  wins outright over the local copy the instant it arrives: the card shows what
+  the agent was actually told, and says so plainly when the words typed into it
+  were not part of it.
 - **`cc-web` started printing its help text instead of starting.** Adding the
   `env` operator subcommands left the program without an action of its own, and
   a command line with subcommands answers a bare invocation with help. Running

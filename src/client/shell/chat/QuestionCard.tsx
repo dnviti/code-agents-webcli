@@ -81,8 +81,21 @@ export function QuestionCard({
   const [draft, setDraft] = React.useState('');
 
   const live = Boolean(request && onAnswer) && sent === null && answered === undefined;
-  const picked = sent ?? answered;
-  const typed = sentOwnWords ?? ownWords;
+  // Local state settles the card on the click, and holds only until the
+  // session's own record of the answer arrives. That record is what the model
+  // was handed, so it wins outright the moment it exists — a card still showing
+  // the sentence this browser sent, beside an agent that was told the question
+  // was skipped, is the one thing it must never say. Both halves move together:
+  // picks and words are one answer, and mixing this browser's words into
+  // someone else's picks would invent a third that nobody gave.
+  const settled = answered !== undefined;
+  const picked = settled ? answered : (sent ?? undefined);
+  const typed = settled ? ownWords : sentOwnWords;
+  // Words this browser sent that are not in that record — a question already
+  // answered from somewhere else, or a session that did not take them. Said
+  // plainly rather than letting the sentence vanish from under whoever typed
+  // it, because the agent is acting on the answer above and not on theirs.
+  const dropped = Boolean(sentOwnWords && settled && !ownWords);
 
   // Only what is both typed and on screen counts. Closing the row takes the
   // sentence back off the card, and an answer that carried it anyway would be
@@ -218,7 +231,13 @@ export function QuestionCard({
           />
         </div>
       ) : (
-        <Answered options={options} picked={picked} ownWords={typed} answerText={answerText} />
+        <Answered
+          options={options}
+          picked={picked}
+          ownWords={typed}
+          answerText={answerText}
+          dropped={dropped}
+        />
       )}
 
       {live ? (
@@ -473,11 +492,14 @@ function Answered({
   picked,
   ownWords,
   answerText,
+  dropped = false,
 }: {
   options: QuestionOption[];
   picked?: string[];
   ownWords?: string;
   answerText?: string;
+  /** True when words typed here are not the answer the session recorded. */
+  dropped?: boolean;
 }): React.JSX.Element {
   // No ids to match against — a card rebuilt from a replayed transcript, where
   // the resolution is known only as the sentence the model was given. Showing
@@ -534,6 +556,16 @@ function Answered({
             : 'What was picked is no longer in this conversation’s record.'}
         </span>
       ) : null}
+      {dropped ? (
+        <span
+          role="status"
+          data-question-answer-dropped="true"
+          style={{ fontSize: 'var(--text-sm)', color: 'var(--warning)', ...WRAPS }}
+        >
+          What you typed was not recorded as the answer to this question, and the agent was not
+          given it.
+        </span>
+      ) : null}
     </div>
   );
 }
@@ -549,6 +581,7 @@ function PlainOption({
 }): React.JSX.Element {
   return (
     <div
+      data-question-option={chosen ? 'chosen' : 'offered'}
       style={{
         display: 'flex',
         alignItems: 'flex-start',

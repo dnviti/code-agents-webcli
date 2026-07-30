@@ -40,6 +40,7 @@ import { TabBar } from '../../src/client/ui/relay/TabBar';
 import { MonacoEditor } from '../../src/client/shell/chat/MonacoEditor';
 import { WorkflowPopup } from '../../src/client/shell/chat/WorkflowPopup';
 import { GitHubItemDialog } from '../../src/client/shell/chat/GitHubItemDialog';
+import { GitHubPanel } from '../../src/client/shell/chat/GitHubPanel';
 import { FileEditorDialog } from '../../src/client/shell/chat/FileEditorDialog';
 import { MessageBubble } from '../../src/client/shell/chat/MessageBubble';
 import { monacoStylesApplied } from '../../src/client/chat/monaco';
@@ -311,6 +312,7 @@ async function run(): Promise<void> {
   await checkNoRowIsDrawnWithNothingToRead();
   await checkAQuestionIsAnsweredByClicking();
   await checkAQuestionCanBeAnsweredInYourOwnWords();
+  await checkTypedWordsThatDidNotLandAreNotShownAsAnswered();
   await checkThePhoneLayoutIsUsable();
   await checkThePhoneReadsTheMessageFirst();
   await checkThePhoneShellSurfacesAreUsable();
@@ -325,6 +327,7 @@ async function run(): Promise<void> {
   await checkANewConversationCanBeStartedFromTheComposer();
   await checkTheFileEditorShowsTheFile();
   await checkAReadOnlyFileStaysReadOnly();
+  await checkTheGitHubPanelSaysWhoIsOnItAndWhatItLinksTo();
   // After the two editor checks on purpose: this one opens a FileEditorDialog,
   // and Monaco is a module-level singleton that does not survive being mounted
   // and torn down before they get to it.
@@ -1041,6 +1044,180 @@ async function checkAQuestionCanBeAnsweredInYourOwnWords(): Promise<void> {
 
   multiRoot.unmount();
   host.remove();
+}
+
+/**
+ * The card settles on the click, and must give that up the moment the session
+ * says something else.
+ *
+ * Reported from a real conversation: a sentence was typed into the card, the
+ * card drew it in green under "Answered in their own words", and the agent's
+ * very next line was "taking the skipped one" — it had been told the question
+ * was skipped. The words never reached it. The cause that day was a server
+ * older than the page it was serving, which dropped a field it had never heard
+ * of, but the shape is general: a second browser answering first, or a session
+ * that no longer holds the question, both end with a record that does not say
+ * what this browser sent. Optimistic state is right up to that point and a lie
+ * afterwards, so `question_resolved` — the same event the model's tool result
+ * was built from — wins outright over it.
+ *
+ * Asserted through the rendered card because the claim is about what a person
+ * reads off the screen, and the bug was invisible at every layer below it: the
+ * frame was correct, the reducer was correct, and the card still said the
+ * question had been answered in words nobody was given.
+ */
+async function checkTypedWordsThatDidNotLandAreNotShownAsAnswered(): Promise<void> {
+  const WORDS = 'We need gitlab, gitea and oidc as well, handled by those platforms.';
+  const OPTIONS = [
+    { label: 'A token per forge, kept in the user’s storage' },
+    { label: 'Install the tool, leave signing in to the user' },
+  ];
+  const ask = {
+    question: 'How should non-GitHub forges be authenticated?',
+    header: 'NON-GITHUB FORGES',
+    multiSelect: false,
+    options: OPTIONS,
+  };
+
+  // One mount per resolution, because the disagreement has to be the *first*
+  // thing the card hears after the click — a card that had already been told
+  // the truth once would pass this without the fix.
+  const answerThenResolveWith = async (
+    resolution: Record<string, unknown>,
+  ): Promise<{
+    text: string;
+    card: HTMLElement | null;
+    outcome: string | null | undefined;
+    teardown: () => void;
+  }> => {
+    const host = document.createElement('div');
+    host.style.cssText = 'width:900px;height:700px;position:absolute;top:0;left:0;display:flex';
+    document.body.appendChild(host);
+
+    const controller = new ChatController('browser-check', { send: () => {} } as never);
+    controller.handle({
+      type: 'chat_snapshot',
+      sessionId: 'browser-check',
+      snapshot: {
+        sessionId: 'browser-check',
+        runtime: 'claude',
+        state: 'awaiting_answer',
+        capabilities: { streaming: true, questions: true },
+        messages: [
+          {
+            id: 'a1', seq: 1, turnId: 't1', role: 'assistant', ts: 1,
+            blocks: [
+              {
+                kind: 'tool', toolId: 'tool-lost', name: 'mcp__ccweb__ask_user_question',
+                toolKind: 'other', status: 'running', input: ask,
+              },
+            ],
+          },
+        ],
+        pendingPermissions: [],
+        pendingQuestions: [
+          {
+            requestId: 'q-lost', toolId: 'tool-lost', ts: 1,
+            question: ask.question, header: ask.header, multiSelect: false,
+            options: OPTIONS.map((option, at) => ({ optionId: `opt-${at}`, ...option })),
+          },
+        ],
+        firstSeq: 1,
+        replayFrom: 1,
+        cursor: 1,
+        live: true,
+        bypassPermissions: false,
+      },
+    } as never);
+
+    const root = createRoot(host);
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/tmp/project',
+        view: DEFAULT_CHAT_VIEW,
+        onViewChange: () => {},
+      } as never),
+    );
+    await wait(400);
+
+    const live = host.querySelector('[data-question-card="live"]') as HTMLElement | null;
+    const open = live?.querySelector('[data-question-own-words="closed"]') as HTMLElement | null;
+    open?.click();
+    await wait(150);
+    const area = live?.querySelector('textarea') as HTMLTextAreaElement | null;
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+    if (area) {
+      setter?.call(area, WORDS);
+      area.dispatchEvent(new Event('input', { bubbles: true }));
+      await wait(150);
+    }
+    (Array.from(live?.querySelectorAll('button') ?? []) as HTMLButtonElement[])
+      .find((button) => (button.textContent || '').trim() === 'Send')
+      ?.click();
+    await wait(200);
+
+    controller.transcript.apply({
+      t: 'question_resolved', seq: 900, ts: 1,
+      requestId: 'q-lost', toolId: 'tool-lost',
+      ...resolution,
+    } as never);
+    await wait(250);
+
+    const card = host.querySelector('[data-question-card="answered"]') as HTMLElement | null;
+    return {
+      text: (card?.textContent || '').replace(/\s+/g, ' '),
+      card,
+      outcome: card?.querySelector('[data-question-answer]')?.getAttribute('data-question-answer'),
+      teardown: () => { root.unmount(); host.remove(); },
+    };
+  };
+
+  // ---------------------------------------------- the record says it was skipped
+  const skipped = await answerThenResolveWith({ optionIds: [], skipped: true });
+  check('a question answered in words still settles as a card', !!skipped.card);
+  check(
+    'a card whose words the session never took does not show them as the answer',
+    !skipped.text.includes(WORDS),
+    skipped.text.slice(0, 200) || 'no answered card',
+  );
+  check(
+    'and says so rather than letting the sentence vanish',
+    !!skipped.card?.querySelector('[data-question-answer-dropped]'),
+    skipped.text.slice(-160),
+  );
+  check(
+    'and reads as the skip the agent was actually told about',
+    skipped.outcome === 'skipped',
+    String(skipped.outcome),
+  );
+  skipped.teardown();
+  await wait(50);
+
+  // -------------------------------- the record says someone else picked an option
+  const overtaken = await answerThenResolveWith({ optionIds: ['opt-1'], skipped: false });
+  const chosenRows = Array.from(
+    overtaken.card?.querySelectorAll('[data-question-option="chosen"]') ?? [],
+  ).map((row) => (row.textContent || '').replace(/\s+/g, ' '));
+  check(
+    'a question answered elsewhere first shows that answer, not this browser’s',
+    chosenRows.length === 1 && chosenRows[0].includes('Install the tool'),
+    chosenRows.join(' | ').slice(0, 200) || 'nothing is marked as chosen',
+  );
+  check(
+    'and does not leave the words this browser sent standing beside it',
+    !overtaken.text.includes(WORDS)
+      && !!overtaken.card?.querySelector('[data-question-answer-dropped]'),
+    overtaken.text.slice(0, 200),
+  );
+  check(
+    'and still marks it as answered rather than skipped',
+    overtaken.outcome === 'chosen',
+    String(overtaken.outcome),
+  );
+  overtaken.teardown();
 }
 
 /**
@@ -12039,4 +12216,294 @@ async function checkTheEnvironmentSizePickerIsUsable(): Promise<void> {
 
   root.unmount();
   host.remove();
+}
+
+/**
+ * What the GitHub panel says beyond a title.
+ *
+ * The panel used to answer "what is open" and nothing else, which is the least
+ * of what a person opens it for: whether anyone has picked an issue up, which
+ * pull request is going to close it, whether it is one part of something
+ * larger. Those facts are now on the row and in the reader, and they are
+ * exactly the sort of thing static markup cannot check — the rows are drawn
+ * from a fetch, and a 320px rail is where three extra facts per row either fit
+ * or push the panel sideways.
+ *
+ * The reader is driven the way a person drives it: open an issue, follow the
+ * pull request that closes it, come back. Following a reference replaces what
+ * is on screen, and a reader that cannot get back to where it came from is a
+ * worse panel than one that never linked at all.
+ */
+async function checkTheGitHubPanelSaysWhoIsOnItAndWhatItLinksTo(): Promise<void> {
+  const REPO = 'dnviti/code-agents-webcli';
+  const link = (kind: 'issue' | 'pr', number: number, extra: Record<string, unknown> = {}) => ({
+    kind,
+    number,
+    url: `https://github.com/${REPO}/${kind === 'pr' ? 'pull' : 'issues'}/${number}`,
+    repo: REPO,
+    ...extra,
+  });
+
+  // The shape the route now serves: normalised, with every empty field absent.
+  const ISSUE = {
+    number: 134,
+    title: 'Approval mode is not applied consistently',
+    url: `https://github.com/${REPO}/issues/134`,
+    state: 'OPEN',
+    author: { login: 'dnviti' },
+    assignees: [{ login: 'ada' }],
+    labels: [{ name: 'bug' }],
+    milestone: '6.0.0',
+    parent: link('issue', 100, { title: 'Approvals, end to end', state: 'OPEN', relation: 'parent' }),
+    childrenTotal: 2,
+    childrenDone: 1,
+    blockedBy: [
+      link('issue', 77, { title: 'Decide the default', state: 'OPEN', relation: 'blocked-by' }),
+      // Closed this morning, and GitHub keeps the dependency. The row must stop
+      // saying "blocked" about it, or ready work gets skipped forever.
+      link('issue', 78, { title: 'Already settled', state: 'CLOSED', relation: 'blocked-by' }),
+    ],
+    references: [
+      link('pr', 151, { title: 'fix: approval mode', state: 'OPEN', relation: 'closed-by' }),
+      // Somewhere else entirely, where the number alone names the wrong thing.
+      {
+        kind: 'issue' as const,
+        number: 5,
+        url: 'https://github.com/another-organisation/a-rather-long-repository-name/issues/5',
+        repo: 'another-organisation/a-rather-long-repository-name',
+        title: 'The upstream bug this waits on',
+        state: 'OPEN',
+        relation: 'mentions' as const,
+      },
+    ],
+  };
+  const PULL = {
+    number: 151,
+    title: 'fix: approval mode',
+    url: `https://github.com/${REPO}/pull/151`,
+    state: 'OPEN',
+    isDraft: false,
+    author: { login: 'dnviti' },
+    assignees: [{ login: 'grace' }],
+    headRefName: 'fix/approval',
+    baseRefName: 'main',
+    reviewDecision: 'APPROVED',
+    checks: { total: 4, passed: 3, failed: 0, pending: 1, state: 'pending' },
+    references: [link('issue', 134, { title: 'Approval mode is not applied consistently', state: 'OPEN', relation: 'closes' })],
+  };
+
+  // Flipped for the last pass: what the panel says when `gh` refused to list.
+  let listRefused = false;
+
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+    const json = (value: unknown) =>
+      new Response(JSON.stringify(value), { status: 200, headers: { 'content-type': 'application/json' } });
+
+    if (url.includes('/github/issue/134')) {
+      return json({
+        kind: 'issue',
+        item: {
+          ...ISSUE,
+          kind: 'issue',
+          body: 'Three start paths disagree about the approval mode.',
+          createdAt: '2026-07-28T09:00:00Z',
+          children: [
+            link('issue', 135, { title: 'Persist the mode', state: 'CLOSED', relation: 'child' }),
+            link('issue', 136, { title: 'Say which mode is on', state: 'OPEN', relation: 'child' }),
+          ],
+          comments: [],
+        },
+      });
+    }
+    if (url.includes('/github/pr/151')) {
+      return json({ kind: 'pr', item: { ...PULL, kind: 'pr', body: 'Reads the mode from one place.', comments: [] } });
+    }
+    if (url.includes('/workspace/') && url.includes('/github')) {
+      return json(listRefused
+        ? {
+          available: true,
+          repo: { nameWithOwner: REPO },
+          prs: [PULL],
+          issues: [],
+          issuesError: 'Unknown JSON field: "subIssuesSummary"',
+        }
+        : { available: true, repo: { nameWithOwner: REPO }, prs: [PULL], issues: [ISSUE] });
+    }
+    return realFetch(input as RequestInfo);
+  }) as typeof window.fetch;
+
+  // The rail's own width, because "does it fit" is half of what is being asked.
+  const host = document.createElement('div');
+  host.style.cssText = 'position:absolute;top:0;left:0;width:320px;height:640px;'
+    + 'display:flex;flex-direction:column;overflow:hidden';
+  document.body.appendChild(host);
+  const root = createRoot(host);
+
+  try {
+    root.render(React.createElement(GitHubPanel, { sessionId: 's1' } as never));
+    await wait(300);
+    settle(document);
+
+    const rowText = (host.innerText || '').replace(/\s+/g, ' ');
+    check(
+      'an issue row names who it is assigned to',
+      /ada/.test(rowText),
+      rowText.slice(0, 240),
+    );
+    check(
+      'an issue row says how many sub-issues are done',
+      /1\/2/.test(rowText),
+      rowText.slice(0, 240),
+    );
+    check(
+      'an issue row names the pull request that closes it',
+      /#151/.test(rowText),
+      rowText.slice(0, 240),
+    );
+    check(
+      'an issue row names what it is part of, and what blocks it',
+      /#100/.test(rowText) && /#77/.test(rowText),
+      rowText.slice(0, 240),
+    );
+    check(
+      'and stops counting a blocker that has been closed',
+      !/#78/.test(rowText),
+      rowText.slice(0, 240),
+    );
+    check(
+      'a pull request row names its assignee and its checks',
+      /grace/.test(rowText) && /3\/4/.test(rowText),
+      rowText.slice(0, 240),
+    );
+
+    // Three more facts per row is exactly how a 320px rail starts scrolling
+    // sideways. They wrap; they do not widen it.
+    check(
+      'the extra facts stay inside the rail',
+      host.scrollWidth <= host.clientWidth + 1,
+      `content ${host.scrollWidth}px in ${host.clientWidth}px`,
+    );
+
+    // Open the issue the way a person does. Matched on the number the row
+    // opens with, not on one anywhere in it: the pull request's own row now
+    // says "#134" too, which is the point of the row and would send this check
+    // into the wrong reader.
+    const issueRow = Array.from(host.querySelectorAll<HTMLElement>('button')).find(
+      (button) => (button.innerText || '').trim().startsWith('#134'),
+    );
+    issueRow?.click();
+    await wait(300);
+    settle(document);
+
+    const dialog = document.querySelector('[role="dialog"]') as HTMLElement | null;
+    const readerText = (dialog?.innerText || '').replace(/\s+/g, ' ');
+    check(
+      'the reader says who the issue is assigned to',
+      /Assigned to/i.test(readerText) && /ada/.test(readerText),
+      readerText.slice(0, 300),
+    );
+    check(
+      'the reader names the pull request that closes it',
+      /Closed by/i.test(readerText) && /#151/.test(readerText),
+      readerText.slice(0, 300),
+    );
+    check(
+      'the reader names the issue this one is part of',
+      /Part of/i.test(readerText) && /#100/.test(readerText),
+      readerText.slice(0, 300),
+    );
+    check(
+      'the reader lists the sub-issues and what is blocking it',
+      /#135/.test(readerText) && /#136/.test(readerText) && /Blocked by/i.test(readerText),
+      readerText.slice(0, 300),
+    );
+
+    check(
+      'a reference into another repository says which repository',
+      /another-organisation\/a-rather-long-repository-name#5/.test(readerText),
+      readerText.slice(0, 400),
+    );
+
+    // The reader is a phone-width panel too, and a repository name is as long
+    // as somebody made it.
+    const links = Array.from(dialog?.querySelectorAll<HTMLElement>('button') || []).filter(
+      (button) => (button.getAttribute('title') || '').includes('#'),
+    );
+    const spilling = links.filter(
+      (row) => row.getBoundingClientRect().right > (dialog as HTMLElement).getBoundingClientRect().right + 0.5,
+    );
+    check(
+      'no reference runs out of the side of the reader',
+      spilling.length === 0,
+      spilling.length ? spilling.map((row) => String(row.getAttribute('title'))).join(' | ') : `${links.length} references`,
+    );
+
+    const bar = dialog?.querySelector('[role="progressbar"]') as HTMLElement | null;
+    check(
+      'the sub-issue progress is readable without seeing the bar',
+      bar?.getAttribute('aria-label') === '1 of 2 sub-issues done',
+      bar ? String(bar.getAttribute('aria-label')) : 'no progress bar',
+    );
+
+    // Follow the pull request out of the issue, then come back.
+    const follow = Array.from(dialog?.querySelectorAll<HTMLElement>('button') || []).find(
+      (button) => (button.getAttribute('title') || '').includes('#151'),
+    );
+    check('a reference in the reader can be followed', Boolean(follow), follow ? 'link found' : 'no link');
+    follow?.click();
+    await wait(300);
+    settle(document);
+
+    const pullText = ((document.querySelector('[role="dialog"]') as HTMLElement | null)?.innerText || '')
+      .replace(/\s+/g, ' ');
+    check(
+      'following a reference opens that pull request',
+      pullText.startsWith('#151') && /grace/.test(pullText),
+      pullText.slice(0, 300),
+    );
+    check(
+      'a followed reference can be left again',
+      Boolean(document.querySelector('[aria-label="Back"]')),
+      'back control',
+    );
+
+    (document.querySelector('[aria-label="Back"]') as HTMLElement | null)?.click();
+    await wait(300);
+    settle(document);
+    const backText = ((document.querySelector('[role="dialog"]') as HTMLElement | null)?.innerText || '')
+      .replace(/\s+/g, ' ');
+    check(
+      'and going back returns to the issue it was followed from',
+      backText.startsWith('#134') && !document.querySelector('[aria-label="Back"]'),
+      backText.slice(0, 200),
+    );
+
+    // A `gh` too old for the sub-issue fields refuses the whole command, and an
+    // empty section is indistinguishable from a repository with nothing open.
+    (document.querySelector('[aria-label="Close"], [aria-label="close"]') as HTMLElement | null)?.click();
+    listRefused = true;
+    root.render(React.createElement('div'));
+    await wait(60);
+    root.render(React.createElement(GitHubPanel, { sessionId: 's1' } as never));
+    await wait(400);
+    settle(document);
+
+    const refusedText = (host.innerText || '').replace(/\s+/g, ' ');
+    check(
+      'a list gh refused does not read as a repository with no open issues',
+      !/No open issues/.test(refusedText) && /could not be listed/i.test(refusedText),
+      refusedText.slice(0, 300),
+    );
+    check(
+      'and the half that answered is still listed',
+      /#151/.test(refusedText) && /fix: approval mode/.test(refusedText),
+      refusedText.slice(0, 300),
+    );
+  } finally {
+    root.unmount();
+    host.remove();
+    window.fetch = realFetch;
+  }
 }
