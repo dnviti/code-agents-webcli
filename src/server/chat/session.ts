@@ -2249,7 +2249,12 @@ export class ChatSession {
    * Returns false for a question this session does not have, which is what a
    * second browser answering one that has already been answered looks like.
    */
-  answerQuestion(requestId: string, optionIds: string[], skipped = false): boolean {
+  answerQuestion(
+    requestId: string,
+    optionIds: string[],
+    skipped = false,
+    text?: string,
+  ): boolean {
     const entry = this.questions.get(requestId);
     if (!entry) return false;
 
@@ -2257,10 +2262,15 @@ export class ChatSession {
     // from a browser, and the labels they resolve to are about to be handed
     // straight to the model as fact.
     const picked = entry.request.options.filter((option) => optionIds.includes(option.optionId));
-    const answered = !skipped && picked.length > 0;
+    // The one part of an answer that is *not* filtered against the options,
+    // because it is by definition not one of them. Bounded at the wire; here it
+    // only has to be non-empty to count as having been answered.
+    const own = typeof text === 'string' ? text.trim() : '';
+    const answered = !skipped && (picked.length > 0 || own.length > 0);
 
     entry.resolve({
       labels: picked.map((option) => option.label),
+      text: answered && own ? own : undefined,
       skipped: !answered,
     });
 
@@ -2270,6 +2280,7 @@ export class ChatSession {
       requestId,
       toolId: entry.request.toolId,
       optionIds: picked.map((option) => option.optionId),
+      text: answered && own ? own : undefined,
       skipped: !answered,
     });
     return true;

@@ -310,6 +310,7 @@ async function run(): Promise<void> {
   await checkSilentStepsLeaveNoRowButKeepTheirTrace();
   await checkNoRowIsDrawnWithNothingToRead();
   await checkAQuestionIsAnsweredByClicking();
+  await checkAQuestionCanBeAnsweredInYourOwnWords();
   await checkThePhoneLayoutIsUsable();
   await checkThePhoneReadsTheMessageFirst();
   await checkThePhoneShellSurfacesAreUsable();
@@ -671,6 +672,374 @@ async function checkAQuestionIsAnsweredByClicking(): Promise<void> {
   );
 
   backRoot.unmount();
+  host.remove();
+}
+
+/**
+ * An option list the model wrote is not the only answer a question can have.
+ *
+ * Two defects, both only visible with a layout engine running and both from the
+ * same real conversation. The options a model writes are sentences — its own
+ * gloss on what picking one would mean — and `Button` sets `white-space:
+ * nowrap`, so every description ran off the right-hand edge of the card and
+ * kept going past the edge of the conversation. And the last option a model
+ * writes is routinely "Let me explain in my own words", which was a button like
+ * any other: clicking it answered the question with the string "Let me explain
+ * in my own words" and bought a wasted round trip.
+ *
+ * So: nothing inside the card may reach past its own border, and that row is a
+ * textarea whose contents are the answer. Asserted against the rendered card
+ * because both claims are about geometry and events, not about props.
+ */
+async function checkAQuestionCanBeAnsweredInYourOwnWords(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const sent: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('browser-check', {
+    send: (message: Record<string, unknown>) => {
+      sent.push(message);
+    },
+  } as never);
+
+  // The question from the conversation this was reported from, verbatim —
+  // including the option the model wrote for itself at the end.
+  const OPTIONS = [
+    {
+      label: 'Persistent storage, attached to each container',
+      description:
+        "The user's workspace lives outside the container and is attached to it, the way per-user " +
+        'environments already keep a home directory. Closing a session leaves the work where it was.',
+    },
+    {
+      label: 'Fresh checkout each time',
+      description:
+        'A session starts by pulling the project into a clean container. Anything not pushed is ' +
+        'gone when the session closes — explicit and cheap, but unforgiving.',
+    },
+    {
+      label: 'Let me explain in my own words',
+      description: 'None of these is quite right.',
+    },
+  ];
+  const ask = {
+    question: "When a session's container is destroyed, what happens to the work inside it?",
+    header: 'WHERE WORK LIVES',
+    multiSelect: false,
+    options: OPTIONS,
+  };
+
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check',
+      runtime: 'claude',
+      state: 'awaiting_answer',
+      capabilities: { streaming: true, questions: true },
+      messages: [
+        {
+          id: 'a1', seq: 1, turnId: 't1', role: 'assistant', ts: 1,
+          blocks: [
+            {
+              kind: 'tool', toolId: 'tool-own', name: 'mcp__ccweb__ask_user_question',
+              toolKind: 'other', status: 'running', input: ask,
+            },
+          ],
+        },
+      ],
+      pendingPermissions: [],
+      pendingQuestions: [
+        {
+          requestId: 'q-own', toolId: 'tool-own', ts: 1,
+          question: ask.question, header: ask.header, multiSelect: false,
+          options: OPTIONS.map((option, at) => ({ optionId: `opt-${at}`, ...option })),
+        },
+      ],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 1,
+      live: true,
+      bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  const card = host.querySelector('[data-question-card="live"]') as HTMLElement | null;
+  check('the live question renders as a card', !!card);
+  if (!card) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  // ------------------------------------------------------------------ wrapping
+  const cardBox = card.getBoundingClientRect();
+  const spilled = Array.from(card.querySelectorAll<HTMLElement>('*')).filter(
+    (node) => node.getBoundingClientRect().right > cardBox.right + 1,
+  );
+  check(
+    'no part of a question reaches past the edge of its own card',
+    spilled.length === 0,
+    spilled.length
+      ? spilled
+          .slice(0, 2)
+          .map((node) => `${(node.textContent || '').trim().slice(0, 28)} → ${Math.round(node.getBoundingClientRect().right)} of ${Math.round(cardBox.right)}`)
+          .join(' | ')
+      : `${Math.round(cardBox.width)}px wide`,
+  );
+
+  const optionButtons = Array.from(card.querySelectorAll('button')) as HTMLButtonElement[];
+  const persistent = optionButtons.find((button) =>
+    (button.textContent || '').includes('Persistent storage'),
+  );
+  check('the first option is its own control', !!persistent);
+  // `scrollWidth > clientWidth` is the layout engine saying "this did not fit".
+  // The bug was one line of text laid out at whatever width it wanted inside a
+  // box the width of the card, so this is the measurement that names it.
+  check(
+    'a long option lays itself out inside the width it was given',
+    !!persistent && persistent.scrollWidth <= persistent.clientWidth + 1,
+    persistent ? `${persistent.scrollWidth}px of content in ${persistent.clientWidth}px` : 'no option',
+  );
+  // And wrapped rather than merely clipped or pushed onto its own long line.
+  // Measured against the description's own type size, so this says "this
+  // paragraph occupies more than one line" rather than trusting a pixel count
+  // that a theme could move.
+  const description = Array.from(card.querySelectorAll<HTMLElement>('span')).find((span) =>
+    (span.textContent || '').startsWith("The user's workspace lives outside"),
+  );
+  const lineOf = (node: HTMLElement): number => parseFloat(getComputedStyle(node).fontSize) || 13;
+  check(
+    'and its description wraps onto as many lines as it needs',
+    !!description && description.getBoundingClientRect().height > lineOf(description) * 2.4,
+    description
+      ? `${Math.round(description.getBoundingClientRect().height)}px at ${lineOf(description)}px type`
+      : 'no description',
+  );
+
+  // ------------------------------------------------------- the free-text row
+  const ownRow = card.querySelector('[data-question-own-words]') as HTMLElement | null;
+  check('the card offers to take an answer in the user’s own words', !!ownRow);
+  check(
+    'and does not offer the model’s own version of it as well',
+    card.querySelectorAll('[data-question-own-words]').length === 1
+      && optionButtons.filter((button) => (button.textContent || '').includes('Let me explain')).length === 1,
+    `${card.querySelectorAll('[data-question-own-words]').length} rows`,
+  );
+  check(
+    'and keeps the wording the model chose for it',
+    (ownRow?.textContent || '').includes('Let me explain in my own words'),
+    (ownRow?.textContent || '').trim().slice(0, 48),
+  );
+
+  const explain = optionButtons.find((button) => (button.textContent || '').includes('Let me explain'));
+  if (explain) {
+    explain.click();
+    await wait(200);
+  }
+
+  // The defect, stated as the thing that must not happen: clicking that row
+  // used to answer the question with its own label and unblock the agent.
+  check(
+    'opening it does not answer the question with the label on it',
+    sent.filter((message) => message.type === 'chat_question_answer').length === 0,
+    `${sent.filter((message) => message.type === 'chat_question_answer').length} answers sent`,
+  );
+
+  const area = card.querySelector('textarea') as HTMLTextAreaElement | null;
+  check('opening it puts a textarea on the card', !!area);
+  check(
+    'which is big enough to write an explanation in',
+    !!area && isPainted(area) && area.getBoundingClientRect().height >= 40,
+    area ? `${Math.round(area.getBoundingClientRect().width)}x${Math.round(area.getBoundingClientRect().height)}` : 'no textarea',
+  );
+  if (!area) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+  setter?.call(area, 'A container per project, not per session.');
+  area.dispatchEvent(new Event('input', { bubbles: true }));
+  await wait(150);
+
+  const send = (Array.from(card.querySelectorAll('button')) as HTMLButtonElement[]).find(
+    (button) => (button.textContent || '').trim() === 'Send',
+  );
+  check('typed words can be sent', !!send && !send.disabled);
+  send?.click();
+  await wait(200);
+
+  const answer = sent.find((message) => message.type === 'chat_question_answer');
+  check('the answer reaches the server', !!answer);
+  check(
+    'and carries the words rather than an option id',
+    !!answer
+      && answer.text === 'A container per project, not per session.'
+      && JSON.stringify(answer.optionIds) === '[]',
+    `${JSON.stringify(answer?.text)} / ${JSON.stringify(answer?.optionIds)}`,
+  );
+  // The half that decides whether the agent hears anything at all: a typed
+  // answer travelling as a skip would reach the model as "they declined".
+  check('and is not sent as a skip', !!answer && answer.skipped === false, String(answer?.skipped));
+
+  // What the server writes back, and what a second browser would see.
+  controller.transcript.apply({
+    t: 'question_resolved',
+    seq: 900,
+    ts: 1,
+    requestId: 'q-own',
+    toolId: 'tool-own',
+    optionIds: [],
+    text: 'A container per project, not per session.',
+    skipped: false,
+  } as never);
+  await wait(200);
+
+  const settled = host.querySelector('[data-question-card="answered"]') as HTMLElement | null;
+  check('the card settles as answered', !!settled);
+  const settledText = (settled?.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'and the answered card shows what was typed',
+    settledText.includes('A container per project, not per session.'),
+    settledText.slice(-80),
+  );
+  check(
+    'and never reads as a question nobody answered',
+    !settledText.includes('Skipped without answering'),
+    settledText.slice(-60),
+  );
+  check(
+    'and still lists the options the model offered',
+    settledText.includes('Persistent storage') && settledText.includes('Fresh checkout'),
+  );
+
+  root.unmount();
+  await wait(50);
+
+  // ------------------------------------------------- and on a pick-several
+  //
+  // Its own mount rather than a second card in the fixture above: a
+  // multi-select answers from the Confirm button under the whole card, so the
+  // claim is that one press carries the ticks *and* the sentence. A card that
+  // sent only one of them would look identical up to the click.
+  const multiSent: Array<Record<string, unknown>> = [];
+  const multi = new ChatController('browser-check', {
+    send: (message: Record<string, unknown>) => {
+      multiSent.push(message);
+    },
+  } as never);
+  const multiAsk = {
+    question: 'Which rules should I apply?',
+    multiSelect: true,
+    options: [{ label: 'semicolons' }, { label: 'trailing commas' }],
+  };
+  multi.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check', runtime: 'claude', state: 'awaiting_answer',
+      capabilities: { streaming: true, questions: true },
+      messages: [
+        {
+          id: 'a1', seq: 1, turnId: 't1', role: 'assistant', ts: 1,
+          blocks: [
+            {
+              kind: 'tool', toolId: 'tool-multi', name: 'mcp__ccweb__ask_user_question',
+              toolKind: 'other', status: 'running', input: multiAsk,
+            },
+          ],
+        },
+      ],
+      pendingPermissions: [],
+      pendingQuestions: [
+        {
+          requestId: 'q-multi', toolId: 'tool-multi', ts: 1,
+          question: multiAsk.question, multiSelect: true,
+          options: [
+            { optionId: 'opt-0', label: 'semicolons' },
+            { optionId: 'opt-1', label: 'trailing commas' },
+          ],
+        },
+      ],
+      firstSeq: 1, replayFrom: 1, cursor: 1, live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const multiRoot = createRoot(host);
+  multiRoot.render(
+    React.createElement(ChatView, {
+      controller: multi,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  const multiCard = host.querySelector('[data-question-card="live"]') as HTMLElement | null;
+  const boxes = multiCard
+    ? (Array.from(multiCard.querySelectorAll('input[type="checkbox"]')) as HTMLInputElement[])
+    : [];
+  check(
+    'a pick-several question still ticks by option, and offers the words as well',
+    boxes.length === 2 && !!multiCard?.querySelector('[data-question-own-words]'),
+    `${boxes.length} boxes`,
+  );
+
+  const openWords = multiCard
+    ? (Array.from(multiCard.querySelectorAll('button')) as HTMLButtonElement[]).find((button) =>
+        (button.textContent || '').includes('own words'),
+      )
+    : undefined;
+  const multiConfirm = (): HTMLButtonElement | undefined =>
+    multiCard
+      ? (Array.from(multiCard.querySelectorAll('button')) as HTMLButtonElement[]).find(
+          (button) => (button.textContent || '').trim() === 'Confirm',
+        )
+      : undefined;
+
+  check('confirm is refused while nothing is ticked and nothing is typed', multiConfirm()?.disabled === true);
+
+  boxes[0]?.click();
+  openWords?.click();
+  await wait(200);
+  const multiArea = multiCard?.querySelector('textarea') as HTMLTextAreaElement | null;
+  if (multiArea) {
+    setter?.call(multiArea, '…but never in generated files.');
+    multiArea.dispatchEvent(new Event('input', { bubbles: true }));
+    await wait(150);
+  }
+  multiConfirm()?.click();
+  await wait(200);
+
+  const multiAnswer = multiSent.find((message) => message.type === 'chat_question_answer');
+  check(
+    'one confirm carries both the ticks and the words',
+    !!multiAnswer
+      && JSON.stringify(multiAnswer.optionIds) === '["opt-0"]'
+      && multiAnswer.text === '…but never in generated files.',
+    `${JSON.stringify(multiAnswer?.optionIds)} / ${JSON.stringify(multiAnswer?.text)}`,
+  );
+
+  multiRoot.unmount();
   host.remove();
 }
 

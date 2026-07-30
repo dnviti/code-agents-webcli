@@ -17,9 +17,14 @@ const {
   looksLikeAskCall,
   askedQuestionFrom,
   normalizeQuestionOptions,
+  isOwnWordsOption,
+  splitOwnWordsOption,
+  OWN_WORDS_LABEL,
+  MAX_QUESTION_ANSWER_TEXT,
   ASK_QUESTION_TOOL_NAME,
 } = require('../dist/shared/chat-events.js');
 const { askChannelFor } = require('../dist/server/chat/registry.js');
+const { MessageProcessor } = require('../dist/server/websocket/messages.js');
 
 // Choice-based questions from the model, end to end (issue #42).
 //
@@ -760,6 +765,357 @@ describe('asking the user a choice-based question', function () {
       // The one thing that must never happen here is silence.
       assert.strictEqual(reply.result.isError, true);
       assert.match(reply.result.content[0].text, /plain text/i);
+    });
+  });
+
+  /**
+   * Answering in words the question did not offer.
+   *
+   * The option list is written by the model, so it cannot anticipate "none of
+   * these is quite right" — and the models know it, which is why they keep
+   * writing that option themselves. Clicking it sent the model its own words
+   * back ("The user selected: 'Let me explain in my own words'"), which answers
+   * nothing and costs a turn. The card offers a textarea instead, and what is
+   * typed into it travels the same path an option id does: through the same
+   * frame, the same session call, the same tool result, and into the same log.
+   */
+  describe('answering in the user’s own words', function () {
+    describe('the option a model writes for it', function () {
+      it('is recognised however the model phrased it', function () {
+        for (const label of [
+          'Let me explain in my own words',
+          'let me explain in my own words.',
+          'I’ll answer in my own words',
+          'Other',
+          'Other (please specify)',
+          'Other…',
+          'None of these',
+          'None of the above',
+          'Something else',
+          'Write my own answer',
+        ]) {
+          assert.ok(isOwnWordsOption(label), `${label} should be read as an invitation to type`);
+        }
+      });
+
+      it('is not confused with an option that is a real choice', function () {
+        for (const label of [
+          'Rewrite it',
+          'Patch it',
+          'Other users',
+          'None of these files have changed',
+          'Otherwise, stop',
+          'Own the deployment',
+        ]) {
+          assert.ok(!isOwnWordsOption(label), `${label} is a choice, not a textarea`);
+        }
+      });
+
+      it('is taken out of the list the card offers, so the row is not drawn twice', function () {
+        const options = normalizeQuestionOptions([
+          { label: 'Persistent storage', description: 'kept between sessions' },
+          { label: 'Fresh checkout each time' },
+          { label: 'Let me explain in my own words', description: 'None of these is quite right.' },
+        ]);
+        const { choices, invitation } = splitOwnWordsOption(options);
+        assert.deepStrictEqual(choices.map((o) => o.label), [
+          'Persistent storage',
+          'Fresh checkout each time',
+        ]);
+        // The model's own wording is kept for the row, rather than replaced with
+        // this app's: it wrote a gloss, and the card can say what it said.
+        assert.strictEqual(invitation.label, 'Let me explain in my own words');
+        assert.strictEqual(invitation.description, 'None of these is quite right.');
+      });
+
+      it('leaves the list alone when there would be nothing left to click', function () {
+        const options = normalizeQuestionOptions(['Other', 'None of the above']);
+        const { choices, invitation } = splitOwnWordsOption(options);
+        assert.strictEqual(invitation, undefined);
+        assert.deepStrictEqual(choices.map((o) => o.label), ['Other', 'None of the above']);
+      });
+
+      it('has a default wording for the questions that do not offer one', function () {
+        assert.ok(isOwnWordsOption(OWN_WORDS_LABEL), 'the card’s own row must match its own rule');
+      });
+    });
+
+    describe('the session', function () {
+      it('carries typed words back to the waiting tool call', async function () {
+        const { s, store } = session();
+        const waiting = s.askQuestion(QUESTION);
+        const asked = store.events.find((e) => e.t === 'question').request;
+
+        s.answerQuestion(asked.requestId, [], false, 'Keep the container, but rebuild it nightly.');
+
+        const reply = await within(waiting, 'the typed answer never came back');
+        assert.strictEqual(reply.text, 'Keep the container, but rebuild it nightly.');
+        // Not one of the labels: a label is an option the model wrote, and the
+        // whole point of this answer is that the model did not write it.
+        assert.deepStrictEqual(reply.labels, []);
+        assert.notStrictEqual(reply.skipped, true, 'typing an answer is not skipping');
+      });
+
+      it('writes them to the transcript beside the picks, not instead of them', function () {
+        const { s, store } = session();
+        s.askQuestion({
+          question: 'Which rules should I apply?',
+          multiSelect: true,
+          options: ['semicolons', 'trailing commas'],
+        });
+        const asked = store.events.find((e) => e.t === 'question').request;
+
+        s.answerQuestion(asked.requestId, [asked.options[0].optionId], false, '…and no tabs.');
+
+        const resolved = store.events.find((e) => e.t === 'question_resolved');
+        assert.deepStrictEqual(resolved.optionIds, ['opt-0']);
+        assert.strictEqual(resolved.text, '…and no tabs.');
+        assert.notStrictEqual(resolved.skipped, true);
+      });
+
+      it('is still a skip when the box was left empty', async function () {
+        const { s, store } = session();
+        const waiting = s.askQuestion(QUESTION);
+        const asked = store.events.find((e) => e.t === 'question').request;
+
+        // What an empty textarea sends: whitespace is not an answer, and a card
+        // that reported it as one would tell the model the user had spoken.
+        s.answerQuestion(asked.requestId, [], false, '   \n  ');
+
+        const reply = await within(waiting, 'the empty answer never came back');
+        assert.strictEqual(reply.skipped, true);
+        assert.strictEqual(reply.text, undefined);
+        assert.strictEqual(
+          store.events.find((e) => e.t === 'question_resolved').text,
+          undefined,
+        );
+      });
+
+      it('never lets a skip carry words with it', async function () {
+        const { s, store } = session();
+        const waiting = s.askQuestion(QUESTION);
+        const asked = store.events.find((e) => e.t === 'question').request;
+
+        // Skip wins over anything left in the box. Both reach the server on the
+        // same frame, and "they skipped, and here is what they said" is not a
+        // state the model should ever have to reconcile.
+        s.answerQuestion(asked.requestId, [], true, 'half a thought');
+
+        const reply = await within(waiting, 'the skip never came back');
+        assert.strictEqual(reply.skipped, true);
+        assert.strictEqual(reply.text, undefined);
+      });
+    });
+
+    describe('what the model is told', function () {
+      it('says the answer was the user’s own, not one of the options it wrote', function () {
+        const { text, isError } = describeAnswer({ labels: [], text: 'Rebuild it nightly.' });
+        assert.match(text, /own words/i);
+        assert.match(text, /"Rebuild it nightly\."/);
+        assert.strictEqual(isError, false);
+        // The failure this guards: an answer of nothing-but-words reaching the
+        // "they skipped it, do not ask again" branch, which would throw away
+        // the one thing the user actually said.
+        assert.ok(!/skipped/i.test(text));
+      });
+
+      it('reports typed words alongside the options that were picked', function () {
+        const { text } = describeAnswer({ labels: ['semicolons'], text: '…and no tabs.' });
+        assert.match(text, /"semicolons"/);
+        assert.match(text, /own words: "…and no tabs\."/);
+      });
+
+      it('still reads an answer of nothing at all as a skip', function () {
+        const { text } = describeAnswer({ labels: [] });
+        assert.match(text, /skipped/i);
+      });
+
+      it('tells the model not to write the option itself', function () {
+        // The tool description is the only place a model reads about the
+        // textarea. Left out, it keeps writing its own "Let me explain" option,
+        // which is the bug the card can only paper over.
+        assert.match(ASK_TOOL_DEFINITION.description, /free-text/i);
+        assert.match(ASK_TOOL_DEFINITION.description, /own words/i);
+      });
+    });
+
+    describe('the transcript reducer', function () {
+      let n = 0;
+      const apply = (state, event) => {
+        applyChatEvent(state, { seq: (n += 1), ts: Date.now(), ...event });
+        return state;
+      };
+      const ask = (state, requestId, toolId) =>
+        apply(state, {
+          t: 'question',
+          request: {
+            requestId, toolId, question: 'Which?', multiSelect: false,
+            options: [{ optionId: 'opt-0', label: 'A' }], ts: 1,
+          },
+        });
+
+      it('keeps the words, keyed by the call that asked', function () {
+        const state = createTranscript({});
+        ask(state, 'q1', 't1');
+        apply(state, {
+          t: 'question_resolved', requestId: 'q1', toolId: 't1', optionIds: [], text: 'neither, really',
+        });
+
+        assert.strictEqual(state.answeredQuestionText.t1, 'neither, really');
+        // An empty pick list *with* words is not a skip. The card reads these
+        // two together, and on the ids alone it would draw "Skipped without
+        // answering" over an answer the user typed.
+        assert.deepStrictEqual(state.answeredQuestions.t1, []);
+      });
+
+      it('takes them back off a question answered a second time by clicking', function () {
+        const state = createTranscript({});
+        ask(state, 'q2', 't2');
+        apply(state, { t: 'question_resolved', requestId: 'q2', toolId: 't2', optionIds: [], text: 'first go' });
+        ask(state, 'q2', 't2');
+        apply(state, { t: 'question_resolved', requestId: 'q2', toolId: 't2', optionIds: ['opt-0'] });
+
+        assert.strictEqual(state.answeredQuestionText.t2, undefined);
+        assert.deepStrictEqual(state.answeredQuestions.t2, ['opt-0']);
+      });
+
+      it('does not keep them for a question that was skipped', function () {
+        const state = createTranscript({});
+        ask(state, 'q3', 't3');
+        apply(state, {
+          t: 'question_resolved', requestId: 'q3', toolId: 't3', optionIds: [], text: 'x', skipped: true,
+        });
+        assert.strictEqual(state.answeredQuestionText.t3, undefined);
+      });
+
+      it('drops them with the conversation when it is cleared', function () {
+        const state = createTranscript({});
+        ask(state, 'q4', 't4');
+        apply(state, { t: 'question_resolved', requestId: 'q4', toolId: 't4', optionIds: [], text: 'said so' });
+        apply(state, { t: 'marker', kind: 'cleared' });
+        assert.deepStrictEqual(state.answeredQuestionText, {});
+      });
+    });
+
+    describe('the socket frame a browser sends', function () {
+      /** A processor with nothing wired but the one chat session under test. */
+      function processorWith(answers) {
+        const record = {
+          id: 's1', ownerUserId: 7, name: 'chat', created: new Date(), lastActivity: new Date(),
+          active: true, agent: 'claude', workingDir: '/tmp', connections: new Set(),
+          outputBuffer: [], maxBufferSize: 10,
+        };
+        const processor = new MessageProcessor({
+          dev: false,
+          claudeSessions: new Map([['s1', record]]),
+          webSocketConnections: new Map([
+            ['w1', {
+              id: 'w1', ws: { readyState: 1, send() {} }, userId: 7, githubLogin: 'tester',
+              claudeSessionId: 's1', chatSessionIds: new Set(['s1']), created: new Date(),
+            }],
+          ]),
+          baseFolder: '/tmp',
+          sessionDurationHours: 5,
+          aliases: {},
+          validatePath: () => ({ valid: true, path: '/tmp' }),
+          getSelectedWorkingDir: () => '/tmp',
+          createSessionRecord: () => record,
+          getRuntimeBridge: () => null,
+          saveSessionsToDisk: async () => {},
+          chatManager: {
+            answerQuestion(...args) {
+              answers.push(args);
+              return true;
+            },
+          },
+        });
+        return processor;
+      }
+
+      it('reaches the session as the answer, trimmed', async function () {
+        const answers = [];
+        await processorWith(answers).handleMessage('w1', {
+          type: 'chat_question_answer',
+          sessionId: 's1',
+          requestId: 'req-1',
+          optionIds: [],
+          skipped: false,
+          text: '  Keep the container.  ',
+        });
+
+        assert.deepStrictEqual(answers, [['s1', 'req-1', [], false, 'Keep the container.']]);
+      });
+
+      it('bounds what it will take, because a frame is not a promise', async function () {
+        const answers = [];
+        await processorWith(answers).handleMessage('w1', {
+          type: 'chat_question_answer',
+          sessionId: 's1',
+          requestId: 'req-1',
+          optionIds: [],
+          text: 'x'.repeat(MAX_QUESTION_ANSWER_TEXT + 500),
+        });
+
+        assert.strictEqual(answers[0][4].length, MAX_QUESTION_ANSWER_TEXT);
+      });
+
+      it('sends nothing at all for a frame that carries no words', async function () {
+        const answers = [];
+        await processorWith(answers).handleMessage('w1', {
+          type: 'chat_question_answer',
+          sessionId: 's1',
+          requestId: 'req-1',
+          optionIds: ['opt-0'],
+        });
+
+        assert.strictEqual(answers[0][4], undefined);
+      });
+    });
+
+    it('carries the words the whole way, over the real socket', async function () {
+      // Every layer above is tested at its own seam; this is the one that says
+      // they are wired to each other. A textarea whose contents stop at any hop
+      // is a card that looks like it works and answers the model with silence.
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'askwords-'));
+      const broker = new PermissionBroker(path.join(root, 'sockets'));
+      try {
+        const socketPath = await broker.listen({
+          permission: async () => ({ allow: false }),
+          question: async () => ({ labels: [], text: 'A container per project, not per session.' }),
+        });
+
+        const child = spawn(process.execPath, [ASK_SERVER], {
+          env: { ...process.env, CCWEB_ASK_SOCKET: socketPath },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        try {
+          const reply = await within(
+            new Promise((resolve) => {
+              let buffer = '';
+              child.stdout.setEncoding('utf8');
+              child.stdout.on('data', (chunk) => {
+                buffer += chunk;
+                const at = buffer.indexOf('\n');
+                if (at !== -1) resolve(JSON.parse(buffer.slice(0, at)));
+              });
+              child.stdin.write(`${JSON.stringify({
+                jsonrpc: '2.0', id: 1, method: 'tools/call',
+                params: { name: 'ask_user_question', arguments: QUESTION },
+              })}\n`);
+            }),
+            'the spawned MCP server never answered',
+            5000,
+          );
+          assert.match(reply.result.content[0].text, /A container per project, not per session\./);
+          assert.match(reply.result.content[0].text, /own words/i);
+          assert.notStrictEqual(reply.result.isError, true);
+        } finally {
+          child.kill();
+        }
+      } finally {
+        broker.close();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
     });
   });
 });

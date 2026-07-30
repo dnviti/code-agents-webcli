@@ -19,7 +19,11 @@ import {
   announceSessionOpened,
 } from './handler.js';
 import { chatUnavailableReason, isChatRuntime } from '../../shared/chat-runtimes.js';
-import { ChatDraft, ChatModelDefault } from '../../shared/chat-events.js';
+import {
+  ChatDraft,
+  ChatModelDefault,
+  MAX_QUESTION_ANSWER_TEXT,
+} from '../../shared/chat-events.js';
 import { applyDraft, clearDraft, draftOf, readDraft } from '../chat/drafts.js';
 import { UserPreferences, resolveApprovalMode } from '../../shared/user-preferences.js';
 import { ChatNotRunningError } from '../chat/session.js';
@@ -217,6 +221,7 @@ export interface ChatManagerLike {
     requestId: string,
     optionIds: string[],
     skipped?: boolean,
+    text?: string,
   ): boolean;
   stop(sessionId: string): Promise<void>;
   readPage(
@@ -244,6 +249,12 @@ interface IncomingMessage {
   fromLine?: number;
   count?: number;
   requestId?: string;
+  /**
+   * The one free-text field a frame carries: a turn on `chat_send`, and what
+   * the user typed in their own words on `chat_question_answer`. Shared rather
+   * than split in two, because the handler that reads it knows which message it
+   * is holding and a second name would only be the same string twice.
+   */
   text?: string;
   attachments?: unknown[];
   /**
@@ -2198,7 +2209,14 @@ export class MessageProcessor {
     const optionIds = Array.isArray(data.optionIds)
       ? data.optionIds.filter((id): id is string => typeof id === 'string')
       : [];
-    manager.answerQuestion(session.id, requestId, optionIds, data.skipped === true);
+    // Free text the user typed instead of picking. Trimmed and bounded here
+    // rather than trusted: it is written to the conversation log and handed to
+    // the model, and this is the edge of the system that a browser writes to.
+    const text =
+      typeof data.text === 'string'
+        ? data.text.trim().slice(0, MAX_QUESTION_ANSWER_TEXT)
+        : undefined;
+    manager.answerQuestion(session.id, requestId, optionIds, data.skipped === true, text);
   }
 
   private async handleChatHistory(

@@ -91,7 +91,7 @@ export interface MessageBubbleProps {
    * Must be referentially stable — this component is memoised, and a fresh
    * closure per render would re-render the whole transcript on every token.
    */
-  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
+  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean, text?: string) => void;
 }
 
 export const MessageBubble = React.memo(function MessageBubble({
@@ -564,7 +564,7 @@ function BlockView({
   plain: boolean;
   caret: boolean;
   transcript: ChatTranscript;
-  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
+  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean, text?: string) => void;
   onRetry?: () => void;
 }) {
   switch (block.kind) {
@@ -653,7 +653,7 @@ function QuestionBlock({
 }: {
   block: ToolBlock;
   transcript: ChatTranscript;
-  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
+  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean, text?: string) => void;
 }): React.JSX.Element | null {
   const asked = askedQuestionFrom(block.input);
   // Still streaming its arguments in, or malformed. Nothing to draw yet — and
@@ -671,6 +671,10 @@ function QuestionBlock({
       multiSelect={asked.multiSelect}
       options={asked.options}
       answered={answered}
+      // The other half of an answer, for a question answered in free text: the
+      // ids alone would come back as an empty list, which is what a skip looks
+      // like, and the card would say nobody answered a question that was.
+      ownWords={request ? undefined : transcript.answerTextFor(block.toolId)}
       // The fallback for a card rebuilt from a snapshot, where the resolution
       // event was folded away before this browser ever saw it: the tool result
       // is the model's own copy of the answer and is still in the block.

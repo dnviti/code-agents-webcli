@@ -105,6 +105,31 @@
   onto that model. A model with no level in its name offers no control at all.
 
 ### Fixed
+- **A question the model asks can be answered in your own words, and its text
+  stays inside the card.** Two defects in the same card, both from the same
+  conversation.
+
+  The options a model writes are sentences — its own gloss on what picking one
+  would mean — and the option rows were drawn with the button style, which does
+  not wrap. Every description ran off the right-hand edge of the card and kept
+  going past the edge of the conversation, so most of what the model wrote about
+  each choice simply could not be read. Option text now wraps, breaking inside a
+  long path or URL if it has to, and the card sizes itself to the column it is in
+  rather than to its widest line.
+
+  And every question now offers a free-text answer alongside the options.
+  "None of these is quite right" is a real answer that a list written in advance
+  cannot anticipate, which models know: they write a final *Let me explain in my
+  own words* option themselves — and clicking it answered the question with that
+  sentence, telling the model nothing and costing a round trip. That row is a
+  textarea now, and what is typed into it travels the way an option does, into
+  the same waiting tool call: the model is told the user answered in their own
+  words and what they said, and the answer is kept in the conversation the way a
+  pick is, so scrolling back past the decision still shows it. A pick-several
+  question takes both at once — tick what applies, add the caveat, confirm once.
+  A model that writes its own version of that option has it folded into this one
+  row rather than offered twice, and the tool description now says not to write
+  one at all.
 - **`cc-web` started printing its help text instead of starting.** Adding the
   `env` operator subcommands left the program without an action of its own, and
   a command line with subcommands answers a bare invocation with help. Running

@@ -80,6 +80,16 @@ export interface TranscriptState {
    * call, which is answered from the pinned card instead.
    */
   answeredQuestions: Record<string, string[]>;
+  /**
+   * What was typed for the questions answered in the user's own words, keyed
+   * exactly as `answeredQuestions` is.
+   *
+   * Its own map rather than a sentinel id in that one, because the ids there
+   * are checked against the options the question offered — a typed answer
+   * belongs to none of them, and giving it one would put a tick on a choice
+   * nobody made.
+   */
+  answeredQuestionText: Record<string, string>;
   /** Lowest seq present. Non-zero once the log head has been trimmed. */
   firstSeq: number;
   /** Highest seq applied. Events at or below this are ignored as replays. */
@@ -151,6 +161,7 @@ export function createTranscript(
     pendingPermissions: [],
     pendingQuestions: [],
     answeredQuestions: {},
+    answeredQuestionText: {},
     firstSeq: 0,
     cursor: 0,
     currentTurnId: null,
@@ -901,9 +912,17 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // Kept after the fact so the card keeps showing what was picked once the
       // request itself is gone, without waiting for the runtime to echo a tool
       // result back.
-      state.answeredQuestions[event.toolId ?? asked?.toolId ?? event.requestId] = event.skipped
-        ? []
-        : [...event.optionIds];
+      const key = event.toolId ?? asked?.toolId ?? event.requestId;
+      state.answeredQuestions[key] = event.skipped ? [] : [...event.optionIds];
+      // Written unconditionally rather than only when there is text, so a
+      // re-answer — the same key resolving twice, which a retried turn does —
+      // cannot leave the previous answer's sentence standing under a card that
+      // was answered by clicking this time.
+      if (!event.skipped && event.text) {
+        state.answeredQuestionText[key] = event.text;
+      } else {
+        delete state.answeredQuestionText[key];
+      }
       if (state.state === 'awaiting_answer' && state.pendingQuestions.length === 0) {
         state.state = 'running';
       }
@@ -978,6 +997,7 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         // exists — the session resolves them at the same moment on its side.
         state.pendingQuestions = [];
         state.answeredQuestions = {};
+        state.answeredQuestionText = {};
         // And the approvals with them, for the same reason and one more: an
         // approval card is drawn above the composer rather than inside the
         // conversation, so it is the one piece of the old conversation that

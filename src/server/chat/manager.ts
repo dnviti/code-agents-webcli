@@ -347,8 +347,11 @@ export class ChatSessionManager {
     requestId: string,
     optionIds: string[],
     skipped = false,
+    text?: string,
   ): boolean {
-    return this.sessions.get(sessionId)?.answerQuestion(requestId, optionIds, skipped) ?? false;
+    return (
+      this.sessions.get(sessionId)?.answerQuestion(requestId, optionIds, skipped, text) ?? false
+    );
   }
 
   async stop(sessionId: string): Promise<void> {

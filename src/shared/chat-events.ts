@@ -1044,6 +1044,16 @@ export type ChatEvent =
       /** Every option the user picked, in the order the question offered them. */
       optionIds: string[];
       /**
+       * What the user typed instead of, or alongside, picking.
+       *
+       * The card always offers a free-text answer, because "none of these is
+       * quite right" is a real answer and an option list the model wrote cannot
+       * anticipate it. Recorded beside the picks rather than folded into them:
+       * an id names something the question offered, and this is the one part of
+       * the answer that it did not.
+       */
+      text?: string;
+      /**
        * True when the user chose to answer nothing.
        *
        * The model is still told — it is blocked and something has to come back —
@@ -1308,6 +1318,16 @@ export interface ChatSnapshot {
    */
   answeredQuestions?: Record<string, string[]>;
   /**
+   * What was typed for the questions answered in the user's own words, keyed
+   * the same way `answeredQuestions` is.
+   *
+   * Separate from that map rather than squeezed into it because the two are
+   * different kinds of thing — ids the question offered, versus the sentence
+   * the user wrote — and a card that showed a typed answer as a tick against
+   * an option nobody picked would be inventing a selection.
+   */
+  answeredQuestionText?: Record<string, string>;
+  /**
    * Turns typed ahead, still waiting. Optional so a snapshot replayed from the
    * store — which knows nothing about a live process — is not obliged to
    * invent one; the session fills it in.
@@ -1462,6 +1482,96 @@ export function normalizeQuestionOptions(raw: unknown): QuestionOption[] {
     options.push({ optionId: `opt-${options.length}`, label, description });
   }
   return options;
+}
+
+/**
+ * The card's own invitation to answer in free text.
+ *
+ * Wording matters more than it looks: this is the row a model reaches for on
+ * its own — it is what Claude writes as a final option, verbatim — so using the
+ * same sentence means a question that arrives with one folds into this row
+ * without the card appearing to offer the same thing twice.
+ */
+export const OWN_WORDS_LABEL = 'Let me explain in my own words';
+
+/**
+ * How much free text one answer may carry.
+ *
+ * The field is an explanation, not a message, and everything typed into it is
+ * written to the conversation log and handed to the model as a tool result. A
+ * ceiling well above any real answer keeps a hand-crafted socket frame from
+ * being an unbounded write.
+ */
+export const MAX_QUESTION_ANSWER_TEXT = 4000;
+
+/**
+ * Options a model writes when it means "or tell me something else".
+ *
+ * Matched rather than merely tolerated because picking one of these sends the
+ * model its own words back — "The user selected: 'Let me explain in my own
+ * words'" — which answers nothing and costs a round trip. The card turns such
+ * an option into the free-text row instead, so the click leads somewhere.
+ *
+ * Deliberately a short table of observed phrasings plus the one substring that
+ * is never anything else. Anything looser risks folding away a real choice, and
+ * the cost of missing one is only that the card's own row appears below it.
+ */
+const OWN_WORDS_LABELS = new Set([
+  'other',
+  'other please specify',
+  'other specify',
+  'something else',
+  'none of these',
+  'none of these fit',
+  'none of these are right',
+  'none of the above',
+  'let me explain',
+  'let me explain myself',
+  'let me describe it',
+  'i ll explain',
+  'i ll explain myself',
+  'write my own',
+  'write my own answer',
+  'type my own',
+  'type my own answer',
+]);
+
+/**
+ * Whether an option is an invitation to type rather than a choice to make.
+ *
+ * Punctuation and case are stripped first because the same option arrives as
+ * "Other…", "other (please specify)" and "Let me explain in my own words." from
+ * one model to the next.
+ */
+export function isOwnWordsOption(label: string): boolean {
+  const normalized = label
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+  if (!normalized) return false;
+  return normalized.includes('own words') || OWN_WORDS_LABELS.has(normalized);
+}
+
+/**
+ * Split an option list into the real choices and the model's own free-text row.
+ *
+ * Every match folds into the one row — a model that offers both "None of these"
+ * and "Let me explain in my own words" is offering the same thing twice — and
+ * the last of them names it, because that is the one a model writes after it
+ * has run out of real answers and so is the most explicit.
+ *
+ * Returns the list untouched when *every* option looks like an invitation to
+ * type: a card with nothing on it but a textarea is not the question the model
+ * asked, and the guard costs one comparison.
+ */
+export function splitOwnWordsOption(options: QuestionOption[]): {
+  choices: QuestionOption[];
+  invitation?: QuestionOption;
+} {
+  const choices = options.filter((option) => !isOwnWordsOption(option.label));
+  if (choices.length === options.length || choices.length === 0) return { choices: options };
+  const inviting = options.filter((option) => isOwnWordsOption(option.label));
+  return { choices, invitation: inviting[inviting.length - 1] };
 }
 
 export function isAskQuestionTool(name: string | undefined): boolean {

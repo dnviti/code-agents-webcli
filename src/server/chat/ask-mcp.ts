@@ -34,6 +34,14 @@ import { ASK_MCP_SERVER, ASK_QUESTION_TOOL } from '../../shared/chat-events.js';
 export interface QuestionAnswer {
   /** Labels of the options picked, in the order they were offered. */
   labels: string[];
+  /**
+   * What the user wrote, when they answered in their own words.
+   *
+   * The card always offers this alongside the options, so it arrives on its own
+   * for "none of these is quite right" and beside `labels` for "these two, and
+   * here is the caveat". Either way it is a real answer and not a skip.
+   */
+  text?: string;
   /** True when the user declined to answer rather than picking nothing. */
   skipped?: boolean;
   /** Set when the question could not be put to anyone. */
@@ -55,7 +63,9 @@ export const ASK_TOOL_DEFINITION = {
     'make and the plausible answers are known up front — which of several approaches to take, ' +
     'which of several candidate files or issues to act on, or any yes/no that would change what ' +
     'you do next. Prefer it over asking in prose: the user answers by clicking, so there is no ' +
-    'wording to guess at. This call blocks until they answer.',
+    'wording to guess at. This call blocks until they answer. Do not add an "other", "none of ' +
+    'these" or "let me explain in my own words" option: the card always offers a free-text box ' +
+    'alongside your options, and whatever the user types there comes back as their answer.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -160,7 +170,13 @@ class AskChannel {
         const line = buffer.slice(0, at).trim();
         buffer = buffer.slice(at + 1);
         if (!line) continue;
-        let reply: { id?: string; labels?: unknown; skipped?: boolean; error?: string };
+        let reply: {
+          id?: string;
+          labels?: unknown;
+          text?: unknown;
+          skipped?: boolean;
+          error?: string;
+        };
         try {
           reply = JSON.parse(line);
         } catch {
@@ -173,6 +189,7 @@ class AskChannel {
         this.waiting.delete(reply.id);
         pending({
           labels: Array.isArray(reply.labels) ? reply.labels.map(String) : [],
+          text: typeof reply.text === 'string' && reply.text ? reply.text : undefined,
           skipped: reply.skipped === true,
           error: reply.error,
         });
@@ -209,7 +226,7 @@ export function describeAnswer(answer: QuestionAnswer): { text: string; isError:
       isError: true,
     };
   }
-  if (answer.skipped || answer.labels.length === 0) {
+  if (answer.skipped || (answer.labels.length === 0 && !answer.text)) {
     return {
       text:
         'The user skipped this question without choosing. Do not ask it again — ' +
@@ -218,10 +235,26 @@ export function describeAnswer(answer: QuestionAnswer): { text: string; isError:
       isError: false,
     };
   }
-  return {
-    text: `The user selected: ${answer.labels.map((label) => `"${label}"`).join(', ')}`,
-    isError: false,
-  };
+  const selected = `The user selected: ${answer.labels.map((label) => `"${label}"`).join(', ')}`;
+  // Their own words are the answer when nothing was picked, and a correction to
+  // what was picked when something was. Said explicitly either way: the model
+  // has to know this sentence is the user's and not one of the options it
+  // wrote, because it is the half of the answer it could not anticipate.
+  if (answer.text && answer.labels.length === 0) {
+    return {
+      text:
+        'The user picked none of the options and answered in their own words: ' +
+        `"${answer.text}". Treat this as their answer and continue from it.`,
+      isError: false,
+    };
+  }
+  if (answer.text) {
+    return {
+      text: `${selected} — and added, in their own words: "${answer.text}"`,
+      isError: false,
+    };
+  }
+  return { text: selected, isError: false };
 }
 
 interface Rpc {

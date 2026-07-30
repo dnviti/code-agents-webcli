@@ -43,7 +43,7 @@ const OPTIONS = [
  * was given, and the turn ending — in the order and with the shapes
  * `ChatSession` writes them.
  */
-function asked(picks, { skipped = false } = {}) {
+function asked(picks, { skipped = false, text } = {}) {
   let seq = 0;
   const next = () => (seq += 1);
   return [
@@ -68,7 +68,7 @@ function asked(picks, { skipped = false } = {}) {
     },
     {
       t: 'question_resolved', seq: next(), ts: 7,
-      requestId: 'req-1', toolId: TOOL_ID, optionIds: picks, skipped,
+      requestId: 'req-1', toolId: TOOL_ID, optionIds: picks, text, skipped,
     },
     { t: 'tool', seq: next(), ts: 8, toolId: TOOL_ID, patch: { status: 'completed', output: 'The user chose: Rewrite it' } },
     { t: 'msg_end', seq: next(), ts: 9, msgId: 'a1' },
@@ -125,6 +125,26 @@ describe('an answered question survives being left and come back to (#113)', fun
       store.append(ref, asked(['opt-0']).slice(0, 6));
       const snapshot = await store.snapshot(ref, {});
       assert.deepStrictEqual(snapshot.answeredQuestions, {});
+    });
+
+    it('carries the words for a question answered in the user’s own', async function () {
+      // The same failure as #113 one layer along: the words are in the log and
+      // the reducer folds them, and a snapshot with nowhere to put them would
+      // redraw the card as one the user had skipped — beside an agent that had
+      // plainly acted on what they wrote.
+      store.append(ref, asked([], { text: 'A container per project, not per session.' }));
+      const snapshot = await store.snapshot(ref, {});
+      assert.strictEqual(
+        snapshot.answeredQuestionText[TOOL_ID],
+        'A container per project, not per session.',
+      );
+      assert.deepStrictEqual(snapshot.answeredQuestions[TOOL_ID], []);
+    });
+
+    it('says nothing about words for a question answered by clicking', async function () {
+      store.append(ref, asked(['opt-1']));
+      const snapshot = await store.snapshot(ref, {});
+      assert.deepStrictEqual(snapshot.answeredQuestionText, {});
     });
   });
 
@@ -215,6 +235,42 @@ describe('an answered question survives being left and come back to (#113)', fun
         ['opt-2'],
         'scrolling back far enough to reach a decision has to show the decision',
       );
+    });
+
+    it('keeps the words a question was answered with across a rejoin', function () {
+      const controller = new mod.ChatController('s1', { send: () => {} });
+      controller.handle(snapshot({}));
+      for (const event of asked([], { text: 'neither — rebuild it nightly' })) {
+        controller.transcript.apply(event);
+      }
+      assert.strictEqual(controller.transcript.answerTextFor(TOOL_ID), 'neither — rebuild it nightly');
+
+      controller.handle(
+        snapshot({
+          messages: controller.transcript.messages,
+          answeredQuestions: { [TOOL_ID]: [] },
+          answeredQuestionText: { [TOOL_ID]: 'neither — rebuild it nightly' },
+          cursor: 10,
+        }),
+      );
+      assert.strictEqual(
+        controller.transcript.answerTextFor(TOOL_ID),
+        'neither — rebuild it nightly',
+        'without this the card comes back reading as one nobody answered',
+      );
+    });
+
+    it('keeps them for a question that arrives by scrolling back through history', function () {
+      const controller = new mod.ChatController('s1', { send: () => {} });
+      controller.handle(snapshot({ firstSeq: 11, replayFrom: 11, cursor: 20 }));
+      controller.handle({
+        type: 'chat_page',
+        sessionId: 's1',
+        events: asked([], { text: 'none of those' }),
+        firstSeq: 1,
+        from: 1,
+      });
+      assert.strictEqual(controller.transcript.answerTextFor(TOOL_ID), 'none of those');
     });
   });
 });

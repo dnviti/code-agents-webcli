@@ -228,6 +228,12 @@ export class ChatTranscript {
       answeredQuestions: snapshot.answeredQuestions
         ? { ...snapshot.answeredQuestions }
         : { ...this.state.answeredQuestions },
+      // Kept together with the picks: a snapshot that carries one carries the
+      // other, and falling back separately would let a rejoin show a question
+      // as answered by clicking when it was in fact answered in free text.
+      answeredQuestionText: snapshot.answeredQuestions
+        ? { ...(snapshot.answeredQuestionText || {}) }
+        : { ...this.state.answeredQuestionText },
       firstSeq: snapshot.firstSeq,
       cursor: snapshot.cursor,
       // The turn the server's replay was still inside. Live events arriving
@@ -279,6 +285,7 @@ export class ChatTranscript {
     firstSeq: number,
     from?: number,
     answers?: Record<string, string[]>,
+    answerText?: Record<string, string>,
   ): void {
     this.state.firstSeq = firstSeq;
     if (from !== undefined) {
@@ -293,6 +300,9 @@ export class ChatTranscript {
     // and the live map is the newer knowledge.
     if (answers) {
       this.state.answeredQuestions = { ...answers, ...this.state.answeredQuestions };
+    }
+    if (answerText) {
+      this.state.answeredQuestionText = { ...answerText, ...this.state.answeredQuestionText };
     }
 
     if (!messages.length) {
@@ -569,6 +579,11 @@ export class ChatTranscript {
     return this.state.answeredQuestions[toolId];
   }
 
+  /** What was typed for that question, when it was answered in the user's own words. */
+  answerTextFor(toolId: string): string | undefined {
+    return this.state.answeredQuestionText[toolId];
+  }
+
   /**
    * Every answer this transcript holds, keyed the way the reducer keys them.
    *
@@ -577,6 +592,11 @@ export class ChatTranscript {
    */
   get answeredQuestions(): Record<string, string[]> {
     return this.state.answeredQuestions;
+  }
+
+  /** The same, for the answers that were typed rather than picked. */
+  get answeredQuestionText(): Record<string, string> {
+    return this.state.answeredQuestionText;
   }
 
   get cursor(): number {

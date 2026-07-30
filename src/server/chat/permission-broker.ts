@@ -52,6 +52,12 @@ export interface QuestionAsk {
 /** What the browser answered, on its way back to the waiting tool call. */
 export interface QuestionReply {
   labels: string[];
+  /**
+   * What the user typed, when they answered in their own words rather than —
+   * or as well as — picking. Beside the labels because it is not one of them:
+   * a label is an option the model wrote, and this is the user's own sentence.
+   */
+  text?: string;
   skipped?: boolean;
   error?: string;
 }

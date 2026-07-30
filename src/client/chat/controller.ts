@@ -685,7 +685,13 @@ export class ChatController {
     // The scratch folded any `question_resolved` in this page correctly; hand
     // those over too, or a question scrolled in from history comes back with
     // every option unticked (#113).
-    this.transcript.prepend(scratch.messages, firstSeq, from, scratch.answeredQuestions);
+    this.transcript.prepend(
+      scratch.messages,
+      firstSeq,
+      from,
+      scratch.answeredQuestions,
+      scratch.answeredQuestionText,
+    );
   }
 
   /**
@@ -968,9 +974,13 @@ export class ChatController {
    * `skipped` is explicit rather than inferred from an empty list: "I picked
    * none of these" and "I do not want to answer" reach the model as different
    * sentences, and the agent is blocked either way until one of them arrives.
+   *
+   * `text` is the third of those sentences — the user answering in their own
+   * words — and travels beside the picks rather than as one of them, because
+   * the ids name options the question offered and this is the part it did not.
    */
-  answerQuestion(requestId: string, optionIds: string[], skipped = false): void {
-    this.send({ type: 'chat_question_answer', requestId, optionIds, skipped });
+  answerQuestion(requestId: string, optionIds: string[], skipped = false, text?: string): void {
+    this.send({ type: 'chat_question_answer', requestId, optionIds, skipped, text });
   }
 
   respondPermission(requestId: string, optionId: string): void {

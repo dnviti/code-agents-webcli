@@ -464,8 +464,8 @@ export function ChatView({
     [controller],
   );
   const answerQuestion = React.useCallback(
-    (requestId: string, optionIds: string[], skipped: boolean) =>
-      controller.answerQuestion(requestId, optionIds, skipped),
+    (requestId: string, optionIds: string[], skipped: boolean, text?: string) =>
+      controller.answerQuestion(requestId, optionIds, skipped, text),
     [controller],
   );
   const cancelQueued = React.useCallback(
