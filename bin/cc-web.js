@@ -80,6 +80,7 @@ program
   .option('--qwen-alias <name>', 'display alias for Qwen Code (default: env QWEN_ALIAS or "Qwen")')
   .option('--kimi-alias <name>', 'display alias for Kimi Code (default: env KIMI_ALIAS or "Kimi")')
   .option('--omp-alias <name>', 'display alias for Oh My Pi (default: env OMP_ALIAS or "Oh My Pi")')
+  .option('--antigravity-alias <name>', 'display alias for Antigravity CLI (default: env ANTIGRAVITY_ALIAS or "Antigravity")')
   .option('--ngrok-auth-token <token>', 'ngrok auth token to open a public tunnel')
   .option('--ngrok-domain <domain>', 'ngrok reserved domain to use for the tunnel')
   .parse();
@@ -129,6 +130,8 @@ async function main() {
       qwenAlias: options.qwenAlias || process.env.QWEN_ALIAS || 'Qwen',
       kimiAlias: options.kimiAlias || process.env.KIMI_ALIAS || 'Kimi',
       ompAlias: options.ompAlias || process.env.OMP_ALIAS || 'Oh My Pi',
+      antigravityAlias:
+        options.antigravityAlias || process.env.ANTIGRAVITY_ALIAS || 'Antigravity',
       folderMode: true // Always use folder mode
     };
 
@@ -151,6 +154,7 @@ async function main() {
       ['Qwen', serverOptions.qwenAlias],
       ['Kimi', serverOptions.kimiAlias],
       ['Oh My Pi', serverOptions.ompAlias],
+      ['Antigravity', serverOptions.antigravityAlias],
     ]
       .map(([name, alias]) => `${name} → "${alias}"`)
       .join(', ');

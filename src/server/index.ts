@@ -34,6 +34,7 @@ import { GrokBridge } from './bridges/grok.js';
 import { QwenBridge } from './bridges/qwen.js';
 import { KimiBridge } from './bridges/kimi.js';
 import { OmpBridge } from './bridges/omp.js';
+import { AntigravityBridge } from './bridges/antigravity.js';
 import { TerminalBridge } from './bridges/terminal.js';
 import { AppDatabase } from './services/database.js';
 import { SessionStore } from './services/session-store.js';
@@ -131,6 +132,7 @@ export class ClaudeCodeWebServer {
   private qwenBridge: BridgeInterface;
   private kimiBridge: BridgeInterface;
   private ompBridge: BridgeInterface;
+  private antigravityBridge: BridgeInterface;
   private terminalBridge: BridgeInterface;
 
   private database: AppDatabase;
@@ -202,6 +204,7 @@ export class ClaudeCodeWebServer {
     this.qwenBridge = new QwenBridge();
     this.kimiBridge = new KimiBridge();
     this.ompBridge = new OmpBridge();
+    this.antigravityBridge = new AntigravityBridge();
     this.terminalBridge = new TerminalBridge();
 
     this.dataDir = config.dataDir;
@@ -488,6 +491,8 @@ export class ClaudeCodeWebServer {
         return this.kimiBridge;
       case 'omp':
         return this.ompBridge;
+      case 'antigravity':
+        return this.antigravityBridge;
       case 'terminal':
         return this.terminalBridge;
       case 'claude':

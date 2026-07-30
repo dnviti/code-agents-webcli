@@ -294,6 +294,10 @@ export class MessageProcessor {
         await this.startRuntime(wsId, 'omp', data.options || {});
         break;
 
+      case 'start_antigravity':
+        await this.startRuntime(wsId, 'antigravity', data.options || {});
+        break;
+
       case 'start_terminal':
         await this.startRuntime(wsId, 'terminal', data.options || {});
         break;
@@ -2147,6 +2151,8 @@ export class MessageProcessor {
         return this.deps.aliases.kimi;
       case 'omp':
         return this.deps.aliases.omp;
+      case 'antigravity':
+        return this.deps.aliases.antigravity;
       case 'terminal':
         return session?.runtimeLabel || 'Terminal';
       case 'claude':
@@ -2171,6 +2177,8 @@ export class MessageProcessor {
         return 'Kimi Code';
       case 'omp':
         return 'Oh My Pi';
+      case 'antigravity':
+        return 'Antigravity CLI';
       case 'terminal':
         return 'terminal';
       case 'claude':

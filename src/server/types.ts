@@ -9,6 +9,7 @@ export type AgentKind =
   | 'qwen'
   | 'kimi'
   | 'omp'
+  | 'antigravity'
   | 'terminal';
 
 export interface ServerOptions {
@@ -28,6 +29,7 @@ export interface ServerOptions {
   qwenAlias?: string;
   kimiAlias?: string;
   ompAlias?: string;
+  antigravityAlias?: string;
   publicBaseUrl?: string;
   githubClientId?: string;
   githubClientSecret?: string;
@@ -46,6 +48,7 @@ export interface Aliases {
   qwen: string;
   kimi: string;
   omp: string;
+  antigravity: string;
 }
 
 export interface SessionRecord {

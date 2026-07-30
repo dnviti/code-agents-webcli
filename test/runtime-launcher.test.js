@@ -42,7 +42,8 @@ after(function () {
 
 const ALIASES = {
   claude: 'Claude', codex: 'Codex', agent: 'Cursor', pi: 'Pi',
-  grok: 'Grok', qwen: 'Qwen', kimi: 'Kimi', omp: 'Oh My Pi', terminal: 'Terminal',
+  grok: 'Grok', qwen: 'Qwen', kimi: 'Kimi', omp: 'Oh My Pi',
+  antigravity: 'Antigravity', terminal: 'Terminal',
 };
 
 function render(onStart, props = {}) {
@@ -85,34 +86,34 @@ describe('RuntimeLauncher', function () {
     // A missing CLI fails at spawn time with no up-front detection, so showing
     // the command makes "it did not start" diagnosable.
     const html = render();
-    for (const binary of ['claude', 'codex', 'cursor-agent', 'pi', 'grok', 'qwen', 'kimi', 'omp']) {
+    for (const binary of ['claude', 'codex', 'cursor-agent', 'pi', 'grok', 'qwen', 'kimi', 'omp', 'agy']) {
       assert.ok(html.includes(binary), `the ${binary} command should be shown`);
     }
   });
 
   it('offers a no-prompts start only for runtimes whose CLI really has one', function () {
     // Claude --dangerously-skip-permissions, Codex bypass, Grok
-    // --always-approve, Qwen --yolo, Kimi --yolo, Oh My Pi --auto-approve.
-    // Cursor and pi have no tool-approval bypass, so offering the control would
-    // be a false promise — the same reasoning that left pi without one in the
-    // bridge. Oh My Pi is a pi fork but does have a real bypass, so unlike pi it
-    // gets the control.
+    // --always-approve, Qwen --yolo, Kimi --yolo, Oh My Pi --auto-approve,
+    // Antigravity --dangerously-skip-permissions. Cursor and pi have no
+    // tool-approval bypass, so offering the control would be a false promise —
+    // the same reasoning that left pi without one in the bridge. Oh My Pi is a
+    // pi fork but does have a real bypass, so unlike pi it gets the control.
     const html = render();
 
     // Each card is a role=button; the destructive control sits inside it.
     const cards = html.split('role="button"').slice(1);
-    assert.strictEqual(cards.length, 9, `expected 9 launch cards, got ${cards.length}`);
+    assert.strictEqual(cards.length, 10, `expected 10 launch cards, got ${cards.length}`);
 
     const withBypass = [];
     for (const card of cards) {
-      const label = ['Claude', 'Codex', 'Cursor', 'Pi', 'Grok', 'Qwen', 'Kimi', 'Oh My Pi', 'Terminal']
+      const label = ['Claude', 'Codex', 'Cursor', 'Pi', 'Grok', 'Qwen', 'Kimi', 'Oh My Pi', 'Antigravity', 'Terminal']
         .find((name) => card.includes(`>${name}<`));
       if (label && /No prompts/.test(card)) withBypass.push(label);
     }
 
     assert.deepStrictEqual(
       withBypass.sort(),
-      ['Claude', 'Codex', 'Grok', 'Kimi', 'Oh My Pi', 'Qwen'],
+      ['Antigravity', 'Claude', 'Codex', 'Grok', 'Kimi', 'Oh My Pi', 'Qwen'],
       'exactly the runtimes with a real bypass flag may offer one',
     );
   });

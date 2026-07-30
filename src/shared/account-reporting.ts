@@ -39,6 +39,15 @@ const NOTES: Record<string, string> = {
     + 'not with a membership or a quota.',
   grok: 'Grok reports what a turn cost and nothing about the account behind it.',
   omp: 'Oh My Pi reports what a turn cost and nothing about the account behind it.',
+  // Its TUI does know: the header of an interactive session reads
+  // "dnviti@gmail.com (Google AI Pro)". None of that reaches the print-mode
+  // stream this app drives it on — `init` carries the model, the working
+  // directory, the tool list and the permission mode, and no event anywhere
+  // carries a plan, a quota or a price.
+  antigravity: 'Antigravity reports tokens per turn — thinking and cached input included — and '
+    + 'nothing about the account behind them. It names no plan and prices no turn over the '
+    + 'headless protocol this app drives it on, even though its own terminal UI shows the plan '
+    + 'in its header.',
   terminal: 'A terminal session has no runtime to ask.',
 };
 

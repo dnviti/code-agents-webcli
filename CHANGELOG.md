@@ -2,7 +2,74 @@
 
 ## [Unreleased]
 
+### Added
+- **Antigravity CLI (`agy`) is a runtime like any other** (#133). Google's coding
+  CLI — the successor to Gemini CLI, which now refuses a personal account
+  outright and points at this one — has its own card in the launcher, opens as a
+  terminal or as a conversation, and carries the same controls, accounting and
+  recovery every other agent here does. It is renameable with
+  `--antigravity-alias` / `ANTIGRAVITY_ALIAS` like the rest, and it takes a
+  per-runtime profile (model, extra arguments, environment) like the rest.
+
+  Three of its habits are handled rather than passed on. It asks "Do you trust
+  the contents of this project?" the first time it sees a folder and then waits
+  forever; the app answers it, the way it already answers Claude's. Driven
+  headlessly it runs every shell tool in a scratch directory of its own — asked
+  to read a file that was sitting right there it reported no such file existed —
+  so the app passes `--new-project`, which puts it back in the folder you picked
+  without adding anything to your own project list. And its `--print-timeout`
+  defaults to five minutes, which cuts a real turn off mid-work; a conversation
+  is not a script, so the ceiling is the interrupt button instead.
+
+  What it will not do, it is not made to look like it does. Headless, it
+  **cannot stop and ask**: anything needing approval is refused on the spot and
+  the run carries on around it. So the mode is chosen when the conversation
+  starts, stated on the card, and each refusal gets its own entry naming what was
+  refused and what would have allowed it — never an unexplained failure. It
+  reports how much it thought and never a word of what, so the reasoning entry
+  says which silence that is instead of opening onto an empty panel. It prices
+  nothing, so the meter says *cost not reported*. It reports no diff for a file
+  edit, so none is drawn. `--mode accept-edits` and `--mode plan` are wired to
+  nothing, because three runs of the same prompt proved they change nothing.
+
+  Files can be attached. agy has no attachment flag and no `@file` mention
+  syntax, but every upload already lands *inside* the session's working
+  directory, and agy reads what it is pointed at — so the paths are named at the
+  end of the prompt and it opens them itself. Images included: a PNG attached in
+  the composer came back with the product name and version read out of the
+  pixels.
+
+  The `/` menu lists your **skills**, and this app's `/clear`, `/new` and
+  `/reset`. agy's own forty slash commands are deliberately not offered — it
+  interprets none of them in this mode, and `/agents` spent 18,441 tokens
+  producing a paragraph about subagents instead of listing them. A skill is the
+  opposite case and is why the menu exists: named in the prompt, agy goes and
+  reads its `SKILL.md` and does what it says.
+
+  Every directory the menu reads was checked by planting a skill in it and
+  asking agy which ones it could see. All four spellings of its workspace root
+  are live (`.agents`, `_agents`, `.agent`, `_agent`), each with a `skills/` and
+  a `plugins/` folder, and each searched **up to the repository root** the way
+  agy searches it — so a skill at the top of a monorepo reaches a session opened
+  three directories down. Personal skills come from `~/.gemini/config`. agy's
+  own built-ins are left off, because only one of the three is reachable and the
+  other two would be menu entries that do nothing.
+
+  The effort control is the interesting one: `--effort` is refused whenever a
+  model is named, and what `agy models` publishes instead is one model id per
+  level (`gemini-3.6-flash-high`, `-medium`, `-low`). So the levels offered are
+  exactly the sibling ids the CLI printed, and picking one moves the next turn
+  onto that model. A model with no level in its name offers no control at all.
+
 ### Fixed
+- **A model list is no longer lost to a probe waiting on stdin.** The command
+  each runtime is asked for its models with was run through `execFile`, which
+  leaves the child an open stdin pipe — and `agy models` waits on that pipe
+  forever. The picker said "this runtime hasn't listed models" about a runtime
+  that lists eleven, and took the full eight-second timeout to say it. The probe
+  now closes stdin, which it never wrote to: measured at 2.0s and the whole list,
+  against no output and no exit before. The same trap has already caught
+  `codex exec` and `pi -p` elsewhere in this codebase.
 - **A chat that has just opened is empty, and the first prompt is turn 1.** The
   approval mode a conversation begins in was announced as a rule written across
   the transcript, and in a conversation nobody had spoken in yet that rule was

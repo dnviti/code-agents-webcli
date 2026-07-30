@@ -14,6 +14,8 @@ export function createConfig(options: ServerOptions): ServerState {
     qwen: options.qwenAlias || process.env.QWEN_ALIAS || 'Qwen',
     kimi: options.kimiAlias || process.env.KIMI_ALIAS || 'Kimi',
     omp: options.ompAlias || process.env.OMP_ALIAS || 'Oh My Pi',
+    antigravity:
+      options.antigravityAlias || process.env.ANTIGRAVITY_ALIAS || 'Antigravity',
   };
 
   return {

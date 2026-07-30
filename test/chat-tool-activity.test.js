@@ -7,6 +7,9 @@ const { AcpChatAdapter } = require('../dist/server/chat/adapters/acp.js');
 const { ClaudeChatAdapter } = require('../dist/server/chat/adapters/claude.js');
 const { CodexAppServerAdapter } = require('../dist/server/chat/adapters/codex.js');
 const { PiChatAdapter } = require('../dist/server/chat/adapters/pi.js');
+const {
+  AntigravityChatAdapter,
+} = require('../dist/server/chat/adapters/antigravity.js');
 const { UsageAccountant } = require('../dist/server/chat/usage-accounting.js');
 const { applyChatEvent, createTranscript } = require('../dist/shared/chat-reducer.js');
 const {
@@ -146,6 +149,30 @@ const RUNTIMES = [
     runtime: 'grok',
     fixture: 'acp-grok.jsonl',
     acp: true,
+  },
+  {
+    // agy 1.1.8, `--print --output-format stream-json`, asked to read a file,
+    // edit it and create another. The capture holds a run_command, a
+    // replace_file_content and a write_to_file.
+    runtime: 'antigravity',
+    fixture: 'antigravity-tool-turn.jsonl',
+    async drive(emit) {
+      const adapter = new AntigravityChatAdapter({
+        sessionId: 'chat-1',
+        workingDir: '/work',
+        command: '/nonexistent',
+        emit,
+      });
+      // `start()` is skipped rather than stubbed: it would spawn `agy models`
+      // for the picker, which is the one thing in this adapter that is not a
+      // pure function of the capture. What `send()` sets up before the first
+      // line arrives is set here instead, which is exactly the two fields
+      // below — the same shape as the `writeLine` stub the codex entry uses.
+      adapter.currentTurnId = 'turn-1';
+      adapter.turnInFlight = true;
+      userTurn(emit, 'turn-1');
+      for (const line of fixture('antigravity-tool-turn.jsonl')) adapter.handleMessage(line);
+    },
   },
 ];
 

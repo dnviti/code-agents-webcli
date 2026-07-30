@@ -122,6 +122,7 @@ export class MessageHandler {
       case 'qwen_started':
       case 'kimi_started':
       case 'omp_started':
+      case 'antigravity_started':
       case 'terminal_started':
         this.onRuntimeStarted(message);
         break;
@@ -134,6 +135,7 @@ export class MessageHandler {
       case 'qwen_stopped':
       case 'kimi_stopped':
       case 'omp_stopped':
+      case 'antigravity_stopped':
       case 'terminal_stopped':
         this.onRuntimeStopped(message);
         break;
