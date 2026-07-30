@@ -251,6 +251,23 @@ export interface WsChatEventMessage {
   event: unknown;
 }
 
+/**
+ * What this conversation's composer holds, on every screen watching it.
+ *
+ * Sent to the screen the typing came from as well as to the others, which is
+ * what `origin` is for: it names the socket whose edit this is, so that screen
+ * can take the revision without taking the text — putting a caret back where it
+ * was two hundred milliseconds ago is exactly the sort of help nobody asked for.
+ * Null when nothing typed it, which is how a composer emptied by a turn being
+ * sent reaches everyone including the sender.
+ */
+export interface WsChatDraftMessage {
+  type: 'chat_draft';
+  sessionId: string;
+  draft: unknown;
+  origin: string | null;
+}
+
 export interface WsChatPageMessage {
   type: 'chat_page';
   sessionId: string;
@@ -470,5 +487,6 @@ export type WsMessage =
   | WsChatStartedMessage
   | WsChatSnapshotMessage
   | WsChatEventMessage
+  | WsChatDraftMessage
   | WsChatPageMessage
   | WsChatPageFailedMessage;

@@ -24,6 +24,24 @@
   deliberately so (#127): it means "take this off my screen", and an
   announcement does not overrule it. A rename already worked this way; the rest
   of the strip now does too.
+- **The message you are in the middle of writing follows you between screens**
+  (#163). The other half of the same problem: the tabs agreed, and then the
+  composer did not. A prompt half typed on a laptop left the phone offering an
+  empty box, a screenshot dropped on one of them was invisible on the other, and
+  a question sent from one screen went on being offered by every other — where
+  pressing send would ask it a second time. The unsent message is now the
+  conversation's rather than the window's. Text and attached files are carried to
+  every screen watching that chat, they arrive on the join so a conversation
+  opened somewhere new opens at the sentence in progress, and sending empties all
+  of them at once. Files are carried as the conversation's own uploads rather
+  than as bytes on the socket, so a second device draws the same picture from the
+  same place; the screen that picked a file keeps the name it picked it under.
+  Typing is announced four times a second at most, and the last write wins —
+  which is the honest rule for one person moving between their own devices, and
+  the reason a message being typed on one screen is never merged with anything.
+  A turn sent again from the transcript deliberately leaves the composer alone,
+  and against a server too old to carry any of this the composer behaves exactly
+  as it did before.
 - **A chat that has just opened is empty, and the first prompt is turn 1.** The
   approval mode a conversation begins in was announced as a rule written across
   the transcript, and in a conversation nobody had spoken in yet that rule was

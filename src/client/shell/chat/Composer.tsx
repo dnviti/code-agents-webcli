@@ -50,6 +50,21 @@ export interface ComposerProps {
   /** Controlled draft, so a session switch can restore what was half-typed. */
   draft?: string;
   onDraftChange?: (text: string) => void;
+  /**
+   * The files already attached to the unsent message, controlled.
+   *
+   * Only the ones that finished uploading. A file still going up is this
+   * component's own business — there is no attachment yet, only a `File` and a
+   * spinner — and it becomes everyone's the moment the server answers with a
+   * url. That split is what lets the same list be the conversation's rather than
+   * this browser's: a laptop can be uploading a screenshot while the phone shows
+   * the two that already landed (#163).
+   *
+   * Absent leaves the list where it used to be: local state, cleared when the
+   * message is sent, seen by nothing else.
+   */
+  attachments?: ChatAttachment[];
+  onAttachmentsChange?: (next: ChatAttachment[]) => void;
   /** Turns already accepted and waiting their place in line. */
   queued?: QueuedTurn[];
   onCancelQueued?: (id: string) => void;
@@ -175,11 +190,20 @@ export interface ComposerProps {
   terminalOpen?: boolean;
 }
 
+/**
+ * One file on its way up, from this browser.
+ *
+ * Only ever `uploading` or `error` now. A finished upload leaves this list for
+ * the attachment list proper, which is the conversation's rather than the
+ * window's — the chip on screen looks identical, but the thing behind it stops
+ * being a `File` nobody else can see and becomes a url every screen can fetch.
+ */
 interface AttachmentEntry {
   key: string;
+  /** Which pick this was, so the chip keeps one identity across the upload. */
+  picked: number;
   file: File;
-  status: 'uploading' | 'done' | 'error';
-  attachment?: ChatAttachment;
+  status: 'uploading' | 'error';
   error?: string;
 }
 
@@ -202,6 +226,33 @@ function safeDetectMobile(): boolean {
 function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} kB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Put a finished upload where it was picked, not where it happened to land.
+ *
+ * Uploads run at the same time, so a small file overtakes a large one and a
+ * batch finishes in an order nobody chose. That matters for two files whose
+ * whole point is the pair of them — "here is before, here is after" reaching the
+ * agent the other way round is not a cosmetic difference.
+ *
+ * Placed ahead of the first file the same window picked *after* it, and behind
+ * everything else. Anything that arrived from another screen is not in `order`
+ * at all and never moves: this window did not see it chosen and has no business
+ * having an opinion about when it was.
+ */
+export function placeByPickOrder(
+  list: ChatAttachment[],
+  attachment: ChatAttachment,
+  picked: number,
+  order: Map<string, number>,
+): ChatAttachment[] {
+  const at = list.findIndex((held) => {
+    const other = order.get(held.url);
+    return other !== undefined && other > picked;
+  });
+  if (at === -1) return [...list, attachment];
+  return [...list.slice(0, at), attachment, ...list.slice(at)];
 }
 
 /** DataTransfer -> File[], covering the Safari/Firefox split the same way paste.ts does. */
@@ -241,6 +292,8 @@ export function Composer({
   onUpload,
   draft,
   onDraftChange,
+  attachments: controlledAttachments,
+  onAttachmentsChange,
   queued = [],
   onCancelQueued,
   onSendQueuedNow,
@@ -294,7 +347,10 @@ export function Composer({
   const [detectedMobile, setIsMobile] = React.useState(safeDetectMobile);
   const isMobile = surfaceIsPhone || detectedMobile;
   const [uncontrolledText, setUncontrolledText] = React.useState('');
+  /** Files still going up from this window, and the ones that failed to. */
   const [entries, setEntries] = React.useState<AttachmentEntry[]>([]);
+  /** Where the finished ones live when nobody outside is holding them. */
+  const [uncontrolledAttachments, setUncontrolledAttachments] = React.useState<ChatAttachment[]>([]);
   const [dragActive, setDragActive] = React.useState(false);
   const [focused, setFocused] = React.useState(false);
   const [activeIndex, setActiveIndex] = React.useState(0);
@@ -343,6 +399,60 @@ export function Composer({
       else setUncontrolledText(next);
     },
     [isControlled, onDraftChange],
+  );
+
+  // Same two-mode arrangement as the draft above, and for the same reason: this
+  // component is also rendered on its own, where there is nobody outside to hold
+  // the list for it.
+  const attachmentsControlled = controlledAttachments !== undefined;
+  const attachments = attachmentsControlled ? controlledAttachments! : uncontrolledAttachments;
+  /**
+   * The list as it stands right now, uploads included.
+   *
+   * A controlled list cannot be updated from a function of its previous value —
+   * that belongs to whoever holds it — so two files finishing within the same
+   * frame would each append to the same stale array and the first one would be
+   * dropped. Writing the answer here as well as sending it out is what makes the
+   * second upload see the first.
+   */
+  const attachmentsRef = React.useRef(attachments);
+  attachmentsRef.current = attachments;
+  /**
+   * The files this window uploaded, kept by the url they were stored under.
+   *
+   * Two things are lost the moment an upload finishes and the chip starts
+   * drawing from the attachment instead of the `File`. The name: the server
+   * stores files under a name it can trust — spaces and brackets become dashes —
+   * so "My Report (final).pdf" would visibly rename itself under the person who
+   * picked it. And the picture: the thumbnail is already in memory here, and
+   * swapping it for a fetch of the same image is a flicker charged for nothing.
+   *
+   * Only ever an improvement on what the other screens see, never a
+   * disagreement about *which* file: both are naming one stored object, this one
+   * by the name it arrived with.
+   */
+  const localFiles = React.useRef(new Map<string, File>());
+  /**
+   * What order the files picked in this window were picked in.
+   *
+   * Uploads run at the same time, so a small file overtakes a large one and they
+   * finish in neither the order they were chosen nor any order a person would
+   * predict. That matters for two files whose whole point is the pair of them —
+   * "here is before, here is after" reaching the agent the other way round is
+   * not a cosmetic difference — so a finished upload takes its place in the list
+   * rather than the next free one at the end.
+   *
+   * Only ever consulted about this window's own picks. A file that arrived from
+   * another screen has no place in this ordering and is never moved by it.
+   */
+  const pickOrder = React.useRef(new Map<string, number>());
+  const setAttachments = React.useCallback(
+    (next: ChatAttachment[]) => {
+      attachmentsRef.current = next;
+      if (attachmentsControlled) onAttachmentsChange?.(next);
+      else setUncontrolledAttachments(next);
+    },
+    [attachmentsControlled, onAttachmentsChange],
   );
 
   // Grows to fit the message, capped in CSS (max-height: 40vh on the element
@@ -478,11 +588,10 @@ export function Composer({
     setActiveIndex(0);
   }, [rowKey]);
 
-  const readyAttachments = entries.filter((e) => e.status === 'done').map((e) => e.attachment!);
   const hasUploading = entries.some((e) => e.status === 'uploading');
   // Deliberately not gated on `busy`. A turn typed while the agent is working
   // is queued rather than refused, which is the whole point of the chips above.
-  const canSend = !disabled && !hasUploading && (text.trim().length > 0 || readyAttachments.length > 0);
+  const canSend = !disabled && !hasUploading && (text.trim().length > 0 || attachments.length > 0);
 
   function closePicker() {
     setDismissed(true);
@@ -510,8 +619,14 @@ export function Composer({
 
   function submit() {
     if (!canSend) return;
-    onSend(text, readyAttachments);
+    onSend(text, attachments);
     setText('');
+    setAttachments([]);
+    localFiles.current.clear();
+    pickOrder.current.clear();
+    // Only this window's failures. A file that could not be uploaded was never
+    // part of the message being sent, but the chip explaining that has no reason
+    // to outlive the message it was attached to.
     setEntries([]);
     setCaret(0);
     setCommandsForced(false);
@@ -615,11 +730,20 @@ export function Composer({
   function addFile(file: File) {
     if (!onUpload) return;
     keySeq.current += 1;
-    const key = `${file.name}-${file.size}-${keySeq.current}`;
-    setEntries((prev) => [...prev, { key, file, status: 'uploading' }]);
+    const picked = keySeq.current;
+    const key = `${file.name}-${file.size}-${picked}`;
+    setEntries((prev) => [...prev, { key, picked, file, status: 'uploading' }]);
     onUpload(file).then(
       (attachment) => {
-        setEntries((prev) => prev.map((e) => (e.key === key ? { ...e, status: 'done', attachment } : e)));
+        // Handed over: the bytes are on the server under a url of its choosing,
+        // so this stops being a file this window is holding and becomes one the
+        // conversation has. The chip does not move — the one drawn from the
+        // local `File` is replaced by one drawn from the attachment, in the same
+        // place, with the same name on it.
+        setEntries((prev) => prev.filter((e) => e.key !== key));
+        localFiles.current.set(attachment.url, file);
+        pickOrder.current.set(attachment.url, picked);
+        setAttachments(placeByPickOrder(attachmentsRef.current, attachment, picked, pickOrder.current));
       },
       (error: unknown) => {
         const message = error instanceof Error ? error.message : 'That file could not be attached.';
@@ -630,6 +754,13 @@ export function Composer({
 
   function addFiles(files: File[]) {
     files.forEach(addFile);
+  }
+
+  /** Take a file out of the message before it is sent, everywhere it is shown. */
+  function removeAttachment(url: string) {
+    localFiles.current.delete(url);
+    pickOrder.current.delete(url);
+    setAttachments(attachmentsRef.current.filter((attachment) => attachment.url !== url));
   }
 
   function removeEntry(key: string) {
@@ -689,6 +820,60 @@ export function Composer({
     // paste has — so every dropped file goes straight to upload.
     addFiles(Array.from(e.dataTransfer.files ?? []));
   }
+
+  /**
+   * Every file on the unsent message, in one list.
+   *
+   * One list rather than two — the ones that have landed and the ones still
+   * going up — because a chip has to survive the moment its upload finishes.
+   * Rendered as two arrays it could not: React keys are scoped to the array they
+   * are in, so a file moving between them is torn down and built again, which
+   * replays the chip's entry animation and throws away the thumbnail it had
+   * already made. A file picked here keeps one identity through both halves of
+   * its life; one that arrived from another screen is named by its url, which is
+   * the only name this window ever knew it by.
+   */
+  const chips: {
+    key: string;
+    name: string;
+    size: number;
+    mime: string;
+    file?: File;
+    preview?: string;
+    status?: 'uploading' | 'error';
+    error?: string;
+    onRemove: () => void;
+  }[] = [
+    ...attachments.map((attachment) => {
+      // Present only for a file picked in this window; every other screen draws
+      // the same attachment from the server's copy of it.
+      const local = localFiles.current.get(attachment.url);
+      const picked = pickOrder.current.get(attachment.url);
+      return {
+        key: picked === undefined ? attachment.url : `picked:${picked}`,
+        name: local?.name ?? attachment.name,
+        size: local?.size ?? attachment.size,
+        mime: local?.type || attachment.mime,
+        file: local,
+        // The server's own copy, which every screen on this account can fetch.
+        // A `blob:` url would be a picture only one window can see, and the
+        // phone showing the same message would draw a broken image in place of
+        // the screenshot.
+        preview: attachment.url,
+        onRemove: () => removeAttachment(attachment.url),
+      };
+    }),
+    ...entries.map((entry) => ({
+      key: `picked:${entry.picked}`,
+      name: entry.file.name,
+      size: entry.file.size,
+      mime: entry.file.type,
+      file: entry.file,
+      status: entry.status,
+      error: entry.error,
+      onRemove: () => removeEntry(entry.key),
+    })),
+  ];
 
   // ------------------------------------------------------------------ paint
 
@@ -768,10 +953,24 @@ export function Composer({
         />
       ) : null}
 
-      {entries.length > 0 ? (
+      {/* The message's files first, then whatever this window is still sending
+          up. Attached order, in effect — an upload joins the first group the
+          moment it lands, at the end of it — and it keeps the row from
+          reshuffling under the cursor as each one finishes. */}
+      {chips.length > 0 ? (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-1-5)' }} aria-label="Attachments">
-          {entries.map((entry) => (
-            <AttachmentChip key={entry.key} entry={entry} onRemove={() => removeEntry(entry.key)} />
+          {chips.map((chip) => (
+            <AttachmentChip
+              key={chip.key}
+              name={chip.name}
+              size={chip.size}
+              mime={chip.mime}
+              file={chip.file}
+              preview={chip.preview}
+              status={chip.status}
+              error={chip.error}
+              onRemove={chip.onRemove}
+            />
           ))}
         </div>
       ) : null}
@@ -2844,10 +3043,44 @@ function QueuedChip({
   );
 }
 
-function AttachmentChip({ entry, onRemove }: { entry: AttachmentEntry; onRemove: () => void }) {
-  const failed = entry.status === 'error';
-  const isImage = entry.file.type.startsWith('image/');
-  const preview = useObjectUrl(isImage && !failed ? entry.file : null);
+/**
+ * One file on the unsent message.
+ *
+ * Named rather than handed an entry, because there are now two kinds of thing
+ * behind an identical chip: a `File` this window is still uploading, and an
+ * attachment the conversation has — which may have been picked on somebody
+ * else's screen and reached this one down the socket. What a chip needs is a
+ * name, a size and something to draw, and both kinds can give all three.
+ */
+function AttachmentChip({
+  name,
+  size,
+  mime,
+  file,
+  preview: previewUrl,
+  status = 'done',
+  error,
+  onRemove,
+}: {
+  name: string;
+  size: number;
+  mime: string;
+  /** Present only while this window is the one uploading it. */
+  file?: File;
+  /** The server's copy, for a file that has finished going up. */
+  preview?: string;
+  status?: 'uploading' | 'done' | 'error';
+  error?: string;
+  onRemove: () => void;
+}) {
+  const failed = status === 'error';
+  const isImage = mime.startsWith('image/');
+  // The local file wins while there is one: it is already in memory, so the
+  // thumbnail appears the instant the file is picked rather than after a round
+  // trip. Once the upload lands there is no `File` any more and the server's own
+  // url takes over — which is also the only one a second screen ever has.
+  const objectUrl = useObjectUrl(isImage && !failed && file ? file : null);
+  const preview = objectUrl ?? (isImage && !failed ? previewUrl : null) ?? null;
   const icon = failed ? 'circle-alert' : isImage ? 'image' : 'file-text';
 
   return (
@@ -2865,11 +3098,11 @@ function AttachmentChip({ entry, onRemove }: { entry: AttachmentEntry; onRemove:
         background: 'var(--muted)',
         border: `1px solid ${failed ? 'var(--destructive)' : 'var(--border)'}`,
         borderRadius: 'var(--radius)',
-        opacity: entry.status === 'uploading' ? 0.75 : 1,
+        opacity: status === 'uploading' ? 0.75 : 1,
         animation: 'relay-chip-in var(--duration-base) var(--ease-out)',
         transition: 'opacity var(--duration-base) var(--ease-standard)',
       }}
-      title={failed ? entry.error : `${entry.file.name} (${formatBytes(entry.file.size)})`}
+      title={failed ? error : `${name} (${formatBytes(size)})`}
     >
       {preview ? (
         // The picture itself, not an icon standing in for one. Attaching a
@@ -2885,18 +3118,18 @@ function AttachmentChip({ entry, onRemove }: { entry: AttachmentEntry; onRemove:
           style={{
             display: 'inline-flex',
             flex: '0 0 auto',
-            animation: entry.status === 'uploading' ? 'relay-pulse 1.2s var(--ease-in-out) infinite' : undefined,
+            animation: status === 'uploading' ? 'relay-pulse 1.2s var(--ease-in-out) infinite' : undefined,
           }}
         >
           <Icon name={icon} size={11} />
         </span>
       )}
-      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entry.file.name}</span>
-      <span style={{ flex: '0 0 auto', color: 'var(--muted-foreground)' }}>{formatBytes(entry.file.size)}</span>
+      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name}</span>
+      <span style={{ flex: '0 0 auto', color: 'var(--muted-foreground)' }}>{formatBytes(size)}</span>
       <button
         type="button"
         onClick={onRemove}
-        aria-label={`Remove ${entry.file.name}`}
+        aria-label={`Remove ${name}`}
         style={{
           display: 'inline-flex',
           flex: '0 0 auto',

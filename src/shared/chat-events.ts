@@ -1196,6 +1196,34 @@ export interface UserTurn {
 }
 
 /**
+ * What is in the composer, before any of it is a turn.
+ *
+ * Deliberately not a transcript event, for the same reason a queued turn is not
+ * one: the log records what happened to a conversation, and a half-typed
+ * sentence has not happened. It rides on the join and on its own broadcast
+ * instead, which is what puts the same unsent prompt on a phone and a laptop
+ * at once (#163).
+ *
+ * The attachments are metadata only — the bytes went up over HTTP when the file
+ * was picked and are served back from the session's own folder, so a second
+ * device draws the chip from the same store rather than from a blob it has no
+ * way to resolve.
+ */
+export interface ChatDraft {
+  text: string;
+  attachments: ChatAttachment[];
+  /**
+   * Which version of this draft it is, counted by the server.
+   *
+   * A counter and never a clock. Two edits from two devices in the same
+   * millisecond carry the same timestamp, so `>` and `>=` are each wrong half
+   * the time — a client deciding whether an arriving draft is newer than the one
+   * it is holding needs an order that actually exists.
+   */
+  revision: number;
+}
+
+/**
  * A turn typed while the agent was still working, waiting its place in line.
  *
  * Deliberately not a transcript event. The log is the record of what happened,

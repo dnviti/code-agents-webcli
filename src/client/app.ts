@@ -200,6 +200,10 @@ export class App {
         syncConversationAttention(this, sessionId);
       },
       onEvent: (sessionId, event) => noteChatEvent(this, sessionId, event),
+      // Which socket this page is on, so a composer edit coming back from the
+      // server is recognised as this screen's own rather than applied over the
+      // top of what is still being typed.
+      origin: () => this.connectionId || null,
     });
     this.folderBrowser = new FolderBrowser(this);
     this.planDetector = new PlanDetector();

@@ -23,6 +23,9 @@ export const SERVER_FEATURES = [
   // Watch several chat sessions on one socket, so a background conversation
   // keeps streaming while the user is looking at a different tab.
   'chat_subscribe',
+  // Carry the unsent composer — the half-typed prompt and the files already
+  // attached to it — between every screen the account has open (#163).
+  'chat_draft',
 ] as const;
 
 export class WebSocketHandler {

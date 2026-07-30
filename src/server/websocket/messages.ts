@@ -19,7 +19,8 @@ import {
   announceSessionOpened,
 } from './handler.js';
 import { chatUnavailableReason, isChatRuntime } from '../../shared/chat-runtimes.js';
-import { ChatModelDefault } from '../../shared/chat-events.js';
+import { ChatDraft, ChatModelDefault } from '../../shared/chat-events.js';
+import { applyDraft, clearDraft, draftOf, readDraft } from '../chat/drafts.js';
 import { UserPreferences, resolveApprovalMode } from '../../shared/user-preferences.js';
 import { ChatNotRunningError } from '../chat/session.js';
 
@@ -230,6 +231,15 @@ interface IncomingMessage {
   requestId?: string;
   text?: string;
   attachments?: unknown[];
+  /**
+   * Whether this turn is the composer being emptied, rather than a turn from
+   * the transcript being asked again.
+   *
+   * Only the first empties the conversation's shared draft. Absent on every
+   * frame from a page that predates the shared composer, which then behaves
+   * exactly as it did: nothing to clear, because nothing was being shared.
+   */
+  fromComposer?: boolean;
   optionId?: string;
   /** Every option picked for a multiple-choice question the model asked. */
   optionIds?: unknown[];
@@ -402,6 +412,10 @@ export class MessageProcessor {
 
       case 'chat_turn_index_request':
         await this.handleChatTurnIndex(wsInfo, data);
+        break;
+
+      case 'chat_draft':
+        this.handleChatDraft(wsInfo, data);
         break;
 
       case 'chat_subscribe':
@@ -1519,6 +1533,13 @@ export class MessageProcessor {
         // and a conversation whose process has since died reports nothing at
         // all. The record is the only thing that still knows what was chosen.
         effortOverride: session.chatEffortOverride || null,
+        // What is in the composer, so a screen that has just opened this
+        // conversation opens it at the sentence the other screen is in the
+        // middle of. Null means nothing has been typed since the server came
+        // up, which is what tells the joining browser it may keep the copy it
+        // has in session storage rather than being cleared by a server that
+        // simply has not heard yet.
+        draft: draftOf(session),
       });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1549,6 +1570,51 @@ export class MessageProcessor {
     const session = this.deps.claudeSessions.get(target);
     if (!session || session.ownerUserId !== wsInfo.userId) return null;
     return session;
+  }
+
+  /**
+   * Take one screen's composer as the conversation's, and tell the others.
+   *
+   * Routed through `broadcastChat` rather than `sendToUser`, so it follows the
+   * conversation: a person may have six tabs open and only some of them are
+   * looking at this chat, and the ones that are not have no composer to put it
+   * in. Everyone watching gets it, including the screen it came from — which is
+   * how that screen learns the revision its own edit was given, and why the
+   * origin rides along for it to recognise itself by.
+   *
+   * Silent on anything it will not take. A draft that arrives malformed, or too
+   * large to be worth carrying, leaves the screen that holds it working exactly
+   * as it did before any of this existed; an error toast per keystroke would be
+   * a worse answer than a feature that quietly stops applying.
+   */
+  private handleChatDraft(wsInfo: WebSocketInfo, data: IncomingMessage): void {
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!session || session.surface !== 'chat') return;
+
+    const input = readDraft(data.text, data.attachments, session.id);
+    if (!input) return;
+
+    this.broadcastDraft(session, applyDraft(session, input), wsInfo.id);
+  }
+
+  /**
+   * Announce a composer to every screen watching this conversation.
+   *
+   * `origin` is the socket the edit came from, or null when it was not a screen
+   * that caused it — a turn being sent empties the composer, and no browser
+   * should treat that as its own echo and skip it.
+   */
+  private broadcastDraft(
+    session: SessionRecord,
+    draft: ChatDraft,
+    origin: string | null,
+  ): void {
+    broadcastChat(
+      session.id,
+      { type: 'chat_draft', sessionId: session.id, draft, origin },
+      this.deps.claudeSessions,
+      this.deps.webSocketConnections,
+    );
   }
 
   private async handleChatSend(
@@ -1616,12 +1682,38 @@ export class MessageProcessor {
       }
     }
 
+    // Read before the send, because the send is not instant: `/clear` restarts
+    // the agent's whole process behind it, and anything typed on any screen
+    // while that runs is a *different* message from the one being sent. Clearing
+    // whatever the composer holds when the await finally returns would throw
+    // that away.
+    const draftAtSend = draftOf(session)?.revision ?? 0;
+
     try {
       await manager.send(session.id, {
         text,
         attachments: Array.isArray(data.attachments) ? data.attachments : undefined,
       });
       session.lastActivity = new Date();
+      // The composer that held this turn is empty now, on every screen. The one
+      // that sent it emptied its own box the moment the button was pressed;
+      // without this the others would go on offering a prompt that has already
+      // been asked, and the next person to press send there would ask it twice.
+      //
+      // Only for a turn that came *from* a composer. "Send this turn again"
+      // takes its text from the transcript and leaves the input alone (see
+      // ChatView.retryTurn), so clearing on every accepted turn would blank a
+      // message somebody was halfway through writing — on every screen at once,
+      // for pressing retry on something else entirely.
+      //
+      // Tagged with the screen it came from, which is not the throwaway detail
+      // it looks like: that screen emptied its own box a round trip ago and may
+      // already be typing the next question into it, and applying this would
+      // take those keystrokes back out.
+      if (data.fromComposer === true && (draftOf(session)?.revision ?? 0) === draftAtSend) {
+        const cleared = clearDraft(session);
+        if (cleared) this.broadcastDraft(session, cleared, wsInfo.id);
+      }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
 
