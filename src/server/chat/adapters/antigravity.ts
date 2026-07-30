@@ -218,6 +218,49 @@ function refusalText(what: string | undefined, detail: string): string {
   );
 }
 
+/**
+ * The prompt agy is actually handed: what the user typed, and where their
+ * attachments are.
+ *
+ * agy takes one string and has no attachment channel — no flag in `--help`, and
+ * no mention syntax either: `@notes.txt` in a prompt reached the model as
+ * literal text and it went and opened the file with a tool of its own. That last
+ * part is what makes this work rather than a fudge. Every upload this app
+ * accepts is written *inside* the session's working directory
+ * (`.cc-web/attachments/`), which is the directory agy is pointed at, and agy
+ * reads what it is pointed at: a text file, and — verified separately, because
+ * it is the case worth doubting — a PNG, whose product name and version it read
+ * out of the pixels with `view_file`.
+ *
+ * So the paths are named in the prompt. This is the same act every other adapter
+ * here performs through whatever door its runtime opens — pi appends `@path` to
+ * argv, codex sends a `localImage` input item — and it is deliberately kept out
+ * of the transcript: `ChatSession.deliver` has already recorded the user's own
+ * words, and the attachment chips beside them are what a reader sees. What the
+ * runtime receives and what the record shows differ here on purpose, the same
+ * way a branch's briefing does.
+ *
+ * Attachments with no `path` are skipped rather than described: that field is
+ * optional, and a runtime that cannot be handed a path has nothing to be told.
+ */
+export function withAttachments(turn: UserTurn): string {
+  const paths = (turn.attachments || [])
+    .map((attachment) => attachment.path)
+    .filter((path): path is string => typeof path === 'string' && path.length > 0);
+  if (paths.length === 0) return turn.text;
+
+  const listed = paths.map((path) => `- ${path}`).join('\n');
+  const preamble =
+    paths.length === 1
+      ? 'The user attached this file to the message above. It is already saved in this '
+        + 'workspace — open it with your own tools when the message refers to it:'
+      : `The user attached these ${paths.length} files to the message above. They are already `
+        + 'saved in this workspace — open them with your own tools when the message refers to them:';
+  // A blank line and a heading, so a message that is nothing but attachments
+  // still reads as a request rather than as a bare list of paths.
+  return `${turn.text}\n\n${preamble}\n${listed}`;
+}
+
 // ------------------------------------------------------------------ adapter
 
 export class AntigravityChatAdapter extends BaseChatAdapter {
@@ -244,8 +287,13 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
     // No flag resumes a conversation at an earlier point; `--conversation` picks
     // up its head.
     fork: false,
-    // `--print` takes one string. No attachment flag exists in `--help`.
-    attachments: false,
+    // By path, in the prompt — see `withAttachments`. There is no attachment
+    // flag and no `@file` mention syntax (probed: `@notes.txt` reached the model
+    // as literal text), but this app already stores every upload *inside* the
+    // session's working directory, and agy reads what it is pointed at. Watched
+    // working both ways: a text file, and a PNG whose product name and version
+    // it read out of the pixels with `view_file`.
+    attachments: true,
     usage: true,
     // Tokens only. Nothing in `init`, `step_update` or `result` prices a turn,
     // and this app buys no price list to guess with.
@@ -253,6 +301,27 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
     // No plan or todo channel: `--mode plan` parses and changes nothing
     // observable, and no step type carries a checklist.
     plan: false,
+    // Not agy's commands — this app's, and the only ones that do anything in an
+    // Antigravity conversation.
+    //
+    // agy has a slash menu of its own, forty entries deep, and every one of them
+    // belongs to its terminal UI: driven headlessly it interprets none of them.
+    // Probed with `/agents`, which the CLI answers instantly at its own prompt —
+    // in `--print` mode it went to the model instead and came back with 18,441
+    // tokens of prose *about* what subagents are. Putting that menu here would be
+    // exactly the defect #71 was filed for: a command offered, picked, and
+    // delivered to an agent that can only read it.
+    //
+    // The three below are different. `ChatSession` intercepts them itself and
+    // never forwards them (see `isClearingCommand`), so they work identically in
+    // every conversation this app runs, agy's included. They are listed because
+    // without them the menu is empty — and an empty list does not merely show an
+    // empty menu, it takes the button that opens it off the composer entirely.
+    commands: [
+      { name: 'clear', description: 'Start a new conversation, forgetting everything above' },
+      { name: 'new', description: 'Start a new conversation — the same thing as /clear' },
+      { name: 'reset', description: 'Start a new conversation — the same thing as /clear' },
+    ],
   };
 
   private turnCounter = 0;
@@ -498,7 +567,7 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
 
     // `--print` last so the prompt is the final pair on the line and a long one
     // does not bury the flags in a log.
-    const args = [...this.buildArgs(), '--print', turn.text];
+    const args = [...this.buildArgs(), '--print', withAttachments(turn)];
 
     return new Promise<void>((resolve, reject) => {
       const child = spawn(this.options.command, args, {

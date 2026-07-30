@@ -144,6 +144,7 @@ Watched working:
 | Reopening a conversation and carrying on in it | the app restarted, the conversation resumed, and the agent answered from history without going back to the file |
 | The folder you picked is the folder it works in | `pwd` and a file read, in a directory agy had never seen |
 | A first launch in an unseen folder reaches a usable session | the terminal surface, past the trust question, with the prompt drawn |
+| An attached file reaches the agent | a PNG dropped into the composer, opened by the agent with `view_file` at the path it was saved to, and the product name read out of the pixels |
 
 Not offered, because the runtime does not provide it:
 
@@ -152,10 +153,23 @@ Not offered, because the runtime does not provide it:
 | Diffs | `replace_file_content` reports its `TargetFile` and nothing else — no old text, no new text, no hunk. A diff here would be one this app computed, not one the agent reported. |
 | Cost | Nothing in `init`, in any step or in the result prices a turn. The meter says *cost not reported* rather than showing a zero. |
 | Approval prompts | Headless, it cannot stop and ask. See [Approval mode](#approval-mode). |
-| Attachments | `--print` takes one string; `--help` has no attachment flag. |
 | A plan or todo list | No step type carries one. |
-| Slash commands | Its own are terminal-UI commands and are not interpreted in this mode. |
+| Its own slash commands | Forty of them, all belonging to its terminal UI, and it interprets none in this mode. `/agents` — which the CLI answers instantly at its own prompt — went to the model instead and came back with 18,441 tokens of prose *about* subagents. The menu lists what an Antigravity conversation can really run, which is this app's own `/clear`, `/new` and `/reset`. |
 | An account or plan reading | Its terminal UI shows the plan in its header; none of that reaches the headless stream. |
+
+**Attachments reach it by path.** agy has no attachment flag and no `@file`
+mention syntax — `@notes.txt` in a prompt arrives at the model as literal text.
+What it does have is a working directory it can read, and every upload this app
+accepts is written *inside* that directory, at `.cc-web/attachments/`. So the
+paths are named at the end of the prompt and the agent opens them with its own
+tools. That covers images as well as text: a PNG attached in the composer was
+opened with `view_file` and the product name and version read out of the pixels.
+
+**The `/` menu lists this app's commands, not agy's.** `/clear`, `/new` and
+`/reset` are intercepted by the conversation itself and never reach any runtime,
+so they work here exactly as they do everywhere else. agy's own forty are absent
+on purpose — it interprets none of them in this mode, and offering one would
+spend a turn's tokens producing a paragraph about what it would have done.
 
 **Not verified: what a sign-in failure looks like.** The credentials on the
 machine this was built on could not be taken away for a test — clearing `HOME`
@@ -272,7 +286,7 @@ directories each runtime's own installer writes into:
 | pi | `.pi/skills` and `.agents/skills` in the project, `~/.pi/agent/skills` and `~/.agents/skills` in your home |
 | Codex | `~/.codex/skills` and `~/.codex/prompts`, and `.codex/skills` in the project |
 | Kimi Code, Oh My Pi | Nothing — both report their own list before the menu can be opened |
-| Antigravity CLI | Nothing. Its slash commands are its terminal UI's own and are not interpreted in the headless mode the WebUI drives — typed there, `/changelog` reaches the model as ordinary text. It has no user-authored commands to find either: its customisations are skills, rules, plugins, hooks and MCP servers, none of which are things a conversation runs by name |
+| Antigravity CLI | Nothing of its own — see below |
 
 Each entry carries the description its author wrote in the skill's frontmatter.
 An entry whose author wrote none is shown with none: a sentence invented here

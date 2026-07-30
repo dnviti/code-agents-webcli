@@ -209,6 +209,7 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
       toolCalls: true,
       interrupt: true,
       resume: true,
+      attachments: true,
       usage: true,
     },
   },

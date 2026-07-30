@@ -32,6 +32,20 @@
   edit, so none is drawn. `--mode accept-edits` and `--mode plan` are wired to
   nothing, because three runs of the same prompt proved they change nothing.
 
+  Files can be attached. agy has no attachment flag and no `@file` mention
+  syntax, but every upload already lands *inside* the session's working
+  directory, and agy reads what it is pointed at — so the paths are named at the
+  end of the prompt and it opens them itself. Images included: a PNG attached in
+  the composer came back with the product name and version read out of the
+  pixels.
+
+  Its own forty slash commands are deliberately not offered — it interprets none
+  of them in this mode, and `/agents` spent 18,441 tokens producing a paragraph
+  about subagents instead of listing them. The menu lists what an Antigravity
+  conversation can actually run, which is this app's own `/clear`, `/new` and
+  `/reset`; without them the menu was empty, and an empty menu takes the button
+  that opens it off the composer entirely.
+
   The effort control is the interesting one: `--effort` is refused whenever a
   model is named, and what `agy models` publishes instead is one model id per
   level (`gemini-3.6-flash-high`, `-medium`, `-low`). So the levels offered are

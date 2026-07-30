@@ -6,6 +6,7 @@ const path = require('path');
 const { AntigravityBridge } = require('../dist/server/bridges/antigravity.js');
 const {
   AntigravityChatAdapter,
+  withAttachments,
 } = require('../dist/server/chat/adapters/antigravity.js');
 const {
   installedModels,
@@ -243,6 +244,52 @@ describe('AntigravityChatAdapter (headless mode)', function () {
     it('puts the profile\'s own arguments last', function () {
       const args = argsFor({ extraArgs: ['--sandbox'] });
       assert.strictEqual(args[args.length - 1], '--sandbox');
+    });
+  });
+
+  describe('attachments', function () {
+    it('names each attached file, by the path it was saved at', function () {
+      // agy has no attachment flag and no mention syntax — `@notes.txt` reaches
+      // the model as literal text. What it does have is a working directory it
+      // can read, and every upload is stored inside it.
+      const prompt = withAttachments({
+        text: 'what is in this?',
+        attachments: [
+          { url: '/a', mime: 'image/png', name: 'shot.png', size: 1, path: '/work/.cc-web/attachments/ab-shot.png' },
+        ],
+      });
+      assert.ok(prompt.startsWith('what is in this?'), prompt);
+      assert.ok(prompt.includes('/work/.cc-web/attachments/ab-shot.png'), prompt);
+      assert.match(prompt, /attached this file/);
+    });
+
+    it('counts them when there is more than one', function () {
+      const prompt = withAttachments({
+        text: 'compare these',
+        attachments: [
+          { url: '/a', mime: 'image/png', name: 'a.png', size: 1, path: '/work/a.png' },
+          { url: '/b', mime: 'image/png', name: 'b.png', size: 1, path: '/work/b.png' },
+        ],
+      });
+      assert.match(prompt, /attached these 2 files/);
+      assert.ok(prompt.includes('/work/a.png') && prompt.includes('/work/b.png'), prompt);
+    });
+
+    it('leaves a turn with no attachments exactly as the user typed it', function () {
+      // The prompt is the user's words. Anything added when there is nothing to
+      // add would be this app talking over them.
+      assert.strictEqual(withAttachments({ text: 'plain question' }), 'plain question');
+      assert.strictEqual(withAttachments({ text: 'plain question', attachments: [] }), 'plain question');
+    });
+
+    it('skips an attachment that has no path, rather than describing it', function () {
+      // `path` is optional on the wire; a runtime that cannot be handed one has
+      // nothing to be told about it.
+      const prompt = withAttachments({
+        text: 'look',
+        attachments: [{ url: '/a', mime: 'image/png', name: 'a.png', size: 1 }],
+      });
+      assert.strictEqual(prompt, 'look');
     });
   });
 
