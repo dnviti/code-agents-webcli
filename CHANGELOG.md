@@ -1,6 +1,6 @@
 # Changelog
 
-## [5.3.4] - unreleased
+## [5.3.4] - 2026-07-30
 
 ### Fixed
 - **Every window and device shows the same tabs** (#163). The strip was built
