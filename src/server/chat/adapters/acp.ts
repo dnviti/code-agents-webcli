@@ -3,6 +3,7 @@ import {
   ChatRole,
   ChatUsage,
   DiffHunk,
+  EffortChoice,
   FileDiff,
   ModelChoice,
   PermissionOption,
@@ -11,11 +12,14 @@ import {
   ToolBlock,
   ToolKind,
   ToolStatus,
+  TurnModelUsage,
   UserTurn,
   classifyTool,
   isAllowOption,
+  rankedEfforts,
 } from '../../../shared/chat-events.js';
 import { ChatAdapterOptions, JsonRpcChatAdapter, permissionRequest } from '../adapter.js';
+import { mapModelUsage } from './model-usage.js';
 
 /**
  * Agent Client Protocol client.
@@ -61,6 +65,29 @@ const ACP_BASE_CAPABILITIES: ChatCapabilities = {
   cost: true,
   plan: true,
 };
+
+/**
+ * ACP agents that report no tokens and no money, measured rather than assumed.
+ *
+ * `usage_update` is a vendor extension. omp, opencode and grok send spend on
+ * one channel or another; kimi sends none of it — probed against kimi 0.29.1
+ * over two prompts with zero `usage_update` notifications, prompt replies of
+ * `{"stopReason":"end_turn"}` with no `usage` key, and no `_meta` on any
+ * session/update. `test/fixtures/chat/acp-kimi-tools.jsonl` is one of those
+ * turns, tool calls and all.
+ *
+ * Advertising `usage: true` for it was not a harmless optimism: the session
+ * files `reportsUsage: capabilities.usage === true` into the permanent record,
+ * so every kimi job went into the history as "this runtime reports usage" with
+ * nothing in the columns — which the dashboard prints as "not reported", the
+ * label reserved for an agent that *could* have spoken and did not.
+ *
+ * Named agents rather than a flag on the base set, because the honest default
+ * for an ACP agent nobody has probed is still the optimistic one: the handshake
+ * corrects it upward, and a turn that ends having said nothing corrects it
+ * downward from evidence (see `noteSpend` in session.ts).
+ */
+const NO_SPEND_REPORTING = new Set(['kimi']);
 
 export interface AcpChatAdapterOptions extends ChatAdapterOptions {
   /** Which CLI this instance drives. Labels errors; never changes behaviour. */
@@ -251,18 +278,78 @@ function extractToolContent(items: unknown[]): ToolPayload {
   return payload;
 }
 
-/** ACP token counts, which spell three of the six fields differently. */
+/**
+ * A tick is a ten-billionth of a dollar.
+ *
+ * Grok quotes a turn's cost only in these, on both of its entry points. The
+ * ratio is not documented anywhere; it is read off a headless run that reported
+ * `total_cost_usd: 0.02338` and `total_cost_usd_ticks: 233800000` for the same
+ * turn. An integer count of tiny units is how you carry money without floating
+ * point, so the app converts once, here, and stores dollars like everyone else.
+ */
+const USD_PER_TICK = 1e-10;
+
+/**
+ * ACP token counts, which spell three of the six fields differently.
+ *
+ * And which the agents then spell differently from each other: kimi and omp
+ * report reasoning as `thoughtTokens`, grok as `reasoningTokens`. Both are read
+ * because both were captured — neither is a guess at a name nobody has sent.
+ */
 function turnUsage(raw: Record<string, unknown>): ChatUsage | undefined {
+  const ticks = num(raw.costUsdTicks);
   const usage: ChatUsage = {
     inputTokens: num(raw.inputTokens),
     outputTokens: num(raw.outputTokens),
     totalTokens: num(raw.totalTokens),
     cacheReadTokens: num(raw.cachedReadTokens),
     cacheWriteTokens: num(raw.cachedWriteTokens),
-    reasoningTokens: num(raw.thoughtTokens),
+    reasoningTokens: num(raw.thoughtTokens) ?? num(raw.reasoningTokens),
+    // Spread in rather than assigned, because an explicit `costUsd: undefined`
+    // is a different object from one without the key to everything that
+    // compares these events — the log, the reducer's merge, and the tests.
+    ...(ticks === undefined ? {} : { costUsd: ticks * USD_PER_TICK }),
   };
   const present = Object.values(usage).some((value) => value !== undefined);
   return present ? usage : undefined;
+}
+
+/**
+ * Which models actually ran the turn, in the spelling ACP agents use for it.
+ *
+ * `mapModelUsage` reads the names claude and headless grok both publish —
+ * `cacheReadInputTokens`, `costUSD`. Over ACP the same grok sends the same map
+ * spelled the way it spells the turn's own totals, `cachedReadTokens` and money
+ * as a count of ticks, so the entries are respelled on the way in rather than
+ * teaching the shared reader a third vocabulary for one fact.
+ *
+ * The map is real and was being dropped whole. Off grok's `session/prompt`
+ * reply, under `_meta.usage`:
+ * `{"grok-build":{"inputTokens":65551,…,"modelCalls":4,"costUsdTicks":357174000}}`.
+ * One key there because one model answered — but that `modelCalls` is the only
+ * round-trip count grok reports at all, and a turn that delegated to a second
+ * model would say so here and nowhere else.
+ *
+ * The tick cost passes straight through, unlike claude's, which has to be
+ * rescaled: grok's `costUsdTicks` is the turn's own, and the entries sum to it
+ * exactly, so a share of it would be the same number arrived at less honestly.
+ */
+function acpModelUsage(usage: Record<string, unknown>): TurnModelUsage[] | undefined {
+  const respelled: Record<string, unknown> = {};
+  for (const [model, value] of Object.entries(record(usage.modelUsage))) {
+    const fields = record(value);
+    const ticks = num(fields.costUsdTicks);
+    respelled[model] = {
+      ...fields,
+      // The agent's own spelling wins where it used it: this is a translation
+      // for the agents that spell it the other way, not a correction.
+      cacheReadInputTokens: num(fields.cacheReadInputTokens) ?? num(fields.cachedReadTokens),
+      cacheCreationInputTokens:
+        num(fields.cacheCreationInputTokens) ?? num(fields.cachedWriteTokens),
+      ...(ticks === undefined ? {} : { costUSD: ticks * USD_PER_TICK }),
+    };
+  }
+  return mapModelUsage({ modelUsage: respelled });
 }
 
 export class AcpChatAdapter extends JsonRpcChatAdapter {
@@ -272,6 +359,32 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   private readonly acpArgs: string[];
   private nativeSessionId: string | null = null;
   private model?: string;
+  /** Model value -> the window the agent published for it, where it did. */
+  private readonly modelWindows = new Map<string, number>();
+  /** The last window announced, so a re-read does not re-emit the same figure. */
+  private reportedWindow?: number;
+  /** The last occupancy announced, for the same reason and on the same rule. */
+  private reportedUsed?: number;
+  /**
+   * The id of the config option that carries this agent's thinking level.
+   *
+   * The option's own `id`, never the literal `thinking`, because this is what
+   * goes back as `configId` on `session/set_config_option` — and an agent that
+   * names its option something else would be unsettable from a hardcoded
+   * string. Null means the agent published no `thought_level` category at all,
+   * which is grok's case and the reason there is a second road below.
+   */
+  private effortOptionId: string | null = null;
+  /** The `model` config option's own id, where the agent published one. */
+  private modelOptionId: string | null = null;
+  /** Model value -> the effort ladder that model's `_meta` published, where it did. */
+  private readonly modelEfforts = new Map<string, EffortChoice[]>();
+  /** Model value -> the level that model's `_meta` said it was running at. */
+  private readonly modelEffortLevels = new Map<string, string>();
+  /** The level the agent said it is on. Never one this app merely asked for. */
+  private effort: string | null = null;
+  /** The last level announced, so a re-read does not re-emit the same one. */
+  private reportedEffort?: string | null;
   private turnId: string | null = null;
   private turnStartedAt = 0;
   private current: OpenMessage | null = null;
@@ -284,6 +397,9 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     super(options);
     this.runtime = options.runtime || 'acp';
     this.acpArgs = options.acpArgs || ['acp'];
+    if (NO_SPEND_REPORTING.has(this.runtime)) {
+      this.capabilities = { ...this.capabilities, usage: false, cost: false };
+    }
   }
 
   protected buildArgs(): string[] {
@@ -312,6 +428,13 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
 
       const session = await this.openSession(init);
       this.applySessionConfig(record(session));
+      // Before the `session` event rather than after it, which is where the
+      // remembered effort goes: this event is what names the model the
+      // conversation is running on, and naming the one we are one round trip
+      // away from replacing would be a false start every relaunch. It also puts
+      // the switch ahead of the effort ladder, which on kimi and grok alike
+      // belongs to the model rather than to the session.
+      await this.applyLaunchModel();
 
       this.emit({
         t: 'session',
@@ -320,6 +443,18 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
         cwd: this.options.workingDir,
         capabilities: this.capabilities,
       });
+      // What the agent itself said it is thinking at, before this app has asked
+      // it for anything. Emitted even when the answer is null, because null is
+      // the true answer for an agent with no ladder and the chip has to be told
+      // to stay empty rather than keep whatever the last runtime left on it.
+      this.emitEffort();
+      // Awaited, unlike the codex adapter's `loadModelList`: a level applied
+      // after the session reports idle is a level the conversation's first turn
+      // did not run at. It costs one round trip, and it cannot fail the
+      // handshake — `applyLaunchEffort` swallows the rejection into an error
+      // event and lets the conversation open at whatever level the agent is
+      // already on.
+      await this.applyLaunchEffort();
       this.emit({ t: 'state', state: 'idle' });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
@@ -359,11 +494,17 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   private applyInitialize(init: Record<string, unknown>): void {
     const agent = record(init.agentCapabilities);
     const prompt = record(agent.promptCapabilities);
-    const sessions = record(agent.sessionCapabilities);
 
     this.loadSupported = agent.loadSession === true;
     this.capabilities.attachments = prompt.image === true || prompt.embeddedContext === true;
-    this.capabilities.resume = this.loadSupported && sessions.resume !== undefined;
+    // `loadSession` alone, because `session/load` is the call `openSession`
+    // actually makes. This used to also require `sessionCapabilities.resume`;
+    // kimi, omp and opencode all publish that key so the gate never bit, and
+    // then grok arrived publishing `loadSession: true` with an empty
+    // `sessionCapabilities` — and loads a session perfectly well. Gating a
+    // capability on a key that is not the one being used advertises the
+    // opposite of the truth in the one place the app promises not to.
+    this.capabilities.resume = this.loadSupported;
   }
 
   /**
@@ -417,12 +558,20 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   /**
    * `session/new` answers with the agent's config surface, not just an id.
    *
-   * The model select is the only place any of the three publishes what it can
+   * The model select is the only place any of these agents publishes what it can
    * run, so it is the source for `capabilities.models` and for the model the
    * session reports. Nothing here *sets* a model: no capture shows the call that
    * would, and `setModel` is left unimplemented rather than guessed.
+   *
+   * Two spellings, both captured live. kimi, omp and opencode answer with a
+   * `configOptions` list holding a `model` option; grok answers with a `models`
+   * object of its own. Reading both is not a guess at a third — an agent that
+   * sends neither simply publishes no list, which is what claude does and what
+   * the picker already handles.
    */
   private applySessionConfig(session: Record<string, unknown>): void {
+    this.applyModelState(record(session.models));
+
     for (const raw of list(session.configOptions)) {
       const option = record(raw);
       if (str(option.category) !== 'model' && str(option.id) !== 'model') continue;
@@ -436,7 +585,254 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
       }
       if (models.length) this.capabilities.models = models;
       this.model = str(option.currentValue) || undefined;
+      // Kept for `setModel`, which needs it back as `configId`. See there for
+      // why the config-option road is preferred over `session/set_model`.
+      this.modelOptionId = str(option.id) || 'model';
     }
+    this.applyEffortOptions(list(session.configOptions));
+    this.readModelWindows(record(session.models));
+    // After both spellings of the model have been read, because grok's ladder
+    // belongs to a model rather than to the session and picking the wrong
+    // model's would publish levels the agent will refuse.
+    this.applyModelEffort();
+    this.emitContextWindow();
+  }
+
+  /**
+   * The thinking level, where the agent publishes it as an ACP config option.
+   *
+   * Alongside the `model` and `mode` categories `applySessionConfig` already
+   * walks there is a `thought_level` one, and it is where kimi and omp both put
+   * this. Read off `session/new` live this session — kimi answers
+   * `{"type":"select","id":"thinking","name":"Thinking","category":"thought_level",
+   * "currentValue":"on","options":[{"value":"off"...},{"value":"on"...}]}` and
+   * omp the same shape with five levels, `off`, `auto`, `low`, `high`, `max`,
+   * where `auto` carries the description "Auto-detect per prompt (low–xhigh)".
+   *
+   * Matched on the category first and the id second, mirroring the two-way
+   * match on the model option directly above: the category is what the protocol
+   * names, the id is only what these two agents happen to call theirs.
+   *
+   * Both publish their options cheapest-first, which is the order
+   * `rankedEfforts` wants, so the list is ranked as it arrives. That puts omp's
+   * `auto` in the middle of its ladder, which is where a level that picks per
+   * prompt honestly belongs.
+   *
+   * `currentValue` is the agent describing itself, and is the only thing this
+   * adapter will emit an `effort` event on the strength of. The option's id is
+   * kept for the setter, which wants it back as `configId`.
+   */
+  private applyEffortOptions(options: unknown[]): void {
+    for (const raw of options) {
+      const option = record(raw);
+      if (str(option.category) !== 'thought_level' && str(option.id) !== 'thinking') continue;
+      const id = str(option.id);
+      if (!id) continue;
+
+      const levels: Array<{ value: string; name?: string; description?: string }> = [];
+      for (const rawChoice of list(option.options)) {
+        const choice = record(rawChoice);
+        const value = str(choice.value);
+        if (!value) continue;
+        levels.push({ value, name: str(choice.name) || value, description: str(choice.description) });
+      }
+      if (levels.length) this.capabilities.efforts = rankedEfforts(levels);
+      this.effortOptionId = id;
+      this.effort = str(option.currentValue) ?? null;
+    }
+  }
+
+  /**
+   * Model windows, where the agent publishes them next to the model list.
+   *
+   * Grok does, in the `models` block of its `session/new` reply — every entry
+   * carries `_meta.totalContextTokens`. That is the most authoritative source
+   * there is for a window, because it is the agent describing the model it
+   * will actually run: grok reports 512,000 for `grok-build` where the nearest
+   * provider-catalogue entry says 256,000. Half.
+   *
+   * Parsed from a real capture (`.work/probes/raw/ctx-grok.jsonl`), not from a
+   * schema anyone imagined. It reads nothing on the agents wired up here
+   * today, which all publish their models through `configOptions` and none of
+   * them a window — it starts answering the moment grok moves onto ACP (#73).
+   *
+   * The same `_meta` is also where grok keeps its thinking ladder, so this walk
+   * collects that too rather than making a second pass over the same list. The
+   * two facts arrive together because they are the same kind of fact: what this
+   * particular model, as this particular agent will run it, can do.
+   */
+  private readModelWindows(models: Record<string, unknown>): void {
+    for (const raw of list(models.availableModels)) {
+      const model = record(raw);
+      const id = str(model.modelId);
+      const meta = record(model._meta);
+      const window = num(meta.totalContextTokens);
+      if (id && window !== undefined && window > 0) this.modelWindows.set(id, window);
+      if (id) this.readModelEffort(id, meta);
+    }
+    const current = str(models.currentModelId);
+    if (current) this.model = current;
+  }
+
+  /**
+   * One model's thinking ladder, as grok publishes it on the model itself.
+   *
+   * `grok agent --no-leader stdio` (0.2.x, probed live) publishes no
+   * `thought_level` config option at all. What it publishes instead is, on each
+   * entry of `models.availableModels`, a `_meta` carrying
+   * `supportsReasoningEffort: true`, the level that model is currently on as
+   * `reasoningEffort`, and the ladder as
+   * `reasoningEfforts: [{id,value,label,description,default}]`.
+   *
+   * That list arrives **ceiling-first** — `high`, `medium`, `low` — and
+   * `rankedEfforts` ranks a list cheapest-first, so it is reversed before
+   * ranking. Ranked as published, grok's cheapest level would be painted as its
+   * most expensive one, which is the one thing the rank exists to get right.
+   * Copied before reversing because `reverse()` is in-place and the array
+   * belongs to the parsed message, not to us.
+   *
+   * A model with no `supportsReasoningEffort` gets no entry, and that is not an
+   * omission: grok's default model `grok-build` genuinely has no such knob, so a
+   * session that opens on it publishes no ladder and the control says so.
+   */
+  private readModelEffort(id: string, meta: Record<string, unknown>): void {
+    if (meta.supportsReasoningEffort !== true) return;
+
+    const levels: Array<{ value: string; name?: string; description?: string }> = [];
+    for (const raw of list(meta.reasoningEfforts).slice().reverse()) {
+      const level = record(raw);
+      // `value` and `id` are the same string on every entry captured; reading
+      // both means an entry that carries only one of them is still usable.
+      const value = str(level.value) || str(level.id);
+      if (!value) continue;
+      levels.push({ value, name: str(level.label) || value, description: str(level.description) });
+    }
+    if (levels.length) this.modelEfforts.set(id, rankedEfforts(levels));
+    const current = str(meta.reasoningEffort);
+    if (current) this.modelEffortLevels.set(id, current);
+  }
+
+  /**
+   * Publish the current model's ladder, for the agents that hang it there.
+   *
+   * Only the current model's, because only the current model's can be set:
+   * grok's setter is `session/set_model`, which carries the level for the model
+   * it names. Switching model therefore switches ladder, and switching to a
+   * model that cannot think harder takes the ladder away entirely — which is
+   * why this clears rather than leaves the previous model's levels standing.
+   *
+   * Returns whether the published ladder changed, so a mid-session model change
+   * can tell the browser and a handshake — which is about to send the whole
+   * capability set with the `session` event anyway — does not have to.
+   */
+  private applyModelEffort(): boolean {
+    // A config option wins where the agent published one: it is the protocol's
+    // own place for this, and no captured agent publishes both.
+    if (this.effortOptionId) return false;
+
+    const previous = this.capabilities.efforts;
+    const efforts = this.model ? this.modelEfforts.get(this.model) : undefined;
+    if (efforts) {
+      this.capabilities.efforts = efforts;
+      this.effort = (this.model ? this.modelEffortLevels.get(this.model) : undefined) ?? null;
+    } else {
+      delete this.capabilities.efforts;
+      this.effort = null;
+    }
+    return this.capabilities.efforts !== previous;
+  }
+
+  /**
+   * Announce the level the agent said it is running at.
+   *
+   * Deduplicated against the last one announced, exactly as the context window
+   * is and for the same reason: re-reading a config surface is not news, and
+   * the transcript is a durable record of what changed rather than of what was
+   * checked. The first call always announces, null included.
+   */
+  private emitEffort(): void {
+    if (this.effort === this.reportedEffort) return;
+    this.reportedEffort = this.effort;
+    this.emit({ t: 'effort', effort: this.effort });
+  }
+
+  /**
+   * Tell the session the ladder itself changed under it.
+   *
+   * Sent as an empty list rather than left out when there is no ladder any
+   * more: a `capabilities` event is merged field by field, so omitting the key
+   * would leave the previous model's levels on offer for a model that will
+   * refuse every one of them.
+   */
+  private publishEfforts(): void {
+    this.emit({ t: 'capabilities', capabilities: { efforts: this.capabilities.efforts || [] } });
+  }
+
+  /**
+   * Tell the session how big the current model's window is, if the agent said.
+   *
+   * Sent as its own `usage` event because it arrives at handshake time, long
+   * before any turn has spent anything — waiting to attach it to a turn's
+   * figures would leave the first conversation without a reading at all.
+   */
+  private emitContextWindow(): void {
+    const window = this.model ? this.modelWindows.get(this.model) : undefined;
+    if (window === undefined || window === this.reportedWindow) return;
+    this.reportedWindow = window;
+    // Named, because this arrives ahead of anything that says which model is
+    // running now: a switch is confirmed on its own channel and the next
+    // message to carry a model belongs to the turn after it. Unnamed, the
+    // session files grok-4.5's 500,000 against grok-build and then retracts it.
+    this.emit({
+      t: 'usage',
+      usage: { contextWindow: window, contextWindowSource: 'agent', contextWindowModel: this.model },
+    });
+  }
+
+  /**
+   * Tell the session how much of that window is occupied right now.
+   *
+   * ACP's own channel for this is `usage_update.used`, which omp and opencode
+   * send and grok does not send once — so a grok conversation had a 512,000
+   * ceiling, no reading against it, and no 80% warning it could ever reach.
+   *
+   * What grok sends instead is `totalTokens` in the `_meta` of every
+   * `session/update`, and it is the right figure rather than a near one: across
+   * the captured turn it moves 1038 → 8363 → 16,381 → 16,641 → 16,812 while
+   * that turn's four requests *totalled* 65,943 tokens. It is the last
+   * request's own occupancy, which is the definition this product measures
+   * against; filing the turn's total here would have drawn a bar four times too
+   * full and been worse than the blank it replaced.
+   *
+   * Deduplicated like the window above, because grok repeats the same figure on
+   * every chunk of a streamed answer and a durable log should record what
+   * changed rather than how often it was mentioned.
+   */
+  private emitContextUsed(used: number | undefined): void {
+    if (used === undefined || used === this.reportedUsed) return;
+    this.reportedUsed = used;
+    this.emit({ t: 'usage', usage: { contextUsed: used } });
+  }
+
+  /**
+   * Grok's model state: `{ currentModelId, availableModels: [{ modelId, ... }] }`.
+   *
+   * Captured from `session/new` and `session/load`; the same object also arrives
+   * unprompted on `_x.ai/models/update`, which this client ignores because a
+   * model list is not worth an extension-specific code path when the handshake
+   * already carries it.
+   */
+  private applyModelState(state: Record<string, unknown>): void {
+    const models: ModelChoice[] = [];
+    for (const raw of list(state.availableModels)) {
+      const choice = record(raw);
+      const value = str(choice.modelId);
+      if (!value) continue;
+      models.push({ value, name: str(choice.name) || value, description: str(choice.description) });
+    }
+    if (models.length) this.capabilities.models = models;
+    const current = str(state.currentModelId);
+    if (current) this.model = current;
   }
 
   // ------------------------------------------------------------- outgoing
@@ -450,7 +846,11 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     const turnId = `${this.runtime}-turn-${++this.counter}`;
     this.turnId = turnId;
     this.turnStartedAt = Date.now();
-    this.emitUserMessage(turn, turnId);
+    // Not the user's message: `ChatSession.deliver` has already written it, and
+    // a second copy here is a second bubble in the same turn (#129). The close
+    // stays, and is the only thing this call was still doing that mattered — it
+    // ends an assistant message left streaming by the previous turn.
+    this.closeMessage();
 
     const prompt: unknown[] = [{ type: 'text', text: turn.text }];
     for (const attachment of turn.attachments || []) {
@@ -474,27 +874,218 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   }
 
   /**
-   * The user's own turn, written into the transcript by the adapter.
+   * Switch the model this session runs on, where the agent accepts it.
    *
-   * The log is the only record of a conversation once the process is gone, and
-   * a log holding only the agent's half is not a conversation.
+   * `session/set_model` is the ACP method for this, and grok answers it —
+   * probed against 0.2.112, which replied `{"model":{"Ok":"grok-4.5"}}` and
+   * followed with a `models/update` naming the new one. An agent that does not
+   * implement it answers `-32601` and this rejects, which is what the caller
+   * already treats as "could not switch live": it falls back to the runtime's
+   * own `/model` command, or to remembering the choice for the next launch.
+   *
+   * That fallback is why this is worth having rather than dangerous. Grok's
+   * headless mode could rewrite `--model` for the next turn, and moving it onto
+   * ACP would otherwise have taken a working model switch away — quietly, since
+   * the picker would have gone on offering the list grok publishes.
    */
-  private emitUserMessage(turn: UserTurn, turnId: string): void {
-    this.closeMessage();
-    const id = `${this.runtime}-user-${++this.counter}`;
-    this.emit({ t: 'msg_start', id, role: 'user', turnId });
-    let index = 0;
-    this.emit({ t: 'block_start', msgId: id, index, block: { kind: 'text', text: turn.text } });
-    for (const attachment of turn.attachments || []) {
-      index += 1;
+  async setModel(model: string): Promise<void> {
+    if (!this.nativeSessionId) {
+      throw new Error(`${this.runtime}: no session to set a model on`);
+    }
+    // Down the config-option road where the agent published one, because that is
+    // the only road that brings the rest of the session's configuration back.
+    //
+    // Probed against kimi this session, switching from `kimi-k2.7-code` to
+    // `~openai/gpt-mini-latest`. `session/set_model` succeeds and answers `{}` —
+    // nothing about the new model at all. `session/set_config_option` with the
+    // *model* option answers with the whole `configOptions` list rebuilt, and
+    // the thinking ladder in it has genuinely changed: `off`/`on` before,
+    // `off`/`low`/`medium`/`high`/`xhigh` after, with `currentValue` moved from
+    // `on` to `high`.
+    //
+    // That difference is not cosmetic. Taking the `set_model` road left the chip
+    // offering `on` — which the new model refuses by name — and hiding the three
+    // levels it had just gained, until the conversation was relaunched.
+    if (this.modelOptionId) {
+      const reply = record(
+        await this.call('session/set_config_option', {
+          sessionId: this.nativeSessionId,
+          configId: this.modelOptionId,
+          value: model,
+        }),
+      );
+      this.model = model;
+      this.applySessionConfig(reply);
+      this.publishEfforts();
+      this.emitEffort();
+      return;
+    }
+
+    await this.call('session/set_model', { sessionId: this.nativeSessionId, modelId: model });
+    this.model = model;
+    // The ladder belongs to the model on grok, so a model switch can hand the
+    // session a different set of levels or none at all. Grok also confirms the
+    // switch with a notification that says the same thing, and the second pass
+    // through here is a no-op — both `applyModelEffort` and `emitEffort` only
+    // speak when something actually moved.
+    if (this.applyModelEffort()) this.publishEfforts();
+    this.emitEffort();
+    // So does the window: grok publishes one per model, and `grok-4.5` is
+    // 500,000 where `grok-build` is 512,000. The config-option road gets this
+    // for free because it re-reads the whole session; this road has to say it,
+    // or the meter goes on measuring against the model that was left behind.
+    this.emitContextWindow();
+  }
+
+  /**
+   * Change how hard this agent thinks, down whichever road it published.
+   *
+   * Two roads, because the agents this adapter serves genuinely have two, and
+   * both were probed live against the installed CLIs this session.
+   *
+   * kimi and omp put the level in a `thought_level` config option, and the
+   * setter is `session/set_config_option` with `{ sessionId, configId, value }`.
+   * It is `configId` and not `optionId`: the wrong spelling came back from kimi
+   * as `-32602 Invalid params` with
+   * `{"configId":{"_errors":["Invalid input: expected string, received undefined"]}}`,
+   * which is about as unambiguous as a protocol gets. Every other name for the
+   * method itself — `session/set_config`, `session/select_config_option`,
+   * `session/set_option`, `session/setConfigOption` — answered `-32601`.
+   * The reply is the whole `configOptions` list again with `currentValue`
+   * already moved, so it is fed back through the same parser the handshake uses
+   * rather than assuming we got the level we asked for; kimi's ladder depends on
+   * the model, so a menu that changed shape is picked up in the same pass.
+   *
+   * grok has no such option and no `session/set_reasoning_effort` either
+   * (`-32601`), and ignores `--reasoning-effort` on the `agent stdio` path —
+   * launching with `low`, `medium`, `high` and a bogus value all left the level
+   * it reported at `high`, because that flag belongs to headless mode. What does
+   * move it is `session/set_model` carrying `_meta.reasoningEffort`, and only
+   * that: `reasoningEffort` at the top level, `effort`, `reasoningEffortId` and
+   * a `modelId` of `grok-4.5:low` all either errored or left the level where it
+   * was.
+   *
+   * A rejection is left to propagate. The caller reports a failed change as
+   * pending-with-reason and shows the message, and these agents write a good
+   * one — kimi refuses with `Unknown thinking effort for model
+   * "openrouter/moonshotai/kimi-k2.7-code": bogus_xyz` and omp with `Unknown ACP
+   * thinking level: bogus_xyz`, each naming the level it would not take.
+   */
+  async setEffort(effort: string): Promise<void> {
+    if (!this.nativeSessionId) {
+      throw new Error(`${this.runtime}: no session to set a reasoning effort on`);
+    }
+
+    if (this.effortOptionId) {
+      const updated = record(
+        await this.call('session/set_config_option', {
+          sessionId: this.nativeSessionId,
+          configId: this.effortOptionId,
+          value: effort,
+        }),
+      );
+      this.applyEffortOptions(list(updated.configOptions));
+      // Published unconditionally rather than on a comparison: the reply is a
+      // freshly built list every time, and one capability event per level the
+      // user chose is a great deal cheaper than a menu that quietly went stale.
+      this.publishEfforts();
+      this.emitEffort();
+      return;
+    }
+
+    if (this.model && this.modelEfforts.has(this.model)) {
+      // Resolving here means grok accepted the call — its reply is only
+      // `{"_meta":{"model":{"Ok":"grok-4.5"}}}`. What actually moves the chip is
+      // the `_x.ai/session_notification` that follows, carrying
+      // `reasoning_effort`, and `handleModelChanged` emits the event off that.
+      // Resolving on the acceptance is still honest: grok validates the level on
+      // this call, so a level it will not run rejects here rather than being
+      // silently dropped on the floor.
+      await this.call('session/set_model', {
+        sessionId: this.nativeSessionId,
+        modelId: this.model,
+        _meta: { reasoningEffort: effort },
+      });
+      return;
+    }
+
+    throw new Error(
+      `${this.runtime} published no reasoning-effort levels${
+        this.model ? ` for ${this.model}` : ''
+      }, so its thinking cannot be changed from here`,
+    );
+  }
+
+  /**
+   * Put a launched-with model into effect, once there is a session to set it on.
+   *
+   * ACP has no launch flag for this either. `session/new` takes a cwd and a
+   * list of MCP servers and nothing else, and the `--model` flag the bridges
+   * pass belongs to these CLIs' interactive modes — nobody has watched
+   * `grok agent stdio` or `kimi acp` read one, and a flag an agent refuses at
+   * spawn takes the whole conversation down, which is precisely what a
+   * remembered preference must never do. So the choice is applied immediately
+   * afterwards, down exactly the road `setModel` takes.
+   *
+   * Without this the choice survived right up to the next process start and
+   * then silently did not. `/clear` restarts the process in place and replays
+   * the options the session was started with; so does relaunching after the
+   * server restarted, or from the unavailable banner. Every turn after one of
+   * those was answered and billed on the profile's model while the composer
+   * went on asserting the chosen one, because the chip renders the override
+   * ahead of the reported model and the per-turn "also ran" hint that would
+   * have exposed it is suppressed while an override exists.
+   *
+   * Best-effort in the same sense as the level below: a model this agent will
+   * not take must not stop the conversation opening, and it is a live
+   * possibility — a model remembered from another runtime's picker is a name
+   * this one has never heard of. The failure is worth a line in the transcript
+   * because it is the one thing the picker cannot show by itself.
+   */
+  private async applyLaunchModel(): Promise<void> {
+    const wanted = this.options.model;
+    if (!wanted || wanted === this.model) return;
+    try {
+      await this.setModel(wanted);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
       this.emit({
-        t: 'block_start',
-        msgId: id,
-        index,
-        block: { kind: 'image', mime: attachment.mime, url: attachment.url, alt: attachment.name },
+        t: 'error',
+        message: `${this.runtime}: could not start on model "${wanted}": ${message}`,
       });
     }
-    this.emit({ t: 'msg_end', msgId: id });
+  }
+
+  /**
+   * Put a launched-with level into effect, once there is a session to put it on.
+   *
+   * ACP has no launch flag for this. `session/new` takes a cwd and a list of MCP
+   * servers and nothing else, and the level lives in a config option — or, on
+   * grok, on a model — that does not exist until the session does. So a
+   * remembered choice is applied immediately afterwards, down exactly the road
+   * `setEffort` takes, and the agent confirms it exactly as it would confirm a
+   * change made mid-conversation.
+   *
+   * Best-effort in the sense the codex adapter's `loadModelList` is: a level
+   * this agent will not take must not stop the conversation opening. It is a
+   * live possibility rather than a theoretical one, because kimi's ladder
+   * depends on the model — a level remembered under one model is refused under
+   * another. Unlike a missing model list this is worth a line in the transcript,
+   * since the user asked for this level and would otherwise watch the chip
+   * silently disagree with the picker.
+   */
+  private async applyLaunchEffort(): Promise<void> {
+    const wanted = this.options.effort;
+    if (!wanted || wanted === this.effort) return;
+    try {
+      await this.setEffort(wanted);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit({
+        t: 'error',
+        message: `${this.runtime}: could not start at reasoning effort "${wanted}": ${message}`,
+      });
+    }
   }
 
   async interrupt(): Promise<void> {
@@ -550,7 +1141,28 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   }
 
   protected handleNotification(method: string, params: Record<string, unknown>): void {
+    if (method === '_x.ai/session_notification') {
+      // Grok's own notification channel, which it runs *alongside* the standard
+      // `session/update` one rather than instead of it. Only the one update kind
+      // anybody has watched arrive on it is read here: routing the whole channel
+      // into the switch below would mean any update grok chose to send down both
+      // pipes got counted twice, and doubling a message chunk is a worse failure
+      // than ignoring an extension nobody has captured.
+      const extension = record(params.update);
+      if (str(extension.sessionUpdate) === 'model_changed') this.handleModelChanged(extension);
+      return;
+    }
     if (method !== 'session/update') return;
+    // Ahead of the switch, because the reading rides on the envelope rather
+    // than on any one kind of update: the first one to carry it in the captured
+    // session is an `available_commands_update` at handshake time, whose own
+    // payload says nothing about usage, and it is the only reason the meter has
+    // a figure before the first prompt. Only grok fills this `_meta` at all —
+    // and not on every update it sends, which is why a missing reading is
+    // skipped rather than read as zero. Across the
+    // 1,386 updates captured from omp, opencode and kimi not one carries the
+    // key — so it can never compete with their `usage_update`.
+    this.emitContextUsed(num(record(params._meta).totalTokens));
     const update = record(params.update);
     const kind = str(update.sessionUpdate);
 
@@ -588,6 +1200,42 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     }
   }
 
+  /**
+   * Grok saying which model, and at which thinking level, it is now running.
+   *
+   * The confirmation half of `setEffort`'s second road, probed live:
+   * `session/set_model` with `{"modelId":"grok-4.5","_meta":{"reasoningEffort":"low"}}`
+   * replies `{"_meta":{"model":{"Ok":"grok-4.5"}}}` and then sends
+   * `_x.ai/session_notification` with
+   * `{"sessionUpdate":"model_changed","model_id":"grok-4.5","reasoning_effort":"low"}`.
+   * The reply says the call was accepted; this says what grok is actually doing,
+   * which is the only thing worth putting on the chip.
+   *
+   * Snake_case here, camelCase in the `session/new` reply that named the same
+   * two things — the same agent, in the same session. Both spellings are read
+   * because a wrong guess would be indistinguishable from grok never answering,
+   * and neither is invented: each was seen on the wire.
+   */
+  private handleModelChanged(update: Record<string, unknown>): void {
+    const modelId = str(update.model_id) || str(update.modelId);
+    if (modelId && modelId !== this.model) {
+      this.model = modelId;
+      // A different model can mean a different ladder, or no ladder — grok's
+      // default `grok-build` has none at all.
+      if (this.applyModelEffort()) this.publishEfforts();
+    }
+
+    const effort = str(update.reasoning_effort) || str(update.reasoningEffort);
+    if (effort) {
+      // Remembered against the model as well as reported, so that a later
+      // switch away and back does not resurrect the level from the handshake
+      // snapshot after the agent has told us it moved on.
+      if (this.model) this.modelEffortLevels.set(this.model, effort);
+      this.effort = effort;
+    }
+    this.emitEffort();
+  }
+
   private handleCommands(update: Record<string, unknown>): void {
     const commands: SlashCommand[] = [];
     for (const raw of list(update.availableCommands)) {
@@ -606,14 +1254,30 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
 
   private handleUsage(update: Record<string, unknown>): void {
     const cost = record(update.cost);
+    // Only USD has a place in the model; another currency reported as dollars
+    // would be a worse answer than no number at all.
+    const costUsd = str(cost.currency) === 'USD' ? num(cost.amount) : undefined;
     this.emit({
       t: 'usage',
       usage: {
-        contextWindow: num(update.size),
+        ...(num(update.size) !== undefined
+          ? {
+              contextWindow: num(update.size),
+              contextWindowSource: 'agent' as const,
+              // Named, exactly as `emitContextWindow` names it and for the same
+              // reason: an unattributed ceiling belongs to no model, so the next
+              // message that says which model is running reads as a switch away
+              // from one the agent never claimed — and the session takes omp's
+              // own figure down and goes asking a catalogue for a worse one.
+              contextWindowModel: this.model,
+            }
+          : {}),
         contextUsed: num(update.used),
-        // Only USD has a place in the model; another currency reported as
-        // dollars would be a worse answer than no number at all.
-        costUsd: str(cost.currency) === 'USD' ? num(cost.amount) : undefined,
+        // Omitted rather than sent as `undefined`. A running total's fields
+        // replace what came before, and the server-side accountant sees the
+        // key before the JSON hop drops it — so a context report carrying no
+        // money used to erase the money already reported.
+        ...(costUsd !== undefined ? { costUsd } : {}),
       },
     });
   }
@@ -843,6 +1507,27 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     return message;
   }
 
+  /**
+   * Whether a chunk of this kind would land in a block that is already open.
+   *
+   * The same three conditions `openMessage` uses to decide it is continuing
+   * rather than starting, plus the block kind — asked here so a whitespace-only
+   * chunk can be told apart from one that would open something (#132).
+   */
+  private continuesOpenBlock(
+    kind: 'text' | 'thinking',
+    role: ChatRole,
+    nativeId: string | undefined,
+  ): boolean {
+    const current = this.current;
+    return Boolean(
+      current
+      && current.role === role
+      && (nativeId === undefined || current.nativeId === nativeId)
+      && current.open?.kind === kind,
+    );
+  }
+
   private appendChunk(
     kind: 'text' | 'thinking',
     role: ChatRole,
@@ -850,6 +1535,18 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     text: string,
   ): void {
     if (!text) return;
+    // A blank reply is not a reply, and it must not be the thing that opens one
+    // (#132). Oh My Pi sends a single space alongside the tool activity on
+    // almost every step; recorded as content, it made each of those steps
+    // "a step that said something" and gave it the bordered row #46 exists to
+    // remove — a model name, a clock, a work counter, and nothing to read.
+    //
+    // Only refuses to *open*. A space arriving inside an already-open text
+    // block is the space between two words, and dropping those glues the
+    // sentence together: "Hello" + " " + "world" would be recorded as
+    // "Helloworld". `thinking` is exempt in full — an empty reasoning block is
+    // a real state that surface handles for itself (#120).
+    if (kind === 'text' && !text.trim() && !this.continuesOpenBlock(kind, role, nativeId)) return;
     const message = this.openMessage(nativeId, role);
     if (message.open && message.open.kind === kind) {
       this.emit({ t: 'block_delta', msgId: message.id, index: message.open.index, text });
@@ -884,8 +1581,21 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   private finishTurn(turnId: string, result: unknown): void {
     const payload = record(result);
     const stopReason = str(payload.stopReason);
-    const usage = turnUsage(record(payload.usage));
+    // Two places, because the agents put it in two places. kimi and omp answer
+    // `session/prompt` with a `usage` field; grok answers with `_meta.usage`,
+    // which is where ACP tells an agent to put anything the spec does not name.
+    // Reading only the first spelling filed every grok turn as free.
+    const meta = record(payload._meta);
+    const usage = turnUsage(record(payload.usage)) ?? turnUsage(record(meta.usage));
+    const models = acpModelUsage(record(payload.usage)) ?? acpModelUsage(record(meta.usage));
     const hadMessage = this.current !== null;
+
+    // The scalars beside `_meta.usage` are not the turn's, they are the last
+    // request's — 16,616 in and 21 out against a turn total of 65,551 and 392 —
+    // so the one figure taken from them is the occupancy, which is the only
+    // thing the last request on its own is the right measure of. Emitted before
+    // the turn closes so it lands inside the job it belongs to.
+    this.emitContextUsed(num(meta.totalTokens));
 
     this.closeMessage(stopReason, usage);
     this.emit({
@@ -895,6 +1605,12 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
       // Counted once. msg_end already folded it into the session total, so
       // repeating it here would double every number the UI shows.
       usage: hadMessage ? undefined : usage,
+      // Not subject to that rule: nothing else in the stream carries the split,
+      // and it is a breakdown of the turn rather than an addition to it.
+      // Grok also announces the same map on a `turn_completed` notification a
+      // beat before this reply — byte-identical, checked against the capture —
+      // and reading both would file every grok turn's round trips twice.
+      ...(models ? { models } : {}),
       durationMs: this.turnStartedAt ? Date.now() - this.turnStartedAt : undefined,
     });
     if (this.turnId === turnId) this.turnId = null;

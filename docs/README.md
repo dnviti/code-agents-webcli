@@ -22,6 +22,7 @@ npx --allow-git=all github:dnviti/code-agents-webcli
 | [Runtimes and profiles](runtimes.md) | The supported agent CLIs, launch profiles, models, capability tiers, the beta WebUI |
 | [Using the terminal](terminal.md) | Sessions, scrollback and history, copy/paste, images, splits, mobile, the PWA |
 | [Usage analytics](analytics.md) | What the usage accounting measures — and that it has no UI today |
+| [Usage accounting](usage-accounting.md) | The durable per-user job history and dashboard: what is recorded, per-agent honesty, the API |
 
 ## Running it properly
 

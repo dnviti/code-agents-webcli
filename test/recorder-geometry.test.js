@@ -83,7 +83,7 @@ describe('session terminal geometry', function () {
         deleteTranscript: () => Promise.resolve(),
       },
       usageReader: {},
-      usageAnalytics: { currentPlan: 'pro', planLimits: {} },
+      usageAnalytics: {},
     });
 
     return { processor, session, sentMessages };

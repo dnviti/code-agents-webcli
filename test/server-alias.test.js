@@ -12,6 +12,7 @@ describe('Server Aliases', function() {
       qwenAlias: 'Tongyi',
       kimiAlias: 'Moonshot',
       ompAlias: 'OhMy',
+      antigravityAlias: 'Gravity',
       noAuth: true // avoid auth middleware complexity
     });
 
@@ -23,11 +24,12 @@ describe('Server Aliases', function() {
     assert.strictEqual(server.aliases.qwen, 'Tongyi');
     assert.strictEqual(server.aliases.kimi, 'Moonshot');
     assert.strictEqual(server.aliases.omp, 'OhMy');
+    assert.strictEqual(server.aliases.antigravity, 'Gravity');
   });
 
   it('should default aliases when not provided', function() {
     const server = new ClaudeCodeWebServer({ noAuth: true });
-    for (const kind of ['claude', 'codex', 'agent', 'pi', 'grok', 'qwen', 'kimi', 'omp']) {
+    for (const kind of ['claude', 'codex', 'agent', 'pi', 'grok', 'qwen', 'kimi', 'omp', 'antigravity']) {
       assert.ok(
         server.aliases[kind] && server.aliases[kind].length > 0,
         `${kind} must have a default alias`,
@@ -39,7 +41,7 @@ describe('Server Aliases', function() {
     const server = new ClaudeCodeWebServer({ noAuth: true });
     // A kind with no bridge fails at start time with a confusing message
     // rather than here, so the mapping is asserted directly.
-    for (const kind of ['claude', 'codex', 'agent', 'pi', 'grok', 'qwen', 'kimi', 'terminal']) {
+    for (const kind of ['claude', 'codex', 'agent', 'pi', 'grok', 'qwen', 'kimi', 'omp', 'antigravity', 'terminal']) {
       assert.ok(server.getRuntimeBridge(kind), `${kind} must resolve to a bridge`);
     }
     assert.strictEqual(server.getRuntimeBridge('nonesuch'), null);
@@ -52,7 +54,7 @@ describe('Server Aliases', function() {
     // starts and simply reports itself as Claude. Asserting the bridges are
     // distinct objects catches a case that was pasted but not re-pointed.
     const server = new ClaudeCodeWebServer({ noAuth: true });
-    const kinds = ['claude', 'codex', 'agent', 'pi', 'grok', 'qwen', 'kimi', 'terminal'];
+    const kinds = ['claude', 'codex', 'agent', 'pi', 'grok', 'qwen', 'kimi', 'omp', 'antigravity', 'terminal'];
     const seen = new Map();
     for (const kind of kinds) {
       const bridge = server.getRuntimeBridge(kind);
@@ -80,6 +82,8 @@ describe('Server Aliases', function() {
     grok: 'Alias-grok',
     qwen: 'Alias-qwen',
     kimi: 'Alias-kimi',
+    omp: 'Alias-omp',
+    antigravity: 'Alias-antigravity',
   };
 
   function serverWithExplicitAliases() {
@@ -92,6 +96,8 @@ describe('Server Aliases', function() {
       grokAlias: EXPLICIT.grok,
       qwenAlias: EXPLICIT.qwen,
       kimiAlias: EXPLICIT.kimi,
+      ompAlias: EXPLICIT.omp,
+      antigravityAlias: EXPLICIT.antigravity,
     });
   }
 

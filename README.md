@@ -1,9 +1,9 @@
 # Code Agents Web CLI
 
-Run Claude Code, Codex, Cursor Agent, pi, Grok, Qwen, Kimi, Oh My Pi and plain
-shells from a browser — on your phone, on a tablet, from another machine on your
-network. One Node process, GitHub sign-in, real terminals, sessions that survive
-a reload.
+Run Claude Code, Codex, Cursor Agent, pi, Grok, Qwen, Kimi, Oh My Pi,
+Antigravity CLI and plain shells from a browser — on your phone, on a tablet,
+from another machine on your network. One Node process, GitHub sign-in, real
+terminals, sessions that survive a reload.
 
 ```bash
 npx --allow-git=all github:dnviti/code-agents-webcli
@@ -101,6 +101,7 @@ The image ships the web server only — the agent CLIs are not bundled. See
 | [Per-user environments](docs/user-environments.md) | Giving every signed-in user their own container, with persistent storage |
 | [Updating](docs/updating.md) | The update banner, who may apply it, which installs can and cannot |
 | [Usage analytics](docs/analytics.md) | What the usage screens read and how the numbers are derived |
+| [Usage accounting](docs/usage-accounting.md) | The durable per-user job history and dashboard: what is recorded, per-agent honesty, the API |
 | [Architecture](docs/architecture.md) | How the pieces fit together |
 | [Troubleshooting](docs/troubleshooting.md) | Symptoms, causes, fixes |
 

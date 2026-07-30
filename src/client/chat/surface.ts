@@ -39,6 +39,13 @@ export function setChatSurface(app: App, info: ChatSurfaceInfo): void {
       runtime: info.runtime ?? previous.runtime,
       runtimeLabel: info.runtimeLabel ?? previous.runtimeLabel,
       workingDir: info.workingDir ?? previous.workingDir,
+      // Always different, so the store always publishes. See `revision` on
+      // ShellChat: every caller of this function is announcing that something
+      // worth redrawing happened, and for the commonest of them — a controller
+      // reporting what the server did with a change — none of the six fields
+      // above move at all. Nothing here is hot: the streaming path goes through
+      // the transcript and never reaches this function.
+      revision: previous.revision + 1,
     },
   });
 }
@@ -64,6 +71,7 @@ export function clearChatSurface(): void {
       runtime: '',
       runtimeLabel: '',
       workingDir: '',
+      revision: shellStore.getSnapshot().chat.revision + 1,
     },
   });
 }

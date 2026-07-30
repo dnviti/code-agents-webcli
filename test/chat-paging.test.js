@@ -74,6 +74,14 @@ describe('paging back through a conversation', function () {
     const c = controller({ firstSeq: 1, replayFrom: 1, cursor: 12 });
     assert.strictEqual(c.transcript.hasMore, false);
 
+    // Opening a conversation asks for its turn index, which is not a page and
+    // is sent however little there is to page (#86).
+    assert.deepStrictEqual(
+      c.sent.map((m) => m.type),
+      ['chat_turn_index_request'],
+    );
+    c.sent.length = 0;
+
     c.loadMore();
     assert.deepStrictEqual(c.sent, [], 'nothing to fetch, so nothing was asked for');
     assert.strictEqual(c.transcript.loadingMore, false);
@@ -83,6 +91,7 @@ describe('paging back through a conversation', function () {
     const c = controller({ firstSeq: 40, replayFrom: 900, cursor: 1200 });
     assert.strictEqual(c.transcript.hasMore, true);
 
+    c.sent.length = 0;
     c.loadMore();
     assert.strictEqual(c.transcript.loadingMore, true);
     assert.strictEqual(c.sent.length, 1);
@@ -148,6 +157,7 @@ describe('paging back through a conversation', function () {
 
   it('does not stack requests while one is in flight', function () {
     const c = controller({ firstSeq: 40, replayFrom: 900, cursor: 1200 });
+    c.sent.length = 0;
     c.loadMore();
     c.loadMore();
     c.loadMore();
@@ -190,5 +200,114 @@ describe('paging back through a conversation', function () {
       ['earlier', 'later'],
     );
     assert.strictEqual(c.transcript.hasMore, false);
+  });
+
+  /**
+   * A conversation recorded before #129 draws one bubble however it is reached.
+   *
+   * The reducer's echo guard needs the app's own user message and the runtime's
+   * copy of it in front of it at the same time. Scrolling back is where they can
+   * arrive apart: each page is folded through a scratch transcript of its own, so
+   * a boundary landing in the few events between them hides each from the other
+   * and both survive. Taken off a real Oh My Pi log — the session wrote its
+   * message at 2485-2487, a `state` event sat at 2488, omp echoed at 2489-2491,
+   * and the client's 200-event walk put the boundary on exactly 2488.
+   */
+  describe('a pre-fix echo split across two pages', function () {
+    const SESSION_TURN = 'turn-71b0d9a2-96e2-48c4-af6a-ab466745cb35';
+    const OWN = 'user-698dc451-1111-2222-3333-444444444444';
+    const PROMPT = 'fai partire l’applicazione e dammi il link';
+
+    function scrolledBack() {
+      const c = controller({ firstSeq: 1, replayFrom: 2688, cursor: 2688, messages: [] });
+
+      // The later page first, exactly as scrolling back asks for them. It holds
+      // the runtime's copy and not the app's, and the server names the turn that
+      // was open where the slice begins.
+      c.loadMore();
+      c.handle({
+        type: 'chat_page',
+        sessionId: 's1',
+        requestId: c.sent[c.sent.length - 1].requestId,
+        firstSeq: 1,
+        from: 2488,
+        openTurnId: SESSION_TURN,
+        events: [
+          { t: 'msg_start', seq: 2489, ts: 9, id: 'omp-user-11', role: 'user', turnId: 'omp-turn-11' },
+          { t: 'block_start', seq: 2490, ts: 9, msgId: 'omp-user-11', index: 0, block: { kind: 'text', text: PROMPT } },
+          { t: 'msg_end', seq: 2491, ts: 9, msgId: 'omp-user-11' },
+          { t: 'msg_start', seq: 2492, ts: 9, id: 'omp-assistant-12', role: 'assistant', turnId: 'omp-turn-11' },
+          { t: 'block_start', seq: 2493, ts: 9, msgId: 'omp-assistant-12', index: 0, block: { kind: 'text', text: 'ecco il link' } },
+          { t: 'msg_end', seq: 2494, ts: 9, msgId: 'omp-assistant-12' },
+        ],
+      });
+
+      // Then the page above it, which is where the app's own message lives.
+      c.loadMore();
+      c.handle({
+        type: 'chat_page',
+        sessionId: 's1',
+        requestId: c.sent[c.sent.length - 1].requestId,
+        firstSeq: 1,
+        from: 2288,
+        openTurnId: SESSION_TURN,
+        events: [
+          { t: 'msg_start', seq: 2485, ts: 8, id: OWN, role: 'user', turnId: SESSION_TURN },
+          { t: 'block_start', seq: 2486, ts: 8, msgId: OWN, index: 0, block: { kind: 'text', text: PROMPT } },
+          { t: 'msg_end', seq: 2487, ts: 8, msgId: OWN },
+        ],
+      });
+      return c;
+    }
+
+    it('draws the prompt once, not twice, after scrolling back to it', function () {
+      const said = scrolledBack()
+        .transcript.messages.filter((m) => m.role === 'user')
+        .map((m) => m.blocks.map((b) => b.text).join(''));
+      assert.deepStrictEqual(said, [PROMPT], 'the runtime’s copy is folded away, wherever the page boundary fell');
+    });
+
+    it('keeps the app’s own message and not the runtime’s', function () {
+      // Which of the two survives matters: the app's is the one the rest of the
+      // conversation is filed under, and the one a resend would quote.
+      const ids = scrolledBack()
+        .transcript.messages.filter((m) => m.role === 'user')
+        .map((m) => m.id);
+      assert.deepStrictEqual(ids, [OWN]);
+    });
+
+    it('leaves the answer that followed it alone', function () {
+      assert.deepStrictEqual(
+        scrolledBack().transcript.messages.map((m) => m.id),
+        [OWN, 'omp-assistant-12'],
+      );
+    });
+
+    it('leaves a page whose user message this app did not write alone', function () {
+      // The rule is "this turn already holds the app's own message", not "drop
+      // anything unfamiliar". A log with no session-minted message in the turn —
+      // anything recorded before the app minted them that way — keeps what it has
+      // rather than losing the only prompt it holds.
+      const c = controller({ firstSeq: 1, replayFrom: 2688, cursor: 2688, messages: [] });
+      c.loadMore();
+      c.handle({
+        type: 'chat_page',
+        sessionId: 's1',
+        requestId: c.sent[c.sent.length - 1].requestId,
+        firstSeq: 1,
+        from: 2488,
+        openTurnId: 'omp-turn-11',
+        events: [
+          { t: 'msg_start', seq: 2489, ts: 9, id: 'omp-user-11', role: 'user', turnId: 'omp-turn-11' },
+          { t: 'block_start', seq: 2490, ts: 9, msgId: 'omp-user-11', index: 0, block: { kind: 'text', text: PROMPT } },
+          { t: 'msg_end', seq: 2491, ts: 9, msgId: 'omp-user-11' },
+        ],
+      });
+      assert.deepStrictEqual(
+        c.transcript.messages.map((m) => m.id),
+        ['omp-user-11'],
+        'the only prompt in the page is still the prompt',
+      );
+    });
   });
 });

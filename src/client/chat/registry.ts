@@ -1,4 +1,5 @@
 import { ChatController } from './controller.js';
+import type { ChatEvent } from '../../shared/chat-events.js';
 
 /**
  * Every chat conversation this browser is watching, one controller each.
@@ -21,24 +22,33 @@ export interface ChatRegistryOptions {
    * "the visible tab moved" from "a background agent said something".
    */
   onChange: (sessionId: string) => void;
+  /**
+   * One event, as the conversation actually applied it.
+   *
+   * Separate from `onChange` because the two answer different questions.
+   * `onChange` says the surface should redraw and carries no reason, which is
+   * all a renderer needs; this carries what happened, which is what deciding
+   * whether to interrupt somebody needs — a turn that *ended* is a different
+   * fact from a transcript that is now one message longer.
+   *
+   * Only called for events the transcript accepted. A reconnect replays what
+   * the browser already holds, and re-announcing a turn that finished ten
+   * minutes ago is exactly the sort of notification that gets the feature
+   * switched off.
+   */
+  onEvent?: (sessionId: string, event: ChatEvent) => void;
 }
 
 /**
  * Messages this registry owns. Anything else belongs to the terminal path.
  *
- * A type missing from this set is not merely unhandled — it is handed to the
- * terminal's own handler, which does not know what a chat message is. Every
- * `case` in ChatController.handle needs an entry here.
+ * Taken from the controller rather than restated here. A type missing from it
+ * is not merely unhandled — it is handed to the terminal's own handler, which
+ * does not know what a chat message is, and it disappears without a word. This
+ * used to be a second list kept by hand, and it fell three types behind the
+ * switch it was meant to mirror.
  */
-const CHAT_MESSAGE_TYPES = new Set([
-  'chat_snapshot',
-  'chat_started',
-  'chat_event',
-  'chat_queue',
-  'chat_page',
-  'chat_page_failed',
-  'chat_unavailable',
-]);
+const CHAT_MESSAGE_TYPES = ChatController.MESSAGE_TYPES;
 
 export class ChatRegistry {
   private readonly controllers = new Map<string, ChatController>();
@@ -78,6 +88,7 @@ export class ChatRegistry {
     const controller = new ChatController(sessionId, {
       send: this.options.send,
       onChange: () => this.options.onChange(sessionId),
+      onEvent: (event) => this.options.onEvent?.(sessionId, event),
     });
     this.controllers.set(sessionId, controller);
     return controller;

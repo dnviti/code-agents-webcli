@@ -1,8 +1,23 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { SessionRecord } from '../types.js';
-import { ChatEvent, ChatSnapshot, NO_CHAT_CAPABILITIES } from '../../shared/chat-events.js';
-import { applyAll, createTranscript } from '../../shared/chat-reducer.js';
+import {
+  AccountLimits,
+  ChatCapabilities,
+  ChatEvent,
+  ChatSnapshot,
+  ChatTurnIndexEntry,
+  ChatUsage,
+  NO_CHAT_CAPABILITIES,
+} from '../../shared/chat-events.js';
+import {
+  applyChatEvent,
+  createTranscript,
+  foldCapabilities,
+  foldSessionUsage,
+} from '../../shared/chat-reducer.js';
+import { TurnOutcome, turnOutcomeOf } from '../../shared/turn-outcome.js';
+import { TurnBoundary, openTurnAfter, openTurnBefore } from '../../shared/turn-boundaries.js';
 
 /**
  * Append-only store of a chat session's normalized event log.
@@ -31,8 +46,12 @@ import { applyAll, createTranscript } from '../../shared/chat-reducer.js';
 
 const MAGIC = 0x43414348; // "CACH" - distinct from history-store's "CAWH" so the two
 // index formats can never be cross-read by mistake if a path is ever confused.
-const FORMAT_VERSION = 1;
-const HEADER_BYTES = 16;
+const FORMAT_VERSION = 2;
+// Version 2 widened the header by one 64-bit field: how many turns the log has
+// dropped, which is the only thing a trimmed conversation cannot work out for
+// itself. An index written by version 1 fails the check and is rebuilt from the
+// log, which is a path this file already has and already exercises.
+const HEADER_BYTES = 24;
 const ENTRY_BYTES = 4;
 
 /** uint32 offsets cap the log; trimming keeps it far below this. */
@@ -43,6 +62,15 @@ const TRIM_CHUNK_BYTES = 1024 * 1024;
 
 /** Same character class history-store enforces, plus the same two named exceptions. */
 const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * Third file, written only for a conversation branched from another: the
+ * history its agent is to be handed when the first message goes.
+ *
+ * Not a log record, deliberately. The log is what was said in this
+ * conversation, and this is a message that has not been sent yet.
+ */
+const CONTEXT_SUFFIX = '.ctx';
 
 /**
  * How a conversation's opening is read: in chunks, up to a ceiling.
@@ -74,6 +102,11 @@ const MESSAGE_SCOPED: ReadonlySet<string> = new Set([
   'block_delta',
   'block_end',
   'msg_end',
+  // A workflow failing writes a message of its own (#140), which makes it one
+  // of these and not a session-level fact. Left out, a failure from hours
+  // earlier replayed into every rejoin and was redrawn at the top of the
+  // window, in a turn of its own, above the conversation it happened inside.
+  'workflow_failed',
 ]);
 
 export interface ChatStoreOptions {
@@ -105,12 +138,51 @@ export interface ChatStats {
 export interface ChatPage extends ChatStats {
   events: ChatEvent[];
   /**
+   * The turn open where this page starts, or null when it starts between two.
+   *
+   * A page is a slice out of the middle of the log and the client replays it
+   * through the reducer, which has no way to know what was open before the
+   * first event it is handed. Without this, every page that begins inside a
+   * turn files its messages under the runtime's own id for that turn — a row
+   * in the index with no prompt to name it by, and no match against the
+   * recorded turn it is half of.
+   */
+  openTurnId?: string | null;
+  /**
    * Lowest seq this page covers, after clamping the request to what is on
    * disk. The client folds it into its own paging floor; without it a client
    * cannot tell a page that reached the head of the log from one that did not,
    * and keeps asking for the same range.
    */
   from: number;
+}
+
+/**
+ * One turn as the log has it. The wire shape, so the server cannot describe a
+ * turn one way and the browser read it another.
+ */
+export type PersistedTurn = ChatTurnIndexEntry;
+
+export interface ChatTurnIndex {
+  turns: PersistedTurn[];
+  /** Lowest seq still on disk, so a caller can explain a list that starts late. */
+  firstSeq: number;
+  /** False when the head of the log has been trimmed and turns are missing. */
+  complete: boolean;
+}
+
+/** One conversation cut at a turn, and what the whole of it has spent. */
+export interface TurnCut {
+  /** Every event from the head of the log through the end of that turn. */
+  events: ChatEvent[];
+  turn: PersistedTurn;
+  /** False when the head of the log was trimmed, so the cut starts late. */
+  complete: boolean;
+  /**
+   * The session's own running usage, which is where the model's context window
+   * is recorded — the one figure a branch has to be measured against.
+   */
+  usage: ChatUsage;
 }
 
 export interface ChatSnapshotOptions {
@@ -135,15 +207,75 @@ interface SessionState {
   firstSeq: number;
   count: number;
   logSize: number;
+  /**
+   * Turns that were trimmed off the head, so the ones left keep their numbers.
+   *
+   * Persisted in the index header because it is the one fact about a
+   * conversation that its surviving log cannot reconstruct. Zero for a
+   * conversation that has never been trimmed, and reset by a `/clear`, which
+   * genuinely does start the numbering again.
+   */
+  turnsDropped: number;
+  /**
+   * What the whole conversation has spent, kept beside the log's geometry.
+   *
+   * Undefined means "not read yet", not "nothing": the first snapshot that
+   * needs it scans the log once and every append after that folds itself in,
+   * so a conversation costs one pass however many times it is rejoined.
+   */
+  usage?: ChatUsage;
+  /** Highest seq already folded into `usage`. */
+  usageSeq: number;
+  /**
+   * Every point at which the open turn changed, kept beside the log's geometry
+   * for the same reason `usage` is: it is read from the whole log, and a
+   * windowed read must not pay for that more than once per conversation.
+   *
+   * Undefined means "not read yet". A handful of rows per turn — it is the
+   * turn boundaries, not the turns' contents.
+   */
+  turnBoundaries?: TurnBoundary[];
+  /** Highest seq already folded into `turnBoundaries`. */
+  turnBoundarySeq: number;
+  /**
+   * What the runtime said it could do, kept here for the same reason `usage`
+   * is: it is a fact about the conversation, and it is recorded at the top of
+   * one rather than anywhere near its end.
+   *
+   * Undefined means "not read yet".
+   */
+  capabilities?: ChatCapabilities;
+  /**
+   * The last account reading the provider stated, from the same full pass.
+   *
+   * Here for exactly the reason `capabilities` is: Claude states its rate-limit
+   * window on the first turn and then only when it changes, so on a long
+   * conversation the statement sits hundreds of events above the replayed tail
+   * (#137). Null once read and nothing was ever said.
+   */
+  limits?: AccountLimits | null;
+  /** Highest seq already folded into `capabilities` and `limits`. */
+  capabilitySeq: number;
 }
 
 export interface ChatStoreLike {
   append(session: ChatSessionRef, events: ChatEvent[]): void;
   stat(session: ChatSessionRef): Promise<ChatStats>;
   read(session: ChatSessionRef, fromSeq: number, count: number): Promise<ChatPage>;
+  turnIndex(session: ChatSessionRef): Promise<ChatTurnIndex>;
   snapshot(session: ChatSessionRef, options?: ChatSnapshotOptions): Promise<ChatSnapshot>;
+  /** Drop everything before `seq`, so a cleared conversation cannot be paged back into. */
+  truncateBefore(session: ChatSessionRef, seq: number): Promise<void>;
   listSessions(ownerUserId: number): Promise<string[]>;
   deleteChat(session: ChatSessionRef): Promise<void>;
+  /**
+   * The two halves of a branch's opening context, optional because almost no
+   * conversation has one and every hand-built store in the tests predates it.
+   * A session that finds neither method simply opens with nothing carried,
+   * which is what every conversation did before branching existed.
+   */
+  openingContext?(session: ChatSessionRef): Promise<string | null>;
+  clearOpeningContext?(session: ChatSessionRef): Promise<void>;
 }
 
 export class ChatStore implements ChatStoreLike {
@@ -157,6 +289,21 @@ export class ChatStore implements ChatStoreLike {
 
   private readonly states = new Map<string, SessionState>();
   private readonly queues = new Map<string, Promise<unknown>>();
+  /**
+   * Openings already read, so listing every conversation is not a scan per row.
+   *
+   * A log is append-only, so once both facts in a `ChatDescription` have been
+   * found they cannot change: the first `session` event stays first and the first
+   * user message stays first however much is written after them. That makes this
+   * a cache with no staleness to manage in the ordinary case — and it is the
+   * difference between a conversation list costing one bounded read per
+   * conversation every time it opens and costing it once per process.
+   *
+   * Only a *settled* answer is kept — see `describe` — and the two operations
+   * that genuinely rewrite the head of a log, a `/clear` and a retention trim,
+   * both drop the entry.
+   */
+  private readonly descriptions = new Map<string, ChatDescription>();
 
   constructor(options: ChatStoreOptions) {
     this.storageDir = path.resolve(options.storageDir);
@@ -217,10 +364,24 @@ export class ChatStore implements ChatStoreLike {
    * a column of "Session 25/07/2026, 21:35" tells a person nothing about which
    * one they were looking for, and the question they asked tells them
    * immediately.
+   *
+   * Queued like every other read of a log, and it has to be for two reasons that
+   * only show up under load. `append` is fire-and-forget by contract, so an
+   * unqueued read can land between "the session emitted the opening message" and
+   * "the opening message is on disk" — and report the conversation as having no
+   * opening at all. And a trim rewrites the head through a rename: it drops the
+   * remembered description first, so an unqueued reader could slip in behind that
+   * and re-remember the head that is about to be replaced.
    */
   async describe(session: ChatSessionRef): Promise<ChatDescription> {
-    const found: ChatDescription = { nativeSessionId: null, firstMessage: null };
     const base = this.basePath(session);
+    return this.enqueue(base, () => this.describeNow(base));
+  }
+
+  private async describeNow(base: string): Promise<ChatDescription> {
+    const found: ChatDescription = { nativeSessionId: null, firstMessage: null };
+    const cached = this.descriptions.get(base);
+    if (cached) return cached;
     const handle = await fs.promises.open(`${base}.jsonl`, 'r').catch(() => null);
     if (!handle) return found;
 
@@ -275,6 +436,15 @@ export class ChatStore implements ChatStoreLike {
         }
       }
 
+      // Kept only when nothing more could change the answer: either both facts
+      // are in hand, or the scan reached its ceiling and a longer read is not
+      // going to be attempted next time either. The remaining case — the whole
+      // log was read and one of them is simply not in it yet — is a conversation
+      // that has barely started, and the very next event may supply it.
+      if ((found.nativeSessionId && found.firstMessage) || offset >= HEAD_SCAN_LIMIT) {
+        this.descriptions.set(base, found);
+      }
+
       return found;
     } finally {
       await handle.close().catch(() => undefined);
@@ -301,7 +471,15 @@ export class ChatStore implements ChatStoreLike {
     // 1 rather than 0: chat-reducer treats cursor 0 as "nothing applied yet",
     // so an empty store reporting firstSeq 1 / cursor 0 reads the same way a
     // freshly created transcript does.
-    const state: SessionState = { firstSeq: 1, count: 0, logSize: 0 };
+    const state: SessionState = {
+      firstSeq: 1,
+      count: 0,
+      logSize: 0,
+      turnsDropped: 0,
+      usageSeq: 0,
+      turnBoundarySeq: 0,
+      capabilitySeq: 0,
+    };
 
     // Sized before the index is read, and unconditionally: it is what tells
     // repairIndex there is a log to rebuild from when the index cannot be
@@ -320,6 +498,7 @@ export class ChatStore implements ChatStoreLike {
           await handle.read(header, 0, HEADER_BYTES, 0);
           if (header.readUInt32BE(0) === MAGIC && header.readUInt16BE(4) === FORMAT_VERSION) {
             state.firstSeq = Number(header.readBigUInt64BE(8));
+            state.turnsDropped = Number(header.readBigUInt64BE(16));
             state.count = Math.floor((size - HEADER_BYTES) / ENTRY_BYTES);
             usable = true;
           }
@@ -343,7 +522,12 @@ export class ChatStore implements ChatStoreLike {
       console.warn(`Chat index ${base}.idx is unreadable; rebuilding it from the log.`);
       state.firstSeq = (await firstSeqInLog(base)) ?? 1;
       state.count = 0;
-      await fs.promises.writeFile(`${base}.idx`, headerBuffer(state.firstSeq));
+      // Rebuilt from a log whose head may be long gone: how many turns went
+      // with it is not in the log, so the count starts again from what is left.
+      // The numbers a rebuilt conversation shows are its own, and they are at
+      // least self-consistent from here on.
+      state.turnsDropped = 0;
+      await fs.promises.writeFile(`${base}.idx`, headerBuffer(state.firstSeq, state.turnsDropped));
     }
 
     await this.repairIndex(base, state);
@@ -522,13 +706,103 @@ export class ChatStore implements ChatStoreLike {
     state.count += events.length;
     state.logSize = offset;
 
+    // Kept current here so the running total never has to be re-scanned: the
+    // events are already in hand, and the alternative is reading a
+    // tens-of-megabytes log again on every rejoin. Only extended when it has
+    // been read at all — before that there is nothing to keep current, and the
+    // first snapshot that asks will scan.
+    if (state.usage) {
+      for (const event of events) {
+        if (event.seq <= state.usageSeq) continue;
+        state.usage = foldSessionUsage(state.usage, event);
+        state.usageSeq = event.seq;
+      }
+    }
+
+    // The turn boundaries the same way, and for the same reason: they are read
+    // from the whole log, and a browser rejoining mid-turn asks for them on
+    // every snapshot.
+    const boundaries = state.turnBoundaries;
+    if (boundaries) {
+      let open = boundaries.length > 0 ? boundaries[boundaries.length - 1].turnId : null;
+      // The last turn the conversation had, which is where an agent speaking
+      // again with nothing asked of it goes back to.
+      let previous: string | null = null;
+      for (let i = boundaries.length - 1; i >= 0; i--) {
+        if (boundaries[i].turnId !== null) {
+          previous = boundaries[i].turnId;
+          break;
+        }
+      }
+      for (const event of events) {
+        if (event.seq <= state.turnBoundarySeq) continue;
+        const next = openTurnAfter(event, open, previous);
+        if (next !== open) {
+          boundaries.push({ seq: event.seq, turnId: next });
+          open = next;
+        }
+        // See `turnBoundaries`: a `/clear` leaves nothing to carry on from.
+        previous = event.t === 'marker' && event.kind === 'cleared' ? null : next ?? previous;
+        state.turnBoundarySeq = event.seq;
+      }
+    }
+
+    // And what the runtime says it can do, on the same terms: a relaunch
+    // introduces itself again part way down the log, and the alternative is
+    // re-reading everything above it to learn what it just said.
+    if (state.capabilities) {
+      for (const event of events) {
+        if (event.seq <= state.capabilitySeq) continue;
+        state.capabilities = foldCapabilities(state.capabilities, event);
+        if (event.t === 'limits') state.limits = event.limits;
+        state.capabilitySeq = event.seq;
+      }
+    }
+
     if (state.count > this.maxEvents || state.logSize > MAX_LOG_BYTES / 2) {
       await this.trimHead(base, state);
     }
   }
 
+  /** Drop the oldest `trimChunkEvents` events, once the log is over its cap. */
+  private async trimHead(base: string, state: SessionState): Promise<void> {
+    await this.dropOldest(base, state, this.trimChunkEvents);
+  }
+
   /**
-   * Drop the oldest `trimChunkEvents` events by rewriting both files.
+   * Everything before `seq` is gone: the log now begins there.
+   *
+   * What `/clear` means on disk. Emptying the window was never enough — the
+   * events were still on the log, so a reload replayed the tail from before
+   * the clear and the conversation the user had just ended came back, one
+   * scrolled page at a time. Nothing downstream needed teaching about the
+   * boundary, because everything downstream — the replay, the pages, the turn
+   * index, the conversation's own description — is read from the log, and the
+   * head is no longer there to be read.
+   *
+   * Irreversible, deliberately: "start a new conversation" is a promise about
+   * what is left behind, not a view over it. What each turn cost is recorded
+   * separately, in the usage store, and is not touched here.
+   */
+  async truncateBefore(session: ChatSessionRef, seq: number): Promise<void> {
+    const base = this.basePath(session);
+    await this.enqueue(base, async () => {
+      const state = await this.loadState(base);
+      await this.dropOldest(base, state, seq - state.firstSeq);
+      // What the runtime said it could do belongs to the conversation that has
+      // just been dropped, and this process would go on answering with it: the
+      // cache is keyed on the log having grown, and a truncation leaves the
+      // cursor where it was. A retention trim is the other caller of
+      // `dropOldest` and does not want this — nothing about the runtime changed
+      // there — so it is forgotten here rather than down inside the drop.
+      state.capabilities = undefined;
+      state.limits = undefined;
+      state.capabilitySeq = 0;
+    });
+  }
+
+  /**
+   * Drop the oldest `count` events by rewriting both files.
    *
    * The surviving log is copied in fixed-size chunks rather than read into one
    * buffer: at the retention cap that buffer would be tens of megabytes, so a
@@ -536,11 +810,25 @@ export class ChatStore implements ChatStoreLike {
    * uses. Both files are replaced via rename, so a crash mid-trim leaves the
    * previous consistent pair in place.
    */
-  private async trimHead(base: string, state: SessionState): Promise<void> {
-    const drop = Math.min(this.trimChunkEvents, state.count);
+  private async dropOldest(base: string, state: SessionState, count: number): Promise<void> {
+    const drop = Math.min(count, state.count);
     if (drop <= 0) {
       return;
     }
+
+    // The head of the log is about to be a different head. This is the one thing
+    // that invalidates a description — the opening message may be among the
+    // events going away — and it covers both callers: a `/clear`, where the
+    // conversation genuinely opens somewhere else now, and a retention trim,
+    // where the opening is simply gone.
+    this.descriptions.delete(base);
+
+    // Counted before the log loses them, because afterwards nothing can. A turn
+    // is numbered by how many came before it in the conversation, and reading
+    // that off the position of a row in what survives renumbers every trimmed
+    // conversation from 1 — so the index, the header's count and the spend
+    // record disagree about the same turn (#86).
+    const dropped = state.turnsDropped + (await this.turnsBelow(base, state, state.firstSeq + drop));
 
     const idxHandle = await fs.promises.open(`${base}.idx`, 'r');
     let cutOffset = 0;
@@ -568,14 +856,32 @@ export class ChatStore implements ChatStoreLike {
 
     await fs.promises.writeFile(
       `${base}.idx.tmp`,
-      Buffer.concat([headerBuffer(state.firstSeq + drop), remaining]),
+      Buffer.concat([headerBuffer(state.firstSeq + drop, dropped), remaining]),
     );
     await fs.promises.rename(`${base}.jsonl.tmp`, `${base}.jsonl`);
     await fs.promises.rename(`${base}.idx.tmp`, `${base}.idx`);
 
     state.firstSeq += drop;
     state.count -= drop;
+    state.turnsDropped = dropped;
     state.logSize = keptBytes;
+  }
+
+  /**
+   * How many turns opened below `seq`.
+   *
+   * The boundaries are already tracked for the turn index, so this is a read of
+   * something the store knows rather than another pass over the log — and it is
+   * only ever asked at a trim, which is rare and already rewriting two files.
+   * A boundary with no turn id is the gap between two turns, not a turn.
+   */
+  private async turnsBelow(base: string, state: SessionState, seq: number): Promise<number> {
+    const stats: ChatStats = {
+      firstSeq: state.firstSeq,
+      cursor: state.count > 0 ? state.firstSeq + state.count - 1 : 0,
+    };
+    const boundaries = await this.turnBoundaries(base, state, stats);
+    return boundaries.filter((boundary) => boundary.seq < seq && boundary.turnId !== null).length;
   }
 
   private async copyLogTail(base: string, from: number, length: number): Promise<void> {
@@ -611,6 +917,277 @@ export class ChatStore implements ChatStoreLike {
     return this.enqueue(base, async () => this.statsOf(await this.loadState(base)));
   }
 
+  /**
+   * Every turn of a conversation, from the first one still on disk.
+   *
+   * The index beside a conversation used to be built from whatever the browser
+   * was holding, so a long conversation's index quietly started part way
+   * through — the very case where an index is the only practical way to
+   * navigate (#86). It is a property of the recorded conversation, so it is read
+   * from the recorded conversation.
+   *
+   * A full scan of the log, deliberately: the whole point is that it does not
+   * stop at a window. It is cheap because it reads one field per line and keeps
+   * one small row per turn, and it is asked for once when a conversation is
+   * opened rather than as anybody scrolls.
+   *
+   * "From the first one still on disk" is the one limit worth stating plainly:
+   * the head of a very long log is trimmed, and turns that were trimmed away
+   * cannot be listed. `firstSeq` is returned so a caller can say so rather than
+   * present a partial list as a whole one.
+   */
+  async turnIndex(session: ChatSessionRef): Promise<ChatTurnIndex> {
+    const base = this.basePath(session);
+    return this.enqueue(base, async () => {
+      const state = await this.loadState(base);
+      const stats = this.statsOf(state);
+      const turns: PersistedTurn[] = [];
+      let openTurnId: string | null = null;
+
+      // The same grouping rule the browser applies to the messages it holds:
+      // consecutive events sharing a turn id are one turn, and a turn id that
+      // comes back after another has intervened is a second one. Two
+      // implementations of that rule would be two answers to "how many turns",
+      // which is the disagreement this whole change removes.
+      //
+      // Against the last turn in the list rather than against the one currently
+      // open, because those differ in the case this exists for: an agent that
+      // picks its own work back up after ending a turn — a background job it
+      // was waiting on finishing — has no turn open and is still in the turn it
+      // was working on. Comparing against `openTurnId` alone filed that as a
+      // second row carrying the same id.
+      const openTurn = (turnId: string, ts: number, id: string, seq: number): PersistedTurn => {
+        const current = turns[turns.length - 1];
+        if (current && current.turnId === turnId) {
+          openTurnId = turnId;
+          return current;
+        }
+        const turn: PersistedTurn = {
+          id,
+          turnId,
+          index: numberFrom + turns.length + 1,
+          label: null,
+          startedAt: ts,
+          startSeq: seq,
+          outcome: null,
+        };
+        turns.push(turn);
+        openTurnId = turnId;
+        return turn;
+      };
+
+      let pending: { turn: PersistedTurn; msgId: string } | null = null;
+      // Set once a `/clear` has cut the log: what is left starts at turn 1 by
+      // construction, so nothing is missing however far back the log was
+      // trimmed.
+      let cleared = false;
+      // What a turn is numbered from. Trimming the head does not renumber what
+      // is left; a `/clear` does, because it genuinely starts a conversation
+      // over in the same tab and nothing above it is reachable any more.
+      let numberFrom = state.turnsDropped;
+      await this.scanLog(base, state, (event) => {
+        switch (event.t) {
+          case 'msg_start': {
+            // Everything said while a turn is open belongs to it, whatever id
+            // it arrived with — the reducer's rule, word for word, because a
+            // second reading of it is a second answer.
+            //
+            // Applied here rather than only in the browser, the alignment
+            // reaches every conversation already on disk: the index is read
+            // from the log each time it is asked for, so an old conversation is
+            // re-read under the settled rule rather than left as it was filed.
+            // Nothing has to be migrated, and nothing was recorded wrongly —
+            // the events were always right, it was the reading of them that
+            // split a request from its answer.
+            const turnId = openTurnAfter(
+              event,
+              openTurnId,
+              turns[turns.length - 1]?.turnId,
+            ) as string;
+            const turn = openTurn(turnId, event.ts, event.id, event.seq);
+            // Only the user's own words may name a turn, and only the first of
+            // them. Anything else is the model titling the reader's question
+            // for them — see `labelFor` on the browser's side.
+            if (event.role === 'user' && turn.label === null) {
+              pending = { turn, msgId: event.id };
+            }
+            return;
+          }
+          case 'block_start': {
+            if (!pending || pending.msgId !== event.msgId) return;
+            if (event.block.kind !== 'text') return;
+            const line = event.block.text.trim().split('\n')[0].trim();
+            if (!line) return;
+            pending.turn.label = line;
+            pending = null;
+            return;
+          }
+          case 'marker': {
+            // `/clear` starts a new conversation in the same tab, and the log
+            // is append-only — everything before this belongs to the one the
+            // user left. The transcript stops paging back here, so the index
+            // has to start again here too, or it would list forty turns a
+            // browser can never be shown (#86, #43).
+            if (event.kind === 'cleared') {
+              turns.length = 0;
+              openTurnId = null;
+              pending = null;
+              cleared = true;
+              numberFrom = 0;
+            }
+            return;
+          }
+          case 'state': {
+            // A runtime that died did not end its turn and nothing else will,
+            // so whatever comes next is a new one. Again the reducer's rule: a
+            // turn left open here would swallow the first thing the user typed
+            // after the crash.
+            openTurnId = openTurnAfter(event, openTurnId);
+            return;
+          }
+          case 'turn_end': {
+            // Against whatever is open, not against the event's own id: a
+            // runtime ends the turn under its own name for it, which is never
+            // the name this app opened it by.
+            // The runtime letting go of work that was interrupted to redirect
+            // it ends nothing: the turn is running again, on the correction.
+            if (event.stale) return;
+            const turn = openTurnId === null ? null : turns[turns.length - 1];
+            if (turn) turn.outcome = turnOutcomeOf(event.stopReason);
+            // Whatever comes next belongs to a turn that has not started yet —
+            // unless it is the agent picking this same work back up, which is
+            // not something anybody asked for and so not a turn. See
+            // `openTurnAfter`.
+            openTurnId = null;
+            return;
+          }
+          default:
+            return;
+        }
+      });
+
+      return { turns, firstSeq: stats.firstSeq, complete: cleared || stats.firstSeq <= 1 };
+    });
+  }
+
+  /**
+   * The conversation as far as one turn, inclusive.
+   *
+   * Where a branch is cut. "Up to and including that turn" is answered from the
+   * turn index rather than by matching ids against events, because the index is
+   * already this store's answer to which turn a message belongs to — a second
+   * reading of that here would be a second answer, and the two would disagree
+   * about exactly the case the index exists for: a turn the agent carried on
+   * with after ending it. So the cut is the seq the *next* turn opens at, and
+   * everything before that belongs to this one however it is filed.
+   *
+   * Two passes over the log, which is a price worth paying once for an action
+   * somebody asked for by name. The slice is held whole because it is about to
+   * be written whole into another log; the store's own retention cap is what
+   * bounds it, and a conversation past that cap has already lost its head.
+   *
+   * Null when no such turn is on disk — a turn from before the log was trimmed,
+   * or an id from another conversation.
+   */
+  async turnCut(session: ChatSessionRef, turnId: string): Promise<TurnCut | null> {
+    const index = await this.turnIndex(session);
+    const at = index.turns.findIndex((turn) => turn.turnId === turnId);
+    if (at < 0) return null;
+
+    const base = this.basePath(session);
+    return this.enqueue(base, async () => {
+      const state = await this.loadState(base);
+      const stats = this.statsOf(state);
+      // The turn after this one opens where this one's copy has to stop. Absent
+      // — this is the newest turn — means everything still being said belongs
+      // to it, so the cut runs to the end of the log.
+      const next = index.turns[at + 1]?.startSeq;
+      const end = next === undefined ? stats.cursor + 1 : next;
+      const events = await this.readSlice(base, state, state.firstSeq, end);
+      return {
+        events,
+        turn: index.turns[at],
+        complete: index.complete,
+        usage: await this.sessionUsage(base, state, stats),
+      };
+    });
+  }
+
+  /**
+   * Keep the context a conversation is to open with, beside its log.
+   *
+   * On disk rather than in memory because the promise it carries outlives this
+   * process: a branch is created, the browser opens its tab, and the first
+   * message may not be typed for an hour. Held only until that message goes —
+   * see `clearOpeningContext` — so a conversation that has started is a
+   * conversation with nothing left here.
+   */
+  async setOpeningContext(session: ChatSessionRef, context: string): Promise<void> {
+    const base = this.basePath(session);
+    await fs.promises.mkdir(path.dirname(base), { recursive: true });
+    await fs.promises.writeFile(`${base}${CONTEXT_SUFFIX}`, context, 'utf8');
+  }
+
+  /** The context this conversation opens with, or null once it has been used. */
+  async openingContext(session: ChatSessionRef): Promise<string | null> {
+    try {
+      const text = await fs.promises.readFile(`${this.basePath(session)}${CONTEXT_SUFFIX}`, 'utf8');
+      return text || null;
+    } catch {
+      // The ordinary case by a wide margin: every conversation that was not
+      // branched has nothing here, and that is not a failure to report.
+      return null;
+    }
+  }
+
+  /** It has been handed over; there is no second first turn. */
+  async clearOpeningContext(session: ChatSessionRef): Promise<void> {
+    await fs.promises
+      .rm(`${this.basePath(session)}${CONTEXT_SUFFIX}`, { force: true })
+      .catch(() => undefined);
+  }
+
+  /**
+   * Walk every event in the log, oldest first, one line at a time.
+   *
+   * Streamed rather than read whole: a long conversation's log is tens of
+   * megabytes, and the caller here keeps one small row per turn out of it. The
+   * point of this method is that it never holds the log in memory.
+   */
+  private async scanLog(
+    base: string,
+    state: SessionState,
+    visit: (event: ChatEvent) => void,
+  ): Promise<void> {
+    let handle: fs.promises.FileHandle;
+    try {
+      handle = await fs.promises.open(`${base}.jsonl`, 'r');
+    } catch {
+      // No log is an empty conversation, not a failure.
+      return;
+    }
+    try {
+      const CHUNK = 1 << 16;
+      const buffer = Buffer.alloc(CHUNK);
+      let carry = '';
+      let position = 0;
+      for (;;) {
+        const { bytesRead } = await handle.read(buffer, 0, CHUNK, position);
+        if (bytesRead === 0) break;
+        position += bytesRead;
+        const lines = (carry + buffer.toString('utf8', 0, bytesRead)).split('\n');
+        // The last piece is whatever fell across the chunk boundary; it is only
+        // a whole line once the next read confirms it, or once the file ends.
+        carry = lines.pop() ?? '';
+        for (const line of lines) visitLine(line, visit);
+        if (position >= state.logSize) break;
+      }
+      if (carry) visitLine(carry, visit);
+    } finally {
+      await handle.close();
+    }
+  }
+
   async read(session: ChatSessionRef, fromSeq: number, count: number): Promise<ChatPage> {
     const base = this.basePath(session);
     return this.enqueue(base, async () => {
@@ -622,11 +1199,12 @@ export class ChatStore implements ChatStoreLike {
       const end = Math.min(stats.cursor + 1, start + wanted);
 
       if (wanted === 0 || end <= start) {
-        return { ...stats, events: [], from: start };
+        return { ...stats, events: [], from: start, openTurnId: null };
       }
 
       const events = await this.readSlice(base, state, start, end);
-      return { ...stats, events, from: start };
+      const boundaries = await this.turnBoundaries(base, state, stats);
+      return { ...stats, events, from: start, openTurnId: openTurnBefore(boundaries, start) };
     });
   }
 
@@ -787,6 +1365,136 @@ export class ChatStore implements ChatStoreLike {
   }
 
   /**
+   * What the conversation has spent, over all of it.
+   *
+   * Read from the log for the same reason the turn index is (#86): it is a
+   * property of the recorded conversation, so nothing that happens to be in a
+   * browser's window may decide it. The full pass costs one streamed read of
+   * the log, once per process per conversation — every append after it folds
+   * itself in — against the alternative of a figure that silently shrinks.
+   *
+   * The one limit worth stating: a log whose head has been trimmed cannot
+   * report what the trimmed turns cost. A total already in hand is kept across
+   * a trim rather than recomputed, so that only shows up on a conversation
+   * first opened after its own head was dropped.
+   */
+  private async sessionUsage(
+    base: string,
+    state: SessionState,
+    stats: ChatStats,
+  ): Promise<ChatUsage> {
+    if (state.usage && state.usageSeq >= stats.cursor) return state.usage;
+
+    let usage: ChatUsage = {};
+    let seq = 0;
+    await this.scanLog(base, state, (event) => {
+      usage = foldSessionUsage(usage, event);
+      if (event.seq > seq) seq = event.seq;
+    });
+
+    state.usage = usage;
+    state.usageSeq = Math.max(seq, stats.cursor);
+    return usage;
+  }
+
+  /**
+   * What the runtime told this conversation it could do, over all of it.
+   *
+   * Read from the whole log, and it has to be: the tail is a window over the
+   * last forty messages, and the single event carrying a runtime's capabilities
+   * is emitted when that runtime *starts* — for claude, in the `init` of its
+   * first turn, which on a conversation of any length is hundreds of events
+   * above the window. Taken from the replay alone, a resumed conversation of
+   * twenty-odd exchanges came back with no slash commands, no attachment
+   * control, no model or effort menu and a stop button that could not stop a
+   * running turn, while the same conversation ten messages shorter came back
+   * whole — a failure with no explanation the user could see (#30).
+   *
+   * The fold is the reducer's, not a second reading of it: a `session` event is
+   * a runtime introducing itself and replaces the set, a `capabilities` event
+   * adds to it. That matters on a conversation that has been resumed under a
+   * runtime whose command list has changed since, where a merge would go on
+   * offering commands the process no longer has.
+   *
+   * Cached exactly like `sessionUsage`, with the same limit: a log whose head
+   * has been trimmed cannot report what a runtime said before the trim, so a
+   * conversation first opened after its own head was dropped has only what it
+   * said since.
+   */
+  private async sessionRuntimeReports(
+    base: string,
+    state: SessionState,
+    stats: ChatStats,
+  ): Promise<{ capabilities: ChatCapabilities; limits?: AccountLimits }> {
+    if (state.capabilities && state.capabilitySeq >= stats.cursor) {
+      return { capabilities: state.capabilities, limits: state.limits ?? undefined };
+    }
+
+    let capabilities: ChatCapabilities = { ...NO_CHAT_CAPABILITIES };
+    // Gathered in the same pass rather than in one of its own: the scan is a
+    // streamed read of the whole log, and a third of them for one field would
+    // be a third read of every conversation that is opened.
+    let limits: AccountLimits | null = null;
+    let seq = 0;
+    await this.scanLog(base, state, (event) => {
+      capabilities = foldCapabilities(capabilities, event);
+      if (event.t === 'limits') limits = event.limits;
+      if (event.seq > seq) seq = event.seq;
+    });
+
+    state.capabilities = capabilities;
+    state.limits = limits;
+    state.capabilitySeq = Math.max(seq, stats.cursor);
+    return { capabilities, limits: limits ?? undefined };
+  }
+
+  /**
+   * Every point in the log at which the open turn changed.
+   *
+   * What a windowed read needs and cannot work out for itself: a snapshot
+   * replays the tail and a page is a slice of the middle, so both routinely
+   * start inside a turn whose opening message is nowhere in what they hold.
+   * Replayed from a standing start, that turn's messages are filed under the
+   * runtime's own name for it rather than the conversation's — an index row
+   * reading "no prompt" beside a question that was asked, and one the recorded
+   * index cannot be matched against to repair it.
+   *
+   * A full scan, cached exactly like `sessionUsage`: once per conversation per
+   * process, with every append folding itself in. What it keeps is a few rows
+   * per turn — where each one opened and where it closed — never the log.
+   */
+  private async turnBoundaries(
+    base: string,
+    state: SessionState,
+    stats: ChatStats,
+  ): Promise<TurnBoundary[]> {
+    if (state.turnBoundaries && state.turnBoundarySeq >= stats.cursor) {
+      return state.turnBoundaries;
+    }
+
+    const boundaries: TurnBoundary[] = [];
+    let open: string | null = null;
+    let previous: string | null = null;
+    let seq = 0;
+    await this.scanLog(base, state, (event) => {
+      const next = openTurnAfter(event, open, previous);
+      if (next !== open) {
+        boundaries.push({ seq: event.seq, turnId: next });
+        open = next;
+      }
+      // `/clear` is a new conversation in the same tab, so there is nothing
+      // left to carry on from: the turns above it belong to the one the user
+      // walked away from.
+      previous = event.t === 'marker' && event.kind === 'cleared' ? null : next ?? previous;
+      if (event.seq > seq) seq = event.seq;
+    });
+
+    state.turnBoundaries = boundaries;
+    state.turnBoundarySeq = Math.max(seq, stats.cursor);
+    return boundaries;
+  }
+
+  /**
    * Replay of a session, capped to its most recent messages.
    *
    * A month-long session must not cost a full replay on every browser join,
@@ -804,8 +1512,37 @@ export class ChatStore implements ChatStoreLike {
 
       const { from: windowStart, events } = await this.replayTail(base, state, stats);
 
-      const transcript = createTranscript(NO_CHAT_CAPABILITIES);
-      applyAll(transcript, events);
+      // Which turn is open is told to the replay rather than worked out by it.
+      //
+      // A tail cannot work it out. It routinely begins inside a turn whose
+      // opening message the window cut, so replayed cold that turn's messages
+      // are filed under the runtime's own id for it — a row in the index with
+      // no prompt to name it by, and one the recorded index cannot be matched
+      // against to repair. Nor is a single seed at the edge enough: the events
+      // carried from before the window include a compaction or interruption
+      // line, which *is* a message, and the turns opened between them were cut
+      // away, so a fold across that stretch loses the thread again.
+      //
+      // The boundaries are the whole log's answer for every seq, so each event
+      // is applied against the turn that was open when it happened, and the
+      // replay lands exactly where a full one would.
+      const boundaries = await this.turnBoundaries(base, state, stats);
+      // Seeded with what the conversation recorded rather than with nothing,
+      // for the same reason its usage is taken from the log: the window cannot
+      // be a basis for a fact about the session. Anything the window does carry
+      // is applied over this and lands on the same answer.
+      const reports = await this.sessionRuntimeReports(base, state, stats);
+      const transcript = createTranscript({ ...reports.capabilities }, { limits: reports.limits });
+      let at = 0;
+      let open: string | null = null;
+      for (const event of events) {
+        while (at < boundaries.length && boundaries[at].seq < event.seq) {
+          open = boundaries[at].turnId;
+          at += 1;
+        }
+        transcript.currentTurnId = open;
+        applyChatEvent(transcript, event);
+      }
 
       return {
         sessionId: session.id,
@@ -813,12 +1550,38 @@ export class ChatStore implements ChatStoreLike {
         messages: transcript.messages,
         state: transcript.state,
         capabilities: transcript.capabilities,
-        usage: transcript.usage,
+        // From the whole conversation, not from the replayed tail. What a
+        // session has spent is a property of the session, and the tail is a
+        // window over its last forty messages: taking it from the transcript
+        // meant a long chat's meter fell to whatever the window happened to
+        // contain the moment the browser reconnected, switched tab or
+        // reloaded — a total that only ever went *down* while the user was
+        // still in the same conversation.
+        usage: await this.sessionUsage(base, state, stats),
         plan: transcript.plan,
         pendingPermissions: transcript.pendingPermissions,
+        // What was picked, for the questions that have been answered (#113).
+        // The replay above folds `question_resolved` the same way a browser
+        // does, and the answer sits between the same two message starts as the
+        // call that asked — so any window holding the card holds its answer.
+        answeredQuestions: transcript.answeredQuestions,
         firstSeq: stats.firstSeq,
         replayFrom: windowStart,
         cursor: stats.cursor,
+        // Where the replay left off, so live events arriving after this join
+        // continue the turn they belong to instead of opening one of their own
+        // under the runtime's name for it.
+        currentTurnId: transcript.currentTurnId,
+        // Replayed out of the log along with everything else, so a rejoin knows
+        // what the runtime said it was thinking at even when nobody ever chose
+        // a level for this conversation.
+        effort: transcript.effort,
+        // Same reasoning as `usage` and `capabilities`: read from the whole
+        // log, not from the replayed tail. A five-hour window stated at the top
+        // of a long conversation is hundreds of events above the window, and
+        // taken from the tail alone every rejoin came back claiming the runtime
+        // had never reported one (#137).
+        limits: transcript.limits,
         live: options.live ?? false,
         bypassPermissions: options.bypassPermissions ?? false,
       };
@@ -868,8 +1631,9 @@ export class ChatStore implements ChatStoreLike {
     const base = this.basePath(session);
     await this.enqueue(base, async () => {
       this.states.delete(base);
+      this.descriptions.delete(base);
       await Promise.all(
-        ['.jsonl', '.idx', '.jsonl.tmp', '.idx.tmp'].map((suffix) =>
+        ['.jsonl', '.idx', '.jsonl.tmp', '.idx.tmp', CONTEXT_SUFFIX].map((suffix) =>
           fs.promises.rm(`${base}${suffix}`, { force: true }).catch(() => undefined),
         ),
       );
@@ -885,6 +1649,23 @@ export class ChatStore implements ChatStoreLike {
  * Reads a bounded prefix: the first line is all that is wanted, and a log whose
  * first record is enormous must not be pulled into memory to find its number.
  */
+/**
+ * Parse one log line and hand it on, skipping anything unreadable.
+ *
+ * A single corrupted record must not take a whole index down with it — the same
+ * rule `readSlice` applies to a page, for the same reason.
+ */
+function visitLine(line: string, visit: (event: ChatEvent) => void): void {
+  const text = line.trim();
+  if (!text) return;
+  try {
+    visit(JSON.parse(text) as ChatEvent);
+  } catch {
+    // Deliberately silent: an index is asked for on every open, and one bad
+    // line would otherwise log on every one of them forever.
+  }
+}
+
 async function firstSeqInLog(base: string): Promise<number | null> {
   const buffer = Buffer.alloc(64 * 1024);
   let read = 0;
@@ -911,12 +1692,13 @@ async function firstSeqInLog(base: string): Promise<number | null> {
   }
 }
 
-function headerBuffer(firstSeq: number): Buffer {
+function headerBuffer(firstSeq: number, turnsDropped = 0): Buffer {
   const header = Buffer.alloc(HEADER_BYTES);
   header.writeUInt32BE(MAGIC, 0);
   header.writeUInt16BE(FORMAT_VERSION, 4);
   header.writeUInt16BE(0, 6);
   header.writeBigUInt64BE(BigInt(firstSeq), 8);
+  header.writeBigUInt64BE(BigInt(turnsDropped), 16);
   return header;
 }
 

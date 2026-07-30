@@ -1,6 +1,6 @@
 import * as React from 'react';
 
-import type { AppSettings, TerminalFontFamilyId, ThemePresetId } from '../../types';
+import type { AppSettings, NotifySettings, TerminalFontFamilyId, ThemePresetId } from '../../types';
 import type { InstallState } from '../store';
 import { Button } from '../../ui/relay/Button';
 import { Dialog } from '../../ui/relay/Dialog';
@@ -8,6 +8,8 @@ import { Select } from '../../ui/relay/Select';
 import { Icon } from '../../ui/relay/Icon';
 import { SettingRow } from '../../ui/relay/SettingRow';
 import { Switch } from '../../ui/relay/Switch';
+import { TOUCH_TARGET, usePhone } from '../../ui/touch';
+import { notifyPermission, requestNotifyPermission, type NotifyPermission } from '../../ui/notify';
 
 const FONT_SIZE_MIN = 10;
 const FONT_SIZE_MAX = 24;
@@ -101,6 +103,42 @@ const INSTALL_COPY: Record<InstallState, { description: string; action: string |
   },
 };
 
+/**
+ * What the notification row says, given what the browser will actually do.
+ *
+ * Same principle as the install row above: there is no state in which a button
+ * is offered that could not work. A refused permission is the one that needs
+ * saying out loud — nothing in the page can ask again once it has happened, so
+ * a row that quietly showed a switch would be promising delivery it cannot make.
+ */
+const NOTIFY_COPY: Record<NotifyPermission, { description: string; action: string | null }> = {
+  granted: {
+    description:
+      'A conversation that finishes, or stops to ask you something, reaches you in another '
+      + 'window, another application, or the installed app. Never the one you are looking at.',
+    action: null,
+  },
+  default: {
+    description:
+      'The browser has not been asked yet. Allow notifications and a conversation that '
+      + 'finishes, or stops to ask you something, can reach you outside this window.',
+    action: 'Allow',
+  },
+  denied: {
+    description:
+      'This browser is blocking notifications for this site, and only its own site settings '
+      + 'can undo that — the page cannot ask again. Until then a waiting conversation is still '
+      + 'marked in the tab strip and the session list.',
+    action: null,
+  },
+  unsupported: {
+    description:
+      'This browser has no notification support, so waiting conversations are marked in the '
+      + 'tab strip and the session list instead.',
+    action: null,
+  },
+};
+
 export function SettingsDialog({
   open,
   settings,
@@ -114,6 +152,7 @@ export function SettingsDialog({
   onOpenEnvironment,
 }: SettingsDialogProps): React.JSX.Element | null {
   const [draft, setDraft] = React.useState<AppSettings>(settings);
+  const isPhone = usePhone();
 
   // Keyed on `open` alone, deliberately: while the dialog is open the caller is
   // being fed previews and re-renders with them, so following `settings` here
@@ -121,6 +160,18 @@ export function SettingsDialog({
   // what makes a cancel-then-reopen show the persisted values, not stale ones.
   React.useEffect(() => {
     if (open) setDraft(settings);
+  }, [open]);
+
+  /**
+   * What the browser currently permits, which is not a setting.
+   *
+   * Re-read on each open because it can change from outside the app entirely —
+   * site settings, a profile reset — and held in state because granting it
+   * from the button below has to redraw this row without saving anything.
+   */
+  const [permission, setPermission] = React.useState<NotifyPermission>(notifyPermission);
+  React.useEffect(() => {
+    if (open) setPermission(notifyPermission());
   }, [open]);
 
   if (!open) return null;
@@ -131,12 +182,35 @@ export function SettingsDialog({
     onPreview(next);
   };
 
+  const updateNotify = (patch: Partial<NotifySettings>): void => {
+    update({ notifications: { ...draft.notifications, ...patch } });
+  };
+
+  /**
+   * Ask the browser, from the click that got us here.
+   *
+   * Outside the draft on purpose: a permission is granted to the browser, not
+   * saved by this dialog, so Cancel cannot take it back and pretending
+   * otherwise would be the confusing half. Switching the feature on asks too —
+   * that is the same gesture, and making somebody find a second button to
+   * finish the thing they just switched on is how a feature ends up looking
+   * broken.
+   */
+  const askPermission = (): void => {
+    void requestNotifyPermission().then(setPermission);
+  };
+
   // A native range with `accent-color` rather than a hand-drawn track: the
   // browser keeps the thumb sizing, keyboard stepping and RTL behaviour, and
   // the accent is the only part that has to match the theme.
   const sliderStyle: React.CSSProperties = {
     width: 150,
-    height: 4,
+    // The element's box *is* the hit area of a native range, and a 4px one is
+    // half a millimetre of screen: on a phone the only way to change the font
+    // size was to land a fingertip on a hairline. The track still paints thin —
+    // the browser centres it in whatever height it is given — so this costs
+    // nothing on a desktop, where the pointer is exact and the row is tight.
+    height: isPhone ? TOUCH_TARGET : 4,
     margin: 0,
     accentColor: 'var(--primary)',
     background: 'var(--border)',
@@ -214,8 +288,8 @@ export function SettingsDialog({
         label="Web chat approvals"
         description={
           draft.chatBypassPermissions
-            ? 'New web chats will run every tool without asking — including shell commands and file writes. Conversations already running keep the setting they started with.'
-            : 'New web chats ask before each tool call. Turn this off to let them read, write and run commands unattended.'
+            ? 'Every new web chat runs tools without asking — including shell commands and file writes — on all your devices. That covers a chat from the launcher, a branch, and starting over. A conversation already running keeps the mode it began in; start a new one to change it.'
+            : 'New web chats ask before each tool call, on all your devices. A conversation already running keeps the mode it began in.'
         }
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -241,6 +315,73 @@ export function SettingsDialog({
             onChange={(checked) => update({ chatBypassPermissions: checked })}
           />
         </div>
+      </SettingRow>
+
+      <SettingRow label="Conversation notifications" description={NOTIFY_COPY[permission].description}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {NOTIFY_COPY[permission].action ? (
+            <Button variant="secondary" onClick={askPermission}>
+              {NOTIFY_COPY[permission].action}
+            </Button>
+          ) : null}
+          <Switch
+            checked={draft.notifications.enabled}
+            disabled={permission === 'unsupported'}
+            ariaLabel="Notify me about conversations"
+            onChange={(checked) => {
+              updateNotify({ enabled: checked });
+              if (checked && permission === 'default') askPermission();
+            }}
+          />
+        </div>
+      </SettingRow>
+
+      <SettingRow
+        label="Notify me when"
+        description="Each of these is a separate moment a conversation stops needing the machine and starts needing you."
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 9, alignItems: 'flex-start' }}>
+          <Switch
+            label="Work finishes"
+            checked={draft.notifications.finished}
+            disabled={!draft.notifications.enabled}
+            onChange={(checked) => updateNotify({ finished: checked })}
+          />
+          <Switch
+            label="A turn or workflow fails"
+            checked={draft.notifications.failed}
+            disabled={!draft.notifications.enabled}
+            onChange={(checked) => updateNotify({ failed: checked })}
+          />
+          <Switch
+            label="An approval is needed"
+            checked={draft.notifications.approval}
+            disabled={!draft.notifications.enabled}
+            onChange={(checked) => updateNotify({ approval: checked })}
+          />
+          <Switch
+            label="A question is asked"
+            checked={draft.notifications.question}
+            disabled={!draft.notifications.enabled}
+            onChange={(checked) => updateNotify({ question: checked })}
+          />
+        </div>
+      </SettingRow>
+
+      <SettingRow
+        label="What notifications say"
+        description={
+          draft.notifications.details
+            ? 'They name the conversation and quote what happened — the command waiting for approval, the question asked.'
+            : 'Reduced to "a conversation needs you". Nothing about the work leaves the app; opening the notification still takes you to it.'
+        }
+      >
+        <Switch
+          checked={draft.notifications.details}
+          disabled={!draft.notifications.enabled}
+          ariaLabel="Include the conversation name and what happened"
+          onChange={(checked) => updateNotify({ details: checked })}
+        />
       </SettingRow>
 
       <SettingRow

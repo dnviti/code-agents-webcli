@@ -24,6 +24,7 @@ before(function () {
     `export { AppShell } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/AppShell'))};`,
     `export { shellStore } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/store'))};`,
     `export { DEFAULT_CHAT_VIEW } from ${JSON.stringify(path.join(ROOT, 'src/client/chat/view-settings'))};`,
+    `export { DEFAULT_NOTIFICATIONS } from ${JSON.stringify(path.join(ROOT, 'src/client/ui/settings'))};`,
   ].join('\n');
 
   const out = path.join(os.tmpdir(), `shell-chrome-${process.pid}.js`);
@@ -40,13 +41,24 @@ before(function () {
   mod = require(out);
   mod.__file = out;
   DEFAULTS.chatView = mod.DEFAULT_CHAT_VIEW;
+  // Taken from the source rather than written out here: a settings dialog reads
+  // whatever `loadSettings` produces, and a hand-built fixture that is missing a
+  // field the dialog now renders proves only that the fixture is old.
+  SETTINGS.notifications = mod.DEFAULT_NOTIFICATIONS;
 });
 
 after(function () {
   if (mod && mod.__file) fs.rmSync(mod.__file, { force: true });
 });
 
-const SETTINGS = { fontSize: 14, theme: 'github-dark', terminalFontFamily: 'jetbrains-mono' };
+const SETTINGS = {
+  fontSize: 14,
+  theme: 'github-dark',
+  terminalFontFamily: 'jetbrains-mono',
+  chatBypassPermissions: false,
+  /** Replaced in `before` with the real defaults, once the bundle exists. */
+  notifications: undefined,
+};
 
 /** Filled in `before`, once the bundle exists. */
 const DEFAULTS = {};

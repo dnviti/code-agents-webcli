@@ -19,6 +19,7 @@ export async function loadConfig(app: App): Promise<void> {
           qwen: cfg.aliases.qwen || 'Qwen',
           kimi: cfg.aliases.kimi || 'Kimi',
           omp: cfg.aliases.omp || 'Oh My Pi',
+          antigravity: cfg.aliases.antigravity || 'Antigravity',
           terminal: 'Terminal',
         };
       }
@@ -29,6 +30,11 @@ export async function loadConfig(app: App): Promise<void> {
       shellStore.setState({
         user: cfg?.currentUser?.githubLogin ?? null,
         logoutUrl: cfg?.logoutUrl ?? null,
+        // The approval preference belongs to the account, so this — the boot
+        // request every page already makes — is where it arrives. Anything
+        // other than a literal `true` is "ask", which covers an older server
+        // that sends no preferences at all as well as a corrupt one.
+        chatBypassPermissions: cfg?.preferences?.chatBypassPermissions === true,
       });
     }
   } catch {
@@ -47,6 +53,7 @@ export function getAlias(app: App, kind: AgentKind | string): string {
   if (kind === 'qwen') return 'Qwen';
   if (kind === 'kimi') return 'Kimi';
   if (kind === 'omp') return 'Oh My Pi';
+  if (kind === 'antigravity') return 'Antigravity';
   if (kind === 'terminal') return 'Terminal';
   return 'Claude';
 }
@@ -103,6 +110,12 @@ export function getRuntimeStartMessage(
     return options.dangerouslySkipPermissions
       ? `Starting ${getAlias(app, 'omp')} (auto-approving every tool call)...`
       : `Starting ${getAlias(app, 'omp')}...`;
+  }
+
+  if (kind === 'antigravity') {
+    return options.dangerouslySkipPermissions
+      ? `Starting ${getAlias(app, 'antigravity')} (auto-approving every tool permission)...`
+      : `Starting ${getAlias(app, 'antigravity')}...`;
   }
 
   if (kind === 'terminal') {

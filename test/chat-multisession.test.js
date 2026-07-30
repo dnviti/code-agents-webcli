@@ -246,6 +246,7 @@ before(function () {
   this.timeout(60000);
   const contents = [
     `export { ChatRegistry } from ${JSON.stringify(path.join(ROOT, 'src/client/chat/registry'))};`,
+    `export { ChatController } from ${JSON.stringify(path.join(ROOT, 'src/client/chat/controller'))};`,
   ].join('\n');
 
   bundle = path.join(os.tmpdir(), `chat-multisession-${process.pid}.js`);
@@ -284,6 +285,14 @@ function snapshotFor(sessionId, text) {
 }
 
 describe('the chat controller registry', function () {
+  /** Every `chat_*` the controller's own switch answers to, read from it. */
+  function handledTypes() {
+    const source = fs.readFileSync(path.join(ROOT, 'src/client/chat/controller.ts'), 'utf8');
+    const handled = [...source.matchAll(/case '(chat_[a-z_]+)':/g)].map((match) => match[1]);
+    assert.ok(handled.length >= 10, `only found ${handled.length} cases — did the switch move?`);
+    return handled;
+  }
+
   function registry({ features = ['chat_subscribe'] } = {}) {
     const sent = [];
     const changed = [];
@@ -395,6 +404,65 @@ describe('the chat controller registry', function () {
   it('leaves non-chat messages to the terminal handler', function () {
     const { reg } = registry();
     assert.strictEqual(reg.handle({ type: 'output', data: 'x' }), false);
+  });
+
+  /**
+   * The routing gap that made a conversation forget its own numbering and its
+   * own bill.
+   *
+   * The registry filtered on a hand-kept list of message types that had fallen
+   * three behind the controller's switch. A type missing from it is not left
+   * unhandled — it goes to the terminal's handler, which discards it — so the
+   * recorded turn index and every per-turn cost were thrown away in silence,
+   * and the chat showed "turn 1" for turn 40 with no money beside it.
+   *
+   * Through the registry deliberately: a test that calls the controller
+   * directly passes with the routing broken, which is exactly what happened.
+   */
+  it('routes every message the controller answers to', function () {
+    const { reg } = registry();
+    reg.handle({ type: 'chat_snapshot', sessionId: 'a', snapshot: snapshotFor('a', 'x') });
+
+    // Read off the switch itself, not off the set the router filters on: the
+    // two agreeing is the claim, so asking one about the other proves nothing.
+    const missing = handledTypes().filter((type) => reg.handle({ type, sessionId: 'a' }) !== true);
+    assert.deepStrictEqual(missing, [], 'these are handed to the terminal handler and lost');
+  });
+
+  it('delivers the recorded turn index, so turns are numbered by the conversation', function () {
+    const { reg } = registry();
+    reg.handle({ type: 'chat_snapshot', sessionId: 'a', snapshot: snapshotFor('a', 'x') });
+
+    reg.handle({
+      type: 'chat_turn_index',
+      sessionId: 'a',
+      turns: [{ id: 'm1', turnId: 't1', index: 40, label: 'the ask', startedAt: 1, outcome: 'done' }],
+      complete: true,
+    });
+
+    const recorded = reg.get('a').transcript.recordedTurns;
+    assert.strictEqual(recorded && recorded.length, 1, 'the index never reached the transcript');
+    assert.strictEqual(recorded[0].index, 40);
+  });
+
+  it('delivers what a turn cost, to the conversation it was spent in', function () {
+    const { reg } = registry();
+    reg.handle({ type: 'chat_snapshot', sessionId: 'a', snapshot: snapshotFor('a', 'x') });
+    reg.handle({ type: 'chat_snapshot', sessionId: 'b', snapshot: snapshotFor('b', 'y') });
+
+    reg.handle({ type: 'chat_turn_spend', sessionId: 'b', turnId: 't1', usage: { costUsd: 4.43 } });
+
+    assert.strictEqual(reg.get('a').transcript.turnSpend.size, 0, 'the bill went to the wrong chat');
+    assert.strictEqual(reg.get('b').transcript.turnSpend.get('t1').costUsd, 4.43);
+  });
+
+  /**
+   * The guard, so the two lists cannot drift apart again: the set is what the
+   * router filters on, and the switch is what actually answers.
+   */
+  it('lists every case its own switch handles', function () {
+    const unrouted = handledTypes().filter((type) => !mod.ChatController.MESSAGE_TYPES.has(type));
+    assert.deepStrictEqual(unrouted, [], 'handled by the controller, never routed to it');
   });
 
   it('stamps every outgoing message with its own session id', function () {

@@ -71,7 +71,7 @@ program
   .option('--allow-any-github-user', 'allow ANY GitHub account to sign in (dangerous: signed-in users can run commands on this host)')
   .option('--data-dir <path>', 'directory for the SQLite database and local state')
   .option('--dev', 'development mode with additional logging')
-  .option('--plan <type>', 'subscription plan (pro, max5, max20)', 'max20')
+  .option('--plan <type>', 'accepted and ignored: plan limits are no longer guessed')
   .option('--claude-alias <name>', 'display alias for Claude (default: env CLAUDE_ALIAS or "Claude")')
   .option('--codex-alias <name>', 'display alias for Codex (default: env CODEX_ALIAS or "Codex")')
   .option('--agent-alias <name>', 'display alias for Agent (default: env AGENT_ALIAS or "Cursor")')
@@ -80,6 +80,7 @@ program
   .option('--qwen-alias <name>', 'display alias for Qwen Code (default: env QWEN_ALIAS or "Qwen")')
   .option('--kimi-alias <name>', 'display alias for Kimi Code (default: env KIMI_ALIAS or "Kimi")')
   .option('--omp-alias <name>', 'display alias for Oh My Pi (default: env OMP_ALIAS or "Oh My Pi")')
+  .option('--antigravity-alias <name>', 'display alias for Antigravity CLI (default: env ANTIGRAVITY_ALIAS or "Antigravity")')
   .option('--ngrok-auth-token <token>', 'ngrok auth token to open a public tunnel')
   .option('--ngrok-domain <domain>', 'ngrok reserved domain to use for the tunnel')
   .option('--containers', 'give every signed-in user their own isolated container')
@@ -202,7 +203,6 @@ async function main() {
       key: options.key,
       setup: options.setup,
       dev: options.dev,
-      plan: options.plan,
       publicBaseUrl: options.publicBaseUrl,
       githubClientId: options.githubClientId,
       githubClientSecret: options.githubClientSecret,
@@ -225,6 +225,8 @@ async function main() {
       qwenAlias: options.qwenAlias || process.env.QWEN_ALIAS || 'Qwen',
       kimiAlias: options.kimiAlias || process.env.KIMI_ALIAS || 'Kimi',
       ompAlias: options.ompAlias || process.env.OMP_ALIAS || 'Oh My Pi',
+      antigravityAlias:
+        options.antigravityAlias || process.env.ANTIGRAVITY_ALIAS || 'Antigravity',
       // Per-user container environments. Absent means the historical
       // behaviour: everything runs on this host, as this account.
       containers: options.containers === true,
@@ -255,7 +257,6 @@ async function main() {
     console.log('Starting Code Agents Web CLI...');
     console.log(`Port: ${port}`);
     console.log('Mode: Folder selection mode');
-    console.log(`Plan: ${options.plan}`);
     // Built from a table rather than one template string: the line grew past
     // terminal width every time a runtime was added, and each addition meant
     // editing a 200-character literal.
@@ -268,6 +269,7 @@ async function main() {
       ['Qwen', serverOptions.qwenAlias],
       ['Kimi', serverOptions.kimiAlias],
       ['Oh My Pi', serverOptions.ompAlias],
+      ['Antigravity', serverOptions.antigravityAlias],
     ]
       .map(([name, alias]) => `${name} → "${alias}"`)
       .join(', ');

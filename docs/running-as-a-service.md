@@ -78,7 +78,7 @@ they are gone the moment the container is replaced.
 
 - It contains **the web server only**.
 - The agent CLIs (`claude`, `codex`, `cursor-agent`, `pi`, `grok`, `qwen`,
-  `kimi`, `omp`) are **not bundled**, so only terminal sessions work out of the
+  `kimi`, `omp`, `agy`) are **not bundled**, so only terminal sessions work out of the
   box. To use the agents, derive an image and install the CLIs into it.
 - The folder browser is bounded by the container's working directory (`/app`), so
   mount your projects and point sessions at them.

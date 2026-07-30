@@ -1,0 +1,9 @@
+You are logged in with grok.com.
+
+Default model: grok-build
+
+Available models:
+  * grok-build (default)
+  - sxs-claude-opus-4-6
+  - grok-experimental-0609-lp-fix-s80
+  - grok-4.5

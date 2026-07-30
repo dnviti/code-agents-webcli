@@ -157,21 +157,45 @@ describe('Composer', function () {
     assert.ok(busy.includes('will go as soon as this turn finishes'), 'and the composer says what will happen to it');
   });
 
-  it('lists what is waiting, in order, each one withdrawable', function () {
+  it('shows one waiting message whole, and withdrawable', function () {
+    const html = render({
+      busy: true,
+      capabilities: caps({ interrupt: true }),
+      queued: [{ id: 'q1', text: 'first in line', ts: 1 }],
+      onCancelQueued() {},
+    });
+
+    assert.ok(html.includes('aria-label="Messages waiting to be sent"'), 'the line is a labelled region');
+    assert.ok(html.includes('first in line'), 'the message is shown');
+    assert.ok(html.includes('aria-label="Remove queued message 1"'), 'and can be withdrawn');
+    assert.ok(!/aria-label="Show \d+ more waiting/.test(html), 'with nothing to open behind it');
+  });
+
+  it('collapses more than one to the newest, with a count of the rest', function () {
     const html = render({
       busy: true,
       capabilities: caps({ interrupt: true }),
       queued: [
         { id: 'q1', text: 'first in line', ts: 1 },
-        { id: 'q2', text: 'second in line', ts: 2, attachments: [{ url: '/a', mime: 'image/png', name: 'a.png', size: 3 }] },
+        { id: 'q2', text: 'second in line', ts: 2 },
+        { id: 'q3', text: 'third in line', ts: 3, attachments: [{ url: '/a', mime: 'image/png', name: 'a.png', size: 3 }] },
       ],
       onCancelQueued() {},
     });
 
-    assert.ok(html.includes('aria-label="Messages waiting to be sent"'), 'the line is a labelled region');
-    assert.ok(html.indexOf('first in line') < html.indexOf('second in line'), 'oldest first');
-    assert.ok(html.includes('aria-label="Remove queued message 1"'), 'each waiting turn can be withdrawn');
-    assert.ok(html.includes('aria-label="Remove queued message 2"'));
+    // The newest is the one still being reconsidered, so it is the one on show.
+    assert.ok(html.includes('third in line'), 'the message just typed is the one drawn');
+    assert.ok(!html.includes('first in line'), 'the rest are behind the count, not stacked up the screen');
+    assert.ok(html.includes('aria-label="Show 2 more waiting messages"'), 'and the count says how many');
+    assert.ok(html.includes('aria-expanded="false"'), 'the control reports that the list is shut');
+    assert.ok(
+      html.includes('aria-label="Remove queued message 3"'),
+      'the message on show keeps everything it had',
+    );
+    assert.ok(
+      /3 messages waiting to be sent, 2 hidden/.test(html),
+      'and the count reaches a screen reader, not only the glyph on the button',
+    );
   });
 
   it('offers no withdraw control when nothing can act on it', function () {
@@ -235,20 +259,341 @@ describe('Composer', function () {
       assert.ok(html.includes('>a-custom-name<'), 'a free-typed override with no matching menu entry is still the label');
     });
 
-    it('surfaces the server’s feedback after a pick, in each of the three shapes', function () {
-      const live = render({ model: 'grok-3-fast', modelFeedback: { applied: 'live', message: 'Switched to grok-3-fast for this conversation.' } });
-      assert.ok(live.includes('Switched to grok-3-fast for this conversation.'));
+    // Issue #128, the answer to the question #119 deliberately left open. The
+    // box itself is raised by an effect and so never renders in a static pass —
+    // the browser check owns that half. What is visible here is the other half
+    // of the same rule: the hover, which a live confirmation used to hold for
+    // the rest of the conversation, displacing the description of what the
+    // control does with a sentence the chip underneath the pointer already says.
+    it('lets a model change that took effect pass in silence, and reports the ones the chip cannot show', function () {
+      const live = render({
+        model: 'grok-3-fast',
+        capabilities: caps({ models: [{ value: 'grok-3-fast', name: 'grok-3-fast' }] }),
+        modelFeedback: { applied: 'live', message: 'Switched to grok-3-fast for this conversation.' },
+      });
+      assert.ok(
+        !live.includes('Switched to grok-3-fast for this conversation.'),
+        'a model that landed is announced by the chip relabelling itself, not by a second copy of the news',
+      );
+      assert.ok(
+        live.includes('title="Model: grok-3-fast"'),
+        'so the hover goes back to describing the control',
+      );
+      assert.ok(live.includes('>grok-3-fast<'), 'and the chip is the thing carrying the change');
 
-      const sent = render({ model: 'claude-opus', modelFeedback: { applied: 'sent', message: 'Sent "/model claude-opus" to the session — check the transcript to confirm it took.' } });
-      assert.ok(sent.includes('check the transcript to confirm it took'));
-
-      const pending = render({ model: 'some-model', modelFeedback: { applied: 'pending', message: 'Saved. some-model will be used the next time a new session starts for this conversation.' } });
-      assert.ok(pending.includes('will be used the next time a new session starts'));
+      // Every other outcome means the conversation is not running on what was
+      // picked. Dropping these would leave a change looking made that was not.
+      for (const applied of ['sent', 'pending', 'cleared']) {
+        const message = `an outcome the chip cannot show for itself: ${applied}`;
+        const html = render({ model: 'grok-3-fast', capabilities: caps({}), modelFeedback: { applied, message } });
+        assert.ok(
+          html.includes(message),
+          `${applied} is not a change that simply took effect, so it still has to reach the user`,
+        );
+      }
     });
 
     it('shows nothing extra when there is no feedback yet', function () {
       const html = render({ capabilities: caps({}) });
       assert.ok(!html.includes('role="status"'), 'no stray feedback region before anything has been picked');
+    });
+
+    // Issue #135. A model reaches a conversation three ways — this chat's own
+    // pick, the account's standing choice, the active runtime profile — and
+    // until now the control said nothing about which. On a profile-pinned
+    // install that was the worst case: the pin was genuinely in force and the
+    // chip read the literal word "model". The menu is click-toggled state, so
+    // the browser check owns the open sheet; what a static pass reaches is the
+    // resting hover, which is also the only route to this on a desktop without
+    // covering the composer.
+    describe('where the model came from', function () {
+      it('names the account’s standing choice', function () {
+        const html = render({
+          model: 'claude-opus-4-6',
+          capabilities: caps({}),
+          modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+        });
+        assert.ok(
+          html.includes('Your standing choice for this runtime: claude-opus-4-6.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      it('names the profile that pinned it', function () {
+        const html = render({
+          model: 'profile-model',
+          capabilities: caps({}),
+          modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(
+          html.includes('From the &quot;House&quot; runtime profile: profile-model.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      it('says plainly when nobody has chosen', function () {
+        const html = render({
+          model: 'grok-build',
+          capabilities: caps({}),
+          modelDefault: { model: null, source: 'runtime' },
+        });
+        assert.ok(
+          html.includes('No default set — this runtime picks for itself.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      // Clearing does not fall back to a standing choice, it forgets one — and
+      // saying "falls back to your last choice" would describe the opposite of
+      // what the click does.
+      it('says a conversation-only pick is exactly that, and what clearing it costs', function () {
+        const html = render({
+          model: 'claude-haiku',
+          modelOverride: 'claude-haiku',
+          capabilities: caps({}),
+          modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+        });
+        assert.ok(html.includes('Chosen for this conversation only.'), 'the override is named as one');
+        assert.ok(
+          html.includes('forgets claude-opus-4-6 as your standing choice for this runtime'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      it('falls back to the profile when this conversation is the only thing overriding it', function () {
+        const html = render({
+          model: 'claude-haiku',
+          modelOverride: 'claude-haiku',
+          capabilities: caps({}),
+          modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(
+          html.includes('Clearing falls back to the &quot;House&quot; runtime profile: profile-model.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      // The word "model" used to sit on the chip for the whole of a
+      // conversation whose runtime never emits a session event, which is every
+      // conversation before its first turn.
+      //
+      // Restated: this asserted the *default* was what the chip named, which was
+      // the defect the adversarial review caught. A default is what the next new
+      // chat would open on — it changes under an open conversation every time
+      // the same account picks a model in another tab, and it may never have
+      // been applied to this one at all. What the chip names is the model the
+      // launch actually used, which the server now sends as `modelPinned`.
+      it('names the model this conversation launched on, not the word “model”', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'profile-model',
+          modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(html.includes('>profile-model<'), 'what the launch used is what the chip names');
+      });
+
+      // The half of the same defect that the restatement above cannot show: a
+      // default the conversation was never launched on must not reach the chip.
+      it('never names a default this conversation was not launched on', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: null,
+          modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+        });
+        assert.ok(
+          !html.includes('>claude-opus-4-6<'),
+          'this conversation launched with no model flag; the standing choice is for the next one',
+        );
+        assert.ok(html.includes('>model<'), 'so the chip claims nothing, as it always did');
+      });
+
+      // And says so, rather than leaving a sentence about the default to be read
+      // as a statement about what is running.
+      it('says a pinned conversation is staying on its model when the default has moved', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'claude-sonnet-4-5',
+          modelDefault: { model: 'claude-opus-4-6', source: 'personal' },
+        });
+        assert.ok(
+          html.includes('Staying on claude-sonnet-4-5.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+        assert.ok(
+          html.includes('Your standing choice for this runtime: claude-opus-4-6.'),
+          'and the default is still named, as the answer for the next new chat',
+        );
+      });
+
+      // The pin and the default agreeing is the ordinary case, and it must not
+      // produce a sentence telling the user something is staying put.
+      it('says nothing about staying when the pin is the default', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'profile-model',
+          modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(!html.includes('Staying on'), html.match(/title="Model[^"]*"/)?.[0] || 'no title');
+      });
+
+      // Version skew: a server that predates this says nothing, and the control
+      // has to read exactly as it shipped rather than assert a source.
+      it('renders exactly as before against a server that says nothing', function () {
+        const before = render({ model: 'grok-build', capabilities: caps({}) });
+        const after = render({ model: 'grok-build', capabilities: caps({}), modelDefault: null });
+        assert.strictEqual(after, before);
+        assert.ok(before.includes('title="Model: grok-build"'), 'and the hover is the old one');
+      });
+    });
+  });
+
+  // The effort chip's popup is click-toggled state like the model chip's, so a
+  // static render only ever shows it shut — these assert the trigger and what it
+  // says about the level in force, not the menu behind it. The ladder here is
+  // claude's, spaced the way `rankedEfforts` spaces a five-level list, because
+  // the rank is what the colour and the meter are both computed from and a made
+  // up spacing would be testing arithmetic this component does not do.
+  describe('the effort control', function () {
+    const efforts = [
+      { value: 'low', name: 'Low', rank: 0 },
+      { value: 'medium', name: 'Medium', rank: 0.25 },
+      { value: 'high', name: 'High', rank: 0.5 },
+      { value: 'xhigh', name: 'Extra high', rank: 0.75 },
+      { value: 'max', name: 'Max', rank: 1 },
+    ];
+
+    it('offers a control when the runtime published a ladder to choose from', function () {
+      const html = render({ capabilities: caps({ efforts }) });
+      assert.ok(
+        html.includes('aria-label="Change how hard the agent thinks"'),
+        'a published ladder is the whole precondition for the control',
+      );
+      assert.ok(html.includes('aria-haspopup="listbox"'), 'the trigger says a menu is behind it');
+      assert.ok(html.includes('aria-expanded="false"'), 'and that the menu is currently shut');
+    });
+
+    // The deliberate difference from the model chip above, which is always
+    // present. A model can be typed at any runtime and tried, so offering the
+    // control is never wrong. An effort level cannot: with no published ladder
+    // there is no value the server would accept, so the control could only ever
+    // refuse — and it would charge the row for the privilege, which on a phone
+    // means pushing Send onto a line of its own to make room for a button that
+    // does nothing.
+    it('takes itself off the row entirely for a runtime that published no ladder', function () {
+      const html = render({ capabilities: caps({}) });
+      assert.ok(
+        !html.includes('aria-label="Change how hard the agent thinks"'),
+        'no ladder means no control at all — not a disabled one, and not an empty one',
+      );
+      assert.ok(html.includes('aria-label="Change model"'), 'while the model control, which can always be tried, stays');
+      assert.ok(html.includes('aria-label="Send message"'), 'and the space goes back to the control that needed it');
+    });
+
+    it('takes itself off the row for a runtime that published an empty ladder', function () {
+      const html = render({ capabilities: caps({ efforts: [] }) });
+      assert.ok(
+        !html.includes('aria-label="Change how hard the agent thinks"'),
+        'a ladder with no rungs on it is the same offer as no ladder',
+      );
+    });
+
+    it('names the level this conversation is running at, not the cheapest on the ladder', function () {
+      const html = render({ effort: 'high', capabilities: caps({ efforts }) });
+      assert.ok(html.includes('>High<'), 'the level in force is the one on the chip');
+      assert.ok(!html.includes('Low'), 'the first entry of the ladder is not a default label');
+      assert.ok(html.includes('title="Effort: High"'), 'and the long form names it too');
+    });
+
+    it('colours and fills the chip by where the level sits on its own runtime’s ladder', function () {
+      const low = render({ effort: 'low', capabilities: caps({ efforts }) });
+      const high = render({ effort: 'max', capabilities: caps({ efforts }) });
+      // The bottom stop is a bare ramp variable; the top is the last stop mixed
+      // fully over the one below it, which is what interpolating rather than
+      // snapping costs at the end of the ladder.
+      const lowTone = 'var(--effort-0)';
+      const highTone = 'color-mix(in oklab, var(--effort-4) 100%, var(--effort-3))';
+      assert.ok(low.includes(`color:${lowTone}`), 'the bottom of the ladder is the same grey as every other chip');
+      assert.ok(high.includes(`color:${highTone}`), 'the top of it reaches the loud end of the ramp');
+      assert.ok(!high.includes(`color:${lowTone}`), 'the two ends are not the same colour');
+      // `low` is rank 0, so one bar; `max` is rank 1, so all four. The meter is
+      // what survives a colourblind reader, so it has to move with the level
+      // rather than sit at a decorative constant.
+      const bars = (html, tone) => html.split(`background:${tone}`).length - 1;
+      assert.strictEqual(bars(low, lowTone), 1, 'the least thinking lights one bar');
+      assert.strictEqual(bars(high, highTone), 4, 'the most lights all of them');
+      assert.strictEqual(bars(low, 'var(--border)'), 3, 'and the rest of the meter stays unlit at the bottom');
+      assert.strictEqual(bars(high, 'var(--border)'), 0, 'with nothing left unlit at the top');
+    });
+
+    it('claims no rank for a level the runtime never published', function () {
+      // A level left over from before a model switch narrowed the ladder. It
+      // cannot be placed on this runtime's scale, so the chip declines to name
+      // it rather than attaching this ladder's colour and meter to it.
+      const html = render({ effort: 'ultra', capabilities: caps({ efforts }) });
+      assert.ok(!html.includes('ultra'), 'a level off the ladder is not read back as though it were on it');
+      assert.ok(html.includes('>effort<'), 'the chip names nothing instead');
+      assert.ok(!html.includes('var(--effort-'), 'and takes none of the ramp with it');
+      assert.strictEqual(
+        (html.match(/background:var\(--border\)/g) || []).length,
+        4,
+        'every bar stays unfilled, because there is no rank to fill them to',
+      );
+    });
+
+    it('is not disabled when the whole composer is', function () {
+      // Same reasoning as the model control: a dead session is exactly when this
+      // is worth touching, because the level is stored against the conversation
+      // and applies the next time one starts.
+      const html = render({ disabled: true, capabilities: caps({ efforts }) });
+      assert.ok(html.includes('aria-label="Change how hard the agent thinks"'), 'the control survives a dead session');
+      assert.ok(
+        !/aria-label="Change how hard the agent thinks"[^>]*disabled/.test(html),
+        'and stays usable, because what it saves is for next time',
+      );
+    });
+
+    it('shows nothing extra before anything has been picked', function () {
+      const html = render({ capabilities: caps({ efforts }) });
+      assert.ok(!html.includes('role="status"'), 'no stray feedback region until the server has said something');
+      assert.ok(!html.includes('role="listbox"'), 'and the menu stays shut until it is asked for');
+    });
+
+    // Issue #119. The popup itself is raised by an effect and so never renders
+    // in a static pass — the browser check owns that half. What is visible here
+    // is the other half of the same rule: the hover, which a live confirmation
+    // used to hold for the rest of the conversation, displacing the description
+    // of what the control does with a sentence the chip underneath the pointer
+    // already spells out.
+    it('lets a change that took effect pass in silence, and reports the ones the chip cannot show', function () {
+      const live = render({
+        effort: 'high',
+        capabilities: caps({ efforts }),
+        effortFeedback: { applied: 'live', message: 'Now thinking at high.' },
+      });
+      assert.ok(
+        !live.includes('Now thinking at high.'),
+        'a level that landed is announced by the chip redrawing, not by a second copy of the news',
+      );
+      assert.ok(
+        live.includes('title="Effort: High"'),
+        'so the hover goes back to describing the control',
+      );
+      assert.ok(live.includes('>High<'), 'and the chip is the thing carrying the change');
+
+      // Every other outcome means the conversation is not running at what was
+      // picked. Dropping these would leave a change looking made that was not.
+      for (const applied of ['refused', 'pending', 'sent', 'cleared']) {
+        const message = `an outcome the chip cannot show for itself: ${applied}`;
+        const html = render({
+          effort: 'high',
+          capabilities: caps({ efforts }),
+          effortFeedback: { applied, message },
+        });
+        assert.ok(
+          html.includes(message),
+          `${applied} is not a change that simply took effect, so it still has to reach the user`,
+        );
+      }
     });
   });
 

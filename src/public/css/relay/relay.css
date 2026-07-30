@@ -72,6 +72,66 @@
   to { opacity: 1; transform: translateY(0); }
 }
 
+/* The reasoning-effort ramp: five stops from "no colour at all" to "as loud as
+   this palette gets".
+
+   Aliases rather than new hex values, so both themes get it for free and it
+   moves with the palette instead of drifting away from it. The bottom stop is
+   the ordinary chip grey, which is the whole idea — an agent left thinking
+   lightly should look like every other quiet control on the row, and the colour
+   should arrive only as the setting climbs.
+
+   The top being the destructive red is deliberate and is not an error signal.
+   Maximum effort is the most expensive thing this control can do, sometimes by
+   an order of magnitude, and a chip that looked identical at `low` and at `max`
+   would be hiding the one number worth noticing. The wording around it never
+   says anything is wrong, so the colour reads as heat rather than as a fault.
+
+   Colour is never the only carrier: the chip also draws a filled bar meter and
+   names the level in text, both of which survive a colourblind reader, a
+   monochrome display and the reduced-motion block below. */
+:root {
+  --effort-0: var(--muted-foreground);
+  --effort-1: var(--info);
+  --effort-2: var(--success);
+  --effort-3: var(--warning);
+  --effort-4: var(--destructive);
+}
+
+/* Two stops are overridden on the light theme, and the reason is contrast
+   rather than taste. The chip names its level in `--text-2xs`, which is small
+   text and wants 4.5:1; measured against the light background, `--success`
+   (#16a34a) manages 3.30 and `--warning` (#ca8a04) only 2.94. Both are perfectly
+   good as a status dot or a border, which is what the rest of the app asks of
+   them — this is the first place either has been asked to *be read at 10px*.
+
+   The replacements are the same two hues taken darker until they clear the bar
+   (5.02 and 4.92), so the ramp keeps its progression and nothing else that uses
+   the semantic tokens is disturbed. The other three already pass on both
+   themes: 4.74 / 5.17 / 4.83 light, and 7.85 through 12.93 dark. */
+.light {
+  --effort-2: #15803d;
+  --effort-3: #a16207;
+}
+
+/* The effort chip, breathing.
+   Amplitude and speed both come from the level (see EffortChip in Composer.tsx,
+   which sets the duration and the two custom properties this reads), so a low
+   setting barely moves and a high one is hard to miss out of the corner of an
+   eye. That is the point of animating it at all: the chip answers "what am I
+   working with" without being read.
+
+   It animates box-shadow and never opacity. A keyframe starting at `opacity: 0`
+   renders as nothing at all under reduced motion and in headless Chrome — the
+   trap `relay-rise` above exists because of — and this chip has to stay legible
+   in exactly those two places. Both ends of the cycle are the resting state, so
+   a run that is frozen to a single frame by the block below lands on the chip
+   as it should look standing still. */
+@keyframes relay-effort-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--effort-glow-off, transparent); }
+  50% { box-shadow: 0 0 var(--effort-glow-size, 6px) 0 var(--effort-glow-on, transparent); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   /* The sheet, the toasts and the spinner all animate; none of them carry
      meaning that survives only in the motion. */

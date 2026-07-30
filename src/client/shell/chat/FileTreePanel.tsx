@@ -2,6 +2,7 @@ import * as React from 'react';
 import { Icon } from '../../ui/relay/Icon.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
 import { Badge, BadgeVariant } from '../../ui/relay/Badge.js';
+import { PHONE_SPACE, PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 
 /**
  * A browser for a session's working tree, shown beside the conversation.
@@ -169,9 +170,17 @@ interface RowContext {
 }
 
 function ChangeBadge({ kind, roundUp }: { kind: FileChangeKind | null; roundUp: number }) {
+  const isPhone = usePhone();
+  // Badge is a desktop-density primitive — 18px tall at `--text-2xs` — and it
+  // takes no phone of its own. Overridden here rather than there because the
+  // letter it draws is the only thing in the row that says a file changed, and
+  // at 10px on a phone it is a smudge beside a 15px name.
+  const scale: React.CSSProperties | null = isPhone
+    ? { height: TOUCH_TARGET / 2, padding: `0 ${PHONE_SPACE.inline}px`, fontSize: PHONE_TEXT.meta }
+    : null;
   if (kind) {
     return (
-      <Badge variant={CHANGE_VARIANT[kind]} dot style={{ ...CHANGE_STYLE[kind], flex: '0 0 auto' }}>
+      <Badge variant={CHANGE_VARIANT[kind]} dot style={{ ...CHANGE_STYLE[kind], flex: '0 0 auto', ...scale }}>
         {CHANGE_LETTER[kind]}
       </Badge>
     );
@@ -181,7 +190,7 @@ function ChangeBadge({ kind, roundUp }: { kind: FileChangeKind | null; roundUp: 
     // still spells out what the collapsed count means.
     return (
       <span title={`${roundUp} changed file${roundUp === 1 ? '' : 's'} inside`}>
-        <Badge variant="neutral" dot style={{ flex: '0 0 auto' }}>
+        <Badge variant="neutral" dot style={{ flex: '0 0 auto', ...scale }}>
           {roundUp}
         </Badge>
       </span>
@@ -204,6 +213,7 @@ function EntryRow({
   const node = ctx.nodes[entry.path] ?? DEFAULT_NODE;
   const [hover, setHover] = React.useState(false);
   const [keyboardFocus, setKeyboardFocus] = React.useState(false);
+  const isPhone = usePhone();
   const navRow: NavRow = { kind: 'entry', navKey: entry.path, entry, level, parentPath };
   const directChange = ctx.changed ? ctx.changed[entry.path] ?? null : null;
   const rollup = entry.isDirectory && !directChange ? descendantChangeCount(ctx.changed, entry.path) : 0;
@@ -239,11 +249,17 @@ function EntryRow({
       style={{
         display: 'flex',
         alignItems: 'center',
-        gap: 6,
-        height: 26,
-        minHeight: 26,
-        paddingLeft: 6 + (level - 1) * 16,
-        paddingRight: 8,
+        gap: isPhone ? PHONE_SPACE.inline : 6,
+        height: isPhone ? TOUCH_TARGET : 26,
+        minHeight: isPhone ? TOUCH_TARGET : 26,
+        // The row *is* the target, and rows stack. Sized alone they are one
+        // continuous strip with invisible seams, and which file opens is
+        // decided by which half of a seam the thumb landed in — so the gap
+        // goes between them, and the radius is what makes it look deliberate.
+        marginBottom: isPhone ? TOUCH_GAP : undefined,
+        borderRadius: isPhone ? 'var(--radius)' : undefined,
+        paddingLeft: (isPhone ? PHONE_SPACE.edge : 6) + (level - 1) * 16,
+        paddingRight: isPhone ? PHONE_SPACE.edge : 8,
         cursor: 'pointer',
         outline: 'none',
         background: hover ? 'var(--accent)' : 'transparent',
@@ -254,8 +270,8 @@ function EntryRow({
         aria-hidden="true"
         style={{
           flex: '0 0 auto',
-          width: 13,
-          height: 13,
+          width: isPhone ? 18 : 13,
+          height: isPhone ? 18 : 13,
           display: 'inline-flex',
           alignItems: 'center',
           justifyContent: 'center',
@@ -264,11 +280,11 @@ function EntryRow({
           transition: 'transform var(--duration-fast) var(--ease-standard)',
         }}
       >
-        {entry.isDirectory ? <Icon name="chevron-right" size={12} /> : null}
+        {entry.isDirectory ? <Icon name="chevron-right" size={isPhone ? 16 : 12} /> : null}
       </span>
       <Icon
         name="folder"
-        size={14}
+        size={isPhone ? 18 : 14}
         style={{
           flex: '0 0 auto',
           color: entry.isDirectory ? 'var(--info)' : 'var(--muted-foreground)',
@@ -276,7 +292,11 @@ function EntryRow({
         }}
       />
       {!entry.isDirectory ? (
-        <Icon name="file-text" size={14} style={{ flex: '0 0 auto', color: 'var(--muted-foreground)' }} />
+        <Icon
+          name="file-text"
+          size={isPhone ? 18 : 14}
+          style={{ flex: '0 0 auto', color: 'var(--muted-foreground)' }}
+        />
       ) : null}
       <span
         style={{
@@ -286,7 +306,7 @@ function EntryRow({
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap',
           fontFamily: 'var(--font-mono)',
-          fontSize: 'var(--text-sm)',
+          fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-sm)',
           color: 'var(--foreground)',
         }}
       >
@@ -297,7 +317,7 @@ function EntryRow({
           style={{
             flex: '0 0 auto',
             fontFamily: 'var(--font-mono)',
-            fontSize: 'var(--text-2xs)',
+            fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)',
             color: 'var(--muted-foreground)',
           }}
         >
@@ -310,16 +330,17 @@ function EntryRow({
 }
 
 function StatusRow({ level, text, tone }: { level: number; text: string; tone: 'muted' | 'destructive' }) {
+  const isPhone = usePhone();
   return (
     <div
       role="presentation"
       style={{
         display: 'flex',
         alignItems: 'center',
-        height: 24,
-        paddingLeft: 6 + level * 16,
+        height: isPhone ? TOUCH_TARGET : 24,
+        paddingLeft: (isPhone ? PHONE_SPACE.edge : 6) + level * 16,
         fontFamily: 'var(--font-sans)',
-        fontSize: 'var(--text-xs)',
+        fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-xs)',
         color: tone === 'destructive' ? 'var(--destructive)' : 'var(--muted-foreground)',
       }}
     >
@@ -334,6 +355,7 @@ function MoreRow({ parentPath, level, remaining, ctx }: { parentPath: string; le
   const active = ctx.activeKey === navKey;
   const [hover, setHover] = React.useState(false);
   const [keyboardFocus, setKeyboardFocus] = React.useState(false);
+  const isPhone = usePhone();
   return (
     <div
       ref={(el) => ctx.registerRef(navKey, el)}
@@ -356,15 +378,20 @@ function MoreRow({ parentPath, level, remaining, ctx }: { parentPath: string; le
       style={{
         display: 'flex',
         alignItems: 'center',
-        height: 24,
-        paddingLeft: 6 + (level - 1) * 16 + 19,
+        height: isPhone ? TOUCH_TARGET : 24,
+        marginBottom: isPhone ? TOUCH_GAP : undefined,
+        borderRadius: isPhone ? 'var(--radius)' : undefined,
+        // Lines up with the *names* above it, not with their twisties: the
+        // indent is the rows' own plus the twisty and the gap after it, both
+        // of which grow with the scale.
+        paddingLeft: (isPhone ? PHONE_SPACE.edge : 6) + (level - 1) * 16 + (isPhone ? 26 : 19),
         cursor: 'pointer',
         outline: 'none',
         background: hover ? 'var(--accent)' : 'transparent',
         boxShadow: keyboardFocus ? 'var(--shadow-focus)' : 'none',
         color: 'var(--info)',
         fontFamily: 'var(--font-sans)',
-        fontSize: 'var(--text-xs)',
+        fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
       }}
     >
       Show {remaining} more…
@@ -427,6 +454,7 @@ export function FileTreePanel({
   const [nodes, setNodes] = React.useState<Record<string, NodeState>>({});
   const [activeKey, setActiveKey] = React.useState<string | null>(null);
   const refs = React.useRef(new Map<string, HTMLDivElement>());
+  const isPhone = usePhone();
 
   const registerRef = React.useCallback((key: string, el: HTMLDivElement | null) => {
     if (el) refs.current.set(key, el);
@@ -571,14 +599,21 @@ export function FileTreePanel({
         style={{
           display: 'flex',
           alignItems: 'center',
-          gap: 6,
-          height: 34,
-          minHeight: 34,
-          padding: '0 6px 0 10px',
+          gap: isPhone ? TOUCH_GAP : 6,
+          // Room for what is in it: IconButton takes the touch floor on a
+          // phone by itself, and a 34px strip left the refresh control hanging
+          // five pixels out of both ends of its own border.
+          height: isPhone ? TOUCH_TARGET + TOUCH_GAP : 34,
+          minHeight: isPhone ? TOUCH_TARGET + TOUCH_GAP : 34,
+          padding: isPhone ? `0 ${TOUCH_GAP}px 0 ${PHONE_SPACE.edge}px` : '0 6px 0 10px',
           borderBottom: '1px solid var(--border)',
         }}
       >
-        <Icon name="hard-drive" size={13} style={{ flex: '0 0 auto', color: 'var(--muted-foreground)' }} />
+        <Icon
+          name="hard-drive"
+          size={isPhone ? 18 : 13}
+          style={{ flex: '0 0 auto', color: 'var(--muted-foreground)' }}
+        />
         <span
           title={root}
           style={{
@@ -588,15 +623,15 @@ export function FileTreePanel({
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
             fontFamily: 'var(--font-mono)',
-            fontSize: 'var(--text-xs)',
+            fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-xs)',
             color: 'var(--muted-foreground)',
           }}
         >
           {root}
         </span>
         {onRefresh ? (
-          <IconButton label="Refresh file tree" size="sm" onClick={onRefresh} disabled={loading}>
-            <Icon name="refresh-cw" size={13} />
+          <IconButton label="Refresh file tree" size={isPhone ? 'lg' : 'sm'} onClick={onRefresh} disabled={loading}>
+            <Icon name="refresh-cw" size={isPhone ? 18 : 13} />
           </IconButton>
         ) : null}
       </div>
@@ -608,7 +643,7 @@ export function FileTreePanel({
           minHeight: 0,
           overflowY: 'auto',
           overflowX: 'hidden',
-          padding: '4px 0',
+          padding: isPhone ? `${TOUCH_GAP}px 0` : '4px 0',
         }}
       >
         {loading ? (
@@ -616,7 +651,7 @@ export function FileTreePanel({
             style={{
               padding: '10px 12px',
               fontFamily: 'var(--font-sans)',
-              fontSize: 'var(--text-sm)',
+              fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-sm)',
               color: 'var(--muted-foreground)',
             }}
           >
@@ -627,7 +662,7 @@ export function FileTreePanel({
             style={{
               padding: '10px 12px',
               fontFamily: 'var(--font-sans)',
-              fontSize: 'var(--text-sm)',
+              fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-sm)',
               color: 'var(--muted-foreground)',
             }}
           >

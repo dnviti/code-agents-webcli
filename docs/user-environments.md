@@ -283,3 +283,12 @@ a `--container-memory` value the kernel refuses.
   limits; finding room for the result is the cluster's own business.
 - Environments are never shared between accounts, and one user cannot see
   another's.
+- Two readings the app takes for its own panels still come from the host, and
+  both are the server's answer rather than the user's: the model list a runtime
+  publishes, which is probed by running the CLI on this machine, and the cached
+  Claude account reading behind *Status*, which is read from the server
+  account's `~/.claude.json`. Neither is a path a user's work travels — a
+  conversation, a terminal, a file, a git command all run in the environment —
+  but a picker offering a model an image does not have, or an account panel
+  describing a plan that is not the signed-in user's, is the shape a wrong one
+  would take.

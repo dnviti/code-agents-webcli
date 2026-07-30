@@ -10,7 +10,8 @@
 // that used to call `document.getElementById(...).classList.add('active')` call
 // `shellStore.setState({ ... })` instead and keep the rest of their logic.
 
-import type { SessionListItem } from '../types';
+import type { NotifySettings, SessionListItem } from '../types';
+import type { ConversationAttention } from '../../shared/chat-alerts';
 import type { ConfirmRequest } from '../ui/confirm';
 import { DEFAULT_CHAT_VIEW, type ChatViewSettings } from '../chat/view-settings';
 
@@ -24,6 +25,16 @@ export interface ShellTab {
   kind: string;
   workingDir: string | null;
   unread: boolean;
+  /**
+   * Whether this conversation has stopped and is waiting on a person.
+   *
+   * A scalar rather than an object because tabs are compared one level deep
+   * (see `shallowEqual`), and because it is the one thing about a conversation
+   * a tab strip can usefully say: this is not progress, it is a stop that only
+   * the user can end. Null for terminals and for conversations that are working
+   * or idle.
+   */
+  attention: ConversationAttention | null;
   /**
    * Which surface this session runs on, fixed when it was started.
    *
@@ -50,6 +61,29 @@ export interface ShellChat {
   runtime: string;
   runtimeLabel: string;
   workingDir: string;
+  /**
+   * Bumped every time this slice is republished, so that it always is.
+   *
+   * The store's `shallowEqual` guard exists to stop a redundant patch waking
+   * every subscriber, and it is right about almost everything here. It was wrong
+   * about this slice in one specific and invisible way: a controller announcing
+   * that something it owns has changed republishes the *same* six values — same
+   * controller object, same session id, same runtime — so the guard saw no
+   * change and told nobody.
+   *
+   * What that cost was every piece of conversation state living on the
+   * controller rather than on the transcript: the model override, the effort
+   * level, and above all the feedback line that reports what the server actually
+   * did with a change. Those only ever redrew when something else happened to
+   * move the transcript in the same moment, which is why a `live` switch looked
+   * fine and a `cleared` or `pending` one left the previous answer on screen —
+   * the runtime emits an event for the first and nothing at all for the others.
+   *
+   * A counter rather than dropping the guard for this slice, because the guard
+   * is load-bearing everywhere else and "this republication is meaningful" is a
+   * claim the caller should have to make rather than a property of the shape.
+   */
+  revision: number;
 }
 
 /*
@@ -87,6 +121,15 @@ export interface ShellDialogs {
   terminalOptions: boolean;
   /** The session list, reachable from the mobile bar and the palette. */
   sessions: boolean;
+  /**
+   * Every conversation this user has, grouped by project and searchable.
+   *
+   * Separate from `sessions` because they answer different questions: that one
+   * lists what is running on the server right now and offers to join or delete
+   * it, this one lists conversations — including the ones nothing is running and
+   * the ones whose tab was closed — and offers to reopen them.
+   */
+  conversations: boolean;
   /** The mobile tab switcher sheet. */
   tabs: boolean;
   /** The mobile "More" sheet. */
@@ -95,6 +138,8 @@ export interface ShellDialogs {
   rename: string | null;
   /** The chat surface's own presentation settings. */
   chatSettings: boolean;
+  /** The token/cost accounting dashboard. */
+  usage: boolean;
 }
 
 export interface FolderEntry {
@@ -215,6 +260,15 @@ export interface ShellState {
    * promising something other than what it does.
    */
   chatBypassPermissions: boolean;
+  /**
+   * When a conversation may interrupt the user, mirrored out of AppSettings.
+   *
+   * Read on every chat event of every conversation this browser watches, which
+   * is why it is here rather than parsed out of localStorage at the point of
+   * use. Six flat booleans, so the store's one-level equality check still sees
+   * a no-op patch for what it is.
+   */
+  notifications: NotifySettings;
   /** Which chat panels are shown, and what the transcript renders. */
   chatView: ChatViewSettings;
 }
@@ -236,10 +290,12 @@ const INITIAL: ShellState = {
     newSession: false,
     terminalOptions: false,
     sessions: false,
+    conversations: false,
     tabs: false,
     more: false,
     rename: null,
     chatSettings: false,
+    usage: false,
   },
   folder: {
     open: false,
@@ -260,6 +316,7 @@ const INITIAL: ShellState = {
     runtime: '',
     runtimeLabel: '',
     workingDir: '',
+    revision: 0,
   },
   plan: null,
   toasts: [],
@@ -270,6 +327,17 @@ const INITIAL: ShellState = {
   logoutUrl: null,
   install: 'unsupported',
   chatBypassPermissions: false,
+  // Replaced by `applySettings` during boot, before the first render. On until
+  // then so a conversation that finishes during startup is not silently missed
+  // by a store that had not read the user's choice yet.
+  notifications: {
+    enabled: true,
+    finished: true,
+    failed: true,
+    approval: true,
+    question: true,
+    details: true,
+  },
   chatView: DEFAULT_CHAT_VIEW,
 };
 

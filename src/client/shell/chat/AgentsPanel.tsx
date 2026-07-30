@@ -30,6 +30,9 @@ export const STATUS_META: Record<ToolStatus, { label: string; variant: BadgeVari
   failed: { label: 'failed', variant: 'destructive' },
   denied: { label: 'denied', variant: 'destructive' },
   canceled: { label: 'canceled', variant: 'outline' },
+  // Not "done" and not "failed": nobody stopped it and nothing is known to have
+  // broken — the runtime stopped talking about it and its turn is over (#139).
+  unknown: { label: 'no longer reporting', variant: 'outline' },
 };
 
 export interface AgentsPanelProps {
@@ -46,9 +49,16 @@ export interface AgentsPanelProps {
 }
 
 export function AgentsPanel({ transcript, onOpenDelegation }: AgentsPanelProps): React.JSX.Element {
+  // The live tier, not `subscribe`. What a workflow is doing arrives as
+  // `workflow_progress`, which the reducer marks neither structural nor meta —
+  // so it reaches `subscribeContent` and nothing else (see transcript.ts). On
+  // the coarse tier this panel showed the counts a run reported at the moment
+  // some *unrelated* structural event last fired: "3 agents · 3 running" under
+  // a workflow that had finished, and no sign of one that had lost an agent
+  // (#140). Every other delegation surface is already here.
   const version = React.useSyncExternalStore(
-    transcript.subscribe,
-    transcript.getVersion,
+    transcript.subscribeContent,
+    transcript.getContentVersion,
     ZERO,
   );
 
@@ -135,7 +145,11 @@ function ActivityRow({
         gap: 7,
         padding: '7px 10px',
         borderBottom: '1px solid var(--border)',
-        opacity: entry.running ? 1 : 0.75,
+        // Finished work is dimmed so the working rows carry the panel — but not
+        // a run that failed. Faded to 0.75 the red it is written in composites
+        // to about 3.3:1 against the rail, under the 4.5:1 body text needs, and
+        // the one row nobody should have to squint at is the broken one (#140).
+        opacity: entry.running || entry.status === 'failed' ? 1 : 0.75,
         cursor: 'pointer',
       }}
     >
@@ -164,6 +178,38 @@ function ActivityRow({
           <Badge variant={meta.variant} dot={entry.running}>
             {meta.label}
           </Badge>
+          {/* What a workflow holds, which is the thing that made it a different
+              kind of row from a sub-agent in the first place (#117). Only when
+              the run has said — a workflow that reports nothing keeps the row
+              it has always had rather than gaining a hollow "0 agents". */}
+          {entry.agentCount ? (
+            <span
+              style={{
+                fontFamily: 'var(--font-mono)',
+                fontSize: 'var(--text-2xs)',
+                color: entry.agentsRunning ? 'var(--warning)' : 'var(--muted-foreground)',
+              }}
+            >
+              {entry.agentsRunning
+                ? `${entry.agentCount} agents · ${entry.agentsRunning} running`
+                : `${entry.agentCount} agents`}
+            </span>
+          ) : null}
+          {/* What went wrong underneath, which the badge above deliberately does
+              not say: a run can return a perfectly good result with two of its
+              twelve agents dead, and a red badge over that would be crying wolf
+              (#140). Its own span so the count is red while the rest is not. */}
+          {entry.agentsFailed ? (
+            <span
+              style={{
+                fontFamily: 'var(--font-mono)',
+                fontSize: 'var(--text-2xs)',
+                color: 'var(--destructive)',
+              }}
+            >
+              {`${entry.agentsFailed} failed`}
+            </span>
+          ) : null}
           {entry.durationMs !== undefined ? (
             <span
               style={{
@@ -190,9 +236,37 @@ function ActivityRow({
             {entry.description}
           </div>
         ) : null}
+        {/* Why it broke, on the row. A red badge that told you *that* something
+            failed and made you open a popup to find out *what* is a row that
+            has answered the easier half of the question (#140). One line: the
+            whole of a runtime error is a stack trace, and the popup is a click
+            away for the rest of it. */}
+        {entry.status === 'failed' && entry.error ? (
+          <div
+            title={entry.error}
+            style={{
+              marginTop: 2,
+              fontFamily: 'var(--font-mono)',
+              fontSize: 'var(--text-2xs)',
+              lineHeight: 'var(--leading-snug)',
+              color: 'var(--destructive)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {firstLine(entry.error)}
+          </div>
+        ) : null}
       </div>
     </div>
   );
+}
+
+/** The headline of a runtime error, without the stack under it. */
+function firstLine(text: string): string {
+  const line = text.split('\n').find((candidate) => candidate.trim()) ?? '';
+  return line.trim();
 }
 
 function formatDuration(ms: number): string {

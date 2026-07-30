@@ -11,6 +11,7 @@ import {
   onUpdateRestarting,
 } from '../ui/update-banner';
 import { stripUnsupportedTerminalSequences } from './text';
+import { createFrameScheduler } from './scheduler';
 import { clearChatSurface, setChatSurface } from '../chat/surface';
 import { settleRuntimeStart } from '../sessions/actions';
 
@@ -19,6 +20,22 @@ export class MessageHandler {
 
   constructor(app: App) {
     this.app = app;
+
+    // The trigger issue #17 names first is another viewer resizing the shared
+    // PTY while this client just sits there — a second tab, a phone, a split.
+    // Nothing happens on this end when it does, so there is no join and no
+    // socket event to hang a recovery off; the user finds the skeleton when
+    // they come back to the tab. Coming back is the event.
+    //
+    // Guarded because this handler is also bundled straight into node for the
+    // tests, where there is no document.
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          this.reclaimTerminalGeometry();
+        }
+      });
+    }
   }
 
   handle(message: WsMessage): void {
@@ -106,6 +123,7 @@ export class MessageHandler {
       case 'qwen_started':
       case 'kimi_started':
       case 'omp_started':
+      case 'antigravity_started':
       case 'terminal_started':
         this.onRuntimeStarted(message);
         break;
@@ -118,6 +136,7 @@ export class MessageHandler {
       case 'qwen_stopped':
       case 'kimi_stopped':
       case 'omp_stopped':
+      case 'antigravity_stopped':
       case 'terminal_stopped':
         this.onRuntimeStopped(message);
         break;
@@ -221,15 +240,55 @@ export class MessageHandler {
     const sessionId = message.sessionId;
     if (!tabs || !sessionId) return;
 
-    const event = message.event as { t?: string; state?: string } | undefined;
+    const event = message.event as {
+      t?: string;
+      state?: string;
+      stale?: boolean;
+      fatal?: boolean;
+    } | undefined;
     if (!event) return;
 
     const background = sessionId !== this.app.currentClaudeSessionId;
 
-    if (event.t === 'permission') {
-      // The one event that is genuinely blocking: the agent has stopped and
+    if (event.t === 'permission' || event.t === 'question') {
+      // The two events that are genuinely blocking: the agent has stopped and
       // will not move again until somebody answers.
       tabs.updateTabStatus(sessionId, 'idle');
+      if (background) tabs.updateUnreadIndicator(sessionId, true);
+      return;
+    }
+
+    if (event.t === 'turn_end') {
+      // The end of a turn is the *only* thing on the wire that says a
+      // conversation stopped working, for claude, for every ACP runtime and for
+      // codex in app-server mode: none of them emits a `state` event when a
+      // turn ends, and the server does not synthesise one because the log
+      // already carries this. Watching states alone left those tabs marked as
+      // running until something else happened to move them, which on a finished
+      // conversation is never.
+      //
+      // A `stale` end is the runtime letting go of work that was interrupted,
+      // with the turn carrying straight on into what interrupted it. Nothing
+      // has stopped, so nothing is reported.
+      if (!event.stale) tabs.updateTabStatus(sessionId, 'idle');
+      return;
+    }
+
+    if (event.t === 'error') {
+      // A runtime that dies says so here and never sends `turn_end` at all.
+      if (event.fatal) tabs.markSessionError(sessionId, true);
+      return;
+    }
+
+    if (event.t === 'workflow_failed') {
+      // The in-app half of telling somebody. The desktop notification is the
+      // other half and it is the one that may not exist — permission is
+      // `default` until a person grants it, and a browser that never got it
+      // leaves the tab as the only surface saying anything happened at all.
+      //
+      // Unread rather than the error mark: the *conversation* has not failed
+      // and may be working perfectly well on something else. What is waiting is
+      // something to read (#140).
       if (background) tabs.updateUnreadIndicator(sessionId, true);
       return;
     }
@@ -293,6 +352,13 @@ export class MessageHandler {
     this.app.historyView?.setRange(this.app.historyRange);
     this.app.currentClaudeSessionName = message.sessionName;
     this.app.terminal?.reset();
+    // Whatever this client last told the PTY about its size stopped being true
+    // the moment somebody else attached: the split pane, the second tab or the
+    // phone that joined last is the one that set the geometry. Forget it here
+    // so the refit below really re-sends ours, and ask for a repaint, because
+    // the program is mid-screen and will not redraw on its own.
+    this.forgetSentGeometry();
+    this.repaintNudgeArmed = true;
     this.scheduleTerminalRefit();
 
     if (this.app.sessionTabManager) {
@@ -504,6 +570,42 @@ export class MessageHandler {
 
   private lastSentCols = 0;
   private lastSentRows = 0;
+  private repaintNudgeArmed = false;
+  /** rAF with a timer behind it: a starved frame here leaves the PTY one row short. */
+  private readonly restoreScheduler = createFrameScheduler();
+  /** And the same for the wave that fires the nudge, or it never fires at all. */
+  private readonly refitScheduler = createFrameScheduler();
+
+  /**
+   * Drop this client's record of the geometry the PTY is running at.
+   *
+   * Nothing used to reset it, and this handler is built once and outlives every
+   * reconnect, session switch and split. The PTY is shared, though: a split
+   * pane, a second tab or a phone joining the same session resizes it to their
+   * screen, and ours never changed — so syncSize() saw nothing to send and the
+   * main terminal went on drawing a full-width screen over a half-width PTY.
+   * Forgetting rather than bypassing the guard in syncSize keeps "send only on
+   * a real change" true for every other path.
+   */
+  forgetSentGeometry(): void {
+    this.lastSentCols = 0;
+    this.lastSentRows = 0;
+  }
+
+  /**
+   * Take the session's geometry back over a socket that never dropped.
+   *
+   * Closing a split is the case that needs saying out loud: the pane held this
+   * same session and left the PTY half a screen wide, then closeSplit() calls
+   * connect(), which returns straight away because the main socket was never
+   * closed. No session_joined arrives, so without this nothing on this path
+   * would ever speak up again and the only cure was resizing the window.
+   */
+  reclaimTerminalGeometry(): void {
+    this.forgetSentGeometry();
+    this.repaintNudgeArmed = true;
+    this.scheduleTerminalRefit();
+  }
 
   /**
    * Fit once now and once after layout settles.
@@ -535,13 +637,83 @@ export class MessageHandler {
     this.app.send({ type: 'resize', cols: terminal.cols, rows: terminal.rows });
   }
 
+  /**
+   * Make the attached program repaint the whole screen.
+   *
+   * Re-sending the size it already has achieves nothing, and a CLI that paints
+   * only the cells it believes changed leaves a rejoined terminal as a skeleton
+   * with the ticking values moving on it. Dipping a row and coming back is two
+   * real SIGWINCHes, which is what makes it redraw from scratch — by hand, that
+   * is what resizing the browser window was doing.
+   *
+   * The two sizes go a frame apart on purpose: back to back they can reach the
+   * program as a single change it reads once, and it repaints nothing.
+   */
+  private nudgeRepaint(): void {
+    const terminal = this.app.terminal;
+    if (
+      !terminal ||
+      !this.app.currentClaudeSessionId ||
+      !this.app.socket ||
+      this.app.socket.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+
+    // A single-row terminal has nothing to give back, and a PTY is never zero
+    // rows tall, so there is no dip to make here.
+    const cols = terminal.cols;
+    const rows = terminal.rows;
+    if (cols <= 0 || rows <= 1) {
+      return;
+    }
+
+    // lastSent deliberately still says the real size: the refit waves that
+    // follow this one in the same frame must stay quiet, or their resize lands
+    // microseconds after the dip and closes the gap the nudge depends on.
+    this.app.send({ type: 'resize', cols, rows: rows - 1 });
+
+    this.restoreScheduler.schedule(() => {
+      const current = this.app.terminal;
+      if (
+        !current ||
+        current.cols <= 0 ||
+        current.rows <= 0 ||
+        !this.app.socket ||
+        this.app.socket.readyState !== WebSocket.OPEN
+      ) {
+        // Giving up here would leave the PTY on the borrowed row while
+        // lastSent still claims the real one, and syncSize would never correct
+        // it: this issue again, made by the fix for it. Forget instead, so the
+        // next fit sends whatever the truth turns out to be.
+        this.forgetSentGeometry();
+        return;
+      }
+
+      // Read again rather than restoring the captured size: a genuine resize
+      // during that frame must win over the row we borrowed.
+      this.lastSentCols = current.cols;
+      this.lastSentRows = current.rows;
+      this.app.send({ type: 'resize', cols: current.cols, rows: current.rows });
+    });
+  }
+
   private scheduleTerminalRefit(): void {
     this.app.fitTerminal();
     this.syncSize();
 
-    requestAnimationFrame(() => {
+    this.refitScheduler.schedule(() => {
       this.app.fitTerminal();
       this.syncSize();
+
+      // After the fit rather than alongside it: nudging a geometry that is
+      // about to change again spends the repaint on the wrong size. Only a join
+      // arms it, so the refits that follow output or a window resize — which
+      // already carry a SIGWINCH of their own — stay silent.
+      if (this.repaintNudgeArmed) {
+        this.repaintNudgeArmed = false;
+        this.nudgeRepaint();
+      }
     });
   }
 }

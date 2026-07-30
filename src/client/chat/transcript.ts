@@ -19,17 +19,20 @@
  */
 
 import {
+  AccountLimits,
   ChatCapabilities,
   ChatEvent,
   ChatMessage,
   ChatSnapshot,
   ChatState,
+  ChatTurnIndexEntry,
   ChatUsage,
   PermissionRequest,
   PlanItem,
   QueuedTurn,
   QuestionRequest,
   NO_CHAT_CAPABILITIES,
+  isSessionMintedMessageId,
 } from '../../shared/chat-events.js';
 import {
   TranscriptState,
@@ -39,6 +42,42 @@ import {
 } from '../../shared/chat-reducer.js';
 
 type Listener = () => void;
+
+/**
+ * Drop a runtime's echo of the prompt once the page carrying this app's own copy
+ * has arrived.
+ *
+ * The reducer already refuses these as they stream in (#129), on the same test:
+ * only `ChatSession.deliver` ever writes a user message and it always mints
+ * `user-<uuid>`, so a second user message in a turn that already holds this app's
+ * own, under a name this app would not have minted, is the runtime repeating the
+ * prompt back. That guard has to see both halves at once, and scrolling back is
+ * exactly where they arrive apart: `absorbPage` folds every history page through
+ * a scratch transcript of its own, so a page boundary landing in the handful of
+ * events between the app's message and the echo hides each from the other and
+ * both survive into the merge — two identical bubbles, side by side, in a turn
+ * eleven pages back. This is the same rule at the one point where the pair is
+ * finally whole.
+ *
+ * Only conversations recorded before the adapters stopped echoing carry a pair at
+ * all, and nothing rewrites them: this decides what is drawn, each time one is
+ * opened.
+ */
+function withoutRuntimeUserEchoes(messages: ChatMessage[]): ChatMessage[] {
+  const ownTurns = new Set<string>();
+  for (const message of messages) {
+    if (message.role === 'user' && message.turnId && isSessionMintedMessageId(message.id)) {
+      ownTurns.add(message.turnId);
+    }
+  }
+  if (!ownTurns.size) return messages;
+  return messages.filter(
+    (message) =>
+      message.role !== 'user'
+      || isSessionMintedMessageId(message.id)
+      || !ownTurns.has(message.turnId),
+  );
+}
 
 export class ChatTranscript {
   private state: TranscriptState;
@@ -92,6 +131,9 @@ export class ChatTranscript {
    * every component that needs both.
    */
   private queued: QueuedTurn[] = [];
+  private recorded: ChatTurnIndexEntry[] | null = null;
+  /** What each finished turn cost, by turn id. See `spendFor`. */
+  private readonly spend = new Map<string, ChatUsage>();
 
   /**
    * What the server last said about the process behind this conversation.
@@ -147,6 +189,21 @@ export class ChatTranscript {
     return this.bypass;
   }
 
+  /**
+   * Show the mode a list row already stated, until the server states it here.
+   *
+   * A display seed and nothing more: it is never sent back in a launch, and the
+   * two authorities — `hydrate` from a snapshot and `setBypassing` from a
+   * `chat_started` — overwrite it without consulting it. It exists because the
+   * session list and the conversations dialog both know the mode before the
+   * pane does, and a pane that opened claiming "asks first" over a conversation
+   * the row had just labelled "approvals bypassed" was the wrong answer in the
+   * dangerous direction (#134).
+   */
+  seedBypass(bypassing: boolean): void {
+    this.setBypassing(bypassing);
+  }
+
   /** Take the mode from a `chat_started`, which announces the launch's own. */
   setBypassing(bypassing: boolean): void {
     if (this.bypass === bypassing) return;
@@ -163,8 +220,28 @@ export class ChatTranscript {
       plan: snapshot.plan || [],
       pendingPermissions: snapshot.pendingPermissions || [],
       pendingQuestions: snapshot.pendingQuestions || [],
+      // What was picked, for the questions already answered (#113). Falling
+      // back to what is already held rather than to nothing: a server that
+      // predates this field must not take the marks off a card this browser
+      // watched being answered a moment ago. Copied because the snapshot is
+      // wire data and the reducer writes into this map in place.
+      answeredQuestions: snapshot.answeredQuestions
+        ? { ...snapshot.answeredQuestions }
+        : { ...this.state.answeredQuestions },
       firstSeq: snapshot.firstSeq,
       cursor: snapshot.cursor,
+      // The turn the server's replay was still inside. Live events arriving
+      // after this join belong to it, and without it the first of them opens a
+      // turn of its own named after nothing the user typed.
+      currentTurnId: snapshot.currentTurnId ?? null,
+      // The level the runtime reported, which `createTranscript` would otherwise
+      // drop — leaving the control blank over a live session that is still
+      // thinking at whatever it opened on.
+      effort: snapshot.effort,
+      // The provider's own account reading, which `createTranscript` would
+      // otherwise drop — leaving a rejoined conversation saying its runtime had
+      // never reported a rate-limit window when it had reported one an hour ago.
+      limits: snapshot.limits,
     });
     // A server that does not report its replay floor gets `firstSeq`, which
     // reads as "nothing older" — no paging offered rather than paging that can
@@ -197,10 +274,25 @@ export class ChatTranscript {
    * already hold), and not moving the floor for that case is what turned a
    * finished request into a spinner nobody could clear.
    */
-  prepend(messages: ChatMessage[], firstSeq: number, from?: number): void {
+  prepend(
+    messages: ChatMessage[],
+    firstSeq: number,
+    from?: number,
+    answers?: Record<string, string[]>,
+  ): void {
     this.state.firstSeq = firstSeq;
     if (from !== undefined) {
       this.oldest = Math.max(firstSeq, Math.min(this.oldest || from, from));
+    }
+
+    // A question far enough back that it arrives by scrolling brings its answer
+    // with it (#113). The page is replayed through a scratch transcript that
+    // folds `question_resolved` correctly; without this, that answer was
+    // computed and then thrown away with the scratch. What is already held
+    // wins: these are keyed by tool call, so a collision is the same answer,
+    // and the live map is the newer knowledge.
+    if (answers) {
+      this.state.answeredQuestions = { ...answers, ...this.state.answeredQuestions };
     }
 
     if (!messages.length) {
@@ -210,9 +302,21 @@ export class ChatTranscript {
 
     const known = new Set(this.state.messages.map((message) => message.id));
     const fresh = messages.filter((message) => !known.has(message.id));
-    this.state.messages = [...fresh, ...this.state.messages];
+    this.state.messages = withoutRuntimeUserEchoes([...fresh, ...this.state.messages]);
     reindexTranscript(this.state);
     this.bumpAll();
+  }
+
+  /**
+   * Start this transcript inside a turn that opened before its first event.
+   *
+   * For the scratch transcript a page is replayed through: the slice begins
+   * wherever the browser scrolled back to, which is routinely the middle of a
+   * turn, and the server says which one so the messages are filed under the
+   * turn the conversation recorded rather than the runtime's name for it.
+   */
+  seedOpenTurn(turnId: string | null | undefined): void {
+    this.state.currentTurnId = turnId ?? null;
   }
 
   get loadingMore(): boolean {
@@ -237,6 +341,52 @@ export class ChatTranscript {
   }
 
   /**
+   * Every turn of this conversation as recorded, or null until the server says.
+   *
+   * Held here rather than on the controller so it travels on the version
+   * counter every surface already subscribes to. It arrives once, well after
+   * the snapshot, and a view memoised on the transcript's version would
+   * otherwise never recompute for it — the index went on showing the one turn
+   * the browser happened to hold, which is the defect it exists to fix (#86).
+   *
+   * Null is not an empty list: it means nobody has answered yet, or the server
+   * is older than this page, and the turn strip falls back to numbering what it
+   * holds. An empty list is a conversation with no turns in it.
+   */
+  get recordedTurns(): ChatTurnIndexEntry[] | null {
+    return this.recorded;
+  }
+
+  /**
+   * What a turn that has ended cost, as the accounting filed it.
+   *
+   * Held beside the recorded index rather than inside it because it arrives
+   * from two directions: with the index when a conversation is opened, and one
+   * turn at a time as they finish. Both are the same figure from the same
+   * place — see `spendByTurn` — so a turn ending is a correction to this map
+   * and never a second opinion.
+   */
+  get turnSpend(): ReadonlyMap<string, ChatUsage> {
+    return this.spend;
+  }
+
+  /** One turn's recorded spend, as the session files it. */
+  setTurnSpend(turnId: string, usage: ChatUsage): void {
+    this.spend.set(turnId, usage);
+    this.notify();
+  }
+
+  setRecordedTurns(turns: ChatTurnIndexEntry[]): void {
+    this.recorded = turns;
+    for (const turn of turns) {
+      // A turn still running has no filed figure yet, and must not be given an
+      // empty one — the surfaces read "nothing recorded" off its absence.
+      if (turn.usage) this.spend.set(turn.turnId, turn.usage);
+    }
+    this.notify();
+  }
+
+  /**
    * A process appeared behind this conversation, or went away.
    *
    * Only a snapshot carried this before, which meant a session relaunched into
@@ -251,9 +401,33 @@ export class ChatTranscript {
     this.notify();
   }
 
-  apply(event: ChatEvent): void {
+  /**
+   * Fold in what a launch announced about the runtime behind this conversation.
+   *
+   * A merge, exactly as a `capabilities` event is one, and for a reason that
+   * only shows up on a relaunch: what a process can say about itself at the
+   * moment it starts is less than the conversation already knows — claude
+   * publishes its slash commands in the `init` of its first turn — so replacing
+   * the set wholesale would empty the picker at the moment the runtime came
+   * back.
+   */
+  setCapabilities(capabilities: Partial<ChatCapabilities>): void {
+    this.state.capabilities = { ...this.state.capabilities, ...capabilities };
+    this.notify();
+  }
+
+  /**
+   * Fold one event in, and say whether it was new.
+   *
+   * The answer is the reducer's own: an event at or below the cursor is a
+   * replay and changes nothing. Returned rather than kept private because it is
+   * the only honest edge in this client — a reconnect redelivers the tail of
+   * the log, and a caller that wants to act *once* per thing that happened has
+   * no other way to tell the difference.
+   */
+  apply(event: ChatEvent): boolean {
     const change = applyChatEvent(this.state, event);
-    if (!change.applied) return;
+    if (!change.applied) return false;
 
     this.version++;
 
@@ -262,11 +436,12 @@ export class ChatTranscript {
       const message = this.state.messages[change.messageIndex];
       if (message) {
         this.bumpMessage(message.id);
-        return;
+        return true;
       }
     }
 
     this.bumpAll();
+    return true;
   }
 
   applyAll(events: ChatEvent[]): void {
@@ -394,6 +569,16 @@ export class ChatTranscript {
     return this.state.answeredQuestions[toolId];
   }
 
+  /**
+   * Every answer this transcript holds, keyed the way the reducer keys them.
+   *
+   * Read off a scratch transcript when a page of history is folded in, so the
+   * answers it computed reach the real one rather than being dropped with it.
+   */
+  get answeredQuestions(): Record<string, string[]> {
+    return this.state.answeredQuestions;
+  }
+
   get cursor(): number {
     return this.state.cursor;
   }
@@ -415,6 +600,39 @@ export class ChatTranscript {
    */
   get model(): string | undefined {
     return this.state.model;
+  }
+
+  /**
+   * Every model the last turn was billed to, when the runtime broke it down.
+   *
+   * One entry — the usual case — says nothing `model` does not already say.
+   * More than one is the fact the header has to carry: the turn did not run on
+   * one model, and a single name would be a claim about work that was split.
+   */
+  get turnModels(): string[] | undefined {
+    return this.state.turnModels;
+  }
+
+  /**
+   * The reasoning-effort level the runtime last reported running at.
+   *
+   * Undefined until a runtime says, which is the state most conversations spend
+   * their life in: an agent left on its own default reports nothing, and
+   * inventing a level for it would put a number on a decision nobody made.
+   */
+  get effort(): string | undefined {
+    return this.state.effort;
+  }
+
+  /**
+   * Where the provider last said this account stands, or undefined.
+   *
+   * Undefined is the ordinary case and means "no runtime has said anything
+   * about an account", not "nothing is left". The status panel is careful about
+   * the difference.
+   */
+  get limits(): AccountLimits | undefined {
+    return this.state.limits;
   }
 
   get lastError(): string | undefined {

@@ -17,8 +17,10 @@ import { RenameDialog } from './dialogs/RenameDialog';
 import { RuntimeProfilesDialog } from './dialogs/RuntimeProfilesDialog';
 import { EnvironmentDialog, type EnvironmentInfo } from './dialogs/EnvironmentDialog';
 import { SessionsDialog } from './dialogs/SessionsDialog';
+import { ConversationsDialog } from './dialogs/ConversationsDialog';
 import { ChatSettingsDialog } from './dialogs/ChatSettingsDialog';
 import { SettingsDialog } from './dialogs/SettingsDialog';
+import { UsageDashboardDialog } from './dialogs/UsageDashboardDialog';
 import { TerminalOptionsDialog } from './dialogs/TerminalOptionsDialog';
 import { BottomNav, type BottomNavDestination } from './BottomNav';
 import { FloatingMenu, type FloatingMenuAction } from './FloatingMenu';
@@ -36,6 +38,8 @@ import { TabContextMenu } from './TabContextMenu';
 import { TerminalHost } from './TerminalHost';
 import { ChatView } from './chat/ChatView';
 import type { ChatController } from '../chat/controller';
+import type { BranchedConversation } from '../chat/branch-api';
+import type { ConversationList, ConversationSummary } from '../../shared/conversations';
 import { CHAT_PANEL_ICONS, type ChatPanelId, type ChatViewSettings } from '../chat/view-settings';
 import { Toasts } from './Toasts';
 import { UpdateBannerView } from './UpdateBannerView';
@@ -99,6 +103,20 @@ export interface ShellActions {
   leaveSession(): void;
   deleteSession(id: string): void;
 
+  // Conversations
+  /** Every conversation this user has, grouped by project. */
+  loadConversations(): Promise<ConversationList>;
+  /**
+   * Put a stored conversation back on screen.
+   *
+   * Joins it when something is still running it, and otherwise brings it back
+   * with its transcript — handing the agent its own context where that is
+   * possible. See `openStoredConversation` in mount.tsx.
+   */
+  openStoredConversation(conversation: ConversationSummary): void;
+  /** Ask, then delete for good. Resolves true when the conversation is gone. */
+  deleteConversation(conversation: ConversationSummary): Promise<boolean>;
+
   // Plan
   acceptPlan(): void;
   rejectPlan(): void;
@@ -109,6 +127,14 @@ export interface ShellActions {
   // Chat surface
   /** Persist and publish a change to the chat's display settings. */
   setChatView(next: ChatViewSettings): void;
+  /**
+   * Open a conversation the chat surface has just created — today, a branch.
+   *
+   * It already exists on the server with its transcript on disk; what is left is
+   * a tab, the switch onto it and the launch of its agent, none of which the
+   * surface inside a conversation has any business doing for itself.
+   */
+  openConversation(conversation: BranchedConversation): void;
 
   // Update banner
   updateAction(): void;
@@ -129,6 +155,7 @@ function tabItems(tabs: ShellTab[]): TabItem[] {
     title: tab.title,
     status: tab.status === 'running' ? 'running' : tab.status === 'error' ? 'error' : 'idle',
     unread: tab.unread,
+    attention: tab.attention,
     tooltip: tab.workingDir ?? tab.title,
   }));
 }
@@ -286,6 +313,11 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           onSelect: () => { closePalette(); actions.newTab(); },
         },
         {
+          label: 'All conversations',
+          icon: <Icon name="message-square" size={13} />,
+          onSelect: () => { closePalette(); closeDialogs({ conversations: true }); },
+        },
+        {
           label: 'All sessions',
           icon: <Icon name="layout-list" size={13} />,
           onSelect: () => { closePalette(); actions.openSessions(); },
@@ -347,6 +379,11 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           label: 'Settings',
           icon: <Icon name="settings" size={13} />,
           onSelect: () => { closePalette(); actions.openSettings(); },
+        },
+        {
+          label: 'Usage',
+          icon: <Icon name="gauge" size={13} />,
+          onSelect: () => { closePalette(); closeDialogs({ usage: true }); },
         },
         // Offered only while the browser is actually holding a deferred
         // prompt, so the entry is never a control that does nothing.
@@ -465,7 +502,10 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           id: 'sessions',
           label: 'Sessions',
           icon: 'layout-list',
-          badge: state.tabs.some((t) => t.unread && t.id !== state.activeId),
+          // A conversation that has stopped for an approval counts as much as
+          // one with unread output: on a phone this destination badge is the
+          // only cross-session signal there is — the tab strip is not rendered.
+          badge: state.tabs.some((t) => (t.unread || t.attention !== null) && t.id !== state.activeId),
           onGo: () => closeDialogs({ tabs: true }),
         },
       ]
@@ -482,7 +522,10 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           id: 'sessions',
           label: 'Sessions',
           icon: 'layout-list',
-          badge: state.tabs.some((t) => t.unread && t.id !== state.activeId),
+          // A conversation that has stopped for an approval counts as much as
+          // one with unread output: on a phone this destination badge is the
+          // only cross-session signal there is — the tab strip is not rendered.
+          badge: state.tabs.some((t) => (t.unread || t.attention !== null) && t.id !== state.activeId),
           onGo: () => closeDialogs({ tabs: true }),
         },
       ];
@@ -491,6 +534,19 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
   // for, and what a destination bar has no business holding.
   const sessionActions: FloatingMenuAction[] = [
     { id: 'new', label: 'New session', icon: 'plus', onPress: actions.newTab },
+    // Only when there is no conversation on screen. Inside one, ChatView puts
+    // this beside its transcript search, which is where the issue asks for it;
+    // here it is the phone's route to the list when every conversation's tab has
+    // been closed — otherwise closing the last one would close the door behind it.
+    ...(chatActive
+      ? []
+      : [{
+          id: 'conversations',
+          label: 'All conversations',
+          icon: 'message-square',
+          expands: true,
+          onPress: () => closeDialogs({ conversations: true }),
+        } as FloatingMenuAction]),
     { id: 'image', label: 'Attach an image', icon: 'image', onPress: actions.attachImage },
     { id: 'rename', label: 'Rename this session', icon: 'pencil', disabled: !active, onPress: () => active && closeDialogs({ rename: active.id }) },
     { id: 'reconnect', label: 'Reconnect', icon: 'rotate-cw', onPress: actions.reconnect },
@@ -543,6 +599,9 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           </IconButton>
         </>
       )}
+      <IconButton label="Usage" size="sm" onClick={() => closeDialogs({ usage: true })}>
+        <Icon name="gauge" />
+      </IconButton>
       <IconButton label="Settings" size="sm" onClick={actions.openSettings}>
         <Icon name="settings" />
       </IconButton>
@@ -654,10 +713,15 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
             runtimeLabel={state.chat.runtimeLabel || state.chat.runtime}
             workingDir={state.chat.workingDir || active?.workingDir || ''}
             isMobile={state.isMobile}
+            // For the recovery notice's labels only. The conversation's own
+            // mode is on the transcript; this is what a *new* one would get.
+            approvalPreference={state.chatBypassPermissions}
             view={view}
             onViewChange={setView}
             onOpenSettings={() => closeDialogs({ chatSettings: true })}
+            onOpenConversations={() => closeDialogs({ conversations: true })}
             menuActions={sessionActions}
+            onOpenConversation={actions.openConversation}
             // The chat surface owns the whole viewport, so the tab strip's own
             // theme button is off-screen while a conversation is showing.
             theme={state.theme}
@@ -733,6 +797,11 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         }}
       />
 
+      <UsageDashboardDialog
+        open={state.dialogs.usage}
+        onClose={() => closeDialogs({ usage: false })}
+      />
+
       <RuntimeProfilesDialog
         open={state.dialogs.runtimeProfiles}
         onClose={() => closeDialogs({ runtimeProfiles: false })}
@@ -799,6 +868,22 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         onClose={() => closeDialogs({ sessions: false })}
       />
 
+      <ConversationsDialog
+        open={state.dialogs.conversations}
+        load={actions.loadConversations}
+        // Every tab, not only the ones known to be chats: a tab whose surface has
+        // not come back from the server yet is still a tab, and a row that says
+        // "open" about it is right either way — picking it switches to that tab.
+        openIds={state.tabs.map((tab) => tab.id)}
+        activeId={state.activeId}
+        onOpen={(conversation) => {
+          closeDialogs({ conversations: false });
+          actions.openStoredConversation(conversation);
+        }}
+        onDelete={actions.deleteConversation}
+        onClose={() => closeDialogs({ conversations: false })}
+      />
+
       <TabSwitcherSheet
         open={state.dialogs.tabs}
         tabs={state.tabs}
@@ -844,6 +929,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         onSwitchMode={actions.switchMode}
         onCloseSession={actions.closeCurrentSession}
         onOpenSettings={actions.openSettings}
+        onOpenUsage={() => closeDialogs({ usage: true, more: false })}
         onToggleTheme={toggleTheme}
         onRename={active ? () => closeDialogs({ rename: active.id, more: false }) : undefined}
       />

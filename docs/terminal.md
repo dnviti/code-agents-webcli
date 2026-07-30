@@ -16,6 +16,14 @@ shows as ended and can be launched again.
 Open several and switch between them from the tab bar. Sessions can also be
 [split side by side](#splits).
 
+Closing a tab means different things for the two surfaces, because the two are
+reached differently. Closing a **terminal** ends it — a shell has no listing of
+its own, so one left running with no tab would hold a working directory open
+with nothing able to reach it. Closing a **conversation** only takes it off this
+screen: it stays in [the conversation list](runtimes.md#finding-a-conversation-again),
+which is where it is reopened from. Deleting, which asks first, is the only way
+to lose either.
+
 ## Scrollback and history
 
 Long sessions used to bog the browser down: the terminal held a 20,000-line

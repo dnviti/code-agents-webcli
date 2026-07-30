@@ -1,7 +1,18 @@
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const WebSocket = require('ws');
 const { MessageProcessor } = require('../dist/server/websocket/messages.js');
 const { HostEnvironment } = require('../dist/server/services/environments/manager.js');
+const { AntigravityChatAdapter } = require('../dist/server/chat/adapters/antigravity.js');
+
+/** A pi skill in a home directory, which is what the menu scan looks for. */
+function skill(home, name) {
+  const dir = path.join(home, '.pi', 'agent', 'skills', name);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: ${name}\n---\n`);
+}
 
 // The environment feature typechecks perfectly while routing nothing: every
 // call site takes an optional parameter, and leaving one out is invisible until
@@ -202,5 +213,120 @@ describe('per-user environments: server wiring', function () {
 
     assert.strictEqual(session.workingDir, '/data/environments/cawc-tester-7');
     assert.strictEqual(started[0].options.workingDir, '/data/environments/cawc-tester-7');
+  });
+});
+
+describe('per-user environments: every runtime launch goes through one', function () {
+  // A new adapter is written by copying an existing one, and the thing most
+  // easily copied from the version before this feature is a bare `spawn`. That
+  // adapter then runs the agent on the host, as the server's account, beside a
+  // terminal for the same conversation that ran in the user's container — and
+  // nothing about it fails, so nothing says so. Antigravity arrived that way.
+  // Read from the sources rather than from `dist`: this is a claim about how an
+  // adapter is written, and the one line that gives it away survives compilation
+  // in a shape nobody would think to grep for.
+  it('leaves no adapter reaching for child_process itself', function () {
+    const dir = path.join(__dirname, '..', 'src', 'server', 'chat', 'adapters');
+    const offenders = fs
+      .readdirSync(dir)
+      .filter((name) => name.endsWith('.ts'))
+      .filter((name) => /^\s*import[\s\S]*?from '(?:node:)?child_process';/m.test(
+        fs.readFileSync(path.join(dir, name), 'utf8'),
+      ));
+
+    assert.deepStrictEqual(
+      offenders,
+      [],
+      `these adapters launch their own processes instead of going through `
+      + `BaseChatAdapter.launchChild, so their runtime runs on the host no matter `
+      + `who owns the conversation: ${offenders.join(', ')}`,
+    );
+  });
+
+  it('launches a turn as the runtime is named inside the container, not by this host\'s path', async function () {
+    const wrapped = [];
+    const environment = {
+      ...fakeEnvironment('cawc-tester-7'),
+      wrap(command, args, options) {
+        wrapped.push({ command, args, options });
+        // Somewhere harmless: this test is about what was asked for, not about
+        // agy, which is not installed on a CI runner in any case.
+        return { command: '/bin/true', args: [], env: {} };
+      },
+    };
+
+    const adapter = new AntigravityChatAdapter({
+      sessionId: 'chat-1',
+      workingDir: '/data/environments/cawc-tester-7/project',
+      // What the bridge found on this machine, and the plain name the image has.
+      command: '/home/operator/.local/bin/agy',
+      commandName: 'agy',
+      environment,
+      emit() {},
+    });
+
+    // The turn cannot succeed against `/bin/true`; what it was launched with is
+    // decided before the process says anything.
+    await adapter.send({ text: 'hello' }).catch(() => {});
+
+    assert.strictEqual(wrapped.length, 1, 'the turn never reached the environment');
+    assert.strictEqual(wrapped[0].command, 'agy');
+    assert.ok(wrapped[0].args.includes('--print'), wrapped[0].args.join(' '));
+    assert.strictEqual(wrapped[0].options.tty, false, 'a headless turn must not be given a terminal');
+  });
+
+  it('opens the command menu on the owner\'s skills, not on the server operator\'s', async function () {
+    // The menu is read off disk before the runtime is even spawned, so it is
+    // read by this process, as this account. A container's home is a bind mount
+    // of a host directory, which an ordinary read can see — but only when the
+    // session hands the scan that directory instead of its own HOME. Get it
+    // wrong and every user's menu is a window onto the operator's machine.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-env-home-'));
+    const ownerHome = path.join(root, 'environments', 'cawc-tester-7');
+    const operatorHome = path.join(root, 'operator');
+    skill(ownerHome, 'deploy-the-thing');
+    skill(operatorHome, 'operators-private-thing');
+
+    const { ChatSession } = require('../dist/server/chat/session.js');
+    const session = new ChatSession(
+      { id: 's1', ownerUserId: 7 },
+      {
+        store: {
+          append() {},
+          async stat() { return { firstSeq: 1, cursor: 0 }; },
+          async read() { return { events: [], firstSeq: 1, from: 1, cursor: 0 }; },
+        },
+        socketDir: fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-env-sock-')),
+        hookScript: path.join(root, 'no-such-hook.js'),
+        broadcast() {},
+        resolveCommand: () => '/bin/cat',
+      },
+    );
+
+    // pi, whose adapter opens without a handshake, for the reason
+    // chat-tool-activity.test.js gives: `/bin/cat` answers nothing and a
+    // protocol handshake would wait on it forever. The runtime is incidental —
+    // what is under test is which home the session scanned.
+    const environment = {
+      ...fakeEnvironment('cawc-tester-7'),
+      homeDir: ownerHome,
+      wrap: () => ({ command: '/bin/cat', args: [], env: {} }),
+    };
+    await session.start({
+      runtime: 'pi',
+      workingDir: path.join(ownerHome, 'project'),
+      environment,
+      env: { HOME: operatorHome },
+    });
+    await session.stop();
+
+    const names = (session.capabilities.commands || []).map((command) => command.name);
+    assert.ok(names.includes('deploy-the-thing'), `the owner's own skill is missing: ${names.join(', ')}`);
+    assert.ok(
+      !names.includes('operators-private-thing'),
+      `the operator's skill leaked into a user's menu: ${names.join(', ')}`,
+    );
+
+    fs.rmSync(root, { recursive: true, force: true });
   });
 });
