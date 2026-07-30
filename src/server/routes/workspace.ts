@@ -10,6 +10,8 @@ import { ATTACHMENT_DIR } from '../services/attachment-store.js';
 import { PathValidation, SessionRecord } from '../types.js';
 import { parseGitStatus, parseUnifiedDiff } from '../../shared/git-status.js';
 import { getOwnedSession, requireUser } from './helpers.js';
+import { UserEnvironment } from '../services/environments/types.js';
+import { HostEnvironment } from '../services/environments/manager.js';
 import { accountReportingNote } from '../../shared/account-reporting.js';
 import type { UsageBurn } from '../../shared/usage-records.js';
 import type { CachedClaudeAccount } from '../services/claude-account.js';
@@ -53,7 +55,12 @@ export interface WorkspaceRoutesDeps {
    * turns it into filesystem access. Required rather than optional: a check
    * that a caller can leave out is a check that will eventually be left out.
    */
-  validatePath(targetPath: string): PathValidation;
+  validatePath(targetPath: string, userId?: number): PathValidation;
+  /**
+   * Where this user's tools run. Optional, and absent means this host, which is
+   * what every deployment without per-user environments gets.
+   */
+  ensureEnvironment?(userId?: number): Promise<UserEnvironment>;
   /**
    * What this app itself measured, for the "measured here" half of the status
    * panel.
@@ -121,28 +128,65 @@ interface RunResult {
   code: number | null;
 }
 
-function run(command: string, args: string[], cwd: string): Promise<RunResult> {
+/**
+ * Run a read-only tool (`git`, `gh`) for a session.
+ *
+ * `environment` decides *where*. Left out — or on the host — this is the same
+ * `execFile` it has always been. Inside a per-user container it matters twice
+ * over: the user's own git identity and their own `gh` credentials are the ones
+ * used, rather than whichever ones the account running the server happens to
+ * have configured for everybody.
+ */
+/** The environment a session's tools run in; this host when there are none. */
+async function environmentFor(
+  deps: WorkspaceRoutesDeps,
+  session: SessionRecord,
+): Promise<UserEnvironment | undefined> {
+  if (!deps.ensureEnvironment) return undefined;
+  try {
+    return await deps.ensureEnvironment(session.ownerUserId);
+  } catch {
+    // A read-only panel is not worth failing a whole request over; falling
+    // back to the host here shows the same files, because the user's home is
+    // a bind mount of a host directory either way.
+    return undefined;
+  }
+}
+
+function run(
+  command: string,
+  args: string[],
+  cwd: string,
+  environment?: UserEnvironment,
+): Promise<RunResult> {
+  const launch = (environment || new HostEnvironment(cwd)).wrap(command, args, {
+    cwd,
+    env: {
+      GIT_TERMINAL_PROMPT: '0',
+      // Status and diff take the index lock by default to refresh stat
+      // information. A panel that polls must not be able to block the
+      // agent's own git commands.
+      GIT_OPTIONAL_LOCKS: '0',
+      // `gh` paginates through a pager when it thinks it has a terminal.
+      GH_PAGER: 'cat',
+      PAGER: 'cat',
+      NO_COLOR: '1',
+    },
+    tty: false,
+  });
+
   return new Promise((resolve) => {
     execFile(
-      command,
-      args,
+      launch.command,
+      launch.args,
       {
-        cwd,
+        // The engine sets the working directory itself, and the host path is
+        // not one the engine client can chdir into.
+        cwd: environment?.kind === 'container' ? undefined : cwd,
         timeout: EXEC_TIMEOUT_MS,
         maxBuffer: MAX_OUTPUT_BYTES,
         windowsHide: true,
-        env: {
-          ...process.env,
-          GIT_TERMINAL_PROMPT: '0',
-          // Status and diff take the index lock by default to refresh stat
-          // information. A panel that polls must not be able to block the
-          // agent's own git commands.
-          GIT_OPTIONAL_LOCKS: '0',
-          // `gh` paginates through a pager when it thinks it has a terminal.
-          GH_PAGER: 'cat',
-          PAGER: 'cat',
-          NO_COLOR: '1',
-        },
+        env: launch.env,
       },
       (error, stdout, stderr) => {
         const failed = error as (Error & { code?: number | string }) | null;
@@ -406,7 +450,7 @@ function sessionFor(deps: WorkspaceRoutesDeps, req: Request, res: Response): Ses
     return null;
   }
 
-  if (!deps.validatePath(session.workingDir).valid) {
+  if (!deps.validatePath(session.workingDir, session.ownerUserId).valid) {
     // The allowed base can be narrowed between runs, and a restored session
     // record outlives the configuration that admitted it.
     res.status(403).json({ error: 'This session works outside the allowed area' });
@@ -476,7 +520,10 @@ function isProjectFile(relativePath: string): boolean {
   return !relativePath.startsWith(`${ATTACHMENT_DIR}/`);
 }
 
-async function buildFileIndex(workingDir: string): Promise<FileIndex> {
+async function buildFileIndex(
+  workingDir: string,
+  environment?: UserEnvironment,
+): Promise<FileIndex> {
   const root = path.resolve(workingDir);
 
   // -z, so a filename with a newline in it is still one entry. --cached plus
@@ -486,6 +533,7 @@ async function buildFileIndex(workingDir: string): Promise<FileIndex> {
     'git',
     ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
     root,
+    environment,
   );
   if (listed.ok) {
     const paths = listed.stdout.split('\0').filter(Boolean).filter(isProjectFile);
@@ -725,7 +773,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       if (cached && Date.now() - cached.at < FIND_CACHE_MS && req.query.refresh !== '1') {
         index = cached.index;
       } else {
-        index = await buildFileIndex(session.workingDir);
+        index = await buildFileIndex(session.workingDir, await environmentFor(deps, session));
         findCache.set(cacheKey, { at: Date.now(), index });
       }
 
@@ -747,7 +795,10 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       const session = sessionFor(deps, req, res);
       if (!session) return;
 
-      const inside = await run('git', ['rev-parse', '--is-inside-work-tree'], session.workingDir);
+      const environment = await environmentFor(deps, session);
+      const inside = await run(
+        'git', ['rev-parse', '--is-inside-work-tree'], session.workingDir, environment,
+      );
       if (!inside.ok || inside.stdout.trim() !== 'true') {
         res.json({ repo: false, reason: 'This folder is not a git repository.' });
         return;
@@ -757,10 +808,10 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         // `-- .` scopes the listing to this session's own directory. Without it
         // a session opened in a subdirectory lists the whole repository —
         // including files it is not allowed to open.
-        run('git', ['status', '--porcelain=v1', '-z', '--branch', '--', '.'], session.workingDir),
-        run('git', ['remote', 'get-url', 'origin'], session.workingDir),
-        run('git', ['log', '-1', '--format=%h%x00%s%x00%an%x00%aI'], session.workingDir),
-        run('git', ['rev-parse', '--show-toplevel'], session.workingDir),
+        run('git', ['status', '--porcelain=v1', '-z', '--branch', '--', '.'], session.workingDir, environment),
+        run('git', ['remote', 'get-url', 'origin'], session.workingDir, environment),
+        run('git', ['log', '-1', '--format=%h%x00%s%x00%an%x00%aI'], session.workingDir, environment),
+        run('git', ['rev-parse', '--show-toplevel'], session.workingDir, environment),
       ]);
 
       if (!status.ok) {
@@ -832,7 +883,8 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       // `--` terminates options, so a file literally named `--cached` is a path.
       if (relative) args.push('--', relative);
 
-      const result = await run('git', args, session.workingDir);
+      const environment = await environmentFor(deps, session);
+      const result = await run('git', args, session.workingDir, environment);
       if (!result.ok && !result.stdout) {
         res.json({ diffs: [], error: result.stderr.trim() || 'git diff failed' });
         return;
@@ -848,6 +900,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
           'git',
           ['status', '--porcelain=v1', '-z', '--', relative],
           session.workingDir,
+          environment,
         );
         if (untracked.ok && untracked.stdout.startsWith('??')) {
           const shown = await run(
@@ -860,6 +913,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
               '--', '/dev/null', relative,
             ],
             session.workingDir,
+            environment,
           );
           // --no-index exits 1 when the files differ, which is always here.
           diffs = parseUnifiedDiff(shown.stdout).map((diff) => ({
@@ -1181,6 +1235,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         'git',
         ['status', '--porcelain=v1', '-z', '--branch'],
         session.workingDir,
+        await environmentFor(deps, session),
       );
       const branch = status.ok
         ? parseGitStatus(status.stdout)
@@ -1329,7 +1384,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      const payload = await readGitHub(session.workingDir);
+      const payload = await readGitHub(session.workingDir, await environmentFor(deps, session));
       ghCache.set(cacheKey, { at: Date.now(), payload });
       res.json(payload);
     },
@@ -1366,6 +1421,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         'gh',
         [kind, 'view', String(number), '--json', fields],
         session.workingDir,
+        await environmentFor(deps, session),
       );
       if (!view.ok) {
         res.status(404).json({
@@ -1391,8 +1447,11 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
  * list. A panel that just shows nothing is indistinguishable from a repository
  * with no open work.
  */
-async function readGitHub(workingDir: string): Promise<Record<string, unknown>> {
-  const version = await run('gh', ['--version'], workingDir);
+async function readGitHub(
+  workingDir: string,
+  environment?: UserEnvironment,
+): Promise<Record<string, unknown>> {
+  const version = await run('gh', ['--version'], workingDir, environment);
   if (!version.ok) {
     return {
       available: false,
@@ -1400,7 +1459,7 @@ async function readGitHub(workingDir: string): Promise<Record<string, unknown>> 
     };
   }
 
-  const auth = await run('gh', ['auth', 'status'], workingDir);
+  const auth = await run('gh', ['auth', 'status'], workingDir, environment);
   if (!auth.ok) {
     return {
       available: false,
@@ -1412,6 +1471,7 @@ async function readGitHub(workingDir: string): Promise<Record<string, unknown>> 
     'gh',
     ['repo', 'view', '--json', 'nameWithOwner,url,defaultBranchRef'],
     workingDir,
+    environment,
   );
   if (!repo.ok) {
     return {
@@ -1428,6 +1488,7 @@ async function readGitHub(workingDir: string): Promise<Record<string, unknown>> 
         '--json', 'number,title,url,state,isDraft,author,headRefName,updatedAt',
       ],
       workingDir,
+      environment,
     ),
     run(
       'gh',
@@ -1436,6 +1497,7 @@ async function readGitHub(workingDir: string): Promise<Record<string, unknown>> 
         '--json', 'number,title,url,state,author,labels,updatedAt',
       ],
       workingDir,
+      environment,
     ),
   ]);
 

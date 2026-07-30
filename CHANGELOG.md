@@ -1,8 +1,51 @@
 # Changelog
 
-## [Unreleased]
+## [6.0.0] - unreleased
 
 ### Added
+- **Every signed-in user can have their own machine.** Until now everyone who
+  signed in shared this one: the same account, the same home directory, the same
+  installed tools. One person's global install changed the environment for
+  everybody, anyone could read anyone else's files and agent credentials, and
+  nothing on the host said which process belonged to whom.
+
+  Turning on per-user environments gives every account its own container, named
+  after them so `docker ps` answers "whose is this?" at a glance, with a home
+  directory that survives the container being destroyed and rebuilt. A package
+  they install once is still there next time. Their terminals, agent runs, chat
+  runtimes, files, uploads and git all happen in there rather than on the host,
+  and CPU and memory limits stop one of them taking the whole machine. Idle
+  environments can be stopped to reclaim resources and come back on the next
+  sign-in with everything as it was.
+
+  Docker and Podman both work, chosen by configuration. `cc-web env ls` shows
+  what exists and whose it is; `cc-web env rm` removes one, with `--purge-data`
+  when revoking access should take the data too.
+
+  It is off unless an administrator asks for it, and an installation that does
+  not enable it behaves exactly as it did before. See
+  [Per-user environments](docs/user-environments.md).
+
+- **The same thing on a Kubernetes cluster.** Point the server at a cluster and
+  each user's environment becomes a Pod instead of a container on this machine,
+  created, reused, resized and removed the same way. Every user's home lives on
+  one shared ReadWriteMany claim, so the file browser, editor and uploads keep
+  working exactly as they do on a single machine.
+
+  Two things do not cross the pod boundary yet, and both are documented: tool
+  approvals and the model's questions travel over a unix socket, and automatic
+  sizing needs metrics-server to have anything to read.
+
+- **You choose how big your own environment is.** *Settings → Workspace
+  environment* offers the sizes your administrator defined — and **Automatic**,
+  which starts from the default, moves up when you have been working it hard for
+  a while, and back down when you have not. It tells you when it moves, and why.
+
+  A size change that can be applied to a running environment is applied at once;
+  one that needs the environment rebuilt waits until nothing is running in it,
+  because rebuilding under a working agent would end the run. The panel says
+  which of the two is happening.
+
 - **Antigravity CLI (`agy`) is a runtime like any other** (#133). Google's coding
   CLI — the successor to Gemini CLI, which now refuses a personal account
   outright and points at this one — has its own card in the launcher, opens as a
@@ -62,6 +105,12 @@
   onto that model. A model with no level in its name offers no control at all.
 
 ### Fixed
+- **`cc-web` started printing its help text instead of starting.** Adding the
+  `env` operator subcommands left the program without an action of its own, and
+  a command line with subcommands answers a bare invocation with help. Running
+  the server with no arguments — which is how almost everyone runs it — did
+  nothing at all. It now starts, and a test runs the real binary to keep it that
+  way.
 - **A model list is no longer lost to a probe waiting on stdin.** The command
   each runtime is asked for its models with was run through `execFile`, which
   leaves the child an open stdin pipe — and `agy models` waits on that pipe

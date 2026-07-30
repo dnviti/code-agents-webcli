@@ -15,6 +15,7 @@ import { NewSessionDialog } from './dialogs/NewSessionDialog';
 import { PlanDialog } from './dialogs/PlanDialog';
 import { RenameDialog } from './dialogs/RenameDialog';
 import { RuntimeProfilesDialog } from './dialogs/RuntimeProfilesDialog';
+import { EnvironmentDialog, type EnvironmentInfo } from './dialogs/EnvironmentDialog';
 import { SessionsDialog } from './dialogs/SessionsDialog';
 import { ConversationsDialog } from './dialogs/ConversationsDialog';
 import { ChatSettingsDialog } from './dialogs/ChatSettingsDialog';
@@ -163,6 +164,76 @@ function closeDialogs(patch: Parameters<typeof shellStore.patchSlice<'dialogs'>>
   shellStore.patchSlice('dialogs', patch);
 }
 
+/**
+ * The user's environment, read when a dialog that shows it opens.
+ *
+ * Read on demand rather than kept live: the size changes rarely, and polling it
+ * from every open tab would cost a request a second across a whole
+ * installation to show a line that almost never moves. The one case that *does*
+ * move on its own — automatic sizing — announces itself over the socket.
+ */
+function useEnvironment(visible: boolean): {
+  info: EnvironmentInfo | null;
+  error: string | null;
+  busy: boolean;
+  notice: string | null;
+  apply(tier: string): Promise<void>;
+} {
+  const [info, setInfo] = React.useState<EnvironmentInfo | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const [notice, setNotice] = React.useState<string | null>(null);
+
+  const read = React.useCallback(async (): Promise<void> => {
+    try {
+      const response = await fetch('/api/environment', { credentials: 'same-origin' });
+      if (!response.ok) throw new Error(String(response.status));
+      setInfo((await response.json()) as EnvironmentInfo);
+      setError(null);
+    } catch {
+      setError('Could not read your environment from the server.');
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (visible) void read();
+  }, [visible, read]);
+
+  // A size the server changed on its own must not leave a stale one on screen.
+  React.useEffect(() => {
+    const onChanged = (): void => { void read(); };
+    window.addEventListener('cc-environment-changed', onChanged);
+    return () => window.removeEventListener('cc-environment-changed', onChanged);
+  }, [read]);
+
+  const apply = React.useCallback(async (tier: string): Promise<void> => {
+    setBusy(true);
+    setNotice(null);
+    try {
+      const response = await fetch('/api/environment/tier', {
+        method: 'PUT',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tier }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setError(payload.message || 'The size could not be changed.');
+        return;
+      }
+      setError(null);
+      setNotice(payload.message || 'Saved.');
+      await read();
+    } catch {
+      setError('The size could not be changed.');
+    } finally {
+      setBusy(false);
+    }
+  }, [read]);
+
+  return { info, error, busy, notice, apply };
+}
+
 export function AppShell({ terminalNode, actions, launcher }: AppShellProps): React.JSX.Element {
   const state: ShellState = React.useSyncExternalStore(
     shellStore.subscribe,
@@ -171,6 +242,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
   );
 
   const active = state.tabs.find((t) => t.id === state.activeId) || null;
+  const environment = useEnvironment(state.dialogs.settings || state.dialogs.environment);
 
   // The chat surface is decided by the server and published into the store; the
   // controller is carried as an opaque handle because its transcript mutates
@@ -711,6 +783,8 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         install={state.install}
         onInstall={() => void installHint()}
         onOpenRuntimeProfiles={() => closeDialogs({ settings: false, runtimeProfiles: true })}
+        environmentsEnabled={environment.info?.enabled === true}
+        onOpenEnvironment={() => closeDialogs({ settings: false, environment: true })}
         onPreview={actions.previewSettings}
         onSave={(next) => { actions.saveSettings(next); closeDialogs({ settings: false }); }}
         onClose={() => {
@@ -731,6 +805,16 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       <RuntimeProfilesDialog
         open={state.dialogs.runtimeProfiles}
         onClose={() => closeDialogs({ runtimeProfiles: false })}
+      />
+
+      <EnvironmentDialog
+        open={state.dialogs.environment}
+        info={environment.info}
+        error={environment.error}
+        busy={environment.busy}
+        notice={environment.notice}
+        onApply={(tier) => void environment.apply(tier)}
+        onClose={() => closeDialogs({ environment: false })}
       />
 
       <ChatSettingsDialog

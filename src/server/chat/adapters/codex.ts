@@ -1,4 +1,3 @@
-import { spawn } from 'child_process';
 import {
   ChatCapabilities,
   ChatUsage,
@@ -1306,22 +1305,12 @@ export class CodexExecAdapter extends BaseChatAdapter {
     this.exited = false;
     this.stdoutBuffer = '';
 
-    const child = spawn(this.options.command, args, {
-      cwd: this.options.workingDir,
-      env: {
-        ...process.env,
-        ...(this.options.env || {}),
-        NO_COLOR: '1',
-        TERM: 'dumb',
-        FORCE_COLOR: '0',
-      },
-      // Closed, not piped: the prompt is the last argv entry and nothing is
-      // ever written here. Left as an open pipe, `codex exec` announces
-      // "Reading additional input from stdin..." and waits on it forever —
-      // measured at no exit after 40s with no output, against 111ms once
-      // closed. The turn would simply never come back.
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }) as AdapterChild;
+    // Closed, not piped: the prompt is the last argv entry and nothing is
+    // ever written here. Left as an open pipe, `codex exec` announces
+    // "Reading additional input from stdin..." and waits on it forever —
+    // measured at no exit after 40s with no output, against 111ms once
+    // closed. The turn would simply never come back.
+    const child = this.launchChild(args, ['ignore', 'pipe', 'pipe']) as AdapterChild;
     this.child = child;
 
     child.stdout.setEncoding('utf8');

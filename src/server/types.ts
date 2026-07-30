@@ -37,6 +37,21 @@ export interface ServerOptions {
   allowedGitHubIds?: string;
   allowAnyGitHubUser?: boolean;
   dataDir?: string;
+  /** Give every signed-in user their own container. Off unless asked for. */
+  containers?: boolean;
+  containerEngine?: string;
+  containerImage?: string;
+  containerCpus?: string;
+  containerMemory?: string;
+  containerIdleMinutes?: number;
+  containerSetupCommand?: string;
+  containerTiers?: string;
+  containerDefaultTier?: string;
+  containerUserTierChoice?: boolean;
+  kubeContext?: string;
+  kubeNamespace?: string;
+  kubeStorageClaim?: string;
+  kubeServiceAccount?: string;
 }
 
 export interface Aliases {

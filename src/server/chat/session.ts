@@ -41,6 +41,7 @@ import {
   permissionHookSettings,
 } from './permission-broker.js';
 import { ASK_SOCKET_ENV, askMcpConfig } from './ask-mcp.js';
+import { UserEnvironment } from '../services/environments/types.js';
 import { ChatStoreLike, ChatSessionRef } from './store.js';
 import { askChannelFor, createChatAdapter, supportsChat } from './registry.js';
 import { FinishedJob, UsageAccountant } from './usage-accounting.js';
@@ -81,6 +82,14 @@ export interface ChatSessionDeps {
   broadcast: (sessionId: string, message: Record<string, unknown>) => void;
   /** Resolve the executable for a runtime, from the existing bridge lookup. */
   resolveCommand: (runtime: string) => string;
+  /**
+   * The same lookup, stopping at the plain name.
+   *
+   * Optional so a caller that has not been updated still works: without it the
+   * resolved host path is used, which is correct on the host and only wrong
+   * for a runtime running somewhere else.
+   */
+  resolveCommandName?: (runtime: string) => string;
   /** Read a file for an agent that delegates filesystem access to its client. */
   readFile?: (sessionId: string, filePath: string) => Promise<string>;
   writeFile?: (sessionId: string, filePath: string, contents: string) => Promise<void>;
@@ -194,6 +203,11 @@ export interface ChatSessionStartOptions {
    * silently move the floor of a transcript nobody asked to close.
    */
   startFresh?: boolean;
+  /**
+   * Where this conversation's runtime runs. Absent means the host, which is
+   * what every caller passed before per-user environments existed.
+   */
+  environment?: UserEnvironment;
 }
 
 interface PendingApproval {
@@ -655,12 +669,31 @@ export class ChatSession {
         question: (ask) => this.askQuestion(ask),
       });
 
+      // Both channels are host-side files reached over a host-side socket, and
+      // the runtime that has to open them may be in a container. `asSeenByRuntime`
+      // translates through the environment's bind mounts; on the host it is the
+      // identity, so these are the same three strings as before.
+      const environment = options.environment;
+      const asSeenByRuntime = (hostPath: string): string => (
+        environment ? environment.toContainerPath(hostPath) : hostPath
+      );
+      const nodePath = environment ? environment.nodePath : process.execPath;
+      const runtimeSocketPath = asSeenByRuntime(socketPath);
+
       if (wantsHook) {
-        extraArgs.push('--settings', permissionHookSettings(this.deps.hookScript, socketPath));
-        env.CCWEB_PERMISSION_SOCKET = socketPath;
+        extraArgs.push('--settings', permissionHookSettings(
+          asSeenByRuntime(this.deps.hookScript),
+          runtimeSocketPath,
+          nodePath,
+        ));
+        env.CCWEB_PERMISSION_SOCKET = runtimeSocketPath;
       }
       if (wantsAsk && askChannel === 'cli') {
-        extraArgs.push('--mcp-config', askMcpConfig(askScript!, socketPath));
+        extraArgs.push('--mcp-config', askMcpConfig(
+          asSeenByRuntime(askScript!),
+          runtimeSocketPath,
+          nodePath,
+        ));
         // Named explicitly rather than relying on the hook to wave it through:
         // with approvals bypassed there is no hook at all, and without this the
         // one tool whose whole purpose is to ask the user something would be the
@@ -674,9 +707,9 @@ export class ChatSession {
         // `session/new`. Same script, same socket, same tool.
         askMcpServer = {
           name: ASK_MCP_SERVER,
-          command: process.execPath,
-          args: [askScript!],
-          env: { [ASK_SOCKET_ENV]: socketPath },
+          command: nodePath,
+          args: [asSeenByRuntime(askScript!)],
+          env: { [ASK_SOCKET_ENV]: runtimeSocketPath },
         };
         this.questionsEnabled = true;
       }
@@ -690,8 +723,15 @@ export class ChatSession {
     // one. That is the whole of the isolation this needs: a session lists what
     // is installed for the person it belongs to, and never what is installed
     // for anybody else on the machine.
+    // In a container that home is the user's own: `homeDir` is the host path
+    // their container's home is a bind mount of, which is precisely what the
+    // ordinary `fs` reads in there can see. On the host it stays the account the
+    // runtime actually runs as, because a host environment's `homeDir` is the
+    // projects base folder and no runtime keeps its skills under that.
     const installedCommands = listInstalledCommands(options.runtime, {
-      home: env.HOME || process.env.HOME,
+      home: options.environment?.kind === 'container'
+        ? options.environment.homeDir
+        : env.HOME || process.env.HOME,
       workingDir: options.workingDir,
     });
 
@@ -704,6 +744,8 @@ export class ChatSession {
       workingDir: options.workingDir,
       installedCommands,
       command: this.deps.resolveCommand(options.runtime),
+      commandName: this.deps.resolveCommandName?.(options.runtime),
+      environment: options.environment,
       model: options.model,
       effort: options.effort,
       extraArgs,

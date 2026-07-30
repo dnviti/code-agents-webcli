@@ -305,7 +305,12 @@ export class PermissionBroker {
  * the CLI kills a hook that overruns — a short timeout would silently turn "the
  * user stepped away" into "the tool was refused".
  */
-export function permissionHookSettings(hookScript: string, socketPath: string): string {
+export function permissionHookSettings(
+  hookScript: string,
+  socketPath: string,
+  /** See the note on `askMcpConfig`: the runtime may not be on this machine. */
+  nodePath: string = process.execPath,
+): string {
   return JSON.stringify({
     hooks: {
       PreToolUse: [
@@ -314,7 +319,7 @@ export function permissionHookSettings(hookScript: string, socketPath: string): 
           hooks: [
             {
               type: 'command',
-              command: `${process.execPath} ${JSON.stringify(hookScript)}`,
+              command: `${nodePath} ${JSON.stringify(hookScript)}`,
               timeout: 3600,
             },
           ],

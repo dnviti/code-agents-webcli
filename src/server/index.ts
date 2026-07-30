@@ -57,6 +57,14 @@ import { broadcastChat, broadcastToAllConnections, sendToUser } from './websocke
 import { ChatStore } from './chat/store.js';
 import { ChatSessionManager } from './chat/manager.js';
 import { AuthService } from './services/auth.js';
+import {
+  APP_MOUNT,
+  EnvironmentManager,
+  SOCKET_MOUNT,
+  createContainerConfig,
+  ensureRoot,
+} from './services/environments/index.js';
+import { UserEnvironment } from './services/environments/types.js';
 import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
 import { readCachedClaudeAccount } from './services/claude-account.js';
@@ -101,6 +109,17 @@ export function applyChatLifecycle(
     record.active = true;
     record.lastActivity = new Date();
   }
+}
+
+/**
+ * The installed package's own root.
+ *
+ * Mounted read-only into every environment so a runtime running there can
+ * execute the approval hook and the question MCP server, which are files of
+ * this app rather than of the image. `__dirname` is `<root>/dist/server`.
+ */
+function appRootDir(): string {
+  return path.resolve(__dirname, '..', '..');
 }
 
 export class ClaudeCodeWebServer {
@@ -170,6 +189,9 @@ export class ClaudeCodeWebServer {
 
   private wsHandler: WebSocketHandler;
   private messageProcessor: MessageProcessor;
+  private environments: EnvironmentManager;
+  private environmentSweep: ReturnType<typeof setInterval> | null = null;
+  private environmentScale: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: ServerOptions = {}) {
     const config = createConfig(options);
@@ -210,6 +232,51 @@ export class ClaudeCodeWebServer {
     this.dataDir = config.dataDir;
     this.database = new AppDatabase({ dataDir: config.dataDir });
     this.usageStore = new UsageStore(this.database);
+
+    // Per-user environments. Off unless an administrator asked for them, in
+    // which case every process this server starts on a user's behalf goes into
+    // that user's container instead of onto this machine.
+    //
+    // Two host directories travel with every environment besides the user's
+    // home: the app's own compiled code, so the approval hook and the question
+    // MCP server can be executed by a runtime that is not on this machine, and
+    // the directory their unix sockets live in, so it can dial back.
+    const containerConfig = createContainerConfig({
+      containers: options.containers,
+      containerEngine: options.containerEngine,
+      containerImage: options.containerImage,
+      containerCpus: options.containerCpus,
+      containerMemory: options.containerMemory,
+      containerIdleMinutes: options.containerIdleMinutes,
+      containerSetupCommand: options.containerSetupCommand,
+      containerTiers: options.containerTiers,
+      containerDefaultTier: options.containerDefaultTier,
+      containerUserTierChoice: options.containerUserTierChoice,
+      kubeContext: options.kubeContext,
+      kubeNamespace: options.kubeNamespace,
+      kubeStorageClaim: options.kubeStorageClaim,
+      kubeServiceAccount: options.kubeServiceAccount,
+      dataDir: config.dataDir,
+      extraMounts: [
+        { hostPath: appRootDir(), containerPath: APP_MOUNT, readOnly: true },
+        { hostPath: path.join(this.database.storageDir, 'cs'), containerPath: SOCKET_MOUNT },
+      ],
+    });
+    if (containerConfig.enabled) {
+      ensureRoot(containerConfig.rootDir);
+      // The socket directory is mounted, so it has to exist before the first
+      // container is created rather than lazily when the first chat starts:
+      // a bind mount of a missing path is created as a root-owned directory by
+      // the engine, which the server then cannot write into.
+      fs.mkdirSync(path.join(this.database.storageDir, 'cs'), { recursive: true, mode: 0o700 });
+    }
+    this.environments = new EnvironmentManager({
+      config: containerConfig,
+      hostHome: this.baseFolder,
+      // Read on every provision rather than cached: the user may change it
+      // from another window between two of their own sessions.
+      getUserTier: (userId) => this.database.getUserSetting(userId, 'environmentTier'),
+    });
     this.sessionStore = new SessionStore({ database: this.database });
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
     this.historyStore = new HistoryStore({ storageDir: this.database.storageDir });
@@ -253,6 +320,14 @@ export class ClaudeCodeWebServer {
         const bridge = this.getRuntimeBridge(runtime as AgentKind);
         const resolved = (bridge as unknown as { command?: string })?.command;
         return resolved || runtime;
+      },
+      // The same lookup, stopping at the name. A runtime running in a
+      // container needs the name, not this machine's path to it — and the name
+      // is not always the runtime's key (`agent` is `cursor-agent`).
+      resolveCommandName: (runtime) => {
+        const bridge = this.getRuntimeBridge(runtime as AgentKind);
+        const name = (bridge as unknown as { defaultCommand?: string })?.defaultCommand;
+        return name || runtime;
       },
       // The chat subsystem does not know about session records, and should not:
       // this is the one seam where a fact it learns has to outlive its process.
@@ -370,7 +445,9 @@ export class ClaudeCodeWebServer {
       baseFolder: this.baseFolder,
       sessionDurationHours: this.sessionDurationHours,
       aliases: this.aliases,
-      validatePath: (targetPath: string) => this.validatePath(targetPath),
+      validatePath: (targetPath: string, userId?: number) => this.validatePath(targetPath, userId),
+      getUserBaseFolder: (userId?: number) => this.getUserBaseFolder(userId),
+      ensureEnvironment: (userId?: number) => this.ensureEnvironment(userId),
       getSelectedWorkingDir: (userId: number) => this.getSelectedWorkingDir(userId),
       createSessionRecord: (params) => this.createSessionRecord(params),
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
@@ -405,12 +482,59 @@ export class ClaudeCodeWebServer {
     this.app = express();
     this.setupExpress();
     this.setupAutoSave();
+    this.setupEnvironmentSweep();
   }
 
-  private isPathWithinBase(targetPath: string): boolean {
+  /**
+   * The root a user's paths are measured against.
+   *
+   * With per-user environments on, that is the user's own home — which is what
+   * makes "files a user creates are invisible to another user" a property of
+   * the app and not only of the container: every path check below is against a
+   * different directory for every account. Without them it is the single
+   * folder the server was started in, exactly as before.
+   */
+  private getUserBaseFolder(userId?: number): string {
+    if (!this.environments.enabled || userId === undefined) {
+      return this.baseFolder;
+    }
+    const owner = this.getEnvironmentOwner(userId);
+    return owner ? this.environments.homeDirFor(owner) : this.baseFolder;
+  }
+
+  private getEnvironmentOwner(userId: number): { id: number; githubLogin: string } | null {
+    const user = this.database.getUserById(userId);
+    return user ? { id: user.id, githubLogin: user.githubLogin } : null;
+  }
+
+  /**
+   * The environment for a user, ready to run something in.
+   *
+   * Falls back to the host when the engine cannot produce one: a broken Docker
+   * is an operational failure, and dropping the user onto the host silently
+   * would be an isolation failure — so it is loud in the log and the caller
+   * still gets a usable session rather than a blank screen.
+   */
+  private async ensureEnvironment(userId?: number): Promise<UserEnvironment> {
+    if (!this.environments.enabled || userId === undefined) {
+      return this.environments.host();
+    }
+    const owner = this.getEnvironmentOwner(userId);
+    if (!owner) {
+      return this.environments.host();
+    }
+    try {
+      return await this.environments.ensureFor(owner);
+    } catch (error) {
+      console.error(`Could not prepare an environment for ${owner.githubLogin}:`, error);
+      throw error;
+    }
+  }
+
+  private isPathWithinBase(targetPath: string, userId?: number): boolean {
     try {
       const resolvedTarget = path.resolve(targetPath);
-      const resolvedBase = path.resolve(this.baseFolder);
+      const resolvedBase = path.resolve(this.getUserBaseFolder(userId));
       return (
         resolvedTarget === resolvedBase
         || resolvedTarget.startsWith(`${resolvedBase}${path.sep}`)
@@ -420,13 +544,13 @@ export class ClaudeCodeWebServer {
     }
   }
 
-  private validatePath(targetPath: string): PathValidation {
+  private validatePath(targetPath: string, userId?: number): PathValidation {
     if (!targetPath) {
       return { valid: false, error: 'Path is required' };
     }
 
     const resolvedPath = path.resolve(targetPath);
-    if (!this.isPathWithinBase(resolvedPath)) {
+    if (!this.isPathWithinBase(resolvedPath, userId)) {
       return {
         valid: false,
         error: 'Access denied: Path is outside the allowed directory',
@@ -607,6 +731,70 @@ export class ClaudeCodeWebServer {
     }
   }
 
+  /**
+   * Stop environments nobody has used lately.
+   *
+   * Safe because the data is on the host: a stopped environment starts again
+   * on the owner's next session with their home exactly as they left it, so
+   * this is a resource decision rather than a lifecycle one. Runs on a
+   * fixed minute tick rather than at the configured interval so that changing
+   * the idle window does not mean restarting the server to feel it.
+   */
+  private setupEnvironmentSweep(): void {
+    if (!this.environments.enabled) {
+      return;
+    }
+    this.environmentScale = setInterval(() => {
+      void this.environments.sampleAndScale((userId) => this.userHasLiveSession(userId))
+        .then((changes) => {
+          for (const change of changes) {
+            console.log(
+              `Environment ${change.name}: ${change.from} → ${change.to} (${change.reason}) [${change.outcome}]`,
+            );
+            // Told, not discovered: a size that changes under someone without
+            // a word is indistinguishable from the machine misbehaving.
+            sendToUser(
+              change.userId,
+              {
+                type: 'environment_tier_changed',
+                tier: change.to,
+                previousTier: change.from,
+                reason: change.reason,
+                outcome: change.outcome,
+              },
+              this.webSocketConnections,
+            );
+          }
+        })
+        .catch((error) => {
+          console.error('Automatic environment sizing failed:', error);
+        });
+    }, 30_000);
+    this.environmentScale.unref?.();
+
+    this.environmentSweep = setInterval(() => {
+      void this.environments.sweepIdle((userId) => this.userHasLiveSession(userId)).then((stopped) => {
+        for (const name of stopped) {
+          console.log(`Stopped idle environment ${name}`);
+        }
+      }).catch((error) => {
+        console.error('Idle environment sweep failed:', error);
+      });
+    }, 60_000);
+    // Never the reason the process stays up.
+    this.environmentSweep.unref?.();
+  }
+
+  /** Whether anything is running for this user right now. */
+  private userHasLiveSession(userId: number): boolean {
+    for (const session of this.claudeSessions.values()) {
+      if (session.ownerUserId === userId && session.active) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private setupAutoSave(): void {
     this.autoSaveInterval = setInterval(() => {
       void this.saveSessionsToDisk();
@@ -634,6 +822,19 @@ export class ClaudeCodeWebServer {
     if (this.autoSaveInterval) {
       clearInterval(this.autoSaveInterval);
       this.autoSaveInterval = null;
+    }
+    if (this.environmentSweep) {
+      clearInterval(this.environmentSweep);
+      this.environmentSweep = null;
+    }
+    if (this.environmentScale) {
+      clearInterval(this.environmentScale);
+      this.environmentScale = null;
+    }
+    // Stopped, never removed: the containers are this server's to start and
+    // stop, but the data in them is the users' and a restart has to find it.
+    if (this.environments.enabled) {
+      await this.environments.stopAll();
     }
     this.updateChecker.stop();
 
@@ -742,8 +943,21 @@ export class ClaudeCodeWebServer {
       baseFolder: this.baseFolder,
       aliases: this.aliases,
       dev: this.dev,
-      validatePath: (targetPath: string) => this.validatePath(targetPath),
-      isPathWithinBase: (targetPath: string) => this.isPathWithinBase(targetPath),
+      validatePath: (targetPath: string, userId?: number) => this.validatePath(targetPath, userId),
+      isPathWithinBase: (targetPath: string, userId?: number) =>
+        this.isPathWithinBase(targetPath, userId),
+      getUserBaseFolder: (userId?: number) => this.getUserBaseFolder(userId),
+      ensureEnvironment: (userId?: number) => this.ensureEnvironment(userId),
+      environments: this.environments,
+      getUserEnvironmentTier: (userId: number) => this.database.getUserSetting(userId, 'environmentTier'),
+      setUserEnvironmentTier: (userId: number, tier: string | null) => {
+        if (tier) {
+          this.database.setUserSetting(userId, 'environmentTier', tier);
+        } else {
+          this.database.deleteUserSetting(userId, 'environmentTier');
+        }
+      },
+      userHasLiveSession: (userId: number) => this.userHasLiveSession(userId),
       getSelectedWorkingDir: (userId: number) => this.getSelectedWorkingDir(userId),
       setSelectedWorkingDir: (userId: number, value: string | null) =>
         this.setSelectedWorkingDir(userId, value),

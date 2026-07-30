@@ -1,0 +1,408 @@
+/**
+ * The container engine, as the rest of this feature needs it.
+ *
+ * Docker and Podman are near-identical at the command line, and the differences
+ * that matter here are few enough to name: Podman rootless needs
+ * `--userns=keep-id` for a bind-mounted home to come back out owned by the host
+ * user, and Docker has no such flag. Everything else is shared, which is why
+ * this is one class with two argv tweaks rather than two implementations.
+ *
+ * No shell is ever involved: every call is `execFile` with an argv array, so a
+ * login, an image name or a setup command can never be read as shell syntax.
+ */
+
+import { execFile } from 'node:child_process';
+import fs from 'node:fs';
+import { ContainerEngineKind, Mount } from './types.js';
+
+export interface RunResult {
+  stdout: string;
+  stderr: string;
+}
+
+export type EngineRunner = (
+  file: string,
+  args: string[],
+  /** Written to the child's stdin and closed. Used to feed manifests to `kubectl apply`. */
+  input?: string,
+) => Promise<RunResult>;
+
+export interface CreateContainerSpec {
+  name: string;
+  image: string;
+  /** Bind mounts, the user's home first. */
+  mounts: Mount[];
+  /** The directory the environment starts in. */
+  containerHome: string;
+  cpus: string | null;
+  memory: string | null;
+  labels: Record<string, string>;
+  env: Record<string, string>;
+}
+
+export interface ContainerDescription {
+  name: string;
+  status: string;
+  image: string;
+  labels: Record<string, string>;
+}
+
+export interface ExecSpec {
+  name: string;
+  cwd?: string;
+  env?: Record<string, string>;
+  tty?: boolean;
+}
+
+/** What one environment is currently consuming, as far as the engine can say. */
+export interface ResourceUsage {
+  /** Cores in use — `1.5` means one and a half cores, not 150% of the limit. */
+  cpuCores: number;
+  memoryBytes: number;
+}
+
+/**
+ * What the manager needs of an engine, and nothing more.
+ *
+ * Written as an interface rather than a base class because the two
+ * implementations share no code worth inheriting: one drives a container
+ * runtime through `docker`/`podman`, the other drives an API server through
+ * `kubectl`, and the only thing they genuinely have in common is this list.
+ */
+export interface EnvironmentEngine {
+  readonly kind: ContainerEngineKind;
+  /**
+   * Bring an environment into existence and into a usable state, whatever
+   * state it was in.
+   *
+   * One call rather than the manager reasoning about statuses, because the
+   * reasoning is engine-specific and getting it wrong is silent: a container
+   * that exists but is stopped is *started*, while a Pod that exists but has
+   * failed cannot be started at all and has to be replaced. Reports whether it
+   * had to build a new one, which is what decides if the setup command runs.
+   */
+  ensure(spec: CreateContainerSpec): Promise<{ created: boolean }>;
+  create(spec: CreateContainerSpec): Promise<void>;
+  start(name: string): Promise<void>;
+  stop(name: string): Promise<void>;
+  remove(name: string): Promise<void>;
+  status(name: string): Promise<string | null>;
+  describe(name: string): Promise<ContainerDescription | null>;
+  exec(spec: ExecSpec, command: string, commandArgs: string[]): Promise<RunResult>;
+  /** Argv for running a command inside an environment, for pty and pipe spawns alike. */
+  execArgs(spec: ExecSpec, command: string, commandArgs: string[]): string[];
+  /** The binary a wrapped command is spawned as. */
+  readonly binary: string;
+  list(label: string): Promise<string[]>;
+  available(): Promise<boolean>;
+  /**
+   * Change an environment's limits without recreating it.
+   *
+   * Returns false when this engine cannot: the caller then rebuilds, which is
+   * lossless but interrupts, so the difference decides whether a user's tier
+   * change applies now or once they are idle.
+   */
+  resize(name: string, cpus: string | null, memory: string | null): Promise<boolean>;
+  /** Current consumption, or null when the engine cannot report it. */
+  usage(name: string): Promise<ResourceUsage | null>;
+}
+
+export const defaultRunner: EngineRunner = (file, args, input) =>
+  new Promise((resolve, reject) => {
+    const child = execFile(file, args, { maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(Object.assign(error, { stdout, stderr }));
+        return;
+      }
+      resolve({ stdout, stderr });
+    });
+
+    if (input !== undefined) {
+      child.stdin?.end(input);
+    }
+  });
+
+/**
+ * Whether bind mounts need an SELinux relabel suffix.
+ *
+ * On an enforcing system (Fedora, RHEL and their derivatives) a bind mount
+ * without `:Z` is readable inside the container only until the first denial;
+ * on every other system the suffix is accepted and ignored. Detected rather
+ * than assumed so the argv stays minimal where it can.
+ */
+export function selinuxEnforcing(readFile: (p: string) => string = (p) => fs.readFileSync(p, 'utf8')): boolean {
+  try {
+    return readFile('/sys/fs/selinux/enforce').trim() === '1';
+  } catch {
+    return false;
+  }
+}
+
+export class ContainerEngine implements EnvironmentEngine {
+  readonly kind: ContainerEngineKind;
+  readonly binary: string;
+  private readonly run: EngineRunner;
+  private readonly relabel: boolean;
+  private readonly uid: number;
+  private readonly gid: number;
+
+  constructor(options: {
+    kind: ContainerEngineKind;
+    runner?: EngineRunner;
+    binary?: string;
+    relabelMounts?: boolean;
+    uid?: number;
+    gid?: number;
+  }) {
+    this.kind = options.kind;
+    this.binary = options.binary || options.kind;
+    this.run = options.runner || defaultRunner;
+    this.relabel = options.relabelMounts ?? selinuxEnforcing();
+    // `process.getuid` is absent on Windows, where this feature does not apply.
+    this.uid = options.uid ?? (process.getuid ? process.getuid() : 0);
+    this.gid = options.gid ?? (process.getgid ? process.getgid() : 0);
+  }
+
+  /** Argv for creating and starting a detached environment. */
+  createArgs(spec: CreateContainerSpec): string[] {
+    const args = [
+      'run',
+      '--detach',
+      '--name', spec.name,
+      '--hostname', spec.name,
+      '--user', `${this.uid}:${this.gid}`,
+    ];
+
+    // Rootless Podman maps the host user to container root by default, which
+    // would leave every file the user creates owned by a subordinate uid on the
+    // host. keep-id maps it to itself instead, so the bind mount stays readable
+    // and writable from both sides.
+    if (this.kind === 'podman') {
+      args.push('--userns=keep-id');
+    }
+
+    for (const [key, value] of Object.entries(spec.labels)) {
+      args.push('--label', `${key}=${value}`);
+    }
+    for (const [key, value] of Object.entries(spec.env)) {
+      args.push('--env', `${key}=${value}`);
+    }
+
+    for (const mount of spec.mounts) {
+      // `z` (shared) rather than `Z` (private) for read-only mounts: the app's
+      // own directory is mounted into every user's environment, and a private
+      // label would relabel it for whichever container was created last,
+      // breaking it for all the others.
+      const suffixes = [
+        mount.readOnly ? 'ro' : null,
+        this.relabel ? (mount.readOnly ? 'z' : 'Z') : null,
+      ].filter(Boolean);
+      const spec_ = `${mount.hostPath}:${mount.containerPath}${suffixes.length ? `:${suffixes.join(',')}` : ''}`;
+      args.push('--volume', spec_);
+    }
+
+    args.push('--workdir', spec.containerHome);
+
+    if (spec.cpus) {
+      args.push('--cpus', spec.cpus);
+    }
+    if (spec.memory) {
+      args.push('--memory', spec.memory);
+    }
+
+    // The image's own entrypoint is displaced: an environment is a place to run
+    // commands in, not a service, and an image whose entrypoint exits would
+    // otherwise take the environment down with it. The loop rather than
+    // `sleep infinity` because the latter is a GNU extension.
+    args.push(
+      '--entrypoint', 'sh',
+      spec.image,
+      '-c', 'while true; do sleep 3600; done',
+    );
+
+    return args;
+  }
+
+  /** Argv prefix that runs a command inside an existing environment. */
+  execArgs(spec: ExecSpec, command: string, commandArgs: string[]): string[] {
+    const args = ['exec', '--interactive'];
+    if (spec.tty) {
+      args.push('--tty');
+    }
+    if (spec.cwd) {
+      args.push('--workdir', spec.cwd);
+    }
+    for (const [key, value] of Object.entries(spec.env || {})) {
+      args.push('--env', `${key}=${value}`);
+    }
+    args.push(spec.name, command, ...commandArgs);
+    return args;
+  }
+
+  async ensure(spec: CreateContainerSpec): Promise<{ created: boolean }> {
+    const status = await this.status(spec.name);
+    if (!status) {
+      await this.create(spec);
+      return { created: true };
+    }
+    if (status !== 'running') {
+      await this.start(spec.name);
+    }
+    return { created: false };
+  }
+
+  async create(spec: CreateContainerSpec): Promise<void> {
+    await this.run(this.binary, this.createArgs(spec));
+  }
+
+  async start(name: string): Promise<void> {
+    await this.run(this.binary, ['start', name]);
+  }
+
+  async stop(name: string): Promise<void> {
+    await this.run(this.binary, ['stop', '--time', '5', name]);
+  }
+
+  async remove(name: string): Promise<void> {
+    await this.run(this.binary, ['rm', '--force', name]);
+  }
+
+  /** `running`, `exited`, … or null when no such container exists. */
+  async status(name: string): Promise<string | null> {
+    try {
+      const { stdout } = await this.run(this.binary, [
+        'inspect', '--format', '{{.State.Status}}', name,
+      ]);
+      return stdout.trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Status, image and labels for one environment.
+   *
+   * Read through `inspect` rather than off a `ps` row because the two engines
+   * disagree about how `{{.Labels}}` prints: Docker emits `k=v,k=v`, Podman
+   * emits Go's `map[k:v k:v]`. `inspect` with an explicit `json` template says
+   * the same thing on both.
+   */
+  async describe(name: string): Promise<ContainerDescription | null> {
+    try {
+      const { stdout } = await this.run(this.binary, [
+        'inspect', '--format', '{{.State.Status}}\t{{.Config.Image}}\t{{json .Config.Labels}}', name,
+      ]);
+      const [status, image, labelsJson] = stdout.trim().split('\t');
+      let labels: Record<string, string> = {};
+      try {
+        labels = JSON.parse(labelsJson || '{}') || {};
+      } catch {
+        labels = {};
+      }
+      return { name, status: status || 'unknown', image: image || '', labels };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Run a one-shot command inside an environment and return its output. */
+  async exec(spec: ExecSpec, command: string, commandArgs: string[]): Promise<RunResult> {
+    return this.run(this.binary, this.execArgs(spec, command, commandArgs));
+  }
+
+  /** Names of every environment this server manages, running or not. */
+  async list(label: string): Promise<string[]> {
+    const { stdout } = await this.run(this.binary, [
+      'ps', '--all',
+      '--filter', `label=${label}`,
+      '--format', '{{.Names}}',
+    ]);
+    return stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+  }
+
+  /**
+   * Change the limits of a running container in place.
+   *
+   * Both engines can do this without a restart, which is the difference
+   * between a tier change the user sees immediately and one that has to wait
+   * for their agent to finish.
+   */
+  async resize(name: string, cpus: string | null, memory: string | null): Promise<boolean> {
+    const args = ['update'];
+    if (cpus) {
+      args.push('--cpus', cpus);
+    }
+    if (memory) {
+      args.push('--memory', memory);
+      // Without a matching swap limit Docker refuses the change on hosts where
+      // swap accounting is on, and Podman quietly leaves swap at the old value.
+      args.push('--memory-swap', memory);
+    }
+    if (args.length === 1) {
+      return true;
+    }
+    args.push(name);
+    await this.run(this.binary, args);
+    return true;
+  }
+
+  /**
+   * What the container is using right now.
+   *
+   * `--no-stream` so this is one sample rather than a subscription; the caller
+   * is polling on its own schedule and a stream would outlive the question.
+   */
+  async usage(name: string): Promise<ResourceUsage | null> {
+    try {
+      const { stdout } = await this.run(this.binary, [
+        'stats', '--no-stream', '--format', '{{.CPUPerc}}\t{{.MemUsage}}', name,
+      ]);
+      const [cpuPerc, memUsage] = stdout.trim().split('\t');
+      const cpu = Number.parseFloat((cpuPerc || '').replace('%', ''));
+      const memory = parseSize((memUsage || '').split('/')[0]);
+      if (!Number.isFinite(cpu) || memory === null) {
+        return null;
+      }
+      // `stats` reports a percentage of one core, so 250% is 2.5 cores.
+      return { cpuCores: cpu / 100, memoryBytes: memory };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Whether the engine binary is present and answering. */
+  async available(): Promise<boolean> {
+    try {
+      await this.run(this.binary, ['version', '--format', '{{.Client.Version}}']);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/**
+ * `1.5GiB`, `512MB`, `2g` → bytes.
+ *
+ * Both engines print human sizes in `stats` and accept them in `--memory`, and
+ * the two spellings differ (`GiB` out, `g` in), so one parser serves both
+ * directions. Binary units throughout: that is what the engines mean by `g`.
+ */
+export function parseSize(raw: string): number | null {
+  const match = /^\s*([0-9]*\.?[0-9]+)\s*([a-zA-Z]*)\s*$/.exec(raw || '');
+  if (!match) {
+    return null;
+  }
+  const value = Number.parseFloat(match[1]);
+  // Both `GiB` (what the container engines print) and `Gi` (what Kubernetes
+  // prints) reduce to `g`. Stripping only a trailing `b` left `Mi` unmatched,
+  // which read every Kubernetes memory figure as unparseable — and an
+  // unparseable figure is a missing sample, so automatic sizing silently never
+  // moved on a cluster.
+  const unit = match[2].toLowerCase().replace(/[ib]+$/, '');
+  const scale: Record<string, number> = {
+    '': 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3, t: 1024 ** 4,
+  };
+  const factor = scale[unit];
+  return factor === undefined || !Number.isFinite(value) ? null : value * factor;
+}

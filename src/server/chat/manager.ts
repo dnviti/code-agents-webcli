@@ -22,6 +22,8 @@ export interface ChatManagerDeps {
   storageDir: string;
   broadcast: (sessionId: string, message: Record<string, unknown>) => void;
   resolveCommand: (runtime: string) => string;
+  /** The runtime's plain CLI name, for environments that resolve it themselves. */
+  resolveCommandName?: (runtime: string) => string;
   /** Passed through to every session; see ChatSessionDeps.onLifecycle. */
   onLifecycle?: (
     sessionId: string,
@@ -97,6 +99,7 @@ export class ChatSessionManager {
         askScript: this.askScript,
         broadcast: this.deps.broadcast,
         resolveCommand: this.deps.resolveCommand,
+        resolveCommandName: this.deps.resolveCommandName,
         readFile: (sessionId, filePath) => this.readFile(sessionId, filePath),
         writeFile: (sessionId, filePath, contents) =>
           this.writeFile(sessionId, filePath, contents),

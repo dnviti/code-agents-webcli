@@ -64,7 +64,9 @@ export interface SessionRoutesDeps {
   webSocketConnections: Map<string, WebSocketInfo>;
   baseFolder: string;
   dev: boolean;
-  validatePath(targetPath: string): PathValidation;
+  validatePath(targetPath: string, userId?: number): PathValidation;
+  /** Optional: without it the single shared base folder is used, as before. */
+  getUserBaseFolder?(userId?: number): string;
   createSessionRecord(params: {
     id: string;
     ownerUserId: number;
@@ -177,7 +179,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     // The same check every other path in this app goes through. A directory
     // that fails it cannot have had a session in it anyway, so this is about
     // refusing to answer questions about the rest of the disk.
-    const validation = deps.validatePath(requested);
+    const validation = deps.validatePath(requested, user.id);
     if (!validation.valid || !validation.path) {
       res.status(403).json({ error: 'That folder is outside the allowed base' });
       return;
@@ -405,9 +407,9 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       owner = parent.id;
     }
 
-    let validWorkingDir = deps.baseFolder;
+    let validWorkingDir = (deps.getUserBaseFolder?.(user.id) ?? deps.baseFolder);
     if (workingDir) {
-      const validation = deps.validatePath(workingDir);
+      const validation = deps.validatePath(workingDir, user.id);
       if (!validation.valid) {
         res.status(403).json({
           error: validation.error,
@@ -417,7 +419,10 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       }
       validWorkingDir = validation.path!;
     } else {
-      validWorkingDir = deps.getSelectedWorkingDir(user.id) || deps.baseFolder;
+      const selected = deps.getSelectedWorkingDir(user.id);
+      validWorkingDir = selected && deps.validatePath(selected, user.id).valid
+        ? selected
+        : (deps.getUserBaseFolder?.(user.id) ?? deps.baseFolder);
     }
 
     const session = deps.createSessionRecord({

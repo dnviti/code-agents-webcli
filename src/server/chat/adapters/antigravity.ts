@@ -1,4 +1,3 @@
-import { spawn } from 'child_process';
 import {
   ChatBlock,
   ChatCapabilities,
@@ -576,20 +575,10 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
     const args = [...this.buildArgs(), '--print', withAttachments(turn)];
 
     return new Promise<void>((resolve, reject) => {
-      const child = spawn(this.options.command, args, {
-        cwd: this.options.workingDir,
-        env: {
-          ...process.env,
-          ...(this.options.env || {}),
-          NO_COLOR: '1',
-          TERM: 'dumb',
-          FORCE_COLOR: '0',
-        },
-        // Closed rather than piped: the prompt is in argv and nothing is ever
-        // written here. Measured as safe — a run with stdin ignored completed in
-        // 5.4s, the same as one with a terminal behind it.
-        stdio: ['ignore', 'pipe', 'pipe'],
-      }) as AdapterChild;
+      // Closed rather than piped: the prompt is in argv and nothing is ever
+      // written here. Measured as safe — a run with stdin ignored completed in
+      // 5.4s, the same as one with a terminal behind it.
+      const child = this.launchChild(args, ['ignore', 'pipe', 'pipe']) as AdapterChild;
 
       this.child = child;
       this.exited = false;

@@ -31,6 +31,7 @@ import { MoreSheet } from '../../src/client/shell/MoreSheet';
 import { ChatSettingsDialog } from '../../src/client/shell/dialogs/ChatSettingsDialog';
 import { SettingsDialog } from '../../src/client/shell/dialogs/SettingsDialog';
 import { DEFAULT_NOTIFICATIONS } from '../../src/client/ui/settings';
+import { EnvironmentDialog } from '../../src/client/shell/dialogs/EnvironmentDialog';
 import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
 import { ConversationsDialog } from '../../src/client/shell/dialogs/ConversationsDialog';
 import { UsageDashboardDialog } from '../../src/client/shell/dialogs/UsageDashboardDialog';
@@ -351,6 +352,7 @@ async function run(): Promise<void> {
   await checkAWaitingConversationIsVisibleWithoutOpeningIt();
   await checkEveryConversationCanBeFoundAndReopened();
   await checkAConversationSaysWhichApprovalModeItIsIn();
+  await checkTheEnvironmentSizePickerIsUsable();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
@@ -11501,4 +11503,171 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
 
   sheetRoot.unmount();
   frame.remove();
+}
+
+/**
+ * The environment size picker, rendered rather than reasoned about.
+ *
+ * Three states this dialog has that a screenshot of the happy path would not
+ * reach, and all three have been wrong in a settings dialog before: the size a
+ * user *chose* differing from the size their environment is *running at* (which
+ * is the normal state under automatic sizing), a change that is waiting for
+ * them to be idle, and a server where the whole feature is off. A picker that
+ * silently shows the wrong current size is the kind of thing people file bugs
+ * about.
+ */
+async function checkTheEnvironmentSizePickerIsUsable(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'position:absolute;top:0;left:0;width:900px;height:700px';
+  document.body.appendChild(host);
+
+  const tiers = [
+    { id: 'small', label: 'Small', cpus: '1', memory: '1g' },
+    { id: 'medium', label: 'Medium', cpus: '2', memory: '2g' },
+    { id: 'large', label: 'Large', cpus: '4', memory: '4g' },
+  ];
+
+  const applied: string[] = [];
+  const root = createRoot(host);
+
+  // 1. Automatic chosen, and the environment currently a size that is not the
+  //    default — exactly what automatic sizing produces.
+  root.render(
+    React.createElement(EnvironmentDialog, {
+      open: true,
+      info: {
+        enabled: true,
+        canChoose: true,
+        tiers,
+        defaultTier: 'medium',
+        tier: 'auto',
+        appliedTier: 'large',
+        intendedTier: 'large',
+        pendingTier: null,
+        running: true,
+      },
+      error: null,
+      busy: false,
+      notice: null,
+      onApply: (tier: string) => applied.push(tier),
+      onClose: () => {},
+    } as never),
+  );
+  await wait(200);
+
+  const select = document.querySelector('select[aria-label="Environment size"]') as HTMLSelectElement | null;
+  check('the size picker renders a select', !!select, select ? 'present' : 'missing');
+  if (!select) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  check(
+    'every configured size is offered, plus automatic',
+    select.options.length === tiers.length + 1,
+    Array.from(select.options).map((o) => o.value).join(','),
+  );
+  check(
+    'the picker shows what the user chose, not the default',
+    select.value === 'auto',
+    `value=${select.value}`,
+  );
+
+  // The distinction the whole panel exists for: chosen 'auto', running 'Large'.
+  // Scoped to the row rather than the dialog: every tier label also appears in
+  // the select's own options, so a dialog-wide search would pass on a panel
+  // that never showed the running size at all.
+  const runningRow = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"] *'))
+    .find((node) => /^Running at/.test(node.innerText || ''));
+  const runningText = runningRow?.innerText || '';
+  check(
+    'it also says what the environment is actually running at',
+    /Large/.test(runningText) && /4 cores/.test(runningText),
+    runningText.replace(/\s+/g, ' ').slice(0, 160) || 'no "Running at" row',
+  );
+  check(
+    'and does not claim it is running the size that was merely chosen',
+    !/\bSmall\b/.test(runningText),
+    runningText.replace(/\s+/g, ' ').slice(0, 160),
+  );
+
+  // Applying sends the selected id, not the running one.
+  select.value = 'small';
+  select.dispatchEvent(new Event('change', { bubbles: true }));
+  await wait(60);
+  const apply = Array.from(document.querySelectorAll('button')).find(
+    (button) => button.textContent?.includes('Apply size'),
+  ) as HTMLButtonElement | undefined;
+  check('there is an apply button', !!apply, apply ? apply.textContent || '' : 'missing');
+  apply?.click();
+  await wait(60);
+  check(
+    'applying sends the size the user picked',
+    applied.length === 1 && applied[0] === 'small',
+    JSON.stringify(applied),
+  );
+
+  // 2. A change waiting for the user to be idle has to be visible, or the
+  //    picker looks like it silently ignored them.
+  root.render(
+    React.createElement(EnvironmentDialog, {
+      open: true,
+      info: {
+        enabled: true, canChoose: true, tiers, defaultTier: 'medium',
+        tier: 'small', appliedTier: 'large', intendedTier: 'small',
+        pendingTier: 'small', running: true,
+      },
+      error: null, busy: false, notice: 'Saved.',
+      onApply: () => {}, onClose: () => {},
+    } as never),
+  );
+  await wait(200);
+
+  const waitingText = (document.querySelector('[role="dialog"]') as HTMLElement | null)?.innerText || '';
+  check(
+    'a size change that is waiting says so',
+    /waiting/i.test(waitingText),
+    waitingText.replace(/\s+/g, ' ').slice(0, 200),
+  );
+
+  // 3. Nothing offered on a server that has no environments, and no dead
+  //    control left enabled.
+  root.render(
+    React.createElement(EnvironmentDialog, {
+      open: true,
+      info: { enabled: false },
+      error: null, busy: false, notice: null,
+      onApply: () => {}, onClose: () => {},
+    } as never),
+  );
+  await wait(200);
+
+  check(
+    'a server without environments offers no size control',
+    !document.querySelector('select[aria-label="Environment size"]'),
+    'select absent',
+  );
+  const disabledApply = Array.from(document.querySelectorAll('button')).find(
+    (button) => button.textContent?.includes('Apply size'),
+  ) as HTMLButtonElement | undefined;
+  check(
+    'and its apply button cannot be pressed',
+    !disabledApply || disabledApply.disabled,
+    disabledApply ? `disabled=${disabledApply.disabled}` : 'no button',
+  );
+
+  // The dialog must still fit the window with every row on screen.
+  const panel = document.querySelector('[role="dialog"]') as HTMLElement | null;
+  if (panel) {
+    const box = panel.getBoundingClientRect();
+    check(
+      'the environment dialog fits on screen',
+      box.top >= 0 && box.bottom <= window.innerHeight,
+      `top=${Math.round(box.top)} bottom=${Math.round(box.bottom)} of ${window.innerHeight}`,
+    );
+  }
+
+  root.unmount();
+  host.remove();
 }

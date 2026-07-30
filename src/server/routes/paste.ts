@@ -8,7 +8,7 @@ export const PASTE_MAX_BYTES = DEFAULT_MAX_BYTES;
 export interface PasteRoutesDeps {
   claudeSessions: Map<string, SessionRecord>;
   pasteStore: PasteStoreLike;
-  validatePath(targetPath: string): PathValidation;
+  validatePath(targetPath: string, userId?: number): PathValidation;
   publicBaseUrl?: string | null;
 }
 
@@ -73,7 +73,7 @@ export function createPasteRoutes(deps: PasteRoutesDeps): Router {
       // SessionStore restores working_dir straight from SQLite without a
       // re-check, so a database written by a looser build — or a base folder
       // narrowed since — must not turn into a write outside the sandbox.
-      const validation = deps.validatePath(session.workingDir);
+      const validation = deps.validatePath(session.workingDir, session.ownerUserId);
       if (!validation.valid || !validation.path) {
         res.status(403).json({ error: 'session_outside_base' });
         return;

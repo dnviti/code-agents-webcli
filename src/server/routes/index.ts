@@ -8,6 +8,7 @@ import { createChatAttachmentRoutes, ChatAttachmentRoutesDeps } from './chat-att
 import { createProfileRoutes, ProfileRoutesDeps } from './profiles.js';
 import { createPreferenceRoutes, PreferenceRoutesDeps } from './preferences.js';
 import { createWorkspaceRoutes, WorkspaceRoutesDeps } from './workspace.js';
+import { createEnvironmentRoutes, EnvironmentRoutesDeps } from './environment.js';
 import { createUsageRoutes, UsageRoutesDeps } from './usage.js';
 
 export interface RegisterRoutesDeps
@@ -20,7 +21,8 @@ export interface RegisterRoutesDeps
     ProfileRoutesDeps,
     PreferenceRoutesDeps,
     WorkspaceRoutesDeps,
-    UsageRoutesDeps {}
+    UsageRoutesDeps,
+    EnvironmentRoutesDeps {}
 
 export function registerRoutes(app: Express, deps: RegisterRoutesDeps): void {
   app.use(createHealthRoutes(deps));
@@ -33,4 +35,5 @@ export function registerRoutes(app: Express, deps: RegisterRoutesDeps): void {
   app.use(createPreferenceRoutes(deps));
   app.use(createWorkspaceRoutes(deps));
   app.use(createUsageRoutes(deps));
+  app.use(createEnvironmentRoutes(deps));
 }

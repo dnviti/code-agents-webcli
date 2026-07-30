@@ -1,4 +1,3 @@
-import { spawn } from 'child_process';
 import { AdapterChild, BaseChatAdapter } from '../adapter.js';
 import {
   ChatCapabilities,
@@ -325,24 +324,13 @@ export class PiChatAdapter extends BaseChatAdapter {
     const args = this.buildTurnArgs(turn);
 
     return new Promise<void>((resolve, reject) => {
-      const child = spawn(this.options.command, args, {
-        cwd: this.options.workingDir,
-        env: {
-          ...process.env,
-          ...(this.options.env || {}),
-          // Same reasoning as the base class: no TUI, no ANSI in the stream.
-          NO_COLOR: '1',
-          TERM: 'dumb',
-          FORCE_COLOR: '0',
-        },
-        // stdin is closed, not piped. The prompt arrives in argv via `-p`, so
-        // nothing is ever written here — and pi waits on stdin when it is a
-        // pipe that stays open, producing no output at all and never exiting.
-        // Measured: an open empty stdin yields 0 bytes and no exit; 'ignore'
-        // completes the same prompt in ~8s. A turn that never answers is
-        // exactly what this looked like from the browser.
-        stdio: ['ignore', 'pipe', 'pipe'],
-      }) as AdapterChild;
+      // stdin is closed, not piped. The prompt arrives in argv via `-p`, so
+      // nothing is ever written here — and pi waits on stdin when it is a
+      // pipe that stays open, producing no output at all and never exiting.
+      // Measured: an open empty stdin yields 0 bytes and no exit; 'ignore'
+      // completes the same prompt in ~8s. A turn that never answers is
+      // exactly what this looked like from the browser.
+      const child = this.launchChild(args, ['ignore', 'pipe', 'pipe']) as AdapterChild;
 
       this.child = child;
       this.exited = false;

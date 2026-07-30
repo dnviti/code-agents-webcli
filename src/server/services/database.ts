@@ -144,7 +144,13 @@ export class AppDatabase {
     return this.isEligibleInstaller ? this.isEligibleInstaller(githubId) : true;
   }
 
-  /** One account by id, or null once it has been deleted. */
+  /**
+   * One account by id, or null once it has been deleted.
+   *
+   * Also where a user id becomes something human-readable: a per-user
+   * environment is named after the login, and only the id travels through the
+   * session and socket layers.
+   */
   getUserById(userId: number): AuthenticatedUser | null {
     const row = this.db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as
       | UserRow
