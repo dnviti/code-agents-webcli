@@ -16,8 +16,12 @@ there is no second command.
 
 ## What it does
 
-- **Real terminals, not a chat box.** Full pseudo-terminals over WebSocket with
-  xterm.js — TUIs, colours, Ctrl-C, the lot.
+- **Real terminals, not just a chat box.** Full pseudo-terminals over WebSocket
+  with xterm.js — TUIs, colours, Ctrl-C, the lot.
+- **Or a structured conversation, when you want one.** The **WebUI (beta)**
+  opens most of the same agents as message bubbles, tool-call cards, diffs and
+  permission prompts instead of a raw TUI, with a trace panel beside it and a
+  GitHub panel that knows what a PR or issue is linked to.
 - **Whatever agent you already use.** Eight agent CLIs plus plain shell sessions.
   Each is optional; the app only ever runs what is on the host's `PATH`.
 - **Multi-user, properly isolated.** GitHub OAuth, an explicit allow-list, and
@@ -35,6 +39,31 @@ there is no second command.
   capability tiers, configured in the UI.
 - **HTTPS everywhere**, with a certificate authority the server generates itself
   so LAN devices get a secure context.
+
+## Screenshots
+
+<table>
+<tr>
+<td width="50%">
+<img src="assets/screenshots/launcher.png" alt="Picking a runtime">
+Pick a runtime — terminal or WebUI — for the folder you're in.
+</td>
+<td width="50%">
+<img src="assets/screenshots/webui-chat.png" alt="The WebUI">
+The WebUI: message bubbles, tool cards, a live trace panel.
+</td>
+</tr>
+<tr>
+<td width="50%">
+<img src="assets/screenshots/github-panel.png" alt="The GitHub panel">
+Issues and pull requests, with who they're assigned to and what they're linked to.
+</td>
+<td width="50%">
+<img src="assets/screenshots/mobile.png" alt="On a phone" width="260">
+The same conversation, built for the phone it will actually be used on.
+</td>
+</tr>
+</table>
 
 ## Before you start
 
