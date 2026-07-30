@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { ChatAttachment, ChatState } from '../../../shared/chat-events.js';
+import { ChatAttachment, ChatDraft, ChatState } from '../../../shared/chat-events.js';
 import { uploadAttachment } from '../../chat/attachments-api.js';
 import { branchConversation, type BranchedConversation } from '../../chat/branch-api.js';
 import { ChatController, type ChatUnavailable } from '../../chat/controller.js';
@@ -334,10 +334,12 @@ export function ChatView({
   // re-render this component — and re-derive the turns and the whole activity
   // projection — on every keystroke.
   const [seed, setSeed] = React.useState<{ key: number; text: string }>({ key: 0, text: '' });
-  // A half-typed message belongs to the conversation it was typed into. The
-  // surface is keyed by session id and remounts on a tab switch, so without
-  // this the draft is destroyed by looking at another chat for a moment.
-  const [draft, setDraft] = useSessionDraft(controller.sessionId);
+  // A half-typed message belongs to the conversation it was typed into, and to
+  // the person typing it rather than to the window they happen to be at. The
+  // surface is keyed by session id and remounts on a tab switch, so without this
+  // the draft is destroyed by looking at another chat for a moment — and without
+  // the sync behind it, by picking up a different device (#163).
+  const [draft, setDraft] = useSyncedDraft(controller);
 
   const list = React.useRef<MessageListHandle | null>(null);
   const root = React.useRef<HTMLElement | null>(null);
@@ -430,7 +432,16 @@ export function ChatView({
 
   const send = React.useCallback(
     (text: string, attachments: ChatAttachment[]) => {
-      controller.sendTurn(text, attachments);
+      // Named as the composer's own send, which is what empties the shared
+      // draft: a turn sent again from the transcript goes through the same
+      // method and must leave a half-written message alone. See sendTurn.
+      controller.sendTurn(text, attachments, { fromComposer: true });
+      // Emptied here, before the composer empties itself. It clears the text and
+      // the files one after the other, and each of those is a publishable state
+      // — so without this the account's other screens would watch the message
+      // they just saw sent come apart in halves. Cleared first, both of those
+      // land on a composer that is already empty and say nothing at all.
+      setDraft(EMPTY_DRAFT);
       // Asking for something new is the end of wherever you were going: the
       // list pins to the bottom for the answer, and a jump landing afterwards
       // would scroll the reply away.
@@ -1184,8 +1195,19 @@ export function ChatView({
               onRetryQueued={retryQueued}
               onFindFiles={findProjectFiles}
               onUpload={upload}
-              draft={draft}
-              onDraftChange={setDraft}
+              draft={draft.text}
+              // Both of these are functions of what the draft *is*, never of
+              // what it was when this render happened: a paste that adds text
+              // and a drop that adds a file can land in the same tick, and the
+              // second one computed from a stale render would undo the first.
+              onDraftChange={(text) => setDraft((prev) => ({ ...prev, text }))}
+              // The files on the unsent message, held here rather than inside
+              // the composer: they are part of what is being written, and what
+              // is being written belongs to the conversation now, not to this
+              // window. A screenshot dropped on a laptop is on the phone's copy
+              // of the same message a moment later.
+              attachments={draft.attachments}
+              onAttachmentsChange={(attachments) => setDraft((prev) => ({ ...prev, attachments }))}
               seedKey={seed.key}
               seedDraft={seed.text}
               branch={branch}
@@ -1393,38 +1415,159 @@ function useBranch(sessionId: string, version: number): string | undefined {
   return branch;
 }
 
+/** What a composer holds before any of it is a turn. */
+interface DraftState {
+  text: string;
+  attachments: ChatAttachment[];
+}
+
+const EMPTY_DRAFT: DraftState = { text: '', attachments: [] };
+
 /**
- * A draft, kept against its own session id.
+ * Read this browser's own copy of a draft back.
  *
  * Session storage rather than local: a draft is something you are in the middle
  * of, and one restored into a new window a week later is a surprise rather than
- * a convenience. Writes are cheap and rare enough not to need debouncing — a
- * keystroke is one small string into one key.
+ * a convenience.
+ *
+ * A bare string is what every version before the shared composer wrote here, and
+ * it still reads correctly — as a draft with nothing attached to it, which is
+ * exactly what it was.
  */
-function useSessionDraft(sessionId: string): [string, (next: string) => void] {
-  const key = `cc-web-chat-draft:${sessionId}`;
-  const [draft, setDraft] = React.useState(() => {
-    try {
-      return sessionStorage.getItem(key) ?? '';
-    } catch {
-      // Private browsing, or storage disabled. The draft simply does not persist.
-      return '';
+function readStoredDraft(key: string): DraftState {
+  let raw: string | null = null;
+  try {
+    raw = sessionStorage.getItem(key);
+  } catch {
+    // Private browsing, or storage disabled. Nothing was kept.
+    return EMPTY_DRAFT;
+  }
+  if (!raw) return EMPTY_DRAFT;
+  try {
+    const parsed = JSON.parse(raw) as Partial<DraftState>;
+    // Anything that parses but is not one of these is a draft from before this
+    // was written that happened to look like JSON — `42`, `true`, `[1, 2]`. It
+    // is still what somebody typed, so it is still their draft.
+    if (!parsed || typeof parsed !== 'object' || typeof parsed.text !== 'string') {
+      return { text: raw, attachments: [] };
     }
+    return {
+      text: parsed.text,
+      attachments: Array.isArray(parsed.attachments) ? parsed.attachments : [],
+    };
+  } catch {
+    return { text: raw, attachments: [] };
+  }
+}
+
+/**
+ * The composer, shared with every other screen looking at this conversation.
+ *
+ * Three copies of one sentence, and each of them earns its place. The React
+ * state is what the field renders from. Session storage is what survives this
+ * page being reloaded, and it is the only copy left when the server has
+ * restarted under an open tab. The server's own is the one the account's other
+ * screens read, which is the whole point (#163).
+ *
+ * The rule between them is the plainest one that works: whoever typed last wins.
+ * There is no merging here and there should not be — two devices belonging to
+ * one person are almost never typed into at the same instant, and the price of
+ * pretending otherwise would be a character-level protocol for a feature whose
+ * real job is to let somebody stand up and finish their sentence on a phone.
+ */
+function useSyncedDraft(
+  controller: ChatController,
+): [DraftState, (next: DraftState | ((prev: DraftState) => DraftState)) => void] {
+  const key = `cc-web-chat-draft:${controller.sessionId}`;
+
+  const [draft, setDraft] = React.useState<DraftState>(() => {
+    // The conversation's own composer beats this browser's memory of it: a tab
+    // switched away from and back has a controller that was listening the whole
+    // time, and what it heard is newer than anything written here.
+    const held = controller.draftValue;
+    if (held.revision > 0) return { text: held.text, attachments: held.attachments };
+    return readStoredDraft(key);
   });
 
-  const update = React.useCallback(
-    (next: string) => {
-      setDraft(next);
+  /** So the effect below can read the current draft without re-running on it. */
+  const latest = React.useRef(draft);
+  latest.current = draft;
+
+  const remember = React.useCallback(
+    (next: DraftState) => {
       try {
-        if (next) sessionStorage.setItem(key, next);
+        if (next.text || next.attachments.length) sessionStorage.setItem(key, JSON.stringify(next));
         else sessionStorage.removeItem(key);
       } catch {
-        // Applying it anyway is right: it works for this session, it just will
+        // Applying it anyway is right: it works for this window, it just will
         // not survive a reload.
       }
     },
     [key],
   );
+
+  /**
+   * Change the composer, here and everywhere.
+   *
+   * Takes a function as well as a value, and the composer needs it to: sending a
+   * message clears the text and the files through two separate callbacks, and
+   * the second of them would otherwise be computed from the render before the
+   * first — putting the sent message straight back into the field, and then on
+   * to every other screen as a fresh edit.
+   */
+  const update = React.useCallback(
+    (next: DraftState | ((prev: DraftState) => DraftState)) => {
+      const value = typeof next === 'function' ? next(latest.current) : next;
+      latest.current = value;
+      setDraft(value);
+      remember(value);
+      controller.publishDraft(value.text, value.attachments);
+    },
+    [controller, remember],
+  );
+
+  React.useEffect(() => {
+    const apply = (incoming: ChatDraft | null): void => {
+      if (incoming) {
+        const next = { text: incoming.text, attachments: incoming.attachments };
+        setDraft(next);
+        remember(next);
+        return;
+      }
+      // The server has no composer for this conversation — it has restarted, or
+      // nothing has been typed into it since it came up. This browser may be the
+      // only thing still holding what was being written, so it offers it rather
+      // than waiting to be asked. Nothing goes out when there is nothing to
+      // offer, so an empty composer stays quiet.
+      const held = latest.current;
+      if (held.text || held.attachments.length) {
+        controller.publishDraft(held.text, held.attachments);
+      }
+    };
+
+    const stop = controller.subscribeDraft(apply);
+    // The join may have been answered before this surface existed — a tab
+    // switched back to has been subscribed all along — in which case no
+    // broadcast is coming and the answer is already on the controller.
+    const answer = controller.draftAnswer;
+    if (answer === 'held') apply(controller.draftValue);
+    else if (answer === 'none') apply(null);
+    return stop;
+  }, [controller, remember]);
+
+  // The moments where a quarter of a second is a quarter of a second too long:
+  // the page being hidden, and this conversation being left. Somebody putting a
+  // laptop down mid-sentence is precisely the person about to pick up a phone.
+  React.useEffect(() => {
+    const flush = (): void => controller.flushDraft();
+    window.addEventListener('pagehide', flush);
+    document.addEventListener('visibilitychange', flush);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      document.removeEventListener('visibilitychange', flush);
+      flush();
+    };
+  }, [controller]);
 
   return [draft, update];
 }

@@ -37,6 +37,12 @@ export interface ChatRegistryOptions {
    * switched off.
    */
   onEvent?: (sessionId: string, event: ChatEvent) => void;
+  /**
+   * This browser's socket id, so a controller can recognise its own composer
+   * edits coming back. Read through a function because it arrives with the
+   * server's `connected` message and changes on every reconnect.
+   */
+  origin?: () => string | null;
 }
 
 /**
@@ -63,6 +69,17 @@ export class ChatRegistry {
    */
   private multiSession = false;
 
+  /**
+   * Whether the server carries the unsent composer between screens.
+   *
+   * Its own flag rather than a second reading of `multiSession`, because the two
+   * arrived in different versions: a server that can watch several conversations
+   * on one socket may still be one that answers `chat_draft` with "this server
+   * does not understand", which on a composer means an error toast per
+   * keystroke.
+   */
+  private draftSync = false;
+
   constructor(private readonly options: ChatRegistryOptions) {}
 
   /** Apply the feature list from the server's `connected` message. */
@@ -71,6 +88,11 @@ export class ChatRegistry {
     const next = list.includes('chat_subscribe');
     const gained = next && !this.multiSession;
     this.multiSession = next;
+    this.draftSync = list.includes('chat_draft');
+    // Told to the conversations that already exist as well as to the ones built
+    // after this: the handshake arrives after a reload has restored its tabs,
+    // so the controllers are routinely older than the answer.
+    for (const controller of this.controllers.values()) controller.setDraftSync(this.draftSync);
     // A reconnect to an upgraded server: pick up the conversations that were
     // opened while it could not carry them.
     if (gained) this.resubscribeAll();
@@ -89,7 +111,9 @@ export class ChatRegistry {
       send: this.options.send,
       onChange: () => this.options.onChange(sessionId),
       onEvent: (event) => this.options.onEvent?.(sessionId, event),
+      origin: this.options.origin,
     });
+    controller.setDraftSync(this.draftSync);
     this.controllers.set(sessionId, controller);
     return controller;
   }

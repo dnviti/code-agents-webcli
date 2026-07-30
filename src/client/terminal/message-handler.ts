@@ -173,6 +173,29 @@ export class MessageHandler {
         this.app.sessionTabManager?.applyRemoteName(message.sessionId, message.name);
         break;
 
+      // A session came into existence somewhere else — or changed surface, which
+      // is announced the same way. Also arrives on the socket that asked for it,
+      // where it folds into the tab that request already put on the strip.
+      case 'session_opened':
+        this.app.sessionTabManager?.applyRemoteOpen({
+          id: message.sessionId,
+          name: message.name,
+          customName: message.customName,
+          workingDir: message.workingDir,
+          surface: message.surface,
+          active: message.active,
+          bypassPermissions: message.bypassPermissions,
+        });
+        this.app.loadSessions();
+        break;
+
+      // A session somewhere is working, or has stopped. The screen attached to
+      // it has the output and ignores this; every other screen with a tab for it
+      // has nothing else to go on.
+      case 'session_activity':
+        this.app.sessionTabManager?.applyRemoteActivity(message.sessionId, message.active);
+        break;
+
       // The session we tried to reattach to is gone (e.g. after a server
       // restart): drop the stale tab rather than leaving a dead terminal.
       case 'session_gone':
@@ -518,6 +541,14 @@ export class MessageHandler {
   private onError(message: { message: string }): void {
     settleRuntimeStart(this.app);
     showError(message.message);
+
+    // An error carries no session id, so the only session it can be attributed
+    // to is the one this socket is on — which is right for a failed start or a
+    // runtime that died, and wrong for anything that failed on the way to a
+    // *different* session. A join in flight is exactly that case: the socket is
+    // still on the old session, so marking it would paint a healthy tab red for
+    // something that went wrong with the tab the user just clicked.
+    if (this.app.pendingJoinSessionId) return;
 
     if (this.app.sessionTabManager && this.app.currentClaudeSessionId) {
       this.app.sessionTabManager.markSessionError(this.app.currentClaudeSessionId, true);
