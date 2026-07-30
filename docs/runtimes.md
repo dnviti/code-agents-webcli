@@ -145,6 +145,8 @@ Watched working:
 | The folder you picked is the folder it works in | `pwd` and a file read, in a directory agy had never seen |
 | A first launch in an unseen folder reaches a usable session | the terminal surface, past the trust question, with the prompt drawn |
 | An attached file reaches the agent | a PNG dropped into the composer, opened by the agent with `view_file` at the path it was saved to, and the product name read out of the pixels |
+| A skill picked from the `/` menu runs | `/release-check` in a project holding `.agents/skills/release-check/SKILL.md`, answered with that skill's own token |
+| A skill above the working directory is found | the same, invoked from `<repo>/packages/web` against a skill at `<repo>/.agents/skills/` |
 
 Not offered, because the runtime does not provide it:
 
@@ -154,7 +156,7 @@ Not offered, because the runtime does not provide it:
 | Cost | Nothing in `init`, in any step or in the result prices a turn. The meter says *cost not reported* rather than showing a zero. |
 | Approval prompts | Headless, it cannot stop and ask. See [Approval mode](#approval-mode). |
 | A plan or todo list | No step type carries one. |
-| Its own slash commands | Forty of them, all belonging to its terminal UI, and it interprets none in this mode. `/agents` — which the CLI answers instantly at its own prompt — went to the model instead and came back with 18,441 tokens of prose *about* subagents. The menu lists what an Antigravity conversation can really run, which is this app's own `/clear`, `/new` and `/reset`. |
+| Its own slash commands | Forty of them, all belonging to its terminal UI, and it interprets none in this mode. `/agents` — which the CLI answers instantly at its own prompt — went to the model instead and came back with 18,441 tokens of prose *about* subagents. The menu offers what an Antigravity conversation can really run instead: your skills, and this app's own `/clear`, `/new` and `/reset`. |
 | An account or plan reading | Its terminal UI shows the plan in its header; none of that reaches the headless stream. |
 
 **Attachments reach it by path.** agy has no attachment flag and no `@file`
@@ -165,11 +167,45 @@ paths are named at the end of the prompt and the agent opens them with its own
 tools. That covers images as well as text: a PNG attached in the composer was
 opened with `view_file` and the product name and version read out of the pixels.
 
-**The `/` menu lists this app's commands, not agy's.** `/clear`, `/new` and
-`/reset` are intercepted by the conversation itself and never reach any runtime,
-so they work here exactly as they do everywhere else. agy's own forty are absent
-on purpose — it interprets none of them in this mode, and offering one would
-spend a turn's tokens producing a paragraph about what it would have done.
+**The `/` menu lists your skills and this app's commands, not agy's.** agy's own
+forty are absent on purpose — it interprets none of them in this mode, and
+offering one would spend a turn's tokens producing a paragraph about what it
+would have done.
+
+What it *does* act on is a **skill** named in the prompt, and that is what the
+menu is for. A skill written to `.agents/skills/release-check/SKILL.md` and
+picked from the menu made agy open that `SKILL.md` and answer with the token the
+skill specifies.
+
+Every directory the menu reads was checked by planting a skill in it and asking
+agy which ones it could see. All four spellings of the workspace root it
+documents — `.agents`, `_agents`, `.agent`, `_agent` — are live, as is a
+`plugins/<name>/skills/` folder under any of them (agy does **not** namespace a
+plugin's skills, so they appear under their own names). The workspace roots are
+searched **up to the repository root**, the way agy searches them, so a skill at
+the top of a monorepo is on the menu of a session opened three directories down.
+Personally-installed skills come from `~/.gemini/config/skills` and
+`~/.gemini/config/plugins`.
+
+Two things are deliberately left off. agy's own **built-in** skills, because
+only one of the three is actually live — `/antigravity_guide` answers from the
+skill, `/permissioned-github` answers "no such skill", and
+`/agy-customizations` quietly opens the wrong file — and two undeliverable
+entries to gain one documentation skill is the wrong trade. And skills reached
+through agy's **`skills.json` / `plugins.json`** pointer files, which can name
+any directory on disk and chain through `inherits`: those work in agy and will
+not appear here. That is the menu under-reporting, which is the safe direction,
+but it is worth knowing if your project uses one.
+
+`~/.agents/skills` is not on the list either, though pi and grok both read it —
+agy's personal root is `~/.gemini/config`. The exception is a home directory
+that is itself a git repository with the session opened underneath it: there the
+workspace walk passes through `~/.agents` and those skills *do* appear, which is
+correct, because agy loads them there too.
+
+Alongside them, `/clear`, `/new` and `/reset`: this app intercepts those itself
+and never sends them to any runtime, so they work here exactly as they do
+everywhere else.
 
 **Not verified: what a sign-in failure looks like.** The credentials on the
 machine this was built on could not be taken away for a test — clearing `HOME`
@@ -286,7 +322,7 @@ directories each runtime's own installer writes into:
 | pi | `.pi/skills` and `.agents/skills` in the project, `~/.pi/agent/skills` and `~/.agents/skills` in your home |
 | Codex | `~/.codex/skills` and `~/.codex/prompts`, and `.codex/skills` in the project |
 | Kimi Code, Oh My Pi | Nothing — both report their own list before the menu can be opened |
-| Antigravity CLI | Nothing of its own — see below |
+| Antigravity CLI | `skills/` and `plugins/` under `.agents`, `_agents`, `.agent` or `_agent` in the project **and in every directory up to the repository root**, and the same two under `~/.gemini/config` |
 
 Each entry carries the description its author wrote in the skill's frontmatter.
 An entry whose author wrote none is shown with none: a sentence invented here

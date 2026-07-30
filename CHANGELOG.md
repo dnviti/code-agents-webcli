@@ -39,12 +39,21 @@
   the composer came back with the product name and version read out of the
   pixels.
 
-  Its own forty slash commands are deliberately not offered — it interprets none
-  of them in this mode, and `/agents` spent 18,441 tokens producing a paragraph
-  about subagents instead of listing them. The menu lists what an Antigravity
-  conversation can actually run, which is this app's own `/clear`, `/new` and
-  `/reset`; without them the menu was empty, and an empty menu takes the button
-  that opens it off the composer entirely.
+  The `/` menu lists your **skills**, and this app's `/clear`, `/new` and
+  `/reset`. agy's own forty slash commands are deliberately not offered — it
+  interprets none of them in this mode, and `/agents` spent 18,441 tokens
+  producing a paragraph about subagents instead of listing them. A skill is the
+  opposite case and is why the menu exists: named in the prompt, agy goes and
+  reads its `SKILL.md` and does what it says.
+
+  Every directory the menu reads was checked by planting a skill in it and
+  asking agy which ones it could see. All four spellings of its workspace root
+  are live (`.agents`, `_agents`, `.agent`, `_agent`), each with a `skills/` and
+  a `plugins/` folder, and each searched **up to the repository root** the way
+  agy searches it — so a skill at the top of a monorepo reaches a session opened
+  three directories down. Personal skills come from `~/.gemini/config`. agy's
+  own built-ins are left off, because only one of the three is reachable and the
+  other two would be menu entries that do nothing.
 
   The effort control is the interesting one: `--effort` is refused whenever a
   model is named, and what `agy models` publishes instead is one model id per

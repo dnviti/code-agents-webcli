@@ -301,22 +301,28 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
     // No plan or todo channel: `--mode plan` parses and changes nothing
     // observable, and no step type carries a checklist.
     plan: false,
-    // Not agy's commands — this app's, and the only ones that do anything in an
-    // Antigravity conversation.
+    // The half of the menu that is this app's own. The other half — the user's
+    // skills — is added by the session from `installed-commands.ts`, which has
+    // an `antigravity` entry naming the directories agy really reads.
     //
-    // agy has a slash menu of its own, forty entries deep, and every one of them
-    // belongs to its terminal UI: driven headlessly it interprets none of them.
-    // Probed with `/agents`, which the CLI answers instantly at its own prompt —
-    // in `--print` mode it went to the model instead and came back with 18,441
-    // tokens of prose *about* what subagents are. Putting that menu here would be
-    // exactly the defect #71 was filed for: a command offered, picked, and
-    // delivered to an agent that can only read it.
+    // What is *not* here is agy's own slash menu, forty entries deep and every
+    // one of them its terminal UI's: driven headlessly it interprets none of
+    // them. Probed with `/agents`, which the CLI answers instantly at its own
+    // prompt — in `--print` mode it went to the model instead and came back with
+    // 18,441 tokens of prose *about* what subagents are. Putting that menu here
+    // would be exactly the defect #71 was filed for: a command offered, picked,
+    // and delivered to an agent that can only read it.
     //
-    // The three below are different. `ChatSession` intercepts them itself and
-    // never forwards them (see `isClearingCommand`), so they work identically in
-    // every conversation this app runs, agy's included. They are listed because
-    // without them the menu is empty — and an empty list does not merely show an
-    // empty menu, it takes the button that opens it off the composer entirely.
+    // A skill is the opposite case, which is why it is offered: agy acts on one
+    // named in the prompt. `/marker-reporter` made it open the SKILL.md in
+    // `.agents/skills/` and answer with the token that skill specifies.
+    //
+    // The three below are this app's, not any runtime's. `ChatSession`
+    // intercepts them itself and never forwards them (see `isClearingCommand`),
+    // so they work identically in every conversation it runs. They are listed
+    // because without them a machine with no skills installed has an empty menu
+    // — and an empty list does not merely show an empty menu, it takes the
+    // button that opens it off the composer entirely.
     commands: [
       { name: 'clear', description: 'Start a new conversation, forgetting everything above' },
       { name: 'new', description: 'Start a new conversation — the same thing as /clear' },
