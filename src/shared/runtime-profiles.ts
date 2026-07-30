@@ -28,6 +28,21 @@
 export const MODEL_TIERS = ['floor', 'mid', 'high', 'top'] as const;
 export type ModelTier = (typeof MODEL_TIERS)[number];
 
+export function isModelTier(value: unknown): value is ModelTier {
+  return typeof value === 'string' && (MODEL_TIERS as readonly string[]).includes(value);
+}
+
+/**
+ * The rung a conversation runs on when its profile does not say.
+ *
+ * `mid` because that is what the ladder itself calls the standard coding model,
+ * and because a default has to be the one that is right for most turns rather
+ * than the one that is cheapest or safest. It is also what makes a ladder saved
+ * before this existed start deciding the model on the very next launch: absent
+ * means `mid`, so nothing has to be re-ticked.
+ */
+export const DEFAULT_CONVERSATION_TIER: ModelTier = 'mid';
+
 export interface RuntimeProfile {
   id: string;
   name: string;
@@ -41,6 +56,14 @@ export interface RuntimeProfile {
   env?: Record<string, string>;
   /** Abstract tiers, written through to the runtime's native config. */
   tiers?: Partial<Record<ModelTier, string>>;
+  /**
+   * Which rung the conversation *itself* runs on.
+   *
+   * The rest of the ladder configures helpers the agent delegates to; this one
+   * names the model answering the person typing. Absent means
+   * `DEFAULT_CONVERSATION_TIER`.
+   */
+  conversationTier?: ModelTier;
 }
 
 export interface RuntimeProfilesConfig {
@@ -184,6 +207,12 @@ export function normalizeProfilesConfig(input: unknown): RuntimeProfilesConfig {
       if (env) profile.env = env;
       const tiers = cleanTiers(candidate.tiers);
       if (tiers) profile.tiers = tiers;
+      // Kept even on a profile with no ladder: the rung is a standing choice
+      // about this profile, and dropping it would silently reset the setting
+      // every time somebody cleared the four boxes to retype them.
+      if (isModelTier(candidate.conversationTier)) {
+        profile.conversationTier = candidate.conversationTier;
+      }
 
       profiles.push(profile);
     }
@@ -220,4 +249,96 @@ export function profilesForRuntime(
   runtime: string,
 ): RuntimeProfile[] {
   return config.profiles.filter((p) => p.runtime === runtime);
+}
+
+/**
+ * An active profile, resolved into the things a launch needs.
+ *
+ * One shape rather than four structural copies, because the ladder made it wide
+ * enough that keeping them in step by hand stopped being free.
+ */
+export interface ResolvedProfile {
+  profileId: string;
+  profileName: string;
+  /** A model typed into the profile by hand. Outranks the ladder. */
+  model?: string;
+  extraArgs?: string[];
+  env?: Record<string, string>;
+  /** The rung this profile's conversations run on, if it has a ladder at all. */
+  ladder?: LadderRung | null;
+  /**
+   * Why the ladder was not applied, when it could not be.
+   *
+   * A session still starts — a ladder that cannot be written through is a
+   * degraded launch, not a failed one — and this is what it says instead of
+   * pretending the rung is live.
+   */
+  ladderError?: string;
+}
+
+/** One rung of a ladder, resolved to the model that is actually on it. */
+export interface LadderRung {
+  tier: ModelTier;
+  model: string;
+  /**
+   * Set when `tier` is not the rung that was asked for, because that one was
+   * left blank. The UI says so rather than reporting a rung nobody chose.
+   */
+  requested?: ModelTier;
+}
+
+/**
+ * The rung a profile's conversation runs on, resolved to a model.
+ *
+ * A blank rung falls to the nearest filled one, measured by distance along the
+ * ladder. A tie — mid empty with floor and high both filled — goes *down*: this
+ * feature exists because people build ladders to control what they spend, so
+ * when the ladder cannot answer the question the cheaper answer is the one that
+ * cannot surprise anybody with a bill.
+ *
+ * Returns null when the profile has no ladder at all, which is the ordinary case
+ * for a profile that only pins a model or sets some environment.
+ */
+export function resolveConversationRung(
+  profile: Pick<RuntimeProfile, 'tiers' | 'conversationTier'>,
+  wanted?: ModelTier,
+): LadderRung | null {
+  const tiers = profile.tiers;
+  if (!tiers) return null;
+
+  const requested = wanted ?? profile.conversationTier ?? DEFAULT_CONVERSATION_TIER;
+  const exact = tiers[requested];
+  if (exact) return { tier: requested, model: exact };
+
+  const from = MODEL_TIERS.indexOf(requested);
+  const nearest = MODEL_TIERS.map((tier, index) => ({ tier, index }))
+    .filter(({ tier }) => Boolean(tiers[tier]))
+    .sort((a, b) => {
+      const byDistance = Math.abs(a.index - from) - Math.abs(b.index - from);
+      return byDistance !== 0 ? byDistance : a.index - b.index;
+    })[0];
+
+  if (!nearest) return null;
+  return { tier: nearest.tier, model: tiers[nearest.tier] as string, requested };
+}
+
+/**
+ * The next rung up from `tier` that has a model on it, or null at the ceiling.
+ *
+ * Skips blank rungs rather than stopping at one: a ladder with floor, mid and
+ * top filled escalates mid → top, because "there is nothing above me" and "the
+ * box above me is empty" are not the same answer to the agent asking.
+ */
+export function nextRungUp(
+  profile: Pick<RuntimeProfile, 'tiers'>,
+  tier: ModelTier,
+): LadderRung | null {
+  const tiers = profile.tiers;
+  if (!tiers) return null;
+  for (let index = MODEL_TIERS.indexOf(tier) + 1; index < MODEL_TIERS.length; index++) {
+    const next = MODEL_TIERS[index];
+    const model = tiers[next];
+    if (model) return { tier: next, model };
+  }
+  return null;
 }

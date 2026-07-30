@@ -311,6 +311,12 @@ const NOTICES: Record<
   interrupted: { notice: 'interrupted', text: 'Interrupted to send' },
   branched: { notice: 'branched', text: 'Branched from an earlier conversation' },
   cleared: { notice: 'cleared', text: 'New conversation' },
+  // Only ever drawn for a change made *during* a conversation — an escalation
+  // granted, the rung it returns to, a profile edited under a running chat.
+  // Never at launch: which model a conversation opened on is a standing fact,
+  // and standing facts belong on the chip beside the composer, which is the
+  // lesson `approvals` above cost us (#134).
+  model: { notice: 'model', text: 'Model changed' },
 };
 
 /** Every token field a runtime can report, so a reset covers all of them. */

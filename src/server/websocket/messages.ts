@@ -23,7 +23,9 @@ import {
   ChatDraft,
   ChatModelDefault,
   MAX_QUESTION_ANSWER_TEXT,
+  describeModelOrigin,
 } from '../../shared/chat-events.js';
+import { ResolvedProfile } from '../../shared/runtime-profiles.js';
 import { applyDraft, clearDraft, draftOf, readDraft } from '../chat/drafts.js';
 import { UserPreferences, resolveApprovalMode } from '../../shared/user-preferences.js';
 import { ChatNotRunningError } from '../chat/session.js';
@@ -114,12 +116,7 @@ export interface MessageProcessorDeps {
    * profile: model, extra args and environment. Returns null when no profile
    * is active, which is the default and must stay a plain unmodified launch.
    */
-  resolveRuntimeProfile(agentKind: AgentKind, workingDir: string): {
-    profileName: string;
-    model?: string;
-    extraArgs?: string[];
-    env?: Record<string, string>;
-  } | null;
+  resolveRuntimeProfile(agentKind: AgentKind, workingDir: string): ResolvedProfile | null;
   /**
    * The active profile for a runtime, read without writing anything.
    *
@@ -129,7 +126,7 @@ export interface MessageProcessorDeps {
    * and asking it through the other accessor would rewrite a runtime's config
    * every time a browser opened a tab.
    */
-  activeProfileFor?(runtime: string): { profileName: string; model?: string } | null;
+  activeProfileFor?(runtime: string): ResolvedProfile | null;
   /**
    * This account's standing model choice for a runtime, and the write that
    * records one. `null` from the setter forgets it.
@@ -742,7 +739,14 @@ export class MessageProcessor {
     // beat it, but only for that conversation, never written back to the profile.)
     const profile = this.deps.resolveRuntimeProfile(agentKind, session.workingDir);
     if (profile) {
-      if (profile.model) safeOptions.model = profile.model;
+      // The rung behind the typed model, on the same terms as the chat launch:
+      // a ladder decides which model does the work, and a terminal started from
+      // this app is work being done. What it cannot have is the rest of #171 —
+      // escalation is a conversation asking a person a question, and a PTY
+      // running the CLI's own interface has no channel this app can put a
+      // question through. The rung it opens on is the rung it stays on.
+      const fromProfile = profile.model || profile.ladder?.model;
+      if (fromProfile) safeOptions.model = fromProfile;
       if (profile.extraArgs?.length) safeOptions.extraArgs = profile.extraArgs;
       if (profile.env && Object.keys(profile.env).length) safeOptions.env = profile.env;
       console.log(`Applying runtime profile "${profile.profileName}" to ${agentKind}`);
@@ -1195,12 +1199,18 @@ export class MessageProcessor {
   /**
    * Which model a *new* conversation on this runtime would open on, and why.
    *
-   * Two layers, in this order: the account's own standing choice, then the
-   * active profile. The personal one wins because a per-conversation override
-   * has always outranked the profile (see the launch below), so a profile was
-   * never a pin an installer could stop a user escaping — and because the only
-   * ordering under which the picker's "Use the default for this runtime" entry
-   * does anything is one where the thing it clears is above the profile.
+   * Three layers, in this order: the account's own standing choice, a model
+   * typed into the active profile, then that profile's ladder rung. The personal
+   * one wins because a per-conversation override has always outranked the
+   * profile (see the launch below), so a profile was never a pin an installer
+   * could stop a user escaping — and because the only ordering under which the
+   * picker's "Use the default for this runtime" entry does anything is one where
+   * the thing it clears is above the profile.
+   *
+   * The rung sits *below* the typed model, which #171 asks for in as many
+   * words: a ladder is what answers when nobody typed anything. Both of the
+   * layers above it are reported by name so the dialog can say which one is
+   * overriding a ladder somebody configured and cannot see working.
    *
    * Re-normalised on the way out. What comes back is a database row, and a
    * hand-edited one must not become an argv on every future launch.
@@ -1212,13 +1222,22 @@ export class MessageProcessor {
   private modelDefaultFor(
     runtime: string | null,
     userId: number,
-    profile: { profileName: string; model?: string } | null,
+    profile: ResolvedProfile | null,
   ): ChatModelDefault {
     const stored = runtime ? this.deps.getUserModelDefault?.(userId, runtime) || '' : '';
     const personal = stored ? normaliseModelName(stored) : undefined;
     if (personal) return { model: personal, source: 'personal' };
     if (profile?.model) {
       return { model: profile.model, source: 'profile', profileName: profile.profileName };
+    }
+    if (profile?.ladder) {
+      return {
+        model: profile.ladder.model,
+        source: 'ladder',
+        profileName: profile.profileName,
+        tier: profile.ladder.tier,
+        ...(profile.ladder.requested ? { requestedTier: profile.ladder.requested } : {}),
+      };
     }
     return { model: null, source: 'runtime' };
   }
@@ -1465,26 +1484,52 @@ export class MessageProcessor {
      * before pins existed — the profile, exactly as before #135.
      *
      * `pinned === undefined` is "nothing recorded"; a recorded `null` is the
-     * answer "it launched with no flag", and it has to outrank the profile or a
-     * profile configured mid-conversation would retcon a conversation that had
+     * answer "it launched with no flag", and it has to outrank the *profile* or
+     * a profile configured mid-conversation would retcon a conversation that had
      * deliberately run bare. That is why this is not a chain of `||`.
+     *
+     * The ladder is the one thing a `null` pin does not outrank, and #171 asks
+     * for that in as many words: "conversations that predate this change move
+     * onto the ladder the next time they are relaunched". Every one of them
+     * carries `null`, so honouring it here would mean the ladder never reached a
+     * single conversation that existed before the upgrade. The exception is
+     * narrow — it is only the rung, never `profile.model`, so the guarantee
+     * #135 bought is intact — and it cannot misfire afterwards: once a laddered
+     * runtime is launched, the rung *is* the model, so a fresh `null` pin can
+     * only be recorded for a profile that has no ladder to fall to.
      */
     const pinned = session.chatModelPinned;
-    const launchModel =
+    const ladderModel = profile?.ladder?.model;
+    // Not const: a rung the provider refuses is retried bare below, and what
+    // the record and the browser are told has to be what actually started.
+    let launchModel =
       session.chatModelOverride
-      || (pinned !== undefined
-        ? pinned || undefined
-        : seedFromAccount
-          ? modelDefault.model || undefined
-          : profile?.model)
+      || (pinned
+        ? pinned
+        : pinned === null
+          ? ladderModel
+          : seedFromAccount
+            ? modelDefault.model || undefined
+            : profile?.model || ladderModel)
       || undefined;
 
+    // Where that model came from, resolved once and reported twice: to the
+    // record, and to every browser watching. A conversation that names a model
+    // and cannot say why it is on it was the whole of #135, and a ladder adds
+    // one more place the answer can come from.
+    let modelOrigin = describeModelOrigin(launchModel, {
+      override: session.chatModelOverride,
+      personal: modelDefault.source === 'personal' ? modelDefault.model : null,
+      profile,
+    });
+    let ladderError = profile?.ladderError ?? null;
+
     try {
-      const chat = await manager.start(session, {
+      const startWith = async (model: string | undefined) => manager.start(session, {
         runtime: agentKind,
         environment: chatEnvironment,
         workingDir: session.workingDir,
-        model: launchModel,
+        model,
         // No profile fallback behind it: profiles are server-wide and keyed by
         // runtime, and an effort level is a per-conversation decision that has
         // never had a profile default to fall back to. Absent means the runtime
@@ -1496,6 +1541,28 @@ export class MessageProcessor {
         resumeSessionId,
         startFresh,
       });
+
+      let chat;
+      try {
+        chat = await startWith(launchModel);
+      } catch (error: unknown) {
+        // A rung whose model the provider will not serve — retired, not on this
+        // account's plan, spelled for a gateway this install is not pointed at.
+        // The conversation carries on at the runtime's own default rather than
+        // refusing to open, and says which of the two it is on. Only for the
+        // ladder: a model somebody typed in themselves is a request to make,
+        // and quietly starting on a different one would answer their question
+        // wrongly rather than not at all.
+        if (modelOrigin.source !== 'ladder') throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`runtime profiles: ${agentKind} refused ${launchModel}: ${message}`);
+        chat = await startWith(undefined);
+        launchModel = undefined;
+        modelOrigin = { model: null, source: 'runtime' };
+        ladderError =
+          `${agentKind} would not start on the ${profile?.ladder?.tier} rung’s model `
+          + `(${message.trim()}), so this conversation is on its own default instead.`;
+      }
 
       session.active = true;
       session.stopRequested = false;
@@ -1517,7 +1584,15 @@ export class MessageProcessor {
       // this conversation is fixed to. `null` rather than absent when there was
       // no flag — "the runtime's own default" is an answer, and it is the one a
       // profile added later must not be allowed to overwrite.
-      session.chatModelPinned = launchModel ?? null;
+      //
+      // A rung is deliberately *not* pinned. The pin exists so an unrelated
+      // profile edit cannot re-model a conversation already under way, but the
+      // rung is not an unrelated edit — it is the profile's standing answer to
+      // the question "which model runs this conversation", and #171 asks for a
+      // changed ladder to reach conversations that are already open. Recording
+      // `null` leaves the rung to be re-read on every relaunch, which is the
+      // same thing one restart later.
+      session.chatModelPinned = modelOrigin.source === 'ladder' ? null : launchModel ?? null;
 
       // Before the broadcast, so the socket that asked for the launch is
       // already a watcher when the very first event goes out.
@@ -1556,6 +1631,13 @@ export class MessageProcessor {
           // picker can say where the model came from instead of leaving a
           // profile-pinned default indistinguishable from no default at all.
           modelDefault,
+          // And where *this* conversation's model came from, which is a
+          // different question the moment a ladder can answer either one.
+          modelOrigin,
+          // Said rather than swallowed: a ladder that could not be written
+          // through has not configured the delegated helpers, so a conversation
+          // that reported the rung anyway would be claiming half a feature.
+          ladderError,
           effortOverride: session.chatEffortOverride || null,
         },
         this.deps.claudeSessions,
@@ -1599,6 +1681,9 @@ export class MessageProcessor {
 
     try {
       const snapshot = await manager.snapshot(session);
+      const runtime = session.agent || session.lastAgent;
+      const active = this.deps.activeProfileFor?.(runtime || '') ?? null;
+      const modelDefault = this.modelDefaultFor(runtime, session.ownerUserId, active);
       sendToWebSocket(wsInfo.ws, {
         type: 'chat_snapshot',
         sessionId,
@@ -1616,10 +1701,22 @@ export class MessageProcessor {
         // can tell the picker why a model is in force. Resolved through the
         // read-only profile accessor — see the dep — since a join must not
         // rewrite a runtime's tier files.
-        modelDefault: this.modelDefaultFor(
-          session.agent || session.lastAgent,
-          session.ownerUserId,
-          this.deps.activeProfileFor?.(session.agent || session.lastAgent || '') ?? null,
+        modelDefault,
+        // And where the model this conversation is on came from, which a join
+        // has to answer from the record: the process may be gone, and a rung is
+        // exactly the kind of provenance no runtime reports about itself.
+        //
+        // A pin of `null` under a laddered profile is the rung — that is what
+        // the launch records for one, so it can be re-read — and the origin has
+        // to reach the same conclusion the next launch will, or a reload would
+        // rename the model between one screen and the next.
+        modelOrigin: describeModelOrigin(
+          session.chatModelOverride || session.chatModelPinned || active?.ladder?.model,
+          {
+            override: session.chatModelOverride,
+            personal: modelDefault.source === 'personal' ? modelDefault.model : null,
+            profile: active,
+          },
         ),
         // Rides on the join for the same reason the model does: the snapshot
         // carries the runtime's own reported level only if it ever reported one,

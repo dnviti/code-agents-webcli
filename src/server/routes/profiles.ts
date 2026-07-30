@@ -84,8 +84,9 @@ export function createProfileRoutes(deps: ProfileRoutesDeps): Router {
       const result = applyTiers(profile, deps.tierContext);
       tierResults[profile.id] = {
         written: result.written,
-        skipped: result.skipped,
+        replaced: result.replaced,
         unsupported: result.unsupported === true,
+        failed: result.failed,
         // A writer that places its files per session cannot act on a save; the
         // sentence it hands back is what the dialog shows instead of silence.
         deferred: result.deferred,

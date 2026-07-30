@@ -18,6 +18,10 @@ import {
 } from './types.js';
 import { createConfig, createUsageAnalyticsOptions } from './config.js';
 import { registerRoutes } from './routes/index.js';
+import {
+  ResolvedProfile,
+  resolveConversationRung,
+} from '../shared/runtime-profiles.js';
 import { RuntimeProfileStore } from './services/runtime-profiles.js';
 import { TierWriterContext, applyTiers, defaultTierContext } from './services/tier-writer.js';
 import { WebSocketHandler } from './websocket/handler.js';
@@ -634,31 +638,40 @@ export class ClaudeCodeWebServer {
    * earlier build (or a data directory restored from backup) may never have
    * been through the save path at all.
    */
-  private resolveRuntimeProfile(agentKind: AgentKind, workingDir: string): {
-    profileName: string;
-    model?: string;
-    extraArgs?: string[];
-    env?: Record<string, string>;
-  } | null {
+  private resolveRuntimeProfile(
+    agentKind: AgentKind,
+    workingDir: string,
+  ): ResolvedProfile | null {
     const profile = this.runtimeProfiles.activeFor(agentKind);
     if (!profile) return null;
 
     // The session's directory is where pi's tier agents go, so it is part of
     // the context rather than something the writer could guess.
     const tierResult = applyTiers(profile, { ...this.tierContext, workingDir });
-    for (const skipped of tierResult.skipped) {
+    for (const replaced of tierResult.replaced) {
       console.warn(
-        `Runtime profile "${profile.name}": left ${skipped.file} alone (${skipped.reason})`,
+        `Runtime profile "${profile.name}": replaced ${replaced.file} (${replaced.reason})`,
       );
     }
 
     const extraArgs = [...tierResult.args, ...(profile.args || [])];
 
+    // A rung is only in force if the ladder behind it reached the runtime. When
+    // the write-through failed, the delegated helpers are not configured and the
+    // conversation's own model would be the only half of the ladder that landed
+    // — so the launch says so and falls back rather than reporting a rung it
+    // half applied.
+    const ladder = resolveConversationRung(profile);
+    const ladderError = ladder && tierResult.failed ? tierResult.failed : undefined;
+
     return {
+      profileId: profile.id,
       profileName: profile.name,
       model: profile.model,
       extraArgs: extraArgs.length ? extraArgs : undefined,
       env: profile.env,
+      ladder: ladderError ? null : ladder,
+      ladderError,
     };
   }
 
@@ -671,9 +684,18 @@ export class ClaudeCodeWebServer {
    * being cut — not launches. Answering them through the other one would
    * rewrite a runtime's config on every tab that opened.
    */
-  private activeProfileFor(runtime: string): { profileName: string; model?: string } | null {
+  private activeProfileFor(runtime: string): ResolvedProfile | null {
     const profile = this.runtimeProfiles.activeFor(runtime);
-    return profile ? { profileName: profile.name, model: profile.model } : null;
+    if (!profile) return null;
+    // The rung is resolved here too: reading a ladder is pure arithmetic over
+    // four strings, and it is only *writing* it through that the caller of this
+    // one must not trigger.
+    return {
+      profileId: profile.id,
+      profileName: profile.name,
+      model: profile.model,
+      ladder: resolveConversationRung(profile),
+    };
   }
 
   /**

@@ -24,6 +24,7 @@
  * that goes stale the week it ships.
  */
 
+import { ModelTier, ResolvedProfile } from './runtime-profiles.js';
 import { TurnOutcome } from './turn-outcome.js';
 
 export type { TurnOutcome };
@@ -388,7 +389,7 @@ export interface ErrorBlock {
  */
 export interface NoticeBlock {
   kind: 'notice';
-  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched';
+  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'model';
   text: string;
   /** Optional detail — how much was reclaimed, what the summary covers. */
   detail?: string;
@@ -840,9 +841,98 @@ export interface ModelChoice {
  */
 export interface ChatModelDefault {
   model: string | null;
-  source: 'personal' | 'profile' | 'runtime';
-  /** Only ever set for `profile`, and only so the picker can name it. */
+  source: ModelDefaultSource;
+  /** Set for `profile` and `ladder`, and only so the picker can name it. */
   profileName?: string;
+  /** Only ever set for `ladder`: which rung of it this model sits on. */
+  tier?: ModelTier;
+  /**
+   * Only on a `ladder` whose chosen rung was blank, naming the rung that was
+   * asked for. The nearest filled one answered instead, and a person reading
+   * "high" beside a profile set to "mid" is owed the reason.
+   */
+  requestedTier?: ModelTier;
+}
+
+/**
+ * Where a model came from, cheapest explanation last.
+ *
+ * `ladder` is below `profile` deliberately and the issue says so outright: a
+ * model somebody typed into a profile, and an account's standing choice, both
+ * still beat the rung. The ladder is what answers when nobody typed anything.
+ */
+export type ModelDefaultSource = 'personal' | 'profile' | 'ladder' | 'runtime';
+
+/**
+ * What *this* conversation is running on, and why — as opposed to
+ * `ChatModelDefault`, which is what the next one would open on.
+ *
+ * The two were the same object until the ladder arrived, and conflating them is
+ * exactly how the chip came to name a standing choice that had never been
+ * applied to the conversation showing it (#135). They are separate now because
+ * the ladder makes the difference visible: a conversation pinned to `high` by a
+ * one-off escalation and a runtime whose *default* is `mid` are both true at
+ * once, and the picker has to say both.
+ *
+ * `override` is the source no default can have: the person in this conversation
+ * picked it out of the menu.
+ */
+export interface ChatModelOrigin {
+  model: string | null;
+  source: 'override' | ModelDefaultSource;
+  profileName?: string;
+  tier?: ModelTier;
+  requestedTier?: ModelTier;
+  /**
+   * Set while a conversation is answering above its usual rung, naming the rung
+   * it returns to. Its presence is what the UI reads as "this is temporary".
+   */
+  escalatedFrom?: ModelTier;
+}
+
+/**
+ * Work out where the model a conversation launched on actually came from.
+ *
+ * By identity against each layer that could have supplied it, rather than by
+ * re-running the precedence chain: the chain already ran, and a second copy of
+ * it in a different file is a second thing to keep in step. Comparing the answer
+ * to the candidates cannot drift from the decision it is describing.
+ *
+ * Order matters where two layers hold the same string — an account default
+ * equal to the profile's model is common, and the higher layer is the one that
+ * decided.
+ */
+export function describeModelOrigin(
+  model: string | undefined,
+  from: {
+    override?: string;
+    personal?: string | null;
+    profile?: ResolvedProfile | null;
+  },
+): ChatModelOrigin {
+  if (!model) return { model: null, source: 'runtime' };
+  if (from.override && from.override === model) return { model, source: 'override' };
+  if (from.personal && from.personal === model) return { model, source: 'personal' };
+
+  const profile = from.profile;
+  if (profile?.model === model) {
+    return { model, source: 'profile', profileName: profile.profileName };
+  }
+  if (profile?.ladder?.model === model) {
+    return {
+      model,
+      source: 'ladder',
+      profileName: profile.profileName,
+      tier: profile.ladder.tier,
+      ...(profile.ladder.requested ? { requestedTier: profile.ladder.requested } : {}),
+    };
+  }
+
+  // A model none of the live layers claims. The commonest cause is a pin: a
+  // conversation continuing on what it launched on, under a profile that has
+  // been edited since. Reported as the conversation's own rather than credited
+  // to a layer that would now answer differently.
+  return { model, source: 'override' };
 }
 
 /**
@@ -1168,7 +1258,7 @@ export type ChatEvent =
       t: 'marker';
       seq: number;
       ts: number;
-      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals';
+      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals' | 'model';
       detail?: string;
       /**
        * On an `approvals` marker: the mode the conversation actually started

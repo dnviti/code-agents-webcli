@@ -688,6 +688,10 @@ function QuestionBlock({
 const NOTICE_GLYPH: Partial<Record<NoticeBlock['notice'], string>> = {
   interrupted: 'square',
   branched: 'git-branch',
+  // A rung change, up or down. One glyph for both directions: the detail beside
+  // it names the rung, and two arrows would encode as a symbol the one thing
+  // the sentence already says out loud.
+  model: 'chevrons-up-down',
 };
 
 /**
