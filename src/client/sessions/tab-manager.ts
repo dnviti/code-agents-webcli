@@ -40,6 +40,39 @@ interface TabRecord {
    * user is looking at a different one.
    */
   surface: 'terminal' | 'chat';
+  /**
+   * Where this tab falls in the order they were opened on this screen.
+   *
+   * Read by `reconcile`, and only there. A tab created while the reconcile's
+   * own listing was already in flight is missing from that listing through no
+   * fault of its own, and removing it would take away the session the user just
+   * started — so a tab younger than the question is left alone.
+   *
+   * A counter rather than a clock. `Date.now()` is accurate to the millisecond
+   * and a server on the same machine answers well inside one, so timestamps
+   * cannot order a tab against a request that has just returned: both readings
+   * come back equal and whichever way the comparison is written is wrong half
+   * the time. This is exact by construction.
+   */
+  openedSeq: number;
+}
+
+/**
+ * A session as the server describes it.
+ *
+ * The same shape whether it arrived in the listing or in an announcement that
+ * one came into existence somewhere else, so one method can turn either into a
+ * tab. `active` and `surface` are optional because the listing has always
+ * allowed them to be absent, and absent means "not running" and "a terminal".
+ */
+export interface ListedSession {
+  id: string;
+  name: string;
+  workingDir: string | null;
+  active?: boolean;
+  surface?: 'terminal' | 'chat';
+  customName?: string | null;
+  bypassPermissions?: boolean;
 }
 
 /**
@@ -142,6 +175,8 @@ export class SessionTabManager {
   tabOrder: string[];
   tabHistory: string[];
   notificationsEnabled: boolean;
+  /** How many tabs this screen has ever opened; see `TabRecord.openedSeq`. */
+  private tabsOpened = 0;
 
   constructor(app: App) {
     this.app = app;
@@ -357,25 +392,8 @@ export class SessionTabManager {
       if (kept.size !== closed.size) writeClosed(kept);
 
       sessions.forEach((raw, index: number) => {
-        const session = raw as unknown as {
-          id: string; name: string; active: boolean; workingDir: string | null;
-          surface?: 'terminal' | 'chat'; customName?: string; bypassPermissions?: boolean;
-        };
-        this.addTab(
-          session.id,
-          session.name,
-          session.active ? 'active' : 'idle',
-          session.workingDir,
-          false,
-          session.customName,
-        );
-        if (session.surface === 'chat') {
-          // Before the subscribe inside setTabSurface, so the pane's very first
-          // paint already states the mode this conversation is in rather than
-          // claiming "asks first" until a snapshot comes back over the socket.
-          this.app.chats.ensure(session.id).seedBypass(session.bypassPermissions === true);
-          this.setTabSurface(session.id, 'chat');
-        }
+        const session = raw as unknown as ListedSession;
+        this.adopt(session);
         const sessionData = this.activeSessions.get(session.id);
         if (sessionData) {
           sessionData.lastAccessed = Date.now() - (sessions.length - index) * 1000;
@@ -391,6 +409,140 @@ export class SessionTabManager {
       console.error('Failed to load sessions:', error);
       return [];
     }
+  }
+
+  /**
+   * Reconcile the strip against what the server actually has.
+   *
+   * The strip is otherwise built once, at page load, and then only ever changed
+   * by something this screen did or was told about. A socket that was away
+   * missed both, so a reconnect used to come back to whatever the strip
+   * remembered from before the drop — a session started elsewhere still absent,
+   * one ended elsewhere still there.
+   *
+   * The listing is the authority, with two deliberate exceptions. A conversation
+   * this screen closed stays closed, because that is what closing one means
+   * (#127). And a tab younger than the question is kept whatever the answer
+   * says: it was created after the listing was asked for, so its absence is the
+   * age of the answer rather than a fact about the session.
+   */
+  async reconcile(): Promise<void> {
+    const asked = this.tabsOpened;
+
+    let listed: ListedSession[];
+    try {
+      const response = await fetch('/api/sessions/list');
+      if (!response.ok) return;
+      const data = await response.json();
+      listed = Array.isArray(data?.sessions) ? (data.sessions as ListedSession[]) : [];
+    } catch {
+      // Offline, or the server is coming back up. The strip is left exactly as
+      // it is: a failed question is not evidence that anything has gone.
+      return;
+    }
+
+    const closed = readClosed();
+    const live = new Set<string>();
+
+    for (const session of listed) {
+      live.add(session.id);
+      if (session.surface === 'chat' && closed.has(session.id)) continue;
+      const known = this.tabs.has(session.id);
+      this.adopt(session);
+      if (known) {
+        // Without the unread mark. A session that went quiet while this socket
+        // was away did not go quiet *at this screen*, and a reconnect that lit
+        // up half the strip would be reporting the disconnection, not the work.
+        this.updateTabStatus(session.id, session.active ? 'active' : 'idle', {
+          markUnread: false,
+        });
+      }
+    }
+
+    for (const record of Array.from(this.tabs.values())) {
+      if (live.has(record.id) || record.openedSeq > asked) continue;
+      this.closeSession(record.id, { skipServerRequest: true });
+    }
+
+    // After the removals, not before: closing a conversation's tab is what
+    // writes it into the closed set, so pruning first would leave the ones this
+    // reconcile just took off the strip behind — a note about a conversation
+    // that no longer exists, kept until some later pass happened to notice.
+    const remembered = readClosed();
+    const kept = new Set(Array.from(remembered).filter((id) => live.has(id)));
+    if (kept.size !== remembered.size) writeClosed(kept);
+  }
+
+  /**
+   * Put a session the server has described onto the strip.
+   *
+   * One place, because the three callers — the page load, a reconcile and an
+   * announcement from another screen — have to produce the same tab from the
+   * same description, and the ordering inside is load-bearing.
+   */
+  private adopt(session: ListedSession): void {
+    const wasChat = this.tabs.get(session.id)?.surface === 'chat';
+
+    // Never switching to it. Every caller here is describing a session rather
+    // than acting on one — a page load restores its own tab afterwards, and
+    // somebody starting a conversation on their laptop is not asking the phone
+    // in their pocket to change what it is showing.
+    this.addTab(
+      session.id,
+      session.name,
+      session.active ? 'active' : 'idle',
+      session.workingDir,
+      false,
+      session.customName ?? undefined,
+    );
+
+    if (session.surface !== 'chat') return;
+
+    // Before the subscribe inside setTabSurface, so the pane's very first paint
+    // already states the mode this conversation is in rather than claiming
+    // "asks first" until a snapshot comes back over the socket. Only as the
+    // surface turns: a conversation already on this screen has been following
+    // its own events and does not want an older answer written over them.
+    if (!wasChat) {
+      this.app.chats.ensure(session.id).seedBypass(session.bypassPermissions === true);
+    }
+    this.setTabSurface(session.id, 'chat');
+  }
+
+  /**
+   * Take a session that came into existence somewhere else.
+   *
+   * Quietly: the tab appears beside whatever this screen is already showing and
+   * never takes it over. Somebody starting a conversation on their laptop is not
+   * asking the phone in their pocket to change what it is displaying.
+   *
+   * A conversation this screen has closed is not reopened by it. Closing one
+   * means "take this off my screen" (#127), and an announcement is not a reason
+   * to overrule that — it would also arrive every time the conversation changed
+   * surface, which is to say every time it was relaunched anywhere.
+   */
+  applyRemoteOpen(session: ListedSession): void {
+    if (!this.tabs.has(session.id) && session.surface === 'chat' && readClosed().has(session.id)) {
+      return;
+    }
+    this.adopt(session);
+  }
+
+  /**
+   * Take the working / idle state of a session from the server.
+   *
+   * Ignored on the screen attached to the session, which has the output itself
+   * and is already running this exact rule off it. Everywhere else this is the
+   * only sign of life there is: output goes to whoever is driving, so without it
+   * a session that has been building for a minute reads as idle on every other
+   * screen — and stays that way until somebody reloads.
+   */
+  applyRemoteActivity(sessionId: string, active: boolean): void {
+    if (!this.tabs.has(sessionId)) return;
+    if (sessionId === this.app.currentClaudeSessionId) return;
+
+    if (active) this.markSessionActivity(sessionId, true);
+    else this.updateTabStatus(sessionId, 'idle');
   }
 
   // ---------------------------------------------------------------------------
@@ -421,7 +573,13 @@ export class SessionTabManager {
     // out loud, so it is not run through the generated-name rules.
     const displayName = customName || generated;
 
-    this.tabs.set(sessionId, { id: sessionId, displayName, customName, surface: 'terminal' });
+    this.tabs.set(sessionId, {
+      id: sessionId,
+      displayName,
+      customName,
+      surface: 'terminal',
+      openedSeq: ++this.tabsOpened,
+    });
     if (!this.tabOrder.includes(sessionId)) {
       this.tabOrder.push(sessionId);
     }
@@ -793,7 +951,11 @@ export class SessionTabManager {
     });
   }
 
-  updateTabStatus(sessionId: string, status: SessionInfo['status']): void {
+  updateTabStatus(
+    sessionId: string,
+    status: SessionInfo['status'],
+    { markUnread = true } = {},
+  ): void {
     const session = this.activeSessions.get(sessionId);
     if (!session) return;
 
@@ -805,7 +967,10 @@ export class SessionTabManager {
 
     // A session that was working and has gone quiet in the background is the
     // one signal worth carrying on the tab, so the dot survives the transition.
-    if (wasActive && status === 'idle' && sessionId !== this.activeTabId) {
+    // `markUnread: false` is for catching up rather than watching — see
+    // `reconcile`, where the transition being noticed is this screen's, not the
+    // session's.
+    if (markUnread && wasActive && status === 'idle' && sessionId !== this.activeTabId) {
       session.unreadOutput = true;
     }
 

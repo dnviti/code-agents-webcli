@@ -107,6 +107,11 @@ export class WebSocketConnection {
           this.startHeartbeat();
           this.clearPongTimeout();
           void this.app.loadSessions();
+          // Nothing announced while this socket was away was queued for it, so
+          // the strip is asked to agree with the server rather than with what it
+          // remembers: a session started elsewhere during the outage is missing
+          // from it, and one ended elsewhere is still on it.
+          void this.app.sessionTabManager?.reconcile();
           // Subscriptions live on the server's socket record, so a reconnect
           // starts with none. Without this every background conversation goes
           // quiet after a dropped connection and only the joined one recovers.
