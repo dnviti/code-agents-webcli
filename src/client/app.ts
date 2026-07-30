@@ -288,6 +288,20 @@ export class App {
     } else {
       hideOverlay();
       this.wireConversationOpener();
+      // A window with nothing open still has to be reachable. The socket used
+      // to be opened by joining a session, so a browser with no tabs — a phone
+      // signed in for the first time, or one whose conversations are all closed
+      // — had no connection at all, and nothing could tell it that a session had
+      // been started on another screen (#163). It sat on the folder browser
+      // until someone reloaded it.
+      //
+      // Without a session id, which is a connection the server is happy to
+      // accept: it only auto-joins when one is named.
+      void this.connect().catch(() => {
+        // Offline, or the server is still coming up. The reconnect loop owns
+        // it from here, and nothing on the screen depends on this having
+        // succeeded.
+      });
       void this.folderBrowser.show();
     }
 

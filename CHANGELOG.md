@@ -3,6 +3,27 @@
 ## [5.3.4] - unreleased
 
 ### Fixed
+- **Every window and device shows the same tabs** (#163). The strip was built
+  once, at page load, and after that only ever changed by something the screen
+  in front of you did — because everything about a session was routed through
+  the session itself. A create answered the socket that asked for it; a delete
+  went down the set of sockets *driving* the session; output reached whoever was
+  attached. None of those is a second device that merely has the tab, so two
+  screens on one account drifted apart within a minute: a conversation started
+  on a laptop never appeared on the phone, a terminal ended on the phone stayed
+  on the laptop as a tab that answered a click with an error — and painted a
+  different, healthy tab red while doing it, since the error named no session and
+  the page could only blame the one it was still on. Sessions are now announced
+  to the *person*: every screen that account has open learns when one opens,
+  when it closes, when it becomes a conversation, and whether it is working
+  right now. Reconnecting reconciles the strip against the server rather than
+  against what it remembered, so an outage no longer leaves a screen permanently
+  behind. A window with nothing open keeps a connection now, which it did not
+  before — a phone signed in for the first time had no socket at all and was
+  unreachable by any of this. Closing a conversation is still per-screen and
+  deliberately so (#127): it means "take this off my screen", and an
+  announcement does not overrule it. A rename already worked this way; the rest
+  of the strip now does too.
 - **A chat that has just opened is empty, and the first prompt is turn 1.** The
   approval mode a conversation begins in was announced as a rule written across
   the transcript, and in a conversation nobody had spoken in yet that rule was

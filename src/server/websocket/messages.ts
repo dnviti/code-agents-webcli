@@ -11,7 +11,13 @@ import {
 import { TranscriptStoreLike } from '../services/transcript-store.js';
 import { HistoryStoreLike } from '../services/history-store.js';
 import { ScrollbackRecorder } from '../services/scrollback.js';
-import { sendToWebSocket, broadcastChat, broadcastToSession } from './handler.js';
+import {
+  sendToWebSocket,
+  broadcastChat,
+  broadcastToSession,
+  announceSessionActivity,
+  announceSessionOpened,
+} from './handler.js';
 import { chatUnavailableReason, isChatRuntime } from '../../shared/chat-runtimes.js';
 import { ChatModelDefault } from '../../shared/chat-events.js';
 import { UserPreferences, resolveApprovalMode } from '../../shared/user-preferences.js';
@@ -23,6 +29,16 @@ import { ChatNotRunningError } from '../chat/session.js';
  * spawn on every future launch of the conversation.
  */
 const MAX_MODEL_NAME = 200;
+
+/**
+ * How often a working session says so to the screens that are not attached to it.
+ *
+ * Not a latency budget: the tab strip calls a session quiet after ninety
+ * seconds without a sign of life, so anything comfortably under that keeps
+ * every screen agreeing. A second is the point where the announcement costs
+ * nothing measurable next to the output it stands in for.
+ */
+const ACTIVITY_ANNOUNCE_MS = 1000;
 
 /**
  * Tidy a typed model name into something safe to keep.
@@ -240,9 +256,46 @@ export class MessageProcessor {
   private deps: MessageProcessorDeps;
   /** One scrollback emulator per session, rebuilding history from the PTY stream. */
   private recorders = new Map<string, ScrollbackRecorder>();
+  /**
+   * When each session last told the user's other screens that it is working.
+   *
+   * Output arrives a keystroke at a time and a build's worth at a time, and the
+   * screens that are not attached to the session cannot use any of it — they
+   * only need to know it is happening. One announcement a second is far below
+   * the ninety the tab strip waits before calling a session quiet, so every
+   * screen reaches the same verdict at the same moment for the price of a few
+   * bytes a second.
+   */
+  private activityAnnounced = new Map<string, number>();
 
   constructor(deps: MessageProcessorDeps) {
     this.deps = deps;
+  }
+
+  /**
+   * Say "this session is working", at most once a second.
+   *
+   * The clock is only ever read here, so a session that goes quiet simply stops
+   * being announced; nothing has to be cancelled and nothing fires late.
+   */
+  private noteActivity(session: SessionRecord): void {
+    const now = Date.now();
+    const last = this.activityAnnounced.get(session.id) ?? 0;
+    if (now - last < ACTIVITY_ANNOUNCE_MS) return;
+    this.activityAnnounced.set(session.id, now);
+    announceSessionActivity(session, true, this.deps.webSocketConnections);
+  }
+
+  /**
+   * Say "this session has stopped", and let the throttle go.
+   *
+   * Forgetting the timestamp is what makes the next run announce itself
+   * immediately instead of waiting out the remainder of a second that belonged
+   * to the previous one.
+   */
+  private noteStopped(session: SessionRecord): void {
+    this.activityAnnounced.delete(session.id);
+    announceSessionActivity(session, false, this.deps.webSocketConnections);
   }
 
   async handleMessage(wsId: string, data: IncomingMessage): Promise<void> {
@@ -453,6 +506,11 @@ export class MessageProcessor {
       lastAgent: session.lastAgent,
       runtimeLabel: session.runtimeLabel,
     });
+
+    // And every other screen this person has open. After `session_created`, so
+    // the socket that asked has already switched to it by the time the same
+    // fact comes back around as an announcement.
+    announceSessionOpened(session, this.deps.webSocketConnections);
   }
 
   async joinSession(wsId: string, claudeSessionId: string): Promise<void> {
@@ -461,9 +519,20 @@ export class MessageProcessor {
 
     const session = this.deps.claudeSessions.get(claudeSessionId);
     if (!session || session.ownerUserId !== wsInfo.userId) {
+      // Named rather than reported as a generic error, because the client can
+      // only act on the specific answer. An `error` says nothing about *which*
+      // session failed, so the page attributed it to the session it was still
+      // on — painting a healthy tab red for a click on a dead one, and leaving
+      // the dead tab in the strip to do it again. `session_gone` says which,
+      // and the tab goes.
+      //
+      // The same answer for a session that belongs to somebody else: as far as
+      // this user is concerned there is no such session, and saying more would
+      // be telling them one exists.
       sendToWebSocket(wsInfo.ws, {
-        type: 'error',
-        message: 'Session not found',
+        type: 'session_gone',
+        sessionId: claudeSessionId,
+        message: 'This session no longer exists.',
       });
       return;
     }
@@ -666,6 +735,9 @@ export class MessageProcessor {
             this.deps.claudeSessions,
             this.deps.webSocketConnections
           );
+          // The bytes go to whoever is attached; the fact that there were any
+          // goes to every screen with a tab for this session.
+          this.noteActivity(currentSession);
         },
         onExit: (code: number | null, signal: string | null) => {
           const currentSession = this.deps.claudeSessions.get(sessionId);
@@ -682,6 +754,11 @@ export class MessageProcessor {
           currentSession.agent = null;
           currentSession.stopRequested = false;
           currentSession.lastActivity = new Date();
+
+          // Whether or not the exit was asked for, and whether or not anyone is
+          // attached: the tab is bright on every screen that saw this session
+          // start, and this is what puts it out.
+          this.noteStopped(currentSession);
 
           if (!stopRequested) {
             broadcastToSession(
@@ -707,6 +784,8 @@ export class MessageProcessor {
           currentSession.agent = null;
           currentSession.stopRequested = false;
           currentSession.lastActivity = new Date();
+
+          this.noteStopped(currentSession);
 
           if (!stopRequested) {
             broadcastToSession(
@@ -760,6 +839,13 @@ export class MessageProcessor {
         this.deps.claudeSessions,
         this.deps.webSocketConnections
       );
+
+      // A run that produces nothing for its first ninety seconds is still a run,
+      // so the tab lights up on the start rather than waiting for output. The
+      // throttle is primed here too, so the first byte does not re-announce
+      // what this line has just said.
+      this.activityAnnounced.set(sessionId, Date.now());
+      announceSessionActivity(session, true, this.deps.webSocketConnections);
     } catch (error: unknown) {
       session.outputBuffer = previousOutputBuffer;
       // The run never started, so hand the id back rather than leaving the
@@ -797,6 +883,8 @@ export class MessageProcessor {
     session.active = false;
     session.agent = null;
     session.lastActivity = new Date();
+
+    this.noteStopped(session);
 
     broadcastToSession(
       sessionId,
@@ -1327,6 +1415,14 @@ export class MessageProcessor {
       // Before the broadcast, so the socket that asked for the launch is
       // already a watcher when the very first event goes out.
       wsInfo.chatSessionIds.add(session.id);
+
+      // The session already existed as a terminal on every other screen — this
+      // is where it becomes a conversation, and a screen that still thinks it is
+      // a terminal never subscribes to its events, so the tab sits there frozen
+      // at whatever it looked like when it was one. Re-announced rather than
+      // given its own message: "here is a session, and here is what it is" is
+      // one fact, and the client already folds a repeat into the tab it has.
+      announceSessionOpened(session, this.deps.webSocketConnections);
 
       // `session.id`, not the socket's joined id: a relaunch names its own
       // conversation, and announcing it under the joined one would tell every

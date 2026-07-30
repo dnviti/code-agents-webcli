@@ -24,6 +24,7 @@ import {
 import { planBranch, tooLargeMessage } from '../chat/branch.js';
 import { TurnCut } from '../chat/store.js';
 import { getOwnedSession, requireUser } from './helpers.js';
+import { announceSessionClosed, announceSessionOpened } from '../websocket/handler.js';
 
 /**
  * How many past conversations one folder offers.
@@ -432,6 +433,11 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     void deps.transcriptStore.ensureTranscript(session);
     void deps.saveSessionsToDisk();
 
+    // Every screen this person has open, including the one that asked — which
+    // adds the tab from this response and folds the announcement into it. A
+    // shell created *inside* a conversation announces nothing; see the helper.
+    announceSessionOpened(session, deps.webSocketConnections);
+
     if (deps.dev) {
       console.log(`Created new session: ${sessionId} for GitHub user ${user.githubLogin}`);
     }
@@ -591,6 +597,10 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       deps.claudeSessions.set(sessionId, branch);
       void deps.transcriptStore.ensureTranscript(branch);
       void deps.saveSessionsToDisk();
+
+      // A branch is a conversation that now exists, so it reaches the user's
+      // other screens on the same terms as one that was started from scratch.
+      announceSessionOpened(branch, deps.webSocketConnections);
 
       res.json({
         success: true,
@@ -762,19 +772,19 @@ function destroySession(deps: SessionRoutesDeps, session: SessionRecord): void {
     }
   }
 
+  // Whoever was driving this session is no longer driving anything. Only them:
+  // a screen that merely had a tab for it was never attached, and clearing a
+  // field it does not hold would tell it to let go of the session it *is* on.
   session.connections.forEach((wsId) => {
     const wsInfo = deps.webSocketConnections.get(wsId);
-    if (wsInfo && wsInfo.ws.readyState === WebSocket.OPEN) {
-      wsInfo.claudeSessionId = null;
-      wsInfo.ws.send(
-        JSON.stringify({
-          type: 'session_deleted',
-          sessionId: session.id,
-          message: 'Session has been deleted',
-        }),
-      );
-    }
+    if (wsInfo) wsInfo.claudeSessionId = null;
   });
+
+  // The news itself goes to every screen this user has open. It used to go down
+  // `connections`, which is the set above — so a second device holding the tab
+  // but looking elsewhere was never told, and went on offering a session that
+  // had ceased to exist.
+  announceSessionClosed(session, deps.webSocketConnections);
 
   session.connections.clear();
   deps.claudeSessions.delete(session.id);

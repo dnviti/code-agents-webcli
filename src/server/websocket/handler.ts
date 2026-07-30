@@ -197,6 +197,100 @@ export function sendToUser(
   }
 }
 
+/**
+ * Tell every screen a user has open that one of their sessions now exists.
+ *
+ * Addressed to the person rather than to the session, and that is the whole
+ * point: nobody is watching a session that was created a millisecond ago, so
+ * anything routed through `session.connections` or `chatSessionIds` reaches
+ * exactly the one socket that asked for it — which is how a conversation
+ * started on a laptop stayed invisible on the phone until someone reloaded.
+ *
+ * Idempotent by design. The same fact is announced again when the session
+ * changes surface, and the socket that created it hears it alongside its own
+ * `session_created`; the client folds a repeat into the tab it already has.
+ *
+ * A shell opened *inside* a conversation is deliberately not announced. It is a
+ * real session, but it is reached through its conversation and only there —
+ * exactly the reason `/api/sessions/list` leaves it out — so announcing it would
+ * put a top-level tab in front of every screen for something that has no
+ * business being one.
+ */
+export function announceSessionOpened(
+  session: SessionRecord,
+  webSocketConnections: Map<string, WebSocketInfo>,
+): void {
+  if (session.ownerSessionId) return;
+
+  sendToUser(
+    session.ownerUserId,
+    {
+      type: 'session_opened',
+      sessionId: session.id,
+      name: session.name,
+      customName: session.customName ?? null,
+      workingDir: session.workingDir,
+      surface: session.surface || 'terminal',
+      active: session.active,
+      // So a conversation that appears on a second screen states the mode it is
+      // really in from its first paint, the same way a tab restored on page
+      // load does.
+      bypassPermissions: session.chatBypassPermissions === true,
+    },
+    webSocketConnections,
+  );
+}
+
+/**
+ * Tell every screen a user has open that one of their sessions has gone.
+ *
+ * Same reasoning as the open, and the same bug in reverse: a delete used to be
+ * announced down `session.connections`, which holds the sockets *driving* the
+ * session. A second device with the tab in its strip but its eyes on another
+ * one is not in there, so it kept offering a session that no longer existed.
+ */
+export function announceSessionClosed(
+  session: SessionRecord,
+  webSocketConnections: Map<string, WebSocketInfo>,
+): void {
+  sendToUser(
+    session.ownerUserId,
+    {
+      type: 'session_deleted',
+      sessionId: session.id,
+      message: 'Session has been deleted',
+    },
+    webSocketConnections,
+  );
+}
+
+/**
+ * Tell every screen whether a session is working right now.
+ *
+ * A terminal's tab goes bright because output is flowing, and output only ever
+ * reached the socket attached to that session — so the same session read as
+ * "working" on one screen and "idle" on every other. This carries the fact
+ * itself rather than the bytes: the screens that are not attached have nothing
+ * to draw with the output and every reason to know it happened.
+ */
+export function announceSessionActivity(
+  session: SessionRecord,
+  active: boolean,
+  webSocketConnections: Map<string, WebSocketInfo>,
+): void {
+  if (session.ownerSessionId) return;
+
+  sendToUser(
+    session.ownerUserId,
+    {
+      type: 'session_activity',
+      sessionId: session.id,
+      active,
+    },
+    webSocketConnections,
+  );
+}
+
 /** Send a message to every connected client, whatever session they are in. */
 export function broadcastToAllConnections(
   data: Record<string, unknown>,

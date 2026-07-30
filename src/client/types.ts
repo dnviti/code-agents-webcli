@@ -352,6 +352,40 @@ export interface WsSessionRenamedMessage {
   name: string;
 }
 
+/**
+ * Sent to every one of the user's sockets when a session comes into existence,
+ * and again when it changes surface.
+ *
+ * Unlike `session_created`, which answers the socket that asked for one, this is
+ * addressed to the person: a conversation started on a laptop is a tab on the
+ * phone too, and the phone was never going to be told by anything routed
+ * through the session itself.
+ */
+export interface WsSessionOpenedMessage {
+  type: 'session_opened';
+  sessionId: string;
+  name: string;
+  customName: string | null;
+  workingDir: string;
+  surface: 'terminal' | 'chat';
+  active: boolean;
+  bypassPermissions: boolean;
+}
+
+/**
+ * Sent to every one of the user's sockets while a session is working, and once
+ * when it stops.
+ *
+ * The output itself only ever reaches the socket attached to the session, which
+ * is why the tab was bright on one screen and dark on every other. This carries
+ * the fact rather than the bytes.
+ */
+export interface WsSessionActivityMessage {
+  type: 'session_activity';
+  sessionId: string;
+  active: boolean;
+}
+
 /** Sent when a reattach targets a session the server no longer has. */
 export interface WsSessionGoneMessage {
   type: 'session_gone';
@@ -423,6 +457,8 @@ export type WsMessage =
   | WsInfoMessage
   | WsSessionDeletedMessage
   | WsSessionRenamedMessage
+  | WsSessionOpenedMessage
+  | WsSessionActivityMessage
   | WsSessionGoneMessage
   | WsPongMessage
   | WsHistoryChunkMessage
