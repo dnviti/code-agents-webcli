@@ -1,6 +1,7 @@
 import {
   ChatAttachment,
   ChatCapabilities,
+  ChatDraft,
   ChatEvent,
   ChatModelDefault,
   ChatSnapshot,
@@ -30,6 +31,18 @@ export interface ChatControllerOptions {
   send: (message: Record<string, unknown>) => void;
   /** Called when the surface should redraw for a reason outside the transcript. */
   onChange?: () => void;
+  /**
+   * This browser's socket id, for telling its own composer edits apart from
+   * another screen's.
+   *
+   * A function rather than a value: the id is handed out in the server's
+   * `connected` message, so it does not exist when the controllers are built,
+   * and it changes on every reconnect. Absent — or answering null — means every
+   * arriving draft is treated as somebody else's, which is the safe way round:
+   * the worst it costs is a caret put back where it was a moment ago, whereas
+   * mistaking another screen's typing for your own echo loses it entirely.
+   */
+  origin?: () => string | null;
   /**
    * Called for each event this conversation actually applied.
    *
@@ -126,6 +139,62 @@ const PAGE_SIZE = 200;
  * with the least the reader can already use.
  */
 const SEEK_PAGE_SIZE = 500;
+
+/**
+ * How often a composer being typed into tells the other screens.
+ *
+ * A quarter of a second, and every keystroke inside one is folded into a single
+ * frame carrying the latest text. Fast enough that a phone watching a laptop
+ * reads as live rather than as a page that refreshes; slow enough that a
+ * hundred-word paragraph is a few dozen small frames instead of six hundred.
+ *
+ * The first keystroke after a pause goes at once — see `publishDraft`. Waiting
+ * out the interval before saying anything would make the *start* of typing the
+ * slowest part of it, which is the part being watched.
+ */
+const DRAFT_PUBLISH_MS = 250;
+
+/** A composer's contents, before the server has numbered them. */
+interface DraftPayload {
+  text: string;
+  attachments: ChatAttachment[];
+}
+
+const NO_DRAFT: ChatDraft = { text: '', attachments: [], revision: 0 };
+
+/**
+ * Whether two composers hold the same thing.
+ *
+ * Attachments are compared by url, which is the server's own name for the
+ * stored file and the only field of the four that is generated rather than
+ * copied from what the browser guessed about it.
+ */
+function sameDraft(a: DraftPayload, b: DraftPayload): boolean {
+  if (a.text !== b.text) return false;
+  if (a.attachments.length !== b.attachments.length) return false;
+  return a.attachments.every((attachment, index) => attachment.url === b.attachments[index].url);
+}
+
+/**
+ * Read a draft off the wire, or nothing.
+ *
+ * Field by field like every other payload this file reads. A server that
+ * predates this sends no draft at all, which has to come back as `null` — the
+ * surface then keeps whatever it has rather than being cleared by a server that
+ * simply has nothing to say about composers.
+ */
+function readDraft(raw: unknown): ChatDraft | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Record<string, unknown>;
+  if (typeof value.text !== 'string') return null;
+  if (typeof value.revision !== 'number' || !Number.isFinite(value.revision)) return null;
+  const attachments = Array.isArray(value.attachments)
+    ? (value.attachments.filter(
+        (item) => item && typeof item === 'object' && typeof (item as ChatAttachment).url === 'string',
+      ) as ChatAttachment[])
+    : [];
+  return { text: value.text, attachments, revision: value.revision };
+}
 
 /**
  * What happened to a jump to a message the browser did not hold.
@@ -232,6 +301,47 @@ export class ChatController {
   /** What the server reported happened to the last effort change requested. */
   private effortResult: EffortSwitchResult | null = null;
 
+  /**
+   * The composer, as the server last numbered it.
+   *
+   * Revision 0 is "nothing has ever been said about this conversation's
+   * composer", which is what a fresh controller holds and what a server too old
+   * to carry drafts leaves it at.
+   */
+  private draft: ChatDraft = NO_DRAFT;
+  /**
+   * What this browser last put on the wire.
+   *
+   * Kept so the same text is not announced twice — a caret moving through a
+   * draft calls the surface's change handler without changing a character — and,
+   * more importantly, so a draft *arriving* from elsewhere is not immediately
+   * announced back as though this screen had typed it.
+   */
+  private draftPublished: DraftPayload = { text: '', attachments: [] };
+  /** The newest local edit still waiting for the interval to come round. */
+  private draftPending: DraftPayload | null = null;
+  private draftTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Whether the server on the other end carries composers at all.
+   *
+   * Off until the handshake says otherwise, for the same reason multi-session
+   * is: this server answers an unknown message with a visible error, so a page
+   * newer than the server it is talking to would put an error toast on screen
+   * per keystroke. See ChatRegistry.setFeatures.
+   */
+  private draftSync = false;
+  private draftListeners = new Set<(draft: ChatDraft | null) => void>();
+  /**
+   * Whether a join has answered the question "what is in this composer" at all.
+   *
+   * Apart from `draft.revision === 0`, which cannot tell "the server says
+   * nothing has been typed" from "this browser has not asked yet" — and a
+   * surface that confuses the two publishes its own stale copy over a newer one
+   * that is still in flight, then ignores the answer for being older than the
+   * revision its own publish just created.
+   */
+  private draftAnswered = false;
+
   constructor(
     readonly sessionId: string,
     private readonly options: ChatControllerOptions,
@@ -253,6 +363,7 @@ export class ChatController {
     'chat_snapshot',
     'chat_started',
     'chat_event',
+    'chat_draft',
     'chat_queue',
     'chat_page',
     'chat_page_failed',
@@ -297,7 +408,42 @@ export class ChatController {
         this.modelPinned = typeof message.modelPinned === 'string' ? message.modelPinned : null;
         this.effortOverride =
           typeof message.effortOverride === 'string' ? message.effortOverride : null;
+        // The composer rides on the join, so a conversation opened on a second
+        // screen opens at the sentence the first one is in the middle of. A
+        // server with nothing to say about it — one that predates this, or one
+        // that has restarted since anybody typed — leaves this browser's own
+        // copy alone and is told about it instead; see `adoptDraft`.
+        this.adoptDraft(readDraft(message.draft));
         this.options.onChange?.();
+        return true;
+      }
+
+      case 'chat_draft': {
+        const draft = readDraft(message.draft);
+        // Stale, and the only ordinary way to arrive here is a rejoin: the
+        // snapshot carries the composer too, so a draft already folded in from
+        // it must not be applied a second time on the broadcast that follows.
+        if (!draft || draft.revision <= this.draft.revision) return true;
+        this.draft = draft;
+
+        // This screen's own typing, numbered and handed back. The field already
+        // holds every character of it and has moved on since — writing it back
+        // would take the caret with it, a quarter of a second into the past.
+        const origin = this.options.origin?.() ?? null;
+        if (origin && message.origin === origin) return true;
+
+        // Recorded as though this browser had sent it, so the surface applying
+        // it does not announce it straight back and set the two screens echoing.
+        this.draftPublished = { text: draft.text, attachments: draft.attachments };
+        // And whatever this screen still had queued is dropped, because it is
+        // now an answer to a question nobody asked: the field it came from has
+        // just been overwritten with this. Left in, it would go out a moment
+        // later, replace the arriving text on the server and on the screen that
+        // sent it — while this screen went on showing what it had adopted. Two
+        // screens, each showing what the other one is not, and nothing left to
+        // correct either of them.
+        this.draftPending = null;
+        this.emitDraft(draft);
         return true;
       }
 
@@ -594,10 +740,189 @@ export class ChatController {
     });
   }
 
-  sendTurn(text: string, attachments: ChatAttachment[] = []): void {
+  /**
+   * Ask the agent something.
+   *
+   * `fromComposer` is what separates a turn somebody just typed from one being
+   * sent again from the transcript, and it is the composer's emptying that hangs
+   * on it: "send this turn again" takes its text from the log and never touches
+   * the input, so a conversation being retried must not blank a half-written
+   * message — here or on any other screen watching it.
+   */
+  sendTurn(
+    text: string,
+    attachments: ChatAttachment[] = [],
+    { fromComposer = false }: { fromComposer?: boolean } = {},
+  ): void {
     const trimmed = text.trim();
     if (!trimmed && !attachments.length) return;
-    this.send({ type: 'chat_send', text: trimmed, attachments });
+    if (fromComposer) {
+      // Whatever was waiting for the publish interval is about to be wrong: the
+      // composer is empty from this moment on every screen, and a trailing frame
+      // landing after the server's own clear would put the sent message straight
+      // back into all of them. Dropped rather than flushed, and the local record
+      // set to empty so the surface's own clear is not announced either — the
+      // server empties the composer as part of accepting the turn, which is both
+      // sooner and more truthful than this browser guessing at it.
+      this.draftPending = null;
+      this.draftPublished = { text: '', attachments: [] };
+    }
+    this.send({ type: 'chat_send', text: trimmed, attachments, fromComposer });
+  }
+
+  /** What this conversation's composer holds, as far as this browser knows. */
+  get draftValue(): ChatDraft {
+    return this.draft;
+  }
+
+  /**
+   * Whether a join has said anything about the composer yet.
+   *
+   * What a surface mounting into an already-open conversation asks, because it
+   * may have missed the answer: a tab switched away from and back keeps its
+   * controller and its subscription, so the snapshot that carried the composer
+   * arrived while nothing was rendering it.
+   */
+  get draftAnswer(): 'unheard' | 'held' | 'none' {
+    if (!this.draftAnswered) return 'unheard';
+    return this.draft.revision > 0 ? 'held' : 'none';
+  }
+
+  /**
+   * Hear about composers that came from somewhere else.
+   *
+   * `null` means the server has no composer for this conversation at all, which
+   * is a different statement from an empty one: it is what a server that has
+   * restarted says, and the surface answers it by publishing whatever it kept in
+   * session storage rather than by clearing itself.
+   *
+   * Its own subscription rather than a redraw through `onChange`, because a
+   * composer being typed into on another screen must not re-render a
+   * conversation four times a second — the transcript, the turn grouping and the
+   * whole activity projection hang off that path.
+   */
+  subscribeDraft(listener: (draft: ChatDraft | null) => void): () => void {
+    this.draftListeners.add(listener);
+    return () => {
+      this.draftListeners.delete(listener);
+    };
+  }
+
+  /** Whether this server carries the composer between screens at all. */
+  get draftSyncAvailable(): boolean {
+    return this.draftSync;
+  }
+
+  /** Told by the registry once the server's feature list has arrived. */
+  setDraftSync(enabled: boolean): void {
+    this.draftSync = enabled;
+  }
+
+  /**
+   * Say what is in this browser's composer.
+   *
+   * Rate-limited rather than debounced, and the difference is what typing feels
+   * like on the screen that is only watching: the first keystroke after a pause
+   * goes immediately, and everything within the interval after it is folded into
+   * one frame carrying the latest text. A debounce would send nothing at all
+   * until the typing stopped, which for a long paragraph is the entire time
+   * somebody is watching it being written.
+   */
+  publishDraft(text: string, attachments: ChatAttachment[] = []): void {
+    if (!this.draftSync) return;
+    const payload: DraftPayload = { text, attachments };
+    // Nothing changed — a caret moved, or this is the surface handing back a
+    // draft that arrived from another screen a moment ago.
+    if (sameDraft(payload, this.draftPublished)) {
+      this.draftPending = null;
+      return;
+    }
+    if (this.draftTimer) {
+      this.draftPending = payload;
+      return;
+    }
+    this.sendDraft(payload);
+    this.draftTimer = setTimeout(() => this.releaseDraft(), DRAFT_PUBLISH_MS);
+  }
+
+  /**
+   * Send whatever is waiting for the interval, now.
+   *
+   * For the moments where waiting a quarter of a second is a quarter of a second
+   * too long: the field losing focus, and the page being hidden or closed. The
+   * last thing typed before somebody picks up their phone is exactly the thing
+   * they picked it up to finish.
+   */
+  flushDraft(): void {
+    const pending = this.draftPending;
+    this.draftPending = null;
+    if (pending) this.sendDraft(pending);
+  }
+
+  private sendDraft(payload: DraftPayload): void {
+    this.draftPublished = payload;
+    this.send({ type: 'chat_draft', text: payload.text, attachments: payload.attachments });
+  }
+
+  private releaseDraft(): void {
+    this.draftTimer = null;
+    const pending = this.draftPending;
+    this.draftPending = null;
+    if (pending) this.publishDraft(pending.text, pending.attachments);
+  }
+
+  /**
+   * Take the composer a join reported, or say that there was not one.
+   *
+   * The revision check is what makes a rejoin harmless: a snapshot answers with
+   * whatever the server holds, which is routinely older than a broadcast this
+   * browser has already applied.
+   */
+  private adoptDraft(draft: ChatDraft | null): void {
+    this.draftAnswered = true;
+    if (!draft) {
+      // Not "the composer is empty" — "nobody has told this server anything
+      // about it". The surface decides what to do with that, and what it does is
+      // offer up the copy it kept.
+      //
+      // The count goes back to nothing with it, and that is the part that is
+      // easy to miss: a server that says it holds no composer is a server that
+      // will number the next one from 1. A browser still holding 7 from before
+      // the restart would then read the next seven edits as older than what it
+      // has and drop every one of them — and it heals itself after a few
+      // seconds of typing, which is exactly what would make it invisible.
+      this.draft = NO_DRAFT;
+      this.draftPublished = { text: '', attachments: [] };
+      this.emitDraft(null);
+      return;
+    }
+    // What the server holds is, by definition, what this browser has managed to
+    // publish — whether or not it is newer than what the browser has. The two
+    // come apart in one ordinary case and it is a case worth surviving: a frame
+    // handed to a socket that was already closing is dropped without a word (see
+    // WebSocketConnection.send), and the browser would otherwise spend the rest
+    // of the conversation believing it had said something it never did, refusing
+    // to repeat it because it matched what it thought it had sent.
+    this.draftPublished = { text: draft.text, attachments: draft.attachments };
+    if (draft.revision > this.draft.revision) {
+      this.draft = draft;
+      // Same reason as the broadcast path: the field this screen was about to
+      // announce has just been overwritten by what arrived, so announcing it
+      // now would replace the newer text everywhere except here.
+      this.draftPending = null;
+      this.emitDraft(draft);
+      return;
+    }
+    // Nothing newer than what this browser already applied. Told anyway, as the
+    // same "the server has nothing for you" the surface answers by offering
+    // whatever it is holding — which after a reconnect is the repair for the
+    // dropped frame above, and the rest of the time is a comparison that finds
+    // the two already agree and says nothing.
+    this.emitDraft(null);
+  }
+
+  private emitDraft(draft: ChatDraft | null): void {
+    for (const listener of this.draftListeners) listener(draft);
   }
 
   interrupt(): void {
@@ -905,6 +1230,10 @@ export class ChatController {
   dispose(): void {
     this.cancelSeek();
     this.settlePage();
+    if (this.draftTimer) clearTimeout(this.draftTimer);
+    this.draftTimer = null;
+    this.draftPending = null;
+    this.draftListeners.clear();
   }
 
   /**

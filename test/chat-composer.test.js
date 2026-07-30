@@ -19,7 +19,7 @@ before(function () {
   const contents = [
     `export { renderToStaticMarkup } from 'react-dom/server';`,
     `export * as React from 'react';`,
-    `export { Composer } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/chat/Composer'))};`,
+    `export { Composer, placeByPickOrder } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/chat/Composer'))};`,
   ].join('\n');
 
   const out = path.join(os.tmpdir(), `chat-composer-${process.pid}.js`);
@@ -118,6 +118,95 @@ describe('Composer', function () {
     });
     assert.ok(both.includes('aria-label="Attach a file or image"'), 'capability + handler: the paperclip must appear');
     assert.ok(both.includes('type="file"'), 'a real file input backs the button');
+  });
+
+  describe('the files on the unsent message', function () {
+    // Attachments belong to the message, and the message belongs to the
+    // conversation rather than to the window it is being typed in (#163). So a
+    // chip has to be drawable from what every screen has — a url, a name and a
+    // size — and not only from the `File` the picking browser happens to hold.
+    const shot = {
+      url: '/api/sessions/s1/chat-attachments/abc123-shot.png',
+      name: 'abc123-shot.png',
+      mime: 'image/png',
+      size: 4096,
+    };
+
+    it('draws a file picked on another screen, which sent no File with it', function () {
+      const html = render({ attachments: [shot], onAttachmentsChange() {} });
+      assert.ok(html.includes('aria-label="Attachments"'), 'the row of chips must be there at all');
+      assert.ok(html.includes('abc123-shot.png'), 'the name is the only thing that says which file it is');
+      assert.ok(html.includes('4 kB'), 'and the size, as it does for a local one');
+    });
+
+    it('shows the picture from the server, not from a blob only one window can resolve', function () {
+      const html = render({ attachments: [shot], onAttachmentsChange() {} });
+      assert.ok(
+        html.includes(`src="${shot.url}"`),
+        'a blob: url would draw a broken image on every screen but the one that picked it',
+      );
+    });
+
+    it('offers to take it off the message, by name', function () {
+      const html = render({ attachments: [shot], onAttachmentsChange() {} });
+      assert.ok(html.includes('aria-label="Remove abc123-shot.png"'));
+    });
+
+    it('draws an icon rather than a picture for something that is not one', function () {
+      const html = render({
+        attachments: [{ ...shot, name: 'notes.pdf', mime: 'application/pdf' }],
+        onAttachmentsChange() {},
+      });
+      assert.ok(!html.includes(`src="${shot.url}"`), 'a pdf is not a thumbnail');
+      assert.ok(html.includes('notes.pdf'));
+    });
+
+    it('can send with nothing typed, as long as something is attached', function () {
+      const html = render({ attachments: [shot], onAttachmentsChange() {} });
+      assert.ok(!html.includes('aria-label="Send message" disabled'), 'a screenshot on its own is a message');
+    });
+
+    // Uploads run at the same time, so a small file overtakes a large one. What
+    // must not change is the order the files were *picked* in: "here is before,
+    // here is after" reaching the agent the other way round is not cosmetic.
+    describe('the order they were picked in', function () {
+      const at = (n) => ({ url: `/u/${n}`, name: `${n}.png`, mime: 'image/png', size: 1 });
+      const seen = (list) => list.map((a) => a.name).join(' ');
+
+      it('puts a file that finished second back in front of one picked after it', function () {
+        const order = new Map([['/u/c', 3]]);
+        // c was picked third and landed first; b was picked second.
+        const list = mod.placeByPickOrder([at('c')], at('b'), 2, order);
+        assert.strictEqual(seen(list), 'b.png c.png');
+      });
+
+      it('appends one picked after everything already there', function () {
+        const order = new Map([['/u/a', 1]]);
+        assert.strictEqual(seen(mod.placeByPickOrder([at('a')], at('b'), 2, order)), 'a.png b.png');
+      });
+
+      it('never moves a file that came from another screen', function () {
+        // Nothing is known about when the peer's file was chosen, so it stays
+        // where it is and the local one goes after it.
+        const list = mod.placeByPickOrder([at('peer')], at('mine'), 1, new Map());
+        assert.strictEqual(seen(list), 'peer.png mine.png');
+      });
+
+      it('keeps a whole batch in order however it finishes', function () {
+        const order = new Map();
+        let list = [];
+        for (const [name, picked] of [['c', 3], ['a', 1], ['d', 4], ['b', 2]]) {
+          list = mod.placeByPickOrder(list, at(name), picked, order);
+          order.set(`/u/${name}`, picked);
+        }
+        assert.strictEqual(seen(list), 'a.png b.png c.png d.png');
+      });
+    });
+
+    it('draws no row at all when the message has no files', function () {
+      const html = render({ attachments: [], onAttachmentsChange() {} });
+      assert.ok(!html.includes('aria-label="Attachments"'));
+    });
   });
 
   it('shows the slash-command popup only with commands advertised and a matching draft', function () {

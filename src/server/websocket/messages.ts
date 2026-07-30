@@ -11,9 +11,16 @@ import {
 import { TranscriptStoreLike } from '../services/transcript-store.js';
 import { HistoryStoreLike } from '../services/history-store.js';
 import { ScrollbackRecorder } from '../services/scrollback.js';
-import { sendToWebSocket, broadcastChat, broadcastToSession } from './handler.js';
+import {
+  sendToWebSocket,
+  broadcastChat,
+  broadcastToSession,
+  announceSessionActivity,
+  announceSessionOpened,
+} from './handler.js';
 import { chatUnavailableReason, isChatRuntime } from '../../shared/chat-runtimes.js';
-import { ChatModelDefault } from '../../shared/chat-events.js';
+import { ChatDraft, ChatModelDefault } from '../../shared/chat-events.js';
+import { applyDraft, clearDraft, draftOf, readDraft } from '../chat/drafts.js';
 import { UserPreferences, resolveApprovalMode } from '../../shared/user-preferences.js';
 import { ChatNotRunningError } from '../chat/session.js';
 import { UserEnvironment } from '../services/environments/types.js';
@@ -25,6 +32,16 @@ import { HostEnvironment } from '../services/environments/manager.js';
  * spawn on every future launch of the conversation.
  */
 const MAX_MODEL_NAME = 200;
+
+/**
+ * How often a working session says so to the screens that are not attached to it.
+ *
+ * Not a latency budget: the tab strip calls a session quiet after ninety
+ * seconds without a sign of life, so anything comfortably under that keeps
+ * every screen agreeing. A second is the point where the announcement costs
+ * nothing measurable next to the output it stands in for.
+ */
+const ACTIVITY_ANNOUNCE_MS = 1000;
 
 /**
  * Tidy a typed model name into something safe to keep.
@@ -229,6 +246,15 @@ interface IncomingMessage {
   requestId?: string;
   text?: string;
   attachments?: unknown[];
+  /**
+   * Whether this turn is the composer being emptied, rather than a turn from
+   * the transcript being asked again.
+   *
+   * Only the first empties the conversation's shared draft. Absent on every
+   * frame from a page that predates the shared composer, which then behaves
+   * exactly as it did: nothing to clear, because nothing was being shared.
+   */
+  fromComposer?: boolean;
   optionId?: string;
   /** Every option picked for a multiple-choice question the model asked. */
   optionIds?: unknown[];
@@ -255,9 +281,46 @@ export class MessageProcessor {
   private deps: MessageProcessorDeps;
   /** One scrollback emulator per session, rebuilding history from the PTY stream. */
   private recorders = new Map<string, ScrollbackRecorder>();
+  /**
+   * When each session last told the user's other screens that it is working.
+   *
+   * Output arrives a keystroke at a time and a build's worth at a time, and the
+   * screens that are not attached to the session cannot use any of it — they
+   * only need to know it is happening. One announcement a second is far below
+   * the ninety the tab strip waits before calling a session quiet, so every
+   * screen reaches the same verdict at the same moment for the price of a few
+   * bytes a second.
+   */
+  private activityAnnounced = new Map<string, number>();
 
   constructor(deps: MessageProcessorDeps) {
     this.deps = deps;
+  }
+
+  /**
+   * Say "this session is working", at most once a second.
+   *
+   * The clock is only ever read here, so a session that goes quiet simply stops
+   * being announced; nothing has to be cancelled and nothing fires late.
+   */
+  private noteActivity(session: SessionRecord): void {
+    const now = Date.now();
+    const last = this.activityAnnounced.get(session.id) ?? 0;
+    if (now - last < ACTIVITY_ANNOUNCE_MS) return;
+    this.activityAnnounced.set(session.id, now);
+    announceSessionActivity(session, true, this.deps.webSocketConnections);
+  }
+
+  /**
+   * Say "this session has stopped", and let the throttle go.
+   *
+   * Forgetting the timestamp is what makes the next run announce itself
+   * immediately instead of waiting out the remainder of a second that belonged
+   * to the previous one.
+   */
+  private noteStopped(session: SessionRecord): void {
+    this.activityAnnounced.delete(session.id);
+    announceSessionActivity(session, false, this.deps.webSocketConnections);
   }
 
   async handleMessage(wsId: string, data: IncomingMessage): Promise<void> {
@@ -368,6 +431,10 @@ export class MessageProcessor {
 
       case 'chat_turn_index_request':
         await this.handleChatTurnIndex(wsInfo, data);
+        break;
+
+      case 'chat_draft':
+        this.handleChatDraft(wsInfo, data);
         break;
 
       case 'chat_subscribe':
@@ -490,6 +557,11 @@ export class MessageProcessor {
       lastAgent: session.lastAgent,
       runtimeLabel: session.runtimeLabel,
     });
+
+    // And every other screen this person has open. After `session_created`, so
+    // the socket that asked has already switched to it by the time the same
+    // fact comes back around as an announcement.
+    announceSessionOpened(session, this.deps.webSocketConnections);
   }
 
   async joinSession(wsId: string, claudeSessionId: string): Promise<void> {
@@ -498,9 +570,20 @@ export class MessageProcessor {
 
     const session = this.deps.claudeSessions.get(claudeSessionId);
     if (!session || session.ownerUserId !== wsInfo.userId) {
+      // Named rather than reported as a generic error, because the client can
+      // only act on the specific answer. An `error` says nothing about *which*
+      // session failed, so the page attributed it to the session it was still
+      // on — painting a healthy tab red for a click on a dead one, and leaving
+      // the dead tab in the strip to do it again. `session_gone` says which,
+      // and the tab goes.
+      //
+      // The same answer for a session that belongs to somebody else: as far as
+      // this user is concerned there is no such session, and saying more would
+      // be telling them one exists.
       sendToWebSocket(wsInfo.ws, {
-        type: 'error',
-        message: 'Session not found',
+        type: 'session_gone',
+        sessionId: claudeSessionId,
+        message: 'This session no longer exists.',
       });
       return;
     }
@@ -729,6 +812,9 @@ export class MessageProcessor {
             this.deps.claudeSessions,
             this.deps.webSocketConnections
           );
+          // The bytes go to whoever is attached; the fact that there were any
+          // goes to every screen with a tab for this session.
+          this.noteActivity(currentSession);
         },
         onExit: (code: number | null, signal: string | null) => {
           const currentSession = this.deps.claudeSessions.get(sessionId);
@@ -745,6 +831,11 @@ export class MessageProcessor {
           currentSession.agent = null;
           currentSession.stopRequested = false;
           currentSession.lastActivity = new Date();
+
+          // Whether or not the exit was asked for, and whether or not anyone is
+          // attached: the tab is bright on every screen that saw this session
+          // start, and this is what puts it out.
+          this.noteStopped(currentSession);
 
           if (!stopRequested) {
             broadcastToSession(
@@ -770,6 +861,8 @@ export class MessageProcessor {
           currentSession.agent = null;
           currentSession.stopRequested = false;
           currentSession.lastActivity = new Date();
+
+          this.noteStopped(currentSession);
 
           if (!stopRequested) {
             broadcastToSession(
@@ -823,6 +916,13 @@ export class MessageProcessor {
         this.deps.claudeSessions,
         this.deps.webSocketConnections
       );
+
+      // A run that produces nothing for its first ninety seconds is still a run,
+      // so the tab lights up on the start rather than waiting for output. The
+      // throttle is primed here too, so the first byte does not re-announce
+      // what this line has just said.
+      this.activityAnnounced.set(sessionId, Date.now());
+      announceSessionActivity(session, true, this.deps.webSocketConnections);
     } catch (error: unknown) {
       session.outputBuffer = previousOutputBuffer;
       // The run never started, so hand the id back rather than leaving the
@@ -860,6 +960,8 @@ export class MessageProcessor {
     session.active = false;
     session.agent = null;
     session.lastActivity = new Date();
+
+    this.noteStopped(session);
 
     broadcastToSession(
       sessionId,
@@ -1410,6 +1512,14 @@ export class MessageProcessor {
       // already a watcher when the very first event goes out.
       wsInfo.chatSessionIds.add(session.id);
 
+      // The session already existed as a terminal on every other screen — this
+      // is where it becomes a conversation, and a screen that still thinks it is
+      // a terminal never subscribes to its events, so the tab sits there frozen
+      // at whatever it looked like when it was one. Re-announced rather than
+      // given its own message: "here is a session, and here is what it is" is
+      // one fact, and the client already folds a repeat into the tab it has.
+      announceSessionOpened(session, this.deps.webSocketConnections);
+
       // `session.id`, not the socket's joined id: a relaunch names its own
       // conversation, and announcing it under the joined one would tell every
       // watcher the wrong chat had come back.
@@ -1505,6 +1615,13 @@ export class MessageProcessor {
         // and a conversation whose process has since died reports nothing at
         // all. The record is the only thing that still knows what was chosen.
         effortOverride: session.chatEffortOverride || null,
+        // What is in the composer, so a screen that has just opened this
+        // conversation opens it at the sentence the other screen is in the
+        // middle of. Null means nothing has been typed since the server came
+        // up, which is what tells the joining browser it may keep the copy it
+        // has in session storage rather than being cleared by a server that
+        // simply has not heard yet.
+        draft: draftOf(session),
       });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1535,6 +1652,51 @@ export class MessageProcessor {
     const session = this.deps.claudeSessions.get(target);
     if (!session || session.ownerUserId !== wsInfo.userId) return null;
     return session;
+  }
+
+  /**
+   * Take one screen's composer as the conversation's, and tell the others.
+   *
+   * Routed through `broadcastChat` rather than `sendToUser`, so it follows the
+   * conversation: a person may have six tabs open and only some of them are
+   * looking at this chat, and the ones that are not have no composer to put it
+   * in. Everyone watching gets it, including the screen it came from — which is
+   * how that screen learns the revision its own edit was given, and why the
+   * origin rides along for it to recognise itself by.
+   *
+   * Silent on anything it will not take. A draft that arrives malformed, or too
+   * large to be worth carrying, leaves the screen that holds it working exactly
+   * as it did before any of this existed; an error toast per keystroke would be
+   * a worse answer than a feature that quietly stops applying.
+   */
+  private handleChatDraft(wsInfo: WebSocketInfo, data: IncomingMessage): void {
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!session || session.surface !== 'chat') return;
+
+    const input = readDraft(data.text, data.attachments, session.id);
+    if (!input) return;
+
+    this.broadcastDraft(session, applyDraft(session, input), wsInfo.id);
+  }
+
+  /**
+   * Announce a composer to every screen watching this conversation.
+   *
+   * `origin` is the socket the edit came from, or null when it was not a screen
+   * that caused it — a turn being sent empties the composer, and no browser
+   * should treat that as its own echo and skip it.
+   */
+  private broadcastDraft(
+    session: SessionRecord,
+    draft: ChatDraft,
+    origin: string | null,
+  ): void {
+    broadcastChat(
+      session.id,
+      { type: 'chat_draft', sessionId: session.id, draft, origin },
+      this.deps.claudeSessions,
+      this.deps.webSocketConnections,
+    );
   }
 
   private async handleChatSend(
@@ -1602,12 +1764,38 @@ export class MessageProcessor {
       }
     }
 
+    // Read before the send, because the send is not instant: `/clear` restarts
+    // the agent's whole process behind it, and anything typed on any screen
+    // while that runs is a *different* message from the one being sent. Clearing
+    // whatever the composer holds when the await finally returns would throw
+    // that away.
+    const draftAtSend = draftOf(session)?.revision ?? 0;
+
     try {
       await manager.send(session.id, {
         text,
         attachments: Array.isArray(data.attachments) ? data.attachments : undefined,
       });
       session.lastActivity = new Date();
+      // The composer that held this turn is empty now, on every screen. The one
+      // that sent it emptied its own box the moment the button was pressed;
+      // without this the others would go on offering a prompt that has already
+      // been asked, and the next person to press send there would ask it twice.
+      //
+      // Only for a turn that came *from* a composer. "Send this turn again"
+      // takes its text from the transcript and leaves the input alone (see
+      // ChatView.retryTurn), so clearing on every accepted turn would blank a
+      // message somebody was halfway through writing — on every screen at once,
+      // for pressing retry on something else entirely.
+      //
+      // Tagged with the screen it came from, which is not the throwaway detail
+      // it looks like: that screen emptied its own box a round trip ago and may
+      // already be typing the next question into it, and applying this would
+      // take those keystrokes back out.
+      if (data.fromComposer === true && (draftOf(session)?.revision ?? 0) === draftAtSend) {
+        const cleared = clearDraft(session);
+        if (cleared) this.broadcastDraft(session, cleared, wsInfo.id);
+      }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
 

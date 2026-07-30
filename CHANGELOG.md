@@ -119,6 +119,49 @@
   now closes stdin, which it never wrote to: measured at 2.0s and the whole list,
   against no output and no exit before. The same trap has already caught
   `codex exec` and `pi -p` elsewhere in this codebase.
+
+## [5.3.4] - 2026-07-30
+
+### Fixed
+- **Every window and device shows the same tabs** (#163). The strip was built
+  once, at page load, and after that only ever changed by something the screen
+  in front of you did — because everything about a session was routed through
+  the session itself. A create answered the socket that asked for it; a delete
+  went down the set of sockets *driving* the session; output reached whoever was
+  attached. None of those is a second device that merely has the tab, so two
+  screens on one account drifted apart within a minute: a conversation started
+  on a laptop never appeared on the phone, a terminal ended on the phone stayed
+  on the laptop as a tab that answered a click with an error — and painted a
+  different, healthy tab red while doing it, since the error named no session and
+  the page could only blame the one it was still on. Sessions are now announced
+  to the *person*: every screen that account has open learns when one opens,
+  when it closes, when it becomes a conversation, and whether it is working
+  right now. Reconnecting reconciles the strip against the server rather than
+  against what it remembered, so an outage no longer leaves a screen permanently
+  behind. A window with nothing open keeps a connection now, which it did not
+  before — a phone signed in for the first time had no socket at all and was
+  unreachable by any of this. Closing a conversation is still per-screen and
+  deliberately so (#127): it means "take this off my screen", and an
+  announcement does not overrule it. A rename already worked this way; the rest
+  of the strip now does too.
+- **The message you are in the middle of writing follows you between screens**
+  (#163). The other half of the same problem: the tabs agreed, and then the
+  composer did not. A prompt half typed on a laptop left the phone offering an
+  empty box, a screenshot dropped on one of them was invisible on the other, and
+  a question sent from one screen went on being offered by every other — where
+  pressing send would ask it a second time. The unsent message is now the
+  conversation's rather than the window's. Text and attached files are carried to
+  every screen watching that chat, they arrive on the join so a conversation
+  opened somewhere new opens at the sentence in progress, and sending empties all
+  of them at once. Files are carried as the conversation's own uploads rather
+  than as bytes on the socket, so a second device draws the same picture from the
+  same place; the screen that picked a file keeps the name it picked it under.
+  Typing is announced four times a second at most, and the last write wins —
+  which is the honest rule for one person moving between their own devices, and
+  the reason a message being typed on one screen is never merged with anything.
+  A turn sent again from the transcript deliberately leaves the composer alone,
+  and against a server too old to carry any of this the composer behaves exactly
+  as it did before.
 - **A chat that has just opened is empty, and the first prompt is turn 1.** The
   approval mode a conversation begins in was announced as a rule written across
   the transcript, and in a conversation nobody had spoken in yet that rule was

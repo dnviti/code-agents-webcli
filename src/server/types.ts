@@ -1,4 +1,5 @@
 import { WebSocket } from 'ws';
+import { ChatDraft } from '../shared/chat-events.js';
 
 export type AgentKind =
   | 'claude'
@@ -190,6 +191,24 @@ export interface SessionRecord {
    * exactly like every row written before this existed.
    */
   chatEffortOverride?: string;
+  /**
+   * What is sitting in this conversation's composer, unsent.
+   *
+   * On the record rather than in a map of its own, and that is the whole of the
+   * cleanup story: a draft cannot outlive the session it belongs to, because it
+   * is part of it. A side table keyed by session id would need forgetting at
+   * every place a session ends — deleted, torn down with its parent
+   * conversation, dropped at a restart — and the one that got missed would be
+   * the leak.
+   *
+   * Deliberately absent from what the store writes to disk (see
+   * services/session-store.ts, which names its columns one by one). A draft is
+   * something you are in the middle of; restoring one into a conversation the
+   * following week is a surprise, not a convenience. Every browser also keeps
+   * its own copy in session storage, so a server restart costs the draft only on
+   * the screens that were not already showing it.
+   */
+  chatDraft?: ChatDraft;
   /**
    * The label the user chose for this session, when they have chosen one.
    *
