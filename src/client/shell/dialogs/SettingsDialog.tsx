@@ -50,6 +50,8 @@ export interface SettingsDialogProps {
   onInstall(): void;
   /** Open the runtime profile editor, which is its own dialog. */
   onOpenRuntimeProfiles(): void;
+  /** Open the deploy target editor, which is its own dialog. */
+  onOpenDeployTargets(): void;
   /** Whether this server gives each user their own environment. */
   environmentsEnabled: boolean;
   /** Open the environment size picker, which is its own dialog. */
@@ -148,6 +150,7 @@ export function SettingsDialog({
   install,
   onInstall,
   onOpenRuntimeProfiles,
+  onOpenDeployTargets,
   environmentsEnabled,
   onOpenEnvironment,
 }: SettingsDialogProps): React.JSX.Element | null {
@@ -389,6 +392,15 @@ export function SettingsDialog({
         description="Pin a model, pass extra arguments, set environment variables, or define capability tiers for each agent. Works with any provider."
       >
         <Button variant="secondary" onClick={onOpenRuntimeProfiles}>
+          Configure
+        </Button>
+      </SettingRow>
+
+      <SettingRow
+        label="Deploy targets"
+        description="Choose where containers run: this machine, a remote Docker or Podman host, or a Kubernetes cluster. Only the account that installed this server can view or change them."
+      >
+        <Button variant="secondary" onClick={onOpenDeployTargets}>
           Configure
         </Button>
       </SettingRow>

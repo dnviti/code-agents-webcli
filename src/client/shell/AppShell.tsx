@@ -16,6 +16,7 @@ import { NewSessionDialog } from './dialogs/NewSessionDialog';
 import { PlanDialog } from './dialogs/PlanDialog';
 import { RenameDialog } from './dialogs/RenameDialog';
 import { RuntimeProfilesDialog } from './dialogs/RuntimeProfilesDialog';
+import { DeployTargetsDialog } from './dialogs/DeployTargetsDialog';
 import { EnvironmentDialog, type EnvironmentInfo } from './dialogs/EnvironmentDialog';
 import { SessionsDialog } from './dialogs/SessionsDialog';
 import { ConversationsDialog } from './dialogs/ConversationsDialog';
@@ -784,6 +785,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         install={state.install}
         onInstall={() => void installHint()}
         onOpenRuntimeProfiles={() => closeDialogs({ settings: false, runtimeProfiles: true })}
+        onOpenDeployTargets={() => closeDialogs({ settings: false, deployTargets: true })}
         environmentsEnabled={environment.info?.enabled === true}
         onOpenEnvironment={() => closeDialogs({ settings: false, environment: true })}
         onPreview={actions.previewSettings}
@@ -806,6 +808,11 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       <RuntimeProfilesDialog
         open={state.dialogs.runtimeProfiles}
         onClose={() => closeDialogs({ runtimeProfiles: false })}
+      />
+
+      <DeployTargetsDialog
+        open={state.dialogs.deployTargets}
+        onClose={() => closeDialogs({ deployTargets: false })}
       />
 
       <EnvironmentDialog

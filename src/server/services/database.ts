@@ -462,6 +462,32 @@ export class AppDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires_at
         ON auth_sessions(expires_at);
+
+      /*
+       * Deployment targets: where new user/project containers are placed. No
+       * target ⇒ host identity, so an empty table keeps the legacy behaviour
+       * exactly as today and the table can be created before any code reads it.
+       */
+      CREATE TABLE IF NOT EXISTS deploy_targets (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        engine TEXT NOT NULL,
+        image TEXT,
+        host_secret TEXT,
+        kubernetes_secret TEXT,
+        tiers_json TEXT,
+        default_tier TEXT,
+        allow_user_tier_choice INTEGER,
+        cpus TEXT,
+        memory TEXT,
+        setup_command TEXT,
+        idle_timeout_minutes INTEGER,
+        caveats_json TEXT NOT NULL DEFAULT '[]',
+        last_check_json TEXT,
+        created_by INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
     `);
 
     // Which surface a session runs on. Added after the fact, so it is nullable

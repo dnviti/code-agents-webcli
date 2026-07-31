@@ -145,6 +145,7 @@ export class ContainerEngine implements EnvironmentEngine {
   private readonly relabel: boolean;
   private readonly uid: number;
   private readonly gid: number;
+  private readonly hostArgs: string[];
 
   constructor(options: {
     kind: ContainerEngineKind;
@@ -153,6 +154,11 @@ export class ContainerEngine implements EnvironmentEngine {
     relabelMounts?: boolean;
     uid?: number;
     gid?: number;
+    /**
+     * Arguments prepended to every docker/podman invocation. Used for remote
+     * hosts (`-H <host>`) and TLS material (`--tlscacert`, ...).
+     */
+    hostArgs?: string[];
   }) {
     this.kind = options.kind;
     this.binary = options.binary || options.kind;
@@ -161,11 +167,13 @@ export class ContainerEngine implements EnvironmentEngine {
     // `process.getuid` is absent on Windows, where this feature does not apply.
     this.uid = options.uid ?? (process.getuid ? process.getuid() : 0);
     this.gid = options.gid ?? (process.getgid ? process.getgid() : 0);
+    this.hostArgs = options.hostArgs || [];
   }
 
   /** Argv for creating and starting a detached environment. */
   createArgs(spec: CreateContainerSpec): string[] {
     const args = [
+      ...this.hostArgs,
       'run',
       '--detach',
       '--name', spec.name,
@@ -225,7 +233,7 @@ export class ContainerEngine implements EnvironmentEngine {
 
   /** Argv prefix that runs a command inside an existing environment. */
   execArgs(spec: ExecSpec, command: string, commandArgs: string[]): string[] {
-    const args = ['exec', '--interactive'];
+    const args = [...this.hostArgs, 'exec', '--interactive'];
     if (spec.tty) {
       args.push('--tty');
     }
@@ -256,21 +264,22 @@ export class ContainerEngine implements EnvironmentEngine {
   }
 
   async start(name: string): Promise<void> {
-    await this.run(this.binary, ['start', name]);
+    await this.run(this.binary, [...this.hostArgs, 'start', name]);
   }
 
   async stop(name: string): Promise<void> {
-    await this.run(this.binary, ['stop', '--time', '5', name]);
+    await this.run(this.binary, [...this.hostArgs, 'stop', '--time', '5', name]);
   }
 
   async remove(name: string): Promise<void> {
-    await this.run(this.binary, ['rm', '--force', name]);
+    await this.run(this.binary, [...this.hostArgs, 'rm', '--force', name]);
   }
 
   /** `running`, `exited`, … or null when no such container exists. */
   async status(name: string): Promise<string | null> {
     try {
       const { stdout } = await this.run(this.binary, [
+        ...this.hostArgs,
         'inspect', '--format', '{{.State.Status}}', name,
       ]);
       return stdout.trim() || null;
@@ -290,6 +299,7 @@ export class ContainerEngine implements EnvironmentEngine {
   async describe(name: string): Promise<ContainerDescription | null> {
     try {
       const { stdout } = await this.run(this.binary, [
+        ...this.hostArgs,
         'inspect', '--format', '{{.State.Status}}\t{{.Config.Image}}\t{{json .Config.Labels}}', name,
       ]);
       const [status, image, labelsJson] = stdout.trim().split('\t');
@@ -313,6 +323,7 @@ export class ContainerEngine implements EnvironmentEngine {
   /** Names of every environment this server manages, running or not. */
   async list(label: string): Promise<string[]> {
     const { stdout } = await this.run(this.binary, [
+      ...this.hostArgs,
       'ps', '--all',
       '--filter', `label=${label}`,
       '--format', '{{.Names}}',
@@ -328,7 +339,7 @@ export class ContainerEngine implements EnvironmentEngine {
    * for their agent to finish.
    */
   async resize(name: string, cpus: string | null, memory: string | null): Promise<boolean> {
-    const args = ['update'];
+    const args = [...this.hostArgs, 'update'];
     if (cpus) {
       args.push('--cpus', cpus);
     }
@@ -355,6 +366,7 @@ export class ContainerEngine implements EnvironmentEngine {
   async usage(name: string): Promise<ResourceUsage | null> {
     try {
       const { stdout } = await this.run(this.binary, [
+        ...this.hostArgs,
         'stats', '--no-stream', '--format', '{{.CPUPerc}}\t{{.MemUsage}}', name,
       ]);
       const [cpuPerc, memUsage] = stdout.trim().split('\t');
@@ -373,7 +385,7 @@ export class ContainerEngine implements EnvironmentEngine {
   /** Whether the engine binary is present and answering. */
   async available(): Promise<boolean> {
     try {
-      await this.run(this.binary, ['version', '--format', '{{.Client.Version}}']);
+      await this.run(this.binary, [...this.hostArgs, 'version', '--format', '{{.Client.Version}}']);
       return true;
     } catch {
       return false;

@@ -73,9 +73,13 @@ import {
   EnvironmentManager,
   SOCKET_MOUNT,
   createContainerConfig,
+  createEngine,
   ensureRoot,
 } from './services/environments/index.js';
-import { UserEnvironment } from './services/environments/types.js';
+import { ContainerConfig, Mount, UserEnvironment } from './services/environments/types.js';
+import { ActiveTargetResolution, EnvironmentEngine } from './services/environments/index.js';
+import { EncryptionKeyRing } from './services/encryption.js';
+import { DeployTargetStore } from './services/deploy-targets.js';
 import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
 import { readCachedClaudeAccount } from './services/claude-account.js';
@@ -202,6 +206,28 @@ export class ClaudeCodeWebServer {
   private wsHandler: WebSocketHandler;
   private messageProcessor: MessageProcessor;
   private environments: EnvironmentManager;
+  private encryptionKeyRing: EncryptionKeyRing;
+  private deployTargets: DeployTargetStore;
+  /** The startup-flag configuration: the 'legacy' entry in the target maps. */
+  private legacyContainerConfig: ContainerConfig;
+  /** Mounts every environment gets, targets included: app code and the socket dir. */
+  private environmentExtraMounts: Mount[];
+  /**
+   * The target set the manager currently places work with.
+   *
+   * Doubles as the cache `resolveActiveDeployTarget` reads: `enabled` and the
+   * tier getters consult it on every call, so the "targets exist?" and
+   * "which is active?" answers are memoized here and rebuilt by
+   * `reloadDeployTargets` — the one path every target mutation goes through —
+   * rather than re-queried from SQLite each time.
+   */
+  private deployTargetMaps: {
+    engines: Map<string, EnvironmentEngine>;
+    configs: Map<string, ContainerConfig>;
+    activeKey: string | null;
+    targetsExist: boolean;
+    targetNames: Map<string, string>;
+  };
   private environmentSweep: ReturnType<typeof setInterval> | null = null;
   private environmentScale: ReturnType<typeof setInterval> | null = null;
 
@@ -254,6 +280,10 @@ export class ClaudeCodeWebServer {
     // home: the app's own compiled code, so the approval hook and the question
     // MCP server can be executed by a runtime that is not on this machine, and
     // the directory their unix sockets live in, so it can dial back.
+    this.environmentExtraMounts = [
+      { hostPath: appRootDir(), containerPath: APP_MOUNT, readOnly: true },
+      { hostPath: path.join(this.database.storageDir, 'cs'), containerPath: SOCKET_MOUNT },
+    ];
     const containerConfig = createContainerConfig({
       containers: options.containers,
       containerEngine: options.containerEngine,
@@ -270,25 +300,59 @@ export class ClaudeCodeWebServer {
       kubeStorageClaim: options.kubeStorageClaim,
       kubeServiceAccount: options.kubeServiceAccount,
       dataDir: config.dataDir,
-      extraMounts: [
-        { hostPath: appRootDir(), containerPath: APP_MOUNT, readOnly: true },
-        { hostPath: path.join(this.database.storageDir, 'cs'), containerPath: SOCKET_MOUNT },
-      ],
+      extraMounts: this.environmentExtraMounts,
     });
-    if (containerConfig.enabled) {
-      ensureRoot(containerConfig.rootDir);
+    this.legacyContainerConfig = containerConfig;
+
+    // Deploy targets: where containers run once an administrator configures
+    // them. The key ring comes first — the store encrypts every secret it
+    // saves with it — and the legacy seed runs once ever, capturing the
+    // startup flags as a 'default' target before the manager is built so the
+    // very first boot already resolves through the table.
+    this.encryptionKeyRing = new EncryptionKeyRing({
+      settings: this.database,
+      key: config.encryptionKey,
+      warn: (message) => console.warn(message),
+    });
+    this.deployTargets = new DeployTargetStore({
+      database: this.database,
+      keyRing: this.encryptionKeyRing,
+      dataDir: this.database.storageDir,
+    });
+    this.deployTargets.seedLegacyTarget(
+      containerConfig,
+      this.database.getInstallerUserId() ?? undefined,
+    );
+    // Plaintext materialization (kubeconfig, TLS PEMs) exists only to drive
+    // engines; it is refreshed here so an edit made offline still reaches the
+    // engine after a restart.
+    this.deployTargets.materializeAllSecrets();
+
+    const targetsExist = this.deployTargets.listTargets().length > 0;
+    if (containerConfig.enabled || targetsExist) {
+      ensureRoot(containerConfig.enabled
+        ? containerConfig.rootDir
+        : path.join(this.database.storageDir, 'environments'));
       // The socket directory is mounted, so it has to exist before the first
       // container is created rather than lazily when the first chat starts:
       // a bind mount of a missing path is created as a root-owned directory by
       // the engine, which the server then cannot write into.
       fs.mkdirSync(path.join(this.database.storageDir, 'cs'), { recursive: true, mode: 0o700 });
     }
+    this.deployTargetMaps = this.buildDeployTargetMaps();
     this.environments = new EnvironmentManager({
       config: containerConfig,
       hostHome: this.baseFolder,
       // Read on every provision rather than cached: the user may change it
       // from another window between two of their own sessions.
       getUserTier: (userId) => this.database.getUserSetting(userId, 'environmentTier'),
+      // Consulted on every ensure: an empty table resolves to the startup
+      // configuration exactly as before this feature existed, a table without
+      // an active target resolves to nothing and work fails loudly.
+      resolveActive: () => this.resolveActiveDeployTarget(),
+      engines: this.deployTargetMaps.engines,
+      configs: this.deployTargetMaps.configs,
+      activeKey: this.deployTargetMaps.activeKey,
     });
     this.sessionStore = new SessionStore({ database: this.database });
     this.transcriptStore = new TranscriptStore({ storageDir: this.database.storageDir });
@@ -525,6 +589,85 @@ export class ClaudeCodeWebServer {
   private getEnvironmentOwner(userId: number): { id: number; githubLogin: string } | null {
     const user = this.database.getUserById(userId);
     return user ? { id: user.id, githubLogin: user.githubLogin } : null;
+  }
+
+  /**
+   * Where new environments go, asked by the manager on every ensure.
+   *
+   * An empty targets table resolves to the startup configuration under the
+   * well-known 'legacy' key — the pre-feature behavior, down to the engine.
+   * A table with no active target resolves to null, which the manager turns
+   * into a loud "no active deploy target" error rather than a quiet fallback
+   * onto this machine.
+   */
+  private resolveActiveDeployTarget(): ActiveTargetResolution | null {
+    // Read from the cached maps, not the store: this runs on every `enabled`
+    // check and tier lookup, and the cache is invalidated by the same reload
+    // that applies any target change, so it cannot go stale.
+    const maps = this.deployTargetMaps;
+    if (!maps.targetsExist) {
+      return { key: 'legacy', config: this.legacyContainerConfig, name: 'startup configuration' };
+    }
+    if (!maps.activeKey) {
+      return null;
+    }
+    const config = maps.configs.get(maps.activeKey);
+    if (!config) {
+      return null;
+    }
+    return { key: maps.activeKey, config, name: maps.targetNames.get(maps.activeKey) };
+  }
+
+  /**
+   * Engines and configs for every stored target, keyed by target id.
+   *
+   * A target whose secrets no longer decrypt (the encryption key changed
+   * under it) is skipped with a warning rather than taking the server down:
+   * every other target, and the startup configuration, still work.
+   */
+  private buildDeployTargetMaps(): {
+    engines: Map<string, EnvironmentEngine>;
+    configs: Map<string, ContainerConfig>;
+    activeKey: string | null;
+    targetsExist: boolean;
+    targetNames: Map<string, string>;
+  } {
+    const engines = new Map<string, EnvironmentEngine>();
+    const configs = new Map<string, ContainerConfig>();
+    const targets = this.deployTargets.listTargets();
+    for (const summary of targets) {
+      try {
+        const targetConfig = this.deployTargets.configForTarget(
+          summary.id,
+          this.database.storageDir,
+          this.environmentExtraMounts,
+        );
+        configs.set(summary.id, targetConfig);
+        engines.set(summary.id, createEngine(targetConfig));
+      } catch (error) {
+        console.warn(`deploy target "${summary.name}" is unusable and was skipped:`, error);
+      }
+    }
+    const activeKey = targets.length === 0
+      ? 'legacy'
+      : this.deployTargets.getActiveTargetId();
+    return {
+      engines,
+      configs,
+      activeKey,
+      targetsExist: targets.length > 0,
+      targetNames: new Map(targets.map((target) => [target.id, target.name])),
+    };
+  }
+
+  /**
+   * Re-read the targets table into the manager after any change. Engines
+   * that still own containers survive the swap inside the manager, so an
+   * edit or a switch never strands running work.
+   */
+  private reloadDeployTargets(): void {
+    this.deployTargetMaps = this.buildDeployTargetMaps();
+    this.environments.reloadTargets(this.deployTargetMaps);
   }
 
   /**
@@ -1070,6 +1213,15 @@ export class ClaudeCodeWebServer {
       selfUpdate: this.selfUpdate,
       getUpdateMode: () => this.getUpdateMode(),
       getInstallerUserId: () => this.database.getInstallerUserId(),
+      deployTargets: this.deployTargets,
+      deployTargetDataDir: this.database.storageDir,
+      createDeployEngine: (deployConfig) => createEngine(deployConfig),
+      // The authoritative engine set for the in-use checks: the manager's own,
+      // which retains engines for containers of edited or deleted targets —
+      // a check that only saw the current target set would be blind to them.
+      enginesForDeployTargets: () => this.environments.reachableEngines(),
+      legacyContainersEnabled: this.legacyContainerConfig.enabled,
+      reloadDeployTargets: () => this.reloadDeployTargets(),
       getInterruptedUpdate: () => {
         // Reported once and then forgotten. Left set, it would keep the banner
         // in its error state — which offers no Update button — for the rest of

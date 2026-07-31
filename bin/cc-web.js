@@ -96,7 +96,8 @@ program
   .option('--kube-context <name>', 'kubectl context to create environments in')
   .option('--kube-namespace <name>', 'namespace for the environment pods (default: default)')
   .option('--kube-storage-claim <name>', 'ReadWriteMany claim holding every user home')
-  .option('--kube-service-account <name>', 'service account for the environment pods');
+  .option('--kube-service-account <name>', 'service account for the environment pods')
+  .option('--encryption-key <key>', 'base64 or hex 32-byte key encrypting deploy-target secrets at rest');
 
 /**
  * Operator commands for the per-user environments.
@@ -247,6 +248,7 @@ async function main() {
       kubeNamespace: options.kubeNamespace,
       kubeStorageClaim: options.kubeStorageClaim,
       kubeServiceAccount: options.kubeServiceAccount,
+      encryptionKey: options.encryptionKey,
       folderMode: true // Always use folder mode
     };
 

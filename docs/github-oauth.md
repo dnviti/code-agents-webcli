@@ -77,11 +77,14 @@ is pinned, so deleting the account does not promote whoever signed in second.
 The installer alone can:
 
 - [apply an update](updating.md) from the web UI,
-- change [runtime profiles](runtimes.md#runtime-profiles), which are server-wide.
+- change [runtime profiles](runtimes.md#runtime-profiles), which are server-wide,
+- configure [deploy targets](deploy-targets.md), which decide where per-user environments run.
 
-Everyone else sees those screens read-only. If an account on the pin is later
-removed from the allow-list, the pin moves — otherwise rights nobody can sign in
-to exercise would lock the page for everyone.
+The runtime-profiles screen is visible to everyone read-only; the
+deploy-targets panel is installer-only end to end and answers `403` to any
+other account, because it names infrastructure. If an account on the pin is
+later removed from the allow-list, the pin moves — otherwise rights nobody can
+sign in to exercise would lock the page for everyone.
 
 ## What the app stores
 

@@ -15,7 +15,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { ContainerEngine, EnvironmentEngine, ResourceUsage } from './engine.js';
 import { KubernetesEngine } from './kubernetes.js';
-import { containerHomeFor, environmentName } from './naming.js';
+import { TARGET_LABEL, containerHomeFor, environmentName, targetLabelValue } from './naming.js';
 import {
   AUTO_TIER,
   AutoState,
@@ -40,6 +40,23 @@ export const MANAGED_LABEL = 'com.code-agents-webcli.managed';
 export const TIER_LABEL = 'com.code-agents-webcli.tier';
 export const USER_ID_LABEL = 'com.code-agents-webcli.user-id';
 export const LOGIN_LABEL = 'com.code-agents-webcli.login';
+export { TARGET_LABEL };
+
+/** Which deploy target an `ensureFor` should place new work on. */
+export interface ActiveTargetResolution {
+  /** The target id, or `'legacy'` for the startup-flag configuration. */
+  key: string;
+  config: ContainerConfig;
+  /** Display name, used in error messages. */
+  name?: string;
+}
+
+/** The replacement engine/config set a `reloadTargets` call installs. */
+export interface ReloadTargetsInput {
+  engines: Map<string, EnvironmentEngine>;
+  configs: Map<string, ContainerConfig>;
+  activeKey: string | null;
+}
 
 function mergedEnv(extra?: Record<string, string>): Record<string, string> {
   const base: Record<string, string> = {};
@@ -183,6 +200,19 @@ export interface EnvironmentManagerOptions {
    * own persistence.
    */
   getUserTier?: (userId: number) => string | null;
+  /**
+   * Multi-target mode: where new environments go, consulted on every ensure.
+   *
+   * Returning null means "deploy targets exist but none is active", which
+   * makes `ensureFor` throw rather than silently falling back to the host.
+   */
+  resolveActive?: () => ActiveTargetResolution | null;
+  /** Engines by target key (`'legacy'` for the startup configuration). */
+  engines?: Map<string, EnvironmentEngine>;
+  /** Container configs by target key, matching `engines`. */
+  configs?: Map<string, ContainerConfig>;
+  /** The active key when `resolveActive` is not supplied. */
+  activeKey?: string | null;
 }
 
 export class EnvironmentManager {
@@ -208,6 +238,25 @@ export class EnvironmentManager {
    */
   private readonly pendingRebuild = new Map<number, EnvironmentTier>();
   private readonly getUserTier: (userId: number) => string | null;
+  /**
+   * Whether this manager places work across deploy targets. The legacy
+   * single-config constructor path leaves this false and behaves exactly as
+   * it always has.
+   */
+  private readonly multiTarget: boolean;
+  private readonly resolveActiveFn: (() => ActiveTargetResolution | null) | null;
+  private engines: Map<string, EnvironmentEngine>;
+  private configs: Map<string, ContainerConfig>;
+  private activeKey: string | null;
+  /**
+   * Which target each known container was placed on, by container name.
+   *
+   * The routing table that lets an edit, a switch or a deletion of a target
+   * leave the containers it already produced reachable: `ensureFor` records
+   * the active key here, `list()` relearns it from the target label, and
+   * every operation on an existing container goes through it.
+   */
+  private readonly containerTarget = new Map<string, string>();
 
   constructor(options: EnvironmentManagerOptions) {
     this.config = options.config;
@@ -215,19 +264,123 @@ export class EnvironmentManager {
     this.hostEnvironment = new HostEnvironment(options.hostHome);
     this.now = options.now || (() => Date.now());
     this.getUserTier = options.getUserTier || (() => null);
+
+    this.multiTarget = Boolean(options.resolveActive || options.engines || options.configs);
+    this.resolveActiveFn = options.resolveActive || null;
+    this.engines = options.engines ? new Map(options.engines) : new Map();
+    this.configs = options.configs ? new Map(options.configs) : new Map();
+    // The startup configuration is always reachable under its well-known key:
+    // pre-upgrade containers carry no target label, and an absent label reads
+    // as 'legacy' everywhere it is consumed.
+    if (!this.engines.has('legacy')) {
+      this.engines.set('legacy', this.engine);
+    }
+    if (!this.configs.has('legacy')) {
+      this.configs.set('legacy', this.config);
+    }
+    this.activeKey = options.activeKey !== undefined
+      ? options.activeKey
+      : (this.multiTarget ? null : 'legacy');
+  }
+
+  /** Where new work would go right now; null when no target is active. */
+  private resolveActiveTarget(): ActiveTargetResolution | null {
+    if (this.resolveActiveFn) {
+      return this.resolveActiveFn();
+    }
+    if (this.multiTarget) {
+      if (!this.activeKey) {
+        return null;
+      }
+      const config = this.configs.get(this.activeKey);
+      return config ? { key: this.activeKey, config } : null;
+    }
+    return { key: 'legacy', config: this.config };
+  }
+
+  private engineForKey(key: string): EnvironmentEngine {
+    const engine = this.engines.get(key);
+    if (engine) {
+      return engine;
+    }
+    // 'legacy' is always reachable: it is the startup configuration this
+    // manager was constructed with, whether or not a reload kept it in the map.
+    if (key === 'legacy') {
+      return this.engine;
+    }
+    // Anything else is a routing bug or a stale placement, and silently
+    // substituting the startup engine would run the container against the
+    // wrong target — loudly name the missing key instead.
+    throw new Error(`no engine for deploy target '${key}'`);
+  }
+
+  private configForKey(key: string): ContainerConfig {
+    return this.configs.get(key) || this.config;
+  }
+
+  /** The engine that owns an existing container, whatever is active now. */
+  private engineForContainer(name: string): EnvironmentEngine {
+    return this.engineForKey(this.containerTarget.get(name) || 'legacy');
+  }
+
+  /** The target a container was placed on, as far as this manager knows. */
+  targetKeyForContainer(name: string): string {
+    return this.containerTarget.get(name) || 'legacy';
+  }
+
+  /**
+   * Every engine this manager can still reach: the current target set plus
+   * any engine retained for containers a reload would otherwise have
+   * stranded. This — not the active set — is the authoritative answer to
+   * "could containers for this target still exist?".
+   */
+  reachableEngines(): Map<string, EnvironmentEngine> {
+    return new Map(this.engines);
+  }
+
+  /**
+   * Install a new set of targets.
+   *
+   * Engines that still own known containers are retained even when the new
+   * set drops them: an edited or deleted target must not strand the work it
+   * already runs. Retained engines only ever serve their existing containers
+   * — new ensures resolve through the new active key and never see them.
+   */
+  reloadTargets(input: ReloadTargetsInput): void {
+    const liveKeys = new Set(this.containerTarget.values());
+
+    const engines = new Map(input.engines);
+    for (const key of liveKeys) {
+      const retained = this.engines.get(key);
+      if (!engines.has(key) && retained) {
+        engines.set(key, retained);
+      }
+    }
+
+    const configs = new Map(input.configs);
+    for (const key of liveKeys) {
+      const retained = this.configs.get(key);
+      if (!configs.has(key) && retained) {
+        configs.set(key, retained);
+      }
+    }
+
+    this.engines = engines;
+    this.configs = configs;
+    this.activeKey = input.activeKey;
   }
 
   /** The catalog an administrator defined, in ladder order. */
   get tiers(): EnvironmentTier[] {
-    return this.config.tiers;
+    return (this.resolveActiveTarget()?.config || this.config).tiers;
   }
 
   get defaultTierId(): string {
-    return this.config.defaultTier;
+    return (this.resolveActiveTarget()?.config || this.config).defaultTier;
   }
 
   get userTierChoiceAllowed(): boolean {
-    return this.config.allowUserTierChoice;
+    return (this.resolveActiveTarget()?.config || this.config).allowUserTierChoice;
   }
 
   /** The size a user's environment is running at right now, if it is running. */
@@ -242,16 +395,33 @@ export class EnvironmentManager {
 
   /** The size this user's environment should be, given their choice. */
   intendedTierFor(userId: number): EnvironmentTier | null {
+    return this.intendedTier(this.resolveActiveTarget()?.config || this.config, userId);
+  }
+
+  private intendedTier(config: ContainerConfig, userId: number): EnvironmentTier | null {
     return resolveTier(
-      this.config.tiers,
+      config.tiers,
       this.getUserTier(userId),
-      this.config.defaultTier,
+      config.defaultTier,
       this.autoTier.get(userId),
     );
   }
 
   get enabled(): boolean {
-    return this.config.enabled;
+    // Resolved rather than read off the startup config: once deploy targets
+    // exist they are the source of truth, and an install started with
+    // containers off still has environments the moment a target is active.
+    // On the legacy single-config path this resolves to `this.config`, so
+    // behavior there is exactly what it was.
+    const active = this.resolveActiveTarget();
+    if (!active) {
+      // Only multi-target mode can resolve to nothing, and null there means
+      // "targets exist, none active" — unplaceable work, not a disabled
+      // feature. Reporting disabled here would make `ensureEnvironment` hand
+      // out the host where `ensureFor` is supposed to throw its loud error.
+      return this.multiTarget;
+    }
+    return active.config.enabled;
   }
 
   /** The environment used when the feature is off, and the fallback when it fails. */
@@ -259,9 +429,9 @@ export class EnvironmentManager {
     return this.hostEnvironment;
   }
 
-  /** Whether the configured engine is installed and answering. */
+  /** Whether the engine new work would land on is installed and answering. */
   async engineAvailable(): Promise<boolean> {
-    return this.engine.available();
+    return this.engineForKey(this.resolveActiveTarget()?.key || 'legacy').available();
   }
 
   nameFor(owner: EnvironmentOwner): string {
@@ -278,8 +448,40 @@ export class EnvironmentManager {
    * Idempotent and safe to call on every request that needs one.
    */
   async ensureFor(owner: EnvironmentOwner): Promise<UserEnvironment> {
-    if (!this.config.enabled) {
+    const active = this.resolveActiveTarget();
+    if (!active) {
+      // Targets exist but none is active: work is unplaceable, and the only
+      // honest answers are a clear error — never a quiet fall back to running
+      // on the host, which is exactly the machine containers exist to keep
+      // this work off.
+      throw new Error(
+        'no active deploy target: deploy targets are configured but none is active; '
+        + 'an administrator must activate one before new work can start',
+      );
+    }
+
+    // Where this user's container goes is decided before anything is checked:
+    // a container the routing table already knows stays on the target that
+    // created it, even when the active target has since moved. Re-placing it
+    // on the newly active target would duplicate it there — same name, shared
+    // rootDir, two writers on one $HOME — and orphan the original.
+    const name = environmentName(active.config.namePrefix, owner);
+    const placedKey = this.containerTarget.get(name);
+    const placement = placedKey && placedKey !== active.key && this.engines.has(placedKey)
+      ? { key: placedKey, config: this.configForKey(placedKey), name: active.name }
+      : active;
+
+    const config = placement.config;
+    if (!config.enabled) {
       return this.hostEnvironment;
+    }
+
+    const engine = this.engineForKey(placement.key);
+    if (this.multiTarget && !(await engine.available())) {
+      throw new Error(
+        `deploy target '${placement.name || placement.key}' is unreachable: `
+        + `the ${config.engine} engine is not answering`,
+      );
     }
 
     this.lastUsed.set(owner.id, this.now());
@@ -297,7 +499,7 @@ export class EnvironmentManager {
       const running = this.ready.get(owner.id);
       if (running) {
         try {
-          await this.engine.stop(running.name);
+          await this.engineForContainer(running.name).stop(running.name);
         } catch (error) {
           console.error(`Environment ${running.name}: could not replace for a size change:`, error);
         }
@@ -306,7 +508,7 @@ export class EnvironmentManager {
       this.pendingRebuild.delete(owner.id);
     }
 
-    const work = this.provision(owner).finally(() => {
+    const work = this.provision(owner, placement).finally(() => {
       this.pending.delete(owner.id);
     });
     this.pending.set(owner.id, work);
@@ -315,7 +517,10 @@ export class EnvironmentManager {
 
   /** The environment already prepared for this user, without preparing one. */
   existing(userId: number): UserEnvironment | null {
-    if (!this.config.enabled) {
+    // Disabled means the host, exactly as before this feature existed —
+    // including on the multi-target path with an empty targets table, where
+    // the legacy resolution is what decides.
+    if (!this.enabled) {
       return this.hostEnvironment;
     }
     return this.ready.get(userId) || null;
@@ -326,81 +531,107 @@ export class EnvironmentManager {
     this.lastUsed.set(userId, this.now());
   }
 
-  private async provision(owner: EnvironmentOwner): Promise<UserEnvironment> {
-    const name = this.nameFor(owner);
-    const homeDir = this.homeDirFor(owner);
+  private async provision(
+    owner: EnvironmentOwner,
+    active: ActiveTargetResolution,
+  ): Promise<UserEnvironment> {
+    const config = active.config;
+    const engine = this.engineForKey(active.key);
+    const name = environmentName(config.namePrefix, owner);
+    const homeDir = path.join(config.rootDir, name);
     const containerHome = containerHomeFor(owner);
 
-    // 0700: the isolation claim has to hold on the host too, not only inside
-    // the container. Created before the container so the bind mount never
-    // brings a root-owned directory into being.
-    await fsp.mkdir(homeDir, { recursive: true, mode: 0o700 });
-    await fsp.chmod(homeDir, 0o700);
+    // The placement is registered before the first await — a reload landing
+    // mid-provision must see which target this container belongs to, so it
+    // retains that engine instead of stranding the container — and rolled
+    // back if provisioning fails, so a failed ensure leaves no route to a
+    // container that never came up.
+    const priorPlacement = this.containerTarget.get(name);
+    this.containerTarget.set(name, active.key);
 
-    const mounts: Mount[] = [
-      { hostPath: homeDir, containerPath: containerHome },
-      ...this.config.extraMounts,
-    ];
+    try {
+      // 0700: the isolation claim has to hold on the host too, not only inside
+      // the container. Created before the container so the bind mount never
+      // brings a root-owned directory into being.
+      await fsp.mkdir(homeDir, { recursive: true, mode: 0o700 });
+      await fsp.chmod(homeDir, 0o700);
 
-    // The tier decides the limits; the flat `--container-cpus`/`--container-memory`
-    // remain as the answer for an installation that wants one size for everyone
-    // and has emptied the catalog.
-    const tier = this.intendedTierFor(owner.id);
+      const mounts: Mount[] = [
+        { hostPath: homeDir, containerPath: containerHome },
+        ...config.extraMounts,
+      ];
 
-    const { created } = await this.engine.ensure({
-      name,
-      image: this.config.image,
-      mounts,
-      containerHome,
-      cpus: tier ? tier.cpus : this.config.cpus,
-      memory: tier ? tier.memory : this.config.memory,
-      labels: {
-        [MANAGED_LABEL]: 'true',
-        [USER_ID_LABEL]: String(owner.id),
-        [LOGIN_LABEL]: owner.githubLogin,
-        ...(tier ? { [TIER_LABEL]: tier.id } : {}),
-      },
-      env: {
-        HOME: containerHome,
-        USER: owner.githubLogin,
-        TERM: 'xterm-256color',
-      },
-    });
+      // The tier decides the limits; the flat `--container-cpus`/`--container-memory`
+      // remain as the answer for an installation that wants one size for everyone
+      // and has emptied the catalog.
+      const tier = this.intendedTier(config, owner.id);
 
-    if (created && this.config.setupCommand) {
-      // Per creation, not per user: a setup command installs into the image's
-      // filesystem, which is exactly the half that a rebuild throws away.
-      // Failure is reported and tolerated — an environment without the extras
-      // is still a usable environment.
-      try {
-        await this.engine.exec(
-          { name, cwd: containerHome, env: { HOME: containerHome } },
-          'sh',
-          ['-c', this.config.setupCommand],
-        );
-      } catch (error) {
-        console.error(`Environment ${name}: setup command failed:`, error);
+      const { created } = await engine.ensure({
+        name,
+        image: config.image,
+        mounts,
+        containerHome,
+        cpus: tier ? tier.cpus : config.cpus,
+        memory: tier ? tier.memory : config.memory,
+        labels: {
+          [MANAGED_LABEL]: 'true',
+          [USER_ID_LABEL]: String(owner.id),
+          [LOGIN_LABEL]: owner.githubLogin,
+          // Which target placed this container, so a later switch of the active
+          // target never makes existing work unreachable. Legacy containers read
+          // as 'legacy', whether the label says so or is absent entirely.
+          [TARGET_LABEL]: targetLabelValue(active.key),
+          ...(tier ? { [TIER_LABEL]: tier.id } : {}),
+        },
+        env: {
+          HOME: containerHome,
+          USER: owner.githubLogin,
+          TERM: 'xterm-256color',
+        },
+      });
+
+      if (created && config.setupCommand) {
+        // Per creation, not per user: a setup command installs into the image's
+        // filesystem, which is exactly the half that a rebuild throws away.
+        // Failure is reported and tolerated — an environment without the extras
+        // is still a usable environment.
+        try {
+          await engine.exec(
+            { name, cwd: containerHome, env: { HOME: containerHome } },
+            'sh',
+            ['-c', config.setupCommand],
+          );
+        } catch (error) {
+          console.error(`Environment ${name}: setup command failed:`, error);
+        }
       }
-    }
 
-    // Probed after any setup command, because installing a nicer shell is one
-    // of the things a setup command is for.
-    const environment = new ContainerEnvironment({
-      name,
-      homeDir,
-      containerHome,
-      engine: this.engine,
-      shells: await this.probeShells(name),
-      mounts,
-    });
+      // Probed after any setup command, because installing a nicer shell is one
+      // of the things a setup command is for.
+      const environment = new ContainerEnvironment({
+        name,
+        homeDir,
+        containerHome,
+        engine,
+        shells: await this.probeShells(name, engine),
+        mounts,
+      });
 
-    this.ready.set(owner.id, environment);
-    if (tier) {
-      this.appliedTier.set(owner.id, tier);
+      this.ready.set(owner.id, environment);
+      if (tier) {
+        this.appliedTier.set(owner.id, tier);
+      }
+      this.pendingRebuild.delete(owner.id);
+      this.lastUsed.set(owner.id, this.now());
+      return environment;
+    } catch (error) {
+      if (priorPlacement === undefined) {
+        this.containerTarget.delete(name);
+      } else {
+        this.containerTarget.set(name, priorPlacement);
+      }
+      throw error;
     }
-    this.pendingRebuild.delete(owner.id);
-    this.lastUsed.set(owner.id, this.now());
-    return environment;
   }
 
   /**
@@ -410,9 +641,9 @@ export class EnvironmentManager {
    * preference so the caller can take the first. `sh` is appended unconditionally
    * as the last resort: a container without it could not have run the probe.
    */
-  private async probeShells(name: string): Promise<string[]> {
+  private async probeShells(name: string, engine: EnvironmentEngine = this.engine): Promise<string[]> {
     try {
-      const { stdout } = await this.engine.exec({ name }, 'sh', [
+      const { stdout } = await engine.exec({ name }, 'sh', [
         '-c',
         'for s in zsh bash sh; do command -v "$s" >/dev/null 2>&1 && echo "$s"; done',
       ]);
@@ -434,15 +665,24 @@ export class EnvironmentManager {
    * the run — the one thing an idle sweep must never do.
    */
   async sweepIdle(isBusy?: (userId: number) => boolean): Promise<string[]> {
-    const minutes = this.config.idleTimeoutMinutes;
-    if (!this.config.enabled || minutes <= 0) {
+    if (!this.multiTarget && (!this.config.enabled || this.config.idleTimeoutMinutes <= 0)) {
       return [];
     }
 
-    const cutoff = this.now() - minutes * 60_000;
     const stopped: string[] = [];
 
     for (const [userId, environment] of [...this.ready]) {
+      // Each container answers to the idle policy of the target that placed
+      // it, not of whichever target happens to be active now.
+      const key = this.containerTarget.get(environment.name) || 'legacy';
+      const config = this.configForKey(key);
+      const engine = this.engineForKey(key);
+      const minutes = config.idleTimeoutMinutes;
+      if (!config.enabled || minutes <= 0) {
+        continue;
+      }
+
+      const cutoff = this.now() - minutes * 60_000;
       const seen = this.lastUsed.get(userId) ?? 0;
       if (seen > cutoff) {
         continue;
@@ -454,9 +694,9 @@ export class EnvironmentManager {
         continue;
       }
       try {
-        const status = await this.engine.status(environment.name);
+        const status = await engine.status(environment.name);
         if (status === 'running') {
-          await this.engine.stop(environment.name);
+          await engine.stop(environment.name);
           stopped.push(environment.name);
         }
         // Dropped from `ready` but not from disk: the next `ensureFor` starts
@@ -471,23 +711,48 @@ export class EnvironmentManager {
     return stopped;
   }
 
-  /** Every environment this server manages, running or not. */
+  /** Every environment this server manages, running or not, across every target. */
   async list(): Promise<EnvironmentSummary[]> {
-    const names = await this.engine.list(`${MANAGED_LABEL}=true`);
     const summaries: EnvironmentSummary[] = [];
+    const seen = new Set<string>();
+    const engines = [...this.engines.entries()];
 
-    for (const name of names) {
-      const described = await this.engine.describe(name);
-      const labels = described?.labels || {};
-      const userId = Number(labels[USER_ID_LABEL]);
-      summaries.push({
-        name,
-        userId: Number.isFinite(userId) && labels[USER_ID_LABEL] ? userId : null,
-        githubLogin: labels[LOGIN_LABEL] || null,
-        status: described?.status || 'unknown',
-        image: described?.image || '',
-        homeDir: path.join(this.config.rootDir, name),
-      });
+    for (const [engineKey, engine] of engines) {
+      let names: string[];
+      try {
+        names = await engine.list(`${MANAGED_LABEL}=true`);
+      } catch (error) {
+        // With one engine there is nothing to fall back on, and the caller
+        // should see the failure. With several, one unreachable target must
+        // not hide the environments the others can still report.
+        if (engines.length === 1) {
+          throw error;
+        }
+        console.error(`Deploy target '${engineKey}': could not list environments:`, error);
+        continue;
+      }
+
+      for (const name of names) {
+        if (seen.has(name)) {
+          continue;
+        }
+        seen.add(name);
+        const described = await engine.describe(name);
+        const labels = described?.labels || {};
+        // The label is the record of where the container was placed; a
+        // container old enough to predate it belongs to the legacy engine.
+        const targetKey = labels[TARGET_LABEL] || 'legacy';
+        this.containerTarget.set(name, targetKey);
+        const userId = Number(labels[USER_ID_LABEL]);
+        summaries.push({
+          name,
+          userId: Number.isFinite(userId) && labels[USER_ID_LABEL] ? userId : null,
+          githubLogin: labels[LOGIN_LABEL] || null,
+          status: described?.status || 'unknown',
+          image: described?.image || '',
+          homeDir: path.join(this.configForKey(targetKey).rootDir, name),
+        });
+      }
     }
 
     return summaries;
@@ -502,7 +767,9 @@ export class EnvironmentManager {
    * revoking access is supposed to mean.
    */
   async remove(name: string, options: { purgeData?: boolean } = {}): Promise<void> {
-    await this.engine.remove(name);
+    const targetKey = this.containerTarget.get(name) || 'legacy';
+    await this.engineForKey(targetKey).remove(name);
+    this.containerTarget.delete(name);
 
     for (const [userId, environment] of [...this.ready]) {
       if (environment.name === name) {
@@ -511,12 +778,13 @@ export class EnvironmentManager {
     }
 
     if (options.purgeData) {
-      const home = path.join(this.config.rootDir, name);
+      const rootDir = this.configForKey(targetKey).rootDir;
+      const home = path.join(rootDir, name);
       // Guarded against a name that would resolve outside the root — the only
       // caller is an operator command, but a `..` here would delete the wrong
       // tree.
       const resolved = path.resolve(home);
-      if (resolved.startsWith(`${path.resolve(this.config.rootDir)}${path.sep}`)) {
+      if (resolved.startsWith(`${path.resolve(rootDir)}${path.sep}`)) {
         await fsp.rm(resolved, { recursive: true, force: true });
       }
     }
@@ -534,7 +802,7 @@ export class EnvironmentManager {
       return null;
     }
     try {
-      return await this.engine.usage(environment.name);
+      return await this.engineForContainer(environment.name).usage(environment.name);
     } catch {
       return null;
     }
@@ -569,8 +837,9 @@ export class EnvironmentManager {
       return 'applied';
     }
 
+    const engine = this.engineForContainer(environment.name);
     try {
-      if (await this.engine.resize(environment.name, tier.cpus, tier.memory)) {
+      if (await engine.resize(environment.name, tier.cpus, tier.memory)) {
         this.appliedTier.set(userId, tier);
         this.pendingRebuild.delete(userId);
         return 'applied';
@@ -584,7 +853,7 @@ export class EnvironmentManager {
       return 'deferred';
     }
 
-    await this.engine.stop(environment.name);
+    await engine.stop(environment.name);
     this.ready.delete(userId);
     this.appliedTier.delete(userId);
     this.pendingRebuild.delete(userId);
@@ -605,7 +874,7 @@ export class EnvironmentManager {
     reason: string;
     outcome: string;
   }>> {
-    if (!this.config.enabled || !this.config.tiers.length) {
+    if (!this.multiTarget && (!this.config.enabled || !this.config.tiers.length)) {
       return [];
     }
 
@@ -616,19 +885,29 @@ export class EnvironmentManager {
         continue;
       }
 
+      // The catalog of the target that placed the container, not of the
+      // active one: a switch must not resize existing work to sizes it was
+      // never built against.
+      const key = this.containerTarget.get(environment.name) || 'legacy';
+      const config = this.configForKey(key);
+      if (!config.enabled || !config.tiers.length) {
+        continue;
+      }
+      const engine = this.engineForKey(key);
+
       const current = this.appliedTier.get(userId)
-        || findTier(this.config.tiers, this.config.defaultTier)
-        || this.config.tiers[0];
+        || findTier(config.tiers, config.defaultTier)
+        || config.tiers[0];
 
       let sample = null;
       try {
-        sample = await this.engine.usage(environment.name);
+        sample = await engine.usage(environment.name);
       } catch {
         sample = null;
       }
 
       const decision = decideAutoTier({
-        tiers: this.config.tiers,
+        tiers: config.tiers,
         current,
         sample,
         state: this.autoState.get(userId) || INITIAL_AUTO_STATE,
@@ -668,7 +947,7 @@ export class EnvironmentManager {
     if (!environment) {
       return false;
     }
-    await this.engine.stop(environment.name);
+    await this.engineForContainer(environment.name).stop(environment.name);
     this.ready.delete(userId);
     return true;
   }
@@ -677,7 +956,7 @@ export class EnvironmentManager {
   async stopAll(): Promise<void> {
     for (const environment of this.ready.values()) {
       try {
-        await this.engine.stop(environment.name);
+        await this.engineForContainer(environment.name).stop(environment.name);
       } catch {
         // A shutdown path: an environment that will not stop is the operator's
         // problem to see in `ps`, not a reason to hang the server's exit.
@@ -700,9 +979,10 @@ export function createEngine(config: ContainerConfig): EnvironmentEngine {
       storageClaim: config.kubernetes.storageClaim,
       serviceAccount: config.kubernetes.serviceAccount,
       rootDir: config.rootDir,
+      kubeconfigPath: config.kubeconfigPath ?? null,
     });
   }
-  return new ContainerEngine({ kind: config.engine });
+  return new ContainerEngine({ kind: config.engine, hostArgs: config.hostArgs });
 }
 
 /** The default root for per-user homes, matching where the rest of the data lives. */

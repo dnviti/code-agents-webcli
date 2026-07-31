@@ -21,6 +21,11 @@ Enabling it is one flag, and turning it off again is removing that flag: the
 server goes straight back to running on the host. The environments and their
 data stay on disk until an operator removes them.
 
+If any deploy targets exist in the database, the active target wins over the
+startup flags. With an empty targets table, the flags behave exactly as
+described here. See [Deploy targets](deploy-targets.md) for how targets relate
+to legacy flags.
+
 ## What you get
 
 - A container per account — or a Pod, on Kubernetes — created the first time

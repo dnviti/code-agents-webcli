@@ -55,6 +55,13 @@ export interface ContainerConfig {
   /** Only read when `engine` is `kubernetes`. */
   kubernetes: KubernetesConfig;
   /**
+   * Engine-specific connection overrides, populated when the config comes from
+   * a deploy target instead of legacy flags. Optional so the legacy single-
+   * config path keeps working unchanged.
+   */
+  hostArgs?: string[];
+  kubeconfigPath?: string;
+  /**
    * The sizes this installation is willing to hand out, in order.
    *
    * Order is meaningful: automatic sizing steps along this list, so the
