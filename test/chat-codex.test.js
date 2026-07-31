@@ -111,6 +111,17 @@ describe('codex app-server adapter', function () {
       assert.strictEqual(adapter.capabilities.cost, false);
     });
 
+    it('offers the app-owned commands and installed skills before the handshake', function () {
+      const { adapter } = harness({
+        installedCommands: [{ name: 'release', description: 'Prepare a release' }],
+      });
+      assert.deepStrictEqual(
+        adapter.capabilities.commands.map((command) => command.name),
+        ['clear', 'new', 'reset', 'release'],
+      );
+      assert.strictEqual(adapter.capabilities.commands[3].description, 'Prepare a release');
+    });
+
     it('passes the app-server subcommand and profile arguments to the spawn', function () {
       const { adapter } = harness({ extraArgs: ['--config', '/tmp/x.yml'] });
       assert.deepStrictEqual(adapter.buildArgs(), ['app-server', '--config', '/tmp/x.yml']);
@@ -143,6 +154,31 @@ describe('codex app-server adapter', function () {
       assert.strictEqual(state.t, 'state');
       assert.strictEqual(state.state, 'idle');
       assert.ok(Math.abs(state.ts - session.ts) <= 50, `state ts ${state.ts} vs session ts ${session.ts}`);
+    });
+
+    it('uses container-visible paths on the wire and the host path in public capabilities', async function () {
+      const h = harness({
+        environment: {
+          kind: 'container',
+          toContainerPath: (value) => `/container${value}`,
+        },
+      });
+      const done = h.adapter.handshake();
+      h.adapter.handleMessage(fixture('codex-appserver-handshake')[0]);
+      await flush();
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: 2,
+        result: { thread: { id: 'th_container' }, model: 'gpt-5.6-sol', cwd: '/container/work' },
+      });
+      await done;
+
+      assert.strictEqual(h.sent.find((message) => message.method === 'thread/start').params.cwd, '/container/work');
+      assert.deepStrictEqual(
+        h.sent.find((message) => message.method === 'skills/list').params.cwds,
+        ['/container/work'],
+      );
+      assert.strictEqual(only(h.events, 'session')[0].cwd, '/work');
     });
 
     it('offers the models codex says it accepts, without waiting for them (#75)', async function () {
@@ -186,6 +222,123 @@ describe('codex app-server adapter', function () {
         { value: 'gpt-5.6-luna', name: 'GPT-5.6-Luna' },
       ]);
       assert.strictEqual(h.adapter.capabilities.models.length, 2);
+    });
+
+    it('offers the enabled skills codex says are available in this working directory', async function () {
+      const h = harness({
+        installedCommands: [{ name: 'fallback-only', description: 'Only the disk scan found this' }],
+      });
+      await boot(h);
+
+      const asked = h.sent.find((message) => message.method === 'skills/list');
+      assert.ok(asked, 'codex publishes its skills over the app-server protocol');
+      assert.deepStrictEqual(asked.params, { cwds: ['/work'] });
+      assert.strictEqual(only(h.events, 'session').length, 1, 'skill discovery must not delay the session');
+
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: asked.id,
+        result: {
+          data: [{
+            cwd: '/work',
+            skills: [
+              {
+                name: 'review',
+                description: 'Review the current changes',
+                path: '/home/user/.agents/skills/review/SKILL.md',
+                enabled: true,
+              },
+              { name: 'disabled-skill', description: 'Do not offer this', enabled: false },
+              { name: 'missing-manifest', description: 'Cannot be invoked', enabled: true },
+            ],
+            errors: [],
+          }],
+        },
+      });
+      await flush();
+
+      const revised = only(h.events, 'capabilities').pop();
+      assert.deepStrictEqual(
+        revised.capabilities.commands.map((command) => command.name),
+        ['clear', 'new', 'reset', 'review'],
+      );
+      assert.strictEqual(
+        revised.capabilities.commands.find((command) => command.name === 'review').description,
+        'Review the current changes',
+      );
+      assert.ok(!revised.capabilities.commands.some((command) => command.name === 'disabled-skill'));
+      assert.ok(!revised.capabilities.commands.some((command) => command.name === 'missing-manifest'));
+      assert.ok(!revised.capabilities.commands.some((command) => command.name === 'fallback-only'));
+      assert.ok(!JSON.stringify(revised.capabilities.commands).includes('/home/user/'), 'paths stay private');
+      assert.deepStrictEqual(h.adapter.capabilities.commands, revised.capabilities.commands);
+    });
+
+    it('refreshes the command menu when codex says its skills changed', async function () {
+      const h = harness({});
+      await boot(h);
+
+      const initial = h.sent.find((message) => message.method === 'skills/list');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: initial.id,
+        result: { data: [{ cwd: '/work', skills: [
+          { name: 'old-skill', description: 'Old', path: '/skills/old/SKILL.md', enabled: true },
+        ], errors: [] }] },
+      });
+      await flush();
+
+      h.adapter.handleNotification('skills/changed', {});
+      await flush();
+      const refresh = h.sent.filter((message) => message.method === 'skills/list').pop();
+      assert.deepStrictEqual(refresh.params, { cwds: ['/work'], forceReload: true });
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: refresh.id,
+        result: { data: [{ cwd: '/work', skills: [
+          { name: 'new-skill', description: 'New', path: '/skills/new/SKILL.md', enabled: true },
+        ], errors: [] }] },
+      });
+      await flush();
+      assert.deepStrictEqual(
+        h.adapter.capabilities.commands.map((command) => command.name),
+        ['clear', 'new', 'reset', 'new-skill'],
+      );
+    });
+
+    it('keeps the stand-in menu when a build has no skills/list method', async function () {
+      const h = harness({
+        installedCommands: [{ name: 'release', description: 'Prepare a release' }],
+        installedSkills: [{ name: 'release', path: '/home/user/.codex/skills/release/SKILL.md' }],
+      });
+      await boot(h);
+      const asked = h.sent.find((message) => message.method === 'skills/list');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: asked.id,
+        error: { code: -32600, message: 'unknown variant `skills/list`' },
+      });
+      await flush();
+
+      assert.deepStrictEqual(
+        h.adapter.capabilities.commands.map((command) => command.name),
+        ['clear', 'new', 'reset', 'release'],
+      );
+      assert.strictEqual(only(h.events, 'error').length, 0);
+
+      h.sent.length = 0;
+      const sendPromise = h.adapter.send({ text: '/release 6.1.0' });
+      await flush();
+      const started = h.sent.find((message) => message.method === 'turn/start');
+      assert.deepStrictEqual(started.params.input, [
+        { type: 'text', text: '$release 6.1.0', text_elements: [] },
+        {
+          type: 'skill',
+          name: 'release',
+          path: '/home/user/.codex/skills/release/SKILL.md',
+        },
+      ]);
+      h.adapter.handleMessage({ jsonrpc: '2.0', id: started.id, result: { turn: { id: 'turn_fallback' } } });
+      await sendPromise;
     });
 
     it('reads the account rate limits codex volunteers (#137)', async function () {
@@ -345,6 +498,48 @@ describe('codex app-server adapter', function () {
         { type: 'image', url: 'https://example.com/b.png' },
       ]);
       h.adapter.handleMessage({ jsonrpc: '2.0', id: started.id, result: { turn: { id: 'turn_x' } } });
+      await sendPromise;
+    });
+
+    it('turns a selected slash skill into Codex’s explicit skill input', async function () {
+      const h = harness();
+      await boot(h);
+      const listed = h.sent.find((message) => message.method === 'skills/list');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: listed.id,
+        result: { data: [{ cwd: '/work', skills: [{
+          name: 'review',
+          description: 'Review changes',
+          path: '/home/user/.agents/skills/review/SKILL.md',
+          enabled: true,
+        }], errors: [] }] },
+      });
+      await flush();
+      h.sent.length = 0;
+
+      const sendPromise = h.adapter.send({ text: '/review the current diff' });
+      await flush();
+      const started = h.sent.find((message) => message.method === 'turn/start');
+      assert.deepStrictEqual(started.params.input, [
+        { type: 'text', text: '$review the current diff', text_elements: [] },
+        { type: 'skill', name: 'review', path: '/home/user/.agents/skills/review/SKILL.md' },
+      ]);
+      h.adapter.handleMessage({ jsonrpc: '2.0', id: started.id, result: { turn: { id: 'turn_skill' } } });
+      await sendPromise;
+    });
+
+    it('leaves an unknown slash untouched instead of guessing that it is a skill', async function () {
+      const h = harness();
+      await boot(h);
+      h.sent.length = 0;
+      const sendPromise = h.adapter.send({ text: '/not-a-reported-skill please' });
+      await flush();
+      const started = h.sent.find((message) => message.method === 'turn/start');
+      assert.deepStrictEqual(started.params.input, [
+        { type: 'text', text: '/not-a-reported-skill please', text_elements: [] },
+      ]);
+      h.adapter.handleMessage({ jsonrpc: '2.0', id: started.id, result: { turn: { id: 'turn_plain' } } });
       await sendPromise;
     });
   });
@@ -738,15 +933,31 @@ describe('codex exec adapter (fallback)', function () {
       assert.strictEqual(adapter.capabilities.toolCalls, true);
       assert.strictEqual(adapter.capabilities.diffs, true);
     });
+
+    it('keeps app-owned commands and disk-discovered skills in fallback mode', function () {
+      const { adapter } = makeAdapter({
+        installedCommands: [{ name: 'release', description: 'Prepare a release' }],
+      });
+      assert.deepStrictEqual(
+        adapter.capabilities.commands.map((command) => command.name),
+        ['clear', 'new', 'reset', 'release'],
+      );
+    });
   });
 
   describe('start', function () {
     it('announces the session without spawning anything', async function () {
-      const { adapter, events } = makeAdapter();
+      const { adapter, events } = makeAdapter({
+        installedCommands: [{ name: 'release', description: 'Prepare a release' }],
+      });
       await adapter.start();
       assert.strictEqual(adapter.child, null);
       assert.strictEqual(events[0].t, 'session');
       assert.strictEqual(events[0].cwd, '/work');
+      assert.deepStrictEqual(
+        events[0].capabilities.commands.map((command) => command.name),
+        ['clear', 'new', 'reset', 'release'],
+      );
       assert.deepStrictEqual(events[1], { t: 'state', state: 'idle', ts: events[1].ts });
     });
   });
@@ -770,6 +981,17 @@ describe('codex exec adapter (fallback)', function () {
         '--foo',
         'bar',
       ]);
+    });
+
+    it('invokes a disk-discovered skill with Codex’s dollar marker', async function () {
+      const { adapter } = makeAdapter({
+        installedCommands: [{ name: 'release', description: 'Prepare a release' }],
+        installedSkills: [{ name: 'release', path: '/home/user/.codex/skills/release/SKILL.md' }],
+      });
+      let spawned;
+      adapter.spawnTurn = (args) => { spawned = args; };
+      await adapter.send({ text: '/release 6.1.0' });
+      assert.strictEqual(spawned[spawned.length - 1], '$release 6.1.0');
     });
   });
 
@@ -839,15 +1061,27 @@ describe('codex exec adapter (fallback)', function () {
 });
 
 describe('codex chat adapter (router)', function () {
-  it('reports no capabilities and is not alive before start() has chosen a mode', function () {
+  it('owns its pre-start capabilities instead of mutating the shared empty sentinel', function () {
     const adapter = new CodexChatAdapter({
       sessionId: 's1',
       workingDir: '/work',
       command: '/nonexistent',
+      installedCommands: [{ name: 'release', description: 'Prepare a release' }],
       emit: () => {},
     });
-    assert.deepStrictEqual(adapter.capabilities, NO_CHAT_CAPABILITIES);
+    assert.notStrictEqual(adapter.capabilities, NO_CHAT_CAPABILITIES);
+    assert.deepStrictEqual(
+      adapter.capabilities.commands.map((command) => command.name),
+      ['clear', 'new', 'reset', 'release'],
+    );
+    assert.strictEqual(NO_CHAT_CAPABILITIES.commands, undefined);
     assert.strictEqual(adapter.alive, false);
+
+    adapter.capabilities.commands.push({ name: 'private-to-one-router' });
+    const other = new CodexChatAdapter({
+      sessionId: 's2', workingDir: '/work', command: '/nonexistent', emit: () => {},
+    });
+    assert.ok(!other.capabilities.commands.some((command) => command.name === 'private-to-one-router'));
   });
 
   it('rejects send() before start() rather than reaching into a null delegate', async function () {

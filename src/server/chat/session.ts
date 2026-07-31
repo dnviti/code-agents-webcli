@@ -36,7 +36,7 @@ import {
 } from '../../shared/runtime-profiles.js';
 import { isClearingCommand, isSlashCommand, mergeSlashCommands } from '../../shared/slash-commands.js';
 import { installedModels } from './installed-models.js';
-import { enumeratesInstalledCommands, listInstalledCommands } from './installed-commands.js';
+import { discoverInstalledCommands, enumeratesInstalledCommands } from './installed-commands.js';
 import { AdapterEvent, ChatAdapter, ChatAdapterOptions } from './adapter.js';
 import {
   PermissionAsk,
@@ -877,12 +877,13 @@ export class ChatSession {
     // ordinary `fs` reads in there can see. On the host it stays the account the
     // runtime actually runs as, because a host environment's `homeDir` is the
     // projects base folder and no runtime keeps its skills under that.
-    const installedCommands = listInstalledCommands(options.runtime, {
+    const installed = discoverInstalledCommands(options.runtime, {
       home: options.environment?.kind === 'container'
         ? options.environment.homeDir
         : env.HOME || process.env.HOME,
       workingDir: options.workingDir,
     });
+    const installedCommands = installed.commands;
 
     // Claimed before the adapter exists, so its `emit` closure below can be
     // told apart from the one belonging to a process this replaces.
@@ -892,6 +893,9 @@ export class ChatSession {
       sessionId: this.ref.id,
       workingDir: options.workingDir,
       installedCommands,
+      // Kept out of `commands`: absolute paths are launch metadata for Codex,
+      // not capabilities a browser or transcript should ever receive.
+      installedSkills: installed.skills,
       command: this.deps.resolveCommand(options.runtime),
       commandName: this.deps.resolveCommandName?.(options.runtime),
       environment: options.environment,
@@ -1197,7 +1201,11 @@ export class ChatSession {
     // replayed later, so a merge applied only to the local copy would be a menu
     // that differs between the server and every client reading it.
     if (this.installedCommands.length > 0 && !enumeratesInstalledCommands(this.runtime)) {
-      if (stamped.t === 'session' && stamped.capabilities.commands) {
+      // A missing property means the runtime said nothing, not that it
+      // positively reported an empty catalogue. Seed the session event too;
+      // otherwise a wrapper that announces fresh capabilities can erase the
+      // stand-in merely by omitting `commands`.
+      if (stamped.t === 'session') {
         stamped.capabilities = {
           ...stamped.capabilities,
           commands: mergeSlashCommands(stamped.capabilities.commands, this.installedCommands),

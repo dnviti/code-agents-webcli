@@ -8,6 +8,7 @@ import {
   NO_CHAT_CAPABILITIES,
   PermissionOption,
   PlanItem,
+  SlashCommand,
   ToolKind,
   ToolStatus,
   UserTurn,
@@ -16,6 +17,7 @@ import {
   rankedEfforts,
 } from '../../../shared/chat-events.js';
 import { blockHasContent } from '../../../shared/chat-visibility.js';
+import { mergeSlashCommands } from '../../../shared/slash-commands.js';
 import { AccountLimitTracker, resetIsoFromEpochSeconds } from '../account-limits.js';
 import {
   AdapterChild,
@@ -449,6 +451,55 @@ function reviewDecisionFor(optionId: string): string {
 const CLIENT_INFO = { name: 'code-agents-webcli', title: 'Code Agents Web CLI', version: '1.0.0' };
 
 /**
+ * Commands implemented by the web chat itself rather than by Codex.
+ *
+ * `ChatSession` intercepts all three and starts a genuinely fresh process, so
+ * they work in app-server and exec mode alike. They also keep the command
+ * control reachable on a machine with no skills installed.
+ */
+const CODEX_APP_COMMANDS: SlashCommand[] = [
+  { name: 'clear', description: 'Start a new conversation, forgetting everything above' },
+  { name: 'new', description: 'Start a new conversation — the same thing as /clear' },
+  { name: 'reset', description: 'Start a new conversation — the same thing as /clear' },
+];
+
+/** A fresh array: adapter capability objects are mutable and must not share one. */
+function initialCodexCommands(options: ChatAdapterOptions): SlashCommand[] {
+  return mergeSlashCommands(CODEX_APP_COMMANDS, options.installedCommands);
+}
+
+interface CodexSkillReference {
+  name: string;
+  path: string;
+}
+
+function initialCodexSkills(options: ChatAdapterOptions): Map<string, CodexSkillReference> {
+  const found = new Map<string, CodexSkillReference>();
+  for (const skill of options.installedSkills ?? []) {
+    const name = String(skill.name || '').trim();
+    const hostPath = String(skill.path || '').trim();
+    if (!name || !hostPath || found.has(name.toLowerCase())) continue;
+    const runtimePath = options.environment
+      ? options.environment.toContainerPath(hostPath)
+      : hostPath;
+    found.set(name.toLowerCase(), { name, path: runtimePath });
+  }
+  return found;
+}
+
+/** `/name args` -> Codex's `$name args`, but only for a known skill. */
+function codexSkillInvocation(
+  text: string,
+  skills: Map<string, CodexSkillReference>,
+): { text: string; skill?: CodexSkillReference } {
+  const selected = /^\s*\/([^\s]+)([\s\S]*)$/.exec(text);
+  const skill = selected ? skills.get(selected[1]!.toLowerCase()) : undefined;
+  return skill && selected
+    ? { text: `$${skill.name}${selected[2] || ''}`, skill }
+    : { text };
+}
+
+/**
  * How long the handshake waits before giving up on a build that never
  * responds.
  *
@@ -462,6 +513,8 @@ const INIT_TIMEOUT_MS = 8_000;
 const THREAD_START_TIMEOUT_MS = 15_000;
 /** Short on purpose: the picker is worth waiting for, but not worth a delayed session. */
 const MODEL_LIST_TIMEOUT_MS = 5_000;
+/** Local discovery, useful but never worth holding the conversation open for. */
+const SKILLS_LIST_TIMEOUT_MS = 5_000;
 /**
  * How long to wait for `account/rateLimits/read`.
  *
@@ -493,6 +546,7 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     // Tokens only -- nothing in the generated schema prices a turn.
     cost: false,
     plan: true,
+    commands: initialCodexCommands(this.options),
   };
 
   private threadId: string | null = null;
@@ -530,6 +584,17 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
   private readonly reasoningChannel = new Map<string, 'content' | 'summary'>();
   /** What codex has said about the account behind this thread. See `loadRateLimits`. */
   private readonly account = new AccountLimitTracker();
+  /** Skill names are public capabilities; their absolute manifest paths stay on the adapter. */
+  private skillPaths = initialCodexSkills(this.options);
+  /** Latest request wins if a filesystem invalidation races launch-time discovery. */
+  private skillListGeneration = 0;
+
+  /** Host path translated to the namespace in which app-server is running. */
+  private runtimeWorkingDir(): string {
+    return this.options.environment
+      ? this.options.environment.toContainerPath(this.options.workingDir)
+      : this.options.workingDir;
+  }
 
   protected buildArgs(): string[] {
     return ['app-server', ...(this.options.extraArgs || [])];
@@ -548,7 +613,7 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     // ahead of it, which reads as a silent hang rather than a rejection.
     this.notify('initialized');
 
-    const params: Record<string, unknown> = { cwd: this.options.workingDir };
+    const params: Record<string, unknown> = { cwd: this.runtimeWorkingDir() };
     if (this.options.model) params.model = this.options.model;
     if (this.options.effort) {
       // There is no `effort` parameter on `thread/start`; the level travels in
@@ -595,6 +660,11 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     // `thread/start` and the `thread/resume` response, alongside `model` and
     // `cwd`, in the schema and in the live capture both.
     this.reportedEffort = str(response.reasoningEffort) ?? null;
+    // Codex resolves the effective catalogue for this cwd itself: shared Agent
+    // Skills, enabled plugins and system skills included, in the environment
+    // where the runtime is actually running. The stand-in above keeps the menu
+    // usable while this deliberately non-blocking request completes.
+    void this.loadSkillList();
     // Not awaited. The picker's menu is worth having but not worth holding a
     // conversation open for, and the answer arrives on its own event whenever
     // it arrives — `capabilities` exists for exactly this, a runtime revising
@@ -609,7 +679,13 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
       t: 'session',
       nativeSessionId: this.threadId || undefined,
       model: this.model,
-      cwd: str(response.cwd) || this.options.workingDir,
+      // App-server runs inside the selected environment and therefore answers
+      // with that environment's path. The rest of this app addresses the
+      // workspace through its host mount, so keep the public/session cwd in
+      // the host namespace while RPC requests use `runtimeWorkingDir()`.
+      cwd: this.options.environment?.kind === 'container'
+        ? this.options.workingDir
+        : str(response.cwd) || this.options.workingDir,
       capabilities: this.capabilities,
     });
     // After `session`, because that event is what introduces the runtime and a
@@ -698,6 +774,63 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     } catch {
       // Deliberately silent: nothing about a missing menu is worth an error
       // event in a transcript, and the conversation is about to start fine.
+    }
+  }
+
+  /**
+   * Ask Codex for the enabled skills it can actually use from this cwd.
+   *
+   * This is a real v2 app-server request, not a guessed RPC. A live 0.135.0
+   * response contains the shared `.agents` catalogue, plugin skills and Codex
+   * system skills as well as the ordinary user directory. Only public names
+   * and descriptions are emitted; manifest paths remain private here so they
+   * can be attached to `turn/start` when a person selects a skill.
+   */
+  private async loadSkillList(forceReload = false): Promise<void> {
+    const generation = ++this.skillListGeneration;
+    try {
+      const params: Record<string, unknown> = { cwds: [this.runtimeWorkingDir()] };
+      if (forceReload) params.forceReload = true;
+      const response = record(
+        await this.withTimeout(
+          this.call('skills/list', params),
+          SKILLS_LIST_TIMEOUT_MS,
+          'skills/list',
+        ),
+      );
+      if (generation !== this.skillListGeneration) return;
+
+      const commands: SlashCommand[] = [];
+      const paths = new Map<string, { name: string; path: string }>();
+      for (const rawEntry of list(response.data)) {
+        for (const rawSkill of list(record(rawEntry).skills)) {
+          const skill = record(rawSkill);
+          if (skill.enabled !== true) continue;
+          const name = str(skill.name)?.trim();
+          const manifest = str(skill.path)?.trim();
+          if (!name || !manifest) continue;
+          const description =
+            str(skill.description)
+            || str(skill.shortDescription)
+            || str(record(skill.interface).shortDescription);
+          commands.push({ name, ...(description ? { description } : {}) });
+          if (!paths.has(name.toLowerCase())) {
+            paths.set(name.toLowerCase(), { name, path: manifest });
+          }
+        }
+      }
+
+      // A successful response is authoritative and replaces the disk stand-in:
+      // among other things this takes disabled skills and removed legacy
+      // prompts back off the menu. The app-owned reset commands remain because
+      // they never travel to Codex in the first place.
+      const available = mergeSlashCommands(CODEX_APP_COMMANDS, commands);
+      this.skillPaths = paths;
+      this.capabilities.commands = available;
+      this.emit({ t: 'capabilities', capabilities: { commands: available } });
+    } catch {
+      // Old app-server builds have no method; slow ones may miss the timeout.
+      // Both keep the initial disk stand-in, with no protocol error in chat.
     }
   }
 
@@ -797,7 +930,18 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
       return;
     }
 
-    const input: Array<Record<string, unknown>> = [{ type: 'text', text: turn.text, text_elements: [] }];
+    // The shared composer speaks `/name`, while Codex's app-server explicitly
+    // invokes skills with `$name` plus a structured skill item. Keep the slash
+    // in the transcript (the session already wrote the person's exact text)
+    // and translate only a name from Codex's own latest catalogue. Unknown
+    // slashes remain untouched instead of being guessed into a different
+    // command, and the private manifest path never enters capabilities/logs.
+    const invocation = codexSkillInvocation(turn.text, this.skillPaths);
+    const skill = invocation.skill;
+    const input: Array<Record<string, unknown>> = [
+      { type: 'text', text: invocation.text, text_elements: [] },
+    ];
+    if (skill?.path) input.push({ type: 'skill', name: skill.name, path: skill.path });
     for (const attachment of turn.attachments || []) {
       input.push(
         attachment.path ? { type: 'localImage', path: attachment.path } : { type: 'image', url: attachment.url },
@@ -945,6 +1089,12 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
         // into a burn rate, which is why the update is worth listening for
         // rather than reading once at launch.
         this.onRateLimits(params);
+        return;
+      case 'skills/changed':
+        // Codex defines this as an invalidation signal, not a delta. Re-read
+        // the effective catalogue so installs, removals and enablement changes
+        // are reflected without restarting the conversation.
+        void this.loadSkillList(true);
         return;
       case 'turn/completed':
         this.onTurnCompleted(params);
@@ -1236,12 +1386,14 @@ export class CodexExecAdapter extends BaseChatAdapter {
     usage: false,
     cost: false,
     plan: false,
+    commands: initialCodexCommands(this.options),
   };
 
   private turnId: string | null = null;
   private assistantMsgId: string | null = null;
   private blockIndex = 0;
   private sawTerminalEvent = false;
+  private readonly installedSkills = initialCodexSkills(this.options);
 
   /** "Alive" means the adapter has not been stopped, not that a child is currently running. */
   get alive(): boolean {
@@ -1298,7 +1450,7 @@ export class CodexExecAdapter extends BaseChatAdapter {
     // resume syntax for this mode, so multi-turn context is a known
     // regression versus app-server -- exactly why capabilities.resume is
     // false here.
-    this.spawnTurn([...this.buildArgs(), turn.text]);
+    this.spawnTurn([...this.buildArgs(), codexSkillInvocation(turn.text, this.installedSkills).text]);
   }
 
   private spawnTurn(args: string[]): void {
@@ -1472,11 +1624,27 @@ export class CodexChatAdapter implements ChatAdapter {
   readonly runtime = 'codex';
   private delegate: ChatAdapter | null = null;
   private sink: (event: AdapterEvent) => void = () => {};
+  private readonly undecidedCapabilities: ChatCapabilities;
 
-  constructor(private readonly options: ChatAdapterOptions) {}
+  constructor(private readonly options: ChatAdapterOptions) {
+    // `ChatSession` augments this before `start()`. Returning the shared
+    // NO_CHAT_CAPABILITIES singleton used to mutate global state and then lose
+    // the commands when a concrete delegate was selected. Both delegates seed
+    // the same list independently; this object only covers the undecided gap.
+    this.undecidedCapabilities = {
+      ...NO_CHAT_CAPABILITIES,
+      // The two delegates disagree about streaming, interruption, resume and
+      // most other features. Both do report tool calls and structured file
+      // changes through the shared `itemToBlock` mapper, so these are safe to
+      // state before the router has selected one.
+      toolCalls: true,
+      diffs: true,
+      commands: initialCodexCommands(options),
+    };
+  }
 
   get capabilities(): ChatCapabilities {
-    return this.delegate?.capabilities ?? NO_CHAT_CAPABILITIES;
+    return this.delegate?.capabilities ?? this.undecidedCapabilities;
   }
 
   get alive(): boolean {

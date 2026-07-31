@@ -235,6 +235,11 @@ describe('Composer', function () {
 
     const filtered = render({ capabilities: caps({ commands }), draft: '/comp' });
     assert.ok(filtered.includes('/compact') && !filtered.includes('/clear'), 'typing narrows the match list');
+
+    const whileBusy = render({ busy: true, capabilities: caps({ commands }), draft: '/' });
+    assert.ok(whileBusy.includes('role="listbox"'), 'working does not hide commands from the queued composer');
+    assert.ok(whileBusy.includes('aria-label="Slash commands and skills"'));
+    assert.ok(whileBusy.includes('aria-label="Queue this message"'), 'the selected command can be queued');
   });
 
   it('keeps sending available while the agent is busy, because a turn queues', function () {

@@ -341,8 +341,10 @@ button beside it — lists what the conversation can run, from the moment it
 opens rather than after a first message has been sent.
 
 **What the runtime says about itself wins.** The ACP agents (Grok Build, Kimi
-Code, Oh My Pi) volunteer their list as the session starts; Claude Code sends
-its own with the first turn. When that list arrives it *replaces* the stand-in.
+Code, Oh My Pi) volunteer their list as the session starts; Codex is asked for
+its enabled skills through `skills/list`; Claude Code sends its own list with
+the first turn. When that list arrives it *replaces* the stand-in in the
+adapter.
 
 For Claude Code that is the end of it. Its list names everything it accepts —
 your skills, your project commands and every enabled plugin's among them — so
@@ -357,16 +359,18 @@ menu a few milliseconds after the conversation opened. There — and only for th
 runtimes that leave their skills out of their own list — what was found on disk
 is added back after the runtime has had its say.
 
-Until that list arrives — and permanently, for Codex and pi, which never report
-one — the menu is only what is installed for the session, read from the
-directories each runtime's own installer writes into:
+Until that list arrives — and permanently for pi and Codex's older exec
+fallback, which cannot report one — the menu is what is installed for the
+session, read from the directories each runtime's own installer writes into.
+Codex also always offers the app-owned `/clear`, `/new` and `/reset`, including
+on a machine with no installed skills:
 
 | Runtime | Read from |
 | --- | --- |
 | Claude Code | `.claude/skills` and `.claude/commands` in the project and in your home, plus the skills and commands of every enabled plugin |
 | Grok Build | `.grok/skills`, `.grok/commands`, `.agents/skills`, and — as Grok itself does by default — your `~/.claude` directories |
 | pi | `.pi/skills` and `.agents/skills` in the project, `~/.pi/agent/skills` and `~/.agents/skills` in your home |
-| Codex | `~/.codex/skills` and `~/.codex/prompts`, and `.codex/skills` in the project |
+| Codex | App-server's effective list (shared Agent Skills, enabled plugins and system skills included); fallback: `.codex/skills` and `.agents/skills` in the project, `~/.codex/skills`, `~/.agents/skills`, `~/.codex/prompts`, and Codex's system skills |
 | Kimi Code, Oh My Pi | Nothing — both report their own list before the menu can be opened |
 | Antigravity CLI | `skills/` and `plugins/` under `.agents`, `_agents`, `.agent` or `_agent` in the project **and in every directory up to the repository root**, and the same two under `~/.gemini/config` |
 
