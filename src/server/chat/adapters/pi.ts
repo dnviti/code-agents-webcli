@@ -187,10 +187,26 @@ export class PiChatAdapter extends BaseChatAdapter {
    * (see the class comment) — `send()` calls it directly to build one turn's
    * full argv.
    */
+  /**
+   * The model the next turn runs on, once something has changed it.
+   *
+   * pi's model is an argv entry rather than anything a running session holds —
+   * one turn is one process — so a change is simply a different command line
+   * next time. There is no live switch to offer, which is why this is
+   * `setModelNextTurn` and not `setModel`: the caller has to be able to say
+   * which of the two it got, and a boolean could not (#171).
+   */
+  private nextTurnModel: string | undefined;
+
+  setModelNextTurn(model: string): void {
+    this.nextTurnModel = model;
+  }
+
   protected buildArgs(): string[] {
     const args = ['--mode', 'json'];
-    if (this.options.model) {
-      args.push('--model', this.options.model);
+    const model = this.nextTurnModel ?? this.options.model;
+    if (model) {
+      args.push('--model', model);
     }
     if (this.effort) {
       // The whole of the effort mechanism, for this runtime. One turn is one

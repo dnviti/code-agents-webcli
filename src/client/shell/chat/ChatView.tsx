@@ -901,6 +901,7 @@ export function ChatView({
         state={chatState}
         exited={Boolean(unavailable)}
         bypassPermissions={bypassPermissions}
+        ladderError={controller.ladderErrorValue}
         showUsage={view.showUsage}
         terminalOpen={terminalOpen}
         railOpen={railOpen}
@@ -1240,6 +1241,11 @@ export function ChatView({
               // chat would open on, and it changes under an open conversation
               // every time the account's standing choice does.
               modelPinned={controller.modelPinnedValue}
+              // And which of four things chose it: the ladder and its rung, the
+              // profile, the account's standing choice, or the runtime itself.
+              // The three above each name a model; only this says why (#171).
+              modelOrigin={controller.modelOriginValue}
+              ladderError={controller.ladderErrorValue}
               // Apart from `model` above, because that one is the override *or*
               // whatever the runtime last reported and the picker has to tell
               // those two apart to say which it is describing.

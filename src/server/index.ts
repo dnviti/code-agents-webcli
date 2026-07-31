@@ -18,8 +18,18 @@ import {
 } from './types.js';
 import { createConfig, createUsageAnalyticsOptions } from './config.js';
 import { registerRoutes } from './routes/index.js';
+import {
+  ResolvedProfile,
+  resolveConversationRung,
+} from '../shared/runtime-profiles.js';
 import { RuntimeProfileStore } from './services/runtime-profiles.js';
-import { TierWriterContext, applyTiers, defaultTierContext } from './services/tier-writer.js';
+import {
+  TierWriterContext,
+  applyTiers,
+  defaultTierContext,
+  supportsTiers,
+  tierCapableRuntimes,
+} from './services/tier-writer.js';
 import { WebSocketHandler } from './websocket/handler.js';
 import { MessageProcessor } from './websocket/messages.js';
 import { PromptSession } from './setup/prompts.js';
@@ -634,31 +644,46 @@ export class ClaudeCodeWebServer {
    * earlier build (or a data directory restored from backup) may never have
    * been through the save path at all.
    */
-  private resolveRuntimeProfile(agentKind: AgentKind, workingDir: string): {
-    profileName: string;
-    model?: string;
-    extraArgs?: string[];
-    env?: Record<string, string>;
-  } | null {
+  private resolveRuntimeProfile(
+    agentKind: AgentKind,
+    workingDir: string,
+  ): ResolvedProfile | null {
     const profile = this.runtimeProfiles.activeFor(agentKind);
     if (!profile) return null;
 
     // The session's directory is where pi's tier agents go, so it is part of
     // the context rather than something the writer could guess.
     const tierResult = applyTiers(profile, { ...this.tierContext, workingDir });
-    for (const skipped of tierResult.skipped) {
+    for (const replaced of tierResult.replaced) {
       console.warn(
-        `Runtime profile "${profile.name}": left ${skipped.file} alone (${skipped.reason})`,
+        `Runtime profile "${profile.name}": replaced ${replaced.file} (${replaced.reason})`,
       );
     }
 
     const extraArgs = [...tierResult.args, ...(profile.args || [])];
 
+    // A rung is only in force if the ladder behind it reached the runtime. When
+    // the write-through failed, the delegated helpers are not configured and the
+    // conversation's own model would be the only half of the ladder that landed
+    // — so the launch says so and falls back rather than reporting a rung it
+    // half applied.
+    // `unsupported` is a runtime with no way to express a ladder at all — the
+    // non-goal the issue states outright: those launch exactly as they do now.
+    // A rung applied anyway would put a `--model` on a claude session whose
+    // helper rungs were written nowhere, from a ladder saved for a different
+    // runtime and carried across by changing the Runtime dropdown.
+    const ladder = tierResult.unsupported ? null : resolveConversationRung(profile);
+    const ladderError = ladder && tierResult.failed ? tierResult.failed : undefined;
+
     return {
+      profileId: profile.id,
       profileName: profile.name,
       model: profile.model,
       extraArgs: extraArgs.length ? extraArgs : undefined,
       env: profile.env,
+      ladder: ladderError ? null : ladder,
+      tiers: profile.tiers,
+      ladderError,
     };
   }
 
@@ -671,9 +696,58 @@ export class ClaudeCodeWebServer {
    * being cut — not launches. Answering them through the other one would
    * rewrite a runtime's config on every tab that opened.
    */
-  private activeProfileFor(runtime: string): { profileName: string; model?: string } | null {
+  private activeProfileFor(runtime: string): ResolvedProfile | null {
     const profile = this.runtimeProfiles.activeFor(runtime);
-    return profile ? { profileName: profile.name, model: profile.model } : null;
+    if (!profile) return null;
+    // The rung is resolved here too: reading a ladder is pure arithmetic over
+    // four strings, and it is only *writing* it through that the caller of this
+    // one must not trigger.
+    const laddered = supportsTiers(runtime);
+    return {
+      profileId: profile.id,
+      profileName: profile.name,
+      model: profile.model,
+      // Same gate as the launch above, and it has to be: this answers the
+      // picker's "where did this model come from", and a rung reported for a
+      // runtime that cannot express one would name a model nothing applied.
+      ladder: laddered ? resolveConversationRung(profile) : null,
+      ...(laddered ? { tiers: profile.tiers } : {}),
+    };
+  }
+
+  /**
+   * Carry edited ladders into the conversations that are open right now.
+   *
+   * Every tier-capable runtime, not only the ones whose profile changed: a save
+   * rewrites the whole configuration at once, and working out which runtimes
+   * actually moved would mean diffing a config against itself. The sessions
+   * decide — one already on the rung it is being offered declines, so an
+   * unrelated save interrupts nobody.
+   */
+  private async applyProfilesToOpenChats(): Promise<void> {
+    for (const runtime of tierCapableRuntimes()) {
+      const profile = this.activeProfileFor(runtime);
+      // Only when the ladder is what decides: a model typed into the profile,
+      // like an account's standing choice, outranks it, and a conversation
+      // running on one of those was never the ladder's to move.
+      const ladder = profile && !profile.model && profile.ladder && profile.tiers
+        ? { tier: profile.ladder.tier, tiers: profile.tiers }
+        : null;
+      const moved = await this.chatManager.reapplyLadder(runtime, ladder);
+      if (moved.length) {
+        console.log(`Runtime profiles: moved ${moved.length} open ${runtime} conversation(s)`);
+      }
+    }
+  }
+
+  /** This account's standing model per runtime, for the profiles dialog. */
+  private getUserModelDefaults(userId: number): Record<string, string> {
+    const defaults: Record<string, string> = {};
+    for (const runtime of tierCapableRuntimes()) {
+      const model = this.database.getUserSetting(userId, `chatModel:${runtime}`);
+      if (model) defaults[runtime] = model;
+    }
+    return defaults;
   }
 
   /**
@@ -974,6 +1048,8 @@ export class ClaudeCodeWebServer {
       userPreferences: this.userPreferences,
       getUserPreferences: (userId: number) => this.userPreferences.get(userId),
       tierContext: this.tierContext,
+      applyProfilesToOpenChats: () => this.applyProfilesToOpenChats(),
+      getUserModelDefaults: (userId: number) => this.getUserModelDefaults(userId),
       updateChecker: this.updateChecker,
       selfUpdate: this.selfUpdate,
       getUpdateMode: () => this.getUpdateMode(),

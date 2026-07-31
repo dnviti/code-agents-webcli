@@ -4,12 +4,14 @@ import {
   ChatDraft,
   ChatEvent,
   ChatModelDefault,
+  ChatModelOrigin,
   ChatSnapshot,
   ChatTurnIndexEntry,
   ChatUsage,
   QueuedTurn,
   NO_CHAT_CAPABILITIES,
 } from '../../shared/chat-events.js';
+import { ModelTier, isModelTier } from '../../shared/runtime-profiles.js';
 import { ChatTranscript } from './transcript.js';
 
 /**
@@ -107,13 +109,51 @@ function readModelDefault(raw: unknown): ChatModelDefault | null {
   if (!raw || typeof raw !== 'object') return null;
   const value = raw as Record<string, unknown>;
   const source = value.source;
-  if (source !== 'personal' && source !== 'profile' && source !== 'runtime') return null;
+  if (source !== 'personal' && source !== 'profile' && source !== 'ladder' && source !== 'runtime') {
+    return null;
+  }
   return {
     model: typeof value.model === 'string' && value.model ? value.model : null,
     source,
     ...(typeof value.profileName === 'string' && value.profileName
       ? { profileName: value.profileName }
       : {}),
+    ...readTiers(value),
+  };
+}
+
+/** The rung fields, shared by a default and by a conversation's own origin. */
+function readTiers(value: Record<string, unknown>): { tier?: ModelTier; requestedTier?: ModelTier } {
+  const tier = isModelTier(value.tier) ? value.tier : undefined;
+  const requestedTier = isModelTier(value.requestedTier) ? value.requestedTier : undefined;
+  return { ...(tier ? { tier } : {}), ...(requestedTier ? { requestedTier } : {}) };
+}
+
+/**
+ * Read the origin of the model *this* conversation is on.
+ *
+ * The same shape as a default plus `override`, which no default can be: the
+ * person in this conversation picked it. Read field by field for the same
+ * reason — a server that predates #171 says nothing, and half an answer to
+ * "where did this model come from" is worse than admitting it does not know.
+ */
+function readModelOrigin(raw: unknown): ChatModelOrigin | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Record<string, unknown>;
+  const source = value.source;
+  if (
+    source !== 'override' && source !== 'personal' && source !== 'profile'
+    && source !== 'ladder' && source !== 'runtime'
+  ) {
+    return null;
+  }
+  return {
+    model: typeof value.model === 'string' && value.model ? value.model : null,
+    source,
+    ...(typeof value.profileName === 'string' && value.profileName
+      ? { profileName: value.profileName }
+      : {}),
+    ...readTiers(value),
   };
 }
 
@@ -284,6 +324,10 @@ export class ChatController {
    * distinction only matters on the server, where the launch is resolved.
    */
   private modelPinned: string | null = null;
+  /** Where the model this conversation is on came from, or null when unsaid. */
+  private modelOrigin: ChatModelOrigin | null = null;
+  /** Why the ladder was not applied, when it was not. */
+  private ladderError: string | null = null;
   /** What the server reported happened to the last model change requested. */
   private modelResult: ModelSwitchResult | null = null;
 
@@ -406,6 +450,11 @@ export class ChatController {
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
         this.modelDefault = readModelDefault(message.modelDefault);
         this.modelPinned = typeof message.modelPinned === 'string' ? message.modelPinned : null;
+        this.modelOrigin = readModelOrigin(message.modelOrigin);
+        this.ladderError =
+          typeof message.ladderError === 'string' && message.ladderError
+            ? message.ladderError
+            : null;
         this.effortOverride =
           typeof message.effortOverride === 'string' ? message.effortOverride : null;
         // The composer rides on the join, so a conversation opened on a second
@@ -493,6 +542,11 @@ export class ChatController {
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
         this.modelDefault = readModelDefault(message.modelDefault);
         this.modelPinned = typeof message.modelPinned === 'string' ? message.modelPinned : null;
+        this.modelOrigin = readModelOrigin(message.modelOrigin);
+        this.ladderError =
+          typeof message.ladderError === 'string' && message.ladderError
+            ? message.ladderError
+            : null;
         this.effortOverride =
           typeof message.effortOverride === 'string' ? message.effortOverride : null;
         this.options.onChange?.();
@@ -1005,6 +1059,24 @@ export class ChatController {
    */
   get modelPinnedValue(): string | null {
     return this.modelPinned;
+  }
+
+  /**
+   * Where the model in force came from — the ladder, the profile, the account's
+   * standing choice, or the runtime's own default.
+   *
+   * Beside `modelDefaultValue` rather than replacing it: one says what this
+   * conversation is on, the other what the next one would open on, and using
+   * either for the other is how the chip came to name a standing choice that
+   * had never been applied to the conversation showing it (#135).
+   */
+  get modelOriginValue(): ChatModelOrigin | null {
+    return this.modelOrigin;
+  }
+
+  /** Why this conversation's ladder was not applied, when it was not. */
+  get ladderErrorValue(): string | null {
+    return this.ladderError;
   }
 
   /** What happened the last time this browser asked to change the model. */

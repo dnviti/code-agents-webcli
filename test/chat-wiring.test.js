@@ -662,7 +662,12 @@ describe('chat wiring', function () {
 
     it('carries the profile default across when the override is cleared', async function () {
       const { processor, chatManager } = build({ surface: 'chat' });
-      processor.deps.resolveRuntimeProfile = () => ({ profileName: 'p', model: 'profile-default' });
+      // Through the read-only accessor, deliberately. The other one writes the
+      // profile's tier files to disk on every call, and picking a model from
+      // the chip is a question about this conversation rather than a launch —
+      // asking it that way rewrote the project's `.pi/agents/*.md` on every
+      // click (#171).
+      processor.deps.activeProfileFor = () => ({ profileName: 'p', model: 'profile-default' });
 
       await processor.handleMessage('ws-1', { type: 'chat_set_model', model: '' });
 

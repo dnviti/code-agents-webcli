@@ -24,6 +24,7 @@
  * that goes stale the week it ships.
  */
 
+import { ModelTier, ResolvedProfile } from './runtime-profiles.js';
 import { TurnOutcome } from './turn-outcome.js';
 
 export type { TurnOutcome };
@@ -388,7 +389,7 @@ export interface ErrorBlock {
  */
 export interface NoticeBlock {
   kind: 'notice';
-  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched';
+  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'model';
   text: string;
   /** Optional detail — how much was reclaimed, what the summary covers. */
   detail?: string;
@@ -840,9 +841,53 @@ export interface ModelChoice {
  */
 export interface ChatModelDefault {
   model: string | null;
-  source: 'personal' | 'profile' | 'runtime';
-  /** Only ever set for `profile`, and only so the picker can name it. */
+  source: ModelDefaultSource;
+  /** Set for `profile` and `ladder`, and only so the picker can name it. */
   profileName?: string;
+  /** Only ever set for `ladder`: which rung of it this model sits on. */
+  tier?: ModelTier;
+  /**
+   * Only on a `ladder` whose chosen rung was blank, naming the rung that was
+   * asked for. The nearest filled one answered instead, and a person reading
+   * "high" beside a profile set to "mid" is owed the reason.
+   */
+  requestedTier?: ModelTier;
+}
+
+/**
+ * Where a model came from, cheapest explanation last.
+ *
+ * `ladder` is below `profile` deliberately and the issue says so outright: a
+ * model somebody typed into a profile, and an account's standing choice, both
+ * still beat the rung. The ladder is what answers when nobody typed anything.
+ */
+export type ModelDefaultSource = 'personal' | 'profile' | 'ladder' | 'runtime';
+
+/**
+ * What *this* conversation is running on, and why — as opposed to
+ * `ChatModelDefault`, which is what the next one would open on.
+ *
+ * The two were the same object until the ladder arrived, and conflating them is
+ * exactly how the chip came to name a standing choice that had never been
+ * applied to the conversation showing it (#135). They are separate now because
+ * the ladder makes the difference visible: a conversation pinned to `high` by a
+ * one-off escalation and a runtime whose *default* is `mid` are both true at
+ * once, and the picker has to say both.
+ *
+ * `override` is the source no default can have: the person in this conversation
+ * picked it out of the menu.
+ */
+export interface ChatModelOrigin {
+  model: string | null;
+  source: 'override' | ModelDefaultSource;
+  profileName?: string;
+  tier?: ModelTier;
+  requestedTier?: ModelTier;
+  /**
+   * Set while a conversation is answering above its usual rung, naming the rung
+   * it returns to. Its presence is what the UI reads as "this is temporary".
+   */
+  escalatedFrom?: ModelTier;
 }
 
 /**
@@ -1168,7 +1213,7 @@ export type ChatEvent =
       t: 'marker';
       seq: number;
       ts: number;
-      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals';
+      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals' | 'model';
       detail?: string;
       /**
        * On an `approvals` marker: the mode the conversation actually started
@@ -1428,8 +1473,21 @@ export function isSessionMintedMessageId(id: string): boolean {
   return /^user-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
 }
 
-/** The one tool that server offers: put a multiple-choice question to the user. */
+/** Put a multiple-choice question to the user, and wait for the answer. */
 export const ASK_QUESTION_TOOL = 'ask_user_question';
+
+/**
+ * Ask to answer from the next model up the profile's capability ladder.
+ *
+ * Offered only to a session that is actually running on a rung — a runtime with
+ * no ladder never sees it, because a tool whose only possible answer is "there
+ * is nothing to escalate to" costs a round trip and reads to the model as the
+ * user having said no.
+ */
+export const TIER_TOOL = 'request_model_tier';
+
+/** What the ladder tool is called once a runtime has namespaced it. */
+export const TIER_TOOL_NAME = `mcp__${ASK_MCP_SERVER}__${TIER_TOOL}`;
 
 /**
  * What the tool is called once a runtime has namespaced it.

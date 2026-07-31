@@ -178,6 +178,22 @@ export interface SessionRecord {
    */
   chatModelPinned?: string | null;
   /**
+   * Why this conversation's ladder is not in force, when it is not.
+   *
+   * A launch says this once and every later screen has to be able to hear it: a
+   * ladder that could not be written to disk, or a rung whose model the
+   * provider refused, leaves a conversation running on something other than the
+   * rung its profile names — and the badge that says so was being cleared by
+   * the next rejoin, reload or second tab, because the join had nothing to
+   * repeat. It stays on the record for that, beside the model the same launch
+   * resolved.
+   *
+   * Deliberately not persisted to disk. It is a fact about a running process:
+   * once the server has gone the conversation is not running on anything, and
+   * the next launch resolves the ladder again and says so itself.
+   */
+  chatLadderError?: string | null;
+  /**
    * The reasoning-effort level this conversation runs at, in the runtime's own
    * vocabulary.
    *

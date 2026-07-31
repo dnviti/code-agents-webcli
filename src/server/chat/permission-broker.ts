@@ -63,18 +63,39 @@ export interface QuestionReply {
 }
 
 /**
- * The two things that dial into a session's socket.
+ * The agent asking to answer from a stronger model than its rung.
  *
- * One socket, two kinds of caller: the PreToolUse hook asking whether a tool may
- * run, and the MCP server asking the user a question. They are kept apart here
- * rather than being squeezed into one decider because the answers have nothing
- * in common — a boolean with a reason versus a list of chosen labels — and a
- * union that had to be narrowed at every call site would be worse than two
- * fields.
+ * `unknown` for the same reason `QuestionAsk` is: the shape is whatever the
+ * model passed to the tool, and the broker only routes.
+ */
+export interface TierAsk {
+  reason?: unknown;
+}
+
+/** What the session decided, on its way back to the waiting tool call. */
+export interface TierReply {
+  granted: boolean;
+  /** The rung now in force, when one was granted. */
+  tier?: string;
+  model?: string;
+  /** The sentence the model reads — a grant, a refusal, or why neither. */
+  detail: string;
+}
+
+/**
+ * The three things that dial into a session's socket.
+ *
+ * One socket, three kinds of caller: the PreToolUse hook asking whether a tool
+ * may run, the MCP server asking the user a question, and the agent asking to
+ * move up a rung. They are kept apart here rather than being squeezed into one
+ * decider because the answers have nothing in common — a boolean with a reason,
+ * a list of chosen labels, a rung and a model — and a union that had to be
+ * narrowed at every call site would be worse than three fields.
  */
 export interface BrokerHandlers {
   permission: (ask: PermissionAsk) => Promise<PermissionAnswer>;
   question: (ask: QuestionAsk) => Promise<QuestionReply>;
+  tier: (ask: TierAsk) => Promise<TierReply>;
 }
 
 /**
@@ -214,7 +235,13 @@ export class PermissionBroker {
   }
 
   private handle(socket: net.Socket, line: string): void {
-    let payload: { id?: string; kind?: string; ask?: PermissionAsk; question?: QuestionAsk };
+    let payload: {
+      id?: string;
+      kind?: string;
+      ask?: PermissionAsk;
+      question?: QuestionAsk;
+      tier?: TierAsk;
+    };
     try {
       payload = JSON.parse(line);
     } catch {
@@ -224,7 +251,7 @@ export class PermissionBroker {
     const id = payload.id;
     if (!id) return;
 
-    const reply = (answer: PermissionAnswer | QuestionReply): void => {
+    const reply = (answer: PermissionAnswer | QuestionReply | TierReply): void => {
       if (socket.destroyed) return;
       socket.write(`${JSON.stringify({ id, ...answer })}\n`);
     };
@@ -246,6 +273,25 @@ export class PermissionBroker {
         .then(reply)
         .catch((error: unknown) => {
           reply({ labels: [], error: describeError(error) });
+        });
+      return;
+    }
+
+    // A request to move up a rung. Failing closed like an approval rather than
+    // open like a question, and for the same reason an approval does: the thing
+    // being asked for costs real money on a more expensive model, so silence
+    // has to mean "no" — but with a sentence, because an agent told only "no"
+    // will ask again.
+    if (payload.kind === 'tier') {
+      if (!handlers) {
+        reply({ granted: false, detail: 'this conversation is not running on a ladder' });
+        return;
+      }
+      handlers
+        .tier(payload.tier ?? {})
+        .then(reply)
+        .catch((error: unknown) => {
+          reply({ granted: false, detail: `the request failed: ${describeError(error)}` });
         });
       return;
     }

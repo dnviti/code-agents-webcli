@@ -1,6 +1,11 @@
 import type { AccountLimits, FileDiff } from '../../shared/chat-events.js';
 import type { UsageBurn } from '../../shared/usage-records.js';
 import type { GitChange } from '../../shared/git-status.js';
+// Imported as well as re-exported below. `export type … from` publishes a name
+// without binding it in this file, so the two GitHub shapes this module's own
+// signatures are written in have to be brought in as well — without this the
+// re-export compiles and every use of them here is an unresolved name.
+import type { GitHubItem, GitHubOverview } from '../../shared/github-items.js';
 
 /**
  * The browser's half of the workspace routes.

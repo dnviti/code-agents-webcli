@@ -27,7 +27,13 @@ import {
   normalizeQuestionOptions,
   ASK_MCP_SERVER,
   ASK_QUESTION_TOOL_NAME,
+  TIER_TOOL_NAME,
 } from '../../shared/chat-events.js';
+import {
+  LadderRung,
+  ModelTier,
+  nextRungUp,
+} from '../../shared/runtime-profiles.js';
 import { isClearingCommand, isSlashCommand, mergeSlashCommands } from '../../shared/slash-commands.js';
 import { installedModels } from './installed-models.js';
 import { enumeratesInstalledCommands, listInstalledCommands } from './installed-commands.js';
@@ -38,9 +44,11 @@ import {
   PermissionBroker,
   QuestionAsk,
   QuestionReply,
+  TierAsk,
+  TierReply,
   permissionHookSettings,
 } from './permission-broker.js';
-import { ASK_SOCKET_ENV, askMcpConfig } from './ask-mcp.js';
+import { ASK_SOCKET_ENV, TIER_ENABLED_ENV, askMcpConfig } from './ask-mcp.js';
 import { UserEnvironment } from '../services/environments/types.js';
 import { ChatStoreLike, ChatSessionRef } from './store.js';
 import { askChannelFor, createChatAdapter, supportsChat } from './registry.js';
@@ -208,6 +216,15 @@ export interface ChatSessionStartOptions {
    * what every caller passed before per-user environments existed.
    */
   environment?: UserEnvironment;
+  /**
+   * The capability ladder this conversation is running on, when it is running
+   * on one.
+   *
+   * `tier` is the rung it opened at and returns to; `tiers` is the whole ladder,
+   * because escalation has to be able to find what is above the current rung
+   * and the profile is server-side configuration the session cannot re-read.
+   */
+  ladder?: { tier: ModelTier; tiers: Partial<Record<ModelTier, string>> };
 }
 
 interface PendingApproval {
@@ -369,6 +386,39 @@ export class ChatSession {
   private limits: AccountLimits | null = null;
   private readonly pending = new Map<string, PendingApproval>();
   private readonly questions = new Map<string, PendingQuestion>();
+  /**
+   * The rung this conversation runs on, and the whole ladder behind it.
+   *
+   * Null for a conversation that is not on a ladder at all, which is what makes
+   * the escalation tool absent rather than present-and-always-refusing.
+   */
+  private ladder: { tier: ModelTier; tiers: Partial<Record<ModelTier, string>> } | null = null;
+  /**
+   * The rung this conversation has been lifted to for the turn in progress.
+   *
+   * Set the moment an escalation is granted and cleared when the turn ends —
+   * which is the observable reading of "once the task that prompted the move is
+   * finished". A task that spans turns asks again, and that is deliberate: the
+   * approval is the only control on what this spends, and a grant that outlived
+   * the work it was granted for would quietly become the conversation's model.
+   */
+  private escalation: {
+    from: ModelTier;
+    to: ModelTier;
+    model: string;
+    /**
+     * True while the grant has been made but the turn it applies to has not
+     * started — either because the runtime cannot change model mid-turn (pi
+     * runs one process per turn) or because the user answered after the turn
+     * that asked had already ended.
+     *
+     * Without it the very next `turn_end` — the one closing the turn the grant
+     * was *not* for — cancelled the escalation before the promised turn began,
+     * so the model was told it had moved up and then answered from the rung it
+     * started on.
+     */
+    startsNextTurn: boolean;
+  } | null = null;
   /**
    * Question tool calls the transcript has opened and nothing has claimed yet.
    *
@@ -678,7 +728,18 @@ export class ChatSession {
     const wantsAsk = Boolean(askChannel) && Boolean(askScript) && fs.existsSync(askScript!);
     let askMcpServer: ChatAdapterOptions['askMcpServer'];
 
-    if (wantsHook || wantsAsk) {
+    // The rung, recorded before anything can be escalated from it. Held on the
+    // session rather than read from the profile on demand, because the profile
+    // is server-wide configuration that can change under a running conversation
+    // and this is a fact about the process that is about to start.
+    this.ladder = options.ladder ?? null;
+    this.escalation = null;
+    // pi is the runtime with a ladder and no MCP support at all, so its
+    // escalation tool arrives as a generated extension instead (see the tier
+    // writer). It still dials this socket, so the socket still has to be open.
+    const wantsTierExtension = Boolean(this.ladder) && options.runtime === 'pi';
+
+    if (wantsHook || wantsAsk || wantsTierExtension) {
       // One shared directory, not one per session. A directory named after the
       // session id cost 37 bytes of a 103-byte path budget, which is what put
       // the socket over the kernel's limit; the random socket filename already
@@ -687,6 +748,7 @@ export class ChatSession {
       const socketPath = await this.broker.listen({
         permission: (ask) => this.askUser(ask),
         question: (ask) => this.askQuestion(ask),
+        tier: (ask) => this.requestTier(ask),
       });
 
       // Both channels are host-side files reached over a host-side socket, and
@@ -700,6 +762,13 @@ export class ChatSession {
       const nodePath = environment ? environment.nodePath : process.execPath;
       const runtimeSocketPath = asSeenByRuntime(socketPath);
 
+      if (wantsTierExtension) {
+        // The generated extension reads both of these at call time, which is
+        // what lets one static file serve every session — and lets a terminal
+        // launch load the same file harmlessly, with nothing to register.
+        env[ASK_SOCKET_ENV] = runtimeSocketPath;
+        env[TIER_ENABLED_ENV] = '1';
+      }
       if (wantsHook) {
         extraArgs.push('--settings', permissionHookSettings(
           asSeenByRuntime(this.deps.hookScript),
@@ -708,28 +777,38 @@ export class ChatSession {
         ));
         env.CCWEB_PERMISSION_SOCKET = runtimeSocketPath;
       }
+      // The escalation tool rides the same MCP server as the question tool, and
+      // is advertised only to a conversation actually on a rung: a tool whose
+      // one possible answer is "there is nothing to escalate to" costs a round
+      // trip and reads to the model as the user having said no.
+      const laddered = Boolean(this.ladder);
       if (wantsAsk && askChannel === 'cli') {
         extraArgs.push('--mcp-config', askMcpConfig(
           asSeenByRuntime(askScript!),
           runtimeSocketPath,
           nodePath,
+          laddered,
         ));
         // Named explicitly rather than relying on the hook to wave it through:
         // with approvals bypassed there is no hook at all, and without this the
         // one tool whose whole purpose is to ask the user something would be the
         // one tool the runtime refused to run.
         extraArgs.push('--allowedTools', ASK_QUESTION_TOOL_NAME);
+        if (laddered) extraArgs.push('--allowedTools', TIER_TOOL_NAME);
         this.questionsEnabled = true;
       }
       if (wantsAsk && askChannel === 'protocol') {
         // ACP agents take their MCP servers in the handshake rather than on the
         // command line, so this goes to the adapter and is sent with
-        // `session/new`. Same script, same socket, same tool.
+        // `session/new`. Same script, same socket, same tools.
         askMcpServer = {
           name: ASK_MCP_SERVER,
           command: nodePath,
           args: [asSeenByRuntime(askScript!)],
-          env: { [ASK_SOCKET_ENV]: runtimeSocketPath },
+          env: {
+            [ASK_SOCKET_ENV]: runtimeSocketPath,
+            ...(laddered ? { [TIER_ENABLED_ENV]: '1' } : {}),
+          },
         };
         this.questionsEnabled = true;
       }
@@ -1161,6 +1240,22 @@ export class ChatSession {
       // reaches the same conclusion from it. Emitting a second event would put
       // the same fact in twice.
       this.state = 'idle';
+    }
+    // `stale` is the interrupt acknowledgement a steer produces, and it closes
+    // no turn — the reducer excludes it from turn accounting for the same
+    // reason. Ending an escalation on one cancels a grant the user has paid for
+    // while the redirected turn is still running.
+    if (stamped.t === 'turn_end' && !stamped.stale && this.escalation) {
+      if (this.escalation.startsNextTurn) {
+        // This is the turn the grant was *not* for. The promised one starts now.
+        this.escalation = { ...this.escalation, startsNextTurn: false };
+      } else {
+        // The task that prompted the move up is over. Not awaited: `ingest` is
+        // synchronous for every one of its callers, and the switch back is a
+        // request to a runtime that may take its time answering. The marker it
+        // emits arrives after this event, which is the order it happened in.
+        void this.endEscalation();
+      }
     }
     if (stamped.t === 'capabilities' && this.capabilities) {
       this.capabilities = { ...this.capabilities, ...stamped.capabilities };
@@ -2223,6 +2318,260 @@ export class ChatSession {
       this.pending.set(requestId, { request, resolve });
       this.ingest({ t: 'permission', request });
       this.setState('awaiting_permission');
+    });
+  }
+
+  /**
+   * The agent asking to answer this task from the next model up its ladder.
+   *
+   * Put to the user as an ordinary approval, because that is exactly what it
+   * is: the app gating the agent, with allow and deny the only two meanings an
+   * answer can have. It draws the card the browser already has, travels the
+   * message the browser already handles, and is recorded in the transcript with
+   * every other decision the conversation made — none of which a bespoke
+   * request type would have got for free.
+   *
+   * The grant lasts until the turn ends. See `escalation`.
+   */
+  private async requestTier(ask: TierAsk): Promise<TierReply> {
+    const ladder = this.ladder;
+    if (!ladder) {
+      return { granted: false, detail: 'this conversation is not running on a capability ladder.' };
+    }
+    // From the rung in force, not the rung it started on: two grants in one turn
+    // would otherwise both offer the same step up, and the second would look to
+    // the user like a request that had already been approved.
+    const from = this.escalation?.to ?? ladder.tier;
+    const next = nextRungUp({ tiers: ladder.tiers }, from);
+    if (!next) {
+      return {
+        granted: false,
+        detail:
+          `You are already on the ${from} rung, which is the highest one this profile fills in. `
+          + 'Carry on with the model you have.',
+      };
+    }
+
+    const reason = typeof ask.reason === 'string' ? ask.reason.trim() : '';
+    const granted = this.bypass
+      ? true
+      : await this.askEscalation(from, next.tier, next.model, reason);
+
+    if (!granted) {
+      return {
+        granted: false,
+        detail:
+          `The user did not approve moving up to the ${next.tier} rung. `
+          + 'Carry on with the model you have, and do not ask again this turn.',
+      };
+    }
+
+    const applied = await this.applyModel(next.model);
+    if (applied === 'no') {
+      // Nothing was changed, so nothing is claimed. A model told it moved up
+      // when it did not will attempt work it cannot do, and the user will be
+      // shown a rung the process was never on.
+      return {
+        granted: false,
+        detail:
+          `The user approved moving up to the ${next.tier} rung, but this runtime cannot change `
+          + 'its model without being restarted, so nothing moved. Carry on with the model you '
+          + 'have and say that the stronger one could not be reached.',
+      };
+    }
+
+    // A grant made while nothing is running belongs to the turn that has not
+    // started yet — the same case as a runtime that can only switch between
+    // turns, and it arises whenever a blocked tool call is abandoned while the
+    // card is still up.
+    const startsNextTurn = applied === 'next-turn' || this.state === 'idle';
+    this.escalation = { from, to: next.tier, model: next.model, startsNextTurn };
+    this.ingest({
+      t: 'marker',
+      kind: 'model',
+      detail: startsNextTurn
+        ? `moving up to the ${next.tier} rung for the next turn — ${next.model}`
+        : `moved up to the ${next.tier} rung — ${next.model}`,
+    });
+
+    return {
+      granted: true,
+      tier: next.tier,
+      model: next.model,
+      detail: startsNextTurn
+        ? `Approved. The ${next.tier} rung (${next.model}) takes effect on your next turn — the `
+          + 'model answering right now cannot be changed mid-turn. Finish or stop here, and the '
+          + `stronger model picks it up. The conversation returns to ${from} after that turn.`
+        : `Approved. You are now answering from the ${next.tier} rung (${next.model}). `
+          + `The conversation returns to ${from} when this turn ends.`,
+    };
+  }
+
+  /**
+   * Put a model in front of the agent, by whichever route its runtime has.
+   *
+   * Three answers, because there are three outcomes and collapsing them to a
+   * boolean is how the escalation came to promise a rung it never reached:
+   * `live` (the running process took it), `next-turn` (the runtime spawns per
+   * turn, so the next one will), and `no` (nothing changed).
+   */
+  private async applyModel(model: string): Promise<'live' | 'next-turn' | 'no'> {
+    const adapter = this.adapter;
+    if (!adapter?.alive) return 'no';
+    if (adapter.setModel) {
+      await adapter.setModel(model);
+      return 'live';
+    }
+    if (adapter.setModelNextTurn) {
+      adapter.setModelNextTurn(model);
+      return 'next-turn';
+    }
+    return 'no';
+  }
+
+  /**
+   * Put an escalation to the user and wait.
+   *
+   * Deliberately not routed through `askUser`: that one has a bypass short
+   * circuit and a tool-name exemption, neither of which means anything here, and
+   * the request has no tool call behind it to gate.
+   */
+  private askEscalation(
+    from: ModelTier,
+    to: ModelTier,
+    model: string,
+    reason: string,
+  ): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const requestId = `tier-${crypto.randomUUID()}`;
+      const request: PermissionRequest = {
+        requestId,
+        title: `Answer from the ${to} rung instead of ${from}?`,
+        toolKind: 'other',
+        input: { rung: to, model },
+        reason: reason || 'The agent gave no reason.',
+        // Two options, not the usual three. The standing "Allow for this
+        // session" would be a lie on the one control in the app that governs
+        // spending: a grant lasts one turn by design, so a user who clicked it
+        // believing the expensive model was authorised session-wide would have
+        // been told the opposite of the truth.
+        options: [
+          { optionId: 'allow_once', kind: 'allow_once', name: 'Allow, for this turn' },
+          { optionId: 'reject_once', kind: 'reject_once', name: 'Stay on this rung' },
+        ],
+        ts: Date.now(),
+      };
+      this.pending.set(requestId, {
+        request,
+        resolve: (answer) => resolve(answer.allow),
+      });
+      this.ingest({ t: 'permission', request });
+      this.setState('awaiting_permission');
+    });
+  }
+
+  /**
+   * The rung this conversation is actually on, or null when it is not on one.
+   *
+   * The escalated rung while an escalation is in force: what a browser joining
+   * mid-turn has to be told is what the process is answering from, not what it
+   * will go back to.
+   */
+  get ladderRung(): LadderRung | null {
+    if (!this.ladder || !this.live) return null;
+    const escalation = this.escalation;
+    if (escalation && !escalation.startsNextTurn) {
+      return { tier: escalation.to, model: escalation.model };
+    }
+    const model = this.ladder.tiers[this.ladder.tier];
+    return model ? { tier: this.ladder.tier, model } : null;
+  }
+
+  /**
+   * Move this conversation onto an edited ladder, mid-conversation.
+   *
+   * Returns false — meaning "not mine" — for a conversation that is not running
+   * on a rung: one pinned by a model somebody typed, or by an account's standing
+   * choice, was never the ladder's to decide and must not be re-modelled by an
+   * edit to it.
+   *
+   * The turn in progress is interrupted, which #171 asks for outright. It is
+   * destructive and deliberately so: the alternative is a conversation that goes
+   * on answering from the model the profile no longer names, for as long as the
+   * turn runs, with the settings page reporting the change as applied.
+   */
+  async reapplyLadder(
+    ladder: { tier: ModelTier; tiers: Partial<Record<ModelTier, string>> } | null,
+  ): Promise<boolean> {
+    if (!this.ladder) return false;
+
+    if (!ladder) {
+      // The ladder is gone — the profile was deleted, deactivated, or had its
+      // rungs cleared. Nothing to switch *to*: this conversation keeps the model
+      // it is on until it is relaunched, which is when the runtime's own default
+      // takes over. Said out loud rather than left to be discovered.
+      this.ladder = null;
+      this.escalation = null;
+      this.ingest({
+        t: 'marker',
+        kind: 'model',
+        detail: 'the ladder this conversation was on is gone; it keeps this model until relaunched',
+      });
+      return true;
+    }
+
+    const model = ladder.tiers[ladder.tier];
+    const unchanged = model
+      && !this.escalation
+      && this.ladder.tier === ladder.tier
+      && this.ladder.tiers[this.ladder.tier] === model;
+    this.ladder = ladder;
+    // Nothing the user would see. Interrupting a turn to change nothing is the
+    // worst possible reading of "takes effect immediately".
+    if (unchanged) return false;
+    if (!model) return false;
+
+    if (this.state !== 'idle') await this.interrupt().catch(() => undefined);
+    // Any escalation belonged to the ladder that has just been replaced.
+    this.escalation = null;
+    const applied = await this.applyModel(model).catch(() => 'no' as const);
+    this.ingest({
+      t: 'marker',
+      kind: 'model',
+      detail: applied === 'no'
+        // Said, not swallowed. The turn was cut short and the model did not
+        // change, which is the worst of both and the user is owed the reason.
+        ? `the profile changed to the ${ladder.tier} rung, ${model} — this runtime cannot take it `
+          + 'without a restart, so this conversation stays on its model until then'
+        : applied === 'next-turn'
+          ? `the profile changed — the next turn runs on the ${ladder.tier} rung, ${model}`
+          : `the profile changed — now on the ${ladder.tier} rung, ${model}`,
+    });
+    return applied !== 'no';
+  }
+
+  /**
+   * Put the conversation back on the rung it belongs to.
+   *
+   * Called when a turn ends, which is the whole lifetime of a grant. Failing to
+   * switch back is not treated as an error: the next turn's launch resolves the
+   * model again from the ladder, so the worst case is one extra turn at the
+   * higher rung rather than a conversation stranded there.
+   */
+  private async endEscalation(): Promise<void> {
+    const escalation = this.escalation;
+    const ladder = this.ladder;
+    if (!escalation || !ladder) return;
+    this.escalation = null;
+
+    const back = ladder.tiers[escalation.from];
+    const applied = back ? await this.applyModel(back).catch(() => 'no' as const) : 'no';
+    this.ingest({
+      t: 'marker',
+      kind: 'model',
+      detail: applied === 'no'
+        ? `the ${escalation.to} rung ends here; the next launch resolves the ladder again`
+        : `back on the ${escalation.from} rung — ${back}`,
     });
   }
 

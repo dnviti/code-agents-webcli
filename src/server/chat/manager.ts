@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { ChatSnapshot, UserTurn } from '../../shared/chat-events.js';
+import { LadderRung, ModelTier } from '../../shared/runtime-profiles.js';
 import { SessionRecord } from '../types.js';
 import { ChatNotRunningError, ChatSession, ChatSessionStartOptions, ChatUsageSink } from './session.js';
 import { ModelCapacityLookup } from './model-capacity.js';
@@ -303,6 +304,37 @@ export class ChatSessionManager {
   /** Carry a new model into the options an in-place `/clear` restart replays. */
   rememberModel(sessionId: string, model: string | undefined): void {
     this.sessions.get(sessionId)?.rememberModel(model);
+  }
+
+  /**
+   * The rung a running session is on, or null when it is not on one.
+   *
+   * Asked of the session rather than worked out from the profile, because the
+   * profile can have changed since the launch and a conversation that launched
+   * bare is indistinguishable from one on a rung by anything the record holds.
+   */
+  ladderOf(sessionId: string): LadderRung | null {
+    return this.sessions.get(sessionId)?.ladderRung ?? null;
+  }
+
+  /**
+   * Move a running conversation onto an edited ladder.
+   *
+   * Which sessions are on one is the session's own answer to give — the manager
+   * has no view of the profile a conversation launched under — so every live
+   * session on the runtime is offered the new ladder and the ones not running on
+   * a rung decline it.
+   */
+  async reapplyLadder(
+    runtime: string,
+    ladder: { tier: ModelTier; tiers: Partial<Record<ModelTier, string>> } | null,
+  ): Promise<string[]> {
+    const moved: string[] = [];
+    for (const [sessionId, session] of this.sessions) {
+      if (!session.live || session.runtimeKind !== runtime) continue;
+      if (await session.reapplyLadder(ladder)) moved.push(sessionId);
+    }
+    return moved;
   }
 
   /** Switch a live session's reasoning effort. False when nothing is running, or the adapter cannot. */

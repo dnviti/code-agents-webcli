@@ -340,7 +340,7 @@ The chip beside the composer both names the model in force and changes it. It
 always accepts a typed name as well as offering whatever the runtime published,
 because a model name can only be judged by trying it.
 
-Three things can decide the model a conversation opens on, and they are consulted
+Four things can decide the model a conversation opens on, and they are consulted
 in this order:
 
 | Layer | Set from | Applies to |
@@ -348,9 +348,13 @@ in this order:
 | **This conversation** | picking a model in the chip, or typing `/model <name>` | this conversation only, until it is cleared |
 | **Your standing choice** | the same pick — a model you choose is remembered for that agent | every **new** chat you open on that agent |
 | **The active runtime profile** | Settings → Runtime profiles, installer-only | every new chat on that agent, for everybody |
+| **The profile's ladder rung** | the same page: which rung **Runs on** names | every chat on that agent, for everybody — see [Which rung the conversation runs on](#which-rung-the-conversation-runs-on) |
 
-Below all three, the CLI is launched with no model flag at all and uses its own
+Below all four, the CLI is launched with no model flag at all and uses its own
 default.
+
+The chip names the rung beside the model when a ladder is what chose it, and the
+line above the list says which of the four layers it came from.
 
 **The picker says which of them is in force**, in a line above the list and on
 the chip's hover, so a model pinned by a profile is visible as a pin rather than
@@ -374,9 +378,17 @@ the model its launch actually used, and that is what it comes back on: a
 relaunch, a resume from the launcher and the recovery banner's restart all return
 to the model that conversation was already using — including across a server
 restart, which is the moment every open conversation gets relaunched. Changing
-your standing choice, or the active profile, affects the next new chat and
-nothing that is open, and a conversation that launched with no model flag at all
-keeps that answer too.
+your standing choice, or the active profile's **Model**, affects the next new
+chat and nothing that is open, and a conversation that launched with no model
+flag at all keeps that answer too.
+
+A **ladder rung is the exception**, and deliberately so: it is the profile's
+standing answer to "which model runs this conversation" rather than an unrelated
+edit, so a conversation running on a rung re-reads it on every launch and an
+edited ladder also reaches conversations that are already open. That exception is
+also what moves conversations older than the ladder onto it — all of them
+recorded "launched with no model flag", and honouring that would have meant the
+ladder never reached one of them.
 
 The chip names that recorded model rather than the default, which is the
 difference between describing this conversation and describing the next one. When
@@ -387,9 +399,11 @@ A **branch** opens on the model its source was actually running, for the same
 reason: the context estimate that decided whether the branch fits was measured
 against that model's window.
 
-Two deliberate omissions. A **terminal** session is unaffected: it runs the CLI's
-own interface, where the model is yours to change inside the tool and nothing
-here could keep a preference in step with it. And the **launcher screen** — the
+Two deliberate omissions. A **terminal** session takes no standing choice: it
+runs the CLI's own interface, where the model is yours to change inside the tool
+and nothing here could keep a preference in step with it. (A profile's model and
+its ladder rung *are* applied at launch — that is the one thing decided before
+the interface exists.) And the **launcher screen** — the
 one before a chat has started — has no model control, so the source line is only
 readable once the conversation is open.
 
@@ -755,7 +769,7 @@ is tied to a vendor: a model is an opaque string passed through untouched, so
 anything your CLI accepts — a hosted model, a gateway id, a local endpoint —
 works.
 
-A profile targets one runtime and carries four things, all optional:
+A profile targets one runtime and carries five things, all optional:
 
 | Field | What it does |
 | --- | --- |
@@ -763,6 +777,7 @@ A profile targets one runtime and carries four things, all optional:
 | **Extra arguments** | Appended after the app's own flags, so they win on CLIs where the last flag wins |
 | **Environment** | Injected into the spawned process |
 | **Capability tiers** | `floor` / `mid` / `high` / `top`, written into the runtime's own config |
+| **Runs on** | Which of those four rungs the conversation itself answers from. Defaults to `mid` — see [Which rung the conversation runs on](#which-rung-the-conversation-runs-on) |
 
 Pick which profile is active per runtime; **None** launches the CLI exactly as a
 shell would.
@@ -821,22 +836,93 @@ Only runtimes that can delegate to sub-agents have somewhere to put these:
 Every other runtime says so in the UI rather than accepting values that would go
 nowhere.
 
-**Neither writer touches your own configuration.** For pi that is worth spelling
-out, because the obvious place to write — `~/.pi/agent/agents/` — is exactly
-where a hand-written ladder lives, and there is no flag to point pi elsewhere. So
-the app uses pi's own precedence instead: agents resolve from `~/.claude/agents`,
-then `~/.pi/agent/agents`, then the project's `.claude/agents`, then the
-project's `.pi/agents`, with later directories winning on name conflicts.
-Writing into the session's project means the app's tiers **override** yours for
-that session while your files stay byte-for-byte intact, keep applying to every
-pi session you run outside this app, and any agent the app does not define — a
-`planner`, a `reviewer` — still loads from your directory.
+For pi, the *location* is worth spelling out. The obvious place to write —
+`~/.pi/agent/agents/` — is exactly where a hand-written ladder lives, and there
+is no flag to point pi elsewhere. So the app uses pi's own precedence instead:
+agents resolve from `~/.claude/agents`, then `~/.pi/agent/agents`, then the
+project's `.claude/agents`, then the project's `.pi/agents`, with later
+directories winning on name conflicts. Writing into the session's project means
+the app's tiers override yours *for that session* while your home directory
+stays byte-for-byte intact, keeps applying to every pi session you run outside
+this app, and any agent the app does not define — a `planner`, a `reviewer` —
+still loads from there.
 
-Two safety rules: generated files carry a `managed-by: code-agents-webcli`
-marker, and **a file without that marker is never overwritten** — if a project
-already has its own `.pi/agents/mid.md`, the app leaves it alone and tells you
-it did. And the generated directory carries its own `.gitignore`, so it never
-shows up in `git status`.
+The generated directory carries its own `.gitignore`, so it never shows up in
+`git status`.
+
+### Which rung the conversation runs on
+
+The four rungs above configure the helpers an agent delegates to. **Runs on**
+names the rung the conversation *itself* answers from — the model that replies
+to what you type. It defaults to `mid`.
+
+That rung's model is used unless something outranks it. In order:
+
+1. A model you picked in this conversation.
+2. Your standing model for that runtime — what you last picked and kept.
+3. A model typed into the profile's **Model** box.
+4. **The rung.**
+5. The runtime's own default, if the ladder cannot answer.
+
+Where a ladder is configured and one of the first three is deciding instead, the
+profile says so rather than letting a filled-in ladder look like a working one.
+Every conversation names the model it is on, the rung that model sits on, and
+which of those five supplied it.
+
+If the rung you chose is blank, the nearest filled one is used — downwards when
+two are equally near, because a ladder that cannot answer should not answer
+expensively. If a provider refuses the rung's model, the session starts on the
+runtime's own default and says so; it is then not on a rung at all, so there is
+no rung to move up from either. If the ladder cannot be written through at all,
+the session still starts, and the header says the ladder was not applied. Either
+way the reason stays on screen for the rest of the conversation, on every screen
+watching it rather than only the one that started it.
+
+A ladder decides on the **first launch after upgrading**: nothing has to be
+re-ticked or re-saved, and conversations that predate this move onto it when
+they are next relaunched. Saving a profile also reaches conversations that are
+already open, interrupting a turn in progress — only the ones actually running
+on the rung, and only when the rung has changed.
+
+Terminal sessions started from the app run on the ladder in the same way.
+Escalation, below, is a conversation asking you a question, so it is chat only:
+a terminal runs the CLI's own interface, which this app has no channel into.
+
+### Moving up a rung
+
+An agent that meets work beyond the model it is on can ask to answer from the
+next rung up. The request reaches you as an ordinary approval, with the agent's
+own one-line reason, and nothing moves until you allow it. Once the turn that
+prompted it ends, the conversation goes back to its usual rung — a task that
+spans turns asks again, which keeps the approval the real control on what this
+spends.
+
+**In a conversation with approvals bypassed, the move happens without asking**,
+along with everything else that mode stops asking about.
+
+Runtimes that take an MCP server get the tool that way. pi has no MCP support at
+all, so it gets the same tool as a generated extension in the session's
+`.pi/ccweb/`, loaded with `-e`. Where a runtime cannot change model mid-turn —
+pi runs one process per turn — the agent is told the stronger model picks up on
+its next turn, rather than being told it is already on it.
+
+### The profile wins
+
+**A runtime configuration file this app manages is replaced, even if you wrote
+it.** Earlier versions did the opposite: a file without the
+`managed-by: code-agents-webcli` marker was left alone and the tier was reported
+as not applied. That was reversed deliberately. A ladder that decides which model
+answers every turn, silently doing nothing because of a file left in a project a
+year ago, is a worse failure than an overwrite.
+
+So: the profile is the single source of truth for the runtimes it covers. What
+was there is copied once to `<file>.bak` beside it and the replacement is
+reported in the dialog, but **nothing in the app restores it** — if you maintain
+a ladder outside this app for use outside this app, keep it somewhere the app
+does not write, which for pi means your home directory rather than the project.
+
+Escalation also spends real money on a more expensive model. The approval step is
+the control on that.
 
 ## Working directories
 

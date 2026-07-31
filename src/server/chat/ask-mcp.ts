@@ -28,7 +28,16 @@
 
 import * as net from 'net';
 import { createInterface } from 'readline';
-import { ASK_MCP_SERVER, ASK_QUESTION_TOOL } from '../../shared/chat-events.js';
+import { ASK_MCP_SERVER, ASK_QUESTION_TOOL, TIER_TOOL } from '../../shared/chat-events.js';
+
+/**
+ * Whether this server should offer the ladder tool at all.
+ *
+ * Set by the session at spawn, and only for a conversation actually running on
+ * a rung. An env var rather than an argument because the runtime composes the
+ * argv, not us — the same reason the socket path arrives this way.
+ */
+export const TIER_ENABLED_ENV = 'CCWEB_TIER_LADDER';
 
 /** What the browser sends back once someone has answered. */
 export interface QuestionAnswer {
@@ -118,17 +127,57 @@ export const ASK_TOOL_DEFINITION = {
   },
 } as const;
 
+/** What the session sends back once a rung request has been decided. */
+export interface TierDecision {
+  granted: boolean;
+  tier?: string;
+  model?: string;
+  detail: string;
+}
+
+/**
+ * The escalation tool, as the model sees it.
+ *
+ * The description carries the cost, because that is the whole judgement being
+ * asked for: a model that reaches for this on every turn turns a ladder built to
+ * control spending into a ladder that only ever runs at the top.
+ */
+export const TIER_TOOL_DEFINITION = {
+  name: TIER_TOOL,
+  description:
+    'Ask to answer this task from the next model up your capability ladder, and wait for the ' +
+    'user to approve. Use it only when the work in front of you is genuinely beyond the model ' +
+    'you are on — subtle debugging, ambiguous architecture, security-sensitive logic, review of ' +
+    'code that matters — and not for work that is merely long or tedious. The stronger model ' +
+    'costs the user real money, they are asked before it is used, and the conversation returns ' +
+    'to its usual rung once this turn ends. This call blocks until they decide. If it is ' +
+    'refused, carry on with the model you have rather than asking again.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      reason: {
+        type: 'string',
+        description:
+          'One sentence on what makes this task too hard for the model you are on. The user ' +
+          'reads this and nothing else before deciding, so name the specific difficulty.',
+      },
+    },
+    required: ['reason'],
+  },
+} as const;
+
 /**
  * The client half of the session socket.
  *
- * One connection, reopened if it drops. A question is matched to its reply by
- * id because the socket is per-session rather than per-call, and a model that
- * asks two things in one turn would otherwise read the wrong answer.
+ * One connection, reopened if it drops. A call is matched to its reply by id
+ * because the socket is per-session rather than per-call, and a model that asks
+ * two things in one turn would otherwise read the wrong answer.
  */
 class AskChannel {
   private socket: net.Socket | null = null;
   private nextId = 0;
   private readonly waiting = new Map<string, (answer: QuestionAnswer) => void>();
+  private readonly waitingTier = new Map<string, (decision: TierDecision) => void>();
 
   constructor(private readonly socketPath: string) {}
 
@@ -146,6 +195,29 @@ class AskChannel {
       this.waiting.set(id, resolve);
       const write = (): void => {
         socket.write(`${JSON.stringify({ id, kind: 'question', question })}\n`);
+      };
+      if (socket.pending) {
+        socket.once('connect', write);
+      } else {
+        write();
+      }
+    });
+  }
+
+  requestTier(reason: unknown): Promise<TierDecision> {
+    return new Promise((resolve) => {
+      const id = `tier-${process.pid}-${(this.nextId += 1)}`;
+      let socket: net.Socket;
+      try {
+        socket = this.connect();
+      } catch (error: unknown) {
+        resolve({ granted: false, detail: describe(error) });
+        return;
+      }
+
+      this.waitingTier.set(id, resolve);
+      const write = (): void => {
+        socket.write(`${JSON.stringify({ id, kind: 'tier', tier: { reason } })}\n`);
       };
       if (socket.pending) {
         socket.once('connect', write);
@@ -182,10 +254,26 @@ class AskChannel {
         } catch {
           continue;
         }
-        // Approval traffic shares this socket; anything not addressed to a
-        // question we asked belongs to the hook and is not ours to consume.
-        const pending = reply.id ? this.waiting.get(reply.id) : undefined;
-        if (!pending || !reply.id) continue;
+        if (!reply.id) continue;
+
+        // Three kinds of traffic share this socket, and each id is minted by
+        // whichever map is waiting on it — so an id in neither belongs to the
+        // approval hook and is not ours to consume.
+        const pendingTier = this.waitingTier.get(reply.id);
+        if (pendingTier) {
+          this.waitingTier.delete(reply.id);
+          const decision = reply as unknown as Partial<TierDecision>;
+          pendingTier({
+            granted: decision.granted === true,
+            tier: typeof decision.tier === 'string' ? decision.tier : undefined,
+            model: typeof decision.model === 'string' ? decision.model : undefined,
+            detail: typeof decision.detail === 'string' ? decision.detail : 'no answer was given',
+          });
+          continue;
+        }
+
+        const pending = this.waiting.get(reply.id);
+        if (!pending) continue;
         this.waiting.delete(reply.id);
         pending({
           labels: Array.isArray(reply.labels) ? reply.labels.map(String) : [],
@@ -203,6 +291,10 @@ class AskChannel {
       for (const [id, resolve] of this.waiting) {
         this.waiting.delete(id);
         resolve({ labels: [], error: reason });
+      }
+      for (const [id, resolve] of this.waitingTier) {
+        this.waitingTier.delete(id);
+        resolve({ granted: false, detail: reason });
       }
     };
     socket.on('error', () => fail('the browser could not be reached to ask this question'));
@@ -273,6 +365,11 @@ export function serveAsk(
   input: NodeJS.ReadableStream,
   output: NodeJS.WritableStream,
   ask: (question: unknown) => Promise<QuestionAnswer>,
+  // Optional so a runtime whose session has no ladder simply never advertises
+  // the tool: an escalation the app cannot grant is worse than one the model
+  // never knew about, because the refusal costs a round trip and reads to the
+  // model as the user saying no.
+  requestTier?: (reason: unknown) => Promise<TierDecision>,
 ): void {
   const send = (message: unknown): void => {
     output.write(`${JSON.stringify(message)}\n`);
@@ -306,19 +403,40 @@ export function serveAsk(
     }
 
     if (method === 'tools/list') {
-      send({ jsonrpc: '2.0', id, result: { tools: [ASK_TOOL_DEFINITION] } });
+      const tools = requestTier
+        ? [ASK_TOOL_DEFINITION, TIER_TOOL_DEFINITION]
+        : [ASK_TOOL_DEFINITION];
+      send({ jsonrpc: '2.0', id, result: { tools } });
       return;
     }
 
     if (method === 'tools/call') {
-      if (params?.name !== ASK_QUESTION_TOOL) {
-        send({ jsonrpc: '2.0', id, error: { code: -32601, message: `no tool named ${String(params?.name)}` } });
+      if (params?.name === ASK_QUESTION_TOOL) {
+        void ask(params?.arguments).then((answer) => {
+          const { text, isError } = describeAnswer(answer);
+          send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError } });
+        });
         return;
       }
-      void ask(params?.arguments).then((answer) => {
-        const { text, isError } = describeAnswer(answer);
-        send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError } });
-      });
+      if (params?.name === TIER_TOOL && requestTier) {
+        const reason = (params?.arguments as { reason?: unknown } | undefined)?.reason;
+        void requestTier(reason).then((decision) => {
+          send({
+            jsonrpc: '2.0',
+            id,
+            result: {
+              content: [{ type: 'text', text: decision.detail }],
+              // Never an error result, even refused. A refusal is an answer the
+              // model is meant to act on — carry on at the rung you are on —
+              // and marking it an error invites a retry of the one call whose
+              // whole cost is asking a person again.
+              isError: false,
+            },
+          });
+        });
+        return;
+      }
+      send({ jsonrpc: '2.0', id, error: { code: -32601, message: `no tool named ${String(params?.name)}` } });
       return;
     }
 
@@ -349,13 +467,17 @@ export function askMcpConfig(
   // mounts under different paths, and this host's node binary is not there at
   // all. The caller translates; the default is the host.
   nodePath: string = process.execPath,
+  laddered = false,
 ): string {
   return JSON.stringify({
     mcpServers: {
       [ASK_MCP_SERVER]: {
         command: nodePath,
         args: [serverScript],
-        env: { [ASK_SOCKET_ENV]: socketPath },
+        env: {
+          [ASK_SOCKET_ENV]: socketPath,
+          ...(laddered ? { [TIER_ENABLED_ENV]: '1' } : {}),
+        },
       },
     },
   });
@@ -364,10 +486,15 @@ export function askMcpConfig(
 function main(): void {
   const socketPath = process.env[ASK_SOCKET_ENV];
   const channel = socketPath ? new AskChannel(socketPath) : null;
-  serveAsk(process.stdin, process.stdout, (question) =>
-    channel
-      ? channel.ask(question)
-      : Promise.resolve({ labels: [], error: 'this session has no channel to the browser' }),
+  const laddered = process.env[TIER_ENABLED_ENV] === '1';
+  serveAsk(
+    process.stdin,
+    process.stdout,
+    (question) =>
+      channel
+        ? channel.ask(question)
+        : Promise.resolve({ labels: [], error: 'this session has no channel to the browser' }),
+    laddered && channel ? (reason) => channel.requestTier(reason) : undefined,
   );
 }
 
