@@ -145,7 +145,8 @@
   on, and which of those chose it. A blank rung falls to the nearest filled one,
   downwards when two are equally near. A rung a provider refuses falls back to
   the runtime's own default and carries on; a ladder that cannot be applied at
-  all still starts the session, and says so in the header.
+  all still starts the session, and says so in the header — and keeps saying so
+  on every screen watching that conversation, not only the one that started it.
 
   Ladders you have already saved start deciding on the first launch after
   upgrading — nothing to re-tick — and conversations older than this move onto

@@ -97,7 +97,12 @@ function build(options = {}) {
         pendingPermissions: [],
         firstSeq: 0,
         cursor: 0,
-        live: true,
+        // Whether a process is answering right now, which is the session's own
+        // answer and not the record's flag. The two disagree in both directions
+        // — an adapter that died through its error path never reports `exited`,
+        // so the record still says active — which is why a test can set them
+        // apart here.
+        live: options.live ?? true,
         bypassPermissions: false,
       };
     },
@@ -301,6 +306,26 @@ describe('a rung the provider will not serve', function () {
     assert.match(started.ladderError, /would not start/);
   });
 
+  it('does not leave the conversation on the rung it was refused', async function () {
+    // The retry used to be launched while the origin still said 'ladder', so
+    // the session was handed the ladder anyway: `ladderOf` then reported the
+    // refused rung to every browser that rejoined — contradicting the launch,
+    // which had just said the opposite — and the escalation tool was offered
+    // from a rung nobody was on.
+    const { processor, calls, session } = build({
+      profile: ladderProfile({ tiers: { mid: 'gateway/mid-model', high: 'gateway/high-model' } }),
+      refuseModel: 'gateway/mid-model',
+    });
+
+    await processor.startChat('ws-1', 'pi', {});
+
+    assert.deepStrictEqual(calls.start.map((c) => c.options.ladder), [
+      { tier: 'mid', tiers: { mid: 'gateway/mid-model', high: 'gateway/high-model' } },
+      undefined,
+    ]);
+    assert.strictEqual(session.chatModelPinned, null);
+  });
+
   it('does not retry a model somebody typed in themselves', async function () {
     // A typed model is a request to make. Quietly starting on a different one
     // answers their question wrongly rather than not at all.
@@ -342,10 +367,12 @@ describe('a browser rejoining a laddered conversation', function () {
     // A conversation that launched bare records the same null pin as one on a
     // rung. Reading the profile's current rung for it would name a model the
     // process is not running — the exact failure #135 introduced this field to
-    // remove.
+    // remove. Running, so the null pin is unambiguous: this process really did
+    // start with no model flag.
     const { processor, session, sent, ws } = build({ profile: ladderProfile() });
     session.surface = 'chat';
     session.agent = 'pi';
+    session.active = true;
     session.chatModelPinned = null;
 
     await processor.subscribeChat(
@@ -356,6 +383,84 @@ describe('a browser rejoining a laddered conversation', function () {
     const snapshot = lastOfType(sent, 'chat_snapshot');
     assert.strictEqual(snapshot.modelOrigin.source, 'runtime');
     assert.strictEqual(snapshot.modelOrigin.model, null);
+  });
+
+  it('claims no model at all for a conversation that has stopped', async function () {
+    // The same null pin, read after the process is gone — a reload, or a tab
+    // opened on a conversation that ended. A laddered conversation records
+    // exactly this pin, so answering "the runtime's own default" here names a
+    // model it was not on and will not be on when it is relaunched. Nothing is
+    // in force while nothing is running, and that is what goes out.
+    const { processor, session, sent, ws } = build({ profile: ladderProfile(), live: false });
+    session.surface = 'chat';
+    session.agent = 'pi';
+    session.chatModelPinned = null;
+
+    await processor.subscribeChat(
+      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
+      session.id,
+    );
+
+    assert.strictEqual(lastOfType(sent, 'chat_snapshot').modelOrigin, null);
+  });
+
+  it('asks the conversation whether it is running, not the record', async function () {
+    // The record is marked active and the process is gone: an adapter that dies
+    // through its error path emits `error`, never `exited`, so nothing ever
+    // corrects the flag the launch set. Reading it here would put the very
+    // sentence this gate exists to remove back on screen.
+    const { processor, session, sent, ws } = build({ profile: ladderProfile(), live: false });
+    session.surface = 'chat';
+    session.agent = 'pi';
+    session.active = true;
+    session.chatModelPinned = null;
+
+    await processor.subscribeChat(
+      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
+      session.id,
+    );
+
+    assert.strictEqual(lastOfType(sent, 'chat_snapshot').modelOrigin, null);
+  });
+
+  it('and answers for a conversation the record has already given up on', async function () {
+    // The other direction, which codex produces on every fallback launch: the
+    // abandoned handshake probe reports an exit into a session whose fallback
+    // is answering normally. The conversation really is on the runtime's own
+    // default and should say so.
+    const { processor, session, sent, ws } = build({ profile: ladderProfile(), live: true });
+    session.surface = 'chat';
+    session.agent = 'pi';
+    session.active = false;
+    session.chatModelPinned = null;
+
+    await processor.subscribeChat(
+      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
+      session.id,
+    );
+
+    assert.strictEqual(lastOfType(sent, 'chat_snapshot').modelOrigin.source, 'runtime');
+  });
+
+  it('still answers for a stopped conversation the record can speak for', async function () {
+    // A pin and an override are not guesses: one is the model this conversation
+    // launched on, the other the model somebody chose for it, and both survive
+    // the process to decide its next launch.
+    const { processor, session, sent, ws } = build({ profile: ladderProfile(), live: false });
+    session.surface = 'chat';
+    session.agent = 'pi';
+    session.chatModelPinned = 'launched/on-this';
+
+    await processor.subscribeChat(
+      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
+      session.id,
+    );
+
+    const snapshot = lastOfType(sent, 'chat_snapshot');
+    assert.deepStrictEqual(snapshot.modelOrigin, {
+      model: 'launched/on-this',
+      source: 'override',
+    });
   });
 
   it('is told the rung, not just the model', async function () {
@@ -376,5 +481,110 @@ describe('a browser rejoining a laddered conversation', function () {
     assert.strictEqual(snapshot.modelOrigin.source, 'ladder');
     assert.strictEqual(snapshot.modelOrigin.tier, 'mid');
     assert.strictEqual(snapshot.modelOrigin.model, 'gateway/mid-model');
+  });
+
+  it('keeps the explanation for a rung it fell to', async function () {
+    // The launch says "mid is blank, so the nearest filled rung answered"; the
+    // running session knows only which rung it is on, so without the profile's
+    // half of it the parenthetical survives exactly one screen.
+    const { processor, session, sent, ws } = build({
+      profile: ladderProfile({ ladder: { tier: 'high', model: 'h', requested: 'mid' } }),
+      runningLadder: { tier: 'high', model: 'h' },
+    });
+    session.surface = 'chat';
+    session.agent = 'pi';
+    session.chatModelPinned = null;
+
+    await processor.subscribeChat(
+      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
+      session.id,
+    );
+
+    const origin = lastOfType(sent, 'chat_snapshot').modelOrigin;
+    assert.strictEqual(origin.tier, 'high');
+    assert.strictEqual(origin.requestedTier, 'mid');
+  });
+
+  it('does not carry that explanation onto a rung the conversation has moved to', async function () {
+    // An escalation, or a ladder edited under a live conversation: the rung the
+    // profile fell to is not the rung being answered from, so the reason it
+    // fell has nothing to say about it.
+    const { processor, session, sent, ws } = build({
+      profile: ladderProfile({ ladder: { tier: 'high', model: 'h', requested: 'mid' } }),
+      runningLadder: { tier: 'top', model: 't' },
+    });
+    session.surface = 'chat';
+    session.agent = 'pi';
+    session.chatModelPinned = null;
+
+    await processor.subscribeChat(
+      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
+      session.id,
+    );
+
+    const origin = lastOfType(sent, 'chat_snapshot').modelOrigin;
+    assert.strictEqual(origin.tier, 'top');
+    assert.strictEqual(origin.requestedTier, undefined);
+  });
+
+  it('repeats why the ladder is not applied, which only the launch was told', async function () {
+    // The badge said so once, to the tab that watched it start. Every other
+    // screen — a reload, a reconnect, a second tab — arrives at a snapshot, and
+    // the client zeroes the field on each one, so a snapshot that stayed silent
+    // took the warning down while the ladder was still not applied.
+    const { processor, session, sent, ws } = build({
+      profile: ladderProfile(),
+      refuseModel: 'gateway/mid-model',
+    });
+
+    await processor.startChat('ws-1', 'pi', {});
+    await processor.subscribeChat(
+      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
+      session.id,
+    );
+
+    assert.match(lastOfType(sent, 'chat_snapshot').ladderError, /would not start/);
+  });
+
+  it('does not hand a conversation a failure that is not its own', async function () {
+    // It launched cleanly; the profile has failed to write its tier files
+    // since. The conversation is running on the rung it resolved then, and a
+    // badge saying its ladder was not applied would be describing somebody
+    // else's next launch.
+    const { processor, session, sent, ws } = build({ profile: ladderProfile() });
+
+    await processor.startChat('ws-1', 'pi', {});
+    processor.deps.activeProfileFor = () =>
+      ladderProfile({ ladderError: 'the ladder could not be written to disk (EROFS)' });
+    await processor.subscribeChat(
+      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
+      session.id,
+    );
+
+    assert.strictEqual(lastOfType(sent, 'chat_snapshot').ladderError, null);
+  });
+
+  it('repeats a ladder that could not be written through, from the profile', async function () {
+    // This half outlives the process: the profile still cannot write its tier
+    // files, so a conversation that has since stopped explains itself from the
+    // profile rather than from a record that never held a launch failure.
+    const { processor, session, sent, ws } = build({
+      profile: {
+        profileId: 'p1',
+        profileName: 'Economy',
+        ladder: null,
+        ladderError: 'the ladder could not be written to disk (EROFS)',
+      },
+      live: false,
+    });
+    session.surface = 'chat';
+    session.agent = 'pi';
+
+    await processor.subscribeChat(
+      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
+      session.id,
+    );
+
+    assert.match(lastOfType(sent, 'chat_snapshot').ladderError, /could not be written/);
   });
 });

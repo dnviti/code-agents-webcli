@@ -1578,7 +1578,7 @@ function describeModelDefault(fallback: ChatModelDefault): string {
  * two are routinely different and stating either as the other is the whole of
  * #135.
  */
-function describeModelOriginLine(origin: ChatModelOrigin): string | null {
+function describeModelOriginLine(origin: ChatModelOrigin, chosen: boolean): string | null {
   if (!origin.model) {
     return origin.source === 'runtime' ? 'Running on this runtime’s own default.' : null;
   }
@@ -1597,7 +1597,16 @@ function describeModelOriginLine(origin: ChatModelOrigin): string | null {
     case 'personal':
       return 'Running on your standing choice for this runtime.';
     case 'override':
-      return 'Chosen for this conversation only.';
+      // Two different facts arrive under this one source, and only one of them
+      // is a choice. A conversation that has an override in force was told to
+      // run this model and can be told to stop; a conversation that merely
+      // *launched* on one is fixed to it because that is what it started with —
+      // a profile's model, an account's standing choice, or a branch's source —
+      // and calling that "chosen" credits the user with a decision they never
+      // made, next to a Clear that would not undo it.
+      return chosen
+        ? 'Chosen for this conversation only.'
+        : `Staying on ${origin.model}, the model it launched on.`;
     default:
       return 'Running on this runtime’s own default.';
   }
@@ -1767,7 +1776,7 @@ function ModelChip({
   // The origin answers "why is this conversation on this model" outright, so it
   // replaces the inference `staysOn` was making from a mismatch. A server that
   // predates it sends nothing and the older wording still applies.
-  const inForce = origin ? describeModelOriginLine(origin) : staysOn;
+  const inForce = origin ? describeModelOriginLine(origin, Boolean(override)) : staysOn;
   const sourceLine = !fallback
     ? inForce
     : override

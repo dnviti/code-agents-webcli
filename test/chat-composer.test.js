@@ -588,6 +588,40 @@ describe('Composer', function () {
         assert.ok(!html.includes('Staying on'), html.match(/title="Model[^"]*"/)?.[0] || 'no title');
       });
 
+      // A pin and a choice arrive under the same origin source, because the
+      // record cannot tell a model apart by where it came from once a
+      // conversation is fixed to it. Only one of them is something the user
+      // said, and the sentence has to be the one that is true — the picker
+      // "must not describe it as a choice" is the pin field's own rule.
+      it('does not call a model the conversation launched on a choice', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'from/the-profile',
+          modelOrigin: { model: 'from/the-profile', source: 'override' },
+          modelDefault: { model: 'something/else', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(
+          html.includes('Staying on from/the-profile, the model it launched on.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+        assert.ok(
+          !html.includes('Chosen for this conversation only'),
+          'nobody chose it, and there is nothing here to clear',
+        );
+      });
+
+      it('still calls a model the user picked a choice', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelOverride: 'picked/in-this-chat',
+          modelOrigin: { model: 'picked/in-this-chat', source: 'override' },
+        });
+        assert.ok(
+          html.includes('Chosen for this conversation only.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
       // Version skew: a server that predates this says nothing, and the control
       // has to read exactly as it shipped rather than assert a source.
       it('renders exactly as before against a server that says nothing', function () {

@@ -39,7 +39,18 @@ function ladderOf(
   profile: ResolvedProfile | null,
 ): ChatModelOrigin | null {
   const rung = manager.ladderOf?.(sessionId);
-  return rung ? ladderOrigin(rung, profile) : null;
+  if (!rung) return null;
+  // Which rung is running is the session's to answer; which rung was *asked
+  // for* is only ever the profile's, because falling to the nearest filled one
+  // happens while the profile is being resolved and the session is handed the
+  // answer rather than the question. Grafted on only while the two still
+  // describe the same resolution, so a conversation moved to another rung since
+  // does not inherit an explanation that belongs to a rung it left.
+  const requested =
+    profile?.ladder?.requested && profile.ladder.tier === rung.tier
+      ? profile.ladder.requested
+      : undefined;
+  return ladderOrigin(requested ? { ...rung, requested } : rung, profile);
 }
 
 /** One rung, told as an origin — the same three facts, said the way the UI reads them. */
@@ -225,7 +236,14 @@ export interface ChatManagerLike {
       ladder?: { tier: ModelTier; tiers: Partial<Record<ModelTier, string>> };
     },
   ): Promise<{ runtimeKind: string; currentCapabilities: unknown; bypassing: boolean }>;
-  snapshot(record: SessionRecord): Promise<unknown>;
+  /**
+   * The transcript, forwarded whole. `live` is the one field this layer reads
+   * for itself — whether a process is answering right now — because a join has
+   * to say what is in force and the record's own `active` flag is not the same
+   * question: it survives an adapter that died through its error path, and it
+   * is cleared by a probe abandoned in favour of a fallback that is running.
+   */
+  snapshot(record: SessionRecord): Promise<{ live?: boolean }>;
   send(sessionId: string, turn: { text: string; attachments?: unknown[] }): Promise<void>;
   interrupt(sessionId: string): Promise<void>;
   /** Switch a live session's model. False when nothing is running, or the adapter cannot. */
@@ -1606,12 +1624,19 @@ export class MessageProcessor {
         if (modelOrigin.source !== 'ladder') throw error;
         const message = error instanceof Error ? error.message : String(error);
         console.warn(`runtime profiles: ${agentKind} refused ${launchModel}: ${message}`);
-        chat = await startWith(undefined);
+        // Corrected *before* the retry, not after it. `startWith` reads the
+        // origin to decide whether to install the ladder on the session, so a
+        // retry launched while it still said 'ladder' put the conversation on a
+        // rung it had just been refused: the escalation tool would be offered
+        // from a rung nobody is on, and a browser rejoining would be told by
+        // `ladderOf` that it is running the very model the provider would not
+        // serve — contradicting the launch, which said the opposite.
         launchModel = undefined;
         modelOrigin = { model: null, source: 'runtime' };
         ladderError =
           `${agentKind} would not start on the ${profile?.ladder?.tier} rung’s model `
           + `(${message.trim()}), so this conversation is on its own default instead.`;
+        chat = await startWith(undefined);
       }
 
       session.active = true;
@@ -1643,6 +1668,12 @@ export class MessageProcessor {
       // `null` leaves the rung to be re-read on every relaunch, which is the
       // same thing one restart later.
       session.chatModelPinned = modelOrigin.source === 'ladder' ? null : launchModel ?? null;
+      // Beside it, and for the same reason: the browser that asked for the
+      // launch is told this in `chat_started`, and every other screen — a
+      // reload, a reconnect, a second tab — arrives at a `chat_snapshot`
+      // instead. Without it on the record the badge saying the ladder is not
+      // applied lasts exactly as long as the tab that watched it start.
+      session.chatLadderError = ladderError;
 
       // Before the broadcast, so the socket that asked for the launch is
       // already a watcher when the very first event goes out.
@@ -1767,14 +1798,43 @@ export class MessageProcessor {
         // the profile's current rung here would draw the chip as running a model
         // the process is not on. A session that is not running has no rung in
         // force to report, and says nothing rather than guessing one.
+        //
+        // Which is why the last branch is gated on the conversation being live.
+        // A null pin says "launched with no model flag" and nothing more: under
+        // a ladder that is what a rung records, so the two are indistinguishable
+        // once the process is gone. While it runs they are not — a rung answers
+        // through `ladderOf` above and never reaches here — but a stopped
+        // laddered conversation would otherwise be announced as running on the
+        // runtime's own default, which is a different model from the one it was
+        // on and from the one its next launch will use. A conversation whose
+        // model was chosen, or which is pinned to one, is still answered for
+        // when it is not running: those are facts the record holds outright.
+        //
+        // The snapshot's own liveness, not `session.active`. They disagree in
+        // both directions and the snapshot is the half that agrees with
+        // `ladderOf`, since both read the chat session: a process that died
+        // through the adapter's error path never reports `exited`, so the
+        // record still calls it active, and codex's abandoned handshake probe
+        // reports one for a conversation whose fallback is running fine.
         modelOrigin: ladderOf(manager, sessionId, active)
           ?? (session.chatModelOverride
             ? { model: session.chatModelOverride, source: 'override' }
             : session.chatModelPinned
               ? { model: session.chatModelPinned, source: 'override' }
-              : session.chatModelPinned === null
+              : session.chatModelPinned === null && snapshot.live
                 ? { model: null, source: 'runtime' }
                 : null),
+        // The same answer the launch gave, for a screen that was not there for
+        // it. A conversation that has launched under this server speaks for
+        // itself — including when it has nothing to report, which is why this
+        // tests for `undefined` rather than falsiness: a clean launch under a
+        // profile that has failed to write since must not inherit a failure
+        // that was not its own. One that has not launched here falls back to
+        // the profile, which is the same answer its next launch would give.
+        ladderError:
+          session.chatLadderError !== undefined
+            ? session.chatLadderError
+            : active?.ladderError ?? null,
         // Rides on the join for the same reason the model does: the snapshot
         // carries the runtime's own reported level only if it ever reported one,
         // and a conversation whose process has since died reports nothing at

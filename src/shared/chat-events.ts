@@ -891,51 +891,6 @@ export interface ChatModelOrigin {
 }
 
 /**
- * Work out where the model a conversation launched on actually came from.
- *
- * By identity against each layer that could have supplied it, rather than by
- * re-running the precedence chain: the chain already ran, and a second copy of
- * it in a different file is a second thing to keep in step. Comparing the answer
- * to the candidates cannot drift from the decision it is describing.
- *
- * Order matters where two layers hold the same string — an account default
- * equal to the profile's model is common, and the higher layer is the one that
- * decided.
- */
-export function describeModelOrigin(
-  model: string | undefined,
-  from: {
-    override?: string;
-    personal?: string | null;
-    profile?: ResolvedProfile | null;
-  },
-): ChatModelOrigin {
-  if (!model) return { model: null, source: 'runtime' };
-  if (from.override && from.override === model) return { model, source: 'override' };
-  if (from.personal && from.personal === model) return { model, source: 'personal' };
-
-  const profile = from.profile;
-  if (profile?.model === model) {
-    return { model, source: 'profile', profileName: profile.profileName };
-  }
-  if (profile?.ladder?.model === model) {
-    return {
-      model,
-      source: 'ladder',
-      profileName: profile.profileName,
-      tier: profile.ladder.tier,
-      ...(profile.ladder.requested ? { requestedTier: profile.ladder.requested } : {}),
-    };
-  }
-
-  // A model none of the live layers claims. The commonest cause is a pin: a
-  // conversation continuing on what it launched on, under a profile that has
-  // been edited since. Reported as the conversation's own rather than credited
-  // to a layer that would now answer differently.
-  return { model, source: 'override' };
-}
-
-/**
  * One reasoning-effort level, as the runtime that offers it named it.
  *
  * `value` is sent back to that runtime verbatim, so it is never a word this app

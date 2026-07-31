@@ -872,8 +872,11 @@ which of those five supplied it.
 If the rung you chose is blank, the nearest filled one is used — downwards when
 two are equally near, because a ladder that cannot answer should not answer
 expensively. If a provider refuses the rung's model, the session starts on the
-runtime's own default and says so. If the ladder cannot be written through at
-all, the session still starts, and the header says the ladder was not applied.
+runtime's own default and says so; it is then not on a rung at all, so there is
+no rung to move up from either. If the ladder cannot be written through at all,
+the session still starts, and the header says the ladder was not applied. Either
+way the reason stays on screen for the rest of the conversation, on every screen
+watching it rather than only the one that started it.
 
 A ladder decides on the **first launch after upgrading**: nothing has to be
 re-ticked or re-saved, and conversations that predate this move onto it when
