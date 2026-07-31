@@ -488,7 +488,75 @@ export class AppDatabase {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+
+      /*
+       * Projects: a repo (or a name-only workspace) plus the container it
+       * builds into, owned by exactly one user. 'target_id' records where the
+       * project was placed and never changes afterwards; a null means the
+       * legacy startup-flag engine, so an installation that defines no deploy
+       * targets still gets projects exactly where its containers already run.
+       *
+       * 'container_json' holds what a restart needs to find the container
+       * again (name, shells); a null means there is no container — never
+       * built, or reclaimed — and the next start rebuilds from the worktree
+       * layout. 'build_log_json' is the ring buffer of build events a
+       * reopened tab replays to rejoin an in-flight build.
+       */
+      CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        repo_url TEXT,
+        repo_host TEXT,
+        target_id TEXT REFERENCES deploy_targets(id),
+        tier_id TEXT,
+        state TEXT NOT NULL,
+        state_detail TEXT,
+        container_json TEXT,
+        build_log_json TEXT,
+        last_activity_at TEXT NOT NULL,
+        last_preserved_commit TEXT,
+        composition_revision TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_projects_owner
+        ON projects(owner_user_id);
+
+      CREATE INDEX IF NOT EXISTS idx_projects_state
+        ON projects(state);
+
+      /*
+       * One credential per user per git host per kind: what clone and the
+       * preservation push authenticate with. Only kind = 'token' exists in
+       * this phase; OAuth kinds arrive with the provider work. The credential
+       * is encrypted with the installation key ring and is never selected
+       * back out in plaintext by any list endpoint.
+       */
+      CREATE TABLE IF NOT EXISTS connected_hosts (
+        id TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        host TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        identity_id TEXT,
+        credential_encrypted TEXT,
+        scopes_json TEXT,
+        expires_at TEXT,
+        last_used_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (user_id, host, kind)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_connected_hosts_user
+        ON connected_hosts(user_id);
     `);
+
+    // The project a session runs inside. Nullable, and a null is load-bearing:
+    // every row written before projects existed is a project-less session,
+    // which is today's behaviour and must keep meaning exactly that.
+    this.addColumnIfMissing('runtime_sessions', 'project_id', 'TEXT REFERENCES projects(id)');
 
     // Which surface a session runs on. Added after the fact, so it is nullable
     // and a null reads as 'terminal' — every row that predates chat mode is a
