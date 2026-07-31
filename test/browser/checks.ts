@@ -311,6 +311,7 @@ async function run(): Promise<void> {
   await checkSilentStepsLeaveNoRowButKeepTheirTrace();
   await checkNoRowIsDrawnWithNothingToRead();
   await checkAQuestionIsAnsweredByClicking();
+  await checkACardTheAgentGaveUpOnStopsOfferingAnAnswer();
   await checkAQuestionCanBeAnsweredInYourOwnWords();
   await checkTypedWordsThatDidNotLandAreNotShownAsAnswered();
   await checkThePhoneLayoutIsUsable();
@@ -362,6 +363,192 @@ async function run(): Promise<void> {
   pre.id = 'results';
   pre.textContent = results.join('\n');
   document.body.appendChild(pre);
+}
+
+/**
+ * A card whose question can no longer be delivered says so, and stops asking.
+ *
+ * Here rather than in a unit test because the defect was entirely a rendered
+ * one (#174). On omp the runtime abandoned the `tools/call` after 30 seconds
+ * while the card stayed on screen with live buttons for another ten minutes —
+ * every one of which would have sent an answer into a request the agent had
+ * already dropped — and the sentence it eventually showed, "Skipped without
+ * answering", blamed the user for a question they were never able to answer.
+ * Both halves of that are about what is on the glass, so both are checked
+ * there: the buttons are gone, and the sentence is the true one.
+ */
+async function checkACardTheAgentGaveUpOnStopsOfferingAnAnswer(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const sent: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('browser-check', {
+    send: (message: Record<string, unknown>) => {
+      sent.push(message);
+    },
+  } as never);
+
+  const ask = {
+    question: 'How should I proceed?',
+    header: 'Next move',
+    multiSelect: false,
+    options: [
+      { label: 'PR #167, then continue #168', description: 'Verify the suite, then open its PR' },
+      { label: 'Continue #168 only', description: 'Leave #167 un-PRd for now' },
+    ],
+  };
+
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check',
+      runtime: 'omp',
+      state: 'awaiting_answer',
+      capabilities: { streaming: true, toolCalls: true, questions: true },
+      messages: [
+        {
+          id: 'm1', seq: 1, turnId: 't1', role: 'assistant', ts: 1,
+          blocks: [{
+            kind: 'tool',
+            toolId: 'write_20|fc_tmp_duo3u3bkp7',
+            name: 'mcp__ccweb_ask_user_question',
+            toolKind: 'other',
+            status: 'running',
+            input: ask,
+          }],
+        },
+      ],
+      pendingPermissions: [],
+      pendingQuestions: [{
+        requestId: 'q-1',
+        toolId: 'write_20|fc_tmp_duo3u3bkp7',
+        question: ask.question,
+        header: ask.header,
+        multiSelect: false,
+        ts: 2,
+        options: [
+          { optionId: 'opt-0', label: ask.options[0].label, description: ask.options[0].description },
+          { optionId: 'opt-1', label: ask.options[1].label, description: ask.options[1].description },
+        ],
+      }],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 2,
+      live: true,
+      bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'omp',
+      runtimeLabel: 'Oh My Pi',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  const liveCard = host.querySelector('[data-question-card="live"]') as HTMLElement | null;
+  check('the question starts out as a live card', !!liveCard);
+  if (!liveCard) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  /**
+   * Buttons a person could actually press.
+   *
+   * Counted rather than trusting `data-question-card`, and by visibility and
+   * reachability rather than by presence: a control left in the tree at
+   * `opacity:0` or `pointer-events:none` still answers `querySelector`, and a
+   * geometry sweep drops it silently instead of failing.
+   */
+  const pressable = (card: HTMLElement): HTMLElement[] =>
+    Array.from(card.querySelectorAll<HTMLElement>('button')).filter((node) => {
+      const style = getComputedStyle(node);
+      const box = node.getBoundingClientRect();
+      return style.visibility !== 'hidden'
+        && style.display !== 'none'
+        && style.pointerEvents !== 'none'
+        && Number(style.opacity || '1') > 0.05
+        && box.width > 0
+        && box.height > 0
+        && node.tabIndex >= 0
+        && !(node as HTMLButtonElement).disabled;
+    });
+
+  check(
+    'a live card offers something to press',
+    pressable(liveCard).length >= 2,
+    `${pressable(liveCard).length} pressable`,
+  );
+
+  // What the runtime giving up looks like from the browser's side: the call
+  // that asked reports failed, and the session resolves the question against
+  // the same tool id — carrying `abandoned`, which is the whole difference
+  // between this and a skip.
+  controller.transcript.apply({
+    t: 'tool',
+    seq: 10,
+    ts: Date.now(),
+    toolId: 'write_20|fc_tmp_duo3u3bkp7',
+    patch: { status: 'failed', error: 'MCP error: Request timeout after 30000ms' },
+  } as never);
+  controller.transcript.apply({
+    t: 'question_resolved',
+    seq: 11,
+    ts: Date.now(),
+    requestId: 'q-1',
+    toolId: 'write_20|fc_tmp_duo3u3bkp7',
+    optionIds: [],
+    abandoned: true,
+  } as never);
+  await wait(250);
+  settle(document);
+
+  const card = host.querySelector('[data-question-card]') as HTMLElement | null;
+  check('the card is still in the conversation, as the record of what was asked', !!card);
+  if (!card) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  check(
+    'it no longer offers an answer nobody would receive',
+    pressable(card).length === 0,
+    `${pressable(card).length} still pressable`,
+  );
+  const text = card.textContent || '';
+  check(
+    'and it says the agent stopped waiting',
+    text.includes('stopped waiting'),
+    text.slice(-90),
+  );
+  check(
+    'rather than blaming the person who was never asked',
+    !text.includes('Skipped without answering'),
+    text.slice(-90),
+  );
+  check(
+    'the outcome is recorded as its own thing, not as a skip',
+    card.querySelector('[data-question-answer="abandoned"]') !== null,
+    card.querySelector('[data-question-answer]')?.getAttribute('data-question-answer') || 'none',
+  );
+  check(
+    'and nothing was sent on the way there',
+    sent.filter((message) => message.type === 'chat_question_answer').length === 0,
+  );
+
+  root.unmount();
+  host.remove();
 }
 
 /**

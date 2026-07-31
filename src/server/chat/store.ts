@@ -1565,6 +1565,9 @@ export class ChatStore implements ChatStoreLike {
         // does, and the answer sits between the same two message starts as the
         // call that asked — so any window holding the card holds its answer.
         answeredQuestions: transcript.answeredQuestions,
+        // And which of them nobody was ever offered the chance to answer, so a
+        // rejoin does not redraw an abandoned card as a skipped one.
+        abandonedQuestions: transcript.abandonedQuestions,
         // And what was typed for the ones answered in free text, which is the
         // only place that sentence exists for a card the browser is rebuilding.
         answeredQuestionText: transcript.answeredQuestionText,

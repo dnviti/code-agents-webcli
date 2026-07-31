@@ -1105,6 +1105,17 @@ export type ChatEvent =
        * but the transcript says "skipped" rather than inventing a selection.
        */
       skipped?: boolean;
+      /**
+       * True when nobody was given the chance: the call that asked died first.
+       *
+       * A different fact from `skipped`, and worth its own field because the two
+       * are opposite accusations. "Skipped" says a person saw the question and
+       * declined it. This says the agent stopped listening — its tool call timed
+       * out, the turn was cancelled, the session was closed — and an answer
+       * given now would reach nothing. Drawing that as a skip blamed the user
+       * for a card they were never able to answer (#174).
+       */
+      abandoned?: boolean;
     }
   | { t: 'state'; seq: number; ts: number; state: ChatState }
   | { t: 'error'; seq: number; ts: number; message: string; fatal?: boolean }
@@ -1362,6 +1373,14 @@ export interface ChatSnapshot {
    * server that predates this should read as "none known", not as malformed.
    */
   answeredQuestions?: Record<string, string[]>;
+  /**
+   * Which of those were never anybody's to answer, keyed the same way.
+   *
+   * Carried across the join for the same reason the answers are: a card the
+   * agent gave up on says so, and a rejoin that dropped this fact would redraw
+   * it as a question its user had skipped.
+   */
+  abandonedQuestions?: Record<string, true>;
   /**
    * What was typed for the questions answered in the user's own words, keyed
    * the same way `answeredQuestions` is.

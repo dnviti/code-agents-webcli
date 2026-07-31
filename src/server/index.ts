@@ -358,6 +358,12 @@ export class ClaudeCodeWebServer {
           void this.saveSessionsToDisk();
         }
       },
+      // The outer edge of what an agent may read and write on its user's
+      // behalf, and the same one the file browser draws. Answered here because
+      // this is the only layer that knows whether per-user environments are on,
+      // and therefore whether "the browsable area" is one shared folder or a
+      // different home for every account.
+      userBaseFolder: (userId) => this.getUserBaseFolder(userId),
     });
     this.runtimeProfiles = new RuntimeProfileStore({ database: this.database });
     this.tierContext = defaultTierContext(this.database.storageDir);

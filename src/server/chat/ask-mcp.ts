@@ -181,7 +181,7 @@ class AskChannel {
 
   constructor(private readonly socketPath: string) {}
 
-  ask(question: unknown): Promise<QuestionAnswer> {
+  ask(question: unknown, onSent?: (id: string) => void): Promise<QuestionAnswer> {
     return new Promise((resolve) => {
       const id = `ask-${process.pid}-${(this.nextId += 1)}`;
       let socket: net.Socket;
@@ -193,6 +193,9 @@ class AskChannel {
       }
 
       this.waiting.set(id, resolve);
+      // Handed straight back, so the server can name this question again if the
+      // runtime cancels the call it belongs to.
+      onSent?.(id);
       const write = (): void => {
         socket.write(`${JSON.stringify({ id, kind: 'question', question })}\n`);
       };
@@ -202,6 +205,35 @@ class AskChannel {
         write();
       }
     });
+  }
+
+  /**
+   * Say that nobody is waiting for this answer any more.
+   *
+   * One line down the same socket and no reply expected: the `tools/call` that
+   * asked has been cancelled by the runtime, so there is nothing left to answer.
+   * The session takes the card down when it arrives — before this, a cancelled
+   * call left a live card that could only send an answer into a closed request.
+   */
+  cancel(id: string): void {
+    const pending = this.waiting.get(id);
+    if (!pending) return;
+    this.waiting.delete(id);
+    pending({ labels: [], error: 'the agent stopped waiting for an answer' });
+    try {
+      const socket = this.connect();
+      const write = (): void => {
+        socket.write(`${JSON.stringify({ id, kind: 'cancel' })}\n`);
+      };
+      if (socket.pending) {
+        socket.once('connect', write);
+      } else {
+        write();
+      }
+    } catch {
+      // No socket to tell. The session is gone or going, and it clears its own
+      // cards on the way out.
+    }
   }
 
   requestTier(reason: unknown): Promise<TierDecision> {
@@ -364,16 +396,30 @@ interface Rpc {
 export function serveAsk(
   input: NodeJS.ReadableStream,
   output: NodeJS.WritableStream,
-  ask: (question: unknown) => Promise<QuestionAnswer>,
+  ask: (question: unknown, onSent?: (id: string) => void) => Promise<QuestionAnswer>,
   // Optional so a runtime whose session has no ladder simply never advertises
   // the tool: an escalation the app cannot grant is worse than one the model
   // never knew about, because the refusal costs a round trip and reads to the
   // model as the user saying no.
   requestTier?: (reason: unknown) => Promise<TierDecision>,
+  // Last rather than beside `ask`, so every existing caller — the tests above
+  // all, which drive this over a real pair of pipes — keeps working unchanged.
+  cancel?: (askId: string) => void,
 ): void {
   const send = (message: unknown): void => {
     output.write(`${JSON.stringify(message)}\n`);
   };
+
+  /**
+   * Questions still blocking a `tools/call`, from the client's request id to
+   * ours.
+   *
+   * The two numbering schemes never meet anywhere else — the client names the
+   * JSON-RPC request, this process names the question on the session socket —
+   * and `notifications/cancelled` speaks only the first. Without the pairing
+   * there is no way to say *which* question the runtime has given up on.
+   */
+  const inFlight = new Map<string, string>();
 
   createInterface({ input }).on('line', (line: string) => {
     if (!line.trim()) return;
@@ -412,7 +458,10 @@ export function serveAsk(
 
     if (method === 'tools/call') {
       if (params?.name === ASK_QUESTION_TOOL) {
-        void ask(params?.arguments).then((answer) => {
+        void ask(params?.arguments, (askId) => {
+          if (id !== undefined) inFlight.set(String(id), askId);
+        }).then((answer) => {
+          if (id !== undefined) inFlight.delete(String(id));
           const { text, isError } = describeAnswer(answer);
           send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError } });
         });
@@ -437,6 +486,23 @@ export function serveAsk(
         return;
       }
       send({ jsonrpc: '2.0', id, error: { code: -32601, message: `no tool named ${String(params?.name)}` } });
+      return;
+    }
+
+    // The client has given up on a call it made. MCP's own way of saying it, and
+    // the one signal that a question can no longer be answered — kimi sends it
+    // on its request timeout, and any client sends it when the user cancels the
+    // turn. Swallowed here until now, which left the card on screen collecting
+    // clicks for a request that had already been dropped at the other end
+    // (#174). No reply: a notification wants none, and the call it names is
+    // over.
+    if (method === 'notifications/cancelled') {
+      const requestId = (params as { requestId?: unknown } | undefined)?.requestId;
+      const askId = requestId === undefined ? undefined : inFlight.get(String(requestId));
+      if (askId) {
+        inFlight.delete(String(requestId));
+        cancel?.(askId);
+      }
       return;
     }
 
@@ -490,11 +556,12 @@ function main(): void {
   serveAsk(
     process.stdin,
     process.stdout,
-    (question) =>
+    (question, onSent) =>
       channel
-        ? channel.ask(question)
+        ? channel.ask(question, onSent)
         : Promise.resolve({ labels: [], error: 'this session has no channel to the browser' }),
     laddered && channel ? (reason) => channel.requestTier(reason) : undefined,
+    channel ? (askId) => channel.cancel(askId) : undefined,
   );
 }
 

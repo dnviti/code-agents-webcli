@@ -51,6 +51,15 @@ export interface QuestionCardProps {
   answered?: string[];
   /** What was typed, for a question answered in the user's own words. */
   ownWords?: string;
+  /**
+   * True when the question ended without anybody being able to answer it.
+   *
+   * Read only for a question that is no longer live, and it changes one
+   * sentence: an unanswered card says the agent stopped waiting rather than
+   * accusing its user of having skipped something they were never shown in
+   * time.
+   */
+  abandoned?: boolean;
   /** Free text describing the outcome when the option ids are not available. */
   answerText?: string;
   onAnswer?: (requestId: string, optionIds: string[], skipped: boolean, text?: string) => void;
@@ -65,6 +74,7 @@ export function QuestionCard({
   answered,
   ownWords,
   answerText,
+  abandoned,
   onAnswer,
 }: QuestionCardProps) {
   // Held locally as well as read from the transcript so the card settles the
@@ -237,6 +247,7 @@ export function QuestionCard({
           ownWords={typed}
           answerText={answerText}
           dropped={dropped}
+          abandoned={abandoned}
         />
       )}
 
@@ -493,6 +504,7 @@ function Answered({
   ownWords,
   answerText,
   dropped = false,
+  abandoned = false,
 }: {
   options: QuestionOption[];
   picked?: string[];
@@ -500,6 +512,8 @@ function Answered({
   answerText?: string;
   /** True when words typed here are not the answer the session recorded. */
   dropped?: boolean;
+  /** True when the question ended before anybody could answer it. */
+  abandoned?: boolean;
 }): React.JSX.Element {
   // No ids to match against — a card rebuilt from a replayed transcript, where
   // the resolution is known only as the sentence the model was given. Showing
@@ -524,13 +538,20 @@ function Answered({
   // that had plainly acted on an answer. A real skip is an empty array; not
   // knowing is `undefined`. Words typed into the card are a third thing again,
   // and the one case where an empty array of picks is still an answer.
+  //
+  // And a fourth: the question that ended before anybody could answer it.
+  // It arrives looking exactly like a skip — no picks, no words — so it has to
+  // be told apart by the flag rather than by the shape of the answer, which is
+  // why the session records one (#174).
   const outcome = ownWords
     ? 'chosen'
     : !picked
       ? 'unknown'
-      : chosen.length === 0
-        ? 'skipped'
-        : 'chosen';
+      : chosen.length > 0
+        ? 'chosen'
+        : abandoned
+          ? 'abandoned'
+          : 'skipped';
   return (
     <div style={{ display: 'grid', gap: 6 }} data-question-answer={outcome}>
       {options.map((option) => (
@@ -553,7 +574,9 @@ function Answered({
         >
           {outcome === 'skipped'
             ? 'Skipped without answering.'
-            : 'What was picked is no longer in this conversation’s record.'}
+            : outcome === 'abandoned'
+              ? 'The agent stopped waiting for an answer, so this was never put to anyone.'
+              : 'What was picked is no longer in this conversation’s record.'}
         </span>
       ) : null}
       {dropped ? (

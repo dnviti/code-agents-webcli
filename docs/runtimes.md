@@ -124,6 +124,52 @@ the app uses. It brings permission prompts, a model list and per-turn cost with
 it, and sessions recorded under the old mode still open — Grok kept the record
 all along; only its headless output was silent about it.
 
+### Questions the agent asks you
+
+An agent that needs a decision only you can make puts a **card** in the
+conversation with the options it wants you to choose between, and stops until
+you answer. There is always a free-text box beside the options, so "none of
+these" is a real answer rather than a dead end.
+
+| Runtime | How it is given the question tool | Verified against |
+| --- | --- | --- |
+| Claude Code | an MCP server passed at spawn | a recorded headless session |
+| Kimi Code, Oh My Pi | an MCP server passed in the ACP handshake | live runs |
+| pi | a generated extension loaded with `-e` | a live run |
+| Codex, Grok Build, Antigravity CLI | not offered — no channel anyone has watched work | — |
+
+**The call blocks, and the app now makes sure it can.** Two of these CLIs put a
+timer on it that this app has to switch off, or the question expires with nobody
+having been asked:
+
+- **Oh My Pi** abandons *any* MCP call after 30 seconds. Measured: two cards in
+  one conversation died at 30.001s each, and the agent — told the tool had
+  failed — asked the same question again, and again, and eventually carried on
+  having guessed. There is no flag and no config key for it, and the ACP
+  handshake has nowhere to put one, so the app sets `OMP_MCP_TIMEOUT_MS=0` on
+  the process it starts. Its own subagents keep a separate 60-second ceiling
+  that nothing can override; a question asked from inside one still expires, and
+  the card says so rather than waiting.
+- **Kimi Code** does the same at 60 seconds. Its lever, `KIMI_MCP_TOOL_TIMEOUT_MS`,
+  accepts 1 to 2147483647 milliseconds and *silently discards* anything else —
+  so the app raises the ceiling to the maximum rather than passing the zero that
+  works for Oh My Pi and would land kimi back on its default.
+
+**pi asks through an extension**, because it has no MCP support and no ACP. The
+file is generated into the session's own `.pi/ccweb/`, is loaded by path, and
+registers nothing at all when it is loaded outside a session. The app also
+passes `--exclude-tools question`: the widely installed `pi-code` package
+registers a tool by that name which, in the mode this app drives, answers itself
+with "UI not available" without anybody being asked — and a model offered two
+question tools sometimes picks the one that cannot work.
+
+**A card that can no longer be answered says so.** If the agent gives up, or the
+turn is stopped, or the conversation is closed, the card stops offering buttons
+and reads *"The agent stopped waiting for an answer"* — which is a different
+statement from *"Skipped without answering"*, and the app no longer prints the
+second one over the first. A question you skip on purpose still reads as
+skipped.
+
 ### Antigravity CLI: what was checked, and what was not
 
 The whole runtime is driven through one entry point — `agy --print
@@ -931,6 +977,18 @@ record, the transcript and pasted-image paths all refer to. The file browser is
 bounded by the working directory chosen during
 [setup](configuration.md#first-run-setup) — only that directory and its
 subdirectories are reachable.
+
+**What an agent may read and write is that same boundary**, not the one folder
+the conversation started in. It matters for the ACP agents (Kimi Code, Oh My Pi,
+Grok Build), which do not open files themselves: they ask the app to, and the
+app decides. Confined to the session's own directory, a conversation working
+across a git worktree of its own repository — one directory over, and somewhere
+the folder picker would happily have sent it — had every read of it refused,
+while the agent's own shell read the same file freely and wrote it back through
+a script. What is still refused is unchanged: anything outside the browsable
+area, and anything belonging to another account. The OS temp directory stays
+reachable, because an agent's write tool and its own shell hand files to each
+other through it.
 
 Every session on the host runs as the **same OS user** — the one running the
 server. There is no per-user sandbox. See

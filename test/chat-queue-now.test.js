@@ -209,7 +209,13 @@ describe('sending a queued message now', function () {
 
     assert.ok(answered, 'the model is blocked until something comes back, even a refusal');
     assert.strictEqual(s.questions.size, 0);
-    assert.ok(store.events.some((e) => e.t === 'question_resolved' && e.requestId === 'q1' && e.skipped));
+    // Abandoned, not skipped. Cutting a turn short is something the *user* did
+    // to the turn; skipping is something they did to the question, and the card
+    // drew the second sentence over the first (#174).
+    const resolved = store.events.find((e) => e.t === 'question_resolved' && e.requestId === 'q1');
+    assert.ok(resolved, 'the card is taken down');
+    assert.strictEqual(resolved.abandoned, true);
+    assert.ok(!resolved.skipped, 'nobody skipped this — they were never asked');
   });
 
   it('sends once when the control is pressed twice', async function () {

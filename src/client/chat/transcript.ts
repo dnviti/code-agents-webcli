@@ -234,6 +234,12 @@ export class ChatTranscript {
       answeredQuestionText: snapshot.answeredQuestions
         ? { ...(snapshot.answeredQuestionText || {}) }
         : { ...this.state.answeredQuestionText },
+      // And which of them the agent had already stopped waiting for, kept on
+      // the same terms: a snapshot that speaks about answers speaks about
+      // these too, and an older server that says nothing leaves what is held.
+      abandonedQuestions: snapshot.answeredQuestions
+        ? { ...(snapshot.abandonedQuestions || {}) }
+        : { ...this.state.abandonedQuestions },
       firstSeq: snapshot.firstSeq,
       cursor: snapshot.cursor,
       // The turn the server's replay was still inside. Live events arriving
@@ -286,6 +292,7 @@ export class ChatTranscript {
     from?: number,
     answers?: Record<string, string[]>,
     answerText?: Record<string, string>,
+    abandoned?: Record<string, true>,
   ): void {
     this.state.firstSeq = firstSeq;
     if (from !== undefined) {
@@ -303,6 +310,9 @@ export class ChatTranscript {
     }
     if (answerText) {
       this.state.answeredQuestionText = { ...answerText, ...this.state.answeredQuestionText };
+    }
+    if (abandoned) {
+      this.state.abandonedQuestions = { ...abandoned, ...this.state.abandonedQuestions };
     }
 
     if (!messages.length) {
@@ -584,6 +594,11 @@ export class ChatTranscript {
     return this.state.answeredQuestionText[toolId];
   }
 
+  /** Whether the agent had stopped waiting by the time that question ended. */
+  abandonedFor(toolId: string): boolean {
+    return this.state.abandonedQuestions[toolId] === true;
+  }
+
   /**
    * Every answer this transcript holds, keyed the way the reducer keys them.
    *
@@ -597,6 +612,11 @@ export class ChatTranscript {
   /** The same, for the answers that were typed rather than picked. */
   get answeredQuestionText(): Record<string, string> {
     return this.state.answeredQuestionText;
+  }
+
+  /** The same, for the questions nobody was given the chance to answer. */
+  get abandonedQuestions(): Record<string, true> {
+    return this.state.abandonedQuestions;
   }
 
   get cursor(): number {
