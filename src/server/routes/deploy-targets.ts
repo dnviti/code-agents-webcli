@@ -27,6 +27,11 @@ import {
 import { ContainerConfig, ContainerEngineKind } from '../services/environments/types.js';
 import { EnvironmentEngine } from '../services/environments/engine.js';
 import { TARGET_LABEL, targetLabelValue } from '../services/environments/naming.js';
+import {
+  DEFAULT_RUN_LIMIT_PER_USER,
+  DEFAULT_IDLE_STOP_MINUTES,
+  DEFAULT_IDLE_RECLAIM_MINUTES,
+} from '../services/projects/store.js';
 
 export interface DeployTargetRoutesDeps {
   deployTargets: DeployTargetStore;
@@ -47,6 +52,16 @@ export interface DeployTargetRoutesDeps {
   /** Rebuild the manager's target set after every successful change. */
   reloadDeployTargets(): void;
   getInstallerUserId(): number | null;
+  /**
+   * Read a deploy-policy setting from app_settings. Optional until the parent
+   * wiring lands; the route guards against absence.
+   */
+  getDeploySetting?(key: string): string | null;
+  /**
+   * Write a deploy-policy setting to app_settings. Optional until the parent
+   * wiring lands; the route guards against absence.
+   */
+  setDeploySetting?(key: string, value: string): void;
 }
 
 /**
@@ -141,6 +156,45 @@ export function createDeployTargetRoutes(deps: DeployTargetRoutesDeps): Router {
       message:
         'Work already running stays on the target it started on; only new '
         + 'environments are placed on the newly active target.',
+    });
+  });
+
+  router.get('/api/admin/deploy-settings', (req: Request, res: Response): void => {
+    if (!gate(req, res, false)) return;
+    if (!deploySettingsAvailable(deps, res)) return;
+
+    res.json({
+      runLimitPerUser: positiveIntSetting(deps.getDeploySetting!('deploy.runLimitPerUser'), DEFAULT_RUN_LIMIT_PER_USER),
+      idleStopMinutes: positiveIntSetting(deps.getDeploySetting!('deploy.idleStopMinutes'), DEFAULT_IDLE_STOP_MINUTES),
+      idleReclaimMinutes: positiveIntSetting(deps.getDeploySetting!('deploy.idleReclaimMinutes'), DEFAULT_IDLE_RECLAIM_MINUTES),
+    });
+  });
+
+  router.put('/api/admin/deploy-settings', (req: Request, res: Response): void => {
+    if (!gate(req, res, true)) return;
+    if (!deploySettingsAvailable(deps, res)) return;
+
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const runLimitPerUser = parsePositiveInt(body.runLimitPerUser);
+    const idleStopMinutes = parsePositiveInt(body.idleStopMinutes);
+    const idleReclaimMinutes = parsePositiveInt(body.idleReclaimMinutes);
+
+    if (runLimitPerUser === null || idleStopMinutes === null || idleReclaimMinutes === null) {
+      res.status(400).json({
+        error: 'invalid_settings',
+        message: 'runLimitPerUser, idleStopMinutes and idleReclaimMinutes must be positive integers.',
+      });
+      return;
+    }
+
+    deps.setDeploySetting!('deploy.runLimitPerUser', String(runLimitPerUser));
+    deps.setDeploySetting!('deploy.idleStopMinutes', String(idleStopMinutes));
+    deps.setDeploySetting!('deploy.idleReclaimMinutes', String(idleReclaimMinutes));
+
+    res.json({
+      runLimitPerUser,
+      idleStopMinutes,
+      idleReclaimMinutes,
     });
   });
 
@@ -572,4 +626,33 @@ function kubeconfigServerUrls(kubeconfig: string | null | undefined): string[] {
     }
   }
   return urls;
+}
+
+/**
+ * The parent wiring for deploy policy settings has not landed yet. Answer a
+ * clear 500 rather than pretending the feature works, and unblock the rest
+ * of the admin API.
+ */
+function deploySettingsAvailable(deps: DeployTargetRoutesDeps, res: Response): boolean {
+  if (!deps.getDeploySetting || !deps.setDeploySetting) {
+    res.status(500).json({
+      error: 'not_configured',
+      message: 'Deploy settings storage is not wired yet.',
+    });
+    return false;
+  }
+  return true;
+}
+
+function positiveIntSetting(raw: string | null, fallback: number): number {
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function parsePositiveInt(value: unknown): number | null {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  if (Math.floor(parsed) !== parsed) return null;
+  return Math.floor(parsed);
 }
