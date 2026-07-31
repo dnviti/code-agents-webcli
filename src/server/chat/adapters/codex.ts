@@ -1346,7 +1346,7 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
         // vocabulary does not have.
         return;
       default:
-        // skills/mcp status/hooks/account/... are not chat content this
+        // mcp status/hooks/account/... are not chat content this
         // adapter has scope to render. Dropping is correct, throwing is not.
         return;
     }
