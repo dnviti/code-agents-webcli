@@ -7,6 +7,8 @@ const {
   CodexChatAdapter,
 } = require('../dist/server/chat/adapters/codex.js');
 const { NO_CHAT_CAPABILITIES } = require('../dist/shared/chat-events.js');
+const { collectAgentActivity } = require('../dist/shared/agent-activity.js');
+const { applyChatEvent, createTranscript } = require('../dist/shared/chat-reducer.js');
 
 // codex-appserver-*.jsonl fixtures are hand-written against the generated
 // TypeScript bindings the CLI itself ships (`.work/probes/raw/codex-ts`):
@@ -90,6 +92,19 @@ function stripTs(events) {
     assert.strictEqual(typeof ts, 'number');
     return rest;
   });
+}
+
+/** Fold the adapter's wire-independent events the same way the browser does. */
+function transcriptOf(events) {
+  const state = createTranscript({});
+  for (const [index, event] of JSON.parse(JSON.stringify(events)).entries()) {
+    applyChatEvent(state, {
+      ...event,
+      seq: index + 1,
+      ts: event.ts ?? 1_000 + index,
+    });
+  }
+  return state;
 }
 
 describe('codex app-server adapter', function () {
@@ -681,6 +696,164 @@ describe('codex app-server adapter', function () {
     });
   });
 
+  describe('a delegated agent broadcast on its own Codex thread', function () {
+    const AGENT_THREAD_ID = 'th_child';
+    const AGENT_TOOL_ID = `codex-agent:${AGENT_THREAD_ID}`;
+
+    async function replay(lines = fixture('codex-appserver-subagent')) {
+      const h = harness();
+      await boot(h);
+      h.events.length = 0;
+      await feed(h, lines);
+      return { ...h, state: transcriptOf(h.events) };
+    }
+
+    function throughActivity(lines, kind) {
+      const end = lines.findIndex((line) =>
+        line.method === 'item/completed'
+        && line.params?.item?.type === 'subAgentActivity'
+        && line.params.item.kind === kind,
+      );
+      assert.ok(end >= 0, `fixture has no completed ${kind} activity`);
+      return lines.slice(0, end + 1);
+    }
+
+    function activityPair(id, kind) {
+      const item = {
+        type: 'subAgentActivity',
+        id,
+        kind,
+        agentThreadId: AGENT_THREAD_ID,
+        agentPath: '/root/scout',
+      };
+      return ['item/started', 'item/completed'].map((method) => ({
+        jsonrpc: '2.0',
+        method,
+        params: { threadId: 'th_123', turnId: 'turn_agents', item },
+      }));
+    }
+
+    function agentBlock(state) {
+      const located = state.toolIndex[AGENT_TOOL_ID];
+      assert.ok(located, 'the stable child-thread id must locate the Agent block');
+      return state.messages[located[0]].blocks[located[1]];
+    }
+
+    it('keeps child work in one Agent row while the parent answer continues streaming', async function () {
+      const { events, state } = await replay();
+      const activity = collectAgentActivity(state.messages);
+
+      assert.strictEqual(activity.length, 1);
+      assert.strictEqual(activity[0].toolId, AGENT_TOOL_ID);
+      assert.strictEqual(activity[0].kind, 'agent');
+      assert.strictEqual(activity[0].name, '/root/scout');
+      assert.strictEqual(activity[0].status, 'completed');
+      assert.strictEqual(activity[0].running, false);
+
+      const block = agentBlock(state);
+      assert.strictEqual(block.kind, 'tool');
+      assert.strictEqual(block.name, 'Agent');
+      assert.strictEqual(block.output, 'child result');
+      assert.strictEqual(block.agent.status, 'completed');
+      assert.strictEqual(block.agent.steps.length, 1);
+      assert.deepStrictEqual(block.agent.steps[0], {
+        id: 'child_command',
+        name: 'shell',
+        toolKind: 'execute',
+        status: 'completed',
+        input: { command: 'cat note.txt', cwd: '/work' },
+        output: 'BANANA\n',
+        ts: block.agent.steps[0].ts,
+      });
+      assert.strictEqual(typeof block.agent.steps[0].ts, 'number');
+
+      const texts = state.messages.flatMap((message) =>
+        message.blocks.filter((candidate) => candidate.kind === 'text').map((candidate) => candidate.text),
+      );
+      assert.deepStrictEqual(texts, ['Parent answer']);
+      assert.ok(!texts.some((text) => text.includes('child result')));
+      assert.ok(!JSON.stringify(state.messages).includes('[unhandled codex item: subAgentActivity]'));
+
+      assert.ok(events.some((event) =>
+        event.t === 'agent_step'
+        && event.parentToolId === AGENT_TOOL_ID
+        && event.step.id === 'child_command',
+      ));
+      assert.strictEqual(state.toolIndex.child_command, undefined);
+      assert.deepStrictEqual(state.orphanToolPatches, {});
+    });
+
+    it('does not duplicate or settle an agent merely because it was interacted with', async function () {
+      const lines = fixture('codex-appserver-subagent');
+      const { state } = await replay(throughActivity(lines, 'interacted'));
+      const activity = collectAgentActivity(state.messages);
+
+      assert.strictEqual(activity.length, 1);
+      assert.strictEqual(activity[0].toolId, AGENT_TOOL_ID);
+      assert.strictEqual(activity[0].status, 'running');
+      assert.strictEqual(activity[0].running, true);
+      assert.strictEqual(agentBlock(state).agent.status, 'running');
+      assert.strictEqual(
+        state.messages.flatMap((message) => message.blocks)
+          .filter((block) => block.kind === 'tool' && block.name === 'Agent').length,
+        1,
+      );
+    });
+
+    it('cancels the existing row when Codex reports that child interrupted', async function () {
+      const lines = fixture('codex-appserver-subagent');
+      const prefix = throughActivity(lines, 'interacted');
+      const { state } = await replay([
+        ...prefix,
+        ...activityPair('interrupt_scout', 'interrupted'),
+        {
+          jsonrpc: '2.0',
+          method: 'thread/status/changed',
+          params: { threadId: AGENT_THREAD_ID, status: { type: 'idle' } },
+        },
+      ]);
+      const activity = collectAgentActivity(state.messages);
+
+      assert.strictEqual(activity.length, 1);
+      assert.strictEqual(activity[0].toolId, AGENT_TOOL_ID);
+      assert.strictEqual(activity[0].status, 'canceled');
+      assert.strictEqual(activity[0].running, false);
+      assert.strictEqual(agentBlock(state).agent.status, 'canceled');
+      assert.deepStrictEqual(state.orphanToolPatches, {});
+    });
+
+    it('preserves a precise failure through idle and clears it when the child reopens', async function () {
+      const lines = fixture('codex-appserver-subagent');
+      const prefix = throughActivity(lines, 'started');
+      const failed = {
+        jsonrpc: '2.0',
+        method: 'error',
+        params: { threadId: AGENT_THREAD_ID, error: { message: 'child crashed' } },
+      };
+      const idle = {
+        jsonrpc: '2.0',
+        method: 'thread/status/changed',
+        params: { threadId: AGENT_THREAD_ID, status: { type: 'idle' } },
+      };
+      const active = {
+        jsonrpc: '2.0',
+        method: 'thread/status/changed',
+        params: { threadId: AGENT_THREAD_ID, status: { type: 'active' } },
+      };
+
+      const stopped = await replay([...prefix, failed, idle]);
+      assert.strictEqual(agentBlock(stopped.state).status, 'failed');
+      assert.strictEqual(agentBlock(stopped.state).agent.status, 'failed');
+      assert.strictEqual(agentBlock(stopped.state).agent.error, 'child crashed');
+
+      const reopened = await replay([...prefix, failed, idle, active]);
+      assert.strictEqual(agentBlock(reopened.state).status, 'running');
+      assert.strictEqual(agentBlock(reopened.state).agent.status, 'running');
+      assert.strictEqual(agentBlock(reopened.state).error, '');
+      assert.strictEqual(agentBlock(reopened.state).agent.error, '');
+    });
+  });
+
   /**
    * An item that arrives already finished, with no `item/started` before it.
    *
@@ -1030,6 +1203,40 @@ describe('codex exec adapter (fallback)', function () {
       const end = only(events, 'msg_end').pop();
       assert.strictEqual(end.stopReason, 'completed');
       assert.strictEqual(only(events, 'turn_end').pop().stopReason, 'completed');
+    });
+
+    it('coalesces every activity for one child into one Agents-panel row', function () {
+      const { adapter, events } = makeAdapter();
+      beginTurn(adapter, 't_agents');
+      for (const [id, kind] of [
+        ['spawn_scout', 'started'],
+        ['message_scout', 'interacted'],
+        ['interrupt_scout', 'interrupted'],
+      ]) {
+        adapter.handleMessage({
+          type: 'item.completed',
+          item: {
+            type: 'subAgentActivity',
+            id,
+            kind,
+            agentThreadId: 'th_exec_child',
+            agentPath: '/root/scout',
+          },
+        });
+      }
+
+      const state = transcriptOf(events);
+      const activity = collectAgentActivity(state.messages);
+      assert.strictEqual(activity.length, 1);
+      assert.strictEqual(activity[0].toolId, 'codex-agent:th_exec_child');
+      assert.strictEqual(activity[0].status, 'canceled');
+      assert.strictEqual(
+        state.messages.flatMap((message) => message.blocks)
+          .filter((block) => block.kind === 'tool' && block.name === 'Agent').length,
+        1,
+      );
+      assert.ok(!JSON.stringify(state.messages).includes('[unhandled codex item: subAgentActivity]'));
+      assert.deepStrictEqual(state.orphanToolPatches, {});
     });
   });
 
