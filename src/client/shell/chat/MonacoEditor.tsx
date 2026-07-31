@@ -40,6 +40,8 @@ export interface MonacoEditorProps extends CodeEditorProps {
    * fallback editor uses.
    */
   path?: string;
+  /** One-based line to reveal and select when this file opens. */
+  initialLine?: number;
 }
 
 type Phase = 'loading' | 'ready' | 'failed';
@@ -53,6 +55,7 @@ export function MonacoEditor({
   ariaLabel = 'File contents',
   height = '100%',
   path,
+  initialLine,
 }: MonacoEditorProps): React.JSX.Element {
   const hostRef = React.useRef<HTMLDivElement | null>(null);
   const handleRef = React.useRef<MonacoHandle | null>(null);
@@ -81,6 +84,8 @@ export function MonacoEditor({
   valueRef.current = value;
   const readOnlyRef = React.useRef(readOnly);
   readOnlyRef.current = readOnly;
+  const initialLineRef = React.useRef(initialLine);
+  initialLineRef.current = initialLine;
 
   React.useEffect(() => {
     let live = true;
@@ -94,6 +99,7 @@ export function MonacoEditor({
           handleRef.current = mod.create(hostRef.current, {
             value: valueRef.current,
             path,
+            initialLine: initialLineRef.current,
             readOnly: readOnlyRef.current,
             theme,
             ariaLabel,
@@ -137,6 +143,10 @@ export function MonacoEditor({
   React.useEffect(() => {
     handleRef.current?.setTheme(theme);
   }, [theme]);
+
+  React.useEffect(() => {
+    if (initialLine !== undefined) handleRef.current?.revealLine(initialLine);
+  }, [initialLine]);
 
   // The app's theme toggle writes a class on <html>; nothing about that
   // reaches React, so this is the only way the editor hears about it. Same
@@ -182,6 +192,7 @@ export function MonacoEditor({
           onSave={onSave}
           ariaLabel={ariaLabel}
           height={height}
+          initialLine={initialLine}
         />
       </div>
     );
@@ -217,6 +228,7 @@ export function MonacoEditor({
             onSave={onSave}
             ariaLabel={ariaLabel}
             height="100%"
+            initialLine={initialLine}
           />
         </div>
       )}

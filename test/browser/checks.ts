@@ -328,8 +328,9 @@ async function run(): Promise<void> {
   await checkANewConversationCanBeStartedFromTheComposer();
   await checkTheFileEditorShowsTheFile();
   await checkAReadOnlyFileStaysReadOnly();
+  await checkAChatFileLinkOpensAtItsSourceLine();
   await checkTheGitHubPanelSaysWhoIsOnItAndWhatItLinksTo();
-  // After the two editor checks on purpose: this one opens a FileEditorDialog,
+  // After the editor checks on purpose: this one opens a FileEditorDialog,
   // and Monaco is a module-level singleton that does not survive being mounted
   // and torn down before they get to it.
   await checkALongPopupTitleStaysInsideItsWindow();
@@ -6579,6 +6580,7 @@ async function checkTheCommandMenuIsFullBeforeTheFirstMessage(): Promise<void> {
 async function checkTheFileEditorShowsTheFile(): Promise<void> {
   const lines = Array.from({ length: 200 }, (_, i) => `line-${i + 1} const value${i + 1} = ${i + 1};`);
   const text = lines.join('\n');
+  const initialLine = 150;
 
   const host = document.createElement('div');
   // Stacked above whatever earlier checks left on the page — the terminal from
@@ -6594,6 +6596,7 @@ async function checkTheFileEditorShowsTheFile(): Promise<void> {
       path: '/tmp/browser-check/sample.ts',
       language: 'ts',
       ariaLabel: 'Contents of sample.ts',
+      initialLine,
     } as never),
   );
 
@@ -6622,6 +6625,18 @@ async function checkTheFileEditorShowsTheFile(): Promise<void> {
 
   const rendered = onScreen();
   check('it renders the file, not an empty frame', rendered.length > 5, `${rendered.length} lines`);
+  check(
+    'a requested source line is revealed when Monaco opens',
+    rendered.some((line) => line.text === lines[initialLine - 1]),
+    rendered.slice(0, 4).map((line) => line.text.split(' ')[0]).join(','),
+  );
+
+  const activeLine = host.querySelector('.line-numbers.active-line-number') as HTMLElement | null;
+  check(
+    'and the cursor is placed on that source line',
+    activeLine?.textContent?.trim() === String(initialLine),
+    activeLine?.textContent?.trim() || 'no active line number',
+  );
 
   // The heart of the report. Every rendered line must be the line the file has
   // at that position — so a window that is complete but shuffled fails here.
@@ -6814,6 +6829,203 @@ async function checkAReadOnlyFileStaysReadOnly(): Promise<void> {
 
   root.unmount();
   host.remove();
+}
+
+/**
+ * An absolute source link in an agent reply stays inside the application.
+ *
+ * This is deliberately end-to-end through ChatView: the regression was a real
+ * anchor asking Express for `/home/.../registry.ts:228`, so unit-testing the
+ * parser or the editor alone cannot prove the browser navigation was stopped,
+ * the line suffix was removed from the file request, and Monaco received it.
+ */
+async function checkAChatFileLinkOpensAtItsSourceLine(): Promise<void> {
+  const workingDir = '/home/dev/projects/webcli';
+  const filePath = `${workingDir}/src/server/chat/registry.ts`;
+  const plainFilePath = `${workingDir}/README.md`;
+  const initialLine = 150;
+  const lines = Array.from({ length: 220 }, (_, i) => `registry-line-${i + 1} const entry${i + 1} = ${i + 1};`);
+  const content = lines.join('\n');
+
+  const controller = new ChatController('file-link-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'file-link-check',
+    snapshot: {
+      sessionId: 'file-link-check',
+      runtime: 'claude',
+      state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true,
+      },
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: 1,
+          blocks: [{ kind: 'text', text: 'Where is the registry entry?' }],
+        },
+        {
+          id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: 2,
+          blocks: [{
+            kind: 'text',
+            text: `Open [registry.ts:${initialLine}](${filePath}:${initialLine}) or [README](${plainFilePath}). Keep [the website](https://example.com) external.`,
+          }],
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const requested: string[] = [];
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const raw = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+    const url = new URL(raw, window.location.href);
+    if (url.pathname.includes('/api/workspace/') && url.pathname.endsWith('/file')) {
+      const requestedPath = url.searchParams.get('path') || '';
+      requested.push(requestedPath);
+      const markdown = requestedPath === plainFilePath;
+      const body = markdown ? '# Project\n\nOpened in the normal preview.' : content;
+      return new Response(
+        JSON.stringify({
+          path: requestedPath,
+          name: markdown ? 'README.md' : 'registry.ts',
+          relativePath: markdown ? 'README.md' : 'src/server/chat/registry.ts',
+          size: body.length,
+          mtimeMs: 1,
+          language: markdown ? 'markdown' : 'typescript',
+          content: body,
+          binary: false,
+          tooLarge: false,
+          writable: false,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    return realFetch.call(window, input as RequestInfo, init);
+  }) as typeof window.fetch;
+
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1100px;height:720px;position:absolute;top:0;left:0;display:flex;z-index:9999';
+  document.body.appendChild(host);
+  const root = createRoot(host);
+
+  try {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir,
+        view: { ...DEFAULT_CHAT_VIEW, panelOpen: false },
+        onViewChange: () => {},
+      } as never),
+    );
+    await wait(300);
+
+    const link = Array.from(host.querySelectorAll('a')).find(
+      (anchor) =>
+        anchor.dataset.workspaceFilePath === filePath
+        && anchor.dataset.workspaceFileLine === String(initialLine),
+    ) as HTMLAnchorElement | undefined;
+    check('an absolute source reference is rendered as a chat link', Boolean(link));
+    if (!link) return;
+
+    check(
+      'workspace links advertise a dialog instead of a new browser tab',
+      link.getAttribute('aria-haspopup') === 'dialog'
+        && link.getAttribute('target') === null
+        && link.getAttribute('href')?.startsWith('#workspace-file='),
+      link.outerHTML,
+    );
+    const external = Array.from(host.querySelectorAll('a')).find(
+      (anchor) => anchor.getAttribute('href') === 'https://example.com',
+    );
+    check(
+      'ordinary web links retain their external-link semantics',
+      external?.getAttribute('target') === '_blank'
+        && external.getAttribute('aria-haspopup') === null,
+      external?.outerHTML || 'no external link',
+    );
+
+    const middleClick = new MouseEvent('auxclick', {
+      bubbles: true,
+      cancelable: true,
+      button: 1,
+    });
+    link.dispatchEvent(middleClick);
+    check('middle-click cannot bypass workspace routing', middleClick.defaultPrevented);
+
+    const click = new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 });
+    link.dispatchEvent(click);
+    check('clicking the source reference stops browser navigation', click.defaultPrevented);
+
+    let ready = false;
+    for (let i = 0; i < 120 && !ready; i++) {
+      await wait(100);
+      ready = host.querySelector('[role="dialog"] [data-monaco-host="ready"]') !== null;
+    }
+
+    check(
+      'the file request removes the source-line suffix',
+      requested.length === 1 && requested[0] === filePath,
+      JSON.stringify(requested),
+    );
+    const dialog = host.querySelector('[role="dialog"]') as HTMLElement | null;
+    check(
+      'the existing file popup opens the referenced file while the workspace rail is closed',
+      Boolean(dialog) && (dialog?.textContent || '').includes('registry.ts'),
+      dialog ? (dialog.textContent || '').slice(0, 120) : 'no dialog',
+    );
+    check('that popup reaches the real Monaco editor', ready);
+
+    // Give Monaco a frame after creation to paint the model window around the
+    // cursor. The host's ready marker is set synchronously with editor.create.
+    await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    await wait(200);
+    const shown = Array.from(dialog?.querySelectorAll('.view-line') || [])
+      .map((node) => (node.textContent || '').replace(/ /g, ' ').trimEnd());
+    const active = dialog?.querySelector('.line-numbers.active-line-number') as HTMLElement | null;
+    check(
+      'the linked source line is visible in Monaco',
+      shown.includes(lines[initialLine - 1]),
+      shown.slice(0, 5).map((line) => line.split(' ')[0]).join(','),
+    );
+    check(
+      'and Monaco puts its cursor on that exact line',
+      active?.textContent?.trim() === String(initialLine),
+      active?.textContent?.trim() || 'no active line',
+    );
+
+    const close = Array.from(dialog?.querySelectorAll('button') || [])
+      .find((button) => button.textContent?.trim() === 'Close') as HTMLButtonElement | undefined;
+    close?.click();
+    await wait(150);
+
+    const plainLink = Array.from(host.querySelectorAll('a')).find(
+      (anchor) => anchor.dataset.workspaceFilePath === plainFilePath,
+    ) as HTMLAnchorElement | undefined;
+    plainLink?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+    for (let i = 0; i < 30 && requested.length < 2; i++) await wait(50);
+    const plainDialog = host.querySelector('[role="dialog"]') as HTMLElement | null;
+    check(
+      'a file link with no line opens through the same popup',
+      requested[1] === plainFilePath && Boolean(plainDialog),
+      JSON.stringify(requested),
+    );
+    check(
+      'and keeps the file editor’s normal preview behaviour',
+      (plainDialog?.textContent || '').includes('Opened in the normal preview.')
+        && plainDialog?.querySelector('[data-monaco-host]') === null,
+      (plainDialog?.textContent || '').slice(0, 120),
+    );
+  } finally {
+    root.unmount();
+    host.remove();
+    window.fetch = realFetch;
+  }
 }
 
 /**
