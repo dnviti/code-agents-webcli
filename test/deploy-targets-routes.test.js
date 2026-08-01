@@ -448,6 +448,38 @@ describe('deploy target routes', function () {
     assert.strictEqual(store.listTargets().length, 0);
   });
 
+  it('fails closed and retains target credentials when runtime inspection fails', async function () {
+    const { target } = await (await createTarget({
+      hostSecret: { host: HOST, tls: TLS },
+    })).json();
+    // A failed list is unknown, not proof that the target is empty.
+    enginesInManager.set(target.id, {
+      kind: 'docker',
+      binary: 'docker',
+      list: async () => {
+        throw new Error(`cannot reach ${HOST}`);
+      },
+    });
+
+    const res = await req('DELETE', `/api/admin/deploy-targets/${target.id}`);
+    assert.strictEqual(res.status, 409);
+    const body = await res.json();
+    assert.strictEqual(body.error, 'target_runtime_unknown');
+    assert.ok(!JSON.stringify(body).includes(HOST), 'connection failures must not leak credentials');
+    assert.strictEqual(store.getTarget(target.id).hostSecret.host, HOST, 'the target and its credentials survive');
+    assert.strictEqual(reloadCount, 1, 'a failed inspection does not reload or remove the target');
+  });
+
+  it('inspects a target runtime even when the manager did not retain its engine', async function () {
+    const { target } = await (await createTarget()).json();
+    engineBehavior.list = async () => ['orphaned-container'];
+
+    const res = await req('DELETE', `/api/admin/deploy-targets/${target.id}`);
+    assert.strictEqual(res.status, 409);
+    assert.deepStrictEqual((await res.json()).containers, ['orphaned-container']);
+    assert.ok(store.getTarget(target.id), 'the target survives a container found by its direct runtime probe');
+  });
+
   it('retains a target recorded by stopped or reclaimed projects', async function () {
     const { target } = await (await createTarget()).json();
     projectRefs.set(target.id, ['project-stopped']);

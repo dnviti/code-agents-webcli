@@ -299,7 +299,12 @@ export function createDeployTargetRoutes(deps: DeployTargetRoutesDeps): Router {
         });
         return;
       }
-      const inUse = await containersOnTarget(deps, id);
+      const inspection = await inspectTargetContainers(deps, existing);
+      if (!inspection.ok) {
+        sendRuntimeUnknown(res, existing);
+        return;
+      }
+      const inUse = inspection.containers;
       if (inUse.length > 0) {
         res.status(409).json({
           error: 'target_in_use',
@@ -332,9 +337,15 @@ export function createDeployTargetRoutes(deps: DeployTargetRoutesDeps): Router {
     // A target with containers still standing is not deletable: deleting it
     // would orphan work nobody can then reach. Ask every engine the manager
     // can still reach — including ones retained for containers of edited
-    // targets; one that cannot be reached cannot report containers, and a
-    // container that cannot be reported cannot block.
-    const inUse = await containersOnTarget(deps, id);
+    // targets. Absence must be proved, not inferred from an unreachable
+    // engine: otherwise deleting this row also deletes the credentials needed
+    // to recover containers the failed inspection could not report.
+    const inspection = await inspectTargetContainers(deps, existing);
+    if (!inspection.ok) {
+      sendRuntimeUnknown(res, existing);
+      return;
+    }
+    const inUse = inspection.containers;
     if (inUse.length > 0) {
       res.status(409).json({
         error: 'target_in_use',
@@ -370,22 +381,54 @@ export function createDeployTargetRoutes(deps: DeployTargetRoutesDeps): Router {
   return router;
 }
 
+type TargetContainerInspection =
+  | { ok: true; containers: string[] }
+  | { ok: false };
+
 /**
- * Every container any reachable engine reports for a target. An engine that
- * cannot be reached cannot report containers, and a container that cannot be
- * reported cannot block — do not let a dead target block tidying up the rest.
+ * Prove that no reachable or current target runtime has containers carrying
+ * this target's label. A freshly built engine covers targets that the manager
+ * could not retain (for example because its first connection attempt failed).
+ * Any failed listing leaves the answer unknown: callers that would remove or
+ * replace credentials must fail closed rather than orphaning that runtime.
  */
-async function containersOnTarget(deps: DeployTargetRoutesDeps, id: string): Promise<string[]> {
-  const label = `${TARGET_LABEL}=${targetLabelValue(id)}`;
-  const inUse: string[] = [];
-  for (const engine of new Set(deps.enginesForDeployTargets().values())) {
+async function inspectTargetContainers(
+  deps: DeployTargetRoutesDeps,
+  target: DeployTarget,
+): Promise<TargetContainerInspection> {
+  const engines = deps.enginesForDeployTargets();
+  const candidates = new Set(engines.values());
+
+  // The manager owns all historic engines, but a target that failed to load
+  // into it still needs its configured runtime queried before its credentials
+  // may be removed.
+  if (!engines.has(target.id)) {
     try {
-      inUse.push(...(await engine.list(label)));
+      const config = deps.deployTargets.configForTarget(target.id, deps.deployTargetDataDir);
+      candidates.add(deps.createDeployEngine(config));
     } catch {
-      // unreachable: see above
+      return { ok: false };
     }
   }
-  return inUse;
+
+  const label = `${TARGET_LABEL}=${targetLabelValue(target.id)}`;
+  const inUse = new Set<string>();
+  for (const engine of candidates) {
+    try {
+      for (const name of await engine.list(label)) inUse.add(name);
+    } catch {
+      return { ok: false };
+    }
+  }
+  return { ok: true, containers: [...inUse] };
+}
+
+/** Do not disclose connection errors, which can contain target credentials. */
+function sendRuntimeUnknown(res: Response, target: DeployTarget): void {
+  res.status(409).json({
+    error: 'target_runtime_unknown',
+    message: `Could not verify that the ${target.engine} target has no containers. Its connection and credentials were left unchanged.`,
+  });
 }
 
 /**
