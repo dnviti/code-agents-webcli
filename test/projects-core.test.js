@@ -2205,27 +2205,41 @@ describe('project lifecycle transaction and preservation recovery', function () 
     const dir = root(); const repo = path.join(dir, 'repo'); const remote = path.join(dir, 'remote.git'); fs.mkdirSync(repo);
     execFileSync('git', ['init', '--bare', remote]);
     const git = (...args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+    const repoUrl = 'https://example.test/repo.git';
     git('init'); git('config', 'user.name', 'Owner'); git('config', 'user.email', 'owner@example.test');
     fs.writeFileSync(path.join(repo, 'tracked.txt'), 'base'); git('add', '-A'); git('commit', '-m', 'base');
-    git('remote', 'add', 'origin', 'https://example.test/repo.git');
+    git('remote', 'add', 'origin', repoUrl);
     const hook = path.join(repo, '.git', 'hooks', 'pre-push');
     fs.writeFileSync(hook, '#!/bin/sh\ngit checkout -B hook-moved\n'); fs.chmodSync(hook, 0o755);
     fs.writeFileSync(path.join(repo, 'tracked.txt'), 'unstaged');
     fs.writeFileSync(path.join(repo, 'staged.txt'), 'staged'); git('add', 'staged.txt');
     fs.writeFileSync(path.join(repo, 'untracked.txt'), 'untracked');
-    const beforeHead = git('rev-parse', 'HEAD'); const beforeStatus = git('status', '--porcelain=v1');
+    const beforeHead = git('rev-parse', 'HEAD'); const beforeStatus = git('status', '--porcelain=v1'); const beforeIndex = git('ls-files', '--stage');
     let pushed = false; const e = engine({ async exec(spec, command, args) {
-      if (command === 'rm') { fs.rmSync(args[args.length - 1], { force: true }); return { stdout: '', stderr: '' }; }
-      if (command === '/bin/sh' && args.includes('push')) { pushed = true; return { stdout: '', stderr: '' }; }
-      // Keep the durable HTTP origin intact for origin validation, but route
-      // this fixture's real local operations inside its temporary checkout.
-      return { stdout: execFileSync(command, args, { encoding: 'utf8', env: { ...process.env, ...(spec.env || {}) } }), stderr: '' };
+      let testArgs = args;
+      if (command === '/bin/sh' && args.includes('push')) {
+        pushed = true;
+        // Production remains HTTP(S)-only. This adapter changes only the
+        // immutable destination and protocol allowlist for a local receive-pack
+        // fixture, while executing the real fresh-bare/alternate-object script.
+        testArgs = args.map((arg) => arg === repoUrl
+          ? `file://${remote}`
+          : arg
+            .replace('GIT_ALLOW_PROTOCOL=http:https', 'GIT_ALLOW_PROTOCOL=http:https:file')
+            .replace('-c protocol.https.allow=always', '-c protocol.https.allow=always -c protocol.file.allow=always'));
+      }
+      return { stdout: execFileSync(command, testArgs, { encoding: 'utf8', env: { ...process.env, ...(spec.env || {}) }, input: spec.input }), stderr: '' };
     } });
-    const result = await preserveProjectWork({ engine: e, containerName: 'box', containerIdentity: 'box-id', repoContainerPath: repo, repoUrl: 'https://example.test/repo.git', author: { name: 'Ada', email: 'ada@example.test' } });
+    const result = await preserveProjectWork({ engine: e, containerName: 'box', containerIdentity: 'box-id', repoContainerPath: repo, repoUrl, author: { name: 'Ada', email: 'ada@example.test' } });
     assert.strictEqual(git('rev-parse', 'HEAD'), beforeHead);
     assert.strictEqual(git('status', '--porcelain=v1'), beforeStatus);
+    assert.strictEqual(git('ls-files', '--stage'), beforeIndex);
     assert.notStrictEqual(git('branch', '--show-current').trim(), 'hook-moved');
     assert.strictEqual(git('cat-file', '-t', result.commit).trim(), 'commit');
+    assert.strictEqual(execFileSync('git', ['--git-dir', remote, 'rev-parse', `refs/heads/${result.branch}`], { encoding: 'utf8' }).trim(), result.commit);
+    assert.strictEqual(execFileSync('git', ['--git-dir', remote, 'show', `${result.commit}:tracked.txt`], { encoding: 'utf8' }), 'unstaged');
+    assert.strictEqual(execFileSync('git', ['--git-dir', remote, 'show', `${result.commit}:staged.txt`], { encoding: 'utf8' }), 'staged');
+    assert.strictEqual(execFileSync('git', ['--git-dir', remote, 'show', `${result.commit}:untracked.txt`], { encoding: 'utf8' }), 'untracked');
     assert.strictEqual(pushed, true);
   });
 
