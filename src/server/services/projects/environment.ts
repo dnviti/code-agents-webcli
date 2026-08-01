@@ -14,6 +14,8 @@ export const PROJECT_WORKSPACE = '/workspace';
 
 export interface ProjectEnvironmentResult {
   environment: UserEnvironment;
+  /** Exact engine snapshot that admitted this project runtime. */
+  engine: EnvironmentEngine;
   workingDir: string;
   /** Host roots a requested/persisted session cwd may be confined within. */
   allowedWorkingDirs: string[];
@@ -251,6 +253,7 @@ export class ProjectEnvironmentManager {
     });
     return {
       environment,
+      engine: target.engine,
       workingDir: this.checkoutPath(project, owner),
       allowedWorkingDirs: [root, ownerHome.hostPath],
       containerAccess: {
@@ -279,9 +282,10 @@ export class ProjectEnvironmentManager {
   async stopAccess(
     project: Project,
     access: ProjectContainerAccess,
+    exactEngine?: EnvironmentEngine,
   ): Promise<'absent' | 'stopped'> {
     this.assertAccess(project, access);
-    const owned = await this.ownedDescription(project);
+    const owned = await this.ownedDescription(project, exactEngine);
     if (!owned) return 'absent';
     if (owned.description.identity !== access.containerIdentity) {
       throw new ProjectContainerOwnershipError(
@@ -339,8 +343,9 @@ export class ProjectEnvironmentManager {
     command: string,
     commandArgs: string[],
     signal?: AbortSignal,
+    exactEngine?: EnvironmentEngine,
   ): Promise<ProjectTrackedExecution> {
-    const owned = await this.ownedAccess(project, access);
+    const owned = await this.ownedAccess(project, access, exactEngine);
     signal?.throwIfAborted();
     const tracked = trackContainerProcess(
       owned.engine,
@@ -391,8 +396,9 @@ export class ProjectEnvironmentManager {
     cwd: string | undefined,
     command: string,
     commandArgs: string[],
+    exactEngine?: EnvironmentEngine,
   ): Promise<ProjectTrackedSpawnDescriptor> {
-    const owned = await this.ownedAccess(project, access);
+    const owned = await this.ownedAccess(project, access, exactEngine);
     const tracked = trackContainerProcess(
       owned.engine,
       access.containerName,

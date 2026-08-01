@@ -55,8 +55,27 @@ describe('MessageProcessor', function() {
           return { id: 'project-1', name: 'Project One' };
         },
         ensureForSession() {
-          return Promise.resolve({ ok: false, reason: 'building' });
+          return Promise.resolve({
+            ok: true,
+            environment: {
+              kind: 'host', name: null, homeDir: '/tmp', containerHome: '/tmp',
+              shells: [], mounts: [], nodePath: process.execPath,
+              toContainerPath: (value) => value,
+              toHostPath: (value) => value,
+              wrap: (command, args, options = {}) => ({ command, args, env: options.env || {} }),
+            },
+            workingDir: '/tmp',
+            allowedWorkingDirs: ['/tmp'],
+            containerAccess: {
+              projectId: 'project-1', ownerUserId: 7, containerName: 'project-1',
+              containerIdentity: 'project-1-id', root: '/', workspaceRoot: '/workspace',
+              ownerHomeRoot: '/home/tester',
+            },
+            leaseId: 'lease-1',
+          });
         },
+        releaseSessionLease() { return true; },
+        touchActivity() {},
       },
       historyStore: {
         append() {},

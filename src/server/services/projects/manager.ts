@@ -16,7 +16,7 @@ import {
   ProjectTrackedSpawnDescriptor,
   validateProjectContainerPath,
 } from './environment.js';
-import { RunResult, isQuiescentContainerStatus } from '../environments/engine.js';
+import { EnvironmentEngine, RunResult, isQuiescentContainerStatus } from '../environments/engine.js';
 import { preserveProjectWork } from './preserve.js';
 import { BuildEvent, Project, ProjectState, ProjectStore, RunningProjectInfo } from './store.js';
 import { PROJECT_LABEL, TARGET_LABEL, targetLabelValue } from '../environments/naming.js';
@@ -67,6 +67,9 @@ interface RecoveryEntry {
 interface IssuedSessionLease {
   ownerUserId: number;
   projectId: string;
+  /** Immutable runtime placement captured before this lease can escape. */
+  project: Project;
+  engine: EnvironmentEngine;
   access: ProjectContainerAccess;
   recoveries: Set<RecoveryEntry>;
   releaseRequested: boolean;
@@ -460,6 +463,11 @@ export class ProjectManager {
         this.issuedLeases.set(lease.leaseId, {
           ownerUserId,
           projectId,
+          project: {
+            ...project,
+            container: { ...(project.container || {}), name: result.containerName },
+          },
+          engine: result.engine,
           access: result.containerAccess,
           recoveries: new Set(),
           releaseRequested: false,
@@ -552,6 +560,7 @@ export class ProjectManager {
       command,
       commandArgs,
       signal,
+      issued.engine,
     );
     const execution = await this.settle(tracked.result);
     const stopped = await this.settle(tracked.processControl.stop());
@@ -594,11 +603,11 @@ export class ProjectManager {
         ...(length === undefined ? [] : [`count=${length}`]),
         'status=none',
       ];
-      return this.spawnTrackedFileCommand(project, issued.access, 'dd', commandArgs);
+      return this.spawnTrackedFileCommand(project, issued.access, issued.engine, 'dd', commandArgs);
     }
     if (input.append && input.exclusive) throw new Error('exclusive project file writes cannot append');
     if (input.exclusive) {
-      return this.spawnTrackedFileCommand(project, issued.access, 'dd', [
+      return this.spawnTrackedFileCommand(project, issued.access, issued.engine, 'dd', [
           `of=${filePath}`,
           'conv=excl',
           'status=none',
@@ -607,6 +616,7 @@ export class ProjectManager {
     return this.spawnTrackedFileCommand(
       project,
       issued.access,
+      issued.engine,
       'tee',
       [...(input.append ? ['-a'] : []), '--', filePath],
     );
@@ -615,6 +625,7 @@ export class ProjectManager {
   private async spawnTrackedFileCommand(
     project: Project,
     access: ProjectContainerAccess,
+    engine: EnvironmentEngine,
     command: string,
     commandArgs: string[],
   ): Promise<ProjectSessionFileProcess> {
@@ -626,6 +637,7 @@ export class ProjectManager {
       undefined,
       command,
       commandArgs,
+      engine,
     );
     return this.spawnIdentityBound(launch);
   }
@@ -924,9 +936,9 @@ export class ProjectManager {
       );
       if (issued.recoveries.size === 0) continue;
 
+      await this.projects.stopAccess(issued.project, issued.access, issued.engine);
       const project = this.deps.store.getProjectForUser(issued.projectId, issued.ownerUserId);
       if (project) {
-        await this.projects.stopAccess(project, issued.access);
         this.deps.store.setState(
           project.id,
           'stopped',

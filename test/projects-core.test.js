@@ -420,6 +420,31 @@ describe('project core lifecycle', function () {
     assert.strictEqual(s.projectHasActiveSessions('one'), false);
   });
 
+  it('uses the admission engine for shutdown recovery after a target reload', async function () {
+    const { manager, s, e, environments, cfg } = setup([project('one')]);
+    await manager.start(1, 'one'); await manager.waitForBuild('one');
+    const admitted = await manager.ensureForSession(1, 'one');
+    assert.strictEqual(admitted.ok, true);
+    const replacement = engine();
+    environments.reloadTargets({
+      engines: new Map([['legacy', replacement]]),
+      configs: new Map([['legacy', cfg]]),
+      activeKey: 'legacy',
+    });
+    manager.registerUnverifiedSessionProcess(1, 'one', admitted.leaseId, {
+      reason: 'controller permanently unavailable',
+      stop: async () => { throw new Error('control plane unavailable'); },
+    });
+    assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), false);
+
+    await manager.shutdown();
+
+    assert.ok(e.calls.some((call) => call.op === 'stop' && call.name === admitted.containerAccess.containerName));
+    assert.strictEqual(replacement.calls.some((call) => call.op === 'stop'), false);
+    assert.strictEqual(s.getProject('one').state, 'stopped');
+    assert.strictEqual(s.projectHasActiveSessions('one'), false);
+  });
+
   it('never stops a same-name replacement while recovering a helper at shutdown', async function () {
     const { manager, s, e } = setup([project('one')]);
     await manager.start(1, 'one'); await manager.waitForBuild('one');
