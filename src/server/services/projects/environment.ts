@@ -4,8 +4,9 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { ContainerEnvironment, EnvironmentManager, LOGIN_LABEL, MANAGED_LABEL, TIER_LABEL, USER_ID_LABEL } from '../environments/manager.js';
 import { EnvironmentEngine, RunResult } from '../environments/engine.js';
+import { trackContainerProcess } from '../environments/process-control.js';
 import { PROJECT_LABEL, projectContainerName, TARGET_LABEL, targetLabelValue } from '../environments/naming.js';
-import { EnvironmentOwner, Mount, UserEnvironment } from '../environments/types.js';
+import { EnvironmentOwner, Mount, UserEnvironment, WrappedProcessControl } from '../environments/types.js';
 import { Project } from './store.js';
 import { repoBaseName } from './clone.js';
 
@@ -36,6 +37,19 @@ export interface ProjectContainerAccess {
   root: '/';
   workspaceRoot: typeof PROJECT_WORKSPACE;
   ownerHomeRoot: string;
+}
+
+export interface ProjectTrackedExecution {
+  result: Promise<RunResult>;
+  processControl: WrappedProcessControl;
+}
+
+export interface ProjectTrackedSpawnDescriptor {
+  file: string;
+  args: string[];
+  processControl: WrappedProcessControl;
+  /** Re-inspect through the exact engine snapshot that built this descriptor. */
+  verifyIdentity(): Promise<void>;
 }
 
 export type ProjectContainerPathLifetime = 'workspace' | 'owner_home' | 'disposable';
@@ -304,19 +318,51 @@ export class ProjectEnvironmentManager {
     commandArgs: string[],
     signal?: AbortSignal,
   ): Promise<RunResult> {
-    this.assertAccess(project, access);
-    const owned = await this.ownedDescription(project);
-    if (!owned) throw new ProjectContainerStateUnknownError(
-      `project container '${access.containerName}' is missing`, access.containerName,
-    );
-    if (owned.description.identity !== access.containerIdentity) {
-      throw new ProjectContainerOwnershipError(`project container '${access.containerName}' was replaced`);
-    }
+    const owned = await this.ownedAccess(project, access);
     return owned.engine.exec(
       { name: access.containerName, identity: access.containerIdentity, cwd: validateProjectContainerPath(access, cwd), signal },
       command,
       commandArgs,
     );
+  }
+
+  /**
+   * Validate first, then start one tracked helper through that same engine.
+   * A rejection from this method means launch was never attempted; once it
+   * resolves, `result` may fail for either a command or transport reason and
+   * its process control must always be settled before admission is released.
+   */
+  async startTrackedExec(
+    project: Project,
+    access: ProjectContainerAccess,
+    cwd: string,
+    command: string,
+    commandArgs: string[],
+    signal?: AbortSignal,
+  ): Promise<ProjectTrackedExecution> {
+    const owned = await this.ownedAccess(project, access);
+    signal?.throwIfAborted();
+    const tracked = trackContainerProcess(
+      owned.engine,
+      access.containerName,
+      access.containerIdentity,
+      command,
+      commandArgs,
+      false,
+    );
+    return {
+      result: owned.engine.exec(
+        {
+          name: access.containerName,
+          identity: access.containerIdentity,
+          cwd: validateProjectContainerPath(access, cwd),
+          signal,
+        },
+        tracked.command,
+        tracked.args,
+      ),
+      processControl: tracked.processControl,
+    };
   }
 
   /** Validate ownership then describe a direct engine-client spawn safely. */
@@ -327,14 +373,7 @@ export class ProjectEnvironmentManager {
     command: string,
     commandArgs: string[],
   ): Promise<{ file: string; args: string[] }> {
-    this.assertAccess(project, access);
-    const owned = await this.ownedDescription(project);
-    if (!owned) throw new ProjectContainerStateUnknownError(
-      `project container '${access.containerName}' is missing`, access.containerName,
-    );
-    if (owned.description.identity !== access.containerIdentity) {
-      throw new ProjectContainerOwnershipError(`project container '${access.containerName}' was replaced`);
-    }
+    const owned = await this.ownedAccess(project, access);
     return {
       file: owned.engine.binary,
       args: owned.engine.execArgs(
@@ -345,9 +384,63 @@ export class ProjectEnvironmentManager {
     };
   }
 
-  private async ownedDescription(project: Project): Promise<{ engine: EnvironmentEngine; description: NonNullable<Awaited<ReturnType<EnvironmentEngine['describe']>>> } | null> {
+  /** Build a tracked pipe descriptor and post-spawn verifier on one engine. */
+  async trackedExecDescriptor(
+    project: Project,
+    access: ProjectContainerAccess,
+    cwd: string | undefined,
+    command: string,
+    commandArgs: string[],
+  ): Promise<ProjectTrackedSpawnDescriptor> {
+    const owned = await this.ownedAccess(project, access);
+    const tracked = trackContainerProcess(
+      owned.engine,
+      access.containerName,
+      access.containerIdentity,
+      command,
+      commandArgs,
+      false,
+    );
+    return {
+      file: owned.engine.binary,
+      args: owned.engine.execArgs(
+        {
+          name: access.containerName,
+          identity: access.containerIdentity,
+          ...(cwd ? { cwd: validateProjectContainerPath(access, cwd) } : {}),
+        },
+        tracked.command,
+        tracked.args,
+      ),
+      processControl: tracked.processControl,
+      verifyIdentity: async () => {
+        await this.ownedAccess(project, access, owned.engine);
+      },
+    };
+  }
+
+  private async ownedAccess(
+    project: Project,
+    access: ProjectContainerAccess,
+    exactEngine?: EnvironmentEngine,
+  ): Promise<{ engine: EnvironmentEngine; description: NonNullable<Awaited<ReturnType<EnvironmentEngine['describe']>>> }> {
+    this.assertAccess(project, access);
+    const owned = await this.ownedDescription(project, exactEngine);
+    if (!owned) throw new ProjectContainerStateUnknownError(
+      `project container '${access.containerName}' is missing`, access.containerName,
+    );
+    if (owned.description.identity !== access.containerIdentity) {
+      throw new ProjectContainerOwnershipError(`project container '${access.containerName}' was replaced`);
+    }
+    return owned;
+  }
+
+  private async ownedDescription(
+    project: Project,
+    exactEngine?: EnvironmentEngine,
+  ): Promise<{ engine: EnvironmentEngine; description: NonNullable<Awaited<ReturnType<EnvironmentEngine['describe']>>> } | null> {
     if (!project.container) return null;
-    const engine = this.environments.projectTarget(project.targetId).engine;
+    const engine = exactEngine || this.environments.projectTarget(project.targetId).engine;
     const described = await this.inspect(engine, project.container.name);
     if (!described) return null;
     if (!described.identity) throw new ProjectContainerStateUnknownError(

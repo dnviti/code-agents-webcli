@@ -1,11 +1,11 @@
 /** Project lifecycle policy: placement, preservation, limits and recovery. */
 
 import { EventEmitter } from 'node:events';
-import { ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { EnvironmentManager, MANAGED_LABEL, USER_ID_LABEL } from '../environments/manager.js';
-import { EnvironmentOwner, UserEnvironment } from '../environments/types.js';
+import { EnvironmentOwner, UserEnvironment, WrappedProcessControl } from '../environments/types.js';
 import { DeployTargetStore } from '../deploy-targets.js';
 import { checkRepositoryAccess, cloneRepository, FetchLike } from './clone.js';
 import {
@@ -13,12 +13,24 @@ import {
   ProjectContainerOwnershipError,
   ProjectContainerStateUnknownError,
   ProjectEnvironmentManager,
+  ProjectTrackedSpawnDescriptor,
   validateProjectContainerPath,
 } from './environment.js';
 import { RunResult, isQuiescentContainerStatus } from '../environments/engine.js';
 import { preserveProjectWork } from './preserve.js';
 import { BuildEvent, Project, ProjectState, ProjectStore, RunningProjectInfo } from './store.js';
 import { PROJECT_LABEL, TARGET_LABEL, targetLabelValue } from '../environments/naming.js';
+import {
+  ProjectSessionFileCommand,
+  ProjectSessionFileProcess,
+  ProjectSessionProcessRecovery,
+  UnverifiedProjectFileProcessError,
+} from './working-dir.js';
+
+export type {
+  ProjectSessionFileCommand,
+  ProjectSessionProcessRecovery,
+} from './working-dir.js';
 
 export type CreateResult =
   | { ok: true; project: Project; state: 'building' | 'running' }
@@ -44,17 +56,6 @@ export type UpdateResult =
   | { ok: false; reason: 'validation'; message: string }
   | { ok: false; reason: 'credential_required'; host: string }
   | { ok: false; reason: 'repo_unreachable'; message: string };
-
-/** Fixed, binary-safe helpers for an engine-backed project file browser. */
-export type ProjectSessionFileCommand =
-  | { operation: 'read'; path: string; offset?: number; length?: number }
-  | { operation: 'write'; path: string; append?: boolean; exclusive?: boolean };
-
-/** Retryable ownership transferred by a helper whose remote exit is uncertain. */
-export interface ProjectSessionProcessRecovery {
-  reason: string;
-  stop?: () => Promise<void>;
-}
 
 interface RecoveryEntry {
   recovery: ProjectSessionProcessRecovery;
@@ -542,7 +543,27 @@ export class ProjectManager {
     const issued = this.requireIssuedLease(ownerUserId, projectId, leaseId);
     const project = this.deps.store.getProjectForUser(projectId, ownerUserId);
     if (!project) throw new Error('project was removed while its session lease was active');
-    return this.projects.exec(project, issued.access, cwd, command, commandArgs, signal);
+    // A rejection here is definitively pre-launch: ownership and an already
+    // aborted signal are checked before a tracking wrapper is started.
+    const tracked = await this.projects.startTrackedExec(
+      project,
+      issued.access,
+      cwd,
+      command,
+      commandArgs,
+      signal,
+    );
+    const execution = await this.settle(tracked.result);
+    const stopped = await this.settle(tracked.processControl.stop());
+    if (!stopped.ok) {
+      const commandDetail = execution.ok ? '' : `; command failed first: ${this.errorDetail(execution.error)}`;
+      throw new UnverifiedProjectFileProcessError(
+        `Could not verify that the project container helper stopped: ${this.errorDetail(stopped.error)}${commandDetail}`,
+        () => tracked.processControl.stop(),
+      );
+    }
+    if (!execution.ok) throw execution.error;
+    return execution.value;
   }
 
   /**
@@ -555,7 +576,7 @@ export class ProjectManager {
     projectId: string,
     leaseId: string,
     input: ProjectSessionFileCommand,
-  ): Promise<ChildProcessWithoutNullStreams> {
+  ): Promise<ProjectSessionFileProcess> {
     const issued = this.requireIssuedLease(ownerUserId, projectId, leaseId);
     const project = this.deps.store.getProjectForUser(projectId, ownerUserId);
     if (!project) throw new Error('project was removed while its session lease was active');
@@ -573,65 +594,160 @@ export class ProjectManager {
         ...(length === undefined ? [] : [`count=${length}`]),
         'status=none',
       ];
-      const launch = await this.projects.execDescriptor(project, issued.access, undefined, 'dd', commandArgs);
-      return this.spawnIdentityBound(project, issued.access, launch);
+      return this.spawnTrackedFileCommand(project, issued.access, 'dd', commandArgs);
     }
     if (input.append && input.exclusive) throw new Error('exclusive project file writes cannot append');
     if (input.exclusive) {
-      const launch = await this.projects.execDescriptor(project, issued.access, undefined, 'dd', [
+      return this.spawnTrackedFileCommand(project, issued.access, 'dd', [
           `of=${filePath}`,
           'conv=excl',
           'status=none',
         ]);
-      return this.spawnIdentityBound(project, issued.access, launch);
     }
-    const launch = await this.projects.execDescriptor(project, issued.access, undefined, 'tee', [ ...(input.append ? ['-a'] : []), '--', filePath ]);
-    return this.spawnIdentityBound(project, issued.access, launch);
+    return this.spawnTrackedFileCommand(
+      project,
+      issued.access,
+      'tee',
+      [...(input.append ? ['-a'] : []), '--', filePath],
+    );
+  }
+
+  private async spawnTrackedFileCommand(
+    project: Project,
+    access: ProjectContainerAccess,
+    command: string,
+    commandArgs: string[],
+  ): Promise<ProjectSessionFileProcess> {
+    // Descriptor validation happens before spawn, so an ownership failure here
+    // is known not to have launched a helper and needs no recovery transfer.
+    const launch = await this.projects.trackedExecDescriptor(
+      project,
+      access,
+      undefined,
+      command,
+      commandArgs,
+    );
+    return this.spawnIdentityBound(launch);
   }
 
   private async spawnIdentityBound(
-    project: Project,
-    access: ProjectContainerAccess,
-    launch: { file: string; args: string[] },
-  ): Promise<ChildProcessWithoutNullStreams> {
-    const child = spawn(launch.file, launch.args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    launch: ProjectTrackedSpawnDescriptor,
+  ): Promise<ProjectSessionFileProcess> {
+    const child = spawn(launch.file, launch.args, { stdio: ['pipe', 'pipe', 'pipe'] }) as ProjectSessionFileProcess;
+    child.processControl = launch.processControl;
     child.on('error', () => { /* surfaced through exit/close to the stream owner */ });
+    try {
+      await this.waitForSpawn(child);
+    } catch (error) {
+      // Node reports a missing/unstartable local engine binary before `spawn`.
+      // No remote helper exists, so wait only for the local handle and preserve
+      // the original error without falsely retaining the project lease.
+      const closed = await this.settle(this.terminateSpawn(child));
+      if (!closed.ok) {
+        throw new Error(
+          `Project container helper could not spawn (${this.errorDetail(error)}) and its local client did not settle: ${this.errorDetail(closed.error)}`,
+        );
+      }
+      throw error;
+    }
     try {
       // Docker/Podman argv already targets the immutable ID. Kubernetes exec
       // is name-addressed, so do a second UID check after the client process is
       // started and before its streams escape this manager.
-      await this.projects.execDescriptor(project, access, undefined, 'true', []);
+      await launch.verifyIdentity();
       return child;
     } catch (error) {
-      await this.terminateSpawn(child);
+      const stopped = await this.settleSpawn(child, launch.processControl);
+      if (!stopped.ok) {
+        throw new UnverifiedProjectFileProcessError(
+          `Project container helper failed post-spawn identity validation (${this.errorDetail(error)}) and could not be settled: ${this.errorDetail(stopped.error)}`,
+          () => this.retrySettleSpawn(child, launch.processControl),
+        );
+      }
       throw error;
     }
   }
 
-  private async terminateSpawn(child: ChildProcessWithoutNullStreams): Promise<void> {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    const wait = (ms: number) => new Promise<void>((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        child.off('close', finish);
+  private waitForSpawn(child: ProjectSessionFileProcess): Promise<void> {
+    if (typeof child.pid === 'number') return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const spawned = (): void => {
+        child.off('error', failed);
         resolve();
       };
-      const timer = setTimeout(finish, ms);
-      timer.unref();
-      child.once('close', finish);
+      const failed = (error: Error): void => {
+        child.off('spawn', spawned);
+        reject(error);
+      };
+      child.once('spawn', spawned);
+      child.once('error', failed);
     });
-    child.kill('SIGTERM');
-    await wait(1_000);
-    if (child.exitCode === null && child.signalCode === null) {
-      child.kill('SIGKILL');
-      await wait(1_000);
-    }
-    if (child.exitCode === null && child.signalCode === null) {
-      throw new Error('project container helper did not terminate after identity validation failed');
-    }
+  }
+
+  private async settleSpawn(
+    child: ProjectSessionFileProcess,
+    processControl: WrappedProcessControl,
+  ): Promise<{ ok: true } | { ok: false; error: unknown }> {
+    const [local, remote] = await Promise.all([
+      this.settle(this.terminateSpawn(child)),
+      this.settle(processControl.stop()),
+    ]);
+    if (!remote.ok) return remote;
+    if (!local.ok) return local;
+    return { ok: true };
+  }
+
+  private async retrySettleSpawn(
+    child: ProjectSessionFileProcess,
+    processControl: WrappedProcessControl,
+  ): Promise<void> {
+    const result = await this.settleSpawn(child, processControl);
+    if (!result.ok) throw result.error;
+  }
+
+  private async terminateSpawn(child: ProjectSessionFileProcess): Promise<void> {
+    if (this.localSpawnClosed(child)) return;
+    await new Promise<void>((resolve, reject) => {
+      let escalation: NodeJS.Timeout | undefined;
+      const finish = (): void => {
+        if (escalation) clearTimeout(escalation);
+        clearTimeout(deadline);
+        resolve();
+      };
+      const deadline = setTimeout(() => {
+        child.off('close', finish);
+        reject(new Error('local project container helper client did not close'));
+      }, 12_000);
+      deadline.unref?.();
+      child.once('close', finish);
+      if (child.exitCode === null && child.signalCode === null) {
+        try { child.kill('SIGTERM'); } catch { /* close remains authoritative */ }
+        escalation = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) {
+            try { child.kill('SIGKILL'); } catch { /* close remains authoritative */ }
+          }
+        }, 500);
+        escalation.unref?.();
+      }
+    });
+  }
+
+  private localSpawnClosed(child: ProjectSessionFileProcess): boolean {
+    return (child.exitCode !== null || child.signalCode !== null)
+      && child.stdin.destroyed
+      && child.stdout.destroyed
+      && child.stderr.destroyed;
+  }
+
+  private settle<T>(promise: Promise<T>): Promise<{ ok: true; value: T } | { ok: false; error: unknown }> {
+    return promise.then(
+      (value) => ({ ok: true as const, value }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+  }
+
+  private errorDetail(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
   }
 
   async reconcileOnBoot(): Promise<void> {

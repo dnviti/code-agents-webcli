@@ -135,7 +135,7 @@ function setup(initial = [], options = {}) {
     cloneTimeoutMs: options.cloneTimeoutMs,
     hasLiveProjectWork: options.hasLiveProjectWork,
   });
-  return { dir, e, s, manager };
+  return { dir, e, s, manager, environments, cfg };
 }
 function project(id, state = 'stopped', repoUrl = null) { const now = new Date().toISOString(); return { id, ownerUserId: 1, name: id, repoUrl, repoHost: repoUrl ? 'example.test' : null, targetId: null, tierId: null, state, stateDetail: null, container: null, rebuildRequired: false, buildLog: [], lastActivityAt: now, lastPreservedCommit: null, lastPreservedBranch: null, compositionRevision: null, createdAt: now, updatedAt: now }; }
 
@@ -464,6 +464,172 @@ describe('project core lifecycle', function () {
     assert.deepStrictEqual(await manager.stop(1, 'one'), { ok: true });
   });
 
+  it('does not finish a bounded project helper until remote process exit is verified', async function () {
+    const { manager, e } = setup([project('one')]);
+    await manager.start(1, 'one'); await manager.waitForBuild('one');
+    const admitted = await manager.ensureForSession(1, 'one'); assert.strictEqual(admitted.ok, true);
+    const calls = [];
+    let releaseProof;
+    const proof = new Promise((resolve) => { releaseProof = resolve; });
+    e.exec = async (spec, command, args) => {
+      calls.push({ spec, command, args });
+      if (calls.length === 1) return { stdout: 'ok', stderr: '' };
+      await proof;
+      return { stdout: '', stderr: '' };
+    };
+
+    let settled = false;
+    const execution = manager.execInSessionContainer(
+      1,
+      'one',
+      admitted.leaseId,
+      '/tmp',
+      'test',
+      ['-e', '/tmp/value'],
+    ).then((result) => { settled = true; return result; });
+    for (let i = 0; i < 20 && calls.length < 2; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    assert.strictEqual(calls.length, 2);
+    assert.strictEqual(settled, false, 'the engine client result is not remote exit proof');
+    assert.strictEqual(calls[0].command, 'sh');
+    assert.deepStrictEqual(calls[0].args.slice(-3), ['test', '-e', '/tmp/value']);
+    assert.strictEqual(calls[0].spec.identity, admitted.containerAccess.containerIdentity);
+    assert.strictEqual(calls[1].command, 'sh');
+    assert.strictEqual(calls[1].spec.identity, admitted.containerAccess.containerIdentity);
+    releaseProof();
+    assert.deepStrictEqual(await execution, { stdout: 'ok', stderr: '' });
+    assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), true);
+  });
+
+  it('uses one engine snapshot for tracked helper launch and stop across a target reload', async function () {
+    const { manager, e, environments, cfg } = setup([project('one')]);
+    await manager.start(1, 'one'); await manager.waitForBuild('one');
+    const admitted = await manager.ensureForSession(1, 'one'); assert.strictEqual(admitted.ok, true);
+    const replacement = engine();
+    const originalDescribe = e.describe;
+    const priorExecs = e.calls.filter((call) => call.op === 'exec').length;
+    let reloaded = false;
+    e.describe = async (name) => {
+      const described = await originalDescribe(name);
+      if (!reloaded) {
+        reloaded = true;
+        environments.reloadTargets({
+          engines: new Map([['legacy', replacement]]),
+          configs: new Map([['legacy', cfg]]),
+          activeKey: 'legacy',
+        });
+      }
+      return described;
+    };
+
+    assert.deepStrictEqual(
+      await manager.execInSessionContainer(1, 'one', admitted.leaseId, '/tmp', 'true', []),
+      { stdout: '', stderr: '' },
+    );
+    assert.ok(e.calls.filter((call) => call.op === 'exec').length >= priorExecs + 2);
+    assert.strictEqual(replacement.calls.some((call) => call.op === 'exec'), false);
+    assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), true);
+  });
+
+  it('does not retain a lease when a bounded helper was already aborted before launch', async function () {
+    const { manager, e } = setup([project('one')]);
+    await manager.start(1, 'one'); await manager.waitForBuild('one');
+    const admitted = await manager.ensureForSession(1, 'one'); assert.strictEqual(admitted.ok, true);
+    let launches = 0;
+    e.exec = async () => { launches += 1; return { stdout: '', stderr: '' }; };
+    const controller = new AbortController();
+    controller.abort();
+
+    let caught;
+    try {
+      await manager.execInSessionContainer(1, 'one', admitted.leaseId, '/tmp', 'true', [], controller.signal);
+    } catch (error) {
+      caught = error;
+    }
+    assert.strictEqual(caught?.name, 'AbortError');
+    assert.strictEqual(caught?.retainProjectLease, undefined);
+    assert.strictEqual(launches, 0);
+    assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), true);
+  });
+
+  it('tags a bounded helper when remote exit proof fails after its client errors', async function () {
+    const { manager, e } = setup([project('one')]);
+    await manager.start(1, 'one'); await manager.waitForBuild('one');
+    const admitted = await manager.ensureForSession(1, 'one'); assert.strictEqual(admitted.ok, true);
+    let attempts = 0;
+    e.exec = async () => {
+      attempts += 1;
+      throw new Error(attempts === 1 ? 'engine client aborted' : 'control plane unavailable');
+    };
+
+    let caught;
+    try {
+      await manager.execInSessionContainer(1, 'one', admitted.leaseId, '/tmp', 'test', [], new AbortController().signal);
+    } catch (error) {
+      caught = error;
+    }
+    assert.strictEqual(caught?.retainProjectLease, true);
+    assert.strictEqual(typeof caught?.retryProjectProcessStop, 'function');
+    assert.match(caught.message, /control plane unavailable/);
+    assert.match(caught.message, /engine client aborted/);
+    assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), true);
+  });
+
+  it('attaches identity-bound remote control to binary project helpers', async function () {
+    const { manager, e } = setup([project('one')]);
+    await manager.start(1, 'one'); await manager.waitForBuild('one');
+    const admitted = await manager.ensureForSession(1, 'one'); assert.strictEqual(admitted.ok, true);
+    const descriptors = [];
+    e.binary = process.execPath;
+    e.execArgs = (spec, command, args) => {
+      descriptors.push({ spec, command, args });
+      return ['-e', 'process.exit(0)'];
+    };
+
+    const child = await manager.spawnSessionFileCommand(
+      1,
+      'one',
+      admitted.leaseId,
+      { operation: 'read', path: '/tmp/x' },
+    );
+    assert.strictEqual(typeof child.processControl.stop, 'function');
+    assert.strictEqual(descriptors[0].command, 'sh');
+    assert.ok(descriptors[0].args.includes('dd'));
+    assert.strictEqual(descriptors[0].spec.identity, admitted.containerAccess.containerIdentity);
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise((resolve) => child.once('close', resolve));
+    }
+    await child.processControl.stop();
+    assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), true);
+  });
+
+  it('does not retain a lease when the local engine client cannot spawn', async function () {
+    const { manager, e } = setup([project('one')]);
+    await manager.start(1, 'one'); await manager.waitForBuild('one');
+    const admitted = await manager.ensureForSession(1, 'one'); assert.strictEqual(admitted.ok, true);
+    e.binary = path.join(os.tmpdir(), 'definitely-missing-project-engine-client');
+    e.execArgs = () => [];
+    const priorExecs = e.calls.filter((call) => call.op === 'exec').length;
+
+    let caught;
+    try {
+      await manager.spawnSessionFileCommand(
+        1,
+        'one',
+        admitted.leaseId,
+        { operation: 'read', path: '/tmp/x' },
+      );
+    } catch (error) {
+      caught = error;
+    }
+    assert.match(caught?.message || '', /ENOENT/);
+    assert.strictEqual(caught?.retainProjectLease, undefined);
+    assert.strictEqual(e.calls.filter((call) => call.op === 'exec').length, priorExecs);
+    assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), true);
+  });
+
   it('does not release binary streams when a same-name runtime replacement wins the spawn race', async function () {
     const { manager, e } = setup([project('one')]);
     await manager.start(1, 'one'); await manager.waitForBuild('one');
@@ -475,6 +641,40 @@ describe('project core lifecycle', function () {
     e.execArgs = () => ['-e', 'setInterval(() => {}, 1000)'];
     await assert.rejects(() => manager.spawnSessionFileCommand(1, 'one', admitted.leaseId, { operation: 'read', path: '/tmp/x' }), /was replaced/);
     assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), true);
+  });
+
+  it('transfers a post-spawn identity-race helper to manager recovery until proof succeeds', async function () {
+    const { manager, s, e } = setup([project('one')]);
+    await manager.start(1, 'one'); await manager.waitForBuild('one');
+    const admitted = await manager.ensureForSession(1, 'one'); assert.strictEqual(admitted.ok, true);
+    const labels = { 'com.code-agents-webcli.managed': 'true', 'com.code-agents-webcli.project': 'one', 'com.code-agents-webcli.user-id': '1', 'com.code-agents-webcli.target': 'legacy' };
+    let inspections = 0;
+    e.describe = async (name) => ({ name, identity: inspections++ ? 'replacement-id' : admitted.containerAccess.containerIdentity, status: 'running', image: 'img', labels });
+    e.binary = process.execPath;
+    e.execArgs = () => ['-e', 'setInterval(() => {}, 1000)'];
+    let proofAvailable = false;
+    e.exec = async () => {
+      if (!proofAvailable) throw new Error('controller unavailable');
+      return { stdout: '', stderr: '' };
+    };
+
+    let caught;
+    try {
+      await manager.spawnSessionFileCommand(1, 'one', admitted.leaseId, { operation: 'read', path: '/tmp/x' });
+    } catch (error) {
+      caught = error;
+    }
+    assert.strictEqual(caught?.retainProjectLease, true);
+    manager.registerUnverifiedSessionProcess(1, 'one', admitted.leaseId, {
+      reason: caught.message,
+      stop: caught.retryProjectProcessStop,
+    });
+    assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), false);
+    proofAvailable = true;
+    for (let i = 0; i < 40 && s.projectHasActiveSessions('one'); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.strictEqual(s.projectHasActiveSessions('one'), false);
   });
 
   it('isolates failing event and broadcast listeners from lifecycle work', async function () {
