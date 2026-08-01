@@ -60,7 +60,10 @@ function localEngine(calls) {
 }
 
 describe('tracked container process control', function() {
-  this.timeout(25000);
+  // The controller deliberately permits a full TERM/KILL/proof cycle of up to
+  // 45 seconds. Leave scheduling headroom when this real PTY test runs beside
+  // the full suite on a busy CI host.
+  this.timeout(50000);
 
   it('preserves a real PTY and kills job-control plus detached descendants', async function() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-process-control-'));
