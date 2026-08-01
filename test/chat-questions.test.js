@@ -1452,14 +1452,23 @@ describe('a question the agent stopped waiting for', function () {
       const output = new PassThrough();
       const cancelled = [];
       const written = [];
+      let resolveAsk;
       output.on('data', (chunk) => written.push(String(chunk)));
 
       serveAsk(
         input,
         output,
-        (_question, onSent) => new Promise(() => { onSent?.('ask-42'); }),
+        (_question, onSent) => new Promise((resolve) => {
+          resolveAsk = resolve;
+          onSent?.('ask-42');
+        }),
         undefined,
-        (askId) => cancelled.push(askId),
+        (askId) => {
+          cancelled.push(askId);
+          // Production AskChannel.cancel resolves the promise as part of
+          // tearing the question down. The response must still stay silent.
+          resolveAsk({ labels: [], error: 'the agent stopped waiting for an answer' });
+        },
       );
 
       input.write(`${JSON.stringify({
@@ -1492,6 +1501,49 @@ describe('a question the agent stopped waiting for', function () {
       await settle();
 
       assert.deepStrictEqual(cancelled, []);
+    });
+
+    it('keeps numeric and string request ids distinct', async function () {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const cancelled = [];
+      const resolvers = new Map();
+      const written = [];
+      output.on('data', (chunk) => written.push(String(chunk)));
+
+      serveAsk(
+        input,
+        output,
+        (question, onSent) => new Promise((resolve) => {
+          const askId = `ask-${question.question}`;
+          resolvers.set(askId, resolve);
+          onSent?.(askId);
+        }),
+        undefined,
+        (askId) => {
+          cancelled.push(askId);
+          resolvers.get(askId)({ labels: [], error: 'cancelled' });
+        },
+      );
+
+      for (const [id, question] of [[7, 'number'], ['7', 'string']]) {
+        input.write(`${JSON.stringify({
+          jsonrpc: '2.0', id, method: 'tools/call',
+          params: { name: 'ask_user_question', arguments: { ...QUESTION, question } },
+        })}\n`);
+      }
+      await settle();
+      input.write(`${JSON.stringify({
+        jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 7 },
+      })}\n`);
+      await settle();
+      resolvers.get('ask-string')({ labels: ['Patch it'] });
+      await settle();
+
+      assert.deepStrictEqual(cancelled, ['ask-number']);
+      const responses = written.join('').trim().split('\n').filter(Boolean).map(JSON.parse);
+      assert.strictEqual(responses.length, 1, 'only the uncancelled call receives a response');
+      assert.strictEqual(responses[0].id, '7');
     });
   });
 });

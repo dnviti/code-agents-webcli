@@ -419,7 +419,11 @@ export function serveAsk(
    * and `notifications/cancelled` speaks only the first. Without the pairing
    * there is no way to say *which* question the runtime has given up on.
    */
-  const inFlight = new Map<string, string>();
+  interface InFlightAsk {
+    askId?: string;
+    cancelled: boolean;
+  }
+  const inFlight = new Map<string | number, InFlightAsk>();
 
   createInterface({ input }).on('line', (line: string) => {
     if (!line.trim()) return;
@@ -458,10 +462,21 @@ export function serveAsk(
 
     if (method === 'tools/call') {
       if (params?.name === ASK_QUESTION_TOOL) {
+        const requestId = typeof id === 'string' || typeof id === 'number' ? id : undefined;
+        const call: InFlightAsk = { cancelled: false };
+        if (requestId !== undefined) inFlight.set(requestId, call);
         void ask(params?.arguments, (askId) => {
-          if (id !== undefined) inFlight.set(String(id), askId);
+          call.askId = askId;
+          // A very fast client can cancel before the question has reached the
+          // session and supplied its id. Complete that deferred teardown here.
+          if (call.cancelled) cancel?.(askId);
         }).then((answer) => {
-          if (id !== undefined) inFlight.delete(String(id));
+          if (requestId !== undefined) {
+            // Do not let an old, slow call delete a newer call that reused the
+            // same request id after cancellation.
+            if (inFlight.get(requestId) === call) inFlight.delete(requestId);
+          }
+          if (call.cancelled) return;
           const { text, isError } = describeAnswer(answer);
           send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError } });
         });
@@ -497,11 +512,18 @@ export function serveAsk(
     // (#174). No reply: a notification wants none, and the call it names is
     // over.
     if (method === 'notifications/cancelled') {
-      const requestId = (params as { requestId?: unknown } | undefined)?.requestId;
-      const askId = requestId === undefined ? undefined : inFlight.get(String(requestId));
-      if (askId) {
-        inFlight.delete(String(requestId));
-        cancel?.(askId);
+      const rawRequestId = (params as { requestId?: unknown } | undefined)?.requestId;
+      const requestId = typeof rawRequestId === 'string' || typeof rawRequestId === 'number'
+        ? rawRequestId
+        : undefined;
+      const call = requestId === undefined ? undefined : inFlight.get(requestId);
+      if (call && requestId !== undefined) {
+        // Mark it before `cancel`: production cancellation resolves `ask` for
+        // cleanup, and its promise continuation must see that the client has
+        // already ended the call and suppress the late JSON-RPC response.
+        call.cancelled = true;
+        inFlight.delete(requestId);
+        if (call.askId) cancel?.(call.askId);
       }
       return;
     }
