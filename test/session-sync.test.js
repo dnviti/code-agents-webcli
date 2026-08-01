@@ -6,6 +6,9 @@ const path = require('path');
 const fs = require('fs');
 
 const { createSessionRoutes } = require('../dist/server/routes/sessions.js');
+const {
+  AccountTabCoordinator,
+} = require('../dist/server/services/account-tab-coordinator.js');
 const { announceSessionOpened } = require('../dist/server/websocket/handler.js');
 
 // The set of tabs a person has open is a fact about the person, not about the
@@ -35,6 +38,15 @@ let currentUser;
 let destroyed;
 let saves;
 let saveSessions;
+let tabAcquireRequests;
+
+async function waitUntil(check, message, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error(message);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
 
 function record(id, over = {}) {
   const session = {
@@ -100,6 +112,9 @@ describe('telling every screen what happened to a session', function () {
     currentUser = USER;
     destroyed = [];
     saves = 0;
+    tabAcquireRequests = 0;
+
+    const tabCoordinator = new AccountTabCoordinator();
 
     const app = express();
     app.use(express.json());
@@ -126,6 +141,12 @@ describe('telling every screen what happened to a session', function () {
         disposeRecorder: (id) => destroyed.push(id),
         getSelectedWorkingDir: () => null,
         sessionStore: { getSessionMetadata: async () => ({}) },
+        tabCoordinator: {
+          acquire: (userId) => {
+            tabAcquireRequests++;
+            return tabCoordinator.acquire(userId);
+          },
+        },
       }),
     );
 
@@ -147,6 +168,7 @@ describe('telling every screen what happened to a session', function () {
     sockets.clear();
     destroyed = [];
     saves = 0;
+    tabAcquireRequests = 0;
     saveSessions = async () => { saves++; };
     currentUser = USER;
   });
@@ -427,9 +449,12 @@ describe('telling every screen what happened to a session', function () {
     };
 
     const moving = reorder(['b', 'a']);
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitUntil(() => saves === 1, 'the reorder reaches persistence');
     const closing = setTab('a', false);
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitUntil(
+      () => tabAcquireRequests === 2,
+      'the close reaches the account transaction queue',
+    );
     assert.strictEqual(saves, 1, 'the close waits for the account reorder transaction');
 
     finishReorder(true);
@@ -450,9 +475,12 @@ describe('telling every screen what happened to a session', function () {
     };
 
     const closing = setTab('a', false);
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitUntil(() => saves === 1, 'the close reaches persistence');
     const creating = create({ name: 'new', workingDir: '/projects/alpha' });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitUntil(
+      () => tabAcquireRequests === 2,
+      'creation reaches the account transaction queue',
+    );
     assert.strictEqual(saves, 1, 'creation waits behind the tentative close');
 
     finishClose(false);
@@ -554,10 +582,12 @@ describe('telling every screen what happened to a session', function () {
     };
 
     const opening = setTab('chat', true);
-    // Let the first handler enter its persistence turn before the close arrives.
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitUntil(() => saves === 1, 'the open reaches persistence');
     const closing = setTab('chat', false);
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitUntil(
+      () => tabAcquireRequests === 2,
+      'the later close reaches the account transaction queue',
+    );
     assert.strictEqual(saves, 1, 'the later device waits behind the first durable write');
 
     releaseFirst(true);
