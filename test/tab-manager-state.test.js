@@ -74,6 +74,7 @@ function fakeApp() {
     chats: {
       subscribed: [],
       dropped: [],
+      controllers: new Map(),
       // What the pane was told to show before any socket traffic: the session
       // list already knows each conversation's approval mode, and a pane that
       // opened claiming "asks first" over a bypassing one was #134.
@@ -87,6 +88,7 @@ function fakeApp() {
         this.calls.push(`subscribe:${id}`);
       },
       drop(id) { this.dropped.push(id); },
+      get(id) { return this.controllers.get(id); },
       ensure(id) {
         const chats = this;
         return {
@@ -227,6 +229,34 @@ describe('session tab state', function () {
       false,
       'output in the foreground session is not something you missed',
     );
+  });
+
+  it('takes a chat tab state from the transcript, not from its still-live process', function () {
+    const { m, app } = manager();
+    m.addTab('chat', 'chat', 'active', null, false);
+    m.setTabSurface('chat', 'chat');
+
+    const transcript = {
+      chatState: 'idle',
+      messages: [{ role: 'user' }, { role: 'assistant' }],
+    };
+    app.chats.controllers.set('chat', { transcript });
+    m.syncShell();
+
+    assert.strictEqual(
+      shellTab('chat').status,
+      'success',
+      'a completed conversation does not inherit the process active flag',
+    );
+
+    transcript.chatState = 'thinking';
+    m.syncShell();
+    assert.strictEqual(shellTab('chat').status, 'running', 'new work restores the spinner');
+
+    transcript.chatState = 'idle';
+    transcript.messages = [];
+    m.syncShell();
+    assert.strictEqual(shellTab('chat').status, 'idle', 'a new empty conversation is only idle');
   });
 
   it('picks the most recently visited surviving tab when the active one closes', async function () {

@@ -332,16 +332,37 @@ export class SessionTabManager {
         const session = this.activeSessions.get(id);
         const record = this.tabs.get(id);
         if (!session || !record) return null;
+
+        // A chat process stays alive between turns so it can accept the next
+        // message. The session endpoint therefore reports `active: true` even
+        // while the conversation itself is ready, which made a completed chat
+        // spin forever in the tab beside a header that correctly said Ready.
+        // Once a controller exists, its transcript is the same authority the
+        // header uses and must win over the process-liveness fallback.
+        const transcript = record.surface === 'chat'
+          ? this.app.chats.get?.(id)?.transcript
+          : undefined;
+        const chatState = transcript?.chatState;
+        const hasCompletedReply = chatState === 'idle'
+          && Boolean(transcript?.messages.some((message) => message.role === 'assistant'));
+        const status: ShellTab['status'] =
+          session.hasError || session.status === 'error' || chatState === 'error'
+            ? 'error'
+            : chatState === 'starting' || chatState === 'thinking' || chatState === 'running'
+              ? 'running'
+              : hasCompletedReply
+                ? 'success'
+                : chatState
+                  ? 'idle'
+                  : session.status === 'active'
+                    ? 'running'
+                    : 'idle';
+
         return {
           id,
           title: record.displayName,
           surface: record.surface,
-          status:
-            session.hasError || session.status === 'error'
-              ? 'error'
-              : session.status === 'active'
-                ? 'running'
-                : 'idle',
+          status,
           // Not yet tracked per session; the server's SessionRecord.agent would
           // have to be plumbed through the list endpoint first.
           kind: '',

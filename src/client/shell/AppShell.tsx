@@ -154,7 +154,7 @@ function tabItems(tabs: ShellTab[]): TabItem[] {
   return tabs.map((tab) => ({
     id: tab.id,
     title: tab.title,
-    status: tab.status === 'running' ? 'running' : tab.status === 'error' ? 'error' : 'idle',
+    status: tab.status,
     unread: tab.unread,
     attention: tab.attention,
     tooltip: tab.workingDir ?? tab.title,

@@ -103,15 +103,27 @@ export class MessageHandler {
       } else {
         clearChatSurface();
       }
-    } else if (message.type === 'chat_event') {
-      this.reflectChatActivity(message);
     }
 
     // The chat surface owns its own message family. Offered them first so this
     // switch does not have to grow a case per chat event, and so an unknown
     // chat message stays inside the chat layer rather than reaching a terminal
     // handler that has no idea what to do with it.
-    if (this.app.chats.handle(message as unknown as Record<string, unknown>)) {
+    const chatHandled = this.app.chats.handle(message as unknown as Record<string, unknown>);
+
+    // Apply live state only after the controller has folded the event into the
+    // transcript. The tab derives chat status from that same transcript as the
+    // header, so reflecting `turn_end` before this point merely republished the
+    // old `running` state and left the spinner stuck beside a Ready header.
+    if (message.type === 'chat_event') {
+      this.reflectChatActivity(message);
+    } else if (message.type === 'chat_snapshot') {
+      // A snapshot is not an event, so reflectChatActivity never sees it. It is
+      // nevertheless the authoritative correction after a reload or rejoin.
+      this.app.sessionTabManager?.syncShell();
+    }
+
+    if (chatHandled) {
       return;
     }
 

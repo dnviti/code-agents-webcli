@@ -997,9 +997,31 @@ function fakeApp() {
       subscribed: [],
       dropped: [],
       seeded: [],
+      controllers: new Map(),
       subscribe(id) { this.subscribed.push(id); },
       drop(id) { this.dropped.push(id); },
-      handle() { return false; },
+      get(id) { return this.controllers.get(id); },
+      handle(message) {
+        if (message.type === 'chat_snapshot') {
+          this.controllers.set(message.sessionId, {
+            transcript: {
+              chatState: message.snapshot.state,
+              messages: message.snapshot.messages || [],
+            },
+          });
+          return true;
+        }
+        if (message.type === 'chat_event') {
+          const transcript = this.controllers.get(message.sessionId)?.transcript;
+          if (transcript && message.event?.t === 'state') {
+            transcript.chatState = message.event.state;
+          } else if (transcript && message.event?.t === 'turn_end') {
+            transcript.chatState = 'idle';
+          }
+          return true;
+        }
+        return false;
+      },
       ensure(id) {
         const chats = this;
         return { seedBypass(value) { chats.seeded.push({ id, value }); } };
@@ -1172,6 +1194,52 @@ describe('a tab strip that keeps up with the other screens', function () {
     assert.deepStrictEqual(m.getOrderedTabIds(), ['b', 'a']);
     assert.strictEqual(m.activeTabId, 'a');
     assert.deepStrictEqual(requests, [], 'the socket event is not written back');
+  });
+
+  it('corrects a still-live chat process from its completed snapshot', function () {
+    const { m, app } = manager();
+    app.sessionTabManager = m;
+    m.addTab('chat', 'chat', 'active', '/projects/chat', false);
+    m.setTabSurface('chat', 'chat');
+
+    new mod.MessageHandler(app).handle({
+      type: 'chat_snapshot',
+      sessionId: 'chat',
+      snapshot: {
+        state: 'idle',
+        messages: [{ id: 'answer', role: 'assistant', blocks: [] }],
+      },
+    });
+
+    assert.strictEqual(
+      shellTab('chat').status,
+      'success',
+      'the completed transcript replaces the process-level active flag',
+    );
+  });
+
+  it('reflects turn completion after the transcript has become idle', function () {
+    const { m, app } = manager();
+    app.sessionTabManager = m;
+    app.currentClaudeSessionId = 'chat';
+    m.addTab('chat', 'chat', 'active', '/projects/chat', false);
+    m.setTabSurface('chat', 'chat');
+    app.chats.controllers.set('chat', {
+      transcript: {
+        chatState: 'running',
+        messages: [{ id: 'answer', role: 'assistant', blocks: [] }],
+      },
+    });
+    m.syncShell();
+    assert.strictEqual(shellTab('chat').status, 'running');
+
+    new mod.MessageHandler(app).handle({
+      type: 'chat_event',
+      sessionId: 'chat',
+      event: { t: 'turn_end', turnId: 'turn-1' },
+    });
+
+    assert.strictEqual(shellTab('chat').status, 'success');
   });
 
   it('moves a stale existing tab when another device genuinely reopens it', function () {
