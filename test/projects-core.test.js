@@ -1747,7 +1747,7 @@ describe('project lifecycle transaction and preservation recovery', function () 
     assert.match(execFileSync('git', ['--git-dir', remote, 'show-ref', result.branch], { encoding: 'utf8' }), new RegExp(result.commit));
   });
 
-  it('fails closed before a top-level WIP commit can reduce dirty embedded repository work to a gitlink', async function () {
+  it('fails closed before a top-level WIP commit can reduce a clean local-only nested commit to a gitlink', async function () {
     const dir = root(); const repo = path.join(dir, 'repo'); const nested = path.join(repo, 'nested'); fs.mkdirSync(nested, { recursive: true });
     const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
     git(repo, 'init'); git(repo, 'config', 'user.name', 'Owner'); git(repo, 'config', 'user.email', 'owner@example.test');
@@ -1757,8 +1757,9 @@ describe('project lifecycle transaction and preservation recovery', function () 
     fs.writeFileSync(path.join(nested, 'inner.txt'), 'base'); git(nested, 'add', 'inner.txt'); git(nested, 'commit', '-m', 'base');
     // This is the shape `git add -A` would otherwise turn into a gitlink.
     git(repo, 'add', 'nested'); git(repo, 'commit', '-m', 'record nested repository');
-    fs.writeFileSync(path.join(nested, 'inner.txt'), 'dirty');
-    fs.writeFileSync(path.join(nested, 'untracked.txt'), 'also dirty');
+    fs.writeFileSync(path.join(nested, 'inner.txt'), 'local-only'); git(nested, 'add', 'inner.txt'); git(nested, 'commit', '-m', 'local-only nested work');
+    const localOnlyCommit = git(nested, 'rev-parse', 'HEAD').trim();
+    assert.strictEqual(git(nested, 'status', '--porcelain'), '', 'a clean worktree does not prove its HEAD is durable');
 
     const calls = []; const e = engine({ async exec(spec, command, args) {
       calls.push({ command, args });
@@ -1767,11 +1768,12 @@ describe('project lifecycle transaction and preservation recovery', function () 
     } });
     await assert.rejects(
       () => preserveProjectWork({ engine: e, containerName: 'box', containerIdentity: 'box-id', repoContainerPath: repo, repoUrl: 'https://example.test/repo.git', author: { name: 'Ada', email: 'ada@example.test' } }),
-      /Nested repository work is not preserved by the top-level WIP commit \(nested\).*retry recovery.*discard explicitly/,
+      /Nested repositories cannot be preserved by the top-level WIP commit \(nested\).*retry recovery.*discard explicitly/,
     );
     assert.strictEqual(calls.some((call) => call.command === 'git' && (call.args.includes('add') || call.args.includes('commit-tree') || call.args.includes('push'))), false);
-    assert.match(git(nested, 'status', '--porcelain'), /inner\.txt/);
-    assert.match(git(nested, 'status', '--porcelain'), /untracked\.txt/);
+    assert.strictEqual(git(nested, 'rev-parse', 'HEAD').trim(), localOnlyCommit);
+    assert.strictEqual(git(nested, 'cat-file', '-t', localOnlyCommit).trim(), 'commit');
+    assert.strictEqual(fs.readFileSync(path.join(nested, 'inner.txt'), 'utf8'), 'local-only');
   });
 
   it('aborts a timed-out preservation network subprocess', async function () {

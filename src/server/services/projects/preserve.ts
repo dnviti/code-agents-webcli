@@ -74,14 +74,16 @@ function isExpectedAbsentCollision(error: unknown): boolean {
 }
 
 /**
- * Find nested Git worktrees without trusting the top-level status summary.
+ * Find nested Git worktrees which a top-level WIP commit cannot preserve.
  *
  * A top-level `git add -A` treats an embedded repository as a gitlink. That
- * records its HEAD, but none of its uncommitted or untracked bytes. Search for
- * both directory and file `.git` entries: normal repositories use the former,
- * while submodule worktrees commonly use the latter.
+ * records its HEAD, but cannot transfer its Git objects to the parent remote.
+ * Even a clean nested repository can therefore contain a local-only commit
+ * that reclaim would destroy. Search for both directory and file `.git`
+ * entries: normal repositories use the former, while submodule worktrees
+ * commonly use the latter.
  */
-async function dirtyNestedRepositories(
+async function nestedRepositories(
   run: (command: string, args: string[]) => Promise<string>,
   repoContainerPath: string,
 ): Promise<string[]> {
@@ -100,19 +102,7 @@ async function dirtyNestedRepositories(
     throw new PreserveError(`Could not inspect nested repositories (${message}); retained workspace requires manual recovery or explicit discard`);
   }
 
-  const nestedRoots = found.split('\0').filter(Boolean).map((gitPath) => gitPath.slice(0, -'/.git'.length));
-  const dirty: string[] = [];
-  for (const nestedRoot of nestedRoots) {
-    let status: string;
-    try {
-      status = await run('git', ['-C', nestedRoot, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none']);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new PreserveError(`Could not inspect nested repository ${nestedRoot} (${message}); retained workspace requires manual recovery or explicit discard`);
-    }
-    if (status.trim()) dirty.push(nestedRoot);
-  }
-  return dirty;
+  return found.split('\0').filter(Boolean).map((gitPath) => gitPath.slice(0, -'/.git'.length));
 }
 
 /**
@@ -175,15 +165,15 @@ export async function preserveProjectWork(options: PreserveOptions): Promise<Pre
   const network = (args: string[]) => exec(['-C', repoContainerPath, ...authArgs, ...args]);
 
   // Do this before treating a clean top-level status as permission to reclaim:
-  // an embedded repository can be invisible to the parent worktree entirely.
-  const nestedDirty = await dirtyNestedRepositories(run, repoContainerPath);
-  if (nestedDirty.length) {
+  // a clean nested HEAD may still exist only in this workspace.
+  const nested = await nestedRepositories(run, repoContainerPath);
+  if (nested.length) {
     const normalizedRoot = repoContainerPath.replace(/\/+$/, '') || '/';
     const rootPrefix = normalizedRoot === '/' ? '/' : `${normalizedRoot}/`;
-    const displayPaths = nestedDirty.map((nestedRoot) => nestedRoot.startsWith(rootPrefix)
+    const displayPaths = nested.map((nestedRoot) => nestedRoot.startsWith(rootPrefix)
       ? nestedRoot.slice(rootPrefix.length)
       : nestedRoot);
-    throw new PreserveError(`Nested repository work is not preserved by the top-level WIP commit (${displayPaths.join(', ')}); commit or back up that work, then retry recovery, or discard explicitly`);
+    throw new PreserveError(`Nested repositories cannot be preserved by the top-level WIP commit (${displayPaths.join(', ')}); push or back up each nested repository, then retry recovery, or discard explicitly`);
   }
 
   let status: string;
