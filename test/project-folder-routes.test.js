@@ -322,12 +322,12 @@ describe('project container folder routes', function () {
     assert.strictEqual(manager.ensured.length, 0);
   });
 
-  it('retains the folder operation lease when remote helper stop is unverified', async function () {
+  it('transfers an unverified folder helper and requests manager-gated lease release', async function () {
     manager.setFailClosed(true);
     const response = await fetch(`${base}/api/folders?projectId=project-1`);
     assert.strictEqual(response.status, 503);
     assert.strictEqual(manager.ensured.length, 1);
-    assert.strictEqual(manager.released.length, 0);
+    assert.strictEqual(manager.released.length, 1);
     assert.strictEqual(manager.unverifiedProcesses.length, 1);
   });
 });

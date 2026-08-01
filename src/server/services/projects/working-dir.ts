@@ -230,6 +230,9 @@ export function releaseProjectSessionLease(
  * The runtime guard is intentionally fail closed for older embedders: if the
  * required method is absent or throws, callers still retain the lease. They do
  * not silently reinterpret failed registration as permission to release.
+ * Returns true only when the caller itself must retain the lease. A false
+ * return after a marked error means ownership transferred successfully, so a
+ * temporary caller should request its normal manager-gated release.
  */
 export function registerUnverifiedProjectProcess(
   manager: ProjectsSessionApi | undefined,
@@ -257,6 +260,10 @@ export function registerUnverifiedProjectProcess(
         lease.leaseId,
         recovery,
       );
+      // Ownership has moved to the manager. The caller must still request its
+      // ordinary lease release: the manager records that request and keeps the
+      // lease counted until every transferred recovery proves the helper gone.
+      return false;
     } catch {
       // The caller retains the lease below. Failed transfer is never release.
     }

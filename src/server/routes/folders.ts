@@ -67,8 +67,7 @@ async function withProjectFolders<T>(
       new ProjectContainerFiles(manager, prepared, prepared.containerAccess.root),
     );
   } catch (error) {
-    retainLease = registerUnverifiedProjectProcess(manager, lease, error)
-      || mustRetainProjectLease(error);
+    retainLease = registerUnverifiedProjectProcess(manager, lease, error);
     throw error;
   } finally {
     if (!retainLease) releaseProjectSessionLease(manager, lease);

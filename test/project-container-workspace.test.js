@@ -486,7 +486,7 @@ describe('arbitrary project container workspaces', function () {
     assert.strictEqual(manager.released.length, 1);
   });
 
-  it('retains PUT and upload leases when remote helper stop cannot be verified', async function () {
+  it('transfers PUT and upload helpers and requests manager-gated lease release', async function () {
     manager.setProcessControl(async () => {
       throw new Error('remote process group still exists');
     });
@@ -499,7 +499,7 @@ describe('arbitrary project container workspaces', function () {
       body: JSON.stringify({ path: 'note.txt', content: 'maybe written', mtimeMs }),
     });
     assert.strictEqual(saved.status, 503);
-    assert.strictEqual(manager.released.length, 0, 'PUT swallowed the fail-closed marker');
+    assert.strictEqual(manager.released.length, 1, 'PUT must request release after recovery ownership transfers');
     assert.strictEqual(manager.unverifiedProcesses.length, 1);
     assert.strictEqual(typeof manager.unverifiedProcesses[0].recovery.stop, 'function');
 
@@ -508,7 +508,7 @@ describe('arbitrary project container workspaces', function () {
       { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: Buffer.from('bytes') },
     );
     assert.strictEqual(uploaded.status, 503);
-    assert.strictEqual(manager.released.length, 0, 'upload swallowed the fail-closed marker');
+    assert.strictEqual(manager.released.length, 2, 'upload must request release after recovery ownership transfers');
     assert.strictEqual(manager.ensured.length, 2);
     assert.strictEqual(manager.unverifiedProcesses.length, 2);
   });
@@ -530,12 +530,12 @@ describe('arbitrary project container workspaces', function () {
       }),
     });
     assert.strictEqual(response.status, 503);
-    assert.strictEqual(manager.released.length, 0);
+    assert.strictEqual(manager.released.length, 1);
     const [{ recovery }] = manager.unverifiedProcesses;
     assert.strictEqual(typeof recovery.stop, 'function');
     await recovery.stop();
     assert.strictEqual(attempts, 2);
-    assert.strictEqual(manager.released.length, 0, 'only the manager may release after recovery');
+    assert.strictEqual(manager.released.length, 1, 'the route requests release while the manager gates completion');
   });
 
   it('fails closed when a project helper has no remote process control', async function () {
@@ -551,7 +551,7 @@ describe('arbitrary project container workspaces', function () {
       }),
     });
     assert.strictEqual(response.status, 503);
-    assert.strictEqual(manager.released.length, 0);
+    assert.strictEqual(manager.released.length, 1);
     assert.strictEqual(manager.unverifiedProcesses.length, 1);
     assert.strictEqual(manager.unverifiedProcesses[0].recovery.stop, undefined);
   });

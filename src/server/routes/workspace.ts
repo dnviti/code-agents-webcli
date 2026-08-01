@@ -680,8 +680,7 @@ function withProjectWorkspace(
         await responseFinished(res);
       }
     } catch (error) {
-      retainLease = registerUnverifiedProjectProcess(deps.projectsManager, lease, error)
-        || mustRetainProjectLease(error);
+      retainLease = registerUnverifiedProjectProcess(deps.projectsManager, lease, error);
       next(error);
     } finally {
       delete res.locals.projectContainerFiles;
