@@ -20,14 +20,62 @@ const {
 /** An engine that records argv instead of running it. */
 function fakeEngine(kind, responses = {}) {
   const calls = [];
+  const known = new Map();
   const runner = async (file, args) => {
     calls.push({ file, args });
     const key = args[0] === 'container' ? args[1] : args[0];
     const handler = responses[key];
+    let result;
     if (typeof handler === 'function') {
-      return handler(args);
+      result = await handler(args);
+    } else if (key === 'inspect') {
+      const name = args[args.length - 1];
+      const description = known.get(name);
+      if (!description) throw new Error(`No such object: ${name}`);
+      result = args.includes('{{.State.Status}}')
+        ? { stdout: `${description.status}\n`, stderr: '' }
+        : {
+            stdout: `${description.identity}\t${description.status}\t${description.image}\t${JSON.stringify(description.labels)}\n`,
+            stderr: '',
+          };
+    } else {
+      result = { stdout: '', stderr: '' };
     }
-    return { stdout: '', stderr: '' };
+
+    if (key === 'run') {
+      const name = args[args.indexOf('--name') + 1];
+      const labels = {};
+      for (let at = 0; at < args.length; at += 1) {
+        if (args[at] !== '--label') continue;
+        const [label, ...value] = args[at + 1].split('=');
+        labels[label] = value.join('=');
+      }
+      const identity = `${name}-id`;
+      known.set(name, {
+        name, identity, status: 'running', image: 'example/image:1', labels,
+      });
+      if (!result.stdout.trim()) result = { ...result, stdout: `${identity}\n` };
+    } else if (key === 'start') {
+      const target = args[args.length - 1];
+      for (const [name, description] of known) {
+        if (name === target || description.identity === target) {
+          known.set(name, { ...description, status: 'running' });
+        }
+      }
+    } else if (key === 'stop') {
+      const target = args[args.length - 1];
+      for (const [name, description] of known) {
+        if (name === target || description.identity === target) {
+          known.set(name, { ...description, status: 'exited' });
+        }
+      }
+    } else if (key === 'rm') {
+      const target = args[args.length - 1];
+      for (const [name, description] of known) {
+        if (name === target || description.identity === target) known.delete(name);
+      }
+    }
+    return result;
   };
   const engine = new ContainerEngine({
     kind,
@@ -36,6 +84,7 @@ function fakeEngine(kind, responses = {}) {
     uid: 1000,
     gid: 1000,
   });
+  engine.replaceForTest = (name, description) => known.set(name, { name, ...description });
   return { engine, calls };
 }
 
@@ -309,6 +358,20 @@ describe('per-user environments', function () {
       assert.ok(calls.find((call) => call.args[0] === 'stop').args.includes('original-id'));
     });
 
+    it('targets immutable identity and detects a same-name replacement during removal', async function () {
+      let inspection = 0;
+      const { engine, calls } = fakeEngine('docker', {
+        rm: async () => ({ stdout: '', stderr: '' }),
+        inspect: async () => ({
+          stdout: `${inspection++ ? 'replacement-id' : 'original-id'}\trunning\timg\t{}\n`,
+          stderr: '',
+        }),
+      });
+      const original = await engine.describe('box');
+      await assert.rejects(() => engine.removeIdentity(original), /replaced during removal/);
+      assert.ok(calls.find((call) => call.args[0] === 'rm').args.includes('original-id'));
+    });
+
     it('fails closed when stop leaves the same container potentially executable', async function () {
       for (const status of ['restarting', 'paused', 'unknown']) {
         const { engine, calls } = fakeEngine('docker', {
@@ -384,6 +447,7 @@ describe('per-user environments', function () {
     const { engine } = fakeEngine('podman');
     const env = new ContainerEnvironment({
       name: 'cawc-alice-1',
+      identity: 'cawc-alice-1-id',
       homeDir: '/data/environments/cawc-alice-1',
       containerHome: '/home/alice-1',
       engine,
@@ -421,7 +485,7 @@ describe('per-user environments', function () {
         'exec', '--interactive', '--tty',
         '--workdir', '/home/alice-1/proj',
         '--env', 'TERM=xterm-256color',
-        'cawc-alice-1', 'bash', '-l',
+        'cawc-alice-1-id', 'bash', '-l',
       ]);
     });
 
@@ -448,19 +512,7 @@ describe('per-user environments', function () {
 
     it('creates an environment on first use and reuses it afterwards', async function () {
       const root = tmpRoot();
-      let exists = false;
-      const { engine, calls } = fakeEngine('podman', {
-        inspect: async (args) => {
-          if (!exists) {
-            throw new Error('No such container');
-          }
-          return managedInspect(args, 'running', 1, 'alice');
-        },
-        run: async () => {
-          exists = true;
-          return { stdout: '', stderr: '' };
-        },
-      });
+      const { engine, calls } = fakeEngine('podman');
       const config = { ...createContainerConfig({ containers: true }, {}), rootDir: root };
       const manager = new EnvironmentManager({ config, engine, hostHome: '/srv/work' });
 
@@ -483,7 +535,6 @@ describe('per-user environments', function () {
       const root = tmpRoot();
       let homeAtCreate = null;
       const { engine } = fakeEngine('podman', {
-        inspect: async () => { throw new Error('No such object'); },
         run: async (args) => {
           const volume = args[args.indexOf('--volume') + 1].split(':')[0];
           homeAtCreate = fs.existsSync(volume);
@@ -501,8 +552,12 @@ describe('per-user environments', function () {
 
     it('starts a stopped environment instead of recreating it', async function () {
       const root = tmpRoot();
-      const { engine, calls } = fakeEngine('docker', {
-        inspect: async (args) => managedInspect(args, 'exited', 4, 'dan'),
+      const { engine, calls } = fakeEngine('docker');
+      engine.replaceForTest('cawc-dan-4', {
+        identity: 'cawc-dan-4-id', status: 'exited', image: 'example/image:1',
+        labels: {
+          [MANAGED_LABEL]: 'true', [USER_ID_LABEL]: '4', [LOGIN_LABEL]: 'dan',
+        },
       });
       const config = { ...createContainerConfig({ containers: true }, {}), rootDir: root };
       const manager = new EnvironmentManager({ config, engine, hostHome: '/srv/work' });
@@ -511,21 +566,15 @@ describe('per-user environments', function () {
       assert.strictEqual(calls.filter((c) => c.args[0] === 'run').length, 0);
       assert.deepStrictEqual(
         calls.filter((c) => c.args[0] === 'start').map((c) => c.args[1]),
-        ['cawc-dan-4'],
+        ['cawc-dan-4-id'],
       );
     });
 
     it('makes one environment when two sign-ins race', async function () {
       const root = tmpRoot();
-      let exists = false;
       const { engine, calls } = fakeEngine('podman', {
-        inspect: async (args) => {
-          if (!exists) throw new Error('No such object');
-          return managedInspect(args, 'running', 5, 'erin');
-        },
         run: async () => {
           await new Promise((resolve) => setTimeout(resolve, 10));
-          exists = true;
           return { stdout: '', stderr: '' };
         },
       });
@@ -542,14 +591,7 @@ describe('per-user environments', function () {
 
     it('runs the setup command once per created container, never on reuse', async function () {
       const root = tmpRoot();
-      let exists = false;
-      const { engine, calls } = fakeEngine('podman', {
-        inspect: async (args) => {
-          if (!exists) throw new Error('No such object');
-          return managedInspect(args, 'running', 6, 'frank');
-        },
-        run: async () => { exists = true; return { stdout: '', stderr: '' }; },
-      });
+      const { engine, calls } = fakeEngine('podman');
       const config = {
         ...createContainerConfig({ containers: true, containerSetupCommand: 'npm i -g x' }, {}),
         rootDir: root,
@@ -564,12 +606,78 @@ describe('per-user environments', function () {
         (c) => c.args[0] === 'exec' && c.args.includes('npm i -g x'),
       );
       assert.strictEqual(setups.length, 1);
+      assert.ok(setups[0].args.includes('cawc-frank-6-id'), 'setup targets immutable identity');
+    });
+
+    it('rejects a foreign same-name container before setup or probing', async function () {
+      const root = tmpRoot();
+      const { engine, calls } = fakeEngine('docker');
+      engine.replaceForTest('cawc-alice-1', {
+        identity: 'foreign-id',
+        status: 'running',
+        image: 'foreign/image',
+        labels: {
+          [MANAGED_LABEL]: 'true',
+          [USER_ID_LABEL]: '999',
+          [LOGIN_LABEL]: 'mallory',
+        },
+      });
+      const config = {
+        ...createContainerConfig({ containers: true, containerSetupCommand: 'touch owned' }, {}),
+        rootDir: root,
+      };
+      const manager = new EnvironmentManager({ config, engine, hostHome: '/srv/work' });
+
+      await assert.rejects(
+        manager.ensureFor({ id: 1, githubLogin: 'alice' }),
+        /mismatched ownership labels/,
+      );
+      await assert.rejects(manager.remove('cawc-alice-1'), /not owned as a user environment/);
+      assert.strictEqual(
+        calls.some((call) => ['run', 'start', 'exec', 'stop', 'rm'].includes(call.args[0])),
+        false,
+        'foreign same-name state is inspected but never executed, started, stopped, or removed',
+      );
+    });
+
+    it('fails provisioning if setup or probing observes a same-name replacement', async function () {
+      const root = tmpRoot();
+      let pair;
+      pair = fakeEngine('podman', {
+        exec: async () => {
+          pair.engine.replaceForTest('cawc-setup-race-31', {
+            identity: 'replacement-id',
+            status: 'running',
+            image: 'example/image:1',
+            labels: {
+              [MANAGED_LABEL]: 'true',
+              [USER_ID_LABEL]: '31',
+              [LOGIN_LABEL]: 'setup-race',
+            },
+          });
+          return { stdout: 'sh\n', stderr: '' };
+        },
+      });
+      const config = {
+        ...createContainerConfig({ containers: true, containerSetupCommand: 'install extras' }, {}),
+        rootDir: root,
+      };
+      const manager = new EnvironmentManager({ config, engine: pair.engine, hostHome: '/srv/work' });
+
+      await assert.rejects(
+        manager.ensureFor({ id: 31, githubLogin: 'setup-race' }),
+        /identity or ownership changed during provisioning/,
+      );
+      const execs = pair.calls.filter((call) => call.args[0] === 'exec');
+      assert.ok(execs.length >= 1);
+      assert.ok(execs.every((call) => call.args.includes('cawc-setup-race-31-id')));
+      assert.ok(execs.every((call) => !call.args.includes('replacement-id')));
+      assert.strictEqual(manager.existing(31), null, 'the replacement is never adopted as ready');
     });
 
     it('reports the shells the image actually has, not this host\'s', async function () {
       const root = tmpRoot();
       const { engine } = fakeEngine('podman', {
-        inspect: async () => { throw new Error('No such object'); },
         exec: async () => ({ stdout: 'bash\nsh\n', stderr: '' }),
       });
       const config = { ...createContainerConfig({ containers: true }, {}), rootDir: root };
@@ -581,7 +689,6 @@ describe('per-user environments', function () {
     it('falls back to sh when the shell probe fails', async function () {
       const root = tmpRoot();
       const { engine } = fakeEngine('podman', {
-        inspect: async () => { throw new Error('No such object'); },
         exec: async () => { throw new Error('probe blew up'); },
       });
       const config = { ...createContainerConfig({ containers: true }, {}), rootDir: root };
@@ -593,7 +700,6 @@ describe('per-user environments', function () {
     it('survives a failing setup command', async function () {
       const root = tmpRoot();
       const { engine } = fakeEngine('podman', {
-        inspect: async () => { throw new Error('No such object'); },
         exec: async () => { throw new Error('setup blew up'); },
       });
       const config = {
@@ -608,12 +714,7 @@ describe('per-user environments', function () {
     it('stops idle environments and leaves busy ones alone', async function () {
       const root = tmpRoot();
       let clock = 1_000_000;
-      const { engine, calls } = fakeEngine('podman', {
-        inspect: async (args) => {
-          const name = args[args.length - 1];
-          return managedInspect(args, 'running', Number(name.split('-').at(-1)));
-        },
-      });
+      const { engine, calls } = fakeEngine('podman');
       const config = {
         ...createContainerConfig({ containers: true, containerIdleMinutes: 10 }, {}),
         rootDir: root,
@@ -632,16 +733,14 @@ describe('per-user environments', function () {
       assert.deepStrictEqual(stopped, ['cawc-hana-8']);
       assert.deepStrictEqual(
         calls.filter((c) => c.args[0] === 'stop').map((c) => c.args[c.args.length - 1]),
-        ['cawc-hana-8'],
+        ['cawc-hana-8-id'],
       );
     });
 
     it('never stops an environment that has something running in it', async function () {
       const root = tmpRoot();
       let clock = 1_000_000;
-      const { engine, calls } = fakeEngine('podman', {
-        inspect: async (args) => managedInspect(args, 'running', 20, 'nina'),
-      });
+      const { engine, calls } = fakeEngine('podman');
       const config = {
         ...createContainerConfig({ containers: true, containerIdleMinutes: 10 }, {}),
         rootDir: root,
@@ -668,13 +767,103 @@ describe('per-user environments', function () {
 
     it('never stops anything when idle stopping is off', async function () {
       const root = tmpRoot();
-      const { engine } = fakeEngine('podman', {
-        inspect: async (args) => managedInspect(args, 'running', 10, 'jo'),
-      });
+      const { engine } = fakeEngine('podman');
       const config = { ...createContainerConfig({ containers: true }, {}), rootDir: root };
       const manager = new EnvironmentManager({ config, engine, hostHome: '/srv/work' });
       await manager.ensureFor({ id: 10, githubLogin: 'jo' });
       assert.deepStrictEqual(await manager.sweepIdle(), []);
+    });
+
+    it('never mutates a same-name replacement through ready lifecycle paths', async function () {
+      const root = tmpRoot();
+      let clock = 1_000_000;
+      const { engine, calls } = fakeEngine('docker');
+      const config = {
+        ...createContainerConfig({ containers: true, containerIdleMinutes: 1 }, {}),
+        rootDir: root,
+      };
+      const manager = new EnvironmentManager({
+        config, engine, hostHome: '/srv/work', now: () => clock,
+      });
+      const owner = { id: 32, githubLogin: 'ready-race' };
+      const environment = await manager.ensureFor(owner);
+      engine.replaceForTest(environment.name, {
+        identity: 'replacement-id',
+        status: 'running',
+        image: 'example/image:1',
+        // Even copied ownership labels cannot turn a new identity into the
+        // environment this manager originally prepared.
+        labels: {
+          [MANAGED_LABEL]: 'true',
+          [USER_ID_LABEL]: String(owner.id),
+          [LOGIN_LABEL]: owner.githubLogin,
+        },
+      });
+      calls.length = 0;
+      clock += 2 * 60_000;
+
+      const originalError = console.error;
+      console.error = () => {};
+      try {
+        await assert.rejects(manager.ensureFor(owner), /replaced before ensure/);
+        assert.deepStrictEqual(await manager.sweepIdle(), []);
+        await assert.rejects(manager.stopFor(owner.id), /same-name container was replaced/);
+        await assert.rejects(
+          manager.applyTier(owner.id, { id: 'large', label: 'Large', cpus: '4', memory: '4g' }),
+          /same-name container was replaced/,
+        );
+        await assert.rejects(manager.remove(environment.name), /same-name container was replaced/);
+      } finally {
+        console.error = originalError;
+      }
+
+      assert.strictEqual(manager.existing(owner.id), environment, 'failed checks retain the original handle');
+      assert.strictEqual(
+        calls.some((call) => ['run', 'start', 'exec', 'stop', 'rm', 'update'].includes(call.args[0])),
+        false,
+        'the replacement receives no lifecycle mutation',
+      );
+    });
+
+    it('targets resize by immutable id and rejects replacement during the update', async function () {
+      const root = tmpRoot();
+      let pair;
+      pair = fakeEngine('docker', {
+        update: async () => {
+          pair.engine.replaceForTest('cawc-resize-race-33', {
+            identity: 'replacement-id',
+            status: 'running',
+            image: 'example/image:1',
+            labels: {
+              [MANAGED_LABEL]: 'true',
+              [USER_ID_LABEL]: '33',
+              [LOGIN_LABEL]: 'resize-race',
+            },
+          });
+          return { stdout: '', stderr: '' };
+        },
+      });
+      const config = { ...createContainerConfig({ containers: true }, {}), rootDir: root };
+      const manager = new EnvironmentManager({ config, engine: pair.engine, hostHome: '/srv/work' });
+      await manager.ensureFor({ id: 33, githubLogin: 'resize-race' });
+
+      const originalError = console.error;
+      console.error = () => {};
+      let outcome;
+      try {
+        outcome = await manager.applyTier(
+          33,
+          { id: 'large', label: 'Large', cpus: '4', memory: '4g' },
+          { busy: true },
+        );
+      } finally {
+        console.error = originalError;
+      }
+      assert.strictEqual(outcome, 'deferred');
+      const update = pair.calls.find((call) => call.args[0] === 'update');
+      assert.ok(update.args.includes('cawc-resize-race-33-id'));
+      assert.ok(!update.args.includes('replacement-id'));
+      assert.strictEqual(manager.appliedTierFor(33).id, 'medium');
     });
 
     it('lists environments with their owners', async function () {
@@ -712,9 +901,7 @@ describe('per-user environments', function () {
 
     it('removes an environment and, on request, its data', async function () {
       const root = tmpRoot();
-      const { engine, calls } = fakeEngine('docker', {
-        inspect: async () => { throw new Error('No such object'); },
-      });
+      const { engine, calls } = fakeEngine('docker');
       const config = { ...createContainerConfig({ containers: true }, {}), rootDir: root };
       const manager = new EnvironmentManager({ config, engine, hostHome: '/srv/work' });
       const env = await manager.ensureFor({ id: 11, githubLogin: 'kim' });
@@ -722,7 +909,7 @@ describe('per-user environments', function () {
 
       await manager.remove('cawc-kim-11');
       assert.ok(fs.existsSync(path.join(env.homeDir, 'secret.txt')), 'data survives a plain remove');
-      assert.ok(calls.some((c) => c.args[0] === 'rm' && c.args.includes('cawc-kim-11')));
+      assert.ok(calls.some((c) => c.args[0] === 'rm' && c.args.includes('cawc-kim-11-id')));
 
       await manager.remove('cawc-kim-11', { purgeData: true });
       assert.ok(!fs.existsSync(env.homeDir), 'purge takes the data with it');
@@ -736,7 +923,10 @@ describe('per-user environments', function () {
       const config = { ...createContainerConfig({ containers: true }, {}), rootDir: root };
       const manager = new EnvironmentManager({ config, engine, hostHome: '/srv/work' });
 
-      await manager.remove(`../${path.basename(outside)}`, { purgeData: true });
+      await assert.rejects(
+        manager.remove(`../${path.basename(outside)}`, { purgeData: true }),
+        /safe path component/,
+      );
       assert.ok(fs.existsSync(outside), 'a traversing name must not delete another tree');
       fs.rmSync(outside, { recursive: true, force: true });
     });

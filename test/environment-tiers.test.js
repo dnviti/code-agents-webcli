@@ -32,26 +32,68 @@ function tmpRoot() {
 /** An engine that records argv and answers scripted responses. */
 function fakeEngine(overrides = {}) {
   const calls = [];
+  const known = new Map();
   const engine = {
     kind: 'podman',
     binary: 'podman',
     calls,
-    async ensure(spec) { calls.push({ op: 'ensure', spec }); return { created: true }; },
+    async ensure(spec) {
+      calls.push({ op: 'ensure', spec });
+      const current = known.get(spec.name);
+      if (current) {
+        known.set(spec.name, { ...current, status: 'running' });
+        return { created: false };
+      }
+      known.set(spec.name, {
+        name: spec.name,
+        identity: `${spec.name}-id`,
+        status: 'running',
+        image: spec.image,
+        labels: { ...spec.labels },
+      });
+      return { created: true };
+    },
     async create(spec) { calls.push({ op: 'create', spec }); },
     async start(name) { calls.push({ op: 'start', name }); },
     async stop(name) { calls.push({ op: 'stop', name }); },
     async remove(name) { calls.push({ op: 'remove', name }); },
     async status() { return 'running'; },
-    async describe() { return null; },
+    async describe(name) { return known.get(name) || null; },
     async describeStrict(name) { return this.describe(name); },
-    async exec() { return { stdout: 'sh\n', stderr: '' }; },
-    execArgs: (spec, command, args) => ['exec', spec.name, command, ...args],
+    async exec(spec) { calls.push({ op: 'exec', spec }); return { stdout: 'sh\n', stderr: '' }; },
+    execArgs: (spec, command, args) => ['exec', spec.identity || spec.name, command, ...args],
     async list() { return []; },
     async available() { return true; },
     async resize(name, cpus, memory) { calls.push({ op: 'resize', name, cpus, memory }); return true; },
     async usage() { return null; },
     ...overrides,
   };
+  engine.ensureIdentity = async (spec, expected) => {
+    const before = await engine.describeStrict(spec.name);
+    if (expected && (!before || before.identity !== expected.identity)) {
+      throw new Error(`container ${spec.name} was replaced before ensure`);
+    }
+    if (!expected && before) throw new Error(`container ${spec.name} appeared before creation`);
+    const result = await engine.ensure(spec);
+    const after = await engine.describeStrict(spec.name);
+    if (!after || (expected && after.identity !== expected.identity)) {
+      throw new Error(`container ${spec.name} changed during ensure`);
+    }
+    return { created: result.created, identity: after.identity };
+  };
+  engine.stopIdentity = async (description) => {
+    await engine.stop(description.identity);
+    const current = known.get(description.name);
+    if (current?.identity !== description.identity) throw new Error('container was replaced during stop');
+    known.set(description.name, { ...current, status: 'exited' });
+  };
+  engine.removeIdentity = async (description) => {
+    await engine.remove(description.identity);
+    const current = known.get(description.name);
+    if (current?.identity !== description.identity) throw new Error('container was replaced during removal');
+    known.delete(description.name);
+  };
+  engine.replaceForTest = (name, description) => known.set(name, { name, ...description });
   if (overrides.resize) {
     engine.resize = async (name, cpus, memory) => {
       calls.push({ op: 'resize', name, cpus, memory });
@@ -340,6 +382,36 @@ describe('environment tiers', function () {
       const outcome = await manager.applyTier(6, TIERS[0], { busy: false });
       assert.strictEqual(outcome, 'applied');
       assert.ok(engine.calls.some((c) => c.op === 'stop'));
+    });
+
+    it('does not tier-stop a same-name replacement after resize falls back', async function () {
+      let engine;
+      engine = fakeEngine({
+        resize: async () => {
+          engine.replaceForTest('cawc-tier-race-9', {
+            identity: 'replacement-id',
+            status: 'running',
+            image: 'img',
+            labels: {},
+          });
+          return false;
+        },
+      });
+      const manager = managerWith(engine);
+      await manager.ensureFor({ id: 9, githubLogin: 'tier-race' });
+
+      const originalError = console.error;
+      console.error = () => {};
+      try {
+        await assert.rejects(
+          manager.applyTier(9, TIERS[2], { busy: false }),
+          /same-name container was replaced/,
+        );
+      } finally {
+        console.error = originalError;
+      }
+      assert.strictEqual(engine.calls.some((call) => call.op === 'stop'), false);
+      assert.strictEqual(manager.existing(9).identity, 'cawc-tier-race-9-id');
     });
 
     it('does nothing when the size is already the one asked for', async function () {
