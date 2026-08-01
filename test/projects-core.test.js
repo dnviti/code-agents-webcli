@@ -4,7 +4,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-const { EnvironmentManager, createContainerConfig } = require('../dist/server/services/environments/index.js');
+const { EnvironmentManager, createContainerConfig, projectContainerName } = require('../dist/server/services/environments/index.js');
 const { ProjectManager } = require('../dist/server/services/projects/manager.js');
 const { checkRepositoryAccess, cloneRepository } = require('../dist/server/services/projects/clone.js');
 const { preserveProjectWork } = require('../dist/server/services/projects/preserve.js');
@@ -1109,13 +1109,136 @@ describe('project core lifecycle', function () {
   });
 
   it('removes verified project-labelled orphan containers on boot', async function () {
+    const id = '123e4567-e89b-42d3-a456-426614174000';
     let present = true;
-    const { manager, e } = setup([], { engine: { async describe(name) { return present ? { name, identity: 'orphan-id', status: 'running', image: 'img', labels: { 'com.code-agents-webcli.managed': 'true', 'com.code-agents-webcli.project': 'gone', 'com.code-agents-webcli.user-id': '1', 'com.code-agents-webcli.target': 'legacy' } } : null; } } });
+    const { manager, e, dir } = setup([], { engine: { async describe(name) { return present ? { name, identity: 'orphan-id', status: 'running', image: 'img', labels: { 'com.code-agents-webcli.managed': 'true', 'com.code-agents-webcli.project': id, 'com.code-agents-webcli.user-id': '1', 'com.code-agents-webcli.target': 'legacy' } } : null; } } });
+    const workspace = path.join(dir, 'projects', id); fs.mkdirSync(workspace, { recursive: true });
     e.list = async (selector) => { e.calls.push({ op: 'list', selector }); return ['orphan']; };
     e.removeIdentity = async (description) => { e.calls.push({ op: 'remove', name: description.name, identity: description.identity }); present = false; };
     await manager.reconcileOnBoot();
     assert.ok(e.calls.some((c) => c.op === 'list' && c.selector === 'com.code-agents-webcli.project'));
     assert.ok(e.calls.some((c) => c.op === 'remove' && c.name === 'orphan' && c.identity === 'orphan-id'));
+    assert.ok(!fs.existsSync(workspace), 'the orphan workspace is removed only after the runtime is gone');
+  });
+
+  it('keeps an interrupted null-container row counted when boot enumeration and inspection fail', async function () {
+    const p = project('one', 'building');
+    const { manager, s, e } = setup([p]);
+    e.list = async () => { throw new Error('target unavailable'); };
+    e.describe = async () => { throw new Error('target unavailable'); };
+
+    await manager.reconcileOnBoot();
+
+    assert.deepStrictEqual(s.getProject(p.id).container, { name: projectContainerName('cawc', p) });
+    assert.strictEqual(s.getProject(p.id).state, 'reclaiming');
+    assert.ok(!e.calls.some((call) => call.op === 'stop' || call.op === 'remove'));
+  });
+
+  it('never treats a non-UUID project label as a deletable orphan workspace path', async function () {
+    const { manager, e, dir } = setup([], { engine: { async describe(name) { return { name, identity: 'malicious-id', status: 'running', image: 'img', labels: { 'com.code-agents-webcli.managed': 'true', 'com.code-agents-webcli.project': '../../outside', 'com.code-agents-webcli.user-id': '1', 'com.code-agents-webcli.target': 'legacy' } }; } } });
+    const outside = path.join(dir, 'outside'); fs.mkdirSync(outside, { recursive: true });
+    e.list = async () => ['malicious'];
+
+    await manager.reconcileOnBoot();
+
+    assert.ok(fs.existsSync(outside));
+    assert.ok(!e.calls.some((call) => call.op === 'remove'));
+  });
+
+  it('retains an orphan workspace when exact container removal cannot be verified', async function () {
+    const id = '123e4567-e89b-42d3-a456-426614174001';
+    let present = true;
+    const { manager, e, dir } = setup([], { engine: { async describe(name) { return present ? { name, identity: 'orphan-id', status: 'running', image: 'img', labels: { 'com.code-agents-webcli.managed': 'true', 'com.code-agents-webcli.project': id, 'com.code-agents-webcli.user-id': '1', 'com.code-agents-webcli.target': 'legacy' } } : null; } } });
+    const workspace = path.join(dir, 'projects', id); fs.mkdirSync(workspace, { recursive: true });
+    e.list = async () => ['orphan'];
+    e.removeIdentity = async () => { throw new Error('engine remove failed'); };
+
+    await manager.reconcileOnBoot();
+
+    assert.strictEqual(present, true);
+    assert.ok(fs.existsSync(workspace));
+  });
+
+  it('cleans a UUID-shaped stale project workspace after a complete empty target scan', async function () {
+    const id = '123e4567-e89b-42d3-a456-426614174002';
+    const { manager, e, dir } = setup([]);
+    const workspace = path.join(dir, 'projects', id); fs.mkdirSync(workspace, { recursive: true });
+    e.list = async () => [];
+
+    await manager.reconcileOnBoot();
+
+    assert.ok(!fs.existsSync(workspace));
+  });
+
+  it('retains a stale workspace when another target sharing its root cannot complete reconciliation', async function () {
+    const id = '123e4567-e89b-42d3-a456-426614174003';
+    const { manager, e, dir, environments, cfg } = setup([]);
+    const other = engine({ async list() { throw new Error('other target unavailable'); } });
+    // The manager keeps target maps internally; two targets may deliberately
+    // share one storage root, so a successful legacy scan cannot prove the
+    // other target has no runtime mounted from this directory.
+    environments.engines.set('other-target', other);
+    environments.configs.set('other-target', { ...cfg });
+    const workspace = path.join(dir, 'projects', id); fs.mkdirSync(workspace, { recursive: true });
+    e.list = async () => [];
+
+    await manager.reconcileOnBoot();
+
+    assert.ok(fs.existsSync(workspace));
+  });
+
+  it('defers a removed orphan workspace while another shared-root target cannot scan', async function () {
+    const id = '123e4567-e89b-42d3-a456-426614174004';
+    let present = true;
+    const { manager, e, dir, environments, cfg } = setup([], {
+      engine: {
+        async describe(name) {
+          return present ? {
+            name, identity: 'orphan-id', status: 'running', image: 'img', labels: {
+              'com.code-agents-webcli.managed': 'true',
+              'com.code-agents-webcli.project': id,
+              'com.code-agents-webcli.user-id': '1',
+              'com.code-agents-webcli.target': 'legacy',
+            },
+          } : null;
+        },
+      },
+    });
+    const other = engine({ async list() { throw new Error('other target unavailable'); } });
+    environments.engines.set('other-target', other);
+    environments.configs.set('other-target', { ...cfg });
+    const workspace = path.join(dir, 'projects', id); fs.mkdirSync(workspace, { recursive: true });
+    e.list = async () => ['orphan'];
+    e.removeIdentity = async () => { present = false; };
+
+    await manager.reconcileOnBoot();
+
+    assert.ok(fs.existsSync(workspace), 'a failed shared-root scan blocks deferred workspace cleanup');
+  });
+
+  it('retains a UUID workspace when a managed runtime has unsafe ownership labels', async function () {
+    const id = '123e4567-e89b-42d3-a456-426614174005';
+    const { manager, e, dir } = setup([], {
+      engine: {
+        async describe(name) {
+          return {
+            name, identity: 'unsafe-id', status: 'running', image: 'img', labels: {
+              'com.code-agents-webcli.managed': 'true',
+              'com.code-agents-webcli.project': id,
+              'com.code-agents-webcli.user-id': 'not-a-user',
+              'com.code-agents-webcli.target': 'legacy',
+            },
+          };
+        },
+      },
+    });
+    const workspace = path.join(dir, 'projects', id); fs.mkdirSync(workspace, { recursive: true });
+    e.list = async () => ['unsafe'];
+
+    await manager.reconcileOnBoot();
+
+    assert.ok(fs.existsSync(workspace));
+    assert.ok(!e.calls.some((call) => call.op === 'remove'));
   });
 
   it('ignores unrelated containers that spoof only the project label on boot', async function () {
@@ -1148,6 +1271,82 @@ describe('project core lifecycle', function () {
     await manager.reconcileOnBoot();
     assert.ok(!e.calls.some((call) => call.op === 'remove' && call.name === 'intruder'));
     assert.ok(e.calls.some((call) => call.op === 'stop' && call.name === 'saved' && call.identity === 'saved-id'));
+  });
+
+  it('adopts an exact crash-window runtime before boot reconciliation retires and reclaims it', async function () {
+    const p = project('one', 'building');
+    const { manager, s, e, dir } = setup([p]);
+    const name = projectContainerName('cawc', p);
+    const workspace = path.join(dir, 'projects', p.id);
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.writeFileSync(path.join(workspace, 'live-workspace'), 'must outlive runtime retirement');
+    let present = true;
+    let status = 'running';
+    const labels = {
+      'com.code-agents-webcli.managed': 'true',
+      'com.code-agents-webcli.project': p.id,
+      'com.code-agents-webcli.user-id': '1',
+      'com.code-agents-webcli.target': 'legacy',
+    };
+    e.list = async () => [name];
+    e.describe = async (candidate) => present && candidate === name
+      ? { name, identity: 'crash-window-id', status, image: 'img', labels }
+      : null;
+    e.stopIdentity = async (description) => {
+      e.calls.push({ op: 'stop', name: description.name, identity: description.identity });
+      status = 'stopped';
+    };
+    e.removeIdentity = async (description) => {
+      e.calls.push({ op: 'remove', name: description.name, identity: description.identity });
+      assert.ok(fs.existsSync(workspace), 'workspace remains until the exact runtime is removed');
+      present = false;
+    };
+
+    await manager.reconcileOnBoot();
+    assert.strictEqual(s.getProject(p.id).state, 'stopped');
+    assert.deepStrictEqual(s.getProject(p.id).container, { name });
+    assert.ok(e.calls.some((call) => call.op === 'stop' && call.identity === 'crash-window-id'));
+
+    assert.deepStrictEqual(await manager.remove(1, p.id), { ok: true });
+    assert.ok(e.calls.some((call) => call.op === 'remove' && call.identity === 'crash-window-id'));
+    assert.strictEqual(present, false, 'the live runtime is not orphaned');
+    assert.ok(!fs.existsSync(workspace));
+  });
+
+  it('does not adopt a wrong-name crash-window runtime that merely claims a project label', async function () {
+    const p = project('one', 'building');
+    const { manager, s, e, dir } = setup([p]);
+    const workspace = path.join(dir, 'projects', p.id);
+    fs.mkdirSync(workspace, { recursive: true });
+    let present = true;
+    e.list = async () => ['wrong-name'];
+    e.describe = async (name) => present && name === 'wrong-name' ? ({
+      name, identity: 'foreign-id', status: 'running', image: 'img', labels: {
+        'com.code-agents-webcli.managed': 'true',
+        'com.code-agents-webcli.project': p.id,
+        'com.code-agents-webcli.user-id': '1',
+        'com.code-agents-webcli.target': 'legacy',
+      },
+    }) : null;
+
+    await manager.reconcileOnBoot();
+
+    assert.deepStrictEqual(s.getProject(p.id).container, {
+      name: 'wrong-name', reconciliationConflict: 'unverified_runtime',
+    });
+    assert.strictEqual(s.getProject(p.id).state, 'reclaiming');
+    assert.ok(!e.calls.some((call) => call.op === 'stop' || call.op === 'remove'));
+    assert.strictEqual((await manager.release(1, p.id, { discard: true })).ok, false);
+    assert.strictEqual((await manager.remove(1, p.id)).ok, false);
+    assert.ok(fs.existsSync(workspace), 'an unverified claimant blocks workspace destruction');
+
+    present = false;
+    e.list = async () => [];
+    await manager.reconcileOnBoot();
+    assert.strictEqual(s.getProject(p.id).container, null);
+    assert.strictEqual(s.getProject(p.id).state, 'stopped');
+    assert.deepStrictEqual(await manager.remove(1, p.id), { ok: true });
+    assert.ok(!fs.existsSync(workspace), 'a complete later scan unlocks deletion only after the claimant is gone');
   });
 
   it('retires every potentially executable recorded runtime on boot before marking it stopped', async function () {

@@ -19,7 +19,7 @@ import {
 import { EnvironmentEngine, RunResult, isQuiescentContainerStatus } from '../environments/engine.js';
 import { preserveProjectWork } from './preserve.js';
 import { BuildEvent, Project, ProjectState, ProjectStore, RunningProjectInfo } from './store.js';
-import { PROJECT_LABEL, TARGET_LABEL, targetLabelValue } from '../environments/naming.js';
+import { PROJECT_LABEL, TARGET_LABEL, projectContainerName, targetLabelValue } from '../environments/naming.js';
 import {
   ProjectSessionFileCommand,
   ProjectSessionFileProcess,
@@ -74,6 +74,9 @@ interface IssuedSessionLease {
   recoveries: Set<RecoveryEntry>;
   releaseRequested: boolean;
 }
+
+/** Project ids are UUIDs; never turn a runtime-controlled label into a path. */
+const PROJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export interface ProjectManagerDeps {
   store: ProjectStore;
@@ -299,6 +302,9 @@ export class ProjectManager {
     if (project.state === 'building' || this.builds.has(projectId)) {
       return { ok: false, reason: 'invalid_state', detail: 'project lifecycle operation is still in progress' };
     }
+    if (project.container?.reconciliationConflict === 'unverified_runtime') {
+      return { ok: false, reason: 'invalid_state', detail: 'project runtime ownership is unverified; wait for a complete boot reconciliation' };
+    }
     if (project.state === 'blocked' && !opts.force) return { ok: false, reason: 'preserve_failed', detail: project.stateDetail || undefined };
     if (this.hasActiveWork(project.id)) {
       return { ok: false, reason: 'invalid_state', detail: 'project has active work' };
@@ -344,6 +350,9 @@ export class ProjectManager {
     // as permission to bypass them.
     if (project.state !== 'blocked' && project.state !== 'reclaiming') {
       return { ok: false, reason: 'invalid_state' };
+    }
+    if (project.container?.reconciliationConflict === 'unverified_runtime') {
+      return { ok: false, reason: 'invalid_state', detail: 'project runtime ownership is unverified; wait for a complete boot reconciliation' };
     }
     if (this.hasActiveWork(project.id)) {
       return { ok: false, reason: 'invalid_state', detail: 'project has active work' };
@@ -777,13 +786,87 @@ export class ProjectManager {
     return error instanceof Error ? error.message : String(error);
   }
 
+  private projectStorageRootForEngine(engineKey: string): string | null {
+    try {
+      return path.resolve(this.deps.environments.projectStorageRoot(engineKey === 'legacy' ? null : engineKey));
+    } catch {
+      return null;
+    }
+  }
+
+  private orphanWorkspacePath(root: string, projectId: string): string {
+    if (!PROJECT_ID.test(projectId)) throw new Error('refusing non-UUID orphan workspace id');
+    const parent = path.resolve(root);
+    const workspace = path.resolve(parent, projectId);
+    if (path.dirname(workspace) !== parent || path.basename(workspace) !== projectId) {
+      throw new Error('refusing unsafe orphan workspace removal');
+    }
+    return workspace;
+  }
+
+  private async removeOrphanWorkspace(root: string, projectId: string): Promise<void> {
+    await fsp.rm(this.orphanWorkspacePath(root, projectId), { recursive: true, force: true });
+  }
+
+  private async removeStaleOrphanWorkspaces(root: string, protectedIds: ReadonlySet<string>): Promise<void> {
+    let entries;
+    try {
+      entries = await fsp.readdir(root, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !PROJECT_ID.test(entry.name)
+        || protectedIds.has(entry.name) || this.deps.store.getProject(entry.name)) continue;
+      await this.removeOrphanWorkspace(root, entry.name);
+    }
+  }
+
   async reconcileOnBoot(): Promise<void> {
     // Boot integration calls this after old runtimes are gone and before any
     // new project attachment is admitted; process-local leases cannot survive.
     this.deps.store.clearSessionLeases();
+    const reconciled = new Set<string>();
+    // A crash can happen after the engine creates a deterministic runtime but
+    // before its name reaches SQLite. Do not rely on the broad label scan to
+    // find it: that scan can itself be unavailable. Record only the expected
+    // name for interrupted, counted rows, then let the identity-bound pass
+    // below prove it absent, owned, foreign, or unreachable.
+    const unrecordedInterrupted = new Set<string>();
+    for (const project of this.deps.store.listProjectsInState('building', 'running', 'reclaiming')) {
+      if (project.container) continue;
+      try {
+        const target = this.deps.environments.projectTarget(project.targetId);
+        this.deps.store.setContainer(project.id, {
+          name: projectContainerName(target.config.namePrefix, project),
+        });
+        unrecordedInterrupted.add(project.id);
+      } catch (error) {
+        reconciled.add(project.id);
+        this.deps.store.setState(
+          project.id,
+          'reclaiming',
+          `Interrupted project runtime placement could not be resolved: ${(error as Error).message}`,
+        );
+        this.publish(this.deps.store.getProject(project.id) as Project);
+      }
+    }
+    // Several deploy targets may intentionally share one storage root. A
+    // stale directory is deletable only after every engine that can mount that
+    // root completed its scan; one uncertain engine could still be executing
+    // from the same workspace.
+    const rootScans = new Map<string, { complete: boolean; protectedIds: Set<string> }>();
+    for (const engineKey of this.deps.environments.reachableEngines().keys()) {
+      const root = this.projectStorageRootForEngine(engineKey);
+      if (root && !rootScans.has(root)) rootScans.set(root, { complete: true, protectedIds: new Set() });
+    }
     for (const [engineKey, engine] of this.deps.environments.reachableEngines()) {
+      const root = this.projectStorageRootForEngine(engineKey);
+      const scan = root ? rootScans.get(root) : undefined;
       let names: string[];
       try { names = await engine.list(PROJECT_LABEL); } catch (error) {
+        if (scan) scan.complete = false;
         console.error(`Project reconcile: could not list target '${engineKey}':`, error);
         continue;
       }
@@ -796,12 +879,39 @@ export class ProjectManager {
           if (!described || described.labels[MANAGED_LABEL] !== 'true') continue;
           const id = described.labels[PROJECT_LABEL];
           const project = id ? this.deps.store.getProject(id) : null;
+          // A managed UUID-labelled runtime can mount this root even when its
+          // labels are malformed or its DB row is gone. Keep its directory
+          // protected unless this exact identity is removed and then proved
+          // absent. This is deliberately per-root: target configurations may
+          // share a workspace root.
+          if (scan && id && PROJECT_ID.test(id)) scan.protectedIds.add(id);
+          if (project && unrecordedInterrupted.has(project.id)
+            && (!project.container
+              || name !== project.container.name
+              || engineKey !== (project.targetId || 'legacy'))) {
+            // The expected name was synthesized above solely to recover a
+            // crash window. A same-label container on another engine or name
+            // must never become its replacement record.
+            reconciled.add(project.id);
+            this.deps.store.setContainer(project.id, {
+              name: described.name,
+              reconciliationConflict: 'unverified_runtime',
+            });
+            this.deps.store.setState(
+              project.id,
+              'reclaiming',
+              'A project-labelled runtime did not match the interrupted project placement; manual recovery required',
+            );
+            this.publish(this.deps.store.getProject(project.id) as Project);
+            continue;
+          }
           // A managed container with no project row is an orphan. A container
           // whose label/name collides with an existing row is *not* an orphan:
           // it may be foreign, so reconciliation must retain the row and let
           // the per-project pass fail closed rather than deleting by name.
           const isSafeOrphan = !project
             && Boolean(id)
+            && PROJECT_ID.test(id)
             && /^\d+$/.test(described.labels[USER_ID_LABEL] || '')
             && described.labels[TARGET_LABEL] === targetLabelValue(engineKey);
           if (isSafeOrphan) {
@@ -809,25 +919,72 @@ export class ProjectManager {
             if (await engine.describeStrict(name)) {
               throw new Error(`managed orphan '${name}' still exists after removal`);
             }
+            if (!root) throw new Error(`managed orphan '${name}' has no resolvable storage root`);
+            // Workspace deletion is deferred until every engine sharing this
+            // root completes. Another target can still have this UUID mounted.
+            scan?.protectedIds.delete(id);
+            continue;
+          }
+          if (project && !project.container) {
+            // A crash can land after the runtime was created but before its
+            // name was committed. Adopt only the exact deterministic runtime
+            // on the recorded target; a project label alone is public data and
+            // is never enough authority to stop or remove a container.
+            const expectedKey = project.targetId || 'legacy';
+            let expected;
+            try {
+              expected = this.deps.environments.projectTarget(project.targetId);
+            } catch {
+              expected = null;
+            }
+            const exactRuntime = Boolean(expected)
+              && engineKey === expectedKey
+              && engine === expected!.engine
+              && described.name === projectContainerName(expected!.config.namePrefix, project)
+              && described.labels[USER_ID_LABEL] === String(project.ownerUserId)
+              && described.labels[TARGET_LABEL] === targetLabelValue(expectedKey);
+            reconciled.add(project.id);
+            if (exactRuntime) {
+              this.deps.store.setContainer(project.id, { name: described.name });
+              continue;
+            }
+            // Do not let a later fallback turn an interrupted build into an
+            // uncounted stopped row while an unverified same-label runtime
+            // may still be executable. Keep it recoverable but unadopted.
+            this.deps.store.setState(
+              project.id,
+              'reclaiming',
+              'A project-labelled runtime did not match the recorded project placement; manual recovery required',
+            );
+            this.publish(this.deps.store.getProject(project.id) as Project);
           }
         } catch (error) {
+          if (scan) scan.complete = false;
           console.error(`Project reconcile: could not reconcile '${name}':`, error);
         }
       }
     }
-
-    const reconciled = new Set<string>();
     for (const snapshot of this.deps.store.listProjectsWithContainers()) {
       reconciled.add(snapshot.id);
       await this.exclusiveFor([snapshot.id], async () => {
         const project = this.deps.store.getProject(snapshot.id);
         if (!project?.container) return;
+        let target;
+        try {
+          target = this.deps.environments.projectTarget(project.targetId);
+        } catch (error) {
+          const detail = `Recorded project target could not be resolved: ${(error as Error).message}`;
+          this.deps.store.setState(project.id, 'reclaiming', detail);
+          this.publish(this.deps.store.getProject(project.id) as Project);
+          return;
+        }
+        const storageRoot = this.projectStorageRootForEngine(target.key);
+        const scan = storageRoot ? rootScans.get(storageRoot) : undefined;
         let described;
         try {
-          described = await this.deps.environments
-            .projectTarget(project.targetId)
-            .engine.describeStrict(project.container.name);
+          described = await target.engine.describeStrict(project.container.name);
         } catch (error) {
+          if (scan) scan.complete = false;
           const detail = `Recorded project container could not be inspected: ${(error as Error).message}`;
           // Its physical state is unknown, so retain a counted state until an
           // operator can reach the target and reconcile it safely.
@@ -836,11 +993,42 @@ export class ProjectManager {
           return;
         }
 
+        if (project.container.reconciliationConflict === 'unverified_runtime') {
+          // This name came from an unadoptable crash-window claimant. Never
+          // stop it, and never let a direct name lookup substitute for a
+          // complete target scan: another same-workspace runtime could have
+          // appeared while the target was unavailable.
+          if (described) {
+            if (scan && PROJECT_ID.test(project.id)) scan.protectedIds.add(project.id);
+            this.deps.store.setState(
+              project.id,
+              'reclaiming',
+              'An unverified project-labelled runtime still exists; manual recovery required',
+            );
+            this.publish(this.deps.store.getProject(project.id) as Project);
+            return;
+          }
+          if (!scan?.complete) {
+            this.deps.store.setState(
+              project.id,
+              'reclaiming',
+              'An unverified project-labelled runtime could not be ruled out by a complete target scan',
+            );
+            this.publish(this.deps.store.getProject(project.id) as Project);
+            return;
+          }
+          this.deps.store.setContainer(project.id, null);
+          this.deps.store.setRebuildRequired(project.id, true);
+          this.deps.store.setState(project.id, 'stopped', 'Unverified runtime is absent after a complete target scan; rebuild required');
+          this.publish(this.deps.store.getProject(project.id) as Project);
+          return;
+        }
+
         if (!described) {
           this.deps.store.setContainer(project.id, null);
           const expectedStoppedPod = project.state === 'stopped'
             && !project.rebuildRequired
-            && this.deps.environments.projectTarget(project.targetId).engine.kind === 'kubernetes';
+            && target.engine.kind === 'kubernetes';
           this.deps.store.setRebuildRequired(project.id, !expectedStoppedPod);
           this.deps.store.setState(
             project.id,
@@ -857,6 +1045,7 @@ export class ProjectManager {
           && described.labels[USER_ID_LABEL] === String(project.ownerUserId)
           && described.labels[TARGET_LABEL] === targetLabelValue(expectedKey);
         if (!ownershipMatches) {
+          if (scan) scan.complete = false;
           // Do not clear the recorded name or touch its workspace: it may now
           // name a foreign container. Keep the lifecycle counted until an
           // operator resolves the ownership conflict deliberately.
@@ -865,7 +1054,7 @@ export class ProjectManager {
           return;
         }
 
-        const engine = this.deps.environments.projectTarget(project.targetId).engine;
+        const engine = target.engine;
         try {
           // Session leases and in-memory command ownership do not survive a
           // server restart. Retire every potentially executable runtime before
@@ -888,6 +1077,7 @@ export class ProjectManager {
             this.deps.store.setContainer(project.id, null);
           }
         } catch (error) {
+          if (scan) scan.complete = false;
           const detail = `Interrupted project container could not be retired safely: ${(error as Error).message}`;
           this.deps.store.setState(project.id, 'reclaiming', detail);
           this.publish(this.deps.store.getProject(project.id) as Project);
@@ -907,6 +1097,17 @@ export class ProjectManager {
       if (reconciled.has(project.id)) continue;
       this.deps.store.setState(project.id, 'stopped', 'Interrupted by server restart; start again to rebuild');
       this.publish(this.deps.store.getProject(project.id) as Project);
+    }
+    // Only sweep after direct project reconciliation too. A successful broad
+    // list is insufficient if an identity-bound inspection later became
+    // uncertain; it could still be holding the shared workspace mount.
+    for (const [root, scan] of rootScans) {
+      if (!scan.complete) continue;
+      try {
+        await this.removeStaleOrphanWorkspaces(root, scan.protectedIds);
+      } catch (error) {
+        console.error(`Project reconcile: could not remove stale workspaces under '${root}':`, error);
+      }
     }
   }
 
@@ -1172,6 +1373,9 @@ export class ProjectManager {
     beforeDestroy?: () => Promise<void>,
     alreadyClaimed = false,
   ): Promise<SimpleResult> {
+    if (project.container?.reconciliationConflict === 'unverified_runtime') {
+      return { ok: false, reason: 'invalid_state', detail: 'project runtime ownership is unverified; wait for a complete boot reconciliation' };
+    }
     const priorState = project.state;
     const priorDetail = project.stateDetail;
     const owner = this.owner(project.ownerUserId);

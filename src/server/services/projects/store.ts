@@ -35,6 +35,12 @@ export interface ProjectContainerInfo {
   name: string;
   image?: string;
   shells?: string[];
+  /**
+   * A boot scan found a same-project runtime which could not be safely
+   * adopted. Its name is retained solely to block destructive lifecycle work
+   * until a later complete scan proves that runtime is gone.
+   */
+  reconciliationConflict?: 'unverified_runtime';
 }
 
 /** One buffered build event, persisted so a reopened tab rejoins the build. */
