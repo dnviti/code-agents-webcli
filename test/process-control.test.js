@@ -10,12 +10,12 @@ const {
   TRACKED_PROCESS_WRAPPER,
 } = require('../dist/server/services/environments/process-control.js');
 
-function waitUntil(predicate, timeoutMs = 8000) {
+function waitUntil(predicate, description = 'condition', timeoutMs = 8000) {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
     const poll = () => {
       if (predicate()) return resolve();
-      if (Date.now() >= deadline) return reject(new Error('condition was not reached'));
+      if (Date.now() >= deadline) return reject(new Error(`${description} was not reached`));
       setTimeout(poll, 20);
     };
     poll();
@@ -93,18 +93,25 @@ describe('tracked container process control', function() {
     const doneFile = path.join(dir, 'runtime.done');
     const jobFile = path.join(dir, 'job.pid');
     const detachedFile = path.join(dir, 'detached.pid');
+    const bashrcFile = path.join(dir, 'bashrc');
+    const shellPrompt = `CAWC_SHELL_READY_${token}> `;
+    const delayedRuntime = TRACKED_PROCESS_GROUP_WRAPPER.replace(
+      '"$@" <&0 >&1 2>&2 &',
+      'sleep 1\n"$@" <&0 >&1 2>&2 &',
+    );
     const calls = [];
     let output = '';
     let terminal;
     let control;
     let cleanupVerified = false;
     try {
+      fs.writeFileSync(bashrcFile, `PS1='${shellPrompt}'\nPROMPT_COMMAND=\n`);
       terminal = pty.spawn(
         'sh',
         [
           '-c', TRACKED_PROCESS_WRAPPER, 'sh', '1', controlFile, doneFile,
-          token, TRACKED_PROCESS_GROUP_WRAPPER,
-          'bash', '--noprofile', '--norc', '-i',
+          token, delayedRuntime,
+          'bash', '--noprofile', '--rcfile', bashrcFile, '-i',
         ],
         {
           cwd: dir,
@@ -120,14 +127,15 @@ describe('tracked container process control', function() {
       );
       terminal.onData((value) => { output += value; });
       const exited = new Promise((resolve) => terminal.onExit(resolve));
-      await waitUntil(() => fs.existsSync(controlFile));
+      await waitUntil(() => fs.existsSync(controlFile), 'runtime identity');
+      await waitUntil(() => output.includes(shellPrompt), 'interactive shell prompt');
 
       terminal.write(
         "sh -c 'printf \"%s\\n\" \"$$\" > \"$CAWC_JOB_FILE\"; trap \"\" TERM; exec sleep 100' & "
           + "setsid sh -c 'printf \"%s\\n\" \"$$\" > \"$CAWC_DETACHED_FILE\"; trap \"\" TERM; while :; do sleep 1; done' & "
           + "printf 'TRACKED_%s\\n' READY\n",
       );
-      await waitUntil(() => output.includes('TRACKED_READY'));
+      await waitUntil(() => output.includes('TRACKED_READY'), 'tracked child command');
 
       const [leader, start] = fs.readFileSync(controlFile, 'utf8').trim().split(/\s+/);
       let job;
@@ -140,7 +148,7 @@ describe('tracked container process control', function() {
         } catch {
           return false;
         }
-      });
+      }, 'tracked child identities');
       assert.ok(job.pgrp !== Number(leader), 'job control opened another process group');
       assert.ok(detached.session !== Number(leader), 'setsid descendant escaped the original SID');
       const tracked = tokenProcesses(token);
@@ -160,14 +168,17 @@ describe('tracked container process control', function() {
         tokenProcesses(token).length === 0
         && processIsGoneOrReplaced(job)
         && processIsGoneOrReplaced(detached)
-      ));
+      ), 'exact tracked child cleanup');
       cleanupVerified = true;
 
       assert.ok(start);
       assert.ok(!/Inappropriate ioctl|job control turned off/i.test(output), output);
       assert.ok(calls.length >= 2, 'verified stop is followed by proof cleanup');
       assert.ok(calls.every((spec) => spec.identity === 'immutable-container-id'));
-      await waitUntil(() => !fs.existsSync(controlFile) && !fs.existsSync(doneFile));
+      await waitUntil(
+        () => !fs.existsSync(controlFile) && !fs.existsSync(doneFile),
+        'control-file cleanup',
+      );
     } finally {
       if (!cleanupVerified && (control || fs.existsSync(controlFile))) {
         try {
@@ -207,13 +218,13 @@ describe('tracked container process control', function() {
         { cwd: dir, env: process.env, cols: 80, rows: 24, name: 'xterm-color' },
       );
       const exited = new Promise((resolve) => terminal.onExit(resolve));
-      await waitUntil(() => fs.existsSync(controlFile));
+      await waitUntil(() => fs.existsSync(controlFile), 'race identity');
       const control = new ContainerProcessControl(
         localEngine([]), 'container', 'container-id', controlFile, doneFile,
       );
       await control.stop();
       await exited;
-      await waitUntil(() => tokenProcesses(token).length === 0);
+      await waitUntil(() => tokenProcesses(token).length === 0, 'race token cleanup');
     } finally {
       try { terminal?.kill(); } catch {}
       fs.rmSync(dir, { recursive: true, force: true });
