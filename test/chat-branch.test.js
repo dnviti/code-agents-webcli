@@ -193,7 +193,12 @@ describe('branching a conversation from one of its turns', function () {
         dev: false,
         validatePath: (target) =>
           target.startsWith('/projects') ? { valid: true, path: target } : { valid: false, error: 'outside' },
-        createSessionRecord: (params) => chatRecord(params.id, params.name, params.workingDir),
+        createSessionRecord: (params) => ({
+          ...chatRecord(params.id, params.name, params.workingDir),
+          ownerSessionId: params.ownerSessionId,
+          projectId: params.projectId,
+          projectWorkingDirKind: params.projectWorkingDirKind,
+        }),
         getRuntimeBridge: () => null,
         saveSessionsToDisk: async () => {
           saves += 1;
@@ -207,6 +212,11 @@ describe('branching a conversation from one of its turns', function () {
         // for it below. A test that wants no profile clears this.
         activeProfileFor: () => activeProfile,
         sessionStore: { getSessionMetadata: async () => ({}) },
+        projectsManager: {
+          getForUser: (ownerUserId, projectId) => ownerUserId === USER.id && projectId === 'project-a'
+            ? { id: projectId, name: 'Alpha project' }
+            : null,
+        },
         chatStore: store,
       }),
     );
@@ -421,6 +431,22 @@ describe('branching a conversation from one of its turns', function () {
     const made = await branching;
     assert.strictEqual(made.status, 200, JSON.stringify(made.body));
     assert.strictEqual(sessions.get(made.body.sessionId).tabOrder, 2);
+  });
+
+  it('returns the complete project namespace identity for a new branch', async function () {
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+    const source = sessions.get('source');
+    source.projectId = 'project-a';
+    source.projectWorkingDirKind = 'container';
+    source.workingDir = '/workspace';
+
+    const made = await branch('source', 'turn-1');
+
+    assert.strictEqual(made.status, 200);
+    assert.strictEqual(made.body.workingDir, '/workspace');
+    assert.strictEqual(made.body.projectId, 'project-a');
+    assert.strictEqual(made.body.projectName, 'Alpha project');
+    assert.strictEqual(made.body.projectWorkingDirKind, 'container');
   });
 
   // The window the history above was just measured against is the source's

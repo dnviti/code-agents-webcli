@@ -5,7 +5,16 @@ import { Dialog } from '../../ui/relay/Dialog';
 import { Icon } from '../../ui/relay/Icon';
 import { Input } from '../../ui/relay/Input';
 import { showConfirm } from '../../ui/confirm';
-import type { BuildEvent, CredentialRequiredPayload, ProjectState, ProjectSummary, RunLimitPayload, RunningProjectInfo } from '../projects-types.js';
+import {
+  buildEventKey,
+  mergeProjectBuildEvents,
+  type BuildEvent,
+  type CredentialRequiredPayload,
+  type ProjectState,
+  type ProjectSummary,
+  type RunLimitPayload,
+  type RunningProjectInfo,
+} from '../projects-types.js';
 
 export interface ProjectsDialogProps {
   open: boolean;
@@ -14,6 +23,7 @@ export interface ProjectsDialogProps {
 }
 
 interface ConnectedHost { host: string; }
+interface ProjectAvailability { available: boolean; message?: string; }
 interface Mutation { busy: boolean; error: string | null; notice: string | null; }
 interface Swap { projectId: string; running: RunningProjectInfo[]; }
 interface UnknownCreate {
@@ -43,7 +53,7 @@ async function request(url: string, method = 'GET', body?: unknown): Promise<{ o
   return response.ok ? { ok: true, data } : { ok: false, status: response.status, data };
 }
 
-const terminalStates: ProjectState[] = ['stopped', 'failed', 'unavailable', 'blocked'];
+const terminalStates: ProjectState[] = ['running', 'stopped', 'failed', 'unavailable', 'blocked'];
 const card: React.CSSProperties = { border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: 12 };
 
 function projectLabel(project: ProjectSummary): string {
@@ -56,34 +66,70 @@ function createdByAttempt(project: ProjectSummary, attempt: UnknownCreate): bool
     && (project.repoUrl || null) === attempt.repoUrl;
 }
 
+function projectEventLabel(event: BuildEvent): string {
+  if (event.t === 'preserve' && event.branch) {
+    return `Preserved work on ${event.branch}${event.commit ? ` at ${event.commit}` : ''}`;
+  }
+  return event.message || event.step || event.state || event.t;
+}
+
 /** Project lifecycle UI. It owns no server state: websocket changes and writes both re-read the list. */
 export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogProps): React.JSX.Element | null {
   const [projects, setProjects] = React.useState<ProjectSummary[]>([]);
   const [hosts, setHosts] = React.useState<ConnectedHost[]>([]);
+  const [availability, setAvailability] = React.useState<ProjectAvailability>({ available: true });
   const [mutation, setMutation] = React.useState<Mutation>({ busy: false, error: null, notice: null });
   const [creating, setCreating] = React.useState(false);
   const [name, setName] = React.useState('');
   const [repoUrl, setRepoUrl] = React.useState('');
+  const [acknowledgeDisposable, setAcknowledgeDisposable] = React.useState(false);
   const [credentialHost, setCredentialHost] = React.useState<string | null>(null);
   const [token, setToken] = React.useState('');
   const [swap, setSwap] = React.useState<Swap | null>(null);
   const [events, setEvents] = React.useState<Record<string, BuildEvent[]>>({});
   const [unknownCreate, setUnknownCreate] = React.useState<UnknownCreate | null>(null);
+  const [editingRepo, setEditingRepo] = React.useState<{ projectId: string; repoUrl: string } | null>(null);
   const sourcesRef = React.useRef(new Map<string, EventSource>());
   const seenEventsRef = React.useRef(new Map<string, Set<string>>());
   const terminalBuildsRef = React.useRef(new Set<string>());
+  const credentialRetryRef = React.useRef<(() => Promise<void>) | null>(null);
 
-  const fetchProjects = React.useCallback(async (): Promise<ProjectSummary[]> => {
+  const mergeListedEventLogs = React.useCallback((listed: ProjectSummary[]): void => {
+    // Seed the SSE dedupe set as well as the rendered state. A reconnect can
+    // replay the same ring-buffer event immediately after this list response;
+    // without the shared key the durable recovery path would make it appear
+    // twice.
+    for (const project of listed) {
+      const seen = seenEventsRef.current.get(project.id) || new Set<string>();
+      for (const event of project.buildLog || []) seen.add(buildEventKey(event));
+      seenEventsRef.current.set(project.id, seen);
+    }
+    setEvents((previous) => mergeProjectBuildEvents(previous, listed));
+  }, []);
+
+  const fetchProjectData = React.useCallback(async (): Promise<{ projects: ProjectSummary[]; availability: ProjectAvailability }> => {
     const result = await request('/api/projects');
     if (!result.ok) throw new Error(message(result));
-    const data = result.data as { projects?: unknown };
-    return Array.isArray(data.projects) ? data.projects as ProjectSummary[] : [];
-  }, []);
+    const data = result.data as { projects?: unknown; availability?: ProjectAvailability };
+    const projects = Array.isArray(data.projects) ? data.projects as ProjectSummary[] : [];
+    mergeListedEventLogs(projects);
+    return {
+      projects,
+      availability: data.availability?.available === false
+        ? data.availability
+        : { available: true },
+    };
+  }, [mergeListedEventLogs]);
+
+  const fetchProjects = React.useCallback(async (): Promise<ProjectSummary[]> => (
+    await fetchProjectData()
+  ).projects, [fetchProjectData]);
 
   const read = React.useCallback(async (): Promise<void> => {
     try {
-      const [listed, hostList] = await Promise.all([fetchProjects(), request('/api/connected-hosts')]);
-      setProjects(listed);
+      const [listed, hostList] = await Promise.all([fetchProjectData(), request('/api/connected-hosts')]);
+      setProjects(listed.projects);
+      setAvailability(listed.availability);
       if (hostList.ok) {
         const body = hostList.data as { hosts?: unknown };
         setHosts(Array.isArray(body.hosts) ? body.hosts as ConnectedHost[] : []);
@@ -92,12 +138,22 @@ export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogP
     } catch (error) {
       setMutation((previous) => ({ ...previous, error: error instanceof Error ? error.message : 'Could not load projects.' }));
     }
-  }, [fetchProjects]);
+  }, [fetchProjectData]);
 
   React.useEffect(() => {
     if (!open) return;
     void read();
   }, [open, read]);
+  React.useEffect(() => {
+    if (open) return;
+    // The dialog stays mounted in AppShell. Secrets and the action they would
+    // replay must not survive closing it and reappear on the next open.
+    credentialRetryRef.current = null;
+    setCredentialHost(null);
+    setToken('');
+    setEditingRepo(null);
+    setSwap(null);
+  }, [open]);
   React.useEffect(() => {
     const changed = (): void => { if (open) void read(); };
     window.addEventListener('cc-projects-changed', changed);
@@ -126,7 +182,7 @@ export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogP
       const receive = (raw: MessageEvent<string>): void => {
         try {
           const event = JSON.parse(raw.data) as BuildEvent;
-          const key = JSON.stringify(event);
+          const key = buildEventKey(event);
           const seen = seenEventsRef.current.get(projectId) || new Set<string>();
           if (seen.has(key)) return;
           seen.add(key);
@@ -169,6 +225,7 @@ export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogP
         setCreating(false);
         setName('');
         setRepoUrl('');
+        setAcknowledgeDisposable(false);
         setMutation({
           busy: false,
           error: null,
@@ -176,11 +233,23 @@ export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogP
         });
         return true;
       }
+      if (matches.length === 0) {
+        // This list is served from the same durable store as create. A
+        // successful reconciliation with no new matching row is the evidence
+        // required before another create is allowed.
+        setUnknownCreate(null);
+        setMutation({
+          busy: false,
+          error: null,
+          notice: 'No matching project exists. It is safe to submit this create again.',
+        });
+        return false;
+      }
       setUnknownCreate(attempt);
       setMutation({
         busy: false,
         error: 'Project creation has an unknown outcome. No automatic retry was sent; check again before starting another create.',
-        notice: matches.length > 1 ? 'More than one new matching project exists, so the client cannot choose one safely.' : null,
+        notice: 'More than one new matching project exists, so the client cannot choose one safely.',
       });
     } catch {
       setUnknownCreate(attempt);
@@ -220,6 +289,7 @@ export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogP
       const result = await request('/api/projects', 'POST', { name: attempt.name, repoUrl: attempt.repoUrl });
       if (!result.ok && result.status === 428) {
         const body = result.data as CredentialRequiredPayload;
+        credentialRetryRef.current = create;
         setCredentialHost(body.host || new URL(repoUrl).host);
         setMutation({ busy: false, error: null, notice: null });
         return;
@@ -239,7 +309,7 @@ export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogP
         setProjects((previous) => [...previous.filter((project) => project.id !== created.id), created]);
       }
       setUnknownCreate(null);
-      setCreating(false); setName(''); setRepoUrl(''); finish('Project created and building.');
+      setCreating(false); setName(''); setRepoUrl(''); setAcknowledgeDisposable(false); finish('Project created and building.');
     } catch {
       await reconcileCreate(attempt);
     }
@@ -251,10 +321,46 @@ export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogP
     try {
       const result = await request('/api/connected-hosts', 'POST', { host: credentialHost, token: token.trim() });
       if (!result.ok) return fail(message(result));
+      const retry = credentialRetryRef.current;
+      credentialRetryRef.current = null;
       setCredentialHost(null); setToken('');
-      // A 428 create has not made a project, so retrying it is safe.
-      await create();
+      // A 428 create/update has not performed its mutation, so replaying that
+      // exact pending action after the credential is stored is safe.
+      if (retry) await retry(); else finish('Connected host saved.');
     } catch { fail('Could not save this host token.'); }
+  };
+
+  const retryProject = async (projectId: string): Promise<void> => {
+    setMutation({ busy: true, error: null, notice: null });
+    try {
+      const result = await request(`/api/projects/${encodeURIComponent(projectId)}/retry`, 'POST', {});
+      if (!result.ok && result.status === 409 && (result.data as { error?: string }).error === 'run_limit') {
+        setSwap({ projectId, running: (result.data as RunLimitPayload).running });
+        setMutation({ busy: false, error: null, notice: null });
+        return;
+      }
+      if (!result.ok) return fail(message(result));
+      setEditingRepo(null);
+      finish('Project rebuild queued.');
+    } catch { fail('Could not retry this project.'); }
+  };
+
+  const updateRepository = async (projectId: string, nextRepoUrl: string): Promise<void> => {
+    const normalized = nextRepoUrl.trim();
+    if (!normalized) return fail('A replacement repository URL is required.');
+    setMutation({ busy: true, error: null, notice: null });
+    try {
+      const result = await request(`/api/projects/${encodeURIComponent(projectId)}`, 'PUT', { repoUrl: normalized });
+      if (!result.ok && result.status === 428) {
+        const body = result.data as CredentialRequiredPayload;
+        credentialRetryRef.current = () => updateRepository(projectId, normalized);
+        setCredentialHost(body.host || new URL(normalized).host);
+        setMutation({ busy: false, error: null, notice: null });
+        return;
+      }
+      if (!result.ok) return fail(message(result));
+      await retryProject(projectId);
+    } catch { fail('Could not update this repository.'); }
   };
 
   const stop = async (project: ProjectSummary): Promise<void> => {
@@ -263,7 +369,14 @@ export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogP
     try { const result = await request(`/api/projects/${encodeURIComponent(project.id)}/stop`, 'POST'); if (!result.ok) return fail(message(result)); finish('Project stopping.'); } catch { fail('Could not stop project.'); }
   };
   const remove = async (project: ProjectSummary, force = false): Promise<void> => {
-    if (!force && !await showConfirm({ title: `Delete ${project.name}?`, description: 'Its workspace will be removed after work is preserved.', confirmLabel: 'Delete project', tone: 'danger' })) return;
+    if (!force && !await showConfirm({
+      title: `Delete ${project.name}?`,
+      description: project.repoUrl
+        ? 'Its workspace will be removed after repository work is preserved.'
+        : 'This project has no repository. Deleting it permanently removes its project workspace; only files in your persistent home survive.',
+      confirmLabel: 'Delete project',
+      tone: 'danger',
+    })) return;
     setMutation({ busy: true, error: null, notice: null });
     try {
       const result = await request(`/api/projects/${encodeURIComponent(project.id)}`, 'DELETE', force ? { force: true } : {});
@@ -288,15 +401,95 @@ export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogP
   };
 
   if (!open) return null;
-  const candidates = (swap?.running || []).filter((project) => !project.hasActiveWork);
-  return <Dialog open={open} title="Projects" description="Persistent workspaces with their own runtime." onClose={onClose} width={680} footer={<><Button variant="secondary" onClick={onClose}>Close</Button><Button variant="primary" disabled={mutation.busy || unknownCreate !== null} onClick={() => setCreating(true)}>New project</Button></>}>
-    {mutation.error ? <p role="alert" style={{ color: 'var(--destructive)' }}>{mutation.error}</p> : null}
-    {mutation.notice ? <p style={{ color: 'var(--muted-foreground)' }}>{mutation.notice}</p> : null}
-    {unknownCreate ? <div style={card}><strong>Creation outcome unknown</strong><p>The client will not repeat this create until the project list has been checked.</p><Button variant="secondary" disabled={mutation.busy} onClick={() => void reconcileCreate(unknownCreate)}>Check again</Button> <Button variant="secondary" disabled={mutation.busy} onClick={() => { setUnknownCreate(null); setMutation({ busy: false, error: null, notice: 'No matching project was selected. Review the list before submitting a new create.' }); }}>Clear without retrying</Button></div> : null}
-    {credentialHost ? <div style={card}><p>Access to <strong>{credentialHost}</strong> requires a token.</p><Input aria-label="Access token" type="password" value={token} onChange={(event) => setToken(event.currentTarget.value)} /><p><Button variant="secondary" onClick={() => { setCredentialHost(null); setToken(''); }}>Cancel</Button> <Button variant="primary" disabled={mutation.busy || !token.trim()} onClick={() => void saveCredential()}>Save and retry</Button></p></div> : null}
-    {swap ? <div style={card}><p>Choose a project to stop. Projects with active work cannot be selected.</p>{candidates.length ? candidates.map((project) => <p key={project.id}><Button variant="secondary" disabled={mutation.busy} onClick={() => void start(swap.projectId, project.id)}>Stop {project.name} and start</Button></p>) : <p>No safe project is available to stop.</p>}<Button variant="secondary" onClick={() => setSwap(null)}>Cancel</Button></div> : null}
-    {creating && !credentialHost ? <div style={card}><p><Input aria-label="Project name" placeholder="Project name" value={name} onChange={(event) => setName(event.currentTarget.value)} /></p><p><Input aria-label="Repository URL" placeholder="https://github.com/owner/repo (optional)" value={repoUrl} onChange={(event) => setRepoUrl(event.currentTarget.value)} /></p><Button variant="secondary" onClick={() => setCreating(false)}>Cancel</Button> <Button variant="primary" disabled={mutation.busy || unknownCreate !== null || !name.trim()} onClick={() => void create()}>Create project</Button></div> : null}
-    {hosts.length ? <div style={{ ...card, marginTop: 10 }}><strong>Connected hosts</strong>{hosts.map((host) => <div key={host.host} style={{ display: 'flex', justifyContent: 'space-between', marginTop: 6 }}><span>{host.host}</span><Button variant="ghost" size="sm" onClick={() => void removeHost(host.host)}>Remove</Button></div>)}</div> : null}
-    <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>{projects.length === 0 ? <p style={{ color: 'var(--muted-foreground)' }}>No projects yet. Create one to get a persistent workspace.</p> : projects.map((project) => <div key={project.id} style={card}><div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}><strong>{project.name}</strong><span>{project.state}</span></div><p style={{ color: 'var(--muted-foreground)', margin: '6px 0' }}>{projectLabel(project)}{project.hasActiveWork ? ' · active work' : ''}</p>{project.repoUrl ? <p style={{ margin: '6px 0', fontSize: 'var(--text-xs)' }}>{project.repoUrl}</p> : null}{(events[project.id] || []).slice(-1).map((event, index) => <p key={index} style={{ margin: '6px 0', fontSize: 'var(--text-xs)' }}><Icon name="loader-circle" size={12} /> {event.message || event.step || event.state}</p>)}<div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}><Button size="sm" variant="secondary" disabled={mutation.busy || project.state !== 'running'} onClick={() => onOpenProject(project.id)}>Open</Button><Button size="sm" variant="secondary" disabled={mutation.busy || project.state === 'running' || project.state === 'building'} onClick={() => void start(project.id)}>Start</Button><Button size="sm" variant="secondary" disabled={mutation.busy || project.state === 'stopped' || project.state === 'building'} onClick={() => void stop(project)}>Stop</Button>{project.state === 'blocked' ? <><Button size="sm" variant="secondary" onClick={() => void release(project, false)}>Retry preservation</Button><Button size="sm" variant="destructive" onClick={() => void release(project, true)}>Discard</Button></> : null}<Button size="sm" variant="ghost" disabled={mutation.busy} onClick={() => void remove(project)}>Delete</Button></div></div>)}</div>
-  </Dialog>;
+  const candidates = (swap?.running || []).filter((project) => !project.hasActiveWork && (!project.state || project.state === 'running'));
+  return (
+    <Dialog
+      open={open}
+      title="Projects"
+      description="Projects with their own containers and resumable stopped worktrees."
+      onClose={onClose}
+      width={680}
+      footer={<><Button variant="secondary" onClick={onClose}>Close</Button><Button variant="primary" disabled={mutation.busy || unknownCreate !== null || !availability.available} onClick={() => setCreating(true)}>New project</Button></>}
+    >
+      {mutation.error ? <p role="alert" style={{ color: 'var(--destructive)' }}>{mutation.error}</p> : null}
+      {mutation.notice ? <p style={{ color: 'var(--muted-foreground)' }}>{mutation.notice}</p> : null}
+      {!availability.available ? <div role="status" style={card}><strong>Projects need a deploy target</strong><p>{availability.message || 'Ask the installer to configure and activate a container deploy target in Settings.'}</p></div> : null}
+      {unknownCreate ? (
+        <div style={card}>
+          <strong>Creation outcome unknown</strong>
+          <p>The client will not repeat this create until the project list has been checked.</p>
+          <Button variant="secondary" disabled={mutation.busy} onClick={() => void reconcileCreate(unknownCreate)}>Check again</Button>{' '}
+        </div>
+      ) : null}
+      {credentialHost ? (
+        <div style={card}>
+          <p>Access to <strong>{credentialHost}</strong> requires a token. It is stored for clone and preservation pushes on this host.</p>
+          <Input aria-label="Access token" type="password" value={token} onChange={(event) => setToken(event.currentTarget.value)} />
+          <p><Button variant="secondary" onClick={() => { credentialRetryRef.current = null; setCredentialHost(null); setToken(''); }}>Cancel</Button>{' '}<Button variant="primary" disabled={mutation.busy || !token.trim()} onClick={() => void saveCredential()}>Save and retry</Button></p>
+        </div>
+      ) : null}
+      {swap ? (
+        <div style={card}>
+          <p>Choose a project to stop. Projects with active work cannot be selected.</p>
+          {candidates.length ? candidates.map((project, index) => <p key={project.id}><Button variant="secondary" disabled={mutation.busy} onClick={() => void start(swap.projectId, project.id)}>{index === 0 ? 'Suggested: ' : ''}Stop {project.name} and start</Button></p>) : <p>No safe project is available to stop.</p>}
+          <Button variant="secondary" onClick={() => setSwap(null)}>Cancel</Button>
+        </div>
+      ) : null}
+      {creating && !credentialHost ? (
+        <div style={card}>
+          <p><Input aria-label="Project name" placeholder="Project name" value={name} onChange={(event) => setName(event.currentTarget.value)} /></p>
+          <p><Input aria-label="Repository URL" placeholder="https://github.com/owner/repo (optional)" value={repoUrl} onChange={(event) => setRepoUrl(event.currentTarget.value)} /></p>
+          {!repoUrl.trim() ? (
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 12 }}>
+              <input type="checkbox" checked={acknowledgeDisposable} onChange={(event) => setAcknowledgeDisposable(event.currentTarget.checked)} />
+              <span>This project has no repository. A rebuild, long-idle reclaim, or deletion permanently discards its project workspace; only your persistent home survives.</span>
+            </label>
+          ) : (
+            <p style={{ color: 'var(--muted-foreground)' }}>The repository working tree is disposable. Before an automatic rebuild, uncommitted work is pushed to a marked WIP branch; files elsewhere in the container are not preserved.</p>
+          )}
+          <Button variant="secondary" onClick={() => { setCreating(false); setAcknowledgeDisposable(false); }}>Cancel</Button>{' '}
+          <Button variant="primary" disabled={mutation.busy || unknownCreate !== null || !name.trim() || (!repoUrl.trim() && !acknowledgeDisposable)} onClick={() => void create()}>Create project</Button>
+        </div>
+      ) : null}
+      {hosts.length ? (
+        <div style={{ ...card, marginTop: 10 }}>
+          <strong>Connected hosts</strong>
+          {hosts.map((host) => <div key={host.host} style={{ display: 'flex', justifyContent: 'space-between', marginTop: 6 }}><span>{host.host}</span><Button variant="ghost" size="sm" onClick={() => void removeHost(host.host)}>Remove</Button></div>)}
+        </div>
+      ) : null}
+      <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
+        {projects.length === 0 ? <p style={{ color: 'var(--muted-foreground)' }}>No projects yet. Create one to get its own container.</p> : projects.map((project) => (
+          <div key={project.id} style={card}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}><strong>{project.name}</strong><span>{project.state}</span></div>
+            <p style={{ color: 'var(--muted-foreground)', margin: '6px 0' }}>{projectLabel(project)}{project.hasActiveWork ? ' · active work' : ''}</p>
+            <p style={{ color: 'var(--muted-foreground)', margin: '6px 0', fontSize: 'var(--text-xs)' }}>{project.targetName || (project.targetId ? `Target ${project.targetId}` : 'Startup target')} · last used {new Date(project.lastActivityAt).toLocaleString()}</p>
+            {project.repoUrl ? <p style={{ margin: '6px 0', fontSize: 'var(--text-xs)' }}>{project.repoUrl}</p> : <p style={{ margin: '6px 0', fontSize: 'var(--text-xs)', color: 'var(--destructive)' }}>No repository — a rebuild, long-idle reclaim, or deletion permanently discards this project workspace.</p>}
+            {project.lastPreservedBranch ? (
+              <p style={{ margin: '6px 0', fontSize: 'var(--text-xs)' }}>
+                Recovery branch: <code>{project.lastPreservedBranch}</code>{project.lastPreservedCommit ? <> · commit <code>{project.lastPreservedCommit}</code></> : null}
+              </p>
+            ) : null}
+            {project.state === 'unavailable' ? (
+              editingRepo?.projectId === project.id ? (
+                <div style={{ ...card, margin: '8px 0' }}>
+                  <Input aria-label={`Replacement repository for ${project.name}`} value={editingRepo.repoUrl} onChange={(event) => setEditingRepo({ projectId: project.id, repoUrl: event.currentTarget.value })} />
+                  <p><Button size="sm" variant="secondary" onClick={() => setEditingRepo(null)}>Cancel</Button>{' '}<Button size="sm" variant="primary" disabled={mutation.busy || !editingRepo.repoUrl.trim()} onClick={() => void updateRepository(project.id, editingRepo.repoUrl)}>Save and retry</Button></p>
+                </div>
+              ) : (
+                <p><Button size="sm" variant="secondary" disabled={mutation.busy} onClick={() => void retryProject(project.id)}>Retry current address</Button>{' '}<Button size="sm" variant="secondary" disabled={mutation.busy} onClick={() => setEditingRepo({ projectId: project.id, repoUrl: project.repoUrl || '' })}>Change repository</Button></p>
+              )
+            ) : null}
+            {(events[project.id] || []).slice(-4).map((event, index) => <p key={`${event.at}-${index}`} style={{ margin: '6px 0', fontSize: 'var(--text-xs)' }}><Icon name="loader-circle" size={12} /> {projectEventLabel(event)}{event.percent !== undefined ? ` · ${event.percent}%` : ''}</p>)}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              <Button size="sm" variant="secondary" disabled={mutation.busy || project.state !== 'running'} onClick={() => onOpenProject(project.id)}>Open</Button>
+              <Button size="sm" variant="secondary" disabled={mutation.busy || !['stopped', 'failed'].includes(project.state)} onClick={() => void start(project.id)}>Start</Button>
+              <Button size="sm" variant="secondary" disabled={mutation.busy || project.state !== 'running' || project.hasActiveWork} onClick={() => void stop(project)}>Stop</Button>
+              {['blocked', 'reclaiming'].includes(project.state) ? <><Button size="sm" variant="secondary" disabled={mutation.busy || project.hasActiveWork} onClick={() => void release(project, false)}>Retry recovery</Button><Button size="sm" variant="destructive" disabled={mutation.busy || project.hasActiveWork} onClick={() => void release(project, true)}>Discard</Button></> : null}
+              <Button size="sm" variant="ghost" disabled={mutation.busy || project.hasActiveWork || project.state === 'building' || project.state === 'reclaiming'} onClick={() => void remove(project)}>Delete</Button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </Dialog>
+  );
 }

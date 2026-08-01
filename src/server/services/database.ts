@@ -557,6 +557,11 @@ export class AppDatabase {
     // every row written before projects existed is a project-less session,
     // which is today's behaviour and must keep meaning exactly that.
     this.addColumnIfMissing('runtime_sessions', 'project_id', 'TEXT REFERENCES projects(id)');
+    this.addColumnIfMissing(
+      'runtime_sessions',
+      'project_working_dir_kind',
+      "TEXT CHECK (project_working_dir_kind IN ('host', 'container'))",
+    );
 
     // Which surface a session runs on. Added after the fact, so it is nullable
     // and a null reads as 'terminal' — every row that predates chat mode is a

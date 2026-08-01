@@ -40,6 +40,7 @@ describe('deploy target routes', function () {
   let engineCalls;
   let enginesInManager;
   let createdConfigs;
+  let projectRefs;
 
   /** The engine the injected factory hands out; behavior set per test. */
   function fakeEngine() {
@@ -64,6 +65,7 @@ describe('deploy target routes', function () {
     createdConfigs = [];
     engineBehavior = { available: async () => true };
     enginesInManager = new Map();
+    projectRefs = new Map();
 
     const app = express();
     app.use(express.json());
@@ -84,6 +86,9 @@ describe('deploy target routes', function () {
         reloadDeployTargets: () => {
           reloadCount += 1;
         },
+        projectIdsForTarget: (id) => projectRefs.get(id) || [],
+        getDeploySetting: (key) => database.getSetting(key),
+        setDeploySetting: (key, value) => database.setSetting(key, value),
         getInstallerUserId: () => installerUserId,
       }),
     );
@@ -189,6 +194,8 @@ describe('deploy target routes', function () {
     assert.strictEqual(list.targets[0].id, target.id);
     assert.strictEqual(list.canEdit, true);
     assert.ok(list.engineCaveats.kubernetes.length > 0, 'k8s caveats ship with the list');
+    assert.match(list.engineCaveats.docker.join(' '), /Linux.*sh.*\/proc.*setsid/i);
+    assert.match(list.engineCaveats.podman.join(' '), /Linux.*sh.*\/proc.*setsid/i);
 
     const detail = await req('GET', `/api/admin/deploy-targets/${target.id}`);
     assert.strictEqual(detail.status, 200);
@@ -439,6 +446,22 @@ describe('deploy target routes', function () {
     const ok = await req('DELETE', `/api/admin/deploy-targets/${target.id}`);
     assert.strictEqual(ok.status, 200);
     assert.strictEqual(store.listTargets().length, 0);
+  });
+
+  it('retains a target recorded by stopped or reclaimed projects', async function () {
+    const { target } = await (await createTarget()).json();
+    projectRefs.set(target.id, ['project-stopped']);
+
+    const changedConnection = await req('PUT', `/api/admin/deploy-targets/${target.id}`, {
+      hostSecret: { host: 'tcp://replacement.example:2376' },
+    });
+    assert.strictEqual(changedConnection.status, 409);
+    assert.deepStrictEqual((await changedConnection.json()).projects, ['project-stopped']);
+
+    const deleted = await req('DELETE', `/api/admin/deploy-targets/${target.id}`);
+    assert.strictEqual(deleted.status, 409);
+    assert.deepStrictEqual((await deleted.json()).projects, ['project-stopped']);
+    assert.ok(store.getTarget(target.id), 'durable project placement keeps its target row');
   });
 
   it('blocks connection edits while containers stand, but not renames or retunes', async function () {

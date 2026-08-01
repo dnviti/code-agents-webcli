@@ -51,17 +51,12 @@ export interface DeployTargetRoutesDeps {
   legacyContainersEnabled: boolean;
   /** Rebuild the manager's target set after every successful change. */
   reloadDeployTargets(): void;
+  /** Durable project rows retain their recorded target even while stopped. */
+  projectIdsForTarget(targetId: string): string[];
   getInstallerUserId(): number | null;
-  /**
-   * Read a deploy-policy setting from app_settings. Optional until the parent
-   * wiring lands; the route guards against absence.
-   */
-  getDeploySetting?(key: string): string | null;
-  /**
-   * Write a deploy-policy setting to app_settings. Optional until the parent
-   * wiring lands; the route guards against absence.
-   */
-  setDeploySetting?(key: string, value: string): void;
+  /** Read and write deploy policy in durable app_settings. */
+  getDeploySetting(key: string): string | null;
+  setDeploySetting(key: string, value: string): void;
 }
 
 /**
@@ -161,35 +156,38 @@ export function createDeployTargetRoutes(deps: DeployTargetRoutesDeps): Router {
 
   router.get('/api/admin/deploy-settings', (req: Request, res: Response): void => {
     if (!gate(req, res, false)) return;
-    if (!deploySettingsAvailable(deps, res)) return;
 
     res.json({
-      runLimitPerUser: positiveIntSetting(deps.getDeploySetting!('deploy.runLimitPerUser'), DEFAULT_RUN_LIMIT_PER_USER),
-      idleStopMinutes: positiveIntSetting(deps.getDeploySetting!('deploy.idleStopMinutes'), DEFAULT_IDLE_STOP_MINUTES),
-      idleReclaimMinutes: positiveIntSetting(deps.getDeploySetting!('deploy.idleReclaimMinutes'), DEFAULT_IDLE_RECLAIM_MINUTES),
+      runLimitPerUser: positiveIntSetting(deps.getDeploySetting('deploy.runLimitPerUser'), DEFAULT_RUN_LIMIT_PER_USER),
+      idleStopMinutes: positiveIntSetting(deps.getDeploySetting('deploy.idleStopMinutes'), DEFAULT_IDLE_STOP_MINUTES),
+      idleReclaimMinutes: positiveIntSetting(deps.getDeploySetting('deploy.idleReclaimMinutes'), DEFAULT_IDLE_RECLAIM_MINUTES),
     });
   });
 
   router.put('/api/admin/deploy-settings', (req: Request, res: Response): void => {
     if (!gate(req, res, true)) return;
-    if (!deploySettingsAvailable(deps, res)) return;
 
     const body = (req.body ?? {}) as Record<string, unknown>;
     const runLimitPerUser = parsePositiveInt(body.runLimitPerUser);
     const idleStopMinutes = parsePositiveInt(body.idleStopMinutes);
     const idleReclaimMinutes = parsePositiveInt(body.idleReclaimMinutes);
 
-    if (runLimitPerUser === null || idleStopMinutes === null || idleReclaimMinutes === null) {
+    if (
+      runLimitPerUser === null
+      || idleStopMinutes === null
+      || idleReclaimMinutes === null
+      || idleReclaimMinutes <= idleStopMinutes
+    ) {
       res.status(400).json({
         error: 'invalid_settings',
-        message: 'runLimitPerUser, idleStopMinutes and idleReclaimMinutes must be positive integers.',
+        message: 'Values must be positive integers, and reclaim must be later than stop.',
       });
       return;
     }
 
-    deps.setDeploySetting!('deploy.runLimitPerUser', String(runLimitPerUser));
-    deps.setDeploySetting!('deploy.idleStopMinutes', String(idleStopMinutes));
-    deps.setDeploySetting!('deploy.idleReclaimMinutes', String(idleReclaimMinutes));
+    deps.setDeploySetting('deploy.runLimitPerUser', String(runLimitPerUser));
+    deps.setDeploySetting('deploy.idleStopMinutes', String(idleStopMinutes));
+    deps.setDeploySetting('deploy.idleReclaimMinutes', String(idleReclaimMinutes));
 
     res.json({
       runLimitPerUser,
@@ -292,6 +290,15 @@ export function createDeployTargetRoutes(deps: DeployTargetRoutesDeps): Router {
     // still stand — the edit would strand them on an engine nobody can now
     // reach. Same rule, and same answer, as the delete below.
     if (connectionFieldsChanged(existing, input)) {
+      const projects = deps.projectIdsForTarget(id);
+      if (projects.length > 0) {
+        res.status(409).json({
+          error: 'target_in_use',
+          message: `This target is still recorded by ${projects.length} project(s). Remove those projects before changing how the target is reached.`,
+          projects,
+        });
+        return;
+      }
       const inUse = await containersOnTarget(deps, id);
       if (inUse.length > 0) {
         res.status(409).json({
@@ -333,6 +340,15 @@ export function createDeployTargetRoutes(deps: DeployTargetRoutesDeps): Router {
         error: 'target_in_use',
         message: `This target still runs ${inUse.length} container(s): ${inUse.join(', ')}. Stop or remove them first.`,
         containers: inUse,
+      });
+      return;
+    }
+    const projects = deps.projectIdsForTarget(id);
+    if (projects.length > 0) {
+      res.status(409).json({
+        error: 'target_in_use',
+        message: `This target is still recorded by ${projects.length} project(s). Remove those projects first.`,
+        projects,
       });
       return;
     }
@@ -628,31 +644,14 @@ function kubeconfigServerUrls(kubeconfig: string | null | undefined): string[] {
   return urls;
 }
 
-/**
- * The parent wiring for deploy policy settings has not landed yet. Answer a
- * clear 500 rather than pretending the feature works, and unblock the rest
- * of the admin API.
- */
-function deploySettingsAvailable(deps: DeployTargetRoutesDeps, res: Response): boolean {
-  if (!deps.getDeploySetting || !deps.setDeploySetting) {
-    res.status(500).json({
-      error: 'not_configured',
-      message: 'Deploy settings storage is not wired yet.',
-    });
-    return false;
-  }
-  return true;
-}
-
 function positiveIntSetting(raw: string | null, fallback: number): number {
   const value = Number(raw);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
 function parsePositiveInt(value: unknown): number | null {
   if (typeof value !== 'number' && typeof value !== 'string') return null;
   const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) return null;
-  if (Math.floor(parsed) !== parsed) return null;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return null;
   return Math.floor(parsed);
 }

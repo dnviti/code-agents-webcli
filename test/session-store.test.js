@@ -161,6 +161,49 @@ describe('SessionStore', function() {
       );
     });
 
+    it('keeps project container paths distinct from host paths', async function() {
+      const insertProject = sessionStore.database.raw.prepare(`
+        INSERT INTO projects (
+          id, owner_user_id, name, state, last_activity_at, created_at, updated_at
+        ) VALUES (?, ?, ?, 'stopped', ?, ?, ?)
+      `);
+      const now = new Date().toISOString();
+      for (const id of ['project-1', 'project-2', 'project-3']) {
+        insertProject.run(id, ownerUserId, id, now, now, now);
+      }
+
+      await sessionStore.saveSessions(new Map([
+        ['container', createSessionRecord({
+          id: 'container',
+          ownerUserId,
+          projectId: 'project-1',
+          workingDir: '/opt/disposable-work',
+          projectWorkingDirKind: 'container',
+        })],
+        ['host', createSessionRecord({
+          id: 'host',
+          ownerUserId,
+          projectId: 'project-2',
+          workingDir: '/host/project-workspace',
+          projectWorkingDirKind: 'host',
+        })],
+        ['legacy', createSessionRecord({
+          id: 'legacy',
+          ownerUserId,
+          projectId: 'project-3',
+          workingDir: '/host/legacy-project-workspace',
+        })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('container').projectWorkingDirKind, 'container');
+      assert.strictEqual(loaded.get('container').workingDir, '/opt/disposable-work');
+      assert.strictEqual(loaded.get('host').projectWorkingDirKind, 'host');
+      assert.strictEqual(loaded.get('legacy').projectWorkingDirKind, undefined);
+    });
+
     it('remembers the approval mode a conversation was running in', async function() {
       // The mode is part of how the user set the conversation up. Lost across a
       // restart, a chat started with approvals bypassed comes back asking for

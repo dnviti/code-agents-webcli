@@ -871,6 +871,8 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         path={state.folder.path}
         parentPath={state.folder.parentPath}
         entries={state.folder.entries}
+        workingDirKind={state.folder.workingDirKind}
+        lifetime={state.folder.lifetime}
         showHidden={state.folder.showHidden}
         loading={state.folder.loading}
         creating={state.folder.creating}

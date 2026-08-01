@@ -21,16 +21,24 @@ export interface ProjectSummary {
   repoUrl: string | null;
   repoHost: string | null;
   targetId: string | null;
+  /** Human-readable placement supplied by the server; null names legacy placement. */
+  targetName?: string | null;
   state: ProjectState;
   stateDetail: string | null;
   lastActivityAt: string;
   hasActiveWork: boolean;
+  /** Exact remote recovery ref created by the latest successful preservation. */
+  lastPreservedBranch: string | null;
+  lastPreservedCommit: string | null;
+  /** Durable lifecycle history, including the exact WIP branch used to preserve work. */
+  buildLog: BuildEvent[];
 }
 
 /** One row of the running list a 409 `run_limit` answer carries. */
 export interface RunningProjectInfo {
   id: string;
   name: string;
+  state?: ProjectState;
   lastActivityAt: string;
   hasActiveWork: boolean;
 }
@@ -48,8 +56,48 @@ export interface BuildEvent {
 }
 
 /** Full project row returned by /api/projects/:id. */
-export interface ProjectDetails extends ProjectSummary {
-  buildLog: BuildEvent[];
+export type ProjectDetails = ProjectSummary;
+
+/** Stable across JSON list responses and SSE frames regardless of object key order. */
+export function buildEventKey(event: BuildEvent): string {
+  return JSON.stringify([
+    event.t,
+    event.step ?? null,
+    event.message ?? null,
+    event.percent ?? null,
+    event.state ?? null,
+    event.branch ?? null,
+    event.commit ?? null,
+    event.at,
+  ]);
+}
+
+/**
+ * Fold each list response's durable build log into the live event view.
+ *
+ * The list is the recovery path after reload or a missed SSE frame. Existing
+ * live entries win their position, while exact persisted duplicates are kept
+ * once. Projects absent from one response retain no visible card anyway, so
+ * keeping their entries here avoids turning a transient filtered response into
+ * destructive local state.
+ */
+export function mergeProjectBuildEvents(
+  previous: Readonly<Record<string, BuildEvent[]>>,
+  projects: readonly ProjectSummary[],
+): Record<string, BuildEvent[]> {
+  const next: Record<string, BuildEvent[]> = { ...previous };
+  for (const project of projects) {
+    const merged = [...(previous[project.id] || [])];
+    const seen = new Set(merged.map(buildEventKey));
+    for (const event of project.buildLog || []) {
+      const key = buildEventKey(event);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(event);
+    }
+    next[project.id] = merged;
+  }
+  return next;
 }
 
 /** 409 run_limit payload. */

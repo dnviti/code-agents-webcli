@@ -29,8 +29,31 @@ function isSameOrigin(req: Request): boolean {
   }
 }
 
-function paramHost(req: Request): string {
-  return String(req.params.host).trim().toLowerCase();
+function normalizedHost(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const raw = value.trim();
+  if (!raw || /[\\/?#@\s]/u.test(raw)) return null;
+
+  try {
+    const parsed = new URL(`https://${raw}`);
+    if (
+      !parsed.hostname
+      || parsed.username
+      || parsed.password
+      || parsed.pathname !== '/'
+      || parsed.search
+      || parsed.hash
+    ) {
+      return null;
+    }
+    return parsed.host.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function paramHost(req: Request): string | null {
+  return normalizedHost(String(req.params.host));
 }
 
 function requireAuth(req: Request, res: Response, write: boolean): AuthenticatedUser | null {
@@ -60,11 +83,14 @@ export function createConnectedHostRoutes(deps: ConnectedHostRoutesDeps): Router
     if (!user) return;
 
     const body = (req.body ?? {}) as Record<string, unknown>;
-    const host = typeof body.host === 'string' ? body.host.trim().toLowerCase() : '';
-    const token = typeof body.token === 'string' ? body.token : '';
+    const host = normalizedHost(body.host);
+    const token = typeof body.token === 'string' ? body.token.trim() : '';
 
     if (!host) {
-      res.status(400).json({ error: 'validation', message: 'host is required.' });
+      res.status(400).json({
+        error: 'validation',
+        message: 'host must be a hostname or hostname:port, without a scheme or path.',
+      });
       return;
     }
     if (!token) {
@@ -85,7 +111,12 @@ export function createConnectedHostRoutes(deps: ConnectedHostRoutesDeps): Router
     const user = requireAuth(req, res, true);
     if (!user) return;
 
-    const removed = deps.projectStore.deleteConnectedHost(user.id, paramHost(req));
+    const host = paramHost(req);
+    if (!host) {
+      res.status(400).json({ error: 'validation', message: 'host is invalid.' });
+      return;
+    }
+    const removed = deps.projectStore.deleteConnectedHost(user.id, host);
     if (!removed) {
       res.status(404).json({ error: 'not_found', message: 'Host not found.' });
       return;

@@ -1,8 +1,21 @@
 import { Router, Request, Response } from 'express';
-import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { PathValidation, SessionRecord, AuthContext, AuthenticatedUser } from '../types.js';
+import {
+  canonicalProjectContainerWorkingDir,
+  projectHostWorkingDirToContainer,
+  releaseProjectSessionLease,
+  registerUnverifiedProjectProcess,
+  restoreProjectWorkingDir,
+  type ProjectSessionEnvironmentResult,
+  type ProjectSessionLease,
+  type ProjectsSessionApi,
+} from '../services/projects/working-dir.js';
+import {
+  mustRetainProjectLease,
+  ProjectContainerFiles,
+} from '../services/projects/container-files.js';
 
 export interface FolderRoutesDeps {
   baseFolder: string;
@@ -14,6 +27,88 @@ export interface FolderRoutesDeps {
   getSelectedWorkingDir(userId: number): string | null;
   setSelectedWorkingDir(userId: number, value: string | null): void;
   saveSessionsToDisk(): Promise<boolean | void>;
+  projectsManager?: ProjectsSessionApi;
+}
+
+type PreparedProject = Extract<ProjectSessionEnvironmentResult, { ok: true }>;
+
+class ProjectFolderUnavailable extends Error {
+  constructor(readonly reason: string, detail?: string) {
+    super(detail ? `Project environment is ${reason}: ${detail}` : `Project environment is ${reason}`);
+  }
+}
+
+async function withProjectFolders<T>(
+  deps: FolderRoutesDeps,
+  user: AuthenticatedUser,
+  projectId: string,
+  operation: (
+    manager: ProjectsSessionApi,
+    prepared: PreparedProject,
+    files: ProjectContainerFiles,
+  ) => Promise<T>,
+): Promise<T> {
+  const manager = deps.projectsManager;
+  if (!manager) throw new ProjectFolderUnavailable('not configured');
+  if (!manager.getForUser(user.id, projectId)) throw new ProjectFolderUnavailable('not_found');
+  const prepared = await manager.ensureForSession(user.id, projectId);
+  if (!prepared.ok) throw new ProjectFolderUnavailable(prepared.reason, prepared.detail);
+  const lease: ProjectSessionLease = {
+    ownerUserId: user.id,
+    projectId,
+    leaseId: prepared.leaseId,
+  };
+  let retainLease = false;
+  try {
+    manager.touchActivity(projectId);
+    return await operation(
+      manager,
+      prepared,
+      new ProjectContainerFiles(manager, prepared, prepared.containerAccess.root),
+    );
+  } catch (error) {
+    retainLease = registerUnverifiedProjectProcess(manager, lease, error)
+      || mustRetainProjectLease(error);
+    throw error;
+  } finally {
+    if (!retainLease) releaseProjectSessionLease(manager, lease);
+  }
+}
+
+function projectIdFrom(source: unknown): string | null | undefined {
+  if (!source || typeof source !== 'object') return undefined;
+  const record = source as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(record, 'projectId')) return undefined;
+  if (typeof record.projectId !== 'string') return null;
+  const id = record.projectId.trim();
+  return id || null;
+}
+
+function requireValidProjectId(
+  res: Response,
+  value: string | null | undefined,
+): value is string | undefined {
+  if (value !== null) return true;
+  res.status(400).json({ error: 'invalid_project_id', message: 'Project id must be a non-empty string' });
+  return false;
+}
+
+function answerProjectError(res: Response, error: unknown): boolean {
+  if (mustRetainProjectLease(error)) {
+    res.status(503).json({
+      error: 'project_process_stop_unverified',
+      message: 'A project helper could not be verified as stopped',
+    });
+    return true;
+  }
+  if (!(error instanceof ProjectFolderUnavailable)) return false;
+  const status = error.reason === 'not_found'
+    ? 404
+    : error.reason === 'shutting_down'
+      ? 503
+      : 409;
+  res.status(status).json({ error: 'project_unavailable', message: error.message });
+  return true;
 }
 
 export function createFolderRoutes(deps: FolderRoutesDeps): Router {
@@ -27,14 +122,72 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
     }
 
     const { parentPath, folderName } = req.body;
+    const projectId = projectIdFrom(req.body);
+    if (!requireValidProjectId(res, projectId)) return;
 
-    if (!folderName || !folderName.trim()) {
+    if (typeof folderName !== 'string' || !folderName.trim()) {
       res.status(400).json({ message: 'Folder name is required' });
       return;
     }
 
-    if (folderName.includes('/') || folderName.includes('\\')) {
+    const trimmedFolderName = folderName.trim();
+    if (
+      folderName.includes('/')
+      || folderName.includes('\\')
+      || folderName.includes('\0')
+      || trimmedFolderName === '.'
+      || trimmedFolderName === '..'
+    ) {
       res.status(400).json({ message: 'Invalid folder name' });
+      return;
+    }
+
+    if (projectId) {
+      try {
+        const created = await withProjectFolders(
+          deps,
+          user,
+          projectId,
+          async (_manager, _prepared, files) => {
+            const confined = await files.confineExisting(
+              typeof parentPath === 'string' ? parentPath : '/',
+            );
+            if (!confined.path) {
+              const error = new Error(confined.missing ? 'Parent folder does not exist' : 'Parent folder is outside the project container') as Error & { status?: number };
+              error.status = confined.missing ? 404 : 403;
+              throw error;
+            }
+            const stat = await files.stat(confined.path);
+            if (!stat || stat.type !== 'directory') {
+              const error = new Error('Parent path is not a directory') as Error & { status?: number };
+              error.status = 400;
+              throw error;
+            }
+            const createdPath = await files.createDirectory(confined.path, trimmedFolderName);
+            return { path: createdPath, lifetime: files.lifetime(createdPath) };
+          },
+        );
+        res.json({
+          success: true,
+          path: created.path,
+          workingDirKind: 'container',
+          lifetime: created.lifetime,
+          message: `Folder "${trimmedFolderName}" created successfully`,
+        });
+      } catch (error) {
+        if (answerProjectError(res, error)) return;
+        const status = (error as Error & { status?: number }).status;
+        if (status) {
+          res.status(status).json({ message: (error as Error).message });
+          return;
+        }
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+          res.status(409).json({ message: 'Folder already exists' });
+          return;
+        }
+        console.error('Failed to create project container folder:', error);
+        res.status(500).json({ message: 'Failed to create folder' });
+      }
       return;
     }
 
@@ -90,6 +243,95 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
     }
 
     const req = _req;
+    const projectId = projectIdFrom(req.query);
+    if (!requireValidProjectId(res, projectId)) return;
+    if (projectId) {
+      try {
+        const data = await withProjectFolders(
+          deps,
+          user,
+          projectId,
+          async (manager, prepared, files) => {
+            const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : '';
+            const session = sessionId ? deps.claudeSessions.get(sessionId) : undefined;
+            if (sessionId && (
+              !session
+              || session.ownerUserId !== user.id
+              || session.projectId !== projectId
+            )) {
+              throw new ProjectFolderUnavailable('not_found');
+            }
+
+            let defaultPath: string | null = null;
+            if (session) {
+              const restored = await restoreProjectWorkingDir(
+                manager,
+                prepared,
+                session.workingDir,
+                session.projectWorkingDirKind,
+              );
+              const cwdChanged = session.workingDir !== restored.workingDir
+                || session.projectWorkingDirKind !== restored.kind;
+              session.workingDir = restored.workingDir;
+              session.projectWorkingDirKind = restored.kind;
+              if (cwdChanged) await deps.saveSessionsToDisk();
+              defaultPath = restored.kind === 'container'
+                ? restored.workingDir
+                : await projectHostWorkingDirToContainer(prepared, restored.workingDir);
+            }
+            defaultPath ??= await projectHostWorkingDirToContainer(prepared, prepared.workingDir);
+            defaultPath ??= prepared.containerAccess.workspaceRoot;
+
+            const requested = typeof req.query.path === 'string' && req.query.path
+              ? req.query.path
+              : defaultPath;
+            const currentPath = await canonicalProjectContainerWorkingDir(
+              manager,
+              prepared,
+              requested,
+            );
+            if (!currentPath) {
+              const error = new Error('Cannot access directory') as Error & { status?: number };
+              error.status = 403;
+              throw error;
+            }
+            const listed = await files.list(
+              currentPath,
+              2000,
+              req.query.showHidden === 'true',
+            );
+            const folders = listed.entries
+              .filter((entry) => entry.isDirectory)
+              .map((entry) => ({
+                name: entry.name,
+                path: entry.path,
+                isDirectory: true,
+                workingDirKind: 'container' as const,
+                lifetime: files.lifetime(entry.path),
+              }))
+              .sort((a, b) => a.name.localeCompare(b.name));
+            const parent = path.posix.dirname(currentPath);
+            return {
+              currentPath,
+              parentPath: currentPath === '/' ? null : parent,
+              folders,
+              home: defaultPath,
+              baseFolder: '/',
+              workingDirKind: 'container' as const,
+              lifetime: files.lifetime(currentPath),
+              truncated: listed.truncated,
+            };
+          },
+        );
+        res.json(data);
+      } catch (error) {
+        if (answerProjectError(res, error)) return;
+        const status = (error as Error & { status?: number }).status || 500;
+        if (status === 500) console.error('Cannot access project container directory:', error);
+        res.status(status).json({ error: 'Cannot access directory', message: 'Cannot access directory' });
+      }
+      return;
+    }
     const requestedPath =
       (req.query.path as string)
       || deps.getSelectedWorkingDir(user.id)
@@ -152,6 +394,76 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
       path?: string;
       sessionId?: string;
     };
+    const projectId = projectIdFrom(req.body);
+    if (!requireValidProjectId(res, projectId)) return;
+    if (projectId) {
+      try {
+        if (!sessionId) {
+          res.status(400).json({ error: 'A project session is required' });
+          return;
+        }
+        const result = await withProjectFolders(
+          deps,
+          user,
+          projectId,
+          async (manager, prepared, files) => {
+            const session = deps.claudeSessions.get(sessionId);
+            if (
+              !session
+              || session.ownerUserId !== user.id
+              || session.projectId !== projectId
+            ) {
+              throw new ProjectFolderUnavailable('not_found');
+            }
+            const canonical = await canonicalProjectContainerWorkingDir(
+              manager,
+              prepared,
+              selectedPath || '',
+            );
+            if (!canonical) {
+              const error = new Error('Directory does not exist in this project container') as Error & { status?: number };
+              error.status = 404;
+              throw error;
+            }
+            session.workingDir = canonical;
+            session.projectWorkingDirKind = 'container';
+            session.lastActivity = new Date();
+            await deps.saveSessionsToDisk();
+            return { canonical, lifetime: files.lifetime(canonical) };
+          },
+        );
+        res.json({
+          success: true,
+          workingDir: result.canonical,
+          workingDirKind: 'container',
+          lifetime: result.lifetime,
+        });
+      } catch (error) {
+        if (answerProjectError(res, error)) return;
+        const status = (error as Error & { status?: number }).status || 500;
+        res.status(status).json({ error: (error as Error).message });
+      }
+      return;
+    }
+
+    let legacySession: SessionRecord | undefined;
+    if (sessionId) {
+      legacySession = deps.claudeSessions.get(sessionId);
+      // Ownership is decided before inspecting any discriminator on the
+      // record. A guessed foreign id must look exactly like a missing id, not
+      // reveal through a 409 that it names somebody else's project session.
+      if (!legacySession || legacySession.ownerUserId !== user.id) {
+        res.status(404).json({ error: 'Session not found' });
+        return;
+      }
+      if (legacySession.projectId) {
+        res.status(409).json({
+          error: 'project_context_required',
+          message: 'Project working directories require an explicit project container context',
+        });
+        return;
+      }
+    }
 
     const validation = deps.validatePath(selectedPath || '', user.id);
     if (!validation.valid) {
@@ -181,16 +493,10 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
         return;
       }
 
-      if (sessionId) {
-        const session = deps.claudeSessions.get(sessionId);
-        if (!session || session.ownerUserId !== user.id) {
-          res.status(404).json({ error: 'Session not found' });
-          return;
-        }
-
-        session.workingDir = validatedPath;
-        session.lastActivity = new Date();
-        void deps.saveSessionsToDisk();
+      if (legacySession) {
+        legacySession.workingDir = validatedPath;
+        legacySession.lastActivity = new Date();
+        await deps.saveSessionsToDisk();
       }
 
       deps.setSelectedWorkingDir(user.id, validatedPath);
@@ -217,6 +523,38 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
 
     try {
       const { path: selectedPath } = req.body;
+      const projectId = projectIdFrom(req.body);
+      if (!requireValidProjectId(res, projectId)) return;
+      if (projectId) {
+        const selected = await withProjectFolders(
+          deps,
+          user,
+          projectId,
+          async (manager, prepared, files) => {
+            const canonical = await canonicalProjectContainerWorkingDir(
+              manager,
+              prepared,
+              typeof selectedPath === 'string' ? selectedPath : '',
+            );
+            if (!canonical) {
+              const error = new Error('Invalid project container directory') as Error & { status?: number };
+              error.status = 400;
+              throw error;
+            }
+            return { canonical, lifetime: files.lifetime(canonical) };
+          },
+        );
+        // A project selection is session-scoped. In particular it must not
+        // poison the user's legacy global host-directory preference with a
+        // same-spelled container path such as `/tmp`.
+        res.json({
+          success: true,
+          workingDir: selected.canonical,
+          workingDirKind: 'container',
+          lifetime: selected.lifetime,
+        });
+        return;
+      }
       const validation = deps.validatePath(selectedPath, user.id);
       if (!validation.valid) {
         res.status(403).json({
@@ -239,6 +577,12 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
         workingDir: validatedPath,
       });
     } catch (error) {
+      if (answerProjectError(res, error)) return;
+      const status = (error as Error & { status?: number }).status;
+      if (status) {
+        res.status(status).json({ error: (error as Error).message });
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       res.status(500).json({
         error: 'Failed to set working directory',

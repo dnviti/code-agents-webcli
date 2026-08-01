@@ -114,6 +114,23 @@ export interface WrappedCommand {
   args: string[];
   /** The environment the *spawn* gets — not the environment the program sees. */
   env: Record<string, string>;
+  /**
+   * An identity-bound stop handle for a long-lived command inside a container.
+   *
+   * Killing `docker exec` or `kubectl exec` only proves that the local client
+   * went away. It does not prove that the command it started in the container
+   * did. Runtime launches opt into this handle and must await it before an
+   * environment may be reclaimed, rebuilt or moved.
+   */
+  processControl?: WrappedProcessControl;
+}
+
+export interface WrappedProcessControl {
+  /**
+   * TERM, then KILL, the exact tracked process and resolve only once its remote
+   * identity can no longer be found. Reject when that cannot be verified.
+   */
+  stop(): Promise<void>;
 }
 
 export interface WrapOptions {
@@ -122,6 +139,11 @@ export interface WrapOptions {
   env?: Record<string, string>;
   /** Whether the wrapped process needs a TTY (`exec -t`). PTY spawns do; pipes do not. */
   tty?: boolean;
+  /**
+   * Track this long-lived process inside a container so its death can be
+   * verified independently of the local engine client.
+   */
+  trackProcess?: boolean;
 }
 
 /**

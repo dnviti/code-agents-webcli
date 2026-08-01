@@ -117,6 +117,12 @@ describe('connected-host routes', function () {
     assert.strictEqual(body.host.host, 'github.com');
     assert.strictEqual(body.host.kind, 'token');
     assert.ok(!body.host.credential, 'credential must not be returned');
+    const stored = database.raw.prepare(
+      'SELECT credential_encrypted FROM connected_hosts WHERE user_id = ? AND host = ?',
+    ).get(OWNER.id, 'github.com').credential_encrypted;
+    assert.ok(stored);
+    assert.ok(!stored.includes('ghp_secret'), 'plaintext token must never be stored in SQLite');
+    assert.strictEqual(projectStore.credentialFor(OWNER.id, 'github.com'), 'ghp_secret');
 
     const list = await req(baseUrl, 'GET', '/api/connected-hosts');
     assert.strictEqual(list.status, 200);
@@ -200,5 +206,28 @@ describe('connected-host routes', function () {
 
     const emptyHost = await req(baseUrl, 'POST', '/api/connected-hosts', { host: '   ', token: 't' });
     assert.strictEqual(emptyHost.status, 400);
+
+    for (const host of [
+      'https://github.com',
+      'github.com/path',
+      'user@github.com',
+      'a b',
+      '/',
+      'github.com:99999',
+    ]) {
+      const invalid = await req(baseUrl, 'POST', '/api/connected-hosts', { host, token: 't' });
+      assert.strictEqual(invalid.status, 400, `expected ${host} to be rejected`);
+    }
+  });
+
+  it('accepts and normalizes a valid host with a port', async function () {
+    const app = appFor(OWNER);
+    serverInfo = await listen(app);
+    const create = await req(serverInfo.baseUrl, 'POST', '/api/connected-hosts', {
+      host: 'GIT.EXAMPLE.COM:8443',
+      token: 'token',
+    });
+    assert.strictEqual(create.status, 200);
+    assert.strictEqual((await create.json()).host.host, 'git.example.com:8443');
   });
 });

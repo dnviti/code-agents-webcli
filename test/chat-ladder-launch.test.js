@@ -114,20 +114,16 @@ function build(options = {}) {
     },
   };
 
-  const connections = new Map([
-    [
-      'ws-1',
-      {
-        id: 'ws-1',
-        ws,
-        userId: options.userId ?? 7,
-        githubLogin: 'tester',
-        claudeSessionId: session.id,
-        chatSessionIds: new Set(),
-        created: new Date(),
-      },
-    ],
-  ]);
+  const wsInfo = {
+    id: 'ws-1',
+    ws,
+    userId: options.userId ?? 7,
+    githubLogin: 'tester',
+    claudeSessionId: session.id,
+    chatSessionIds: new Set(),
+    created: new Date(),
+  };
+  const connections = new Map([['ws-1', wsInfo]]);
   session.connections.add('ws-1');
 
   const processor = new MessageProcessor({
@@ -161,7 +157,7 @@ function build(options = {}) {
     usageAnalytics: {},
   });
 
-  return { processor, session, calls, sent, ws };
+  return { processor, session, calls, sent, ws, wsInfo };
 }
 
 const lastOfType = (sent, type) => sent.filter((m) => m.type === type).pop();
@@ -369,16 +365,13 @@ describe('a browser rejoining a laddered conversation', function () {
     // process is not running — the exact failure #135 introduced this field to
     // remove. Running, so the null pin is unambiguous: this process really did
     // start with no model flag.
-    const { processor, session, sent, ws } = build({ profile: ladderProfile() });
+    const { processor, session, sent, wsInfo } = build({ profile: ladderProfile() });
     session.surface = 'chat';
     session.agent = 'pi';
     session.active = true;
     session.chatModelPinned = null;
 
-    await processor.subscribeChat(
-      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
-      session.id,
-    );
+    await processor.subscribeChat(wsInfo, session.id);
 
     const snapshot = lastOfType(sent, 'chat_snapshot');
     assert.strictEqual(snapshot.modelOrigin.source, 'runtime');
@@ -391,15 +384,12 @@ describe('a browser rejoining a laddered conversation', function () {
     // exactly this pin, so answering "the runtime's own default" here names a
     // model it was not on and will not be on when it is relaunched. Nothing is
     // in force while nothing is running, and that is what goes out.
-    const { processor, session, sent, ws } = build({ profile: ladderProfile(), live: false });
+    const { processor, session, sent, wsInfo } = build({ profile: ladderProfile(), live: false });
     session.surface = 'chat';
     session.agent = 'pi';
     session.chatModelPinned = null;
 
-    await processor.subscribeChat(
-      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
-      session.id,
-    );
+    await processor.subscribeChat(wsInfo, session.id);
 
     assert.strictEqual(lastOfType(sent, 'chat_snapshot').modelOrigin, null);
   });
@@ -409,16 +399,13 @@ describe('a browser rejoining a laddered conversation', function () {
     // through its error path emits `error`, never `exited`, so nothing ever
     // corrects the flag the launch set. Reading it here would put the very
     // sentence this gate exists to remove back on screen.
-    const { processor, session, sent, ws } = build({ profile: ladderProfile(), live: false });
+    const { processor, session, sent, wsInfo } = build({ profile: ladderProfile(), live: false });
     session.surface = 'chat';
     session.agent = 'pi';
     session.active = true;
     session.chatModelPinned = null;
 
-    await processor.subscribeChat(
-      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
-      session.id,
-    );
+    await processor.subscribeChat(wsInfo, session.id);
 
     assert.strictEqual(lastOfType(sent, 'chat_snapshot').modelOrigin, null);
   });
@@ -428,16 +415,13 @@ describe('a browser rejoining a laddered conversation', function () {
     // abandoned handshake probe reports an exit into a session whose fallback
     // is answering normally. The conversation really is on the runtime's own
     // default and should say so.
-    const { processor, session, sent, ws } = build({ profile: ladderProfile(), live: true });
+    const { processor, session, sent, wsInfo } = build({ profile: ladderProfile(), live: true });
     session.surface = 'chat';
     session.agent = 'pi';
     session.active = false;
     session.chatModelPinned = null;
 
-    await processor.subscribeChat(
-      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
-      session.id,
-    );
+    await processor.subscribeChat(wsInfo, session.id);
 
     assert.strictEqual(lastOfType(sent, 'chat_snapshot').modelOrigin.source, 'runtime');
   });
@@ -446,15 +430,12 @@ describe('a browser rejoining a laddered conversation', function () {
     // A pin and an override are not guesses: one is the model this conversation
     // launched on, the other the model somebody chose for it, and both survive
     // the process to decide its next launch.
-    const { processor, session, sent, ws } = build({ profile: ladderProfile(), live: false });
+    const { processor, session, sent, wsInfo } = build({ profile: ladderProfile(), live: false });
     session.surface = 'chat';
     session.agent = 'pi';
     session.chatModelPinned = 'launched/on-this';
 
-    await processor.subscribeChat(
-      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
-      session.id,
-    );
+    await processor.subscribeChat(wsInfo, session.id);
 
     const snapshot = lastOfType(sent, 'chat_snapshot');
     assert.deepStrictEqual(snapshot.modelOrigin, {
@@ -464,7 +445,7 @@ describe('a browser rejoining a laddered conversation', function () {
   });
 
   it('is told the rung, not just the model', async function () {
-    const { processor, session, sent, ws } = build({
+    const { processor, session, sent, wsInfo } = build({
       profile: ladderProfile(),
       runningLadder: { tier: 'mid', model: 'gateway/mid-model' },
     });
@@ -472,10 +453,7 @@ describe('a browser rejoining a laddered conversation', function () {
     session.agent = 'pi';
     session.chatModelPinned = null;
 
-    await processor.subscribeChat(
-      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
-      session.id,
-    );
+    await processor.subscribeChat(wsInfo, session.id);
 
     const snapshot = lastOfType(sent, 'chat_snapshot');
     assert.strictEqual(snapshot.modelOrigin.source, 'ladder');
@@ -487,7 +465,7 @@ describe('a browser rejoining a laddered conversation', function () {
     // The launch says "mid is blank, so the nearest filled rung answered"; the
     // running session knows only which rung it is on, so without the profile's
     // half of it the parenthetical survives exactly one screen.
-    const { processor, session, sent, ws } = build({
+    const { processor, session, sent, wsInfo } = build({
       profile: ladderProfile({ ladder: { tier: 'high', model: 'h', requested: 'mid' } }),
       runningLadder: { tier: 'high', model: 'h' },
     });
@@ -495,10 +473,7 @@ describe('a browser rejoining a laddered conversation', function () {
     session.agent = 'pi';
     session.chatModelPinned = null;
 
-    await processor.subscribeChat(
-      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
-      session.id,
-    );
+    await processor.subscribeChat(wsInfo, session.id);
 
     const origin = lastOfType(sent, 'chat_snapshot').modelOrigin;
     assert.strictEqual(origin.tier, 'high');
@@ -509,7 +484,7 @@ describe('a browser rejoining a laddered conversation', function () {
     // An escalation, or a ladder edited under a live conversation: the rung the
     // profile fell to is not the rung being answered from, so the reason it
     // fell has nothing to say about it.
-    const { processor, session, sent, ws } = build({
+    const { processor, session, sent, wsInfo } = build({
       profile: ladderProfile({ ladder: { tier: 'high', model: 'h', requested: 'mid' } }),
       runningLadder: { tier: 'top', model: 't' },
     });
@@ -517,10 +492,7 @@ describe('a browser rejoining a laddered conversation', function () {
     session.agent = 'pi';
     session.chatModelPinned = null;
 
-    await processor.subscribeChat(
-      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
-      session.id,
-    );
+    await processor.subscribeChat(wsInfo, session.id);
 
     const origin = lastOfType(sent, 'chat_snapshot').modelOrigin;
     assert.strictEqual(origin.tier, 'top');
@@ -532,16 +504,13 @@ describe('a browser rejoining a laddered conversation', function () {
     // screen — a reload, a reconnect, a second tab — arrives at a snapshot, and
     // the client zeroes the field on each one, so a snapshot that stayed silent
     // took the warning down while the ladder was still not applied.
-    const { processor, session, sent, ws } = build({
+    const { processor, session, sent, wsInfo } = build({
       profile: ladderProfile(),
       refuseModel: 'gateway/mid-model',
     });
 
     await processor.startChat('ws-1', 'pi', {});
-    await processor.subscribeChat(
-      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
-      session.id,
-    );
+    await processor.subscribeChat(wsInfo, session.id);
 
     assert.match(lastOfType(sent, 'chat_snapshot').ladderError, /would not start/);
   });
@@ -551,15 +520,12 @@ describe('a browser rejoining a laddered conversation', function () {
     // since. The conversation is running on the rung it resolved then, and a
     // badge saying its ladder was not applied would be describing somebody
     // else's next launch.
-    const { processor, session, sent, ws } = build({ profile: ladderProfile() });
+    const { processor, session, sent, wsInfo } = build({ profile: ladderProfile() });
 
     await processor.startChat('ws-1', 'pi', {});
     processor.deps.activeProfileFor = () =>
       ladderProfile({ ladderError: 'the ladder could not be written to disk (EROFS)' });
-    await processor.subscribeChat(
-      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
-      session.id,
-    );
+    await processor.subscribeChat(wsInfo, session.id);
 
     assert.strictEqual(lastOfType(sent, 'chat_snapshot').ladderError, null);
   });
@@ -568,7 +534,7 @@ describe('a browser rejoining a laddered conversation', function () {
     // This half outlives the process: the profile still cannot write its tier
     // files, so a conversation that has since stopped explains itself from the
     // profile rather than from a record that never held a launch failure.
-    const { processor, session, sent, ws } = build({
+    const { processor, session, sent, wsInfo } = build({
       profile: {
         profileId: 'p1',
         profileName: 'Economy',
@@ -580,10 +546,7 @@ describe('a browser rejoining a laddered conversation', function () {
     session.surface = 'chat';
     session.agent = 'pi';
 
-    await processor.subscribeChat(
-      { id: 'ws-1', ws, userId: 7, chatSessionIds: new Set() },
-      session.id,
-    );
+    await processor.subscribeChat(wsInfo, session.id);
 
     assert.match(lastOfType(sent, 'chat_snapshot').ladderError, /could not be written/);
   });

@@ -151,25 +151,10 @@ export class WebSocketHandler {
   }
 
   cleanupConnection(wsId: string): void {
-    const wsInfo = this.deps.webSocketConnections.get(wsId);
-    if (!wsInfo) return;
-
-    wsInfo.chatSessionIds.clear();
-
-    // Remove from session if joined
-    if (wsInfo.claudeSessionId) {
-      const session = this.deps.claudeSessions.get(wsInfo.claudeSessionId);
-      if (session) {
-        session.connections.delete(wsId);
-        session.lastActivity = new Date();
-
-        if (session.connections.size === 0 && this.deps.dev) {
-          console.log(`No more connections to session ${wsInfo.claudeSessionId}`);
-        }
-      }
-    }
-
-    this.deps.webSocketConnections.delete(wsId);
+    // MessageProcessor owns the non-persisted project lease maps. Routing both
+    // close and error through the same idempotent hook prevents either event
+    // from leaving an attachment claim behind.
+    this.messageProcessor.cleanupConnection(wsId);
   }
 }
 
@@ -222,6 +207,7 @@ export function sendToUser(
 export function announceSessionOpened(
   session: SessionRecord,
   webSocketConnections: Map<string, WebSocketInfo>,
+  projectName?: string | null,
 ): void {
   // A runtime relaunch re-announces its metadata through this same helper. That
   // must not turn a conversation the account closed back into a tab; only the
@@ -237,6 +223,8 @@ export function announceSessionOpened(
       customName: session.customName ?? null,
       workingDir: session.workingDir,
       projectId: session.projectId,
+      ...(projectName !== undefined ? { projectName } : {}),
+      projectWorkingDirKind: session.projectWorkingDirKind,
       surface: session.surface || 'terminal',
       active: session.active,
       // So a conversation that appears on a second screen states the mode it is

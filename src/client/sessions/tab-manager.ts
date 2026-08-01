@@ -42,6 +42,7 @@ interface TabRecord {
   surface: 'terminal' | 'chat';
   projectId?: string | null;
   projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
   /**
    * Where this tab falls in the order they were opened on this screen.
    *
@@ -77,6 +78,7 @@ export interface ListedSession {
   bypassPermissions?: boolean;
   projectId?: string | null;
   projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
 }
 
 /**
@@ -332,7 +334,7 @@ export class SessionTabManager {
    */
   syncShell(): void {
     const tabs: ShellTab[] = this.getOrderedTabIds()
-      .map((id) => {
+      .map((id): ShellTab | null => {
         const session = this.activeSessions.get(id);
         const record = this.tabs.get(id);
         if (!session || !record) return null;
@@ -371,11 +373,12 @@ export class SessionTabManager {
           // have to be plumbed through the list endpoint first.
           kind: '',
           workingDir: session.workingDir,
+          projectWorkingDirKind: session.projectWorkingDirKind,
           unread: session.unreadOutput,
           attention: session.attention ?? null,
           projectId: record.projectId,
           projectName: record.projectName,
-        } satisfies ShellTab;
+        };
       })
       .filter((tab): tab is ShellTab => tab !== null);
 
@@ -688,6 +691,7 @@ export class SessionTabManager {
       session.customName ?? undefined,
       session.projectId,
       session.projectName,
+      session.projectWorkingDirKind,
     );
 
     if (session.surface !== 'chat') return;
@@ -768,6 +772,7 @@ export class SessionTabManager {
     customName?: string,
     projectId?: string | null,
     projectName?: string | null,
+    projectWorkingDirKind?: 'host' | 'container',
   ): void {
     const existing = this.tabs.get(sessionId);
     if (existing) {
@@ -781,6 +786,26 @@ export class SessionTabManager {
       }
       if (projectName !== undefined && existing.projectName !== projectName) {
         existing.projectName = projectName;
+        changed = true;
+      }
+      if (
+        projectWorkingDirKind !== undefined
+        && existing.projectWorkingDirKind !== projectWorkingDirKind
+      ) {
+        existing.projectWorkingDirKind = projectWorkingDirKind;
+        changed = true;
+      }
+      const active = this.activeSessions.get(sessionId);
+      if (active && workingDir !== null && active.workingDir !== workingDir) {
+        active.workingDir = workingDir;
+        changed = true;
+      }
+      if (
+        active
+        && projectWorkingDirKind !== undefined
+        && active.projectWorkingDirKind !== projectWorkingDirKind
+      ) {
+        active.projectWorkingDirKind = projectWorkingDirKind;
         changed = true;
       }
       if (changed) this.syncShell();
@@ -802,6 +827,7 @@ export class SessionTabManager {
       surface: 'terminal',
       projectId,
       projectName,
+      projectWorkingDirKind,
       openedSeq: ++this.tabsOpened,
     });
     if (!this.tabOrder.includes(sessionId)) {
@@ -815,6 +841,7 @@ export class SessionTabManager {
       name: customName || sessionName,
       status,
       workingDir,
+      projectWorkingDirKind,
       lastAccessed: Date.now(),
       lastActivity: Date.now(),
       unreadOutput: false,
@@ -1426,7 +1453,12 @@ export class SessionTabManager {
     if (!session) return;
     const { connection } = shellStore.getSnapshot();
     shellStore.setState({
-      connection: { ...connection, workingDir: session.workingDir },
+      connection: {
+        ...connection,
+        workingDir: session.workingDir,
+        projectId: this.tabs.get(sessionId)?.projectId,
+        projectWorkingDirKind: session.projectWorkingDirKind,
+      },
     });
   }
 

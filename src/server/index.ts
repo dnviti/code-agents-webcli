@@ -18,6 +18,7 @@ import {
 } from './types.js';
 import { createConfig, createUsageAnalyticsOptions } from './config.js';
 import { registerRoutes } from './routes/index.js';
+import { retireProjectSessions, type SessionRoutesDeps } from './routes/sessions.js';
 import {
   ResolvedProfile,
   resolveConversationRung,
@@ -80,6 +81,8 @@ import { ContainerConfig, Mount, UserEnvironment } from './services/environments
 import { ActiveTargetResolution, EnvironmentEngine } from './services/environments/index.js';
 import { EncryptionKeyRing } from './services/encryption.js';
 import { DeployTargetStore } from './services/deploy-targets.js';
+import { ProjectStore } from './services/projects/store.js';
+import { ProjectManager } from './services/projects/manager.js';
 import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
 import { readCachedClaudeAccount } from './services/claude-account.js';
@@ -162,6 +165,8 @@ export class ClaudeCodeWebServer {
   private claudeSessions: Map<string, SessionRecord>;
   private webSocketConnections: Map<string, WebSocketInfo>;
   private tabCoordinator: AccountTabCoordinator;
+  /** Throttle autonomous chat-event writes to the project activity clock. */
+  private projectActivityTouched: Map<string, number>;
 
   private claudeBridge: BridgeInterface;
   private codexBridge: BridgeInterface;
@@ -203,6 +208,8 @@ export class ClaudeCodeWebServer {
    * listens and closing it alone would leave the port held.
    */
   private listener: net.Server | null;
+  /** Raw demultiplexer sockets, including clients that have sent no TLS byte. */
+  private listenerSockets: Set<net.Socket>;
   /** The local CA, when one was generated; offered at /ca.crt for other devices. */
   private caFile: string | undefined;
   private wss: WebSocket.Server | null;
@@ -212,6 +219,8 @@ export class ClaudeCodeWebServer {
   private environments: EnvironmentManager;
   private encryptionKeyRing: EncryptionKeyRing;
   private deployTargets: DeployTargetStore;
+  private projectStore: ProjectStore;
+  private projects: ProjectManager;
   /** The startup-flag configuration: the 'legacy' entry in the target maps. */
   private legacyContainerConfig: ContainerConfig;
   /** Mounts every environment gets, targets included: app code and the socket dir. */
@@ -254,12 +263,14 @@ export class ClaudeCodeWebServer {
     this.autoSaveInterval = null;
     this.server = null;
     this.listener = null;
+    this.listenerSockets = new Set();
     this.caFile = undefined;
     this.wss = null;
 
     this.claudeSessions = new Map();
     this.webSocketConnections = new Map();
     this.tabCoordinator = new AccountTabCoordinator();
+    this.projectActivityTouched = new Map();
 
     this.claudeBridge = new ClaudeBridge();
     this.codexBridge = new CodexBridge();
@@ -323,6 +334,10 @@ export class ClaudeCodeWebServer {
       keyRing: this.encryptionKeyRing,
       dataDir: this.database.storageDir,
     });
+    this.projectStore = new ProjectStore({
+      database: this.database,
+      keyRing: this.encryptionKeyRing,
+    });
     this.deployTargets.seedLegacyTarget(
       containerConfig,
       this.database.getInstallerUserId() ?? undefined,
@@ -383,13 +398,16 @@ export class ClaudeCodeWebServer {
         spendByTurn: (sessionId, userId) => this.usageStore.spendByTurn(sessionId, userId),
       },
       storageDir: this.database.storageDir,
-      broadcast: (sessionId, message) =>
+      broadcast: (sessionId, message) => {
+        const projectId = this.claudeSessions.get(sessionId)?.projectId;
+        if (projectId) this.touchProjectActivity(projectId);
         broadcastChat(
           sessionId,
           message,
           this.claudeSessions,
           this.webSocketConnections,
-        ),
+        );
+      },
       // Whose preference decides the mode of a conversation restarted from
       // inside itself. The chat subsystem has no idea who owns anything.
       chatBypassPreference: (userId) =>
@@ -414,12 +432,17 @@ export class ClaudeCodeWebServer {
       // this is the one seam where a fact it learns has to outlive its process.
       onLifecycle: (sessionId, change) => {
         const record = this.claudeSessions.get(sessionId);
+        if (record) {
+          applyChatLifecycle(
+            record,
+            change,
+            (id, active) => this.sessionStore.setActive(id, active),
+          );
+        }
+        // Apply the record transition first: exited=false is an in-place chat
+        // restart, and project re-admission must observe active=true.
+        this.messageProcessor?.handleChatLifecycle(sessionId, change);
         if (!record) return;
-        applyChatLifecycle(
-          record,
-          change,
-          (id, active) => this.sessionStore.setActive(id, active),
-        );
         // Written through rather than left to the thirty-second autosave: the
         // conversation this is about is one that was cleared and then left
         // alone, and what it is protected from is the process going away. The
@@ -529,6 +552,30 @@ export class ClaudeCodeWebServer {
       },
     });
 
+    this.projects = new ProjectManager({
+      store: this.projectStore,
+      environments: this.environments,
+      deployTargets: this.deployTargets,
+      ownerFor: (userId: number) => this.getEnvironmentOwner(userId),
+      authorFor: (userId: number) => this.projectAuthorFor(userId),
+      broadcast: (userId: number, payload: unknown) => {
+        sendToUser(
+          userId,
+          payload as Record<string, unknown>,
+          this.webSocketConnections,
+        );
+      },
+      // Use the same awaited teardown as an explicit session deletion. The
+      // helper follows owned shells to a fixed point before the project row and
+      // its workspace are removed.
+      deleteProjectSessions: async (projectId: string) => {
+        await retireProjectSessions(this.sessionRouteDeps(), projectId);
+      },
+      // Durable active flags and atomic admission leases live in ProjectStore.
+      // This closes the remaining process-local observation gaps.
+      hasLiveProjectWork: (projectId: string) => this.hasLiveProjectWork(projectId),
+    });
+
     this.messageProcessor = new MessageProcessor({
       dev: this.dev,
       claudeSessions: this.claudeSessions,
@@ -539,6 +586,7 @@ export class ClaudeCodeWebServer {
       validatePath: (targetPath: string, userId?: number) => this.validatePath(targetPath, userId),
       getUserBaseFolder: (userId?: number) => this.getUserBaseFolder(userId),
       ensureEnvironment: (userId?: number) => this.ensureEnvironment(userId),
+      projectsManager: this.projects,
       sessionStore: this.sessionStore,
       getSelectedWorkingDir: (userId: number) => this.getSelectedWorkingDir(userId),
       createSessionRecord: (params) => this.createSessionRecord(params),
@@ -558,6 +606,16 @@ export class ClaudeCodeWebServer {
       transcriptStore: this.transcriptStore,
       historyStore: this.historyStore,
       chatManager: this.chatManager,
+      resolveChatAttachment: (session, attachment) => this.attachmentStore.resolveForTurn(
+        {
+          id: session.id,
+          ownerUserId: session.ownerUserId,
+          workingDir: session.workingDir,
+          projectId: session.projectId,
+          projectWorkingDirKind: session.projectWorkingDirKind,
+        },
+        attachment,
+      ),
       usageReader: this.usageReader,
       usageAnalytics: this.usageAnalytics,
     });
@@ -598,6 +656,75 @@ export class ClaudeCodeWebServer {
   private getEnvironmentOwner(userId: number): { id: number; githubLogin: string } | null {
     const user = this.database.getUserById(userId);
     return user ? { id: user.id, githubLogin: user.githubLogin } : null;
+  }
+
+  /** Git identity used by the preservation commit before a project rebuild. */
+  private projectAuthorFor(userId: number): { name: string; email: string } {
+    const user = this.database.getUserById(userId);
+    if (!user) {
+      throw new Error(`project owner ${userId} is unavailable for preservation`);
+    }
+    const clean = (value: string): string => value
+      .replace(/[\u0000-\u001f\u007f-\u009f]+/gu, ' ')
+      .replace(/\s+/gu, ' ')
+      .trim();
+    const login = clean(user.githubLogin) || `user-${user.id}`;
+    const name = clean(user.githubName || '') || login;
+    const suppliedEmail = clean(user.email || '');
+    const safeLogin = login.replace(/[^a-zA-Z0-9_.-]+/gu, '-') || `user-${user.id}`;
+    const safeGitHubId = user.githubId.replace(/[^a-zA-Z0-9]+/gu, '') || String(user.id);
+    const email = /^[^\s<>@]+@[^\s<>@]+$/u.test(suppliedEmail)
+      ? suppliedEmail
+      : `${safeGitHubId}+${safeLogin}@users.noreply.github.com`;
+    return { name, email };
+  }
+
+  /**
+   * Process-local work protected from project stop/reclaim.
+   *
+   * A dormant persisted session alone does not keep a project running forever.
+   * Active runtimes and sockets do, including shells whose only project link is
+   * a chain of owner-session ids. Durable active rows and admission leases are
+   * checked independently by ProjectStore.
+   */
+  private hasLiveProjectWork(projectId: string): boolean {
+    if (this.messageProcessor?.hasPendingProjectWork(projectId)) return true;
+    const related = new Set<string>();
+    for (const session of this.claudeSessions.values()) {
+      if (session.projectId === projectId) related.add(session.id);
+    }
+
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const session of this.claudeSessions.values()) {
+        if (session.ownerSessionId && related.has(session.ownerSessionId) && !related.has(session.id)) {
+          related.add(session.id);
+          changed = true;
+        }
+      }
+    }
+
+    if (related.size === 0) return false;
+    for (const sessionId of related) {
+      const session = this.claudeSessions.get(sessionId);
+      if (session?.active || (session?.connections.size ?? 0) > 0) return true;
+    }
+    for (const socket of this.webSocketConnections.values()) {
+      if (socket.claudeSessionId && related.has(socket.claudeSessionId)) return true;
+      for (const watched of socket.chatSessionIds) {
+        if (related.has(watched)) return true;
+      }
+    }
+    return false;
+  }
+
+  /** Keep a long autonomous chat turn active without writing SQLite per token. */
+  private touchProjectActivity(projectId: string): void {
+    const now = Date.now();
+    const last = this.projectActivityTouched.get(projectId) ?? 0;
+    if (now - last < 1000) return;
+    this.projectActivityTouched.set(projectId, now);
+    this.projects?.touchActivity(projectId, new Date(now));
   }
 
   /**
@@ -740,11 +867,13 @@ export class ClaudeCodeWebServer {
     connections?: string[];
     ownerSessionId?: string;
     projectId?: string | null;
+    projectWorkingDirKind?: 'host' | 'container';
   }): SessionRecord {
     return {
       id: params.id,
       ownerSessionId: params.ownerSessionId,
       projectId: params.projectId,
+      projectWorkingDirKind: params.projectWorkingDirKind,
       ownerUserId: params.ownerUserId,
       name: params.name || `Session ${new Date().toLocaleString()}`,
       created: new Date(),
@@ -815,7 +944,7 @@ export class ClaudeCodeWebServer {
    */
   private resolveRuntimeProfile(
     agentKind: AgentKind,
-    workingDir: string,
+    workingDir?: string,
   ): ResolvedProfile | null {
     const profile = this.runtimeProfiles.activeFor(agentKind);
     if (!profile) return null;
@@ -842,7 +971,17 @@ export class ClaudeCodeWebServer {
     // helper rungs were written nowhere, from a ladder saved for a different
     // runtime and carried across by changing the Runtime dropdown.
     const ladder = tierResult.unsupported ? null : resolveConversationRung(profile);
-    const ladderError = ladder && tierResult.failed ? tierResult.failed : undefined;
+    // Runtime launches normally always name a host-visible working directory.
+    // An omitted one here is the explicit container-only namespace used by a
+    // project session. Pi's ladder files cannot be written with host fs in that
+    // case; reporting the ladder as active would be a more dangerous lie than
+    // starting on the profile's ordinary model without delegated rungs.
+    const ladderError = ladder
+      ? tierResult.failed
+        || (!workingDir && tierResult.deferred
+          ? 'Capability tiers cannot be written into this container-only working directory.'
+          : undefined)
+      : undefined;
 
     return {
       profileId: profile.id,
@@ -1043,12 +1182,45 @@ export class ClaudeCodeWebServer {
       void this.saveSessionsToDisk();
     }, 30000);
     process.on('beforeExit', () => {
-      void this.saveSessionsToDisk();
+      if (!this.isShuttingDown) void this.saveSessionsToDisk();
     });
   }
 
   private async saveSessionsToDisk(): Promise<boolean> {
     return this.sessionStore.saveSessions(this.claudeSessions);
+  }
+
+  /**
+   * One composition object for both public session routes and project
+   * retirement, so deletion cannot accidentally take a weaker teardown path.
+   */
+  private sessionRouteDeps(): SessionRoutesDeps {
+    return {
+      claudeSessions: this.claudeSessions,
+      webSocketConnections: this.webSocketConnections,
+      baseFolder: this.baseFolder,
+      dev: this.dev,
+      validatePath: (targetPath: string, userId?: number) => this.validatePath(targetPath, userId),
+      getUserBaseFolder: (userId?: number) => this.getUserBaseFolder(userId),
+      createSessionRecord: (params) => this.createSessionRecord(params),
+      getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
+      stopSessionRuntime: (session) =>
+        this.messageProcessor.retireSessionRuntime(session),
+      saveSessionsToDisk: () => this.saveSessionsToDisk(),
+      transcriptStore: this.transcriptStore,
+      historyStore: this.historyStore,
+      getScreenSnapshot: (sessionId: string) => this.messageProcessor.getScreenSnapshot(sessionId),
+      disposeRecorder: (sessionId: string) => this.messageProcessor.disposeRecorder(sessionId),
+      getSelectedWorkingDir: (userId: number) => this.getSelectedWorkingDir(userId),
+      activeProfileFor: (runtime: string) => this.activeProfileFor(runtime),
+      tabCoordinator: this.tabCoordinator,
+      sessionStore: this.sessionStore,
+      projectsManager: this.projects,
+      releaseProjectSessionResources: (sessionId) =>
+        this.messageProcessor.releaseProjectSessionResources(sessionId),
+      sessionTeardown: this.sessionTeardown,
+      chatStore: this.chatStore,
+    };
   }
 
   async shutdown(): Promise<void> {
@@ -1058,10 +1230,33 @@ export class ClaudeCodeWebServer {
     this.isShuttingDown = true;
 
     console.log('\nGracefully shutting down...');
-    await this.saveSessionsToDisk();
-    // Let the emulators finish parsing and flush; a bare flush would miss
-    // whatever is still queued in the parser.
-    await this.messageProcessor.drainAllRecorders();
+    // Stop project policy work and new network admission first. `close()`
+    // stops accepting synchronously; its promise settles once the live sockets
+    // terminated below have released the listener.
+    this.projects.stopSweep();
+    const closeListener = new Promise<void>((resolve) => {
+      const bound = this.listener || this.server;
+      if (!bound || !bound.listening) {
+        resolve();
+        return;
+      }
+      const timeout = setTimeout(() => {
+        // A response that ignores graceful close must not hold the port
+        // forever. Destroy both HTTP(S)-tracked connections and raw demux
+        // sockets (including clients that connected but sent no first byte),
+        // then keep waiting for the server's real close callback below.
+        this.server?.closeAllConnections?.();
+        for (const socket of this.listenerSockets) socket.destroy();
+        const closable = bound as net.Server & { closeAllConnections?(): void };
+        closable.closeAllConnections?.();
+      }, 5000);
+      timeout.unref?.();
+      bound.close(() => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+
     if (this.autoSaveInterval) {
       clearInterval(this.autoSaveInterval);
       this.autoSaveInterval = null;
@@ -1074,16 +1269,11 @@ export class ClaudeCodeWebServer {
       clearInterval(this.environmentScale);
       this.environmentScale = null;
     }
-    // Stopped, never removed: the containers are this server's to start and
-    // stop, but the data in them is the users' and a restart has to find it.
-    if (this.environments.enabled) {
-      await this.environments.stopAll();
-    }
     this.updateChecker.stop();
 
     if (this.wss) {
-      // close() stops accepting new connections but leaves established ones
-      // open, which keeps the HTTP server from ever closing.
+      // Stop already-connected clients from creating more work while the rest
+      // of shutdown drains. The network listener above blocks new handshakes.
       for (const client of this.wss.clients) {
         try {
           client.terminate();
@@ -1095,42 +1285,64 @@ export class ClaudeCodeWebServer {
       this.wss = null;
     }
 
+    // The close event normally takes this path. Run it explicitly as well so
+    // every attachment lease is released before persistence and runtime drain.
+    await Promise.all(
+      [...this.webSocketConnections.keys()].map((wsId) => this.wsHandler.cleanupConnection(wsId)),
+    );
+
+    // Let the emulators finish parsing and flush; a bare flush would miss
+    // whatever is still queued in the parser.
+    await this.messageProcessor.drainAllRecorders();
+
+    // A launch admitted just before its socket closed can still be awaiting an
+    // environment or bridge spawn. Wait it out before taking the one final
+    // snapshot of active runtimes, or it could appear after the scan.
+    await this.messageProcessor.drainPendingRuntimeStarts();
+
     for (const [sessionId, session] of this.claudeSessions.entries()) {
       if (session.active && session.agent) {
-        const bridge = this.getRuntimeBridge(session.agent);
-        if (bridge) {
-          await bridge.stopSession(sessionId);
-        }
+        await this.messageProcessor.stopRuntime(sessionId, session.agent);
       }
     }
+
+    // A failed earlier teardown deliberately leaves its ChatSessionManager
+    // handle reachable even if a stale record says inactive. Retry every such
+    // owner before releasing admission or clearing maps; rejection aborts
+    // shutdown rather than orphaning an unverified container process.
+    await this.chatManager.stopAll();
+
+    for (const sessionId of this.claudeSessions.keys()) {
+      // Defensive and idempotent: covers an admission acquired immediately
+      // before an already-finished runtime reported its final lifecycle event.
+      this.messageProcessor.releaseProjectSessionResources(sessionId);
+    }
+
+    await this.saveSessionsToDisk();
+
+    // Existing workspace requests can own short project leases. Let their
+    // responses finish before closing lifecycle admission and SQLite. The
+    // five-second listener backstop prevents a broken client from hanging
+    // shutdown forever; a forced close can still interrupt that client's work.
+    await closeListener;
 
     this.claudeSessions.clear();
     this.webSocketConnections.clear();
 
-    await new Promise<void>((resolve) => {
-      // The port is held by the demultiplexer, not by the https server, so it
-      // is the one that has to be closed; closing the https server would return
-      // immediately and leave the address in use on the next start.
-      const bound = this.listener || this.server;
-      if (bound && bound.listening) {
-        // close() waits for every open connection, and a WebSocket is never
-        // idle, so shutdown would hang forever with any client attached. Close
-        // the WebSocket server (which terminates its sockets) first, and keep a
-        // deadline as a backstop.
-        const timeout = setTimeout(() => resolve(), 5000);
-        timeout.unref?.();
+    // Builds and queued lifecycle finalizers still write SQLite. Drain them
+    // after runtime/attachment release and before either environments or the
+    // database can disappear underneath them.
+    await this.projects.shutdown();
 
-        bound.close(() => {
-          clearTimeout(timeout);
-          resolve();
-        });
-      } else {
-        resolve();
-      }
-    });
+    // Stopped, never removed: the containers are this server's to start and
+    // stop, but the data in them is the users' and a restart has to find it.
+    if (this.environments.enabled) {
+      await this.environments.stopAll();
+    }
 
     this.listener = null;
     this.server = null;
+    this.listenerSockets.clear();
     this.database.close();
   }
 
@@ -1180,16 +1392,11 @@ export class ClaudeCodeWebServer {
     // served by express.static above with the right content types.
 
     registerRoutes(this.app, {
-      claudeSessions: this.claudeSessions,
-      webSocketConnections: this.webSocketConnections,
+      ...this.sessionRouteDeps(),
       folderMode: this.folderMode,
-      baseFolder: this.baseFolder,
       aliases: this.aliases,
-      dev: this.dev,
-      validatePath: (targetPath: string, userId?: number) => this.validatePath(targetPath, userId),
       isPathWithinBase: (targetPath: string, userId?: number) =>
         this.isPathWithinBase(targetPath, userId),
-      getUserBaseFolder: (userId?: number) => this.getUserBaseFolder(userId),
       ensureEnvironment: (userId?: number) => this.ensureEnvironment(userId),
       environments: this.environments,
       getUserEnvironmentTier: (userId: number) => this.database.getUserSetting(userId, 'environmentTier'),
@@ -1201,21 +1408,8 @@ export class ClaudeCodeWebServer {
         }
       },
       userHasLiveSession: (userId: number) => this.userHasLiveSession(userId),
-      getSelectedWorkingDir: (userId: number) => this.getSelectedWorkingDir(userId),
       setSelectedWorkingDir: (userId: number, value: string | null) =>
         this.setSelectedWorkingDir(userId, value),
-      activeProfileFor: (runtime: string) => this.activeProfileFor(runtime),
-      createSessionRecord: (params) => this.createSessionRecord(params),
-      tabCoordinator: this.tabCoordinator,
-      getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
-      stopSessionRuntime: (session) =>
-        session.agent
-          ? this.messageProcessor.stopRuntime(session.id, session.agent)
-          : Promise.resolve(),
-      saveSessionsToDisk: () => this.saveSessionsToDisk(),
-      transcriptStore: this.transcriptStore,
-      historyStore: this.historyStore,
-      sessionTeardown: this.sessionTeardown,
       pasteStore: this.pasteStore,
       attachmentStore: this.attachmentStore,
       runtimeProfiles: this.runtimeProfiles,
@@ -1237,6 +1431,23 @@ export class ClaudeCodeWebServer {
       enginesForDeployTargets: () => this.environments.reachableEngines(),
       legacyContainersEnabled: this.legacyContainerConfig.enabled,
       reloadDeployTargets: () => this.reloadDeployTargets(),
+      projectIdsForTarget: (targetId: string) => this.projectStore.projectIdsForTarget(targetId),
+      getDeploySetting: (key: string) => this.database.getSetting(key),
+      setDeploySetting: (key: string, value: string) => this.database.setSetting(key, value),
+      manager: this.projects,
+      projectStore: this.projectStore,
+      targetNameFor: (project) => this.projects.targetNameFor(project),
+      projectAvailability: () => {
+        try {
+          this.environments.activeProjectTarget();
+          return { available: true };
+        } catch (error) {
+          return {
+            available: false,
+            message: error instanceof Error ? error.message : String(error),
+          };
+        }
+      },
       getInterruptedUpdate: () => {
         // Reported once and then forgotten. Left set, it would keep the banner
         // in its error state — which offers no Update button — for the rest of
@@ -1246,12 +1457,6 @@ export class ClaudeCodeWebServer {
         this.interruptedUpdate = null;
         return interrupted;
       },
-      getScreenSnapshot: (sessionId: string) =>
-        this.messageProcessor.getScreenSnapshot(sessionId),
-      disposeRecorder: (sessionId: string) => this.messageProcessor.disposeRecorder(sessionId),
-      sessionStore: this.sessionStore,
-      // For listing past conversations in a folder.
-      chatStore: this.chatStore,
       // For the status panel's "measured here" half. Passed rather than reached
       // for so a build that does not track usage simply omits the figure,
       // instead of showing a zero that reads as "you have spent nothing".
@@ -1300,6 +1505,7 @@ export class ClaudeCodeWebServer {
     // truth to decide whether a project may be stopped or swapped. (#168)
     await this.sessionStore.resetActiveFlags();
     await this.loadPersistedSessions();
+    await this.projects.reconcileOnBoot();
 
     // A marker left behind means a previous update was killed part-way — host
     // reboot, OOM, an outside restart — so the global prefix may be half
@@ -1359,14 +1565,27 @@ export class ClaudeCodeWebServer {
     });
 
     const server = createHttpsOnlyPort(secure);
+    server.on('connection', (socket) => {
+      this.listenerSockets.add(socket);
+      socket.once('close', () => this.listenerSockets.delete(socket));
+    });
 
+    // Startup has now passed every operation that can throw before binding.
+    // Starting here avoids leaving an idle sweep behind when auth or
+    // certificate preparation fails.
+    this.projects.startSweep();
     return await new Promise((resolve, reject) => {
+      const onError = (error: Error): void => {
+        this.projects.stopSweep();
+        reject(error);
+      };
+      server.once('error', onError);
       server.listen(this.port, () => {
+        server.off('error', onError);
         this.server = secure;
         this.listener = server;
         resolve(secure);
       });
-      server.on('error', reject);
     });
   }
 

@@ -98,6 +98,24 @@ as a set of deploy targets rather than through these flags. You can name
 several targets, switch the active one at runtime, and let each carry its own
 connection secrets. See [Deploy targets](deploy-targets.md).
 
+### Project lifetime settings
+
+Projects use deploy targets, but their lifetime policy is installation-wide and
+is configured by the installer in **Settings → Deploy targets**. These values are
+stored in the application database and survive a restart; they are not CLI
+flags or environment variables.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| Maximum running projects per user | `3` | Limits one user's building/running projects. It does not limit how many projects they may create or keep stopped. |
+| Idle stop | `60 minutes` | Stops a project with no active sessions, attachments, builds, commands, or agent work. Its worktree remains. |
+| Idle reclaim | `7 days` | Reclaims a long-stopped idle project after preservation succeeds; its next open builds a fresh container and checkout. |
+
+The reclaim period is intentionally longer than idle stop. Repository changes
+are preserved to a non-overwriting WIP branch before a reclaim or rebuild; a
+failed preservation blocks the operation until its user retries or explicitly
+discards the uncommitted checkout work. See [Projects](projects.md).
+
 ### TLS
 
 | Flag | Default | What it does |
@@ -208,6 +226,7 @@ Everything sits under the data directory — `~/.code-agents-webcli` unless
 | `pastes/<user>/<session>.json` | Manifests for [pasted images](terminal.md#pasting-images). The image bytes live in the project directory. |
 | `<user>/<session>.jsonl` | Event log for a [WebUI chat](runtimes.md#the-webui-beta) session. |
 | `runtime-profiles/` | Generated per-runtime tier configuration that cannot be written into a project. |
+| `<target-root>/projects/<project-id>/` | Disposable project worktree on its recorded deploy target. For the legacy target the default root is `<data-dir>/environments`; it can be removed during reclaim and rebuilt from its repository. |
 
 The database holds OAuth credentials, live auth sessions, and the encryption key
 for deploy-target secrets when no `CODE_AGENTS_WEBCLI_ENCRYPTION_KEY` is supplied.

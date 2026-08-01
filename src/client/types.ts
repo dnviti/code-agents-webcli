@@ -81,6 +81,8 @@ export interface SessionInfo {
   name: string;
   status: 'idle' | 'active' | 'error' | 'disconnected';
   workingDir: string | null;
+  /** Namespace of workingDir for a project session; absent means host. */
+  projectWorkingDirKind?: 'host' | 'container';
   lastAccessed: number;
   lastActivity: number;
   unreadOutput: boolean;
@@ -178,14 +180,20 @@ export interface SessionListItem {
   /** Project identity, when this session was opened from a project workspace. */
   projectId?: string | null;
   projectName?: string | null;
+  /** Namespace of workingDir for a project session; absent means host. */
+  projectWorkingDirKind?: 'host' | 'container';
 }
 
 export interface FolderData {
   currentPath: string;
   parentPath: string | null;
+  workingDirKind?: 'host' | 'container';
+  lifetime?: 'workspace' | 'owner_home' | 'disposable';
   folders: Array<{
     name: string;
     path: string;
+    workingDirKind?: 'host' | 'container';
+    lifetime?: 'workspace' | 'owner_home' | 'disposable';
   }>;
 }
 
@@ -210,6 +218,7 @@ export interface WsSessionCreatedMessage {
   /** Absent only when connected to a server predating project sessions. */
   projectId?: string | null;
   projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
 }
 
 export interface WsSessionJoinedMessage {
@@ -220,6 +229,7 @@ export interface WsSessionJoinedMessage {
   /** Absent only when connected to a server predating project sessions. */
   projectId?: string | null;
   projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
   active: boolean;
   outputBuffer?: string[];
   lastAgent?: AgentKind;
@@ -248,6 +258,7 @@ export interface WsChatStartedMessage {
   agent: AgentKind;
   runtimeLabel: string;
   workingDir?: string;
+  projectWorkingDirKind?: 'host' | 'container';
   capabilities?: unknown;
   bypassPermissions?: boolean;
 }
@@ -416,6 +427,7 @@ export interface WsSessionOpenedMessage {
   bypassPermissions: boolean;
   projectId?: string | null;
   projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
 }
 
 /**

@@ -15,6 +15,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { ContainerEngine, EnvironmentEngine, ResourceUsage } from './engine.js';
 import { KubernetesEngine } from './kubernetes.js';
+import { trackContainerProcess } from './process-control.js';
 import { TARGET_LABEL, containerHomeFor, environmentName, targetLabelValue } from './naming.js';
 import {
   AUTO_TIER,
@@ -137,12 +138,15 @@ export class ContainerEnvironment implements UserEnvironment {
   /** Resolved through the image's PATH: the host's binary is not in there. */
   readonly nodePath = 'node';
   private readonly engine: EnvironmentEngine;
+  /** Immutable engine/container identity; names may be reused after rebuild. */
+  private readonly identity?: string;
 
   constructor(options: {
     name: string;
     homeDir: string;
     containerHome: string;
     engine: EnvironmentEngine;
+    identity?: string;
     shells?: readonly string[];
     mounts?: readonly Mount[];
   }) {
@@ -150,6 +154,7 @@ export class ContainerEnvironment implements UserEnvironment {
     this.homeDir = options.homeDir;
     this.containerHome = options.containerHome;
     this.engine = options.engine;
+    this.identity = options.identity;
     this.shells = options.shells || [];
     this.mounts = options.mounts
       || [{ hostPath: options.homeDir, containerPath: options.containerHome }];
@@ -193,16 +198,31 @@ export class ContainerEnvironment implements UserEnvironment {
 
   wrap(command: string, args: string[], options: WrapOptions = {}): WrappedCommand {
     const cwd = options.cwd ? this.toContainerPath(options.cwd) : this.containerHome;
+    const tracked = options.trackProcess
+      ? trackContainerProcess(
+          this.engine,
+          this.name,
+          this.identity,
+          command,
+          args,
+          options.tty === true,
+        )
+      : null;
     const execArgs = this.engine.execArgs(
       { name: this.name, cwd, env: options.env, tty: options.tty },
-      command,
-      args,
+      tracked?.command || command,
+      tracked?.args || args,
     );
     // The spawn itself gets this process's environment: it is running the
     // engine client, not the user's program. Everything the user's program
     // should see was turned into `--env` flags above, which is also what keeps
     // the server's own secrets out of the container.
-    return { command: this.engine.binary, args: execArgs, env: mergedEnv() };
+    return {
+      command: this.engine.binary,
+      args: execArgs,
+      env: mergedEnv(),
+      processControl: tracked?.processControl,
+    };
   }
 }
 

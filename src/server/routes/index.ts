@@ -11,6 +11,8 @@ import { createWorkspaceRoutes, WorkspaceRoutesDeps } from './workspace.js';
 import { createEnvironmentRoutes, EnvironmentRoutesDeps } from './environment.js';
 import { createUsageRoutes, UsageRoutesDeps } from './usage.js';
 import { createDeployTargetRoutes, DeployTargetRoutesDeps } from './deploy-targets.js';
+import { createProjectRoutes, ProjectsRoutesDeps } from './projects.js';
+import { createConnectedHostRoutes, ConnectedHostRoutesDeps } from './connected-hosts.js';
 
 export interface RegisterRoutesDeps
   extends HealthRoutesDeps,
@@ -24,7 +26,9 @@ export interface RegisterRoutesDeps
     WorkspaceRoutesDeps,
     UsageRoutesDeps,
     EnvironmentRoutesDeps,
-    DeployTargetRoutesDeps {}
+    DeployTargetRoutesDeps,
+    ProjectsRoutesDeps,
+    ConnectedHostRoutesDeps {}
 
 export function registerRoutes(app: Express, deps: RegisterRoutesDeps): void {
   app.use(createHealthRoutes(deps));
@@ -39,4 +43,6 @@ export function registerRoutes(app: Express, deps: RegisterRoutesDeps): void {
   app.use(createUsageRoutes(deps));
   app.use(createEnvironmentRoutes(deps));
   app.use(createDeployTargetRoutes(deps));
+  app.use(createProjectRoutes(deps));
+  app.use(createConnectedHostRoutes(deps));
 }

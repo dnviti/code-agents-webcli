@@ -52,4 +52,16 @@ describe('ClaudeBridge', function() {
       assert.strictEqual(result.length, 0);
     });
   });
+
+  it('fails closed when a container wrapper omits process control', async function() {
+    const environment = {
+      kind: 'container',
+      wrap(command, args) { return { command, args, env: process.env }; },
+    };
+    await assert.rejects(
+      bridge.startSession('missing-control', { environment }),
+      /verified process control/,
+    );
+    assert.strictEqual(bridge.getSession('missing-control'), undefined);
+  });
 });

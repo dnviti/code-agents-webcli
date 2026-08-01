@@ -129,6 +129,33 @@ describe('acp chat adapter', function () {
       const h = harness({ extraArgs: ['--config', '/tmp/x.yml'] });
       assert.deepStrictEqual(h.adapter.buildArgs(), ['acp', '--config', '/tmp/x.yml']);
     });
+
+    it('uses the runtime-visible cwd in ACP handshakes', async function () {
+      const environment = {
+        kind: 'container',
+        toContainerPath(value) {
+          assert.strictEqual(value, '/host/projects/alpha');
+          return '/workspace/alpha';
+        },
+      };
+      const h = harness({ workingDir: '/host/projects/alpha', cwdKind: 'host', environment });
+      await boot(h, fixture('acp-omp'));
+
+      const opened = h.sent.find((message) => message.method === 'session/new');
+      assert.strictEqual(opened.params.cwd, '/workspace/alpha');
+      assert.strictEqual(only(h.events, 'session')[0].cwd, '/workspace/alpha');
+    });
+
+    it('does not translate an explicitly container-local ACP cwd', async function () {
+      const environment = {
+        kind: 'container',
+        toContainerPath() { throw new Error('container cwd must not be translated as a host path'); },
+      };
+      const h = harness({ workingDir: '/tmp/work', cwdKind: 'container', environment });
+      await boot(h, fixture('acp-omp'));
+      const opened = h.sent.find((message) => message.method === 'session/new');
+      assert.strictEqual(opened.params.cwd, '/tmp/work');
+    });
   });
 
   describe('streaming messages', function () {

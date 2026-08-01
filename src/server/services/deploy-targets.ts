@@ -501,13 +501,16 @@ function buildHostArgs(target: DeployTarget, dataDir: string): string[] | undefi
 }
 
 export function caveatsFor(engine: ContainerEngineKind): string[] {
+  const runtimePrerequisite =
+    'The image must be Linux and provide sh, a readable /proc, and setsid; terminals and agent sessions depend on them.';
   if (engine === 'kubernetes') {
     return [
+      runtimePrerequisite,
       'Approval prompts and agent questions from inside the pod do not reach the browser; only bypassPermissions mode is supported there.',
       'The automatic size tier needs metrics-server.',
     ];
   }
-  return [];
+  return [runtimePrerequisite];
 }
 
 /**

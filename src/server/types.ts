@@ -130,6 +130,18 @@ export interface SessionRecord {
    */
   projectId?: string | null;
   /**
+   * Which namespace `workingDir` belongs to for a project session.
+   *
+   * `host` means one of the manager's bind-mounted persistent paths and
+   * `container` means an absolute path that exists only inside the project's
+   * disposable container filesystem. Absent is the backwards-compatible host
+   * interpretation for every row written before container-local cwd support.
+   * The distinction must be persisted: both namespaces use absolute strings,
+   * so inferring it from a path would be ambiguous and could launch work in a
+   * different directory than the one the user selected.
+   */
+  projectWorkingDirKind?: 'host' | 'container';
+  /**
    * The runtime's own id for this conversation, when it reported one.
    *
    * Kept so a chat can be resumed *with its context* after the server restarts:
@@ -271,6 +283,12 @@ export interface SessionRecord {
   customName?: string;
   terminalOptions: TerminalOptions | null;
   stopRequested: boolean;
+  /**
+   * Transient deletion gate. Set before draining an in-flight launch so no
+   * process can materialise after its record and project lease are removed.
+   * Never persisted.
+   */
+  retiring?: boolean;
   /** Identifies the current PTY run so late callbacks from a previous run are ignored. */
   runId?: string;
   workingDir: string;
@@ -339,6 +357,8 @@ export interface SessionListItem {
   workingDir: string;
   /** The project this tab is bound to, when it is not a legacy session. */
   projectId?: string | null;
+  /** Namespace of workingDir for a project session; absent means host. */
+  projectWorkingDirKind?: 'host' | 'container';
   connectedClients: number;
   lastActivity: Date;
   /** Absent means terminal; the client needs it to watch chat sessions it is not driving. */

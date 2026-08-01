@@ -56,7 +56,7 @@ export interface SettingsDialogProps {
   environmentsEnabled: boolean;
   /** Open the environment size picker, which is its own dialog. */
   onOpenEnvironment(): void;
-  /** Open persistent project workspaces. */
+  /** Open project containers and their lifecycle controls. */
   onOpenProjects(): void;
 }
 
@@ -279,7 +279,7 @@ export function SettingsDialog({
 
       <SettingRow
         label="Projects"
-        description="Create and manage persistent repository workspaces."
+        description="Create and manage repository projects in their own containers."
       >
         <Button variant="secondary" size="sm" onClick={onOpenProjects}>Manage projects</Button>
       </SettingRow>

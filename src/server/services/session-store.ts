@@ -42,6 +42,7 @@ interface RuntimeSessionRow {
   tab_open: number | null;
   tab_order: number | null;
   project_id: string | null;
+  project_working_dir_kind: string | null;
 }
 
 export class SessionStore {
@@ -86,7 +87,8 @@ export class SessionStore {
           custom_name,
           tab_open,
           tab_order,
-          project_id
+          project_id,
+          project_working_dir_kind
         )
         VALUES (
           @id,
@@ -115,7 +117,8 @@ export class SessionStore {
           @custom_name,
           @tab_open,
           @tab_order,
-          @project_id
+          @project_id,
+          @project_working_dir_kind
         )
       `);
 
@@ -230,6 +233,15 @@ export class SessionStore {
         // The project this session was created against, if any. Project-less
         // sessions keep today's behaviour. (#168)
         project_id: session.projectId ?? null,
+        // Absolute host and container paths share one string field, so this
+        // discriminator is the only safe way to interpret it after restart.
+        // A null remains the legacy host meaning for older rows.
+        project_working_dir_kind:
+          session.projectId
+          && (session.projectWorkingDirKind === 'host'
+            || session.projectWorkingDirKind === 'container')
+            ? session.projectWorkingDirKind
+            : null,
       }));
 
       replaceAll(rows);
@@ -273,7 +285,8 @@ export class SessionStore {
             custom_name,
             tab_open,
             tab_order,
-            project_id
+            project_id,
+            project_working_dir_kind
           FROM runtime_sessions
           ORDER BY created_at ASC
         `)
@@ -354,6 +367,12 @@ export class SessionStore {
           tabOrder: row.tab_order ?? undefined,
           // Project-less sessions keep today's behaviour. (#168)
           projectId: row.project_id ?? undefined,
+          projectWorkingDirKind:
+            row.project_working_dir_kind === 'container'
+              ? 'container'
+              : row.project_working_dir_kind === 'host'
+                ? 'host'
+                : undefined,
         });
       }
 

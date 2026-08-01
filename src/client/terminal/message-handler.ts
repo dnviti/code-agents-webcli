@@ -238,6 +238,7 @@ export class MessageHandler {
           bypassPermissions: message.bypassPermissions,
           projectId: message.projectId,
           projectName: message.projectName,
+          projectWorkingDirKind: message.projectWorkingDirKind,
         });
         this.app.loadSessions();
         break;
@@ -407,6 +408,7 @@ export class MessageHandler {
     workingDir: string;
     projectId?: string | null;
     projectName?: string | null;
+    projectWorkingDirKind?: 'host' | 'container';
   }): void {
     this.app.currentClaudeSessionId = message.sessionId;
     this.app.currentClaudeSessionName = message.sessionName;
@@ -422,6 +424,7 @@ export class MessageHandler {
         undefined,
         message.projectId,
         message.projectName,
+        message.projectWorkingDirKind,
       );
       this.app.sessionTabManager.switchToTab(message.sessionId);
     }
@@ -438,6 +441,7 @@ export class MessageHandler {
     history?: { firstLine: number; totalLines: number };
     projectId?: string | null;
     projectName?: string | null;
+    projectWorkingDirKind?: 'host' | 'container';
   }): void {
     this.app.currentClaudeSessionId = message.sessionId;
     this.app.historyRange = message.history ?? { firstLine: 0, totalLines: 0 };
@@ -463,6 +467,7 @@ export class MessageHandler {
         undefined,
         message.projectId,
         message.projectName,
+        message.projectWorkingDirKind,
       );
       this.app.sessionTabManager.updateTabStatus(
         message.sessionId,

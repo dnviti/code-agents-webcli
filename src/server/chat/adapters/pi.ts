@@ -240,7 +240,7 @@ export class PiChatAdapter extends BaseChatAdapter {
         // confirms it; until then the conversation shows none.
         model: this.reportedModel,
         nativeSessionId: this.nativeSessionId,
-        cwd: this.options.workingDir,
+        cwd: this.runtimeWorkingDir,
         capabilities: this.capabilities,
       });
     }
@@ -319,14 +319,20 @@ export class PiChatAdapter extends BaseChatAdapter {
    * over by `onAgentSettled` — a line of stdout that arrives first.
    */
   get readyForTurn(): boolean {
-    return !this.turnInFlight;
+    return !this.turnInFlight
+      && (!this.child || this.exited)
+      && !this.childNeedsVerifiedClose();
   }
 
   async send(turn: UserTurn): Promise<void> {
     if (this.stopped) {
       throw new Error('pi chat adapter is stopped');
     }
-    if (this.turnInFlight) {
+    if (
+      this.turnInFlight
+      || (this.child && !this.exited)
+      || this.childNeedsVerifiedClose()
+    ) {
       throw new Error('pi: a turn is already running on this session');
     }
 
@@ -374,34 +380,65 @@ export class PiChatAdapter extends BaseChatAdapter {
       child.on('spawn', accept);
 
       child.on('error', (error: Error) => {
-        this.exited = true;
-        this.turnInFlight = false;
-        this.emit({ t: 'error', message: `pi: ${error.message}` });
-        this.emit({ t: 'state', state: 'idle' });
-        if (!settled) {
-          settled = true;
-          reject(error);
-        }
+        void (async () => {
+          try {
+            await this.waitForVerifiedClose(child);
+          } catch (verificationError: unknown) {
+            const message = verificationError instanceof Error
+              ? verificationError.message
+              : String(verificationError);
+            this.emit({ t: 'error', message: `pi: ${message}`, fatal: true });
+            if (!settled) {
+              settled = true;
+              reject(verificationError);
+            }
+            return;
+          }
+          if (this.child !== child || this.exited) return;
+          this.exited = true;
+          this.turnInFlight = false;
+          this.emit({ t: 'error', message: `pi: ${error.message}` });
+          this.emit({ t: 'state', state: 'idle' });
+          if (!settled) {
+            settled = true;
+            reject(error);
+          }
+        })();
       });
 
-      child.on('exit', (code, signal) => this.onTurnExit(code, signal));
+      child.on('exit', (code, signal) => {
+        void this.onTurnExit(child, code, signal);
+      });
     });
   }
 
   async interrupt(): Promise<void> {
-    if (!this.child || this.exited) return;
+    const child = this.child;
+    if (!child || !this.childNeedsVerifiedClose(child)) return;
     // pi's one-shot process has no cancel message; killing it is the only
     // way to stop mid-turn, and it ends only this turn — the session stays
     // usable for the next send(), which spawns a fresh process.
     this.turnInterrupted = true;
-    this.child.kill('SIGINT');
+    await this.terminateChild(child, 'SIGTERM');
   }
 
   respondPermission(_requestId: string, _optionId: string): void {
     // capabilities.permissions is false: nothing is ever pending to answer.
   }
 
-  private onTurnExit(code: number | null, signal: NodeJS.Signals | null): void {
+  private async onTurnExit(
+    child: AdapterChild,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): Promise<void> {
+    try {
+      await this.waitForVerifiedClose(child);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit({ t: 'error', message: `pi: ${message}`, fatal: true });
+      return;
+    }
+    if (this.child !== child || this.exited) return;
     this.exited = true;
     this.turnInFlight = false;
 
@@ -538,7 +575,7 @@ export class PiChatAdapter extends BaseChatAdapter {
       nativeSessionId: this.nativeSessionId,
       // Same as in `start()`: what pi reported, which at this point is nothing.
       model: this.reportedModel,
-      cwd: typeof event.cwd === 'string' ? event.cwd : this.options.workingDir,
+      cwd: typeof event.cwd === 'string' ? event.cwd : this.runtimeWorkingDir,
       capabilities: this.capabilities,
     });
   }
