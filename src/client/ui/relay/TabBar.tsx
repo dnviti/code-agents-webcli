@@ -1,5 +1,6 @@
 import * as React from 'react';
 
+import { SessionStateIcon } from '../SessionStateIcon';
 import { Icon } from './Icon';
 
 export type TabStatus = 'running' | 'error' | (string & {});
@@ -19,29 +20,6 @@ export interface TabItem {
   attention?: 'approval' | 'question' | null;
   /** Shown on hover; the strip truncates titles aggressively. */
   tooltip?: string;
-}
-
-/** What the dot means when a tab is waiting, said in words as well as colour. */
-const ATTENTION_LABEL: Record<'approval' | 'question', string> = {
-  approval: 'Waiting for approval',
-  question: 'Asked you a question',
-};
-
-function tabDotColour(tab: TabItem): string {
-  return tab.status === 'error' ? 'var(--destructive)'
-    : tab.attention === 'approval' ? 'var(--warning)'
-      : tab.attention === 'question' ? 'var(--info)'
-        : tab.status === 'running' ? 'var(--ansi-green)'
-          : tab.unread ? 'var(--primary)' : 'var(--muted-foreground)';
-}
-
-/** Words for the state dot when it carries information rather than decoration. */
-function tabDotLabel(tab: TabItem): string | undefined {
-  if (tab.attention) return ATTENTION_LABEL[tab.attention];
-  if (tab.status === 'error') return 'Error';
-  if (tab.status === 'running') return 'Running';
-  if (tab.unread) return 'Unread output';
-  return undefined;
 }
 
 // `matches(':focus-visible')` throws a SyntaxError on engines that do not know the
@@ -101,18 +79,6 @@ function Tab({
 
   const closeVisible = hover || active || focusWithin;
 
-  // Waiting outranks running, which is not the obvious order and is the whole
-  // point. `status` here does not mean "the agent is working": for a
-  // conversation it is the server's `active` flag, which means the process is
-  // alive and is true of an agent that has been stopped for an approval since
-  // yesterday. So a blocked conversation whose tab was joined, or whose page
-  // was reloaded, painted a working green dot while the very same element told
-  // a screen reader it was waiting for approval.
-  //
-  // It outranks unread for a different reason: unread is cleared by looking at
-  // the tab, and this is not — the dot goes when the approval is answered, not
-  // when it is noticed.
-  const dot = tabDotColour(tab);
   const activeShadow = active ? 'inset 0 2px 0 var(--foreground)' : '';
   const wrapperStyle: React.CSSProperties = {
     position: 'relative', display: 'flex', alignItems: 'center', gap: 8, padding: '0 8px 0 12px',
@@ -126,14 +92,6 @@ function Tab({
     boxShadow: focusVisible
       ? (activeShadow ? activeShadow + ', var(--shadow-focus)' : 'var(--shadow-focus)')
       : (activeShadow || 'none'),
-  };
-  const dotStyle: React.CSSProperties = {
-    width: 6, height: 6, flex: '0 0 auto', borderRadius: 'var(--radius-full)', background: dot,
-    // And nothing pulses while it is stopped: the pulse is what reads as
-    // progress, on a session that is making none until somebody answers it.
-    animation: tab.status === 'running' && !tab.attention
-      ? 'relay-pulse 1.6s ease-in-out infinite'
-      : 'none',
   };
   const labelStyle: React.CSSProperties = {
     flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-sm)',
@@ -231,16 +189,12 @@ function Tab({
       onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
       style={wrapperStyle}
     >
-      {tab.status ? (
-        // Named when it is carrying something, unnamed when it is only
-        // decoration: a dot announced as "idle" on every tab in the strip is
-        // noise, and a waiting session that says nothing at all is the failure
-        // this row is here to prevent.
-        tab.attention ? (
-          <span role="img" aria-label={ATTENTION_LABEL[tab.attention]} style={dotStyle} />
-        ) : (
-          <span style={dotStyle} />
-        )
+      {tab.status || tab.unread || tab.attention ? (
+        <SessionStateIcon
+          status={tab.status}
+          unread={tab.unread}
+          attention={tab.attention}
+        />
       ) : null}
       <span style={labelStyle}>{tab.title}</span>
       <button
@@ -360,7 +314,6 @@ function TabOverflowMenu({
     >
       {tabs.map((tab, index) => {
         const selected = tab.id === activeId;
-        const cue = tabDotLabel(tab);
         return (
           <button
             ref={(element) => { itemRefs.current[index] = element; }}
@@ -394,16 +347,11 @@ function TabOverflowMenu({
               cursor: 'pointer',
             }}
           >
-            <span
-              role={cue ? 'img' : undefined}
-              aria-label={cue}
-              style={{
-                width: 6,
-                height: 6,
-                flex: '0 0 auto',
-                borderRadius: 'var(--radius-full)',
-                background: tabDotColour(tab),
-              }}
+            <SessionStateIcon
+              status={tab.status}
+              unread={tab.unread}
+              attention={tab.attention}
+              size={13}
             />
             <span
               style={{

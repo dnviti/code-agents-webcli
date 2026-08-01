@@ -99,6 +99,44 @@ describe('Relay accessibility guards', function () {
     );
   });
 
+  it('names and distinguishes every session state with an icon', function () {
+    const { renderToStaticMarkup, React, TabBar } = mod;
+    const html = renderToStaticMarkup(
+      React.createElement(TabBar, {
+        tabs: [
+          { id: 'working', title: 'working', status: 'running' },
+          { id: 'approval', title: 'approval', status: 'running', attention: 'approval' },
+          { id: 'input', title: 'input', status: 'running', attention: 'question' },
+          { id: 'success', title: 'success', status: 'idle', unread: true },
+          { id: 'error', title: 'error', status: 'error' },
+          { id: 'idle', title: 'idle', status: 'idle' },
+        ],
+        activeId: 'working',
+      }),
+    );
+
+    for (const state of ['working', 'waiting-approval', 'waiting-input', 'success', 'error', 'idle']) {
+      assert.ok(
+        html.includes(`data-tab-state="${state}"`),
+        `the tab strip must render a distinct ${state} icon`,
+      );
+    }
+    for (const label of [
+      'Working',
+      'Waiting for approval',
+      'Waiting for input',
+      'Completed',
+      'Error',
+      'Idle',
+    ]) {
+      assert.ok(html.includes(`aria-label="${label}"`), `${label} must be announced in words`);
+    }
+    assert.ok(
+      /animation:relay-spin 900ms linear infinite/.test(html),
+      'only the working icon should carry motion',
+    );
+  });
+
   it('announces a vertical separator as vertical', function () {
     const { renderToStaticMarkup, React, Separator } = mod;
     const vertical = renderToStaticMarkup(React.createElement(Separator, { orientation: 'vertical' }));

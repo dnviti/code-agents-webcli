@@ -5706,9 +5706,9 @@ async function checkAnOverflowingTabStripCanBeNavigated(): Promise<void> {
     `${rows.length} rows`,
   );
   check(
-    'the overflow chooser carries waiting and unread cues',
+    'the overflow chooser carries waiting and completed cues',
     Boolean(menu?.querySelector('[aria-label="Waiting for approval"]'))
-      && Boolean(menu?.querySelector('[aria-label="Unread output"]')),
+      && Boolean(menu?.querySelector('[aria-label="Completed"]')),
     menu?.textContent || 'no menu',
   );
 
@@ -12542,8 +12542,8 @@ function setInputValue(field: HTMLInputElement, value: string): void {
  * be refused, and on iOS outside an installed app it is not even offered, so
  * the marks inside the product are the only thing some people will ever get.
  *
- * It cannot be a unit test. Every claim here is about paint — that the waiting
- * dot resolves to a different colour from the unread dot, and that the phone
+ * It cannot be a unit test. Every claim here is about paint — that each state
+ * icon resolves to its own colour and motion, and that the phone
  * sheet, which is the *only* cross-session surface on a phone because the tab
  * strip is not rendered there at all, actually draws the words at a size an eye
  * can read. Without the app's own stylesheets every `var(--warning)` resolves
@@ -12568,6 +12568,7 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
         { id: 'asked', title: 'docs', status: 'running', unread: true, attention: 'question' },
         { id: 'unread', title: 'webcli', status: 'idle', unread: true },
         { id: 'quiet', title: 'notes', status: 'running' },
+        { id: 'failed', title: 'deploy', status: 'error' },
       ],
       activeId: 'quiet',
       onSelect: () => {},
@@ -12580,13 +12581,19 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
 
   const strip = host.querySelector('[role="tablist"][aria-label="Sessions"]') as HTMLElement;
   const tabs = Array.from(strip.querySelectorAll<HTMLElement>('[role="tab"]'));
-  const dotOf = (tab: HTMLElement): HTMLElement => tab.firstElementChild as HTMLElement;
-  const colourOf = (tab: HTMLElement): string => getComputedStyle(dotOf(tab)).backgroundColor;
+  const stateOf = (tab: HTMLElement): HTMLElement => (
+    tab.querySelector('[data-tab-state]') as HTMLElement
+  );
+  const glyphOf = (tab: HTMLElement): HTMLElement => (
+    stateOf(tab).querySelector('.ricon') as HTMLElement
+  );
+  const colourOf = (tab: HTMLElement): string => getComputedStyle(stateOf(tab)).color;
 
   const waiting = colourOf(tabs[0]);
   const asked = colourOf(tabs[1]);
   const unread = colourOf(tabs[2]);
   const quiet = colourOf(tabs[3]);
+  const failed = colourOf(tabs[4]);
 
   check(
     'a conversation waiting for approval is not painted as ordinary unread output',
@@ -12604,17 +12611,34 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
     `approval=${waiting} question=${asked} running=${quiet}`,
   );
   check(
-    'and nothing pulses while it waits',
-    getComputedStyle(dotOf(tabs[0])).animationName === 'none'
-      && getComputedStyle(dotOf(tabs[3])).animationName !== 'none',
-    `waiting=${getComputedStyle(dotOf(tabs[0])).animationName} running=${getComputedStyle(dotOf(tabs[3])).animationName}`,
+    'success and failure have distinct semantic colours',
+    unread !== quiet && failed !== unread && failed !== waiting && /rgb/.test(failed),
+    `success=${unread} error=${failed} working=${quiet}`,
   );
   check(
-    'and the waiting dot says so in words, not only in colour',
-    dotOf(tabs[0]).getAttribute('aria-label') === 'Waiting for approval'
-      && dotOf(tabs[1]).getAttribute('aria-label') === 'Asked you a question'
-      && dotOf(tabs[2]).getAttribute('aria-label') === null,
-    `${dotOf(tabs[0]).getAttribute('aria-label')} / ${dotOf(tabs[1]).getAttribute('aria-label')}`,
+    'only the working icon spins',
+    getComputedStyle(glyphOf(tabs[0])).animationName === 'none'
+      && getComputedStyle(glyphOf(tabs[3])).animationName === 'relay-spin',
+    `waiting=${getComputedStyle(glyphOf(tabs[0])).animationName} working=${getComputedStyle(glyphOf(tabs[3])).animationName}`,
+  );
+  check(
+    'each state uses the corresponding icon rather than a generic dot',
+    tabs.every((tab) => Boolean(glyphOf(tab).querySelector('svg')))
+      && stateOf(tabs[0]).dataset.tabState === 'waiting-approval'
+      && stateOf(tabs[1]).dataset.tabState === 'waiting-input'
+      && stateOf(tabs[2]).dataset.tabState === 'success'
+      && stateOf(tabs[3]).dataset.tabState === 'working'
+      && stateOf(tabs[4]).dataset.tabState === 'error',
+    tabs.map((tab) => stateOf(tab).dataset.tabState).join(' / '),
+  );
+  check(
+    'and every state says so in words, not only in colour',
+    stateOf(tabs[0]).getAttribute('aria-label') === 'Waiting for approval'
+      && stateOf(tabs[1]).getAttribute('aria-label') === 'Waiting for input'
+      && stateOf(tabs[2]).getAttribute('aria-label') === 'Completed'
+      && stateOf(tabs[3]).getAttribute('aria-label') === 'Working'
+      && stateOf(tabs[4]).getAttribute('aria-label') === 'Error',
+    tabs.map((tab) => stateOf(tab).getAttribute('aria-label')).join(' / '),
   );
 
   root.unmount();
@@ -12646,6 +12670,8 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
         tabs: [
           { id: 'waiting', title: 'infra', status: 'running', unread: true, attention: 'approval', workingDir: '/srv/infra' },
           { id: 'quiet', title: 'notes', status: 'running', unread: false, attention: null, workingDir: '/srv/notes' },
+          { id: 'complete', title: 'tests', status: 'idle', unread: true, attention: null, workingDir: '/srv/tests' },
+          { id: 'failed', title: 'deploy', status: 'error', unread: false, attention: null, workingDir: '/srv/deploy' },
         ],
         activeId: 'quiet',
         onSelect: () => {},
@@ -12669,6 +12695,14 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
     'and says it at a size that can be read',
     Boolean(said) && (said as { size: number }).size >= PHONE_MIN_TEXT,
     said ? `${said.size}px, floor ${PHONE_MIN_TEXT}px` : 'not drawn',
+  );
+  const phoneStates = Array.from(doc.querySelectorAll<HTMLElement>('[data-tab-state]'))
+    .map((node) => node.dataset.tabState);
+  check(
+    'the phone session sheet uses the same state icons as the desktop strip',
+    ['waiting-approval', 'working', 'success', 'error']
+      .every((state) => phoneStates.includes(state)),
+    phoneStates.join(' / '),
   );
 
   sheetRoot.unmount();
