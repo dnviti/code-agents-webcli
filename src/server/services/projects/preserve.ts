@@ -74,6 +74,48 @@ function isExpectedAbsentCollision(error: unknown): boolean {
 }
 
 /**
+ * Find nested Git worktrees without trusting the top-level status summary.
+ *
+ * A top-level `git add -A` treats an embedded repository as a gitlink. That
+ * records its HEAD, but none of its uncommitted or untracked bytes. Search for
+ * both directory and file `.git` entries: normal repositories use the former,
+ * while submodule worktrees commonly use the latter.
+ */
+async function dirtyNestedRepositories(
+  run: (command: string, args: string[]) => Promise<string>,
+  repoContainerPath: string,
+): Promise<string[]> {
+  const normalizedRoot = repoContainerPath.replace(/\/+$/, '') || '/';
+  const rootGitDir = normalizedRoot === '/' ? '/.git' : `${normalizedRoot}/.git`;
+  let found: string;
+  try {
+    found = await run('find', [
+      normalizedRoot,
+      '-path', rootGitDir, '-prune',
+      '-o', '(', '-type', 'd', '-name', '.git', '-print0', '-prune', ')',
+      '-o', '(', '-type', 'f', '-name', '.git', '-print0', ')',
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new PreserveError(`Could not inspect nested repositories (${message}); retained workspace requires manual recovery or explicit discard`);
+  }
+
+  const nestedRoots = found.split('\0').filter(Boolean).map((gitPath) => gitPath.slice(0, -'/.git'.length));
+  const dirty: string[] = [];
+  for (const nestedRoot of nestedRoots) {
+    let status: string;
+    try {
+      status = await run('git', ['-C', nestedRoot, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none']);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new PreserveError(`Could not inspect nested repository ${nestedRoot} (${message}); retained workspace requires manual recovery or explicit discard`);
+    }
+    if (status.trim()) dirty.push(nestedRoot);
+  }
+  return dirty;
+}
+
+/**
  * Commit and push uncommitted work, or report there was none.
  *
  * Throws PreserveError on any failure — no credential, push denied, host
@@ -131,6 +173,18 @@ export async function preserveProjectWork(options: PreserveOptions): Promise<Pre
   ];
   const inRepo = (args: string[]) => exec(['-C', repoContainerPath, ...args]);
   const network = (args: string[]) => exec(['-C', repoContainerPath, ...authArgs, ...args]);
+
+  // Do this before treating a clean top-level status as permission to reclaim:
+  // an embedded repository can be invisible to the parent worktree entirely.
+  const nestedDirty = await dirtyNestedRepositories(run, repoContainerPath);
+  if (nestedDirty.length) {
+    const normalizedRoot = repoContainerPath.replace(/\/+$/, '') || '/';
+    const rootPrefix = normalizedRoot === '/' ? '/' : `${normalizedRoot}/`;
+    const displayPaths = nestedDirty.map((nestedRoot) => nestedRoot.startsWith(rootPrefix)
+      ? nestedRoot.slice(rootPrefix.length)
+      : nestedRoot);
+    throw new PreserveError(`Nested repository work is not preserved by the top-level WIP commit (${displayPaths.join(', ')}); commit or back up that work, then retry recovery, or discard explicitly`);
+  }
 
   let status: string;
   try {
