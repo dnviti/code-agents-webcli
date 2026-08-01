@@ -334,6 +334,15 @@ export function createDeployTargetRoutes(deps: DeployTargetRoutesDeps): Router {
       return;
     }
 
+    const projects = deps.projectIdsForTarget(id);
+    if (projects.length > 0) {
+      res.status(409).json({
+        error: 'target_in_use',
+        message: `This target is still recorded by ${projects.length} project(s). Remove those projects first.`,
+        projects,
+      });
+      return;
+    }
     // A target with containers still standing is not deletable: deleting it
     // would orphan work nobody can then reach. Ask every engine the manager
     // can still reach — including ones retained for containers of edited
@@ -351,15 +360,6 @@ export function createDeployTargetRoutes(deps: DeployTargetRoutesDeps): Router {
         error: 'target_in_use',
         message: `This target still runs ${inUse.length} container(s): ${inUse.join(', ')}. Stop or remove them first.`,
         containers: inUse,
-      });
-      return;
-    }
-    const projects = deps.projectIdsForTarget(id);
-    if (projects.length > 0) {
-      res.status(409).json({
-        error: 'target_in_use',
-        message: `This target is still recorded by ${projects.length} project(s). Remove those projects first.`,
-        projects,
       });
       return;
     }
