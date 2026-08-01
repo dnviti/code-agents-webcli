@@ -135,6 +135,12 @@ export interface WrappedProcessControl {
 
 export interface WrapOptions {
   cwd?: string;
+  /**
+   * `host` is the long-standing default. `container` is explicit for a
+   * project session whose cwd is in the image layer (for example `/tmp`), so
+   * an absolute string is never guessed as one namespace or the other.
+   */
+  cwdKind?: 'host' | 'container';
   /** Variables the program should see. In container mode these become `-e` flags. */
   env?: Record<string, string>;
   /** Whether the wrapped process needs a TTY (`exec -t`). PTY spawns do; pipes do not. */
@@ -149,9 +155,9 @@ export interface WrapOptions {
 /**
  * Where one user's processes run and where their files live.
  *
- * `homeDir` is always a *host* path: the file browser, editor, uploads and git
- * keep using ordinary `fs`, because the container's home is a bind mount of that
- * directory rather than a copy inside an image layer.
+ * `homeDir` is always a host-backed path. Generic filesystem consumers may use
+ * ordinary `fs` only for host-kind cwd values; an explicit container-kind cwd
+ * can point anywhere in the image and must use the engine-backed project API.
  */
 export interface UserEnvironment {
   readonly kind: 'host' | 'container';

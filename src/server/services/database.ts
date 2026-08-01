@@ -513,9 +513,14 @@ export class AppDatabase {
         state TEXT NOT NULL,
         state_detail TEXT,
         container_json TEXT,
+        /* A durable lifecycle fact, not a human-readable state_detail: the
+         * retained checkout must be preserved, wiped and freshly cloned on
+         * the next build. */
+        rebuild_required INTEGER NOT NULL DEFAULT 0,
         build_log_json TEXT,
         last_activity_at TEXT NOT NULL,
         last_preserved_commit TEXT,
+        last_preserved_branch TEXT,
         composition_revision TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -526,6 +531,23 @@ export class AppDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_projects_state
         ON projects(state);
+
+      /*
+       * A lease exists only while a runtime or browser attachment is admitted
+       * to a project. Rows, rather than a mutable counter, make the refcount
+       * auditable and idempotently releasable. Lifecycle claims change the
+       * project state in the same BEGIN IMMEDIATE transaction that verifies
+       * this table is empty, closing admission before an engine stop begins.
+       */
+      CREATE TABLE IF NOT EXISTS project_session_leases (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_project_session_leases_project
+        ON project_session_leases(project_id);
 
       /*
        * One credential per user per git host per kind: what clone and the
@@ -557,11 +579,22 @@ export class AppDatabase {
     // every row written before projects existed is a project-less session,
     // which is today's behaviour and must keep meaning exactly that.
     this.addColumnIfMissing('runtime_sessions', 'project_id', 'TEXT REFERENCES projects(id)');
+    // Null means every pre-project-session row and is interpreted as the
+    // legacy host path. A non-null discriminator prevents `/tmp` being guessed
+    // as a host path when a project terminal/file browser uses image storage.
     this.addColumnIfMissing(
       'runtime_sessions',
       'project_working_dir_kind',
       "TEXT CHECK (project_working_dir_kind IN ('host', 'container'))",
     );
+    // A missing recorded environment is different from an ordinary stopped
+    // one (notably Kubernetes stops delete Pods). Keep that distinction as a
+    // durable fact so recovery never has to infer it from prose state_detail.
+    this.addColumnIfMissing('projects', 'rebuild_required', 'INTEGER NOT NULL DEFAULT 0');
+    // The commit alone is insufficient when preservation had to choose a
+    // collision suffix. Keep the exact recovery ref across later build-log
+    // resets and server restarts.
+    this.addColumnIfMissing('projects', 'last_preserved_branch', 'TEXT');
 
     // Which surface a session runs on. Added after the fact, so it is nullable
     // and a null reads as 'terminal' — every row that predates chat mode is a

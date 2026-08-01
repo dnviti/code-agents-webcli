@@ -43,6 +43,16 @@ export const USER_ID_LABEL = 'com.code-agents-webcli.user-id';
 export const LOGIN_LABEL = 'com.code-agents-webcli.login';
 export { TARGET_LABEL };
 
+const OWNER_HOME_MAP_DIR = '.owner-homes';
+
+interface OwnerHomeIdentity {
+  /** Existing user-container name and legacy host-directory basename. */
+  name: string;
+  hostPath: string;
+  /** Kept immutable because tools often persist absolute paths under $HOME. */
+  containerPath: string;
+}
+
 /** Which deploy target an `ensureFor` should place new work on. */
 export interface ActiveTargetResolution {
   /** The target id, or `'legacy'` for the startup-flag configuration. */
@@ -197,7 +207,17 @@ export class ContainerEnvironment implements UserEnvironment {
   }
 
   wrap(command: string, args: string[], options: WrapOptions = {}): WrappedCommand {
-    const cwd = options.cwd ? this.toContainerPath(options.cwd) : this.containerHome;
+    let cwd = this.containerHome;
+    if (options.cwd) {
+      if (options.cwdKind === 'container') {
+        if (options.cwd.includes('\0') || !path.posix.isAbsolute(options.cwd)) {
+          throw new Error('Container cwd must be an absolute path');
+        }
+        cwd = path.posix.normalize(options.cwd);
+      } else {
+        cwd = this.toContainerPath(options.cwd);
+      }
+    }
     const tracked = options.trackProcess
       ? trackContainerProcess(
           this.engine,
@@ -209,7 +229,13 @@ export class ContainerEnvironment implements UserEnvironment {
         )
       : null;
     const execArgs = this.engine.execArgs(
-      { name: this.name, cwd, env: options.env, tty: options.tty },
+      {
+        name: this.name,
+        identity: this.identity,
+        cwd,
+        env: options.env,
+        tty: options.tty,
+      },
       tracked?.command || command,
       tracked?.args || args,
     );
@@ -420,6 +446,58 @@ export class EnvironmentManager {
   }
 
   /**
+   * Resolve a project container's recorded placement.  Unlike user ensures,
+   * this deliberately never consults the active target: moving the active
+   * target must not make an existing project's container run somewhere else.
+   */
+  projectTarget(targetId: string | null): ActiveTargetResolution & { engine: EnvironmentEngine } {
+    const key = targetId || 'legacy';
+    const config = key === 'legacy' ? this.configForKey(key) : this.configs.get(key);
+    const engine = key === 'legacy' ? this.engineForKey(key) : this.engines.get(key);
+    if (!config || !engine) {
+      throw new Error(`recorded deploy target '${key}' is no longer reachable`);
+    }
+    if (config.engine !== 'kubernetes' && config.hostArgs?.length) {
+      throw new Error(`project workspaces do not support remote ${config.engine} bind mounts`);
+    }
+    return { key, config, engine };
+  }
+
+  /** The only placement used for a new project. */
+  activeProjectTarget(): ActiveTargetResolution & { engine: EnvironmentEngine } {
+    const active = this.resolveActiveTarget();
+    if (!active) {
+      throw new Error('no active deploy target: an administrator must activate one before new work can start');
+    }
+    if (!active.config.enabled) {
+      throw new Error('project environments are disabled: configure and activate a deploy target first');
+    }
+    if (active.config.engine !== 'kubernetes' && active.config.hostArgs?.length) {
+      throw new Error(`project workspaces do not support remote ${active.config.engine} bind mounts`);
+    }
+    return { ...active, engine: this.engineForKey(active.key) };
+  }
+
+  /**
+   * The durable owner-home path as seen from one target.  Projects mount this
+   * alongside their own workspace so rebuilding a project never costs a user
+   * their sign-in or home-directory state.
+   */
+  ownerHomeOnTarget(owner: EnvironmentOwner, targetId: string | null): {
+    hostPath: string;
+    containerPath: string;
+  } {
+    const target = this.projectTarget(targetId);
+    const identity = this.ownerHomeForConfig(target.config, owner);
+    return { hostPath: identity.hostPath, containerPath: identity.containerPath };
+  }
+
+  /** Durable root shared by project workspaces placed on one target. */
+  projectStorageRoot(targetId: string | null): string {
+    return path.join(this.projectTarget(targetId).config.rootDir, 'projects');
+  }
+
+  /**
    * Install a new set of targets.
    *
    * Engines that still own known containers are retained even when the new
@@ -490,6 +568,11 @@ export class EnvironmentManager {
     return this.intendedTier(this.resolveActiveTarget()?.config || this.config, userId);
   }
 
+  /** Resolve a user's tier against a recorded target, never today's active one. */
+  intendedTierOnTarget(userId: number, targetId: string | null): EnvironmentTier | null {
+    return this.intendedTier(this.projectTarget(targetId).config, userId);
+  }
+
   private intendedTier(config: ContainerConfig, userId: number): EnvironmentTier | null {
     return resolveTier(
       config.tiers,
@@ -527,11 +610,13 @@ export class EnvironmentManager {
   }
 
   nameFor(owner: EnvironmentOwner): string {
-    return environmentName(this.config.namePrefix, owner);
+    const config = this.resolveActiveTarget()?.config || this.config;
+    return this.ownerHomeForConfig(config, owner).name;
   }
 
   homeDirFor(owner: EnvironmentOwner): string {
-    return path.join(this.config.rootDir, this.nameFor(owner));
+    const config = this.resolveActiveTarget()?.config || this.config;
+    return this.ownerHomeForConfig(config, owner).hostPath;
   }
 
   /**
@@ -573,7 +658,7 @@ export class EnvironmentManager {
       return this.hostEnvironment;
     }
 
-    const name = environmentName(placement.config.namePrefix, owner);
+    const name = this.ownerHomeForConfig(placement.config, owner).name;
     const priorTarget = this.containerTarget.get(name);
     const priorPlacement = this.containerPlacement.get(name);
 
@@ -646,7 +731,7 @@ export class EnvironmentManager {
     }
 
     while (true) {
-      const name = environmentName(active.config.namePrefix, owner);
+      const name = this.ownerHomeForConfig(active.config, owner).name;
       const known = this.containerPlacement.get(name);
       if (known) {
         return { ...known, config: this.configForContainer(name) };
@@ -677,7 +762,7 @@ export class EnvironmentManager {
       if (!current.config.enabled) {
         return null;
       }
-      if (environmentName(current.config.namePrefix, owner) !== name) {
+      if (this.ownerHomeForConfig(current.config, owner).name !== name) {
         active = current;
         continue;
       }
@@ -949,9 +1034,10 @@ export class EnvironmentManager {
   ): Promise<UserEnvironment> {
     const config = active.config;
     const engine = active.engine;
-    const name = environmentName(config.namePrefix, owner);
-    const homeDir = path.join(config.rootDir, name);
-    const containerHome = containerHomeFor(owner);
+    const identity = this.ownerHomeForConfig(config, owner);
+    const name = identity.name;
+    const homeDir = identity.hostPath;
+    const containerHome = identity.containerPath;
 
     // 0700: the isolation claim has to hold on the host too, not only inside
     // the container. Created before the container so the bind mount never
@@ -1028,6 +1114,94 @@ export class EnvironmentManager {
     this.pendingRebuild.delete(owner.id);
     this.lastUsed.set(owner.id, this.now());
     return environment;
+  }
+
+  /**
+   * Resolve the durable owner home from an immutable user-id pointer.
+   *
+   * The pointed-to path deliberately keeps the original login-derived shape:
+   * existing #167 containers can keep their mount and their in-container HOME
+   * unchanged. The pointer filename, not the mutable login, is the identity.
+   * When upgrading an existing installation after a login rename, a single
+   * validated legacy directory is discovered. Multiple candidates fail closed.
+   */
+  private ownerHomeForConfig(config: ContainerConfig, owner: EnvironmentOwner): OwnerHomeIdentity {
+    if (!Number.isSafeInteger(owner.id) || owner.id <= 0) {
+      throw new Error('environment owner id must be a positive integer');
+    }
+    const root = path.resolve(config.rootDir);
+    const mapDir = path.join(root, OWNER_HOME_MAP_DIR);
+    const pointerPath = path.join(mapDir, `${owner.id}.json`);
+    const readPointer = (): OwnerHomeIdentity | null => {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(pointerPath, 'utf8')) as {
+          name?: unknown;
+          containerPath?: unknown;
+        };
+        return this.validateOwnerHomeIdentity(root, owner.id, parsed.name, parsed.containerPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw new Error(`owner home mapping for user ${owner.id} is invalid: ${(error as Error).message}`);
+      }
+    };
+    const recorded = readPointer();
+    if (recorded) return recorded;
+
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    const suffix = `-${owner.id}`;
+    const candidates = fs.readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name !== OWNER_HOME_MAP_DIR && entry.name.endsWith(suffix))
+      .map((entry) => entry.name);
+    if (candidates.length > 1) {
+      throw new Error(`owner home mapping for user ${owner.id} is ambiguous`);
+    }
+
+    fs.mkdirSync(mapDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(mapDir, 0o700);
+
+    const name = candidates[0] || environmentName(config.namePrefix, owner);
+    const legacyContainerName = name.startsWith(`${config.namePrefix}-`)
+      ? name.slice(config.namePrefix.length + 1)
+      : null;
+    const containerPath = legacyContainerName && legacyContainerName.endsWith(suffix)
+      ? `/home/${legacyContainerName}`
+      : containerHomeFor(owner);
+    const identity = this.validateOwnerHomeIdentity(root, owner.id, name, containerPath);
+    const payload = `${JSON.stringify({ version: 1, name, containerPath })}\n`;
+    try {
+      fs.writeFileSync(pointerPath, payload, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const raced = readPointer();
+      if (!raced) throw new Error(`owner home mapping for user ${owner.id} disappeared during creation`);
+      return raced;
+    }
+    return identity;
+  }
+
+  private validateOwnerHomeIdentity(
+    root: string,
+    ownerId: number,
+    rawName: unknown,
+    rawContainerPath: unknown,
+  ): OwnerHomeIdentity {
+    if (typeof rawName !== 'string' || path.basename(rawName) !== rawName || rawName === OWNER_HOME_MAP_DIR) {
+      throw new Error('host directory is not a safe root child');
+    }
+    const suffix = `-${ownerId}`;
+    if (!rawName.endsWith(suffix) || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(rawName)) {
+      throw new Error('host directory does not belong to this immutable user id');
+    }
+    if (
+      typeof rawContainerPath !== 'string'
+      || path.posix.dirname(rawContainerPath) !== '/home'
+      || !path.posix.basename(rawContainerPath).endsWith(suffix)
+    ) {
+      throw new Error('container home does not belong to this immutable user id');
+    }
+    const hostPath = path.resolve(root, rawName);
+    if (path.dirname(hostPath) !== root) throw new Error('host directory escapes its target root');
+    return { name: rawName, hostPath, containerPath: rawContainerPath };
   }
 
   /**

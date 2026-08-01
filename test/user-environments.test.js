@@ -49,7 +49,7 @@ function managedInspect(args, status, userId, login = 'user') {
     return { stdout: `${status}\n`, stderr: '' };
   }
   return {
-    stdout: `${status}\texample/image:1\t${JSON.stringify({
+    stdout: `container-${userId}\t${status}\texample/image:1\t${JSON.stringify({
       [MANAGED_LABEL]: 'true',
       [USER_ID_LABEL]: String(userId),
       [LOGIN_LABEL]: login,
@@ -213,13 +213,14 @@ describe('per-user environments', function () {
     it('reads attributes through inspect, not off a ps row', async function () {
       const { engine, calls } = fakeEngine('podman', {
         inspect: async () => ({
-          stdout: 'running\talpine:3\t{"com.code-agents-webcli.login":"alice"}\n',
+          stdout: 'immutable-id\trunning\talpine:3\t{"com.code-agents-webcli.login":"alice"}\n',
           stderr: '',
         }),
       });
       const described = await engine.describe('box');
       assert.deepStrictEqual(described, {
         name: 'box',
+        identity: 'immutable-id',
         status: 'running',
         image: 'alpine:3',
         labels: { 'com.code-agents-webcli.login': 'alice' },
@@ -260,9 +261,9 @@ describe('per-user environments', function () {
 
     it('does not turn malformed inspect labels into strict absence', async function () {
       const { engine } = fakeEngine('docker', {
-        inspect: async () => ({ stdout: 'running\timg\t{broken\n', stderr: '' }),
+        inspect: async () => ({ stdout: 'box-id\trunning\timg\t{broken\n', stderr: '' }),
       });
-      await assert.rejects(engine.describeStrict('box'), /invalid labels/);
+      await assert.rejects(engine.describeStrict('box'), /malformed labels/);
       assert.strictEqual(await engine.describe('box'), null);
     });
 
@@ -286,6 +287,72 @@ describe('per-user environments', function () {
       );
       assert.strictEqual(calls.some((call) => call.args[0] === 'start'), false);
       assert.strictEqual(calls.some((call) => call.args[0] === 'run'), false);
+    });
+
+    it('does not confuse transport failure or malformed output with strict absence', async function () {
+      const uncertain = fakeEngine('docker', { inspect: async () => { throw new Error('daemon timeout'); } }).engine;
+      await assert.rejects(() => uncertain.describeStrict('box'), /could not inspect.*timeout/i);
+      assert.strictEqual(await uncertain.describe('box'), null);
+      const malformed = fakeEngine('docker', { inspect: async () => ({ stdout: 'garbage', stderr: '' }) }).engine;
+      await assert.rejects(() => malformed.describeStrict('box'), /malformed inspection/i);
+      assert.strictEqual(await malformed.describe('box'), null);
+    });
+
+    it('targets immutable identity and detects a same-name replacement during stop', async function () {
+      let inspection = 0;
+      const { engine, calls } = fakeEngine('docker', {
+        stop: async () => ({ stdout: '', stderr: '' }),
+        inspect: async () => ({ stdout: `${inspection++ ? 'replacement-id' : 'original-id'}\trunning\timg\t{}\n`, stderr: '' }),
+      });
+      const original = await engine.describe('box');
+      await assert.rejects(() => engine.stopIdentity(original), /replaced during stop/);
+      assert.ok(calls.find((call) => call.args[0] === 'stop').args.includes('original-id'));
+    });
+
+    it('fails closed when stop leaves the same container potentially executable', async function () {
+      for (const status of ['restarting', 'paused', 'unknown']) {
+        const { engine, calls } = fakeEngine('docker', {
+          stop: async () => ({ stdout: '', stderr: '' }),
+          inspect: async () => ({ stdout: `original-id\t${status}\timg\t{}\n`, stderr: '' }),
+        });
+        await assert.rejects(
+          () => engine.stopIdentity({ name: 'box', identity: 'original-id', status: 'running', image: 'img', labels: {} }),
+          new RegExp(`potentially executable.*${status}`, 'i'),
+        );
+        assert.ok(calls.find((call) => call.args[0] === 'stop').args.includes('original-id'));
+      }
+    });
+
+    it('accepts only a proven quiescent same-identity state after stop', async function () {
+      const { engine } = fakeEngine('podman', {
+        stop: async () => ({ stdout: '', stderr: '' }),
+        inspect: async () => ({ stdout: 'original-id\texited\timg\t{}\n', stderr: '' }),
+      });
+      await engine.stopIdentity({ name: 'box', identity: 'original-id', status: 'running', image: 'img', labels: {} });
+    });
+
+    it('never starts a stopped same-name replacement during identity-safe ensure', async function () {
+      const { engine, calls } = fakeEngine('docker', {
+        inspect: async () => ({ stdout: 'replacement-id\texited\timg\t{}\n', stderr: '' }),
+      });
+      await assert.rejects(() => engine.ensureIdentity({ name: 'box' }, { name: 'box', identity: 'original-id', status: 'exited', image: 'img', labels: {} }), /replaced before ensure/);
+      assert.strictEqual(calls.some((call) => call.args[0] === 'start'), false);
+    });
+
+    it('returns and verifies the immutable ID emitted by fresh creation', async function () {
+      let inspection = 0;
+      const { engine } = fakeEngine('docker', {
+        inspect: async () => {
+          if (inspection++ === 0) throw new Error('No such object');
+          return { stdout: 'created-id\trunning\timg\t{}\n', stderr: '' };
+        },
+        run: async () => ({ stdout: 'created-id\n', stderr: '' }),
+      });
+      const spec = {
+        name: 'box', image: 'img', containerHome: '/workspace', cpus: null, memory: null,
+        labels: {}, env: {}, mounts: [],
+      };
+      assert.deepStrictEqual(await engine.ensureIdentity(spec, null), { created: true, identity: 'created-id' });
     });
 
     it('never passes user text through a shell', function () {
@@ -625,7 +692,7 @@ describe('per-user environments', function () {
           const name = args[args.length - 1];
           const [status, id, login] = owners[name];
           return {
-            stdout: `${status}\texample/image:1\t${JSON.stringify({
+            stdout: `${name}-id\t${status}\texample/image:1\t${JSON.stringify({
               [MANAGED_LABEL]: 'true',
               [USER_ID_LABEL]: String(id),
               [LOGIN_LABEL]: login,

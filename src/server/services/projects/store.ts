@@ -61,9 +61,12 @@ export interface Project {
   state: ProjectState;
   stateDetail: string | null;
   container: ProjectContainerInfo | null;
+  /** True only when retained workspace bytes must be replaced on next build. */
+  rebuildRequired: boolean;
   buildLog: BuildEvent[];
   lastActivityAt: string;
   lastPreservedCommit: string | null;
+  lastPreservedBranch: string | null;
   compositionRevision: string | null;
   createdAt: string;
   updatedAt: string;
@@ -82,6 +85,7 @@ export interface CreateProjectInput {
 export interface RunningProjectInfo {
   id: string;
   name: string;
+  state: ProjectState;
   lastActivityAt: string;
   /** Active sessions in it — the signal that a swap must never stop it. */
   hasActiveWork: boolean;
@@ -100,6 +104,14 @@ export type StartAttempt =
       /** Present when reason is `run_limit`: what the user is running now. */
       running?: RunningProjectInfo[];
     };
+
+export type LifecycleClaim =
+  | { ok: true; project: Project }
+  | { ok: false; reason: 'not_found' | 'invalid_state' | 'active_work' | 'not_idle' };
+
+export type SessionLeaseAttempt =
+  | { ok: true; leaseId: string }
+  | { ok: false; reason: 'not_found' | 'invalid_state' };
 
 export interface ConnectedHost {
   id: string;
@@ -178,10 +190,10 @@ export class ProjectStore {
       .prepare(
         `INSERT INTO projects (
           id, owner_user_id, name, repo_url, repo_host, target_id, tier_id,
-          state, state_detail, container_json, build_log_json,
-          last_activity_at, last_preserved_commit, composition_revision,
+          state, state_detail, container_json, rebuild_required, build_log_json,
+          last_activity_at, last_preserved_commit, last_preserved_branch, composition_revision,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'stopped', 'created, not built yet', NULL, NULL, ?, NULL, NULL, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'stopped', 'created, not built yet', NULL, 0, NULL, ?, NULL, NULL, NULL, ?, ?)`,
       )
       .run(
         id,
@@ -233,6 +245,22 @@ export class ProjectStore {
     return rows.map(toProject);
   }
 
+  /** Every project whose recorded container must be checked during boot recovery. */
+  listProjectsWithContainers(): Project[] {
+    const rows = this.db.raw
+      .prepare('SELECT * FROM projects WHERE container_json IS NOT NULL')
+      .all() as ProjectRow[];
+    return rows.map(toProject);
+  }
+
+  /** Project ids retaining a target, used to guard admin edits/deletion. */
+  projectIdsForTarget(targetId: string): string[] {
+    const rows = this.db.raw
+      .prepare('SELECT id FROM projects WHERE target_id = ? ORDER BY created_at ASC')
+      .all(targetId) as Array<{ id: string }>;
+    return rows.map((row) => row.id);
+  }
+
   /** Display fields only; state and placement are not editable here. */
   updateProject(
     id: string,
@@ -269,6 +297,13 @@ export class ProjectStore {
       .run(container ? JSON.stringify(container) : null, new Date().toISOString(), id);
   }
 
+  /** Mark (or clear) a true workspace replacement requirement durably. */
+  setRebuildRequired(id: string, required: boolean): void {
+    this.db.raw
+      .prepare('UPDATE projects SET rebuild_required = ?, updated_at = ? WHERE id = ?')
+      .run(required ? 1 : 0, new Date().toISOString(), id);
+  }
+
   /**
    * Record activity. Activity is what keeps a project out of the idle sweep,
    * and the sweep is the only reason this timestamp exists.
@@ -279,10 +314,10 @@ export class ProjectStore {
       .run((when ?? new Date()).toISOString(), new Date().toISOString(), id);
   }
 
-  recordPreservedCommit(id: string, commit: string): void {
+  recordPreservation(id: string, branch: string, commit: string): void {
     this.db.raw
-      .prepare('UPDATE projects SET last_preserved_commit = ?, updated_at = ? WHERE id = ?')
-      .run(commit, new Date().toISOString(), id);
+      .prepare('UPDATE projects SET last_preserved_branch = ?, last_preserved_commit = ?, updated_at = ? WHERE id = ?')
+      .run(branch, commit, new Date().toISOString(), id);
   }
 
   deleteProject(id: string): void {
@@ -311,10 +346,14 @@ export class ProjectStore {
     const rows = this.db.raw
       .prepare(
         `SELECT p.id, p.name, p.last_activity_at,
-           EXISTS(
+           p.state,
+           (EXISTS(
              SELECT 1 FROM runtime_sessions s
              WHERE s.project_id = p.id AND s.active = 1
-           ) AS has_active_work
+           ) OR EXISTS(
+             SELECT 1 FROM project_session_leases l
+             WHERE l.project_id = p.id
+           )) AS has_active_work
          FROM projects p
          WHERE p.owner_user_id = ? AND p.state IN (${marks})
          ORDER BY p.last_activity_at ASC`,
@@ -322,12 +361,14 @@ export class ProjectStore {
       .all(ownerUserId, ...COUNTED_STATES) as Array<{
       id: string;
       name: string;
+      state: ProjectState;
       last_activity_at: string;
       has_active_work: number;
     }>;
     return rows.map((row) => ({
       id: row.id,
       name: row.name,
+      state: row.state,
       lastActivityAt: row.last_activity_at,
       hasActiveWork: Boolean(row.has_active_work),
     }));
@@ -363,6 +404,7 @@ export class ProjectStore {
         return { ok: false, reason: 'invalid_state' };
       }
 
+      let stopCandidate: string | null = null;
       if (input.stopProjectId) {
         const candidate = this.db.raw
           .prepare('SELECT state FROM projects WHERE id = ? AND owner_user_id = ?')
@@ -376,13 +418,20 @@ export class ProjectStore {
         if (busy) {
           return { ok: false, reason: 'stop_candidate_busy' };
         }
-        this.setState(input.stopProjectId, 'stopped');
-        this.touchActivity(input.stopProjectId);
+        stopCandidate = input.stopProjectId;
       }
 
-      const count = this.countRunning(input.ownerUserId);
+      // Do not stop the candidate until every condition has passed.  A lowered
+      // limit can leave a user already over quota; a swap must not silently
+      // take one project down merely to return the same run-limit error.
+      const count = this.countRunning(input.ownerUserId) - (stopCandidate ? 1 : 0);
       if (count >= input.limit) {
         return { ok: false, reason: 'run_limit', running: this.runningProjects(input.ownerUserId) };
+      }
+
+      if (stopCandidate) {
+        this.setState(stopCandidate, 'stopped');
+        this.touchActivity(stopCandidate);
       }
 
       const now = new Date().toISOString();
@@ -399,9 +448,102 @@ export class ProjectStore {
   /** Whether any session row says work is live in this project. */
   projectHasActiveSessions(projectId: string): boolean {
     const row = this.db.raw
-      .prepare('SELECT 1 AS x FROM runtime_sessions WHERE project_id = ? AND active = 1 LIMIT 1')
-      .get(projectId) as { x: number } | undefined;
+      .prepare(
+        `SELECT 1 AS x
+           WHERE EXISTS(
+             SELECT 1 FROM runtime_sessions WHERE project_id = ? AND active = 1
+           ) OR EXISTS(
+             SELECT 1 FROM project_session_leases WHERE project_id = ?
+           )`,
+      )
+      .get(projectId, projectId) as { x: number } | undefined;
     return Boolean(row);
+  }
+
+  /**
+   * Atomically admit one runtime/attachment while the project is runnable.
+   * A stop/swap transaction either observes this row and refuses, or changes
+   * state first so this acquisition refuses; there is no observation gap.
+   */
+  tryAcquireSessionLease(projectId: string, ownerUserId: number): SessionLeaseAttempt {
+    return immediateTransaction(this.db.raw, (): SessionLeaseAttempt => {
+      const project = this.getProjectForUser(projectId, ownerUserId);
+      if (!project) return { ok: false, reason: 'not_found' };
+      if (project.state !== 'running') return { ok: false, reason: 'invalid_state' };
+      const leaseId = randomUUID();
+      this.db.raw
+        .prepare(
+          `INSERT INTO project_session_leases (id, project_id, owner_user_id, created_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(leaseId, projectId, ownerUserId, new Date().toISOString());
+      this.touchActivity(projectId);
+      return { ok: true, leaseId };
+    });
+  }
+
+  /** Release is exact and idempotent, suitable for both detach and exit finalizers. */
+  releaseSessionLease(projectId: string, ownerUserId: number, leaseId: string): boolean {
+    return immediateTransaction(this.db.raw, () => {
+      const result = this.db.raw
+        .prepare(
+          `DELETE FROM project_session_leases
+           WHERE id = ? AND project_id = ? AND owner_user_id = ?`,
+        )
+        .run(leaseId, projectId, ownerUserId);
+      if (result.changes > 0) this.touchActivity(projectId);
+      return result.changes > 0;
+    });
+  }
+
+  /**
+   * Leases describe this server process's live runtimes/connections. Call only
+   * during boot recovery, after old runtimes are known dead and before new
+   * project session admission opens.
+   */
+  clearSessionLeases(): number {
+    return this.db.raw.prepare('DELETE FROM project_session_leases').run().changes;
+  }
+
+  /**
+   * Atomically close admission for a stop before the engine is touched.
+   * `reclaiming` doubles as the short-lived stopping claim: it remains counted,
+   * and session creation cannot mistake it for a runnable project.
+   */
+  tryClaimStop(input: {
+    projectId: string;
+    ownerUserId: number;
+    idleBefore?: Date;
+  }): LifecycleClaim {
+    return immediateTransaction(this.db.raw, (): LifecycleClaim => {
+      const project = this.getProjectForUser(input.projectId, input.ownerUserId);
+      if (!project) return { ok: false, reason: 'not_found' };
+      if (project.state !== 'running') return { ok: false, reason: 'invalid_state' };
+      if (input.idleBefore && project.lastActivityAt > input.idleBefore.toISOString()) {
+        return { ok: false, reason: 'not_idle' };
+      }
+      if (this.projectHasActiveSessions(project.id)) return { ok: false, reason: 'active_work' };
+      this.setState(project.id, 'reclaiming', 'Stopping project environment');
+      return { ok: true, project };
+    });
+  }
+
+  /** Claim an idle stopped row so a stale sweep snapshot cannot reclaim a restart. */
+  tryClaimIdleReclaim(input: {
+    projectId: string;
+    ownerUserId: number;
+    idleBefore: Date;
+  }): LifecycleClaim {
+    return immediateTransaction(this.db.raw, (): LifecycleClaim => {
+      const project = this.getProjectForUser(input.projectId, input.ownerUserId);
+      if (!project) return { ok: false, reason: 'not_found' };
+      if (project.state !== 'stopped') return { ok: false, reason: 'invalid_state' };
+      if (project.lastActivityAt > input.idleBefore.toISOString()) return { ok: false, reason: 'not_idle' };
+      if (this.projectHasActiveSessions(project.id)) return { ok: false, reason: 'active_work' };
+      this.setState(project.id, 'reclaiming', 'Reclaiming idle project workspace');
+      this.setRebuildRequired(project.id, true);
+      return { ok: true, project };
+    });
   }
 
   /* ------------------------------------------------------------------ */
@@ -544,9 +686,11 @@ interface ProjectRow {
   state: string;
   state_detail: string | null;
   container_json: string | null;
+  rebuild_required: number | null;
   build_log_json: string | null;
   last_activity_at: string;
   last_preserved_commit: string | null;
+  last_preserved_branch: string | null;
   composition_revision: string | null;
   created_at: string;
   updated_at: string;
@@ -564,9 +708,11 @@ function toProject(row: ProjectRow): Project {
     state: row.state as ProjectState,
     stateDetail: row.state_detail,
     container: parseJson<ProjectContainerInfo | null>(row.container_json, null),
+    rebuildRequired: Boolean(row.rebuild_required),
     buildLog: parseJson<BuildEvent[]>(row.build_log_json, []),
     lastActivityAt: row.last_activity_at,
     lastPreservedCommit: row.last_preserved_commit,
+    lastPreservedBranch: row.last_preserved_branch,
     compositionRevision: row.composition_revision,
     createdAt: row.created_at,
     updatedAt: row.updated_at,

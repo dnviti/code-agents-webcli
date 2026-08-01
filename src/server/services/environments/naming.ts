@@ -56,12 +56,14 @@ export const PROJECT_LABEL = 'com.code-agents-webcli.project';
  *
  * A project's UUID is not a number, and the shared `environmentName` shape —
  * prefix, slug, trailing id that no login fragment can impersonate — wants
- * one. Eight hex characters of the id's SHA-256 read as a uint32 is stable
+ * one. Twelve hex characters of the id's SHA-256 read as a safe integer are stable
  * across restarts, unique in practice, and says nothing about the id itself.
  */
 export function projectNameHash(projectId: string): number {
-  const digest = createHash('sha256').update(projectId).digest('hex').slice(0, 8);
-  return Number.parseInt(digest, 16) >>> 0;
+  // Twelve hex digits keep the suffix inside Number.MAX_SAFE_INTEGER while
+  // raising the collision space from 32 to 48 bits.
+  const digest = createHash('sha256').update(projectId).digest('hex').slice(0, 12);
+  return Number.parseInt(digest, 16);
 }
 
 /**
