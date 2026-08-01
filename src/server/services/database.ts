@@ -514,6 +514,18 @@ export class AppDatabase {
     // renaming outlived the page that did it.
     this.addColumnIfMissing('runtime_sessions', 'custom_name', 'TEXT');
 
+    // Whether this session is in its owner's shared tab strip. Nullable for a
+    // backward-readable additive migration: every row from before tabs were
+    // account-scoped carries null, and null reads as the historical answer —
+    // open — while remaining distinguishable during the one-time migration of
+    // browser-local closes. INTEGER because SQLite has no boolean.
+    this.addColumnIfMissing('runtime_sessions', 'tab_open', 'INTEGER');
+
+    // The account-owned position of a standalone tab. Older rows remain null
+    // and retain their stable load order until the first explicit reorder.
+    // INTEGER is sufficient: positions are compact ordinals, not timestamps.
+    this.addColumnIfMissing('runtime_sessions', 'tab_order', 'INTEGER');
+
     // Which project — which working folder, by name — a recorded job ran in.
     // Nullable and null-by-default, and the null is load-bearing: work filed
     // before this column existed ran somewhere nobody wrote down, and the

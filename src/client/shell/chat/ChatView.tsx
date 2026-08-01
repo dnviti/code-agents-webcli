@@ -28,6 +28,7 @@ import { Icon } from '../../ui/relay/Icon.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
 import { showNotification } from '../../ui/notifications.js';
 import { PhoneContext } from '../../ui/touch.js';
+import { visualViewportKeyboardInset } from '../../ui/keyboard-viewport.js';
 import { FloatingMenu } from '../FloatingMenu.js';
 import { KEY_STRIP_HEIGHT } from '../KeyStrip.js';
 import { Composer } from './Composer.js';
@@ -1831,7 +1832,7 @@ function useKeyboardInset(isMobile: boolean): number {
     if (!viewport) return;
 
     const apply = () => {
-      const covered = window.innerHeight - viewport.height;
+      const covered = visualViewportKeyboardInset(viewport);
       if (covered <= KEYBOARD_MIN_INSET_PX) {
         setInset(0);
         return;
@@ -1842,9 +1843,13 @@ function useKeyboardInset(isMobile: boolean): number {
     apply();
     viewport.addEventListener('resize', apply);
     viewport.addEventListener('scroll', apply);
+    document.addEventListener('focusin', apply);
+    document.addEventListener('focusout', apply);
     return () => {
       viewport.removeEventListener('resize', apply);
       viewport.removeEventListener('scroll', apply);
+      document.removeEventListener('focusin', apply);
+      document.removeEventListener('focusout', apply);
     };
   }, [isMobile]);
 

@@ -123,6 +123,10 @@ async function resumeConversation(app: App, conversation: ResumableConversation)
 
   try {
     if (app.sessionTabManager) {
+      const reopened = await app.sessionTabManager.reopenSession(conversation.id);
+      if (!reopened) {
+        throw new Error('That conversation was closed on another device');
+      }
       app.sessionTabManager.addTab(
         conversation.id,
         conversation.name,
@@ -220,7 +224,17 @@ async function openStoredConversation(
 ): Promise<void> {
   try {
     const tabs = app.sessionTabManager;
-    if (tabs?.tabs.has(conversation.id)) {
+    const alreadyOpenHere = tabs?.tabs.has(conversation.id) === true;
+    // Always restate the account-level open state, even when this window has a
+    // stale local tab from a close announcement it missed while disconnected.
+    // Switching that stale copy alone would leave every other device closed.
+    if (tabs) {
+      const reopened = await tabs.reopenSession(conversation.id);
+      if (!reopened) {
+        throw new Error('That conversation was closed on another device');
+      }
+    }
+    if (alreadyOpenHere && tabs) {
       await tabs.switchToTab(conversation.id);
       return;
     }

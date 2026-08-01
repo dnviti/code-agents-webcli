@@ -43,8 +43,13 @@ export function watchViewport(app: App): void {
   });
 }
 
-export function disablePullToRefresh(): void {
+export function disablePullToRefresh(): () => void {
+  type TouchAxis = 'pending' | 'horizontal' | 'vertical' | 'multitouch';
+  const directionThreshold = 8;
+  let startX = 0;
+  let startY = 0;
   let lastY = 0;
+  let axis: TouchAxis = 'pending';
 
   const findScrollableAncestor = (target: EventTarget | null): HTMLElement | null => {
     let node = target instanceof HTMLElement ? target : null;
@@ -66,52 +71,92 @@ export function disablePullToRefresh(): void {
     return null;
   };
 
-  document.addEventListener(
-    'touchstart',
-    (e: TouchEvent) => {
-      lastY = e.touches[0].clientY;
-    },
-    { passive: false },
-  );
+  const onTouchStart = (e: TouchEvent): void => {
+    const touch = e.touches[0];
+    if (!touch) return;
+    axis = e.touches.length === 1 ? 'pending' : 'multitouch';
+    startX = touch.clientX;
+    startY = touch.clientY;
+    lastY = touch.clientY;
+  };
 
-  document.addEventListener(
-    'touchmove',
-    (e: TouchEvent) => {
-      if (e.defaultPrevented) {
-        lastY = e.touches[0].clientY;
+  const onTouchMove = (e: TouchEvent): void => {
+    const touch = e.touches[0];
+    if (!touch) return;
+    if (e.touches.length !== 1 || axis === 'multitouch') {
+      // Pinch zoom and other multi-finger gestures never belong to the
+      // pull-to-refresh guard. Keep this gesture unclaimed until every finger
+      // lifts and a new touchstart chooses a fresh axis.
+      axis = 'multitouch';
+      return;
+    }
+
+    if (e.defaultPrevented) {
+      lastY = touch.clientY;
+      return;
+    }
+
+    const x = touch.clientX;
+    const y = touch.clientY;
+
+    if (axis === 'pending') {
+      const dx = Math.abs(x - startX);
+      const dy = Math.abs(y - startY);
+      if (Math.max(dx, dy) < directionThreshold) {
+        // Finger jitter is not intent. Claiming a two-pixel downward sample
+        // here would cancel native horizontal panning before the swipe had
+        // travelled far enough for its direction to be knowable.
+        lastY = y;
         return;
       }
+      axis = dx > dy ? 'horizontal' : 'vertical';
+    }
 
-      const y = e.touches[0].clientY;
-      const isPullingDown = y > lastY;
-      const scrollableAncestor = findScrollableAncestor(e.target);
-
-      if (scrollableAncestor) {
-        const maxScrollTop = Math.max(0, scrollableAncestor.scrollHeight - scrollableAncestor.clientHeight);
-        const canUseScrollableAncestor = isPullingDown
-          ? scrollableAncestor.scrollTop > 0
-          : scrollableAncestor.scrollTop < maxScrollTop;
-
-        if (canUseScrollableAncestor) {
-          lastY = y;
-          return;
-        }
-      }
-
-      const scrollTop =
-        window.pageYOffset ||
-        document.documentElement.scrollTop ||
-        document.body.scrollTop ||
-        0;
-
-      if (scrollTop === 0 && isPullingDown) {
-        e.preventDefault();
-      }
-
+    // Pull-to-refresh is a vertical gesture. Once a swipe chooses horizontal,
+    // never reconsider it mid-gesture: preventing one later touchmove would
+    // cancel the tab strip's native pan and momentum retroactively.
+    if (axis === 'horizontal') {
       lastY = y;
-    },
-    { passive: false },
-  );
+      return;
+    }
+
+    const isPullingDown = y > lastY;
+    const scrollableAncestor = findScrollableAncestor(e.target);
+
+    if (scrollableAncestor) {
+      const maxScrollTop = Math.max(0, scrollableAncestor.scrollHeight - scrollableAncestor.clientHeight);
+      const canUseScrollableAncestor = isPullingDown
+        ? scrollableAncestor.scrollTop > 0
+        : scrollableAncestor.scrollTop < maxScrollTop;
+
+      if (canUseScrollableAncestor) {
+        lastY = y;
+        return;
+      }
+    }
+
+    const scrollTop =
+      window.pageYOffset ||
+      document.documentElement.scrollTop ||
+      document.body.scrollTop ||
+      0;
+
+    if (scrollTop === 0 && isPullingDown) {
+      e.preventDefault();
+    }
+
+    lastY = y;
+  };
+
+  document.addEventListener('touchstart', onTouchStart, { passive: false });
+  document.addEventListener('touchmove', onTouchMove, { passive: false });
+
+  // The app installs this once for its lifetime. Returning cleanup makes the
+  // gesture guard independently testable and safe for any future remount.
+  return () => {
+    document.removeEventListener('touchstart', onTouchStart);
+    document.removeEventListener('touchmove', onTouchMove);
+  };
 }
 
 export function sendEscape(app: App): void {

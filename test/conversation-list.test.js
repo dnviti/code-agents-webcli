@@ -227,6 +227,22 @@ describe('listing every conversation by project', function () {
     assert.strictEqual(project.conversations[0].canResume, true);
   });
 
+  it('keeps a conversation whose tab is closed available to reopen', async function () {
+    // Tab membership and conversation lifetime are deliberately separate. If
+    // the full conversation list applied the strip's `tabOpen` filter too, the
+    // act of closing a tab would remove the only route that can bring it back.
+    await conversation('closed-tab', 'riapri questa conversazione', {
+      tabOpen: false,
+    });
+
+    const got = await list();
+    const ids = got.body.projects.flatMap((project) =>
+      project.conversations.map((entry) => entry.id),
+    );
+
+    assert.deepStrictEqual(ids, ['closed-tab']);
+  });
+
   it('says which conversations are running right now', async function () {
     await conversation('live', 'in corso', { active: true });
     await conversation('quiet', 'ferma', { active: false });

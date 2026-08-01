@@ -32,6 +32,7 @@ import {
 } from './services/tier-writer.js';
 import { WebSocketHandler } from './websocket/handler.js';
 import { MessageProcessor } from './websocket/messages.js';
+import { AccountTabCoordinator } from './services/account-tab-coordinator.js';
 import { PromptSession } from './setup/prompts.js';
 import { runRunModeWizard } from './setup/wizard.js';
 import { INSTALL_COMMAND } from '../shared/update.js';
@@ -152,6 +153,7 @@ export class ClaudeCodeWebServer {
 
   private claudeSessions: Map<string, SessionRecord>;
   private webSocketConnections: Map<string, WebSocketInfo>;
+  private tabCoordinator: AccountTabCoordinator;
 
   private claudeBridge: BridgeInterface;
   private codexBridge: BridgeInterface;
@@ -227,6 +229,7 @@ export class ClaudeCodeWebServer {
 
     this.claudeSessions = new Map();
     this.webSocketConnections = new Map();
+    this.tabCoordinator = new AccountTabCoordinator();
 
     this.claudeBridge = new ClaudeBridge();
     this.codexBridge = new CodexBridge();
@@ -466,6 +469,7 @@ export class ClaudeCodeWebServer {
       ensureEnvironment: (userId?: number) => this.ensureEnvironment(userId),
       getSelectedWorkingDir: (userId: number) => this.getSelectedWorkingDir(userId),
       createSessionRecord: (params) => this.createSessionRecord(params),
+      tabCoordinator: this.tabCoordinator,
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
       resolveRuntimeProfile: (agentKind: AgentKind, workingDir: string) =>
@@ -595,6 +599,11 @@ export class ClaudeCodeWebServer {
       agent: null,
       lastAgent: null,
       runtimeLabel: null,
+      // A new standalone session is a new tab, so it comes after every tab the
+      // account already has. Nested shells are not part of the top-level strip.
+      tabOrder: params.ownerSessionId
+        ? undefined
+        : nextAccountTabOrder(this.claudeSessions, params.ownerUserId),
       terminalOptions: null,
       stopRequested: false,
       workingDir: params.workingDir,
@@ -884,8 +893,8 @@ export class ClaudeCodeWebServer {
     });
   }
 
-  private async saveSessionsToDisk(): Promise<void> {
-    await this.sessionStore.saveSessions(this.claudeSessions);
+  private async saveSessionsToDisk(): Promise<boolean> {
+    return this.sessionStore.saveSessions(this.claudeSessions);
   }
 
   async shutdown(): Promise<void> {
@@ -1043,6 +1052,7 @@ export class ClaudeCodeWebServer {
         this.setSelectedWorkingDir(userId, value),
       activeProfileFor: (runtime: string) => this.activeProfileFor(runtime),
       createSessionRecord: (params) => this.createSessionRecord(params),
+      tabCoordinator: this.tabCoordinator,
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
       transcriptStore: this.transcriptStore,
@@ -1198,4 +1208,16 @@ export class ClaudeCodeWebServer {
 export async function startServer(options: ServerOptions): Promise<http.Server | https.Server> {
   const server = new ClaudeCodeWebServer(options);
   return await server.start();
+}
+
+/** Position a newly created standalone session after this account's tabs. */
+function nextAccountTabOrder(sessions: Map<string, SessionRecord>, userId: number): number {
+  let maximum = -1;
+  for (const session of sessions.values()) {
+    if (session.ownerUserId !== userId || session.ownerSessionId || session.tabOpen === false) {
+      continue;
+    }
+    if (Number.isFinite(session.tabOrder)) maximum = Math.max(maximum, session.tabOrder!);
+  }
+  return maximum + 1;
 }

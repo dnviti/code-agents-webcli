@@ -173,6 +173,19 @@
   actually decides something.
 
 ### Fixed
+- **Closing a conversation tab now closes it on every device signed into the
+  account.** Tab membership was the last part of the strip kept in browser
+  storage, so closing a conversation on one screen left it open everywhere else
+  and each device accumulated a different set. Open and closed tabs now belong
+  to the account, survive a server restart, and are announced live to every
+  connected screen; reconnecting screens take the persisted answer instead of
+  republishing stale tabs. Order is shared too, while the selected tab remains
+  local to each window. Reopening from the conversation list does the same in
+  reverse. The conversation itself, its transcript and any running agent are
+  still preserved; only deleting removes them. Existing browser-local closures
+  are imported once on upgrade. An overflowing strip can now be moved with the
+  mouse wheel, swiped on a touch screen, or opened as a complete,
+  keyboard-accessible tab list.
 - **A question the agent asks you now reaches you, and waits** (#174). On Oh My
   Pi it did neither. Its MCP client abandons any call after thirty seconds, and
   the one tool whose entire purpose is to wait for a person is a call like any

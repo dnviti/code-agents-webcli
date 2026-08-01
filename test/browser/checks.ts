@@ -48,6 +48,8 @@ import { Toasts } from '../../src/client/shell/Toasts';
 import { shellStore } from '../../src/client/shell/store';
 import { FileTreePanel } from '../../src/client/shell/chat/FileTreePanel';
 import { TerminalSplit } from '../../src/client/shell/chat/TerminalSplit';
+import { disablePullToRefresh } from '../../src/client/ui/mobile';
+import { visualViewportKeyboardInset } from '../../src/client/ui/keyboard-viewport';
 
 /**
  * A real workflow run, as the adapter emitted it.
@@ -319,6 +321,7 @@ async function run(): Promise<void> {
   await checkThePhoneShellSurfacesAreUsable();
   await checkTheConversationsTerminalCanBeDrivenFromAPhone();
   await checkALongTabNameStaysInsideTheStrip();
+  await checkAnOverflowingTabStripCanBeNavigated();
   await checkAnUnreportedFigureIsNeverDrawnAsZero();
   await checkTheUsageChartsAreInteractive();
   await checkAServerOlderThanThePageSaysSo();
@@ -5532,6 +5535,228 @@ async function checkALongTabNameStaysInsideTheStrip(): Promise<void> {
 
   sheetRoot.unmount();
   frame.remove();
+}
+
+/**
+ * A hidden scrollbar still needs two discoverable ways to reach what it hides:
+ * the wheel already under the pointer, and an explicit list for precise jumps.
+ * This needs a layout engine because the button is intentionally conditional on
+ * measured overflow rather than on an arbitrary tab count.
+ */
+async function checkAnOverflowingTabStripCanBeNavigated(): Promise<void> {
+  const tabs = [
+    { id: 'one', title: 'gateway', status: 'running' },
+    { id: 'two', title: 'deploy', status: 'idle', attention: 'approval' },
+    { id: 'three', title: 'documentation', status: 'idle', unread: true },
+    { id: 'four', title: 'tests', status: 'idle' },
+    { id: 'five', title: 'release', status: 'idle' },
+    { id: 'six', title: 'metrics', status: 'idle' },
+    { id: 'seven', title: 'cleanup', status: 'idle' },
+  ];
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1200px;position:absolute;top:0;left:0';
+  document.body.appendChild(host);
+
+  const root = createRoot(host);
+  let selected = '';
+  const render = (shown: typeof tabs): void => root.render(
+    React.createElement(TabBar, {
+      tabs: shown,
+      activeId: 'one',
+      onSelect: (id: string) => { selected = id; },
+      ariaLabel: 'Overflow sessions',
+    } as never),
+  );
+
+  render(tabs);
+  await wait(150);
+  check(
+    'the all-tabs control stays out of a tab strip that fits',
+    !host.querySelector('[aria-label="All open tabs"]'),
+    'wide strip',
+  );
+
+  host.style.width = '420px';
+  // Headless Chrome's virtual-time mode does not deliver ResizeObserver
+  // notifications for this synthetic host resize. A real viewport resize also
+  // emits this event, and the component keeps it as a fallback to the observer.
+  window.dispatchEvent(new Event('resize'));
+  await wait(150);
+  const strip = host.querySelector('[role="tablist"][aria-label="Overflow sessions"]') as HTMLElement;
+  const trigger = host.querySelector('[aria-label="All open tabs"]') as HTMLButtonElement | null;
+  check(
+    'an overflowing tab strip offers a list of every open tab',
+    Boolean(trigger),
+    trigger ? 'control shown' : `content ${strip?.scrollWidth}px in ${strip?.clientWidth}px`,
+  );
+
+  const stripStyles = window.getComputedStyle(strip);
+  // Chromium canonicalises `pan-x pan-y pinch-zoom` to its equivalent keyword,
+  // `manipulation`; other engines may preserve the three explicit tokens.
+  const allowsPanAndZoom = (touchAction: string): boolean => {
+    const values = touchAction.split(/\s+/);
+    return touchAction === 'manipulation'
+      || (values.includes('pan-x') && values.includes('pan-y') && values.includes('pinch-zoom'));
+  };
+  const bodyTouchAction = window.getComputedStyle(document.body).touchAction;
+  check(
+    'an overflowing tab strip accepts native horizontal touch swipes',
+    stripStyles.overflowX === 'auto'
+      && allowsPanAndZoom(stripStyles.touchAction)
+      && allowsPanAndZoom(bodyTouchAction)
+      && stripStyles.overscrollBehaviorX === 'contain',
+    `overflow=${stripStyles.overflowX} touch=${stripStyles.touchAction} body-touch=${bodyTouchAction} overscroll=${stripStyles.overscrollBehaviorX}`,
+  );
+
+  // A component can advertise native panning correctly and still have an
+  // ancestor cancel the gesture. The app-wide pull-to-refresh guard used to do
+  // exactly that whenever a mostly-horizontal finger drifted slightly down.
+  const touchEventAt = (
+    type: 'touchstart' | 'touchmove',
+    ...points: Array<[number, number]>
+  ): TouchEvent => {
+    const event = new Event(type, { bubbles: true, cancelable: true }) as TouchEvent;
+    Object.defineProperty(event, 'touches', {
+      value: points.map(([clientX, clientY], identifier) => ({ clientX, clientY, identifier })),
+    });
+    return event;
+  };
+  const removePullGuard = disablePullToRefresh();
+  strip.dispatchEvent(touchEventAt('touchstart', [300, 30]));
+  const jitter = touchEventAt('touchmove', [299, 32]);
+  strip.dispatchEvent(jitter);
+  const swipe = touchEventAt('touchmove', [180, 34]);
+  strip.dispatchEvent(swipe);
+  check(
+    'the pull-to-refresh guard leaves a horizontal tab swipe native after finger jitter',
+    !jitter.defaultPrevented && !swipe.defaultPrevented,
+    `jitter=${jitter.defaultPrevented} swipe=${swipe.defaultPrevented}`,
+  );
+
+  strip.dispatchEvent(touchEventAt('touchstart', [260, 40], [160, 40]));
+  const pinch = touchEventAt('touchmove', [280, 48], [140, 32]);
+  strip.dispatchEvent(pinch);
+  check(
+    'the pull-to-refresh guard leaves pinch zoom native over the tab strip',
+    !pinch.defaultPrevented,
+    `prevented=${pinch.defaultPrevented}`,
+  );
+
+  strip.dispatchEvent(touchEventAt('touchstart', [200, 30]));
+  strip.dispatchEvent(touchEventAt('touchmove', [201, 33]));
+  const downwardPull = touchEventAt('touchmove', [202, 52]);
+  strip.dispatchEvent(downwardPull);
+  check(
+    'the gesture guard still blocks a deliberate downward pull at the page top',
+    downwardPull.defaultPrevented,
+    `prevented=${downwardPull.defaultPrevented}`,
+  );
+  removePullGuard();
+
+  const textEntry = document.createElement('textarea');
+  document.body.appendChild(textEntry);
+  textEntry.focus();
+  const layoutHeight = window.innerHeight;
+  const pinchInset = visualViewportKeyboardInset(
+    { height: layoutHeight / 2, scale: 2 },
+    layoutHeight,
+    textEntry,
+  );
+  const keyboardInset = visualViewportKeyboardInset(
+    { height: layoutHeight - 300, scale: 1 },
+    layoutHeight,
+    textEntry,
+  );
+  check(
+    'pinch zoom is not mistaken for a software keyboard by mobile chrome or chat',
+    pinchInset === 0 && keyboardInset === 300,
+    `pinch=${pinchInset}px keyboard=${keyboardInset}px`,
+  );
+  textEntry.remove();
+
+  strip.scrollLeft = 0;
+  const vertical = new WheelEvent('wheel', { deltaY: 120, cancelable: true, bubbles: true });
+  strip.dispatchEvent(vertical);
+  check(
+    'a vertical mouse wheel moves an overflowing tab strip sideways',
+    strip.scrollLeft > 0 && vertical.defaultPrevented,
+    `left=${strip.scrollLeft} prevented=${vertical.defaultPrevented}`,
+  );
+
+  const horizontal = new WheelEvent('wheel', {
+    deltaX: 40,
+    deltaY: 2,
+    cancelable: true,
+    bubbles: true,
+  });
+  strip.dispatchEvent(horizontal);
+  check(
+    'horizontal trackpad input keeps its native scrolling path',
+    !horizontal.defaultPrevented,
+    `prevented=${horizontal.defaultPrevented}`,
+  );
+
+  trigger?.click();
+  await wait(80);
+  const menu = host.querySelector('[role="menu"][aria-label="Open tabs"]') as HTMLElement | null;
+  const rows = Array.from(menu?.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]') || []);
+  check(
+    'the overflow chooser lists every open tab in strip order',
+    rows.length === tabs.length && rows.map((row) => row.textContent?.trim()).join('|').includes('gateway|deploy'),
+    `${rows.length} rows`,
+  );
+  check(
+    'the overflow chooser carries waiting and unread cues',
+    Boolean(menu?.querySelector('[aria-label="Waiting for approval"]'))
+      && Boolean(menu?.querySelector('[aria-label="Unread output"]')),
+    menu?.textContent || 'no menu',
+  );
+
+  rows[4]?.click();
+  await wait(40);
+  check(
+    'choosing from the all-tabs list selects that tab and closes the list',
+    selected === 'five' && !host.querySelector('[role="menu"][aria-label="Open tabs"]'),
+    `selected=${selected}`,
+  );
+
+  (host.querySelector('[aria-label="All open tabs"]') as HTMLButtonElement | null)?.click();
+  await wait(80);
+  const reopenedTrigger = host.querySelector('[aria-label="All open tabs"]') as HTMLButtonElement | null;
+  const activeRow = host.querySelector('[role="menuitemradio"][aria-checked="true"]');
+  check(
+    'the all-tabs menu puts keyboard focus on the current tab',
+    document.activeElement === activeRow,
+    document.activeElement ? describe(document.activeElement) : 'no focus',
+  );
+  window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  await wait(40);
+  check(
+    'Escape closes the all-tabs menu and returns focus to its button',
+    !host.querySelector('[role="menu"][aria-label="Open tabs"]') && document.activeElement === reopenedTrigger,
+    document.activeElement ? describe(document.activeElement) : 'no focus',
+  );
+
+  reopenedTrigger?.click();
+  await wait(40);
+  document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+  await wait(40);
+  check(
+    'a click outside closes the all-tabs menu',
+    !host.querySelector('[role="menu"][aria-label="Open tabs"]'),
+    'outside click',
+  );
+
+  render(tabs.slice(0, 2));
+  await wait(150);
+  check(
+    'the all-tabs control disappears as soon as the remaining tabs fit',
+    !host.querySelector('[aria-label="All open tabs"]'),
+    'two tabs remain',
+  );
+
+  root.unmount();
+  host.remove();
 }
 
 /** The floating menu with its own button already pressed. */

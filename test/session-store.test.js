@@ -116,6 +116,51 @@ describe('SessionStore', function() {
       assert.strictEqual(loaded.get('chat').ownerSessionId, undefined);
     });
 
+    it('remembers whether a conversation is in the account tab strip', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['closed', createSessionRecord({
+          id: 'closed',
+          ownerUserId,
+          surface: 'chat',
+          tabOpen: false,
+        })],
+        ['legacy-open', createSessionRecord({
+          id: 'legacy-open',
+          ownerUserId,
+          surface: 'chat',
+        })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('closed').tabOpen, false);
+      assert.strictEqual(
+        loaded.get('legacy-open').tabOpen,
+        undefined,
+        'a pre-feature record remains visibly open but available for one-time migration',
+      );
+    });
+
+    it('remembers the account-owned tab order while leaving legacy rows unordered', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['first', createSessionRecord({ id: 'first', ownerUserId, tabOrder: 0 })],
+        ['second', createSessionRecord({ id: 'second', ownerUserId, tabOrder: 1 })],
+        ['legacy', createSessionRecord({ id: 'legacy', ownerUserId })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('first').tabOrder, 0);
+      assert.strictEqual(loaded.get('second').tabOrder, 1);
+      assert.strictEqual(
+        loaded.get('legacy').tabOrder,
+        undefined,
+        'an upgraded database preserves the pre-feature stable load order',
+      );
+    });
+
     it('remembers the approval mode a conversation was running in', async function() {
       // The mode is part of how the user set the conversation up. Lost across a
       // restart, a chat started with approvals bypassed comes back asking for
@@ -259,6 +304,28 @@ describe('SessionStore', function() {
 
       assert.strictEqual(loaded.size, 1, 'the upgrade must not cost the user their sessions');
       assert.strictEqual(loaded.get('old').customName, undefined);
+    });
+
+    it('adds the tab-open column to a database that predates it', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['old', createSessionRecord({ id: 'old', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.raw.exec('ALTER TABLE runtime_sessions DROP COLUMN tab_open');
+      sessionStore.database.close();
+
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      const loaded = await sessionStore.loadSessions();
+
+      assert.strictEqual(loaded.size, 1, 'the upgrade must not cost the user their sessions');
+      assert.strictEqual(
+        loaded.get('old').tabOpen,
+        undefined,
+        'every pre-feature tab remains visibly open and marked as not yet migrated',
+      );
+
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      assert.strictEqual((await sessionStore.loadSessions()).get('old').tabOpen, undefined);
     });
 
     it('adds the model-override column to a database that predates it', async function () {

@@ -39,6 +39,8 @@ interface RuntimeSessionRow {
   chat_model_pinned: string | null;
   chat_effort_override: string | null;
   custom_name: string | null;
+  tab_open: number | null;
+  tab_order: number | null;
 }
 
 export class SessionStore {
@@ -80,7 +82,9 @@ export class SessionStore {
           chat_model_override,
           chat_model_pinned,
           chat_effort_override,
-          custom_name
+          custom_name,
+          tab_open,
+          tab_order
         )
         VALUES (
           @id,
@@ -106,7 +110,9 @@ export class SessionStore {
           @chat_model_override,
           @chat_model_pinned,
           @chat_effort_override,
-          @custom_name
+          @custom_name,
+          @tab_open,
+          @tab_order
         )
       `);
 
@@ -204,6 +210,17 @@ export class SessionStore {
         // under the name it was created with, which is the one thing the user
         // renamed it to get away from.
         custom_name: session.customName || null,
+        // Closing a conversation is a tab operation, not deletion. Persist the
+        // account-owned visibility so every device and the next server process
+        // agree. NULL remains distinct from an explicit open: it marks a row
+        // written before account-wide tabs existed, which lets the one-time
+        // browser migration apply an old local close exactly once without a
+        // stale browser later overriding a newer reopen.
+        tab_open:
+          session.tabOpen === true ? 1 : session.tabOpen === false ? 0 : null,
+        // Null preserves the stable load order of rows written before shared
+        // ordering existed. Every explicit reorder writes compact ordinals.
+        tab_order: Number.isFinite(session.tabOrder) ? session.tabOrder : null,
       }));
 
       replaceAll(rows);
@@ -244,7 +261,9 @@ export class SessionStore {
             chat_model_override,
             chat_model_pinned,
             chat_effort_override,
-            custom_name
+            custom_name,
+            tab_open,
+            tab_order
           FROM runtime_sessions
           ORDER BY created_at ASC
         `)
@@ -317,6 +336,12 @@ export class SessionStore {
           // An empty string reads as "never renamed" for the same reason: the
           // write side only ever stores a trimmed non-empty name or null.
           customName: row.custom_name || undefined,
+          // Preserve the migration marker. Everywhere that renders the strip
+          // treats undefined as open; only the conditional legacy-close route
+          // needs to distinguish it from a tab explicitly reopened later.
+          tabOpen:
+            row.tab_open === 1 ? true : row.tab_open === 0 ? false : undefined,
+          tabOrder: row.tab_order ?? undefined,
         });
       }
 
