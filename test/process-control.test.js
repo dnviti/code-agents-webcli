@@ -96,6 +96,8 @@ describe('tracked container process control', function() {
     const calls = [];
     let output = '';
     let terminal;
+    let control;
+    let cleanupVerified = false;
     try {
       terminal = pty.spawn(
         'sh',
@@ -104,15 +106,25 @@ describe('tracked container process control', function() {
           token, TRACKED_PROCESS_GROUP_WRAPPER,
           'bash', '--noprofile', '--norc', '-i',
         ],
-        { cwd: dir, env: process.env, cols: 80, rows: 24, name: 'xterm-color' },
+        {
+          cwd: dir,
+          env: {
+            ...process.env,
+            CAWC_JOB_FILE: jobFile,
+            CAWC_DETACHED_FILE: detachedFile,
+          },
+          cols: 80,
+          rows: 24,
+          name: 'xterm-color',
+        },
       );
       terminal.onData((value) => { output += value; });
       const exited = new Promise((resolve) => terminal.onExit(resolve));
       await waitUntil(() => fs.existsSync(controlFile));
 
       terminal.write(
-        `sh -c 'printf "%s\\n" "$$" > "$1"; trap "" TERM; exec sleep 100' sh ${JSON.stringify(jobFile)} & `
-          + `setsid sh -c 'printf "%s\\n" "$$" > "$1"; trap "" TERM; while :; do sleep 1; done' sh ${JSON.stringify(detachedFile)} & `
+        "sh -c 'printf \"%s\\n\" \"$$\" > \"$CAWC_JOB_FILE\"; trap \"\" TERM; exec sleep 100' & "
+          + "setsid sh -c 'printf \"%s\\n\" \"$$\" > \"$CAWC_DETACHED_FILE\"; trap \"\" TERM; while :; do sleep 1; done' & "
           + "printf 'TRACKED_%s\\n' READY\n",
       );
       await waitUntil(() => output.includes('TRACKED_READY'));
@@ -135,7 +147,7 @@ describe('tracked container process control', function() {
       assert.ok(tracked.includes(job.pid), 'job-control child carries the runtime token');
       assert.ok(tracked.includes(detached.pid), 'detached child carries the runtime token');
 
-      const control = new ContainerProcessControl(
+      control = new ContainerProcessControl(
         localEngine(calls),
         'immutable-container-name',
         'immutable-container-id',
@@ -149,6 +161,7 @@ describe('tracked container process control', function() {
         && processIsGoneOrReplaced(job)
         && processIsGoneOrReplaced(detached)
       ));
+      cleanupVerified = true;
 
       assert.ok(start);
       assert.ok(!/Inappropriate ioctl|job control turned off/i.test(output), output);
@@ -156,6 +169,18 @@ describe('tracked container process control', function() {
       assert.ok(calls.every((spec) => spec.identity === 'immutable-container-id'));
       await waitUntil(() => !fs.existsSync(controlFile) && !fs.existsSync(doneFile));
     } finally {
+      if (!cleanupVerified && (control || fs.existsSync(controlFile))) {
+        try {
+          control ??= new ContainerProcessControl(
+            localEngine(calls),
+            'immutable-container-name',
+            'immutable-container-id',
+            controlFile,
+            doneFile,
+          );
+          await control.stop();
+        } catch {}
+      }
       try { terminal?.kill(); } catch {}
       fs.rmSync(dir, { recursive: true, force: true });
     }
