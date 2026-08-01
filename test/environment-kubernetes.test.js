@@ -217,6 +217,14 @@ describe('the kubernetes engine', function () {
       const args = engine.execArgs({ name: 'pod-1' }, 'ls', []);
       assert.deepStrictEqual(args.slice(-2), ['--', 'ls']);
     });
+
+    it('sends exec stdin through kubectl without putting it in argv', async function () {
+      const { engine, calls } = engineWith({});
+      await engine.exec({ name: 'pod-1', input: 'bearer-token\n' }, 'cat', []);
+      const call = calls.find((entry) => entry.args.includes('exec'));
+      assert.strictEqual(call.input, 'bearer-token\n');
+      assert.ok(!call.args.some((arg) => arg.includes('bearer-token')));
+    });
   });
 
   describe('lifecycle', function () {

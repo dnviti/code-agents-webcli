@@ -255,7 +255,7 @@ describe('project core lifecycle', function () {
     const { manager, e, s } = setup([p], { fetch: async () => ({ status: 200 }), cloneTimeoutMs: 5, engine: {
       async exec(spec, command, args) {
         e.calls.push({ op: 'exec', spec, command, args });
-        if (command !== 'sh') return { stdout: '', stderr: '' };
+        if (command !== '/bin/sh') return { stdout: '', stderr: '' };
         return new Promise((_resolve, reject) => {
           spec.signal.addEventListener('abort', () => {
             aborted = true;
@@ -1932,14 +1932,38 @@ describe('project repository transport', function () {
   it('passes auth as a one-shot git header and redacts it from clone failures', async function () {
     const e = engine({ async exec(spec, command, args) {
       assert.strictEqual(spec.identity, 'box-id');
-      if (command === 'sh') {
-        assert.ok(spec.env.CAWC_GIT_HTTP_EXTRA_HEADER.includes('secret'));
+      if (command === '/bin/sh') {
+        assert.strictEqual(spec.input, 'secret\n');
+        assert.ok(!spec.env);
         assert.ok(!args.some((arg) => arg.includes('secret')));
         throw Object.assign(new Error('secret failed'), { stderr: 'secret failed' });
       }
       return { stdout: '', stderr: '' };
     } });
     await assert.rejects(() => cloneRepository({ engine: e, containerName: 'box', containerIdentity: 'box-id', repoUrl: 'https://example.test/a.git', destination: '/workspace/a', credential: 'secret' }), /\*\*\* failed/);
+  });
+
+  it('rejects line-delimited credentials before invoking an engine command', async function () {
+    let calls = 0; const e = engine({ async exec() { calls += 1; return { stdout: '', stderr: '' }; } });
+    for (const credential of ['line\nbreak', 'line\rbreak', 'nul\0byte']) {
+      await assert.rejects(() => cloneRepository({ engine: e, containerName: 'box', containerIdentity: 'box-id', repoUrl: 'https://example.test/a.git', destination: '/workspace/a', credential }), /unsafe line break/);
+    }
+    assert.strictEqual(calls, 0);
+  });
+
+  it('bounds an isolated clone directory setup before Git starts', async function () {
+    let mkdirSignal; let startedGit = false;
+    const e = engine({ async exec(spec, command) {
+      if (command === 'mkdir') {
+        mkdirSignal = spec.signal;
+        return new Promise((_resolve, reject) => spec.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+      }
+      if (command === '/bin/sh') startedGit = true;
+      return { stdout: '', stderr: '' };
+    } });
+    await assert.rejects(() => cloneRepository({ engine: e, containerName: 'box', containerIdentity: 'box-id', repoUrl: 'https://example.test/a.git', destination: '/workspace/a', timeoutMs: 1 }), /timed out/);
+    assert.strictEqual(mkdirSignal.aborted, true);
+    assert.strictEqual(startedGit, false);
   });
 
   it('does not let global url rewriting redirect an isolated clone', async function () {
@@ -2192,7 +2216,7 @@ describe('project lifecycle transaction and preservation recovery', function () 
     const beforeHead = git('rev-parse', 'HEAD'); const beforeStatus = git('status', '--porcelain=v1');
     let pushed = false; const e = engine({ async exec(spec, command, args) {
       if (command === 'rm') { fs.rmSync(args[args.length - 1], { force: true }); return { stdout: '', stderr: '' }; }
-      if (command === 'sh' && args.includes('push')) { pushed = true; return { stdout: '', stderr: '' }; }
+      if (command === '/bin/sh' && args.includes('push')) { pushed = true; return { stdout: '', stderr: '' }; }
       // Keep the durable HTTP origin intact for origin validation, but route
       // this fixture's real local operations inside its temporary checkout.
       return { stdout: execFileSync(command, args, { encoding: 'utf8', env: { ...process.env, ...(spec.env || {}) } }), stderr: '' };

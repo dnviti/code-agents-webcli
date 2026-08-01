@@ -503,7 +503,7 @@ export class KubernetesEngine implements EnvironmentEngine {
   }
 
   async exec(spec: ExecSpec, command: string, commandArgs: string[]): Promise<RunResult> {
-    return this.run(this.binary, this.execArgs(spec, command, commandArgs), undefined, spec.signal);
+    return this.run(this.binary, this.execArgs(spec, command, commandArgs), spec.input, spec.signal);
   }
 
   async list(label: string): Promise<string[]> {

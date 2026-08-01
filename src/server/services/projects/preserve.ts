@@ -121,11 +121,12 @@ export async function preserveProjectWork(options: PreserveOptions): Promise<Pre
   if (credential && recorded.protocol !== 'https:') {
     throw new PreserveError('Repository credentials require HTTPS');
   }
+  if (credential && /[\r\n\0]/.test(credential)) throw new PreserveError('Repository credential contains an unsafe line break');
 
   const timeoutMs = options.timeoutMs ?? REPOSITORY_CLONE_TIMEOUT_MS;
   const deadline = Date.now() + timeoutMs;
   /** Every helper subprocess is bounded against one operation deadline. */
-  const run = async (command: string, args: string[], env?: Record<string, string>, recovery = false): Promise<string> => {
+  const run = async (command: string, args: string[], env?: Record<string, string>, recovery = false, input?: string): Promise<string> => {
     const remaining = recovery ? timeoutMs : Math.max(1, deadline - Date.now());
     const controller = new AbortController();
     let timeout: NodeJS.Timeout | null = null;
@@ -140,7 +141,7 @@ export async function preserveProjectWork(options: PreserveOptions): Promise<Pre
         timeout.unref();
       });
       const { stdout } = await Promise.race([
-        engine.exec({ name: containerName, identity: containerIdentity, signal: controller.signal, env }, command, args),
+        engine.exec({ name: containerName, identity: containerIdentity, signal: controller.signal, env, input }, command, args),
         timedOutPromise,
       ]);
       return stdout;
@@ -197,7 +198,7 @@ export async function preserveProjectWork(options: PreserveOptions): Promise<Pre
     '-C', repoContainerPath,
     'rev-parse', '--path-format=absolute', '--git-path', 'objects',
   ]);
-  const sourceObjects = (await run(sourceObjectLookup.command, sourceObjectLookup.args, sourceObjectLookup.env)).trim();
+  const sourceObjects = (await run(sourceObjectLookup.command, sourceObjectLookup.args)).trim();
   if (!sourceObjects.startsWith('/')) throw new PreserveError('Could not locate repository objects for safe preservation');
   const base = `cc-web/wip/${wipDate(now())}-${head}`;
 
@@ -232,7 +233,7 @@ export async function preserveProjectWork(options: PreserveOptions): Promise<Pre
     transportDirectory = `/tmp/cawc-preserve-transport-${randomUUID()}`;
     await run('mkdir', ['-m', '700', '--', transportDirectory]);
     const transportInit = isolatedGitNetworkInvocation(['init', '--bare', '--quiet', transportDirectory], null, sourceObjects);
-    await run(transportInit.command, transportInit.args, transportInit.env);
+    await run(transportInit.command, transportInit.args);
     // The temporary bare repository has no project-local config. Its only view
     // of project data is the source object database, read as an alternate so
     // the WIP commit can be packed for the immutable recorded URL.
@@ -241,7 +242,7 @@ export async function preserveProjectWork(options: PreserveOptions): Promise<Pre
         '--git-dir', transportDirectory,
         ...args,
       ], credential, sourceObjects);
-      return run(transport.command, transport.args, transport.env);
+      return run(transport.command, transport.args, undefined, false, transport.input);
     };
     for (let counter = 0; counter <= MAX_WIP_COLLISION_RETRIES; counter += 1) {
       branch = counter === 0 ? base : `${base}-${counter}`;

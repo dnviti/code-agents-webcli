@@ -61,6 +61,8 @@ export interface ExecSpec {
   env?: Record<string, string>;
   tty?: boolean;
   signal?: AbortSignal;
+  /** Optional stdin sent to the in-container command, never encoded in argv. */
+  input?: string;
 }
 
 /** What one environment is currently consuming, as far as the engine can say. */
@@ -464,7 +466,7 @@ export class ContainerEngine implements EnvironmentEngine {
 
   /** Run a one-shot command inside an environment and return its output. */
   async exec(spec: ExecSpec, command: string, commandArgs: string[]): Promise<RunResult> {
-    return this.run(this.binary, this.execArgs(spec, command, commandArgs), undefined, spec.signal);
+    return this.run(this.binary, this.execArgs(spec, command, commandArgs), spec.input, spec.signal);
   }
 
   /** Names of every environment this server manages, running or not. */

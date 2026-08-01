@@ -115,10 +115,12 @@ export function isolatedGitNetworkInvocation(
   gitArgs: string[],
   credential?: string | null,
   alternateObjects?: string,
-): { command: string; args: string[]; env?: Record<string, string> } {
+): { command: string; args: string[]; input?: string } {
   const assignments = [
     'PATH=/usr/local/bin:/usr/bin:/bin',
-    'HOME=/tmp',
+    // Do not let curl/Git discover a user-controlled .netrc or XDG file.
+    'HOME=/nonexistent',
+    'XDG_CONFIG_HOME=/nonexistent',
     'LC_ALL=C',
     'GIT_CONFIG_GLOBAL=/dev/null',
     'GIT_CONFIG_SYSTEM=/dev/null',
@@ -126,19 +128,20 @@ export function isolatedGitNetworkInvocation(
     'GIT_ASKPASS=/bin/false',
     'GIT_TERMINAL_PROMPT=0',
     'GIT_ALLOW_PROTOCOL=http:https',
-    `GIT_CONFIG_COUNT=${credential ? '1' : '0'}`,
-    ...(credential ? ['GIT_CONFIG_KEY_0=http.extraHeader', 'GIT_CONFIG_VALUE_0="$CAWC_GIT_HTTP_EXTRA_HEADER"'] : []),
-    ...(alternateObjects ? ['GIT_ALTERNATE_OBJECT_DIRECTORIES="$CAWC_GIT_ALTERNATE_OBJECTS"'] : []),
   ];
+  const git = `exec git ${credential ? '--config-env=http.extraHeader=CAWC_GIT_HTTP_EXTRA_HEADER ' : ''}-c core.hooksPath=/dev/null -c credential.helper= -c http.followRedirects=false -c protocol.allow=never -c protocol.http.allow=always -c protocol.https.allow=always "$@"`;
+  const inner = credential
+    ? `IFS= read -r CAWC_GIT_BEARER_TOKEN || exit 1; CAWC_GIT_HTTP_EXTRA_HEADER="AUTHORIZATION: bearer $CAWC_GIT_BEARER_TOKEN"; export CAWC_GIT_HTTP_EXTRA_HEADER; ${git}`
+    : git;
+  const outer = alternateObjects
+    ? `CAWC_GIT_ALTERNATE_OBJECTS=$1; shift; exec /usr/bin/env -i ${assignments.join(' ')} GIT_ALTERNATE_OBJECT_DIRECTORIES="$CAWC_GIT_ALTERNATE_OBJECTS" /bin/sh -c '${inner}' sh "$@"`
+    : `exec /usr/bin/env -i ${assignments.join(' ')} /bin/sh -c '${inner}' sh "$@"`;
   return {
     // `env -i` drops inherited Git config, proxy, trace and credential-helper
     // variables. The shell program is fixed; Git arguments are passed as `$@`.
-    command: 'sh',
-    args: ['-c', `exec env -i ${assignments.join(' ')} git -c core.hooksPath=/dev/null -c credential.helper= -c http.followRedirects=false -c protocol.allow=never -c protocol.http.allow=always -c protocol.https.allow=always "$@"`, 'sh', ...gitArgs],
-    env: {
-      ...(credential ? { CAWC_GIT_HTTP_EXTRA_HEADER: `AUTHORIZATION: bearer ${credential}` } : {}),
-      ...(alternateObjects ? { CAWC_GIT_ALTERNATE_OBJECTS: alternateObjects } : {}),
-    },
+    command: '/bin/sh',
+    args: ['-c', outer, 'sh', ...(alternateObjects ? [alternateObjects] : []), ...gitArgs],
+    ...(credential ? { input: `${credential}\n` } : {}),
   };
 }
 
@@ -159,24 +162,32 @@ export async function cloneRepository(options: {
   if (!url || (credential && url.protocol !== 'https:')) {
     throw new CloneError(credential ? 'Repository credentials require HTTPS' : 'Invalid repository URL');
   }
+  if (credential && /[\r\n\0]/.test(credential)) throw new CloneError('Repository credential contains an unsafe line break');
   const controller = new AbortController();
   let timeout: NodeJS.Timeout | null = null;
   let didTimeout = false;
   const isolatedCwd = `/tmp/cawc-clone-${randomUUID()}`;
+  const timedOut = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      didTimeout = true;
+      controller.abort();
+      reject(new CloneError(`Repository clone timed out after ${timeoutMs}ms`));
+    }, Math.max(1, timeoutMs));
+    timeout.unref();
+  });
   try {
-    await engine.exec({ name: containerName, identity: containerIdentity, signal: controller.signal }, 'mkdir', ['-m', '700', '--', isolatedCwd]);
-    const timedOut = new Promise<never>((_resolve, reject) => {
-      timeout = setTimeout(() => {
-        didTimeout = true;
-        controller.abort();
-        reject(new CloneError(`Repository clone timed out after ${timeoutMs}ms`));
-      }, Math.max(1, timeoutMs));
-      timeout.unref();
-    });
+    await Promise.race([
+      engine.exec(
+        { name: containerName, identity: containerIdentity, signal: controller.signal },
+        'mkdir',
+        ['-m', '700', '--', isolatedCwd],
+      ),
+      timedOut,
+    ]);
     const transport = isolatedGitNetworkInvocation(['clone', '--', repoUrl, destination], credential);
     await Promise.race([
       engine.exec(
-        { name: containerName, identity: containerIdentity, cwd: isolatedCwd, signal: controller.signal, env: transport.env },
+        { name: containerName, identity: containerIdentity, cwd: isolatedCwd, signal: controller.signal, input: transport.input },
         transport.command,
         transport.args,
       ),
@@ -189,8 +200,25 @@ export async function cloneRepository(options: {
     throw new CloneError(redact((err.stderr || err.message || String(error)).trim(), credential));
   } finally {
     if (timeout) clearTimeout(timeout);
+    const cleanupController = new AbortController();
+    let cleanupTimeout: NodeJS.Timeout | null = null;
     try {
-      await engine.exec({ name: containerName, identity: containerIdentity }, 'rm', ['-rf', '--', isolatedCwd]);
+      const cleanupTimedOut = new Promise<never>((_resolve, reject) => {
+        cleanupTimeout = setTimeout(() => {
+          cleanupController.abort();
+          reject(new Error('isolated clone cleanup timed out'));
+        }, Math.min(Math.max(1, timeoutMs), 10_000));
+        cleanupTimeout.unref();
+      });
+      await Promise.race([
+        engine.exec(
+          { name: containerName, identity: containerIdentity, signal: cleanupController.signal },
+          'rm',
+          ['-rf', '--', isolatedCwd],
+        ),
+        cleanupTimedOut,
+      ]);
     } catch { /* The isolated cwd contains no owner work or credentials. */ }
+    finally { if (cleanupTimeout) clearTimeout(cleanupTimeout); }
   }
 }

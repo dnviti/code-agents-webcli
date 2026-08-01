@@ -21,8 +21,8 @@ const {
 function fakeEngine(kind, responses = {}) {
   const calls = [];
   const known = new Map();
-  const runner = async (file, args) => {
-    calls.push({ file, args });
+  const runner = async (file, args, input) => {
+    calls.push({ file, args, input });
     const key = args[0] === 'container' ? args[1] : args[0];
     const handler = responses[key];
     let result;
@@ -257,6 +257,14 @@ describe('per-user environments', function () {
 
       const withoutTty = engine.execArgs({ name: 'box' }, 'ls', []);
       assert.deepStrictEqual(withoutTty, ['exec', '--interactive', 'box', 'ls']);
+    });
+
+    it('sends exec stdin through the runner without putting it in engine argv', async function () {
+      const { engine, calls } = fakeEngine('docker');
+      await engine.exec({ name: 'box', input: 'bearer-token\n' }, 'cat', []);
+      const call = calls.find((entry) => entry.args.includes('exec'));
+      assert.strictEqual(call.input, 'bearer-token\n');
+      assert.ok(!call.args.some((arg) => arg.includes('bearer-token')));
     });
 
     it('reads attributes through inspect, not off a ps row', async function () {
