@@ -40,7 +40,28 @@ function tokenProcesses(token) {
 function stat(pid) {
   const raw = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
   const fields = raw.slice(raw.lastIndexOf(') ') + 2).trim().split(/\s+/);
-  return { state: fields[0], pgrp: Number(fields[2]), session: Number(fields[3]) };
+  return {
+    state: fields[0],
+    pgrp: Number(fields[2]),
+    session: Number(fields[3]),
+    startTime: fields[19],
+  };
+}
+
+function processIsGoneOrReplaced(process) {
+  try {
+    const current = stat(process.pid);
+    return current.state === 'Z' || current.startTime !== process.startTime;
+  } catch {
+    return true;
+  }
+}
+
+function processFromFile(file) {
+  const value = fs.readFileSync(file, 'utf8').trim();
+  if (!/^\d+$/.test(value)) throw new Error(`process identity is not ready: ${file}`);
+  const pid = Number(value);
+  return { pid, ...stat(pid) };
 }
 
 function localEngine(calls) {
@@ -70,6 +91,8 @@ describe('tracked container process control', function() {
     const token = `abcde-${process.pid}-${Date.now()}`;
     const controlFile = path.join(dir, 'runtime.pid');
     const doneFile = path.join(dir, 'runtime.done');
+    const jobFile = path.join(dir, 'job.pid');
+    const detachedFile = path.join(dir, 'detached.pid');
     const calls = [];
     let output = '';
     let terminal;
@@ -88,23 +111,29 @@ describe('tracked container process control', function() {
       await waitUntil(() => fs.existsSync(controlFile));
 
       terminal.write(
-        "sleep 100 & setsid sh -c 'trap \"\" TERM; while :; do sleep 1; done' & printf 'TRACKED_%s\\n' READY\n",
+        `sh -c 'printf "%s\\n" "$$" > "$1"; trap "" TERM; exec sleep 100' sh ${JSON.stringify(jobFile)} & `
+          + `setsid sh -c 'printf "%s\\n" "$$" > "$1"; trap "" TERM; while :; do sleep 1; done' sh ${JSON.stringify(detachedFile)} & `
+          + "printf 'TRACKED_%s\\n' READY\n",
       );
       await waitUntil(() => output.includes('TRACKED_READY'));
 
       const [leader, start] = fs.readFileSync(controlFile, 'utf8').trim().split(/\s+/);
-      let members;
+      let job;
+      let detached;
       await waitUntil(() => {
         try {
-          members = tokenProcesses(token).map((pid) => ({ pid, ...stat(pid) }));
-          return members.some((member) => member.pgrp !== Number(leader))
-            && members.some((member) => member.session !== Number(leader));
+          job = processFromFile(jobFile);
+          detached = processFromFile(detachedFile);
+          return true;
         } catch {
           return false;
         }
       });
-      assert.ok(members.some((member) => member.pgrp !== Number(leader)), 'job control opened another process group');
-      assert.ok(members.some((member) => member.session !== Number(leader)), 'setsid descendant escaped the original SID');
+      assert.ok(job.pgrp !== Number(leader), 'job control opened another process group');
+      assert.ok(detached.session !== Number(leader), 'setsid descendant escaped the original SID');
+      const tracked = tokenProcesses(token);
+      assert.ok(tracked.includes(job.pid), 'job-control child carries the runtime token');
+      assert.ok(tracked.includes(detached.pid), 'detached child carries the runtime token');
 
       const control = new ContainerProcessControl(
         localEngine(calls),
@@ -115,7 +144,11 @@ describe('tracked container process control', function() {
       );
       await control.stop();
       await exited;
-      await waitUntil(() => tokenProcesses(token).length === 0);
+      await waitUntil(() => (
+        tokenProcesses(token).length === 0
+        && processIsGoneOrReplaced(job)
+        && processIsGoneOrReplaced(detached)
+      ));
 
       assert.ok(start);
       assert.ok(!/Inappropriate ioctl|job control turned off/i.test(output), output);
