@@ -40,6 +40,8 @@ interface TabRecord {
    * user is looking at a different one.
    */
   surface: 'terminal' | 'chat';
+  projectId?: string | null;
+  projectName?: string | null;
   /**
    * Where this tab falls in the order they were opened on this screen.
    *
@@ -73,6 +75,8 @@ export interface ListedSession {
   surface?: 'terminal' | 'chat';
   customName?: string | null;
   bypassPermissions?: boolean;
+  projectId?: string | null;
+  projectName?: string | null;
 }
 
 /**
@@ -369,6 +373,8 @@ export class SessionTabManager {
           workingDir: session.workingDir,
           unread: session.unreadOutput,
           attention: session.attention ?? null,
+          projectId: record.projectId,
+          projectName: record.projectName,
         } satisfies ShellTab;
       })
       .filter((tab): tab is ShellTab => tab !== null);
@@ -680,6 +686,8 @@ export class SessionTabManager {
       session.workingDir,
       false,
       session.customName ?? undefined,
+      session.projectId,
+      session.projectName,
     );
 
     if (session.surface !== 'chat') return;
@@ -758,8 +766,26 @@ export class SessionTabManager {
     workingDir: string | null = null,
     autoSwitch = true,
     customName?: string,
+    projectId?: string | null,
+    projectName?: string | null,
   ): void {
-    if (this.tabs.has(sessionId)) return;
+    const existing = this.tabs.get(sessionId);
+    if (existing) {
+      // Announcements race the create response and the initial session list.
+      // A later payload may be the first one carrying project identity, so an
+      // existing tab must absorb metadata instead of freezing its first shape.
+      let changed = false;
+      if (projectId !== undefined && existing.projectId !== projectId) {
+        existing.projectId = projectId;
+        changed = true;
+      }
+      if (projectName !== undefined && existing.projectName !== projectName) {
+        existing.projectName = projectName;
+        changed = true;
+      }
+      if (changed) this.syncShell();
+      return;
+    }
     this.membershipRevision++;
 
     const isDefaultSessionName = sessionName.startsWith('Session ') && sessionName.includes(':');
@@ -774,6 +800,8 @@ export class SessionTabManager {
       displayName,
       customName,
       surface: 'terminal',
+      projectId,
+      projectName,
       openedSeq: ++this.tabsOpened,
     });
     if (!this.tabOrder.includes(sessionId)) {

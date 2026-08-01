@@ -461,6 +461,50 @@ function buildLauncher(app: App): React.ReactNode {
   return <LauncherHost />;
 }
 
+/** Create and focus a session whose workspace is resolved by the project manager. */
+async function createProjectSession(app: App, projectId: string): Promise<void> {
+  try {
+    const response = await app.authFetch('/api/sessions/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId }),
+    });
+    if (!response.ok) throw new Error('Failed to create project session');
+    const data = await response.json() as {
+      sessionId: string;
+      session?: {
+        name?: string;
+        workingDir?: string;
+        projectId?: string | null;
+        projectName?: string | null;
+      };
+    };
+    const sessionName = data.session?.name || 'Project session';
+    const workingDir = data.session?.workingDir || '';
+    app.startPromptRequested = true;
+    if (app.sessionTabManager) {
+      app.sessionTabManager.addTab(
+        data.sessionId,
+        sessionName,
+        'idle',
+        workingDir,
+        true,
+        undefined,
+        data.session?.projectId ?? projectId,
+        data.session?.projectName,
+      );
+      await app.sessionTabManager.switchToTab(data.sessionId);
+    } else {
+      await app.joinSession(data.sessionId);
+    }
+    app.loadSessions();
+  } catch (error) {
+    app.startPromptRequested = false;
+    console.error('Failed to create project session:', error);
+    showError('Could not open a session for this project.');
+  }
+}
+
 /**
  * The complete list of what the chrome may do to the app.
  *
@@ -505,6 +549,7 @@ function buildActions(app: App): ShellActions {
     openSettings: () => app.showSettings(),
 
     createSession: (name, workingDir) => void createNewSession(app, name, workingDir),
+    openProjectSession: (projectId) => void createProjectSession(app, projectId),
     startShell: (shell) => startTerminalShell(app, shell),
     runCommand: (command) => runTerminalCommand(app, command),
 

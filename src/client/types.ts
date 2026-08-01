@@ -150,6 +150,8 @@ export interface SessionCreateResponse {
   session: {
     name: string;
     workingDir: string;
+    projectId?: string | null;
+    projectName?: string | null;
   };
 }
 
@@ -173,6 +175,9 @@ export interface SessionListItem {
    * is the same direction every other unknown in this rule takes.
    */
   bypassPermissions?: boolean;
+  /** Project identity, when this session was opened from a project workspace. */
+  projectId?: string | null;
+  projectName?: string | null;
 }
 
 export interface FolderData {
@@ -202,6 +207,8 @@ export interface WsSessionCreatedMessage {
   sessionId: string;
   sessionName: string;
   workingDir: string;
+  projectId?: string | null;
+  projectName?: string | null;
 }
 
 export interface WsSessionJoinedMessage {
@@ -210,6 +217,8 @@ export interface WsSessionJoinedMessage {
   sessionName: string;
   workingDir: string;
   active: boolean;
+  projectId?: string | null;
+  projectName?: string | null;
   outputBuffer?: string[];
   lastAgent?: AgentKind;
   runtimeLabel?: string;
@@ -403,6 +412,8 @@ export interface WsSessionOpenedMessage {
   surface: 'terminal' | 'chat';
   active: boolean;
   bypassPermissions: boolean;
+  projectId?: string | null;
+  projectName?: string | null;
 }
 
 /**
@@ -493,6 +504,25 @@ export interface WsEnvironmentTierChangedMessage {
   outcome: string;
 }
 
+/** Broadcast: a project this user owns changed state. */
+export interface WsProjectUpdatedMessage {
+  type: 'project_updated';
+  project: {
+    id: string;
+    name: string;
+    state: string;
+    stateDetail?: string | null;
+    lastActivityAt?: string;
+    hasActiveWork?: boolean;
+  };
+}
+
+/** Broadcast: a project this user owns was deleted. */
+export interface WsProjectRemovedMessage {
+  type: 'project_removed';
+  projectId: string;
+}
+
 export type WsMessage =
   | WsConnectedMessage
   | WsSessionCreatedMessage
@@ -519,6 +549,8 @@ export type WsMessage =
   | WsUpdateDoneMessage
   | WsUpdateRestartingMessage
   | WsEnvironmentTierChangedMessage
+  | WsProjectUpdatedMessage
+  | WsProjectRemovedMessage
   | WsChatStartedMessage
   | WsChatSnapshotMessage
   | WsChatEventMessage

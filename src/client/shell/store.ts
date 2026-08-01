@@ -35,6 +35,8 @@ export interface ShellTab {
    * or idle.
    */
   attention: ConversationAttention | null;
+  projectId: string | null | undefined;
+  projectName: string | null | undefined;
   /**
    * Which surface this session runs on, fixed when it was started.
    *
@@ -117,6 +119,8 @@ export interface ShellDialogs {
   runtimeProfiles: boolean;
   /** Where containers run: the installer's deploy target editor. */
   deployTargets: boolean;
+  /** The user's persistent project environments. */
+  projects: boolean;
   /** The per-user environment size picker; only reachable when the server has environments. */
   environment: boolean;
   newSession: boolean;
@@ -289,6 +293,7 @@ const INITIAL: ShellState = {
     settings: false,
     runtimeProfiles: false,
     deployTargets: false,
+    projects: false,
     environment: false,
     newSession: false,
     terminalOptions: false,

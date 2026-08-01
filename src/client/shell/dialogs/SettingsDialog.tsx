@@ -56,6 +56,8 @@ export interface SettingsDialogProps {
   environmentsEnabled: boolean;
   /** Open the environment size picker, which is its own dialog. */
   onOpenEnvironment(): void;
+  /** Open persistent project workspaces. */
+  onOpenProjects(): void;
 }
 
 /**
@@ -153,6 +155,7 @@ export function SettingsDialog({
   onOpenDeployTargets,
   environmentsEnabled,
   onOpenEnvironment,
+  onOpenProjects,
 }: SettingsDialogProps): React.JSX.Element | null {
   const [draft, setDraft] = React.useState<AppSettings>(settings);
   const isPhone = usePhone();
@@ -274,6 +277,12 @@ export function SettingsDialog({
         />
       </SettingRow>
 
+      <SettingRow
+        label="Projects"
+        description="Create and manage persistent repository workspaces."
+      >
+        <Button variant="secondary" size="sm" onClick={onOpenProjects}>Manage projects</Button>
+      </SettingRow>
       <SettingRow
         label="Terminal font"
         description="Nerd Font entries add the powerline and icon glyphs prompts expect."
