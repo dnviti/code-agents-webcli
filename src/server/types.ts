@@ -122,6 +122,14 @@ export interface SessionRecord {
    */
   ownerSessionId?: string;
   /**
+   * The project this session was created against, if any.
+   *
+   * Nullable and absent on every session written before projects existed, so
+   * `undefined` reads as "no project" and project-less sessions behave exactly
+   * as today. (#168)
+   */
+  projectId?: string | null;
+  /**
    * The runtime's own id for this conversation, when it reported one.
    *
    * Kept so a chat can be resumed *with its context* after the server restarts:
@@ -329,6 +337,8 @@ export interface SessionListItem {
   lastAgent: AgentKind | null;
   runtimeLabel: string | null;
   workingDir: string;
+  /** The project this tab is bound to, when it is not a legacy session. */
+  projectId?: string | null;
   connectedClients: number;
   lastActivity: Date;
   /** Absent means terminal; the client needs it to watch chat sessions it is not driving. */

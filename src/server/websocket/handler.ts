@@ -236,6 +236,7 @@ export function announceSessionOpened(
       name: session.name,
       customName: session.customName ?? null,
       workingDir: session.workingDir,
+      projectId: session.projectId,
       surface: session.surface || 'terminal',
       active: session.active,
       // So a conversation that appears on a second screen states the mode it is

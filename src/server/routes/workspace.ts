@@ -1,4 +1,4 @@
-import express, { Router, Request, Response } from 'express';
+import express, { NextFunction, Router, Request, Response } from 'express';
 import { execFile } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -70,6 +70,30 @@ export interface WorkspaceRoutesDeps {
    * what every deployment without per-user environments gets.
    */
   ensureEnvironment?(userId?: number): Promise<UserEnvironment>;
+  /**
+   * Structural project-manager seam. Project sessions must use this even when
+   * a normal user environment is also available. (#168)
+   */
+  projectsManager?: {
+    getForUser(ownerUserId: number, projectId: string): { id: string } | null;
+    ensureForSession(
+      ownerUserId: number,
+      projectId: string,
+    ): Promise<
+      | { ok: true; environment: UserEnvironment; workingDir: string }
+      | {
+          ok: false;
+          reason: 'not_found' | 'run_limit' | 'failed' | 'building';
+          running?: {
+            id: string;
+            name: string;
+            lastActivityAt: string;
+            hasActiveWork: boolean;
+          }[];
+          detail?: string;
+        }
+    >;
+  };
   /**
    * What this app itself measured, for the "measured here" half of the status
    * panel.
@@ -146,11 +170,27 @@ interface RunResult {
  * used, rather than whichever ones the account running the server happens to
  * have configured for everybody.
  */
+class ProjectEnvironmentUnavailable extends Error {
+  constructor(readonly reason: string, detail?: string) {
+    super(detail ? `Project environment is ${reason}: ${detail}` : `Project environment is ${reason}`);
+  }
+}
+
 /** The environment a session's tools run in; this host when there are none. */
 async function environmentFor(
   deps: WorkspaceRoutesDeps,
   session: SessionRecord,
 ): Promise<UserEnvironment | undefined> {
+  if (session.projectId) {
+    const manager = deps.projectsManager;
+    if (!manager) throw new ProjectEnvironmentUnavailable('not configured');
+    const resolved = await manager.ensureForSession(session.ownerUserId, session.projectId);
+    if (!resolved.ok) throw new ProjectEnvironmentUnavailable(resolved.reason, resolved.detail);
+    // The manager owns the checkout mapping. Never substitute a host or a
+    // user environment for a record that explicitly names a project.
+    session.workingDir = resolved.workingDir;
+    return resolved.environment;
+  }
   if (!deps.ensureEnvironment) return undefined;
   try {
     return await deps.ensureEnvironment(session.ownerUserId);
@@ -459,7 +499,7 @@ function sessionFor(deps: WorkspaceRoutesDeps, req: Request, res: Response): Ses
     return null;
   }
 
-  if (!deps.validatePath(session.workingDir, session.ownerUserId).valid) {
+  if (!session.projectId && !deps.validatePath(session.workingDir, session.ownerUserId).valid) {
     // The allowed base can be narrowed between runs, and a restored session
     // record outlives the configuration that admitted it.
     res.status(403).json({ error: 'This session works outside the allowed area' });
@@ -1460,6 +1500,14 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       res.json({ kind, item: normalizeItem(kind, parseJson(view.stdout, null), timeline) });
     },
   );
+
+  router.use((error: unknown, _req: Request, res: Response, next: NextFunction): void => {
+    if (error instanceof ProjectEnvironmentUnavailable) {
+      res.status(409).json({ error: 'project_unavailable', detail: error.message });
+      return;
+    }
+    next(error);
+  });
 
   return router;
 }

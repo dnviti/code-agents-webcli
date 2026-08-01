@@ -71,6 +71,26 @@ import { UserEnvironment } from '../services/environments/types.js';
 import { HostEnvironment } from '../services/environments/manager.js';
 
 /**
+ * Structural seam for the project manager supplied by the #168 composition
+ * root. This slice intentionally does not import its parallel implementation.
+ */
+type ProjectSessionEnvironment =
+  | { ok: true; environment: UserEnvironment; workingDir: string }
+  | {
+      ok: false;
+      reason: 'not_found' | 'run_limit' | 'failed' | 'building';
+      detail?: string;
+    };
+
+interface ProjectsSessionApi {
+  getForUser(ownerUserId: number, projectId: string): { id: string; name: string } | null;
+  ensureForSession(
+    ownerUserId: number,
+    projectId: string,
+  ): Promise<ProjectSessionEnvironment>;
+}
+
+/**
  * The longest model name worth storing. Real ones are far shorter; this only
  * has to stop an unbounded string from being persisted and then handed to a
  * spawn on every future launch of the conversation.
@@ -139,6 +159,10 @@ export interface MessageProcessorDeps {
   getUserBaseFolder?(userId?: number): string;
   /** Prepare (creating or starting if needed) the environment a user's processes run in. */
   ensureEnvironment?(userId?: number): Promise<UserEnvironment>;
+  /** Project sessions resolve only through this manager, never through a user environment. */
+  projectsManager?: ProjectsSessionApi;
+  /** Active-state DB truth for project run-limit checks. */
+  sessionStore?: { setActive(id: string, active: boolean): Promise<void> };
   getSelectedWorkingDir(userId: number): string | null;
   createSessionRecord(params: {
     id: string;
@@ -564,6 +588,43 @@ export class MessageProcessor {
       : new HostEnvironment(this.deps.baseFolder);
   }
 
+  /**
+   * Resolve a record's actual execution environment. A persisted project id is
+   * an instruction, not a hint: falling back to the host or user environment
+   * here would run project work in the wrong checkout after a restart.
+   */
+  private async environmentForSession(session: SessionRecord): Promise<UserEnvironment> {
+    if (!session.projectId) return this.userEnvironment(session.ownerUserId);
+
+    const manager = this.deps.projectsManager;
+    if (!manager) {
+      throw new Error('This project session cannot be resolved until project support is configured.');
+    }
+    const resolved = await manager.ensureForSession(session.ownerUserId, session.projectId);
+    if (!resolved.ok) {
+      const detail = resolved.detail ? `: ${resolved.detail}` : '';
+      throw new Error(`This project's environment is ${resolved.reason}${detail}`);
+    }
+    // A project may have been rebuilt or renamed while the session was idle;
+    // use the manager's current checkout rather than a stale host path.
+    session.workingDir = resolved.workingDir;
+    return resolved.environment;
+  }
+
+  private persistActive(session: SessionRecord, active: boolean): void {
+    void this.deps.sessionStore?.setActive(session.id, active);
+  }
+
+  private projectIdentity(session: SessionRecord): {
+    projectId: string | null;
+    projectName: string | null;
+  } {
+    const projectId = session.projectId || null;
+    if (!projectId) return { projectId: null, projectName: null };
+    const project = this.deps.projectsManager?.getForUser(session.ownerUserId, projectId);
+    return { projectId, projectName: project?.name || null };
+  }
+
   async createAndJoinSession(
     wsId: string,
     name?: string,
@@ -646,6 +707,7 @@ export class MessageProcessor {
           workingDir: session.workingDir,
           lastAgent: session.lastAgent,
           runtimeLabel: session.runtimeLabel,
+          ...this.projectIdentity(session),
         });
       }
 
@@ -724,6 +786,7 @@ export class MessageProcessor {
       runtimeLabel: session.runtimeLabel,
       surface: session.surface || 'terminal',
       outputBuffer: replayBuffer,
+      ...this.projectIdentity(session),
     });
 
     // A chat session's transcript is not in the PTY replay above — it is a
@@ -882,13 +945,14 @@ export class MessageProcessor {
     // window where they saw runId undefined and dropped the event.
     const runId = randomUUID();
     const previousRunId = session.runId;
+    let runEnded = false;
     session.runId = runId;
 
     // A session created before per-user environments were switched on points at
     // a folder on the host, which this user's environment cannot see. Moved to
     // their own root rather than refused: the alternative is a tab that can
     // never be started again and no way to say why from inside it.
-    if (!this.deps.validatePath(session.workingDir, wsInfo.userId).valid) {
+    if (!session.projectId && !this.deps.validatePath(session.workingDir, wsInfo.userId).valid) {
       session.workingDir = this.userBaseFolder(wsInfo.userId);
     }
 
@@ -897,14 +961,14 @@ export class MessageProcessor {
     // is not up yet fails with an engine error the user cannot act on.
     let environment;
     try {
-      environment = await this.userEnvironment(wsInfo.userId);
-    } catch {
+      environment = await this.environmentForSession(session);
+    } catch (error) {
       session.runId = previousRunId;
       sendToWebSocket(wsInfo.ws, {
         type: 'error',
-        message:
-          'Your workspace environment could not be started. '
-          + 'Ask an administrator to check the container engine on the server.',
+        message: error instanceof Error
+          ? error.message
+          : 'Your workspace environment could not be started.',
       });
       return;
     }
@@ -939,7 +1003,9 @@ export class MessageProcessor {
           this.retireRecorder(currentSession);
 
           const stopRequested = currentSession.stopRequested;
+          runEnded = true;
           currentSession.active = false;
+          this.persistActive(currentSession, false);
           currentSession.agent = null;
           currentSession.stopRequested = false;
           currentSession.lastActivity = new Date();
@@ -969,7 +1035,9 @@ export class MessageProcessor {
           if (!currentSession || currentSession.runId !== runId) return;
 
           const stopRequested = currentSession.stopRequested;
+          runEnded = true;
           currentSession.active = false;
+          this.persistActive(currentSession, false);
           currentSession.agent = null;
           currentSession.stopRequested = false;
           currentSession.lastActivity = new Date();
@@ -990,7 +1058,16 @@ export class MessageProcessor {
         },
       })) as RuntimeSession;
 
+      // A bridge may report an immediate exit while `startSession()` is still
+      // resolving. Do not resurrect that finished run below — especially not
+      // in SQLite, where it would make a dead project look busy. (#168)
+      if (runEnded) {
+        if (session.runId === runId) session.runId = previousRunId;
+        return;
+      }
+
       session.active = true;
+      this.persistActive(session, true);
       session.agent = agentKind;
       session.lastAgent = agentKind;
       session.stopRequested = false;
@@ -1042,6 +1119,7 @@ export class MessageProcessor {
       if (session.runId === runId) {
         session.runId = previousRunId;
       }
+      this.persistActive(session, false);
 
       const errorMessage = error instanceof Error ? error.message : String(error);
       if (this.deps.dev) {
@@ -1064,12 +1142,16 @@ export class MessageProcessor {
     const session = this.deps.claudeSessions.get(sessionId);
     if (!session || !session.active) return;
 
-    const bridge = this.deps.getRuntimeBridge(agentKind);
-    if (!bridge) return;
-
     session.stopRequested = true;
-    await bridge.stopSession(sessionId);
+    if (session.surface === 'chat') {
+      await this.deps.chatManager?.stop(sessionId);
+    } else {
+      const bridge = this.deps.getRuntimeBridge(agentKind);
+      if (!bridge) return;
+      await bridge.stopSession(sessionId);
+    }
     session.active = false;
+    this.persistActive(session, false);
     session.agent = null;
     session.lastActivity = new Date();
 
@@ -1547,20 +1629,20 @@ export class MessageProcessor {
     session.runtimeLabel = this.getRuntimeLabel(agentKind as AgentKind, session);
     session.lastActivity = new Date();
 
-    if (!this.deps.validatePath(session.workingDir, session.ownerUserId).valid) {
+    if (!session.projectId && !this.deps.validatePath(session.workingDir, session.ownerUserId).valid) {
       // Same reasoning as the pty path above.
       session.workingDir = this.userBaseFolder(session.ownerUserId);
     }
 
     let chatEnvironment;
     try {
-      chatEnvironment = await this.userEnvironment(session.ownerUserId);
-    } catch {
+      chatEnvironment = await this.environmentForSession(session);
+    } catch (error) {
       sendToWebSocket(wsInfo.ws, {
         type: 'error',
-        message:
-          'Your workspace environment could not be started. '
-          + 'Ask an administrator to check the container engine on the server.',
+        message: error instanceof Error
+          ? error.message
+          : 'Your workspace environment could not be started.',
       });
       return;
     }
@@ -1689,6 +1771,7 @@ export class MessageProcessor {
       }
 
       session.active = true;
+      this.persistActive(session, true);
       session.stopRequested = false;
       session.sessionStartTime = session.sessionStartTime || new Date();
       // Recorded on the record, not just handed to the process: the process is
@@ -1778,6 +1861,7 @@ export class MessageProcessor {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       session.active = false;
+      this.persistActive(session, false);
       // Left on 'chat' deliberately: the conversation log for this session is
       // a chat log, and flipping the surface back would show the user an empty
       // terminal as the explanation for a failed chat launch.

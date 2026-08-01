@@ -98,6 +98,7 @@ import { UserPreferenceStore } from './services/user-preferences.js';
 export function applyChatLifecycle(
   record: SessionRecord,
   change: { nativeSessionId?: string | null; exited?: boolean; bypassing?: boolean },
+  writeActive?: (sessionId: string, active: boolean) => void | Promise<void>,
 ): void {
   if (change.nativeSessionId !== undefined) {
     record.nativeChatSessionId = change.nativeSessionId || undefined;
@@ -123,6 +124,9 @@ export function applyChatLifecycle(
     // sitting in, with an agent answering, is listed as finished.
     record.active = true;
     record.lastActivity = new Date();
+  }
+  if (change.exited !== undefined) {
+    void writeActive?.(record.id, !change.exited);
   }
 }
 
@@ -411,7 +415,11 @@ export class ClaudeCodeWebServer {
       onLifecycle: (sessionId, change) => {
         const record = this.claudeSessions.get(sessionId);
         if (!record) return;
-        applyChatLifecycle(record, change);
+        applyChatLifecycle(
+          record,
+          change,
+          (id, active) => this.sessionStore.setActive(id, active),
+        );
         // Written through rather than left to the thirty-second autosave: the
         // conversation this is about is one that was cleared and then left
         // alone, and what it is protected from is the process going away. The
@@ -531,6 +539,7 @@ export class ClaudeCodeWebServer {
       validatePath: (targetPath: string, userId?: number) => this.validatePath(targetPath, userId),
       getUserBaseFolder: (userId?: number) => this.getUserBaseFolder(userId),
       ensureEnvironment: (userId?: number) => this.ensureEnvironment(userId),
+      sessionStore: this.sessionStore,
       getSelectedWorkingDir: (userId: number) => this.getSelectedWorkingDir(userId),
       createSessionRecord: (params) => this.createSessionRecord(params),
       tabCoordinator: this.tabCoordinator,
@@ -730,10 +739,12 @@ export class ClaudeCodeWebServer {
     workingDir: string;
     connections?: string[];
     ownerSessionId?: string;
+    projectId?: string | null;
   }): SessionRecord {
     return {
       id: params.id,
       ownerSessionId: params.ownerSessionId,
+      projectId: params.projectId,
       ownerUserId: params.ownerUserId,
       name: params.name || `Session ${new Date().toLocaleString()}`,
       created: new Date(),
@@ -1197,6 +1208,10 @@ export class ClaudeCodeWebServer {
       createSessionRecord: (params) => this.createSessionRecord(params),
       tabCoordinator: this.tabCoordinator,
       getRuntimeBridge: (agentKind: AgentKind) => this.getRuntimeBridge(agentKind),
+      stopSessionRuntime: (session) =>
+        session.agent
+          ? this.messageProcessor.stopRuntime(session.id, session.agent)
+          : Promise.resolve(),
       saveSessionsToDisk: () => this.saveSessionsToDisk(),
       transcriptStore: this.transcriptStore,
       historyStore: this.historyStore,
@@ -1280,6 +1295,10 @@ export class ClaudeCodeWebServer {
   }
 
   async start(): Promise<http.Server | https.Server> {
+    // No process survives a server restart. This is deliberately before the
+    // project manager's future boot reconciliation, which reads the same DB
+    // truth to decide whether a project may be stopped or swapped. (#168)
+    await this.sessionStore.resetActiveFlags();
     await this.loadPersistedSessions();
 
     // A marker left behind means a previous update was killed part-way — host

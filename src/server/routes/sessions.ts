@@ -1,5 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import WebSocket from 'ws';
 import {
   SessionRecord,
@@ -34,6 +36,35 @@ import {
   announceSessionTabClosed,
   announceSessionTabsReordered,
 } from '../websocket/handler.js';
+import { UserEnvironment } from '../services/environments/types.js';
+
+/**
+ * Structural seam for project-backed sessions. S3 consumes the pinned
+ * ProjectManager API without importing its module. (#168)
+ */
+interface ProjectRunningInfo {
+  id: string;
+  name: string;
+  lastActivityAt: string;
+  hasActiveWork: boolean;
+}
+
+type ProjectSessionEnvResult =
+  | { ok: true; environment: UserEnvironment; workingDir: string }
+  | {
+      ok: false;
+      reason: 'not_found' | 'run_limit' | 'failed' | 'building';
+      running?: ProjectRunningInfo[];
+      detail?: string;
+    };
+
+interface ProjectsSessionApi {
+  getForUser(ownerUserId: number, projectId: string): { id: string } | null;
+  ensureForSession(
+    ownerUserId: number,
+    projectId: string,
+  ): Promise<ProjectSessionEnvResult>;
+}
 
 /**
  * How many past conversations one folder offers.
@@ -84,8 +115,14 @@ export interface SessionRoutesDeps {
     workingDir: string;
     connections?: string[];
     ownerSessionId?: string;
+    projectId?: string | null;
   }): SessionRecord;
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
+  /**
+   * Stop whichever process owns this record. The real composition root routes
+   * chats through ChatSessionManager and terminals through their bridge.
+   */
+  stopSessionRuntime?(session: SessionRecord): Promise<void>;
   /** `false` means the SQLite write was attempted but did not commit. */
   saveSessionsToDisk(): Promise<boolean | void>;
   transcriptStore: TranscriptStoreLike;
@@ -111,7 +148,16 @@ export interface SessionRoutesDeps {
   activeProfileFor?(runtime: string): { profileName: string; model?: string } | null;
   sessionStore: {
     getSessionMetadata(): Promise<any>;
+    /** Write-through for the runtime active flag. Optional for tests. */
+    setActive?(id: string, active: boolean): Promise<void>;
+    /** Boot reset for stale active flags. Optional for tests. */
+    resetActiveFlags?(): Promise<void>;
   };
+  /**
+   * Optional project manager seam. When absent, project-aware create is not
+   * available and project-less sessions behave exactly as today. (#168)
+   */
+  projectsManager?: ProjectsSessionApi;
   /**
    * Optional so the hand-built deps literals in the existing tests keep
    * compiling; the server always supplies one.
@@ -308,6 +354,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         lastAgent: session.lastAgent,
         runtimeLabel: session.runtimeLabel,
         workingDir: session.workingDir,
+        projectId: session.projectId,
         connectedClients: session.connections.size,
         lastActivity: session.lastActivity,
         surface: session.surface || 'terminal',
@@ -563,7 +610,6 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       }
     },
   );
-
   router.post('/api/sessions/create', async (req: Request, res: Response): Promise<void> => {
     const user = requireUser(res);
     if (!user) {
@@ -571,7 +617,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       return;
     }
 
-    const { name, workingDir, ownerSessionId } = req.body;
+    const { name, workingDir, ownerSessionId, projectId } = req.body;
     const sessionId = randomUUID();
 
     // The name is bound into a SQLite statement on every autosave, and SQLite
@@ -591,6 +637,14 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       });
       return;
     }
+    if (projectId !== undefined && projectId !== null && typeof projectId !== 'string') {
+      res.status(400).json({ error: 'invalid_project_id', message: 'Project id must be a string' });
+      return;
+    }
+    if (typeof projectId === 'string' && projectId.trim().length === 0) {
+      res.status(400).json({ error: 'invalid_project_id', message: 'Project id cannot be empty' });
+      return;
+    }
 
     // A session can declare that it belongs to a conversation, which is what
     // keeps it out of the listings and ties its lifetime to that conversation's.
@@ -598,6 +652,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     // would let one request hide a session from its own owner's tab strip, or
     // attach it to somebody else's teardown.
     let owner: string | undefined;
+    let ownerRecord: SessionRecord | undefined;
     if (ownerSessionId !== undefined && ownerSessionId !== null) {
       if (typeof ownerSessionId !== 'string') {
         res.status(400).json({
@@ -615,20 +670,90 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         return;
       }
       owner = parent.id;
+      ownerRecord = parent;
     }
 
+    const submittedProjectId = typeof projectId === 'string' ? projectId : undefined;
+    const inheritedProjectId = ownerRecord?.projectId || undefined;
+    if (
+      ownerRecord
+      && projectId !== undefined
+      && (projectId === null ? undefined : submittedProjectId) !== inheritedProjectId
+    ) {
+      res.status(400).json({
+        error: 'owner_project_mismatch',
+        message: 'A conversation terminal must use the conversation project',
+      });
+      return;
+    }
+    const effectiveProjectId = ownerRecord ? inheritedProjectId : submittedProjectId;
+
+    let persistedProjectId: string | undefined;
+    let projectCheckout: string | undefined;
     let validWorkingDir = (deps.getUserBaseFolder?.(user.id) ?? deps.baseFolder);
-    if (workingDir) {
-      const validation = deps.validatePath(workingDir, user.id);
-      if (!validation.valid) {
-        res.status(403).json({
-          error: validation.error,
-          message: 'Cannot create session with working directory outside the allowed area',
-        });
+    if (effectiveProjectId) {
+      // Check owner scope before provisioning anything. A guessed id must not
+      // start another user's project or disclose whether it can be started.
+      const projects = deps.projectsManager;
+      if (!projects || !projects.getForUser(user.id, effectiveProjectId)) {
+        res.status(404).json({ error: 'project_not_found', message: 'Project not found' });
         return;
       }
-      validWorkingDir = validation.path!;
-    } else {
+
+      const prepared = await projects.ensureForSession(user.id, effectiveProjectId);
+      if (!prepared.ok) {
+        if (prepared.reason === 'not_found') {
+          res.status(404).json({ error: 'project_not_found', message: 'Project not found' });
+        } else if (prepared.reason === 'run_limit') {
+          res.status(409).json({ error: 'run_limit', running: prepared.running || [] });
+        } else {
+          res.status(409).json({
+            error: prepared.reason === 'building' ? 'project_building' : 'project_unavailable',
+            detail: prepared.detail,
+          });
+        }
+        return;
+      }
+      persistedProjectId = effectiveProjectId;
+      projectCheckout = prepared.workingDir;
+      // A project manager is the authority for its checkout. A caller may
+      // still name a subdirectory below it, but a bare create always lands in
+      // the checkout it just prepared.
+      validWorkingDir = prepared.workingDir;
+      if (ownerRecord?.projectId === effectiveProjectId) {
+        // A split terminal opens where its conversation is working. The
+        // manager's checkout remains the security boundary, so a stale or
+        // tampered parent path falls back to the checkout rather than legacy.
+        validWorkingDir = confinedProjectWorkingDir(
+          prepared.workingDir,
+          ownerRecord.workingDir,
+        ) || prepared.workingDir;
+      }
+    }
+
+    if (workingDir) {
+      if (persistedProjectId && projectCheckout) {
+        const confined = confinedProjectWorkingDir(projectCheckout, workingDir);
+        if (!confined) {
+          res.status(403).json({
+            error: 'invalid_project_working_dir',
+            message: 'Project sessions must work inside the project checkout',
+          });
+          return;
+        }
+        validWorkingDir = confined;
+      } else {
+        const validation = deps.validatePath(workingDir, user.id);
+        if (!validation.valid) {
+          res.status(403).json({
+            error: validation.error,
+            message: 'Cannot create session with working directory outside the allowed area',
+          });
+          return;
+        }
+        validWorkingDir = validation.path!;
+      }
+    } else if (!persistedProjectId) {
       const selected = deps.getSelectedWorkingDir(user.id);
       validWorkingDir = selected && deps.validatePath(selected, user.id).valid
         ? selected
@@ -657,6 +782,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         name,
         workingDir: validWorkingDir,
         ownerSessionId: owner,
+        projectId: persistedProjectId,
       });
       if (!owner) session.tabOrder = nextAccountTabOrder(deps.claudeSessions, user.id);
       deps.claudeSessions.set(sessionId, session);
@@ -696,6 +822,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         id: sessionId,
         name: session.name,
         workingDir: session.workingDir,
+        projectId: session.projectId,
         lastAgent: session.lastAgent,
         runtimeLabel: session.runtimeLabel,
       },
@@ -779,6 +906,9 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         ownerUserId: user.id,
         name: branchName(source, cut.turn.index),
         workingDir: source.workingDir,
+        // A branch is a continuation in the same checkout. Losing this would
+        // make its next launch silently fall back to the user's environment.
+        projectId: source.projectId,
       });
       // The conversation this one came from, running the same agent in the same
       // place. Not `agent`, which says a process is up: nothing is running here
@@ -918,6 +1048,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       lastAgent: session.lastAgent,
       runtimeLabel: session.runtimeLabel,
       workingDir: session.workingDir,
+      projectId: session.projectId,
       connectedClients: session.connections.size,
       lastActivity: session.lastActivity,
     });
@@ -967,7 +1098,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         return;
       }
 
-      for (const candidate of removed) destroySession(deps, candidate);
+      for (const candidate of removed) await destroySession(deps, candidate);
       res.json({ success: true, message: 'Session deleted' });
     } finally {
       release();
@@ -1069,21 +1200,59 @@ function restoreSessionMapOrder(
 }
 
 /**
- * End one session: its process, its sockets, its record and everything stored
- * for it.
- *
- * Its own function because a delete is no longer one session — a conversation
- * takes the shells opened inside it with it — and doing that inline would mean
- * two copies of a teardown where a missed line leaks a pty.
- *
- * Not responsible for persisting the map: the caller saves once for the whole
- * cascade rather than once per session torn down.
+ * Retire every session a deleted project owns, including shells whose only
+ * link is their owning project conversation. The project manager calls this
+ * before it destroys the project row; clearing `projectId` would turn a stale
+ * tab into a legacy-host session on its next launch.
  */
-function destroySession(deps: SessionRoutesDeps, session: SessionRecord): void {
+export async function retireProjectSessions(
+  deps: SessionRoutesDeps,
+  projectId: string,
+): Promise<string[]> {
+  const ids = new Set(
+    Array.from(deps.claudeSessions.values())
+      .filter((session) => session.projectId === projectId)
+      .map((session) => session.id),
+  );
+
+  // A terminal split is a distinct session with no reason to duplicate the
+  // parent's project id. Follow owner links to a fixed point so an owned shell
+  // (and any future nested child surface) cannot outlive its project.
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const session of deps.claudeSessions.values()) {
+      if (session.ownerSessionId && ids.has(session.ownerSessionId) && !ids.has(session.id)) {
+        ids.add(session.id);
+        changed = true;
+      }
+    }
+  }
+
+  const sessions = Array.from(deps.claudeSessions.values())
+    .filter((session) => ids.has(session.id));
+  for (const session of sessions) await destroySession(deps, session);
+  if (sessions.length > 0) await deps.saveSessionsToDisk();
+  return sessions.map((session) => session.id);
+}
+
+/**
+ * End one session: await its process, then remove its sockets, record and
+ * stored transcript/history. The caller persists once for the whole cascade.
+ */
+async function destroySession(deps: SessionRoutesDeps, session: SessionRecord): Promise<void> {
   if (session.active && session.agent) {
-    const bridge = deps.getRuntimeBridge(session.agent);
-    if (bridge) {
-      void bridge.stopSession(session.id);
+    if (deps.stopSessionRuntime) {
+      await deps.stopSessionRuntime(session);
+    } else {
+      // Compatibility for embedders/tests that predate the unified hook. Chat
+      // sessions require the hook; a bridge is only a correct fallback for the
+      // terminal surface.
+      if (session.surface === 'chat') {
+        throw new Error('Cannot retire an active chat session without a chat stop hook');
+      }
+      const bridge = deps.getRuntimeBridge(session.agent);
+      if (!bridge) throw new Error(`Cannot stop runtime ${session.agent}`);
+      await bridge.stopSession(session.id);
     }
   }
 
@@ -1106,11 +1275,32 @@ function destroySession(deps: SessionRoutesDeps, session: SessionRecord): void {
   // Without this the headless emulator for a deleted session would live for
   // as long as the process does.
   deps.disposeRecorder(session.id);
-  void deps.transcriptStore.deleteTranscript(session);
-  void deps.historyStore.deleteHistory(session);
+  await Promise.all([
+    deps.transcriptStore.deleteTranscript(session),
+    deps.historyStore.deleteHistory(session),
+  ]);
   // Subsystems that registered their own cleanup (pasted images, and
   // whatever comes next) rather than each appending a line here.
   deps.sessionTeardown?.dispose(session);
+}
+
+/** Resolve an existing requested directory and prove its real path is in the checkout. */
+function confinedProjectWorkingDir(checkout: string, requested: string): string | null {
+  try {
+    const root = fs.realpathSync(checkout);
+    const candidate = fs.realpathSync(requested);
+    const relative = path.relative(root, candidate);
+    if (
+      relative === ''
+      || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))
+    ) {
+      return candidate;
+    }
+  } catch {
+    // A cwd has to exist. Treat a missing path exactly like an escape rather
+    // than storing a project session that can never launch.
+  }
+  return null;
 }
 
 /**

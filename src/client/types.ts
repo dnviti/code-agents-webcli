@@ -207,6 +207,7 @@ export interface WsSessionCreatedMessage {
   sessionId: string;
   sessionName: string;
   workingDir: string;
+  /** Absent only when connected to a server predating project sessions. */
   projectId?: string | null;
   projectName?: string | null;
 }
@@ -216,9 +217,10 @@ export interface WsSessionJoinedMessage {
   sessionId: string;
   sessionName: string;
   workingDir: string;
-  active: boolean;
+  /** Absent only when connected to a server predating project sessions. */
   projectId?: string | null;
   projectName?: string | null;
+  active: boolean;
   outputBuffer?: string[];
   lastAgent?: AgentKind;
   runtimeLabel?: string;
