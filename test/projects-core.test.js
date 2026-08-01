@@ -343,6 +343,105 @@ describe('project core lifecycle', function () {
     assert.strictEqual(s.projectHasActiveSessions('one'), false);
   });
 
+  it('keeps a released lease counted until every unverified helper retry succeeds', async function () {
+    const { manager, s } = setup([project('one')]);
+    await manager.start(1, 'one'); await manager.waitForBuild('one');
+    const admitted = await manager.ensureForSession(1, 'one');
+    assert.strictEqual(admitted.ok, true);
+
+    let finishFirst;
+    let finishSecond;
+    const firstGate = new Promise((resolve) => { finishFirst = resolve; });
+    const secondGate = new Promise((resolve) => { finishSecond = resolve; });
+    manager.registerUnverifiedSessionProcess(1, 'one', admitted.leaseId, {
+      reason: 'first helper uncertain',
+      stop: () => firstGate,
+    });
+    manager.registerUnverifiedSessionProcess(1, 'one', admitted.leaseId, {
+      reason: 'second helper uncertain',
+      stop: () => secondGate,
+    });
+
+    assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), false);
+    assert.strictEqual(s.projectHasActiveSessions('one'), true);
+    finishFirst();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(s.projectHasActiveSessions('one'), true, 'one unresolved helper keeps admission closed');
+    finishSecond();
+    for (let i = 0; i < 20 && s.projectHasActiveSessions('one'); i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.strictEqual(s.projectHasActiveSessions('one'), false);
+    assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), false);
+  });
+
+  it('keeps retrying a transferred stop after the caller releases its last handle', async function () {
+    const { manager, s } = setup([project('one')]);
+    await manager.start(1, 'one'); await manager.waitForBuild('one');
+    const admitted = await manager.ensureForSession(1, 'one');
+    let attempts = 0;
+    manager.registerUnverifiedSessionProcess(1, 'one', admitted.leaseId, {
+      reason: 'transient controller failure',
+      stop: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('temporary transport error');
+      },
+    });
+    assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), false);
+    for (let i = 0; i < 30 && s.projectHasActiveSessions('one'); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(attempts >= 2);
+    assert.strictEqual(s.projectHasActiveSessions('one'), false);
+  });
+
+  it('stops the exact lease container on shutdown when helper proof stays unavailable', async function () {
+    const { manager, s, e } = setup([project('one')]);
+    await manager.start(1, 'one'); await manager.waitForBuild('one');
+    const admitted = await manager.ensureForSession(1, 'one');
+    assert.strictEqual(admitted.ok, true);
+    const stopped = [];
+    e.stopIdentity = async (description) => {
+      stopped.push(description.identity);
+      const item = await e.describe(description.name);
+      if (item) item.status = 'stopped';
+    };
+    manager.registerUnverifiedSessionProcess(1, 'one', admitted.leaseId, {
+      reason: 'controller unavailable',
+      stop: async () => { throw new Error('control plane still unavailable'); },
+    });
+    assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), false);
+
+    await manager.shutdown();
+
+    assert.deepStrictEqual(stopped, [admitted.containerAccess.containerIdentity]);
+    assert.strictEqual(s.getProject('one').state, 'stopped');
+    assert.match(s.getProject('one').stateDetail, /helper-process exit could not be verified/);
+    assert.strictEqual(s.projectHasActiveSessions('one'), false);
+  });
+
+  it('never stops a same-name replacement while recovering a helper at shutdown', async function () {
+    const { manager, s, e } = setup([project('one')]);
+    await manager.start(1, 'one'); await manager.waitForBuild('one');
+    const admitted = await manager.ensureForSession(1, 'one');
+    assert.strictEqual(admitted.ok, true);
+    const originalDescribe = e.describe;
+    const original = await originalDescribe(admitted.containerAccess.containerName);
+    e.describe = async (name) => ({
+      ...original,
+      name,
+      identity: 'same-name-replacement',
+    });
+    manager.registerUnverifiedSessionProcess(1, 'one', admitted.leaseId, {
+      reason: 'no retry handle',
+    });
+    assert.strictEqual(manager.releaseSessionLease(1, 'one', admitted.leaseId), false);
+
+    await assert.rejects(() => manager.shutdown(), /replaced before recovery/);
+    assert.strictEqual(s.projectHasActiveSessions('one'), true);
+    assert.strictEqual(e.calls.some((call) => call.op === 'stop'), false);
+  });
+
   it('holds an admission lease before returning so a concurrent stop cannot kill the attachment', async function () {
     let enteredEnsure; let finishEnsure;
     const ensureEntered = new Promise((resolve) => { enteredEnsure = resolve; });

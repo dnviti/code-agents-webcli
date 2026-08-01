@@ -50,6 +50,27 @@ export type ProjectSessionFileCommand =
   | { operation: 'read'; path: string; offset?: number; length?: number }
   | { operation: 'write'; path: string; append?: boolean; exclusive?: boolean };
 
+/** Retryable ownership transferred by a helper whose remote exit is uncertain. */
+export interface ProjectSessionProcessRecovery {
+  reason: string;
+  stop?: () => Promise<void>;
+}
+
+interface RecoveryEntry {
+  recovery: ProjectSessionProcessRecovery;
+  attempt: Promise<boolean> | null;
+  retryTimer?: NodeJS.Timeout;
+  lastError?: string;
+}
+
+interface IssuedSessionLease {
+  ownerUserId: number;
+  projectId: string;
+  access: ProjectContainerAccess;
+  recoveries: Set<RecoveryEntry>;
+  releaseRequested: boolean;
+}
+
 export interface ProjectManagerDeps {
   store: ProjectStore;
   environments: EnvironmentManager;
@@ -77,7 +98,7 @@ export class ProjectManager {
   private readonly lifecycleTails = new Map<string, Promise<void>>();
   private readonly builds = new Map<string, Promise<void>>();
   private readonly creations = new Set<Promise<CreateResult>>();
-  private readonly issuedLeases = new Map<string, { ownerUserId: number; projectId: string; access: ProjectContainerAccess }>();
+  private readonly issuedLeases = new Map<string, IssuedSessionLease>();
   private readonly leaseWaiters = new Set<() => void>();
   private sweepTask: Promise<void> | null = null;
   private shuttingDown = false;
@@ -439,6 +460,8 @@ export class ProjectManager {
           ownerUserId,
           projectId,
           access: result.containerAccess,
+          recoveries: new Set(),
+          releaseRequested: false,
         });
         return {
           ok: true,
@@ -467,12 +490,39 @@ export class ProjectManager {
    */
   releaseSessionLease(ownerUserId: number, projectId: string, leaseId: string): boolean {
     const issued = this.issuedLeases.get(leaseId);
-    const released = this.deps.store.releaseSessionLease(projectId, ownerUserId, leaseId);
-    if (issued && issued.ownerUserId === ownerUserId && issued.projectId === projectId) {
-      this.issuedLeases.delete(leaseId);
-      this.resolveLeaseWaiters();
+    if (!issued || issued.ownerUserId !== ownerUserId || issued.projectId !== projectId) {
+      return this.deps.store.releaseSessionLease(projectId, ownerUserId, leaseId);
     }
-    return released;
+    issued.releaseRequested = true;
+    if (issued.recoveries.size > 0) {
+      for (const entry of issued.recoveries) {
+        void this.retryRecovery(leaseId, issued, entry);
+      }
+      return false;
+    }
+    return this.finishLeaseRelease(leaseId, issued);
+  }
+
+  /**
+   * Take synchronous ownership of an unverified helper before its caller can
+   * forget the child handle. Ordinary release remains blocked until every
+   * registered helper is proved gone; retries are coalesced per helper.
+   */
+  registerUnverifiedSessionProcess(
+    ownerUserId: number,
+    projectId: string,
+    leaseId: string,
+    recovery: ProjectSessionProcessRecovery,
+  ): void {
+    const issued = this.requireIssuedLease(ownerUserId, projectId, leaseId);
+    const entry: RecoveryEntry = { recovery, attempt: null };
+    issued.recoveries.add(entry);
+    if (recovery.stop) {
+      void this.retryRecovery(leaseId, issued, entry).catch((error: unknown) => {
+        // retryRecovery records the error and deliberately keeps ownership.
+        console.error(`Project ${projectId}: helper stop retry failed:`, error);
+      });
+    }
   }
 
   /**
@@ -741,6 +791,37 @@ export class ProjectManager {
         ...(this.sweepTask ? [this.sweepTask] : []),
       ]);
       await Promise.allSettled(pending);
+    }
+    // Most helpers settle on their first transferred retry. Anything still
+    // uncertain at shutdown is resolved by stopping the exact immutable
+    // project container that issued the lease. This is the safe backstop:
+    // releasing merely because the local engine client is gone could orphan a
+    // command that is still writing the workspace.
+    for (const [leaseId, issued] of Array.from(this.issuedLeases)) {
+      if (issued.recoveries.size === 0) continue;
+      for (const entry of issued.recoveries) {
+        if (entry.retryTimer) clearTimeout(entry.retryTimer);
+        entry.retryTimer = undefined;
+      }
+      await Promise.all(
+        Array.from(issued.recoveries, (entry) => this.retryRecovery(leaseId, issued, entry)),
+      );
+      if (issued.recoveries.size === 0) continue;
+
+      const project = this.deps.store.getProjectForUser(issued.projectId, issued.ownerUserId);
+      if (project) {
+        await this.projects.stopAccess(project, issued.access);
+        this.deps.store.setState(
+          project.id,
+          'stopped',
+          'Project runtime stopped during shutdown because helper-process exit could not be verified',
+        );
+      }
+      issued.recoveries.clear();
+      issued.releaseRequested = true;
+      if (!this.finishLeaseRelease(leaseId, issued)) {
+        throw new Error(`Project ${issued.projectId}: could not release recovered session lease`);
+      }
     }
     // Routes/runtime finalizers are allowed to release after admission closes.
     // SQLite must remain open until every lease this manager handed out has
@@ -1136,12 +1217,64 @@ export class ProjectManager {
     return task;
   }
 
-  private requireIssuedLease(ownerUserId: number, projectId: string, leaseId: string): { ownerUserId: number; projectId: string; access: ProjectContainerAccess } {
+  private requireIssuedLease(ownerUserId: number, projectId: string, leaseId: string): IssuedSessionLease {
     const issued = this.issuedLeases.get(leaseId);
     if (!issued || issued.ownerUserId !== ownerUserId || issued.projectId !== projectId) {
       throw new Error('project session lease is no longer active');
     }
     return issued;
+  }
+
+  private retryRecovery(
+    leaseId: string,
+    issued: IssuedSessionLease,
+    entry: RecoveryEntry,
+  ): Promise<boolean> {
+    if (!issued.recoveries.has(entry)) return Promise.resolve(true);
+    if (entry.attempt) return entry.attempt;
+    if (!entry.recovery.stop) return Promise.resolve(false);
+
+    const attempt = Promise.resolve()
+      .then(() => entry.recovery.stop!())
+      .then(() => {
+        if (entry.retryTimer) clearTimeout(entry.retryTimer);
+        entry.retryTimer = undefined;
+        issued.recoveries.delete(entry);
+        if (issued.releaseRequested && issued.recoveries.size === 0) {
+          this.finishLeaseRelease(leaseId, issued);
+        }
+        return true;
+      })
+      .catch((error: unknown) => {
+        entry.lastError = error instanceof Error ? error.message : String(error);
+        if (issued.releaseRequested && !this.shuttingDown && !entry.retryTimer) {
+          entry.retryTimer = setTimeout(() => {
+            entry.retryTimer = undefined;
+            void this.retryRecovery(leaseId, issued, entry);
+          }, 1_000);
+          entry.retryTimer.unref();
+        }
+        return false;
+      })
+      .finally(() => {
+        if (entry.attempt === attempt) entry.attempt = null;
+      });
+    entry.attempt = attempt;
+    return attempt;
+  }
+
+  private finishLeaseRelease(leaseId: string, issued: IssuedSessionLease): boolean {
+    if (issued.recoveries.size > 0) return false;
+    const released = this.deps.store.releaseSessionLease(
+      issued.projectId,
+      issued.ownerUserId,
+      leaseId,
+    );
+    if (this.issuedLeases.get(leaseId) === issued) {
+      this.issuedLeases.delete(leaseId);
+      this.resolveLeaseWaiters();
+    }
+    return released;
   }
 
   private waitForLeaseChange(): Promise<void> {

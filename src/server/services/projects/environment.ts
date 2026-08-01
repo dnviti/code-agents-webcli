@@ -261,6 +261,23 @@ export class ProjectEnvironmentManager {
     return 'stopped';
   }
 
+  /** Stop only the immutable container that issued a still-live session lease. */
+  async stopAccess(
+    project: Project,
+    access: ProjectContainerAccess,
+  ): Promise<'absent' | 'stopped'> {
+    this.assertAccess(project, access);
+    const owned = await this.ownedDescription(project);
+    if (!owned) return 'absent';
+    if (owned.description.identity !== access.containerIdentity) {
+      throw new ProjectContainerOwnershipError(
+        `project container '${access.containerName}' was replaced before recovery`,
+      );
+    }
+    await owned.engine.stopIdentity(owned.description);
+    return 'stopped';
+  }
+
   async remove(project: Project): Promise<void> {
     if (!project.container) return;
     const owned = await this.ownedDescription(project);
@@ -287,10 +304,7 @@ export class ProjectEnvironmentManager {
     commandArgs: string[],
     signal?: AbortSignal,
   ): Promise<RunResult> {
-    if (access.projectId !== project.id || access.ownerUserId !== project.ownerUserId
-      || !project.container || access.containerName !== project.container.name) {
-      throw new ProjectContainerOwnershipError('project container access does not match the recorded project');
-    }
+    this.assertAccess(project, access);
     const owned = await this.ownedDescription(project);
     if (!owned) throw new ProjectContainerStateUnknownError(
       `project container '${access.containerName}' is missing`, access.containerName,
@@ -313,10 +327,7 @@ export class ProjectEnvironmentManager {
     command: string,
     commandArgs: string[],
   ): Promise<{ file: string; args: string[] }> {
-    if (access.projectId !== project.id || access.ownerUserId !== project.ownerUserId
-      || !project.container || access.containerName !== project.container.name) {
-      throw new ProjectContainerOwnershipError('project container access does not match the recorded project');
-    }
+    this.assertAccess(project, access);
     const owned = await this.ownedDescription(project);
     if (!owned) throw new ProjectContainerStateUnknownError(
       `project container '${access.containerName}' is missing`, access.containerName,
@@ -351,6 +362,15 @@ export class ProjectEnvironmentManager {
       throw new ProjectContainerOwnershipError(`project container '${project.container.name}' has mismatched ownership labels`);
     }
     return { engine, description: described };
+  }
+
+  private assertAccess(project: Project, access: ProjectContainerAccess): void {
+    if (access.projectId !== project.id || access.ownerUserId !== project.ownerUserId
+      || !project.container || access.containerName !== project.container.name) {
+      throw new ProjectContainerOwnershipError(
+        'project container access does not match the recorded project',
+      );
+    }
   }
 
   private async inspect(engine: EnvironmentEngine, name: string) {
