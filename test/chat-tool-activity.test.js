@@ -504,9 +504,13 @@ describe('a runtime reporting its own commands does not drop what is installed',
     // On the event too, not just on the session's copy: the browser builds its
     // menu from the log, so a merge applied only locally is a menu that differs
     // between the server and every client reading it.
+    // The one carrying commands. A pi session now also announces that it can
+    // ask questions (#174), which is a `capabilities` event of its own and
+    // arrives first — taking whichever came first found that one and read it as
+    // a command list that had lost everything.
     const reported = broadcast
       .map((message) => message.event)
-      .find((event) => event && event.t === 'capabilities');
+      .find((event) => event && event.t === 'capabilities' && event.capabilities.commands);
     assert.deepStrictEqual(
       (reported.capabilities.commands || []).map((command) => command.name),
       ['compact', 'commit'],

@@ -6,6 +6,7 @@ import { ChatController, type ChatUnavailable } from '../../chat/controller.js';
 import { fetchStatus, findFiles } from '../../chat/workspace-api.js';
 import { activityEvents } from '../../chat/activity.js';
 import { loadEffortPreferences, rememberEffort } from '../../chat/effort-preference.js';
+import type { WorkspaceFileTarget } from '../../chat/file-links.js';
 import type { ChatTranscript } from '../../chat/transcript.js';
 import {
   groupTurns,
@@ -27,9 +28,11 @@ import { Icon } from '../../ui/relay/Icon.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
 import { showNotification } from '../../ui/notifications.js';
 import { PhoneContext } from '../../ui/touch.js';
+import { visualViewportKeyboardInset } from '../../ui/keyboard-viewport.js';
 import { FloatingMenu } from '../FloatingMenu.js';
 import { KEY_STRIP_HEIGHT } from '../KeyStrip.js';
 import { Composer } from './Composer.js';
+import { FileEditorDialog } from './FileEditorDialog.js';
 import { MessageList, type MessageListHandle } from './MessageList.js';
 import { hasVisibleContent, messageText } from './MessageBubble.js';
 import { PermissionCard } from './PermissionCard.js';
@@ -42,6 +45,7 @@ import { TracePanel } from './TracePanel.js';
 import { TranscriptSearch } from './TranscriptSearch.js';
 import { TurnIndex } from './TurnIndex.js';
 import { WorkspacePanel } from './WorkspacePanel.js';
+import { WorkspaceFileLinkContext } from './WorkspaceFileLinkContext.js';
 import { chatCommandFor, isTextEntry } from './keymap.js';
 
 /**
@@ -340,6 +344,10 @@ export function ChatView({
   // the draft is destroyed by looking at another chat for a moment — and without
   // the sync behind it, by picking up a different device (#163).
   const [draft, setDraft] = useSyncedDraft(controller);
+  // Shared by the transcript and both workspace tabs. Keeping it above the
+  // rail means a code link can open the same popup even while that rail is
+  // closed, and closing the rail no longer closes a file somebody is reading.
+  const [editing, setEditing] = React.useState<WorkspaceFileTarget | null>(null);
 
   const list = React.useRef<MessageListHandle | null>(null);
   const root = React.useRef<HTMLElement | null>(null);
@@ -347,6 +355,18 @@ export function ChatView({
   const width = useElementWidth(root);
   const keyboardInset = useKeyboardInset(isMobile);
   const branch = useBranch(controller.sessionId, version);
+
+  const openFile = React.useCallback((path: string) => {
+    setEditing({ path });
+  }, []);
+
+  const openLinkedFile = React.useCallback((target: WorkspaceFileTarget) => {
+    setEditing(target);
+  }, []);
+  const workspaceFileLinks = React.useMemo(
+    () => ({ workingDir, onOpen: openLinkedFile }),
+    [openLinkedFile, workingDir],
+  );
 
   const setView = React.useCallback(
     (patch: Partial<ChatViewSettings>) => onViewChange?.({ ...view, ...patch }),
@@ -990,23 +1010,25 @@ export function ChatView({
             />
           ) : null}
 
-          <MessageList
-            ref={list}
-            transcript={transcript}
-            turns={turns}
-            currentTurnId={currentTurnId}
-            openTurnIds={openTurnIds}
-            onToggleTurn={toggleTurn}
-            onLoadMore={loadMore}
-            onShowWork={showWork}
-            onEditTurn={seedDraft}
-            onCopyTurn={copyTurn}
-            onForkTurn={branchTurn}
-            onRetry={retryTurn}
-            showThinking={view.showThinking}
-            showToolCalls={view.showToolCalls}
-            onAnswerQuestion={answerQuestion}
-          />
+          <WorkspaceFileLinkContext.Provider value={workspaceFileLinks}>
+            <MessageList
+              ref={list}
+              transcript={transcript}
+              turns={turns}
+              currentTurnId={currentTurnId}
+              openTurnIds={openTurnIds}
+              onToggleTurn={toggleTurn}
+              onLoadMore={loadMore}
+              onShowWork={showWork}
+              onEditTurn={seedDraft}
+              onCopyTurn={copyTurn}
+              onForkTurn={branchTurn}
+              onRetry={retryTurn}
+              showThinking={view.showThinking}
+              showToolCalls={view.showToolCalls}
+              onAnswerQuestion={answerQuestion}
+            />
+          </WorkspaceFileLinkContext.Provider>
 
           {terminalOpen ? (
             <div ref={terminalRegion} style={{ flex: '0 0 auto', minWidth: 0 }}>
@@ -1036,6 +1058,7 @@ export function ChatView({
               trace={trace}
               onSelectTab={(panelTab: ChatPanelId) => setView({ panelTab })}
               onClose={() => setView({ panelOpen: false })}
+              onOpenFile={openFile}
               isMobile
             />
           ) : null}
@@ -1279,6 +1302,7 @@ export function ChatView({
             onSelectTab={(panelTab: ChatPanelId) => setView({ panelTab })}
             onClose={() => setView({ panelOpen: false })}
             onResize={(panelWidth) => setView({ panelWidth })}
+            onOpenFile={openFile}
           />
         ) : null}
 
@@ -1322,6 +1346,19 @@ export function ChatView({
         ) : null}
 
       </div>
+      <FileEditorDialog
+        // A new target is a new editor lifecycle. Without the key, the previous
+        // file's contents and dirty badge can survive for a frame while the
+        // next request is in flight; a different location in the same file also
+        // needs its line-navigation effect to run again.
+        key={editing ? `${editing.path}:${editing.line ?? ''}` : 'none'}
+        open={editing !== null}
+        sessionId={controller.sessionId}
+        filePath={editing?.path ?? ''}
+        initialLine={editing?.line}
+        onClose={() => setEditing(null)}
+        isMobile={isMobile}
+      />
     </section>
     </PhoneContext.Provider>
   );
@@ -1795,7 +1832,7 @@ function useKeyboardInset(isMobile: boolean): number {
     if (!viewport) return;
 
     const apply = () => {
-      const covered = window.innerHeight - viewport.height;
+      const covered = visualViewportKeyboardInset(viewport);
       if (covered <= KEYBOARD_MIN_INSET_PX) {
         setInset(0);
         return;
@@ -1806,9 +1843,13 @@ function useKeyboardInset(isMobile: boolean): number {
     apply();
     viewport.addEventListener('resize', apply);
     viewport.addEventListener('scroll', apply);
+    document.addEventListener('focusin', apply);
+    document.addEventListener('focusout', apply);
     return () => {
       viewport.removeEventListener('resize', apply);
       viewport.removeEventListener('scroll', apply);
+      document.removeEventListener('focusin', apply);
+      document.removeEventListener('focusout', apply);
     };
   }, [isMobile]);
 

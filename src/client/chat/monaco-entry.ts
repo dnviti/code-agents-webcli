@@ -61,6 +61,8 @@ export interface CreateOptions {
    * throw away most of what this chunk was added for.
    */
   path?: string;
+  /** One-based line to reveal and put under the cursor on creation. */
+  initialLine?: number;
   readOnly?: boolean;
   theme: ThemeName;
   ariaLabel?: string;
@@ -74,6 +76,7 @@ export interface MonacoHandle {
   setValue(next: string): void;
   setReadOnly(readOnly: boolean): void;
   setTheme(theme: ThemeName): void;
+  revealLine(line: number): void;
   layout(): void;
   focus(): void;
   dispose(): void;
@@ -337,6 +340,18 @@ export function create(container: HTMLElement, options: CreateOptions): MonacoHa
   // appears — but nothing is listening either until this is added.
   editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => options.onSave?.());
 
+  const revealLine = (line: number): void => {
+    // A location can outlive the file version it referred to. Opening the
+    // nearest surviving line is useful; asking Monaco for line 228 of a
+    // 40-line model throws and leaves the whole popup looking broken.
+    const requested = Number.isFinite(line) ? Math.trunc(line) : 1;
+    const target = Math.min(model.getLineCount(), Math.max(1, requested));
+    editor.setPosition({ lineNumber: target, column: 1 });
+    editor.revealLineInCenter(target, monaco.editor.ScrollType.Immediate);
+  };
+
+  if (options.initialLine !== undefined) revealLine(options.initialLine);
+
   return {
     getValue: () => editor.getValue(),
     setValue: (next) => {
@@ -351,6 +366,7 @@ export function create(container: HTMLElement, options: CreateOptions): MonacoHa
       defineThemes();
       monaco.editor.setTheme(theme === 'light' ? LIGHT : DARK);
     },
+    revealLine,
     layout: () => editor.layout(),
     focus: () => editor.focus(),
     dispose: () => {

@@ -279,13 +279,17 @@ export class App {
     this.splitContainer = new SplitContainer(this);
     this.splitContainer.setupDropZones();
 
-    if (this.sessionTabManager.tabs.size > 0) {
+    // Asked even when the first list is empty. A cold-start notification may
+    // name a conversation whose tab was closed, in which case choosing the
+    // initial tab first reopens it account-wide and obtains its description.
+    const initialTabId = await this.sessionTabManager.initialTabId();
+
+    if (initialTabId) {
       // The tab this browser was last on, or the first one if that session is
       // gone — not always the first one, which sent every reload back to the
       // start of the strip. A notification acted on during startup outranks
       // both, and is consumed here rather than switching twice.
-      const initialTabId = this.sessionTabManager.initialTabId();
-      if (initialTabId) await this.sessionTabManager.switchToTab(initialTabId);
+      await this.sessionTabManager.switchToTab(initialTabId);
       hideOverlay();
       // After the initial switch, so a click that landed mid-boot is the tab
       // this window opens on rather than one it moves off a moment later. A
@@ -330,7 +334,10 @@ export class App {
       } catch {
         // Focusing is a courtesy; switching is the part that matters.
       }
-      void this.sessionTabManager.switchToTab(sessionId);
+      void this.sessionTabManager.reopenAndSwitch(sessionId).catch((error) => {
+        console.error('Failed to open conversation from notification:', error);
+        showNotification('That conversation could not be opened');
+      });
     });
     watchAttention(this);
   }

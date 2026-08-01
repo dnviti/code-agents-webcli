@@ -679,6 +679,11 @@ function QuestionBlock({
       // event was folded away before this browser ever saw it: the tool result
       // is the model's own copy of the answer and is still in the block.
       answerText={!request && !answered ? block.output : undefined}
+      // Whether anybody was ever in a position to answer. An empty list of
+      // picks says "no options were chosen" and nothing about why; this is the
+      // difference between a question its user declined and one whose agent had
+      // already stopped listening (#174).
+      abandoned={!request && transcript.abandonedFor(block.toolId)}
       onAnswer={onAnswerQuestion}
     />
   );

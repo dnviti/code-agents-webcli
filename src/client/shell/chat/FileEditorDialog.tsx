@@ -30,6 +30,8 @@ export interface FileEditorDialogProps {
   sessionId: string;
   /** Absolute path, as the file tree reports it. */
   filePath: string;
+  /** One-based source line requested by a chat link. */
+  initialLine?: number;
   onClose: () => void;
   /** Anchor to the bottom edge, where a thumb can reach the buttons. */
   isMobile?: boolean;
@@ -66,6 +68,7 @@ export function FileEditorDialog({
   open,
   sessionId,
   filePath,
+  initialLine,
   onClose,
   isMobile = false,
 }: FileEditorDialogProps): React.JSX.Element | null {
@@ -87,8 +90,13 @@ export function FileEditorDialog({
   const previewable = markdown || html;
   // Keyed on the file so opening a second markdown file comes back to the
   // preview rather than inheriting the last one's toggle.
-  const [view, setView] = React.useState<ViewMode>(previewable ? 'preview' : 'code');
-  React.useEffect(() => setView(previewable ? 'preview' : 'code'), [previewable, filePath]);
+  const [view, setView] = React.useState<ViewMode>(
+    initialLine === undefined && previewable ? 'preview' : 'code',
+  );
+  React.useEffect(
+    () => setView(initialLine === undefined && previewable ? 'preview' : 'code'),
+    [previewable, filePath, initialLine],
+  );
 
   // Read inside callbacks that outlive the render they were made in.
   const dirtyRef = React.useRef(false);
@@ -348,6 +356,7 @@ export function FileEditorDialog({
               onSave={() => void save()}
               ariaLabel={`Contents of ${file.relativePath}`}
               height={bodyHeight}
+              initialLine={initialLine}
             />
           )}
           <div

@@ -90,6 +90,16 @@ export interface TranscriptState {
    * nobody made.
    */
   answeredQuestionText: Record<string, string>;
+  /**
+   * Questions nobody was given the chance to answer, keyed exactly as
+   * `answeredQuestions` is.
+   *
+   * Its own map for the same reason the text has one: an empty list of picks
+   * already means "skipped", and a card the agent stopped waiting for is not a
+   * card its user declined. The card reads this to stop offering buttons that
+   * would send an answer nowhere.
+   */
+  abandonedQuestions: Record<string, true>;
   /** Lowest seq present. Non-zero once the log head has been trimmed. */
   firstSeq: number;
   /** Highest seq applied. Events at or below this are ignored as replays. */
@@ -162,6 +172,7 @@ export function createTranscript(
     pendingQuestions: [],
     answeredQuestions: {},
     answeredQuestionText: {},
+    abandonedQuestions: {},
     firstSeq: 0,
     cursor: 0,
     currentTurnId: null,
@@ -920,6 +931,15 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // result back.
       const key = event.toolId ?? asked?.toolId ?? event.requestId;
       state.answeredQuestions[key] = event.skipped ? [] : [...event.optionIds];
+      // Written both ways round, because a card can resolve twice: a question
+      // the agent gave up on and then asked again lands on the same key, and a
+      // stale "nobody could answer this" under a freshly answered card would be
+      // the same wrong sentence in the other direction.
+      if (event.abandoned) {
+        state.abandonedQuestions[key] = true;
+      } else {
+        delete state.abandonedQuestions[key];
+      }
       // Written unconditionally rather than only when there is text, so a
       // re-answer — the same key resolving twice, which a retried turn does —
       // cannot leave the previous answer's sentence standing under a card that
@@ -1004,6 +1024,7 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         state.pendingQuestions = [];
         state.answeredQuestions = {};
         state.answeredQuestionText = {};
+        state.abandonedQuestions = {};
         // And the approvals with them, for the same reason and one more: an
         // approval card is drawn above the composer rather than inside the
         // conversation, so it is the one piece of the old conversation that

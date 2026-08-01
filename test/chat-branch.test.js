@@ -394,6 +394,35 @@ describe('branching a conversation from one of its turns', function () {
     assert.ok(saves > 0, 'and the new record is persisted');
   });
 
+  it('allocates its append position when the finished branch is inserted', async function () {
+    await record('source', conversation({ turns: 2, contextWindow: 200_000 }));
+    sessions.get('source').tabOrder = 0;
+
+    const originalSetOpeningContext = store.setOpeningContext.bind(store);
+    let openingStarted;
+    const started = new Promise((resolve) => { openingStarted = resolve; });
+    let finishOpening;
+    const finished = new Promise((resolve) => { finishOpening = resolve; });
+    store.setOpeningContext = async (ref, context) => {
+      await originalSetOpeningContext(ref, context);
+      openingStarted();
+      await finished;
+    };
+
+    const branching = branch('source', 'turn-1');
+    await started;
+    // Another tab opens during the branch's durable-log work. Capturing the
+    // position when createSessionRecord ran would now duplicate this ordinal.
+    const newer = chatRecord('newer');
+    newer.tabOrder = 1;
+    sessions.set(newer.id, newer);
+    finishOpening();
+
+    const made = await branching;
+    assert.strictEqual(made.status, 200, JSON.stringify(made.body));
+    assert.strictEqual(sessions.get(made.body.sessionId).tabOrder, 2);
+  });
+
   // The window the history above was just measured against is the source's
   // model, and a source running on the profile's model carries no override to
   // copy. Left blank the branch is a conversation that has never chatted, so

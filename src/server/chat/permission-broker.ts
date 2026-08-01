@@ -94,7 +94,16 @@ export interface TierReply {
  */
 export interface BrokerHandlers {
   permission: (ask: PermissionAsk) => Promise<PermissionAnswer>;
-  question: (ask: QuestionAsk) => Promise<QuestionReply>;
+  /**
+   * A question, and a signal that fires if the caller gives up on it.
+   *
+   * The signal is the honest half. A `tools/call` blocks a runtime's MCP client,
+   * and a client that has stopped waiting says so — kimi sends
+   * `notifications/cancelled`, which arrives here as a cancel line. Without it
+   * the card stayed on screen offering buttons whose answer had nowhere left to
+   * go (#174).
+   */
+  question: (ask: QuestionAsk, signal?: AbortSignal) => Promise<QuestionReply>;
   tier: (ask: TierAsk) => Promise<TierReply>;
 }
 
@@ -125,6 +134,14 @@ export class PermissionBroker {
   private tempDir: string | null = null;
   private handlers: BrokerHandlers | null = null;
   private readonly open = new Set<net.Socket>();
+  /**
+   * Questions still in flight, so a later cancel line can find its own.
+   *
+   * Keyed by the id the caller minted, which is the only name the two sides
+   * share: the session's request id is created after this point and is never
+   * sent back down the socket.
+   */
+  private readonly askedQuestions = new Map<string, AbortController>();
 
   constructor(private readonly socketDir: string) {}
 
@@ -268,12 +285,27 @@ export class PermissionBroker {
         reply({ labels: [], error: 'this session is not accepting questions' });
         return;
       }
+      const abort = new AbortController();
+      this.askedQuestions.set(id, abort);
       handlers
-        .question(question)
+        .question(question, abort.signal)
         .then(reply)
         .catch((error: unknown) => {
           reply({ labels: [], error: describeError(error) });
+        })
+        .finally(() => {
+          this.askedQuestions.delete(id);
         });
+      return;
+    }
+
+    // The caller has stopped waiting for one of its own questions. No reply
+    // goes back: the `tools/call` this belongs to is already over on the other
+    // side, and writing to it would be answering nobody. What it is for is the
+    // card, which the session takes down when the signal fires.
+    if (payload.kind === 'cancel') {
+      this.askedQuestions.get(id)?.abort();
+      this.askedQuestions.delete(id);
       return;
     }
 
@@ -318,6 +350,10 @@ export class PermissionBroker {
       socket.destroy();
     }
     this.open.clear();
+    // Dropped rather than aborted: the session stopping is what closes this, and
+    // it takes its own cards down as it goes. Firing the signals here would ask
+    // it to do the same job twice.
+    this.askedQuestions.clear();
 
     if (this.server) {
       this.server.close();

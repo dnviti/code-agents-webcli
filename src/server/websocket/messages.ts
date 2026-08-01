@@ -11,6 +11,7 @@ import {
 import { TranscriptStoreLike } from '../services/transcript-store.js';
 import { HistoryStoreLike } from '../services/history-store.js';
 import { ScrollbackRecorder } from '../services/scrollback.js';
+import { AccountTabCoordinatorLike } from '../services/account-tab-coordinator.js';
 import {
   sendToWebSocket,
   broadcastChat,
@@ -146,8 +147,10 @@ export interface MessageProcessorDeps {
     workingDir: string;
     connections?: string[];
   }): SessionRecord;
+  /** Shared with HTTP tab routes so creation cannot cross a tentative close/reorder. */
+  tabCoordinator?: AccountTabCoordinatorLike;
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
-  saveSessionsToDisk(): Promise<void>;
+  saveSessionsToDisk(): Promise<boolean | void>;
   /**
    * Launch configuration for this runtime, already resolved from the active
    * profile: model, extra args and environment. Returns null when no profile
@@ -393,7 +396,7 @@ export class MessageProcessor {
         break;
 
       case 'leave_session':
-        await this.leaveSession(wsId);
+        await this.leaveSession(wsId, data.sessionId);
         break;
 
       case 'start_claude':
@@ -568,6 +571,7 @@ export class MessageProcessor {
   ): Promise<void> {
     const wsInfo = this.deps.webSocketConnections.get(wsId);
     if (!wsInfo) return;
+    const requestedFromSessionId = wsInfo.claudeSessionId;
 
     let validWorkingDir = this.userBaseFolder(wsInfo.userId);
     if (workingDir) {
@@ -590,34 +594,69 @@ export class MessageProcessor {
         : this.userBaseFolder(wsInfo.userId);
     }
 
-    const sessionId = randomUUID();
-    const session = this.deps.createSessionRecord({
-      id: sessionId,
-      ownerUserId: wsInfo.userId,
-      name,
-      workingDir: validWorkingDir,
-      connections: [wsId],
-    });
+    const release = this.deps.tabCoordinator
+      ? await this.deps.tabCoordinator.acquire(wsInfo.userId)
+      : () => {};
+    try {
+      // Waiting behind an account write gives this socket time to disconnect or
+      // choose a newer destination. A delayed create must not overwrite that
+      // newer join (nor create an unattached session for a dead socket).
+      const currentInfo = this.deps.webSocketConnections.get(wsId);
+      if (currentInfo !== wsInfo || wsInfo.claudeSessionId !== requestedFromSessionId) return;
 
-    this.deps.claudeSessions.set(sessionId, session);
-    wsInfo.claudeSessionId = sessionId;
-    void this.deps.transcriptStore.ensureTranscript(session);
+      const sessionId = randomUUID();
+      // Construct inside the account turn: the real factory allocates the
+      // append position from the live map, which is now guaranteed committed.
+      const session = this.deps.createSessionRecord({
+        id: sessionId,
+        ownerUserId: wsInfo.userId,
+        name,
+        workingDir: validWorkingDir,
+      });
 
-    this.deps.saveSessionsToDisk();
+      this.deps.claudeSessions.set(sessionId, session);
+      let saved = false;
+      try {
+        saved = (await this.deps.saveSessionsToDisk()) !== false;
+      } catch (error) {
+        console.error('Failed to persist socket-created session:', error);
+      }
+      if (!saved) {
+        this.deps.claudeSessions.delete(sessionId);
+        sendToWebSocket(wsInfo.ws, {
+          type: 'error',
+          message: 'The new session could not be saved',
+        });
+        return;
+      }
 
-    sendToWebSocket(wsInfo.ws, {
-      type: 'session_created',
-      sessionId,
-      sessionName: session.name,
-      workingDir: session.workingDir,
-      lastAgent: session.lastAgent,
-      runtimeLabel: session.runtimeLabel,
-    });
+      void this.deps.transcriptStore.ensureTranscript(session);
+      // Persistence itself can be deferred. Recheck once more before attaching:
+      // a newer join that won while SQLite was pending must stay the destination.
+      const intentStillCurrent =
+        this.deps.webSocketConnections.get(wsId) === wsInfo
+        && wsInfo.claudeSessionId === requestedFromSessionId;
+      if (intentStillCurrent) {
+        session.connections.add(wsId);
+        wsInfo.claudeSessionId = sessionId;
+        sendToWebSocket(wsInfo.ws, {
+          type: 'session_created',
+          sessionId,
+          sessionName: session.name,
+          workingDir: session.workingDir,
+          lastAgent: session.lastAgent,
+          runtimeLabel: session.runtimeLabel,
+        });
+      }
 
-    // And every other screen this person has open. After `session_created`, so
-    // the socket that asked has already switched to it by the time the same
-    // fact comes back around as an announcement.
-    announceSessionOpened(session, this.deps.webSocketConnections);
+      // And every other screen this person has open. After `session_created`,
+      // so the asking socket has switched before the account announcement. If
+      // it moved meanwhile, this is deliberately the only message it receives:
+      // the new tab still exists account-wide but never steals that newer focus.
+      announceSessionOpened(session, this.deps.webSocketConnections);
+    } finally {
+      release();
+    }
   }
 
   async joinSession(wsId: string, claudeSessionId: string): Promise<void> {
@@ -666,6 +705,12 @@ export class MessageProcessor {
       totalLines: 0,
     }));
 
+    // Joins for one socket can overlap because WebSocket message callbacks are
+    // async. If a newer join won while transcript/history reads were awaited,
+    // this answer is obsolete: emitting it would paint the old destination and
+    // prompt the client to leave the newer one as an "orphan".
+    if (wsInfo.claudeSessionId !== claudeSessionId || !session.connections.has(wsId)) return;
+
     // Send session info and replay buffer
     sendToWebSocket(wsInfo.ws, {
       type: 'session_joined',
@@ -695,9 +740,13 @@ export class MessageProcessor {
     }
   }
 
-  async leaveSession(wsId: string): Promise<void> {
+  async leaveSession(wsId: string, expectedSessionId?: string): Promise<void> {
     const wsInfo = this.deps.webSocketConnections.get(wsId);
     if (!wsInfo || !wsInfo.claudeSessionId) return;
+    // A client rejecting a late join names the obsolete destination. If the
+    // socket has already joined something newer, that cleanup must not detach
+    // the winner.
+    if (expectedSessionId && wsInfo.claudeSessionId !== expectedSessionId) return;
 
     const session = this.deps.claudeSessions.get(wsInfo.claudeSessionId);
     if (session) {

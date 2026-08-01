@@ -15,7 +15,7 @@ import type { ConversationAttention } from '../../shared/chat-alerts';
 import type { ConfirmRequest } from '../ui/confirm';
 import { DEFAULT_CHAT_VIEW, type ChatViewSettings } from '../chat/view-settings';
 
-export type ShellTabStatus = 'running' | 'error' | 'idle';
+export type ShellTabStatus = 'running' | 'success' | 'error' | 'idle';
 
 export interface ShellTab {
   id: string;

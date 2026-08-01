@@ -39,6 +39,27 @@ export class MessageHandler {
   }
 
   handle(message: WsMessage): void {
+    // A tab can disappear while its join is crossing the socket. In particular,
+    // closing active A starts a fallback join to B; an account-wide close for B
+    // can then remove it before the server's answer arrives. Nothing below may
+    // paint, replay, subscribe or select a session that no longer has a tab.
+    // The server has already attached this socket by the time it sends the
+    // answer, so explicitly leave it again before discarding the message.
+    if (
+      message.type === 'session_joined' &&
+      this.app.sessionTabManager &&
+      !this.app.sessionTabManager.tabs.has(message.sessionId)
+    ) {
+      if (this.app.pendingJoinSessionId === message.sessionId) {
+        const resolve = this.app.pendingJoinResolve;
+        this.app.pendingJoinResolve = null;
+        this.app.pendingJoinSessionId = null;
+        resolve?.();
+      }
+      this.app.send({ type: 'leave_session', sessionId: message.sessionId });
+      return;
+    }
+
     // The surface a session runs on is the server's decision, and it arrives
     // on exactly these two messages. Read before dispatching, because the chat
     // handler below consumes chat_started and the terminal path never sees it.
@@ -82,15 +103,27 @@ export class MessageHandler {
       } else {
         clearChatSurface();
       }
-    } else if (message.type === 'chat_event') {
-      this.reflectChatActivity(message);
     }
 
     // The chat surface owns its own message family. Offered them first so this
     // switch does not have to grow a case per chat event, and so an unknown
     // chat message stays inside the chat layer rather than reaching a terminal
     // handler that has no idea what to do with it.
-    if (this.app.chats.handle(message as unknown as Record<string, unknown>)) {
+    const chatHandled = this.app.chats.handle(message as unknown as Record<string, unknown>);
+
+    // Apply live state only after the controller has folded the event into the
+    // transcript. The tab derives chat status from that same transcript as the
+    // header, so reflecting `turn_end` before this point merely republished the
+    // old `running` state and left the spinner stuck beside a Ready header.
+    if (message.type === 'chat_event') {
+      this.reflectChatActivity(message);
+    } else if (message.type === 'chat_snapshot') {
+      // A snapshot is not an event, so reflectChatActivity never sees it. It is
+      // nevertheless the authoritative correction after a reload or rejoin.
+      this.app.sessionTabManager?.syncShell();
+    }
+
+    if (chatHandled) {
       return;
     }
 
@@ -167,6 +200,21 @@ export class MessageHandler {
 
       case 'session_deleted':
         this.onSessionDeleted(message);
+        break;
+
+      // Closing a conversation is not deleting it: the transcript and any
+      // running agent remain, but the tab leaves every screen on the account.
+      // The screen that asked already removed it optimistically, so this is
+      // deliberately idempotent there.
+      case 'session_tab_closed':
+        this.app.sessionTabManager?.applyRemoteClose(message.sessionId);
+        this.app.loadSessions();
+        break;
+
+      // Order belongs to the account, selection to this window. Applying this
+      // rearranges the strip without selecting a tab or echoing another write.
+      case 'session_tabs_reordered':
+        this.app.sessionTabManager?.applyRemoteOrder(message.sessionIds);
         break;
 
       // Someone renamed this session — in another window, on another device, or

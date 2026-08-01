@@ -392,6 +392,17 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   /** Options offered with a pending approval, so a reply can be validated. */
   private readonly permissionOptions = new Map<string, PermissionOption[]>();
   private loadSupported = false;
+  /**
+   * Paths this turn has already been refused, so it is said once.
+   *
+   * An agent that is told it may not read a file frequently tries again — a
+   * different tool, a second attempt after a grep, the same file from a
+   * subagent. Eleven identical red errors in one conversation is what that
+   * looked like (#174), and repeating a refusal makes it neither truer nor
+   * clearer. Cleared at each turn, because "you still cannot" is worth saying
+   * again to somebody who has since asked for something new.
+   */
+  private readonly refusedThisTurn = new Set<string>();
 
   constructor(options: AcpChatAdapterOptions) {
     super(options);
@@ -846,6 +857,7 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     const turnId = `${this.runtime}-turn-${++this.counter}`;
     this.turnId = turnId;
     this.turnStartedAt = Date.now();
+    this.refusedThisTurn.clear();
     // Not the user's message: `ChatSession.deliver` has already written it, and
     // a second copy here is a second bubble in the same turn (#129). The close
     // stays, and is the only thing this call was still doing that mattered — it
@@ -1467,7 +1479,7 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       this.respondError(id, -32603, message);
-      this.emit({ t: 'error', message: `${this.runtime}: could not read ${path}: ${message}` });
+      this.reportRefusal('read', path, message);
     }
   }
 
@@ -1485,8 +1497,23 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       this.respondError(id, -32603, message);
-      this.emit({ t: 'error', message: `${this.runtime}: could not write ${path}: ${message}` });
+      this.reportRefusal('write', path, message);
     }
+  }
+
+  /**
+   * Tell the conversation a file operation was refused — once per turn.
+   *
+   * The agent is always told, every time: `respondError` has already run by the
+   * time this is called, and an unanswered request is an agent that never takes
+   * another step. This is only about how many times the person watching has to
+   * read the same sentence.
+   */
+  private reportRefusal(kind: 'read' | 'write', filePath: string, message: string): void {
+    const key = `${kind}:${filePath}:${message}`;
+    if (this.refusedThisTurn.has(key)) return;
+    this.refusedThisTurn.add(key);
+    this.emit({ t: 'error', message: `${this.runtime}: could not ${kind} ${filePath} — ${message}` });
   }
 
   // -------------------------------------------------------- message assembly

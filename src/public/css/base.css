@@ -39,7 +39,9 @@ body {
     height: 100dvh;
     overflow: hidden;
     overscroll-behavior: none;
-    touch-action: pan-x pan-y;
+    /* Keep native panning and pinch zoom available. Individual surfaces such
+       as xterm opt out only where they implement the gesture themselves. */
+    touch-action: pan-x pan-y pinch-zoom;
     position: relative;
     line-height: 1.5;
     text-rendering: optimizeLegibility;

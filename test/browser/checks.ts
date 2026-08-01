@@ -48,6 +48,8 @@ import { Toasts } from '../../src/client/shell/Toasts';
 import { shellStore } from '../../src/client/shell/store';
 import { FileTreePanel } from '../../src/client/shell/chat/FileTreePanel';
 import { TerminalSplit } from '../../src/client/shell/chat/TerminalSplit';
+import { disablePullToRefresh } from '../../src/client/ui/mobile';
+import { visualViewportKeyboardInset } from '../../src/client/ui/keyboard-viewport';
 
 /**
  * A real workflow run, as the adapter emitted it.
@@ -311,6 +313,7 @@ async function run(): Promise<void> {
   await checkSilentStepsLeaveNoRowButKeepTheirTrace();
   await checkNoRowIsDrawnWithNothingToRead();
   await checkAQuestionIsAnsweredByClicking();
+  await checkACardTheAgentGaveUpOnStopsOfferingAnAnswer();
   await checkAQuestionCanBeAnsweredInYourOwnWords();
   await checkTypedWordsThatDidNotLandAreNotShownAsAnswered();
   await checkThePhoneLayoutIsUsable();
@@ -318,6 +321,7 @@ async function run(): Promise<void> {
   await checkThePhoneShellSurfacesAreUsable();
   await checkTheConversationsTerminalCanBeDrivenFromAPhone();
   await checkALongTabNameStaysInsideTheStrip();
+  await checkAnOverflowingTabStripCanBeNavigated();
   await checkAnUnreportedFigureIsNeverDrawnAsZero();
   await checkTheUsageChartsAreInteractive();
   await checkAServerOlderThanThePageSaysSo();
@@ -327,8 +331,9 @@ async function run(): Promise<void> {
   await checkANewConversationCanBeStartedFromTheComposer();
   await checkTheFileEditorShowsTheFile();
   await checkAReadOnlyFileStaysReadOnly();
+  await checkAChatFileLinkOpensAtItsSourceLine();
   await checkTheGitHubPanelSaysWhoIsOnItAndWhatItLinksTo();
-  // After the two editor checks on purpose: this one opens a FileEditorDialog,
+  // After the editor checks on purpose: this one opens a FileEditorDialog,
   // and Monaco is a module-level singleton that does not survive being mounted
   // and torn down before they get to it.
   await checkALongPopupTitleStaysInsideItsWindow();
@@ -362,6 +367,192 @@ async function run(): Promise<void> {
   pre.id = 'results';
   pre.textContent = results.join('\n');
   document.body.appendChild(pre);
+}
+
+/**
+ * A card whose question can no longer be delivered says so, and stops asking.
+ *
+ * Here rather than in a unit test because the defect was entirely a rendered
+ * one (#174). On omp the runtime abandoned the `tools/call` after 30 seconds
+ * while the card stayed on screen with live buttons for another ten minutes —
+ * every one of which would have sent an answer into a request the agent had
+ * already dropped — and the sentence it eventually showed, "Skipped without
+ * answering", blamed the user for a question they were never able to answer.
+ * Both halves of that are about what is on the glass, so both are checked
+ * there: the buttons are gone, and the sentence is the true one.
+ */
+async function checkACardTheAgentGaveUpOnStopsOfferingAnAnswer(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const sent: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('browser-check', {
+    send: (message: Record<string, unknown>) => {
+      sent.push(message);
+    },
+  } as never);
+
+  const ask = {
+    question: 'How should I proceed?',
+    header: 'Next move',
+    multiSelect: false,
+    options: [
+      { label: 'PR #167, then continue #168', description: 'Verify the suite, then open its PR' },
+      { label: 'Continue #168 only', description: 'Leave #167 un-PRd for now' },
+    ],
+  };
+
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check',
+      runtime: 'omp',
+      state: 'awaiting_answer',
+      capabilities: { streaming: true, toolCalls: true, questions: true },
+      messages: [
+        {
+          id: 'm1', seq: 1, turnId: 't1', role: 'assistant', ts: 1,
+          blocks: [{
+            kind: 'tool',
+            toolId: 'write_20|fc_tmp_duo3u3bkp7',
+            name: 'mcp__ccweb_ask_user_question',
+            toolKind: 'other',
+            status: 'running',
+            input: ask,
+          }],
+        },
+      ],
+      pendingPermissions: [],
+      pendingQuestions: [{
+        requestId: 'q-1',
+        toolId: 'write_20|fc_tmp_duo3u3bkp7',
+        question: ask.question,
+        header: ask.header,
+        multiSelect: false,
+        ts: 2,
+        options: [
+          { optionId: 'opt-0', label: ask.options[0].label, description: ask.options[0].description },
+          { optionId: 'opt-1', label: ask.options[1].label, description: ask.options[1].description },
+        ],
+      }],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 2,
+      live: true,
+      bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'omp',
+      runtimeLabel: 'Oh My Pi',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  const liveCard = host.querySelector('[data-question-card="live"]') as HTMLElement | null;
+  check('the question starts out as a live card', !!liveCard);
+  if (!liveCard) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  /**
+   * Buttons a person could actually press.
+   *
+   * Counted rather than trusting `data-question-card`, and by visibility and
+   * reachability rather than by presence: a control left in the tree at
+   * `opacity:0` or `pointer-events:none` still answers `querySelector`, and a
+   * geometry sweep drops it silently instead of failing.
+   */
+  const pressable = (card: HTMLElement): HTMLElement[] =>
+    Array.from(card.querySelectorAll<HTMLElement>('button')).filter((node) => {
+      const style = getComputedStyle(node);
+      const box = node.getBoundingClientRect();
+      return style.visibility !== 'hidden'
+        && style.display !== 'none'
+        && style.pointerEvents !== 'none'
+        && Number(style.opacity || '1') > 0.05
+        && box.width > 0
+        && box.height > 0
+        && node.tabIndex >= 0
+        && !(node as HTMLButtonElement).disabled;
+    });
+
+  check(
+    'a live card offers something to press',
+    pressable(liveCard).length >= 2,
+    `${pressable(liveCard).length} pressable`,
+  );
+
+  // What the runtime giving up looks like from the browser's side: the call
+  // that asked reports failed, and the session resolves the question against
+  // the same tool id — carrying `abandoned`, which is the whole difference
+  // between this and a skip.
+  controller.transcript.apply({
+    t: 'tool',
+    seq: 10,
+    ts: Date.now(),
+    toolId: 'write_20|fc_tmp_duo3u3bkp7',
+    patch: { status: 'failed', error: 'MCP error: Request timeout after 30000ms' },
+  } as never);
+  controller.transcript.apply({
+    t: 'question_resolved',
+    seq: 11,
+    ts: Date.now(),
+    requestId: 'q-1',
+    toolId: 'write_20|fc_tmp_duo3u3bkp7',
+    optionIds: [],
+    abandoned: true,
+  } as never);
+  await wait(250);
+  settle(document);
+
+  const card = host.querySelector('[data-question-card]') as HTMLElement | null;
+  check('the card is still in the conversation, as the record of what was asked', !!card);
+  if (!card) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  check(
+    'it no longer offers an answer nobody would receive',
+    pressable(card).length === 0,
+    `${pressable(card).length} still pressable`,
+  );
+  const text = card.textContent || '';
+  check(
+    'and it says the agent stopped waiting',
+    text.includes('stopped waiting'),
+    text.slice(-90),
+  );
+  check(
+    'rather than blaming the person who was never asked',
+    !text.includes('Skipped without answering'),
+    text.slice(-90),
+  );
+  check(
+    'the outcome is recorded as its own thing, not as a skip',
+    card.querySelector('[data-question-answer="abandoned"]') !== null,
+    card.querySelector('[data-question-answer]')?.getAttribute('data-question-answer') || 'none',
+  );
+  check(
+    'and nothing was sent on the way there',
+    sent.filter((message) => message.type === 'chat_question_answer').length === 0,
+  );
+
+  root.unmount();
+  host.remove();
 }
 
 /**
@@ -5346,6 +5537,228 @@ async function checkALongTabNameStaysInsideTheStrip(): Promise<void> {
   frame.remove();
 }
 
+/**
+ * A hidden scrollbar still needs two discoverable ways to reach what it hides:
+ * the wheel already under the pointer, and an explicit list for precise jumps.
+ * This needs a layout engine because the button is intentionally conditional on
+ * measured overflow rather than on an arbitrary tab count.
+ */
+async function checkAnOverflowingTabStripCanBeNavigated(): Promise<void> {
+  const tabs = [
+    { id: 'one', title: 'gateway', status: 'running' },
+    { id: 'two', title: 'deploy', status: 'idle', attention: 'approval' },
+    { id: 'three', title: 'documentation', status: 'idle', unread: true },
+    { id: 'four', title: 'tests', status: 'idle' },
+    { id: 'five', title: 'release', status: 'idle' },
+    { id: 'six', title: 'metrics', status: 'idle' },
+    { id: 'seven', title: 'cleanup', status: 'idle' },
+  ];
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1200px;position:absolute;top:0;left:0';
+  document.body.appendChild(host);
+
+  const root = createRoot(host);
+  let selected = '';
+  const render = (shown: typeof tabs): void => root.render(
+    React.createElement(TabBar, {
+      tabs: shown,
+      activeId: 'one',
+      onSelect: (id: string) => { selected = id; },
+      ariaLabel: 'Overflow sessions',
+    } as never),
+  );
+
+  render(tabs);
+  await wait(150);
+  check(
+    'the all-tabs control stays out of a tab strip that fits',
+    !host.querySelector('[aria-label="All open tabs"]'),
+    'wide strip',
+  );
+
+  host.style.width = '420px';
+  // Headless Chrome's virtual-time mode does not deliver ResizeObserver
+  // notifications for this synthetic host resize. A real viewport resize also
+  // emits this event, and the component keeps it as a fallback to the observer.
+  window.dispatchEvent(new Event('resize'));
+  await wait(150);
+  const strip = host.querySelector('[role="tablist"][aria-label="Overflow sessions"]') as HTMLElement;
+  const trigger = host.querySelector('[aria-label="All open tabs"]') as HTMLButtonElement | null;
+  check(
+    'an overflowing tab strip offers a list of every open tab',
+    Boolean(trigger),
+    trigger ? 'control shown' : `content ${strip?.scrollWidth}px in ${strip?.clientWidth}px`,
+  );
+
+  const stripStyles = window.getComputedStyle(strip);
+  // Chromium canonicalises `pan-x pan-y pinch-zoom` to its equivalent keyword,
+  // `manipulation`; other engines may preserve the three explicit tokens.
+  const allowsPanAndZoom = (touchAction: string): boolean => {
+    const values = touchAction.split(/\s+/);
+    return touchAction === 'manipulation'
+      || (values.includes('pan-x') && values.includes('pan-y') && values.includes('pinch-zoom'));
+  };
+  const bodyTouchAction = window.getComputedStyle(document.body).touchAction;
+  check(
+    'an overflowing tab strip accepts native horizontal touch swipes',
+    stripStyles.overflowX === 'auto'
+      && allowsPanAndZoom(stripStyles.touchAction)
+      && allowsPanAndZoom(bodyTouchAction)
+      && stripStyles.overscrollBehaviorX === 'contain',
+    `overflow=${stripStyles.overflowX} touch=${stripStyles.touchAction} body-touch=${bodyTouchAction} overscroll=${stripStyles.overscrollBehaviorX}`,
+  );
+
+  // A component can advertise native panning correctly and still have an
+  // ancestor cancel the gesture. The app-wide pull-to-refresh guard used to do
+  // exactly that whenever a mostly-horizontal finger drifted slightly down.
+  const touchEventAt = (
+    type: 'touchstart' | 'touchmove',
+    ...points: Array<[number, number]>
+  ): TouchEvent => {
+    const event = new Event(type, { bubbles: true, cancelable: true }) as TouchEvent;
+    Object.defineProperty(event, 'touches', {
+      value: points.map(([clientX, clientY], identifier) => ({ clientX, clientY, identifier })),
+    });
+    return event;
+  };
+  const removePullGuard = disablePullToRefresh();
+  strip.dispatchEvent(touchEventAt('touchstart', [300, 30]));
+  const jitter = touchEventAt('touchmove', [299, 32]);
+  strip.dispatchEvent(jitter);
+  const swipe = touchEventAt('touchmove', [180, 34]);
+  strip.dispatchEvent(swipe);
+  check(
+    'the pull-to-refresh guard leaves a horizontal tab swipe native after finger jitter',
+    !jitter.defaultPrevented && !swipe.defaultPrevented,
+    `jitter=${jitter.defaultPrevented} swipe=${swipe.defaultPrevented}`,
+  );
+
+  strip.dispatchEvent(touchEventAt('touchstart', [260, 40], [160, 40]));
+  const pinch = touchEventAt('touchmove', [280, 48], [140, 32]);
+  strip.dispatchEvent(pinch);
+  check(
+    'the pull-to-refresh guard leaves pinch zoom native over the tab strip',
+    !pinch.defaultPrevented,
+    `prevented=${pinch.defaultPrevented}`,
+  );
+
+  strip.dispatchEvent(touchEventAt('touchstart', [200, 30]));
+  strip.dispatchEvent(touchEventAt('touchmove', [201, 33]));
+  const downwardPull = touchEventAt('touchmove', [202, 52]);
+  strip.dispatchEvent(downwardPull);
+  check(
+    'the gesture guard still blocks a deliberate downward pull at the page top',
+    downwardPull.defaultPrevented,
+    `prevented=${downwardPull.defaultPrevented}`,
+  );
+  removePullGuard();
+
+  const textEntry = document.createElement('textarea');
+  document.body.appendChild(textEntry);
+  textEntry.focus();
+  const layoutHeight = window.innerHeight;
+  const pinchInset = visualViewportKeyboardInset(
+    { height: layoutHeight / 2, scale: 2 },
+    layoutHeight,
+    textEntry,
+  );
+  const keyboardInset = visualViewportKeyboardInset(
+    { height: layoutHeight - 300, scale: 1 },
+    layoutHeight,
+    textEntry,
+  );
+  check(
+    'pinch zoom is not mistaken for a software keyboard by mobile chrome or chat',
+    pinchInset === 0 && keyboardInset === 300,
+    `pinch=${pinchInset}px keyboard=${keyboardInset}px`,
+  );
+  textEntry.remove();
+
+  strip.scrollLeft = 0;
+  const vertical = new WheelEvent('wheel', { deltaY: 120, cancelable: true, bubbles: true });
+  strip.dispatchEvent(vertical);
+  check(
+    'a vertical mouse wheel moves an overflowing tab strip sideways',
+    strip.scrollLeft > 0 && vertical.defaultPrevented,
+    `left=${strip.scrollLeft} prevented=${vertical.defaultPrevented}`,
+  );
+
+  const horizontal = new WheelEvent('wheel', {
+    deltaX: 40,
+    deltaY: 2,
+    cancelable: true,
+    bubbles: true,
+  });
+  strip.dispatchEvent(horizontal);
+  check(
+    'horizontal trackpad input keeps its native scrolling path',
+    !horizontal.defaultPrevented,
+    `prevented=${horizontal.defaultPrevented}`,
+  );
+
+  trigger?.click();
+  await wait(80);
+  const menu = host.querySelector('[role="menu"][aria-label="Open tabs"]') as HTMLElement | null;
+  const rows = Array.from(menu?.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]') || []);
+  check(
+    'the overflow chooser lists every open tab in strip order',
+    rows.length === tabs.length && rows.map((row) => row.textContent?.trim()).join('|').includes('gateway|deploy'),
+    `${rows.length} rows`,
+  );
+  check(
+    'the overflow chooser carries waiting and completed cues',
+    Boolean(menu?.querySelector('[aria-label="Waiting for approval"]'))
+      && Boolean(menu?.querySelector('[aria-label="Completed"]')),
+    menu?.textContent || 'no menu',
+  );
+
+  rows[4]?.click();
+  await wait(40);
+  check(
+    'choosing from the all-tabs list selects that tab and closes the list',
+    selected === 'five' && !host.querySelector('[role="menu"][aria-label="Open tabs"]'),
+    `selected=${selected}`,
+  );
+
+  (host.querySelector('[aria-label="All open tabs"]') as HTMLButtonElement | null)?.click();
+  await wait(80);
+  const reopenedTrigger = host.querySelector('[aria-label="All open tabs"]') as HTMLButtonElement | null;
+  const activeRow = host.querySelector('[role="menuitemradio"][aria-checked="true"]');
+  check(
+    'the all-tabs menu puts keyboard focus on the current tab',
+    document.activeElement === activeRow,
+    document.activeElement ? describe(document.activeElement) : 'no focus',
+  );
+  window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  await wait(40);
+  check(
+    'Escape closes the all-tabs menu and returns focus to its button',
+    !host.querySelector('[role="menu"][aria-label="Open tabs"]') && document.activeElement === reopenedTrigger,
+    document.activeElement ? describe(document.activeElement) : 'no focus',
+  );
+
+  reopenedTrigger?.click();
+  await wait(40);
+  document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+  await wait(40);
+  check(
+    'a click outside closes the all-tabs menu',
+    !host.querySelector('[role="menu"][aria-label="Open tabs"]'),
+    'outside click',
+  );
+
+  render(tabs.slice(0, 2));
+  await wait(150);
+  check(
+    'the all-tabs control disappears as soon as the remaining tabs fit',
+    !host.querySelector('[aria-label="All open tabs"]'),
+    'two tabs remain',
+  );
+
+  root.unmount();
+  host.remove();
+}
+
 /** The floating menu with its own button already pressed. */
 function OpenFloatingMenu({ actions }: { actions: FloatingMenuAction[] }): React.ReactElement {
   const ref = React.useRef<HTMLDivElement | null>(null);
@@ -6392,6 +6805,7 @@ async function checkTheCommandMenuIsFullBeforeTheFirstMessage(): Promise<void> {
 async function checkTheFileEditorShowsTheFile(): Promise<void> {
   const lines = Array.from({ length: 200 }, (_, i) => `line-${i + 1} const value${i + 1} = ${i + 1};`);
   const text = lines.join('\n');
+  const initialLine = 150;
 
   const host = document.createElement('div');
   // Stacked above whatever earlier checks left on the page — the terminal from
@@ -6407,6 +6821,7 @@ async function checkTheFileEditorShowsTheFile(): Promise<void> {
       path: '/tmp/browser-check/sample.ts',
       language: 'ts',
       ariaLabel: 'Contents of sample.ts',
+      initialLine,
     } as never),
   );
 
@@ -6435,6 +6850,18 @@ async function checkTheFileEditorShowsTheFile(): Promise<void> {
 
   const rendered = onScreen();
   check('it renders the file, not an empty frame', rendered.length > 5, `${rendered.length} lines`);
+  check(
+    'a requested source line is revealed when Monaco opens',
+    rendered.some((line) => line.text === lines[initialLine - 1]),
+    rendered.slice(0, 4).map((line) => line.text.split(' ')[0]).join(','),
+  );
+
+  const activeLine = host.querySelector('.line-numbers.active-line-number') as HTMLElement | null;
+  check(
+    'and the cursor is placed on that source line',
+    activeLine?.textContent?.trim() === String(initialLine),
+    activeLine?.textContent?.trim() || 'no active line number',
+  );
 
   // The heart of the report. Every rendered line must be the line the file has
   // at that position — so a window that is complete but shuffled fails here.
@@ -6627,6 +7054,203 @@ async function checkAReadOnlyFileStaysReadOnly(): Promise<void> {
 
   root.unmount();
   host.remove();
+}
+
+/**
+ * An absolute source link in an agent reply stays inside the application.
+ *
+ * This is deliberately end-to-end through ChatView: the regression was a real
+ * anchor asking Express for `/home/.../registry.ts:228`, so unit-testing the
+ * parser or the editor alone cannot prove the browser navigation was stopped,
+ * the line suffix was removed from the file request, and Monaco received it.
+ */
+async function checkAChatFileLinkOpensAtItsSourceLine(): Promise<void> {
+  const workingDir = '/home/dev/projects/webcli';
+  const filePath = `${workingDir}/src/server/chat/registry.ts`;
+  const plainFilePath = `${workingDir}/README.md`;
+  const initialLine = 150;
+  const lines = Array.from({ length: 220 }, (_, i) => `registry-line-${i + 1} const entry${i + 1} = ${i + 1};`);
+  const content = lines.join('\n');
+
+  const controller = new ChatController('file-link-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'file-link-check',
+    snapshot: {
+      sessionId: 'file-link-check',
+      runtime: 'claude',
+      state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true,
+      },
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: 1,
+          blocks: [{ kind: 'text', text: 'Where is the registry entry?' }],
+        },
+        {
+          id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: 2,
+          blocks: [{
+            kind: 'text',
+            text: `Open [registry.ts:${initialLine}](${filePath}:${initialLine}) or [README](${plainFilePath}). Keep [the website](https://example.com) external.`,
+          }],
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const requested: string[] = [];
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const raw = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+    const url = new URL(raw, window.location.href);
+    if (url.pathname.includes('/api/workspace/') && url.pathname.endsWith('/file')) {
+      const requestedPath = url.searchParams.get('path') || '';
+      requested.push(requestedPath);
+      const markdown = requestedPath === plainFilePath;
+      const body = markdown ? '# Project\n\nOpened in the normal preview.' : content;
+      return new Response(
+        JSON.stringify({
+          path: requestedPath,
+          name: markdown ? 'README.md' : 'registry.ts',
+          relativePath: markdown ? 'README.md' : 'src/server/chat/registry.ts',
+          size: body.length,
+          mtimeMs: 1,
+          language: markdown ? 'markdown' : 'typescript',
+          content: body,
+          binary: false,
+          tooLarge: false,
+          writable: false,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    return realFetch.call(window, input as RequestInfo, init);
+  }) as typeof window.fetch;
+
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1100px;height:720px;position:absolute;top:0;left:0;display:flex;z-index:9999';
+  document.body.appendChild(host);
+  const root = createRoot(host);
+
+  try {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir,
+        view: { ...DEFAULT_CHAT_VIEW, panelOpen: false },
+        onViewChange: () => {},
+      } as never),
+    );
+    await wait(300);
+
+    const link = Array.from(host.querySelectorAll('a')).find(
+      (anchor) =>
+        anchor.dataset.workspaceFilePath === filePath
+        && anchor.dataset.workspaceFileLine === String(initialLine),
+    ) as HTMLAnchorElement | undefined;
+    check('an absolute source reference is rendered as a chat link', Boolean(link));
+    if (!link) return;
+
+    check(
+      'workspace links advertise a dialog instead of a new browser tab',
+      link.getAttribute('aria-haspopup') === 'dialog'
+        && link.getAttribute('target') === null
+        && link.getAttribute('href')?.startsWith('#workspace-file='),
+      link.outerHTML,
+    );
+    const external = Array.from(host.querySelectorAll('a')).find(
+      (anchor) => anchor.getAttribute('href') === 'https://example.com',
+    );
+    check(
+      'ordinary web links retain their external-link semantics',
+      external?.getAttribute('target') === '_blank'
+        && external.getAttribute('aria-haspopup') === null,
+      external?.outerHTML || 'no external link',
+    );
+
+    const middleClick = new MouseEvent('auxclick', {
+      bubbles: true,
+      cancelable: true,
+      button: 1,
+    });
+    link.dispatchEvent(middleClick);
+    check('middle-click cannot bypass workspace routing', middleClick.defaultPrevented);
+
+    const click = new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 });
+    link.dispatchEvent(click);
+    check('clicking the source reference stops browser navigation', click.defaultPrevented);
+
+    let ready = false;
+    for (let i = 0; i < 120 && !ready; i++) {
+      await wait(100);
+      ready = host.querySelector('[role="dialog"] [data-monaco-host="ready"]') !== null;
+    }
+
+    check(
+      'the file request removes the source-line suffix',
+      requested.length === 1 && requested[0] === filePath,
+      JSON.stringify(requested),
+    );
+    const dialog = host.querySelector('[role="dialog"]') as HTMLElement | null;
+    check(
+      'the existing file popup opens the referenced file while the workspace rail is closed',
+      Boolean(dialog) && (dialog?.textContent || '').includes('registry.ts'),
+      dialog ? (dialog.textContent || '').slice(0, 120) : 'no dialog',
+    );
+    check('that popup reaches the real Monaco editor', ready);
+
+    // Give Monaco a frame after creation to paint the model window around the
+    // cursor. The host's ready marker is set synchronously with editor.create.
+    await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    await wait(200);
+    const shown = Array.from(dialog?.querySelectorAll('.view-line') || [])
+      .map((node) => (node.textContent || '').replace(/ /g, ' ').trimEnd());
+    const active = dialog?.querySelector('.line-numbers.active-line-number') as HTMLElement | null;
+    check(
+      'the linked source line is visible in Monaco',
+      shown.includes(lines[initialLine - 1]),
+      shown.slice(0, 5).map((line) => line.split(' ')[0]).join(','),
+    );
+    check(
+      'and Monaco puts its cursor on that exact line',
+      active?.textContent?.trim() === String(initialLine),
+      active?.textContent?.trim() || 'no active line',
+    );
+
+    const close = Array.from(dialog?.querySelectorAll('button') || [])
+      .find((button) => button.textContent?.trim() === 'Close') as HTMLButtonElement | undefined;
+    close?.click();
+    await wait(150);
+
+    const plainLink = Array.from(host.querySelectorAll('a')).find(
+      (anchor) => anchor.dataset.workspaceFilePath === plainFilePath,
+    ) as HTMLAnchorElement | undefined;
+    plainLink?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+    for (let i = 0; i < 30 && requested.length < 2; i++) await wait(50);
+    const plainDialog = host.querySelector('[role="dialog"]') as HTMLElement | null;
+    check(
+      'a file link with no line opens through the same popup',
+      requested[1] === plainFilePath && Boolean(plainDialog),
+      JSON.stringify(requested),
+    );
+    check(
+      'and keeps the file editor’s normal preview behaviour',
+      (plainDialog?.textContent || '').includes('Opened in the normal preview.')
+        && plainDialog?.querySelector('[data-monaco-host]') === null,
+      (plainDialog?.textContent || '').slice(0, 120),
+    );
+  } finally {
+    root.unmount();
+    host.remove();
+    window.fetch = realFetch;
+  }
 }
 
 /**
@@ -11918,8 +12542,8 @@ function setInputValue(field: HTMLInputElement, value: string): void {
  * be refused, and on iOS outside an installed app it is not even offered, so
  * the marks inside the product are the only thing some people will ever get.
  *
- * It cannot be a unit test. Every claim here is about paint — that the waiting
- * dot resolves to a different colour from the unread dot, and that the phone
+ * It cannot be a unit test. Every claim here is about paint — that each state
+ * icon resolves to its own colour and motion, and that the phone
  * sheet, which is the *only* cross-session surface on a phone because the tab
  * strip is not rendered there at all, actually draws the words at a size an eye
  * can read. Without the app's own stylesheets every `var(--warning)` resolves
@@ -11944,6 +12568,7 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
         { id: 'asked', title: 'docs', status: 'running', unread: true, attention: 'question' },
         { id: 'unread', title: 'webcli', status: 'idle', unread: true },
         { id: 'quiet', title: 'notes', status: 'running' },
+        { id: 'failed', title: 'deploy', status: 'error' },
       ],
       activeId: 'quiet',
       onSelect: () => {},
@@ -11956,13 +12581,19 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
 
   const strip = host.querySelector('[role="tablist"][aria-label="Sessions"]') as HTMLElement;
   const tabs = Array.from(strip.querySelectorAll<HTMLElement>('[role="tab"]'));
-  const dotOf = (tab: HTMLElement): HTMLElement => tab.firstElementChild as HTMLElement;
-  const colourOf = (tab: HTMLElement): string => getComputedStyle(dotOf(tab)).backgroundColor;
+  const stateOf = (tab: HTMLElement): HTMLElement => (
+    tab.querySelector('[data-tab-state]') as HTMLElement
+  );
+  const glyphOf = (tab: HTMLElement): HTMLElement => (
+    stateOf(tab).querySelector('.ricon') as HTMLElement
+  );
+  const colourOf = (tab: HTMLElement): string => getComputedStyle(stateOf(tab)).color;
 
   const waiting = colourOf(tabs[0]);
   const asked = colourOf(tabs[1]);
   const unread = colourOf(tabs[2]);
   const quiet = colourOf(tabs[3]);
+  const failed = colourOf(tabs[4]);
 
   check(
     'a conversation waiting for approval is not painted as ordinary unread output',
@@ -11980,17 +12611,34 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
     `approval=${waiting} question=${asked} running=${quiet}`,
   );
   check(
-    'and nothing pulses while it waits',
-    getComputedStyle(dotOf(tabs[0])).animationName === 'none'
-      && getComputedStyle(dotOf(tabs[3])).animationName !== 'none',
-    `waiting=${getComputedStyle(dotOf(tabs[0])).animationName} running=${getComputedStyle(dotOf(tabs[3])).animationName}`,
+    'success and failure have distinct semantic colours',
+    unread !== quiet && failed !== unread && failed !== waiting && /rgb/.test(failed),
+    `success=${unread} error=${failed} working=${quiet}`,
   );
   check(
-    'and the waiting dot says so in words, not only in colour',
-    dotOf(tabs[0]).getAttribute('aria-label') === 'Waiting for approval'
-      && dotOf(tabs[1]).getAttribute('aria-label') === 'Asked you a question'
-      && dotOf(tabs[2]).getAttribute('aria-label') === null,
-    `${dotOf(tabs[0]).getAttribute('aria-label')} / ${dotOf(tabs[1]).getAttribute('aria-label')}`,
+    'only the working icon spins',
+    getComputedStyle(glyphOf(tabs[0])).animationName === 'none'
+      && getComputedStyle(glyphOf(tabs[3])).animationName === 'relay-spin',
+    `waiting=${getComputedStyle(glyphOf(tabs[0])).animationName} working=${getComputedStyle(glyphOf(tabs[3])).animationName}`,
+  );
+  check(
+    'each state uses the corresponding icon rather than a generic dot',
+    tabs.every((tab) => Boolean(glyphOf(tab).querySelector('svg')))
+      && stateOf(tabs[0]).dataset.tabState === 'waiting-approval'
+      && stateOf(tabs[1]).dataset.tabState === 'waiting-input'
+      && stateOf(tabs[2]).dataset.tabState === 'success'
+      && stateOf(tabs[3]).dataset.tabState === 'working'
+      && stateOf(tabs[4]).dataset.tabState === 'error',
+    tabs.map((tab) => stateOf(tab).dataset.tabState).join(' / '),
+  );
+  check(
+    'and every state says so in words, not only in colour',
+    stateOf(tabs[0]).getAttribute('aria-label') === 'Waiting for approval'
+      && stateOf(tabs[1]).getAttribute('aria-label') === 'Waiting for input'
+      && stateOf(tabs[2]).getAttribute('aria-label') === 'Completed'
+      && stateOf(tabs[3]).getAttribute('aria-label') === 'Working'
+      && stateOf(tabs[4]).getAttribute('aria-label') === 'Error',
+    tabs.map((tab) => stateOf(tab).getAttribute('aria-label')).join(' / '),
   );
 
   root.unmount();
@@ -12022,6 +12670,8 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
         tabs: [
           { id: 'waiting', title: 'infra', status: 'running', unread: true, attention: 'approval', workingDir: '/srv/infra' },
           { id: 'quiet', title: 'notes', status: 'running', unread: false, attention: null, workingDir: '/srv/notes' },
+          { id: 'complete', title: 'tests', status: 'idle', unread: true, attention: null, workingDir: '/srv/tests' },
+          { id: 'failed', title: 'deploy', status: 'error', unread: false, attention: null, workingDir: '/srv/deploy' },
         ],
         activeId: 'quiet',
         onSelect: () => {},
@@ -12045,6 +12695,14 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
     'and says it at a size that can be read',
     Boolean(said) && (said as { size: number }).size >= PHONE_MIN_TEXT,
     said ? `${said.size}px, floor ${PHONE_MIN_TEXT}px` : 'not drawn',
+  );
+  const phoneStates = Array.from(doc.querySelectorAll<HTMLElement>('[data-tab-state]'))
+    .map((node) => node.dataset.tabState);
+  check(
+    'the phone session sheet uses the same state icons as the desktop strip',
+    ['waiting-approval', 'working', 'success', 'error']
+      .every((state) => phoneStates.includes(state)),
+    phoneStates.join(' / '),
   );
 
   sheetRoot.unmount();

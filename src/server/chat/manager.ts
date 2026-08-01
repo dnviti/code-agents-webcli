@@ -39,6 +39,15 @@ export interface ChatManagerDeps {
   chatBypassPreference?: (userId: number) => boolean;
   /** Passed through to every session; see ChatSessionDeps.usage. */
   usage?: ChatUsageSink;
+  /**
+   * The folder a given user is allowed to browse, and now the outer edge of
+   * what a conversation of theirs may read and write. See `confine`.
+   *
+   * Optional so a manager built without it — every test that does not care, and
+   * any embedder — keeps the older, tighter behaviour of the session directory
+   * alone rather than silently gaining a wider one.
+   */
+  userBaseFolder?: (userId: number) => string;
 }
 
 export class ChatSessionManager {
@@ -101,9 +110,13 @@ export class ChatSessionManager {
         broadcast: this.deps.broadcast,
         resolveCommand: this.deps.resolveCommand,
         resolveCommandName: this.deps.resolveCommandName,
-        readFile: (sessionId, filePath) => this.readFile(sessionId, filePath),
+        // Closed over the owner for the same reason `resolveBypass` below is:
+        // what a conversation may reach is a fact about the person it belongs
+        // to, and the id is right here at the one moment it is certain.
+        readFile: (sessionId, filePath) =>
+          this.readFile(sessionId, filePath, record.ownerUserId),
         writeFile: (sessionId, filePath, contents) =>
-          this.writeFile(sessionId, filePath, contents),
+          this.writeFile(sessionId, filePath, contents, record.ownerUserId),
         onLifecycle: this.deps.onLifecycle,
         // Closed over this record's owner, so a conversation restarted from
         // inside itself resolves against the preference of the person whose
@@ -136,10 +149,14 @@ export class ChatSessionManager {
    * the request arrives over a socket from a process we launched but do not
    * control, and "read /etc/shadow" is a perfectly well-formed request.
    */
-  private async readFile(sessionId: string, filePath: string): Promise<string> {
+  private async readFile(
+    sessionId: string,
+    filePath: string,
+    ownerUserId?: number,
+  ): Promise<string> {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error('no such chat session');
-    const resolved = this.confine(session.workingDir, filePath);
+    const resolved = this.confine(session.workingDir, filePath, ownerUserId);
     return fs.promises.readFile(resolved, 'utf8');
   }
 
@@ -147,33 +164,63 @@ export class ChatSessionManager {
     sessionId: string,
     filePath: string,
     contents: string,
+    ownerUserId?: number,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error('no such chat session');
-    const resolved = this.confine(session.workingDir, filePath);
+    const resolved = this.confine(session.workingDir, filePath, ownerUserId);
     await fs.promises.mkdir(path.dirname(resolved), { recursive: true });
     await fs.promises.writeFile(resolved, contents, 'utf8');
   }
 
   /**
-   * Resolve a path and prove it stays inside the session's directory.
+   * Resolve a path and prove the agent is allowed to be there.
    *
    * `path.resolve` collapses `..` before the comparison, and the separator on
    * the prefix check stops `/home/u/project-secrets` passing as a child of
    * `/home/u/project`.
    *
-   * The OS temp directory is the one other allowed root. An agent's write
-   * tool and its own shell share the real filesystem, so a handoff like
-   * `gh issue create --body-file /tmp/notes.md` only works when the file the
-   * agent was told to write lands where its shell will look for it — and
-   * scratch space is what a temp dir is for.
+   * Three roots are allowed, and the widest of them is deliberate. The session's
+   * own directory is the obvious one. The OS temp directory is the second: an
+   * agent's write tool and its own shell share the real filesystem, so a handoff
+   * like `gh issue create --body-file /tmp/notes.md` only works when the file the
+   * agent was told to write lands where its shell will look for it, and scratch
+   * space is what a temp dir is for.
+   *
+   * The third is the owner's base folder — the same boundary the file browser
+   * enforces, so this allows exactly what its user could have pointed the
+   * conversation at in the first place. The session directory alone was too
+   * tight to be either safe or useful (#174): an agent working across a git
+   * worktree of its own repository, one directory over, had every read refused
+   * while its own shell read the same file freely, and answered by writing the
+   * file through a script instead. A boundary that stops only the polite path
+   * costs the user a screen of red errors and buys nothing. What this still
+   * refuses is what matters and is unchanged: another account's files, anything
+   * outside the browsable area, and `/etc` and its neighbours.
+   *
+   * Without `userBaseFolder` — an embedder that did not supply one, and every
+   * test that does not care — the older, tighter rule stands.
    */
-  private confine(workingDir: string, filePath: string): string {
+  private confine(workingDir: string, filePath: string, ownerUserId?: number): string {
     const root = path.resolve(workingDir);
     const resolved = path.resolve(root, filePath);
     if (resolved === root || resolved.startsWith(root + path.sep)) return resolved;
     if (this.insideTempDir(resolved)) return resolved;
-    throw new Error(`refusing to touch ${filePath}: outside the session directory`);
+    if (this.insideBaseFolder(resolved, ownerUserId)) return resolved;
+    throw new Error('outside the folders this conversation may use');
+  }
+
+  /** Whether a resolved path is inside the browsable area of its owner. */
+  private insideBaseFolder(resolved: string, ownerUserId?: number): boolean {
+    if (!this.deps.userBaseFolder || ownerUserId === undefined) return false;
+    try {
+      const base = path.resolve(this.deps.userBaseFolder(ownerUserId));
+      return resolved === base || resolved.startsWith(base + path.sep);
+    } catch {
+      // A base folder that cannot be resolved is not an invitation to allow the
+      // path: it is one fewer root, and the check simply fails.
+      return false;
+    }
   }
 
   private insideTempDir(resolved: string): boolean {

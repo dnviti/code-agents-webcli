@@ -1,4 +1,5 @@
 import {
+  AgentStepPatch,
   ChatCapabilities,
   ChatUsage,
   DiffHunk,
@@ -8,6 +9,8 @@ import {
   NO_CHAT_CAPABILITIES,
   PermissionOption,
   PlanItem,
+  SlashCommand,
+  ToolBlock,
   ToolKind,
   ToolStatus,
   UserTurn,
@@ -16,6 +19,7 @@ import {
   rankedEfforts,
 } from '../../../shared/chat-events.js';
 import { blockHasContent } from '../../../shared/chat-visibility.js';
+import { mergeSlashCommands } from '../../../shared/slash-commands.js';
 import { AccountLimitTracker, resetIsoFromEpochSeconds } from '../account-limits.js';
 import {
   AdapterChild,
@@ -66,6 +70,153 @@ function num(value: unknown): number | undefined {
 
 function list(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+/** One Codex child thread, projected onto the shared delegation vocabulary. */
+interface CodexSubAgent {
+  threadId: string;
+  toolId: string;
+  path: string;
+  status: ToolStatus;
+  announced: boolean;
+  startedAt?: number;
+  toolUses: number;
+  stepIds: Set<string>;
+  prompt?: string;
+  model?: string;
+}
+
+interface BufferedSubAgentNotification {
+  method: string;
+  params: Record<string, unknown>;
+}
+
+/**
+ * A stable transcript identity for a child, independent of the action that
+ * mentioned it. `subAgentActivity.id` is the spawn/send/interrupt call id and
+ * therefore changes; `agentThreadId` is the identity that does not.
+ */
+function codexSubAgentToolId(threadId: string): string {
+  return `codex-agent:${threadId}`;
+}
+
+function subAgentActivityStatus(kind: unknown): ToolStatus | undefined {
+  switch (str(kind)) {
+    case 'started':
+      return 'running';
+    case 'interrupted':
+      return 'canceled';
+    // Contacting an agent says nothing about whether it is currently running:
+    // a queued message and a follow-up that starts a turn use the same item.
+    case 'interacted':
+    default:
+      return undefined;
+  }
+}
+
+function subAgentActivityLabel(kind: unknown, path: string): string {
+  switch (str(kind)) {
+    case 'started':
+      return path ? `Started ${path}` : 'Started';
+    case 'interacted':
+      return path ? `Contacted ${path}` : 'Contacted';
+    case 'interrupted':
+      return path ? `Interrupted ${path}` : 'Interrupted';
+    default:
+      return path || 'Agent activity';
+  }
+}
+
+function threadStatus(value: unknown): ToolStatus | undefined {
+  switch (str(record(value).type) || str(value)) {
+    case 'active':
+      return 'running';
+    case 'idle':
+      return 'completed';
+    case 'systemError':
+      return 'failed';
+    case 'notLoaded':
+      // Dormant, not failed. Unlike `unknown`, completed can be reopened when
+      // the same retained child receives a later follow-up and becomes active.
+      return 'completed';
+    default:
+      return undefined;
+  }
+}
+
+function childTurnStatus(value: unknown): ToolStatus | undefined {
+  switch (str(value)) {
+    case 'inProgress':
+      return 'running';
+    case 'completed':
+      return 'completed';
+    case 'interrupted':
+      return 'canceled';
+    case 'failed':
+      return 'failed';
+    default:
+      return undefined;
+  }
+}
+
+function collabAgentStateStatus(value: unknown): ToolStatus | undefined {
+  switch (str(record(value).status) || str(value)) {
+    case 'pendingInit':
+      return 'pending';
+    case 'running':
+      return 'running';
+    case 'completed':
+      return 'completed';
+    case 'interrupted':
+    case 'shutdown':
+      return 'canceled';
+    case 'errored':
+      return 'failed';
+    case 'notFound':
+      return 'unknown';
+    default:
+      return undefined;
+  }
+}
+
+const TERMINAL_AGENT_STATUS: ReadonlySet<ToolStatus> = new Set([
+  'completed',
+  'failed',
+  'denied',
+  'canceled',
+  'unknown',
+]);
+
+const BUFFERED_SUB_AGENT_METHODS: ReadonlySet<string> = new Set([
+  'turn/started',
+  'turn/completed',
+  'item/started',
+  'item/completed',
+  'thread/status/changed',
+  'error',
+]);
+
+const MAX_BUFFERED_SUB_AGENT_THREADS = 32;
+const MAX_BUFFERED_SUB_AGENT_EVENTS = 128;
+
+function subAgentStatusLabel(status: ToolStatus, path: string): string {
+  const target = path || 'agent';
+  switch (status) {
+    case 'pending':
+      return `Waiting to start ${target}`;
+    case 'running':
+      return `Running ${target}`;
+    case 'completed':
+      return `Completed ${target}`;
+    case 'failed':
+      return `Failed ${target}`;
+    case 'denied':
+      return `Denied ${target}`;
+    case 'canceled':
+      return `Interrupted ${target}`;
+    case 'unknown':
+      return `No longer reporting ${target}`;
+  }
 }
 
 // --------------------------------------------------------------- diffs
@@ -203,6 +354,33 @@ const TOOL_ITEM_TYPES = new Set([
 
 function isToolItemType(type: string): boolean {
   return TOOL_ITEM_TYPES.has(type);
+}
+
+function subAgentToolBlock(agent: CodexSubAgent, includeRun = true): ToolBlock {
+  const label = agent.path || 'Codex agent';
+  const block: ToolBlock = {
+    kind: 'tool',
+    toolId: agent.toolId,
+    name: 'Agent',
+    toolKind: 'task',
+    status: agent.status,
+    input: {
+      name: label,
+      agentThreadId: agent.threadId,
+      ...(agent.prompt ? { description: agent.prompt } : {}),
+      ...(agent.model ? { model: agent.model } : {}),
+    },
+  };
+  if (includeRun) {
+    block.agent = {
+      steps: [],
+      status: agent.status,
+      activity: subAgentStatusLabel(agent.status, agent.path),
+      subagentType: label,
+      ...(agent.prompt ? { prompt: agent.prompt } : {}),
+    };
+  }
+  return block;
 }
 
 /** Anything this adapter has no dedicated rendering for, described rather than dropped. */
@@ -351,9 +529,40 @@ function itemToBlock(item: Record<string, unknown>) {
         input: { prompt: item.prompt, model: item.model },
       };
 
+    // App-server mode handles this specially so separate activity call ids are
+    // coalesced onto one child thread and its instantaneous item completion is
+    // not mistaken for the child finishing. The mapper still knows the shape
+    // for `codex exec --json`, where there is no separate routing layer.
+    case 'subAgentActivity': {
+      const threadId = str(item.agentThreadId) || '';
+      if (!threadId) return null;
+      const status = subAgentActivityStatus(item.kind) || 'running';
+      return subAgentToolBlock({
+        threadId,
+        toolId: codexSubAgentToolId(threadId),
+        path: str(item.agentPath) || '',
+        status,
+        announced: true,
+        toolUses: 0,
+        stepIds: new Set<string>(),
+      }, false);
+    }
+
     default:
       return { kind: 'text' as const, text: describeUnmappedItem(item) };
   }
+}
+
+function agentStepFrom(block: ToolBlock): AgentStepPatch {
+  return {
+    id: block.toolId,
+    name: block.name,
+    toolKind: block.toolKind,
+    status: block.status,
+    input: block.input,
+    output: block.output,
+    error: block.error,
+  };
 }
 
 function safeJson(value: unknown): string | undefined {
@@ -449,6 +658,55 @@ function reviewDecisionFor(optionId: string): string {
 const CLIENT_INFO = { name: 'code-agents-webcli', title: 'Code Agents Web CLI', version: '1.0.0' };
 
 /**
+ * Commands implemented by the web chat itself rather than by Codex.
+ *
+ * `ChatSession` intercepts all three and starts a genuinely fresh process, so
+ * they work in app-server and exec mode alike. They also keep the command
+ * control reachable on a machine with no skills installed.
+ */
+const CODEX_APP_COMMANDS: SlashCommand[] = [
+  { name: 'clear', description: 'Start a new conversation, forgetting everything above' },
+  { name: 'new', description: 'Start a new conversation — the same thing as /clear' },
+  { name: 'reset', description: 'Start a new conversation — the same thing as /clear' },
+];
+
+/** A fresh array: adapter capability objects are mutable and must not share one. */
+function initialCodexCommands(options: ChatAdapterOptions): SlashCommand[] {
+  return mergeSlashCommands(CODEX_APP_COMMANDS, options.installedCommands);
+}
+
+interface CodexSkillReference {
+  name: string;
+  path: string;
+}
+
+function initialCodexSkills(options: ChatAdapterOptions): Map<string, CodexSkillReference> {
+  const found = new Map<string, CodexSkillReference>();
+  for (const skill of options.installedSkills ?? []) {
+    const name = String(skill.name || '').trim();
+    const hostPath = String(skill.path || '').trim();
+    if (!name || !hostPath || found.has(name.toLowerCase())) continue;
+    const runtimePath = options.environment
+      ? options.environment.toContainerPath(hostPath)
+      : hostPath;
+    found.set(name.toLowerCase(), { name, path: runtimePath });
+  }
+  return found;
+}
+
+/** `/name args` -> Codex's `$name args`, but only for a known skill. */
+function codexSkillInvocation(
+  text: string,
+  skills: Map<string, CodexSkillReference>,
+): { text: string; skill?: CodexSkillReference } {
+  const selected = /^\s*\/([^\s]+)([\s\S]*)$/.exec(text);
+  const skill = selected ? skills.get(selected[1]!.toLowerCase()) : undefined;
+  return skill && selected
+    ? { text: `$${skill.name}${selected[2] || ''}`, skill }
+    : { text };
+}
+
+/**
  * How long the handshake waits before giving up on a build that never
  * responds.
  *
@@ -462,6 +720,8 @@ const INIT_TIMEOUT_MS = 8_000;
 const THREAD_START_TIMEOUT_MS = 15_000;
 /** Short on purpose: the picker is worth waiting for, but not worth a delayed session. */
 const MODEL_LIST_TIMEOUT_MS = 5_000;
+/** Local discovery, useful but never worth holding the conversation open for. */
+const SKILLS_LIST_TIMEOUT_MS = 5_000;
 /**
  * How long to wait for `account/rateLimits/read`.
  *
@@ -493,6 +753,7 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     // Tokens only -- nothing in the generated schema prices a turn.
     cost: false,
     plan: true,
+    commands: initialCodexCommands(this.options),
   };
 
   private threadId: string | null = null;
@@ -528,8 +789,27 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
   private readonly planText = new Map<string, string>();
   /** itemId -> which of a reasoning item's two channels is filling its block. */
   private readonly reasoningChannel = new Map<string, 'content' | 'summary'>();
+  /** Child thread id -> the one synthetic Agent block shown in the rail. */
+  private readonly subAgents = new Map<string, CodexSubAgent>();
+  /**
+   * A child starts running before its parent receives the activity item that
+   * names it. Hold the small, structural part of that early stream until the
+   * row exists; prose and deltas are deliberately not buffered.
+   */
+  private readonly bufferedSubAgentNotifications = new Map<string, BufferedSubAgentNotification[]>();
   /** What codex has said about the account behind this thread. See `loadRateLimits`. */
   private readonly account = new AccountLimitTracker();
+  /** Skill names are public capabilities; their absolute manifest paths stay on the adapter. */
+  private skillPaths = initialCodexSkills(this.options);
+  /** Latest request wins if a filesystem invalidation races launch-time discovery. */
+  private skillListGeneration = 0;
+
+  /** Host path translated to the namespace in which app-server is running. */
+  private runtimeWorkingDir(): string {
+    return this.options.environment
+      ? this.options.environment.toContainerPath(this.options.workingDir)
+      : this.options.workingDir;
+  }
 
   protected buildArgs(): string[] {
     return ['app-server', ...(this.options.extraArgs || [])];
@@ -548,7 +828,7 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     // ahead of it, which reads as a silent hang rather than a rejection.
     this.notify('initialized');
 
-    const params: Record<string, unknown> = { cwd: this.options.workingDir };
+    const params: Record<string, unknown> = { cwd: this.runtimeWorkingDir() };
     if (this.options.model) params.model = this.options.model;
     if (this.options.effort) {
       // There is no `effort` parameter on `thread/start`; the level travels in
@@ -595,6 +875,11 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     // `thread/start` and the `thread/resume` response, alongside `model` and
     // `cwd`, in the schema and in the live capture both.
     this.reportedEffort = str(response.reasoningEffort) ?? null;
+    // Codex resolves the effective catalogue for this cwd itself: shared Agent
+    // Skills, enabled plugins and system skills included, in the environment
+    // where the runtime is actually running. The stand-in above keeps the menu
+    // usable while this deliberately non-blocking request completes.
+    void this.loadSkillList();
     // Not awaited. The picker's menu is worth having but not worth holding a
     // conversation open for, and the answer arrives on its own event whenever
     // it arrives — `capabilities` exists for exactly this, a runtime revising
@@ -609,7 +894,13 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
       t: 'session',
       nativeSessionId: this.threadId || undefined,
       model: this.model,
-      cwd: str(response.cwd) || this.options.workingDir,
+      // App-server runs inside the selected environment and therefore answers
+      // with that environment's path. The rest of this app addresses the
+      // workspace through its host mount, so keep the public/session cwd in
+      // the host namespace while RPC requests use `runtimeWorkingDir()`.
+      cwd: this.options.environment?.kind === 'container'
+        ? this.options.workingDir
+        : str(response.cwd) || this.options.workingDir,
       capabilities: this.capabilities,
     });
     // After `session`, because that event is what introduces the runtime and a
@@ -698,6 +989,63 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     } catch {
       // Deliberately silent: nothing about a missing menu is worth an error
       // event in a transcript, and the conversation is about to start fine.
+    }
+  }
+
+  /**
+   * Ask Codex for the enabled skills it can actually use from this cwd.
+   *
+   * This is a real v2 app-server request, not a guessed RPC. A live 0.135.0
+   * response contains the shared `.agents` catalogue, plugin skills and Codex
+   * system skills as well as the ordinary user directory. Only public names
+   * and descriptions are emitted; manifest paths remain private here so they
+   * can be attached to `turn/start` when a person selects a skill.
+   */
+  private async loadSkillList(forceReload = false): Promise<void> {
+    const generation = ++this.skillListGeneration;
+    try {
+      const params: Record<string, unknown> = { cwds: [this.runtimeWorkingDir()] };
+      if (forceReload) params.forceReload = true;
+      const response = record(
+        await this.withTimeout(
+          this.call('skills/list', params),
+          SKILLS_LIST_TIMEOUT_MS,
+          'skills/list',
+        ),
+      );
+      if (generation !== this.skillListGeneration) return;
+
+      const commands: SlashCommand[] = [];
+      const paths = new Map<string, { name: string; path: string }>();
+      for (const rawEntry of list(response.data)) {
+        for (const rawSkill of list(record(rawEntry).skills)) {
+          const skill = record(rawSkill);
+          if (skill.enabled !== true) continue;
+          const name = str(skill.name)?.trim();
+          const manifest = str(skill.path)?.trim();
+          if (!name || !manifest) continue;
+          const description =
+            str(skill.description)
+            || str(skill.shortDescription)
+            || str(record(skill.interface).shortDescription);
+          commands.push({ name, ...(description ? { description } : {}) });
+          if (!paths.has(name.toLowerCase())) {
+            paths.set(name.toLowerCase(), { name, path: manifest });
+          }
+        }
+      }
+
+      // A successful response is authoritative and replaces the disk stand-in:
+      // among other things this takes disabled skills and removed legacy
+      // prompts back off the menu. The app-owned reset commands remain because
+      // they never travel to Codex in the first place.
+      const available = mergeSlashCommands(CODEX_APP_COMMANDS, commands);
+      this.skillPaths = paths;
+      this.capabilities.commands = available;
+      this.emit({ t: 'capabilities', capabilities: { commands: available } });
+    } catch {
+      // Old app-server builds have no method; slow ones may miss the timeout.
+      // Both keep the initial disk stand-in, with no protocol error in chat.
     }
   }
 
@@ -797,7 +1145,18 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
       return;
     }
 
-    const input: Array<Record<string, unknown>> = [{ type: 'text', text: turn.text, text_elements: [] }];
+    // The shared composer speaks `/name`, while Codex's app-server explicitly
+    // invokes skills with `$name` plus a structured skill item. Keep the slash
+    // in the transcript (the session already wrote the person's exact text)
+    // and translate only a name from Codex's own latest catalogue. Unknown
+    // slashes remain untouched instead of being guessed into a different
+    // command, and the private manifest path never enters capabilities/logs.
+    const invocation = codexSkillInvocation(turn.text, this.skillPaths);
+    const skill = invocation.skill;
+    const input: Array<Record<string, unknown>> = [
+      { type: 'text', text: invocation.text, text_elements: [] },
+    ];
+    if (skill?.path) input.push({ type: 'skill', name: skill.name, path: skill.path });
     for (const attachment of turn.attachments || []) {
       input.push(
         attachment.path ? { type: 'localImage', path: attachment.path } : { type: 'image', url: attachment.url },
@@ -905,6 +1264,24 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
   }
 
   protected handleNotification(method: string, params: Record<string, unknown>): void {
+    const item = record(params.item);
+    if (
+      (method === 'item/started' || method === 'item/completed')
+      && str(item.type) === 'subAgentActivity'
+    ) {
+      // Codex opens and completes this item immediately. Its completion means
+      // "the activity was recorded", not "the child finished", so consume the
+      // durable half once and let child turn/status notifications own liveness.
+      if (method === 'item/completed') this.onSubAgentActivity(params, item);
+      return;
+    }
+
+    const sourceThreadId = str(params.threadId);
+    if (sourceThreadId && this.threadId && sourceThreadId !== this.threadId) {
+      this.onForeignThreadNotification(sourceThreadId, method, params);
+      return;
+    }
+
     switch (method) {
       case 'turn/started':
         this.ensureAssistantMessage(str(record(params.turn).id) || str(params.turnId) || '');
@@ -946,6 +1323,12 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
         // rather than reading once at launch.
         this.onRateLimits(params);
         return;
+      case 'skills/changed':
+        // Codex defines this as an invalidation signal, not a delta. Re-read
+        // the effective catalogue so installs, removals and enablement changes
+        // are reflected without restarting the conversation.
+        void this.loadSkillList(true);
+        return;
       case 'turn/completed':
         this.onTurnCompleted(params);
         return;
@@ -963,10 +1346,307 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
         // vocabulary does not have.
         return;
       default:
-        // skills/mcp status/hooks/account/... are not chat content this
+        // mcp status/hooks/account/... are not chat content this
         // adapter has scope to render. Dropping is correct, throwing is not.
         return;
     }
+  }
+
+  /**
+   * One activity item becomes one durable delegation row.
+   *
+   * `started`, `interacted` and `interrupted` each have their own item id. The
+   * child thread id is the only stable identity, so later activity patches the
+   * first row instead of adding one row for every message sent to the child.
+   */
+  private onSubAgentActivity(
+    params: Record<string, unknown>,
+    item: Record<string, unknown>,
+  ): void {
+    const threadId = str(item.agentThreadId);
+    if (!threadId) return;
+
+    const kind = str(item.kind) || '';
+    const path = str(item.agentPath) || '';
+    let agent = this.subAgents.get(threadId);
+    if (!agent) {
+      agent = {
+        threadId,
+        toolId: codexSubAgentToolId(threadId),
+        path,
+        status: subAgentActivityStatus(kind) || 'pending',
+        announced: false,
+        startedAt: num(params.completedAtMs) || num(params.startedAtMs),
+        toolUses: 0,
+        stepIds: new Set<string>(),
+      };
+      this.subAgents.set(threadId, agent);
+    } else if (path) {
+      agent.path = path;
+    }
+
+    const activityStatus = subAgentActivityStatus(kind);
+    if (activityStatus) agent.status = activityStatus;
+
+    if (kind === 'started' && !agent.announced) {
+      const emittingThreadId = str(params.threadId);
+      const rootEvent = !emittingThreadId || !this.threadId || emittingThreadId === this.threadId;
+      const turnId = rootEvent ? str(params.turnId) || this.turnId : this.turnId;
+      const msgId = this.assistantMsgId || (turnId ? this.ensureAssistantMessage(turnId) : null);
+      if (msgId) {
+        this.emit({
+          t: 'block_start',
+          msgId,
+          index: this.blockIndex++,
+          block: subAgentToolBlock(agent),
+        });
+        agent.announced = true;
+      }
+    }
+
+    // An interrupt is the final word even when an older idle notification was
+    // waiting for registration. For starts, the opposite is true: a very fast
+    // child may already have completed, and that buffered outcome must win over
+    // the merely historical fact that it started.
+    if (kind === 'interrupted') this.drainBufferedSubAgentNotifications(agent);
+
+    const label = agent.path || 'Codex agent';
+    const input = {
+      name: label,
+      agentThreadId: threadId,
+      activityId: str(item.id),
+      ...(agent.prompt ? { description: agent.prompt } : {}),
+      ...(agent.model ? { model: agent.model } : {}),
+    };
+    const toolPatch: Partial<ToolBlock> = { input };
+    if (activityStatus) {
+      toolPatch.status = activityStatus;
+      if (activityStatus === 'running' || activityStatus === 'pending') toolPatch.error = '';
+    }
+    this.emit({ t: 'tool', toolId: agent.toolId, patch: toolPatch });
+
+    const progress: Record<string, unknown> = {
+      activity: subAgentActivityLabel(kind, agent.path),
+      subagentType: label,
+    };
+    if (activityStatus) {
+      progress.status = activityStatus;
+      if (activityStatus === 'running' || activityStatus === 'pending') progress.error = '';
+    }
+    this.emit({
+      t: 'agent_progress',
+      parentToolId: agent.toolId,
+      patch: progress,
+    });
+
+    if (kind !== 'interrupted') this.drainBufferedSubAgentNotifications(agent);
+  }
+
+  /** Never let another Codex thread borrow the parent chat's message state. */
+  private onForeignThreadNotification(
+    threadId: string,
+    method: string,
+    params: Record<string, unknown>,
+  ): void {
+    const agent = this.subAgents.get(threadId);
+    if (agent) {
+      this.onSubAgentNotification(agent, method, params);
+      return;
+    }
+
+    // A spawned thread can announce its turn before spawn_agent has returned
+    // the activity item to the parent. Buffer only bounded, final-shape events:
+    // item completions contain aggregate output, so high-volume deltas add no
+    // fidelity here and would make an unrecognised internal thread unbounded.
+    if (!BUFFERED_SUB_AGENT_METHODS.has(method)) return;
+    let buffered = this.bufferedSubAgentNotifications.get(threadId);
+    if (!buffered) {
+      if (this.bufferedSubAgentNotifications.size >= MAX_BUFFERED_SUB_AGENT_THREADS) return;
+      buffered = [];
+      this.bufferedSubAgentNotifications.set(threadId, buffered);
+    }
+    if (buffered.length < MAX_BUFFERED_SUB_AGENT_EVENTS) buffered.push({ method, params });
+  }
+
+  private drainBufferedSubAgentNotifications(agent: CodexSubAgent): void {
+    const buffered = this.bufferedSubAgentNotifications.get(agent.threadId);
+    if (!buffered) return;
+    this.bufferedSubAgentNotifications.delete(agent.threadId);
+    for (const notification of buffered) {
+      this.onSubAgentNotification(agent, notification.method, notification.params);
+    }
+  }
+
+  private onSubAgentNotification(
+    agent: CodexSubAgent,
+    method: string,
+    params: Record<string, unknown>,
+  ): void {
+    switch (method) {
+      case 'turn/started': {
+        const turn = record(params.turn);
+        const startedAt = num(turn.startedAt);
+        if (startedAt !== undefined) agent.startedAt = startedAt * 1000;
+        this.updateSubAgentStatus(agent, 'running', { activity: `Running ${agent.path || 'agent'}` });
+        return;
+      }
+
+      case 'item/started':
+        this.onSubAgentItem(agent, record(params.item), false);
+        return;
+
+      case 'item/completed':
+        this.onSubAgentItem(agent, record(params.item), true);
+        return;
+
+      case 'turn/completed': {
+        const turn = record(params.turn);
+        const status = childTurnStatus(turn.status);
+        if (!status) return;
+        if (
+          status === 'completed'
+          && (agent.status === 'canceled' || agent.status === 'failed' || agent.status === 'denied')
+        ) return;
+        const error = str(record(turn.error).message);
+        this.updateSubAgentStatus(agent, status, {
+          activity:
+            status === 'completed'
+              ? `Completed ${agent.path || 'agent'}`
+              : status === 'canceled'
+                ? `Interrupted ${agent.path || 'agent'}`
+                : status === 'failed'
+                  ? `Failed ${agent.path || 'agent'}`
+                  : `Running ${agent.path || 'agent'}`,
+          durationMs: num(turn.durationMs),
+          error,
+        });
+        return;
+      }
+
+      case 'thread/status/changed': {
+        const status = threadStatus(params.status);
+        if (!status) return;
+        // Idle/unloaded is coarser than the child's own terminal verdict. It
+        // may close a running child, but must not turn a known failure or
+        // interruption into an apparent success.
+        if (
+          status === 'completed'
+          && (agent.status === 'canceled' || agent.status === 'failed' || agent.status === 'denied')
+        ) return;
+        this.updateSubAgentStatus(agent, status, {
+          activity:
+            status === 'running'
+              ? `Running ${agent.path || 'agent'}`
+              : status === 'completed'
+                ? `Completed ${agent.path || 'agent'}`
+                : status === 'failed'
+                  ? `Failed ${agent.path || 'agent'}`
+                  : `No longer reporting ${agent.path || 'agent'}`,
+        });
+        return;
+      }
+
+      case 'error': {
+        const message = str(record(params.error).message) || 'Codex subagent failed';
+        this.updateSubAgentStatus(agent, 'failed', {
+          activity: `Failed ${agent.path || 'agent'}`,
+          error: message,
+        });
+        return;
+      }
+
+      default:
+        return;
+    }
+  }
+
+  private onSubAgentItem(
+    agent: CodexSubAgent,
+    item: Record<string, unknown>,
+    completed: boolean,
+  ): void {
+    const block = itemToBlock(item);
+    if (!block) return;
+
+    if (block.kind === 'tool') {
+      const first = !agent.stepIds.has(block.toolId);
+      if (first) {
+        agent.stepIds.add(block.toolId);
+        agent.toolUses += 1;
+      }
+      this.emit({
+        t: 'agent_step',
+        parentToolId: agent.toolId,
+        step: agentStepFrom(block),
+      });
+      this.emit({
+        t: 'agent_progress',
+        parentToolId: agent.toolId,
+        patch: {
+          activity: completed ? `Finished ${block.name}` : `Using ${block.name}`,
+          lastTool: block.name,
+          toolUses: agent.toolUses,
+        },
+      });
+      return;
+    }
+
+    if (!completed) return;
+    if (block.kind === 'text' && block.text.trim()) {
+      this.emit({ t: 'tool', toolId: agent.toolId, patch: { output: block.text } });
+      this.emit({
+        t: 'agent_progress',
+        parentToolId: agent.toolId,
+        patch: { activity: `Reported back from ${agent.path || 'agent'}` },
+      });
+      return;
+    }
+    if (block.kind === 'plan') {
+      const plan = block.items.map((entry) => entry.text).find((text) => text.trim());
+      if (plan) {
+        this.emit({
+          t: 'agent_progress',
+          parentToolId: agent.toolId,
+          patch: { activity: plan.replace(/\s+/g, ' ').trim().slice(0, 140) },
+        });
+      }
+    }
+  }
+
+  private updateSubAgentStatus(
+    agent: CodexSubAgent,
+    status: ToolStatus,
+    details: { activity?: string; durationMs?: number; error?: string } = {},
+  ): void {
+    agent.status = status;
+    // A retained child can receive a later follow-up after failing. Empty is
+    // intentional rather than undefined: events cross JSON boundaries, and
+    // the reducer only assigns defined progress fields, so this is the one
+    // serialisable way to clear the previous run's error on a genuine reopen.
+    const error = details.error ?? (status === 'running' || status === 'pending' ? '' : undefined);
+    const durationMs = details.durationMs
+      ?? (TERMINAL_AGENT_STATUS.has(status) && agent.startedAt !== undefined
+        ? Math.max(0, Date.now() - agent.startedAt)
+        : undefined);
+    this.emit({
+      t: 'tool',
+      toolId: agent.toolId,
+      patch: {
+        status,
+        ...(durationMs !== undefined ? { durationMs } : {}),
+        ...(error !== undefined ? { error } : {}),
+      },
+    });
+    this.emit({
+      t: 'agent_progress',
+      parentToolId: agent.toolId,
+      patch: {
+        status,
+        ...(details.activity ? { activity: details.activity } : {}),
+        ...(durationMs !== undefined ? { durationMs } : {}),
+        ...(error !== undefined ? { error } : {}),
+      },
+    });
   }
 
   private onItem(params: Record<string, unknown>, completed: boolean): void {
@@ -991,6 +1671,9 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
       // channel a delayed result would use, so a completed item whose
       // "started" notification a reconnect missed still renders.
       if (block.kind === 'tool') this.emit({ t: 'tool', toolId: itemId, patch: block });
+      if (type === 'collabAgentToolCall') {
+        this.onLegacyCollabAgentActivity(params, item, msgId);
+      }
       return;
     }
 
@@ -1029,6 +1712,76 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
       return;
     }
     this.emit({ t: 'block_end', msgId, index, block });
+  }
+
+  /**
+   * Older Codex collaboration calls carry target state on the management tool
+   * item instead of publishing `subAgentActivity`. Keep the management call in
+   * the trace, and additionally project each target child onto the same stable
+   * Agent row the newer protocol uses.
+   */
+  private onLegacyCollabAgentActivity(
+    params: Record<string, unknown>,
+    item: Record<string, unknown>,
+    msgId: string,
+  ): void {
+    const states = record(item.agentsStates);
+    const receiverIds = new Set(
+      [
+        ...list(item.receiverThreadIds).filter((entry): entry is string => typeof entry === 'string'),
+        ...Object.keys(states),
+      ].filter(Boolean),
+    );
+    if (receiverIds.size === 0) return;
+
+    const prompt = str(item.prompt);
+    const model = str(item.model);
+    const callFailed = str(item.status) === 'failed';
+    for (const threadId of receiverIds) {
+      const reported = collabAgentStateStatus(states[threadId]);
+      let agent = this.subAgents.get(threadId);
+      if (!agent) {
+        agent = {
+          threadId,
+          toolId: codexSubAgentToolId(threadId),
+          path: '',
+          status: reported || (callFailed ? 'failed' : 'running'),
+          announced: false,
+          startedAt: num(params.completedAtMs) || num(params.startedAtMs),
+          toolUses: 0,
+          stepIds: new Set<string>(),
+          prompt,
+          model,
+        };
+        this.subAgents.set(threadId, agent);
+      } else {
+        if (prompt) agent.prompt = prompt;
+        if (model) agent.model = model;
+      }
+
+      if (!agent.announced) {
+        this.emit({
+          t: 'block_start',
+          msgId,
+          index: this.blockIndex++,
+          block: subAgentToolBlock(agent),
+        });
+        agent.announced = true;
+      }
+
+      const status = reported || (callFailed ? 'failed' : undefined);
+      if (status) {
+        const message = str(record(states[threadId]).message);
+        this.updateSubAgentStatus(agent, status, {
+          activity: subAgentStatusLabel(status, agent.path),
+          ...(status === 'failed' && message ? { error: message } : {}),
+        });
+        if (status === 'completed' && message) {
+          this.emit({ t: 'tool', toolId: agent.toolId, patch: { output: message } });
+        }
+      }
+      this.drainBufferedSubAgentNotifications(agent);
+    }
   }
 
   private onTextDelta(itemId: string, delta: string): void {
@@ -1236,12 +1989,16 @@ export class CodexExecAdapter extends BaseChatAdapter {
     usage: false,
     cost: false,
     plan: false,
+    commands: initialCodexCommands(this.options),
   };
 
   private turnId: string | null = null;
   private assistantMsgId: string | null = null;
   private blockIndex = 0;
   private sawTerminalEvent = false;
+  /** Coalesce the activity call ids for one child into one Agents-panel row. */
+  private readonly subAgents = new Map<string, CodexSubAgent>();
+  private readonly installedSkills = initialCodexSkills(this.options);
 
   /** "Alive" means the adapter has not been stopped, not that a child is currently running. */
   get alive(): boolean {
@@ -1286,6 +2043,7 @@ export class CodexExecAdapter extends BaseChatAdapter {
     this.assistantMsgId = null;
     this.blockIndex = 0;
     this.sawTerminalEvent = false;
+    this.subAgents.clear();
 
     // The user's own message is not written here. `ChatSession.deliver` has
     // already put it in the transcript, with the turn id it minted and the text
@@ -1298,7 +2056,7 @@ export class CodexExecAdapter extends BaseChatAdapter {
     // resume syntax for this mode, so multi-turn context is a known
     // regression versus app-server -- exactly why capabilities.resume is
     // false here.
-    this.spawnTurn([...this.buildArgs(), turn.text]);
+    this.spawnTurn([...this.buildArgs(), codexSkillInvocation(turn.text, this.installedSkills).text]);
   }
 
   private spawnTurn(args: string[]): void {
@@ -1390,6 +2148,10 @@ export class CodexExecAdapter extends BaseChatAdapter {
         const item = record(envelope.item);
         const itemType = str(item.type);
         if (!itemType || itemType === 'userMessage' || itemType === 'hookPrompt') return;
+        if (itemType === 'subAgentActivity') {
+          this.onSubAgentActivity(item);
+          return;
+        }
         const block = itemToBlock(item);
         if (!block) return;
         // Exec mode reports each item once, already finished, so this is the
@@ -1428,6 +2190,62 @@ export class CodexExecAdapter extends BaseChatAdapter {
         // covering the full set (see the class doc comment).
         return;
     }
+  }
+
+  /**
+   * Exec has no child-thread stream, but it may still report several activity
+   * items for one child. Open that child once and patch its stable thread id;
+   * otherwise the panel keeps the first stale row when an interrupt follows.
+   */
+  private onSubAgentActivity(item: Record<string, unknown>): void {
+    const threadId = str(item.agentThreadId);
+    if (!threadId) return;
+
+    const kind = str(item.kind) || '';
+    const path = str(item.agentPath) || '';
+    const reported = subAgentActivityStatus(kind);
+    let agent = this.subAgents.get(threadId);
+    if (!agent) {
+      agent = {
+        threadId,
+        toolId: codexSubAgentToolId(threadId),
+        path,
+        status: reported || 'running',
+        announced: true,
+        toolUses: 0,
+        stepIds: new Set<string>(),
+      };
+      this.subAgents.set(threadId, agent);
+      if (!this.assistantMsgId) {
+        this.assistantMsgId = `a_${this.turnId}`;
+        this.emit({ t: 'msg_start', id: this.assistantMsgId, role: 'assistant', turnId: this.turnId || '' });
+      }
+      // No AgentRun here: exec cannot hear the child complete, so turn_end is
+      // allowed to settle an otherwise-open activity as unknown.
+      this.emit({
+        t: 'block_start',
+        msgId: this.assistantMsgId,
+        index: this.blockIndex++,
+        block: subAgentToolBlock(agent, false),
+      });
+    } else {
+      if (path) agent.path = path;
+      if (reported) agent.status = reported;
+    }
+
+    const input = {
+      name: agent.path || 'Codex agent',
+      agentThreadId: threadId,
+      activityId: str(item.id),
+    };
+    this.emit({
+      t: 'tool',
+      toolId: agent.toolId,
+      patch: {
+        input,
+        ...(reported ? { status: reported } : {}),
+      },
+    });
   }
 
   private closeTurn(stopReason: string): void {
@@ -1472,11 +2290,27 @@ export class CodexChatAdapter implements ChatAdapter {
   readonly runtime = 'codex';
   private delegate: ChatAdapter | null = null;
   private sink: (event: AdapterEvent) => void = () => {};
+  private readonly undecidedCapabilities: ChatCapabilities;
 
-  constructor(private readonly options: ChatAdapterOptions) {}
+  constructor(private readonly options: ChatAdapterOptions) {
+    // `ChatSession` augments this before `start()`. Returning the shared
+    // NO_CHAT_CAPABILITIES singleton used to mutate global state and then lose
+    // the commands when a concrete delegate was selected. Both delegates seed
+    // the same list independently; this object only covers the undecided gap.
+    this.undecidedCapabilities = {
+      ...NO_CHAT_CAPABILITIES,
+      // The two delegates disagree about streaming, interruption, resume and
+      // most other features. Both do report tool calls and structured file
+      // changes through the shared `itemToBlock` mapper, so these are safe to
+      // state before the router has selected one.
+      toolCalls: true,
+      diffs: true,
+      commands: initialCodexCommands(options),
+    };
+  }
 
   get capabilities(): ChatCapabilities {
-    return this.delegate?.capabilities ?? NO_CHAT_CAPABILITIES;
+    return this.delegate?.capabilities ?? this.undecidedCapabilities;
   }
 
   get alive(): boolean {

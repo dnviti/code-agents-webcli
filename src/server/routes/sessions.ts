@@ -14,6 +14,10 @@ import {
 import { TranscriptStoreLike } from '../services/transcript-store.js';
 import { HistoryStoreLike } from '../services/history-store.js';
 import { SessionTeardownLike } from '../services/session-teardown.js';
+import {
+  AccountTabCoordinator,
+  AccountTabCoordinatorLike,
+} from '../services/account-tab-coordinator.js';
 import { stripAnsi } from '../services/ansi.js';
 import { ChatEvent } from '../../shared/chat-events.js';
 import {
@@ -24,7 +28,12 @@ import {
 import { planBranch, tooLargeMessage } from '../chat/branch.js';
 import { TurnCut } from '../chat/store.js';
 import { getOwnedSession, requireUser } from './helpers.js';
-import { announceSessionClosed, announceSessionOpened } from '../websocket/handler.js';
+import {
+  announceSessionClosed,
+  announceSessionOpened,
+  announceSessionTabClosed,
+  announceSessionTabsReordered,
+} from '../websocket/handler.js';
 
 /**
  * How many past conversations one folder offers.
@@ -77,7 +86,8 @@ export interface SessionRoutesDeps {
     ownerSessionId?: string;
   }): SessionRecord;
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
-  saveSessionsToDisk(): Promise<void>;
+  /** `false` means the SQLite write was attempted but did not commit. */
+  saveSessionsToDisk(): Promise<boolean | void>;
   transcriptStore: TranscriptStoreLike;
   historyStore: HistoryStoreLike;
   /** Lines still on screen, not yet scrolled into history. */
@@ -107,6 +117,8 @@ export interface SessionRoutesDeps {
    * compiling; the server always supplies one.
    */
   sessionTeardown?: SessionTeardownLike;
+  /** Shared with socket-created sessions so all account tab writes serialize. */
+  tabCoordinator?: AccountTabCoordinatorLike;
   /**
    * The chat log, for listing past conversations in a folder.
    *
@@ -133,6 +145,12 @@ export interface SessionRoutesDeps {
 
 export function createSessionRoutes(deps: SessionRoutesDeps): Router {
   const router = Router();
+  // Membership and order are one account-owned value. Serialize every such
+  // mutation for a user: a reorder must validate the same open set it persists,
+  // and a failed older write must never roll back a newer close or reopen.
+  const tabCoordinator = deps.tabCoordinator ?? new AccountTabCoordinator();
+  const acquireTabMutation = (userId: number): Promise<() => void> =>
+    tabCoordinator.acquire(userId);
 
   router.get('/api/sessions/persistence', async (_req: Request, res: Response): Promise<void> => {
     const user = requireUser(res);
@@ -268,18 +286,21 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
    * client the user has open, including ones with no relation to the
    * conversation that opened it.
    */
-  router.get('/api/sessions/list', (_req: Request, res: Response): void => {
+  router.get('/api/sessions/list', async (_req: Request, res: Response): Promise<void> => {
     const user = requireUser(res);
     if (!user) {
       res.status(401).json({ error: 'authentication_required' });
       return;
     }
 
-    const sessionList: SessionListItem[] = Array.from(deps.claudeSessions.entries())
-      .filter(([, session]) => session.ownerUserId === user.id)
-      .filter(([, session]) => !session.ownerSessionId)
-      .map(([id, session]) => ({
-        id,
+    // A mutation updates the in-memory records before awaiting SQLite. Wait for
+    // that transaction to commit or roll back so reconnecting clients can never
+    // photograph tentative membership/order that durability later refused.
+    const release = await acquireTabMutation(user.id);
+    try {
+      const sessionList: SessionListItem[] = orderedAccountTabs(deps.claudeSessions, user.id)
+        .map((session) => ({
+        id: session.id,
         name: session.name,
         created: session.created,
         active: session.active,
@@ -296,10 +317,82 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         // dialog; the tab strip was the one place the fact was known and not
         // carried.
         bypassPermissions: session.chatBypassPermissions === true,
-      }));
+        }));
 
-    res.json({ sessions: sessionList });
+      res.json({ sessions: sessionList });
+    } finally {
+      release();
+    }
   });
+
+  /** Replace the order of this account's complete, currently open tab set. */
+  router.patch(
+    '/api/sessions/tabs/order',
+    async (req: Request, res: Response): Promise<void> => {
+      const user = requireUser(res);
+      if (!user) {
+        res.status(401).json({ error: 'authentication_required' });
+        return;
+      }
+
+      const requested = req.body?.sessionIds;
+      if (
+        !Array.isArray(requested)
+        || requested.some((id) => typeof id !== 'string' || id.length === 0)
+        || new Set(requested).size !== requested.length
+      ) {
+        res.status(400).json({
+          error: 'invalid_tab_order',
+          message: 'Tab order must contain each open session exactly once',
+        });
+        return;
+      }
+
+      const sessionIds = requested as string[];
+      const release = await acquireTabMutation(user.id);
+      try {
+        const current = orderedAccountTabs(deps.claudeSessions, user.id);
+        const currentIds = new Set(current.map((session) => session.id));
+        if (
+          sessionIds.length !== current.length
+          || sessionIds.some((id) => !currentIds.has(id))
+        ) {
+          // Includes missing, foreign, closed and newly opened IDs without
+          // revealing which one caused the mismatch. A stale reorder can never
+          // reopen or close anything by implication.
+          res.status(409).json({
+            error: 'tab_set_changed',
+            message: 'The open tab set changed; reload it before reordering',
+          });
+          return;
+        }
+
+        const byId = new Map(current.map((session) => [session.id, session]));
+        const previous = current.map((session) => [session, session.tabOrder] as const);
+        sessionIds.forEach((id, index) => { byId.get(id)!.tabOrder = index; });
+
+        let saved = false;
+        try {
+          saved = (await deps.saveSessionsToDisk()) !== false;
+        } catch (error) {
+          console.error('Failed to persist conversation tab order:', error);
+        }
+        if (!saved) {
+          for (const [session, order] of previous) session.tabOrder = order;
+          res.status(503).json({
+            error: 'tab_order_not_saved',
+            message: 'The tab order could not be saved',
+          });
+          return;
+        }
+
+        announceSessionTabsReordered(user.id, sessionIds, deps.webSocketConnections);
+        res.json({ success: true, sessionIds });
+      } finally {
+        release();
+      }
+    },
+  );
 
   /**
    * Rename a session.
@@ -355,7 +448,123 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     res.json({ success: true, name: trimmed });
   });
 
-  router.post('/api/sessions/create', (req: Request, res: Response): void => {
+  /**
+   * Open or close one conversation tab for the whole account.
+   *
+   * This changes only strip membership. Deleting a conversation remains the
+   * separate DELETE endpoint below; terminal tabs still take that path because
+   * a terminal with no tab would be an unreachable live PTY.
+   */
+  router.patch(
+    '/api/sessions/:sessionId/tab',
+    async (req: Request, res: Response): Promise<void> => {
+      const user = requireUser(res);
+      if (!user) {
+        res.status(401).json({ error: 'authentication_required' });
+        return;
+      }
+
+      const sessionId = req.params.sessionId as string;
+      const session = getOwnedSession(deps.claudeSessions, sessionId, user);
+      if (!session) {
+        // The same answer for a missing session and another account's session:
+        // ownership must not become an existence oracle.
+        res.status(404).json({ error: 'Session not found' });
+        return;
+      }
+
+      if (
+        typeof req.body?.open !== 'boolean'
+        || (req.body?.legacy !== undefined && typeof req.body.legacy !== 'boolean')
+        || (req.body?.legacy === true && req.body.open !== false)
+      ) {
+        res.status(400).json({
+          error: 'invalid_tab_state',
+          message: 'Tab state must name whether the tab is open',
+        });
+        return;
+      }
+
+      if (session.surface !== 'chat' || session.ownerSessionId) {
+        res.status(400).json({
+          error: 'unsupported_tab_session',
+          message: 'Only standalone conversation tabs can be opened or closed',
+        });
+        return;
+      }
+
+      const release = await acquireTabMutation(user.id);
+      try {
+        // It may have been deleted while this request waited behind an earlier
+        // device. Re-read under the mutation turn instead of writing through a
+        // stale object that is no longer in the authoritative map.
+        const current = getOwnedSession(deps.claudeSessions, sessionId, user);
+        if (!current) {
+          res.status(404).json({ error: 'Session not found' });
+          return;
+        }
+
+        const open = req.body.open as boolean;
+        const legacy = req.body.legacy === true;
+
+        // The retired browser-local close list can exist on several devices.
+        // Apply one of those old tombstones only while the persisted row still
+        // says no account-level decision has ever been recorded. Once any
+        // device migrated, closed or explicitly reopened it, another stale
+        // browser must not get to close it merely because it started later.
+        if (legacy && current.tabOpen !== undefined) {
+          res.json({ success: true, open: current.tabOpen, applied: false });
+          return;
+        }
+
+        const previousOpen = current.tabOpen;
+        const previousOrder = current.tabOrder;
+        const genuinelyReopened = open && current.tabOpen === false;
+        const appendedOrder = genuinelyReopened
+          ? nextAccountTabOrder(deps.claudeSessions, user.id)
+          : current.tabOrder;
+        current.tabOpen = open;
+        if (genuinelyReopened) current.tabOrder = appendedOrder;
+        let saved = false;
+        try {
+          saved = (await deps.saveSessionsToDisk()) !== false;
+        } catch (error) {
+          console.error('Failed to persist conversation tab state:', error);
+        }
+        if (!saved) {
+          current.tabOpen = previousOpen;
+          current.tabOrder = previousOrder;
+          res.status(503).json({
+            error: 'tab_state_not_saved',
+            message: 'The tab state could not be saved',
+          });
+          return;
+        }
+
+        // Durability comes before visibility. A client that receives this event
+        // may immediately disconnect; its reconnect list must already agree.
+        if (open) {
+          announceSessionOpened(current, deps.webSocketConnections);
+          // State the complete order even for an idempotent open. A stale live
+          // client may be missing this tab and append the announcement locally,
+          // while the server already has it in the middle of the strip.
+          announceSessionTabsReordered(
+            user.id,
+            orderedAccountTabs(deps.claudeSessions, user.id).map((item) => item.id),
+            deps.webSocketConnections,
+          );
+        } else {
+          announceSessionTabClosed(current, deps.webSocketConnections);
+        }
+
+        res.json({ success: true, open, applied: true });
+      } finally {
+        release();
+      }
+    },
+  );
+
+  router.post('/api/sessions/create', async (req: Request, res: Response): Promise<void> => {
     const user = requireUser(res);
     if (!user) {
       res.status(401).json({ error: 'authentication_required' });
@@ -426,22 +635,55 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         : (deps.getUserBaseFolder?.(user.id) ?? deps.baseFolder);
     }
 
-    const session = deps.createSessionRecord({
-      id: sessionId,
-      ownerUserId: user.id,
-      name,
-      workingDir: validWorkingDir,
-      ownerSessionId: owner,
-    });
+    const release = await acquireTabMutation(user.id);
+    let session: SessionRecord;
+    try {
+      if (owner) {
+        const currentParent = getOwnedSession(deps.claudeSessions, owner, user);
+        if (!currentParent || currentParent.surface !== 'chat') {
+          res.status(409).json({
+            error: 'owner_session_changed',
+            message: 'That conversation is no longer available',
+          });
+          return;
+        }
+      }
+      // Allocate and insert inside the same account turn as visibility/order.
+      // Otherwise a close that later rolls back can leave this new tab sharing
+      // its tentative append position.
+      session = deps.createSessionRecord({
+        id: sessionId,
+        ownerUserId: user.id,
+        name,
+        workingDir: validWorkingDir,
+        ownerSessionId: owner,
+      });
+      if (!owner) session.tabOrder = nextAccountTabOrder(deps.claudeSessions, user.id);
+      deps.claudeSessions.set(sessionId, session);
 
-    deps.claudeSessions.set(sessionId, session);
-    void deps.transcriptStore.ensureTranscript(session);
-    void deps.saveSessionsToDisk();
+      let saved = false;
+      try {
+        saved = (await deps.saveSessionsToDisk()) !== false;
+      } catch (error) {
+        console.error('Failed to persist new session:', error);
+      }
+      if (!saved) {
+        deps.claudeSessions.delete(sessionId);
+        res.status(503).json({
+          error: 'session_not_saved',
+          message: 'The new session could not be saved',
+        });
+        return;
+      }
 
-    // Every screen this person has open, including the one that asked — which
-    // adds the tab from this response and folds the announcement into it. A
-    // shell created *inside* a conversation announces nothing; see the helper.
-    announceSessionOpened(session, deps.webSocketConnections);
+      void deps.transcriptStore.ensureTranscript(session);
+      // Every screen this person has open, including the one that asked — which
+      // adds the tab from this response and folds the announcement into it. A
+      // shell created *inside* a conversation announces nothing; see the helper.
+      announceSessionOpened(session, deps.webSocketConnections);
+    } finally {
+      release();
+    }
 
     if (deps.dev) {
       console.log(`Created new session: ${sessionId} for GitHub user ${user.githubLogin}`);
@@ -599,13 +841,37 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       }
       await store.setOpeningContext(ref, plan.context);
 
-      deps.claudeSessions.set(sessionId, branch);
-      void deps.transcriptStore.ensureTranscript(branch);
-      void deps.saveSessionsToDisk();
+      const release = await acquireTabMutation(user.id);
+      try {
+        // Creating the record happened before the durable branch log was built,
+        // which can take long enough for another device to reorder or close
+        // tabs. Allocate and insert only after that account mutation commits or
+        // rolls back, never against its tentative positions.
+        branch.tabOrder = nextAccountTabOrder(deps.claudeSessions, user.id);
+        deps.claudeSessions.set(sessionId, branch);
 
-      // A branch is a conversation that now exists, so it reaches the user's
-      // other screens on the same terms as one that was started from scratch.
-      announceSessionOpened(branch, deps.webSocketConnections);
+        let saved = false;
+        try {
+          saved = (await deps.saveSessionsToDisk()) !== false;
+        } catch (error) {
+          console.error('Failed to persist branched session:', error);
+        }
+        if (!saved) {
+          deps.claudeSessions.delete(sessionId);
+          res.status(503).json({
+            error: 'branch_not_saved',
+            message: 'The branch could not be saved',
+          });
+          return;
+        }
+
+        void deps.transcriptStore.ensureTranscript(branch);
+        // A branch is a conversation that now exists, so it reaches the user's
+        // other screens on the same terms as one started from scratch.
+        announceSessionOpened(branch, deps.webSocketConnections);
+      } finally {
+        release();
+      }
 
       res.json({
         success: true,
@@ -657,7 +923,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     });
   });
 
-  router.delete('/api/sessions/:sessionId', (req: Request, res: Response): void => {
+  router.delete('/api/sessions/:sessionId', async (req: Request, res: Response): Promise<void> => {
     const user = requireUser(res);
     if (!user) {
       res.status(401).json({ error: 'authentication_required' });
@@ -665,25 +931,47 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     }
 
     const sessionId = req.params.sessionId as string;
-    const session = getOwnedSession(deps.claudeSessions, sessionId, user);
-    if (!session) {
-      res.status(404).json({ error: 'Session not found' });
-      return;
-    }
-
-    // The conversation's own shells go with it. They are only reachable through
-    // it, so a conversation deleted without them would leave ptys running that
-    // nothing in the app — no tab, no listing, no pane — can ever reach again.
-    for (const owned of deps.claudeSessions.values()) {
-      if (owned.ownerSessionId === sessionId) {
-        destroySession(deps, owned);
+    const release = await acquireTabMutation(user.id);
+    try {
+      const session = getOwnedSession(deps.claudeSessions, sessionId, user);
+      if (!session) {
+        res.status(404).json({ error: 'Session not found' });
+        return;
       }
+
+      // Stage membership removal first, but stop processes/delete logs/announce
+      // only after SQLite accepts it. A concurrent list waits on this turn and
+      // therefore sees either the whole deletion or none of it.
+      const originalIds = Array.from(deps.claudeSessions.keys());
+      // Children first, as before: their ptys must be torn down before the
+      // conversation that is their only route of access.
+      const removed = [
+        ...Array.from(deps.claudeSessions.values())
+          .filter((candidate) => candidate.ownerSessionId === sessionId),
+        session,
+      ];
+      for (const candidate of removed) deps.claudeSessions.delete(candidate.id);
+
+      let saved = false;
+      try {
+        saved = (await deps.saveSessionsToDisk()) !== false;
+      } catch (error) {
+        console.error('Failed to persist session deletion:', error);
+      }
+      if (!saved) {
+        restoreSessionMapOrder(deps.claudeSessions, removed, originalIds);
+        res.status(503).json({
+          error: 'session_delete_not_saved',
+          message: 'The session could not be deleted',
+        });
+        return;
+      }
+
+      for (const candidate of removed) destroySession(deps, candidate);
+      res.json({ success: true, message: 'Session deleted' });
+    } finally {
+      release();
     }
-
-    destroySession(deps, session);
-    void deps.saveSessionsToDisk();
-
-    res.json({ success: true, message: 'Session deleted' });
   });
 
   /**
@@ -758,6 +1046,28 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
   return router;
 }
 
+/** Restore staged deletions at their exact Map positions after a refused save. */
+function restoreSessionMapOrder(
+  sessions: Map<string, SessionRecord>,
+  removed: SessionRecord[],
+  originalIds: string[],
+): void {
+  const current = new Map(sessions);
+  const staged = new Map(removed.map((session) => [session.id, session]));
+  sessions.clear();
+
+  for (const id of originalIds) {
+    const session = current.get(id) ?? staged.get(id);
+    if (session) sessions.set(id, session);
+    current.delete(id);
+    staged.delete(id);
+  }
+  // Preserve mutations from other accounts that legitimately completed while
+  // this user's persistence was in flight.
+  for (const [id, session] of current) sessions.set(id, session);
+  for (const [id, session] of staged) sessions.set(id, session);
+}
+
 /**
  * End one session: its process, its sockets, its record and everything stored
  * for it.
@@ -825,6 +1135,42 @@ function chatRecords(deps: SessionRoutesDeps, userId: number): SessionRecord[] {
     .filter((session) => session.surface === 'chat')
     .filter((session) => !session.ownerSessionId)
     .sort((a, b) => activityMs(b) - activityMs(a));
+}
+
+/** The exact tab-strip membership for one account, in its durable order. */
+function orderedAccountTabs(
+  sessions: Map<string, SessionRecord>,
+  userId: number,
+): SessionRecord[] {
+  return Array.from(sessions.values())
+    .filter((session) => session.ownerUserId === userId)
+    .filter((session) => !session.ownerSessionId)
+    // A closed conversation remains in the conversation list, not this strip.
+    // Undefined is the pre-feature value and therefore still means open.
+    .filter((session) => session.tabOpen !== false)
+    .sort((left, right) => {
+      const leftOrdered = Number.isFinite(left.tabOrder);
+      const rightOrdered = Number.isFinite(right.tabOrder);
+      // Legacy rows precede positions assigned to tabs created/reopened after
+      // the upgrade. Returning zero preserves their Map order (and, after a
+      // restart, SessionStore's created-at load order) exactly.
+      if (!leftOrdered && !rightOrdered) return 0;
+      if (!leftOrdered) return -1;
+      if (!rightOrdered) return 1;
+      return left.tabOrder! - right.tabOrder!;
+    });
+}
+
+/** The append position for a new or genuinely reopened tab in this account. */
+function nextAccountTabOrder(sessions: Map<string, SessionRecord>, userId: number): number {
+  let maximum = -1;
+  for (const session of sessions.values()) {
+    if (session.ownerUserId !== userId || session.ownerSessionId || session.tabOpen === false) {
+      continue;
+    }
+    if (Number.isFinite(session.tabOrder)) maximum = Math.max(maximum, session.tabOrder!);
+  }
+  return maximum + 1;
 }
 
 /**

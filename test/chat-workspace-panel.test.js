@@ -578,4 +578,13 @@ describe('MonacoEditor', function () {
     const html = render('MonacoEditor', { value: 'plain text' });
     assert.ok(html.includes('plain text'));
   });
+
+  it('carries an initial line into the built-in editor while Monaco loads', function () {
+    const html = render('MonacoEditor', {
+      value: 'one\ntwo\nthree',
+      path: 'src/a.ts',
+      initialLine: 3,
+    });
+    assert.ok(html.includes('data-initial-line="3"'));
+  });
 });

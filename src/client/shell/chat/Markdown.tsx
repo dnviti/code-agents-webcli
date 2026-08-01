@@ -7,10 +7,15 @@ import {
   markdownToText,
   parseMarkdown,
 } from '../../chat/markdown.js';
+import { workspaceFileTarget } from '../../chat/file-links.js';
 import { ROLE_COLOR_VAR, canHighlight, highlight } from '../../chat/highlight.js';
 import { isMermaidLanguage } from '../../chat/mermaid.js';
 import { MermaidBlock } from './MermaidBlock.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import {
+  WorkspaceFileLinkContext,
+  type WorkspaceFileLinkScope,
+} from './WorkspaceFileLinkContext.js';
 
 /**
  * Renders parsed markdown as React elements.
@@ -34,10 +39,16 @@ export const Markdown = React.memo(function Markdown({ text, dense }: MarkdownPr
   // Parsing is pure and cheap, but a streaming message re-renders per token and
   // the tree is identical whenever the text has not moved.
   const nodes = React.useMemo(() => parseMarkdown(text), [text]);
-  return <>{nodes.map((node, i) => renderBlock(node, i, Boolean(dense)))}</>;
+  const fileLinks = React.useContext(WorkspaceFileLinkContext);
+  return <>{nodes.map((node, i) => renderBlock(node, i, Boolean(dense), fileLinks))}</>;
 });
 
-function renderBlock(node: MarkdownNode, key: React.Key, dense: boolean): React.ReactNode {
+function renderBlock(
+  node: MarkdownNode,
+  key: React.Key,
+  dense: boolean,
+  fileLinks: WorkspaceFileLinkScope | null,
+): React.ReactNode {
   const gap = dense ? 6 : 10;
 
   switch (node.type) {
@@ -52,7 +63,7 @@ function renderBlock(node: MarkdownNode, key: React.Key, dense: boolean): React.
             wordBreak: 'break-word',
           }}
         >
-          {node.children.map(renderInline)}
+          {node.children.map((child, i) => renderInline(child, i, fileLinks))}
         </p>
       );
 
@@ -71,7 +82,7 @@ function renderBlock(node: MarkdownNode, key: React.Key, dense: boolean): React.
             lineHeight: 'var(--leading-snug)',
           },
         },
-        node.children.map(renderInline),
+        node.children.map((child, i) => renderInline(child, i, fileLinks)),
       );
     }
 
@@ -107,15 +118,23 @@ function renderBlock(node: MarkdownNode, key: React.Key, dense: boolean): React.
             color: 'var(--muted-foreground)',
           }}
         >
-          {node.children.map((child, i) => renderBlock(child, i, dense))}
+          {node.children.map((child, i) => renderBlock(child, i, dense, fileLinks))}
         </blockquote>
       );
 
     case 'list':
-      return <List key={key} node={node} dense={dense} />;
+      return <List key={key} node={node} dense={dense} fileLinks={fileLinks} />;
 
     case 'table':
-      return <Table key={key} head={node.head} align={node.align} rows={node.rows} />;
+      return (
+        <Table
+          key={key}
+          head={node.head}
+          align={node.align}
+          rows={node.rows}
+          fileLinks={fileLinks}
+        />
+      );
 
     default:
       return null;
@@ -125,9 +144,11 @@ function renderBlock(node: MarkdownNode, key: React.Key, dense: boolean): React.
 function List({
   node,
   dense,
+  fileLinks,
 }: {
   node: Extract<MarkdownNode, { type: 'list' }>;
   dense: boolean;
+  fileLinks: WorkspaceFileLinkScope | null;
 }) {
   const hasTasks = node.items.some((item) => item.checked !== undefined);
 
@@ -137,7 +158,7 @@ function List({
     return (
       <div style={{ margin: `0 0 ${dense ? 6 : 10}px`, display: 'grid', gap: 4 }}>
         {node.items.map((item, i) => (
-          <TaskRow key={i} item={item} dense={dense} />
+          <TaskRow key={i} item={item} dense={dense} fileLinks={fileLinks} />
         ))}
       </div>
     );
@@ -160,13 +181,21 @@ function List({
       React.createElement(
         'li',
         { key: i, style: { lineHeight: 'var(--leading-normal)' } },
-        item.children.map((child, j) => renderBlock(child, j, true)),
+        item.children.map((child, j) => renderBlock(child, j, true, fileLinks)),
       ),
     ),
   );
 }
 
-function TaskRow({ item, dense }: { item: ListItem; dense: boolean }) {
+function TaskRow({
+  item,
+  dense,
+  fileLinks,
+}: {
+  item: ListItem;
+  dense: boolean;
+  fileLinks: WorkspaceFileLinkScope | null;
+}) {
   const done = item.checked === true;
   return (
     <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
@@ -195,7 +224,7 @@ function TaskRow({ item, dense }: { item: ListItem; dense: boolean }) {
           textDecoration: done ? 'line-through' : undefined,
         }}
       >
-        {item.children.map((child, i) => renderBlock(child, i, dense))}
+        {item.children.map((child, i) => renderBlock(child, i, dense, fileLinks))}
       </div>
     </div>
   );
@@ -205,10 +234,12 @@ function Table({
   head,
   align,
   rows,
+  fileLinks,
 }: {
   head: InlineNode[][];
   align: Align[];
   rows: InlineNode[][][];
+  fileLinks: WorkspaceFileLinkScope | null;
 }) {
   const cell = (a: Align): React.CSSProperties => ({
     padding: '4px 10px',
@@ -240,7 +271,7 @@ function Table({
                   whiteSpace: 'nowrap',
                 }}
               >
-                {cells.map(renderInline)}
+                {cells.map((child, j) => renderInline(child, j, fileLinks))}
               </th>
             ))}
           </tr>
@@ -250,7 +281,7 @@ function Table({
             <tr key={i}>
               {row.map((cells, j) => (
                 <td key={j} style={cell(align[j])}>
-                  {cells.map(renderInline)}
+                  {cells.map((child, k) => renderInline(child, k, fileLinks))}
                 </td>
               ))}
             </tr>
@@ -369,7 +400,40 @@ export function CodeBlock({ lang, text, complete = true }: CodeBlockProps) {
   );
 }
 
-function renderInline(node: InlineNode, key: React.Key): React.ReactNode {
+function renderInline(
+  node: InlineNode,
+  key: React.Key,
+  fileLinks: WorkspaceFileLinkScope | null,
+): React.ReactNode {
+  if ((node.type === 'link' || node.type === 'filelink') && fileLinks) {
+    const target = workspaceFileTarget(node.href, fileLinks.workingDir);
+    if (target) {
+      return (
+        <a
+          key={key}
+          // Keep the browser fallback inside this document. In particular, a
+          // Windows drive letter must never become a custom URL scheme when a
+          // middle-click or context-menu action bypasses React's click handler.
+          href={`#workspace-file=${encodeURIComponent(node.href)}`}
+          title={node.title}
+          aria-haspopup="dialog"
+          data-workspace-file-path={target.path}
+          data-workspace-file-line={target.line}
+          onClick={(event) => {
+            event.preventDefault();
+            fileLinks.onOpen(target);
+          }}
+          onAuxClick={(event) => {
+            if (event.button === 1) event.preventDefault();
+          }}
+          style={{ color: 'var(--info)', textDecoration: 'underline' }}
+        >
+          {node.children.map((child, i) => renderInline(child, i, fileLinks))}
+        </a>
+      );
+    }
+  }
+
   switch (node.type) {
     case 'text':
       return <React.Fragment key={key}>{node.value}</React.Fragment>;
@@ -377,17 +441,17 @@ function renderInline(node: InlineNode, key: React.Key): React.ReactNode {
     case 'strong':
       return (
         <strong key={key} style={{ fontWeight: 'var(--font-semibold)' }}>
-          {node.children.map(renderInline)}
+          {node.children.map((child, i) => renderInline(child, i, fileLinks))}
         </strong>
       );
 
     case 'em':
-      return <em key={key}>{node.children.map(renderInline)}</em>;
+      return <em key={key}>{node.children.map((child, i) => renderInline(child, i, fileLinks))}</em>;
 
     case 'strike':
       return (
         <span key={key} style={{ textDecoration: 'line-through', opacity: 0.7 }}>
-          {node.children.map(renderInline)}
+          {node.children.map((child, i) => renderInline(child, i, fileLinks))}
         </span>
       );
 
@@ -421,8 +485,18 @@ function renderInline(node: InlineNode, key: React.Key): React.ReactNode {
           rel="noreferrer noopener"
           style={{ color: 'var(--info)', textDecoration: 'underline' }}
         >
-          {node.children.map(renderInline)}
+          {node.children.map((child, i) => renderInline(child, i, fileLinks))}
         </a>
+      );
+
+    case 'filelink':
+      // A machine-local Windows path only becomes interactive inside the
+      // matching ChatView workspace. Everywhere else it remains visible text,
+      // never a browser-owned `c:` or UNC navigation.
+      return (
+        <React.Fragment key={key}>
+          {node.children.map((child, i) => renderInline(child, i, fileLinks))}
+        </React.Fragment>
       );
 
     case 'image':

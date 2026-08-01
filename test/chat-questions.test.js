@@ -23,7 +23,7 @@ const {
   MAX_QUESTION_ANSWER_TEXT,
   ASK_QUESTION_TOOL_NAME,
 } = require('../dist/shared/chat-events.js');
-const { askChannelFor } = require('../dist/server/chat/registry.js');
+const { askChannelFor, askEnvFor } = require('../dist/server/chat/registry.js');
 const { MessageProcessor } = require('../dist/server/websocket/messages.js');
 
 // Choice-based questions from the model, end to end (issue #42).
@@ -1199,6 +1199,351 @@ describe('asking the user a choice-based question', function () {
         broker.close();
         fs.rmSync(root, { recursive: true, force: true });
       }
+    });
+  });
+});
+
+// A question nobody could answer (#174).
+//
+// The incident that produced this: a conversation on omp put two identical
+// cards on screen and the agent went on without either. Reconstructed from the
+// logs afterwards, three separate things had gone wrong.
+//
+// omp's MCP client abandons every `tools/call` after 30 seconds — a sensible
+// ceiling for a tool that computes something and a nonsense one for the tool
+// whose whole purpose is to wait for a person. Nothing on this side learned the
+// call had died, so both cards stayed live and clickable for the ten minutes
+// that followed, and a click would have gone into a request omp had already
+// dropped. And what the cards eventually said — "Skipped without answering" —
+// was written by the Stop button, blaming the user for a question they were
+// never in a position to answer.
+describe('a question the agent stopped waiting for', function () {
+  const ROOT_DIR = path.join(__dirname, '..');
+
+  function memoryStore() {
+    const events = [];
+    return {
+      events,
+      append(_ref, batch) { events.push(...batch); },
+      async stat() { return { firstSeq: 1, cursor: events.length }; },
+      async read() { return { events: [], firstSeq: 1, from: 1, cursor: events.length }; },
+      async snapshot() {
+        return {
+          sessionId: 's1', runtime: 'omp', messages: [], state: 'idle',
+          capabilities: {}, pendingPermissions: [], firstSeq: 1, replayFrom: 1,
+          cursor: events.length, live: true, bypassPermissions: false,
+        };
+      },
+    };
+  }
+
+  function bareSession() {
+    const store = memoryStore();
+    const s = new ChatSession(
+      { id: 's1', ownerUserId: 7 },
+      {
+        store,
+        socketDir: fs.mkdtempSync(path.join(os.tmpdir(), 'abandon-')),
+        hookScript: path.join(ROOT_DIR, 'does-not-exist.js'),
+        broadcast: () => {},
+        resolveCommand: () => 'omp',
+      },
+    );
+    return { s, store };
+  }
+
+  /** The tick the session defers its own resolution by, so ordering holds. */
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  describe('the launch that stops it happening at all', function () {
+    it('tells each runtime to wait, in the only vocabulary each one has', function () {
+      // omp: 0 means "no client-side timeout" and is documented as such.
+      assert.deepStrictEqual(askEnvFor('omp'), { OMP_MCP_TIMEOUT_MS: '0' });
+      // kimi: the same idea, and a trap. Its parser accepts 1…2147483647 and
+      // silently discards anything else — so 0 there is not "disabled", it is
+      // invalid, and it lands back on the 60s default it was meant to remove.
+      assert.deepStrictEqual(askEnvFor('kimi'), { KIMI_MCP_TOOL_TIMEOUT_MS: '2147483647' });
+      assert.ok(Number(askEnvFor('kimi').KIMI_MCP_TOOL_TIMEOUT_MS) >= 1);
+      // Nothing invented for the runtimes nobody has measured.
+      assert.deepStrictEqual(askEnvFor('claude'), {});
+      assert.deepStrictEqual(askEnvFor('nonesuch'), {});
+    });
+
+    it('is a copy, so one session cannot edit the table for the next', function () {
+      const first = askEnvFor('omp');
+      first.OMP_MCP_TIMEOUT_MS = '30000';
+      assert.strictEqual(askEnvFor('omp').OMP_MCP_TIMEOUT_MS, '0');
+    });
+  });
+
+  describe('the card that outlived its call', function () {
+    it('closes when the call that asked reports failed', async function () {
+      const { s, store } = bareSession();
+      const waiting = s.askQuestion({ ...QUESTION });
+      const asked = store.events.find((e) => e.t === 'question').request;
+      // The pairing that makes this possible: the pending question is filed
+      // under the tool call's id, and the failure patch carries the same one.
+      asked.toolId = 'write_20|fc_tmp_duo3u3bkp7';
+      s.questions.get(asked.requestId).request.toolId = asked.toolId;
+
+      s.ingest({
+        t: 'tool',
+        toolId: 'write_20|fc_tmp_duo3u3bkp7',
+        patch: { status: 'failed', error: 'MCP error: Request timeout after 30000ms' },
+      });
+      await settle();
+
+      const reply = await within(waiting, 'the blocked tool call was never released');
+      assert.ok(reply.error, 'the model is told, rather than left holding the call open');
+      assert.strictEqual(s.questions.size, 0);
+
+      const resolved = store.events.find((e) => e.t === 'question_resolved');
+      assert.ok(resolved, 'the card is taken down');
+      assert.strictEqual(resolved.abandoned, true);
+      assert.ok(!resolved.skipped, 'nobody skipped it — nobody was asked');
+    });
+
+    it('refuses an answer clicked after that point', async function () {
+      const { s, store } = bareSession();
+      s.askQuestion({ ...QUESTION });
+      const asked = store.events.find((e) => e.t === 'question').request;
+      s.questions.get(asked.requestId).request.toolId = 'call-1';
+
+      s.ingest({ t: 'tool', toolId: 'call-1', patch: { status: 'failed' } });
+      await settle();
+
+      // False is what the browser gets, and it is the truthful answer: omp
+      // deletes the request id inside its own timeout callback, so a reply
+      // written under it would have been dropped without a word.
+      assert.strictEqual(s.answerQuestion(asked.requestId, [asked.options[0].optionId]), false);
+      const resolutions = store.events.filter((e) => e.t === 'question_resolved');
+      assert.strictEqual(resolutions.length, 1, 'and no second resolution invents an answer');
+    });
+
+    it('leaves the conversation running rather than waiting on nobody', async function () {
+      const { s, store } = bareSession();
+      s.askQuestion({ ...QUESTION });
+      const asked = store.events.find((e) => e.t === 'question').request;
+      s.questions.get(asked.requestId).request.toolId = 'call-1';
+      assert.strictEqual(s.state, 'awaiting_answer');
+
+      s.ingest({ t: 'tool', toolId: 'call-1', patch: { status: 'failed' } });
+      await settle();
+
+      assert.notStrictEqual(s.state, 'awaiting_answer');
+    });
+
+    it('says so after the patch that caused it, not before', async function () {
+      // Ordering, because the log is read back in sequence and a resolution
+      // numbered ahead of the failure that caused it reads as a card that
+      // closed for no reason. `ingest` is re-entrant-hostile; this is why the
+      // session defers.
+      const { s, store } = bareSession();
+      s.askQuestion({ ...QUESTION });
+      const asked = store.events.find((e) => e.t === 'question').request;
+      s.questions.get(asked.requestId).request.toolId = 'call-1';
+
+      s.ingest({ t: 'tool', toolId: 'call-1', patch: { status: 'failed' } });
+      await settle();
+
+      const failure = store.events.findIndex((e) => e.t === 'tool' && e.patch.status === 'failed');
+      const resolved = store.events.findIndex((e) => e.t === 'question_resolved');
+      assert.ok(failure >= 0 && resolved > failure, 'the failure is recorded first');
+    });
+
+    it('leaves a call that succeeded alone', async function () {
+      // A question tool call *completes* precisely when somebody answered it,
+      // and the answer has already been recorded by the time the status lands.
+      const { s, store } = bareSession();
+      s.askQuestion({ ...QUESTION });
+      const asked = store.events.find((e) => e.t === 'question').request;
+      s.questions.get(asked.requestId).request.toolId = 'call-1';
+
+      s.ingest({ t: 'tool', toolId: 'call-1', patch: { status: 'completed' } });
+      await settle();
+
+      assert.strictEqual(s.questions.size, 1, 'the card is still live');
+      assert.ok(!store.events.some((e) => e.t === 'question_resolved'));
+    });
+
+    it('leaves another call’s question alone', async function () {
+      const { s, store } = bareSession();
+      s.askQuestion({ ...QUESTION });
+      const asked = store.events.find((e) => e.t === 'question').request;
+      s.questions.get(asked.requestId).request.toolId = 'call-1';
+
+      s.ingest({ t: 'tool', toolId: 'some-other-call', patch: { status: 'failed' } });
+      await settle();
+
+      assert.strictEqual(s.questions.size, 1);
+    });
+
+    it('takes the card down when the conversation is closed', async function () {
+      const { s, store } = bareSession();
+      const waiting = s.askQuestion({ ...QUESTION });
+      await s.stop();
+
+      const reply = await within(waiting, 'the tool call was never released');
+      assert.ok(reply.error);
+      // The event is the point: resolving the promise unblocks the runtime, and
+      // does nothing for a browser already watching, which went on offering
+      // buttons until something made it rebuild from scratch.
+      const resolved = store.events.find((e) => e.t === 'question_resolved');
+      assert.ok(resolved, 'a browser already watching is told too');
+      assert.strictEqual(resolved.abandoned, true);
+    });
+  });
+
+  describe('the client’s record of it', function () {
+    it('is a different fact from a skip, and survives a rejoin', function () {
+      const state = createTranscript({});
+      applyChatEvent(state, {
+        t: 'question', seq: 1, ts: 1,
+        request: { requestId: 'q1', toolId: 't1', question: 'which?', options: [] },
+      });
+      applyChatEvent(state, {
+        t: 'question_resolved', seq: 2, ts: 2, requestId: 'q1', toolId: 't1',
+        optionIds: [], abandoned: true,
+      });
+
+      // Both are recorded: an empty list of picks is what the card draws, and
+      // the flag is what tells it which sentence to draw underneath.
+      assert.deepStrictEqual(state.answeredQuestions.t1, []);
+      assert.strictEqual(state.abandonedQuestions.t1, true);
+      assert.deepStrictEqual(state.pendingQuestions, []);
+    });
+
+    it('is cleared when the same question is asked again and answered', function () {
+      // The retry in the incident: the agent asked the identical question a
+      // second time. A stale "nobody could answer this" left under a card that
+      // was answered on the retry would be the same wrong sentence in the other
+      // direction.
+      const state = createTranscript({});
+      applyChatEvent(state, {
+        t: 'question_resolved', seq: 1, ts: 1, requestId: 'q1', toolId: 't1',
+        optionIds: [], abandoned: true,
+      });
+      applyChatEvent(state, {
+        t: 'question_resolved', seq: 2, ts: 2, requestId: 'q2', toolId: 't1',
+        optionIds: ['opt-0'],
+      });
+
+      assert.deepStrictEqual(state.answeredQuestions.t1, ['opt-0']);
+      assert.strictEqual(state.abandonedQuestions.t1, undefined);
+    });
+
+    it('goes back to nothing on /clear, with the cards it belongs to', function () {
+      const state = createTranscript({});
+      applyChatEvent(state, {
+        t: 'question_resolved', seq: 1, ts: 1, requestId: 'q1', toolId: 't1',
+        optionIds: [], abandoned: true,
+      });
+      applyChatEvent(state, { t: 'marker', seq: 2, ts: 2, kind: 'cleared', detail: '' });
+      assert.deepStrictEqual(state.abandonedQuestions, {});
+    });
+  });
+
+  describe('the cancel an MCP client sends', function () {
+    it('reaches the session as an abandonment, and answers nothing', async function () {
+      // kimi does send `notifications/cancelled` when it gives up; omp does
+      // not. Swallowed here until now, at the `id === undefined` guard that
+      // exists for notifications generally.
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const cancelled = [];
+      const written = [];
+      let resolveAsk;
+      output.on('data', (chunk) => written.push(String(chunk)));
+
+      serveAsk(
+        input,
+        output,
+        (_question, onSent) => new Promise((resolve) => {
+          resolveAsk = resolve;
+          onSent?.('ask-42');
+        }),
+        undefined,
+        (askId) => {
+          cancelled.push(askId);
+          // Production AskChannel.cancel resolves the promise as part of
+          // tearing the question down. The response must still stay silent.
+          resolveAsk({ labels: [], error: 'the agent stopped waiting for an answer' });
+        },
+      );
+
+      input.write(`${JSON.stringify({
+        jsonrpc: '2.0', id: 7, method: 'tools/call',
+        params: { name: 'ask_user_question', arguments: QUESTION },
+      })}\n`);
+      await settle();
+      input.write(`${JSON.stringify({
+        jsonrpc: '2.0', method: 'notifications/cancelled',
+        params: { requestId: 7, reason: 'Request timeout after 60000ms' },
+      })}\n`);
+      await settle();
+
+      assert.deepStrictEqual(cancelled, ['ask-42'], 'the question it names, not some other one');
+      assert.ok(
+        !written.some((line) => line.includes('"id":7')),
+        'a cancelled request wants no reply — the call is already over at the other end',
+      );
+    });
+
+    it('ignores a cancel for a call it never had', async function () {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const cancelled = [];
+      serveAsk(input, output, () => new Promise(() => {}), undefined, (id) => cancelled.push(id));
+
+      input.write(`${JSON.stringify({
+        jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 99 },
+      })}\n`);
+      await settle();
+
+      assert.deepStrictEqual(cancelled, []);
+    });
+
+    it('keeps numeric and string request ids distinct', async function () {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const cancelled = [];
+      const resolvers = new Map();
+      const written = [];
+      output.on('data', (chunk) => written.push(String(chunk)));
+
+      serveAsk(
+        input,
+        output,
+        (question, onSent) => new Promise((resolve) => {
+          const askId = `ask-${question.question}`;
+          resolvers.set(askId, resolve);
+          onSent?.(askId);
+        }),
+        undefined,
+        (askId) => {
+          cancelled.push(askId);
+          resolvers.get(askId)({ labels: [], error: 'cancelled' });
+        },
+      );
+
+      for (const [id, question] of [[7, 'number'], ['7', 'string']]) {
+        input.write(`${JSON.stringify({
+          jsonrpc: '2.0', id, method: 'tools/call',
+          params: { name: 'ask_user_question', arguments: { ...QUESTION, question } },
+        })}\n`);
+      }
+      await settle();
+      input.write(`${JSON.stringify({
+        jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 7 },
+      })}\n`);
+      await settle();
+      resolvers.get('ask-string')({ labels: ['Patch it'] });
+      await settle();
+
+      assert.deepStrictEqual(cancelled, ['ask-number']);
+      const responses = written.join('').trim().split('\n').filter(Boolean).map(JSON.parse);
+      assert.strictEqual(responses.length, 1, 'only the uncancelled call receives a response');
+      assert.strictEqual(responses[0].id, '7');
     });
   });
 });

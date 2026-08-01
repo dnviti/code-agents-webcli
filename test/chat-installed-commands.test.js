@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
+  discoverInstalledCommands,
   listInstalledCommands,
   describeFrom,
 } = require('../dist/server/chat/installed-commands.js');
@@ -149,6 +150,27 @@ describe('installed skills and commands', function () {
     // grok reads Claude's directories too, by default, and says so in its docs.
     assert.deepStrictEqual(names(scan('grok')).sort(), ['claude-only', 'grok-only']);
     assert.deepStrictEqual(names(scan('claude')), ['claude-only']);
+  });
+
+  it('uses Codex’s shared and system skill roots as a fallback for older builds', function () {
+    skill('project/.agents/skills/project-shared', 'name: project-shared');
+    skill('home/.agents/skills/user-shared', 'name: user-shared');
+    skill('home/.codex/skills/.system/system-skill', 'name: system-skill');
+    assert.deepStrictEqual(
+      names(scan('codex')),
+      ['project-shared', 'user-shared', 'system-skill'],
+    );
+  });
+
+  it('keeps skill paths in private discovery metadata, not public menu entries', function () {
+    skill('home/.codex/skills/release', 'name: release\ndescription: Prepare a release');
+    const found = discoverInstalledCommands('codex', { home: home(), workingDir: cwd() });
+    assert.deepStrictEqual(found.commands, [{ name: 'release', description: 'Prepare a release' }]);
+    assert.deepStrictEqual(found.skills, [{
+      name: 'release',
+      path: path.join(home(), '.codex/skills/release/SKILL.md'),
+    }]);
+    assert.ok(!JSON.stringify(found.commands).includes(home()), 'the browser-facing list has no absolute path');
   });
 
   it('reads all four of agy’s workspace root spellings', function () {

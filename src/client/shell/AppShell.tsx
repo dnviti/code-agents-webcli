@@ -5,6 +5,7 @@ import { Badge } from '../ui/relay/Badge';
 import { CommandPalette, type CommandPaletteGroup } from '../ui/relay/CommandPalette';
 import { Icon } from '../ui/relay/Icon';
 import { PhoneContext } from '../ui/touch';
+import { visualViewportKeyboardInset } from '../ui/keyboard-viewport';
 import { IconButton } from '../ui/relay/IconButton';
 import { StatusBar, type StatusBarSegment } from '../ui/relay/StatusBar';
 import { TabBar, type TabItem } from '../ui/relay/TabBar';
@@ -153,7 +154,7 @@ function tabItems(tabs: ShellTab[]): TabItem[] {
   return tabs.map((tab) => ({
     id: tab.id,
     title: tab.title,
-    status: tab.status === 'running' ? 'running' : tab.status === 'error' ? 'error' : 'idle',
+    status: tab.status,
     unread: tab.unread,
     attention: tab.attention,
     tooltip: tab.workingDir ?? tab.title,
@@ -1065,10 +1066,18 @@ function useKeyboardUp(isMobile: boolean): boolean {
       setUp(false);
       return;
     }
-    const measure = (): void => setUp(window.innerHeight - viewport.height > 160);
+    const measure = (): void => setUp(visualViewportKeyboardInset(viewport) > 160);
     measure();
     viewport.addEventListener('resize', measure);
-    return () => viewport.removeEventListener('resize', measure);
+    viewport.addEventListener('scroll', measure);
+    document.addEventListener('focusin', measure);
+    document.addEventListener('focusout', measure);
+    return () => {
+      viewport.removeEventListener('resize', measure);
+      viewport.removeEventListener('scroll', measure);
+      document.removeEventListener('focusin', measure);
+      document.removeEventListener('focusout', measure);
+    };
   }, [isMobile]);
 
   return up;

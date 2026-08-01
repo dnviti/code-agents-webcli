@@ -173,6 +173,59 @@
   actually decides something.
 
 ### Fixed
+- **Closing a conversation tab now closes it on every device signed into the
+  account.** Tab membership was the last part of the strip kept in browser
+  storage, so closing a conversation on one screen left it open everywhere else
+  and each device accumulated a different set. Open and closed tabs now belong
+  to the account, survive a server restart, and are announced live to every
+  connected screen; reconnecting screens take the persisted answer instead of
+  republishing stale tabs. Order is shared too, while the selected tab remains
+  local to each window. Reopening from the conversation list does the same in
+  reverse. The conversation itself, its transcript and any running agent are
+  still preserved; only deleting removes them. Existing browser-local closures
+  are imported once on upgrade. An overflowing strip can now be moved with the
+  mouse wheel, swiped on a touch screen, or opened as a complete,
+  keyboard-accessible tab list.
+- **A question the agent asks you now reaches you, and waits** (#174). On Oh My
+  Pi it did neither. Its MCP client abandons any call after thirty seconds, and
+  the one tool whose entire purpose is to wait for a person is a call like any
+  other: the card appeared, the agent stopped listening half a minute later, and
+  the card stayed on screen — live, clickable and lying — for as long as the turn
+  ran. Ten and a half minutes, in the conversation this was reported from, during
+  which any click would have gone into a request the agent had already dropped.
+  Meanwhile the agent, told its question had failed, asked the same thing again,
+  drew a second card beside the first, and eventually carried on having guessed.
+
+  There is no flag and no setting for that timeout, and the handshake this app
+  uses has nowhere to put one, so the app now switches it off in the environment
+  it starts Oh My Pi with. Kimi Code had the same ceiling at sixty seconds and is
+  raised out of the way too — by a different value, because zero means "no
+  timeout" to one of them and "invalid, use the default" to the other.
+
+  And because a runtime can always stop listening for reasons of its own, a card
+  now ends when the call behind it does: the buttons go, and it says *the agent
+  stopped waiting for an answer*. That sentence used to read *skipped without
+  answering*, which said the user had been asked and declined — about two cards
+  they were never in a position to answer. Stopping a turn or closing a
+  conversation says the same true thing now, rather than the accusation.
+- **pi can ask you a question at all.** It had no way to, and it did not know
+  that: a widely installed pi package offers the model a question tool that, in
+  the mode this app runs pi in, answers itself with "UI not available" without
+  anybody being asked. The agent read that as a dead end and guessed, and all
+  anyone saw was a grey tool row. pi is now given a real question tool of its
+  own — the same card, the same free-text box, the same block until you answer —
+  and the broken one is kept out of its way.
+- **An agent can read the folder next door** (#174). A conversation could only
+  read and write inside the single folder it was started in, which is narrower
+  than the area its own file browser offers: a session in a repository could not
+  read a git worktree of that same repository sitting beside it, and filled the
+  conversation with red errors saying so. The refusals were also mostly pointless
+  — Oh My Pi recovers from a refused read by opening the file itself, so they
+  reported a failure that had not happened, once per attempt, with the path
+  printed twice. A refused *write* did fail, and the agent worked around that by
+  running a script that wrote the same file. What an agent may touch is now the
+  same boundary the file browser draws; everything outside it is refused exactly
+  as before, and a refusal is said once, in words that name the boundary.
 - **Stopping a turn no longer reads as the turn failing.** Claude reports a run
   it was told to abandon exactly the way it reports one that broke — `is_error`,
   subtype `error_during_execution` — so pressing stop, or correcting the agent by

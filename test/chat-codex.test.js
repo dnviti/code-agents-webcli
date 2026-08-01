@@ -7,6 +7,8 @@ const {
   CodexChatAdapter,
 } = require('../dist/server/chat/adapters/codex.js');
 const { NO_CHAT_CAPABILITIES } = require('../dist/shared/chat-events.js');
+const { collectAgentActivity } = require('../dist/shared/agent-activity.js');
+const { applyChatEvent, createTranscript } = require('../dist/shared/chat-reducer.js');
 
 // codex-appserver-*.jsonl fixtures are hand-written against the generated
 // TypeScript bindings the CLI itself ships (`.work/probes/raw/codex-ts`):
@@ -92,6 +94,19 @@ function stripTs(events) {
   });
 }
 
+/** Fold the adapter's wire-independent events the same way the browser does. */
+function transcriptOf(events) {
+  const state = createTranscript({});
+  for (const [index, event] of JSON.parse(JSON.stringify(events)).entries()) {
+    applyChatEvent(state, {
+      ...event,
+      seq: index + 1,
+      ts: event.ts ?? 1_000 + index,
+    });
+  }
+  return state;
+}
+
 describe('codex app-server adapter', function () {
   describe('capabilities', function () {
     it('claims what app-server structurally supports', function () {
@@ -109,6 +124,17 @@ describe('codex app-server adapter', function () {
       assert.strictEqual(adapter.capabilities.fork, false);
       // Tokens only; nothing in the schema prices a turn.
       assert.strictEqual(adapter.capabilities.cost, false);
+    });
+
+    it('offers the app-owned commands and installed skills before the handshake', function () {
+      const { adapter } = harness({
+        installedCommands: [{ name: 'release', description: 'Prepare a release' }],
+      });
+      assert.deepStrictEqual(
+        adapter.capabilities.commands.map((command) => command.name),
+        ['clear', 'new', 'reset', 'release'],
+      );
+      assert.strictEqual(adapter.capabilities.commands[3].description, 'Prepare a release');
     });
 
     it('passes the app-server subcommand and profile arguments to the spawn', function () {
@@ -143,6 +169,31 @@ describe('codex app-server adapter', function () {
       assert.strictEqual(state.t, 'state');
       assert.strictEqual(state.state, 'idle');
       assert.ok(Math.abs(state.ts - session.ts) <= 50, `state ts ${state.ts} vs session ts ${session.ts}`);
+    });
+
+    it('uses container-visible paths on the wire and the host path in public capabilities', async function () {
+      const h = harness({
+        environment: {
+          kind: 'container',
+          toContainerPath: (value) => `/container${value}`,
+        },
+      });
+      const done = h.adapter.handshake();
+      h.adapter.handleMessage(fixture('codex-appserver-handshake')[0]);
+      await flush();
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: 2,
+        result: { thread: { id: 'th_container' }, model: 'gpt-5.6-sol', cwd: '/container/work' },
+      });
+      await done;
+
+      assert.strictEqual(h.sent.find((message) => message.method === 'thread/start').params.cwd, '/container/work');
+      assert.deepStrictEqual(
+        h.sent.find((message) => message.method === 'skills/list').params.cwds,
+        ['/container/work'],
+      );
+      assert.strictEqual(only(h.events, 'session')[0].cwd, '/work');
     });
 
     it('offers the models codex says it accepts, without waiting for them (#75)', async function () {
@@ -186,6 +237,123 @@ describe('codex app-server adapter', function () {
         { value: 'gpt-5.6-luna', name: 'GPT-5.6-Luna' },
       ]);
       assert.strictEqual(h.adapter.capabilities.models.length, 2);
+    });
+
+    it('offers the enabled skills codex says are available in this working directory', async function () {
+      const h = harness({
+        installedCommands: [{ name: 'fallback-only', description: 'Only the disk scan found this' }],
+      });
+      await boot(h);
+
+      const asked = h.sent.find((message) => message.method === 'skills/list');
+      assert.ok(asked, 'codex publishes its skills over the app-server protocol');
+      assert.deepStrictEqual(asked.params, { cwds: ['/work'] });
+      assert.strictEqual(only(h.events, 'session').length, 1, 'skill discovery must not delay the session');
+
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: asked.id,
+        result: {
+          data: [{
+            cwd: '/work',
+            skills: [
+              {
+                name: 'review',
+                description: 'Review the current changes',
+                path: '/home/user/.agents/skills/review/SKILL.md',
+                enabled: true,
+              },
+              { name: 'disabled-skill', description: 'Do not offer this', enabled: false },
+              { name: 'missing-manifest', description: 'Cannot be invoked', enabled: true },
+            ],
+            errors: [],
+          }],
+        },
+      });
+      await flush();
+
+      const revised = only(h.events, 'capabilities').pop();
+      assert.deepStrictEqual(
+        revised.capabilities.commands.map((command) => command.name),
+        ['clear', 'new', 'reset', 'review'],
+      );
+      assert.strictEqual(
+        revised.capabilities.commands.find((command) => command.name === 'review').description,
+        'Review the current changes',
+      );
+      assert.ok(!revised.capabilities.commands.some((command) => command.name === 'disabled-skill'));
+      assert.ok(!revised.capabilities.commands.some((command) => command.name === 'missing-manifest'));
+      assert.ok(!revised.capabilities.commands.some((command) => command.name === 'fallback-only'));
+      assert.ok(!JSON.stringify(revised.capabilities.commands).includes('/home/user/'), 'paths stay private');
+      assert.deepStrictEqual(h.adapter.capabilities.commands, revised.capabilities.commands);
+    });
+
+    it('refreshes the command menu when codex says its skills changed', async function () {
+      const h = harness({});
+      await boot(h);
+
+      const initial = h.sent.find((message) => message.method === 'skills/list');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: initial.id,
+        result: { data: [{ cwd: '/work', skills: [
+          { name: 'old-skill', description: 'Old', path: '/skills/old/SKILL.md', enabled: true },
+        ], errors: [] }] },
+      });
+      await flush();
+
+      h.adapter.handleNotification('skills/changed', {});
+      await flush();
+      const refresh = h.sent.filter((message) => message.method === 'skills/list').pop();
+      assert.deepStrictEqual(refresh.params, { cwds: ['/work'], forceReload: true });
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: refresh.id,
+        result: { data: [{ cwd: '/work', skills: [
+          { name: 'new-skill', description: 'New', path: '/skills/new/SKILL.md', enabled: true },
+        ], errors: [] }] },
+      });
+      await flush();
+      assert.deepStrictEqual(
+        h.adapter.capabilities.commands.map((command) => command.name),
+        ['clear', 'new', 'reset', 'new-skill'],
+      );
+    });
+
+    it('keeps the stand-in menu when a build has no skills/list method', async function () {
+      const h = harness({
+        installedCommands: [{ name: 'release', description: 'Prepare a release' }],
+        installedSkills: [{ name: 'release', path: '/home/user/.codex/skills/release/SKILL.md' }],
+      });
+      await boot(h);
+      const asked = h.sent.find((message) => message.method === 'skills/list');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: asked.id,
+        error: { code: -32600, message: 'unknown variant `skills/list`' },
+      });
+      await flush();
+
+      assert.deepStrictEqual(
+        h.adapter.capabilities.commands.map((command) => command.name),
+        ['clear', 'new', 'reset', 'release'],
+      );
+      assert.strictEqual(only(h.events, 'error').length, 0);
+
+      h.sent.length = 0;
+      const sendPromise = h.adapter.send({ text: '/release 6.1.0' });
+      await flush();
+      const started = h.sent.find((message) => message.method === 'turn/start');
+      assert.deepStrictEqual(started.params.input, [
+        { type: 'text', text: '$release 6.1.0', text_elements: [] },
+        {
+          type: 'skill',
+          name: 'release',
+          path: '/home/user/.codex/skills/release/SKILL.md',
+        },
+      ]);
+      h.adapter.handleMessage({ jsonrpc: '2.0', id: started.id, result: { turn: { id: 'turn_fallback' } } });
+      await sendPromise;
     });
 
     it('reads the account rate limits codex volunteers (#137)', async function () {
@@ -347,6 +515,48 @@ describe('codex app-server adapter', function () {
       h.adapter.handleMessage({ jsonrpc: '2.0', id: started.id, result: { turn: { id: 'turn_x' } } });
       await sendPromise;
     });
+
+    it('turns a selected slash skill into Codex’s explicit skill input', async function () {
+      const h = harness();
+      await boot(h);
+      const listed = h.sent.find((message) => message.method === 'skills/list');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: listed.id,
+        result: { data: [{ cwd: '/work', skills: [{
+          name: 'review',
+          description: 'Review changes',
+          path: '/home/user/.agents/skills/review/SKILL.md',
+          enabled: true,
+        }], errors: [] }] },
+      });
+      await flush();
+      h.sent.length = 0;
+
+      const sendPromise = h.adapter.send({ text: '/review the current diff' });
+      await flush();
+      const started = h.sent.find((message) => message.method === 'turn/start');
+      assert.deepStrictEqual(started.params.input, [
+        { type: 'text', text: '$review the current diff', text_elements: [] },
+        { type: 'skill', name: 'review', path: '/home/user/.agents/skills/review/SKILL.md' },
+      ]);
+      h.adapter.handleMessage({ jsonrpc: '2.0', id: started.id, result: { turn: { id: 'turn_skill' } } });
+      await sendPromise;
+    });
+
+    it('leaves an unknown slash untouched instead of guessing that it is a skill', async function () {
+      const h = harness();
+      await boot(h);
+      h.sent.length = 0;
+      const sendPromise = h.adapter.send({ text: '/not-a-reported-skill please' });
+      await flush();
+      const started = h.sent.find((message) => message.method === 'turn/start');
+      assert.deepStrictEqual(started.params.input, [
+        { type: 'text', text: '/not-a-reported-skill please', text_elements: [] },
+      ]);
+      h.adapter.handleMessage({ jsonrpc: '2.0', id: started.id, result: { turn: { id: 'turn_plain' } } });
+      await sendPromise;
+    });
   });
 
   describe('translating a text turn', function () {
@@ -483,6 +693,164 @@ describe('codex app-server adapter', function () {
       assert.strictEqual(turn.turnId, 'turn_2');
       assert.strictEqual(turn.stopReason, 'completed');
       assert.strictEqual(turn.durationMs, 500);
+    });
+  });
+
+  describe('a delegated agent broadcast on its own Codex thread', function () {
+    const AGENT_THREAD_ID = 'th_child';
+    const AGENT_TOOL_ID = `codex-agent:${AGENT_THREAD_ID}`;
+
+    async function replay(lines = fixture('codex-appserver-subagent')) {
+      const h = harness();
+      await boot(h);
+      h.events.length = 0;
+      await feed(h, lines);
+      return { ...h, state: transcriptOf(h.events) };
+    }
+
+    function throughActivity(lines, kind) {
+      const end = lines.findIndex((line) =>
+        line.method === 'item/completed'
+        && line.params?.item?.type === 'subAgentActivity'
+        && line.params.item.kind === kind,
+      );
+      assert.ok(end >= 0, `fixture has no completed ${kind} activity`);
+      return lines.slice(0, end + 1);
+    }
+
+    function activityPair(id, kind) {
+      const item = {
+        type: 'subAgentActivity',
+        id,
+        kind,
+        agentThreadId: AGENT_THREAD_ID,
+        agentPath: '/root/scout',
+      };
+      return ['item/started', 'item/completed'].map((method) => ({
+        jsonrpc: '2.0',
+        method,
+        params: { threadId: 'th_123', turnId: 'turn_agents', item },
+      }));
+    }
+
+    function agentBlock(state) {
+      const located = state.toolIndex[AGENT_TOOL_ID];
+      assert.ok(located, 'the stable child-thread id must locate the Agent block');
+      return state.messages[located[0]].blocks[located[1]];
+    }
+
+    it('keeps child work in one Agent row while the parent answer continues streaming', async function () {
+      const { events, state } = await replay();
+      const activity = collectAgentActivity(state.messages);
+
+      assert.strictEqual(activity.length, 1);
+      assert.strictEqual(activity[0].toolId, AGENT_TOOL_ID);
+      assert.strictEqual(activity[0].kind, 'agent');
+      assert.strictEqual(activity[0].name, '/root/scout');
+      assert.strictEqual(activity[0].status, 'completed');
+      assert.strictEqual(activity[0].running, false);
+
+      const block = agentBlock(state);
+      assert.strictEqual(block.kind, 'tool');
+      assert.strictEqual(block.name, 'Agent');
+      assert.strictEqual(block.output, 'child result');
+      assert.strictEqual(block.agent.status, 'completed');
+      assert.strictEqual(block.agent.steps.length, 1);
+      assert.deepStrictEqual(block.agent.steps[0], {
+        id: 'child_command',
+        name: 'shell',
+        toolKind: 'execute',
+        status: 'completed',
+        input: { command: 'cat note.txt', cwd: '/work' },
+        output: 'BANANA\n',
+        ts: block.agent.steps[0].ts,
+      });
+      assert.strictEqual(typeof block.agent.steps[0].ts, 'number');
+
+      const texts = state.messages.flatMap((message) =>
+        message.blocks.filter((candidate) => candidate.kind === 'text').map((candidate) => candidate.text),
+      );
+      assert.deepStrictEqual(texts, ['Parent answer']);
+      assert.ok(!texts.some((text) => text.includes('child result')));
+      assert.ok(!JSON.stringify(state.messages).includes('[unhandled codex item: subAgentActivity]'));
+
+      assert.ok(events.some((event) =>
+        event.t === 'agent_step'
+        && event.parentToolId === AGENT_TOOL_ID
+        && event.step.id === 'child_command',
+      ));
+      assert.strictEqual(state.toolIndex.child_command, undefined);
+      assert.deepStrictEqual(state.orphanToolPatches, {});
+    });
+
+    it('does not duplicate or settle an agent merely because it was interacted with', async function () {
+      const lines = fixture('codex-appserver-subagent');
+      const { state } = await replay(throughActivity(lines, 'interacted'));
+      const activity = collectAgentActivity(state.messages);
+
+      assert.strictEqual(activity.length, 1);
+      assert.strictEqual(activity[0].toolId, AGENT_TOOL_ID);
+      assert.strictEqual(activity[0].status, 'running');
+      assert.strictEqual(activity[0].running, true);
+      assert.strictEqual(agentBlock(state).agent.status, 'running');
+      assert.strictEqual(
+        state.messages.flatMap((message) => message.blocks)
+          .filter((block) => block.kind === 'tool' && block.name === 'Agent').length,
+        1,
+      );
+    });
+
+    it('cancels the existing row when Codex reports that child interrupted', async function () {
+      const lines = fixture('codex-appserver-subagent');
+      const prefix = throughActivity(lines, 'interacted');
+      const { state } = await replay([
+        ...prefix,
+        ...activityPair('interrupt_scout', 'interrupted'),
+        {
+          jsonrpc: '2.0',
+          method: 'thread/status/changed',
+          params: { threadId: AGENT_THREAD_ID, status: { type: 'idle' } },
+        },
+      ]);
+      const activity = collectAgentActivity(state.messages);
+
+      assert.strictEqual(activity.length, 1);
+      assert.strictEqual(activity[0].toolId, AGENT_TOOL_ID);
+      assert.strictEqual(activity[0].status, 'canceled');
+      assert.strictEqual(activity[0].running, false);
+      assert.strictEqual(agentBlock(state).agent.status, 'canceled');
+      assert.deepStrictEqual(state.orphanToolPatches, {});
+    });
+
+    it('preserves a precise failure through idle and clears it when the child reopens', async function () {
+      const lines = fixture('codex-appserver-subagent');
+      const prefix = throughActivity(lines, 'started');
+      const failed = {
+        jsonrpc: '2.0',
+        method: 'error',
+        params: { threadId: AGENT_THREAD_ID, error: { message: 'child crashed' } },
+      };
+      const idle = {
+        jsonrpc: '2.0',
+        method: 'thread/status/changed',
+        params: { threadId: AGENT_THREAD_ID, status: { type: 'idle' } },
+      };
+      const active = {
+        jsonrpc: '2.0',
+        method: 'thread/status/changed',
+        params: { threadId: AGENT_THREAD_ID, status: { type: 'active' } },
+      };
+
+      const stopped = await replay([...prefix, failed, idle]);
+      assert.strictEqual(agentBlock(stopped.state).status, 'failed');
+      assert.strictEqual(agentBlock(stopped.state).agent.status, 'failed');
+      assert.strictEqual(agentBlock(stopped.state).agent.error, 'child crashed');
+
+      const reopened = await replay([...prefix, failed, idle, active]);
+      assert.strictEqual(agentBlock(reopened.state).status, 'running');
+      assert.strictEqual(agentBlock(reopened.state).agent.status, 'running');
+      assert.strictEqual(agentBlock(reopened.state).error, '');
+      assert.strictEqual(agentBlock(reopened.state).agent.error, '');
     });
   });
 
@@ -738,15 +1106,31 @@ describe('codex exec adapter (fallback)', function () {
       assert.strictEqual(adapter.capabilities.toolCalls, true);
       assert.strictEqual(adapter.capabilities.diffs, true);
     });
+
+    it('keeps app-owned commands and disk-discovered skills in fallback mode', function () {
+      const { adapter } = makeAdapter({
+        installedCommands: [{ name: 'release', description: 'Prepare a release' }],
+      });
+      assert.deepStrictEqual(
+        adapter.capabilities.commands.map((command) => command.name),
+        ['clear', 'new', 'reset', 'release'],
+      );
+    });
   });
 
   describe('start', function () {
     it('announces the session without spawning anything', async function () {
-      const { adapter, events } = makeAdapter();
+      const { adapter, events } = makeAdapter({
+        installedCommands: [{ name: 'release', description: 'Prepare a release' }],
+      });
       await adapter.start();
       assert.strictEqual(adapter.child, null);
       assert.strictEqual(events[0].t, 'session');
       assert.strictEqual(events[0].cwd, '/work');
+      assert.deepStrictEqual(
+        events[0].capabilities.commands.map((command) => command.name),
+        ['clear', 'new', 'reset', 'release'],
+      );
       assert.deepStrictEqual(events[1], { t: 'state', state: 'idle', ts: events[1].ts });
     });
   });
@@ -770,6 +1154,17 @@ describe('codex exec adapter (fallback)', function () {
         '--foo',
         'bar',
       ]);
+    });
+
+    it('invokes a disk-discovered skill with Codex’s dollar marker', async function () {
+      const { adapter } = makeAdapter({
+        installedCommands: [{ name: 'release', description: 'Prepare a release' }],
+        installedSkills: [{ name: 'release', path: '/home/user/.codex/skills/release/SKILL.md' }],
+      });
+      let spawned;
+      adapter.spawnTurn = (args) => { spawned = args; };
+      await adapter.send({ text: '/release 6.1.0' });
+      assert.strictEqual(spawned[spawned.length - 1], '$release 6.1.0');
     });
   });
 
@@ -809,6 +1204,40 @@ describe('codex exec adapter (fallback)', function () {
       assert.strictEqual(end.stopReason, 'completed');
       assert.strictEqual(only(events, 'turn_end').pop().stopReason, 'completed');
     });
+
+    it('coalesces every activity for one child into one Agents-panel row', function () {
+      const { adapter, events } = makeAdapter();
+      beginTurn(adapter, 't_agents');
+      for (const [id, kind] of [
+        ['spawn_scout', 'started'],
+        ['message_scout', 'interacted'],
+        ['interrupt_scout', 'interrupted'],
+      ]) {
+        adapter.handleMessage({
+          type: 'item.completed',
+          item: {
+            type: 'subAgentActivity',
+            id,
+            kind,
+            agentThreadId: 'th_exec_child',
+            agentPath: '/root/scout',
+          },
+        });
+      }
+
+      const state = transcriptOf(events);
+      const activity = collectAgentActivity(state.messages);
+      assert.strictEqual(activity.length, 1);
+      assert.strictEqual(activity[0].toolId, 'codex-agent:th_exec_child');
+      assert.strictEqual(activity[0].status, 'canceled');
+      assert.strictEqual(
+        state.messages.flatMap((message) => message.blocks)
+          .filter((block) => block.kind === 'tool' && block.name === 'Agent').length,
+        1,
+      );
+      assert.ok(!JSON.stringify(state.messages).includes('[unhandled codex item: subAgentActivity]'));
+      assert.deepStrictEqual(state.orphanToolPatches, {});
+    });
   });
 
   describe('tolerance', function () {
@@ -839,15 +1268,27 @@ describe('codex exec adapter (fallback)', function () {
 });
 
 describe('codex chat adapter (router)', function () {
-  it('reports no capabilities and is not alive before start() has chosen a mode', function () {
+  it('owns its pre-start capabilities instead of mutating the shared empty sentinel', function () {
     const adapter = new CodexChatAdapter({
       sessionId: 's1',
       workingDir: '/work',
       command: '/nonexistent',
+      installedCommands: [{ name: 'release', description: 'Prepare a release' }],
       emit: () => {},
     });
-    assert.deepStrictEqual(adapter.capabilities, NO_CHAT_CAPABILITIES);
+    assert.notStrictEqual(adapter.capabilities, NO_CHAT_CAPABILITIES);
+    assert.deepStrictEqual(
+      adapter.capabilities.commands.map((command) => command.name),
+      ['clear', 'new', 'reset', 'release'],
+    );
+    assert.strictEqual(NO_CHAT_CAPABILITIES.commands, undefined);
     assert.strictEqual(adapter.alive, false);
+
+    adapter.capabilities.commands.push({ name: 'private-to-one-router' });
+    const other = new CodexChatAdapter({
+      sessionId: 's2', workingDir: '/work', command: '/nonexistent', emit: () => {},
+    });
+    assert.ok(!other.capabilities.commands.some((command) => command.name === 'private-to-one-router'));
   });
 
   it('rejects send() before start() rather than reaching into a null delegate', async function () {

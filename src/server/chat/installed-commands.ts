@@ -2,6 +2,22 @@ import fs from 'fs';
 import path from 'path';
 import { SlashCommand } from '../../shared/chat-events.js';
 
+/** Private launch metadata kept separate from the capabilities sent to browsers. */
+export interface InstalledSkill {
+  name: string;
+  path: string;
+}
+
+export interface InstalledCommandDiscovery {
+  commands: SlashCommand[];
+  skills: InstalledSkill[];
+}
+
+interface FoundCommand extends SlashCommand {
+  /** Present only for Agent Skills, never serialized into `commands`. */
+  skillPath?: string;
+}
+
 /**
  * What is installed for this session, read off disk.
  *
@@ -9,9 +25,10 @@ import { SlashCommand } from '../../shared/chat-events.js';
  * runtime knows that list, and every runtime tells us late or not at all:
  * Claude sends it with the first turn's `init`, so a brand-new session used to
  * offer a handful of built-ins and nothing else until a message had already
- * been sent; codex, grok and pi never send one. The ACP agents are the
- * exception — they volunteer theirs immediately after `session/new` — and where
- * a runtime does say something, what it says wins outright.
+ * been sent; pi never sends one. The ACP agents volunteer theirs immediately
+ * after `session/new`, and current Codex app-server builds answer
+ * `skills/list` once the session is open. Where a runtime does say something,
+ * what it says wins outright.
  *
  * So this is the stand-in, and it is deliberately not clever. It reads the
  * directories each runtime's own installer writes skills and commands into,
@@ -104,8 +121,14 @@ const LOCATIONS: Record<string, Location[]> = {
   ],
   codex: [
     { base: 'cwd', dir: '.codex/skills', kind: 'skills' },
+    { base: 'cwd', dir: '.agents/skills', kind: 'skills' },
     { base: 'home', dir: '.codex/skills', kind: 'skills' },
+    { base: 'home', dir: '.agents/skills', kind: 'skills' },
     { base: 'home', dir: '.codex/prompts', kind: 'commands' },
+    // Hidden children are skipped by the generic walk. This explicit root is
+    // the fallback for exec mode and app-server builds without `skills/list`;
+    // current app-server builds report the same system skills themselves.
+    { base: 'home', dir: '.codex/skills/.system', kind: 'skills' },
   ],
   /**
    * agy's customisation system: a `skills/` folder inside a "customisation
@@ -233,7 +256,10 @@ const ENUMERATES_INSTALLED: Record<string, boolean> = {
   claude: true,
   grok: false,
   pi: false,
-  codex: false,
+  // App-server's `skills/list` is the effective enabled catalogue, including
+  // shared, plugin and system skills. Exec mode never sends an update, so its
+  // launch-time disk stand-in remains intact despite this being true.
+  codex: true,
   // Stated rather than left to the default, because it has been checked: agy
   // never reports a command list at all, so there is nothing that could
   // legitimately replace what is on disk.
@@ -386,7 +412,7 @@ function scanSkills(
   root: string,
   prefix: string,
   depth: number,
-  out: SlashCommand[],
+  out: FoundCommand[],
   maxDepth: number = MAX_COMMAND_DEPTH,
 ): void {
   if (out.length >= MAX_ENTRIES || depth > maxDepth) return;
@@ -401,7 +427,9 @@ function scanSkills(
       // where the frontmatter disagrees the frontmatter is what its author
       // wrote, so it is what the menu shows.
       const name = cleanName(fields.name || entry.name);
-      if (name) out.push({ name: prefix + name, description: fields.description });
+      if (name) {
+        out.push({ name: prefix + name, description: fields.description, skillPath: manifest });
+      }
       continue;
     }
     scanSkills(dir, prefix, depth + 1, out, maxDepth);
@@ -415,7 +443,7 @@ function scanSkills(
  * is how Claude Code and grok both address a project command that lives in a
  * folder.
  */
-function scanCommands(root: string, prefix: string, depth: number, out: SlashCommand[]): void {
+function scanCommands(root: string, prefix: string, depth: number, out: FoundCommand[]): void {
   if (out.length >= MAX_ENTRIES || depth > MAX_COMMAND_DEPTH) return;
   for (const entry of entriesIn(root)) {
     if (out.length >= MAX_ENTRIES) return;
@@ -469,7 +497,7 @@ function enabledPlugins(home: string): Map<string, boolean> | null {
   return found;
 }
 
-function scanPlugins(home: string, out: SlashCommand[]): void {
+function scanPlugins(home: string, out: FoundCommand[]): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(fs.readFileSync(path.join(home, '.claude/plugins/installed_plugins.json'), 'utf8'));
@@ -516,16 +544,16 @@ export interface InstalledCommandsOptions {
  * Names are unique: the first location to claim a name keeps it, and the table
  * is ordered so that is the one the runtime would itself prefer.
  */
-export function listInstalledCommands(
+export function discoverInstalledCommands(
   runtime: string,
   options: InstalledCommandsOptions,
-): SlashCommand[] {
+): InstalledCommandDiscovery {
   const locations = LOCATIONS[runtime];
-  if (!locations) return [];
+  if (!locations) return { commands: [], skills: [] };
   const home = options.home;
   directoriesLeft = MAX_DIRECTORIES;
 
-  const found: SlashCommand[] = [];
+  const found: FoundCommand[] = [];
   for (const location of locations) {
     if (found.length >= MAX_ENTRIES) break;
     const roots =
@@ -553,13 +581,27 @@ export function listInstalledCommands(
   if (runtime === 'claude' && home) scanPlugins(home, found);
 
   const seen = new Set<string>();
-  const unique: SlashCommand[] = [];
+  const commands: SlashCommand[] = [];
+  const skills: InstalledSkill[] = [];
   for (const command of found) {
     if (seen.has(command.name)) continue;
     seen.add(command.name);
-    unique.push(command.description ? command : { name: command.name });
+    commands.push(
+      command.description
+        ? { name: command.name, description: command.description }
+        : { name: command.name },
+    );
+    if (command.skillPath) skills.push({ name: command.name, path: command.skillPath });
   }
-  return unique;
+  return { commands, skills };
+}
+
+/** Public compatibility surface for callers that only need menu entries. */
+export function listInstalledCommands(
+  runtime: string,
+  options: InstalledCommandsOptions,
+): SlashCommand[] {
+  return discoverInstalledCommands(runtime, options).commands;
 }
 
 /**

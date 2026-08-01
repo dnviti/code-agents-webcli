@@ -17,6 +17,8 @@ export type MonacoTheme = 'dark' | 'light';
 export interface MonacoCreateOptions {
   value: string;
   path?: string;
+  /** One-based line to put under the cursor when the editor opens. */
+  initialLine?: number;
   readOnly?: boolean;
   theme: MonacoTheme;
   ariaLabel?: string;
@@ -29,6 +31,7 @@ export interface MonacoHandle {
   setValue(next: string): void;
   setReadOnly(readOnly: boolean): void;
   setTheme(theme: MonacoTheme): void;
+  revealLine(line: number): void;
   layout(): void;
   focus(): void;
   dispose(): void;

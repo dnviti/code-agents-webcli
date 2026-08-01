@@ -140,6 +140,24 @@ describe('chat markdown parser', function () {
       assert.strictEqual(image[0].type, 'image');
       assert.strictEqual(image[0].alt, 'alt');
     });
+
+    it('preserves absolute Windows paths as inert file-link nodes', function () {
+      const drive = String.raw`C:\dev\webcli\src\app.ts:31`;
+      const driveLink = md.parseInline(`[app](${drive})`);
+      assert.strictEqual(driveLink[0].type, 'filelink');
+      assert.strictEqual(driveLink[0].href, drive);
+
+      const unc = String.raw`\\buildbox\work\webcli\src\app.ts:44`;
+      const uncLink = md.parseInline(`[app](${unc})`);
+      assert.strictEqual(uncLink[0].type, 'filelink');
+      assert.strictEqual(uncLink[0].href, unc);
+    });
+
+    it('does not treat a drive-relative path as a file link', function () {
+      const nodes = md.parseInline(String.raw`[app](C:src\app.ts:31)`);
+      assert.strictEqual(nodes.some((node) => node.type === 'filelink'), false);
+      assert.ok(allText(nodes).join('').includes('app'));
+    });
   });
 
   describe('streaming input', function () {
@@ -207,7 +225,7 @@ describe('chat markdown parser', function () {
 
       for (const source of dangerous) {
         const nodes = md.parseInline(source);
-        const links = nodes.filter((n) => n.type === 'link');
+        const links = nodes.filter((n) => n.type === 'link' || n.type === 'filelink');
         assert.strictEqual(links.length, 0, `${source} must not become a link`);
         // It still shows: hiding the attempt would be worse than refusing it.
         assert.ok(allText(nodes).join('').includes('click'));
@@ -248,6 +266,13 @@ describe('chat markdown parser', function () {
       const text = md.markdownToText(md.parseMarkdown('# Title\n\n- one\n- two'));
       assert.ok(text.includes('Title'));
       assert.ok(text.includes('one'));
+    });
+
+    it('flattens a Windows file link to its visible label', function () {
+      const text = md.markdownToText(
+        md.parseMarkdown(String.raw`Open [app.ts](C:\dev\webcli\src\app.ts:31)`),
+      );
+      assert.strictEqual(text, 'Open app.ts');
     });
   });
 });

@@ -13,7 +13,7 @@ export interface FolderRoutesDeps {
   isPathWithinBase(targetPath: string, userId?: number): boolean;
   getSelectedWorkingDir(userId: number): string | null;
   setSelectedWorkingDir(userId: number, value: string | null): void;
-  saveSessionsToDisk(): Promise<void>;
+  saveSessionsToDisk(): Promise<boolean | void>;
 }
 
 export function createFolderRoutes(deps: FolderRoutesDeps): Router {

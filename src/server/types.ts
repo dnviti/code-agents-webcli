@@ -86,6 +86,26 @@ export interface SessionRecord {
    */
   surface?: 'terminal' | 'chat';
   /**
+   * Whether this standalone session belongs in its owner's shared tab strip.
+   *
+   * Closing a conversation removes the tab without deleting the conversation,
+   * so that visibility has to outlive both the page and the server process. It
+   * is owned by the account, just like the session itself: every device sees the
+   * same answer. Absent means open, which preserves every record written before
+   * the field existed and keeps terminal sessions on their historical path
+   * (closing one deletes it outright).
+   */
+  tabOpen?: boolean;
+  /**
+   * This tab's position in its owner's shared strip.
+   *
+   * Nullable in storage so sessions written before account-wide ordering keep
+   * their stable Map/load order. New standalone sessions and every accepted
+   * reorder receive an explicit number; a genuinely reopened conversation is
+   * assigned after the current maximum.
+   */
+  tabOrder?: number;
+  /**
    * The conversation this session belongs to, when it is not a session of its
    * own.
    *

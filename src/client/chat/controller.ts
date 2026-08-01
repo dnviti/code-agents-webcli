@@ -745,6 +745,7 @@ export class ChatController {
       from,
       scratch.answeredQuestions,
       scratch.answeredQuestionText,
+      scratch.abandonedQuestions,
     );
   }
 

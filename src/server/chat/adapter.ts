@@ -122,6 +122,13 @@ export interface ChatAdapterOptions {
    * descriptions for a runtime — Claude — that reports names bare.
    */
   installedCommands?: SlashCommand[];
+  /**
+   * Agent Skill manifests behind `installedCommands`, for runtimes whose wire
+   * protocol distinguishes invoking a skill from sending similarly shaped
+   * prompt text. Never copied into capabilities: these are absolute paths in
+   * the session owner's environment.
+   */
+  installedSkills?: Array<{ name: string; path: string }>;
 }
 
 export interface ChatAdapter {

@@ -249,18 +249,20 @@ describe('shell chrome', function () {
     }));
 
     assert.ok(html.includes('aria-current="true"'), 'the active session is marked');
-    assert.ok(html.includes('aria-label="Unread output"'), 'unread activity is visible');
+    assert.ok(html.includes('New output'), 'unread activity is visible while work continues');
     assert.ok(html.includes('aria-label="Close b"'), 'every session can be closed from the sheet');
     assert.ok(html.includes('New session'), 'a new session is one tap away');
     assert.ok(html.includes('All sessions'), 'the server-wide list stays reachable');
   });
 
-  it('renders a running session with the online dot and an idle one without a warning', function () {
+  it('renders distinct working and idle state icons without a false warning', function () {
     const idle = render(reset({ tabs: [tab('a')], activeId: 'a' }));
     assert.ok(!/var\(--warning\)/.test(idle), 'an idle session must not paint a warning');
+    assert.ok(/data-tab-state="idle"/.test(idle), 'an idle session uses the idle icon');
 
     const running = render(reset({ tabs: [tab('a', { status: 'running' })], activeId: 'a' }));
-    assert.ok(/var\(--ansi-green\)/.test(running), 'a running session paints the online dot');
+    assert.ok(/data-tab-state="working"/.test(running), 'a running session uses the working icon');
+    assert.ok(/var\(--ansi-cyan\)/.test(running), 'the working icon uses the working colour');
   });
 
   it('mounts the connection overlay over the terminal, not over the tabs', function () {

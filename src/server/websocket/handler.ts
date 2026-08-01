@@ -223,7 +223,10 @@ export function announceSessionOpened(
   session: SessionRecord,
   webSocketConnections: Map<string, WebSocketInfo>,
 ): void {
-  if (session.ownerSessionId) return;
+  // A runtime relaunch re-announces its metadata through this same helper. That
+  // must not turn a conversation the account closed back into a tab; only the
+  // explicit tab-open route changes this durable state.
+  if (session.ownerSessionId || session.tabOpen === false) return;
 
   sendToUser(
     session.ownerUserId,
@@ -239,6 +242,46 @@ export function announceSessionOpened(
       // really in from its first paint, the same way a tab restored on page
       // load does.
       bypassPermissions: session.chatBypassPermissions === true,
+    },
+    webSocketConnections,
+  );
+}
+
+/**
+ * Tell every screen belonging to an account to remove one tab.
+ *
+ * Distinct from `announceSessionClosed`: a tab close preserves the conversation,
+ * transcript, runtime and any shells it owns. A client that treated this as
+ * `session_deleted` would erase local conversation state for a record that is
+ * still available from the conversation list.
+ */
+export function announceSessionTabClosed(
+  session: SessionRecord,
+  webSocketConnections: Map<string, WebSocketInfo>,
+): void {
+  if (session.ownerSessionId) return;
+
+  sendToUser(
+    session.ownerUserId,
+    {
+      type: 'session_tab_closed',
+      sessionId: session.id,
+    },
+    webSocketConnections,
+  );
+}
+
+/** Tell only this account's screens the authoritative order of its open tabs. */
+export function announceSessionTabsReordered(
+  userId: number,
+  sessionIds: string[],
+  webSocketConnections: Map<string, WebSocketInfo>,
+): void {
+  sendToUser(
+    userId,
+    {
+      type: 'session_tabs_reordered',
+      sessionIds,
     },
     webSocketConnections,
   );

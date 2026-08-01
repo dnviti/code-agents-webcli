@@ -20,7 +20,6 @@ import type { AgentActivityKind } from '../../../shared/agent-activity.js';
 import { FileTreePanel, type FileTreeEntry } from './FileTreePanel.js';
 import { GitChangesPanel } from './GitChangesPanel.js';
 import { GitHubPanel } from './GitHubPanel.js';
-import { FileEditorDialog } from './FileEditorDialog.js';
 import { WorkflowPopup } from './WorkflowPopup.js';
 import { AgentPopup } from './AgentPopup.js';
 import { LinksPanel } from './LinksPanel.js';
@@ -51,6 +50,8 @@ export interface WorkspacePanelProps {
   onClose: () => void;
   /** Persist a new rail width, once the drag has settled. */
   onResize?: (width: number) => void;
+  /** Open a workspace file in the chat surface's shared editor popup. */
+  onOpenFile: (path: string) => void;
   /** Full-width sheet instead of a fixed rail. */
   isMobile?: boolean;
   /**
@@ -73,16 +74,13 @@ export function WorkspacePanel({
   onSelectTab,
   onClose,
   onResize,
+  onOpenFile,
   isMobile = false,
   trace,
 }: WorkspacePanelProps): React.JSX.Element | null {
   const tabs = enabledPanels(settings);
   const active = tabs.includes(settings.panelTab) ? settings.panelTab : tabs[0];
 
-  // The file the editor is showing, or null. Held here rather than inside the
-  // Files tab so a file opened from Changes uses the same dialog — one editor,
-  // one place that knows whether it has unsaved work.
-  const [editing, setEditing] = React.useState<string | null>(null);
   /**
    * The delegation whose detail popup is open, and which kind it is.
    *
@@ -130,20 +128,6 @@ export function WorkspacePanel({
       />
     ) : null;
 
-  const editor = (
-    <FileEditorDialog
-      // Keyed on the file: without it, reopening the editor paints the last
-      // file's text and its "unsaved" badge for a frame before the new fetch
-      // lands, which reads as the wrong file having been opened.
-      key={editing ?? 'none'}
-      open={editing !== null}
-      sessionId={sessionId}
-      filePath={editing ?? ''}
-      onClose={() => setEditing(null)}
-      isMobile={isMobile}
-    />
-  );
-
   if (tabs.length === 0) {
     return (
       <Rail isMobile={isMobile} width={width} onResize={onResize} onDragWidth={setDragWidth}>
@@ -167,10 +151,10 @@ export function WorkspacePanel({
           )
         ) : null}
         {active === 'files' ? (
-          <FilesTab sessionId={sessionId} root={workingDir} onOpenFile={setEditing} />
+          <FilesTab sessionId={sessionId} root={workingDir} onOpenFile={onOpenFile} />
         ) : null}
         {active === 'changes' ? (
-          <GitChangesPanel sessionId={sessionId} revision={revision} onOpenFile={setEditing} />
+          <GitChangesPanel sessionId={sessionId} revision={revision} onOpenFile={onOpenFile} />
         ) : null}
         {active === 'github' ? <GitHubPanel sessionId={sessionId} /> : null}
         {active === 'agents' ? (
@@ -189,7 +173,6 @@ export function WorkspacePanel({
           />
         ) : null}
       </div>
-      {editor}
       {delegation}
     </Rail>
   );

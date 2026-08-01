@@ -36,7 +36,7 @@ import {
 } from '../../shared/runtime-profiles.js';
 import { isClearingCommand, isSlashCommand, mergeSlashCommands } from '../../shared/slash-commands.js';
 import { installedModels } from './installed-models.js';
-import { enumeratesInstalledCommands, listInstalledCommands } from './installed-commands.js';
+import { discoverInstalledCommands, enumeratesInstalledCommands } from './installed-commands.js';
 import { AdapterEvent, ChatAdapter, ChatAdapterOptions } from './adapter.js';
 import {
   PermissionAsk,
@@ -49,9 +49,10 @@ import {
   permissionHookSettings,
 } from './permission-broker.js';
 import { ASK_SOCKET_ENV, TIER_ENABLED_ENV, askMcpConfig } from './ask-mcp.js';
+import { writePiAskExtension } from './pi-ask-extension.js';
 import { UserEnvironment } from '../services/environments/types.js';
 import { ChatStoreLike, ChatSessionRef } from './store.js';
-import { askChannelFor, createChatAdapter, supportsChat } from './registry.js';
+import { askChannelFor, askEnvFor, createChatAdapter, supportsChat } from './registry.js';
 import { FinishedJob, UsageAccountant } from './usage-accounting.js';
 import { UsageJobInput } from '../services/usage-store.js';
 import { projectNameFor, tokenTotal } from '../../shared/usage-records.js';
@@ -292,6 +293,24 @@ const QUEUE_READY_TIMEOUT_MS = 15_000;
  * next queued message into work it has nothing to do with.
  */
 const INTERRUPT_ACK_WINDOW_MS = 5_000;
+
+/**
+ * Tool statuses that mean the call is over and nothing will be handed back to
+ * it.
+ *
+ * Read only against calls that asked a question, and only to close the card
+ * that belongs to one. `completed` is deliberately absent — an ask call
+ * completes precisely when somebody answered it, and that resolution has
+ * already happened by the time the status lands. `unknown` is here because the
+ * reducer writes it onto calls the runtime stopped talking about, which is the
+ * same fate arriving by a quieter route.
+ */
+const DEAD_TOOL_STATUS: ReadonlySet<string> = new Set([
+  'failed',
+  'denied',
+  'canceled',
+  'unknown',
+]);
 
 /**
  * Turn endings that are the turn being cut short rather than finishing.
@@ -725,7 +744,12 @@ export class ChatSession {
     const wantsHook = !this.bypass && options.runtime === 'claude' && fs.existsSync(this.deps.hookScript);
     const askScript = this.deps.askScript;
     const askChannel = askChannelFor(options.runtime);
-    const wantsAsk = Boolean(askChannel) && Boolean(askScript) && fs.existsSync(askScript!);
+    // The MCP server has to exist on disk before it can be handed to anybody.
+    // pi's channel is exempt because there is nothing to hand over: its tool is
+    // a generated extension that carries its own client to the socket.
+    const wantsAsk = askChannel === 'extension'
+      ? true
+      : Boolean(askChannel) && Boolean(askScript) && fs.existsSync(askScript!);
     let askMcpServer: ChatAdapterOptions['askMcpServer'];
 
     // The rung, recorded before anything can be escalated from it. Held on the
@@ -747,7 +771,7 @@ export class ChatSession {
       this.broker = new PermissionBroker(this.deps.socketDir);
       const socketPath = await this.broker.listen({
         permission: (ask) => this.askUser(ask),
-        question: (ask) => this.askQuestion(ask),
+        question: (ask, signal) => this.askQuestion(ask, signal),
         tier: (ask) => this.requestTier(ask),
       });
 
@@ -782,6 +806,12 @@ export class ChatSession {
       // one possible answer is "there is nothing to escalate to" costs a round
       // trip and reads to the model as the user having said no.
       const laddered = Boolean(this.ladder);
+      // Whatever this runtime needs before it will wait for an answer, applied
+      // once for both channels. A question a person never gets to see is worse
+      // than no question tool at all, and on omp a default MCP client timeout
+      // produces exactly that — see `askEnv` in registry.ts for what it is and
+      // why zero is the answer.
+      if (wantsAsk) Object.assign(env, askEnvFor(options.runtime));
       if (wantsAsk && askChannel === 'cli') {
         extraArgs.push('--mcp-config', askMcpConfig(
           asSeenByRuntime(askScript!),
@@ -796,6 +826,26 @@ export class ChatSession {
         extraArgs.push('--allowedTools', ASK_QUESTION_TOOL_NAME);
         if (laddered) extraArgs.push('--allowedTools', TIER_TOOL_NAME);
         this.questionsEnabled = true;
+      }
+      if (wantsAsk && askChannel === 'extension') {
+        // pi's question tool, generated into the working directory and loaded by
+        // path. The socket is what switches it on: the same file loaded by a
+        // terminal launch of pi finds nothing in the environment and registers
+        // nothing, which is what keeps one static file honest across both.
+        //
+        // `--exclude-tools question` goes with it. The `pi-code` package many
+        // installs carry registers a tool by that name which, in the mode this
+        // app drives, answers itself with "UI not available" without anybody
+        // being asked — and a model handed two question tools will sometimes
+        // pick the one that cannot work (#174). Naming a tool that is not
+        // installed is harmless, so this is passed whether or not it is.
+        const written = writePiAskExtension(options.workingDir);
+        if (written) {
+          env[ASK_SOCKET_ENV] = runtimeSocketPath;
+          extraArgs.push('-e', written);
+          extraArgs.push('--exclude-tools', 'question');
+          this.questionsEnabled = true;
+        }
       }
       if (wantsAsk && askChannel === 'protocol') {
         // ACP agents take their MCP servers in the handshake rather than on the
@@ -827,12 +877,13 @@ export class ChatSession {
     // ordinary `fs` reads in there can see. On the host it stays the account the
     // runtime actually runs as, because a host environment's `homeDir` is the
     // projects base folder and no runtime keeps its skills under that.
-    const installedCommands = listInstalledCommands(options.runtime, {
+    const installed = discoverInstalledCommands(options.runtime, {
       home: options.environment?.kind === 'container'
         ? options.environment.homeDir
         : env.HOME || process.env.HOME,
       workingDir: options.workingDir,
     });
+    const installedCommands = installed.commands;
 
     // Claimed before the adapter exists, so its `emit` closure below can be
     // told apart from the one belonging to a process this replaces.
@@ -842,6 +893,9 @@ export class ChatSession {
       sessionId: this.ref.id,
       workingDir: options.workingDir,
       installedCommands,
+      // Kept out of `commands`: absolute paths are launch metadata for Codex,
+      // not capabilities a browser or transcript should ever receive.
+      installedSkills: installed.skills,
       command: this.deps.resolveCommand(options.runtime),
       commandName: this.deps.resolveCommandName?.(options.runtime),
       environment: options.environment,
@@ -1147,7 +1201,11 @@ export class ChatSession {
     // replayed later, so a merge applied only to the local copy would be a menu
     // that differs between the server and every client reading it.
     if (this.installedCommands.length > 0 && !enumeratesInstalledCommands(this.runtime)) {
-      if (stamped.t === 'session' && stamped.capabilities.commands) {
+      // A missing property means the runtime said nothing, not that it
+      // positively reported an empty catalogue. Seed the session event too;
+      // otherwise a wrapper that announces fresh capabilities can erase the
+      // stand-in merely by omitting `commands`.
+      if (stamped.t === 'session') {
         stamped.capabilities = {
           ...stamped.capabilities,
           commands: mergeSlashCommands(stamped.capabilities.commands, this.installedCommands),
@@ -1279,6 +1337,24 @@ export class ChatSession {
     // later as a patch, which is the first point the text is knowable.
     if (stamped.t === 'tool' && stamped.patch.input !== undefined) {
       this.noteAskCall(stamped.toolId, stamped.patch.name, stamped.patch.input);
+    }
+    // The call that asked has ended without an answer, so the question ends too.
+    // This is the whole of the fix for a card that outlived its own tool call by
+    // ten minutes (#174): an agent whose MCP client gives up on the call says so
+    // right here, in a patch carrying the very id the question was filed under,
+    // and until now nothing read it. A click after this point could never have
+    // reached the model — the runtime has already dropped the request — so the
+    // card stops offering one.
+    //
+    // Deferred rather than resolved on the spot, for the reason `noteSpend`
+    // spells out below: `ingest` is running, and a second `ingest` from inside
+    // it would number and broadcast the resolution *ahead* of the patch that
+    // caused it. A microtask is the smallest wait that puts it after.
+    if (stamped.t === 'tool' && DEAD_TOOL_STATUS.has(stamped.patch.status as string)) {
+      const dead = stamped.toolId;
+      if (this.questionsFor(dead).length > 0) {
+        queueMicrotask(() => this.abandonQuestionsFor(dead));
+      }
     }
     if (stamped.t === 'turn_end') {
       this.askCalls = [];
@@ -2240,6 +2316,13 @@ export class ChatSession {
     this.pending.clear();
     // A question is moot once the turn it belongs to is cancelled, and a card
     // left on screen would invite an answer with nothing left to receive it.
+    //
+    // Recorded as abandoned rather than skipped, which it never was: the user
+    // pressed stop, and stopping a turn is not the same act as reading a
+    // question and declining to answer it. Drawn as "skipped without answering"
+    // it read as an accusation — in the conversation that prompted #174 it was
+    // the *only* thing on screen about two cards whose tool calls had died ten
+    // minutes earlier, so the record blamed the user for the runtime's timeout.
     for (const [requestId, entry] of this.questions) {
       entry.resolve({ labels: [], error: 'the turn was interrupted' });
       this.ingest({
@@ -2247,7 +2330,7 @@ export class ChatSession {
         requestId,
         toolId: entry.request.toolId,
         optionIds: [],
-        skipped: true,
+        abandoned: true,
       });
     }
     this.questions.clear();
@@ -2624,7 +2707,7 @@ export class ChatSession {
    * with an error the model can read is better than putting an empty card on
    * screen and blocking the turn behind it.
    */
-  private askQuestion(ask: QuestionAsk): Promise<QuestionReply> {
+  private askQuestion(ask: QuestionAsk, signal?: AbortSignal): Promise<QuestionReply> {
     const question = typeof ask.question === 'string' ? ask.question.trim() : '';
     const options = normalizeQuestionOptions(ask.options);
 
@@ -2652,6 +2735,14 @@ export class ChatSession {
       this.questions.set(requestId, { request, resolve });
       this.ingest({ t: 'question', request });
       this.setState('awaiting_answer');
+      // The caller giving up is the other way this ends. Registered after the
+      // card exists so the listener has something to take down, and harmless
+      // if it never fires — the abort controller goes when the call does.
+      signal?.addEventListener(
+        'abort',
+        () => this.abandonQuestion(requestId, 'the agent stopped waiting for an answer'),
+        { once: true },
+      );
     });
   }
 
@@ -2696,6 +2787,52 @@ export class ChatSession {
       skipped: !answered,
     });
     return true;
+  }
+
+  /** The pending questions asked by one tool call, usually none or one. */
+  private questionsFor(toolId: string): string[] {
+    const ids: string[] = [];
+    for (const [requestId, entry] of this.questions) {
+      if (entry.request.toolId === toolId) ids.push(requestId);
+    }
+    return ids;
+  }
+
+  /**
+   * End the questions a dead tool call was waiting on, and say so.
+   *
+   * The counterpart to `answerQuestion` for the case where nobody got to
+   * answer. The waiting promise is still resolved — the MCP server on the other
+   * end of the socket is holding a `tools/call` open, and abandoning it in
+   * silence would strand that process rather than the card — but what goes into
+   * the transcript is `abandoned`, not `skipped`. The two look identical on
+   * screen if you conflate them and they say opposite things about the user.
+   */
+  private abandonQuestionsFor(toolId: string, reason = 'the agent stopped waiting for an answer'): void {
+    for (const requestId of this.questionsFor(toolId)) {
+      this.abandonQuestion(requestId, reason);
+    }
+  }
+
+  /** The same for one question, which is how a cancelled call arrives. */
+  private abandonQuestion(requestId: string, reason: string): void {
+    const entry = this.questions.get(requestId);
+    if (!entry) return;
+    entry.resolve({ labels: [], error: reason });
+    this.questions.delete(requestId);
+    this.ingest({
+      t: 'question_resolved',
+      requestId,
+      toolId: entry.request.toolId,
+      optionIds: [],
+      abandoned: true,
+    });
+    // Nothing left to wait for. Said here rather than left to the next event,
+    // because a conversation that goes on reporting `awaiting_answer` with no
+    // card to answer is one whose composer stays out of the user's way.
+    if (this.questions.size === 0 && this.state === 'awaiting_answer') {
+      this.setState(this.live ? 'running' : 'idle');
+    }
   }
 
   /**
@@ -2801,8 +2938,18 @@ export class ChatSession {
     // one waiting on these promises: resolving them here is what turns a
     // shutdown into a tool result rather than a connection that simply stops
     // answering.
-    for (const [, entry] of this.questions) {
+    // Written to the log as well as resolved, which it was not before: a browser
+    // already watching this conversation is told the card is over, instead of
+    // going on offering buttons until something makes it rejoin and rebuild.
+    for (const [requestId, entry] of this.questions) {
       entry.resolve({ labels: [], error: 'the session was stopped' });
+      this.ingest({
+        t: 'question_resolved',
+        requestId,
+        toolId: entry.request.toolId,
+        optionIds: [],
+        abandoned: true,
+      });
     }
     this.questions.clear();
     this.clearQueue();

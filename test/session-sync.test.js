@@ -6,6 +6,10 @@ const path = require('path');
 const fs = require('fs');
 
 const { createSessionRoutes } = require('../dist/server/routes/sessions.js');
+const {
+  AccountTabCoordinator,
+} = require('../dist/server/services/account-tab-coordinator.js');
+const { announceSessionOpened } = require('../dist/server/websocket/handler.js');
 
 // The set of tabs a person has open is a fact about the person, not about the
 // window they happen to be looking at (#163).
@@ -32,6 +36,17 @@ let server;
 let base;
 let currentUser;
 let destroyed;
+let saves;
+let saveSessions;
+let tabAcquireRequests;
+
+async function waitUntil(check, message, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error(message);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
 
 function record(id, over = {}) {
   const session = {
@@ -96,6 +111,10 @@ describe('telling every screen what happened to a session', function () {
     sockets = new Map();
     currentUser = USER;
     destroyed = [];
+    saves = 0;
+    tabAcquireRequests = 0;
+
+    const tabCoordinator = new AccountTabCoordinator();
 
     const app = express();
     app.use(express.json());
@@ -112,7 +131,7 @@ describe('telling every screen what happened to a session', function () {
         validatePath: (target) => ({ valid: true, path: target }),
         createSessionRecord: (params) => record(params.id, params),
         getRuntimeBridge: () => null,
-        saveSessionsToDisk: async () => {},
+        saveSessionsToDisk: () => saveSessions(),
         transcriptStore: {
           ensureTranscript: async () => {},
           deleteTranscript: async () => {},
@@ -122,6 +141,12 @@ describe('telling every screen what happened to a session', function () {
         disposeRecorder: (id) => destroyed.push(id),
         getSelectedWorkingDir: () => null,
         sessionStore: { getSessionMetadata: async () => ({}) },
+        tabCoordinator: {
+          acquire: (userId) => {
+            tabAcquireRequests++;
+            return tabCoordinator.acquire(userId);
+          },
+        },
       }),
     );
 
@@ -142,6 +167,9 @@ describe('telling every screen what happened to a session', function () {
     sessions.clear();
     sockets.clear();
     destroyed = [];
+    saves = 0;
+    tabAcquireRequests = 0;
+    saveSessions = async () => { saves++; };
     currentUser = USER;
   });
 
@@ -158,6 +186,29 @@ describe('telling every screen what happened to a session', function () {
     const response = await fetch(`${base}/api/sessions/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  }
+
+  async function setTab(id, open, options = {}) {
+    const response = await fetch(`${base}/api/sessions/${encodeURIComponent(id)}/tab`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ open, ...options }),
+    });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  }
+
+  async function reorder(sessionIds) {
+    const response = await fetch(`${base}/api/sessions/tabs/order`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionIds }),
+    });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  }
+
+  async function list() {
+    const response = await fetch(`${base}/api/sessions/list`);
     return { status: response.status, body: await response.json().catch(() => null) };
   }
 
@@ -207,6 +258,362 @@ describe('telling every screen what happened to a session', function () {
     assert.deepStrictEqual(typed(phone, 'session_opened'), []);
   });
 
+  it('closes a conversation tab on every screen without deleting or stopping it', async function () {
+    const chat = record('chat', {
+      surface: 'chat',
+      active: true,
+      agent: 'claude',
+      connections: new Set(['w1']),
+    });
+    sessions.set(chat.id, chat);
+    const laptop = socket('w1', USER.id, { claudeSessionId: 'chat' });
+    const phone = socket('w2', USER.id);
+    const stranger = socket('w3', OTHER.id);
+    for (const info of [laptop, phone, stranger]) sockets.set(info.id, info);
+
+    const result = await setTab('chat', false);
+
+    assert.deepStrictEqual(result, {
+      status: 200,
+      body: { success: true, open: false, applied: true },
+    });
+    assert.strictEqual(chat.tabOpen, false);
+    assert.strictEqual(sessions.get('chat'), chat, 'the conversation record remains');
+    assert.strictEqual(chat.active, true, 'its running agent is not stopped');
+    assert.deepStrictEqual(destroyed, [], 'none of its durable data is torn down');
+    assert.strictEqual(saves, 1, 'the account-level tab state is persisted immediately');
+    const expected = { type: 'session_tab_closed', sessionId: 'chat' };
+    assert.deepStrictEqual(typed(laptop, 'session_tab_closed'), [expected]);
+    assert.deepStrictEqual(typed(phone, 'session_tab_closed'), [expected]);
+    assert.deepStrictEqual(stranger.sent, [], 'another account hears nothing');
+
+    const listed = await list();
+    assert.strictEqual(listed.status, 200);
+    assert.deepStrictEqual(listed.body.sessions, [], 'a closed tab is absent from the strip list');
+  });
+
+  it('reopens a conversation tab on every screen', async function () {
+    const chat = record('chat', { surface: 'chat', tabOpen: false });
+    sessions.set(chat.id, chat);
+    const laptop = socket('w1', USER.id);
+    const phone = socket('w2', USER.id);
+    for (const info of [laptop, phone]) sockets.set(info.id, info);
+
+    const result = await setTab('chat', true);
+
+    assert.deepStrictEqual(result, {
+      status: 200,
+      body: { success: true, open: true, applied: true },
+    });
+    assert.strictEqual(chat.tabOpen, true);
+    const expected = {
+      type: 'session_opened',
+      sessionId: 'chat',
+      name: 'Session chat',
+      customName: null,
+      workingDir: '/projects/alpha',
+      surface: 'chat',
+      active: false,
+      bypassPermissions: false,
+    };
+    assert.deepStrictEqual(typed(laptop, 'session_opened'), [expected]);
+    assert.deepStrictEqual(typed(phone, 'session_opened'), [expected]);
+    assert.deepStrictEqual(typed(phone, 'session_tabs_reordered'), [
+      { type: 'session_tabs_reordered', sessionIds: ['chat'] },
+    ]);
+    assert.deepStrictEqual((await list()).body.sessions.map((entry) => entry.id), ['chat']);
+  });
+
+  it('persists one exact tab order and announces it only to this account', async function () {
+    sessions.set('a', record('a', { surface: 'chat' }));
+    sessions.set('b', record('b', { surface: 'chat' }));
+    sessions.set('theirs', record('theirs', { ownerUserId: OTHER.id, surface: 'chat' }));
+    const laptop = socket('w1', USER.id);
+    const phone = socket('w2', USER.id);
+    const stranger = socket('w3', OTHER.id);
+    for (const info of [laptop, phone, stranger]) sockets.set(info.id, info);
+
+    const result = await reorder(['b', 'a']);
+
+    assert.deepStrictEqual(result, {
+      status: 200,
+      body: { success: true, sessionIds: ['b', 'a'] },
+    });
+    assert.strictEqual(saves, 1, 'success is acknowledged only after persistence');
+    assert.strictEqual(sessions.get('b').tabOrder, 0);
+    assert.strictEqual(sessions.get('a').tabOrder, 1);
+    assert.deepStrictEqual((await list()).body.sessions.map((entry) => entry.id), ['b', 'a']);
+    const expected = { type: 'session_tabs_reordered', sessionIds: ['b', 'a'] };
+    assert.deepStrictEqual(typed(laptop, 'session_tabs_reordered'), [expected]);
+    assert.deepStrictEqual(typed(phone, 'session_tabs_reordered'), [expected]);
+    assert.deepStrictEqual(stranger.sent, [], 'another account never receives this order');
+  });
+
+  it('rejects stale, duplicate and foreign reorder sets without changing membership', async function () {
+    sessions.set('a', record('a', { surface: 'chat', tabOrder: 0 }));
+    sessions.set('b', record('b', { surface: 'chat', tabOrder: 1 }));
+    sessions.set('theirs', record('theirs', {
+      ownerUserId: OTHER.id,
+      surface: 'chat',
+      tabOrder: 0,
+    }));
+
+    assert.strictEqual((await reorder(['a', 'a'])).status, 400, 'duplicates are malformed');
+    assert.strictEqual((await reorder(['a'])).status, 409, 'a missing open tab is stale');
+    assert.strictEqual((await reorder(['a', 'theirs'])).status, 409, 'foreign IDs are not accepted');
+    assert.strictEqual((await reorder(['a', 'b', 'ghost'])).status, 409);
+    assert.strictEqual(saves, 0);
+    assert.deepStrictEqual((await list()).body.sessions.map((entry) => entry.id), ['a', 'b']);
+  });
+
+  it('rolls a reorder back when persistence fails', async function () {
+    sessions.set('a', record('a', { surface: 'chat', tabOrder: 0 }));
+    sessions.set('b', record('b', { surface: 'chat', tabOrder: 1 }));
+    const phone = socket('w1', USER.id);
+    sockets.set(phone.id, phone);
+    saveSessions = async () => { saves++; return false; };
+
+    const result = await reorder(['b', 'a']);
+
+    assert.strictEqual(result.status, 503);
+    assert.strictEqual(sessions.get('a').tabOrder, 0);
+    assert.strictEqual(sessions.get('b').tabOrder, 1);
+    assert.deepStrictEqual(phone.sent, [], 'an order that will not survive is never announced');
+    assert.deepStrictEqual((await list()).body.sessions.map((entry) => entry.id), ['a', 'b']);
+  });
+
+  it('does not let a list observe a tentative reorder that later rolls back', async function () {
+    sessions.set('a', record('a', { surface: 'chat', tabOrder: 0 }));
+    sessions.set('b', record('b', { surface: 'chat', tabOrder: 1 }));
+    let finishSave;
+    const saving = new Promise((resolve) => { finishSave = resolve; });
+    saveSessions = async () => saving;
+
+    const moving = reorder(['b', 'a']);
+    await new Promise((resolve) => setImmediate(resolve));
+    let listSettled = false;
+    const listing = list().then((value) => { listSettled = true; return value; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(listSettled, false, 'the list waits for the account transaction');
+
+    finishSave(false);
+    assert.strictEqual((await moving).status, 503);
+    assert.deepStrictEqual(
+      (await listing).body.sessions.map((entry) => entry.id),
+      ['a', 'b'],
+      'the first visible snapshot is the rolled-back durable order',
+    );
+  });
+
+  it('appends a genuinely reopened tab without moving an idempotently open one', async function () {
+    sessions.set('a', record('a', { surface: 'chat', tabOpen: true, tabOrder: 0 }));
+    sessions.set('b', record('b', { surface: 'chat', tabOpen: true, tabOrder: 1 }));
+    sessions.set('closed', record('closed', { surface: 'chat', tabOpen: false, tabOrder: 0 }));
+    const phone = socket('w1', USER.id);
+    sockets.set(phone.id, phone);
+
+    assert.strictEqual((await setTab('closed', true)).status, 200);
+    assert.strictEqual(sessions.get('closed').tabOrder, 2);
+    assert.deepStrictEqual(
+      (await list()).body.sessions.map((entry) => entry.id),
+      ['a', 'b', 'closed'],
+    );
+    assert.deepStrictEqual(typed(phone, 'session_tabs_reordered').at(-1), {
+      type: 'session_tabs_reordered',
+      sessionIds: ['a', 'b', 'closed'],
+    });
+
+    assert.strictEqual((await setTab('a', true)).status, 200);
+    assert.strictEqual(sessions.get('a').tabOrder, 0, 'restating open does not move the tab');
+    assert.deepStrictEqual(
+      (await list()).body.sessions.map((entry) => entry.id),
+      ['a', 'b', 'closed'],
+    );
+    assert.deepStrictEqual(
+      typed(phone, 'session_tabs_reordered').at(-1),
+      { type: 'session_tabs_reordered', sessionIds: ['a', 'b', 'closed'] },
+      'an idempotent open also corrects another stale client\'s insertion position',
+    );
+  });
+
+  it('serializes a reorder with a close across the whole account', async function () {
+    sessions.set('a', record('a', { surface: 'chat', tabOrder: 0 }));
+    sessions.set('b', record('b', { surface: 'chat', tabOrder: 1 }));
+
+    let finishReorder;
+    const reorderSaved = new Promise((resolve) => { finishReorder = resolve; });
+    saveSessions = async () => {
+      saves++;
+      if (saves === 1) return reorderSaved;
+      return true;
+    };
+
+    const moving = reorder(['b', 'a']);
+    await waitUntil(() => saves === 1, 'the reorder reaches persistence');
+    const closing = setTab('a', false);
+    await waitUntil(
+      () => tabAcquireRequests === 2,
+      'the close reaches the account transaction queue',
+    );
+    assert.strictEqual(saves, 1, 'the close waits for the account reorder transaction');
+
+    finishReorder(true);
+    assert.strictEqual((await moving).status, 200);
+    assert.strictEqual((await closing).status, 200);
+    assert.strictEqual(saves, 2);
+    assert.deepStrictEqual((await list()).body.sessions.map((entry) => entry.id), ['b']);
+  });
+
+  it('allocates a new tab only after a failed close has rolled back', async function () {
+    sessions.set('a', record('a', { surface: 'chat', tabOrder: 5 }));
+    let finishClose;
+    const closeSaved = new Promise((resolve) => { finishClose = resolve; });
+    saveSessions = async () => {
+      saves++;
+      if (saves === 1) return closeSaved;
+      return true;
+    };
+
+    const closing = setTab('a', false);
+    await waitUntil(() => saves === 1, 'the close reaches persistence');
+    const creating = create({ name: 'new', workingDir: '/projects/alpha' });
+    await waitUntil(
+      () => tabAcquireRequests === 2,
+      'creation reaches the account transaction queue',
+    );
+    assert.strictEqual(saves, 1, 'creation waits behind the tentative close');
+
+    finishClose(false);
+    assert.strictEqual((await closing).status, 503);
+    const made = await creating;
+    assert.strictEqual(made.status, 200);
+    assert.strictEqual(sessions.get(made.body.sessionId).tabOrder, 6);
+    assert.deepStrictEqual(
+      (await list()).body.sessions.map((entry) => entry.id),
+      ['a', made.body.sessionId],
+    );
+  });
+
+  it('rejects invalid, terminal, nested and other-account tab changes', async function () {
+    sessions.set('chat', record('chat', { surface: 'chat' }));
+    sessions.set('terminal', record('terminal'));
+    sessions.set('nested', record('nested', { surface: 'chat', ownerSessionId: 'chat' }));
+    sessions.set('theirs', record('theirs', { ownerUserId: OTHER.id, surface: 'chat' }));
+    const mine = socket('w1', USER.id);
+    sockets.set(mine.id, mine);
+
+    assert.strictEqual((await setTab('chat', 'false')).status, 400);
+    assert.strictEqual((await setTab('terminal', false)).status, 400);
+    assert.strictEqual((await setTab('nested', false)).status, 400);
+    assert.strictEqual((await setTab('theirs', false)).status, 404);
+
+    currentUser = OTHER;
+    assert.strictEqual((await setTab('chat', false)).status, 404);
+    assert.strictEqual(sessions.get('chat').tabOpen, undefined, 'no rejected write changes state');
+    assert.deepStrictEqual(mine.sent, [], 'no rejected write is announced');
+  });
+
+  it('applies each legacy browser close once and never lets a stale device undo a reopen', async function () {
+    const chat = record('chat', { surface: 'chat' });
+    sessions.set(chat.id, chat);
+    const laptop = socket('w1', USER.id);
+    const phone = socket('w2', USER.id);
+    sockets.set(laptop.id, laptop);
+    sockets.set(phone.id, phone);
+
+    const migrated = await setTab('chat', false, { legacy: true });
+    assert.deepStrictEqual(migrated, {
+      status: 200,
+      body: { success: true, open: false, applied: true },
+    });
+    assert.strictEqual(chat.tabOpen, false);
+    assert.strictEqual(saves, 1);
+    assert.strictEqual(typed(phone, 'session_tab_closed').length, 1);
+
+    const reopened = await setTab('chat', true);
+    assert.deepStrictEqual(reopened.body, { success: true, open: true, applied: true });
+    assert.strictEqual(chat.tabOpen, true);
+    assert.strictEqual(saves, 2);
+
+    // A second browser still has the old origin-local tombstone. It starts
+    // after the reopen, but that old fact is not a newer close intent.
+    laptop.sent.length = 0;
+    phone.sent.length = 0;
+    const stale = await setTab('chat', false, { legacy: true });
+    assert.deepStrictEqual(stale, {
+      status: 200,
+      body: { success: true, open: true, applied: false },
+    });
+    assert.strictEqual(chat.tabOpen, true, 'the explicit reopen wins');
+    assert.strictEqual(saves, 2, 'an ignored legacy write is not persisted');
+    assert.deepStrictEqual(laptop.sent, [], 'an ignored tombstone is not broadcast');
+    assert.deepStrictEqual(phone.sent, []);
+  });
+
+  it('does not announce or acknowledge a close that SQLite refused to save', async function () {
+    const chat = record('chat', { surface: 'chat' });
+    sessions.set(chat.id, chat);
+    const phone = socket('w1', USER.id);
+    sockets.set(phone.id, phone);
+    saveSessions = async () => { saves++; return false; };
+
+    const result = await setTab('chat', false);
+
+    assert.strictEqual(result.status, 503);
+    assert.strictEqual(result.body.error, 'tab_state_not_saved');
+    assert.strictEqual(chat.tabOpen, undefined, 'the failed mutation is rolled back');
+    assert.strictEqual(saves, 1);
+    assert.deepStrictEqual(phone.sent, [], 'no device acts on state that will not survive restart');
+    assert.deepStrictEqual((await list()).body.sessions.map((entry) => entry.id), ['chat']);
+  });
+
+  it('serializes cross-device tab writes through persistence in server arrival order', async function () {
+    const chat = record('chat', { surface: 'chat', tabOpen: false });
+    sessions.set(chat.id, chat);
+    const phone = socket('w1', USER.id);
+    sockets.set(phone.id, phone);
+
+    let releaseFirst;
+    const firstSave = new Promise((resolve) => { releaseFirst = resolve; });
+    saveSessions = async () => {
+      saves++;
+      if (saves === 1) return firstSave;
+      return true;
+    };
+
+    const opening = setTab('chat', true);
+    await waitUntil(() => saves === 1, 'the open reaches persistence');
+    const closing = setTab('chat', false);
+    await waitUntil(
+      () => tabAcquireRequests === 2,
+      'the later close reaches the account transaction queue',
+    );
+    assert.strictEqual(saves, 1, 'the later device waits behind the first durable write');
+
+    releaseFirst(true);
+    const [opened, closed] = await Promise.all([opening, closing]);
+    assert.strictEqual(opened.status, 200);
+    assert.strictEqual(closed.status, 200);
+    assert.strictEqual(saves, 2);
+    assert.strictEqual(chat.tabOpen, false, 'the later close is the final account state');
+    assert.deepStrictEqual(
+      phone.sent.map((message) => message.type),
+      ['session_opened', 'session_tabs_reordered', 'session_tab_closed'],
+      'every online screen observes the same persisted order',
+    );
+    assert.deepStrictEqual((await list()).body.sessions, []);
+  });
+
+  it('does not resurrect a closed tab when runtime metadata is re-announced', function () {
+    const hidden = record('hidden', { surface: 'chat', tabOpen: false });
+    const phone = socket('w1', USER.id);
+    sockets.set(phone.id, phone);
+
+    announceSessionOpened(hidden, sockets);
+
+    assert.deepStrictEqual(phone.sent, []);
+  });
+
   it('announces a delete to a screen that has the tab but was never attached', async function () {
     // The old delete went down `session.connections`, which holds the sockets
     // *driving* the session. A second device with the tab in its strip and its
@@ -229,6 +636,22 @@ describe('telling every screen what happened to a session', function () {
     assert.deepStrictEqual(typed(elsewhere, 'session_deleted'), [expected]);
     assert.deepStrictEqual(stranger.sent, [], 'another user hears nothing');
     assert.deepStrictEqual(destroyed, ['s1'], 'the session really is torn down');
+  });
+
+  it('restores the exact legacy Map order when a delete cannot be persisted', async function () {
+    sessions.set('a', record('a'));
+    sessions.set('b', record('b'));
+    saveSessions = async () => false;
+
+    const result = await remove('a');
+
+    assert.strictEqual(result.status, 503);
+    assert.deepStrictEqual(
+      (await list()).body.sessions.map((entry) => entry.id),
+      ['a', 'b'],
+      'rollback must not move an unordered legacy tab to the Map tail',
+    );
+    assert.deepStrictEqual(destroyed, [], 'teardown starts only after durable deletion');
   });
 
   it('lets go of the session only on the sockets that were driving it', async function () {
@@ -352,6 +775,39 @@ describe('announcing a session over the socket that made it', function () {
     assert.deepStrictEqual(stranger.sent, []);
   });
 
+  it('does not let a deferred socket create overwrite a newer join', async function () {
+    const asking = socket('w1', USER.id, { claudeSessionId: 'a' });
+    const phone = socket('w2', USER.id);
+    const a = record('a', { connections: new Set(['w1']) });
+    const c = record('c');
+    const { processor, claudeSessions } = processorWith([asking, phone], [a, c]);
+    let finishSave;
+    processor.deps.saveSessionsToDisk = () => new Promise((resolve) => { finishSave = resolve; });
+
+    const creating = processor.createAndJoinSession('w1', 'new', '/projects/alpha');
+    await new Promise((resolve) => setImmediate(resolve));
+    const createdId = Array.from(claudeSessions.keys()).find((id) => id !== 'a' && id !== 'c');
+    assert.ok(createdId, 'the durable tab is staged while save is pending');
+
+    await processor.joinSession('w1', 'c');
+    assert.strictEqual(asking.claudeSessionId, 'c');
+    finishSave(true);
+    await creating;
+
+    assert.strictEqual(asking.claudeSessionId, 'c', 'the newer destination keeps focus');
+    assert.ok(!claudeSessions.get(createdId).connections.has('w1'));
+    assert.deepStrictEqual(
+      typed(asking, 'session_created'),
+      [],
+      'the delayed create acknowledgement cannot switch the client back',
+    );
+    assert.deepStrictEqual(
+      typed(phone, 'session_opened').map((message) => message.sessionId),
+      [createdId],
+      'the successfully saved tab still exists for the account',
+    );
+  });
+
   it('names the session a join could not find, rather than reporting a bare error', async function () {
     // An `error` carries no session id, so the page could only attribute it to
     // the session it was still on — painting a healthy tab red for a click on a
@@ -377,6 +833,48 @@ describe('announcing a session over the socket that made it', function () {
     await processor.joinSession('w1', 'theirs');
 
     assert.deepStrictEqual(mine.sent.map((message) => message.type), ['session_gone']);
+  });
+
+  it('does not let a late A-to-B join detach the newer C destination', async function () {
+    const mine = socket('w1', USER.id, { claudeSessionId: 'a' });
+    const a = record('a', { connections: new Set(['w1']) });
+    const b = record('b');
+    const c = record('c');
+    const { processor } = processorWith([mine], [a, b, c]);
+
+    let releaseB;
+    const bTranscript = new Promise((resolve) => { releaseB = resolve; });
+    processor.deps.transcriptStore.readTranscriptChunks = async (session) => {
+      if (session.id === 'b') await bTranscript;
+      return [];
+    };
+
+    const joiningB = processor.joinSession('w1', 'b');
+    await Promise.resolve();
+    assert.strictEqual(mine.claudeSessionId, 'b');
+
+    // Before B's transcript finishes, another pair of remote closes makes C
+    // the actual fallback. C completes first.
+    await processor.joinSession('w1', 'c');
+    assert.strictEqual(mine.claudeSessionId, 'c');
+    assert.deepStrictEqual(
+      typed(mine, 'session_joined').map((message) => message.sessionId),
+      ['c'],
+    );
+
+    releaseB();
+    await joiningB;
+    assert.deepStrictEqual(
+      typed(mine, 'session_joined').map((message) => message.sessionId),
+      ['c'],
+      'the obsolete B read produces no late acknowledgement',
+    );
+
+    // Defense in depth for an old server that did send B late: the client now
+    // names B in its cleanup, and the newer C attachment is left untouched.
+    await processor.handleMessage('w1', { type: 'leave_session', sessionId: 'b' });
+    assert.strictEqual(mine.claudeSessionId, 'c');
+    assert.ok(c.connections.has('w1'));
   });
 
   it('lights the tab on every screen when a runtime starts, and puts it out when it exits', async function () {
@@ -482,20 +980,48 @@ function fakeApp() {
   const joined = [];
   const app = {
     joined,
+    sent: [],
+    sessionListLoads: 0,
     isMobile: false,
     currentClaudeSessionId: null,
     currentClaudeSessionName: null,
     getAlias: () => 'Claude',
+    authFetch: (url, init) => global.fetch(url, init),
     joinSession: async (id) => { joined.push(id); app.currentClaudeSessionId = id; },
+    send(message) { app.sent.push(message); },
     leaveSession() {},
+    loadSessions() { app.sessionListLoads += 1; },
     folderBrowser: { show() {} },
     isCreatingNewSession: false,
     chats: {
       subscribed: [],
       dropped: [],
       seeded: [],
+      controllers: new Map(),
       subscribe(id) { this.subscribed.push(id); },
       drop(id) { this.dropped.push(id); },
+      get(id) { return this.controllers.get(id); },
+      handle(message) {
+        if (message.type === 'chat_snapshot') {
+          this.controllers.set(message.sessionId, {
+            transcript: {
+              chatState: message.snapshot.state,
+              messages: message.snapshot.messages || [],
+            },
+          });
+          return true;
+        }
+        if (message.type === 'chat_event') {
+          const transcript = this.controllers.get(message.sessionId)?.transcript;
+          if (transcript && message.event?.t === 'state') {
+            transcript.chatState = message.event.state;
+          } else if (transcript && message.event?.t === 'turn_end') {
+            transcript.chatState = 'idle';
+          }
+          return true;
+        }
+        return false;
+      },
       ensure(id) {
         const chats = this;
         return { seedBypass(value) { chats.seeded.push({ id, value }); } };
@@ -533,6 +1059,7 @@ describe('a tab strip that keeps up with the other screens', function () {
 
     const contents = [
       `export { SessionTabManager } from ${JSON.stringify(path.join(ROOT, 'src/client/sessions/tab-manager'))};`,
+      `export { MessageHandler } from ${JSON.stringify(path.join(ROOT, 'src/client/terminal/message-handler'))};`,
       `export { shellStore } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/store'))};`,
     ].join('\n');
 
@@ -621,21 +1148,203 @@ describe('a tab strip that keeps up with the other screens', function () {
     assert.deepStrictEqual(app.chats.subscribed, ['chat'], 'and it is not subscribed twice');
   });
 
-  it('leaves a conversation this screen closed off this screen', async function () {
-    // Closing one means "take this off my screen" (#127). An announcement is
-    // not a reason to overrule that, and one arrives every time the conversation
-    // is relaunched anywhere.
+  it('adopts a conversation reopened on another screen without taking focus', async function () {
     const sessions = [listed('chat', { surface: 'chat' })];
     respondTo = () => ({ ok: true, json: async () => ({ sessions }) });
 
     const { m } = manager();
     await m.loadSessions();
-    m.closeSession('chat');
+    m.closeSession('chat', { skipServerRequest: true });
     assert.ok(!m.tabs.has('chat'));
 
     m.applyRemoteOpen(listed('chat', { surface: 'chat' }));
 
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['chat']);
+    assert.strictEqual(m.activeTabId, null, 'another screen does not select this window\'s tab');
+  });
+
+  it('applies a remote tab close without echoing it back to the server', function () {
+    const { m, app } = manager();
+    app.sessionTabManager = m;
+    m.addTab('chat', 'chat', 'idle', '/projects/chat', false);
+    m.setTabSurface('chat', 'chat');
+    requests.length = 0;
+
+    new mod.MessageHandler(app).handle({ type: 'session_tab_closed', sessionId: 'chat' });
+
     assert.deepStrictEqual(m.getOrderedTabIds(), []);
+    assert.deepStrictEqual(app.chats.dropped, ['chat']);
+    assert.deepStrictEqual(requests, [], 'the broadcast must not cause another PATCH');
+    assert.strictEqual(app.sessionListLoads, 1, 'an open session list is refreshed too');
+  });
+
+  it('applies a remote account order without echoing it or moving focus', function () {
+    const { m, app } = manager();
+    app.sessionTabManager = m;
+    m.addTab('a', 'a', 'idle', '/projects/a', false);
+    m.addTab('b', 'b', 'idle', '/projects/b', false);
+    m.activeTabId = 'a';
+    requests.length = 0;
+
+    new mod.MessageHandler(app).handle({
+      type: 'session_tabs_reordered',
+      sessionIds: ['b', 'a'],
+    });
+
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['b', 'a']);
+    assert.strictEqual(m.activeTabId, 'a');
+    assert.deepStrictEqual(requests, [], 'the socket event is not written back');
+  });
+
+  it('corrects a still-live chat process from its completed snapshot', function () {
+    const { m, app } = manager();
+    app.sessionTabManager = m;
+    m.addTab('chat', 'chat', 'active', '/projects/chat', false);
+    m.setTabSurface('chat', 'chat');
+
+    new mod.MessageHandler(app).handle({
+      type: 'chat_snapshot',
+      sessionId: 'chat',
+      snapshot: {
+        state: 'idle',
+        messages: [{ id: 'answer', role: 'assistant', blocks: [] }],
+      },
+    });
+
+    assert.strictEqual(
+      shellTab('chat').status,
+      'success',
+      'the completed transcript replaces the process-level active flag',
+    );
+  });
+
+  it('reflects turn completion after the transcript has become idle', function () {
+    const { m, app } = manager();
+    app.sessionTabManager = m;
+    app.currentClaudeSessionId = 'chat';
+    m.addTab('chat', 'chat', 'active', '/projects/chat', false);
+    m.setTabSurface('chat', 'chat');
+    app.chats.controllers.set('chat', {
+      transcript: {
+        chatState: 'running',
+        messages: [{ id: 'answer', role: 'assistant', blocks: [] }],
+      },
+    });
+    m.syncShell();
+    assert.strictEqual(shellTab('chat').status, 'running');
+
+    new mod.MessageHandler(app).handle({
+      type: 'chat_event',
+      sessionId: 'chat',
+      event: { t: 'turn_end', turnId: 'turn-1' },
+    });
+
+    assert.strictEqual(shellTab('chat').status, 'success');
+  });
+
+  it('moves a stale existing tab when another device genuinely reopens it', function () {
+    const { m, app } = manager();
+    app.sessionTabManager = m;
+    // This window missed the close, so X is still present at its old position.
+    m.addTab('x', 'x', 'idle', '/projects/x', false);
+    m.addTab('keep', 'keep', 'idle', '/projects/keep', false);
+    m.activeTabId = 'keep';
+    const handler = new mod.MessageHandler(app);
+
+    handler.handle({
+      type: 'session_opened',
+      sessionId: 'x',
+      name: 'x',
+      customName: null,
+      workingDir: '/projects/x',
+      surface: 'chat',
+      active: false,
+      bypassPermissions: false,
+    });
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['x', 'keep'], 'open alone is idempotent');
+
+    handler.handle({ type: 'session_tabs_reordered', sessionIds: ['keep', 'x'] });
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['keep', 'x'], 'the full reopen order appends X');
+    assert.strictEqual(m.activeTabId, 'keep');
+  });
+
+  it('detaches a late fallback join after both tabs close remotely', async function () {
+    const { m, app } = manager();
+    app.sessionTabManager = m;
+    app.pendingJoinResolve = null;
+    app.pendingJoinSessionId = null;
+    app.left = 0;
+    app.leaveSession = () => { app.left += 1; };
+    app.fitTerminal = () => {};
+    app.historyRange = { firstLine: 0, totalLines: 0 };
+    app.historyView = null;
+    app.terminal = null;
+    app.splitContainer = null;
+    app.pendingRuntimeStart = null;
+    app.startPromptRequested = false;
+    app.socket = null;
+
+    m.addTab('a', 'a', 'idle', '/projects/a', false);
+    m.addTab('b', 'b', 'idle', '/projects/b', false);
+    m.setTabSurface('a', 'chat');
+    m.setTabSurface('b', 'chat');
+    await m.switchToTab('a');
+
+    // Closing the active tab selects B immediately, but hold its actual join
+    // answer until after the account has closed B too.
+    let fallbackSettled = false;
+    app.joinSession = (id) => new Promise((resolve) => {
+      app.joined.push(id);
+      app.pendingJoinSessionId = id;
+      app.pendingJoinResolve = () => {
+        fallbackSettled = true;
+        resolve();
+      };
+    });
+
+    const handler = new mod.MessageHandler(app);
+    handler.handle({ type: 'session_tab_closed', sessionId: 'a' });
+    assert.strictEqual(m.activeTabId, 'b');
+    assert.strictEqual(app.pendingJoinSessionId, 'b');
+
+    handler.handle({ type: 'session_tab_closed', sessionId: 'b' });
+    await Promise.resolve();
+
+    assert.deepStrictEqual(m.getOrderedTabIds(), []);
+    assert.strictEqual(m.activeTabId, null);
+    assert.strictEqual(app.pendingJoinSessionId, null, 'closing B invalidates its pending join');
+    assert.strictEqual(app.pendingJoinResolve, null);
+    assert.strictEqual(fallbackSettled, true, 'the abandoned switch promise is settled promptly');
+
+    handler.handle({
+      type: 'session_joined',
+      sessionId: 'b',
+      sessionName: 'b',
+      workingDir: '/projects/b',
+      active: true,
+      surface: 'terminal',
+    });
+
+    assert.notStrictEqual(
+      app.currentClaudeSessionId,
+      'b',
+      'the late answer cannot make a tabless session current',
+    );
+    assert.notStrictEqual(
+      mod.shellStore.getSnapshot().chat.sessionId,
+      'b',
+      'the late answer cannot put the orphan on screen',
+    );
+    assert.deepStrictEqual(
+      app.sent,
+      [{ type: 'leave_session', sessionId: 'b' }],
+      'cleanup names only the obsolete join and cannot detach a newer destination',
+    );
+
+    // The ordinary acknowledgement completes the detach and clears the stale
+    // record of A, which the server left as soon as it began joining B.
+    handler.handle({ type: 'session_left' });
+    assert.strictEqual(app.currentClaudeSessionId, null);
   });
 
   it('shows a session as working while it works somewhere else', function () {
@@ -704,6 +1413,57 @@ describe('a tab strip that keeps up with the other screens', function () {
     assert.deepStrictEqual(m.getOrderedTabIds(), ['just-now']);
   });
 
+  it('does not resurrect a remotely closed tab from an older list response', async function () {
+    let answerList;
+    const pendingList = new Promise((resolve) => { answerList = resolve; });
+    let lists = 0;
+    respondTo = () => {
+      lists++;
+      if (lists === 1) return pendingList;
+      return { ok: true, json: async () => ({ sessions: [] }) };
+    };
+
+    const { m } = manager();
+    const reconciling = m.reconcile();
+
+    // This screen did not have the tab, but the event is still newer than the
+    // in-flight photograph, which contains it. The close must invalidate that
+    // response even though there is no local record to remove yet.
+    m.applyRemoteClose('closed');
+    answerList({
+      ok: true,
+      json: async () => ({ sessions: [listed('closed', { surface: 'chat' })] }),
+    });
+    await reconciling;
+
+    assert.deepStrictEqual(m.getOrderedTabIds(), []);
+    assert.strictEqual(lists, 2, 'the invalidated photograph is replaced with a fresh one');
+  });
+
+  it('does not resurrect a remotely closed tab from the initial list either', async function () {
+    let answerList;
+    const pendingList = new Promise((resolve) => { answerList = resolve; });
+    let lists = 0;
+    respondTo = () => {
+      lists++;
+      if (lists === 1) return pendingList;
+      return { ok: true, json: async () => ({ sessions: [] }) };
+    };
+
+    const { m } = manager();
+    const loading = m.loadSessions();
+
+    m.applyRemoteClose('closed');
+    answerList({
+      ok: true,
+      json: async () => ({ sessions: [listed('closed', { surface: 'chat' })] }),
+    });
+    await loading;
+
+    assert.deepStrictEqual(m.getOrderedTabIds(), []);
+    assert.strictEqual(lists, 2, 'startup also retries an invalidated account snapshot');
+  });
+
   it('does not mark half the strip unread just because it reconnected', async function () {
     // The session went quiet while this socket was away. It did not go quiet
     // *at this screen*, and lighting up the strip would be reporting the
@@ -722,24 +1482,27 @@ describe('a tab strip that keeps up with the other screens', function () {
     assert.strictEqual(shellTab('worker').unread, false);
   });
 
-  it('keeps a closed conversation closed through a reconcile, and forgets deleted ones', async function () {
-    let sessions = [listed('closed', { surface: 'chat' }), listed('gone', { surface: 'chat' })];
+  it('reconciles a tab close missed while this screen was offline', async function () {
+    let sessions = [
+      listed('kept', { surface: 'chat' }),
+      listed('closed-elsewhere', { surface: 'chat' }),
+    ];
     respondTo = () => ({ ok: true, json: async () => ({ sessions }) });
 
     const { m } = manager();
     await m.loadSessions();
-    m.closeSession('closed');
-    m.closeSession('gone');
+    requests.length = 0;
 
-    sessions = [listed('closed', { surface: 'chat' })];
+    sessions = [listed('kept', { surface: 'chat' })];
     await m.reconcile();
 
-    assert.deepStrictEqual(m.getOrderedTabIds(), [], 'neither comes back');
-    assert.deepStrictEqual(
-      JSON.parse(stored.get('cc-web-closed-conversations')),
-      ['closed'],
-      'the note about a conversation the server no longer has is dropped',
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['kept']);
+    assert.strictEqual(
+      requests.filter((request) => request.init?.method === 'PATCH').length,
+      0,
+      'catching up to server state does not write the same close back',
     );
+    assert.strictEqual(stored.get('cc-web-closed-conversations'), undefined);
   });
 
   it('leaves the strip alone when the listing cannot be had', async function () {

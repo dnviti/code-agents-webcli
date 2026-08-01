@@ -363,6 +363,18 @@ export interface WsSessionDeletedMessage {
   message: string;
 }
 
+/** A conversation tab closed on one of this account's screens. */
+export interface WsSessionTabClosedMessage {
+  type: 'session_tab_closed';
+  sessionId: string;
+}
+
+/** The authoritative order of every currently open tab on this account. */
+export interface WsSessionTabsReorderedMessage {
+  type: 'session_tabs_reordered';
+  sessionIds: string[];
+}
+
 /**
  * Sent to every one of the user's sockets when a session is renamed, including
  * the one that asked, so a second window follows the new label without a reload.
@@ -493,6 +505,8 @@ export type WsMessage =
   | WsErrorMessage
   | WsInfoMessage
   | WsSessionDeletedMessage
+  | WsSessionTabClosedMessage
+  | WsSessionTabsReorderedMessage
   | WsSessionRenamedMessage
   | WsSessionOpenedMessage
   | WsSessionActivityMessage
