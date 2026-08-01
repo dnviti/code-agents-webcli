@@ -506,6 +506,37 @@ describe('project core lifecycle', function () {
     assert.ok(!e.calls.some((call) => call.op === 'stop'));
   });
 
+  it('lets explicit recovery retry a terminal reclaiming project', async function () {
+    const p = project('one', 'reclaiming');
+    p.container = { name: 'saved' };
+    p.rebuildRequired = true;
+    const { manager, s, dir } = setup([p]);
+    const workspace = path.join(dir, 'projects', 'one');
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.writeFileSync(path.join(workspace, 'discarded.txt'), 'transient');
+
+    assert.deepStrictEqual(await manager.release(1, 'one'), { ok: true });
+    assert.strictEqual(s.getProject('one').state, 'stopped');
+    assert.ok(!fs.existsSync(workspace));
+  });
+
+  it('lets an explicit discard recover a terminal reclaiming project', async function () {
+    const p = project('one', 'reclaiming', 'https://example.test/a.git');
+    p.container = { name: 'saved' };
+    p.rebuildRequired = true;
+    const { manager, s, dir } = setup([p]);
+    const workspace = path.join(dir, 'projects', 'one');
+    fs.mkdirSync(path.join(workspace, 'a', '.git'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, 'a', 'discarded.txt'), 'transient');
+
+    assert.deepStrictEqual(
+      await manager.release(1, 'one', { discard: true }),
+      { ok: true },
+    );
+    assert.strictEqual(s.getProject('one').state, 'stopped');
+    assert.ok(!fs.existsSync(workspace));
+  });
+
   it('never stops a known foreign container when reclaim preparation rejects it', async function () {
     const p = project('one', 'running', 'https://example.test/a.git'); p.container = { name: 'saved' };
     const { manager, s, e, dir } = setup([p], { engine: {

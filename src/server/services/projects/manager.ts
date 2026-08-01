@@ -295,7 +295,16 @@ export class ProjectManager {
   private async releaseLocked(ownerUserId: number, projectId: string, opts: { discard?: boolean }): Promise<SimpleResult> {
     const project = this.deps.store.getProjectForUser(projectId, ownerUserId);
     if (!project) return { ok: false, reason: 'not_found' };
-    if (project.state !== 'blocked') return { ok: false, reason: 'invalid_state' };
+    // `blocked` is a preservation failure after the physical runtime was
+    // proven stopped. `reclaiming` is the fail-closed counterpart: teardown or
+    // its target-side outcome could not be verified, so it remains counted.
+    // Both are terminal recovery states once their exclusive lifecycle action
+    // has returned. Calling release through the same per-project lock retries
+    // all ownership and liveness checks; it never treats an in-flight reclaim
+    // as permission to bypass them.
+    if (project.state !== 'blocked' && project.state !== 'reclaiming') {
+      return { ok: false, reason: 'invalid_state' };
+    }
     if (this.hasActiveWork(project.id)) {
       return { ok: false, reason: 'invalid_state', detail: 'project has active work' };
     }
