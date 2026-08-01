@@ -888,19 +888,6 @@ export class ProjectManager {
           if (!described) continue;
           const id = described.labels[PROJECT_LABEL];
           const project = id ? this.deps.store.getProject(id) : null;
-          if (project?.container?.reconciliationConflict === 'unverified_runtime') {
-            // A conflict remains observed even if this claimant's labels have
-            // changed. Its stored name does not grant placement authority.
-            reconciled.add(project.id);
-            observedConflictClaimants.add(project.id);
-            this.deps.store.setState(
-              project.id,
-              'reclaiming',
-              'An unverified project-labelled runtime still exists; manual recovery required',
-            );
-            this.publish(this.deps.store.getProject(project.id) as Project);
-            continue;
-          }
           if (project) {
             // A project label identifies a workspace, not the authority to
             // use it. Check placement before the managed-label early return:
@@ -921,11 +908,15 @@ export class ProjectManager {
               && described.labels[USER_ID_LABEL] === String(project.ownerUserId)
               && described.labels[TARGET_LABEL] === targetLabelValue(expectedKey);
             if (!exactRuntime) {
+              // A conflict remains observed even if this claimant's labels
+              // changed. Keep the recorded/deterministic name: the claimant
+              // name itself is never placement authority and must not replace
+              // the identity-bound runtime we still need to retire.
               reconciled.add(project.id);
               observedConflictClaimants.add(project.id);
               this.deps.store.setContainer(project.id, project.container
                 ? { ...project.container, reconciliationConflict: 'unverified_runtime' }
-                : { name: described.name, reconciliationConflict: 'unverified_runtime' });
+                : { name: expectedName, reconciliationConflict: 'unverified_runtime' });
               this.deps.store.setState(
                 project.id,
                 'reclaiming',
@@ -1034,12 +1025,11 @@ export class ProjectManager {
           return;
         }
 
-        if (project.container.reconciliationConflict === 'unverified_runtime') {
-          // This name came from an unadoptable crash-window claimant. Never
-          // stop it, and never let a direct name lookup substitute for a
-          // complete target scan: another same-workspace runtime could have
-          // appeared while the target was unavailable.
-          if (described || observedConflictClaimants.has(project.id)) {
+        const hasConflict = project.container.reconciliationConflict === 'unverified_runtime';
+        if (hasConflict && !described) {
+          // The expected runtime is absent, but a mismatch observed anywhere
+          // in this complete boot pass still blocks workspace destruction.
+          if (observedConflictClaimants.has(project.id) || !engineScansComplete || !scan?.complete) {
             if (scan && PROJECT_ID.test(project.id)) scan.protectedIds.add(project.id);
             this.deps.store.setState(
               project.id,
@@ -1049,15 +1039,7 @@ export class ProjectManager {
             this.publish(this.deps.store.getProject(project.id) as Project);
             return;
           }
-          if (!engineScansComplete || !scan?.complete) {
-            this.deps.store.setState(
-              project.id,
-              'reclaiming',
-              'An unverified project-labelled runtime could not be ruled out by a complete target scan',
-            );
-            this.publish(this.deps.store.getProject(project.id) as Project);
-            return;
-          }
+          // Every target completed and no mismatched claimant was seen.
           this.deps.store.setContainer(project.id, null);
           this.deps.store.setRebuildRequired(project.id, true);
           this.deps.store.setState(project.id, 'stopped', 'Unverified runtime is absent after a complete target scan; rebuild required');
@@ -1097,6 +1079,7 @@ export class ProjectManager {
         }
 
         const engine = target.engine;
+        let expectedRuntimeAbsent = false;
         try {
           // Session leases and in-memory command ownership do not survive a
           // server restart. Retire every potentially executable runtime before
@@ -1116,13 +1099,38 @@ export class ProjectManager {
               throw new Error(`container '${described.name}' is still potentially executable (${after.status})`);
             }
           } else {
-            this.deps.store.setContainer(project.id, null);
+            expectedRuntimeAbsent = true;
+            if (!hasConflict) this.deps.store.setContainer(project.id, null);
           }
         } catch (error) {
           engineScansComplete = false;
           if (scan) scan.complete = false;
           const detail = `Interrupted project container could not be retired safely: ${(error as Error).message}`;
           this.deps.store.setState(project.id, 'reclaiming', detail);
+          this.publish(this.deps.store.getProject(project.id) as Project);
+          return;
+        }
+
+        if (hasConflict) {
+          if (observedConflictClaimants.has(project.id) || !engineScansComplete || !scan?.complete) {
+            // The exact runtime was retired, but retain the marker (including
+            // after Kubernetes deletes it) until a later full scan proves no
+            // mismatched claimant survived elsewhere.
+            this.deps.store.setState(
+              project.id,
+              'reclaiming',
+              'Recorded runtime was retired but an unverified project-labelled runtime still exists',
+            );
+            this.publish(this.deps.store.getProject(project.id) as Project);
+            return;
+          }
+          if (expectedRuntimeAbsent) {
+            this.deps.store.setContainer(project.id, null);
+          } else {
+            const { reconciliationConflict: _conflict, ...verifiedContainer } = project.container;
+            this.deps.store.setContainer(project.id, verifiedContainer);
+          }
+          this.deps.store.setState(project.id, 'stopped', 'Project runtime stopped after a complete conflict-free boot scan');
           this.publish(this.deps.store.getProject(project.id) as Project);
           return;
         }

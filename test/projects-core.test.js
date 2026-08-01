@@ -1349,7 +1349,8 @@ describe('project core lifecycle', function () {
     await manager.reconcileOnBoot();
     assert.ok(!e.calls.some((call) => call.op === 'remove' && call.name === 'intruder'));
     assert.deepStrictEqual(p.container, { name: 'saved', reconciliationConflict: 'unverified_runtime' });
-    assert.ok(!e.calls.some((call) => call.op === 'stop' || call.op === 'remove'));
+    assert.ok(e.calls.some((call) => call.op === 'stop' && call.name === 'saved'));
+    assert.ok(!e.calls.some((call) => call.op === 'stop' && call.name === 'intruder'));
   });
 
   it('adopts an exact crash-window runtime before boot reconciliation retires and reclaims it', async function () {
@@ -1452,7 +1453,7 @@ describe('project core lifecycle', function () {
     assert.ok(fs.existsSync(workspace));
   });
 
-  it('blocks deletion when a recorded runtime has a second wrong-name claimant', async function () {
+  it('retires the expected runtime but blocks deletion until a second claimant is gone', async function () {
     const id = '123e4567-e89b-42d3-a456-426614174010';
     const p = project(id, 'stopped'); p.container = { name: 'expected' };
     const { manager, s, e, dir } = setup([p]);
@@ -1463,18 +1464,47 @@ describe('project core lifecycle', function () {
       'com.code-agents-webcli.user-id': '1',
       'com.code-agents-webcli.target': 'legacy',
     };
-    e.list = async () => ['expected', 'wrong-name'];
-    e.describe = async (name) => ['expected', 'wrong-name'].includes(name)
-      ? { name, identity: `${name}-id`, status: 'running', image: 'img', labels }
-      : null;
+    let expectedPresent = true;
+    let expectedStatus = 'running';
+    let wrongPresent = true;
+    e.list = async () => [
+      ...(expectedPresent ? ['expected'] : []),
+      ...(wrongPresent ? ['wrong-name'] : []),
+    ];
+    e.describe = async (name) => {
+      if (name === 'expected' && expectedPresent) return {
+        name, identity: 'expected-id', status: expectedStatus, image: 'img', labels,
+      };
+      if (name === 'wrong-name' && wrongPresent) return {
+        name, identity: 'wrong-id', status: 'running', image: 'img', labels,
+      };
+      return null;
+    };
+    e.stopIdentity = async (description) => {
+      e.calls.push({ op: 'stop', name: description.name, identity: description.identity });
+      if (description.name === 'expected') expectedStatus = 'stopped';
+    };
+    e.removeIdentity = async (description) => {
+      e.calls.push({ op: 'remove', name: description.name, identity: description.identity });
+      if (description.name === 'expected') expectedPresent = false;
+    };
 
     await manager.reconcileOnBoot();
 
     assert.deepStrictEqual(s.getProject(id).container, { name: 'expected', reconciliationConflict: 'unverified_runtime' });
+    assert.ok(e.calls.some((call) => call.op === 'stop' && call.name === 'expected'));
+    assert.ok(!e.calls.some((call) => call.op === 'stop' && call.name === 'wrong-name'));
     assert.strictEqual((await manager.release(1, id, { discard: true })).ok, false);
     assert.strictEqual((await manager.remove(1, id)).ok, false);
     assert.ok(fs.existsSync(workspace));
-    assert.ok(!e.calls.some((call) => call.op === 'stop' || call.op === 'remove'));
+
+    wrongPresent = false;
+    await manager.reconcileOnBoot();
+    assert.deepStrictEqual(s.getProject(id).container, { name: 'expected' });
+    assert.strictEqual(s.getProject(id).state, 'stopped');
+    assert.deepStrictEqual(await manager.remove(1, id), { ok: true });
+    assert.strictEqual(expectedPresent, false);
+    assert.ok(!fs.existsSync(workspace));
   });
 
   it('retains a cross-target crash-window claimant until every engine scan proves it absent', async function () {
