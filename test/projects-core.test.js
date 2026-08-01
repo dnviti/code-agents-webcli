@@ -203,7 +203,7 @@ describe('project core lifecycle', function () {
     assert.ok(spec.cpus); assert.ok(spec.memory);
   });
 
-  it('returns building promptly and refuses deletion until the tracked build finishes', async function () {
+  it('returns building promptly and rejects lifecycle actions until the tracked build finishes', async function () {
     let finish;
     const gate = new Promise((resolve) => { finish = resolve; });
     const { manager, s } = setup([project('one')], { engine: { async ensure() { await gate; return { created: true }; } } });
@@ -213,6 +213,9 @@ describe('project core lifecycle', function () {
     assert.strictEqual(s.getProject('one').state, 'building');
     const deletion = await deleting;
     assert.strictEqual(deletion.reason, 'invalid_state');
+    assert.strictEqual((await manager.start(1, 'one')).reason, 'invalid_state');
+    assert.strictEqual((await manager.stop(1, 'one')).reason, 'invalid_state');
+    assert.strictEqual((await manager.release(1, 'one')).reason, 'invalid_state');
     finish(); await manager.waitForBuild('one');
     assert.strictEqual(s.getProject('one').state, 'running');
   });
@@ -270,7 +273,7 @@ describe('project core lifecycle', function () {
     assert.ok(e.calls.some((call) => call.op === 'stop'));
   });
 
-  it('retains a counted build state when clone cleanup cannot stop the running container', async function () {
+  it('retains a counted recovery state when clone cleanup cannot stop the running container', async function () {
     const p = project('one', 'stopped', 'https://example.test/a.git');
     const { manager, s } = setup([p], { fetch: async () => ({ status: 200 }), engine: {
       async exec() { throw new Error('clone failed'); },
@@ -280,7 +283,7 @@ describe('project core lifecycle', function () {
     await manager.start(1, 'one');
     await manager.waitForBuild('one');
 
-    assert.strictEqual(s.getProject('one').state, 'building');
+    assert.strictEqual(s.getProject('one').state, 'reclaiming');
     assert.match(s.getProject('one').stateDetail, /could not be stopped/);
   });
 
@@ -719,9 +722,11 @@ describe('project core lifecycle', function () {
       async describe(name) { return { name, identity: 'foreign-id', status: 'running', image: 'foreign', labels: {} }; },
     } });
     await manager.start(1, 'one'); await manager.waitForBuild('one');
-    assert.strictEqual(s.getProject('one').state, 'building');
+    assert.strictEqual(s.getProject('one').state, 'reclaiming');
     assert.match(s.getProject('one').stateDetail, /mismatched ownership/);
     assert.ok(!e.calls.some((call) => call.op === 'ensure'));
+    assert.deepStrictEqual(await manager.remove(1, 'one'), { ok: true });
+    assert.ok(!e.calls.some((call) => call.op === 'remove'), 'terminal recovery never removes the foreign container');
   });
 
   it('rejects a foreign container that appears between preflight describe and ensure', async function () {
@@ -736,7 +741,7 @@ describe('project core lifecycle', function () {
     await manager.start(1, 'one');
     await manager.waitForBuild('one');
 
-    assert.strictEqual(s.getProject('one').state, 'building');
+    assert.strictEqual(s.getProject('one').state, 'reclaiming');
     assert.match(s.getProject('one').stateDetail, /changed ownership/);
     assert.ok(!e.calls.some((call) => call.op === 'exec'), 'no command executes in the foreign container');
     assert.ok(!e.calls.some((call) => call.op === 'stop'), 'a known foreign container is never stopped');
@@ -751,10 +756,46 @@ describe('project core lifecycle', function () {
     await manager.start(1, 'one');
     await manager.waitForBuild('one');
 
-    assert.strictEqual(s.getProject('one').state, 'building');
+    assert.strictEqual(s.getProject('one').state, 'reclaiming');
     assert.ok(s.getProject('one').container?.name);
     assert.match(s.getProject('one').stateDetail, /could not be verified/);
     assert.ok(!e.calls.some((call) => call.op === 'stop' || call.op === 'exec'));
+  });
+
+  it('releases a settled unknown build only after proving ownership, then permits a retry', async function () {
+    const p = project('one', 'stopped');
+    const { manager, s, e } = setup([p]);
+    let spec = null;
+    let verificationFails = true;
+    let removed = false;
+    e.describe = async (name) => {
+      if (!spec || removed || verificationFails) return null;
+      return { name, identity: 'owned-id', status: 'running', image: spec.image, labels: spec.labels };
+    };
+    e.ensure = async (next) => {
+      e.calls.push({ op: 'ensure', spec: next });
+      spec = next;
+      removed = false;
+      return { created: true };
+    };
+    e.removeIdentity = async (description) => {
+      e.calls.push({ op: 'remove', name: description.name });
+      removed = true;
+    };
+
+    await manager.start(1, 'one');
+    await manager.waitForBuild('one');
+    assert.strictEqual(s.getProject('one').state, 'reclaiming');
+    assert.ok(s.getProject('one').container?.name, 'the unknown runtime remains recorded for recovery');
+
+    verificationFails = false;
+    assert.deepStrictEqual(await manager.release(1, 'one'), { ok: true });
+    assert.strictEqual(s.getProject('one').state, 'stopped');
+    assert.ok(e.calls.some((call) => call.op === 'remove'), 'release removes only the newly verified owned runtime');
+
+    assert.deepStrictEqual(await manager.retry(1, 'one'), { ok: true, state: 'building' });
+    await manager.waitForBuild('one');
+    assert.strictEqual(s.getProject('one').state, 'running');
   });
 
   it('keeps a partially started owned container counted when its compensating stop fails', async function () {
@@ -770,7 +811,7 @@ describe('project core lifecycle', function () {
     await manager.start(1, 'one');
     await manager.waitForBuild('one');
 
-    assert.strictEqual(s.getProject('one').state, 'building');
+    assert.strictEqual(s.getProject('one').state, 'reclaiming');
     assert.strictEqual(s.getProject('one').container.name, attemptedSpec.name);
     assert.match(s.getProject('one').stateDetail, /same-name project container appeared/);
     assert.ok(!e.calls.some((call) => call.op === 'stop'), 'an unproven replacement is never stopped');

@@ -168,6 +168,9 @@ export class ProjectManager {
 
   async start(ownerUserId: number, projectId: string, opts: { stopProjectId?: string } = {}): Promise<StartResult> {
     if (this.shuttingDown) return { ok: false, reason: 'shutting_down', detail: 'Project manager is shutting down' };
+    if (this.builds.has(projectId)) {
+      return { ok: false, reason: 'invalid_state', detail: 'project build is still in progress' };
+    }
     return this.exclusiveFor(
       [projectId, ...(opts.stopProjectId ? [opts.stopProjectId] : [])],
       () => this.startLocked(ownerUserId, projectId, opts),
@@ -237,6 +240,9 @@ export class ProjectManager {
 
   async stop(ownerUserId: number, projectId: string): Promise<SimpleResult> {
     if (this.shuttingDown) return { ok: false, reason: 'shutting_down', detail: 'Project manager is shutting down' };
+    if (this.builds.has(projectId)) {
+      return { ok: false, reason: 'invalid_state', detail: 'project build is still in progress' };
+    }
     return this.exclusiveFor([projectId], () => this.stopLocked(ownerUserId, projectId));
   }
 
@@ -278,7 +284,10 @@ export class ProjectManager {
   async remove(ownerUserId: number, projectId: string, opts: { force?: boolean } = {}): Promise<SimpleResult> {
     if (this.shuttingDown) return { ok: false, reason: 'shutting_down', detail: 'Project manager is shutting down' };
     const current = this.deps.store.getProjectForUser(projectId, ownerUserId);
-    if (current && (current.state === 'building' || current.state === 'reclaiming' || this.builds.has(projectId))) {
+    // A settled `reclaiming` row is a recovery request, not an in-flight
+    // operation. `reclaim()` redoes its ownership and liveness checks before
+    // touching either the runtime or workspace.
+    if (current && (current.state === 'building' || this.builds.has(projectId))) {
       return { ok: false, reason: 'invalid_state', detail: 'project lifecycle operation is still in progress' };
     }
     return this.exclusiveFor([projectId], () => this.removeLocked(ownerUserId, projectId, opts));
@@ -287,7 +296,7 @@ export class ProjectManager {
   private async removeLocked(ownerUserId: number, projectId: string, opts: { force?: boolean }): Promise<SimpleResult> {
     const project = this.deps.store.getProjectForUser(projectId, ownerUserId);
     if (!project) return { ok: false, reason: 'not_found' };
-    if (project.state === 'building' || project.state === 'reclaiming' || this.builds.has(projectId)) {
+    if (project.state === 'building' || this.builds.has(projectId)) {
       return { ok: false, reason: 'invalid_state', detail: 'project lifecycle operation is still in progress' };
     }
     if (project.state === 'blocked' && !opts.force) return { ok: false, reason: 'preserve_failed', detail: project.stateDetail || undefined };
@@ -314,12 +323,18 @@ export class ProjectManager {
 
   async release(ownerUserId: number, projectId: string, opts: { discard?: boolean } = {}): Promise<SimpleResult> {
     if (this.shuttingDown) return { ok: false, reason: 'shutting_down', detail: 'Project manager is shutting down' };
+    if (this.builds.has(projectId)) {
+      return { ok: false, reason: 'invalid_state', detail: 'project build is still in progress' };
+    }
     return this.exclusiveFor([projectId], () => this.releaseLocked(ownerUserId, projectId, opts));
   }
 
   private async releaseLocked(ownerUserId: number, projectId: string, opts: { discard?: boolean }): Promise<SimpleResult> {
     const project = this.deps.store.getProjectForUser(projectId, ownerUserId);
     if (!project) return { ok: false, reason: 'not_found' };
+    if (this.builds.has(projectId)) {
+      return { ok: false, reason: 'invalid_state', detail: 'project build is still in progress' };
+    }
     // `blocked` is a preservation failure after the physical runtime was
     // proven stopped. `reclaiming` is the fail-closed counterpart: teardown or
     // its target-side outcome could not be verified, so it remains counted.
@@ -1057,9 +1072,9 @@ export class ProjectManager {
           ? error.containerName
           : project.container?.name;
         if (containerName) this.deps.store.setContainer(project.id, { name: containerName });
-        this.deps.store.setState(project.id, 'building', message);
+        this.deps.store.setState(project.id, 'reclaiming', message);
         this.event(this.deps.store.getProject(project.id) as Project, {
-          t: 'error', state: 'building', message,
+          t: 'error', state: 'reclaiming', message,
         });
         return;
       }
@@ -1068,11 +1083,12 @@ export class ProjectManager {
           await this.projects.stop(workingProject);
         } catch (stopError) {
           const detail = `${message}; project container could not be stopped: ${(stopError as Error).message}`;
-          // `building` remains counted. Publishing an uncounted terminal state
-          // while the engine still runs would make the run cap fictional.
-          this.deps.store.setState(project.id, 'building', detail);
+          // `reclaiming` remains counted. The build has settled, but the
+          // runtime could still run; recovery must re-check its ownership and
+          // liveness before it can release this slot.
+          this.deps.store.setState(project.id, 'reclaiming', detail);
           this.event(this.deps.store.getProject(project.id) as Project, {
-            t: 'error', state: 'building', message: detail,
+            t: 'error', state: 'reclaiming', message: detail,
           });
           return;
         }
