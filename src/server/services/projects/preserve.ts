@@ -12,7 +12,7 @@
  */
 
 import { EnvironmentEngine } from '../environments/engine.js';
-import { repositoryUrl } from './clone.js';
+import { isolatedGitNetworkInvocation, repositoryUrl } from './clone.js';
 import { REPOSITORY_CLONE_TIMEOUT_MS } from './clone.js';
 import { randomUUID } from 'node:crypto';
 
@@ -154,15 +154,7 @@ export async function preserveProjectWork(options: PreserveOptions): Promise<Pre
   };
   const exec = (args: string[], env?: Record<string, string>) => run('git', args, env);
 
-  // Local commands never receive the header. A worktree may change `origin`,
-  // hooks or aliases; credentials belong only on explicit network operations
-  // against the immutable URL stored on the project row.
-  const authArgs = [
-    '-c', 'core.hooksPath=/dev/null',
-    ...(credential ? ['-c', `http.extraHeader=AUTHORIZATION: bearer ${credential}`] : []),
-  ];
   const inRepo = (args: string[]) => exec(['-C', repoContainerPath, ...args]);
-  const network = (args: string[]) => exec(['-C', repoContainerPath, ...authArgs, ...args]);
 
   // Do this before treating a clean top-level status as permission to reclaim:
   // a clean nested HEAD may still exist only in this workspace.
@@ -201,6 +193,12 @@ export async function preserveProjectWork(options: PreserveOptions): Promise<Pre
 
   const priorHead = (await inRepo(['rev-parse', 'HEAD'])).trim();
   const head = (await inRepo(['rev-parse', '--short', 'HEAD'])).trim();
+  const sourceObjectLookup = isolatedGitNetworkInvocation([
+    '-C', repoContainerPath,
+    'rev-parse', '--path-format=absolute', '--git-path', 'objects',
+  ]);
+  const sourceObjects = (await run(sourceObjectLookup.command, sourceObjectLookup.args, sourceObjectLookup.env)).trim();
+  if (!sourceObjects.startsWith('/')) throw new PreserveError('Could not locate repository objects for safe preservation');
   const base = `cc-web/wip/${wipDate(now())}-${head}`;
 
   // Do not use a check-then-push decision. A ref can be created after
@@ -216,6 +214,7 @@ export async function preserveProjectWork(options: PreserveOptions): Promise<Pre
     GIT_COMMITTER_EMAIL: author.email,
   };
   let commit = '';
+  let transportDirectory = '';
   try {
     // A private index plus commit-tree records tracked, staged and untracked
     // bytes without moving HEAD or changing the owner's real index/worktree.
@@ -230,6 +229,20 @@ export async function preserveProjectWork(options: PreserveOptions): Promise<Pre
       '-m', `wip: preserve uncommitted work (${branch})`,
     ], indexEnv)).trim();
     if (!commit) throw new PreserveError('Git did not return a WIP commit id');
+    transportDirectory = `/tmp/cawc-preserve-transport-${randomUUID()}`;
+    await run('mkdir', ['-m', '700', '--', transportDirectory]);
+    const transportInit = isolatedGitNetworkInvocation(['init', '--bare', '--quiet', transportDirectory], null, sourceObjects);
+    await run(transportInit.command, transportInit.args, transportInit.env);
+    // The temporary bare repository has no project-local config. Its only view
+    // of project data is the source object database, read as an alternate so
+    // the WIP commit can be packed for the immutable recorded URL.
+    const network = (args: string[]) => {
+      const transport = isolatedGitNetworkInvocation([
+        '--git-dir', transportDirectory,
+        ...args,
+      ], credential, sourceObjects);
+      return run(transport.command, transport.args, transport.env);
+    };
     for (let counter = 0; counter <= MAX_WIP_COLLISION_RETRIES; counter += 1) {
       branch = counter === 0 ? base : `${base}-${counter}`;
       try {
@@ -258,6 +271,11 @@ export async function preserveProjectWork(options: PreserveOptions): Promise<Pre
     try {
       await run('rm', ['-f', '--', temporaryIndex], undefined, true);
     } catch { /* A stale private index cannot make destructive continuation unsafe. */ }
+    if (transportDirectory) {
+      try {
+        await run('rm', ['-rf', '--', transportDirectory], undefined, true);
+      } catch { /* A stale isolated transport contains no owner work or credentials. */ }
+    }
   }
 
   return { preserved: true, clean: false, branch, commit };

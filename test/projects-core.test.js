@@ -255,6 +255,7 @@ describe('project core lifecycle', function () {
     const { manager, e, s } = setup([p], { fetch: async () => ({ status: 200 }), cloneTimeoutMs: 5, engine: {
       async exec(spec, command, args) {
         e.calls.push({ op: 'exec', spec, command, args });
+        if (command !== 'sh') return { stdout: '', stderr: '' };
         return new Promise((_resolve, reject) => {
           spec.signal.addEventListener('abort', () => {
             aborted = true;
@@ -924,6 +925,7 @@ describe('project core lifecycle', function () {
       e.calls.push({ op: 'exec', spec, command, args });
       if (args.includes('status')) return { stdout: ' M work.txt\n', stderr: '' };
       if (args.includes('remote')) return { stdout: 'https://example.test/a.git\n', stderr: '' };
+      if (args.includes('rev-parse') && args.includes('--git-path')) return { stdout: '/workspace/repo/.git/objects\n', stderr: '' };
       if (args.includes('rev-parse') && args.includes('--short')) return { stdout: 'abc123\n', stderr: '' };
       if (args.includes('rev-parse')) return { stdout: 'abcdef\n', stderr: '' };
       if (args.includes('write-tree')) return { stdout: 'tree-id\n', stderr: '' };
@@ -999,6 +1001,7 @@ describe('project core lifecycle', function () {
       harness.e.calls.push({ op: 'exec', spec, command, args });
       if (args.includes('status')) return { stdout: ' M work.txt\n', stderr: '' };
       if (args.includes('remote')) return { stdout: 'https://example.test/a.git\n', stderr: '' };
+      if (args.includes('rev-parse') && args.includes('--git-path')) return { stdout: '/workspace/repo/.git/objects\n', stderr: '' };
       if (args.includes('rev-parse') && args.includes('--short')) return { stdout: 'abc123\n', stderr: '' };
       if (args.includes('rev-parse')) return { stdout: 'abcdef\n', stderr: '' };
       if (args.includes('write-tree')) return { stdout: 'tree-id\n', stderr: '' };
@@ -1191,6 +1194,7 @@ describe('project core lifecycle', function () {
         harness.e.calls.push({ op: 'exec', spec, command, args });
         if (args.includes('status')) return { stdout: ' M uncommitted.txt\n', stderr: '' };
         if (args.includes('remote')) return { stdout: 'https://example.test/a.git\n', stderr: '' };
+        if (args.includes('rev-parse') && args.includes('--git-path')) return { stdout: '/workspace/repo/.git/objects\n', stderr: '' };
         if (args.includes('rev-parse') && args.includes('--short')) return { stdout: 'abc123\n', stderr: '' };
         if (args.includes('rev-parse')) return { stdout: 'abcdef012345\n', stderr: '' };
         if (args.includes('write-tree')) return { stdout: 'tree-id\n', stderr: '' };
@@ -1236,6 +1240,7 @@ describe('project core lifecycle', function () {
       harness.e.calls.push({ op: 'exec', spec, command, args });
       if (args.includes('status')) return { stdout: ' M uncommitted.txt\n', stderr: '' };
       if (args.includes('remote')) return { stdout: 'https://example.test/a.git\n', stderr: '' };
+      if (args.includes('rev-parse') && args.includes('--git-path')) return { stdout: '/workspace/repo/.git/objects\n', stderr: '' };
       if (args.includes('rev-parse') && args.includes('--short')) return { stdout: 'abc123\n', stderr: '' };
       if (args.includes('rev-parse')) return { stdout: 'abcdef\n', stderr: '' };
       if (args.includes('write-tree')) return { stdout: 'tree-id\n', stderr: '' };
@@ -1297,6 +1302,7 @@ describe('project core lifecycle', function () {
       e.calls.push({ op: 'exec', spec: execSpec, command, args });
       if (args.includes('status')) return { stdout: ' M work.txt\n', stderr: '' };
       if (args.includes('remote')) return { stdout: 'https://example.test/a.git\n', stderr: '' };
+      if (args.includes('rev-parse') && args.includes('--git-path')) return { stdout: '/workspace/repo/.git/objects\n', stderr: '' };
       if (args.includes('rev-parse') && args.includes('--short')) return { stdout: 'abc\n', stderr: '' };
       if (args.includes('rev-parse')) return { stdout: 'abcdef\n', stderr: '' };
       if (args.includes('write-tree')) return { stdout: 'tree-id\n', stderr: '' };
@@ -1469,6 +1475,7 @@ describe('project core lifecycle', function () {
       engineRef.calls.push({ op: 'exec', spec, command, args });
       if (args.includes('status')) return { stdout: ' M work.txt\n', stderr: '' };
       if (args.includes('remote')) return { stdout: 'https://example.test/a.git\n', stderr: '' };
+      if (args.includes('rev-parse') && args.includes('--git-path')) return { stdout: '/workspace/repo/.git/objects\n', stderr: '' };
       if (args.includes('rev-parse') && args.includes('--short')) return { stdout: 'abc123\n', stderr: '' };
       if (args.includes('rev-parse')) return { stdout: 'abcdef\n', stderr: '' };
       if (args.includes('write-tree')) return { stdout: 'tree-id\n', stderr: '' };
@@ -1534,12 +1541,32 @@ describe('project repository transport', function () {
     assert.ok(!result.message.includes('owner-secret')); assert.match(result.message, /\*\*\*/);
   });
   it('passes auth as a one-shot git header and redacts it from clone failures', async function () {
-    const e = engine({ async exec(spec, _cmd, args) {
+    const e = engine({ async exec(spec, command, args) {
       assert.strictEqual(spec.identity, 'box-id');
-      assert.ok(args.includes('http.extraHeader=AUTHORIZATION: bearer secret'));
-      throw Object.assign(new Error('secret failed'), { stderr: 'secret failed' });
+      if (command === 'sh') {
+        assert.ok(spec.env.CAWC_GIT_HTTP_EXTRA_HEADER.includes('secret'));
+        assert.ok(!args.some((arg) => arg.includes('secret')));
+        throw Object.assign(new Error('secret failed'), { stderr: 'secret failed' });
+      }
+      return { stdout: '', stderr: '' };
     } });
     await assert.rejects(() => cloneRepository({ engine: e, containerName: 'box', containerIdentity: 'box-id', repoUrl: 'https://example.test/a.git', destination: '/workspace/a', credential: 'secret' }), /\*\*\* failed/);
+  });
+
+  it('does not let global url rewriting redirect an isolated clone', async function () {
+    const dir = root(); const attacker = path.join(dir, 'attacker.git'); const destination = path.join(dir, 'clone'); const global = path.join(dir, 'global.gitconfig');
+    execFileSync('git', ['init', '--bare', attacker]);
+    execFileSync('git', ['config', '--file', global, `url.file://${attacker}.insteadOf`, 'https://127.0.0.1:1/intended.git']);
+    const previous = process.env.GIT_CONFIG_GLOBAL; process.env.GIT_CONFIG_GLOBAL = global;
+    const e = engine({ async exec(spec, command, args) {
+      return { stdout: execFileSync(command, args, { cwd: spec.cwd, encoding: 'utf8', env: { ...process.env, ...(spec.env || {}) } }), stderr: '' };
+    } });
+    try {
+      await assert.rejects(() => cloneRepository({ engine: e, containerName: 'box', containerIdentity: 'box-id', repoUrl: 'https://127.0.0.1:1/intended.git', destination, timeoutMs: 2_000 }));
+      assert.ok(!fs.existsSync(destination), 'the attacker repository was never cloned');
+    } finally {
+      if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = previous;
+    }
   });
 
   it('never consults the installation GitHub token for a private repository', async function () {
@@ -1712,6 +1739,7 @@ describe('project lifecycle transaction and preservation recovery', function () 
       calls.push(args);
       if (args.includes('status')) return { stdout: ' M work.txt\n', stderr: '' };
       if (args.includes('remote')) return { stdout: 'https://example.test/mutable-origin.git\n', stderr: '' };
+      if (args.includes('rev-parse') && args.includes('--git-path')) return { stdout: '/workspace/repo/.git/objects\n', stderr: '' };
       if (args.includes('rev-parse') && args.includes('--short')) return { stdout: 'abc123\n', stderr: '' };
       if (args.includes('rev-parse')) return { stdout: 'abcdef012345\n', stderr: '' };
       if (args.includes('write-tree')) return { stdout: 'tree-id\n', stderr: '' };
@@ -1727,6 +1755,7 @@ describe('project lifecycle transaction and preservation recovery', function () 
     assert.strictEqual(retried.preserved, true);
     assert.ok(calls.filter((args) => args.includes('push')).length === 2, 'retry pushes the restored work');
     const credentialed = calls.filter((args) => args.some((arg) => arg.includes('owner-secret')));
+    assert.strictEqual(credentialed.length, 0, 'the host credential is never placed in a Git argv array');
     assert.ok(credentialed.every((args) => args.includes('ls-remote') || args.includes('push')));
     assert.ok(credentialed.every((args) => args.includes('https://example.test/repo.git')));
     assert.ok(credentialed.every((args) => !args.includes('https://example.test/mutable-origin.git')));
@@ -1742,6 +1771,7 @@ describe('project lifecycle transaction and preservation recovery', function () 
       calls.push(args);
       if (args.includes('status')) return { stdout: ' M work.txt\n', stderr: '' };
       if (args.includes('remote')) return { stdout: 'https://example.test/repo.git\n', stderr: '' };
+      if (args.includes('rev-parse') && args.includes('--git-path')) return { stdout: '/workspace/repo/.git/objects\n', stderr: '' };
       if (args.includes('rev-parse') && args.includes('--short')) return { stdout: 'abc\n', stderr: '' };
       if (args.includes('rev-parse')) return { stdout: 'abcdef\n', stderr: '' };
       if (args.includes('write-tree')) return { stdout: 'tree-id\n', stderr: '' };
@@ -1771,21 +1801,45 @@ describe('project lifecycle transaction and preservation recovery', function () 
     fs.writeFileSync(path.join(repo, 'staged.txt'), 'staged'); git('add', 'staged.txt');
     fs.writeFileSync(path.join(repo, 'untracked.txt'), 'untracked');
     const beforeHead = git('rev-parse', 'HEAD'); const beforeStatus = git('status', '--porcelain=v1');
-    const e = engine({ async exec(spec, command, args) {
+    let pushed = false; const e = engine({ async exec(spec, command, args) {
       if (command === 'rm') { fs.rmSync(args[args.length - 1], { force: true }); return { stdout: '', stderr: '' }; }
+      if (command === 'sh' && args.includes('push')) { pushed = true; return { stdout: '', stderr: '' }; }
       // Keep the durable HTTP origin intact for origin validation, but route
-      // this fixture's one network operation to a local bare repository.
-      const executedArgs = args.includes('push')
-        ? args.map((arg) => arg === 'https://example.test/repo.git' ? `file://${remote}` : arg)
-        : args;
-      return { stdout: execFileSync(command, executedArgs, { encoding: 'utf8', env: { ...process.env, ...(spec.env || {}) } }), stderr: '' };
+      // this fixture's real local operations inside its temporary checkout.
+      return { stdout: execFileSync(command, args, { encoding: 'utf8', env: { ...process.env, ...(spec.env || {}) } }), stderr: '' };
     } });
     const result = await preserveProjectWork({ engine: e, containerName: 'box', containerIdentity: 'box-id', repoContainerPath: repo, repoUrl: 'https://example.test/repo.git', author: { name: 'Ada', email: 'ada@example.test' } });
     assert.strictEqual(git('rev-parse', 'HEAD'), beforeHead);
     assert.strictEqual(git('status', '--porcelain=v1'), beforeStatus);
     assert.notStrictEqual(git('branch', '--show-current').trim(), 'hook-moved');
     assert.strictEqual(git('cat-file', '-t', result.commit).trim(), 'commit');
-    assert.match(execFileSync('git', ['--git-dir', remote, 'show-ref', result.branch], { encoding: 'utf8' }), new RegExp(result.commit));
+    assert.strictEqual(pushed, true);
+  });
+
+  it('does not let local or global URL rewriting redirect WIP pushes', async function () {
+    for (const scope of ['local', 'global']) {
+      const dir = root(); const repo = path.join(dir, 'repo'); const attacker = path.join(dir, 'attacker.git'); const global = path.join(dir, 'global.gitconfig');
+      const intended = 'https://127.0.0.1:1/intended.git'; fs.mkdirSync(repo, { recursive: true });
+      const git = (...args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+      execFileSync('git', ['init', '--bare', attacker]);
+      git('init'); git('config', 'user.name', 'Owner'); git('config', 'user.email', 'owner@example.test');
+      fs.writeFileSync(path.join(repo, 'work.txt'), 'base'); git('add', 'work.txt'); git('commit', '-m', 'base'); git('remote', 'add', 'origin', intended);
+      fs.writeFileSync(path.join(repo, 'work.txt'), 'dirty');
+      if (scope === 'local') git('config', `url.file://${attacker}.insteadOf`, intended);
+      else execFileSync('git', ['config', '--file', global, `url.file://${attacker}.insteadOf`, intended]);
+      const previous = process.env.GIT_CONFIG_GLOBAL; if (scope === 'global') process.env.GIT_CONFIG_GLOBAL = global;
+      const e = engine({ async exec(spec, command, args) {
+        return { stdout: execFileSync(command, args, { cwd: spec.cwd, encoding: 'utf8', env: { ...process.env, ...(spec.env || {}) } }), stderr: '' };
+      } });
+      try {
+        await assert.rejects(() => preserveProjectWork({ engine: e, containerName: 'box', containerIdentity: 'box-id', repoContainerPath: repo, repoUrl: intended, author: { name: 'Ada', email: 'ada@example.test' }, timeoutMs: 2_000 }));
+        assert.strictEqual(execFileSync('git', ['--git-dir', attacker, 'for-each-ref'], { encoding: 'utf8' }), '', `${scope} rewrite must not receive a WIP ref`);
+      } finally {
+        if (scope === 'global') {
+          if (previous === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = previous;
+        }
+      }
+    }
   });
 
   it('fails closed before a top-level WIP commit can reduce a clean local-only nested commit to a gitlink', async function () {
@@ -1821,6 +1875,7 @@ describe('project lifecycle transaction and preservation recovery', function () 
     let signal; const e = engine({ async exec(spec, _cmd, args) {
       if (args.includes('status')) return { stdout: ' M work.txt\n', stderr: '' };
       if (args.includes('remote')) return { stdout: 'https://example.test/repo.git\n', stderr: '' };
+      if (args.includes('rev-parse') && args.includes('--git-path')) return { stdout: '/workspace/repo/.git/objects\n', stderr: '' };
       if (args.includes('rev-parse') && args.includes('--short')) return { stdout: 'abc\n', stderr: '' };
       if (args.includes('rev-parse')) return { stdout: 'abcdef\n', stderr: '' };
       if (args.includes('write-tree')) return { stdout: 'tree-id\n', stderr: '' };
@@ -1836,6 +1891,7 @@ describe('project lifecycle transaction and preservation recovery', function () 
     let pushes = 0; const collisionEngine = engine({ async exec(_spec, _cmd, args) {
       if (args.includes('status')) return { stdout: ' M work.txt\n', stderr: '' };
       if (args.includes('remote')) return { stdout: 'https://example.test/repo.git\n', stderr: '' };
+      if (args.includes('rev-parse') && args.includes('--git-path')) return { stdout: '/workspace/repo/.git/objects\n', stderr: '' };
       if (args.includes('rev-parse') && args.includes('--short')) return { stdout: 'abc\n', stderr: '' };
       if (args.includes('rev-parse')) return { stdout: 'abcdef\n', stderr: '' };
       if (args.includes('write-tree')) return { stdout: 'tree-id\n', stderr: '' };

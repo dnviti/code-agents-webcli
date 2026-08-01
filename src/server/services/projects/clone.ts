@@ -1,6 +1,7 @@
 /** Safe, HTTP-only repository access and cloning for project workspaces. */
 
 import { EnvironmentEngine } from '../environments/engine.js';
+import { randomUUID } from 'node:crypto';
 
 export type RepositoryAccess =
   | { ok: true; host: string }
@@ -105,6 +106,42 @@ function redact(message: string, token: string | null | undefined): string {
   return token ? message.split(token).join('***') : message;
 }
 
+/**
+ * Configuration for a Git transport that must not inherit a project's Git
+ * settings. In particular, `url.*.insteadOf` and `pushInsteadOf` could turn
+ * the recorded URL into an attacker endpoint after we attach a host token.
+ */
+export function isolatedGitNetworkInvocation(
+  gitArgs: string[],
+  credential?: string | null,
+  alternateObjects?: string,
+): { command: string; args: string[]; env?: Record<string, string> } {
+  const assignments = [
+    'PATH=/usr/local/bin:/usr/bin:/bin',
+    'HOME=/tmp',
+    'LC_ALL=C',
+    'GIT_CONFIG_GLOBAL=/dev/null',
+    'GIT_CONFIG_SYSTEM=/dev/null',
+    'GIT_CONFIG_NOSYSTEM=1',
+    'GIT_ASKPASS=/bin/false',
+    'GIT_TERMINAL_PROMPT=0',
+    'GIT_ALLOW_PROTOCOL=http:https',
+    `GIT_CONFIG_COUNT=${credential ? '1' : '0'}`,
+    ...(credential ? ['GIT_CONFIG_KEY_0=http.extraHeader', 'GIT_CONFIG_VALUE_0="$CAWC_GIT_HTTP_EXTRA_HEADER"'] : []),
+    ...(alternateObjects ? ['GIT_ALTERNATE_OBJECT_DIRECTORIES="$CAWC_GIT_ALTERNATE_OBJECTS"'] : []),
+  ];
+  return {
+    // `env -i` drops inherited Git config, proxy, trace and credential-helper
+    // variables. The shell program is fixed; Git arguments are passed as `$@`.
+    command: 'sh',
+    args: ['-c', `exec env -i ${assignments.join(' ')} git -c core.hooksPath=/dev/null -c credential.helper= -c http.followRedirects=false -c protocol.allow=never -c protocol.http.allow=always -c protocol.https.allow=always "$@"`, 'sh', ...gitArgs],
+    env: {
+      ...(credential ? { CAWC_GIT_HTTP_EXTRA_HEADER: `AUTHORIZATION: bearer ${credential}` } : {}),
+      ...(alternateObjects ? { CAWC_GIT_ALTERNATE_OBJECTS: alternateObjects } : {}),
+    },
+  };
+}
+
 /** Clone inside the project container without ever writing an auth token to disk. */
 export async function cloneRepository(options: {
   engine: EnvironmentEngine;
@@ -122,11 +159,12 @@ export async function cloneRepository(options: {
   if (!url || (credential && url.protocol !== 'https:')) {
     throw new CloneError(credential ? 'Repository credentials require HTTPS' : 'Invalid repository URL');
   }
-  const auth = credential ? ['-c', `http.extraHeader=AUTHORIZATION: bearer ${credential}`] : [];
   const controller = new AbortController();
   let timeout: NodeJS.Timeout | null = null;
   let didTimeout = false;
+  const isolatedCwd = `/tmp/cawc-clone-${randomUUID()}`;
   try {
+    await engine.exec({ name: containerName, identity: containerIdentity, signal: controller.signal }, 'mkdir', ['-m', '700', '--', isolatedCwd]);
     const timedOut = new Promise<never>((_resolve, reject) => {
       timeout = setTimeout(() => {
         didTimeout = true;
@@ -135,11 +173,13 @@ export async function cloneRepository(options: {
       }, Math.max(1, timeoutMs));
       timeout.unref();
     });
+    const transport = isolatedGitNetworkInvocation(['clone', '--', repoUrl, destination], credential);
     await Promise.race([
-      engine.exec({ name: containerName, identity: containerIdentity, cwd: '/workspace', signal: controller.signal }, 'git', [
-        ...auth,
-        'clone', '--', repoUrl, destination,
-      ]),
+      engine.exec(
+        { name: containerName, identity: containerIdentity, cwd: isolatedCwd, signal: controller.signal, env: transport.env },
+        transport.command,
+        transport.args,
+      ),
       timedOut,
     ]);
   } catch (error) {
@@ -149,5 +189,8 @@ export async function cloneRepository(options: {
     throw new CloneError(redact((err.stderr || err.message || String(error)).trim(), credential));
   } finally {
     if (timeout) clearTimeout(timeout);
+    try {
+      await engine.exec({ name: containerName, identity: containerIdentity }, 'rm', ['-rf', '--', isolatedCwd]);
+    } catch { /* The isolated cwd contains no owner work or credentials. */ }
   }
 }
