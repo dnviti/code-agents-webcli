@@ -88,12 +88,21 @@ describe('tracked container process control', function() {
       await waitUntil(() => fs.existsSync(controlFile));
 
       terminal.write(
-        "sleep 100 & setsid sh -c 'trap \"\" TERM; while :; do sleep 1; done' & echo TRACKED_READY\n",
+        "sleep 100 & setsid sh -c 'trap \"\" TERM; while :; do sleep 1; done' & printf 'TRACKED_%s\\n' READY\n",
       );
       await waitUntil(() => output.includes('TRACKED_READY'));
 
       const [leader, start] = fs.readFileSync(controlFile, 'utf8').trim().split(/\s+/);
-      const members = tokenProcesses(token).map((pid) => ({ pid, ...stat(pid) }));
+      let members;
+      await waitUntil(() => {
+        try {
+          members = tokenProcesses(token).map((pid) => ({ pid, ...stat(pid) }));
+          return members.some((member) => member.pgrp !== Number(leader))
+            && members.some((member) => member.session !== Number(leader));
+        } catch {
+          return false;
+        }
+      });
       assert.ok(members.some((member) => member.pgrp !== Number(leader)), 'job control opened another process group');
       assert.ok(members.some((member) => member.session !== Number(leader)), 'setsid descendant escaped the original SID');
 
