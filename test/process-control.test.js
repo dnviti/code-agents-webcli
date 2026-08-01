@@ -105,7 +105,14 @@ describe('tracked container process control', function() {
     let control;
     let cleanupVerified = false;
     try {
-      fs.writeFileSync(bashrcFile, `PS1='${shellPrompt}'\nPROMPT_COMMAND=\n`);
+      fs.writeFileSync(bashrcFile, [
+        `PS1='${shellPrompt}'`,
+        'PROMPT_COMMAND=',
+        "sh -c 'printf \"%s\\n\" \"$$\" > \"$CAWC_JOB_FILE\"; trap \"\" TERM; exec sleep 100' &",
+        "setsid sh -c 'printf \"%s\\n\" \"$$\" > \"$CAWC_DETACHED_FILE\"; trap \"\" TERM; while :; do sleep 1; done' &",
+        "printf 'TRACKED_%s\\n' READY",
+        '',
+      ].join('\n'));
       terminal = pty.spawn(
         'sh',
         [
@@ -128,16 +135,10 @@ describe('tracked container process control', function() {
       terminal.onData((value) => { output += value; });
       const exited = new Promise((resolve) => terminal.onExit(resolve));
       await waitUntil(() => fs.existsSync(controlFile), 'runtime identity');
-      await waitUntil(() => output.includes(shellPrompt), 'interactive shell prompt');
-
-      terminal.write(
-        "sh -c 'printf \"%s\\n\" \"$$\" > \"$CAWC_JOB_FILE\"; trap \"\" TERM; exec sleep 100' & "
-          + "setsid sh -c 'printf \"%s\\n\" \"$$\" > \"$CAWC_DETACHED_FILE\"; trap \"\" TERM; while :; do sleep 1; done' & "
-          // A PTY receives Enter as carriage return. A bare line feed executes
-          // only under some terminal modes and left the command pending in CI.
-          + "printf 'TRACKED_%s\\n' READY\r",
+      await waitUntil(
+        () => output.includes('TRACKED_READY') && output.includes(shellPrompt),
+        'interactive tracked-child startup',
       );
-      await waitUntil(() => output.includes('TRACKED_READY'), 'tracked child command');
 
       const [leader, start] = fs.readFileSync(controlFile, 'utf8').trim().split(/\s+/);
       let job;
