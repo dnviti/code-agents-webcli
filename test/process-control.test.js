@@ -133,7 +133,9 @@ describe('tracked container process control', function() {
       terminal.write(
         "sh -c 'printf \"%s\\n\" \"$$\" > \"$CAWC_JOB_FILE\"; trap \"\" TERM; exec sleep 100' & "
           + "setsid sh -c 'printf \"%s\\n\" \"$$\" > \"$CAWC_DETACHED_FILE\"; trap \"\" TERM; while :; do sleep 1; done' & "
-          + "printf 'TRACKED_%s\\n' READY\n",
+          // A PTY receives Enter as carriage return. A bare line feed executes
+          // only under some terminal modes and left the command pending in CI.
+          + "printf 'TRACKED_%s\\n' READY\r",
       );
       await waitUntil(() => output.includes('TRACKED_READY'), 'tracked child command');
 
