@@ -786,9 +786,13 @@ export class ProjectManager {
     return error instanceof Error ? error.message : String(error);
   }
 
-  private projectStorageRootForEngine(engineKey: string): string | null {
+  private async projectStorageRootForEngine(engineKey: string): Promise<string | null> {
     try {
-      return path.resolve(this.deps.environments.projectStorageRoot(engineKey === 'legacy' ? null : engineKey));
+      // Group aliases by their physical root. A lexical `resolve()` would let
+      // a failing alias scan race a successful sweep of the same bytes.
+      return await fsp.realpath(path.resolve(
+        this.deps.environments.projectStorageRoot(engineKey === 'legacy' ? null : engineKey),
+      ));
     } catch {
       return null;
     }
@@ -833,7 +837,6 @@ export class ProjectManager {
     // find it: that scan can itself be unavailable. Record only the expected
     // name for interrupted, counted rows, then let the identity-bound pass
     // below prove it absent, owned, foreign, or unreachable.
-    const unrecordedInterrupted = new Set<string>();
     for (const project of this.deps.store.listProjectsInState('building', 'running', 'reclaiming')) {
       if (project.container) continue;
       try {
@@ -841,7 +844,6 @@ export class ProjectManager {
         this.deps.store.setContainer(project.id, {
           name: projectContainerName(target.config.namePrefix, project),
         });
-        unrecordedInterrupted.add(project.id);
       } catch (error) {
         reconciled.add(project.id);
         this.deps.store.setState(
@@ -857,15 +859,21 @@ export class ProjectManager {
     // root completed its scan; one uncertain engine could still be executing
     // from the same workspace.
     const rootScans = new Map<string, { complete: boolean; protectedIds: Set<string> }>();
+    // A conflict name is not placement authority. Until every reachable
+    // engine has completed this pass, a claimant might still be alive on a
+    // different target, so do not clear its durable conflict marker.
+    let engineScansComplete = true;
+    const observedConflictClaimants = new Set<string>();
     for (const engineKey of this.deps.environments.reachableEngines().keys()) {
-      const root = this.projectStorageRootForEngine(engineKey);
+      const root = await this.projectStorageRootForEngine(engineKey);
       if (root && !rootScans.has(root)) rootScans.set(root, { complete: true, protectedIds: new Set() });
     }
     for (const [engineKey, engine] of this.deps.environments.reachableEngines()) {
-      const root = this.projectStorageRootForEngine(engineKey);
+      const root = await this.projectStorageRootForEngine(engineKey);
       const scan = root ? rootScans.get(root) : undefined;
       let names: string[];
       try { names = await engine.list(PROJECT_LABEL); } catch (error) {
+        engineScansComplete = false;
         if (scan) scan.complete = false;
         console.error(`Project reconcile: could not list target '${engineKey}':`, error);
         continue;
@@ -874,37 +882,64 @@ export class ProjectManager {
         try {
           const described = await engine.describeStrict(name);
           // The project label is public metadata and can appear on unrelated
-          // containers. Only this application's explicitly managed containers
-          // are eligible for reconciliation or destructive orphan cleanup.
-          if (!described || described.labels[MANAGED_LABEL] !== 'true') continue;
+          // containers. Any UUID-labelled container might still mount the
+          // matching workspace, however, so protect it before deciding
+          // whether its ownership labels permit reconciliation.
+          if (!described) continue;
           const id = described.labels[PROJECT_LABEL];
           const project = id ? this.deps.store.getProject(id) : null;
-          // A managed UUID-labelled runtime can mount this root even when its
-          // labels are malformed or its DB row is gone. Keep its directory
-          // protected unless this exact identity is removed and then proved
-          // absent. This is deliberately per-root: target configurations may
-          // share a workspace root.
-          if (scan && id && PROJECT_ID.test(id)) scan.protectedIds.add(id);
-          if (project && unrecordedInterrupted.has(project.id)
-            && (!project.container
-              || name !== project.container.name
-              || engineKey !== (project.targetId || 'legacy'))) {
-            // The expected name was synthesized above solely to recover a
-            // crash window. A same-label container on another engine or name
-            // must never become its replacement record.
+          if (project?.container?.reconciliationConflict === 'unverified_runtime') {
+            // A conflict remains observed even if this claimant's labels have
+            // changed. Its stored name does not grant placement authority.
             reconciled.add(project.id);
-            this.deps.store.setContainer(project.id, {
-              name: described.name,
-              reconciliationConflict: 'unverified_runtime',
-            });
+            observedConflictClaimants.add(project.id);
             this.deps.store.setState(
               project.id,
               'reclaiming',
-              'A project-labelled runtime did not match the interrupted project placement; manual recovery required',
+              'An unverified project-labelled runtime still exists; manual recovery required',
             );
             this.publish(this.deps.store.getProject(project.id) as Project);
             continue;
           }
+          if (project) {
+            // A project label identifies a workspace, not the authority to
+            // use it. Check placement before the managed-label early return:
+            // even a foreign claimant must block lifecycle deletion.
+            const expectedKey = project.targetId || 'legacy';
+            let expected;
+            try {
+              expected = this.deps.environments.projectTarget(project.targetId);
+            } catch {
+              expected = null;
+            }
+            const expectedName = project.container?.name || projectContainerName(expected?.config.namePrefix || '', project);
+            const exactRuntime = Boolean(expected)
+              && engineKey === expectedKey
+              && engine === expected!.engine
+              && described.name === expectedName
+              && described.labels[MANAGED_LABEL] === 'true'
+              && described.labels[USER_ID_LABEL] === String(project.ownerUserId)
+              && described.labels[TARGET_LABEL] === targetLabelValue(expectedKey);
+            if (!exactRuntime) {
+              reconciled.add(project.id);
+              observedConflictClaimants.add(project.id);
+              this.deps.store.setContainer(project.id, project.container
+                ? { ...project.container, reconciliationConflict: 'unverified_runtime' }
+                : { name: described.name, reconciliationConflict: 'unverified_runtime' });
+              this.deps.store.setState(
+                project.id,
+                'reclaiming',
+                'A project-labelled runtime did not match the recorded project placement; manual recovery required',
+              );
+              this.publish(this.deps.store.getProject(project.id) as Project);
+              continue;
+            }
+          }
+          if (scan && id && PROJECT_ID.test(id)
+            && described.labels[MANAGED_LABEL] !== 'true') scan.protectedIds.add(id);
+          // Only this application's explicitly managed containers are
+          // eligible for reconciliation or destructive orphan cleanup.
+          if (described.labels[MANAGED_LABEL] !== 'true') continue;
           // A managed container with no project row is an orphan. A container
           // whose label/name collides with an existing row is *not* an orphan:
           // it may be foreign, so reconciliation must retain the row and let
@@ -914,6 +949,11 @@ export class ProjectManager {
             && PROJECT_ID.test(id)
             && /^\d+$/.test(described.labels[USER_ID_LABEL] || '')
             && described.labels[TARGET_LABEL] === targetLabelValue(engineKey);
+          // A managed UUID-labelled runtime with an unsafe claimant shape is
+          // never removable, and may be using this root. Safe orphans are
+          // intentionally not protected: a removal failure makes the entire
+          // root scan incomplete instead.
+          if (!isSafeOrphan && scan && id && PROJECT_ID.test(id)) scan.protectedIds.add(id);
           if (isSafeOrphan) {
             await engine.removeIdentity(described);
             if (await engine.describeStrict(name)) {
@@ -922,7 +962,6 @@ export class ProjectManager {
             if (!root) throw new Error(`managed orphan '${name}' has no resolvable storage root`);
             // Workspace deletion is deferred until every engine sharing this
             // root completes. Another target can still have this UUID mounted.
-            scan?.protectedIds.delete(id);
             continue;
           }
           if (project && !project.container) {
@@ -959,6 +998,7 @@ export class ProjectManager {
             this.publish(this.deps.store.getProject(project.id) as Project);
           }
         } catch (error) {
+          engineScansComplete = false;
           if (scan) scan.complete = false;
           console.error(`Project reconcile: could not reconcile '${name}':`, error);
         }
@@ -978,12 +1018,13 @@ export class ProjectManager {
           this.publish(this.deps.store.getProject(project.id) as Project);
           return;
         }
-        const storageRoot = this.projectStorageRootForEngine(target.key);
+        const storageRoot = await this.projectStorageRootForEngine(target.key);
         const scan = storageRoot ? rootScans.get(storageRoot) : undefined;
         let described;
         try {
           described = await target.engine.describeStrict(project.container.name);
         } catch (error) {
+          engineScansComplete = false;
           if (scan) scan.complete = false;
           const detail = `Recorded project container could not be inspected: ${(error as Error).message}`;
           // Its physical state is unknown, so retain a counted state until an
@@ -998,7 +1039,7 @@ export class ProjectManager {
           // stop it, and never let a direct name lookup substitute for a
           // complete target scan: another same-workspace runtime could have
           // appeared while the target was unavailable.
-          if (described) {
+          if (described || observedConflictClaimants.has(project.id)) {
             if (scan && PROJECT_ID.test(project.id)) scan.protectedIds.add(project.id);
             this.deps.store.setState(
               project.id,
@@ -1008,7 +1049,7 @@ export class ProjectManager {
             this.publish(this.deps.store.getProject(project.id) as Project);
             return;
           }
-          if (!scan?.complete) {
+          if (!engineScansComplete || !scan?.complete) {
             this.deps.store.setState(
               project.id,
               'reclaiming',
@@ -1045,6 +1086,7 @@ export class ProjectManager {
           && described.labels[USER_ID_LABEL] === String(project.ownerUserId)
           && described.labels[TARGET_LABEL] === targetLabelValue(expectedKey);
         if (!ownershipMatches) {
+          engineScansComplete = false;
           if (scan) scan.complete = false;
           // Do not clear the recorded name or touch its workspace: it may now
           // name a foreign container. Keep the lifecycle counted until an
@@ -1077,6 +1119,7 @@ export class ProjectManager {
             this.deps.store.setContainer(project.id, null);
           }
         } catch (error) {
+          engineScansComplete = false;
           if (scan) scan.complete = false;
           const detail = `Interrupted project container could not be retired safely: ${(error as Error).message}`;
           this.deps.store.setState(project.id, 'reclaiming', detail);

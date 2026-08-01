@@ -1241,6 +1241,84 @@ describe('project core lifecycle', function () {
     assert.ok(!e.calls.some((call) => call.op === 'remove'));
   });
 
+  it('retains an unsafe UUID workspace when a safe duplicate is removed later in the scan', async function () {
+    const id = '123e4567-e89b-42d3-a456-426614174006';
+    let safePresent = true;
+    const { manager, e, dir } = setup([], {
+      engine: {
+        async describe(name) {
+          if (name === 'unsafe') return {
+            name, identity: 'unsafe-id', status: 'running', image: 'img', labels: {
+              'com.code-agents-webcli.managed': 'true',
+              'com.code-agents-webcli.project': id,
+              'com.code-agents-webcli.user-id': 'foreign',
+              'com.code-agents-webcli.target': 'legacy',
+            },
+          };
+          if (name === 'safe' && safePresent) return {
+            name, identity: 'safe-id', status: 'running', image: 'img', labels: {
+              'com.code-agents-webcli.managed': 'true',
+              'com.code-agents-webcli.project': id,
+              'com.code-agents-webcli.user-id': '1',
+              'com.code-agents-webcli.target': 'legacy',
+            },
+          };
+          return null;
+        },
+      },
+    });
+    const workspace = path.join(dir, 'projects', id); fs.mkdirSync(workspace, { recursive: true });
+    e.list = async () => ['unsafe', 'safe'];
+    e.removeIdentity = async (description) => { if (description.name === 'safe') safePresent = false; };
+
+    await manager.reconcileOnBoot();
+
+    assert.ok(fs.existsSync(workspace), 'the unsafe duplicate still protects the shared UUID workspace');
+    assert.strictEqual(safePresent, false, 'the safe duplicate was nevertheless retired');
+  });
+
+  it('retains a UUID workspace when an unmanaged claimant carries its project label', async function () {
+    const id = '123e4567-e89b-42d3-a456-426614174007';
+    const { manager, e, dir } = setup([], {
+      engine: {
+        async describe(name) {
+          return {
+            name, identity: 'foreign-id', status: 'running', image: 'img', labels: {
+              'com.code-agents-webcli.project': id,
+            },
+          };
+        },
+      },
+    });
+    const workspace = path.join(dir, 'projects', id); fs.mkdirSync(workspace, { recursive: true });
+    e.list = async () => ['unmanaged'];
+
+    await manager.reconcileOnBoot();
+
+    assert.ok(fs.existsSync(workspace));
+  });
+
+  it('groups symlinked storage roots before allowing a stale workspace sweep', async function () {
+    const id = '123e4567-e89b-42d3-a456-426614174008';
+    const { manager, e, dir, environments, cfg } = setup([]);
+    const alias = path.join(path.dirname(dir), `${path.basename(dir)}-alias`);
+    try {
+      fs.symlinkSync(dir, alias, 'dir');
+    } catch (error) {
+      if (error.code === 'EPERM' || error.code === 'EACCES' || error.code === 'ENOTSUP') this.skip();
+      throw error;
+    }
+    const other = engine({ async list() { throw new Error('aliased target unavailable'); } });
+    environments.engines.set('other-target', other);
+    environments.configs.set('other-target', { ...cfg, rootDir: alias });
+    const workspace = path.join(dir, 'projects', id); fs.mkdirSync(workspace, { recursive: true });
+    e.list = async () => [];
+
+    await manager.reconcileOnBoot();
+
+    assert.ok(fs.existsSync(workspace));
+  });
+
   it('ignores unrelated containers that spoof only the project label on boot', async function () {
     const { manager, e } = setup([], { engine: { async describe(name) { return { name, labels: { 'com.code-agents-webcli.project': 'gone' } }; } } });
     e.list = async () => ['unrelated'];
@@ -1270,7 +1348,8 @@ describe('project core lifecycle', function () {
     };
     await manager.reconcileOnBoot();
     assert.ok(!e.calls.some((call) => call.op === 'remove' && call.name === 'intruder'));
-    assert.ok(e.calls.some((call) => call.op === 'stop' && call.name === 'saved' && call.identity === 'saved-id'));
+    assert.deepStrictEqual(p.container, { name: 'saved', reconciliationConflict: 'unverified_runtime' });
+    assert.ok(!e.calls.some((call) => call.op === 'stop' || call.op === 'remove'));
   });
 
   it('adopts an exact crash-window runtime before boot reconciliation retires and reclaims it', async function () {
@@ -1332,7 +1411,7 @@ describe('project core lifecycle', function () {
     await manager.reconcileOnBoot();
 
     assert.deepStrictEqual(s.getProject(p.id).container, {
-      name: 'wrong-name', reconciliationConflict: 'unverified_runtime',
+      name: projectContainerName('cawc', p), reconciliationConflict: 'unverified_runtime',
     });
     assert.strictEqual(s.getProject(p.id).state, 'reclaiming');
     assert.ok(!e.calls.some((call) => call.op === 'stop' || call.op === 'remove'));
@@ -1347,6 +1426,87 @@ describe('project core lifecycle', function () {
     assert.strictEqual(s.getProject(p.id).state, 'stopped');
     assert.deepStrictEqual(await manager.remove(1, p.id), { ok: true });
     assert.ok(!fs.existsSync(workspace), 'a complete later scan unlocks deletion only after the claimant is gone');
+  });
+
+  it('blocks deletion for a stopped null-container row claimed by a wrong-name runtime', async function () {
+    const id = '123e4567-e89b-42d3-a456-426614174009';
+    const p = project(id, 'stopped');
+    const { manager, s, e, dir } = setup([p]);
+    const workspace = path.join(dir, 'projects', id); fs.mkdirSync(workspace, { recursive: true });
+    e.list = async () => ['wrong-name'];
+    e.describe = async (name) => name === 'wrong-name' ? ({
+      name, identity: 'foreign-id', status: 'running', image: 'img', labels: {
+        'com.code-agents-webcli.managed': 'true',
+        'com.code-agents-webcli.project': id,
+        'com.code-agents-webcli.user-id': '1',
+        'com.code-agents-webcli.target': 'legacy',
+      },
+    }) : null;
+
+    await manager.reconcileOnBoot();
+
+    assert.strictEqual(s.getProject(id).container.reconciliationConflict, 'unverified_runtime');
+    assert.strictEqual(s.getProject(id).state, 'reclaiming');
+    assert.strictEqual((await manager.release(1, id, { discard: true })).ok, false);
+    assert.strictEqual((await manager.remove(1, id)).ok, false);
+    assert.ok(fs.existsSync(workspace));
+  });
+
+  it('blocks deletion when a recorded runtime has a second wrong-name claimant', async function () {
+    const id = '123e4567-e89b-42d3-a456-426614174010';
+    const p = project(id, 'stopped'); p.container = { name: 'expected' };
+    const { manager, s, e, dir } = setup([p]);
+    const workspace = path.join(dir, 'projects', id); fs.mkdirSync(workspace, { recursive: true });
+    const labels = {
+      'com.code-agents-webcli.managed': 'true',
+      'com.code-agents-webcli.project': id,
+      'com.code-agents-webcli.user-id': '1',
+      'com.code-agents-webcli.target': 'legacy',
+    };
+    e.list = async () => ['expected', 'wrong-name'];
+    e.describe = async (name) => ['expected', 'wrong-name'].includes(name)
+      ? { name, identity: `${name}-id`, status: 'running', image: 'img', labels }
+      : null;
+
+    await manager.reconcileOnBoot();
+
+    assert.deepStrictEqual(s.getProject(id).container, { name: 'expected', reconciliationConflict: 'unverified_runtime' });
+    assert.strictEqual((await manager.release(1, id, { discard: true })).ok, false);
+    assert.strictEqual((await manager.remove(1, id)).ok, false);
+    assert.ok(fs.existsSync(workspace));
+    assert.ok(!e.calls.some((call) => call.op === 'stop' || call.op === 'remove'));
+  });
+
+  it('retains a cross-target crash-window claimant until every engine scan proves it absent', async function () {
+    const id = '123e4567-e89b-42d3-a456-426614174011';
+    const p = project(id, 'building');
+    const { manager, s, e, dir, environments, cfg } = setup([p]);
+    const other = engine({
+      async list() { return ['wrong-engine']; },
+      async describe(name) {
+        return name === 'wrong-engine' ? {
+          name, identity: 'other-id', status: 'running', image: 'img', labels: {
+            'com.code-agents-webcli.managed': 'true',
+            'com.code-agents-webcli.project': id,
+            'com.code-agents-webcli.user-id': '1',
+            'com.code-agents-webcli.target': 'other-target',
+          },
+        } : null;
+      },
+    });
+    environments.engines.set('other-target', other);
+    environments.configs.set('other-target', { ...cfg });
+    const workspace = path.join(dir, 'projects', id); fs.mkdirSync(workspace, { recursive: true });
+    e.list = async () => [];
+    e.describe = async () => null;
+
+    await manager.reconcileOnBoot();
+
+    assert.strictEqual(s.getProject(id).container.reconciliationConflict, 'unverified_runtime');
+    assert.strictEqual(s.getProject(id).state, 'reclaiming');
+    assert.strictEqual((await manager.release(1, id, { discard: true })).ok, false);
+    assert.strictEqual((await manager.remove(1, id)).ok, false);
+    assert.ok(fs.existsSync(workspace));
   });
 
   it('retires every potentially executable recorded runtime on boot before marking it stopped', async function () {
