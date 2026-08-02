@@ -1780,11 +1780,12 @@ export function splitOwnWordsOption(options: QuestionOption[]): {
 
 export function isAskQuestionTool(name: string | undefined): boolean {
   if (!name) return false;
-  // Suffix match on a separator of either width. Claude namespaces MCP tools as
+  // Suffix match on the separators runtimes put between a server and its tool.
+  // Codex uses `ccweb.ask_user_question`; Claude namespaces MCP tools as
   // `mcp__<server>__<tool>`; omp reports the same tool as
   // `mcp__ccweb_ask_user_question`, with one underscore. Both were observed —
   // an exact-name table would have silently failed for one of them.
-  return name === ASK_QUESTION_TOOL || /(^|_)ask_user_question$/.test(name);
+  return name === ASK_QUESTION_TOOL || /(^|[._:/])ask_user_question$/.test(name);
 }
 
 /**

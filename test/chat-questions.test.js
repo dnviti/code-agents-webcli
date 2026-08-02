@@ -5,6 +5,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const { PassThrough } = require('stream');
 
+const registry = require('../dist/server/chat/registry.js');
 const { ChatSession } = require('../dist/server/chat/session.js');
 const { PermissionBroker } = require('../dist/server/chat/permission-broker.js');
 const { serveAsk, describeAnswer, ASK_TOOL_DEFINITION, askMcpConfig } = require('../dist/server/chat/ask-mcp.js');
@@ -96,11 +97,28 @@ function session({ bypass = false } = {}) {
 }
 
 /** Resolve, or fail loudly rather than letting mocha time out with no clue. */
-function within(promise, what, ms = 1000) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(what)), ms)),
-  ]);
+async function within(promise, what, ms = 1000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(what)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function eventuallyValue(read, what, ms = 1000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const value = read();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(what);
 }
 
 describe('asking the user a choice-based question', function () {
@@ -201,6 +219,106 @@ describe('asking the user a choice-based question', function () {
       assert.strictEqual(reply.id, 7);
       assert.match(reply.result.content[0].text, /Patch it/);
       assert.notStrictEqual(reply.result.isError, true);
+    });
+
+    it('works through a real Default-mode session and waits for the Web answer', async function () {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'default-question-mcp-'));
+      const store = memoryStore();
+      const sent = [];
+      let adapterOptions;
+      let child;
+      const realFactory = registry.createChatAdapter;
+      registry.createChatAdapter = (runtime, options) => {
+        adapterOptions = options;
+        return {
+          runtime,
+          capabilities: { streaming: true, permissions: false, interrupt: true },
+          alive: true,
+          readyForTurn: true,
+          async start() {},
+          async send(turn) { sent.push(turn.text); },
+          async interrupt() {},
+          async stop() { this.alive = false; },
+          respondPermission() {},
+        };
+      };
+
+      const chat = new ChatSession(
+        { id: 's1', ownerUserId: 7 },
+        {
+          store,
+          socketDir: path.join(root, 'sockets'),
+          hookScript: path.join(root, 'missing-hook.js'),
+          askScript: ASK_SERVER,
+          broadcast: () => {},
+          resolveCommand: () => path.join(root, 'missing-runtime'),
+        },
+      );
+
+      try {
+        await chat.start({
+          runtime: 'claude',
+          workingDir: root,
+          bypassPermissions: true,
+          planMode: false,
+        });
+        await chat.send({ text: 'Help me choose an implementation.' });
+        assert.match(sent[0], /both Default and Plan mode/);
+        assert.match(sent[0], /ask_user_question tool/);
+
+        const at = adapterOptions.extraArgs.indexOf('--mcp-config');
+        assert.ok(at >= 0, 'Default mode must inject the questionnaire MCP server');
+        const config = JSON.parse(adapterOptions.extraArgs[at + 1]).mcpServers.ccweb;
+        child = spawn(config.command, config.args, {
+          env: { ...process.env, ...config.env },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+
+        const queued = [];
+        const waiting = [];
+        let buffer = '';
+        child.stdout.setEncoding('utf8');
+        child.stdout.on('data', (chunk) => {
+          buffer += chunk;
+          let newline;
+          while ((newline = buffer.indexOf('\n')) !== -1) {
+            const reply = JSON.parse(buffer.slice(0, newline));
+            buffer = buffer.slice(newline + 1);
+            const resolve = waiting.shift();
+            if (resolve) resolve(reply);
+            else queued.push(reply);
+          }
+        });
+        const nextReply = () => queued.length
+          ? Promise.resolve(queued.shift())
+          : within(new Promise((resolve) => waiting.push(resolve)), 'the Default-mode MCP server never replied', 5000);
+        const sendRpc = (message) => child.stdin.write(`${JSON.stringify(message)}\n`);
+
+        sendRpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } });
+        assert.strictEqual((await nextReply()).result.serverInfo.name, 'ccweb');
+        sendRpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+        assert.ok((await nextReply()).result.tools.some((tool) => tool.name === 'ask_user_question'));
+
+        sendRpc({
+          jsonrpc: '2.0', id: 3, method: 'tools/call',
+          params: { name: 'ask_user_question', arguments: QUESTION },
+        });
+        const request = await eventuallyValue(
+          () => store.events.find((event) => event.t === 'question')?.request,
+          'the questionnaire MCP call never reached the Web session',
+          5000,
+        );
+        assert.strictEqual(chat.answerQuestion(request.requestId, ['opt-1']), true);
+        const answer = await nextReply();
+        assert.strictEqual(answer.id, 3);
+        assert.match(answer.result.content[0].text, /Patch it/);
+        assert.notStrictEqual(answer.result.isError, true);
+      } finally {
+        child?.kill();
+        await chat.stop();
+        registry.createChatAdapter = realFactory;
+        fs.rmSync(root, { recursive: true, force: true });
+      }
     });
 
     it('passes the model’s own question through untouched', async function () {
@@ -718,6 +836,8 @@ describe('asking the user a choice-based question', function () {
       // and an exact-name table would have silently failed for it while
       // passing for Claude.
       assert.ok(isAskQuestionTool('mcp__ccweb_ask_user_question'));
+      // Codex app-server joins the MCP server and tool with a dot.
+      assert.ok(isAskQuestionTool('ccweb.ask_user_question'));
       assert.ok(isAskQuestionTool(ASK_TOOL_DEFINITION.name));
       assert.ok(!isAskQuestionTool('Bash'));
       assert.ok(!isAskQuestionTool(undefined));

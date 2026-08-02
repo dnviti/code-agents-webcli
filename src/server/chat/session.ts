@@ -28,6 +28,7 @@ import {
   askedQuestionFrom,
   normalizeQuestionOptions,
   ASK_MCP_SERVER,
+  ASK_QUESTION_TOOL,
   ASK_QUESTION_TOOL_NAME,
   MAX_PLAN_TEXT,
   SUBMIT_PLAN_TOOL_NAME,
@@ -461,6 +462,14 @@ export class QueueFullError extends Error {
 // is in force. /clear, /new and /reset are handled as lifecycle commands before
 // this check and start a genuinely fresh conversation.
 const PLAN_SAFE_SLASH_COMMANDS = new Set(['/model', '/effort']);
+
+function questionToolDirective(): string {
+  return [
+    '[Interactive questions are available in this Web conversation in both Default and Plan mode.]',
+    `When the next step needs a user decision, call the ${ASK_QUESTION_TOOL} tool and wait for the answer instead of guessing or asking in prose.`,
+    'Use an ordinary response when no user decision is needed.',
+  ].join(' ');
+}
 
 function questionFallbackDirective(): string {
   return [
@@ -2769,8 +2778,12 @@ export class ChatSession {
     const planInstruction = !command && this.planMode
       ? planModeDirective(Boolean(await this.planDocument()))
       : null;
-    const questionInstruction = !command && this.questionFallbackEnabled
-      ? questionFallbackDirective()
+    const questionInstruction = !command
+      ? this.questionsEnabled
+        ? questionToolDirective()
+        : this.questionFallbackEnabled
+          ? questionFallbackDirective()
+          : null
       : null;
     const runtimeText = [questionInstruction, planInstruction, carried, turn.text]
       .filter(Boolean)
@@ -3612,9 +3625,11 @@ export class ChatSession {
         if (!this.adapter?.alive || !this.adapterReady) {
           throw new Error(`the ${this.runtime || 'agent'} process was not ready for another turn`);
         }
-        const questionInstruction = this.questionFallbackEnabled
-          ? questionFallbackDirective()
-          : null;
+        const questionInstruction = this.questionsEnabled
+          ? questionToolDirective()
+          : this.questionFallbackEnabled
+            ? questionFallbackDirective()
+            : null;
         await this.adapter.send({
           text: [questionInstruction, acceptedPlanDirective(plan)].filter(Boolean).join('\n\n'),
         });

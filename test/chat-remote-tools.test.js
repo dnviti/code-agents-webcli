@@ -71,7 +71,8 @@ describe('the shared-home tools in remote Web-chat runtimes', function () {
           cost: false, plan: false,
         },
         async start() {},
-        async send() {},
+        sent: [],
+        async send(turn) { this.sent.push(turn.text); },
         async interrupt() {},
         async stop() { this.alive = false; },
         respondPermission() {},
@@ -132,6 +133,14 @@ describe('the shared-home tools in remote Web-chat runtimes', function () {
           const at = adapter.options.extraArgs.indexOf('-e');
           assert.ok(at >= 0);
           assert.match(adapter.options.extraArgs[at + 1], /^\/home\/remote-user\/\.ccweb-callback\/.+\/\.pi\/ccweb\/ask-user\.ts$/);
+        }
+
+        await session.send({ text: 'Choose the safest approach.' });
+        if (runtime === 'antigravity') {
+          assert.match(adapter.sent[0], /Interactive-question fallback/);
+        } else {
+          assert.match(adapter.sent[0], /both Default and Plan mode/);
+          assert.match(adapter.sent[0], /ask_user_question tool/);
         }
 
         await session.stop();
