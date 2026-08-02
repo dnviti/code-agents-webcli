@@ -638,7 +638,7 @@ describe('per-user environments', function () {
 
       await assert.rejects(
         manager.ensureFor({ id: 1, githubLogin: 'alice' }),
-        /mismatched ownership labels/,
+        /belongs to another user/,
       );
       await assert.rejects(manager.remove('cawc-alice-1'), /not owned as a user environment/);
       assert.strictEqual(

@@ -406,7 +406,7 @@ export class KubernetesEngine implements EnvironmentEngine {
         pod = JSON.parse(stdout);
       } catch (error) {
         throw new EnvironmentInspectionError(
-          `malformed pod JSON for '${name}': ${error instanceof Error ? error.message : String(error)}`,
+          `engine returned invalid JSON for '${name}': ${error instanceof Error ? error.message : String(error)}`,
         );
       }
       const identity = typeof pod.metadata?.uid === 'string' ? pod.metadata.uid : '';

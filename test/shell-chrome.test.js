@@ -265,6 +265,27 @@ describe('shell chrome', function () {
     assert.ok(/var\(--ansi-cyan\)/.test(running), 'the working icon uses the working colour');
   });
 
+  it('keeps project context on a successful project tab', function () {
+    const html = render(reset({
+      tabs: [tab('project-session', {
+        title: 'Fix project tabs',
+        status: 'success',
+        workingDir: '/workspace/code-agents-webcli',
+        projectId: 'project-1',
+        projectName: 'Code Agents WebCLI',
+      })],
+      activeId: 'project-session',
+    }));
+
+    assert.ok(/>Fix project tabs<\/span>/.test(html), 'the session title remains visible');
+    assert.ok(/>Code Agents WebCLI<\/span>/.test(html), 'the project label remains visible');
+    assert.ok(
+      html.includes('title="Code Agents WebCLI · /workspace/code-agents-webcli"'),
+      'the project-aware tab title remains present',
+    );
+    assert.ok(/data-tab-state="success"/.test(html), 'the completed state remains successful');
+  });
+
   it('mounts the connection overlay over the terminal, not over the tabs', function () {
     const html = render(reset({ tabs: [tab('a')], activeId: 'a', overlay: 'error', errorText: 'boom' }));
     assert.ok(html.includes('boom'), 'the error text should render');

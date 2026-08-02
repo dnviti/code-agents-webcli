@@ -736,16 +736,18 @@ export class EnvironmentManager {
     }
 
     while (true) {
+      // Empty targets table plus disabled startup flags is the historical host
+      // path. Check before resolving the durable owner home: that resolution
+      // creates its identity mapping on disk, while disabled installations
+      // must remain entirely side-effect free.
+      if (!active.config.enabled) {
+        return null;
+      }
+
       const name = this.ownerHomeForConfig(active.config, owner).name;
       const known = this.containerPlacement.get(name);
       if (known) {
         return { ...known, config: this.configForContainer(name) };
-      }
-
-      // Empty targets table plus disabled startup flags is the historical host
-      // path. It must not probe the synthetic legacy engine at all.
-      if (!active.config.enabled) {
-        return null;
       }
 
       if (!this.multiTarget) {

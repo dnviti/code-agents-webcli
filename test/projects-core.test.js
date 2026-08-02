@@ -37,9 +37,10 @@ function engine(overrides = {}) {
     return ensured;
   };
   result.describe = async (name) => known.get(name) || (customDescribe ? customDescribe.call(result, name) : null);
+  result.describeStrict = async (name) => result.describe(name);
   result.ensureIdentity = async (spec, expected) => {
     const ensured = await result.ensure(spec, expected);
-    const described = await result.describe(spec.name);
+    const described = await result.describeStrict(spec.name);
     if (!described?.identity) throw new Error('test engine did not expose an ensured identity');
     return { ...ensured, identity: described.identity };
   };

@@ -897,7 +897,12 @@ describe('project session integration', function () {
       },
     }, 'project-1');
     await chatStopStarted;
-    assert.strictEqual(sessions.has('project-chat'), true, 'record remains until chat stop resolves');
+    assert.strictEqual(
+      sessions.has('project-chat'),
+      false,
+      'durable membership is removed before teardown once SQLite accepts the deletion',
+    );
+    assert.strictEqual(saves, 1, 'runtime teardown starts only after the deletion is durable');
     assert.deepStrictEqual(transcripts, [], 'stored state is untouched while the process is live');
     releaseChatStop();
     const retired = await retirement;
@@ -918,5 +923,43 @@ describe('project session integration', function () {
     assert(order.indexOf('stop:project-chat') < order.indexOf('release:project-chat'));
     assert(order.indexOf('release:project-chat') < order.indexOf('transcript:project-chat'));
     assert.strictEqual(saves, 1);
+  });
+
+  it('restores a project session tree when SQLite refuses the deletion', async function () {
+    const sessions = new Map([
+      ['project-chat', record({ id: 'project-chat', projectId: 'project-1', surface: 'chat', active: true, agent: 'claude' })],
+      ['project-shell', record({ id: 'project-shell', ownerSessionId: 'project-chat', active: true, agent: 'terminal' })],
+      ['other-project', record({ id: 'other-project', projectId: 'project-2' })],
+    ]);
+    let stopped = 0;
+    let deleted = 0;
+
+    await assert.rejects(
+      retireProjectSessions({
+        claudeSessions: sessions,
+        webSocketConnections: new Map(),
+        saveSessionsToDisk: async () => false,
+        stopSessionRuntime: async () => { stopped++; },
+        releaseProjectSessionResources: () => {},
+        transcriptStore: {
+          deleteTranscript: async () => { deleted++; },
+        },
+        historyStore: {
+          deleteHistory: async () => { deleted++; },
+        },
+        disposeRecorder: () => {},
+      }, 'project-1'),
+      /could not be saved/,
+    );
+
+    assert.deepStrictEqual(
+      [...sessions.keys()],
+      ['project-chat', 'project-shell', 'other-project'],
+      'rollback restores the exact shared Map order',
+    );
+    assert.strictEqual(sessions.get('project-chat').retiring, false);
+    assert.strictEqual(sessions.get('project-shell').retiring, false);
+    assert.strictEqual(stopped, 0, 'runtime teardown starts only after durable deletion');
+    assert.strictEqual(deleted, 0, 'stored logs remain untouched after a refused save');
   });
 });
