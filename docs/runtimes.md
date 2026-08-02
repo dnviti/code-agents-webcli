@@ -93,6 +93,35 @@ protocol are different processes, so there is nothing to switch between.
 
 It is beta, and labelled as such in the UI.
 
+### Plan mode
+
+Every WebUI runtime has a **Plan** control beside the model and effort controls.
+Turn it on before sending a request when you want the agent to investigate and
+propose work without implementing it. The control stays with the conversation,
+including across reloads, devices and server restarts; changing it is disabled
+while a turn is active so the rule cannot change underneath work already in
+flight.
+
+The agent submits a complete Markdown plan to a dedicated review dialog. Plans
+are numbered revisions: a revision replaces the previous document, and only the
+latest can be accepted or rejected. Closing the dialog changes nothing.
+
+- **Accept plan** turns Plan mode off and immediately starts an internal
+  implementation turn with the accepted revision. It does not manufacture a
+  user message, and the runtime's normal approval policy still applies.
+- **Reject plan** keeps Plan mode on and keeps the document for reference, then
+  returns focus to the composer so you can describe the revision you want.
+- Turning Plan mode off while idle keeps the latest document. Starting a new
+  conversation clears both the mode and the document.
+
+Runtime slash commands that could start work outside this contract are refused
+while Plan mode is on. Model and effort selection remain available, as do the
+app's new-conversation commands, which clear the Plan state as described above.
+
+If a runtime cannot load the submission tool, its final planning response is
+captured as the Plan document instead. A storage or delivery failure leaves the
+control available and reports the failure so the plan can be retried.
+
 ### Tool activity
 
 When an agent runs a command or edits a file, that shows up in the conversation
@@ -129,14 +158,36 @@ all along; only its headless output was silent about it.
 An agent that needs a decision only you can make puts a **card** in the
 conversation with the options it wants you to choose between, and stops until
 you answer. There is always a free-text box beside the options, so "none of
-these" is a real answer rather than a dead end.
+these" is a real answer rather than a dead end. The same questionnaire is
+available in ordinary conversations and in Plan mode; it is not tied to either
+approval mode.
 
 | Runtime | How it is given the question tool | Verified against |
 | --- | --- | --- |
 | Claude Code | an MCP server passed at spawn | a recorded headless session |
-| Kimi Code, Oh My Pi | an MCP server passed in the ACP handshake | live runs |
+| Codex | an MCP server added with session-local app-server configuration | the app-server configuration schema |
+| Grok Build, Kimi Code, Oh My Pi | an MCP server passed in the ACP handshake | live protocol captures |
 | pi | a generated extension loaded with `-e` | a live run |
-| Codex, Grok Build, Antigravity CLI | not offered — no channel anyone has watched work | — |
+| Antigravity CLI | a structured response handoff, because its headless mode has no MCP or extension hook | its streamed final-response path |
+
+An unanswered card is part of the durable conversation: navigating away,
+reloading or opening the conversation on another device does not discard it.
+Once answered or skipped, the card remains in history with that outcome. If the
+question channel cannot reach the Web server, the tool tells the agent to ask in
+ordinary prose instead of leaving the turn waiting forever.
+
+On a host-local session the MCP/extension bridge uses the session's private Unix
+socket. In Docker, Podman and Kubernetes environments it uses an owner-only
+callback endpoint in the user's shared home. Requests, replies, cancellation
+markers and the liveness lease are written atomically as authenticated,
+encrypted per-session envelopes; the decryption secret is passed only to the
+runtime's launch environment and is not stored in that directory. The server rejects
+replaced or symlinked transport paths, keeps every child operation beneath a
+verified open directory descriptor, cleans up stale crash artifacts without
+following links, and removes the endpoint when the conversation process closes.
+This is at-rest protection for the shared volume, not isolation from another
+process able to inspect the launched runtime's environment. No inbound container
+or pod port is opened.
 
 **The call blocks, and the app now makes sure it can.** Two of these CLIs put a
 timer on it that this app has to switch off, or the question expires with nobody

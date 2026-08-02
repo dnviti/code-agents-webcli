@@ -8,11 +8,31 @@ import {
   ChatSnapshot,
   ChatTurnIndexEntry,
   ChatUsage,
+  PlanDocument,
   QueuedTurn,
   NO_CHAT_CAPABILITIES,
 } from '../../shared/chat-events.js';
 import { ModelTier, isModelTier } from '../../shared/runtime-profiles.js';
 import { ChatTranscript } from './transcript.js';
+
+export interface PlanActionFeedback {
+  action: 'accept' | 'reject' | 'mode';
+  revision?: number;
+  accepted?: boolean;
+  changed?: boolean;
+  message: string;
+}
+
+function readPlanDocument(raw: unknown): PlanDocument | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Record<string, unknown>;
+  if (typeof value.markdown !== 'string' || !value.markdown.trim()) return null;
+  return {
+    markdown: value.markdown,
+    revision: typeof value.revision === 'number' && value.revision > 0 ? value.revision : 1,
+    ts: typeof value.ts === 'number' ? value.ts : 0,
+  };
+}
 
 /**
  * One conversation's half of the socket.
@@ -344,6 +364,10 @@ export class ChatController {
   private effortOverride: string | null = null;
   /** What the server reported happened to the last effort change requested. */
   private effortResult: EffortSwitchResult | null = null;
+  /** Conversation-scoped plan state, never inferred from transcript todo items. */
+  private planMode = false;
+  private planDocument: PlanDocument | null = null;
+  private planResult: PlanActionFeedback | null = null;
 
   /**
    * The composer, as the server last numbered it.
@@ -414,6 +438,12 @@ export class ChatController {
     'chat_unavailable',
     'chat_model_result',
     'chat_effort_result',
+    'chat_plan_mode',
+    'chat_plan_document',
+    'chat_plan_action',
+    'chat_plan_result',
+    'chat_plan_accept_result',
+    'chat_plan_reject_result',
     'chat_turn_index',
     'chat_turn_index_failed',
     'chat_turn_spend',
@@ -457,6 +487,9 @@ export class ChatController {
             : null;
         this.effortOverride =
           typeof message.effortOverride === 'string' ? message.effortOverride : null;
+        const planSnapshot = snapshot as ChatSnapshot & { planMode?: unknown; planDocument?: unknown };
+        this.planMode = planSnapshot.planMode === true || message.planMode === true;
+        this.planDocument = readPlanDocument(planSnapshot.planDocument ?? message.planDocument);
         // The composer rides on the join, so a conversation opened on a second
         // screen opens at the sentence the first one is in the middle of. A
         // server with nothing to say about it — one that predates this, or one
@@ -549,6 +582,7 @@ export class ChatController {
             : null;
         this.effortOverride =
           typeof message.effortOverride === 'string' ? message.effortOverride : null;
+        this.planMode = message.planMode === true;
         this.options.onChange?.();
         return true;
       }
@@ -591,6 +625,58 @@ export class ChatController {
         this.effortResult = {
           applied,
           message: String(message.message || ''),
+        };
+        this.options.onChange?.();
+        return true;
+      }
+
+      case 'chat_plan_mode': {
+        this.planMode = message.planMode === true;
+        this.planResult = {
+          action: 'mode',
+          changed: message.changed !== false,
+          message: String(message.message || message.detail || ''),
+        };
+        this.options.onChange?.();
+        return true;
+      }
+
+      case 'chat_plan_document': {
+        // Null is a meaningful value here: `/clear` uses it to remove the
+        // retained document. Nullish coalescing would turn that into undefined
+        // and leave an old plan painted indefinitely.
+        const raw = Object.prototype.hasOwnProperty.call(message, 'plan')
+          ? message.plan
+          : message.planDocument;
+        const plan = readPlanDocument(raw);
+        if (raw === null) {
+          this.planDocument = null;
+          this.planResult = null;
+        } else if (plan) {
+          if (plan.revision !== this.planDocument?.revision) this.planResult = null;
+          this.planDocument = plan;
+        }
+        this.options.onChange?.();
+        return true;
+      }
+
+      case 'chat_plan_action':
+      case 'chat_plan_result':
+      case 'chat_plan_accept_result':
+      case 'chat_plan_reject_result': {
+        const action = message.action === 'reject' || type === 'chat_plan_reject_result' ? 'reject' : 'accept';
+        const raw = Object.prototype.hasOwnProperty.call(message, 'plan')
+          ? message.plan
+          : message.planDocument;
+        const plan = readPlanDocument(raw);
+        if (raw === null) this.planDocument = null;
+        if (plan) this.planDocument = plan;
+        if (typeof message.planMode === 'boolean') this.planMode = message.planMode;
+        this.planResult = {
+          action,
+          revision: typeof message.revision === 'number' ? message.revision : undefined,
+          accepted: message.accepted !== false && message.ok !== false,
+          message: String(message.message || message.detail || ''),
         };
         this.options.onChange?.();
         return true;
@@ -746,6 +832,7 @@ export class ChatController {
       scratch.answeredQuestions,
       scratch.answeredQuestionText,
       scratch.abandonedQuestions,
+      scratch.questionHistory,
     );
   }
 
@@ -1107,6 +1194,10 @@ export class ChatController {
     return this.effortResult;
   }
 
+  get planModeValue(): boolean { return this.planMode; }
+  get planDocumentValue(): PlanDocument | null { return this.planDocument; }
+  get planFeedback(): PlanActionFeedback | null { return this.planResult; }
+
   /**
    * Ask the server to change how hard this conversation thinks, or clear the
    * choice with an empty string.
@@ -1118,6 +1209,24 @@ export class ChatController {
    */
   setEffort(effort: string): void {
     this.send({ type: 'chat_set_effort', effort });
+  }
+
+  setPlanMode(planMode: boolean): void {
+    this.planResult = null;
+    this.options.onChange?.();
+    this.send({ type: 'chat_set_plan_mode', planMode });
+  }
+
+  acceptPlan(revision: number): void {
+    this.planResult = null;
+    this.options.onChange?.();
+    this.send({ type: 'chat_accept_plan', revision });
+  }
+
+  rejectPlan(revision: number): void {
+    this.planResult = null;
+    this.options.onChange?.();
+    this.send({ type: 'chat_reject_plan', revision });
   }
 
   /** Tell the server this browser wants this conversation's live events. */

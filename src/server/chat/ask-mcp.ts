@@ -28,7 +28,13 @@
 
 import * as net from 'net';
 import { createInterface } from 'readline';
-import { ASK_MCP_SERVER, ASK_QUESTION_TOOL, TIER_TOOL } from '../../shared/chat-events.js';
+import {
+  ASK_MCP_SERVER,
+  ASK_QUESTION_TOOL,
+  SUBMIT_PLAN_TOOL,
+  SUBMIT_PLAN_TOOL_DESCRIPTION,
+  TIER_TOOL,
+} from '../../shared/chat-events.js';
 
 /**
  * Whether this server should offer the ladder tool at all.
@@ -166,6 +172,27 @@ export const TIER_TOOL_DEFINITION = {
   },
 } as const;
 
+export interface PlanDecision {
+  accepted: boolean;
+  revision?: number;
+  detail: string;
+}
+
+export const SUBMIT_PLAN_TOOL_DEFINITION = {
+  name: SUBMIT_PLAN_TOOL,
+  description: SUBMIT_PLAN_TOOL_DESCRIPTION,
+  inputSchema: {
+    type: 'object',
+    properties: {
+      markdown: {
+        type: 'string',
+        description: 'The complete latest plan as markdown, not a diff against an earlier revision.',
+      },
+    },
+    required: ['markdown'],
+  },
+} as const;
+
 /**
  * The client half of the session socket.
  *
@@ -178,6 +205,7 @@ class AskChannel {
   private nextId = 0;
   private readonly waiting = new Map<string, (answer: QuestionAnswer) => void>();
   private readonly waitingTier = new Map<string, (decision: TierDecision) => void>();
+  private readonly waitingPlan = new Map<string, (decision: PlanDecision) => void>();
 
   constructor(private readonly socketPath: string) {}
 
@@ -259,6 +287,26 @@ class AskChannel {
     });
   }
 
+  submitPlan(markdown: unknown): Promise<PlanDecision> {
+    return new Promise((resolve) => {
+      const id = `plan-${process.pid}-${(this.nextId += 1)}`;
+      let socket: net.Socket;
+      try {
+        socket = this.connect();
+      } catch (error: unknown) {
+        resolve({ accepted: false, detail: describe(error) });
+        return;
+      }
+
+      this.waitingPlan.set(id, resolve);
+      const write = (): void => {
+        socket.write(`${JSON.stringify({ id, kind: 'plan', plan: { markdown } })}\n`);
+      };
+      if (socket.pending) socket.once('connect', write);
+      else write();
+    });
+  }
+
   private connect(): net.Socket {
     if (this.socket && !this.socket.destroyed) return this.socket;
 
@@ -287,6 +335,18 @@ class AskChannel {
           continue;
         }
         if (!reply.id) continue;
+
+        const pendingPlan = this.waitingPlan.get(reply.id);
+        if (pendingPlan) {
+          this.waitingPlan.delete(reply.id);
+          const decision = reply as unknown as Partial<PlanDecision>;
+          pendingPlan({
+            accepted: decision.accepted === true,
+            revision: typeof decision.revision === 'number' ? decision.revision : undefined,
+            detail: typeof decision.detail === 'string' ? decision.detail : 'no answer was given',
+          });
+          continue;
+        }
 
         // Three kinds of traffic share this socket, and each id is minted by
         // whichever map is waiting on it — so an id in neither belongs to the
@@ -327,6 +387,10 @@ class AskChannel {
       for (const [id, resolve] of this.waitingTier) {
         this.waitingTier.delete(id);
         resolve({ granted: false, detail: reason });
+      }
+      for (const [id, resolve] of this.waitingPlan) {
+        this.waitingPlan.delete(id);
+        resolve({ accepted: false, detail: reason });
       }
     };
     socket.on('error', () => fail('the browser could not be reached to ask this question'));
@@ -405,6 +469,7 @@ export function serveAsk(
   // Last rather than beside `ask`, so every existing caller — the tests above
   // all, which drive this over a real pair of pipes — keeps working unchanged.
   cancel?: (askId: string) => void,
+  submitPlan?: (markdown: unknown) => Promise<PlanDecision>,
 ): void {
   const send = (message: unknown): void => {
     output.write(`${JSON.stringify(message)}\n`);
@@ -453,9 +518,11 @@ export function serveAsk(
     }
 
     if (method === 'tools/list') {
-      const tools = requestTier
-        ? [ASK_TOOL_DEFINITION, TIER_TOOL_DEFINITION]
-        : [ASK_TOOL_DEFINITION];
+      const tools = [
+        ASK_TOOL_DEFINITION,
+        ...(requestTier ? [TIER_TOOL_DEFINITION] : []),
+        ...(submitPlan ? [SUBMIT_PLAN_TOOL_DEFINITION] : []),
+      ];
       send({ jsonrpc: '2.0', id, result: { tools } });
       return;
     }
@@ -495,6 +562,20 @@ export function serveAsk(
               // and marking it an error invites a retry of the one call whose
               // whole cost is asking a person again.
               isError: false,
+            },
+          });
+        });
+        return;
+      }
+      if (params?.name === SUBMIT_PLAN_TOOL && submitPlan) {
+        const markdown = (params?.arguments as { markdown?: unknown } | undefined)?.markdown;
+        void submitPlan(markdown).then((decision) => {
+          send({
+            jsonrpc: '2.0',
+            id,
+            result: {
+              content: [{ type: 'text', text: decision.detail }],
+              isError: !decision.accepted,
             },
           });
         });
@@ -584,6 +665,7 @@ function main(): void {
         : Promise.resolve({ labels: [], error: 'this session has no channel to the browser' }),
     laddered && channel ? (reason) => channel.requestTier(reason) : undefined,
     channel ? (askId) => channel.cancel(askId) : undefined,
+    channel ? (markdown) => channel.submitPlan(markdown) : undefined,
   );
 }
 

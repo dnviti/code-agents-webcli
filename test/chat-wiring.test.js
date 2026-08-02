@@ -19,10 +19,12 @@ function createSessionRecord(params = {}) {
     lastActivity: new Date(),
     active: params.active ?? false,
     agent: params.agent ?? null,
-    lastAgent: null,
+    lastAgent: params.lastAgent ?? null,
     runtimeLabel: null,
     surface: params.surface,
+    nativeChatSessionId: params.nativeChatSessionId,
     chatBypassPermissions: params.chatBypassPermissions,
+    chatPlanMode: params.chatPlanMode,
     terminalOptions: null,
     stopRequested: false,
     workingDir: params.workingDir || '/tmp/project',
@@ -167,7 +169,7 @@ function build(sessionOverrides = {}, managerOverrides = {}, deps = {}) {
     getSelectedWorkingDir: () => '/tmp',
     createSessionRecord,
     getRuntimeBridge: () => null,
-    saveSessionsToDisk: () => Promise.resolve(),
+    saveSessionsToDisk: deps.saveSessionsToDisk || (() => Promise.resolve()),
     resolveRuntimeProfile: () => null,
     chatManager,
     transcriptStore: {
@@ -217,6 +219,30 @@ describe('chat wiring', function () {
       assert.strictEqual(session.surface, 'chat');
       assert.strictEqual(session.active, true);
       assert.strictEqual(session.agent, 'claude');
+    });
+
+    it('passes a persisted plan mode into a resumed launch', async function () {
+      const { processor, chatManager } = build({
+        surface: 'chat', agent: 'claude', lastAgent: 'claude', chatPlanMode: true,
+        nativeChatSessionId: 'native-1',
+      });
+
+      await processor.startChat('ws-1', 'claude', { resume: true });
+
+      assert.strictEqual(chatManager.calls.start[0].options.planMode, true);
+    });
+
+    it('clears a persisted plan mode before starting a fresh conversation', async function () {
+      const { processor, session, chatManager, sent } = build({
+        surface: 'chat', agent: 'claude', lastAgent: 'claude', chatPlanMode: true,
+        nativeChatSessionId: 'native-1',
+      });
+
+      await processor.startChat('ws-1', 'claude', { resume: false });
+
+      assert.strictEqual(chatManager.calls.start[0].options.planMode, false);
+      assert.strictEqual(session.chatPlanMode, false);
+      assert.strictEqual(lastOfType(sent, 'chat_started').planMode, false);
     });
 
     it('refuses a runtime with no verified chat adapter, and says why', async function () {
@@ -1101,6 +1127,175 @@ describe('chat wiring', function () {
       const { processor, sent } = build({ surface: undefined });
       await processor.joinSession('ws-1', 'session-1');
       assert.strictEqual(lastOfType(sent, 'session_joined').surface, 'terminal');
+    });
+  });
+
+  describe('the durable plan lifecycle', function () {
+    it('persists an idle mode switch and broadcasts the manager’s response', async function () {
+      let saves = 0;
+      const { processor, session, sent } = build(
+        { surface: 'chat', chatPlanMode: false },
+        {
+          async setPlanMode(id, on) {
+            assert.strictEqual(id, 'session-1');
+            assert.strictEqual(on, true);
+            return { planMode: true, changed: true, detail: 'Plan mode is on.' };
+          },
+        },
+        { saveSessionsToDisk: async () => { saves += 1; } },
+      );
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_plan_mode', sessionId: 'session-1', planMode: true });
+
+      assert.strictEqual(session.chatPlanMode, true);
+      assert.strictEqual(saves, 1, 'the next launch must inherit the accepted mode');
+      assert.deepStrictEqual(lastOfType(sent, 'chat_plan_mode'), {
+        type: 'chat_plan_mode', sessionId: 'session-1', planMode: true, changed: true, message: 'Plan mode is on.',
+      });
+    });
+
+    it('awaits persistence when the live mode lifecycle mutates the record before returning', async function () {
+      let saves = 0;
+      let held;
+      const { processor, session } = build(
+        { surface: 'chat', chatPlanMode: false },
+        {
+          async setPlanMode(_id, on) {
+            held.chatPlanMode = on;
+            return { planMode: on, changed: true, detail: 'Plan mode changed live.' };
+          },
+        },
+        { saveSessionsToDisk: async () => { saves += 1; } },
+      );
+      held = session;
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_set_plan_mode', sessionId: 'session-1', planMode: true,
+      });
+
+      assert.strictEqual(session.chatPlanMode, true);
+      assert.strictEqual(saves, 1, 'the already-mutated record still needs an awaited disk save');
+    });
+
+    it('routes accept and reject with only the revision the user reviewed', async function () {
+      const calls = [];
+      const { processor, sent } = build(
+        { surface: 'chat', chatPlanMode: true },
+        {
+          async acceptPlan(id, revision) {
+            calls.push(['accept', id, revision]);
+            return { accepted: true, action: 'accept', planMode: false, revision, detail: 'Implementing revision 3.' };
+          },
+          async rejectPlan(id, revision) {
+            calls.push(['reject', id, revision]);
+            return { accepted: true, action: 'reject', planMode: true, revision, detail: 'Plan remains open.' };
+          },
+        },
+      );
+
+      await processor.handleMessage('ws-1', { type: 'chat_accept_plan', sessionId: 'session-1', revision: 3 });
+      await processor.handleMessage('ws-1', { type: 'chat_reject_plan', sessionId: 'session-1', revision: 4 });
+
+      assert.deepStrictEqual(calls, [['accept', 'session-1', 3], ['reject', 'session-1', 4]]);
+      const actions = sent.filter((message) => message.type === 'chat_plan_action');
+      assert.deepStrictEqual(actions.map(({ action, accepted, planMode, revision }) => ({ action, accepted, planMode, revision })), [
+        { action: 'accept', accepted: true, planMode: false, revision: 3 },
+        { action: 'reject', accepted: true, planMode: true, revision: 4 },
+      ]);
+    });
+
+    it('resumes a stopped conversation and immediately accepts its durable plan', async function () {
+      const starts = [];
+      const accepts = [];
+      let running = false;
+      let saves = 0;
+      const { processor, session, sent } = build(
+        {
+          surface: 'chat', active: false, agent: null, lastAgent: 'claude',
+          nativeChatSessionId: 'native-plan-7', chatPlanMode: true,
+        },
+        {
+          async snapshot(record) {
+            return {
+              sessionId: record.id,
+              runtime: 'claude',
+              live: running,
+              planDocument: { markdown: '# Durable plan', revision: 7, ts: 10 },
+              messages: [], state: 'idle', capabilities: {}, pendingPermissions: [],
+              firstSeq: 0, cursor: 0, bypassPermissions: false,
+            };
+          },
+          async start(record, options) {
+            starts.push({ record, options });
+            running = true;
+            return {
+              runtimeKind: options.runtime,
+              currentCapabilities: { planMode: true },
+              bypassing: false,
+              live: true,
+            };
+          },
+          async acceptPlan(id, revision) {
+            accepts.push({ id, revision, running });
+            if (!running) return null;
+            return {
+              accepted: true, action: 'accept', planMode: false, revision,
+              detail: `Plan revision ${revision} accepted. Implementation started.`,
+            };
+          },
+        },
+        { saveSessionsToDisk: async () => { saves += 1; } },
+      );
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_accept_plan', sessionId: 'session-1', revision: 7,
+      });
+
+      assert.strictEqual(starts.length, 1, 'Accept must relaunch the stopped conversation');
+      assert.strictEqual(starts[0].options.resumeSessionId, 'native-plan-7');
+      assert.strictEqual(starts[0].options.startFresh, false);
+      assert.strictEqual(starts[0].options.planMode, true, 'the durable plan must survive relaunch');
+      assert.deepStrictEqual(accepts, [{ id: 'session-1', revision: 7, running: true }]);
+      assert.strictEqual(session.active, true);
+      assert.strictEqual(session.chatPlanMode, false);
+      assert.strictEqual(saves, 2, 'the relaunch and accepted mode must both be durable');
+      assert.deepStrictEqual(lastOfType(sent, 'chat_plan_action'), {
+        type: 'chat_plan_action', sessionId: 'session-1', action: 'accept',
+        accepted: true, planMode: false, revision: 7,
+        message: 'Plan revision 7 accepted. Implementation started.',
+      });
+    });
+
+    it('does not relaunch a stopped conversation for a stale plan revision', async function () {
+      let starts = 0;
+      let accepts = 0;
+      const { processor, sent } = build(
+        {
+          surface: 'chat', active: false, agent: null, lastAgent: 'claude',
+          chatPlanMode: true,
+        },
+        {
+          async snapshot() {
+            return {
+              runtime: 'claude', live: false,
+              planDocument: { markdown: '# Newer plan', revision: 8, ts: 11 },
+            };
+          },
+          async start() { starts += 1; throw new Error('must not start'); },
+          async acceptPlan() { accepts += 1; throw new Error('must not accept'); },
+        },
+      );
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_accept_plan', sessionId: 'session-1', revision: 7,
+      });
+
+      assert.strictEqual(starts, 0);
+      assert.strictEqual(accepts, 0);
+      const action = lastOfType(sent, 'chat_plan_action');
+      assert.strictEqual(action.accepted, false);
+      assert.strictEqual(action.revision, 8);
+      assert.match(action.message, /stale/i);
     });
   });
 

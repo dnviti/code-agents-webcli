@@ -313,9 +313,11 @@ async function run(): Promise<void> {
   await checkSilentStepsLeaveNoRowButKeepTheirTrace();
   await checkNoRowIsDrawnWithNothingToRead();
   await checkAQuestionIsAnsweredByClicking();
+  await checkANoToolFallbackQuestionSurvivesReload();
   await checkACardTheAgentGaveUpOnStopsOfferingAnAnswer();
   await checkAQuestionCanBeAnsweredInYourOwnWords();
   await checkTypedWordsThatDidNotLandAreNotShownAsAnswered();
+  await checkThePlanControlCanBeReviewedAndActedOn();
   await checkThePhoneLayoutIsUsable();
   await checkThePhoneReadsTheMessageFirst();
   await checkThePhoneShellSurfacesAreUsable();
@@ -866,6 +868,234 @@ async function checkAQuestionIsAnsweredByClicking(): Promise<void> {
   );
 
   backRoot.unmount();
+  host.remove();
+}
+
+/**
+ * A structured-response fallback has no tool bubble to own its question card.
+ *
+ * That is the path used when a runtime cannot call the questionnaire MCP: the
+ * server still records a real `QuestionRequest`, but its `toolId` is absent and
+ * the reducer gives it a durable question block in the assistant message that
+ * asked it. This drives that card through a combined picked-and-typed answer, then
+ * destroys both the view and controller and rebuilds them from the snapshot a
+ * reload receives. A card backed only by component state passes before the
+ * teardown and disappears, or comes back blank, afterwards.
+ */
+async function checkANoToolFallbackQuestionSurvivesReload(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const request = {
+    requestId: 'fallback-browser-question',
+    question: 'Which rollout safeguards should the fallback path use?',
+    header: 'Fallback rollout',
+    multiSelect: true,
+    ts: 1,
+    options: [
+      { optionId: 'opt-0', label: 'Canary tenants', description: 'Start with the internal cohort.' },
+      { optionId: 'opt-1', label: 'Feature flag', description: 'Keep an immediate off switch.' },
+    ],
+  };
+  const ownWords = 'Pause automatically if the questionnaire delivery rate drops.';
+  const sent: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('fallback-browser', {
+    send: (message: Record<string, unknown>) => sent.push(message),
+  } as never);
+
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'fallback-browser',
+    snapshot: {
+      sessionId: 'fallback-browser',
+      runtime: 'grok',
+      state: 'awaiting_answer',
+      capabilities: { streaming: true, questions: true, plan: true },
+      messages: [
+        {
+          id: 'fallback-assistant',
+          seq: 1,
+          turnId: 'fallback-turn',
+          role: 'assistant',
+          ts: 1,
+          blocks: [
+            { kind: 'text', text: 'I need one rollout detail before continuing.' },
+            { kind: 'question', request },
+          ],
+        },
+      ],
+      pendingPermissions: [],
+      pendingQuestions: [request],
+      questionHistory: [request],
+      queued: [],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 1,
+      live: true,
+      bypassPermissions: false,
+      planMode: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'grok',
+      runtimeLabel: 'Grok CLI',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+  settle(document);
+
+  const live = host.querySelector('[data-question-card="live"]') as HTMLElement | null;
+  check(
+    'a no-tool fallback question is a live card in the default-mode conversation',
+    Boolean(live)
+      && Boolean(live?.closest('[role="log"]'))
+      && Boolean(live?.closest('[data-message-id="fallback-assistant"]'))
+      && !live?.closest('[aria-label="Questions from the assistant"]'),
+    live ? (live.textContent || '').replace(/\s+/g, ' ').slice(0, 180) : 'no live fallback card',
+  );
+
+  const first = live?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+  first?.click();
+  (live?.querySelector('[data-question-own-words="closed"]') as HTMLElement | null)?.click();
+  await wait(150);
+  const area = live?.querySelector('textarea') as HTMLTextAreaElement | null;
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+  if (area) {
+    setter?.call(area, ownWords);
+    area.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  await wait(150);
+  const confirm = (Array.from(live?.querySelectorAll('button') ?? []) as HTMLButtonElement[])
+    .find((button) => (button.textContent || '').trim() === 'Confirm');
+  confirm?.click();
+  await wait(200);
+
+  const answer = sent.find((message) => message.type === 'chat_question_answer');
+  check(
+    'the no-tool fallback card sends its selected and typed answer by request id',
+    Boolean(answer)
+      && answer?.requestId === request.requestId
+      && JSON.stringify(answer?.optionIds) === '["opt-0"]'
+      && answer?.text === ownWords
+      && answer?.skipped === false,
+    JSON.stringify(answer ?? null),
+  );
+
+  // The durable answer the session writes after delivering the response. This
+  // supersedes the card's optimistic click state and is what every other
+  // browser — including this one after a reload — is meant to read.
+  controller.transcript.apply({
+    t: 'question_resolved',
+    seq: 2,
+    ts: 2,
+    requestId: request.requestId,
+    optionIds: ['opt-0'],
+    text: ownWords,
+    skipped: false,
+  } as never);
+  await wait(200);
+  settle(document);
+
+  const settled = host.querySelector('[data-question-card="answered"]') as HTMLElement | null;
+  const settledText = (settled?.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'the resolved no-tool fallback remains a readable answered card',
+    Boolean(settled)
+      && Boolean(settled?.closest('[role="log"]'))
+      && !settled?.closest('[aria-label="Questions from the assistant"]')
+      && settledText.includes(request.question)
+      && settledText.includes('Canary tenants')
+      && settledText.includes(ownWords)
+      && settled?.querySelectorAll('[data-question-option="chosen"]').length === 2,
+    settledText.slice(0, 260) || 'no answered fallback card',
+  );
+
+  root.unmount();
+  await wait(50);
+
+  const reloaded = new ChatController('fallback-browser', { send: () => {} } as never);
+  reloaded.handle({
+    type: 'chat_snapshot',
+    sessionId: 'fallback-browser',
+    snapshot: {
+      sessionId: 'fallback-browser',
+      runtime: 'grok',
+      state: 'idle',
+      capabilities: { streaming: true, questions: true, plan: true },
+      messages: [
+        {
+          id: 'fallback-assistant',
+          seq: 1,
+          turnId: 'fallback-turn',
+          role: 'assistant',
+          ts: 1,
+          blocks: [
+            { kind: 'text', text: 'I need one rollout detail before continuing.' },
+            {
+              kind: 'question',
+              request,
+              answer: {
+                optionIds: ['opt-0'],
+                text: ownWords,
+                skipped: false,
+              },
+            },
+          ],
+        },
+      ],
+      pendingPermissions: [],
+      pendingQuestions: [],
+      questionHistory: [request],
+      queued: [],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 2,
+      live: true,
+      bypassPermissions: false,
+      planMode: false,
+    },
+  } as never);
+
+  const reloadedRoot = createRoot(host);
+  reloadedRoot.render(
+    React.createElement(ChatView, {
+      controller: reloaded,
+      runtime: 'grok',
+      runtimeLabel: 'Grok CLI',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(350);
+  settle(document);
+
+  const cards = Array.from(host.querySelectorAll<HTMLElement>('[data-question-card]'));
+  const afterReload = cards[0] ?? null;
+  const afterReloadText = (afterReload?.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'a fresh controller rebuilds the fallback question and answer from its durable message block',
+    cards.length === 1
+      && afterReload?.getAttribute('data-question-card') === 'answered'
+      && Boolean(afterReload.closest('[role="log"]'))
+      && !afterReload.closest('[aria-label="Questions from the assistant"]')
+      && afterReloadText.includes(request.question)
+      && afterReloadText.includes('Canary tenants')
+      && afterReloadText.includes(ownWords)
+      && afterReload?.querySelectorAll('[data-question-option="chosen"]').length === 2
+      && afterReload.querySelectorAll('button').length === 0,
+    `${cards.length} cards :: ${afterReloadText.slice(0, 260) || 'no fallback card'}`,
+  );
+
+  reloadedRoot.unmount();
   host.remove();
 }
 
@@ -4598,6 +4828,367 @@ async function checkThePhoneReadsTheMessageFirst(): Promise<void> {
 
   root.unmount();
   host.remove();
+}
+
+/**
+ * Plan mode is a conversation control, not a hidden slash command.
+ *
+ * This is deliberately a rendered check. The regression that prompted the
+ * feature was the button disappearing from the Web UI, and the two most
+ * important follow-on guarantees are geometric: the revision can be read and
+ * acted on without leaving the conversation, and the same route remains
+ * reachable once a phone has folded the composer's secondary controls away.
+ */
+async function checkThePlanControlCanBeReviewedAndActedOn(): Promise<void> {
+  const markdown = [
+    '# Deployment plan',
+    '',
+    '1. Preserve the current conversation state.',
+    '2. Verify the browser and server paths together.',
+    '3. Ship only after the checks pass.',
+  ].join('\n');
+  const plan = { markdown, revision: 4, ts: Date.now() };
+  const capabilities = {
+    streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+    questions: true, planMode: true, interrupt: true, resume: true, fork: false,
+    attachments: true, usage: true, cost: true, plan: false,
+    models: [{ name: 'claude-opus-4-6', value: 'claude-opus-4-6' }],
+  };
+  const snapshot = (
+    sessionId: string,
+    state: 'idle' | 'running',
+    document = plan,
+  ): Record<string, unknown> => ({
+    type: 'chat_snapshot',
+    sessionId,
+    planMode: true,
+    planDocument: document,
+    snapshot: {
+      sessionId,
+      runtime: 'claude',
+      state,
+      capabilities,
+      messages: [],
+      pendingPermissions: [],
+      pendingQuestions: [],
+      queued: [],
+      firstSeq: 0,
+      replayFrom: 0,
+      cursor: 0,
+      live: true,
+      bypassPermissions: false,
+      planMode: true,
+      planDocument: document,
+    },
+  });
+
+  const host = document.createElement('div');
+  host.style.cssText = 'width:960px;height:720px;position:absolute;top:0;left:0;display:flex;overflow:hidden';
+  document.body.appendChild(host);
+
+  const sent: Array<Record<string, unknown>> = [];
+  let redraw = (): void => {};
+  const controller = new ChatController('plan-browser-check', {
+    send: (message: unknown) => sent.push(message as Record<string, unknown>),
+    onChange: () => redraw(),
+  } as never);
+  controller.handle(snapshot('plan-browser-check', 'running') as never);
+
+  const root = createRoot(host);
+  const paint = (): void => {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude',
+        workingDir: '/tmp/project',
+        view: { ...DEFAULT_CHAT_VIEW, panelOpen: false },
+        onViewChange: () => {},
+      } as never),
+    );
+  };
+  paint();
+  redraw = paint;
+  await wait(300);
+  settle(document);
+
+  const planToggle = host.querySelector<HTMLButtonElement>('button[aria-label^="Plan mode"]');
+  const modelToggle = host.querySelector<HTMLElement>('[aria-label="Change model"]');
+  const planBox = planToggle?.getBoundingClientRect();
+  const modelBox = modelToggle?.getBoundingClientRect();
+  check(
+    'the desktop composer exposes a readable Plan control',
+    Boolean(planToggle)
+      && isPainted(planToggle!)
+      && (planToggle!.textContent || '').trim() === 'Plan on'
+      && (planBox?.width || 0) >= 54
+      && (planBox?.height || 0) >= 24,
+    planToggle && planBox
+      ? `${(planToggle.textContent || '').trim()} at ${Math.round(planBox.width)}x${Math.round(planBox.height)}`
+      : 'no Plan control',
+  );
+  check(
+    'the Plan control sits with the model controls',
+    Boolean(planBox)
+      && Boolean(modelBox)
+      && modelBox!.right <= planBox!.left + 1
+      && Math.abs((modelBox!.top + modelBox!.bottom) / 2 - (planBox!.top + planBox!.bottom) / 2) <= 3,
+    planBox && modelBox
+      ? `model ends ${Math.round(modelBox.right)}, Plan starts ${Math.round(planBox.left)}`
+      : 'one of the controls is missing',
+  );
+  check(
+    'an active planning turn disables the mode switch and explains why',
+    planToggle?.disabled === true
+      && (planToggle.title || '').includes('available when that turn ends'),
+    planToggle ? planToggle.title : 'no Plan control',
+  );
+
+  const review = host.querySelector<HTMLButtonElement>('[aria-label="Read the submitted plan"]');
+  check(
+    'the latest submitted plan has a review control',
+    Boolean(review) && isPainted(review!),
+    review ? (review.textContent || '').trim() : 'no review control',
+  );
+  review?.click();
+  await wait(200);
+  settle(document);
+
+  let dialog = host.querySelector<HTMLElement>('[role="dialog"]');
+  const dialogText = (dialog?.innerText || '').replace(/\s+/g, ' ');
+  check(
+    'the review dialog names the revision and renders the whole plan',
+    Boolean(dialog)
+      && /revision 4/i.test(dialogText)
+      && dialogText.includes('Deployment plan')
+      && dialogText.includes('Preserve the current conversation state')
+      && dialogText.includes('Ship only after the checks pass'),
+    dialogText.slice(0, 240) || 'no dialog',
+  );
+
+  const actionButton = (label: string): HTMLButtonElement | null =>
+    Array.from(dialog?.querySelectorAll<HTMLButtonElement>('button') || [])
+      .find((button) => (button.textContent || '').trim() === label) ?? null;
+  const rejectWhileBusy = actionButton('Reject plan');
+  const acceptWhileBusy = actionButton('Accept plan');
+  check(
+    'accepting and rejecting are disabled while the planning turn is active',
+    rejectWhileBusy?.disabled === true && acceptWhileBusy?.disabled === true,
+    `reject=${String(rejectWhileBusy?.disabled)} accept=${String(acceptWhileBusy?.disabled)}`,
+  );
+  check(
+    'the disabled plan actions say what must finish first',
+    dialogText.includes('Wait for the active turn to finish before accepting or rejecting this plan.'),
+    dialogText.slice(0, 240),
+  );
+
+  const sentBeforeClose = sent.length;
+  (dialog?.querySelector('[aria-label="Close"]') as HTMLElement | null)?.click();
+  await wait(120);
+  check(
+    'closing the plan review is inert',
+    host.querySelector('[role="dialog"]') === null
+      && sent.length === sentBeforeClose
+      && controller.planModeValue
+      && controller.planDocumentValue?.revision === 4,
+    `${sent.length - sentBeforeClose} messages, mode=${String(controller.planModeValue)}, revision=${String(controller.planDocumentValue?.revision)}`,
+  );
+
+  // The turn ends. The same revision can now be rejected, which keeps Plan
+  // mode on and returns the caret to the ordinary composer for feedback.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'plan-browser-check',
+    event: { t: 'state', seq: 1, ts: Date.now(), state: 'idle' },
+  } as never);
+  await wait(120);
+  (host.querySelector('[aria-label="Read the submitted plan"]') as HTMLElement | null)?.click();
+  await wait(120);
+  dialog = host.querySelector<HTMLElement>('[role="dialog"]');
+  const reject = Array.from(dialog?.querySelectorAll<HTMLButtonElement>('button') || [])
+    .find((button) => (button.textContent || '').trim() === 'Reject plan');
+  reject?.click();
+  await wait(50);
+  const rejectMessage = sent[sent.length - 1];
+  check(
+    'Reject sends the revision being reviewed',
+    rejectMessage?.type === 'chat_reject_plan' && rejectMessage.revision === 4,
+    JSON.stringify(rejectMessage || null),
+  );
+  controller.handle({
+    type: 'chat_plan_action',
+    sessionId: 'plan-browser-check',
+    action: 'reject',
+    revision: 4,
+    accepted: true,
+    planMode: true,
+    plan,
+    message: 'Plan rejected. Add feedback in the composer.',
+  } as never);
+  await wait(180);
+  const field = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message"]');
+  check(
+    'a confirmed rejection closes review, keeps Plan mode, and focuses feedback',
+    host.querySelector('[role="dialog"]') === null
+      && controller.planModeValue
+      && document.activeElement === field,
+    `dialog=${String(Boolean(host.querySelector('[role="dialog"]')))} mode=${String(controller.planModeValue)} focus=${(document.activeElement as HTMLElement | null)?.getAttribute('aria-label') || 'none'}`,
+  );
+
+  // Acceptance is a distinct callback and names the same latest revision. The
+  // server response is authoritative for leaving Plan mode; the dialog only
+  // closes after that response arrives.
+  (host.querySelector('[aria-label="Read the submitted plan"]') as HTMLElement | null)?.click();
+  await wait(120);
+  dialog = host.querySelector<HTMLElement>('[role="dialog"]');
+  const accept = Array.from(dialog?.querySelectorAll<HTMLButtonElement>('button') || [])
+    .find((button) => (button.textContent || '').trim() === 'Accept plan');
+  accept?.click();
+  await wait(50);
+  const acceptMessage = sent[sent.length - 1];
+  check(
+    'Accept sends the revision being reviewed',
+    acceptMessage?.type === 'chat_accept_plan' && acceptMessage.revision === 4,
+    JSON.stringify(acceptMessage || null),
+  );
+  controller.handle({
+    type: 'chat_plan_action',
+    sessionId: 'plan-browser-check',
+    action: 'accept',
+    revision: 4,
+    accepted: true,
+    planMode: false,
+    plan,
+    message: 'Plan accepted. Implementation started.',
+  } as never);
+  await wait(150);
+  check(
+    'a confirmed acceptance closes review and leaves Plan mode',
+    host.querySelector('[role="dialog"]') === null
+      && !controller.planModeValue
+      && controller.planDocumentValue?.revision === 4,
+    `dialog=${String(Boolean(host.querySelector('[role="dialog"]')))} mode=${String(controller.planModeValue)}`,
+  );
+
+  root.unmount();
+  host.remove();
+
+  // A real phone viewport, not a 390px div in the desktop page. The review is
+  // fixed to the viewport, so only an iframe can prove its sheet stays inside a
+  // phone rather than silently measuring the desktop around the fixture.
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html style="height:100%"><head>'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
+    + '</head><body style="margin:0;height:100%;display:flex;overflow:hidden"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const phonePlan = { ...plan, revision: 9 };
+  let phoneRedraw = (): void => {};
+  const phoneController = new ChatController('plan-phone-check', {
+    send: () => {},
+    onChange: () => phoneRedraw(),
+  } as never);
+  phoneController.handle(snapshot('plan-phone-check', 'idle', phonePlan) as never);
+  const phoneRoot = createRoot(doc.body);
+  const paintPhone = (): void => phoneRoot.render(React.createElement(PhoneSurface, { controller: phoneController }));
+  paintPhone();
+  phoneRedraw = paintPhone;
+  await wait(400);
+  settle(doc);
+
+  const more = doc.querySelector<HTMLButtonElement>('[aria-label="Show the other controls"]');
+  check('the phone can reveal its secondary composer controls', Boolean(more) && isPainted(more!));
+  more?.click();
+  await wait(180);
+  settle(doc);
+
+  const phoneToggle = doc.querySelector<HTMLButtonElement>('button[aria-label^="Plan mode"]');
+  const phoneReview = doc.querySelector<HTMLButtonElement>('[aria-label="Read the submitted plan"]');
+  const viewportWidth = frame.contentWindow?.innerWidth || 390;
+  const viewportHeight = frame.contentWindow?.innerHeight || 740;
+  const inViewport = (node: Element): boolean => {
+    const box = node.getBoundingClientRect();
+    return box.left >= -1
+      && box.top >= -1
+      && box.right <= viewportWidth + 1
+      && box.bottom <= viewportHeight + 1;
+  };
+  check(
+    'the phone exposes Plan after expanding the other controls',
+    Boolean(phoneToggle)
+      && isPainted(phoneToggle!)
+      && inViewport(phoneToggle!)
+      && laidOutSize(phoneToggle!).width >= PHONE_TARGET
+      && laidOutSize(phoneToggle!).height >= PHONE_TARGET,
+    phoneToggle
+      ? `${Math.round(phoneToggle.getBoundingClientRect().left)}..${Math.round(phoneToggle.getBoundingClientRect().right)}, ${laidOutSize(phoneToggle).width}x${laidOutSize(phoneToggle).height}`
+      : 'no Plan control',
+  );
+  check(
+    'the phone can reach the submitted revision from the same expanded row',
+    Boolean(phoneReview)
+      && isPainted(phoneReview!)
+      && inViewport(phoneReview!)
+      && laidOutSize(phoneReview!).width >= PHONE_TARGET
+      && laidOutSize(phoneReview!).height >= PHONE_TARGET,
+    phoneReview
+      ? `${Math.round(phoneReview.getBoundingClientRect().left)}..${Math.round(phoneReview.getBoundingClientRect().right)}, ${laidOutSize(phoneReview).width}x${laidOutSize(phoneReview).height}`
+      : 'no review control',
+  );
+
+  phoneReview?.click();
+  await wait(180);
+  settle(doc);
+  const sheet = doc.querySelector<HTMLElement>('[role="dialog"]');
+  const sheetBox = sheet?.getBoundingClientRect();
+  const sheetText = (sheet?.innerText || '').replace(/\s+/g, ' ');
+  check(
+    'the phone review opens as a revisioned sheet inside the viewport',
+    Boolean(sheet)
+      && Boolean(sheetBox)
+      && sheetBox!.left >= -1
+      && sheetBox!.right <= viewportWidth + 1
+      && sheetBox!.top >= -1
+      && sheetBox!.bottom <= viewportHeight + 1
+      && /revision 9/i.test(sheetText),
+    sheetBox
+      ? `${Math.round(sheetBox.left)},${Math.round(sheetBox.top)} ${Math.round(sheetBox.width)}x${Math.round(sheetBox.height)} in ${viewportWidth}x${viewportHeight}`
+      : 'no sheet',
+  );
+  check(
+    'the phone plan sheet keeps its content and actions within its width',
+    Boolean(sheet)
+      && sheet!.scrollWidth <= sheet!.clientWidth + 1
+      && sheetText.includes('Deployment plan')
+      && sheetText.includes('Ship only after the checks pass'),
+    sheet ? `content ${sheet.scrollWidth}px in ${sheet.clientWidth}px` : 'no sheet',
+  );
+  const sheetActions = Array.from(sheet?.querySelectorAll<HTMLButtonElement>('button') || [])
+    .filter((button) => /^(Accept|Reject) plan$/.test((button.textContent || '').trim()));
+  const unreachable = sheetActions.filter(
+    (button) => !isPainted(button)
+      || !inViewport(button)
+      || laidOutSize(button).width < PHONE_TARGET
+      || laidOutSize(button).height < PHONE_TARGET,
+  );
+  check(
+    'both plan decisions remain reachable on the phone sheet',
+    sheetActions.length === 2 && unreachable.length === 0,
+    sheetActions.length
+      ? sheetActions.map((button) => `${(button.textContent || '').trim()}=${laidOutSize(button).width}x${laidOutSize(button).height}`).join(' | ')
+      : 'no decision buttons',
+  );
+
+  phoneRoot.unmount();
+  frame.remove();
 }
 
 async function checkThePhoneLayoutIsUsable(): Promise<void> {

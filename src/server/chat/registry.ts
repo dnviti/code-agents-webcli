@@ -40,10 +40,11 @@ export type ChatAdapterFactory = (options: ChatAdapterOptions) => ChatAdapter;
  * `extension` — as a generated file loaded with `-e` (pi), which has no MCP of
  *   its own and no ACP. A different road to the same place: the tool has the
  *   same name, dials the same socket and draws the same card.
+ * `config` — as process-local `-c mcp_servers...` overrides (codex app-server).
  *
- * Absent means the runtime has no verified way to accept one, and it simply
- * reports `questions: false` rather than being handed a flag nobody has watched
- * it parse.
+ * Absent means the runtime has no verified way to accept one. ChatSession then
+ * uses its structured-response handoff, so the Web surface still offers the
+ * same durable question card without inventing a CLI flag.
  *
  * A wired channel is not a promise the model will use it. kimi accepts the
  * server, spawns it and exposes the tool — verified — but ships a native
@@ -55,7 +56,7 @@ export type ChatAdapterFactory = (options: ChatAdapterOptions) => ChatAdapter;
  * this tool the question reaches a person, and when it does not, the outcome is
  * the one kimi would have produced regardless.
  */
-export type AskChannel = 'cli' | 'protocol' | 'extension';
+export type AskChannel = 'cli' | 'protocol' | 'extension' | 'config';
 
 interface RuntimeChatEntry {
   factory: ChatAdapterFactory;
@@ -120,6 +121,7 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
   },
   codex: {
     factory: (options) => new CodexChatAdapter(options),
+    askChannel: 'config',
     advertised: {
       streaming: true,
       thinking: true,
@@ -129,6 +131,7 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
       interrupt: true,
       resume: true,
       usage: true,
+      questions: true,
     },
   },
   /**
@@ -151,9 +154,11 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
    * process, and one leader behind every session on a multi-user installation
    * is a state-sharing boundary nobody chose.
    *
-   * `askChannel` stays unset. Grok accepts `mcpServers` on `session/new`, but
-   * nobody has watched a question from it reach this app's socket, and this
-   * table does not advertise what has not been seen working.
+   * Grok takes the same inline MCP-server descriptor as the other ACP agents.
+   * The descriptor is deliberately transport-agnostic: `ChatSession` supplies
+   * the command, arguments and environment, so it can point at either the local
+   * socket bridge or the authenticated, encrypted shared-file bridge without
+   * the registry acquiring a second, runtime-specific launch path.
    */
   grok: {
     factory: (options) =>
@@ -176,7 +181,13 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
       resume: true,
       usage: true,
       cost: true,
+      // The ACP `session/new` schema accepts the same mcpServers list as the
+      // verified kimi/omp path. The live Grok capture records MCP startup and
+      // server-status notifications; keeping this capability here makes the
+      // pre-launch UI agree with the session wiring below.
+      questions: true,
     },
+    askChannel: 'protocol',
   },
   /**
    * pi, which asks its questions through an extension rather than a server.
@@ -273,10 +284,8 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
    * to offer a person, so nothing here pretends there is — the choice is made at
    * launch, said on the card, and each refusal is explained in the conversation.
    *
-   * `askChannel` stays unset for the same reason it is unset for grok: agy
-   * accepts MCP servers through a config file of its own, but nobody has watched
-   * a question from it reach this app's socket, and this table does not
-   * advertise what has not been seen working.
+   * Agy exposes no session-scoped MCP/extension flag, so its questionnaire uses
+   * the structured final-response fallback owned by ChatSession.
    */
   antigravity: {
     factory: (options) => new AntigravityChatAdapter(options),
@@ -288,6 +297,7 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
       resume: true,
       attachments: true,
       usage: true,
+      questions: true,
     },
   },
 };
@@ -295,9 +305,8 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
 /**
  * How this runtime takes the question server, or undefined if it does not.
  *
- * Only the runtimes it has actually been watched working on: claude and the ACP
- * agents. Codex, pi and grok are one probe away, and get `questions: false`
- * until someone runs it.
+ * Only channels actually supported by the runtime are named here. A runtime
+ * with no entry is handled by ChatSession's structured-response fallback.
  */
 export function askChannelFor(runtime: string): AskChannel | undefined {
   return RUNTIMES[runtime]?.askChannel;
@@ -344,7 +353,14 @@ export function chatCapableRuntimes(): string[] {
 export function advertisedChatCapabilities(runtime: string): ChatCapabilities {
   const entry = RUNTIMES[runtime];
   if (!entry) return { ...NO_CHAT_CAPABILITIES };
-  return { ...NO_CHAT_CAPABILITIES, ...entry.advertised };
+  return {
+    ...NO_CHAT_CAPABILITIES,
+    ...entry.advertised,
+    // Both are app-supplied capabilities. A runtime without an injectable tool
+    // channel uses the normalized response fallback after it starts.
+    questions: true,
+    planMode: true,
+  };
 }
 
 export function createChatAdapter(

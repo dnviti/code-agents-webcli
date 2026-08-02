@@ -23,7 +23,13 @@ const {
   MAX_QUESTION_ANSWER_TEXT,
   ASK_QUESTION_TOOL_NAME,
 } = require('../dist/shared/chat-events.js');
-const { askChannelFor, askEnvFor } = require('../dist/server/chat/registry.js');
+const {
+  askChannelFor,
+  askEnvFor,
+  advertisedChatCapabilities,
+  chatCapableRuntimes,
+  createChatAdapter,
+} = require('../dist/server/chat/registry.js');
 const { MessageProcessor } = require('../dist/server/websocket/messages.js');
 
 // Choice-based questions from the model, end to end (issue #42).
@@ -659,14 +665,49 @@ describe('asking the user a choice-based question', function () {
     });
 
     it('knows which runtimes have a verified way to take the server', function () {
-      // Only the ones this has actually been watched working on. A runtime that
-      // gets a flag nobody has seen it parse is a capability claim with nothing
-      // behind it.
+      // Only real injection points are named here. Antigravity has no such
+      // hook and is deliberately absent; ChatSession gives it the structured
+      // final-response handoff instead of inventing a flag.
       assert.strictEqual(askChannelFor('claude'), 'cli');
       assert.strictEqual(askChannelFor('kimi'), 'protocol');
       assert.strictEqual(askChannelFor('omp'), 'protocol');
-      assert.strictEqual(askChannelFor('codex'), undefined);
+      assert.strictEqual(askChannelFor('grok'), 'protocol');
+      assert.strictEqual(askChannelFor('codex'), 'config');
+      assert.strictEqual(askChannelFor('pi'), 'extension');
+      assert.strictEqual(askChannelFor('antigravity'), undefined);
       assert.strictEqual(askChannelFor('nonesuch'), undefined);
+    });
+
+    it('offers questions and Plan mode on every registered Web-chat runtime', function () {
+      assert.deepStrictEqual(
+        chatCapableRuntimes().sort(),
+        ['antigravity', 'claude', 'codex', 'grok', 'kimi', 'omp', 'pi'],
+      );
+      for (const runtime of chatCapableRuntimes()) {
+        const capabilities = advertisedChatCapabilities(runtime);
+        assert.strictEqual(capabilities.questions, true, `${runtime} questions`);
+        assert.strictEqual(capabilities.planMode, true, `${runtime} Plan mode`);
+      }
+    });
+
+    it('advertises and constructs Grok with the shared ACP question path', function () {
+      // Grok is an ACP client, so it must receive the exact descriptor that
+      // session/new already passes to kimi and omp. The descriptor itself is
+      // opaque to the registry: that keeps a later socket-to-file transport
+      // change in the session bridge, rather than splitting Grok from ACP.
+      assert.strictEqual(advertisedChatCapabilities('grok').questions, true);
+      const adapter = createChatAdapter('grok', {
+        sessionId: 'grok-question',
+        workingDir: '/work',
+        command: '/nonexistent',
+        askMcpServer: {
+          name: 'ccweb', command: '/usr/bin/node', args: ['/bridge.js'],
+          env: { CCWEB_ASK_SOCKET: '/tmp/ask.sock' },
+        },
+        emit() {},
+      });
+      assert.ok(adapter, 'Grok must remain a chat runtime');
+      assert.strictEqual(adapter.runtime, 'grok');
     });
 
     it('matches the namespaced name a runtime reports the call under', function () {

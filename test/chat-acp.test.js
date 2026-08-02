@@ -156,6 +156,26 @@ describe('acp chat adapter', function () {
       const opened = h.sent.find((message) => message.method === 'session/new');
       assert.strictEqual(opened.params.cwd, '/tmp/work');
     });
+
+    it('hands the question bridge to an ACP session in its protocol shape', async function () {
+      const h = harness({
+        runtime: 'grok',
+        askMcpServer: {
+          name: 'ccweb',
+          command: '/usr/bin/node',
+          args: ['/bridge.js'],
+          env: { CCWEB_ASK_SOCKET: '/tmp/ask.sock' },
+        },
+      });
+      await boot(h, fixture('acp-omp'));
+      const opened = h.sent.find((message) => message.method === 'session/new');
+      assert.deepStrictEqual(opened.params.mcpServers, [{
+        name: 'ccweb',
+        command: '/usr/bin/node',
+        args: ['/bridge.js'],
+        env: [{ name: 'CCWEB_ASK_SOCKET', value: '/tmp/ask.sock' }],
+      }]);
+    });
   });
 
   describe('streaming messages', function () {

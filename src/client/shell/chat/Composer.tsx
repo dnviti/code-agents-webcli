@@ -187,6 +187,14 @@ export interface ComposerProps {
     applied: 'live' | 'sent' | 'pending' | 'cleared' | 'refused';
     message: string;
   } | null;
+  /** Conversation plan mode is available for every Web-chat runtime. */
+  planMode?: boolean;
+  onSetPlanMode?: (on: boolean) => void;
+  /** A planning turn already received its directive, so changing it would lie. */
+  planLocked?: boolean;
+  planFeedback?: { action: string; changed?: boolean; message: string } | null;
+  planDocument?: { markdown: string; revision: number; ts: number } | null;
+  onOpenPlan?: () => void;
   /** Drives what the permission chip reports. */
   bypassPermissions?: boolean;
   /**
@@ -329,6 +337,12 @@ export function Composer({
   effort,
   onSetEffort,
   effortFeedback,
+  planMode = false,
+  onSetPlanMode,
+  planLocked = false,
+  planFeedback,
+  planDocument,
+  onOpenPlan,
   bypassPermissions = false,
   terminalOpen = false,
   onNewChat,
@@ -1221,6 +1235,21 @@ export function Composer({
                 feedback={effortFeedback}
                 onPick={(value) => onSetEffort?.(value)}
               />
+
+              {onSetPlanMode ? (
+                <PlanModeChip
+                  on={planMode}
+                  locked={planLocked}
+                  feedback={planFeedback}
+                  onToggle={onSetPlanMode}
+                />
+              ) : null}
+
+              {planDocument && onOpenPlan ? (
+                <ChipButton label="Read the submitted plan" text="Plan" onClick={onOpenPlan}>
+                  <Icon name="list-todo" size={13} />
+                </ChipButton>
+              ) : null}
 
               <PermissionChip bypassPermissions={bypassPermissions} />
             </>
@@ -2510,6 +2539,48 @@ function EffortMeter({ filled, tone }: { filled: number; tone: string }): React.
  * made. A picker here that silently did nothing would be the worst of the three
  * options available.
  */
+function PlanModeChip({
+  on,
+  locked,
+  feedback,
+  onToggle,
+}: {
+  on: boolean;
+  locked: boolean;
+  feedback?: { action: string; changed?: boolean; message: string } | null;
+  onToggle: (on: boolean) => void;
+}): React.JSX.Element {
+  const isPhone = usePhone();
+  const label = on
+    ? 'Plan mode is on — the agent must submit a plan before implementation'
+    : 'Plan mode — ask the agent to prepare a plan first';
+  const refusal = feedback?.action === 'mode' && feedback.changed === false ? feedback.message : '';
+  const reason = locked
+    ? 'The agent is preparing a plan right now. This control is available when that turn ends.'
+    : refusal;
+  return (
+    <button
+      type="button"
+      onClick={() => onToggle(!on)}
+      disabled={locked}
+      aria-pressed={on}
+      aria-label={label}
+      title={reason ? `${label}. ${reason}` : label}
+      style={{
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: '0 0 auto', gap: 5,
+        height: isPhone ? TOUCH_TARGET : 26, padding: isPhone ? '0 10px' : '0 8px', whiteSpace: 'nowrap',
+        background: on ? 'var(--accent)' : 'transparent', border: `1px solid ${on ? 'var(--ring)' : 'var(--border)'}`,
+        borderRadius: 'var(--radius)', fontFamily: 'var(--font-sans)', fontSize: isPhone ? PHONE_TEXT.label : 'var(--text-2xs)',
+        color: on ? 'var(--foreground)' : 'var(--muted-foreground)', opacity: locked ? 0.5 : 1,
+        cursor: locked ? 'not-allowed' : 'pointer',
+      }}
+    >
+      <Icon name="list-todo" size={isPhone ? 14 : 12} />
+      <span>{on ? 'Plan on' : 'Plan'}</span>
+    </button>
+  );
+}
+
 function PermissionChip({ bypassPermissions }: { bypassPermissions: boolean }): React.JSX.Element {
   return (
     <Chip

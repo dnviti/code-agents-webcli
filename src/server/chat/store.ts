@@ -9,6 +9,7 @@ import {
   ChatTurnIndexEntry,
   ChatUsage,
   NO_CHAT_CAPABILITIES,
+  PlanDocument,
 } from '../../shared/chat-events.js';
 import {
   applyChatEvent,
@@ -71,6 +72,9 @@ const SESSION_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
  * conversation, and this is a message that has not been sent yet.
  */
 const CONTEXT_SUFFIX = '.ctx';
+
+/** Latest complete Plan-mode document for the conversation. */
+const PLAN_SUFFIX = '.plan';
 
 /**
  * How a conversation's opening is read: in chunks, up to a ceiling.
@@ -276,6 +280,9 @@ export interface ChatStoreLike {
    */
   openingContext?(session: ChatSessionRef): Promise<string | null>;
   clearOpeningContext?(session: ChatSessionRef): Promise<void>;
+  setPlanDocument?(session: ChatSessionRef, plan: PlanDocument): Promise<void>;
+  planDocument?(session: ChatSessionRef): Promise<PlanDocument | null>;
+  clearPlanDocument?(session: ChatSessionRef): Promise<void>;
 }
 
 export class ChatStore implements ChatStoreLike {
@@ -798,6 +805,10 @@ export class ChatStore implements ChatStoreLike {
       state.capabilities = undefined;
       state.limits = undefined;
       state.capabilitySeq = 0;
+      // The Plan document belongs to the discarded conversation. Keeping its
+      // removal in this same per-session queue means an older in-flight save
+      // cannot land after the truncation and resurrect it.
+      await fs.promises.rm(`${base}${PLAN_SUFFIX}`, { force: true });
     });
   }
 
@@ -1145,6 +1156,47 @@ export class ChatStore implements ChatStoreLike {
     await fs.promises
       .rm(`${this.basePath(session)}${CONTEXT_SUFFIX}`, { force: true })
       .catch(() => undefined);
+  }
+
+  /** Atomically replace the latest plan document. */
+  async setPlanDocument(session: ChatSessionRef, plan: PlanDocument): Promise<void> {
+    const base = this.basePath(session);
+    await this.enqueue(base, async () => {
+      const target = `${base}${PLAN_SUFFIX}`;
+      const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
+      await fs.promises.mkdir(path.dirname(base), { recursive: true });
+      try {
+        await fs.promises.writeFile(temporary, JSON.stringify(plan), { encoding: 'utf8', mode: 0o600 });
+        await fs.promises.rename(temporary, target);
+      } catch (error) {
+        await fs.promises.rm(temporary, { force: true }).catch(() => undefined);
+        throw error;
+      }
+    });
+  }
+
+  async planDocument(session: ChatSessionRef): Promise<PlanDocument | null> {
+    const base = this.basePath(session);
+    return this.enqueue(base, async () => {
+      try {
+        const raw = await fs.promises.readFile(`${base}${PLAN_SUFFIX}`, 'utf8');
+        const value = JSON.parse(raw) as Partial<PlanDocument>;
+        if (typeof value.markdown !== 'string' || value.markdown.length === 0) return null;
+        if (!Number.isSafeInteger(value.revision) || Number(value.revision) < 1) return null;
+        return {
+          markdown: value.markdown,
+          revision: Number(value.revision),
+          ts: typeof value.ts === 'number' && Number.isFinite(value.ts) ? value.ts : 0,
+        };
+      } catch {
+        return null;
+      }
+    });
+  }
+
+  async clearPlanDocument(session: ChatSessionRef): Promise<void> {
+    const base = this.basePath(session);
+    await this.enqueue(base, () => fs.promises.rm(`${base}${PLAN_SUFFIX}`, { force: true }));
   }
 
   /**
@@ -1560,6 +1612,7 @@ export class ChatStore implements ChatStoreLike {
         usage: await this.sessionUsage(base, state, stats),
         plan: transcript.plan,
         pendingPermissions: transcript.pendingPermissions,
+        questionHistory: transcript.questionHistory,
         // What was picked, for the questions that have been answered (#113).
         // The replay above folds `question_resolved` the same way a browser
         // does, and the answer sits between the same two message starts as the
@@ -1639,8 +1692,10 @@ export class ChatStore implements ChatStoreLike {
       this.states.delete(base);
       this.descriptions.delete(base);
       await Promise.all(
-        ['.jsonl', '.idx', '.jsonl.tmp', '.idx.tmp', CONTEXT_SUFFIX].map((suffix) =>
-          fs.promises.rm(`${base}${suffix}`, { force: true }).catch(() => undefined),
+        ['.jsonl', '.idx', '.jsonl.tmp', '.idx.tmp', CONTEXT_SUFFIX, PLAN_SUFFIX].map((suffix) =>
+          suffix === PLAN_SUFFIX
+            ? fs.promises.rm(`${base}${suffix}`, { force: true })
+            : fs.promises.rm(`${base}${suffix}`, { force: true }).catch(() => undefined),
         ),
       );
     });

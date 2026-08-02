@@ -3,6 +3,37 @@
 ## [6.0.0] - unreleased
 
 ### Added
+- **Plan mode is back as a complete WebUI workflow on every chat runtime**
+  (#179). The Plan control sits beside the model and effort controls on desktop
+  and phone, and belongs to the conversation rather than the browser: its state
+  and latest complete Markdown document survive navigation, reloads, another
+  device and an app restart. Submitted plans are numbered revisions, with only
+  the latest actionable. Closing the review is inert; rejecting keeps Plan mode
+  and returns to the composer for feedback; accepting turns it off and starts
+  implementation immediately under the conversation's normal approval policy.
+  Changing mode or acting on a plan is locked while a turn is active, a new
+  conversation clears both mode and document, and failures keep the review
+  available to retry.
+
+- **The agent's questionnaire now works in Default and Plan mode on every WebUI
+  runtime and every deployment target** (#180). Claude, Codex, Grok, Kimi and
+  Oh My Pi receive the same MCP server through their supported session-local
+  channel; pi receives the equivalent generated extension; Antigravity uses a
+  structured final-response handoff because its headless CLI exposes no MCP or
+  extension hook. Single choice, multiple choice, free text and skip all use the
+  same durable card, and answered cards remain readable in history.
+
+  Containers on another Docker or Podman host and Kubernetes pods now relay
+  questions and Plan submissions through the shared per-user home. Every
+  request, reply, cancellation and liveness lease is an authenticated,
+  encrypted per-session envelope written atomically to an owner-only endpoint;
+  the secret itself is never stored there. The bridge refuses replaced or
+  symlinked transport paths, pins child operations to verified open directory
+  descriptors, and safely prunes stale crash artifacts. A broken channel tells
+  the agent to ask in prose rather than hanging. Tool approvals
+  remain Unix-socket based and therefore still do not cross a remote-host or pod
+  boundary.
+
 - **Every signed-in user can have their own machine.** Until now everyone who
   signed in shared this one: the same account, the same home directory, the same
   installed tools. One person's global install changed the environment for
@@ -32,9 +63,9 @@
   one shared ReadWriteMany claim, so the file browser, editor and uploads keep
   working exactly as they do on a single machine.
 
-  Two things do not cross the pod boundary yet, and both are documented: tool
-  approvals and the model's questions travel over a unix socket, and automatic
-  sizing needs metrics-server to have anything to read.
+  Tool approvals still do not cross the pod boundary and automatic sizing needs
+  metrics-server to have anything to read. Model questions and Plan submissions
+  now use the shared home claim and do cross it.
 
 - **You choose how big your own environment is.** *Settings → Workspace
   environment* offers the sizes your administrator defined — and **Automatic**,

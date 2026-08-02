@@ -59,10 +59,14 @@ and in each engine's caveats.
   data directory (and every configured extra mount) through shared storage at
   those exact same paths; without it, environment creation cannot produce a
   usable home.
-- **Tool approvals and agent questions from a remote Docker or Podman host do
-  not reach the browser.** Their channel is a Unix socket on the server host;
-  sharing the directory exposes its path but does not forward that socket to a
-  different machine. Conversations that bypass approvals are unaffected.
+- **Tool approvals from a remote Docker or Podman host do not reach the
+  browser.** Their channel is still a Unix socket on the server host, so
+  conversations on a remote engine should bypass approvals. Agent questions
+  and Plan submissions do cross the boundary: they use an owner-only callback
+  directory with authenticated, encrypted per-session envelopes in the shared
+  per-user home. Callback file operations stay beneath verified open directory
+  handles even if a visible path is replaced. A missing or stale callback fails
+  back to prose instead of leaving the runtime waiting.
 - Remote Docker and Podman targets can run per-user environments, but they
   cannot host [projects](projects.md): project workspaces must also be visible
   to the server-side file browser. Project creation fails loudly instead of
@@ -77,11 +81,11 @@ and in each engine's caveats.
   and patch pods in the namespace you name.
 - Storage must be a **ReadWriteMany** claim; see
   [Per-user environments → Storage on Kubernetes](user-environments.md#storage-on-kubernetes).
-- **Tool approvals and agent questions from inside a pod do not reach the
-  browser.** Both travel over a unix socket, which does not cross a pod boundary.
-  Conversations that bypass approvals are unaffected; conversations that ask for
-  them will not get their prompts. This is a hard limitation of the pod
-  boundary, not a setting.
+- **Tool approvals from inside a pod do not reach the browser.** Their Unix
+  socket does not cross the pod boundary, so these conversations should bypass
+  approvals. Agent questions and Plan submissions use the ReadWriteMany home
+  claim instead and do reach the WebUI; no Service or inbound pod port is
+  required.
 - **Automatic sizing needs metrics-server.** Without it `kubectl top` has nothing
   to report, and automatic sizing stays where it is.
 

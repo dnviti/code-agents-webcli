@@ -100,7 +100,12 @@ import { UserPreferenceStore } from './services/user-preferences.js';
  */
 export function applyChatLifecycle(
   record: SessionRecord,
-  change: { nativeSessionId?: string | null; exited?: boolean; bypassing?: boolean },
+  change: {
+    nativeSessionId?: string | null;
+    exited?: boolean;
+    bypassing?: boolean;
+    planMode?: boolean;
+  },
   writeActive?: (sessionId: string, active: boolean) => void | Promise<void>,
 ): void {
   if (change.nativeSessionId !== undefined) {
@@ -113,6 +118,9 @@ export function applyChatLifecycle(
     // as bypassing, and the next resume would restore a permission it no longer
     // had — the exact silent widening this rule exists to prevent (#134).
     record.chatBypassPermissions = change.bypassing;
+  }
+  if (change.planMode !== undefined) {
+    record.chatPlanMode = change.planMode;
   }
   if (change.exited === true) {
     // Frees the session for a relaunch in the same tab. Without it the
@@ -452,7 +460,11 @@ export class ClaudeCodeWebServer {
         // Likewise a mode that changed under a `/clear`: it is a standing
         // permission, and one that only exists in memory is one a restart
         // silently rewrites.
-        if (change.nativeSessionId === null || change.bypassing !== undefined) {
+        if (
+          change.nativeSessionId === null
+          || change.bypassing !== undefined
+          || change.planMode !== undefined
+        ) {
           void this.saveSessionsToDisk();
         }
       },

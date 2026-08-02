@@ -76,6 +76,26 @@ function asked(picks, { skipped = false, text } = {}) {
   ];
 }
 
+function fallbackAsked(picks, { skipped = false, text } = {}) {
+  const request = {
+    requestId: 'fallback-req-1',
+    question: 'Which fallback path should I take?',
+    multiSelect: false,
+    options: OPTIONS,
+    ts: 1,
+  };
+  return {
+    request,
+    events: [
+      { t: 'question', seq: 1, ts: 1, request },
+      {
+        t: 'question_resolved', seq: 2, ts: 2,
+        requestId: request.requestId, optionIds: picks, text, skipped,
+      },
+    ],
+  };
+}
+
 describe('an answered question survives being left and come back to (#113)', function () {
   describe('what the server hands a browser that rejoins', function () {
     let dir;
@@ -145,6 +165,20 @@ describe('an answered question survives being left and come back to (#113)', fun
       store.append(ref, asked(['opt-1']));
       const snapshot = await store.snapshot(ref, {});
       assert.deepStrictEqual(snapshot.answeredQuestionText, {});
+    });
+
+    it('retains an answered fallback question that has no tool block of its own', async function () {
+      const fallback = fallbackAsked(['opt-1']);
+      store.append(ref, fallback.events);
+      const snapshot = await store.snapshot(ref, {});
+      assert.deepStrictEqual(snapshot.questionHistory, [fallback.request]);
+      assert.deepStrictEqual(snapshot.answeredQuestions[fallback.request.requestId], ['opt-1']);
+      assert.deepStrictEqual(snapshot.pendingQuestions || [], []);
+      assert.deepStrictEqual(snapshot.messages[0].blocks[0], {
+        kind: 'question',
+        request: fallback.request,
+        answer: { optionIds: ['opt-1'] },
+      }, 'the fallback decision has a chronological, self-contained transcript block');
     });
   });
 
@@ -258,6 +292,30 @@ describe('an answered question survives being left and come back to (#113)', fun
         'neither — rebuild it nightly',
         'without this the card comes back reading as one nobody answered',
       );
+    });
+
+    it('keeps a resolved no-tool fallback question through live resolution and reload', function () {
+      const fallback = fallbackAsked(['opt-1']);
+      const controller = new mod.ChatController('s1', { send: () => {} });
+      controller.handle(snapshot({}));
+      controller.transcript.apply(fallback.events[0]);
+      controller.transcript.apply(fallback.events[1]);
+      assert.strictEqual(controller.transcript.pendingQuestions.length, 0);
+      assert.deepStrictEqual(controller.transcript.questionHistory, [fallback.request]);
+      assert.deepStrictEqual(controller.transcript.answerFor(fallback.request.requestId), ['opt-1']);
+      assert.deepStrictEqual(controller.transcript.messages[0].blocks[0].answer, {
+        optionIds: ['opt-1'],
+      });
+
+      controller.handle(snapshot({
+        messages: controller.transcript.messages,
+        pendingQuestions: [],
+        questionHistory: [fallback.request],
+        answeredQuestions: { [fallback.request.requestId]: ['opt-1'] },
+        cursor: 2,
+      }));
+      assert.deepStrictEqual(controller.transcript.questionHistory, [fallback.request]);
+      assert.deepStrictEqual(controller.transcript.answerFor(fallback.request.requestId), ['opt-1']);
     });
 
     it('keeps them for a question that arrives by scrolling back through history', function () {

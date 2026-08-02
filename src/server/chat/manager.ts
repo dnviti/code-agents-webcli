@@ -4,7 +4,14 @@ import * as path from 'path';
 import { ChatSnapshot, UserTurn } from '../../shared/chat-events.js';
 import { LadderRung, ModelTier } from '../../shared/runtime-profiles.js';
 import { SessionRecord } from '../types.js';
-import { ChatNotRunningError, ChatSession, ChatSessionStartOptions, ChatUsageSink } from './session.js';
+import {
+  ChatNotRunningError,
+  ChatSession,
+  ChatSessionStartOptions,
+  ChatUsageSink,
+  PlanActionResult,
+  PlanModeResult,
+} from './session.js';
 import { ModelCapacityLookup } from './model-capacity.js';
 import { ChatStore, ChatTurnIndex } from './store.js';
 
@@ -32,6 +39,7 @@ export interface ChatManagerDeps {
       nativeSessionId?: string | null;
       exited?: boolean;
       bypassing?: boolean;
+      planMode?: boolean;
       restarting?: boolean;
     },
   ) => void;
@@ -287,6 +295,11 @@ export class ChatSessionManager {
       ...snapshot,
       runtime: snapshot.runtime || record.lastAgent || '',
       nativeSessionId,
+      planMode: record.chatPlanMode === true,
+      planDocument: (await this.deps.store.planDocument?.({
+        id: record.id,
+        ownerUserId: record.ownerUserId,
+      })) ?? null,
     };
   }
 
@@ -404,6 +417,29 @@ export class ChatSessionManager {
   /** Carry a new effort level into the options an in-place `/clear` restart replays. */
   rememberEffort(sessionId: string, effort: string | undefined): void {
     this.sessions.get(sessionId)?.rememberEffort(effort);
+  }
+
+  async setPlanMode(sessionId: string, on: boolean): Promise<PlanModeResult | null> {
+    const session = this.sessions.get(sessionId);
+    return session ? session.setPlanMode(on) : null;
+  }
+
+  rememberPlanMode(sessionId: string, on: boolean): void {
+    this.sessions.get(sessionId)?.rememberPlanMode(on);
+  }
+
+  async acceptPlan(sessionId: string, revision: number): Promise<PlanActionResult | null> {
+    const session = this.sessions.get(sessionId);
+    // A stopped ChatSession can still be retained in the map after its adapter
+    // exits. Treat it the same as a process lost across a server restart: the
+    // WebSocket layer must relaunch the conversation before Accept can keep its
+    // promise to begin implementation immediately.
+    return session?.live ? session.acceptPlan(revision) : null;
+  }
+
+  async rejectPlan(sessionId: string, revision: number): Promise<PlanActionResult | null> {
+    const session = this.sessions.get(sessionId);
+    return session ? session.rejectPlan(revision) : null;
   }
 
   /** Drop a turn that was typed ahead and has not run yet. */

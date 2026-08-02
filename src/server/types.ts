@@ -249,6 +249,8 @@ export interface SessionRecord {
    * exactly like every row written before this existed.
    */
   chatEffortOverride?: string;
+  /** Durable Plan-mode choice for this conversation. Absent reads as off. */
+  chatPlanMode?: boolean;
   /**
    * What is sitting in this conversation's composer, unsent.
    *

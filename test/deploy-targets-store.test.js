@@ -86,8 +86,9 @@ describe('deploy target store', function () {
       assert.ok(caveats.some((c) => c.includes('bypassPermissions')));
       assert.ok(caveats.some((c) => c.includes('metrics-server')));
       const dockerCaveats = caveatsFor('docker');
-      assert.strictEqual(dockerCaveats.length, 1);
+      assert.strictEqual(dockerCaveats.length, 2);
       assert.match(dockerCaveats[0], /Linux.*sh.*\/proc.*setsid/);
+      assert.match(dockerCaveats[1], /remote engine.*questions.*still work/i);
     });
   });
 

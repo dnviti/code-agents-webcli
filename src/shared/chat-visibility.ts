@@ -77,6 +77,8 @@ export function blockDraws(block: ChatBlock): boolean {
       return block.items.some((item) => item.text.trim().length > 0);
     case 'notice':
       return block.text.trim().length > 0;
+    case 'question':
+      return block.request.question.trim().length > 0;
     case 'image':
     case 'error':
       return true;
@@ -119,6 +121,8 @@ export function blockHasContent(block: ChatBlock): boolean {
       return block.text.trim().length > 0;
     case 'plan':
       return block.items.some((item) => item.text.trim().length > 0);
+    case 'question':
+      return block.request.question.trim().length > 0;
     default:
       return true;
   }

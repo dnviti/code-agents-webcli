@@ -227,6 +227,24 @@ describe('SessionStore', function() {
       assert.strictEqual(loaded.get('manual').chatBypassPermissions, undefined);
     });
 
+    it('round-trips plan mode and reads a pre-migration row as off', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['planning', createSessionRecord({ id: 'planning', ownerUserId, surface: 'chat', chatPlanMode: true })],
+        ['ordinary', createSessionRecord({ id: 'ordinary', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      let loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('planning').chatPlanMode, true);
+      assert.strictEqual(loaded.get('ordinary').chatPlanMode, false);
+
+      sessionStore.database.raw.exec('ALTER TABLE runtime_sessions DROP COLUMN chat_plan_mode');
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('planning').chatPlanMode, false, 'a pre-plan row must never be restored in plan mode');
+    });
+
     it('keeps “granted approvals” apart from “nothing granted”', async function () {
       // Three states, not two, since #134. A conversation that launched and
       // asked is recorded as `false`, which is a decision the rule replays on

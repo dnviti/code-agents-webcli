@@ -79,6 +79,15 @@ function withoutRuntimeUserEchoes(messages: ChatMessage[]): ChatMessage[] {
   );
 }
 
+/** Merge durable question records by request id while preserving their order. */
+function mergeQuestionHistory(...groups: QuestionRequest[][]): QuestionRequest[] {
+  const merged = new Map<string, QuestionRequest>();
+  for (const group of groups) {
+    for (const question of group) merged.set(question.requestId, question);
+  }
+  return [...merged.values()];
+}
+
 export class ChatTranscript {
   private state: TranscriptState;
   private listeners = new Set<Listener>();
@@ -213,13 +222,19 @@ export class ChatTranscript {
 
   /** Replace everything with a server snapshot, e.g. on join or reconnect. */
   hydrate(snapshot: ChatSnapshot): void {
+    const pendingQuestions = snapshot.pendingQuestions || [];
+    const questionHistory = mergeQuestionHistory(
+      snapshot.questionHistory ?? this.state.questionHistory,
+      pendingQuestions,
+    );
     this.state = createTranscript(snapshot.capabilities, {
       messages: snapshot.messages,
       state: snapshot.state,
       usage: snapshot.usage || {},
       plan: snapshot.plan || [],
       pendingPermissions: snapshot.pendingPermissions || [],
-      pendingQuestions: snapshot.pendingQuestions || [],
+      pendingQuestions,
+      questionHistory,
       // What was picked, for the questions already answered (#113). Falling
       // back to what is already held rather than to nothing: a server that
       // predates this field must not take the marks off a card this browser
@@ -293,6 +308,7 @@ export class ChatTranscript {
     answers?: Record<string, string[]>,
     answerText?: Record<string, string>,
     abandoned?: Record<string, true>,
+    questions?: QuestionRequest[],
   ): void {
     this.state.firstSeq = firstSeq;
     if (from !== undefined) {
@@ -313,6 +329,9 @@ export class ChatTranscript {
     }
     if (abandoned) {
       this.state.abandonedQuestions = { ...abandoned, ...this.state.abandonedQuestions };
+    }
+    if (questions) {
+      this.state.questionHistory = mergeQuestionHistory(questions, this.state.questionHistory);
     }
 
     if (!messages.length) {
@@ -571,6 +590,11 @@ export class ChatTranscript {
   /** Questions the model asked that nobody has answered yet. */
   get pendingQuestions(): QuestionRequest[] {
     return this.state.pendingQuestions;
+  }
+
+  /** Questions that still need a card after they stop being pending. */
+  get questionHistory(): QuestionRequest[] {
+    return this.state.questionHistory;
   }
 
   /**

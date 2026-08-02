@@ -36,6 +36,7 @@ import {
   carriesTokens,
   isSessionMintedMessageId,
   mergeUsage,
+  withoutQuestionFallbackEnvelope,
 } from './chat-events.js';
 import { turnOutcomeOf } from './turn-outcome.js';
 import { openTurnAfter } from './turn-boundaries.js';
@@ -70,6 +71,11 @@ export interface TranscriptState {
    * which is where scrolling back finds it.
    */
   pendingQuestions: QuestionRequest[];
+  /**
+   * Every question event still retained in the loaded log, including resolved
+   * questions with no tool block from which a historical card could be rebuilt.
+   */
+  questionHistory: QuestionRequest[];
   /**
    * Answers already given, keyed by the tool call that asked.
    *
@@ -170,6 +176,7 @@ export function createTranscript(
     plan: [],
     pendingPermissions: [],
     pendingQuestions: [],
+    questionHistory: [],
     answeredQuestions: {},
     answeredQuestionText: {},
     abandonedQuestions: {},
@@ -908,6 +915,11 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
     }
 
     case 'question': {
+      const recorded = state.questionHistory.findIndex(
+        (question) => question.requestId === event.request.requestId,
+      );
+      if (recorded < 0) state.questionHistory.push(event.request);
+      else state.questionHistory[recorded] = event.request;
       const already = state.pendingQuestions.some(
         (pending) => pending.requestId === event.request.requestId,
       );
@@ -918,7 +930,55 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // stop button all read this, and "waiting for approval" over a question
       // about which of three approaches to take is simply the wrong sentence.
       state.state = 'awaiting_answer';
-      return { messageIndex: null, structural: false, meta: true, applied: true };
+
+      // A normal ask tool already owns its card in the message that contains
+      // the call. The structured-response fallback has no tool block at all,
+      // so make the question itself a durable block on the assistant response
+      // that asked it. The raw private envelope in that response is hidden;
+      // this is the readable chronological replacement that survives replay.
+      const toolOwnsCard = event.request.toolId
+        ? state.toolIndex[event.request.toolId] !== undefined
+        : false;
+      if (toolOwnsCard) {
+        return { messageIndex: null, structural: false, meta: true, applied: true };
+      }
+
+      let messageIndex = -1;
+      for (let i = state.messages.length - 1; i >= 0; i -= 1) {
+        if (state.messages[i].role === 'assistant') {
+          messageIndex = i;
+          break;
+        }
+      }
+      if (messageIndex >= 0) {
+        const message = state.messages[messageIndex];
+        const exists = message.blocks.some(
+          (block) => block.kind === 'question'
+            && block.request.requestId === event.request.requestId,
+        );
+        if (!exists) message.blocks.push({ kind: 'question', request: event.request });
+        return { messageIndex, structural: false, meta: true, applied: true };
+      }
+
+      // Defensive route for a runtime that asks before it has emitted any
+      // assistant message. It still gets a transcript row and never falls back
+      // to a question that can only be found beside the composer.
+      const message: ChatMessage = {
+        id: `question-${event.request.requestId}`,
+        seq: event.seq,
+        turnId: state.currentTurnId ?? lastTurnId(state) ?? `question-${event.seq}`,
+        role: 'assistant',
+        ts: event.ts,
+        blocks: [{ kind: 'question', request: event.request }],
+      };
+      state.index[message.id] = state.messages.length;
+      state.messages.push(message);
+      return {
+        messageIndex: state.messages.length - 1,
+        structural: true,
+        meta: true,
+        applied: true,
+      };
     }
 
     case 'question_resolved': {
@@ -949,10 +1009,34 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       } else {
         delete state.answeredQuestionText[key];
       }
+      // A no-tool fallback owns a real chronological block. Put its outcome on
+      // that block as well as in the compatibility lookup maps so snapshots,
+      // branches and copied history remain self-contained.
+      let resolvedMessageIndex: number | null = null;
+      for (let i = state.messages.length - 1; i >= 0; i -= 1) {
+        const block = state.messages[i].blocks.find(
+          (candidate) => candidate.kind === 'question'
+            && candidate.request.requestId === event.requestId,
+        );
+        if (!block || block.kind !== 'question') continue;
+        block.answer = {
+          optionIds: [...event.optionIds],
+          ...(event.text ? { text: event.text } : null),
+          ...(event.skipped ? { skipped: true } : null),
+          ...(event.abandoned ? { abandoned: true } : null),
+        };
+        resolvedMessageIndex = i;
+        break;
+      }
       if (state.state === 'awaiting_answer' && state.pendingQuestions.length === 0) {
         state.state = 'running';
       }
-      return { messageIndex: null, structural: false, meta: true, applied: true };
+      return {
+        messageIndex: resolvedMessageIndex,
+        structural: false,
+        meta: true,
+        applied: true,
+      };
     }
 
     case 'state': {
@@ -1022,6 +1106,7 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         // longer on screen, and answering it would reach a turn that no longer
         // exists — the session resolves them at the same moment on its side.
         state.pendingQuestions = [];
+        state.questionHistory = [];
         state.answeredQuestions = {};
         state.answeredQuestionText = {};
         state.abandonedQuestions = {};
@@ -1188,7 +1273,10 @@ export function applyAll(state: TranscriptState, events: ChatEvent[]): Transcrip
 export function messageText(message: ChatMessage): string {
   const parts: string[] = [];
   for (const block of message.blocks) {
-    parts.push(blockText(block));
+    const text = blockText(block);
+    parts.push(message.role === 'assistant' && block.kind === 'text'
+      ? withoutQuestionFallbackEnvelope(text)
+      : text);
   }
   return parts.filter(Boolean).join('\n');
 }
@@ -1206,6 +1294,14 @@ function blockText(block: ChatBlock): string {
       return block.items.map((item) => `- [${item.status}] ${item.text}`).join('\n');
     case 'image':
       return block.alt || '';
+    case 'question':
+      return [
+        block.request.question,
+        ...block.request.options.map((option) => option.label),
+        ...((block.answer?.optionIds ?? []).map((optionId) =>
+          block.request.options.find((option) => option.optionId === optionId)?.label ?? optionId)),
+        block.answer?.text ?? '',
+      ].join('\n');
     default:
       return '';
   }

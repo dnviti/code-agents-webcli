@@ -82,6 +82,16 @@ export interface TierReply {
   detail: string;
 }
 
+export interface PlanAsk {
+  markdown?: unknown;
+}
+
+export interface PlanReply {
+  accepted: boolean;
+  revision?: number;
+  detail: string;
+}
+
 /**
  * The three things that dial into a session's socket.
  *
@@ -105,6 +115,8 @@ export interface BrokerHandlers {
    */
   question: (ask: QuestionAsk, signal?: AbortSignal) => Promise<QuestionReply>;
   tier: (ask: TierAsk) => Promise<TierReply>;
+  /** Complete Plan-mode markdown submitted by the model. */
+  plan?: (ask: PlanAsk) => Promise<PlanReply>;
 }
 
 /**
@@ -258,6 +270,7 @@ export class PermissionBroker {
       ask?: PermissionAsk;
       question?: QuestionAsk;
       tier?: TierAsk;
+      plan?: PlanAsk;
     };
     try {
       payload = JSON.parse(line);
@@ -268,7 +281,7 @@ export class PermissionBroker {
     const id = payload.id;
     if (!id) return;
 
-    const reply = (answer: PermissionAnswer | QuestionReply | TierReply): void => {
+    const reply = (answer: PermissionAnswer | QuestionReply | TierReply | PlanReply): void => {
       if (socket.destroyed) return;
       socket.write(`${JSON.stringify({ id, ...answer })}\n`);
     };
@@ -325,6 +338,17 @@ export class PermissionBroker {
         .catch((error: unknown) => {
           reply({ granted: false, detail: `the request failed: ${describeError(error)}` });
         });
+      return;
+    }
+
+    if (payload.kind === 'plan') {
+      if (!handlers?.plan) {
+        reply({ accepted: false, detail: 'this session is not accepting Plan documents' });
+        return;
+      }
+      handlers.plan(payload.plan ?? {}).then(reply).catch((error: unknown) => {
+        reply({ accepted: false, detail: `the plan could not be stored: ${describeError(error)}` });
+      });
       return;
     }
 

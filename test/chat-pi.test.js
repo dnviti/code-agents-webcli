@@ -309,12 +309,13 @@ describe('pi asking the user a question', function () {
     assert.strictEqual(ASK_QUESTION_TOOL, 'ask_user_question');
   });
 
-  it('registers nothing at all without a socket in the environment', function () {
+  it('registers nothing at all without either callback transport', function () {
     // The same file is loaded by a terminal launch of pi, where there is no
     // session behind it. `if (!SOCKET) return;` is what makes one static file
     // safe in both places.
-    assert.match(PI_ASK_EXTENSION, /if \(!SOCKET\) return;/);
+    assert.match(PI_ASK_EXTENSION, /if \(!SOCKET && !\(CALLBACK_DIR && CALLBACK_TOKEN\)\) return;/);
     assert.ok(PI_ASK_EXTENSION.includes('process.env.CCWEB_ASK_SOCKET'));
+    assert.ok(PI_ASK_EXTENSION.includes('process.env.CCWEB_CALLBACK_DIR'));
   });
 
   it('writes into the session’s own directory, ignored by git', function () {

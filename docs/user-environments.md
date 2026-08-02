@@ -206,14 +206,13 @@ spec:
 Mount it in the server's deployment at the same path as `--data-dir`'s
 `environments/` directory, and the two halves line up.
 
-Two limitations follow from the pod boundary, and both are specific to
-Kubernetes:
+Two operational limitations remain specific to Kubernetes:
 
-- **Tool approvals and the model's questions do not reach the browser.** Both
-  travel over a unix socket, which does not cross a pod boundary. Conversations
-  that bypass approvals are unaffected; conversations that ask for them will not
-  get their prompts. Run those on a single-machine engine until this moves to a
-  network transport.
+- **Tool approvals do not reach the browser.** They travel over a Unix socket,
+  which does not cross a pod boundary. Conversations that bypass approvals are
+  unaffected. The model's questions and Plan submissions use an authenticated,
+  encrypted file callback in the ReadWriteMany home instead, so those do reach
+  the WebUI.
 - **Automatic sizing needs metrics-server.** Without it `kubectl top` has
   nothing to report, and automatic sizing stays where it is.
 
@@ -240,8 +239,18 @@ the database beside it.
 
 Two further directories are mounted into every environment: the app's own
 installation directory, read-only, and the directory its chat sockets live in.
-That is how tool approvals and the model's questions still reach your browser
-from a runtime that is not on this host. Neither contains user data.
+The socket is how tool approvals reach the browser when the container is on this
+host. Interactive questions and Plan submissions use a per-session
+`.ccweb-callback` directory in the persistent home instead, so they also work on
+a remote engine or in a pod. Its files are owner-only and contain authenticated,
+encrypted per-session envelopes rather than the callback secret or readable
+conversation content. The endpoint rejects replaced or symlinked transport
+paths and pins each child operation to a verified open directory descriptor, so
+replacing the visible path cannot redirect a write, rename, read or cleanup.
+It expires stale crash artifacts and is removed when the chat process closes.
+This protects callback data at rest on the shared volume; the launched runtime
+necessarily receives the per-session secret in its environment, so it is not an
+isolation boundary against another process with access to that runtime.
 
 ## Projects and persistent homes
 

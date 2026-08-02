@@ -38,6 +38,7 @@ interface RuntimeSessionRow {
   chat_model_override: string | null;
   chat_model_pinned: string | null;
   chat_effort_override: string | null;
+  chat_plan_mode: number | null;
   custom_name: string | null;
   tab_open: number | null;
   tab_order: number | null;
@@ -84,6 +85,7 @@ export class SessionStore {
           chat_model_override,
           chat_model_pinned,
           chat_effort_override,
+          chat_plan_mode,
           custom_name,
           tab_open,
           tab_order,
@@ -114,6 +116,7 @@ export class SessionStore {
           @chat_model_override,
           @chat_model_pinned,
           @chat_effort_override,
+          @chat_plan_mode,
           @custom_name,
           @tab_open,
           @tab_order,
@@ -215,6 +218,7 @@ export class SessionStore {
         // a server restart shows the chip at the runtime default while the
         // process it describes is still running at the level the user picked.
         chat_effort_override: session.chatEffortOverride || null,
+        chat_plan_mode: session.chatPlanMode === true ? 1 : 0,
         // The label the user chose. Without this a restart brings a session back
         // under the name it was created with, which is the one thing the user
         // renamed it to get away from.
@@ -282,6 +286,7 @@ export class SessionStore {
             chat_model_override,
             chat_model_pinned,
             chat_effort_override,
+            chat_plan_mode,
             custom_name,
             tab_open,
             tab_order,
@@ -356,6 +361,7 @@ export class SessionStore {
           // chosen" rather than as an instruction to pass the runtime an empty
           // `--effort`, which every one of them would refuse.
           chatEffortOverride: row.chat_effort_override || undefined,
+          chatPlanMode: row.chat_plan_mode === 1,
           // An empty string reads as "never renamed" for the same reason: the
           // write side only ever stores a trimmed non-empty name or null.
           customName: row.custom_name || undefined,

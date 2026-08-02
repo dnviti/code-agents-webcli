@@ -46,9 +46,9 @@ export interface ContainerConfig {
   /**
    * Host directories every environment gets besides the user's home.
    *
-   * This is how the approval hook and the question channel keep working inside
-   * a container: both are host-side files reached by a host-side unix socket,
-   * and the runtime running in the container has to be able to open them.
+   * This is how the approval hook keeps working inside a host-local container:
+   * its script and Unix socket are host-side paths the runtime has to open.
+   * Questions and Plan submissions use the already-mounted persistent home.
    * Empty by default, so the module stays usable without them.
    */
   extraMounts: Mount[];
@@ -181,9 +181,10 @@ export interface UserEnvironment {
   /**
    * Every host directory this environment can see, home first.
    *
-   * Not only the user's home: the approval hook and the question channel are
-   * host-side files and a host-side unix socket that the *runtime* has to
-   * reach, so they are mounted too and translated through the same lookup.
+   * Not only the user's home: the approval hook uses host-side files and a
+   * host-side Unix socket that the *runtime* has to reach, so they are mounted
+   * too and translated through the same lookup. The question/Plan callback is
+   * created inside the home itself.
    * Empty on the host, where nothing needs translating.
    */
   readonly mounts: readonly Mount[];

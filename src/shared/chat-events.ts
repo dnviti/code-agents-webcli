@@ -121,6 +121,16 @@ export interface PlanItem {
   priority?: string;
 }
 
+/** The latest complete plan submitted for a conversation. */
+export interface PlanDocument {
+  /** Complete markdown, never a patch against an earlier revision. */
+  markdown: string;
+  /** Monotonically increasing within one conversation. */
+  revision: number;
+  /** When this revision was submitted, in milliseconds since the epoch. */
+  ts: number;
+}
+
 export interface TextBlock {
   kind: 'text';
   text: string;
@@ -395,6 +405,27 @@ export interface NoticeBlock {
   detail?: string;
 }
 
+/**
+ * A durable question that had no tool-call block to render it.
+ *
+ * Native/MCP questions remain part of their `ToolBlock`. Structured-response
+ * fallback questions do not have one, so the shared reducer folds their
+ * question event into the assistant message as this block. That gives the
+ * answered card a chronological home in copied/reloaded conversation history
+ * instead of leaving it permanently pinned beside the composer.
+ */
+export interface InteractiveQuestionBlock {
+  kind: 'question';
+  request: QuestionRequest;
+  /** The durable outcome, filled when the matching resolution event arrives. */
+  answer?: {
+    optionIds: string[];
+    text?: string;
+    skipped?: boolean;
+    abandoned?: boolean;
+  };
+}
+
 export type ChatBlock =
   | TextBlock
   | ThinkingBlock
@@ -402,7 +433,8 @@ export type ChatBlock =
   | ImageBlock
   | PlanBlock
   | ErrorBlock
-  | NoticeBlock;
+  | NoticeBlock
+  | InteractiveQuestionBlock;
 
 /**
  * Token and cost accounting for a message, turn or session.
@@ -776,6 +808,8 @@ export interface ChatCapabilities {
    * existed still parses; absent reads as false everywhere it is consulted.
    */
   questions?: boolean;
+  /** The session can receive and persist a submitted Plan-mode document. */
+  planMode?: boolean;
   interrupt: boolean;
   /** A session can be resumed after the process is gone. */
   resume: boolean;
@@ -1339,6 +1373,10 @@ export interface ChatSnapshot {
   capabilities: ChatCapabilities;
   usage?: ChatUsage;
   plan?: PlanItem[];
+  /** Durable Plan-mode state, independent from the runtime's todo-plan output. */
+  planMode?: boolean;
+  /** The latest complete submitted plan, if the conversation has one. */
+  planDocument?: PlanDocument | null;
   /**
    * Where the account stood the last time the provider said anything about it.
    *
@@ -1357,6 +1395,11 @@ export interface ChatSnapshot {
    * that predates this should read as "none pending", not as malformed.
    */
   pendingQuestions?: QuestionRequest[];
+  /**
+   * Questions retained for history, including structured-response fallback
+   * questions that have no tool block to own their answered card.
+   */
+  questionHistory?: QuestionRequest[];
   /**
    * Answers already given, keyed by the tool call that asked — falling back to
    * the request id when there was no call to pair with, exactly as the reducer
@@ -1471,6 +1514,7 @@ export const NO_CHAT_CAPABILITIES: ChatCapabilities = {
   cost: false,
   plan: false,
   questions: false,
+  planMode: false,
 };
 
 /** The MCP server this app exposes to the runtimes it launches. */
@@ -1494,6 +1538,89 @@ export function isSessionMintedMessageId(id: string): boolean {
 
 /** Put a multiple-choice question to the user, and wait for the answer. */
 export const ASK_QUESTION_TOOL = 'ask_user_question';
+
+/** Private structured-response markers used only when a runtime has no tool hook. */
+export const QUESTION_FALLBACK_OPEN = '<ccweb-question>';
+export const QUESTION_FALLBACK_CLOSE = '</ccweb-question>';
+
+/**
+ * Remove the private no-MCP wire envelope from anything a person can read,
+ * copy, export or search. An incomplete envelope is hidden while streaming so
+ * its protocol JSON never flashes before the durable QuestionCard replaces it.
+ */
+export function withoutQuestionFallbackEnvelope(text: string): string {
+  let cursor = 0;
+  let cleaned = '';
+  let removed = false;
+  const appendVisible = (segment: string): void => {
+    // An envelope normally occupies its own line. Removing it leaves the
+    // newline before and after adjacent, which would invent a blank paragraph
+    // between prose that was one line apart. Collapse only that one boundary.
+    if (cleaned.endsWith('\n') && segment.startsWith('\r\n')) {
+      cleaned += segment.slice(2);
+    } else if (cleaned.endsWith('\n') && segment.startsWith('\n')) {
+      cleaned += segment.slice(1);
+    } else {
+      cleaned += segment;
+    }
+  };
+  // Each pass advances beyond a complete closing marker, so this is bounded by
+  // the input length without putting model-authored JSON through a regexp.
+  while (cursor < text.length) {
+    const start = text.indexOf(QUESTION_FALLBACK_OPEN, cursor);
+    if (start < 0) {
+      appendVisible(text.slice(cursor));
+      break;
+    }
+    removed = true;
+    appendVisible(text.slice(cursor, start));
+    const end = text.indexOf(
+      QUESTION_FALLBACK_CLOSE,
+      start + QUESTION_FALLBACK_OPEN.length,
+    );
+    // Hide an incomplete trailing envelope immediately while it streams.
+    if (end < 0) return cleaned.trimEnd();
+    cursor = end + QUESTION_FALLBACK_CLOSE.length;
+  }
+  return removed ? cleaned.trim() : text;
+}
+
+/** Submit the complete latest Plan-mode document to the Web client. */
+export const SUBMIT_PLAN_TOOL = 'submit_plan';
+
+/** What the submission tool is called after Claude-style MCP namespacing. */
+export const SUBMIT_PLAN_TOOL_NAME = `mcp__${ASK_MCP_SERVER}__${SUBMIT_PLAN_TOOL}`;
+
+/** Largest plan accepted by the durable store. */
+export const MAX_PLAN_TEXT = 200_000;
+
+export const SUBMIT_PLAN_TOOL_DESCRIPTION =
+  'Submit your complete implementation plan as markdown for the user to review. In Plan mode, '
+  + 'do this before making changes. Submit the complete revised document again whenever the plan '
+  + 'changes; the newest numbered revision replaces the previous one.';
+
+/** Instruction prepended only to the runtime copy of a Plan-mode user turn. */
+export function planModeDirective(hasPlan: boolean): string {
+  const revision = hasPlan
+    ? 'A plan already exists; submit the complete revised plan again if this turn changes it.'
+    : 'No plan has been submitted yet; do not finish this planning turn without submitting one.';
+  return [
+    '[Plan mode is active because the user selected it in the Web interface.]',
+    'Plan the work without implementing it. Do not edit files or run commands that change state.',
+    `Submit the complete plan as markdown with the ${SUBMIT_PLAN_TOOL} tool.`,
+    revision,
+  ].join(' ');
+}
+
+/** Internal turn sent after the user accepts the latest plan. */
+export function acceptedPlanDirective(plan: PlanDocument): string {
+  return [
+    `[The user accepted Plan revision ${plan.revision}. Plan mode is now off.]`,
+    'Implement the accepted plan now. Follow the normal permission and approval policy for every action.',
+    'The accepted plan follows:',
+    plan.markdown,
+  ].join('\n\n');
+}
 
 /**
  * Ask to answer from the next model up the profile's capability ladder.

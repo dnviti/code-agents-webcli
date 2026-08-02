@@ -506,11 +506,14 @@ export function caveatsFor(engine: ContainerEngineKind): string[] {
   if (engine === 'kubernetes') {
     return [
       runtimePrerequisite,
-      'Approval prompts and agent questions from inside the pod do not reach the browser; only bypassPermissions mode is supported there.',
+      'Approval prompts from inside the pod do not reach the browser, so bypassPermissions mode is required there. Agent questions and Plan submissions use the shared home claim and do reach it.',
       'The automatic size tier needs metrics-server.',
     ];
   }
-  return [runtimePrerequisite];
+  return [
+    runtimePrerequisite,
+    'On a remote engine, approval prompts do not reach the browser. Agent questions and Plan submissions use the shared per-user home and still work.',
+  ];
 }
 
 /**

@@ -157,6 +157,13 @@ function blockWeight(block: ChatBlock): number {
       return IMAGE_COST;
     case 'plan':
       return block.items.reduce((sum, item) => sum + item.text.length, 0);
+    case 'question':
+      return block.request.question.length
+        + block.request.options.reduce(
+          (sum, option) => sum + option.label.length + (option.description?.length ?? 0),
+          0,
+        )
+        + (block.answer?.text?.length ?? 0);
     case 'tool': {
       let weight = block.name.length + (block.title?.length ?? 0);
       weight += block.output?.length ?? 0;

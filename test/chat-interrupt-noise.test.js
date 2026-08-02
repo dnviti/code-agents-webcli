@@ -187,7 +187,14 @@ describe('a turn that was stopped is not a turn that failed', function () {
       store.events.some((event) => event.t === 'marker' && event.kind === 'interrupted'),
       'the interrupt is still on the record — as the interrupt it was',
     );
-    assert.deepStrictEqual(adapter.sent, ['count to a hundred', 'actually, stop']);
+    // This fake launch deliberately has no question MCP script, so ChatSession
+    // supplies its private structured-question fallback ahead of each runtime
+    // prompt. The transcript still contains only the user's words; at this seam
+    // the contract is that the promoted correction remains the final, intact
+    // part of the prompt and reaches the adapter in order.
+    assert.strictEqual(adapter.sent.length, 2);
+    assert.ok(adapter.sent[0].endsWith('\n\ncount to a hundred'));
+    assert.ok(adapter.sent[1].endsWith('\n\nactually, stop'));
   });
 
   it('leaves no error card when the stop button ends the turn', async function () {

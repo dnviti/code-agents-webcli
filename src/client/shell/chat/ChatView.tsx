@@ -38,6 +38,7 @@ import { hasVisibleContent, messageText } from './MessageBubble.js';
 import { PermissionCard } from './PermissionCard.js';
 import { QuestionCard } from './QuestionCard.js';
 import { PlanPanel } from './PlanPanel.js';
+import { PlanDocDialog } from './PlanDocDialog.js';
 import { SessionHeader } from './SessionHeader.js';
 import { LiveStreamRibbon } from './StreamRibbon.js';
 import { TerminalSplit } from './TerminalSplit.js';
@@ -199,15 +200,23 @@ export function ChatView({
   const bypassPermissions = transcript.bypassing;
   const plan = transcript.plan;
   const pending = transcript.pendingPermissions;
-  // Only the questions that have nowhere else to be drawn. A question that
-  // names the call that asked it renders inside the conversation at that call,
-  // which is where it was asked; this is the safety net for one that could not
-  // be correlated, and without it that question would have no button anywhere
-  // and the turn behind it would never move.
+  // Only *pending* legacy/incomplete questions that have nowhere else to be
+  // drawn. Tool questions live at their call and structured-response fallbacks
+  // are folded into an assistant message as durable question blocks. Settled
+  // history never belongs in this assertive composer-adjacent safety net: in a
+  // paged conversation its original message may simply not be loaded yet.
   const strayQuestions = React.useMemo(
     () =>
       transcript.pendingQuestions.filter(
-        (request) => !request.toolId || !transcript.message(messageIdOfTool(transcript, request.toolId)),
+        (request) => {
+          if (request.toolId && transcript.message(messageIdOfTool(transcript, request.toolId))) {
+            return false;
+          }
+          return !transcript.messages.some((message) => message.blocks.some(
+            (block) => block.kind === 'question'
+              && block.request.requestId === request.requestId,
+          ));
+        },
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [transcript, version],
@@ -215,6 +224,10 @@ export function ChatView({
   const exited = chatState === 'exited';
   const unavailable = controller.unavailableReason;
   const busy = transcript.busy;
+  const planLocked = transcript.live
+    && chatState !== 'idle'
+    && chatState !== 'exited'
+    && chatState !== 'error';
   // Wider than `busy`, which is only what the send button needs to know: a turn
   // that is waiting on an approval or a question is still a turn in flight, and
   // it is the one a queued correction most often needs to get in front of.
@@ -333,6 +346,8 @@ export function ChatView({
   // leave the timeline's effect with nothing to react to.
   const [focus, setFocus] = React.useState<{ id?: string; nonce: number }>({ nonce: 0 });
   const [indexSheet, setIndexSheet] = React.useState(false);
+  const [planOpen, setPlanOpen] = React.useState(false);
+  const [planAction, setPlanAction] = React.useState<'accept' | 'reject' | null>(null);
   const [planSheet, setPlanSheet] = React.useState(false);
   // A draft seed, not a controlled value: making the composer controlled would
   // re-render this component — and re-derive the turns and the whole activity
@@ -348,6 +363,20 @@ export function ChatView({
   // rail means a code link can open the same popup even while that rail is
   // closed, and closing the rail no longer closes a file somebody is reading.
   const [editing, setEditing] = React.useState<WorkspaceFileTarget | null>(null);
+
+  const planFeedback = controller.planFeedback;
+  React.useEffect(() => {
+    if (!planAction || !planFeedback || planFeedback.action !== planAction) return;
+    setPlanAction(null);
+    if (planFeedback.accepted !== true) return;
+    setPlanOpen(false);
+    if (planAction === 'reject') {
+      window.setTimeout(
+        () => root.current?.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message"]')?.focus(),
+        0,
+      );
+    }
+  }, [planAction, planFeedback]);
 
   const list = React.useRef<MessageListHandle | null>(null);
   const root = React.useRef<HTMLElement | null>(null);
@@ -1167,17 +1196,24 @@ export function ChatView({
                 aria-live="assertive"
                 style={{ display: 'grid', gap: 'var(--space-2)', maxHeight: '50vh', overflowY: 'auto' }}
               >
-                {strayQuestions.map((request) => (
-                  <QuestionCard
-                    key={request.requestId}
+                {strayQuestions.map((recorded) => {
+                  const request = transcript.pendingQuestions.find(
+                    (pendingQuestion) => pendingQuestion.requestId === recorded.requestId,
+                  );
+                  const answerKey = recorded.toolId ?? recorded.requestId;
+                  return <QuestionCard
+                    key={recorded.requestId}
                     request={request}
-                    question={request.question}
-                    header={request.header}
-                    multiSelect={request.multiSelect}
-                    options={request.options}
+                    question={recorded.question}
+                    header={recorded.header}
+                    multiSelect={recorded.multiSelect}
+                    options={recorded.options}
+                    answered={request ? undefined : transcript.answerFor(answerKey)}
+                    ownWords={request ? undefined : transcript.answerTextFor(answerKey)}
+                    abandoned={!request && transcript.abandonedFor(answerKey)}
                     onAnswer={answerQuestion}
-                  />
-                ))}
+                  />;
+                })}
               </div>
             ) : null}
 
@@ -1281,6 +1317,12 @@ export function ChatView({
               effort={controller.effortOverrideValue ?? transcript.effort}
               onSetEffort={setEffort}
               effortFeedback={controller.effortFeedback}
+              planMode={controller.planModeValue}
+              planLocked={planLocked}
+              onSetPlanMode={(on) => controller.setPlanMode(on)}
+              planFeedback={controller.planFeedback}
+              planDocument={controller.planDocumentValue}
+              onOpenPlan={() => setPlanOpen(true)}
               // Deliberately the same path as typing it: the button and the
               // three spellings have to end in one state, and the surest way
               // to keep them that way is for the button to *be* the command.
@@ -1359,6 +1401,7 @@ export function ChatView({
         onClose={() => setEditing(null)}
         isMobile={isMobile}
       />
+      {planOpen ? <PlanDocDialog plan={controller.planDocumentValue} planMode={controller.planModeValue} disabled={planLocked} feedback={controller.planFeedback?.message || null} retryAction={controller.planFeedback?.accepted === false && controller.planFeedback.action !== 'mode' ? controller.planFeedback.action : null} onAccept={(revision) => { setPlanAction('accept'); controller.acceptPlan(revision); }} onReject={(revision) => { setPlanAction('reject'); controller.rejectPlan(revision); }} onClose={() => setPlanOpen(false)} /> : null}
     </section>
     </PhoneContext.Provider>
   );

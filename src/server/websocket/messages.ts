@@ -259,6 +259,7 @@ export interface ChatManagerLike {
       bypassPermissions?: boolean;
       resumeSessionId?: string;
       startFresh?: boolean;
+      planMode?: boolean;
       /** Where the runtime runs; absent means this host. */
       environment?: UserEnvironment;
       /** Rechecked synchronously at the adapter's final pre-spawn boundary. */
@@ -280,7 +281,11 @@ export interface ChatManagerLike {
    * question: it survives an adapter that died through its error path, and it
    * is cleared by a probe abandoned in favour of a fallback that is running.
    */
-  snapshot(record: SessionRecord): Promise<{ live?: boolean }>;
+  snapshot(record: SessionRecord): Promise<{
+    live?: boolean;
+    runtime?: string;
+    planDocument?: { markdown: string; revision: number; ts: number } | null;
+  }>;
   send(sessionId: string, turn: { text: string; attachments?: unknown[] }): Promise<void>;
   interrupt(sessionId: string): Promise<void>;
   /** Switch a live session's model. False when nothing is running, or the adapter cannot. */
@@ -293,6 +298,31 @@ export interface ChatManagerLike {
   setEffort(sessionId: string, effort: string): Promise<boolean>;
   /** Carry a new effort level into the options an in-place `/clear` restart replays. */
   rememberEffort(sessionId: string, effort: string | undefined): void;
+  setPlanMode?(
+    sessionId: string,
+    on: boolean,
+  ): Promise<{ planMode: boolean; changed: boolean; detail: string } | null>;
+  rememberPlanMode?(sessionId: string, on: boolean): void;
+  acceptPlan?(
+    sessionId: string,
+    revision: number,
+  ): Promise<{
+    accepted: boolean;
+    action: 'accept' | 'reject';
+    planMode: boolean;
+    revision?: number;
+    detail: string;
+  } | null>;
+  rejectPlan?(
+    sessionId: string,
+    revision: number,
+  ): Promise<{
+    accepted: boolean;
+    action: 'accept' | 'reject';
+    planMode: boolean;
+    revision?: number;
+    detail: string;
+  } | null>;
   cancelQueued(sessionId: string, queuedId: string): boolean;
   /** Interrupt what is running and deliver one waiting turn immediately. */
   sendQueuedNow(sessionId: string, queuedId: string): Promise<boolean>;
@@ -368,6 +398,8 @@ interface IncomingMessage {
    * stored and replayed into every future launch.
    */
   effort?: string | null;
+  planMode?: boolean;
+  revision?: number;
 }
 
 interface HeldProjectSessionLease extends ProjectSessionLease {
@@ -517,6 +549,18 @@ export class MessageProcessor {
 
       case 'chat_set_effort':
         await this.handleChatSetEffort(wsInfo, data);
+        break;
+
+      case 'chat_set_plan_mode':
+        await this.handleChatSetPlanMode(wsInfo, data);
+        break;
+
+      case 'chat_accept_plan':
+        await this.handleChatPlanAction(wsInfo, data, 'accept');
+        break;
+
+      case 'chat_reject_plan':
+        await this.handleChatPlanAction(wsInfo, data, 'reject');
         break;
 
       case 'chat_queue_cancel':
@@ -2286,6 +2330,11 @@ export class MessageProcessor {
 
     let chatMayBeAlive = false;
     try {
+      // Starting fresh is a new conversation even when the old one never
+      // produced an event. In that empty-log case ChatSession has no truncation
+      // boundary at which to report the reset back, so clear the durable record
+      // here as well and make the launch announcement agree with the process.
+      if (startFresh) session.chatPlanMode = false;
       const startWith = async (model: string | undefined) => manager.start(session, {
         runtime: agentKind,
         environment: chatEnvironment,
@@ -2309,6 +2358,7 @@ export class MessageProcessor {
             ? { tier: profile.ladder.tier, tiers: profile.tiers }
             : undefined,
         bypassPermissions,
+        planMode: startFresh ? false : session.chatPlanMode === true,
         resumeSessionId,
         startFresh,
         cancelled: () => (
@@ -2475,6 +2525,7 @@ export class MessageProcessor {
           // that reported the rung anyway would be claiming half a feature.
           ladderError,
           effortOverride: session.chatEffortOverride || null,
+          planMode: session.chatPlanMode === true,
         },
         this.deps.claudeSessions,
         this.deps.webSocketConnections,
@@ -3067,6 +3118,175 @@ export class MessageProcessor {
    * Choosing a level before anything has launched is legitimate and lands in the
    * same saved-for-next-launch state a model choice does.
    */
+  private async handleChatSetPlanMode(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!session) return;
+
+    const requested = data.planMode === true;
+    // The live lifecycle updates the registry record synchronously. Capture
+    // the durable value first, otherwise comparing only after the call makes a
+    // real change look already saved and an app restart silently restores the
+    // previous mode.
+    const previousPlanMode = session.chatPlanMode;
+    const running = await this.deps.chatManager?.setPlanMode?.(session.id, requested) ?? null;
+    const result = running ?? {
+      planMode: requested,
+      changed: session.chatPlanMode === requested ? false : true,
+      detail: requested
+        ? 'Plan mode is on and will apply when this conversation runs.'
+        : 'Plan mode is off. The latest plan was kept.',
+    };
+
+    session.chatPlanMode = result.planMode;
+    if (previousPlanMode !== result.planMode) {
+      await this.deps.saveSessionsToDisk();
+    }
+    this.deps.chatManager?.rememberPlanMode?.(session.id, result.planMode);
+
+    broadcastChat(
+      session.id,
+      {
+        type: 'chat_plan_mode',
+        sessionId: session.id,
+        planMode: result.planMode,
+        changed: result.changed,
+        message: result.detail,
+      },
+      this.deps.claudeSessions,
+      this.deps.webSocketConnections,
+    );
+  }
+
+  private async handleChatPlanAction(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+    action: 'accept' | 'reject',
+  ): Promise<void> {
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    const manager = this.deps.chatManager;
+    if (!session || !manager) return;
+    // Accept may turn Plan mode off inside ChatSession before returning. The
+    // pre-action value is what tells us whether that mutation still needs its
+    // awaited registry save.
+    const previousPlanMode = session.chatPlanMode;
+
+    const revision = Number.isSafeInteger(data.revision) && Number(data.revision) > 0
+      ? Number(data.revision)
+      : 0;
+    let snapshot = action === 'accept'
+      ? await manager.snapshot(session).catch(() => null)
+      : null;
+    // Do not ask a retained, exited ChatSession to accept first. Its ordinary
+    // rejection says only that it is not live; the useful operation here is to
+    // bring the durable conversation back and deliver the implementation turn.
+    let result = action === 'accept' && snapshot?.live === false
+      ? null
+      : action === 'accept'
+        ? await manager.acceptPlan?.(session.id, revision) ?? null
+        : await manager.rejectPlan?.(session.id, revision) ?? null;
+
+    // A stopped conversation can keep/reject a plan. Accept is different: once
+    // the durable document and reviewed revision have been checked, relaunch
+    // the same conversation and immediately hand the plan to the live session.
+    if (!result) {
+      snapshot ??= await manager.snapshot(session).catch(() => null);
+      const plan = snapshot?.planDocument ?? null;
+      if (action === 'accept') {
+        if (!session.chatPlanMode) {
+          result = { accepted: false, action, planMode: false, detail: 'Plan mode is not active.' };
+        } else if (!plan) {
+          result = { accepted: false, action, planMode: true, detail: 'There is no plan to accept.' };
+        } else if (revision !== plan.revision) {
+          result = {
+            accepted: false,
+            action,
+            planMode: true,
+            revision: plan.revision,
+            detail: `Revision ${revision} is stale. Review revision ${plan.revision} before accepting.`,
+          };
+        } else if (!manager.acceptPlan) {
+          result = {
+            accepted: false,
+            action,
+            planMode: true,
+            revision: plan.revision,
+            detail: 'This server cannot start implementation from the Plan control.',
+          };
+        } else {
+          const runtime = session.lastAgent || session.agent || snapshot?.runtime || '';
+          if (!runtime) {
+            result = {
+              accepted: false,
+              action,
+              planMode: true,
+              revision: plan.revision,
+              detail: 'The conversation runtime is unknown, so implementation could not be started.',
+            };
+          } else {
+            // `resume: true` is continuation semantics even for a runtime that
+            // never supplied a native id: it preserves the durable Plan and the
+            // conversation's approval mode instead of treating this as Start
+            // fresh. When an id exists, startChat passes it through normally.
+            await this.startChat(wsInfo.id, runtime, { resume: true }, session.id);
+            result = await manager.acceptPlan(session.id, revision);
+            if (!result) {
+              result = {
+                accepted: false,
+                action,
+                planMode: true,
+                revision: plan.revision,
+                detail: 'The conversation could not be resumed to implement this plan. Retry Accept.',
+              };
+            }
+          }
+        }
+      } else if (!session.chatPlanMode) {
+        result = { accepted: false, action, planMode: false, detail: 'Plan mode is not active.' };
+      } else if (!plan) {
+        result = { accepted: false, action, planMode: true, detail: 'There is no plan to reject.' };
+      } else if (revision !== plan.revision) {
+        result = {
+          accepted: false,
+          action,
+          planMode: true,
+          revision: plan.revision,
+          detail: `Revision ${revision} is stale. Review revision ${plan.revision} instead.`,
+        };
+      } else {
+        result = {
+          accepted: true,
+          action,
+          planMode: true,
+          revision: plan.revision,
+          detail: `Plan revision ${plan.revision} rejected. Add feedback in the composer to request a revision.`,
+        };
+      }
+    }
+
+    session.chatPlanMode = result.planMode;
+    if (previousPlanMode !== result.planMode) {
+      await this.deps.saveSessionsToDisk();
+    }
+
+    broadcastChat(
+      session.id,
+      {
+        type: 'chat_plan_action',
+        sessionId: session.id,
+        action,
+        accepted: result.accepted,
+        planMode: result.planMode,
+        revision: result.revision,
+        message: result.detail,
+      },
+      this.deps.claudeSessions,
+      this.deps.webSocketConnections,
+    );
+  }
+
   private async handleChatSetEffort(
     wsInfo: WebSocketInfo,
     data: IncomingMessage,

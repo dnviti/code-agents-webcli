@@ -554,6 +554,17 @@ describe('MessageBubble', function () {
     // Reasoning is working, not answer, and does not belong on the clipboard.
     assert.ok(!text.includes('first thought'));
   });
+
+  it('keeps a prose-prefixed fallback question envelope out of visible and copied history', function () {
+    const raw = 'I need a choice.\n<ccweb-question>{"question":"First?","options":[{"label":"A"}]}</ccweb-question>\nOne more detail.\n<ccweb-question>{"question":"Second?","options":[{"label":"B"}]}</ccweb-question>';
+    const assistant = message({ blocks: [{ kind: 'text', text: raw }] });
+    const html = renderBubble(assistant);
+    assert.ok(stripTags(html).includes('I need a choice.'));
+    assert.ok(stripTags(html).includes('One more detail.'));
+    assert.ok(!html.includes('ccweb-question'));
+    assert.ok(!html.includes('&quot;question&quot;'));
+    assert.strictEqual(mod.messageText(assistant).trim(), 'I need a choice.\nOne more detail.');
+  });
 });
 
 describe('MessageList', function () {

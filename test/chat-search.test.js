@@ -82,6 +82,20 @@ describe('chat search', function () {
     assert.deepStrictEqual(hits, []);
   });
 
+  it('does not index the private structured-question envelope', async function () {
+    const raw = 'I need your choice.\n<ccweb-question>{"question":"PRIVATE_PROTOCOL_ONE","options":[{"label":"A"}]}</ccweb-question>\nAnother decision follows.\n<ccweb-question>{"question":"PRIVATE_PROTOCOL_TWO","options":[{"label":"B"}]}</ccweb-question>';
+    store.append({ id: 'fallback', ownerUserId: 1 }, textTurn(1, 'assistant', raw));
+    await store.stat({ id: 'fallback', ownerUserId: 1 });
+
+    assert.deepStrictEqual(await searchChatSessions(store, 1, 'PRIVATE_PROTOCOL_ONE'), []);
+    assert.deepStrictEqual(await searchChatSessions(store, 1, 'PRIVATE_PROTOCOL_TWO'), []);
+    const visible = await searchChatSessions(store, 1, 'need your choice');
+    assert.strictEqual(visible.length, 1);
+    assert.ok(!visible[0].snippet.includes('ccweb-question'));
+    assert.ok(!visible[0].snippet.includes('PRIVATE_PROTOCOL_ONE'));
+    assert.ok(!visible[0].snippet.includes('PRIVATE_PROTOCOL_TWO'));
+  });
+
   it('returns nothing for a blank query rather than matching everything', async function () {
     const events = loadFixture('store-events.jsonl');
     store.append({ id: 's1', ownerUserId: 1 }, events);

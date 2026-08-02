@@ -20,6 +20,7 @@ before(function () {
     `export { renderToStaticMarkup } from 'react-dom/server';`,
     `export * as React from 'react';`,
     `export { Composer, placeByPickOrder } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/chat/Composer'))};`,
+    `export { PlanDocDialog } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/chat/PlanDocDialog'))};`,
   ].join('\n');
 
   const out = path.join(os.tmpdir(), `chat-composer-${process.pid}.js`);
@@ -68,6 +69,18 @@ function render(props) {
   return renderToStaticMarkup(
     React.createElement(Composer, Object.assign({ onSend() {}, onInterrupt() {}, busy: false, capabilities: caps({}) }, props)),
   );
+}
+
+function renderPlan(props) {
+  const { renderToStaticMarkup, React, PlanDocDialog } = mod;
+  return renderToStaticMarkup(React.createElement(PlanDocDialog, {
+    plan: { markdown: '# Retained', revision: 2, ts: 1 },
+    planMode: true,
+    onAccept() {},
+    onReject() {},
+    onClose() {},
+    ...props,
+  }));
 }
 
 describe('Composer', function () {
@@ -795,5 +808,38 @@ describe('Composer', function () {
     const long = render({ draft: 'x'.repeat(20000) });
     assert.ok(long.length > 0);
     assert.ok(long.includes('x'.repeat(200)), 'the long draft text itself is rendered, not truncated');
+  });
+
+  describe('Plan mode', function () {
+    it('keeps the Plan control beside the runtime controls and exposes the submitted plan', function () {
+      const html = render({
+        planMode: true,
+        onSetPlanMode() {},
+        planDocument: { markdown: '# Plan', revision: 3, ts: 1 },
+        onOpenPlan() {},
+      });
+      assert.ok(html.includes('aria-label="Plan mode is on'), 'the mode remains a labelled control');
+      assert.ok(html.includes('>Plan on<'), 'the on-state is readable on narrow/mobile rows too');
+      assert.ok(html.includes('aria-label="Read the submitted plan"'), 'the latest plan can be reopened');
+      assert.ok(html.indexOf('Plan mode is on') < html.indexOf('Approvals asked for'), 'it sits with model/runtime controls, before approval state');
+    });
+
+    it('shows plan mode off without hiding the control', function () {
+      const html = render({ planMode: false, onSetPlanMode() {} });
+      assert.ok(html.includes('aria-label="Plan mode — ask the agent to prepare a plan first"'));
+      assert.ok(html.includes('>Plan<'));
+    });
+
+    it('disables the mode control during an active planning turn and explains why', function () {
+      const html = render({ planMode: true, planLocked: true, onSetPlanMode() {} });
+      assert.match(html, /disabled=""[^>]*aria-pressed="true"/);
+      assert.ok(html.includes('available when that turn ends'));
+    });
+
+    it('keeps a retained plan read-only while Plan mode is off', function () {
+      const html = renderPlan({ planMode: false });
+      assert.strictEqual((html.match(/disabled=""/g) || []).length, 2);
+      assert.ok(html.includes('Turn Plan mode on before accepting or rejecting'));
+    });
   });
 });

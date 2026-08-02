@@ -69,11 +69,7 @@ export interface KubernetesOptions {
   rootDir: string;
   /** Service account for the environment pods, when the cluster needs one named. */
   serviceAccount?: string | null;
-  /**
-   * Host:port the pods can reach this server on, for the approval and question
-   * channel. Without it a unix socket would be the only transport, and a unix
-   * socket does not cross a pod boundary.
-   */
+  /** Reserved host callback address for integrations outside the shared-home channel. */
   callbackHost?: string | null;
   /**
    * Path to a kubeconfig file to use for every kubectl invocation. When set,

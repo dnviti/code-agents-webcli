@@ -31,8 +31,13 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { ASK_QUESTION_TOOL } from '../../shared/chat-events.js';
+import {
+  ASK_QUESTION_TOOL,
+  SUBMIT_PLAN_TOOL,
+  SUBMIT_PLAN_TOOL_DESCRIPTION,
+} from '../../shared/chat-events.js';
 import { MANAGED_MARKER } from '../services/tier-writer.js';
+import { FILE_CALLBACK_GENERATED_CLIENT_SOURCE } from './file-callback.js';
 
 /** Where the extension is written, relative to the session's working directory. */
 export const PI_ASK_EXTENSION_PATH = path.join('.pi', 'ccweb', 'ask-user.ts');
@@ -49,10 +54,19 @@ export const PI_ASK_EXTENSION = `// ${MANAGED_MARKER}
 // browser and blocks until somebody answers it.
 import { Type } from "typebox";
 import * as net from "node:net";
+import * as crypto from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 
 const SOCKET = process.env.CCWEB_ASK_SOCKET;
+const CALLBACK_DIR = process.env.CCWEB_CALLBACK_DIR;
+const CALLBACK_TOKEN = process.env.CCWEB_CALLBACK_TOKEN;
+const CALLBACK_LIVENESS_MS = Number(process.env.CCWEB_CALLBACK_LIVENESS_MS) || 10000;
 
-function ask(question: string, header: string | undefined, options: any[], multiSelect: boolean) {
+${FILE_CALLBACK_GENERATED_CLIENT_SOURCE}
+
+function askSocket(question: string, header: string | undefined, options: any[], multiSelect: boolean) {
   return new Promise<string>((resolve) => {
     const socket = net.createConnection(SOCKET as string);
     const id = "ask-" + process.pid + "-" + Date.now();
@@ -111,8 +125,135 @@ function ask(question: string, header: string | undefined, options: any[], multi
   });
 }
 
+function submitPlanSocket(markdown: string) {
+  return new Promise<string>((resolve) => {
+    const socket = net.createConnection(SOCKET as string);
+    const id = "plan-" + process.pid + "-" + Date.now();
+    let buffer = "";
+    const done = (text: string) => {
+      socket.destroy();
+      resolve(text);
+    };
+    socket.setEncoding("utf8");
+    socket.on("connect", () => {
+      socket.write(JSON.stringify({ id, kind: "plan", plan: { markdown } }) + "\\n");
+    });
+    socket.on("data", (chunk: string) => {
+      buffer += chunk;
+      let at: number;
+      while ((at = buffer.indexOf("\\n")) !== -1) {
+        const line = buffer.slice(0, at).trim();
+        buffer = buffer.slice(at + 1);
+        if (!line) continue;
+        try {
+          const reply = JSON.parse(line);
+          if (reply.id !== id) continue;
+          done(typeof reply.detail === "string" ? reply.detail :
+            (reply.accepted ? "Plan saved." : "The Plan document was refused."));
+          return;
+        } catch {
+          // Not ours, or not JSON.
+        }
+      }
+    });
+    socket.on("error", () => done(
+      "The plan could not reach the Web interface. Return it as your final markdown reply instead.",
+    ));
+    socket.on("close", () => done(
+      "The conversation ended before the plan could be stored. Return it as markdown instead.",
+    ));
+  });
+}
+
+async function fileRequest(kind: string, payload: any): Promise<any> {
+  if (!CALLBACK_DIR || !CALLBACK_TOKEN) throw new Error("no callback channel");
+  const layout = await callbackLayout(CALLBACK_DIR);
+  const id = crypto.randomBytes(16).toString("base64url");
+  const requestFile = path.join(layout.requests.path, id + ".json");
+  const replyFile = path.join(layout.replies.path, id + ".json");
+  const heartbeatFile = path.join(layout.replies.path, "heartbeat.json");
+  const initialHeartbeat: any = await callbackRead(
+    layout.replies, heartbeatFile, CALLBACK_TOKEN, CALLBACK_AAD_PREFIX + "heartbeat",
+  );
+  let lastHeartbeat = typeof initialHeartbeat?.ts === "number" ? initialHeartbeat.ts : null;
+  let lastHeartbeatChange = Date.now();
+  await callbackAtomic(
+    layout.requests,
+    requestFile,
+    CALLBACK_TOKEN,
+    callbackAad("request", id),
+    { id, kind, payload, createdAt: Date.now() },
+  );
+  const deadline = Date.now() + 2147000000;
+  let nextLivenessCheck = Date.now() + CALLBACK_LIVENESS_MS;
+  try {
+    while (Date.now() < deadline) {
+      const reply: any = await callbackRead(
+        layout.replies, replyFile, CALLBACK_TOKEN, callbackAad("reply", id),
+      );
+      if (reply) {
+        if (reply.id !== id) throw new Error("invalid callback reply");
+        if (reply.error) throw new Error(reply.error);
+        if (reply.cancelled) throw new Error("the agent stopped waiting");
+        return reply.result;
+      }
+      if (Date.now() >= nextLivenessCheck) {
+        const heartbeat: any = await callbackRead(
+          layout.replies, heartbeatFile, CALLBACK_TOKEN, CALLBACK_AAD_PREFIX + "heartbeat",
+        );
+        if (!heartbeat || typeof heartbeat.ts !== "number") {
+          throw new Error("the callback server is unavailable");
+        }
+        if (heartbeat.ts !== lastHeartbeat) {
+          lastHeartbeat = heartbeat.ts;
+          lastHeartbeatChange = Date.now();
+        } else if (Date.now() - lastHeartbeatChange >= CALLBACK_LIVENESS_MS) {
+          throw new Error("the callback server is unavailable");
+        }
+        nextLivenessCheck = Date.now() + Math.min(2000, CALLBACK_LIVENESS_MS);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    throw new Error("the browser did not answer before the callback timed out");
+  } finally {
+    await callbackUnlink(layout.requests, requestFile).catch(() => {});
+    await callbackUnlink(layout.replies, replyFile).catch(() => {});
+  }
+}
+
+function describeQuestionReply(reply: any): string {
+  if (reply?.error) return "The question could not be put to the user: " + reply.error +
+    ". Ask in your reply instead, in plain prose.";
+  const labels = Array.isArray(reply?.labels) ? reply.labels : [];
+  const typed = typeof reply?.text === "string" && reply.text ? reply.text : "";
+  if (reply?.skipped || (labels.length === 0 && !typed)) return
+    "The user skipped this question without choosing. Do not ask it again - carry on with the most reasonable option and say which one you took.";
+  if (labels.length && typed) return "The user chose: " + labels.join(", ") + ". They also said: " + typed;
+  return typed ? "The user answered in their own words: " + typed : "The user chose: " + labels.join(", ");
+}
+
+async function ask(question: string, header: string | undefined, options: any[], multiSelect: boolean) {
+  if (SOCKET) return askSocket(question, header, options, multiSelect);
+  try {
+    return describeQuestionReply(await fileRequest("question", { question, header, options, multiSelect }));
+  } catch (error: any) {
+    return "The question could not reach the user: " + error.message + ". Ask in prose instead.";
+  }
+}
+
+async function submitPlan(markdown: string) {
+  if (SOCKET) return submitPlanSocket(markdown);
+  try {
+    const result = await fileRequest("plan", { markdown });
+    return result?.detail || (result?.accepted ? "Plan saved." : "The Plan document was refused.");
+  } catch (error: any) {
+    return "The plan could not reach the Web interface: " + error.message +
+      ". Return it as your final markdown reply instead.";
+  }
+}
+
 export default function (pi: any) {
-  if (!SOCKET) return;
+  if (!SOCKET && !(CALLBACK_DIR && CALLBACK_TOKEN)) return;
   pi.registerTool({
     name: "${ASK_QUESTION_TOOL}",
     label: "Ask the user",
@@ -158,8 +299,144 @@ export default function (pi: any) {
       return { content: [{ type: "text", text }], details: {} };
     },
   });
+  pi.registerTool({
+    name: "${SUBMIT_PLAN_TOOL}",
+    label: "Submit plan",
+    description: ${JSON.stringify(SUBMIT_PLAN_TOOL_DESCRIPTION)},
+    parameters: Type.Object({
+      markdown: Type.String({
+        description: "The complete latest plan as markdown, not a patch against an earlier revision.",
+      }),
+    }),
+    async execute(_toolCallId: string, params: { markdown: string }) {
+      const text = await submitPlan(params.markdown);
+      return { content: [{ type: "text", text }], details: {} };
+    },
+  });
 }
 `;
+
+interface OpenGeneratedDirectory {
+  fd: number;
+  accessPath: string;
+  visiblePath: string;
+  dev: number;
+  ino: number;
+}
+
+function generatedFdAccessPath(fd: number): string {
+  return process.platform === 'linux' ? `/proc/self/fd/${fd}` : `/dev/fd/${fd}`;
+}
+
+function sameGeneratedDirectory(
+  left: { dev: number; ino: number },
+  right: { dev: number; ino: number },
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function openGeneratedDirectory(target: string, visiblePath = target): OpenGeneratedDirectory {
+  const fd = fs.openSync(
+    target,
+    fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+  );
+  try {
+    const stat = fs.fstatSync(fd);
+    const accessPath = generatedFdAccessPath(fd);
+    const anchored = fs.statSync(accessPath);
+    if (!stat.isDirectory() || !anchored.isDirectory() || !sameGeneratedDirectory(stat, anchored)) {
+      throw new Error('generated pi callback fd access is unavailable');
+    }
+    return { fd, accessPath, visiblePath, dev: stat.dev, ino: stat.ino };
+  } catch (error) {
+    fs.closeSync(fd);
+    throw error;
+  }
+}
+
+function openGeneratedChildDirectory(
+  parent: OpenGeneratedDirectory,
+  name: string,
+): OpenGeneratedDirectory {
+  const target = path.join(parent.accessPath, name);
+  try {
+    fs.mkdirSync(target, { mode: 0o700 });
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  return openGeneratedDirectory(target, path.join(parent.visiblePath, name));
+}
+
+function verifyGeneratedDirectory(directory: OpenGeneratedDirectory): void {
+  const visible = openGeneratedDirectory(directory.visiblePath);
+  try {
+    if (!sameGeneratedDirectory(visible, directory)) {
+      throw new Error('pi callback artifact directory changed during the operation');
+    }
+  } finally {
+    fs.closeSync(visible.fd);
+  }
+}
+
+function openPiGeneratedDirectory(workingDir: string): OpenGeneratedDirectory {
+  const working = openGeneratedDirectory(path.resolve(workingDir));
+  let pi: OpenGeneratedDirectory | null = null;
+  try {
+    pi = openGeneratedChildDirectory(working, '.pi');
+    return openGeneratedChildDirectory(pi, 'ccweb');
+  } finally {
+    if (pi) fs.closeSync(pi.fd);
+    fs.closeSync(working.fd);
+  }
+}
+
+function ensureGeneratedIgnore(directory: OpenGeneratedDirectory, contents: string): void {
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(
+      path.join(directory.accessPath, '.gitignore'),
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    fs.writeFileSync(fd, contents, { encoding: 'utf8' });
+    fs.fsyncSync(fd);
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+}
+
+function writeGeneratedArtifact(directory: OpenGeneratedDirectory, name: string, contents: string): void {
+  let artifactFd: number | null = null;
+  try {
+    try {
+      artifactFd = fs.openSync(
+        path.join(directory.accessPath, name),
+        fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
+      );
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      artifactFd = fs.openSync(
+        path.join(directory.accessPath, name),
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+        0o600,
+      );
+    }
+    const artifactStat = fs.fstatSync(artifactFd);
+    if (!artifactStat.isFile() || artifactStat.nlink !== 1) {
+      throw new Error('unsafe generated pi callback artifact');
+    }
+    verifyGeneratedDirectory(directory);
+    fs.ftruncateSync(artifactFd, 0);
+    fs.writeFileSync(artifactFd, contents, { encoding: 'utf8' });
+    fs.fchmodSync(artifactFd, 0o600);
+    fs.fsyncSync(artifactFd);
+    verifyGeneratedDirectory(directory);
+  } finally {
+    if (artifactFd !== null) fs.closeSync(artifactFd);
+  }
+}
 
 /**
  * Put the extension in the session's working directory, and say where.
@@ -179,30 +456,21 @@ export default function (pi: any) {
  * would cost the user everything else too.
  */
 export function writePiAskExtension(workingDir: string): string | null {
+  let directory: OpenGeneratedDirectory | null = null;
   try {
-    const file = path.join(workingDir, PI_ASK_EXTENSION_PATH);
-    const dir = path.dirname(file);
-    fs.mkdirSync(dir, { recursive: true });
-    try {
-      fs.writeFileSync(
-        path.join(dir, '.gitignore'),
-        [
-          '# Written by code-agents-webcli: generated tools for this session.',
-          '# Regenerated on every launch; nothing here is yours to keep.',
-          '*',
-          '',
-        ].join('\n'),
-        { flag: 'wx' },
-      );
-    } catch {
-      // Already there — the normal case after the first launch, and the case
-      // where the ladder's own writer got here first. Either way it says the
-      // same thing about the same directory.
-    }
-    fs.writeFileSync(file, PI_ASK_EXTENSION, 'utf8');
+    directory = openPiGeneratedDirectory(workingDir);
+    ensureGeneratedIgnore(directory, [
+      '# Written by code-agents-webcli: generated tools for this session.',
+      '# Regenerated on every launch; nothing here is yours to keep.',
+      '*',
+      '',
+    ].join('\n'));
+    writeGeneratedArtifact(directory, 'ask-user.ts', PI_ASK_EXTENSION);
     return PI_ASK_EXTENSION_PATH;
   } catch (error) {
     console.warn('Could not write the question extension for pi:', error);
     return null;
+  } finally {
+    if (directory) fs.closeSync(directory.fd);
   }
 }

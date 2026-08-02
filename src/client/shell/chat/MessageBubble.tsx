@@ -8,6 +8,7 @@ import {
   NoticeBlock,
   ToolBlock,
   askedQuestionFrom,
+  withoutQuestionFallbackEnvelope,
 } from '../../../shared/chat-events.js';
 import {
   blockDraws,
@@ -594,7 +595,7 @@ function BlockView({
         // or a diff — which are not in the selector — keeps the width its
         // content needs; a descendant selector would have capped them too.
         <div className="chat-prose" style={{ minWidth: 0 }}>
-          <Markdown text={block.text} />
+          <Markdown text={withoutQuestionFallbackEnvelope(block.text)} />
           {caret ? <Caret /> : null}
         </div>
       );
@@ -622,6 +623,28 @@ function BlockView({
 
     case 'plan':
       return <PlanPanel items={block.items} />;
+
+    case 'question': {
+      const recorded = block.request;
+      const request = transcript.pendingQuestions.find(
+        (pending) => pending.requestId === recorded.requestId,
+      );
+      const answerKey = recorded.toolId ?? recorded.requestId;
+      const durable = block.answer;
+      return (
+        <QuestionCard
+          request={request}
+          question={recorded.question}
+          header={recorded.header}
+          multiSelect={recorded.multiSelect}
+          options={recorded.options}
+          answered={request ? undefined : (transcript.answerFor(answerKey) ?? durable?.optionIds)}
+          ownWords={request ? undefined : (transcript.answerTextFor(answerKey) ?? durable?.text)}
+          abandoned={!request && (transcript.abandonedFor(answerKey) || durable?.abandoned)}
+          onAnswer={onAnswerQuestion}
+        />
+      );
+    }
 
     case 'image':
       return <ImageView block={block} />;
@@ -926,6 +949,9 @@ export function plainText(message: ChatMessage): string {
     .join('\n\n');
 }
 
+/** Keep the private no-MCP wire envelope out of rendered and copied history. */
+export { withoutQuestionFallbackEnvelope };
+
 /** Plain text of a whole message, for the copy button. */
 export function messageText(message: ChatMessage): string {
   const parts: string[] = [];
@@ -934,7 +960,9 @@ export function messageText(message: ChatMessage): string {
       case 'text':
         // Reasoning is deliberately left out: copying a message is copying the
         // answer, not the working.
-        parts.push(message.role === 'user' ? block.text : markdownText(block.text));
+        parts.push(message.role === 'user'
+          ? block.text
+          : markdownText(withoutQuestionFallbackEnvelope(block.text)));
         break;
       case 'error':
         parts.push(block.text);
@@ -951,6 +979,15 @@ export function messageText(message: ChatMessage): string {
         break;
       case 'image':
         parts.push(block.alt ? `${block.alt} (${block.url})` : block.url);
+        break;
+      case 'question':
+        parts.push([
+          block.request.question,
+          ...block.request.options.map((option) => option.label),
+          ...((block.answer?.optionIds ?? []).map((optionId) =>
+            block.request.options.find((option) => option.optionId === optionId)?.label ?? optionId)),
+          block.answer?.text ?? '',
+        ].join('\n'));
         break;
       default:
         break;

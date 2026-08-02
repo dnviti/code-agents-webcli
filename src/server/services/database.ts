@@ -641,6 +641,9 @@ export class AppDatabase {
     // null is what "chose no level" has always meant.
     this.addColumnIfMissing('runtime_sessions', 'chat_effort_override', 'TEXT');
 
+    // A conversation-level mode, not process state. Null on older rows reads as off.
+    this.addColumnIfMissing('runtime_sessions', 'chat_plan_mode', 'INTEGER');
+
     // The label the user chose for this session. Nullable and null-by-default:
     // a null is "never renamed", which is true of every row written before
     // renaming outlived the page that did it.

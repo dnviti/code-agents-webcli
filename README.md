@@ -22,6 +22,10 @@ there is no second command.
   opens most of the same agents as message bubbles, tool-call cards, diffs and
   permission prompts instead of a raw TUI, with a trace panel beside it and a
   GitHub panel that knows what a PR or issue is linked to.
+- **Plan first, then implement.** A durable Plan mode works with every WebUI
+  runtime, keeps numbered revisions for review, and starts implementation only
+  when the latest one is accepted. Agents can ask single-choice, multi-choice or
+  free-text questions in both ordinary and planning turns.
 - **Whatever agent you already use.** Eight agent CLIs plus plain shell sessions.
   Each is optional; the app only ever runs what is on the host's `PATH`.
 - **Multi-user, properly isolated.** GitHub OAuth, an explicit allow-list, and
