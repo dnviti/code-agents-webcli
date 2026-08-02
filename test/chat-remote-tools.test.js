@@ -126,6 +126,17 @@ describe('the shared-home tools in remote Web-chat runtimes', function () {
         } else if (runtime === 'codex') {
           assert.ok(adapter.options.extraArgs.some((arg) => String(arg).startsWith('mcp_servers.ccweb.command=')));
           assert.ok(adapter.options.extraArgs.some((arg) => String(arg).includes('ccweb-mcp.mjs')));
+          const forwarded = adapter.options.extraArgs.find(
+            (arg) => String(arg).startsWith('mcp_servers.ccweb.env_vars='),
+          );
+          assert.deepStrictEqual(
+            JSON.parse(forwarded.slice(forwarded.indexOf('=') + 1)),
+            ['CCWEB_CALLBACK_DIR', 'CCWEB_CALLBACK_TOKEN'],
+          );
+          assert.ok(
+            !adapter.options.extraArgs.some((arg) => String(arg).includes(adapter.options.env.CCWEB_CALLBACK_TOKEN)),
+            'the callback token must be inherited by name, never exposed in argv',
+          );
         } else if (['grok', 'kimi', 'omp'].includes(runtime)) {
           assert.strictEqual(adapter.options.askMcpServer.name, 'ccweb');
           assert.match(adapter.options.askMcpServer.args[0], /^\/home\/remote-user\/\.ccweb-callback\/.+\/ccweb-mcp\.mjs$/);

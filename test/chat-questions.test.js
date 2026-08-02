@@ -181,6 +181,34 @@ describe('asking the user a choice-based question', function () {
       };
     }
 
+    function launchMcp(command, args, env) {
+      const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+      const queued = [];
+      const waiting = [];
+      let buffer = '';
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        buffer += chunk;
+        let newline;
+        while ((newline = buffer.indexOf('\n')) !== -1) {
+          const reply = JSON.parse(buffer.slice(0, newline));
+          buffer = buffer.slice(newline + 1);
+          const resolve = waiting.shift();
+          if (resolve) resolve(reply);
+          else queued.push(reply);
+        }
+      });
+      return {
+        child,
+        send(message) { child.stdin.write(`${JSON.stringify(message)}\n`); },
+        next() {
+          return queued.length
+            ? Promise.resolve(queued.shift())
+            : within(new Promise((resolve) => waiting.push(resolve)), 'the Default-mode MCP server never replied', 5000);
+        },
+      };
+    }
+
     it('advertises exactly one tool, with a schema the model can fill in', async function () {
       const mcp = drive(() => ({ labels: [] }));
       mcp.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
@@ -226,7 +254,7 @@ describe('asking the user a choice-based question', function () {
       const store = memoryStore();
       const sent = [];
       let adapterOptions;
-      let child;
+      let mcp;
       const realFactory = registry.createChatAdapter;
       registry.createChatAdapter = (runtime, options) => {
         adapterOptions = options;
@@ -269,37 +297,14 @@ describe('asking the user a choice-based question', function () {
         const at = adapterOptions.extraArgs.indexOf('--mcp-config');
         assert.ok(at >= 0, 'Default mode must inject the questionnaire MCP server');
         const config = JSON.parse(adapterOptions.extraArgs[at + 1]).mcpServers.ccweb;
-        child = spawn(config.command, config.args, {
-          env: { ...process.env, ...config.env },
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
+        mcp = launchMcp(config.command, config.args, { ...process.env, ...config.env });
 
-        const queued = [];
-        const waiting = [];
-        let buffer = '';
-        child.stdout.setEncoding('utf8');
-        child.stdout.on('data', (chunk) => {
-          buffer += chunk;
-          let newline;
-          while ((newline = buffer.indexOf('\n')) !== -1) {
-            const reply = JSON.parse(buffer.slice(0, newline));
-            buffer = buffer.slice(newline + 1);
-            const resolve = waiting.shift();
-            if (resolve) resolve(reply);
-            else queued.push(reply);
-          }
-        });
-        const nextReply = () => queued.length
-          ? Promise.resolve(queued.shift())
-          : within(new Promise((resolve) => waiting.push(resolve)), 'the Default-mode MCP server never replied', 5000);
-        const sendRpc = (message) => child.stdin.write(`${JSON.stringify(message)}\n`);
+        mcp.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } });
+        assert.strictEqual((await mcp.next()).result.serverInfo.name, 'ccweb');
+        mcp.send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+        assert.ok((await mcp.next()).result.tools.some((tool) => tool.name === 'ask_user_question'));
 
-        sendRpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } });
-        assert.strictEqual((await nextReply()).result.serverInfo.name, 'ccweb');
-        sendRpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
-        assert.ok((await nextReply()).result.tools.some((tool) => tool.name === 'ask_user_question'));
-
-        sendRpc({
+        mcp.send({
           jsonrpc: '2.0', id: 3, method: 'tools/call',
           params: { name: 'ask_user_question', arguments: QUESTION },
         });
@@ -309,12 +314,95 @@ describe('asking the user a choice-based question', function () {
           5000,
         );
         assert.strictEqual(chat.answerQuestion(request.requestId, ['opt-1']), true);
-        const answer = await nextReply();
+        const answer = await mcp.next();
         assert.strictEqual(answer.id, 3);
         assert.match(answer.result.content[0].text, /Patch it/);
         assert.notStrictEqual(answer.result.isError, true);
       } finally {
-        child?.kill();
+        mcp?.child.kill();
+        await chat.stop();
+        registry.createChatAdapter = realFactory;
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it('forwards the Default-mode callback through Codex’s MCP environment allowlist', async function () {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-question-mcp-'));
+      const store = memoryStore();
+      let adapterOptions;
+      let mcp;
+      const realFactory = registry.createChatAdapter;
+      registry.createChatAdapter = (runtime, options) => {
+        adapterOptions = options;
+        return {
+          runtime,
+          capabilities: { streaming: true, permissions: false, interrupt: true },
+          alive: true,
+          readyForTurn: true,
+          async start() {},
+          async send() {},
+          async interrupt() {},
+          async stop() { this.alive = false; },
+          respondPermission() {},
+        };
+      };
+
+      const chat = new ChatSession(
+        { id: 's1', ownerUserId: 7 },
+        {
+          store,
+          socketDir: path.join(root, 'sockets'),
+          hookScript: path.join(root, 'missing-hook.js'),
+          askScript: ASK_SERVER,
+          broadcast: () => {},
+          resolveCommand: () => path.join(root, 'missing-runtime'),
+        },
+      );
+
+      try {
+        await chat.start({
+          runtime: 'codex',
+          workingDir: root,
+          bypassPermissions: true,
+          planMode: false,
+        });
+        const overrides = new Map();
+        for (let index = 0; index < adapterOptions.extraArgs.length - 1; index += 1) {
+          if (adapterOptions.extraArgs[index] !== '-c') continue;
+          const override = adapterOptions.extraArgs[index + 1];
+          const equals = override.indexOf('=');
+          overrides.set(override.slice(0, equals), override.slice(equals + 1));
+        }
+        const command = JSON.parse(overrides.get('mcp_servers.ccweb.command'));
+        const args = JSON.parse(overrides.get('mcp_servers.ccweb.args'));
+        const envVars = JSON.parse(overrides.get('mcp_servers.ccweb.env_vars'));
+        assert.deepStrictEqual(envVars, ['CCWEB_ASK_SOCKET']);
+
+        // Codex does not give an MCP child its own ambient CCWEB_* variables.
+        // Reproduce that policy here, then copy only the names its `env_vars`
+        // setting allows. Without the setting this server answers immediately
+        // with "this session has no channel to the browser" and no card opens.
+        const childEnv = Object.fromEntries(
+          Object.entries(process.env).filter(([name]) => !name.startsWith('CCWEB_')),
+        );
+        for (const name of envVars) childEnv[name] = adapterOptions.env[name];
+        mcp = launchMcp(command, args, childEnv);
+        mcp.send({
+          jsonrpc: '2.0', id: 1, method: 'tools/call',
+          params: { name: 'ask_user_question', arguments: QUESTION },
+        });
+        const request = await eventuallyValue(
+          () => store.events.find((event) => event.t === 'question')?.request,
+          'Codex did not forward its callback environment to the questionnaire MCP',
+          5000,
+        );
+        assert.strictEqual(chat.answerQuestion(request.requestId, ['opt-0']), true);
+        const answer = await mcp.next();
+        assert.strictEqual(answer.id, 1);
+        assert.match(answer.result.content[0].text, /Rewrite it/);
+        assert.notStrictEqual(answer.result.isError, true);
+      } finally {
+        mcp?.child.kill();
         await chat.stop();
         registry.createChatAdapter = realFactory;
         fs.rmSync(root, { recursive: true, force: true });

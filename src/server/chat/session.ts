@@ -1074,13 +1074,22 @@ export class ChatSession {
       const script = fileEndpoint ? runtimeFileBridge : asSeenByRuntime(askScript!);
       if (!fileEndpoint) env[ASK_SOCKET_ENV] = runtimeSocketPath;
       if (laddered) env[TIER_ENABLED_ENV] = '1';
+      const forwardedMcpEnv = [
+        ...(fileEndpoint ? [FILE_CALLBACK_DIR_ENV, FILE_CALLBACK_TOKEN_ENV] : [ASK_SOCKET_ENV]),
+        ...(laddered ? [TIER_ENABLED_ENV] : []),
+      ];
       // Codex app-server accepts the same dotted TOML overrides as `codex -c`.
-      // They live on this one spawned process and never touch ~/.codex/config.toml.
+      // It deliberately gives MCP children only variables named in `env_vars`,
+      // rather than inheriting the app-server environment. Pass the names, not
+      // their values: the file callback token must never appear in process argv.
+      // These overrides live on this one process and never touch ~/.codex/config.toml.
       extraArgs.push(
         '-c',
         `mcp_servers.${ASK_MCP_SERVER}.command=${JSON.stringify(nodePath)}`,
         '-c',
         `mcp_servers.${ASK_MCP_SERVER}.args=${JSON.stringify([script])}`,
+        '-c',
+        `mcp_servers.${ASK_MCP_SERVER}.env_vars=${JSON.stringify(forwardedMcpEnv)}`,
       );
       this.questionsEnabled = true;
     }
