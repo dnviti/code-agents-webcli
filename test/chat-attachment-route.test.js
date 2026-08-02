@@ -12,6 +12,7 @@ const {
   safeName,
   displayMime,
   serveKind,
+  storedAttachmentNameFromUrl,
 } = require('../dist/server/services/attachment-store.js');
 
 // Uploading a file to a chat turn, end to end over the real route.
@@ -34,6 +35,8 @@ describe('chat attachment route', function () {
   let currentUser;
   let sessions;
   let allowPath;
+  let validatePathCalls;
+  let attachmentStore;
 
   const OWNER = { id: 1, githubId: '1', githubLogin: 'tizio', githubName: null, avatarUrl: null, email: null };
   const OTHER = { id: 2, githubId: '2', githubLogin: 'altro', githubName: null, avatarUrl: null, email: null };
@@ -42,10 +45,20 @@ describe('chat attachment route', function () {
     workingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-attach-wd-'));
     currentUser = OWNER;
     allowPath = true;
+    validatePathCalls = 0;
+    attachmentStore = new AttachmentStore();
 
     sessions = new Map([
       ['mine', { id: 'mine', ownerUserId: 1, workingDir, active: true, connections: new Set() }],
       ['theirs', { id: 'theirs', ownerUserId: 2, workingDir, active: true, connections: new Set() }],
+      ['project-container', {
+        id: 'project-container', ownerUserId: 1, workingDir: '/tmp', projectId: 'p1',
+        projectWorkingDirKind: 'container', active: true, connections: new Set(),
+      }],
+      ['project-host', {
+        id: 'project-host', ownerUserId: 1, workingDir, projectId: 'p1',
+        projectWorkingDirKind: 'host', active: true, connections: new Set(),
+      }],
     ]);
 
     const app = express();
@@ -56,9 +69,11 @@ describe('chat attachment route', function () {
     app.use(
       createChatAttachmentRoutes({
         claudeSessions: sessions,
-        attachmentStore: new AttachmentStore(),
-        validatePath: (target) =>
-          (allowPath ? { valid: true, path: target } : { valid: false, error: 'outside' }),
+        attachmentStore,
+        validatePath: (target) => {
+          validatePathCalls += 1;
+          return allowPath ? { valid: true, path: target } : { valid: false, error: 'outside' };
+        },
       }),
     );
 
@@ -161,6 +176,22 @@ describe('chat attachment route', function () {
     assert.strictEqual((await response.json()).error, 'session_outside_base');
   });
 
+  it('rejects every project namespace before a container path can touch host fs', async function () {
+    const canary = path.join(os.tmpdir(), `cawc-attach-canary-${process.pid}-${Date.now()}`);
+    fs.writeFileSync(canary, 'untouched');
+    try {
+      for (const sessionId of ['project-container', 'project-host']) {
+        const response = await upload(sessionId, 'x.txt', Buffer.from('overwrite'));
+        assert.strictEqual(response.status, 409);
+        assert.strictEqual((await response.json()).error, 'unsupported_attachment_namespace');
+      }
+      assert.strictEqual(validatePathCalls, 0, 'host validation must not interpret a project path');
+      assert.strictEqual(fs.readFileSync(canary, 'utf8'), 'untouched');
+    } finally {
+      fs.rmSync(canary, { force: true });
+    }
+  });
+
   it('refuses a cross-origin write even though the cookie would ride along', async function () {
     const response = await fetch(`${baseUrl}/api/sessions/mine/chat-attachments?name=x.txt`, {
       method: 'POST',
@@ -201,9 +232,75 @@ describe('chat attachment route', function () {
     assert.strictEqual(fs.readFileSync(first.path, 'utf8'), 'one');
     assert.strictEqual(fs.readFileSync(second.path, 'utf8'), 'two');
   });
+
+  it('refuses a symlinked .cc-web instead of writing through it', async function () {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-attach-outside-'));
+    try {
+      fs.symlinkSync(outside, path.join(workingDir, '.cc-web'));
+      const response = await upload('mine', 'escape.txt', Buffer.from('do not write'));
+      assert.strictEqual(response.status, 403);
+      assert.strictEqual((await response.json()).error, 'unsafe_attachment_dir');
+      assert.deepStrictEqual(fs.readdirSync(outside), []);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('derives turn metadata from the owned URL, never a forged path or mismatched name', async function () {
+    const first = await upload('mine', 'first.txt', Buffer.from('first'), 'text/plain').then((r) => r.json());
+    const second = await upload('mine', 'second.txt', Buffer.from('second'), 'text/plain').then((r) => r.json());
+
+    const resolved = await attachmentStore.resolveForTurn(
+      { id: 'mine', ownerUserId: 1, workingDir },
+      {
+        url: first.url,
+        name: 'second.txt',
+        mime: 'image/png',
+        size: 999999,
+        path: second.path,
+        storedName: path.basename(second.path),
+      },
+    );
+
+    assert.strictEqual(resolved.path, first.path, 'the URL is the only stored identity');
+    assert.strictEqual(resolved.name, 'first.txt');
+    assert.strictEqual(resolved.mime, 'application/octet-stream');
+    assert.strictEqual(resolved.size, 5);
+    assert.strictEqual(fs.readFileSync(resolved.path, 'utf8'), 'first');
+  });
 });
 
 describe('attachment names and types', function () {
+  it('rejects a project namespace before resolving an identically named host path', async function () {
+    const canary = path.join(os.tmpdir(), `cawc-turn-attach-canary-${process.pid}-${Date.now()}`);
+    fs.writeFileSync(canary, 'untouched');
+    try {
+      const store = new AttachmentStore();
+      await assert.rejects(
+        () => store.resolveForTurn(
+          {
+            id: 'project-chat',
+            ownerUserId: 1,
+            workingDir: '/tmp',
+            projectId: 'p1',
+            projectWorkingDirKind: 'container',
+          },
+          {
+            url: '/api/sessions/project-chat/chat-attachments/abcdef012345-canary.txt',
+            name: 'canary.txt',
+            mime: 'text/plain',
+            size: 1,
+            path: canary,
+          },
+        ),
+        (error) => error && error.code === 'UNSUPPORTED_ATTACHMENT_NAMESPACE',
+      );
+      assert.strictEqual(fs.readFileSync(canary, 'utf8'), 'untouched');
+    } finally {
+      fs.rmSync(canary, { force: true });
+    }
+  });
+
   it('reduces a filename to something that can only be a filename', function () {
     assert.strictEqual(safeName('notes.txt'), 'notes.txt');
     assert.strictEqual(safeName('../../etc/passwd'), 'passwd');
@@ -230,5 +327,123 @@ describe('attachment names and types', function () {
     const other = serveKind(Buffer.from('<html>'), 'abcdef012345-evil.html');
     assert.strictEqual(other.contentType, 'application/octet-stream');
     assert.strictEqual(other.inline, false);
+  });
+
+  it('accepts only an exact canonical owned attachment URL', function () {
+    const good = '/api/sessions/mine/chat-attachments/abcdef012345-notes.txt';
+    assert.strictEqual(storedAttachmentNameFromUrl(good, 'mine'), 'abcdef012345-notes.txt');
+    for (const forged of [
+      `${good}/nested`,
+      `${good}?download=1`,
+      '/api/sessions/other/chat-attachments/abcdef012345-notes.txt',
+      '/api/sessions/mine/chat-attachments/abcdef012345-%2Fetc',
+      '/api/sessions/mine/chat-attachments/not-a-stored-name',
+    ]) {
+      assert.strictEqual(storedAttachmentNameFromUrl(forged, 'mine'), null, forged);
+    }
+  });
+});
+
+describe('attachment directory race safety', function () {
+  let workingDir;
+  let outside;
+  let session;
+
+  beforeEach(function () {
+    workingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-attach-race-wd-'));
+    outside = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-attach-race-outside-'));
+    session = {
+      id: 'race',
+      ownerUserId: 1,
+      workingDir,
+      projectId: undefined,
+      projectWorkingDirKind: undefined,
+    };
+  });
+
+  afterEach(function () {
+    fs.rmSync(workingDir, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  });
+
+  function swapContainer() {
+    const container = path.join(workingDir, '.cc-web');
+    fs.renameSync(container, path.join(workingDir, '.cc-web-opened'));
+    fs.symlinkSync(outside, container);
+  }
+
+  async function streamBytes(stream) {
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+    return Buffer.concat(chunks);
+  }
+
+  it('keeps an existing attachment intact when a generated name collides', async function () {
+    const store = new AttachmentStore({ randomId: () => 'abcdef012345' });
+    const first = await store.save(
+      session,
+      { filename: 'same.txt', declaredMime: 'text/plain', bytes: Buffer.from('first') },
+    );
+    await assert.rejects(() => store.save(
+      session,
+      { filename: 'same.txt', declaredMime: 'text/plain', bytes: Buffer.from('second') },
+    ));
+    assert.strictEqual(fs.readFileSync(first.absolutePath, 'utf8'), 'first');
+  });
+
+  it('cannot redirect a save by swapping .cc-web after its directory fd opens', async function () {
+    fs.mkdirSync(path.join(workingDir, '.cc-web', 'attachments'), { recursive: true });
+    const store = new AttachmentStore({
+      randomId: () => 'abcdef012345',
+      testHooks: { afterDirectoryOpened: swapContainer },
+    });
+
+    await assert.rejects(
+      () => store.save(session, {
+        filename: 'secret.txt', declaredMime: 'text/plain', bytes: Buffer.from('must stay local'),
+      }),
+      (error) => error && error.code === 'UNSAFE_ATTACHMENT_DIR',
+    );
+    assert.deepStrictEqual(fs.readdirSync(outside), [], 'nothing is created through the new symlink');
+    assert.deepStrictEqual(
+      fs.readdirSync(path.join(workingDir, '.cc-web-opened', 'attachments')),
+      [],
+      'a write completed on the bound inode is removed when no safe visible path can be returned',
+    );
+  });
+
+  it('rejects a runtime path when .cc-web changes during resolution', async function () {
+    const stored = await new AttachmentStore({ randomId: () => 'abcdef012345' }).save(
+      session,
+      { filename: 'mine.txt', declaredMime: 'text/plain', bytes: Buffer.from('mine') },
+    );
+    fs.mkdirSync(path.join(outside, 'attachments'));
+    fs.writeFileSync(path.join(outside, 'attachments', path.basename(stored.absolutePath)), 'host secret');
+
+    const racing = new AttachmentStore({
+      testHooks: { afterDirectoryOpened: swapContainer },
+    });
+    await assert.rejects(
+      () => racing.resolveForTurn(session, {
+        url: `/api/sessions/race/chat-attachments/${path.basename(stored.absolutePath)}`,
+        name: 'mine.txt', mime: 'text/plain', size: 4, path: '/etc/passwd',
+      }),
+      (error) => error && error.code === 'NOT_FOUND',
+    );
+  });
+
+  it('streams the already-open inode when .cc-web changes during download', async function () {
+    const stored = await new AttachmentStore({ randomId: () => 'abcdef012345' }).save(
+      session,
+      { filename: 'mine.txt', declaredMime: 'text/plain', bytes: Buffer.from('mine') },
+    );
+    fs.mkdirSync(path.join(outside, 'attachments'));
+    fs.writeFileSync(path.join(outside, 'attachments', path.basename(stored.absolutePath)), 'host secret');
+
+    const racing = new AttachmentStore({
+      testHooks: { afterDirectoryOpened: swapContainer },
+    });
+    const opened = await racing.openForDownload(session, path.basename(stored.absolutePath));
+    assert.strictEqual((await streamBytes(opened.stream)).toString('utf8'), 'mine');
   });
 });

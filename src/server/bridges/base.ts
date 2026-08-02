@@ -2,7 +2,10 @@ import { spawn as spawnPty, IPty } from '../services/pty.js';
 import * as path from 'path';
 import * as fs from 'fs';
 import { execFileSync } from 'child_process';
-import { UserEnvironment } from '../services/environments/types.js';
+import {
+  UserEnvironment,
+  WrappedProcessControl,
+} from '../services/environments/types.js';
 import { HostEnvironment } from '../services/environments/manager.js';
 
 export interface BridgeSession {
@@ -11,8 +14,20 @@ export interface BridgeSession {
   created: Date;
   active: boolean;
   killTimeout: ReturnType<typeof setTimeout> | null;
+  closeTimeout: ReturnType<typeof setTimeout> | null;
   stopRequested: boolean;
   finalized: boolean;
+  clientExited: boolean;
+  closed: Promise<void>;
+  resolveClosed: () => void;
+  stopPromise: Promise<void> | null;
+  processControl?: WrappedProcessControl;
+  terminalEvent:
+    | { kind: 'exit'; exitCode: number; signal: number }
+    | { kind: 'error'; error: Error }
+    | null;
+  onExit: (exitCode: number, signal: number) => void;
+  onError: (error: Error) => void;
 }
 
 export interface SessionInfo {
@@ -24,6 +39,8 @@ export interface SessionInfo {
 
 export interface StartSessionOptions {
   workingDir?: string;
+  /** Whether workingDir is already an absolute path inside the container. */
+  cwdKind?: 'host' | 'container';
   /**
    * Where this agent runs. Absent means the host, which is what every caller
    * passed before per-user environments existed.
@@ -208,6 +225,7 @@ export abstract class BaseBridge {
         : this.resolvedCommand;
       const launch = environment.wrap(command, args, {
         cwd: workingDir,
+        cwdKind: options.cwdKind,
         env: {
           // Profile variables sit between the inherited environment and the
           // terminal settings: they may override an inherited value (that is
@@ -219,7 +237,11 @@ export abstract class BaseBridge {
           COLORTERM: 'truecolor',
         },
         tty: true,
+        trackProcess: true,
       });
+      if (environment.kind === 'container' && !launch.processControl) {
+        throw new Error('Container environment did not provide verified process control');
+      }
 
       const ptyProcess = spawnPty(launch.command, launch.args, {
         // In a container the engine sets the working directory itself, and the
@@ -231,14 +253,27 @@ export abstract class BaseBridge {
         name: 'xterm-color',
       });
 
+      let resolveClosed!: () => void;
+      const closed = new Promise<void>((resolve) => {
+        resolveClosed = resolve;
+      });
       const session: BridgeSession = {
         process: ptyProcess,
         workingDir,
         created: new Date(),
         active: true,
         killTimeout: null,
+        closeTimeout: null,
         stopRequested: false,
         finalized: false,
+        clientExited: false,
+        closed,
+        resolveClosed,
+        stopPromise: null,
+        processControl: launch.processControl,
+        terminalEvent: null,
+        onExit,
+        onError,
       };
 
       this.sessions.set(sessionId, session);
@@ -264,14 +299,21 @@ export abstract class BaseBridge {
       });
 
       ptyProcess.onExit(({ exitCode, signal }) => {
-        if (!this.finalizeSession(sessionId, session)) {
-          return;
+        if (!session.clientExited) {
+          session.clientExited = true;
+          session.terminalEvent ||= {
+            kind: 'exit',
+            exitCode: exitCode ?? 0,
+            signal: signal ?? 0,
+          };
+          session.resolveClosed();
         }
-
-        console.log(
-          `${displayName} session ${sessionId} exited with code ${exitCode}, signal ${signal}`,
-        );
-        onExit(exitCode ?? 0, signal ?? 0);
+        void this.stopAndFinalizeSession(sessionId, session).catch((error) => {
+          console.error(
+            `${displayName} session ${sessionId} could not verify shutdown:`,
+            error,
+          );
+        });
       });
 
       (ptyProcess as any).on('error', (error: Error) => {
@@ -279,15 +321,17 @@ export abstract class BaseBridge {
           return;
         }
 
-        if (!this.finalizeSession(sessionId, session)) {
-          return;
-        }
-
         console.error(
           `${displayName} session ${sessionId} error:`,
           error,
         );
-        onError(error);
+        session.terminalEvent ||= { kind: 'error', error };
+        void this.stopAndFinalizeSession(sessionId, session).catch((stopError) => {
+          console.error(
+            `${displayName} session ${sessionId} could not verify shutdown:`,
+            stopError,
+          );
+        });
       });
 
       console.log(
@@ -348,45 +392,7 @@ export abstract class BaseBridge {
     if (!session) {
       return;
     }
-
-    try {
-      if (session.killTimeout) {
-        clearTimeout(session.killTimeout);
-        session.killTimeout = null;
-      }
-
-      if (session.active && session.process) {
-        session.stopRequested = true;
-        session.active = false;
-        session.process.kill('SIGTERM');
-
-        session.killTimeout = setTimeout(() => {
-          if (!session.finalized && session.process) {
-            try {
-              session.process.kill('SIGKILL');
-            } catch {
-              // Process is already gone.
-            }
-          }
-        }, 5000);
-        session.killTimeout.unref?.();
-      }
-    } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : String(error);
-      console.warn(`Error stopping session ${sessionId}:`, message);
-    }
-
-    session.stopRequested = true;
-    session.active = false;
-
-    // Free the id now rather than when the PTY finally dies, so restarting the
-    // same session immediately after a stop does not hit "already exists".
-    // The captured `session` object keeps the kill timer and exit handlers
-    // working, and finalizeSession only deletes an entry it still owns.
-    if (this.sessions.get(sessionId) === session) {
-      this.sessions.delete(sessionId);
-    }
+    await this.stopAndFinalizeSession(sessionId, session);
   }
 
   /**
@@ -436,6 +442,10 @@ export abstract class BaseBridge {
       clearTimeout(session.killTimeout);
       session.killTimeout = null;
     }
+    if (session.closeTimeout) {
+      clearTimeout(session.closeTimeout);
+      session.closeTimeout = null;
+    }
 
     session.active = false;
     // Only drop the map entry if it still belongs to this run: a restart under
@@ -444,6 +454,117 @@ export abstract class BaseBridge {
       this.sessions.delete(sessionId);
     }
     return true;
+  }
+
+  /**
+   * Stop both halves of a container-backed run: the local engine client and
+   * the identity-bound process group inside the container. The shared promise
+   * makes explicit stops, PTY exits and PTY errors one teardown rather than
+   * three racing lifecycle notifications.
+   */
+  private async stopAndFinalizeSession(
+    sessionId: string,
+    session: BridgeSession,
+  ): Promise<void> {
+    if (session.finalized) return;
+    if (session.stopPromise) return session.stopPromise;
+
+    const attempt = (async () => {
+      session.stopRequested = true;
+      session.active = false;
+
+      const localStop = this.stopLocalClient(sessionId, session);
+      const remoteStop = session.processControl?.stop() ?? Promise.resolve();
+      const [localResult, remoteResult] = await Promise.allSettled([
+        localStop,
+        remoteStop,
+      ]);
+
+      if (remoteResult.status === 'rejected') throw remoteResult.reason;
+      if (localResult.status === 'rejected') throw localResult.reason;
+      if (!this.finalizeSession(sessionId, session)) return;
+
+      const event = session.terminalEvent;
+      if (event?.kind === 'error') {
+        try {
+          session.onError(event.error);
+        } catch (error) {
+          console.error(`Session ${sessionId} error callback failed:`, error);
+        }
+        return;
+      }
+
+      const exitCode = event?.kind === 'exit' ? event.exitCode : 0;
+      const signal = event?.kind === 'exit' ? event.signal : 0;
+      console.log(
+        `${this.getDisplayName()} session ${sessionId} exited with code ${exitCode}, signal ${signal}`,
+      );
+      try {
+        session.onExit(exitCode, signal);
+      } catch (error) {
+        console.error(`Session ${sessionId} exit callback failed:`, error);
+      }
+    })();
+
+    session.stopPromise = attempt;
+    try {
+      await attempt;
+    } catch (error) {
+      // Fail closed, but allow an explicit later stop to retry a transient
+      // engine failure while the bridge still owns this session id.
+      if (session.stopPromise === attempt) session.stopPromise = null;
+      throw error;
+    }
+  }
+
+  private async stopLocalClient(
+    sessionId: string,
+    session: BridgeSession,
+  ): Promise<void> {
+    if (session.clientExited) return;
+
+    try {
+      session.process.kill('SIGTERM');
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`Error sending SIGTERM to session ${sessionId}:`, message);
+    }
+
+    if (!session.killTimeout) {
+      session.killTimeout = setTimeout(() => {
+        if (!session.clientExited) {
+          try {
+            session.process.kill('SIGKILL');
+          } catch {
+            // A concurrent exit won the race; its callback resolves `closed`.
+          }
+        }
+      }, 5000);
+      session.killTimeout.unref?.();
+    }
+
+    const failed = new Promise<never>((_resolve, reject) => {
+      if (session.closeTimeout) clearTimeout(session.closeTimeout);
+      session.closeTimeout = setTimeout(() => {
+        reject(new Error(
+          `Could not verify that the ${this.getDisplayName()} client for session ${sessionId} closed`,
+        ));
+      }, 10_000);
+      session.closeTimeout.unref?.();
+    });
+
+    try {
+      await Promise.race([session.closed, failed]);
+    } finally {
+      if (session.killTimeout) {
+        clearTimeout(session.killTimeout);
+        session.killTimeout = null;
+      }
+      if (session.closeTimeout) {
+        clearTimeout(session.closeTimeout);
+        session.closeTimeout = null;
+      }
+    }
   }
 
   private shouldIgnorePtyError(

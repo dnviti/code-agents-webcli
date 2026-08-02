@@ -70,6 +70,18 @@ export function createPasteRoutes(deps: PasteRoutesDeps): Router {
         return;
       }
 
+      // Project paths are not host paths, even when their strings happen to
+      // match one (`/tmp` is the dangerous example). Until paste storage is
+      // container-aware, reject both project namespaces before validatePath or
+      // any store call so a container cwd can never alias the host filesystem.
+      if (
+        (session.projectId !== undefined && session.projectId !== null)
+        || session.projectWorkingDirKind !== undefined
+      ) {
+        res.status(409).json({ error: 'unsupported_paste_namespace' });
+        return;
+      }
+
       // SessionStore restores working_dir straight from SQLite without a
       // re-check, so a database written by a looser build — or a base folder
       // narrowed since — must not turn into a write outside the sandbox.

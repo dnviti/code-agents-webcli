@@ -236,6 +236,9 @@ export class MessageHandler {
           surface: message.surface,
           active: message.active,
           bypassPermissions: message.bypassPermissions,
+          projectId: message.projectId,
+          projectName: message.projectName,
+          projectWorkingDirKind: message.projectWorkingDirKind,
         });
         this.app.loadSessions();
         break;
@@ -286,6 +289,13 @@ export class MessageHandler {
           'info',
         );
         window.dispatchEvent(new CustomEvent('cc-environment-changed'));
+        break;
+
+      case 'project_updated':
+      case 'project_removed':
+        // The projects dialog re-reads itself off this event, so an open panel
+        // never stays stale. No toast: these are frequent background churn.
+        window.dispatchEvent(new CustomEvent('cc-projects-changed'));
         break;
 
       case 'update_done':
@@ -392,7 +402,14 @@ export class MessageHandler {
     }
   }
 
-  private onSessionCreated(message: { sessionId: string; sessionName: string; workingDir: string }): void {
+  private onSessionCreated(message: {
+    sessionId: string;
+    sessionName: string;
+    workingDir: string;
+    projectId?: string | null;
+    projectName?: string | null;
+    projectWorkingDirKind?: 'host' | 'container';
+  }): void {
     this.app.currentClaudeSessionId = message.sessionId;
     this.app.currentClaudeSessionName = message.sessionName;
     this.app.loadSessions();
@@ -403,6 +420,11 @@ export class MessageHandler {
         message.sessionName,
         'idle',
         message.workingDir,
+        true,
+        undefined,
+        message.projectId,
+        message.projectName,
+        message.projectWorkingDirKind,
       );
       this.app.sessionTabManager.switchToTab(message.sessionId);
     }
@@ -417,6 +439,9 @@ export class MessageHandler {
     lastAgent?: string;
     runtimeLabel?: string;
     history?: { firstLine: number; totalLines: number };
+    projectId?: string | null;
+    projectName?: string | null;
+    projectWorkingDirKind?: 'host' | 'container';
   }): void {
     this.app.currentClaudeSessionId = message.sessionId;
     this.app.historyRange = message.history ?? { firstLine: 0, totalLines: 0 };
@@ -433,6 +458,17 @@ export class MessageHandler {
     this.scheduleTerminalRefit();
 
     if (this.app.sessionTabManager) {
+      this.app.sessionTabManager.addTab(
+        message.sessionId,
+        message.sessionName,
+        message.active ? 'active' : 'idle',
+        message.workingDir,
+        false,
+        undefined,
+        message.projectId,
+        message.projectName,
+        message.projectWorkingDirKind,
+      );
       this.app.sessionTabManager.updateTabStatus(
         message.sessionId,
         message.active ? 'active' : 'idle',

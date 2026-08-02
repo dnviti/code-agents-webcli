@@ -19,12 +19,19 @@ function fakeKubectl(responses = {}) {
       const result = await handler(args, input);
       const output = args[args.indexOf('-o') + 1];
       if (output === 'json' && result.stdout.trim() && !result.stdout.trim().startsWith('{')) {
+        const raw = result.stdout.trim();
+        const fields = raw.split('\t');
+        const podIndex = args.indexOf('pod');
+        const name = podIndex >= 0 ? args[podIndex + 1] : 'pod';
+        const [identity, phase, image, labelsJson] = fields.length === 4
+          ? fields
+          : [`${name}-uid`, raw, 'example/image:1', '{}'];
         return {
           ...result,
           stdout: JSON.stringify({
-            status: { phase: result.stdout.trim() },
-            spec: { containers: [{ image: 'example/image:1' }] },
-            metadata: { labels: {} },
+            status: { phase },
+            spec: { containers: [{ image }] },
+            metadata: { uid: identity, labels: JSON.parse(labelsJson || '{}') },
           }),
         };
       }
@@ -66,7 +73,10 @@ const SPEC = {
 describe('the kubernetes engine', function () {
   describe('targeting', function () {
     it('names the context and namespace on every call', async function () {
-      const { engine, calls } = engineWith({});
+      const { engine, calls } = engineWith({ get: async (args) => {
+        if (args.includes('pods')) return { stdout: '', stderr: '' };
+        throw new Error('Error from server (NotFound): pods "x" not found');
+      } });
       await engine.status('x');
       await engine.list('a=b');
       await engine.remove('x');
@@ -160,9 +170,11 @@ describe('the kubernetes engine', function () {
     it('is fed to kubectl on stdin rather than through a file', async function () {
       const { engine, calls } = engineWith({});
       await engine.create(SPEC);
-      const apply = calls.find((c) => c.args.includes('apply'));
-      assert.deepStrictEqual(apply.args.slice(-2), ['-f', '-']);
-      assert.strictEqual(JSON.parse(apply.input).metadata.name, 'cawc-alice-1');
+      const create = calls.find((c) => c.args.includes('create'));
+      assert.ok(create.args.includes('-f') && create.args.includes('-'));
+      assert.ok(create.args.includes('jsonpath={.metadata.uid}'));
+      assert.strictEqual(JSON.parse(create.input).metadata.name, 'cawc-alice-1');
+      assert.strictEqual(calls.some((c) => c.args.includes('apply')), false);
     });
   });
 
@@ -205,6 +217,14 @@ describe('the kubernetes engine', function () {
       const args = engine.execArgs({ name: 'pod-1' }, 'ls', []);
       assert.deepStrictEqual(args.slice(-2), ['--', 'ls']);
     });
+
+    it('sends exec stdin through kubectl without putting it in argv', async function () {
+      const { engine, calls } = engineWith({});
+      await engine.exec({ name: 'pod-1', input: 'bearer-token\n' }, 'cat', []);
+      const call = calls.find((entry) => entry.args.includes('exec'));
+      assert.strictEqual(call.input, 'bearer-token\n');
+      assert.ok(!call.args.some((arg) => arg.includes('bearer-token')));
+    });
   });
 
   describe('lifecycle', function () {
@@ -219,7 +239,7 @@ describe('the kubernetes engine', function () {
       assert.strictEqual(result.created, true);
       // A Pod cannot be started; the only way back is a new one.
       assert.ok(calls.some((c) => c.args.includes('delete')));
-      assert.ok(calls.some((c) => c.args.includes('apply')));
+      assert.ok(calls.some((c) => c.args.includes('create')));
     });
 
     it('reuses a running pod without touching it', async function () {
@@ -227,7 +247,7 @@ describe('the kubernetes engine', function () {
         get: async () => ({ stdout: 'Running', stderr: '' }),
       });
       assert.deepStrictEqual(await engine.ensure(SPEC), { created: false });
-      assert.strictEqual(calls.some((c) => c.args.includes('apply')), false);
+      assert.strictEqual(calls.some((c) => c.args.includes('create')), false);
       assert.strictEqual(calls.some((c) => c.args.includes('delete')), false);
     });
 
@@ -237,7 +257,10 @@ describe('the kubernetes engine', function () {
           stdout: JSON.stringify({
             status: { phase: 'Running' },
             spec: { containers: [{ image: 'img' }] },
-            metadata: { labels: { 'com.code-agents-webcli.managed': 'false' } },
+            metadata: {
+              uid: 'pod-uid',
+              labels: { 'com.code-agents-webcli.managed': 'false' },
+            },
           }),
           stderr: '',
         }),
@@ -270,8 +293,8 @@ describe('the kubernetes engine', function () {
     it('reports a failed pod rather than waiting out the timeout', async function () {
       let created = false;
       const { engine } = engineWith({
-        get: async () => ({ stdout: created ? 'Failed' : '', stderr: '' }),
-        apply: async () => { created = true; return { stdout: '', stderr: '' }; },
+        get: async () => { if (!created) throw new Error('Error from server (NotFound): pods "cawc-alice-1" not found'); return { stdout: 'Failed', stderr: '' }; },
+        create: async () => { created = true; return { stdout: '', stderr: '' }; },
       });
       await assert.rejects(() => engine.ensure(SPEC), /did not start: pod is failed/);
     });
@@ -295,7 +318,7 @@ describe('the kubernetes engine', function () {
     });
 
     it('reports no pod as null rather than throwing', async function () {
-      const { engine } = engineWith({ get: async () => { throw new Error('NotFound'); } });
+      const { engine } = engineWith({ get: async () => { throw new Error('Error from server (NotFound): pods "gone" not found'); } });
       assert.strictEqual(await engine.status('gone'), null);
       assert.strictEqual(await engine.describe('gone'), null);
     });
@@ -314,6 +337,121 @@ describe('the kubernetes engine', function () {
       });
       await assert.rejects(engine.describeStrict('pod-1'), /invalid JSON/);
       assert.strictEqual(await engine.describe('pod-1'), null);
+    });
+
+    it('propagates transport and malformed pod inspection uncertainty on the strict path', async function () {
+      const transport = engineWith({ get: async () => { throw new Error('TLS timeout'); } }).engine;
+      await assert.rejects(() => transport.describeStrict('pod-1'), /timeout/i);
+      assert.strictEqual(await transport.describe('pod-1'), null);
+      const malformed = engineWith({ get: async () => ({ stdout: '{}', stderr: '' }) }).engine;
+      await assert.rejects(() => malformed.describeStrict('pod-1'));
+      assert.strictEqual(await malformed.describe('pod-1'), null);
+    });
+
+    it('uses a Kubernetes UID precondition for identity-bound deletion', async function () {
+      let removed = false;
+      const { engine, calls } = engineWith({
+        delete: async () => { removed = true; return { stdout: '', stderr: '' }; },
+        get: async () => { if (removed) throw new Error('Error from server (NotFound): pods "pod-1" not found'); return { stdout: 'uid-1\tRunning\timg\t{}', stderr: '' }; },
+      });
+      await engine.removeIdentity({ name: 'pod-1', identity: 'uid-1', status: 'running', image: 'img', labels: {} });
+      const deletion = calls.find((call) => call.args.includes('--raw'));
+      assert.match(deletion.input, /"uid":"uid-1"/);
+    });
+
+    it('waits through asynchronous same-UID termination until the pod is absent', async function () {
+      let inspections = 0;
+      const { engine } = engineWith({
+        delete: async () => ({ stdout: '', stderr: '' }),
+        get: async () => {
+          inspections += 1;
+          if (inspections > 3) throw new Error('Error from server (NotFound): pods "pod-1" not found');
+          return { stdout: 'uid-1\tRunning\timg\t{}\n', stderr: '' };
+        },
+      });
+      await engine.removeIdentity({ name: 'pod-1', identity: 'uid-1', status: 'running', image: 'img', labels: {} });
+      assert.strictEqual(inspections, 4);
+    });
+
+    it('fails closed if deletion reveals a replacement UID or never completes', async function () {
+      const replaced = engineWith({
+        delete: async () => ({ stdout: '', stderr: '' }),
+        get: async () => ({ stdout: 'replacement-uid\tRunning\timg\t{}\n', stderr: '' }),
+      }).engine;
+      await assert.rejects(
+        () => replaced.removeIdentity({ name: 'pod-1', identity: 'uid-1', status: 'running', image: 'img', labels: {} }),
+        /replaced during removal/i,
+      );
+
+      const timedOut = engineWith({
+        delete: async () => ({ stdout: '', stderr: '' }),
+        get: async () => ({ stdout: 'uid-1\tRunning\timg\t{}\n', stderr: '' }),
+      }, { readyTimeoutSeconds: 0 }).engine;
+      await assert.rejects(
+        () => timedOut.removeIdentity({ name: 'pod-1', identity: 'uid-1', status: 'running', image: 'img', labels: {} }),
+        /removal timeout/i,
+      );
+    });
+
+    it('never deletes a non-running same-name replacement during identity-safe ensure', async function () {
+      const { engine, calls } = engineWith({ get: async () => ({ stdout: 'replacement-uid\tFailed\timg\t{}', stderr: '' }) });
+      await assert.rejects(() => engine.ensureIdentity(SPEC, { name: SPEC.name, identity: 'original-uid', status: 'failed', image: 'img', labels: {} }), /replaced before ensure/);
+      assert.strictEqual(calls.some((call) => call.args.includes('delete')), false);
+    });
+
+    it('returns and waits for the new UID when replacing an expected failed pod', async function () {
+      let present = true; let identity = 'old-uid'; let phase = 'Failed';
+      const { engine, calls } = engineWith({
+        get: async (args) => {
+          if (!present) throw new Error(`Error from server (NotFound): pods "${SPEC.name}" not found`);
+          if (args[args.indexOf('-o') + 1] === 'json') {
+            return { stdout: `${identity}\t${phase}\timg\t{}\n`, stderr: '' };
+          }
+          return { stdout: phase, stderr: '' };
+        },
+        delete: async () => { present = false; return { stdout: '', stderr: '' }; },
+        create: async () => {
+          present = true; identity = 'new-uid'; phase = 'Running';
+          return { stdout: `${identity}\n`, stderr: '' };
+        },
+      });
+
+      assert.deepStrictEqual(await engine.ensureIdentity(SPEC, {
+        name: SPEC.name, identity: 'old-uid', status: 'failed', image: 'img', labels: {},
+      }), { created: true, identity: 'new-uid' });
+      assert.ok(calls.some((call) => call.args.includes('create')));
+      assert.strictEqual(calls.some((call) => call.args.includes('apply')), false);
+    });
+
+    it('does not adopt a pod that wins the absent-to-create race', async function () {
+      let present = false;
+      const { engine, calls } = engineWith({
+        get: async () => {
+          if (!present) throw new Error(`Error from server (NotFound): pods "${SPEC.name}" not found`);
+          return { stdout: 'replacement-uid\tRunning\timg\t{}\n', stderr: '' };
+        },
+        create: async () => {
+          present = true;
+          throw new Error(`Error from server (AlreadyExists): pods "${SPEC.name}" already exists`);
+        },
+      });
+
+      await assert.rejects(() => engine.ensureIdentity(SPEC, null), /already exists/i);
+      assert.strictEqual(calls.some((call) => call.args.includes('delete')), false);
+      assert.strictEqual(calls.some((call) => call.args.includes('apply')), false);
+    });
+
+    it('rejects a same-name replacement while the created pod is becoming ready', async function () {
+      let inspected = false;
+      const { engine } = engineWith({
+        get: async () => {
+          if (!inspected) { inspected = true; throw new Error(`Error from server (NotFound): pods "${SPEC.name}" not found`); }
+          return { stdout: 'replacement-uid\tRunning\timg\t{}\n', stderr: '' };
+        },
+        create: async () => ({ stdout: 'created-uid\n', stderr: '' }),
+      });
+
+      await assert.rejects(() => engine.ensureIdentity(SPEC, null), /changed identity while waiting/i);
     });
 
     it('reads usage from kubectl top, in cores and bytes', async function () {

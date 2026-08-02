@@ -2,6 +2,7 @@ import { spawn, ChildProcessByStdio, ChildProcessWithoutNullStreams } from 'chil
 import { Readable } from 'stream';
 import { UserEnvironment } from '../services/environments/types.js';
 import { HostEnvironment } from '../services/environments/manager.js';
+import { WrappedProcessControl } from '../services/environments/types.js';
 import {
   ChatCapabilities,
   ChatEvent,
@@ -33,6 +34,8 @@ export type AdapterEvent = ChatEvent extends infer Event
 export interface ChatAdapterOptions {
   sessionId: string;
   workingDir: string;
+  /** Whether workingDir is already an absolute path inside the container. */
+  cwdKind?: 'host' | 'container';
   /** Resolved executable for the runtime, from the existing bridge lookup. */
   command: string;
   /**
@@ -202,6 +205,20 @@ export type AdapterChild =
   | ChildProcessWithoutNullStreams
   | ChildProcessByStdio<null, Readable, Readable>;
 
+interface AdapterChildLifecycle {
+  child: AdapterChild;
+  closed: boolean;
+  closedPromise: Promise<void>;
+  resolveClosed: () => void;
+  processControl?: WrappedProcessControl;
+  spawned: boolean;
+  spawnSettled: boolean;
+  spawnOutcome: Promise<boolean>;
+  resolveSpawnOutcome: (spawned: boolean) => void;
+  remoteVerified: boolean;
+  stopPromise: Promise<void> | null;
+}
+
 /**
  * Shared plumbing for adapters that drive a child process over stdio.
  *
@@ -222,11 +239,48 @@ export abstract class BaseChatAdapter implements ChatAdapter {
   protected stderrTail = '';
   protected stopped = false;
   protected exited = false;
+  private childLifecycle: AdapterChildLifecycle | null = null;
+  /**
+   * The cwd as the runtime itself sees it.
+   *
+   * Session records deliberately keep a host path for bind-mounted locations
+   * so server-owned file APIs can use it. Protocol handshakes run inside the
+   * container, however, and must receive the translated mount path. An
+   * explicitly container-local cwd is already in that namespace and is left
+   * unchanged. Resolve this once, after project admission supplied the exact
+   * environment, so every protocol and the actual spawn agree.
+   */
+  protected readonly runtimeWorkingDir: string;
 
-  constructor(protected readonly options: ChatAdapterOptions) {}
+  constructor(protected readonly options: ChatAdapterOptions) {
+    const environment = options.environment;
+    this.runtimeWorkingDir = environment?.kind === 'container'
+      && options.cwdKind !== 'container'
+      ? environment.toContainerPath(options.workingDir)
+      : options.workingDir;
+  }
 
   get alive(): boolean {
-    return Boolean(this.child) && !this.exited;
+    const lifecycle = this.childLifecycle;
+    return Boolean(this.child) && (
+      !this.exited
+      || Boolean(
+        lifecycle
+        && lifecycle.child === this.child
+        && (!lifecycle.closed || !lifecycle.remoteVerified),
+      )
+    );
+  }
+
+  /** A one-shot adapter may not replace this lifecycle until proof settles. */
+  protected childNeedsVerifiedClose(child: AdapterChild | null = this.child): boolean {
+    if (!child) return false;
+    const lifecycle = this.childLifecycle;
+    return Boolean(
+      lifecycle
+      && lifecycle.child === child
+      && (!lifecycle.closed || !lifecycle.remoteVerified),
+    );
   }
 
   /** Arguments for the spawn. */
@@ -243,7 +297,33 @@ export abstract class BaseChatAdapter implements ChatAdapter {
   protected async handshake(): Promise<void> {}
 
   protected emit(event: AdapterEvent): void {
-    this.options.emit({ ...event, ts: event.ts ?? Date.now() } as AdapterEvent);
+    const stamped = { ...event, ts: event.ts ?? Date.now() } as AdapterEvent;
+    const lifecycle = this.childLifecycle;
+    // An engine client can exit while its `docker exec`/`kubectl exec` command
+    // is still running remotely. `state: exited` releases project admission,
+    // so container-backed adapters may publish it only after the token-bound
+    // remote process group has been verified gone.
+    if (
+      stamped.t === 'state'
+      && stamped.state === 'exited'
+      && lifecycle
+      && (!lifecycle.closed || !lifecycle.remoteVerified)
+    ) {
+      void this.waitForVerifiedClose(lifecycle.child).then(() => {
+        this.options.emit(stamped);
+      }).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.options.emit({
+          t: 'error',
+          message: `${this.runtime}: ${message}`,
+          fatal: true,
+          ts: Date.now(),
+        });
+        this.options.emit({ t: 'state', state: 'error', ts: Date.now() });
+      });
+      return;
+    }
+    this.options.emit(stamped);
   }
 
   /**
@@ -274,6 +354,7 @@ export abstract class BaseChatAdapter implements ChatAdapter {
       args,
       {
         cwd: this.options.workingDir,
+        cwdKind: this.options.cwdKind,
         env: {
           ...(this.options.env || {}),
           // These CLIs check for a TTY to decide whether to draw a TUI and to
@@ -287,14 +368,66 @@ export abstract class BaseChatAdapter implements ChatAdapter {
         // Deliberately no tty: `exec -t` would give the CLI exactly the
         // terminal it must not detect, and would merge stderr into stdout.
         tty: false,
+        trackProcess: true,
       },
     );
+    if (environment?.kind === 'container' && !launch.processControl) {
+      throw new Error(
+        `${this.runtime}: container environment did not provide verified process control`,
+      );
+    }
 
-    return spawn(launch.command, launch.args, {
+    const child = spawn(launch.command, launch.args, {
       cwd: environment?.kind === 'container' ? undefined : this.options.workingDir,
       env: launch.env,
       stdio,
     }) as ChildProcessWithoutNullStreams;
+    let resolveClosed!: () => void;
+    const closedPromise = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    let resolveSpawnOutcome!: (spawned: boolean) => void;
+    const spawnOutcome = new Promise<boolean>((resolve) => {
+      resolveSpawnOutcome = resolve;
+    });
+    const lifecycle: AdapterChildLifecycle = {
+      child,
+      closed: false,
+      closedPromise,
+      resolveClosed,
+      processControl: launch.processControl,
+      spawned: false,
+      spawnSettled: false,
+      spawnOutcome,
+      resolveSpawnOutcome,
+      remoteVerified: !launch.processControl,
+      stopPromise: null,
+    };
+    this.childLifecycle = lifecycle;
+    child.once('spawn', () => {
+      lifecycle.spawned = true;
+      lifecycle.spawnSettled = true;
+      lifecycle.resolveSpawnOutcome(true);
+    });
+    child.once('error', () => {
+      // An async spawn error before `spawn` proves the engine client never
+      // launched, so there cannot be a remote process/control file to verify.
+      if (!lifecycle.spawned) {
+        lifecycle.spawnSettled = true;
+        lifecycle.remoteVerified = true;
+        lifecycle.resolveSpawnOutcome(false);
+      }
+    });
+    const markClosed = (): void => {
+      if (lifecycle.closed) return;
+      lifecycle.closed = true;
+      lifecycle.resolveClosed();
+    };
+    // `exit` precedes stdio shutdown. A one-shot adapter may still receive the
+    // last stdout chunks after it, so only `close` authorises buffer reset,
+    // lifecycle replacement, or publication of `state: exited`.
+    child.once('close', markClosed);
+    return child;
   }
 
   async start(): Promise<void> {
@@ -318,9 +451,18 @@ export abstract class BaseChatAdapter implements ChatAdapter {
     });
 
     child.on('error', (error: Error) => {
-      this.exited = true;
       this.emit({ t: 'error', message: `${this.runtime}: ${error.message}`, fatal: true });
       this.emit({ t: 'state', state: 'error' });
+      const lifecycle = this.childLifecycle?.child === child
+        ? this.childLifecycle
+        : null;
+      if (lifecycle && !lifecycle.spawned) {
+        // ENOENT/EACCES before `spawn` proves there is no engine client and no
+        // remote command. Still wait for Node's `close` event before declaring
+        // the adapter gone so its stdio lifecycle cannot race replacement.
+        this.exited = true;
+        this.emit({ t: 'state', state: 'exited' });
+      }
     });
 
     child.on('exit', (code, signal) => {
@@ -404,29 +546,110 @@ export abstract class BaseChatAdapter implements ChatAdapter {
   async stop(): Promise<void> {
     this.stopped = true;
     const child = this.child;
-    if (!child || this.exited) return;
-
+    if (!child) return;
     try {
       // Absent for the one-shot adapters, which never opened one.
       child.stdin?.end();
     } catch {
-      // Already closed; the kill below is what actually matters.
+      // Already closed; verified teardown below is what actually matters.
     }
+    await this.terminateChild(child, 'SIGTERM');
+  }
 
-    child.kill('SIGTERM');
-    // Same escalation the PTY bridge uses, for the same reason: a runtime
-    // mid-tool-call can ignore SIGTERM, and a session that will not die blocks
-    // the id from being reused.
-    const escalate = setTimeout(() => {
-      if (!this.exited) {
+  /**
+   * Await one particular launch, not whichever child a later one stored.
+   * One-shot adapters call this from their exit/error handlers before making a
+   * turn idle or allowing the next process to replace its lifecycle handle.
+   */
+  protected async waitForVerifiedClose(child: AdapterChild): Promise<void> {
+    await this.settleChild(child);
+  }
+
+  /** Used by one-shot interrupt as well as whole-session stop. */
+  protected async terminateChild(
+    child: AdapterChild,
+    signal: NodeJS.Signals = 'SIGTERM',
+  ): Promise<void> {
+    await this.settleChild(child, signal);
+  }
+
+  private async settleChild(
+    child: AdapterChild,
+    signal?: NodeJS.Signals,
+  ): Promise<void> {
+    const lifecycle = this.childLifecycle?.child === child
+      ? this.childLifecycle
+      : null;
+    if (!lifecycle) {
+      throw new Error(`${this.runtime}: cannot verify the child process lifecycle`);
+    }
+    if (lifecycle.stopPromise) return lifecycle.stopPromise;
+
+    const attempt = (async () => {
+      if (signal && !lifecycle.closed) {
         try {
-          child.kill('SIGKILL');
+          child.kill(signal);
         } catch {
-          // Gone between the check and the call.
+          // The verified exit/close event below remains the authority.
         }
       }
-    }, 5000);
-    escalate.unref?.();
+
+      let escalate: ReturnType<typeof setTimeout> | null = null;
+      let closeTimeout: ReturnType<typeof setTimeout> | null = null;
+      const localStop = lifecycle.closed
+        ? Promise.resolve()
+        : Promise.race([
+            lifecycle.closedPromise,
+            new Promise<never>((_resolve, reject) => {
+              if (signal) {
+                escalate = setTimeout(() => {
+                  if (!lifecycle.closed) {
+                    try {
+                      child.kill('SIGKILL');
+                    } catch {
+                      // A concurrent exit won the race.
+                    }
+                  }
+                }, 5000);
+                escalate.unref?.();
+              }
+              closeTimeout = setTimeout(() => {
+                reject(new Error(
+                  `${this.runtime}: could not verify that the local runtime client closed`,
+                ));
+              }, 10_000);
+              closeTimeout.unref?.();
+            }),
+          ]).finally(() => {
+            if (escalate) clearTimeout(escalate);
+            if (closeTimeout) clearTimeout(closeTimeout);
+          });
+
+      // `spawn()` returning is not the `spawn` event. An immediate stop can
+      // arrive in that gap; wait for either successful spawn or the definitive
+      // pre-spawn error before deciding whether a remote command can exist.
+      const spawned = lifecycle.spawnSettled
+        ? lifecycle.spawned
+        : await lifecycle.spawnOutcome;
+      const remoteStop = spawned && lifecycle.processControl
+        ? lifecycle.processControl.stop()
+        : Promise.resolve();
+      const [localResult, remoteResult] = await Promise.allSettled([
+        localStop,
+        remoteStop,
+      ]);
+      if (remoteResult.status === 'rejected') throw remoteResult.reason;
+      if (localResult.status === 'rejected') throw localResult.reason;
+      lifecycle.remoteVerified = true;
+    })();
+
+    lifecycle.stopPromise = attempt;
+    try {
+      await attempt;
+    } catch (error) {
+      if (lifecycle.stopPromise === attempt) lifecycle.stopPromise = null;
+      throw error;
+    }
   }
 }
 

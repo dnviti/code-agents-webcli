@@ -46,6 +46,18 @@ interface LoadState {
   engineCaveats: Record<EngineKind, string[]>;
 }
 
+interface DeploySettings {
+  runLimitPerUser: number;
+  idleStopMinutes: number;
+  idleReclaimMinutes: number;
+}
+
+interface DeploySettingsForm {
+  runLimitPerUser: string;
+  idleStopMinutes: string;
+  idleReclaimMinutes: string;
+}
+
 export interface DeployTargetsDialogProps {
   open: boolean;
   onClose(): void;
@@ -154,28 +166,40 @@ export function DeployTargetsDialog({
   const [error, setError] = React.useState<string | null>(null);
   const [notice, setNotice] = React.useState<string | null>(null);
   const [form, setForm] = React.useState<FormState | null>(null);
+  const [settingsForm, setSettingsForm] = React.useState<DeploySettingsForm | null>(null);
   const [busy, setBusy] = React.useState(false);
   /** Per-target check outcomes, shown next to the Check button. */
   const [checks, setChecks] = React.useState<Record<string, { ok: boolean; error?: string }>>({});
 
   const load = React.useCallback((): void => {
-    fetch('/api/admin/deploy-targets', { credentials: 'same-origin' })
-      .then((res) => {
-        if (res.status === 403) {
+    Promise.all([
+      fetch('/api/admin/deploy-targets', { credentials: 'same-origin' }),
+      fetch('/api/admin/deploy-settings', { credentials: 'same-origin' }),
+    ])
+      .then(async ([targetsResponse, settingsResponse]) => {
+        if (targetsResponse.status === 403 || settingsResponse.status === 403) {
           // The panel is installer-only end to end; anyone else gets nothing.
-          return Promise.reject(
-            new Error('only the account that installed this server can view deploy targets'),
-          );
+          throw new Error('only the account that installed this server can view deploy targets');
         }
-        return res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`));
+        if (!targetsResponse.ok) throw new Error(`targets HTTP ${targetsResponse.status}`);
+        if (!settingsResponse.ok) throw new Error(`project settings HTTP ${settingsResponse.status}`);
+        return {
+          targets: await targetsResponse.json(),
+          settings: await settingsResponse.json() as DeploySettings,
+        };
       })
-      .then((data) => {
+      .then(({ targets: data, settings }) => {
         setState({
           targets: data.targets ?? [],
           activeTargetId: data.activeTargetId ?? null,
           canEdit: data.canEdit === true,
           legacyContainersEnabled: data.legacyContainersEnabled === true,
           engineCaveats: data.engineCaveats ?? { docker: [], podman: [], kubernetes: [] },
+        });
+        setSettingsForm({
+          runLimitPerUser: String(settings.runLimitPerUser),
+          idleStopMinutes: String(settings.idleStopMinutes),
+          idleReclaimMinutes: String(settings.idleReclaimMinutes),
         });
       })
       .catch((err: Error) => setError(`Could not load deploy targets: ${err.message}`));
@@ -309,6 +333,29 @@ export function DeployTargetsDialog({
       .catch((err: Error) => setError(err.message));
   };
 
+  const saveDeploySettings = (): void => {
+    if (!settingsForm) return;
+    const settings: DeploySettings = {
+      runLimitPerUser: Number(settingsForm.runLimitPerUser),
+      idleStopMinutes: Number(settingsForm.idleStopMinutes),
+      idleReclaimMinutes: Number(settingsForm.idleReclaimMinutes),
+    };
+    if (Object.values(settings).some((value) => !Number.isInteger(value) || value <= 0)) {
+      setError('Project limits and idle windows must be positive whole numbers.');
+      return;
+    }
+    if (settings.idleReclaimMinutes <= settings.idleStopMinutes) {
+      setError('Reclaim must happen later than idle stop.');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    request('/api/admin/deploy-settings', 'PUT', settings)
+      .then(() => setNotice('Project lifecycle settings saved.'))
+      .catch((err: Error) => setError(err.message))
+      .finally(() => setBusy(false));
+  };
+
   return (
     <Dialog
       open={open}
@@ -363,11 +410,70 @@ export function DeployTargetsDialog({
             </div>
           </div>
 
+          {settingsForm ? (
+            <section
+              style={{
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-md)',
+                padding: 14,
+                marginBottom: 16,
+              }}
+            >
+              <div style={{ fontFamily: 'var(--font-sans)', fontSize: 'var(--text-ui)', marginBottom: 8 }}>
+                Project lifecycle
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 10 }}>
+                <div>
+                  <div style={labelStyle}>Running projects per user</div>
+                  <Input
+                    aria-label="Running projects per user"
+                    type="number"
+                    min="1"
+                    step="1"
+                    disabled={readOnly}
+                    value={settingsForm.runLimitPerUser}
+                    onChange={(event) => setSettingsForm({ ...settingsForm, runLimitPerUser: event.target.value })}
+                  />
+                </div>
+                <div>
+                  <div style={labelStyle}>Stop after minutes</div>
+                  <Input
+                    aria-label="Project idle stop minutes"
+                    type="number"
+                    min="1"
+                    step="1"
+                    disabled={readOnly}
+                    value={settingsForm.idleStopMinutes}
+                    onChange={(event) => setSettingsForm({ ...settingsForm, idleStopMinutes: event.target.value })}
+                  />
+                </div>
+                <div>
+                  <div style={labelStyle}>Reclaim after minutes</div>
+                  <Input
+                    aria-label="Project idle reclaim minutes"
+                    type="number"
+                    min="1"
+                    step="1"
+                    disabled={readOnly}
+                    value={settingsForm.idleReclaimMinutes}
+                    onChange={(event) => setSettingsForm({ ...settingsForm, idleReclaimMinutes: event.target.value })}
+                  />
+                </div>
+              </div>
+              <div style={{ ...noteStyle, margin: '8px 0' }}>
+                The limit is per user. Idle projects stop with their worktree intact; reclaimed projects rebuild from their repository.
+              </div>
+              <Button variant="secondary" disabled={readOnly || busy} onClick={saveDeploySettings}>
+                Save project settings
+              </Button>
+            </section>
+          ) : null}
+
           {state.targets.length === 0 ? (
             <div style={{ ...noteStyle, marginBottom: 16 }}>
               {state.legacyContainersEnabled
                 ? 'No targets yet — the startup configuration still decides where containers run. Add a target to manage placement from here.'
-                : 'No targets yet. Add one to run environments in containers; until then everything runs on this machine.'}
+                : 'No targets yet. Add one to run projects in containers. Project work never falls back to this machine.'}
             </div>
           ) : null}
 
@@ -506,6 +612,11 @@ function TargetForm({
           value={form.image}
           onChange={(e) => onChange({ image: e.target.value })}
         />
+        <div style={{ ...noteStyle, marginTop: 6 }}>
+          Images must be Linux-based and include <code>sh</code>, a readable{' '}
+          <code>/proc</code>, and <code>setsid</code> so terminals and agents can be
+          stopped safely.
+        </div>
       </div>
 
       <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>

@@ -686,7 +686,7 @@ describe('nothing of the old conversation outlives it', function () {
     // the relaunch that would fix it is refused because of the claim.
     assert.deepStrictEqual(
       lifecycle.filter((change) => change.exited !== undefined),
-      [{ exited: true }],
+      [{ exited: true, restarting: false }],
     );
   });
 });

@@ -41,6 +41,8 @@ interface RuntimeSessionRow {
   custom_name: string | null;
   tab_open: number | null;
   tab_order: number | null;
+  project_id: string | null;
+  project_working_dir_kind: string | null;
 }
 
 export class SessionStore {
@@ -84,7 +86,9 @@ export class SessionStore {
           chat_effort_override,
           custom_name,
           tab_open,
-          tab_order
+          tab_order,
+          project_id,
+          project_working_dir_kind
         )
         VALUES (
           @id,
@@ -112,7 +116,9 @@ export class SessionStore {
           @chat_effort_override,
           @custom_name,
           @tab_open,
-          @tab_order
+          @tab_order,
+          @project_id,
+          @project_working_dir_kind
         )
       `);
 
@@ -137,7 +143,10 @@ export class SessionStore {
         name: session.name || 'Unnamed Session',
         created_at: toIsoString(session.created),
         last_activity: toIsoString(session.lastActivity),
-        active: 0,
+        // The database is the run-limit authority. Keeping this in step with
+        // the runtime record also means an ordinary autosave cannot erase a
+        // live flag written by `setActive` between two ticks. (#168)
+        active: session.active ? 1 : 0,
         agent: null,
         last_agent: session.lastAgent,
         runtime_label: session.runtimeLabel,
@@ -221,6 +230,18 @@ export class SessionStore {
         // Null preserves the stable load order of rows written before shared
         // ordering existed. Every explicit reorder writes compact ordinals.
         tab_order: Number.isFinite(session.tabOrder) ? session.tabOrder : null,
+        // The project this session was created against, if any. Project-less
+        // sessions keep today's behaviour. (#168)
+        project_id: session.projectId ?? null,
+        // Absolute host and container paths share one string field, so this
+        // discriminator is the only safe way to interpret it after restart.
+        // A null remains the legacy host meaning for older rows.
+        project_working_dir_kind:
+          session.projectId
+          && (session.projectWorkingDirKind === 'host'
+            || session.projectWorkingDirKind === 'container')
+            ? session.projectWorkingDirKind
+            : null,
       }));
 
       replaceAll(rows);
@@ -263,7 +284,9 @@ export class SessionStore {
             chat_effort_override,
             custom_name,
             tab_open,
-            tab_order
+            tab_order,
+            project_id,
+            project_working_dir_kind
           FROM runtime_sessions
           ORDER BY created_at ASC
         `)
@@ -342,6 +365,14 @@ export class SessionStore {
           tabOpen:
             row.tab_open === 1 ? true : row.tab_open === 0 ? false : undefined,
           tabOrder: row.tab_order ?? undefined,
+          // Project-less sessions keep today's behaviour. (#168)
+          projectId: row.project_id ?? undefined,
+          projectWorkingDirKind:
+            row.project_working_dir_kind === 'container'
+              ? 'container'
+              : row.project_working_dir_kind === 'host'
+                ? 'host'
+                : undefined,
         });
       }
 
@@ -385,6 +416,36 @@ export class SessionStore {
         exists: false,
         error: error instanceof Error ? error.message : String(error),
       };
+    }
+  }
+
+  /**
+   * Write-through for the runtime's active flag.
+   *
+   * In-memory `active` is the runtime signal; the database copy is what the
+   * run-limit sweep reads inside its transaction, so every start/stop/exit
+   * must write through. Fire-and-forget: the WS flow never blocks on SQLite.
+   * (#168)
+   */
+  async setActive(id: string, active: boolean): Promise<void> {
+    try {
+      this.database.raw
+        .prepare('UPDATE runtime_sessions SET active = @active WHERE id = @id')
+        .run({ active: active ? 1 : 0, id });
+    } catch (error) {
+      console.error(`Failed to set active flag for session ${id}:`, error);
+    }
+  }
+
+  /**
+   * Reset every active flag at boot. A restart leaves no live processes, so
+   * any `active = 1` rows are stale. (#168)
+   */
+  async resetActiveFlags(): Promise<void> {
+    try {
+      this.database.raw.prepare('UPDATE runtime_sessions SET active = 0').run();
+    } catch (error) {
+      console.error('Failed to reset active flags:', error);
     }
   }
 }

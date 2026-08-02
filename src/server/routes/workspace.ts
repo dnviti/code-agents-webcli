@@ -1,4 +1,4 @@
-import express, { Router, Request, Response } from 'express';
+import express, { NextFunction, Router, Request, Response } from 'express';
 import { execFile } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -24,6 +24,20 @@ import { HostEnvironment } from '../services/environments/manager.js';
 import { accountReportingNote } from '../../shared/account-reporting.js';
 import type { UsageBurn } from '../../shared/usage-records.js';
 import type { CachedClaudeAccount } from '../services/claude-account.js';
+import {
+  releaseProjectSessionLease,
+  registerUnverifiedProjectProcess,
+  restoreProjectWorkingDir,
+  type ProjectSessionEnvironmentResult,
+  type ProjectSessionLease,
+  type ProjectsSessionApi,
+} from '../services/projects/working-dir.js';
+import {
+  mustRetainProjectLease,
+  ProjectContainerFiles,
+  rethrowIfProjectLeaseMustBeRetained,
+  type ConfinedContainerPath,
+} from '../services/projects/container-files.js';
 
 /**
  * The workspace a chat session is working in: its files, its git state, and —
@@ -56,6 +70,8 @@ import type { CachedClaudeAccount } from '../services/claude-account.js';
 
 export interface WorkspaceRoutesDeps {
   claudeSessions: Map<string, SessionRecord>;
+  /** Persist an authoritative cwd/kind repair made while preparing a project. */
+  saveSessionsToDisk(): Promise<boolean | void>;
   /**
    * The same base-directory check the session routes use.
    *
@@ -70,6 +86,11 @@ export interface WorkspaceRoutesDeps {
    * what every deployment without per-user environments gets.
    */
   ensureEnvironment?(userId?: number): Promise<UserEnvironment>;
+  /**
+   * Structural project-manager seam. Project sessions must use this even when
+   * a normal user environment is also available. (#168)
+   */
+  projectsManager?: ProjectsSessionApi;
   /**
    * What this app itself measured, for the "measured here" half of the status
    * panel.
@@ -146,11 +167,25 @@ interface RunResult {
  * used, rather than whichever ones the account running the server happens to
  * have configured for everybody.
  */
+class ProjectEnvironmentUnavailable extends Error {
+  constructor(readonly reason: string, detail?: string) {
+    super(detail ? `Project environment is ${reason}: ${detail}` : `Project environment is ${reason}`);
+  }
+}
+
 /** The environment a session's tools run in; this host when there are none. */
 async function environmentFor(
   deps: WorkspaceRoutesDeps,
   session: SessionRecord,
+  res: Response,
 ): Promise<UserEnvironment | undefined> {
+  if (session.projectId) {
+    const resolved = res.locals.projectWorkspace as
+      | Extract<ProjectSessionEnvironmentResult, { ok: true }>
+      | undefined;
+    if (!resolved) throw new ProjectEnvironmentUnavailable('not prepared');
+    return resolved.environment;
+  }
   if (!deps.ensureEnvironment) return undefined;
   try {
     return await deps.ensureEnvironment(session.ownerUserId);
@@ -167,7 +202,24 @@ function run(
   args: string[],
   cwd: string,
   environment?: UserEnvironment,
+  containerFiles?: ProjectContainerFiles,
 ): Promise<RunResult> {
+  if (containerFiles) {
+    return containerFiles.exec(
+      'env',
+      [
+        'GIT_TERMINAL_PROMPT=0',
+        'GIT_OPTIONAL_LOCKS=0',
+        'GH_PAGER=cat',
+        'PAGER=cat',
+        'NO_COLOR=1',
+        command,
+        ...args,
+      ],
+      cwd,
+      EXEC_TIMEOUT_MS,
+    );
+  }
   const launch = (environment || new HostEnvironment(cwd)).wrap(command, args, {
     cwd,
     env: {
@@ -379,6 +431,56 @@ async function readHead(filePath: string, count: number): Promise<Buffer> {
   }
 }
 
+interface WorkspaceStat {
+  type: 'file' | 'directory' | 'other';
+  size: number;
+  mtimeMs: number;
+}
+
+function projectContainerFiles(res: Response): ProjectContainerFiles | undefined {
+  return res.locals.projectContainerFiles as ProjectContainerFiles | undefined;
+}
+
+async function confineWorkspace(
+  session: SessionRecord,
+  res: Response,
+  requested: string,
+): Promise<ConfinedContainerPath> {
+  const container = projectContainerFiles(res);
+  return container
+    ? container.confineExisting(requested)
+    : confineReal(session.workingDir, requested);
+}
+
+async function statWorkspace(res: Response, target: string): Promise<WorkspaceStat | null> {
+  const container = projectContainerFiles(res);
+  if (container) return container.stat(target);
+  const stat = await fsp.stat(target).catch(() => null);
+  if (!stat) return null;
+  return {
+    type: stat.isFile() ? 'file' : stat.isDirectory() ? 'directory' : 'other',
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+  };
+}
+
+async function readWorkspace(
+  res: Response,
+  target: string,
+  limit: number,
+): Promise<Buffer> {
+  const container = projectContainerFiles(res);
+  if (container) return container.readBuffer(target, limit);
+  const buffer = await fsp.readFile(target);
+  if (buffer.length > limit) throw new Error('workspace file exceeded read limit');
+  return buffer;
+}
+
+async function readWorkspaceHead(res: Response, target: string, count: number): Promise<Buffer> {
+  const container = projectContainerFiles(res);
+  return container ? container.readHead(target, count) : readHead(target, count);
+}
+
 /**
  * Parse a `Range` header into byte offsets, or report it unsatisfiable.
  *
@@ -416,19 +518,60 @@ function parseRange(
   return { start, end: Math.min(end, size - 1) };
 }
 
-function streamFile(res: Response, filePath: string, range: { start: number; end: number } | null): void {
+function streamHostFile(
+  res: Response,
+  filePath: string,
+  range: { start: number; end: number } | null,
+): Promise<void> {
   const stream = range
     ? createReadStream(filePath, { start: range.start, end: range.end })
     : createReadStream(filePath);
 
-  stream.on('error', () => {
-    // Headers are already out by the time a read fails mid-stream; the only
-    // honest signal left is to drop the connection rather than append an error
-    // document to a half-sent video.
-    if (!res.headersSent) res.status(500).json({ error: 'read_failed' });
-    else res.destroy();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      res.off('close', onResponseClose);
+      resolve();
+    };
+    const onResponseClose = (): void => {
+      if (!res.writableEnded) stream.destroy();
+      finish();
+    };
+    stream.once('error', () => {
+      // Headers are already out by the time a read fails mid-stream; the only
+      // honest signal left is to drop the connection rather than append an
+      // error document to a half-sent video.
+      if (!res.headersSent) res.status(500).json({ error: 'read_failed' });
+      else res.destroy();
+      finish();
+    });
+    stream.once('close', finish);
+    res.once('close', onResponseClose);
+    stream.pipe(res);
   });
-  stream.pipe(res);
+}
+
+async function streamWorkspaceFile(
+  res: Response,
+  target: string,
+  range: { start: number; end: number } | null,
+): Promise<void> {
+  const container = projectContainerFiles(res);
+  if (container) {
+    try {
+      await container.streamFile(res, target, range);
+    } catch (error) {
+      // A disconnected browser is already the complete answer. The backend
+      // killed and awaited its child before rejecting, so the lease can be
+      // released without sending an error through Express after the socket is
+      // gone.
+      if (mustRetainProjectLease(error) || !res.destroyed) throw error;
+    }
+    return;
+  }
+  await streamHostFile(res, target, range);
 }
 
 /** True when a buffer is not text the editor can safely round-trip. */
@@ -453,13 +596,16 @@ function sessionFor(deps: WorkspaceRoutesDeps, req: Request, res: Response): Ses
     return null;
   }
 
-  const session = getOwnedSession(deps.claudeSessions, req.params.sessionId as string, user);
+  // Regex asset routes expose the same id as capture 0 rather than a named
+  // parameter; all other workspace routes use `sessionId`.
+  const sessionId = String(req.params.sessionId ?? req.params[0] ?? '');
+  const session = getOwnedSession(deps.claudeSessions, sessionId, user);
   if (!session) {
     res.status(404).json({ error: 'Session not found' });
     return null;
   }
 
-  if (!deps.validatePath(session.workingDir, session.ownerUserId).valid) {
+  if (!session.projectId && !deps.validatePath(session.workingDir, session.ownerUserId).valid) {
     // The allowed base can be narrowed between runs, and a restored session
     // record outlives the configuration that admitted it.
     res.status(403).json({ error: 'This session works outside the allowed area' });
@@ -467,6 +613,94 @@ function sessionFor(deps: WorkspaceRoutesDeps, req: Request, res: Response): Ses
   }
 
   return session;
+}
+
+type WorkspaceHandler = (req: Request, res: Response) => Promise<void>;
+
+/**
+ * Own one project admission lease for the complete HTTP operation.
+ *
+ * The wrapper prepares before any filesystem access and releases in `finally`.
+ * Streaming responses keep the handler promise alive until the response has
+ * finished or the client has disconnected, so a stop cannot remove the
+ * workspace underneath a file that is still being served.
+ */
+function withProjectWorkspace(
+  deps: WorkspaceRoutesDeps,
+  handler: WorkspaceHandler,
+): (req: Request, res: Response, next: NextFunction) => Promise<void> {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const session = sessionFor(deps, req, res);
+    if (!session) return;
+
+    let lease: ProjectSessionLease | undefined;
+    let retainLease = false;
+    try {
+      if (session.projectId) {
+        const manager = deps.projectsManager;
+        if (!manager) throw new ProjectEnvironmentUnavailable('not configured');
+        if (!manager.getForUser(session.ownerUserId, session.projectId)) {
+          throw new ProjectEnvironmentUnavailable('not_found');
+        }
+        const prepared = await manager.ensureForSession(session.ownerUserId, session.projectId);
+        if (!prepared.ok) {
+          throw new ProjectEnvironmentUnavailable(prepared.reason, prepared.detail);
+        }
+        lease = {
+          ownerUserId: session.ownerUserId,
+          projectId: session.projectId,
+          leaseId: prepared.leaseId,
+        };
+        // Keep a cwd in either authorised root. Only a stale/missing/escaped
+        // path falls back to the manager's current checkout.
+        const cwd = await restoreProjectWorkingDir(
+          manager,
+          prepared,
+          session.workingDir,
+          session.projectWorkingDirKind,
+        );
+        const cwdChanged = session.workingDir !== cwd.workingDir
+          || session.projectWorkingDirKind !== cwd.kind;
+        session.workingDir = cwd.workingDir;
+        session.projectWorkingDirKind = cwd.kind;
+        if (cwdChanged) await deps.saveSessionsToDisk();
+        res.locals.projectWorkspace = prepared;
+        if (cwd.kind === 'container') {
+          res.locals.projectContainerFiles = new ProjectContainerFiles(
+            manager,
+            prepared,
+            cwd.workingDir,
+          );
+        }
+        manager.touchActivity(session.projectId);
+      }
+
+      await handler(req, res);
+      if (!res.writableEnded && !res.destroyed) {
+        await responseFinished(res);
+      }
+    } catch (error) {
+      retainLease = registerUnverifiedProjectProcess(deps.projectsManager, lease, error);
+      next(error);
+    } finally {
+      delete res.locals.projectContainerFiles;
+      delete res.locals.projectWorkspace;
+      if (!retainLease) releaseProjectSessionLease(deps.projectsManager, lease);
+    }
+  };
+}
+
+function responseFinished(res: Response): Promise<void> {
+  if (res.writableEnded || res.destroyed) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = (): void => {
+      res.off('finish', done);
+      res.off('close', done);
+      resolve();
+    };
+    res.once('finish', done);
+    res.once('close', done);
+  });
 }
 
 interface GhCacheEntry {
@@ -487,6 +721,15 @@ interface FindCacheEntry {
 
 /** Shared by every session; keyed by id and working directory. */
 const findCache = new Map<string, FindCacheEntry>();
+
+function workspaceCacheKey(session: SessionRecord): string {
+  return [
+    session.id,
+    session.projectId || '',
+    session.projectId ? session.projectWorkingDirKind || 'host' : 'host',
+    session.workingDir,
+  ].join(':');
+}
 
 /**
  * Directories the fallback walk never descends into.
@@ -532,8 +775,9 @@ function isProjectFile(relativePath: string): boolean {
 async function buildFileIndex(
   workingDir: string,
   environment?: UserEnvironment,
+  containerFiles?: ProjectContainerFiles,
 ): Promise<FileIndex> {
-  const root = path.resolve(workingDir);
+  const root = containerFiles ? path.posix.resolve(workingDir) : path.resolve(workingDir);
 
   // -z, so a filename with a newline in it is still one entry. --cached plus
   // --others --exclude-standard is "tracked, and untracked that git would not
@@ -543,6 +787,7 @@ async function buildFileIndex(
     ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
     root,
     environment,
+    containerFiles,
   );
   if (listed.ok) {
     const paths = listed.stdout.split('\0').filter(Boolean).filter(isProjectFile);
@@ -550,6 +795,19 @@ async function buildFileIndex(
       paths: paths.slice(0, MAX_INDEXED_FILES),
       truncated: paths.length > MAX_INDEXED_FILES,
       source: 'git',
+    };
+  }
+
+  if (containerFiles) {
+    const walked = await containerFiles.walkFiles(
+      MAX_INDEXED_FILES,
+      MAX_WALK_DIRS,
+      [...WALK_SKIP],
+    );
+    return {
+      paths: walked.paths.filter(isProjectFile),
+      truncated: walked.truncated,
+      source: 'walk',
     };
   }
 
@@ -600,12 +858,13 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
 
   router.get(
     '/api/workspace/:sessionId/files',
-    async (req: Request, res: Response): Promise<void> => {
+    withProjectWorkspace(deps, async (req: Request, res: Response): Promise<void> => {
       const session = sessionFor(deps, req, res);
       if (!session) return;
 
-      const { path: target, missing } = await confineReal(
-        session.workingDir,
+      const { path: target, missing } = await confineWorkspace(
+        session,
+        res,
         String(req.query.path || '.'),
       );
       if (!target) {
@@ -618,6 +877,19 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       }
 
       try {
+        const container = projectContainerFiles(res);
+        if (container) {
+          const listed = await container.list(target, MAX_ENTRIES);
+          res.json({
+            root: session.workingDir,
+            path: target,
+            truncated: listed.truncated,
+            entries: listed.entries,
+            projectWorkingDirKind: 'container',
+            lifetime: container.lifetime(target),
+          });
+          return;
+        }
         const found = await fsp.readdir(target, { withFileTypes: true });
         const entries = await Promise.all(
           found.slice(0, MAX_ENTRIES).map(async (entry) => {
@@ -645,13 +917,17 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
           path: target,
           truncated: found.length > MAX_ENTRIES,
           entries,
+          ...(session.projectId
+            ? { projectWorkingDirKind: session.projectWorkingDirKind || 'host' }
+            : {}),
         });
       } catch (error) {
+        rethrowIfProjectLeaseMustBeRetained(error);
         // fs errors embed absolute paths and errno detail; keep that server-side.
         console.error('Cannot list workspace directory:', error);
         res.status(404).json({ error: 'Cannot read this directory' });
       }
-    },
+    }),
   );
 
   // -------------------------------------------------------------- raw bytes
@@ -682,12 +958,12 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
    */
   router.get(
     '/api/workspace/:sessionId/raw',
-    async (req: Request, res: Response): Promise<void> => {
+    withProjectWorkspace(deps, async (req: Request, res: Response): Promise<void> => {
       const session = sessionFor(deps, req, res);
       if (!session) return;
 
       const requested = typeof req.query.path === 'string' ? req.query.path : '';
-      const { path: target, base, missing } = await confineReal(session.workingDir, requested);
+      const { path: target, base, missing } = await confineWorkspace(session, res, requested);
       if (!target) {
         res.status(missing ? 404 : 403).json({ error: missing ? 'not_found' : 'outside_session' });
         return;
@@ -699,8 +975,8 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      const stat = await fsp.stat(target).catch(() => null);
-      if (!stat || !stat.isFile()) {
+      const stat = await statWorkspace(res, target);
+      if (!stat || stat.type !== 'file') {
         res.status(404).json({ error: 'not_found' });
         return;
       }
@@ -709,7 +985,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      const head = await readHead(target, SNIFF_BYTES);
+      const head = await readWorkspaceHead(res, target, SNIFF_BYTES);
       const serve = rawContentType(head, target);
 
       res.setHeader('Content-Type', serve.contentType);
@@ -741,13 +1017,13 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         res.status(206);
         res.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${stat.size}`);
         res.setHeader('Content-Length', String(range.end - range.start + 1));
-        streamFile(res, target, range);
+        await streamWorkspaceFile(res, target, range);
         return;
       }
 
       res.setHeader('Content-Length', String(stat.size));
-      streamFile(res, target, null);
-    },
+      await streamWorkspaceFile(res, target, null);
+    }),
   );
 
   // ------------------------------------------------------------- find files
@@ -769,20 +1045,24 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
    */
   router.get(
     '/api/workspace/:sessionId/find',
-    async (req: Request, res: Response): Promise<void> => {
+    withProjectWorkspace(deps, async (req: Request, res: Response): Promise<void> => {
       const session = sessionFor(deps, req, res);
       if (!session) return;
 
       const query = typeof req.query.q === 'string' ? req.query.q.slice(0, 200) : '';
       const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 40));
 
-      const cacheKey = `${session.id}:${session.workingDir}`;
+      const cacheKey = workspaceCacheKey(session);
       const cached = findCache.get(cacheKey);
       let index: FileIndex;
       if (cached && Date.now() - cached.at < FIND_CACHE_MS && req.query.refresh !== '1') {
         index = cached.index;
       } else {
-        index = await buildFileIndex(session.workingDir, await environmentFor(deps, session));
+        index = await buildFileIndex(
+          session.workingDir,
+          await environmentFor(deps, session, res),
+          projectContainerFiles(res),
+        );
         findCache.set(cacheKey, { at: Date.now(), index });
       }
 
@@ -793,20 +1073,21 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         source: index.source,
         matches: rankFilePaths(index.paths, query, limit).map((match) => match.path),
       });
-    },
+    }),
   );
 
   // -------------------------------------------------------------------- git
 
   router.get(
     '/api/workspace/:sessionId/git',
-    async (req: Request, res: Response): Promise<void> => {
+    withProjectWorkspace(deps, async (req: Request, res: Response): Promise<void> => {
       const session = sessionFor(deps, req, res);
       if (!session) return;
 
-      const environment = await environmentFor(deps, session);
+      const environment = await environmentFor(deps, session, res);
+      const container = projectContainerFiles(res);
       const inside = await run(
-        'git', ['rev-parse', '--is-inside-work-tree'], session.workingDir, environment,
+        'git', ['rev-parse', '--is-inside-work-tree'], session.workingDir, environment, container,
       );
       if (!inside.ok || inside.stdout.trim() !== 'true') {
         res.json({ repo: false, reason: 'This folder is not a git repository.' });
@@ -817,10 +1098,10 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         // `-- .` scopes the listing to this session's own directory. Without it
         // a session opened in a subdirectory lists the whole repository —
         // including files it is not allowed to open.
-        run('git', ['status', '--porcelain=v1', '-z', '--branch', '--', '.'], session.workingDir, environment),
-        run('git', ['remote', 'get-url', 'origin'], session.workingDir, environment),
-        run('git', ['log', '-1', '--format=%h%x00%s%x00%an%x00%aI'], session.workingDir, environment),
-        run('git', ['rev-parse', '--show-toplevel'], session.workingDir, environment),
+        run('git', ['status', '--porcelain=v1', '-z', '--branch', '--', '.'], session.workingDir, environment, container),
+        run('git', ['remote', 'get-url', 'origin'], session.workingDir, environment, container),
+        run('git', ['log', '-1', '--format=%h%x00%s%x00%an%x00%aI'], session.workingDir, environment, container),
+        run('git', ['rev-parse', '--show-toplevel'], session.workingDir, environment, container),
       ]);
 
       if (!status.ok) {
@@ -837,8 +1118,9 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       // subdirectory would otherwise ask for `<dir>/<repo-relative-path>` and
       // get a file that does not exist.
       const repoRoot = top.ok ? top.stdout.trim() : session.workingDir;
+      const paths = container ? path.posix : path;
       const toSession = (value: string): string =>
-        path.relative(session.workingDir, path.resolve(repoRoot, value)) || '.';
+        paths.relative(session.workingDir, paths.resolve(repoRoot, value)) || '.';
 
       res.json({
         repo: true,
@@ -854,12 +1136,12 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
           ? { sha, subject: subject || '', author: author || '', date: date ? date.trim() : '' }
           : null,
       });
-    },
+    }),
   );
 
   router.get(
     '/api/workspace/:sessionId/git/diff',
-    async (req: Request, res: Response): Promise<void> => {
+    withProjectWorkspace(deps, async (req: Request, res: Response): Promise<void> => {
       const session = sessionFor(deps, req, res);
       if (!session) return;
 
@@ -868,7 +1150,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
 
       let relative: string | undefined;
       if (requested) {
-        const { path: resolved, missing } = await confineReal(session.workingDir, requested);
+        const { path: resolved, missing } = await confineWorkspace(session, res, requested);
         if (!resolved) {
           // A path that is merely gone is not a diff to refuse; it is a diff
           // with nothing in it, which is what a just-deleted file looks like.
@@ -881,8 +1163,12 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         }
         // Relative to the *lexical* root: git resolves its own pathspecs, and
         // handing it a realpath from a different mount would miss the file.
-        const lexical = confine(session.workingDir, requested);
-        relative = path.relative(session.workingDir, lexical || resolved) || '.';
+        const container = projectContainerFiles(res);
+        const lexical = container
+          ? container.lexical(requested)
+          : confine(session.workingDir, requested);
+        const paths = container ? path.posix : path;
+        relative = paths.relative(session.workingDir, lexical || resolved) || '.';
       }
 
       // `--no-color` and a fixed context: the parser reads the machine format,
@@ -892,8 +1178,9 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       // `--` terminates options, so a file literally named `--cached` is a path.
       if (relative) args.push('--', relative);
 
-      const environment = await environmentFor(deps, session);
-      const result = await run('git', args, session.workingDir, environment);
+      const environment = await environmentFor(deps, session, res);
+      const container = projectContainerFiles(res);
+      const result = await run('git', args, session.workingDir, environment, container);
       if (!result.ok && !result.stdout) {
         res.json({ diffs: [], error: result.stderr.trim() || 'git diff failed' });
         return;
@@ -910,6 +1197,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
           ['status', '--porcelain=v1', '-z', '--', relative],
           session.workingDir,
           environment,
+          container,
         );
         if (untracked.ok && untracked.stdout.startsWith('??')) {
           const shown = await run(
@@ -923,6 +1211,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
             ],
             session.workingDir,
             environment,
+            container,
           );
           // --no-index exits 1 when the files differ, which is always here.
           diffs = parseUnifiedDiff(shown.stdout).map((diff) => ({
@@ -934,7 +1223,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       }
 
       res.json({ diffs });
-    },
+    }),
   );
 
   // ------------------------------------------------------------------- file
@@ -949,7 +1238,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
    */
   router.get(
     '/api/workspace/:sessionId/file',
-    async (req: Request, res: Response): Promise<void> => {
+    withProjectWorkspace(deps, async (req: Request, res: Response): Promise<void> => {
       const session = sessionFor(deps, req, res);
       if (!session) return;
 
@@ -959,7 +1248,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      const { path: target, base, missing } = await confineReal(session.workingDir, requested);
+      const { path: target, base, missing } = await confineWorkspace(session, res, requested);
       if (!target) {
         res
           .status(missing ? 404 : 403)
@@ -967,18 +1256,16 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      let stat;
-      try {
-        stat = await fsp.stat(target);
-      } catch {
+      const stat = await statWorkspace(res, target);
+      if (!stat) {
         res.status(404).json({ error: 'That file no longer exists' });
         return;
       }
-      if (stat.isDirectory()) {
+      if (stat.type === 'directory') {
         res.status(400).json({ error: 'That is a directory, not a file' });
         return;
       }
-      if (!stat.isFile()) {
+      if (stat.type !== 'file') {
         // Not merely "not a directory": reading a FIFO never returns, and it
         // holds one of libuv's four threadpool slots for the life of the
         // process. Four of those and every fs operation on the server stops.
@@ -1012,8 +1299,9 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
 
       let buffer: Buffer;
       try {
-        buffer = await fsp.readFile(target);
-      } catch {
+        buffer = await readWorkspace(res, target, MAX_EDIT_BYTES);
+      } catch (error) {
+        rethrowIfProjectLeaseMustBeRetained(error);
         res.status(403).json({ error: 'That file could not be read' });
         return;
       }
@@ -1036,7 +1324,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         binary: false,
         tooLarge: false,
       });
-    },
+    }),
   );
 
   /**
@@ -1054,7 +1342,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
    */
   router.put(
     '/api/workspace/:sessionId/file',
-    async (req: Request, res: Response): Promise<void> => {
+    withProjectWorkspace(deps, async (req: Request, res: Response): Promise<void> => {
       const session = sessionFor(deps, req, res);
       if (!session) return;
 
@@ -1072,7 +1360,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      const { path: target, base, missing } = await confineReal(session.workingDir, body.path);
+      const { path: target, base, missing } = await confineWorkspace(session, res, body.path);
       if (!target) {
         res
           .status(missing ? 404 : 403)
@@ -1084,14 +1372,12 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      let stat;
-      try {
-        stat = await fsp.stat(target);
-      } catch {
+      const stat = await statWorkspace(res, target);
+      if (!stat) {
         res.status(404).json({ error: 'That file no longer exists' });
         return;
       }
-      if (!stat.isFile()) {
+      if (stat.type !== 'file') {
         res.status(400).json({ error: 'That is not a file' });
         return;
       }
@@ -1116,34 +1402,34 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       // decision made in the browser and this endpoint is not only reachable
       // from the browser. Writing UTF-8 over a PNG is not an edit.
       try {
-        const handle = await fsp.open(target, 'r');
-        try {
-          const sniff = Buffer.alloc(Math.min(SNIFF_BYTES, stat.size));
-          if (sniff.length > 0) {
-            await handle.read(sniff, 0, sniff.length, 0);
-            if (looksBinary(sniff)) {
-              res.status(400).json({ error: 'That file is not text' });
-              return;
-            }
-          }
-        } finally {
-          await handle.close();
+        const sniff = await readWorkspaceHead(res, target, Math.min(SNIFF_BYTES, stat.size));
+        if (sniff.length > 0 && looksBinary(sniff)) {
+          res.status(400).json({ error: 'That file is not text' });
+          return;
         }
-      } catch {
+      } catch (error) {
+        rethrowIfProjectLeaseMustBeRetained(error);
         res.status(403).json({ error: 'That file could not be read' });
         return;
       }
 
       try {
-        await fsp.writeFile(target, body.content, 'utf8');
-      } catch {
+        const container = projectContainerFiles(res);
+        if (container) await container.writeFile(target, Buffer.from(body.content, 'utf8'));
+        else await fsp.writeFile(target, body.content, 'utf8');
+      } catch (error) {
+        rethrowIfProjectLeaseMustBeRetained(error);
         res.status(403).json({ error: 'That file could not be written' });
         return;
       }
 
-      const after = await fsp.stat(target);
+      const after = await statWorkspace(res, target);
+      if (!after || after.type !== 'file') {
+        res.status(500).json({ error: 'That file could not be verified after saving' });
+        return;
+      }
       res.json({ saved: true, mtimeMs: after.mtimeMs, size: after.size });
-    },
+    }),
   );
 
   // ------------------------------------------------------------------ asset
@@ -1163,7 +1449,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
    */
   router.get(
     /^\/api\/workspace\/([^/]+)\/asset\/(.*)$/,
-    async (req: Request, res: Response): Promise<void> => {
+    withProjectWorkspace(deps, async (req: Request, res: Response): Promise<void> => {
       // A regex route, because a path parameter cannot contain slashes and the
       // whole point here is that it can. The captures arrive as an object keyed
       // by position, not as an array.
@@ -1183,7 +1469,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      const { path: target, base, missing } = await confineReal(session.workingDir, requested);
+      const { path: target, base, missing } = await confineWorkspace(session, res, requested);
       if (!target || missing) {
         res.status(missing ? 404 : 403).end();
         return;
@@ -1193,8 +1479,8 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      const stat = await fsp.stat(target).catch(() => null);
-      if (!stat?.isFile()) {
+      const stat = await statWorkspace(res, target);
+      if (!stat || stat.type !== 'file') {
         res.status(404).end();
         return;
       }
@@ -1203,7 +1489,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      const head = await readHead(target, SNIFF_BYTES);
+      const head = await readWorkspaceHead(res, target, SNIFF_BYTES);
       const serve = previewContentType(head, target);
       res.setHeader('Content-Type', serve.contentType);
       res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -1216,8 +1502,8 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         res.setHeader('Content-Security-Policy', 'sandbox allow-scripts allow-forms');
       }
       res.setHeader('Cache-Control', 'no-store');
-      streamFile(res, target, null);
-    },
+      await streamWorkspaceFile(res, target, null);
+    }),
   );
 
   // ----------------------------------------------------------------- status
@@ -1236,7 +1522,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
    */
   router.get(
     '/api/workspace/:sessionId/status',
-    async (req: Request, res: Response): Promise<void> => {
+    withProjectWorkspace(deps, async (req: Request, res: Response): Promise<void> => {
       const session = sessionFor(deps, req, res);
       if (!session) return;
 
@@ -1244,7 +1530,8 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         'git',
         ['status', '--porcelain=v1', '-z', '--branch'],
         session.workingDir,
-        await environmentFor(deps, session),
+        await environmentFor(deps, session, res),
+        projectContainerFiles(res),
       );
       const branch = status.ok
         ? parseGitStatus(status.stdout)
@@ -1292,8 +1579,16 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         // The working directory is part of "where am I", and the header shows
         // only its last segment.
         workingDir: session.workingDir,
+        ...(session.projectId
+          ? {
+              projectWorkingDirKind: session.projectWorkingDirKind || 'host',
+              ...(projectContainerFiles(res)
+                ? { lifetime: projectContainerFiles(res)!.lifetime(session.workingDir) }
+                : {}),
+            }
+          : {}),
       });
-    },
+    }),
   );
 
   // ----------------------------------------------------------------- upload
@@ -1314,7 +1609,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
     '/api/workspace/:sessionId/upload',
     // Route-scoped, so the app-wide express.json() limit is unaffected.
     express.raw({ type: () => true, limit: MAX_UPLOAD_BYTES }),
-    async (req: Request, res: Response): Promise<void> => {
+    withProjectWorkspace(deps, async (req: Request, res: Response): Promise<void> => {
       const session = sessionFor(deps, req, res);
       if (!session) return;
 
@@ -1335,7 +1630,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      const { path: folder, base, missing } = await confineReal(session.workingDir, dir);
+      const { path: folder, base, missing } = await confineWorkspace(session, res, dir);
       if (!folder) {
         res
           .status(missing ? 404 : 403)
@@ -1343,13 +1638,14 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         return;
       }
 
-      const folderStat = await fsp.stat(folder).catch(() => null);
-      if (!folderStat?.isDirectory()) {
+      const folderStat = await statWorkspace(res, folder);
+      if (!folderStat || folderStat.type !== 'directory') {
         res.status(400).json({ error: 'That is not a folder' });
         return;
       }
 
-      const target = path.join(folder, name);
+      const container = projectContainerFiles(res);
+      let target = container ? path.posix.join(folder, name) : path.join(folder, name);
       if (insideGitDir(base, target)) {
         res.status(403).json({ error: 'Files inside .git are not writable here' });
         return;
@@ -1357,10 +1653,29 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
 
       const overwrite = req.query.overwrite === '1';
       try {
-        // `wx` unless overwrite was asked for: the flag does the check and the
-        // write as one operation, so nothing can appear in between.
-        await fsp.writeFile(target, bytes, { flag: overwrite ? 'w' : 'wx' });
+        if (container) {
+          if (overwrite) {
+            const existing = await container.confineExisting(target);
+            if (existing.path) {
+              target = existing.path;
+            } else if (!existing.missing) {
+              res.status(403).json({ error: 'Path is outside the session directory' });
+              return;
+            }
+            // A missing overwrite target is still created exclusively. If a
+            // link appears after confinement, the descriptor refuses it
+            // instead of following it into another container directory.
+            await container.writeFile(target, bytes, existing.path === null);
+          } else {
+            await container.writeFile(target, bytes, true);
+          }
+        } else {
+          // `wx` unless overwrite was asked for: the flag does the check and
+          // write as one operation, so nothing can appear in between.
+          await fsp.writeFile(target, bytes, { flag: overwrite ? 'w' : 'wx' });
+        }
       } catch (error) {
+        rethrowIfProjectLeaseMustBeRetained(error);
         if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
           res.status(409).json({ error: 'A file with that name is already there', name });
           return;
@@ -1372,28 +1687,32 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       res.json({
         saved: true,
         name,
-        path: path.relative(base, target),
+        path: (container ? path.posix : path).relative(base, target),
         size: bytes.length,
       });
-    },
+    }),
   );
 
   // ----------------------------------------------------------------- github
 
   router.get(
     '/api/workspace/:sessionId/github',
-    async (req: Request, res: Response): Promise<void> => {
+    withProjectWorkspace(deps, async (req: Request, res: Response): Promise<void> => {
       const session = sessionFor(deps, req, res);
       if (!session) return;
 
-      const cacheKey = `${session.id}:${session.workingDir}`;
+      const cacheKey = workspaceCacheKey(session);
       const cached = ghCache.get(cacheKey);
       if (cached && Date.now() - cached.at < GH_CACHE_MS && req.query.refresh !== '1') {
         res.json(cached.payload);
         return;
       }
 
-      const payload = await readGitHub(session.workingDir, await environmentFor(deps, session));
+      const payload = await readGitHub(
+        session.workingDir,
+        await environmentFor(deps, session, res),
+        projectContainerFiles(res),
+      );
       // A failure is not worth half a minute. Rate limits, a dropped network
       // and a `gh` that was mid-upgrade all clear on their own, and pinning the
       // failure means the refresh control does nothing about it.
@@ -1401,7 +1720,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
         ghCache.set(cacheKey, { at: Date.now(), payload });
       }
       res.json(payload);
-    },
+    }),
   );
 
   /**
@@ -1414,7 +1733,7 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
    */
   router.get(
     '/api/workspace/:sessionId/github/:kind/:number',
-    async (req: Request, res: Response): Promise<void> => {
+    withProjectWorkspace(deps, async (req: Request, res: Response): Promise<void> => {
       const session = sessionFor(deps, req, res);
       if (!session) return;
 
@@ -1438,15 +1757,17 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       }
       const scope = repo ? ['-R', repo] : [];
 
-      const environment = await environmentFor(deps, session);
+      const environment = await environmentFor(deps, session, res);
+      const container = projectContainerFiles(res);
       const [view, timeline] = await Promise.all([
         run(
           'gh',
           [kind, 'view', String(number), ...scope, '--json', kind === 'pr' ? PR_ITEM_FIELDS : ISSUE_ITEM_FIELDS],
           session.workingDir,
           environment,
+          container,
         ),
-        readCrossReferences(session.workingDir, number, repo, environment),
+        readCrossReferences(session.workingDir, number, repo, environment, container),
       ]);
 
       if (!view.ok) {
@@ -1458,8 +1779,24 @@ export function createWorkspaceRoutes(deps: WorkspaceRoutesDeps): Router {
       }
 
       res.json({ kind, item: normalizeItem(kind, parseJson(view.stdout, null), timeline) });
-    },
+    }),
   );
+
+  router.use((error: unknown, _req: Request, res: Response, next: NextFunction): void => {
+    if (mustRetainProjectLease(error)) {
+      if (res.headersSent) res.destroy();
+      else res.status(503).json({ error: 'project_process_stop_unverified' });
+      return;
+    }
+    if (error instanceof ProjectEnvironmentUnavailable) {
+      res.status(error.reason === 'shutting_down' ? 503 : 409).json({
+        error: 'project_unavailable',
+        detail: error.message,
+      });
+      return;
+    }
+    next(error);
+  });
 
   return router;
 }
@@ -1536,6 +1873,7 @@ async function readCrossReferences(
   number: number,
   repo: string,
   environment?: UserEnvironment,
+  containerFiles?: ProjectContainerFiles,
 ): Promise<GitHubRef[]> {
   // `-F` reads its value as JSON — which is what expands `:owner` and `:repo`
   // into this directory's repository, and what turns a repository actually
@@ -1555,6 +1893,7 @@ async function readCrossReferences(
     ],
     workingDir,
     environment,
+    containerFiles,
   );
   if (!result.ok) return [];
   return crossReferencesOf(parseJson(result.stdout, null));
@@ -1591,8 +1930,9 @@ fragment event on CrossReferencedEvent{
 async function readGitHub(
   workingDir: string,
   environment?: UserEnvironment,
+  containerFiles?: ProjectContainerFiles,
 ): Promise<Record<string, unknown>> {
-  const version = await run('gh', ['--version'], workingDir, environment);
+  const version = await run('gh', ['--version'], workingDir, environment, containerFiles);
   if (!version.ok) {
     return {
       available: false,
@@ -1600,7 +1940,7 @@ async function readGitHub(
     };
   }
 
-  const auth = await run('gh', ['auth', 'status'], workingDir, environment);
+  const auth = await run('gh', ['auth', 'status'], workingDir, environment, containerFiles);
   if (!auth.ok) {
     return {
       available: false,
@@ -1613,6 +1953,7 @@ async function readGitHub(
     ['repo', 'view', '--json', 'nameWithOwner,url,defaultBranchRef'],
     workingDir,
     environment,
+    containerFiles,
   );
   if (!repo.ok) {
     return {
@@ -1622,8 +1963,8 @@ async function readGitHub(
   }
 
   const [prs, issues] = await Promise.all([
-    list(['pr', 'list'], PR_LIST_FIELDS, PR_LIST_FALLBACK, workingDir, environment),
-    list(['issue', 'list'], ISSUE_LIST_FIELDS, ISSUE_LIST_FALLBACK, workingDir, environment),
+    list(['pr', 'list'], PR_LIST_FIELDS, PR_LIST_FALLBACK, workingDir, environment, containerFiles),
+    list(['issue', 'list'], ISSUE_LIST_FIELDS, ISSUE_LIST_FALLBACK, workingDir, environment, containerFiles),
   ]);
 
   // Normalised here rather than passed through: the fields the panel now asks
@@ -1659,12 +2000,13 @@ async function list(
   fallback: string,
   workingDir: string,
   environment?: UserEnvironment,
+  containerFiles?: ProjectContainerFiles,
 ): Promise<{ rows: unknown[]; error?: string }> {
   const argv = [...command, '--state', 'open', '--limit', '20', '--json'];
-  const full = await run('gh', [...argv, fields], workingDir, environment);
+  const full = await run('gh', [...argv, fields], workingDir, environment, containerFiles);
   if (full.ok) return { rows: rows(full.stdout) };
 
-  const older = await run('gh', [...argv, fallback], workingDir, environment);
+  const older = await run('gh', [...argv, fallback], workingDir, environment, containerFiles);
   if (older.ok) return { rows: rows(older.stdout) };
 
   return {

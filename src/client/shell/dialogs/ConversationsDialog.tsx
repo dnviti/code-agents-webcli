@@ -270,21 +270,31 @@ export function ConversationsDialog({
             <Placeholder>Nothing matches “{query.trim()}”.</Placeholder>
           ) : null}
 
-          {visible.map((project) => (
-            <ProjectGroup
-              key={project.dir}
-              project={project}
-              // Searching opens everything: a match inside a folded group is a
-              // search that found nothing as far as the user can tell.
-              expanded={searching || !collapsed.has(project.dir)}
-              foldable={!searching}
-              onToggle={() => toggleGroup(project.dir)}
-              openIds={withTabs}
-              activeId={activeId ?? null}
-              onOpen={onOpen}
-              onDelete={remove}
-            />
-          ))}
+          {visible.map((project) => {
+            // Older servers omit `key`; the tuple fallback still prevents two
+            // project containers that both call their cwd `/workspace` from
+            // sharing React and collapse state.
+            const groupKey = project.key || JSON.stringify([
+              project.projectId || null,
+              project.workingDirKind || 'host',
+              project.dir,
+            ]);
+            return (
+              <ProjectGroup
+                key={groupKey}
+                project={project}
+                // Searching opens everything: a match inside a folded group is a
+                // search that found nothing as far as the user can tell.
+                expanded={searching || !collapsed.has(groupKey)}
+                foldable={!searching}
+                onToggle={() => toggleGroup(groupKey)}
+                openIds={withTabs}
+                activeId={activeId ?? null}
+                onOpen={onOpen}
+                onDelete={remove}
+              />
+            );
+          })}
         </div>
       </div>
     </Dialog>

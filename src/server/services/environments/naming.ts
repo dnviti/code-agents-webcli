@@ -10,6 +10,8 @@
  * own: it is truncated and then stripped of trailing digits and dashes.
  */
 
+import { createHash } from 'node:crypto';
+
 const MAX_SLUG = 32;
 /** Kubernetes label values are limited to 63 DNS-subdomain-compatible characters. */
 const MAX_LABEL_VALUE = 63;
@@ -46,6 +48,43 @@ export function containerHomeFor(owner: { id: number; githubLogin: string }): st
 /** Every managed container carries the id of the deploy target it was placed on. */
 export const TARGET_LABEL = 'com.code-agents-webcli.target';
 
+/** Every project container carries the id of the project it was built for. */
+export const PROJECT_LABEL = 'com.code-agents-webcli.project';
+
+/**
+ * The numeric suffix of a project container's name.
+ *
+ * A project's UUID is not a number, and the shared `environmentName` shape —
+ * prefix, slug, trailing id that no login fragment can impersonate — wants
+ * one. Twelve hex characters of the id's SHA-256 read as a safe integer are stable
+ * across restarts, unique in practice, and says nothing about the id itself.
+ */
+export function projectNameHash(projectId: string): number {
+  // Twelve hex digits keep the suffix inside Number.MAX_SAFE_INTEGER while
+  // raising the collision space from 32 to 48 bits.
+  const digest = createHash('sha256').update(projectId).digest('hex').slice(0, 12);
+  return Number.parseInt(digest, 16);
+}
+
+/**
+ * The full container name for a project.
+ *
+ * Deterministic from the project id and name, so a rebuild after a reclaim
+ * lands on the same name — but computed from the *current* name, so a rename
+ * changes it. Callers therefore record the name in the project's container
+ * metadata at build time and use the recorded name for every operation on an
+ * existing container; this function is for creation only.
+ */
+export function projectContainerName(
+  prefix: string,
+  project: { id: string; name: string },
+): string {
+  return environmentName(prefix, {
+    id: projectNameHash(project.id),
+    githubLogin: `p-${project.name}`,
+  });
+}
+
 /**
  * Sanitise a value for the `com.code-agents-webcli.target` label.
  *
@@ -71,11 +110,11 @@ export function targetLabelValue(value: string): string {
   // Leave room for a `-<6-char hash>` suffix, and do not let the truncation
   // itself end on a dash or dot.
   const prefix = base.slice(0, MAX_LABEL_VALUE - 7).replace(/[^a-z0-9]+$/, '');
-  const hash = createHash(value).slice(0, 6);
+  const hash = createFnvHash(value).slice(0, 6);
   return `${prefix}-${hash}`;
 }
 
-function createHash(input: string): string {
+function createFnvHash(input: string): string {
   // A small, dependency-free FNV-1a variant keeps this deterministic and
   // readable without pulling in a crypto import for naming alone.
   let hash = 0x811c9dc5;

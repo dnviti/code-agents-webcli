@@ -32,6 +32,7 @@ describe('paste-image route', function () {
   let currentUser;
   let sessions;
   let allowPath;
+  let validatePathCalls;
 
   const OWNER = {
     id: 1, githubId: '1', githubLogin: 'tizio', githubName: null, avatarUrl: null, email: null,
@@ -45,10 +46,19 @@ describe('paste-image route', function () {
     workingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-route-wd-'));
     currentUser = OWNER;
     allowPath = true;
+    validatePathCalls = 0;
 
     sessions = new Map([
       ['mine', { id: 'mine', ownerUserId: 1, workingDir, active: true, connections: new Set() }],
       ['theirs', { id: 'theirs', ownerUserId: 2, workingDir, active: true, connections: new Set() }],
+      ['project-container', {
+        id: 'project-container', ownerUserId: 1, workingDir: '/tmp', projectId: 'p1',
+        projectWorkingDirKind: 'container', active: true, connections: new Set(),
+      }],
+      ['project-host', {
+        id: 'project-host', ownerUserId: 1, workingDir, projectId: 'p1',
+        projectWorkingDirKind: 'host', active: true, connections: new Set(),
+      }],
     ]);
 
     const app = express();
@@ -60,8 +70,10 @@ describe('paste-image route', function () {
       createPasteRoutes({
         claudeSessions: sessions,
         pasteStore: new PasteStore({ storageDir }),
-        validatePath: (target) =>
-          (allowPath ? { valid: true, path: target } : { valid: false, error: 'outside' }),
+        validatePath: (target) => {
+          validatePathCalls += 1;
+          return allowPath ? { valid: true, path: target } : { valid: false, error: 'outside' };
+        },
       }),
     );
 
@@ -176,6 +188,23 @@ describe('paste-image route', function () {
     assert.strictEqual(response.status, 403);
     assert.strictEqual((await response.json()).error, 'session_outside_base');
     assert.deepStrictEqual(listFiles(workingDir), []);
+  });
+
+  it('rejects every project namespace before a container path can touch host fs', async function () {
+    const canary = path.join(os.tmpdir(), `cawc-paste-canary-${process.pid}-${Date.now()}`);
+    fs.writeFileSync(canary, 'untouched');
+    try {
+      for (const sessionId of ['project-container', 'project-host']) {
+        const response = await post(sessionId, PNG);
+        assert.strictEqual(response.status, 409);
+        assert.strictEqual((await response.json()).error, 'unsupported_paste_namespace');
+      }
+      assert.strictEqual(validatePathCalls, 0, 'host validation must not interpret a project path');
+      assert.strictEqual(fs.readFileSync(canary, 'utf8'), 'untouched');
+      assert.ok(!fs.existsSync(path.join(workingDir, '.cc-web')));
+    } finally {
+      fs.rmSync(canary, { force: true });
+    }
   });
 
   it('refuses a cross-origin write', async function () {

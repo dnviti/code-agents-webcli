@@ -183,6 +183,27 @@ function fakeTimers() {
 }
 
 describe('AntigravityChatAdapter (headless mode)', function () {
+  it('announces the translated runtime cwd inside a project container', async function () {
+    const events = [];
+    const adapter = new AntigravityChatAdapter({
+      sessionId: 'chat-project',
+      workingDir: '/host/projects/alpha',
+      cwdKind: 'host',
+      environment: {
+        kind: 'container',
+        toContainerPath(value) {
+          assert.strictEqual(value, '/host/projects/alpha');
+          return '/workspace/alpha';
+        },
+      },
+      command: 'agy',
+      emit: (event) => events.push(event),
+    });
+    adapter.loadModels = async () => {};
+    await adapter.start();
+    assert.strictEqual(events.find((event) => event.t === 'session').cwd, '/workspace/alpha');
+  });
+
   describe('the command line it builds', function () {
     function argsFor(options = {}) {
       return new AntigravityChatAdapter({

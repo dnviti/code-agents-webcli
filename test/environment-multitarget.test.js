@@ -6,6 +6,7 @@ const path = require('path');
 const {
   EnvironmentManager,
   createContainerConfig,
+  LOGIN_LABEL,
   MANAGED_LABEL,
   TARGET_LABEL,
   USER_ID_LABEL,
@@ -20,26 +21,77 @@ const {
 /** An engine that records operations and answers with scripted responses. */
 function fakeEngine(kind, overrides = {}) {
   const calls = [];
+  const known = new Map();
   const engine = {
     kind,
     binary: kind,
     calls,
-    async ensure(spec) { calls.push({ op: 'ensure', spec }); return { created: true }; },
+    async ensure(spec) {
+      calls.push({ op: 'ensure', spec });
+      const current = known.get(spec.name);
+      if (current) {
+        known.set(spec.name, { ...current, status: 'running' });
+        return { created: false };
+      }
+      return { created: true };
+    },
     async create(spec) { calls.push({ op: 'create', spec }); },
     async start(name) { calls.push({ op: 'start', name }); },
     async stop(name) { calls.push({ op: 'stop', name }); },
     async remove(name) { calls.push({ op: 'remove', name }); },
     async status() { return 'running'; },
-    async describe() { return null; },
+    async describe(name) { return known.get(name) || null; },
     async describeStrict(name) { return this.describe(name); },
-    async exec() { return { stdout: 'sh\n', stderr: '' }; },
-    execArgs: (spec, command, args) => ['exec', spec.name, command, ...args],
+    async exec(spec) { calls.push({ op: 'exec', spec }); return { stdout: 'sh\n', stderr: '' }; },
+    execArgs: (spec, command, args) => ['exec', spec.identity || spec.name, command, ...args],
     async list() { return []; },
     async available() { calls.push({ op: 'available' }); return true; },
     async resize(name, cpus, memory) { calls.push({ op: 'resize', name, cpus, memory }); return true; },
-    async usage() { return null; },
+    async usage(name) { calls.push({ op: 'usage', name }); return null; },
     ...overrides,
   };
+  engine.ensureIdentity = async (spec, expected) => {
+    const before = await engine.describeStrict(spec.name);
+    if (expected && (!before || before.identity !== expected.identity)) {
+      throw new Error(`container ${spec.name} was replaced before ensure`);
+    }
+    if (!expected && before) throw new Error(`container ${spec.name} appeared before creation`);
+    if (before && !known.has(spec.name)) known.set(spec.name, before);
+    const result = await engine.ensure(spec);
+    let current = known.get(spec.name);
+    if (!current) {
+      current = {
+        name: spec.name,
+        identity: `${kind}-${spec.name}-id`,
+        status: 'running',
+        image: spec.image,
+        labels: { ...spec.labels },
+      };
+      known.set(spec.name, current);
+    }
+    if (expected && current.identity !== expected.identity) {
+      throw new Error(`container ${spec.name} changed during ensure`);
+    }
+    return { created: result.created, identity: current.identity };
+  };
+  engine.stopIdentity = async (description) => {
+    await engine.stop(description.identity);
+    const current = known.get(description.name);
+    if (current && current.identity !== description.identity) {
+      throw new Error(`container ${description.name} was replaced during stop`);
+    }
+    if (current) known.set(description.name, { ...current, status: 'exited' });
+  };
+  engine.removeIdentity = async (description) => {
+    await engine.remove(description.identity);
+    const current = known.get(description.name);
+    if (current && current.identity !== description.identity) {
+      throw new Error(`container ${description.name} was replaced during removal`);
+    }
+    if (current) known.delete(description.name);
+  };
+  engine.replaceForTest = (name, description) => known.set(name, { name, ...description });
+  engine.descriptionForTest = (name) => known.get(name) || null;
   return engine;
 }
 
@@ -52,10 +104,13 @@ function forbiddenEngine() {
     kind: 'docker',
     binary: 'docker',
     ensure: fail('ensure'),
+    ensureIdentity: fail('ensureIdentity'),
     create: fail('create'),
     start: fail('start'),
     stop: fail('stop'),
     remove: fail('remove'),
+    stopIdentity: fail('stopIdentity'),
+    removeIdentity: fail('removeIdentity'),
     status: fail('status'),
     describe: fail('describe'),
     describeStrict: fail('describeStrict'),
@@ -119,6 +174,7 @@ function multiManager() {
 function managedDescription(name, targetKey, userId = 1) {
   return {
     name,
+    identity: `${name}-id`,
     status: 'running',
     image: 'img',
     labels: {
@@ -191,7 +247,7 @@ describe('multi-target environments', function () {
     const name = manager.nameFor(owner);
     state.activeKey = TARGET_B;
     engines.get(TARGET_A).list = async () => [name];
-    engines.get(TARGET_A).describe = async () => managedDescription(name, TARGET_A);
+    engines.get(TARGET_A).describeStrict = async () => managedDescription(name, TARGET_A);
 
     const env = await manager.ensureFor(owner);
 
@@ -226,7 +282,7 @@ describe('multi-target environments', function () {
       await scanGate;
       return [name];
     };
-    engines.get(TARGET_A).describe = async () => managedDescription(name, TARGET_A);
+    engines.get(TARGET_A).describeStrict = async () => managedDescription(name, TARGET_A);
 
     const first = manager.ensureFor(owner);
     await scanEntered;
@@ -255,7 +311,7 @@ describe('multi-target environments', function () {
     // one logical placement rather than two duplicate containers.
     for (const key of ['legacy', TARGET_A]) {
       engines.get(key).list = async () => [name];
-      engines.get(key).describe = async () => managedDescription(name, TARGET_A);
+      engines.get(key).describeStrict = async () => managedDescription(name, TARGET_A);
     }
 
     await manager.ensureFor(owner);
@@ -286,7 +342,7 @@ describe('multi-target environments', function () {
     // startup flags are removed on a later restart.
     for (const key of ['legacy', TARGET_A]) {
       engines.get(key).list = async () => [name];
-      engines.get(key).describe = async () => managedDescription(name, null);
+      engines.get(key).describeStrict = async () => managedDescription(name, null);
     }
 
     await manager.ensureFor(owner);
@@ -308,7 +364,7 @@ describe('multi-target environments', function () {
     const owner = { id: 1, githubLogin: 'ada' };
     const name = 'cawc-ada-1';
     engineA.list = async () => [name];
-    engineA.describe = async () => managedDescription(name, null);
+    engineA.describeStrict = async () => managedDescription(name, null);
 
     const manager = new EnvironmentManager({
       config: legacyConfig,
@@ -343,7 +399,7 @@ describe('multi-target environments', function () {
       await scanGate;
       return [name];
     };
-    engineA.describe = async () => managedDescription(name, TARGET_A);
+    engineA.describeStrict = async () => managedDescription(name, TARGET_A);
 
     const pending = manager.ensureFor(owner);
     await scanEntered;
@@ -366,7 +422,7 @@ describe('multi-target environments', function () {
     const owner = { id: 1, githubLogin: 'ada' };
     const name = manager.nameFor(owner);
     engines.get(TARGET_B).list = async () => [name];
-    engines.get(TARGET_B).describe = async () => managedDescription(name, TARGET_A);
+    engines.get(TARGET_B).describeStrict = async () => managedDescription(name, TARGET_A);
 
     await assert.rejects(manager.ensureFor(owner), /labeled for deploy target.*found on/);
     assert.strictEqual(engines.get(TARGET_A).calls.filter((call) => call.op === 'ensure').length, 0);
@@ -379,7 +435,7 @@ describe('multi-target environments', function () {
     const name = manager.nameFor(owner);
     for (const key of [TARGET_A, TARGET_B]) {
       engines.get(key).list = async () => [name];
-      engines.get(key).describe = async () => managedDescription(name, key);
+      engines.get(key).describeStrict = async () => managedDescription(name, key);
     }
 
     await assert.rejects(manager.ensureFor(owner), /exists on multiple deploy targets/);
@@ -409,7 +465,7 @@ describe('multi-target environments', function () {
     const name = manager.nameFor(owner);
     for (const engine of [oldEngineA, replacementEngineA]) {
       engine.list = async () => [name];
-      engine.describe = async () => managedDescription(name, TARGET_A, owner.id);
+      engine.describeStrict = async () => managedDescription(name, TARGET_A, owner.id);
     }
 
     await assert.rejects(
@@ -425,7 +481,7 @@ describe('multi-target environments', function () {
     const owner = { id: 1, githubLogin: 'ada' };
     const name = manager.nameFor(owner);
     engines.get(TARGET_A).list = async () => [name];
-    engines.get(TARGET_A).describe = async () => managedDescription(name, TARGET_A, 2);
+    engines.get(TARGET_A).describeStrict = async () => managedDescription(name, TARGET_A, 2);
 
     await assert.rejects(manager.ensureFor(owner), /belongs to another user/);
     assert.strictEqual(engines.get(TARGET_A).calls.filter((call) => call.op === 'ensure').length, 0);
@@ -453,8 +509,9 @@ describe('multi-target environments', function () {
     const { manager, engines } = multiManager();
     const owner = { id: 1, githubLogin: 'ada' };
     const name = manager.nameFor(owner);
-    engines.get(TARGET_A).describe = async () => ({
+    engines.get(TARGET_A).describeStrict = async () => ({
       name,
+      identity: `${name}-id`,
       status: 'running',
       image: 'unrelated',
       labels: {},
@@ -473,8 +530,9 @@ describe('multi-target environments', function () {
     const ensuredBefore = engineA.calls.filter((call) => call.op === 'ensure').length;
 
     // Simulate an operator replacing the object behind a still-known name.
-    engineA.describe = async () => ({
+    engineA.describeStrict = async () => ({
       name,
+      identity: `${name}-replacement-id`,
       status: 'running',
       image: 'unrelated',
       labels: {},
@@ -487,7 +545,7 @@ describe('multi-target environments', function () {
   it('treats a strict collision-inspection failure as an error, not absence', async function () {
     const { manager, engines } = multiManager();
     const engineA = engines.get(TARGET_A);
-    engineA.describe = async () => {
+    engineA.describeStrict = async () => {
       throw new Error('inspect authentication failed');
     };
 
@@ -521,11 +579,43 @@ describe('multi-target environments', function () {
     assert.strictEqual(manager.targetKeyForContainer(env.name), 'legacy');
   });
 
+  it('does not adopt a same-name replacement on a retained target', async function () {
+    const { manager, state, engines } = multiManager();
+    const environment = await manager.ensureFor({ id: 1, githubLogin: 'ada' });
+    state.activeKey = TARGET_B;
+    const engineA = engines.get(TARGET_A);
+    engineA.replaceForTest(environment.name, {
+      identity: 'replacement-id',
+      status: 'running',
+      image: 'img',
+      labels: {
+        [MANAGED_LABEL]: 'true',
+        [USER_ID_LABEL]: '1',
+        [LOGIN_LABEL]: 'ada',
+        [TARGET_LABEL]: TARGET_A,
+      },
+    });
+    engineA.calls.length = 0;
+
+    await assert.rejects(
+      manager.ensureFor({ id: 1, githubLogin: 'ada' }),
+      /replaced before ensure/,
+    );
+    await assert.rejects(manager.stopFor(1), /same-name container was replaced/);
+    await assert.rejects(manager.remove(environment.name), /same-name container was replaced/);
+    assert.strictEqual(
+      engineA.calls.some((call) => ['ensure', 'start', 'stop', 'remove', 'resize', 'exec'].includes(call.op)),
+      false,
+    );
+    assert.strictEqual(engines.get(TARGET_B).calls.length, 0, 'replacement never reroutes to active target');
+  });
+
   it('does not trust listing labels as routes for destructive operations', async function () {
     const { manager, state, engines } = multiManager();
     engines.get(TARGET_A).list = async () => ['cawc-ada-1'];
     engines.get(TARGET_A).describe = async (name) => ({
       name,
+      identity: `${name}-id`,
       status: 'running',
       image: 'img',
       // The object was observed through A but claims B. list() is an operator
@@ -538,6 +628,63 @@ describe('multi-target environments', function () {
     assert.strictEqual(state.activeKey, TARGET_A);
 
     await assert.rejects(manager.remove('cawc-ada-1'), /deploy target has not been verified/);
+    for (const engine of engines.values()) {
+      assert.strictEqual(engine.calls.filter((call) => call.op === 'remove').length, 0);
+    }
+  });
+
+  it('reports listed ownership and owner homes without adopting destructive routes', async function () {
+    const { manager, state, engines, configs } = multiManager();
+    engines.get(TARGET_A).list = async () => ['cawc-ada-1'];
+    engines.get(TARGET_A).describe = async (name) => ({
+      name,
+      identity: `${name}-id`,
+      status: 'running',
+      image: 'img',
+      labels: {
+        [MANAGED_LABEL]: 'true',
+        [USER_ID_LABEL]: '1',
+        [LOGIN_LABEL]: 'ada',
+        [TARGET_LABEL]: TARGET_A,
+      },
+    });
+    // A container old enough to predate the label belongs to the legacy engine.
+    engines.get('legacy').list = async () => ['cawc-cid-3'];
+    engines.get('legacy').describe = async (name) => ({
+      name,
+      identity: `${name}-id`,
+      status: 'running',
+      image: 'img',
+      labels: {
+        [MANAGED_LABEL]: 'true',
+        [USER_ID_LABEL]: '3',
+        [LOGIN_LABEL]: 'cid',
+      },
+    });
+
+    const list = await manager.list();
+    const byName = new Map(list.map((environment) => [environment.name, environment]));
+    assert.deepStrictEqual([...byName.keys()].sort(), ['cawc-ada-1', 'cawc-cid-3']);
+    assert.deepStrictEqual(
+      [byName.get('cawc-ada-1').userId, byName.get('cawc-ada-1').githubLogin],
+      [1, 'ada'],
+    );
+    assert.strictEqual(
+      byName.get('cawc-ada-1').homeDir,
+      path.join(configs.get(TARGET_A).rootDir, 'cawc-ada-1'),
+    );
+    assert.deepStrictEqual(
+      [byName.get('cawc-cid-3').userId, byName.get('cawc-cid-3').githubLogin],
+      [3, 'cid'],
+    );
+    assert.strictEqual(
+      byName.get('cawc-cid-3').homeDir,
+      path.join(configs.get('legacy').rootDir, 'cawc-cid-3'),
+    );
+    assert.strictEqual(state.activeKey, TARGET_A);
+
+    await assert.rejects(manager.remove('cawc-ada-1'), /deploy target has not been verified/);
+    await assert.rejects(manager.remove('cawc-cid-3'), /deploy target has not been verified/);
     for (const engine of engines.values()) {
       assert.strictEqual(engine.calls.filter((call) => call.op === 'remove').length, 0);
     }
@@ -786,6 +933,30 @@ describe('multi-target environments', function () {
       // No extra engine round-trip: the single-config path must not change.
       assert.strictEqual(engine.calls.filter((c) => c.op === 'available').length, 0);
       assert.strictEqual(manager.targetKeyForContainer(env.name), 'legacy');
+    });
+
+    it('accepts an owned pre-target container with no target label', async function () {
+      const engine = fakeEngine('docker');
+      const config = targetConfig();
+      engine.replaceForTest('cawc-legacy-41', {
+        identity: 'legacy-id',
+        status: 'running',
+        image: config.image,
+        labels: {
+          [MANAGED_LABEL]: 'true',
+          [USER_ID_LABEL]: '41',
+          [LOGIN_LABEL]: 'legacy',
+        },
+      });
+      const manager = new EnvironmentManager({ config, engine, hostHome: '/srv/work' });
+
+      const environment = await manager.ensureFor({ id: 41, githubLogin: 'legacy' });
+      assert.strictEqual(environment.identity, 'legacy-id');
+      await manager.stopFor(41);
+      assert.deepStrictEqual(
+        engine.calls.filter((call) => call.op === 'stop').map((call) => call.name),
+        ['legacy-id'],
+      );
     });
 
     it('still returns the host environment when containers are disabled', async function () {

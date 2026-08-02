@@ -79,13 +79,15 @@ describe('deploy target store', function () {
       assert.throws(() => store.createTarget({ name: 'x', engine: 'lxc' }), /unsupported engine/);
     });
 
-    it('computes caveats for kubernetes and stays quiet for docker', function () {
+    it('computes kubernetes caveats and states the runtime image contract for docker', function () {
       const { store } = harness();
       const { id } = store.createTarget({ name: 'k', engine: 'kubernetes' });
       const caveats = store.getTarget(id).caveats;
       assert.ok(caveats.some((c) => c.includes('bypassPermissions')));
       assert.ok(caveats.some((c) => c.includes('metrics-server')));
-      assert.deepStrictEqual(caveatsFor('docker'), []);
+      const dockerCaveats = caveatsFor('docker');
+      assert.strictEqual(dockerCaveats.length, 1);
+      assert.match(dockerCaveats[0], /Linux.*sh.*\/proc.*setsid/);
     });
   });
 

@@ -129,6 +129,7 @@ describe('TerminalBridge', function() {
     });
 
     ptys[0].emitExit(0, 15);
+    await new Promise((resolve) => setImmediate(resolve));
 
     assert.strictEqual(bridge.getSession('session-4'), undefined);
     assert.deepStrictEqual(exitResult, { code: 0, signal: 15 });
@@ -137,7 +138,11 @@ describe('TerminalBridge', function() {
   it('stops the PTY with SIGTERM', async function() {
     await bridge.startSession('session-5', { shell: 'bash' });
 
-    await bridge.stopSession('session-5');
+    const stopping = bridge.stopSession('session-5');
+
+    assert.ok(bridge.getSession('session-5'), 'ownership remains until close');
+    ptys[0].emitExit(143, 15);
+    await stopping;
 
     assert.deepStrictEqual(ptys[0].killSignals, ['SIGTERM']);
   });
@@ -151,11 +156,54 @@ describe('TerminalBridge', function() {
       }
     });
 
-    await bridge.stopSession('session-6');
+    const stopping = bridge.stopSession('session-6');
     ptys[0].emitError(Object.assign(new Error('read EIO'), { code: 'EIO' }));
     ptys[0].emitExit(143, 0);
+    await stopping;
 
     assert.strictEqual(reportedError, null);
     assert.strictEqual(bridge.getSession('session-6'), undefined);
+  });
+
+  it('retains the session until remote process proof succeeds', async function() {
+    let verifyRemote;
+    const remoteProof = new Promise((resolve) => { verifyRemote = resolve; });
+    const environment = {
+      kind: 'container',
+      name: 'project-runtime',
+      shells: ['sh'],
+      wrap(command, args) {
+        return {
+          command,
+          args,
+          env: process.env,
+          processControl: { stop: () => remoteProof },
+        };
+      },
+    };
+    await bridge.startSession('session-remote-proof', { shell: 'sh', environment });
+
+    const stopping = bridge.stopSession('session-remote-proof');
+    ptys[0].emitExit(143, 15);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.ok(bridge.getSession('session-remote-proof'));
+    verifyRemote();
+    await stopping;
+    assert.strictEqual(bridge.getSession('session-remote-proof'), undefined);
+  });
+
+  it('fails before spawning when a container omits process control', async function() {
+    const environment = {
+      kind: 'container',
+      shells: ['sh'],
+      wrap(command, args) { return { command, args, env: process.env }; },
+    };
+
+    await assert.rejects(
+      bridge.startSession('session-missing-control', { shell: 'sh', environment }),
+      /verified process control/,
+    );
+    assert.strictEqual(spawnCalls.length, 0);
   });
 });

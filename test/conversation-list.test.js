@@ -108,6 +108,14 @@ before(async function () {
       disposeRecorder: () => {},
       getSelectedWorkingDir: () => null,
       sessionStore: { getSessionMetadata: async () => ({}) },
+      projectsManager: {
+        getForUser: (ownerUserId, projectId) => {
+          if (ownerUserId !== USER.id) return null;
+          if (projectId === 'project-a') return { id: projectId, name: 'Alpha project' };
+          if (projectId === 'project-b') return { id: projectId, name: 'Beta project' };
+          return null;
+        },
+      },
       chatStore,
     }),
   );
@@ -173,6 +181,34 @@ describe('listing every conversation by project', function () {
     assert.deepStrictEqual(Object.keys(byDir).sort(), ['/projects/alpha', '/projects/beta']);
     assert.strictEqual(byDir['/projects/alpha'].length, 2);
     assert.deepStrictEqual(byDir['/projects/beta'], ['beta uno']);
+  });
+
+  it('never collapses identical container paths across projects or namespaces', async function () {
+    await conversation('project-a-container', 'alpha container', {
+      projectId: 'project-a', projectWorkingDirKind: 'container', workingDir: '/workspace',
+    });
+    await conversation('project-b-container', 'beta container', {
+      projectId: 'project-b', projectWorkingDirKind: 'container', workingDir: '/workspace',
+    });
+    await conversation('project-a-host', 'alpha host', {
+      projectId: 'project-a', projectWorkingDirKind: 'host', workingDir: '/workspace',
+    });
+
+    const got = await list();
+    assert.strictEqual(got.body.projects.length, 3);
+    assert.strictEqual(new Set(got.body.projects.map((project) => project.key)).size, 3);
+    const identities = got.body.projects.map((project) => [
+      project.projectId, project.workingDirKind, project.dir, project.name,
+    ]);
+    assert.deepStrictEqual(identities, [
+      ['project-a', 'container', '/workspace', 'Alpha project'],
+      ['project-b', 'container', '/workspace', 'Beta project'],
+      ['project-a', 'host', '/workspace', 'Alpha project'],
+    ]);
+    for (const project of got.body.projects) {
+      assert.strictEqual(project.conversations[0].projectId, project.projectId);
+      assert.strictEqual(project.conversations[0].workingDirKind, project.workingDirKind);
+    }
   });
 
   it('names a group by the folder’s leaf and keeps the whole path', async function () {

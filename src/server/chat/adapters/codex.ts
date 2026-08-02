@@ -804,13 +804,6 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
   /** Latest request wins if a filesystem invalidation races launch-time discovery. */
   private skillListGeneration = 0;
 
-  /** Host path translated to the namespace in which app-server is running. */
-  private runtimeWorkingDir(): string {
-    return this.options.environment
-      ? this.options.environment.toContainerPath(this.options.workingDir)
-      : this.options.workingDir;
-  }
-
   protected buildArgs(): string[] {
     return ['app-server', ...(this.options.extraArgs || [])];
   }
@@ -828,7 +821,7 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     // ahead of it, which reads as a silent hang rather than a rejection.
     this.notify('initialized');
 
-    const params: Record<string, unknown> = { cwd: this.runtimeWorkingDir() };
+    const params: Record<string, unknown> = { cwd: this.runtimeWorkingDir };
     if (this.options.model) params.model = this.options.model;
     if (this.options.effort) {
       // There is no `effort` parameter on `thread/start`; the level travels in
@@ -897,7 +890,7 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
       // App-server runs inside the selected environment and therefore answers
       // with that environment's path. The rest of this app addresses the
       // workspace through its host mount, so keep the public/session cwd in
-      // the host namespace while RPC requests use `runtimeWorkingDir()`.
+      // the host namespace while RPC requests use `runtimeWorkingDir`.
       cwd: this.options.environment?.kind === 'container'
         ? this.options.workingDir
         : str(response.cwd) || this.options.workingDir,
@@ -1004,7 +997,7 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
   private async loadSkillList(forceReload = false): Promise<void> {
     const generation = ++this.skillListGeneration;
     try {
-      const params: Record<string, unknown> = { cwds: [this.runtimeWorkingDir()] };
+      const params: Record<string, unknown> = { cwds: [this.runtimeWorkingDir] };
       if (forceReload) params.forceReload = true;
       const response = record(
         await this.withTimeout(
@@ -2008,7 +2001,7 @@ export class CodexExecAdapter extends BaseChatAdapter {
   async start(): Promise<void> {
     // No handshake exists in this mode; a turn either runs or its spawn
     // fails, and either way that surfaces from send(), not from here.
-    this.emit({ t: 'session', cwd: this.options.workingDir, capabilities: this.capabilities });
+    this.emit({ t: 'session', cwd: this.runtimeWorkingDir, capabilities: this.capabilities });
     this.emit({ t: 'state', state: 'idle' });
   }
 
@@ -2028,11 +2021,11 @@ export class CodexExecAdapter extends BaseChatAdapter {
    * goes idle — while this process is still exiting.
    */
   get readyForTurn(): boolean {
-    return !(this.child && !this.exited);
+    return (!this.child || this.exited) && !this.childNeedsVerifiedClose();
   }
 
   async send(turn: UserTurn): Promise<void> {
-    if (this.child && !this.exited) {
+    if ((this.child && !this.exited) || this.childNeedsVerifiedClose()) {
       // One process serves exactly one turn; the session layer is expected
       // to await each send()'s turn_end before starting the next.
       throw new Error('codex exec: a turn is already running');
@@ -2080,21 +2073,39 @@ export class CodexExecAdapter extends BaseChatAdapter {
     });
 
     child.on('error', (error: Error) => {
-      this.exited = true;
-      this.emit({ t: 'error', message: `codex exec: ${error.message}`, fatal: false });
-      this.closeTurn('error');
+      void this.finishChild(child, async () => {
+        this.emit({ t: 'error', message: `codex exec: ${error.message}`, fatal: false });
+        this.closeTurn('error');
+      });
     });
 
     child.on('exit', () => {
-      this.exited = true;
-      if (this.stopped || this.sawTerminalEvent) return;
-      const detail = this.stderrTail.trim();
-      this.emit({
-        t: 'error',
-        message: detail ? `codex exec exited unexpectedly: ${detail}` : 'codex exec exited unexpectedly',
+      void this.finishChild(child, async () => {
+        if (this.stopped || this.sawTerminalEvent) return;
+        const detail = this.stderrTail.trim();
+        this.emit({
+          t: 'error',
+          message: detail ? `codex exec exited unexpectedly: ${detail}` : 'codex exec exited unexpectedly',
+        });
+        this.closeTurn('exited');
       });
-      this.closeTurn('exited');
     });
+  }
+
+  private async finishChild(
+    child: AdapterChild,
+    finish: () => Promise<void>,
+  ): Promise<void> {
+    try {
+      await this.waitForVerifiedClose(child);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit({ t: 'error', message: `codex exec: ${message}`, fatal: true });
+      return;
+    }
+    if (this.child !== child || this.exited) return;
+    this.exited = true;
+    await finish();
   }
 
   /**
@@ -2265,7 +2276,10 @@ export class CodexExecAdapter extends BaseChatAdapter {
     // No cancel channel exists in this mode (capabilities.interrupt is
     // false); killing the in-flight process is the only lever available if
     // something calls this anyway.
-    if (this.child && !this.exited) this.child.kill('SIGTERM');
+    const child = this.child;
+    if (child && this.childNeedsVerifiedClose(child)) {
+      await this.terminateChild(child, 'SIGTERM');
+    }
   }
 
   respondPermission(_requestId: string, _optionId: string): void {
@@ -2336,20 +2350,29 @@ export class CodexChatAdapter implements ChatAdapter {
     const probeOptions: ChatAdapterOptions = { ...this.options, emit: (event) => this.sink(event) };
 
     const primary = new CodexAppServerAdapter(probeOptions);
+    // Own the probe before it can materialize a child. If start or the
+    // verified teardown below fails, callers must still be able to reach the
+    // exact adapter whose process may remain alive through this facade.
+    this.delegate = primary;
     try {
       await primary.start();
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`codex: app-server handshake failed, falling back to exec --json: ${message}`);
-      await primary.stop().catch(() => undefined);
+      // Do not start a fallback beside a probe whose container process could
+      // not be verified gone. `stop()` carries that proof for both host and
+      // container launches.
+      await primary.stop();
       this.sink = this.options.emit; // discard the buffered probe noise; nothing is replayed
       const fallback = new CodexExecAdapter(this.options);
-      await fallback.start();
+      // The primary is proven gone at this point. Transfer ownership before
+      // fallback start for the same reason the probe is installed early: a
+      // failed start must remain stoppable through the router.
       this.delegate = fallback;
+      await fallback.start();
       return;
     }
 
-    this.delegate = primary;
     this.sink = this.options.emit;
     for (const event of buffered) this.options.emit(event);
   }

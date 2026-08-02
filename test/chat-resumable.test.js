@@ -100,6 +100,12 @@ before(async function () {
       disposeRecorder: () => {},
       getSelectedWorkingDir: () => null,
       sessionStore: { getSessionMetadata: async () => ({}) },
+      projectsManager: {
+        getForUser: (ownerUserId, projectId) =>
+          ownerUserId === USER.id && ['project-a', 'project-b'].includes(projectId)
+            ? { id: projectId, name: projectId === 'project-a' ? 'Alpha' : 'Beta' }
+            : null,
+      },
       chatStore,
     }),
   );
@@ -118,8 +124,11 @@ after(function () {
   if (storageDir) fs.rmSync(storageDir, { recursive: true, force: true });
 });
 
-async function list(dir) {
-  const response = await fetch(`${base}/api/sessions/resumable?dir=${encodeURIComponent(dir)}`);
+async function list(dir, options = {}) {
+  const query = new URLSearchParams({ dir });
+  if (options.projectId) query.set('projectId', options.projectId);
+  if (options.workingDirKind) query.set('workingDirKind', options.workingDirKind);
+  const response = await fetch(`${base}/api/sessions/resumable?${query}`);
   return { status: response.status, body: await response.json().catch(() => null) };
 }
 
@@ -165,6 +174,50 @@ describe('listing conversations to resume', function () {
 
     const got = await list('/projects/beta');
     assert.deepStrictEqual(got.body.conversations.map((c) => c.firstMessage), ['beta']);
+  });
+
+  it('authorises and matches project, namespace and cwd as one identity', async function () {
+    sessions.set('project-a-chat', record('project-a-chat', {
+      projectId: 'project-a', projectWorkingDirKind: 'container', workingDir: '/workspace',
+    }));
+    sessions.set('project-b-chat', record('project-b-chat', {
+      projectId: 'project-b', projectWorkingDirKind: 'container', workingDir: '/workspace',
+    }));
+    sessions.set('project-a-host', record('project-a-host', {
+      projectId: 'project-a', projectWorkingDirKind: 'host', workingDir: '/workspace',
+    }));
+    await writeChat('project-a-chat', opened('alpha container', 'n-a'));
+    await writeChat('project-b-chat', opened('beta container', 'n-b'));
+    await writeChat('project-a-host', opened('alpha host', 'n-h'));
+
+    const got = await list('/workspace', {
+      projectId: 'project-a', workingDirKind: 'container',
+    });
+    assert.strictEqual(got.status, 200);
+    assert.deepStrictEqual(
+      got.body.conversations.map((entry) => entry.firstMessage),
+      ['alpha container'],
+    );
+    assert.strictEqual(got.body.projectId, 'project-a');
+    assert.strictEqual(got.body.workingDirKind, 'container');
+  });
+
+  it('does not reveal an absent or foreign project through the resume query', async function () {
+    const got = await list('/workspace', {
+      projectId: 'not-mine', workingDirKind: 'container',
+    });
+    assert.strictEqual(got.status, 404);
+  });
+
+  it('requires an explicit namespace for a project resume query', async function () {
+    assert.strictEqual((await list('/workspace', { projectId: 'project-a' })).status, 400);
+  });
+
+  it('never downgrades a present blank project id to a legacy host query', async function () {
+    const blank = await fetch(
+      `http://127.0.0.1:${server.address().port}/api/sessions/resumable?dir=${encodeURIComponent('/projects/alpha')}&projectId=`,
+    );
+    assert.strictEqual(blank.status, 400);
   });
 
   it('never shows another user’s conversations', async function () {

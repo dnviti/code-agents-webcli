@@ -34,6 +34,7 @@ import {
   ResourceUsage,
   RunResult,
   defaultRunner,
+  EnvironmentInspectionError,
   parseSize,
   validateIdentityLabels,
 } from './engine.js';
@@ -88,6 +89,11 @@ export interface KubernetesOptions {
 interface PodResources {
   requests: Record<string, string>;
   limits: Record<string, string>;
+}
+
+function isPodNotFound(detail: string): boolean {
+  return /Error from server \(NotFound\): pods? "[^"]+" not found/i.test(detail)
+    || /"reason"\s*:\s*"NotFound"[\s\S]*"kind"\s*:\s*"pods?"/i.test(detail);
 }
 
 /**
@@ -226,7 +232,10 @@ export class KubernetesEngine implements EnvironmentEngine {
             image: spec.image,
             command: ['sh', '-c', 'while true; do sleep 3600; done'],
             workingDir: spec.containerHome,
-            env: Object.entries(spec.env).map(([name, value]) => ({ name, value })),
+            env: [
+              ...Object.entries(spec.env).map(([name, value]) => ({ name, value })),
+              { name: 'CAWC_POD_UID', valueFrom: { fieldRef: { fieldPath: 'metadata.uid' } } },
+            ],
             volumeMounts,
             ...(Object.keys(resources.limits).length || Object.keys(resources.requests).length
               ? { resources }
@@ -261,12 +270,47 @@ export class KubernetesEngine implements EnvironmentEngine {
     return { created: true };
   }
 
+  async ensureIdentity(spec: CreateContainerSpec, expected: ContainerDescription | null): Promise<{ created: boolean; identity: string }> {
+    const current = await this.describeStrict(spec.name);
+    if (expected) {
+      if (!current || current.identity !== expected.identity) {
+        throw new EnvironmentInspectionError(`pod '${spec.name}' was replaced before ensure`);
+      }
+      validateIdentityLabels(spec, current);
+      if (current.status === 'running') return { created: false, identity: current.identity };
+      await this.removeIdentity(expected);
+    } else if (current) {
+      throw new EnvironmentInspectionError(`pod '${spec.name}' appeared before creation`);
+    }
+    const identity = await this.createPod(spec);
+    if (!identity) {
+      throw new EnvironmentInspectionError(`pod '${spec.name}' was created without a verifiable UID`);
+    }
+    await this.waitForRunningIdentity(spec.name, identity);
+    const created = await this.describeStrict(spec.name);
+    if (!created || created.identity !== identity) {
+      throw new EnvironmentInspectionError(`pod '${spec.name}' changed identity after creation`);
+    }
+    validateIdentityLabels(spec, created);
+    return { created: true, identity };
+  }
+
   async create(spec: CreateContainerSpec): Promise<void> {
-    await this.run(
+    await this.createPod(spec);
+  }
+
+  /**
+   * Kubernetes `create` is a single create-only API operation. Unlike apply,
+   * it fails with AlreadyExists if the absent name is occupied between our
+   * inspection and this call, and its response supplies the exact new UID.
+   */
+  private async createPod(spec: CreateContainerSpec): Promise<string | null> {
+    const { stdout } = await this.run(
       this.binary,
-      [...this.base(), 'apply', '-f', '-'],
+      [...this.base(), 'create', '-f', '-', '-o', 'jsonpath={.metadata.uid}'],
       JSON.stringify(this.podManifest(spec)),
     );
+    return stdout.trim() || null;
   }
 
   /**
@@ -295,61 +339,114 @@ export class KubernetesEngine implements EnvironmentEngine {
     ]);
   }
 
+  async stopIdentity(description: ContainerDescription): Promise<void> {
+    await this.removeIdentity(description);
+  }
+
+  async removeIdentity(description: ContainerDescription): Promise<void> {
+    const endpoint = `/api/v1/namespaces/${encodeURIComponent(this.namespace)}/pods/${encodeURIComponent(description.name)}`;
+    try {
+      await this.run(this.binary, [...this.base(), 'delete', '--raw', endpoint, '-f', '-'], JSON.stringify({
+        apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: description.identity },
+      }));
+    } catch (error) {
+      const candidate = error as Error & { stderr?: string };
+      const detail = `${candidate.message || ''}\n${candidate.stderr || ''}`;
+      if (!isPodNotFound(detail)) throw error;
+    }
+    // DELETE acknowledgement precedes final object disappearance. Poll the
+    // exact UID through its Terminating window; a replacement or inspection
+    // failure is not absence and must fail closed immediately.
+    const deadline = Date.now() + this.readyTimeoutSeconds * 1000;
+    for (;;) {
+      const after = await this.describeStrict(description.name);
+      if (!after) return;
+      if (after.identity !== description.identity) {
+        throw new EnvironmentInspectionError(`pod '${description.name}' was replaced during removal`);
+      }
+      if (Date.now() >= deadline) {
+        throw new EnvironmentInspectionError(
+          `pod '${description.name}' still exists after ${this.readyTimeoutSeconds}s removal timeout`,
+        );
+      }
+      await new Promise((resolve) => { setTimeout(resolve, this.pollIntervalMs); });
+    }
+  }
+
   async status(name: string): Promise<string | null> {
     try {
       const { stdout } = await this.run(this.binary, [
         ...this.base(), 'get', 'pod', name, '-o', 'jsonpath={.status.phase}',
       ]);
       const phase = stdout.trim();
-      if (!phase) {
-        return null;
-      }
-      // Mapped onto the container runtime's vocabulary so the manager, the
-      // operator listing and the tests all read one set of words.
+      if (!phase) throw new EnvironmentInspectionError(`malformed pod status response for '${name}'`);
       return phase === 'Running' ? 'running' : phase.toLowerCase();
-    } catch {
-      return null;
+    } catch (error) {
+      const candidate = error as Error & { stderr?: string };
+      const detail = `${candidate.message || ''}\n${candidate.stderr || ''}`;
+      if (isPodNotFound(detail)) return null;
+      throw new EnvironmentInspectionError(`could not inspect pod status '${name}': ${detail.trim()}`);
     }
   }
 
   async describeStrict(name: string): Promise<ContainerDescription | null> {
-    const { stdout } = await this.run(this.binary, [
-      ...this.base(), 'get', 'pod', name, '--ignore-not-found',
-      '-o', 'json',
-    ]);
-    if (!stdout.trim()) {
-      return null;
-    }
-    let pod: {
-      status?: { phase?: unknown };
-      spec?: { containers?: Array<{ image?: unknown }> };
-      metadata?: { labels?: unknown };
-    };
     try {
-      pod = JSON.parse(stdout);
+      const { stdout } = await this.run(this.binary, [
+        ...this.base(), 'get', 'pod', name, '--ignore-not-found',
+        '-o', 'json',
+      ]);
+      if (!stdout.trim()) return null;
+
+      let pod: {
+        status?: { phase?: unknown };
+        spec?: { containers?: Array<{ image?: unknown }> };
+        metadata?: { uid?: unknown; labels?: unknown };
+      };
+      try {
+        pod = JSON.parse(stdout);
+      } catch (error) {
+        throw new EnvironmentInspectionError(
+          `engine returned invalid JSON for '${name}': ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      const identity = typeof pod.metadata?.uid === 'string' ? pod.metadata.uid : '';
+      const phase = typeof pod.status?.phase === 'string' ? pod.status.phase : '';
+      if (!identity || !phase) {
+        throw new EnvironmentInspectionError(`malformed pod inspection response for '${name}'`);
+      }
+      const image = typeof pod.spec?.containers?.[0]?.image === 'string'
+        ? pod.spec.containers[0].image
+        : '';
+      const rawLabels = pod.metadata?.labels;
+      if (
+        rawLabels !== undefined
+        && (
+          rawLabels === null
+          || typeof rawLabels !== 'object'
+          || Array.isArray(rawLabels)
+          || Object.values(rawLabels as Record<string, unknown>)
+            .some((value) => typeof value !== 'string')
+        )
+      ) {
+        throw new EnvironmentInspectionError(`malformed pod labels for '${name}'`);
+      }
+      const labels = (rawLabels || {}) as Record<string, string>;
+      return {
+        name,
+        identity,
+        status: phase === 'Running' ? 'running' : phase.toLowerCase(),
+        image,
+        labels: desanitiseLabels(labels),
+      };
     } catch (error) {
-      throw new Error(
-        `engine returned invalid JSON for '${name}': ${error instanceof Error ? error.message : String(error)}`,
+      const candidate = error as Error & { stderr?: string; stdout?: string };
+      const detail = `${candidate.message || ''}\n${candidate.stderr || ''}\n${candidate.stdout || ''}`;
+      if (isPodNotFound(detail)) return null;
+      if (error instanceof EnvironmentInspectionError) throw error;
+      throw new EnvironmentInspectionError(
+        `could not inspect pod '${name}': ${detail.trim()}`,
       );
     }
-    const phase = typeof pod.status?.phase === 'string' ? pod.status.phase : '';
-    const image = typeof pod.spec?.containers?.[0]?.image === 'string'
-      ? pod.spec.containers[0].image
-      : '';
-    const rawLabels = pod.metadata?.labels;
-    if (rawLabels !== undefined && (rawLabels === null || typeof rawLabels !== 'object')) {
-      throw new Error(`engine returned invalid labels for '${name}'`);
-    }
-    const labels = Object.fromEntries(
-      Object.entries((rawLabels || {}) as Record<string, unknown>)
-        .filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
-    );
-    return {
-      name,
-      status: phase === 'Running' ? 'running' : (phase || 'unknown').toLowerCase(),
-      image: image || '',
-      labels: desanitiseLabels(labels),
-    };
   }
 
   async describe(name: string): Promise<ContainerDescription | null> {
@@ -378,6 +475,17 @@ export class KubernetesEngine implements EnvironmentEngine {
 
     const envPairs = Object.entries(spec.env || {}).map(([key, value]) => `${key}=${value}`);
 
+    if (spec.identity) {
+      args.push(
+        'sh', '-c',
+        '[ "$CAWC_POD_UID" = "$1" ] || exit 125; shift; cd "$1" || exit 1; shift; exec "$@"',
+        'sh', spec.identity, spec.cwd || '/',
+        ...(envPairs.length ? ['env', ...envPairs] : []),
+        command, ...commandArgs,
+      );
+      return args;
+    }
+
     if (spec.cwd) {
       args.push(
         'sh', '-c', 'cd "$1" || exit 1; shift; exec "$@"', 'sh', spec.cwd,
@@ -395,7 +503,7 @@ export class KubernetesEngine implements EnvironmentEngine {
   }
 
   async exec(spec: ExecSpec, command: string, commandArgs: string[]): Promise<RunResult> {
-    return this.run(this.binary, this.execArgs(spec, command, commandArgs));
+    return this.run(this.binary, this.execArgs(spec, command, commandArgs), spec.input, spec.signal);
   }
 
   async list(label: string): Promise<string[]> {
@@ -518,6 +626,27 @@ export class KubernetesEngine implements EnvironmentEngine {
         throw new Error(
           `Environment ${name} was not running after ${this.readyTimeoutSeconds}s`
           + (status ? ` (pod is ${status})` : ' (no pod appeared)'),
+        );
+      }
+      await new Promise((resolve) => { setTimeout(resolve, this.pollIntervalMs); });
+    }
+  }
+
+  /** Poll one immutable Pod, never a same-name object that replaced it. */
+  private async waitForRunningIdentity(name: string, identity: string): Promise<void> {
+    const deadline = Date.now() + this.readyTimeoutSeconds * 1000;
+    for (;;) {
+      const described = await this.describeStrict(name);
+      if (!described || described.identity !== identity) {
+        throw new EnvironmentInspectionError(`pod '${name}' changed identity while waiting for it to start`);
+      }
+      if (described.status === 'running') return;
+      if (described.status === 'failed' || described.status === 'succeeded') {
+        throw new Error(`Environment ${name} did not start: pod is ${described.status}`);
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Environment ${name} was not running after ${this.readyTimeoutSeconds}s (pod is ${described.status})`,
         );
       }
       await new Promise((resolve) => { setTimeout(resolve, this.pollIntervalMs); });

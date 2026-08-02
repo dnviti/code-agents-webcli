@@ -84,6 +84,23 @@ describe('pi chat adapter', function () {
     assert.strictEqual(sessionEvents[0].nativeSessionId, 'resumed-abc');
   });
 
+  it('announces the translated runtime cwd when resuming in a project container', async function () {
+    const { adapter, events } = makeAdapter({
+      resumeSessionId: 'resumed-project',
+      workingDir: '/host/projects/alpha',
+      cwdKind: 'host',
+      environment: {
+        kind: 'container',
+        toContainerPath(value) {
+          assert.strictEqual(value, '/host/projects/alpha');
+          return '/workspace/alpha';
+        },
+      },
+    });
+    await adapter.start();
+    assert.strictEqual(events.find((event) => event.t === 'session').cwd, '/workspace/alpha');
+  });
+
   it('turns pi\'s cumulative message_update stream into incremental deltas with no duplication', function () {
     // This fixture slice contains the exact case that makes cumulative-vs-delta
     // matter: two consecutive updates report the same cumulative thinking text

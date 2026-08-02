@@ -2,7 +2,10 @@ import { spawn as defaultSpawnPty, IPty } from '../services/pty.js';
 import * as path from 'path';
 import * as fs from 'fs';
 import { execFileSync as defaultExecFileSync } from 'child_process';
-import { UserEnvironment } from '../services/environments/types.js';
+import {
+  UserEnvironment,
+  WrappedProcessControl,
+} from '../services/environments/types.js';
 import { HostEnvironment } from '../services/environments/manager.js';
 
 export interface TerminalSession {
@@ -11,8 +14,20 @@ export interface TerminalSession {
   created: Date;
   active: boolean;
   killTimeout: ReturnType<typeof setTimeout> | null;
+  closeTimeout: ReturnType<typeof setTimeout> | null;
   stopRequested: boolean;
   finalized: boolean;
+  clientExited: boolean;
+  closed: Promise<void>;
+  resolveClosed: () => void;
+  stopPromise: Promise<void> | null;
+  processControl?: WrappedProcessControl;
+  terminalEvent:
+    | { kind: 'exit'; exitCode: number; signal: number }
+    | { kind: 'error'; error: Error }
+    | null;
+  onExit: (exitCode: number, signal: number) => void;
+  onError: (error: Error) => void;
   runtimeLabel: string;
   terminalMode: 'shell' | 'command';
   shell: string;
@@ -30,6 +45,8 @@ export interface TerminalSessionInfo {
 
 export interface TerminalStartOptions {
   workingDir?: string;
+  /** Whether workingDir is already an absolute path inside the container. */
+  cwdKind?: 'host' | 'container';
   /**
    * Where this terminal runs. Absent means the host, which is what every
    * caller passed before per-user environments existed.
@@ -289,14 +306,19 @@ export class TerminalBridge {
         launchConfig.args,
         {
           cwd: workingDir,
+          cwdKind: options.cwdKind,
           env: {
             TERM: 'xterm-256color',
             FORCE_COLOR: '1',
             COLORTERM: 'truecolor',
           },
           tty: true,
+          trackProcess: true,
         },
       );
+      if (options.environment?.kind === 'container' && !launch.processControl) {
+        throw new Error('Container environment did not provide verified process control');
+      }
 
       const terminalProcess = this.spawnPty(
         launch.command,
@@ -313,14 +335,27 @@ export class TerminalBridge {
         },
       );
 
+      let resolveClosed!: () => void;
+      const closed = new Promise<void>((resolve) => {
+        resolveClosed = resolve;
+      });
       const session: TerminalSession = {
         process: terminalProcess,
         workingDir,
         created: new Date(),
         active: true,
         killTimeout: null,
+        closeTimeout: null,
         stopRequested: false,
         finalized: false,
+        clientExited: false,
+        closed,
+        resolveClosed,
+        stopPromise: null,
+        processControl: launch.processControl,
+        terminalEvent: null,
+        onExit,
+        onError,
         runtimeLabel: launchConfig.runtimeLabel,
         terminalMode: launchConfig.mode,
         shell: launchConfig.shell,
@@ -339,14 +374,21 @@ export class TerminalBridge {
       });
 
       terminalProcess.onExit(({ exitCode, signal }) => {
-        if (!this.finalizeSession(sessionId, session)) {
-          return;
+        if (!session.clientExited) {
+          session.clientExited = true;
+          session.terminalEvent ||= {
+            kind: 'exit',
+            exitCode: exitCode ?? 0,
+            signal: signal ?? 0,
+          };
+          session.resolveClosed();
         }
-
-        console.log(
-          `Terminal session ${sessionId} exited with code ${exitCode}, signal ${signal}`,
-        );
-        onExit(exitCode ?? 0, signal ?? 0);
+        void this.stopAndFinalizeSession(sessionId, session).catch((error) => {
+          console.error(
+            `Terminal session ${sessionId} could not verify shutdown:`,
+            error,
+          );
+        });
       });
 
       (terminalProcess as any).on('error', (error: Error) => {
@@ -354,15 +396,17 @@ export class TerminalBridge {
           return;
         }
 
-        if (!this.finalizeSession(sessionId, session)) {
-          return;
-        }
-
         console.error(
           `Terminal session ${sessionId} error:`,
           error,
         );
-        onError(error);
+        session.terminalEvent ||= { kind: 'error', error };
+        void this.stopAndFinalizeSession(sessionId, session).catch((stopError) => {
+          console.error(
+            `Terminal session ${sessionId} could not verify shutdown:`,
+            stopError,
+          );
+        });
       });
 
       console.log(
@@ -429,33 +473,7 @@ export class TerminalBridge {
       return;
     }
 
-    try {
-      if (session.killTimeout) {
-        clearTimeout(session.killTimeout);
-        session.killTimeout = null;
-      }
-
-      if (session.active && session.process) {
-        session.stopRequested = true;
-        session.active = false;
-        session.process.kill('SIGTERM');
-        session.killTimeout = setTimeout(() => {
-          if (!session.finalized && session.process) {
-            session.process.kill('SIGKILL');
-          }
-        }, 5000);
-      }
-    } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : String(error);
-      console.warn(
-        `Error stopping terminal session ${sessionId}:`,
-        message,
-      );
-    }
-
-    session.stopRequested = true;
-    session.active = false;
+    await this.stopAndFinalizeSession(sessionId, session);
   }
 
   getSession(sessionId: string): TerminalSession | undefined {
@@ -497,10 +515,119 @@ export class TerminalBridge {
       clearTimeout(session.killTimeout);
       session.killTimeout = null;
     }
+    if (session.closeTimeout) {
+      clearTimeout(session.closeTimeout);
+      session.closeTimeout = null;
+    }
 
     session.active = false;
-    this.sessions.delete(sessionId);
+    if (this.sessions.get(sessionId) === session) {
+      this.sessions.delete(sessionId);
+    }
     return true;
+  }
+
+  private async stopAndFinalizeSession(
+    sessionId: string,
+    session: TerminalSession,
+  ): Promise<void> {
+    if (session.finalized) return;
+    if (session.stopPromise) return session.stopPromise;
+
+    const attempt = (async () => {
+      session.stopRequested = true;
+      session.active = false;
+
+      const localStop = this.stopLocalClient(sessionId, session);
+      const remoteStop = session.processControl?.stop() ?? Promise.resolve();
+      const [localResult, remoteResult] = await Promise.allSettled([
+        localStop,
+        remoteStop,
+      ]);
+
+      if (remoteResult.status === 'rejected') throw remoteResult.reason;
+      if (localResult.status === 'rejected') throw localResult.reason;
+      if (!this.finalizeSession(sessionId, session)) return;
+
+      const event = session.terminalEvent;
+      if (event?.kind === 'error') {
+        try {
+          session.onError(event.error);
+        } catch (error) {
+          console.error(`Terminal session ${sessionId} error callback failed:`, error);
+        }
+        return;
+      }
+
+      const exitCode = event?.kind === 'exit' ? event.exitCode : 0;
+      const signal = event?.kind === 'exit' ? event.signal : 0;
+      console.log(
+        `Terminal session ${sessionId} exited with code ${exitCode}, signal ${signal}`,
+      );
+      try {
+        session.onExit(exitCode, signal);
+      } catch (error) {
+        console.error(`Terminal session ${sessionId} exit callback failed:`, error);
+      }
+    })();
+
+    session.stopPromise = attempt;
+    try {
+      await attempt;
+    } catch (error) {
+      if (session.stopPromise === attempt) session.stopPromise = null;
+      throw error;
+    }
+  }
+
+  private async stopLocalClient(
+    sessionId: string,
+    session: TerminalSession,
+  ): Promise<void> {
+    if (session.clientExited) return;
+
+    try {
+      session.process.kill('SIGTERM');
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`Error sending SIGTERM to terminal session ${sessionId}:`, message);
+    }
+
+    if (!session.killTimeout) {
+      session.killTimeout = setTimeout(() => {
+        if (!session.clientExited) {
+          try {
+            session.process.kill('SIGKILL');
+          } catch {
+            // A concurrent exit won the race.
+          }
+        }
+      }, 5000);
+      session.killTimeout.unref?.();
+    }
+
+    const failed = new Promise<never>((_resolve, reject) => {
+      if (session.closeTimeout) clearTimeout(session.closeTimeout);
+      session.closeTimeout = setTimeout(() => {
+        reject(new Error(
+          `Could not verify that the terminal client for session ${sessionId} closed`,
+        ));
+      }, 10_000);
+      session.closeTimeout.unref?.();
+    });
+
+    try {
+      await Promise.race([session.closed, failed]);
+    } finally {
+      if (session.killTimeout) {
+        clearTimeout(session.killTimeout);
+        session.killTimeout = null;
+      }
+      if (session.closeTimeout) {
+        clearTimeout(session.closeTimeout);
+        session.closeTimeout = null;
+      }
+    }
   }
 
   private shouldIgnorePtyError(

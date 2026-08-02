@@ -375,7 +375,9 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
    * child is still exiting.
    */
   get readyForTurn(): boolean {
-    return !this.turnInFlight;
+    return !this.turnInFlight
+      && (!this.child || this.exited)
+      && !this.childNeedsVerifiedClose();
   }
 
   async start(): Promise<void> {
@@ -387,7 +389,7 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
     this.emit({
       t: 'session',
       ...(this.conversationId ? { nativeSessionId: this.conversationId } : {}),
-      cwd: this.options.workingDir,
+      cwd: this.runtimeWorkingDir,
       capabilities: this.capabilities,
     });
     // Best effort and deliberately not awaited: the picker is worth having and
@@ -554,7 +556,13 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
 
   async send(turn: UserTurn): Promise<void> {
     if (this.stopped) throw new Error('antigravity chat adapter is stopped');
-    if (this.turnInFlight) throw new Error('antigravity: a turn is already running on this session');
+    if (
+      this.turnInFlight
+      || (this.child && !this.exited)
+      || this.childNeedsVerifiedClose()
+    ) {
+      throw new Error('antigravity: a turn is already running on this session');
+    }
 
     this.turnInFlight = true;
     this.turnInterrupted = false;
@@ -606,33 +614,64 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
       child.on('spawn', accept);
 
       child.on('error', (error: Error) => {
-        this.exited = true;
-        this.emit({ t: 'error', message: `antigravity: ${error.message}` });
-        this.closeTurn('error');
-        if (!settled) {
-          settled = true;
-          reject(error);
-        }
+        void (async () => {
+          try {
+            await this.waitForVerifiedClose(child);
+          } catch (verificationError: unknown) {
+            const message = verificationError instanceof Error
+              ? verificationError.message
+              : String(verificationError);
+            this.emit({ t: 'error', message: `antigravity: ${message}`, fatal: true });
+            if (!settled) {
+              settled = true;
+              reject(verificationError);
+            }
+            return;
+          }
+          if (this.child !== child || this.exited) return;
+          this.exited = true;
+          this.emit({ t: 'error', message: `antigravity: ${error.message}` });
+          this.closeTurn('error');
+          if (!settled) {
+            settled = true;
+            reject(error);
+          }
+        })();
       });
 
-      child.on('exit', (code, signal) => this.onTurnExit(code, signal));
+      child.on('exit', (code, signal) => {
+        void this.onTurnExit(child, code, signal);
+      });
     });
   }
 
   async interrupt(): Promise<void> {
-    if (!this.child || this.exited) return;
+    const child = this.child;
+    if (!child || !this.childNeedsVerifiedClose(child)) return;
     // A one-shot process has no cancel message. Killing it ends this turn and
     // nothing else: the conversation lives in agy's own store, and the next
     // `send()` resumes it with `--conversation`.
     this.turnInterrupted = true;
-    this.child.kill('SIGINT');
+    await this.terminateChild(child, 'SIGTERM');
   }
 
   respondPermission(_requestId: string, _optionId: string): void {
     // capabilities.permissions is false: nothing is ever pending to answer.
   }
 
-  private onTurnExit(code: number | null, signal: NodeJS.Signals | null): void {
+  private async onTurnExit(
+    child: AdapterChild,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): Promise<void> {
+    try {
+      await this.waitForVerifiedClose(child);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit({ t: 'error', message: `antigravity: ${message}`, fatal: true });
+      return;
+    }
+    if (this.child !== child || this.exited) return;
     this.exited = true;
 
     if (this.stopped) {
@@ -728,7 +767,7 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
       t: 'session',
       ...(this.conversationId ? { nativeSessionId: this.conversationId } : {}),
       ...(this.reportedModel ? { model: this.reportedModel } : {}),
-      cwd: str(init.cwd) || this.options.workingDir,
+      cwd: str(init.cwd) || this.runtimeWorkingDir,
       capabilities: this.capabilities,
     });
   }

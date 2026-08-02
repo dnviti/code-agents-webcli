@@ -28,7 +28,12 @@ export interface ChatManagerDeps {
   /** Passed through to every session; see ChatSessionDeps.onLifecycle. */
   onLifecycle?: (
     sessionId: string,
-    change: { nativeSessionId?: string | null; exited?: boolean; bypassing?: boolean },
+    change: {
+      nativeSessionId?: string | null;
+      exited?: boolean;
+      bypassing?: boolean;
+      restarting?: boolean;
+    },
   ) => void;
   /**
    * The approval preference of a given user; see ChatSessionDeps.resolveBypass.
@@ -110,13 +115,13 @@ export class ChatSessionManager {
         broadcast: this.deps.broadcast,
         resolveCommand: this.deps.resolveCommand,
         resolveCommandName: this.deps.resolveCommandName,
-        // Closed over the owner for the same reason `resolveBypass` below is:
-        // what a conversation may reach is a fact about the person it belongs
-        // to, and the id is right here at the one moment it is certain.
-        readFile: (sessionId, filePath) =>
-          this.readFile(sessionId, filePath, record.ownerUserId),
-        writeFile: (sessionId, filePath, contents) =>
-          this.writeFile(sessionId, filePath, contents, record.ownerUserId),
+        readFile: options.fileAccess
+          ? (_sessionId, filePath) => options.fileAccess!.readFile(filePath)
+          : (sessionId, filePath) => this.readFile(sessionId, filePath, record.ownerUserId),
+        writeFile: options.fileAccess
+          ? (_sessionId, filePath, contents) => options.fileAccess!.writeFile(filePath, contents)
+          : (sessionId, filePath, contents) =>
+            this.writeFile(sessionId, filePath, contents, record.ownerUserId),
         onLifecycle: this.deps.onLifecycle,
         // Closed over this record's owner, so a conversation restarted from
         // inside itself resolves against the preference of the person whose
@@ -133,7 +138,12 @@ export class ChatSessionManager {
     try {
       await session.start(options);
     } catch (error) {
-      this.sessions.delete(record.id);
+      // `ChatSession.start` verifies teardown before dropping its adapter. If
+      // that proof failed, retain the session so admission remains closed and
+      // a later explicit stop can retry the identity-bound control path.
+      if (!session.ownsAdapter && this.sessions.get(record.id) === session) {
+        this.sessions.delete(record.id);
+      }
       throw error;
     }
 
@@ -436,8 +446,10 @@ export class ChatSessionManager {
   async stop(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    this.sessions.delete(sessionId);
     await session.stop();
+    if (this.sessions.get(sessionId) === session) {
+      this.sessions.delete(sessionId);
+    }
   }
 
   async stopAll(): Promise<void> {
