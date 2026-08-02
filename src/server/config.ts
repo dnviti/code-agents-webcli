@@ -45,6 +45,8 @@ export function createConfig(options: ServerOptions): ServerState {
       options.allowAnyGitHubUser === true ||
       process.env.GITHUB_ALLOW_ANY_USER === 'true',
     dataDir: options.dataDir || process.env.CODE_AGENTS_WEBCLI_DATA_DIR || null,
+    encryptionKey:
+      options.encryptionKey || process.env.CODE_AGENTS_WEBCLI_ENCRYPTION_KEY || null,
     sessionDurationHours,
     aliases,
     startTime: Date.now(),

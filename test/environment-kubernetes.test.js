@@ -16,7 +16,19 @@ function fakeKubectl(responses = {}) {
     const verb = args.find((a, i) => i > 0 && !a.startsWith('-') && args[i - 1] !== '--context' && args[i - 1] !== '--namespace');
     const handler = responses[verb];
     if (typeof handler === 'function') {
-      return handler(args, input);
+      const result = await handler(args, input);
+      const output = args[args.indexOf('-o') + 1];
+      if (output === 'json' && result.stdout.trim() && !result.stdout.trim().startsWith('{')) {
+        return {
+          ...result,
+          stdout: JSON.stringify({
+            status: { phase: result.stdout.trim() },
+            spec: { containers: [{ image: 'example/image:1' }] },
+            metadata: { labels: {} },
+          }),
+        };
+      }
+      return result;
     }
     return { stdout: '', stderr: '' };
   };
@@ -80,6 +92,15 @@ describe('the kubernetes engine', function () {
       // The spellings people actually type.
       assert.strictEqual(createContainerConfig({ containerEngine: 'k8s' }, {}).engine, 'kubernetes');
       assert.strictEqual(createContainerConfig({ containerEngine: 'kube' }, {}).engine, 'kubernetes');
+    });
+
+    it('checks availability with namespace-scoped pod access', async function () {
+      const { engine, calls } = engineWith({});
+
+      assert.strictEqual(await engine.available(), true);
+      const probe = calls.find((call) => call.args.includes('--limit=1'));
+      assert.ok(probe.args.includes('pods'));
+      assert.strictEqual(probe.args.includes('namespace'), false);
     });
   });
 
@@ -210,6 +231,25 @@ describe('the kubernetes engine', function () {
       assert.strictEqual(calls.some((c) => c.args.includes('delete')), false);
     });
 
+    it('refuses to adopt a running pod with incompatible identity labels', async function () {
+      const { engine, calls } = engineWith({
+        get: async () => ({
+          stdout: JSON.stringify({
+            status: { phase: 'Running' },
+            spec: { containers: [{ image: 'img' }] },
+            metadata: { labels: { 'com.code-agents-webcli.managed': 'false' } },
+          }),
+          stderr: '',
+        }),
+      });
+      await assert.rejects(
+        engine.ensure({ ...SPEC, identityLabels: ['com.code-agents-webcli.managed'] }),
+        /incompatible ownership label/,
+      );
+      assert.strictEqual(calls.some((c) => c.args.includes('apply')), false);
+      assert.strictEqual(calls.some((c) => c.args.includes('delete')), false);
+    });
+
     it('waits for a new pod instead of racing the scheduler', async function () {
       const phases = ['Pending', 'Pending', 'Running'];
       let index = 0;
@@ -258,6 +298,22 @@ describe('the kubernetes engine', function () {
       const { engine } = engineWith({ get: async () => { throw new Error('NotFound'); } });
       assert.strictEqual(await engine.status('gone'), null);
       assert.strictEqual(await engine.describe('gone'), null);
+    });
+
+    it('does not turn a strict kubectl failure into absence', async function () {
+      const { engine } = engineWith({
+        get: async () => { throw new Error('Forbidden'); },
+      });
+      await assert.rejects(engine.describeStrict('pod-1'), /Forbidden/);
+      assert.strictEqual(await engine.describe('pod-1'), null);
+    });
+
+    it('does not turn malformed pod JSON into strict absence', async function () {
+      const { engine } = engineWith({
+        get: async () => ({ stdout: '{broken', stderr: '' }),
+      });
+      await assert.rejects(engine.describeStrict('pod-1'), /invalid JSON/);
+      assert.strictEqual(await engine.describe('pod-1'), null);
     });
 
     it('reads usage from kubectl top, in cores and bytes', async function () {

@@ -115,6 +115,8 @@ export interface ShellDialogs {
   settings: boolean;
   /** Per-runtime launch configuration: model, args, env, tiers. */
   runtimeProfiles: boolean;
+  /** Where containers run: the installer's deploy target editor. */
+  deployTargets: boolean;
   /** The per-user environment size picker; only reachable when the server has environments. */
   environment: boolean;
   newSession: boolean;
@@ -286,6 +288,7 @@ const INITIAL: ShellState = {
   dialogs: {
     settings: false,
     runtimeProfiles: false,
+    deployTargets: false,
     environment: false,
     newSession: false,
     terminalOptions: false,

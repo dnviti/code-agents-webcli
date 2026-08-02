@@ -43,6 +43,7 @@ function fakeEngine(overrides = {}) {
     async remove(name) { calls.push({ op: 'remove', name }); },
     async status() { return 'running'; },
     async describe() { return null; },
+    async describeStrict(name) { return this.describe(name); },
     async exec() { return { stdout: 'sh\n', stderr: '' }; },
     execArgs: (spec, command, args) => ['exec', spec.name, command, ...args],
     async list() { return []; },
@@ -306,6 +307,29 @@ describe('environment tiers', function () {
       assert.strictEqual(engine.calls.filter((c) => c.op === 'ensure').length, before + 1);
       assert.strictEqual(manager.pendingTierFor(5), null);
       assert.strictEqual(manager.appliedTierFor(5).id, 'large');
+    });
+
+    it('keeps a deferred change pending when the old environment cannot stop', async function () {
+      const engine = fakeEngine({
+        resize: async () => false,
+        stop: async () => { throw new Error('daemon refused the stop'); },
+      });
+      let chosen = 'medium';
+      const manager = managerWith(engine, { options: { getUserTier: () => chosen } });
+      await manager.ensureFor({ id: 8, githubLogin: 'hal' });
+
+      chosen = 'large';
+      assert.strictEqual(await manager.applyTier(8, TIERS[2], { busy: true }), 'deferred');
+      const ensuresBefore = engine.calls.filter((call) => call.op === 'ensure').length;
+
+      await assert.rejects(
+        manager.ensureFor({ id: 8, githubLogin: 'hal' }),
+        /could not replace for a size change: daemon refused the stop/,
+      );
+      assert.strictEqual(manager.pendingTierFor(8).id, 'large');
+      assert.strictEqual(manager.appliedTierFor(8).id, 'medium');
+      assert.strictEqual(engine.calls.filter((call) => call.op === 'ensure').length, ensuresBefore);
+      assert.strictEqual(manager.existing(8).name, 'cawc-hal-8');
     });
 
     it('rebuilds straight away when nothing is running', async function () {

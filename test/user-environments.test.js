@@ -22,7 +22,7 @@ function fakeEngine(kind, responses = {}) {
   const calls = [];
   const runner = async (file, args) => {
     calls.push({ file, args });
-    const key = args[0];
+    const key = args[0] === 'container' ? args[1] : args[0];
     const handler = responses[key];
     if (typeof handler === 'function') {
       return handler(args);
@@ -41,6 +41,21 @@ function fakeEngine(kind, responses = {}) {
 
 function tmpRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'cawc-env-'));
+}
+
+function managedInspect(args, status, userId, login = 'user') {
+  const format = args[args.indexOf('--format') + 1] || '';
+  if (!format.includes('Config.Labels')) {
+    return { stdout: `${status}\n`, stderr: '' };
+  }
+  return {
+    stdout: `${status}\texample/image:1\t${JSON.stringify({
+      [MANAGED_LABEL]: 'true',
+      [USER_ID_LABEL]: String(userId),
+      [LOGIN_LABEL]: login,
+    })}\n`,
+    stderr: '',
+  };
 }
 
 describe('per-user environments', function () {
@@ -217,12 +232,60 @@ describe('per-user environments', function () {
       assert.ok(!ps.args.some((a) => a.includes('{{.Labels}}')));
     });
 
+    it('scopes inspection to containers so same-named images are irrelevant', async function () {
+      const { engine, calls } = fakeEngine('podman', {
+        inspect: async () => { throw new Error('No such container'); },
+      });
+
+      assert.strictEqual(await engine.describeStrict('shared-name'), null);
+      const inspect = calls.find((call) => call.args.includes('inspect'));
+      assert.deepStrictEqual(inspect.args.slice(0, 2), ['container', 'inspect']);
+    });
+
     it('reports an absent container rather than throwing', async function () {
       const { engine } = fakeEngine('docker', {
         inspect: async () => { throw new Error('No such object'); },
       });
       assert.strictEqual(await engine.status('gone'), null);
       assert.strictEqual(await engine.describe('gone'), null);
+    });
+
+    it('does not turn an inspect failure into strict absence', async function () {
+      const { engine } = fakeEngine('docker', {
+        inspect: async () => { throw new Error('permission denied by daemon'); },
+      });
+      await assert.rejects(engine.describeStrict('box'), /permission denied/);
+      assert.strictEqual(await engine.describe('box'), null, 'operator views remain best-effort');
+    });
+
+    it('does not turn malformed inspect labels into strict absence', async function () {
+      const { engine } = fakeEngine('docker', {
+        inspect: async () => ({ stdout: 'running\timg\t{broken\n', stderr: '' }),
+      });
+      await assert.rejects(engine.describeStrict('box'), /invalid labels/);
+      assert.strictEqual(await engine.describe('box'), null);
+    });
+
+    it('refuses to adopt an existing container with incompatible identity labels', async function () {
+      const { engine, calls } = fakeEngine('docker', {
+        inspect: async (args) => managedInspect(args, 'running', 2, 'other'),
+      });
+      await assert.rejects(
+        engine.ensure({
+          name: 'cawc-alice-1',
+          image: 'example/image:1',
+          mounts: [],
+          containerHome: '/home/alice-1',
+          cpus: null,
+          memory: null,
+          labels: { [MANAGED_LABEL]: 'true', [USER_ID_LABEL]: '1' },
+          identityLabels: [MANAGED_LABEL, USER_ID_LABEL],
+          env: {},
+        }),
+        /incompatible ownership label/,
+      );
+      assert.strictEqual(calls.some((call) => call.args[0] === 'start'), false);
+      assert.strictEqual(calls.some((call) => call.args[0] === 'run'), false);
     });
 
     it('never passes user text through a shell', function () {
@@ -320,11 +383,11 @@ describe('per-user environments', function () {
       const root = tmpRoot();
       let exists = false;
       const { engine, calls } = fakeEngine('podman', {
-        inspect: async () => {
+        inspect: async (args) => {
           if (!exists) {
-            throw new Error('no such container');
+            throw new Error('No such container');
           }
-          return { stdout: 'running\n', stderr: '' };
+          return managedInspect(args, 'running', 1, 'alice');
         },
         run: async () => {
           exists = true;
@@ -353,7 +416,7 @@ describe('per-user environments', function () {
       const root = tmpRoot();
       let homeAtCreate = null;
       const { engine } = fakeEngine('podman', {
-        inspect: async () => { throw new Error('absent'); },
+        inspect: async () => { throw new Error('No such object'); },
         run: async (args) => {
           const volume = args[args.indexOf('--volume') + 1].split(':')[0];
           homeAtCreate = fs.existsSync(volume);
@@ -372,7 +435,7 @@ describe('per-user environments', function () {
     it('starts a stopped environment instead of recreating it', async function () {
       const root = tmpRoot();
       const { engine, calls } = fakeEngine('docker', {
-        inspect: async () => ({ stdout: 'exited\n', stderr: '' }),
+        inspect: async (args) => managedInspect(args, 'exited', 4, 'dan'),
       });
       const config = { ...createContainerConfig({ containers: true }, {}), rootDir: root };
       const manager = new EnvironmentManager({ config, engine, hostHome: '/srv/work' });
@@ -389,9 +452,9 @@ describe('per-user environments', function () {
       const root = tmpRoot();
       let exists = false;
       const { engine, calls } = fakeEngine('podman', {
-        inspect: async () => {
-          if (!exists) throw new Error('absent');
-          return { stdout: 'running', stderr: '' };
+        inspect: async (args) => {
+          if (!exists) throw new Error('No such object');
+          return managedInspect(args, 'running', 5, 'erin');
         },
         run: async () => {
           await new Promise((resolve) => setTimeout(resolve, 10));
@@ -414,9 +477,9 @@ describe('per-user environments', function () {
       const root = tmpRoot();
       let exists = false;
       const { engine, calls } = fakeEngine('podman', {
-        inspect: async () => {
-          if (!exists) throw new Error('absent');
-          return { stdout: 'running', stderr: '' };
+        inspect: async (args) => {
+          if (!exists) throw new Error('No such object');
+          return managedInspect(args, 'running', 6, 'frank');
         },
         run: async () => { exists = true; return { stdout: '', stderr: '' }; },
       });
@@ -439,7 +502,7 @@ describe('per-user environments', function () {
     it('reports the shells the image actually has, not this host\'s', async function () {
       const root = tmpRoot();
       const { engine } = fakeEngine('podman', {
-        inspect: async () => { throw new Error('absent'); },
+        inspect: async () => { throw new Error('No such object'); },
         exec: async () => ({ stdout: 'bash\nsh\n', stderr: '' }),
       });
       const config = { ...createContainerConfig({ containers: true }, {}), rootDir: root };
@@ -451,7 +514,7 @@ describe('per-user environments', function () {
     it('falls back to sh when the shell probe fails', async function () {
       const root = tmpRoot();
       const { engine } = fakeEngine('podman', {
-        inspect: async () => { throw new Error('absent'); },
+        inspect: async () => { throw new Error('No such object'); },
         exec: async () => { throw new Error('probe blew up'); },
       });
       const config = { ...createContainerConfig({ containers: true }, {}), rootDir: root };
@@ -463,7 +526,7 @@ describe('per-user environments', function () {
     it('survives a failing setup command', async function () {
       const root = tmpRoot();
       const { engine } = fakeEngine('podman', {
-        inspect: async () => { throw new Error('absent'); },
+        inspect: async () => { throw new Error('No such object'); },
         exec: async () => { throw new Error('setup blew up'); },
       });
       const config = {
@@ -479,7 +542,10 @@ describe('per-user environments', function () {
       const root = tmpRoot();
       let clock = 1_000_000;
       const { engine, calls } = fakeEngine('podman', {
-        inspect: async () => ({ stdout: 'running', stderr: '' }),
+        inspect: async (args) => {
+          const name = args[args.length - 1];
+          return managedInspect(args, 'running', Number(name.split('-').at(-1)));
+        },
       });
       const config = {
         ...createContainerConfig({ containers: true, containerIdleMinutes: 10 }, {}),
@@ -507,7 +573,7 @@ describe('per-user environments', function () {
       const root = tmpRoot();
       let clock = 1_000_000;
       const { engine, calls } = fakeEngine('podman', {
-        inspect: async () => ({ stdout: 'running', stderr: '' }),
+        inspect: async (args) => managedInspect(args, 'running', 20, 'nina'),
       });
       const config = {
         ...createContainerConfig({ containers: true, containerIdleMinutes: 10 }, {}),
@@ -536,7 +602,7 @@ describe('per-user environments', function () {
     it('never stops anything when idle stopping is off', async function () {
       const root = tmpRoot();
       const { engine } = fakeEngine('podman', {
-        inspect: async () => ({ stdout: 'running', stderr: '' }),
+        inspect: async (args) => managedInspect(args, 'running', 10, 'jo'),
       });
       const config = { ...createContainerConfig({ containers: true }, {}), rootDir: root };
       const manager = new EnvironmentManager({ config, engine, hostHome: '/srv/work' });
@@ -580,7 +646,7 @@ describe('per-user environments', function () {
     it('removes an environment and, on request, its data', async function () {
       const root = tmpRoot();
       const { engine, calls } = fakeEngine('docker', {
-        inspect: async () => { throw new Error('absent'); },
+        inspect: async () => { throw new Error('No such object'); },
       });
       const config = { ...createContainerConfig({ containers: true }, {}), rootDir: root };
       const manager = new EnvironmentManager({ config, engine, hostHome: '/srv/work' });

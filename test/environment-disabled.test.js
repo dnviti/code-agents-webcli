@@ -33,6 +33,7 @@ function forbiddenEngine() {
     remove: fail('remove'),
     status: fail('status'),
     describe: fail('describe'),
+    describeStrict: fail('describeStrict'),
     exec: fail('exec'),
     execArgs: fail('execArgs'),
     list: fail('list'),

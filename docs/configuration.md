@@ -82,6 +82,7 @@ for the prerequisites, where the data lives, and the operator commands.
 | `--container-memory <size>` | unlimited | Memory limit per environment, e.g. `4g`. |
 | `--container-idle-minutes <n>` | `0` | Stop an idle environment after this long; `0` never does. |
 | `--container-setup <command>` | — | Shell run once inside each newly created environment. |
+| `--encryption-key <key>` | — | base64 or hex 32-byte key for deploy-target secrets. |
 
 Two subcommands operate on them, and work whether or not the server is running:
 
@@ -89,6 +90,13 @@ Two subcommands operate on them, and work whether or not the server is running:
 cc-web env ls                                # what exists, and whose it is
 cc-web env rm <name> [--purge-data]          # remove one, optionally with its data
 ```
+
+### Deploy targets
+
+Once the feature is on, the place environments run is configured in the web UI
+as a set of deploy targets rather than through these flags. You can name
+several targets, switch the active one at runtime, and let each carry its own
+connection secrets. See [Deploy targets](deploy-targets.md).
 
 ### TLS
 
@@ -165,6 +173,7 @@ Useful in a container or a unit file, where flags are awkward.
 | `CODE_AGENTS_WEBCLI_CONTAINER_MEMORY` | `--container-memory` | unlimited |
 | `CODE_AGENTS_WEBCLI_CONTAINER_IDLE_MINUTES` | `--container-idle-minutes` | `0` |
 | `CODE_AGENTS_WEBCLI_CONTAINER_SETUP` | `--container-setup` | — |
+| `CODE_AGENTS_WEBCLI_ENCRYPTION_KEY` | `--encryption-key` | — |
 | `CLAUDE_ALIAS` … `ANTIGRAVITY_ALIAS` | `--*-alias` | see above |
 
 These have **no flag** and can only be set through the environment:
@@ -200,9 +209,10 @@ Everything sits under the data directory — `~/.code-agents-webcli` unless
 | `<user>/<session>.jsonl` | Event log for a [WebUI chat](runtimes.md#the-webui-beta) session. |
 | `runtime-profiles/` | Generated per-runtime tier configuration that cannot be written into a project. |
 
-The database holds OAuth credentials and live auth sessions. Treat it as
-sensitive, and include it in whatever you back up — losing it loses your users,
-their sessions and your configuration.
+The database holds OAuth credentials, live auth sessions, and the encryption key
+for deploy-target secrets when no `CODE_AGENTS_WEBCLI_ENCRYPTION_KEY` is supplied.
+Treat it as sensitive, and include it in whatever you back up — losing it loses
+your users, their sessions and your configuration.
 
 Some files are written **inside your project directory** rather than the data
 directory, because the agent CLIs have to be able to read them:

@@ -53,6 +53,8 @@ export interface ServerOptions {
   kubeNamespace?: string;
   kubeStorageClaim?: string;
   kubeServiceAccount?: string;
+  /** Base64/hex 32-byte key encrypting deploy-target secrets at rest. */
+  encryptionKey?: string;
 }
 
 export interface Aliases {
@@ -371,6 +373,7 @@ export interface ServerState {
   allowedGitHubIds: string[];
   allowAnyGitHubUser: boolean;
   dataDir: string | null;
+  encryptionKey: string | null;
   sessionDurationHours: number;
   aliases: Aliases;
   startTime: number;

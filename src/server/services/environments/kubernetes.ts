@@ -35,7 +35,9 @@ import {
   RunResult,
   defaultRunner,
   parseSize,
+  validateIdentityLabels,
 } from './engine.js';
+import { TARGET_LABEL, targetLabelValue } from './naming.js';
 import { ContainerEngineKind, Mount } from './types.js';
 
 /** The one container in every environment Pod. */
@@ -72,6 +74,11 @@ export interface KubernetesOptions {
    * socket does not cross a pod boundary.
    */
   callbackHost?: string | null;
+  /**
+   * Path to a kubeconfig file to use for every kubectl invocation. When set,
+   * `--kubeconfig <path>` precedes `--context` and `--namespace`.
+   */
+  kubeconfigPath?: string | null;
   /** Seconds to wait for a new pod to become ready. */
   readyTimeoutSeconds?: number;
   /** Overrides the poll interval while waiting; only tests set this. */
@@ -118,6 +125,7 @@ export class KubernetesEngine implements EnvironmentEngine {
   private readonly storageClaim: string;
   private readonly rootDir: string;
   private readonly serviceAccount: string | null;
+  private readonly kubeconfigPath: string | null;
   private readonly readyTimeoutSeconds: number;
   private readonly pollIntervalMs: number;
 
@@ -129,13 +137,17 @@ export class KubernetesEngine implements EnvironmentEngine {
     this.storageClaim = options.storageClaim;
     this.rootDir = options.rootDir;
     this.serviceAccount = options.serviceAccount ?? null;
+    this.kubeconfigPath = options.kubeconfigPath ?? null;
     this.readyTimeoutSeconds = options.readyTimeoutSeconds ?? 120;
     this.pollIntervalMs = options.pollIntervalMs ?? 1000;
   }
 
-  /** Context and namespace on every call, so none of them can land elsewhere. */
+  /** Kubeconfig, context and namespace on every call, so none can land elsewhere. */
   private base(): string[] {
     const args: string[] = [];
+    if (this.kubeconfigPath) {
+      args.push('--kubeconfig', this.kubeconfigPath);
+    }
     if (this.context) {
       args.push('--context', this.context);
     }
@@ -227,16 +239,20 @@ export class KubernetesEngine implements EnvironmentEngine {
   }
 
   async ensure(spec: CreateContainerSpec): Promise<{ created: boolean }> {
-    const status = await this.status(spec.name);
+    const described = await this.describeStrict(spec.name);
 
-    if (status === 'running') {
+    if (described) {
+      validateIdentityLabels(spec, described);
+    }
+
+    if (described?.status === 'running') {
       return { created: false };
     }
 
     // A pod that exists but is not running cannot be revived, and `apply` will
     // not replace it — most of a Pod's spec is immutable. Deleting first is the
     // only way forward, and it is safe: the home is on the claim.
-    if (status) {
+    if (described) {
       await this.remove(spec.name);
     }
 
@@ -296,25 +312,49 @@ export class KubernetesEngine implements EnvironmentEngine {
     }
   }
 
+  async describeStrict(name: string): Promise<ContainerDescription | null> {
+    const { stdout } = await this.run(this.binary, [
+      ...this.base(), 'get', 'pod', name, '--ignore-not-found',
+      '-o', 'json',
+    ]);
+    if (!stdout.trim()) {
+      return null;
+    }
+    let pod: {
+      status?: { phase?: unknown };
+      spec?: { containers?: Array<{ image?: unknown }> };
+      metadata?: { labels?: unknown };
+    };
+    try {
+      pod = JSON.parse(stdout);
+    } catch (error) {
+      throw new Error(
+        `engine returned invalid JSON for '${name}': ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const phase = typeof pod.status?.phase === 'string' ? pod.status.phase : '';
+    const image = typeof pod.spec?.containers?.[0]?.image === 'string'
+      ? pod.spec.containers[0].image
+      : '';
+    const rawLabels = pod.metadata?.labels;
+    if (rawLabels !== undefined && (rawLabels === null || typeof rawLabels !== 'object')) {
+      throw new Error(`engine returned invalid labels for '${name}'`);
+    }
+    const labels = Object.fromEntries(
+      Object.entries((rawLabels || {}) as Record<string, unknown>)
+        .filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+    );
+    return {
+      name,
+      status: phase === 'Running' ? 'running' : (phase || 'unknown').toLowerCase(),
+      image: image || '',
+      labels: desanitiseLabels(labels),
+    };
+  }
+
   async describe(name: string): Promise<ContainerDescription | null> {
     try {
-      const { stdout } = await this.run(this.binary, [
-        ...this.base(), 'get', 'pod', name,
-        '-o', 'jsonpath={.status.phase}{"\\t"}{.spec.containers[0].image}{"\\t"}{.metadata.labels}',
-      ]);
-      const [phase, image, labelsJson] = stdout.trim().split('\t');
-      let labels: Record<string, string> = {};
-      try {
-        labels = JSON.parse(labelsJson || '{}') || {};
-      } catch {
-        labels = {};
-      }
-      return {
-        name,
-        status: phase === 'Running' ? 'running' : (phase || 'unknown').toLowerCase(),
-        image: image || '',
-        labels: desanitiseLabels(labels),
-      };
+      return await this.describeStrict(name);
     } catch {
       return null;
     }
@@ -431,7 +471,12 @@ export class KubernetesEngine implements EnvironmentEngine {
 
   async available(): Promise<boolean> {
     try {
-      await this.run(this.binary, [...this.base(), 'get', 'namespace', this.namespace, '-o', 'name']);
+      // Probe only the namespace-scoped permission environments actually use.
+      // A least-privileged Role may manage Pods without being allowed to GET
+      // the cluster-scoped Namespace object itself.
+      await this.run(this.binary, [
+        ...this.base(), 'get', 'pods', '--limit=1', '-o', 'name',
+      ]);
       return true;
     } catch {
       return false;
@@ -491,7 +536,9 @@ export class KubernetesEngine implements EnvironmentEngine {
 function sanitiseLabels(labels: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(labels)) {
-    out[key] = value.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 63);
+    out[key] = key === TARGET_LABEL
+      ? targetLabelValue(value)
+      : value.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 63);
   }
   return out;
 }
