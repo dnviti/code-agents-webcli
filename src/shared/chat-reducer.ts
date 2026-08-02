@@ -639,6 +639,7 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         blocks: [],
         streaming: true,
         model: event.model,
+        ...(event.workflow ? { workflow: event.workflow } : {}),
         ...(event.steer ? { steer: true as const } : {}),
       };
       state.index[event.id] = state.messages.length;

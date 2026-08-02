@@ -54,6 +54,17 @@ export interface WorkspacePanelProps {
   onOpenFile: (path: string) => void;
   /** Full-width sheet instead of a fixed rail. */
   isMobile?: boolean;
+  /** The guided issue workflow is forbidden while this conversation plans. */
+  planMode?: boolean;
+  /** A dead session cannot accept a new workflow turn. */
+  unavailableReason?: string | null;
+  /** Conversation-scoped popup draft, owned above the conditional rail. */
+  issuePrompt?: string;
+  /** Stable admission key retained beside the popup draft. */
+  issueRequestId?: string;
+  onIssuePromptChange?: (value: string) => void;
+  /** Starts the app-owned GitHub issue workflow in the active conversation. */
+  onStartGitHubIssue?: (prompt: string, requestId: string) => Promise<void>;
   /**
    * The `trace` tab's contents, built by the caller.
    *
@@ -76,6 +87,12 @@ export function WorkspacePanel({
   onResize,
   onOpenFile,
   isMobile = false,
+  planMode = false,
+  unavailableReason,
+  issuePrompt = '',
+  issueRequestId,
+  onIssuePromptChange,
+  onStartGitHubIssue,
   trace,
 }: WorkspacePanelProps): React.JSX.Element | null {
   const tabs = enabledPanels(settings);
@@ -156,7 +173,17 @@ export function WorkspacePanel({
         {active === 'changes' ? (
           <GitChangesPanel sessionId={sessionId} revision={revision} onOpenFile={onOpenFile} />
         ) : null}
-        {active === 'github' ? <GitHubPanel sessionId={sessionId} /> : null}
+        {active === 'github' ? (
+          <GitHubPanel
+            sessionId={sessionId}
+            planMode={planMode}
+            unavailableReason={unavailableReason}
+            issuePrompt={issuePrompt}
+            issueRequestId={issueRequestId}
+            onIssuePromptChange={onIssuePromptChange}
+            onStartIssue={onStartGitHubIssue}
+          />
+        ) : null}
         {active === 'agents' ? (
           <AgentsPanel
             transcript={transcript}

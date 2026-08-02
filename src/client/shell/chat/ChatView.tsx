@@ -2,7 +2,11 @@ import * as React from 'react';
 import { ChatAttachment, ChatDraft, ChatState } from '../../../shared/chat-events.js';
 import { uploadAttachment } from '../../chat/attachments-api.js';
 import { branchConversation, type BranchedConversation } from '../../chat/branch-api.js';
-import { ChatController, type ChatUnavailable } from '../../chat/controller.js';
+import {
+  ChatController,
+  createBuiltInWorkflowRequestId,
+  type ChatUnavailable,
+} from '../../chat/controller.js';
 import { fetchStatus, findFiles } from '../../chat/workspace-api.js';
 import { activityEvents } from '../../chat/activity.js';
 import { loadEffortPreferences, rememberEffort } from '../../chat/effort-preference.js';
@@ -223,6 +227,14 @@ export function ChatView({
   );
   const exited = chatState === 'exited';
   const unavailable = controller.unavailableReason;
+  const workflowUnavailableReason = !controller.builtInWorkflowsAvailable
+    ? 'This server does not support guided workflows.'
+    : unavailable?.message
+      ?? (exited
+        ? 'This conversation has ended.'
+        : !transcript.live
+          ? 'This conversation is not running. Resume it before creating an issue.'
+          : null);
   const busy = transcript.busy;
   const planLocked = transcript.live
     && chatState !== 'idle'
@@ -359,6 +371,21 @@ export function ChatView({
   // the draft is destroyed by looking at another chat for a moment — and without
   // the sync behind it, by picking up a different device (#163).
   const [draft, setDraft] = useSyncedDraft(controller);
+  // Unlike the synchronized composer, this popup draft is local to the active
+  // conversation. It lives above the conditional rail so closing the rail or
+  // crossing the phone breakpoint cannot destroy it.
+  const [issueDraft, setIssueDraft] = React.useState(() => ({
+    text: '',
+    requestId: createBuiltInWorkflowRequestId(),
+  }));
+  const setIssuePrompt = React.useCallback((text: string) => {
+    setIssueDraft((current) => current.text === text
+      ? current
+      : { text, requestId: createBuiltInWorkflowRequestId() });
+  }, []);
+  React.useEffect(() => {
+    setIssueDraft({ text: '', requestId: createBuiltInWorkflowRequestId() });
+  }, [controller.sessionId]);
   // Shared by the transcript and both workspace tabs. Keeping it above the
   // rail means a code link can open the same popup even while that rail is
   // closed, and closing the rail no longer closes a file somebody is reading.
@@ -507,6 +534,24 @@ export function ChatView({
     // want to be looking at its end, not wherever you had scrolled to.
     list.current?.pin();
   }, [controller]);
+  const startGitHubIssue = React.useCallback(
+    async (prompt: string, requestId: string) => {
+      // This is not composer submission: preserving that draft is important
+      // when the issue interview is queued behind a current turn.
+      await controller.startBuiltInWorkflow('gh-issue', prompt, requestId);
+      controller.cancelSeek();
+      setSeeking(null);
+      setSelectedTurnId(null);
+      list.current?.pin();
+      if (isMobile) setView({ panelOpen: false });
+      // At this point the popup handoff is complete and its success path will
+      // clear the retained prompt/id. The server may now release its dedupe
+      // entry; before this point a timeout or local failure must remain safe to
+      // retry with the same id.
+      controller.acknowledgeBuiltInWorkflow('gh-issue', requestId);
+    },
+    [controller, isMobile, setView],
+  );
   const loadMore = React.useCallback(() => controller.loadMore(), [controller]);
   const respond = React.useCallback(
     (requestId: string, optionId: string) => controller.respondPermission(requestId, optionId),
@@ -736,6 +781,21 @@ export function ChatView({
       // A turn replayed from history can begin with something other than a
       // user message. Silence would read as a broken button.
       showNotification('There is no message to send again for this turn.');
+      return;
+    }
+    if (opener?.workflow) {
+      const requestId = createBuiltInWorkflowRequestId();
+      void controller.startBuiltInWorkflow(opener.workflow, text, requestId)
+        .then(() => {
+          list.current?.pin();
+          controller.acknowledgeBuiltInWorkflow(opener.workflow!, requestId);
+        })
+        .catch((error: unknown) => {
+          showNotification(
+            error instanceof Error ? error.message : 'That guided workflow could not be started again.',
+            'error',
+          );
+        });
       return;
     }
     controller.sendTurn(text, []);
@@ -1089,6 +1149,12 @@ export function ChatView({
               onClose={() => setView({ panelOpen: false })}
               onOpenFile={openFile}
               isMobile
+              planMode={controller.planModeValue}
+              unavailableReason={workflowUnavailableReason}
+              issuePrompt={issueDraft.text}
+              issueRequestId={issueDraft.requestId}
+              onIssuePromptChange={setIssuePrompt}
+              onStartGitHubIssue={startGitHubIssue}
             />
           ) : null}
 
@@ -1345,6 +1411,12 @@ export function ChatView({
             onClose={() => setView({ panelOpen: false })}
             onResize={(panelWidth) => setView({ panelWidth })}
             onOpenFile={openFile}
+            planMode={controller.planModeValue}
+            unavailableReason={workflowUnavailableReason}
+            issuePrompt={issueDraft.text}
+            issueRequestId={issueDraft.requestId}
+            onIssuePromptChange={setIssuePrompt}
+            onStartGitHubIssue={startGitHubIssue}
           />
         ) : null}
 

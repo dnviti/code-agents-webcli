@@ -26,8 +26,12 @@ import {
   ChatDraft,
   ChatModelDefault,
   ChatModelOrigin,
+  BuiltInWorkflowId,
+  MAX_BUILT_IN_WORKFLOW_PROMPT,
   MAX_QUESTION_ANSWER_TEXT,
+  isBuiltInWorkflowId,
 } from '../../shared/chat-events.js';
+import { builtInWorkflowInstructions } from '../chat/builtin-workflows.js';
 import { LadderRung, ModelTier, ResolvedProfile } from '../../shared/runtime-profiles.js';
 
 /**
@@ -98,6 +102,24 @@ const MAX_MODEL_NAME = 200;
  * nothing measurable next to the output it stands in for.
  */
 const ACTIVITY_ANNOUNCE_MS = 1000;
+
+/** A bounded process-lifetime cache prevents arbitrary ids becoming retained state. */
+const MAX_BUILT_IN_WORKFLOW_ADMISSIONS = 512;
+const MAX_BUILT_IN_WORKFLOW_REQUEST_ID = 200;
+
+interface BuiltInWorkflowAdmissionResult {
+  accepted: boolean;
+  message: string;
+  status?: 'accepted' | 'queued';
+}
+
+interface BuiltInWorkflowAdmission {
+  workflow: BuiltInWorkflowId;
+  prompt: string;
+  promise: Promise<BuiltInWorkflowAdmissionResult>;
+  /** True only after the state-changing admission took ownership of the turn. */
+  accepted: boolean;
+}
 
 /**
  * Tidy a typed model name into something safe to keep.
@@ -284,9 +306,13 @@ export interface ChatManagerLike {
   snapshot(record: SessionRecord): Promise<{
     live?: boolean;
     runtime?: string;
+    planMode?: boolean;
     planDocument?: { markdown: string; revision: number; ts: number } | null;
   }>;
-  send(sessionId: string, turn: { text: string; attachments?: unknown[] }): Promise<void>;
+  send(
+    sessionId: string,
+    turn: { text: string; attachments?: unknown[]; workflow?: BuiltInWorkflowId },
+  ): Promise<'accepted' | 'queued'>;
   interrupt(sessionId: string): Promise<void>;
   /** Switch a live session's model. False when nothing is running, or the adapter cannot. */
   setModel(sessionId: string, model: string): Promise<boolean>;
@@ -361,6 +387,8 @@ interface IncomingMessage {
   fromLine?: number;
   count?: number;
   requestId?: string;
+  /** Correlates an app-owned workflow request with its admission result. */
+  workflow?: string;
   /**
    * The one free-text field a frame carries: a turn on `chat_send`, and what
    * the user typed in their own words on `chat_question_answer`. Shared rather
@@ -436,6 +464,14 @@ export class MessageProcessor {
     string,
     { session: SessionRecord; runId: string | undefined; promise: Promise<void> }
   >();
+  /**
+   * Successful workflow admissions keyed by owner, conversation and client id.
+   *
+   * The browser retries with the same id after a timeout. Keeping the in-flight
+   * promise as well as its answer makes both a concurrent retry and a lost
+   * acknowledgement exactly-once at the chat-manager boundary.
+   */
+  private builtInWorkflowAdmissions = new Map<string, BuiltInWorkflowAdmission>();
 
   constructor(deps: MessageProcessorDeps) {
     this.deps = deps;
@@ -537,6 +573,14 @@ export class MessageProcessor {
 
       case 'chat_send':
         await this.handleChatSend(wsInfo, data);
+        break;
+
+      case 'chat_start_builtin_workflow':
+        await this.handleChatStartBuiltInWorkflow(wsInfo, data);
+        break;
+
+      case 'chat_builtin_workflow_ack':
+        this.handleChatBuiltInWorkflowAck(wsInfo, data);
         break;
 
       case 'chat_interrupt':
@@ -2932,6 +2976,182 @@ export class MessageProcessor {
 
       sendToWebSocket(wsInfo.ws, { type: 'error', message });
     }
+  }
+
+  /**
+   * Admit one app-owned guided workflow without borrowing the composer path.
+   *
+   * The browser needs a positive, correlated answer before it closes the
+   * popup. Ordinary chat sends deliberately do not have that handshake: their
+   * composer draft is cleared as soon as the server takes ownership. A workflow
+   * prompt is separate so an unrelated synchronized draft remains untouched.
+   */
+  private async handleChatStartBuiltInWorkflow(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const requestId = typeof data.requestId === 'string' ? data.requestId : '';
+    const requestedSessionId = typeof data.sessionId === 'string' ? data.sessionId : '';
+    const workflow = data.workflow;
+    const reply = (
+      accepted: boolean,
+      message: string,
+      status?: 'accepted' | 'queued',
+      sessionId = requestedSessionId,
+    ): void => {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_builtin_workflow_result',
+        sessionId,
+        requestId,
+        workflow,
+        accepted,
+        ...(status ? { status } : {}),
+        message,
+      });
+    };
+
+    if (!requestId) {
+      // A caller without a correlation id cannot safely close a popup. It is
+      // still told why on its socket for debugging/version-skew visibility.
+      reply(false, 'The workflow request was missing its correlation id.');
+      return;
+    }
+    if (requestId.length > MAX_BUILT_IN_WORKFLOW_REQUEST_ID) {
+      reply(false, 'The workflow request correlation id is too large.');
+      return;
+    }
+    if (!isBuiltInWorkflowId(workflow)) {
+      reply(false, 'That built-in workflow is unavailable.');
+      return;
+    }
+
+    const prompt = typeof data.text === 'string' ? data.text : '';
+    const trimmed = prompt.trim();
+    if (!trimmed) {
+      reply(false, 'Describe the issue before starting the guided workflow.');
+      return;
+    }
+    if (prompt.length > MAX_BUILT_IN_WORKFLOW_PROMPT) {
+      reply(
+        false,
+        `The workflow prompt is too large; the limit is ${MAX_BUILT_IN_WORKFLOW_PROMPT.toLocaleString('en-US')} characters.`,
+      );
+      return;
+    }
+
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo, requestedSessionId);
+    if (!manager || !session || session.surface !== 'chat') {
+      reply(false, 'This conversation is unavailable.');
+      return;
+    }
+
+    const admissionKey = `${wsInfo.userId}:${session.id}:${requestId}`;
+    let admission = this.builtInWorkflowAdmissions.get(admissionKey);
+    if (admission && (admission.workflow !== workflow || admission.prompt !== trimmed)) {
+      reply(false, 'That workflow request id was already used for a different prompt.', undefined, session.id);
+      return;
+    }
+    if (!admission) {
+      if (this.builtInWorkflowAdmissions.size >= MAX_BUILT_IN_WORKFLOW_ADMISSIONS) {
+        reply(false, 'Too many guided workflow requests are being admitted. Please try again.', undefined, session.id);
+        return;
+      }
+      admission = {
+        workflow,
+        prompt: trimmed,
+        promise: this.admitBuiltInWorkflow(manager, session, workflow, trimmed),
+        accepted: false,
+      };
+      this.builtInWorkflowAdmissions.set(admissionKey, admission);
+    }
+
+    const result = await admission.promise;
+    // Rejections must be retryable with the same id once the underlying state
+    // changes (Plan mode off, queue space available, runtime resumed). Only a
+    // result that took ownership of the turn is safe to replay.
+    if (result.accepted) {
+      admission.accepted = true;
+    } else if (this.builtInWorkflowAdmissions.get(admissionKey) === admission) {
+      this.builtInWorkflowAdmissions.delete(admissionKey);
+    }
+    reply(result.accepted, result.message, result.status, session.id);
+  }
+
+  /** Perform the one state-changing admission shared by all duplicate frames. */
+  private async admitBuiltInWorkflow(
+    manager: ChatManagerLike,
+    session: SessionRecord,
+    workflow: BuiltInWorkflowId,
+    prompt: string,
+  ): Promise<BuiltInWorkflowAdmissionResult> {
+    if (session.chatPlanMode === true) {
+      return {
+        accepted: false,
+        message: 'Turn Plan mode off before starting a workflow that can create a GitHub issue.',
+      };
+    }
+
+    // Check the installed asset before a user message reaches the transcript.
+    // A missing package asset is actionable server configuration, not a prompt
+    // the agent should attempt to interpret without its required instructions.
+    try {
+      builtInWorkflowInstructions(workflow);
+    } catch (error: unknown) {
+      return { accepted: false, message: error instanceof Error ? error.message : String(error) };
+    }
+
+    const snapshot = await manager.snapshot(session).catch(() => null);
+    if (!snapshot) {
+      return { accepted: false, message: 'This conversation could not be checked. Please try again.' };
+    }
+    if (snapshot.live !== true) {
+      return {
+        accepted: false,
+        message: 'This conversation is not running. Resume it before starting the workflow.',
+      };
+    }
+    if (snapshot.planMode === true) {
+      return {
+        accepted: false,
+        message: 'Turn Plan mode off before starting a workflow that can create a GitHub issue.',
+      };
+    }
+
+    try {
+      const status = await manager.send(session.id, { text: prompt, workflow });
+      if (status !== 'accepted' && status !== 'queued') {
+        throw new Error('The conversation did not confirm whether the guided workflow started.');
+      }
+      session.lastActivity = new Date();
+      this.noteActivity(session);
+      return {
+        accepted: true,
+        status,
+        message: status === 'queued' ? 'The guided workflow is queued.' : 'The guided workflow started.',
+      };
+    } catch (error: unknown) {
+      return { accepted: false, message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /**
+   * Forget a successful admission once its browser has finished the local
+   * handoff and promises not to retry that correlation id.
+   *
+   * There is deliberately no reply. This frame is cleanup after the correlated
+   * result, not another operation the popup must wait for. If it is lost, the
+   * bounded cache keeps the safer failure mode: a later replay still dedupes.
+   */
+  private handleChatBuiltInWorkflowAck(wsInfo: WebSocketInfo, data: IncomingMessage): void {
+    const requestId = typeof data.requestId === 'string' ? data.requestId : '';
+    const workflow = data.workflow;
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!requestId || !isBuiltInWorkflowId(workflow) || !session) return;
+    const key = `${wsInfo.userId}:${session.id}:${requestId}`;
+    const admission = this.builtInWorkflowAdmissions.get(key);
+    if (!admission || admission.workflow !== workflow || !admission.accepted) return;
+    this.builtInWorkflowAdmissions.delete(key);
   }
 
   private async handleChatInterrupt(

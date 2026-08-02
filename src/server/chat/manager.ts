@@ -355,9 +355,9 @@ export class ChatSessionManager {
       }));
   }
 
-  async send(sessionId: string, turn: UserTurn): Promise<void> {
+  async send(sessionId: string, turn: UserTurn): Promise<'accepted' | 'queued'> {
     const session = this.require(sessionId);
-    await session.send(turn);
+    return session.send(turn);
   }
 
   async interrupt(sessionId: string): Promise<void> {

@@ -120,4 +120,12 @@ describe('install surface', function () {
       }
     }
   });
+
+  it('ships the app-owned gh-issue workflow with the compiled chat server', function () {
+    const source = path.join(ROOT, 'src', 'server', 'chat', 'builtin-workflows', 'gh-issue', 'SKILL.md');
+    const built = path.join(ROOT, 'dist', 'server', 'chat', 'builtin-workflows', 'gh-issue', 'SKILL.md');
+    assert.ok(fs.existsSync(source), 'the bundled workflow source must be version controlled');
+    assert.ok(fs.existsSync(built), 'the bundled workflow must be copied into dist');
+    assert.strictEqual(fs.readFileSync(built, 'utf8'), fs.readFileSync(source, 'utf8'));
+  });
 });

@@ -284,5 +284,14 @@ describe('one prompt makes one user turn (#129)', function () {
         'two real prompts are two messages, however identical their text',
       );
     });
+
+    it('retains app-owned workflow intent without changing the visible prompt', function () {
+      const events = askedByTheSession('Describe the issue.');
+      events[0].workflow = 'gh-issue';
+      const state = fold(events);
+
+      assert.strictEqual(state.messages[0].workflow, 'gh-issue');
+      assert.strictEqual(textOf(state.messages[0]), 'Describe the issue.');
+    });
   });
 });

@@ -26,6 +26,9 @@ export const SERVER_FEATURES = [
   // Carry the unsent composer — the half-typed prompt and the files already
   // attached to it — between every screen the account has open (#163).
   'chat_draft',
+  // Admit an app-bundled guided workflow with a correlated result, so a popup
+  // closes only after the server has taken ownership of its prompt.
+  'chat_builtin_workflow',
 ] as const;
 
 export class WebSocketHandler {

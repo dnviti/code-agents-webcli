@@ -1,6 +1,7 @@
 import * as React from 'react';
 import { Badge } from '../../ui/relay/Badge.js';
 import { Icon } from '../../ui/relay/Icon.js';
+import { IconButton } from '../../ui/relay/IconButton.js';
 import {
   fetchGitHub,
   reviewDecisionLabel,
@@ -12,6 +13,7 @@ import {
 } from '../../chat/workspace-api.js';
 import { PanelBody, PanelHeader, PanelNote, useWorkspaceData } from './PanelShell.js';
 import { GitHubItemDialog } from './GitHubItemDialog.js';
+import { GitHubIssuePromptDialog } from './GitHubIssuePromptDialog.js';
 
 /**
  * Open pull requests and issues on this working directory's GitHub remote.
@@ -26,16 +28,35 @@ import { GitHubItemDialog } from './GitHubItemDialog.js';
 
 export interface GitHubPanelProps {
   sessionId: string;
+  planMode?: boolean;
+  unavailableReason?: string | null;
+  issuePrompt?: string;
+  issueRequestId?: string;
+  onIssuePromptChange?: (value: string) => void;
+  onStartIssue?: (prompt: string, requestId: string) => Promise<void>;
 }
 
-export function GitHubPanel({ sessionId }: GitHubPanelProps): React.JSX.Element {
+export function GitHubPanel({
+  sessionId,
+  planMode = false,
+  unavailableReason,
+  issuePrompt = '',
+  issueRequestId,
+  onIssuePromptChange,
+  onStartIssue,
+}: GitHubPanelProps): React.JSX.Element {
   const [refreshing, setRefreshing] = React.useState(false);
+  const [issueOpen, setIssueOpen] = React.useState(false);
   // The trail of things being read, most recent last. One dialog at a time —
   // a stack of windows over a 320px rail would be unusable — but following a
   // reference out of an issue has to be undoable, so what it was followed from
   // is kept rather than replaced.
   const [trail, setTrail] = React.useState<Array<{ kind: 'issue' | 'pr'; number: number; repo?: string }>>([]);
   const openItem = trail[trail.length - 1] || null;
+
+  React.useEffect(() => {
+    setIssueOpen(false);
+  }, [sessionId]);
 
   const open = React.useCallback((kind: 'issue' | 'pr', number: number, repo?: string) => {
     setTrail([{ kind, number, repo }]);
@@ -60,6 +81,25 @@ export function GitHubPanel({ sessionId }: GitHubPanelProps): React.JSX.Element 
 
   const prs = data?.prs ?? [];
   const issues = data?.issues ?? [];
+  const issueDisabledReason = planMode
+    ? 'Turn off Plan mode to create a GitHub issue.'
+    : unavailableReason
+      ? unavailableReason
+      : busy
+        ? 'Checking GitHub availability…'
+        // Effects have not run during the first render, so `busy` is still
+        // false even though the availability request has not started. Until
+        // it returns, offer no workflow without a verified repository.
+        : !data && !error
+          ? 'Checking GitHub availability…'
+          : error
+            ? 'GitHub availability could not be checked.'
+            : data && !data.available
+              ? data.reason || 'GitHub is not available here.'
+              : !onStartIssue || !issueRequestId
+                ? 'GitHub issue creation is unavailable in this conversation.'
+                : null;
+  const issueLabel = issueDisabledReason ? `Create GitHub issue — ${issueDisabledReason}` : 'Create GitHub issue';
 
   return (
     <>
@@ -68,7 +108,18 @@ export function GitHubPanel({ sessionId }: GitHubPanelProps): React.JSX.Element 
         detail={data?.repo?.nameWithOwner || undefined}
         onRefresh={refresh}
         busy={busy}
-      />
+      >
+        <IconButton
+          label={issueLabel}
+          size="sm"
+          aria-haspopup="dialog"
+          aria-expanded={issueOpen}
+          disabled={Boolean(issueDisabledReason)}
+          onClick={() => setIssueOpen(true)}
+        >
+          <Icon name="plus" size={14} />
+        </IconButton>
+      </PanelHeader>
       <PanelBody>
         {error ? <PanelNote tone="destructive" icon="circle-alert">{error}</PanelNote> : null}
         {!error && !data && busy ? <PanelNote>Asking the GitHub CLI…</PanelNote> : null}
@@ -117,6 +168,20 @@ export function GitHubPanel({ sessionId }: GitHubPanelProps): React.JSX.Element 
           onClose={() => setTrail([])}
         />
       ) : null}
+      <GitHubIssuePromptDialog
+        open={issueOpen}
+        value={issuePrompt}
+        requestId={issueRequestId ?? ''}
+        disabledReason={issueDisabledReason}
+        onValueChange={onIssuePromptChange ?? (() => undefined)}
+        onClose={() => setIssueOpen(false)}
+        onStart={async (prompt, requestId) => {
+          if (!onStartIssue) throw new Error('GitHub issue creation is unavailable in this conversation.');
+          await onStartIssue(prompt, requestId);
+          onIssuePromptChange?.('');
+          setIssueOpen(false);
+        }}
+      />
     </>
   );
 }

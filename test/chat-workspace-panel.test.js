@@ -30,6 +30,7 @@ before(function () {
     `export { AgentsPanel } from ${JSON.stringify(path.join(CHAT_DIR, 'AgentsPanel'))};`,
     `export { LinksPanel } from ${JSON.stringify(path.join(CHAT_DIR, 'LinksPanel'))};`,
     `export { GitHubPanel } from ${JSON.stringify(path.join(CHAT_DIR, 'GitHubPanel'))};`,
+    `export { GitHubIssuePromptDialog } from ${JSON.stringify(path.join(CHAT_DIR, 'GitHubIssuePromptDialog'))};`,
     `export { GitChangesPanel } from ${JSON.stringify(path.join(CHAT_DIR, 'GitChangesPanel'))};`,
     `export { ChatSettingsDialog } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/dialogs/ChatSettingsDialog'))};`,
     `export { CodeEditor } from ${JSON.stringify(path.join(CHAT_DIR, 'CodeEditor'))};`,
@@ -380,6 +381,47 @@ describe('panels that fetch', function () {
     const html = render('GitHubPanel', { sessionId: 's1' });
     assert.ok(/GitHub/.test(html));
     assert.ok(/aria-label="Refresh github"/.test(html));
+    assert.ok(/aria-label="Create GitHub issue/.test(html));
+    assert.ok(/Checking GitHub availability/.test(html), 'the action waits for repository availability');
+  });
+
+  it('explains why the guided issue action is unavailable', function () {
+    const html = render('GitHubPanel', { sessionId: 's1', planMode: true, onStartIssue: async () => {} });
+    assert.ok(/Turn off Plan mode to create a GitHub issue/.test(html));
+    assert.ok(/disabled=""/.test(html));
+  });
+
+  it('renders a labelled one-field issue handoff dialog', function () {
+    const html = render('GitHubIssuePromptDialog', {
+      open: true, value: '', requestId: 'dialog-test',
+      onValueChange() {}, onStart: async () => {}, onClose() {},
+    });
+    assert.ok(/Create GitHub issue/.test(html));
+    assert.ok(/What should this issue cover/.test(html));
+    assert.ok(/textarea/.test(html));
+    assert.ok(/Start/.test(html));
+    assert.ok(/box-shadow:none/.test(html.replace(/\s/g, '')), 'the textarea has a Relay focus-ring state');
+  });
+
+  it('keeps an open issue dialog behind the same changing availability gate', function () {
+    const html = render('GitHubIssuePromptDialog', {
+      open: true,
+      value: 'A complete issue brief.',
+      requestId: 'dialog-gated-test',
+      disabledReason: 'Turn off Plan mode to create a GitHub issue.',
+      onValueChange() {}, onStart: async () => {}, onClose() {},
+    });
+    assert.ok(/role="status"/.test(html));
+    assert.ok(/Turn off Plan mode/.test(html));
+    assert.ok(/disabled=""/.test(html));
+  });
+
+  it('owns the issue popup draft above the rail that can unmount', function () {
+    const chatView = fs.readFileSync(path.join(CHAT_DIR, 'ChatView.tsx'), 'utf8');
+    const workspace = fs.readFileSync(path.join(CHAT_DIR, 'WorkspacePanel.tsx'), 'utf8');
+    assert.match(chatView, /const \[issueDraft, setIssueDraft\] = React\.useState/);
+    assert.match(chatView, /issueRequestId=\{issueDraft\.requestId\}/);
+    assert.doesNotMatch(workspace, /\[issueDraft, setIssueDraft\]|\[issuePrompt, setIssuePrompt\]/);
   });
 });
 

@@ -334,6 +334,7 @@ async function run(): Promise<void> {
   await checkTheFileEditorShowsTheFile();
   await checkAReadOnlyFileStaysReadOnly();
   await checkAChatFileLinkOpensAtItsSourceLine();
+  await checkARetriedGuidedIssueKeepsItsWorkflow();
   await checkTheGitHubPanelSaysWhoIsOnItAndWhatItLinksTo();
   // After the editor checks on purpose: this one opens a FileEditorDialog,
   // and Monaco is a module-level singleton that does not survive being mounted
@@ -13467,6 +13468,86 @@ async function checkTheEnvironmentSizePickerIsUsable(): Promise<void> {
   host.remove();
 }
 
+/** Retrying the recorded prompt must restore its hidden app-owned workflow. */
+async function checkARetriedGuidedIssueKeepsItsWorkflow(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'position:absolute;top:0;left:0;width:960px;height:680px;display:flex';
+  document.body.appendChild(host);
+
+  const sent: Array<Record<string, unknown>> = [];
+  let controller!: ChatController;
+  controller = new ChatController('guided-retry-check', {
+    send: (message) => {
+      sent.push(message as Record<string, unknown>);
+      if (message.type !== 'chat_start_builtin_workflow') return;
+      queueMicrotask(() => controller.handle({
+        type: 'chat_builtin_workflow_result',
+        sessionId: 'guided-retry-check',
+        requestId: message.requestId,
+        workflow: 'gh-issue',
+        accepted: true,
+        status: 'accepted',
+        message: 'Started.',
+      }));
+    },
+  });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'guided-retry-check',
+    snapshot: {
+      sessionId: 'guided-retry-check', runtime: 'claude', state: 'idle',
+      capabilities: {},
+      messages: [
+        {
+          id: 'user-guided-retry', seq: 1, turnId: 'turn-guided-retry', role: 'user', ts: Date.now(),
+          workflow: 'gh-issue', blocks: [{ kind: 'text', text: 'The issue prompt to retry.' }],
+        },
+        {
+          id: 'assistant-guided-retry', seq: 2, turnId: 'turn-guided-retry', role: 'assistant', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'Let us specify it.' }],
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+  sent.length = 0;
+
+  const root = createRoot(host);
+  try {
+    root.render(React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/home/dev/project',
+      branch: 'main',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never));
+    await wait(300);
+    settle(document);
+
+    const retry = host.querySelector<HTMLButtonElement>('[aria-label="Retry this turn"]');
+    retry?.click();
+    await wait(40);
+    const workflowStart = sent.find((message) => message.type === 'chat_start_builtin_workflow');
+    check(
+      'retrying a guided issue restores its workflow instead of sending ordinary chat',
+      Boolean(
+        workflowStart
+        && workflowStart.workflow === 'gh-issue'
+        && workflowStart.text === 'The issue prompt to retry.'
+        && !sent.some((message) => message.type === 'chat_send'),
+      ),
+      JSON.stringify(sent),
+    );
+  } finally {
+    root.unmount();
+    controller.dispose();
+    host.remove();
+  }
+}
+
 /**
  * What the GitHub panel says beyond a title.
  *
@@ -13543,6 +13624,26 @@ async function checkTheGitHubPanelSaysWhoIsOnItAndWhatItLinksTo(): Promise<void>
 
   // Flipped for the last pass: what the panel says when `gh` refused to list.
   let listRefused = false;
+  let issueStarts = 0;
+  let issuePrompt = '';
+  const issueRequestIds: string[] = [];
+  let refuseIssue = false;
+  const startIssue = async (prompt: string, requestId: string): Promise<void> => {
+    issueStarts += 1;
+    issuePrompt = prompt;
+    issueRequestIds.push(requestId);
+    if (refuseIssue) throw new Error('The queue is full; try again after a message runs.');
+  };
+  let setHarnessPlanMode: React.Dispatch<React.SetStateAction<boolean>> = () => undefined;
+  function GitHubIssueHarness(): React.JSX.Element {
+    const [prompt, setPrompt] = React.useState('');
+    const [planMode, setPlanMode] = React.useState(false);
+    setHarnessPlanMode = setPlanMode;
+    return React.createElement(GitHubPanel, {
+      sessionId: 's1', planMode, issuePrompt: prompt, issueRequestId: 'browser-guided-issue',
+      onIssuePromptChange: setPrompt, onStartIssue: startIssue,
+    });
+  }
 
   const realFetch = window.fetch;
   window.fetch = (async (input: RequestInfo | URL) => {
@@ -13591,7 +13692,7 @@ async function checkTheGitHubPanelSaysWhoIsOnItAndWhatItLinksTo(): Promise<void>
   const root = createRoot(host);
 
   try {
-    root.render(React.createElement(GitHubPanel, { sessionId: 's1' } as never));
+    root.render(React.createElement(GitHubIssueHarness));
     await wait(300);
     settle(document);
 
@@ -13631,6 +13732,114 @@ async function checkTheGitHubPanelSaysWhoIsOnItAndWhatItLinksTo(): Promise<void>
     // sideways. They wrap; they do not widen it.
     check(
       'the extra facts stay inside the rail',
+      host.scrollWidth <= host.clientWidth + 1,
+      `content ${host.scrollWidth}px in ${host.clientWidth}px`,
+    );
+
+    const createIssue = host.querySelector<HTMLButtonElement>('[aria-label^="Create GitHub issue"]');
+    createIssue?.focus();
+    createIssue?.click();
+    await wait(40);
+    settle(document);
+    let issueDialog = document.querySelector('[role="dialog"]') as HTMLElement | null;
+    let issueField = issueDialog?.querySelector<HTMLTextAreaElement>('textarea') || null;
+    check(
+      'the GitHub action opens the labelled guided-issue dialog and autofocuses its field',
+      Boolean(issueDialog && /Create GitHub issue/.test(issueDialog.innerText) && issueField && document.activeElement === issueField),
+      issueDialog?.innerText || 'no dialog',
+    );
+    check(
+      'the guided issue textarea shows a visible focus ring',
+      Boolean(issueField && getComputedStyle(issueField).boxShadow !== 'none'),
+      issueField ? getComputedStyle(issueField).boxShadow : 'no field',
+    );
+    setHarnessPlanMode(true);
+    await wait(40);
+    let startButton = Array.from(issueDialog?.querySelectorAll<HTMLButtonElement>('button') || []).find(
+      (button) => button.textContent?.trim() === 'Start',
+    );
+    check(
+      'an open guided-issue dialog follows a newly active Plan-mode gate',
+      Boolean(
+        startButton?.disabled
+        && issueDialog?.querySelector('[role="status"]')?.textContent?.includes('Turn off Plan mode'),
+      ),
+      `disabled=${startButton?.disabled} text=${issueDialog?.textContent || 'no dialog'}`,
+    );
+    setHarnessPlanMode(false);
+    await wait(40);
+    (Array.from(issueDialog?.querySelectorAll<HTMLButtonElement>('button') || []).find(
+      (button) => button.textContent?.trim() === 'Start',
+    ))?.click();
+    await wait(100);
+    settle(document);
+    check(
+      'an empty guided issue prompt stays open with an inline error',
+      issueStarts === 0
+        && Boolean(issueDialog?.querySelector('[role="alert"]')?.textContent?.includes('Describe the issue')),
+      issueDialog?.querySelector('[role="alert"]')?.textContent
+        || `invalid=${issueField?.getAttribute('aria-invalid')} text=${issueDialog?.textContent || 'no dialog'}`,
+    );
+    const setIssueField = (field: HTMLTextAreaElement | null, value: string): void => {
+      if (!field) return;
+      const descriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+      descriptor?.set?.call(field, value);
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    setIssueField(issueField, 'Keep this unfinished issue brief.');
+    await wait(0);
+    (Array.from(issueDialog?.querySelectorAll<HTMLButtonElement>('button') || []).find(
+      (button) => button.textContent?.trim() === 'Cancel',
+    ))?.click();
+    await wait(40);
+    check(
+      'cancelling returns focus to the GitHub action',
+      document.activeElement === createIssue,
+      document.activeElement?.getAttribute('aria-label') || document.activeElement?.tagName || 'nothing focused',
+    );
+    createIssue?.focus();
+    createIssue?.click();
+    await wait(40);
+    issueDialog = document.querySelector('[role="dialog"]') as HTMLElement | null;
+    issueField = issueDialog?.querySelector<HTMLTextAreaElement>('textarea') || null;
+    check(
+      'a cancelled issue brief survives when the dialog is reopened',
+      issueField?.value === 'Keep this unfinished issue brief.',
+      JSON.stringify(issueField?.value || ''),
+    );
+    if (issueField) {
+      setIssueField(issueField, 'The settings page loses work\nwhen a request is queued.');
+      await wait(0);
+      refuseIssue = true;
+      (Array.from(issueDialog?.querySelectorAll<HTMLButtonElement>('button') || []).find(
+        (button) => button.textContent?.trim() === 'Start',
+      ))?.click();
+      await wait(100);
+      settle(document);
+    }
+    check(
+      'a refused issue start keeps the prompt and shows the correlated error',
+      issueStarts === 1
+        && issueField?.value.includes('\n')
+        && Boolean(issueDialog?.querySelector('[role="alert"]')?.textContent?.includes('queue is full')),
+      `${issueStarts} start(s): ${JSON.stringify(issuePrompt)} — invalid=${issueField?.getAttribute('aria-invalid')} text=${issueDialog?.textContent || 'no dialog'}`,
+    );
+    refuseIssue = false;
+    (Array.from(issueDialog?.querySelectorAll<HTMLButtonElement>('button') || []).find(
+      (button) => button.textContent?.trim() === 'Start',
+    ))?.click();
+    await wait(40);
+    check(
+      'retrying the guided issue prompt submits once and closes only after acceptance',
+      issueStarts === 2
+        && issuePrompt.includes('\n')
+        && issueRequestIds.length === 2
+        && issueRequestIds[0] === issueRequestIds[1]
+        && !document.querySelector('[role="dialog"]'),
+      `${issueStarts} start(s), ids=${JSON.stringify(issueRequestIds)}: ${JSON.stringify(issuePrompt)}`,
+    );
+    check(
+      'the GitHub issue handoff does not widen the narrow rail',
       host.scrollWidth <= host.clientWidth + 1,
       `content ${host.scrollWidth}px in ${host.clientWidth}px`,
     );
@@ -13735,7 +13944,7 @@ async function checkTheGitHubPanelSaysWhoIsOnItAndWhatItLinksTo(): Promise<void>
     listRefused = true;
     root.render(React.createElement('div'));
     await wait(60);
-    root.render(React.createElement(GitHubPanel, { sessionId: 's1' } as never));
+    root.render(React.createElement(GitHubIssueHarness));
     await wait(400);
     settle(document);
 

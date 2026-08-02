@@ -278,6 +278,8 @@ async function build() {
     console.warn('[assets] WARNING: @xterm/xterm/css/xterm.css not found; terminal styling will be missing.');
   }
 
+  copyBuiltinWorkflowAssets({ watch: isWatch });
+
   console.log('[assets] Done.\n');
 
   if (isWatch) {
@@ -301,6 +303,44 @@ async function build() {
   }
 
   console.log('Build complete!');
+}
+
+/**
+ * Built-in workflows are application assets, not guest-installed skills. Keep
+ * them beside the compiled chat server so an npm package and Docker image ship
+ * the exact guidance used at runtime.
+ */
+function copyBuiltinWorkflowAssets({ watch }) {
+  const sourceRoot = path.join(REPO_ROOT, 'src', 'server', 'chat', 'builtin-workflows');
+  const destinationRoot = path.join(REPO_ROOT, 'dist', 'server', 'chat', 'builtin-workflows');
+  const ghIssueSource = path.join(sourceRoot, 'gh-issue', 'SKILL.md');
+  const ghIssueDestination = path.join(destinationRoot, 'gh-issue', 'SKILL.md');
+
+  if (!fs.existsSync(ghIssueSource)) {
+    throw new Error(`[workflows] Required bundled workflow is missing: ${ghIssueSource}`);
+  }
+
+  const copy = () => {
+    fs.mkdirSync(path.dirname(ghIssueDestination), { recursive: true });
+    fs.copyFileSync(ghIssueSource, ghIssueDestination);
+  };
+
+  copy();
+  console.log('[workflows] Copied bundled gh-issue workflow.');
+
+  if (watch) {
+    fs.watch(ghIssueSource, (_event) => {
+      try {
+        if (!fs.existsSync(ghIssueSource)) {
+          throw new Error('source file was removed');
+        }
+        copy();
+        console.log('[workflows] Updated bundled gh-issue workflow.');
+      } catch (error) {
+        console.error('[workflows] Failed to copy bundled gh-issue workflow:', error.message);
+      }
+    });
+  }
 }
 
 const REPO_ROOT = path.join(__dirname, '..');

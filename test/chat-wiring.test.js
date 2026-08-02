@@ -196,6 +196,238 @@ function build(sessionOverrides = {}, managerOverrides = {}, deps = {}) {
 const lastOfType = (sent, type) => sent.filter((m) => m.type === type).pop();
 
 describe('chat wiring', function () {
+  describe('built-in guided workflows', function () {
+    it('admits the GitHub issue workflow through the active chat and reports a correlated queue result', async function () {
+      const { processor, session, chatManager, sent } = build({}, {
+        async send(sessionId, turn) {
+          this.calls.send.push({ sessionId, turn });
+          return 'queued';
+        },
+      });
+      session.surface = 'chat';
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: session.id, requestId: 'workflow-1',
+        workflow: 'gh-issue', text: '/clear should be described, not executed.',
+      });
+
+      assert.deepStrictEqual(chatManager.calls.send, [{
+        sessionId: session.id,
+        turn: { text: '/clear should be described, not executed.', workflow: 'gh-issue' },
+      }]);
+      assert.deepStrictEqual(lastOfType(sent, 'chat_builtin_workflow_result'), {
+        type: 'chat_builtin_workflow_result', sessionId: session.id, requestId: 'workflow-1',
+        workflow: 'gh-issue', accepted: true, status: 'queued', message: 'The guided workflow is queued.',
+      });
+    });
+
+    it('replays a successful admission for the same request id without sending the workflow twice', async function () {
+      let sends = 0;
+      const { processor, session, sent } = build({ surface: 'chat' }, {
+        async send() {
+          sends += 1;
+          return 'accepted';
+        },
+      });
+      const frame = {
+        type: 'chat_start_builtin_workflow', sessionId: session.id, requestId: 'lost-ack',
+        workflow: 'gh-issue', text: 'Create an issue for lost search filters.',
+      };
+
+      await processor.handleMessage('ws-1', frame);
+      const realNow = Date.now;
+      try {
+        Date.now = () => realNow() + 365 * 24 * 60 * 60 * 1000;
+        await processor.handleMessage('ws-1', frame);
+      } finally {
+        Date.now = realNow;
+      }
+
+      assert.strictEqual(
+        sends,
+        1,
+        'a retained prompt retried long after a lost acknowledgement must not create a second turn',
+      );
+      const results = sent.filter((message) =>
+        message.type === 'chat_builtin_workflow_result' && message.requestId === 'lost-ack');
+      assert.strictEqual(results.length, 2);
+      assert.ok(results.every((result) => result.accepted && result.status === 'accepted'));
+
+      await processor.handleMessage('ws-1', { ...frame, text: 'A different issue.' });
+      assert.strictEqual(sends, 1);
+      assert.match(lastOfType(sent, 'chat_builtin_workflow_result').message, /different prompt/);
+    });
+
+    it('shares an in-flight admission and lets a rejected id be retried', async function () {
+      let release;
+      let sends = 0;
+      const gate = new Promise((resolve) => { release = resolve; });
+      const concurrent = build({ surface: 'chat' }, {
+        async send() {
+          sends += 1;
+          await gate;
+          return 'queued';
+        },
+      });
+      const frame = {
+        type: 'chat_start_builtin_workflow', sessionId: concurrent.session.id, requestId: 'concurrent',
+        workflow: 'gh-issue', text: 'Create an issue.',
+      };
+      const first = concurrent.processor.handleMessage('ws-1', frame);
+      const second = concurrent.processor.handleMessage('ws-1', frame);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.strictEqual(sends, 1);
+      await concurrent.processor.handleMessage('ws-1', {
+        type: 'chat_builtin_workflow_ack', sessionId: concurrent.session.id,
+        requestId: 'concurrent', workflow: 'gh-issue',
+      });
+      release();
+      await Promise.all([first, second]);
+      assert.strictEqual(
+        concurrent.sent.filter((message) => message.requestId === 'concurrent').length,
+        2,
+      );
+      await concurrent.processor.handleMessage('ws-1', frame);
+      assert.strictEqual(sends, 1, 'an acknowledgement sent before acceptance cannot defeat dedupe');
+
+      let attempts = 0;
+      const retryable = build({ surface: 'chat' }, {
+        async send() {
+          attempts += 1;
+          if (attempts === 1) throw new Error('queue full');
+          return 'accepted';
+        },
+      });
+      const retryFrame = {
+        type: 'chat_start_builtin_workflow', sessionId: retryable.session.id, requestId: 'retry-rejection',
+        workflow: 'gh-issue', text: 'Create an issue.',
+      };
+      await retryable.processor.handleMessage('ws-1', retryFrame);
+      await retryable.processor.handleMessage('ws-1', retryFrame);
+      assert.strictEqual(attempts, 2, 'a refusal must not poison the correlation id');
+      const retryResults = retryable.sent.filter((message) => message.requestId === 'retry-rejection');
+      assert.deepStrictEqual(retryResults.map((result) => result.accepted), [false, true]);
+    });
+
+    it('releases a successful dedupe entry only after the owning client acknowledges it', async function () {
+      let sends = 0;
+      const { processor, session } = build({ surface: 'chat' }, {
+        async send() {
+          sends += 1;
+          return 'accepted';
+        },
+      });
+      const frame = {
+        type: 'chat_start_builtin_workflow', sessionId: session.id, requestId: 'ack-cleanup',
+        workflow: 'gh-issue', text: 'Create an issue.',
+      };
+      await processor.handleMessage('ws-1', frame);
+      await processor.handleMessage('ws-1', frame);
+      assert.strictEqual(sends, 1, 'unacknowledged retries remain deduplicated');
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_builtin_workflow_ack', sessionId: session.id,
+        requestId: 'ack-cleanup', workflow: 'not-a-workflow',
+      });
+      await processor.handleMessage('ws-1', frame);
+      assert.strictEqual(sends, 1, 'an invalid acknowledgement cannot release the entry');
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_builtin_workflow_ack', sessionId: session.id,
+        requestId: 'ack-cleanup', workflow: 'gh-issue',
+      });
+      await processor.handleMessage('ws-1', frame);
+      assert.strictEqual(sends, 2, 'an acknowledged id no longer consumes retained admission capacity');
+    });
+
+    it('rejects blank prompts, Plan mode, and unknown workflows before they reach the chat manager', async function () {
+      const { processor, session, chatManager, sent } = build({ surface: 'chat', chatPlanMode: true });
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: session.id, requestId: 'blank', workflow: 'gh-issue', text: '   ',
+      });
+      await processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: session.id, requestId: 'plan', workflow: 'gh-issue', text: 'Create an issue.',
+      });
+      await processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: session.id, requestId: 'unknown', workflow: 'not-a-workflow', text: 'Create an issue.',
+      });
+
+      assert.strictEqual(chatManager.calls.send.length, 0);
+      const results = sent.filter((message) => message.type === 'chat_builtin_workflow_result');
+      assert.match(results.find((result) => result.requestId === 'blank').message, /Describe the issue/);
+      assert.match(results.find((result) => result.requestId === 'plan').message, /Plan mode off/);
+      assert.match(results.find((result) => result.requestId === 'unknown').message, /unavailable/);
+    });
+
+    it('rejects oversized prompts and conversations the caller cannot own or drive', async function () {
+      const oversized = build({ surface: 'chat' });
+      await oversized.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: oversized.session.id,
+        requestId: 'oversized', workflow: 'gh-issue', text: 'x'.repeat(20_001),
+      });
+      assert.match(lastOfType(oversized.sent, 'chat_builtin_workflow_result').message, /20,000 characters/);
+      assert.strictEqual(oversized.chatManager.calls.send.length, 0);
+
+      const padded = build({ surface: 'chat' });
+      await padded.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: padded.session.id,
+        requestId: 'padded', workflow: 'gh-issue', text: `${' '.repeat(20_001)}issue`,
+      });
+      assert.match(lastOfType(padded.sent, 'chat_builtin_workflow_result').message, /20,000 characters/);
+      assert.strictEqual(padded.chatManager.calls.send.length, 0);
+
+      const foreign = build({ surface: 'chat', ownerUserId: 99 });
+      await foreign.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: foreign.session.id,
+        requestId: 'foreign', workflow: 'gh-issue', text: 'Create an issue.',
+      });
+      assert.match(lastOfType(foreign.sent, 'chat_builtin_workflow_result').message, /unavailable/);
+      assert.strictEqual(foreign.chatManager.calls.send.length, 0);
+
+      const terminal = build({ surface: 'terminal' });
+      await terminal.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: terminal.session.id,
+        requestId: 'terminal', workflow: 'gh-issue', text: 'Create an issue.',
+      });
+      assert.match(lastOfType(terminal.sent, 'chat_builtin_workflow_result').message, /unavailable/);
+      assert.strictEqual(terminal.chatManager.calls.send.length, 0);
+    });
+
+    it('keeps the popup open when liveness cannot be confirmed or the queue refuses the turn', async function () {
+      const stopped = build({ surface: 'chat' }, {
+        async snapshot() { return { live: false }; },
+      });
+      await stopped.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: stopped.session.id,
+        requestId: 'stopped', workflow: 'gh-issue', text: 'Create an issue.',
+      });
+      assert.match(lastOfType(stopped.sent, 'chat_builtin_workflow_result').message, /not running/);
+      assert.strictEqual(stopped.chatManager.calls.send.length, 0);
+
+      const unchecked = build({ surface: 'chat' }, {
+        async snapshot() { throw new Error('store offline'); },
+      });
+      await unchecked.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: unchecked.session.id,
+        requestId: 'unchecked', workflow: 'gh-issue', text: 'Create an issue.',
+      });
+      assert.match(lastOfType(unchecked.sent, 'chat_builtin_workflow_result').message, /could not be checked/);
+      assert.strictEqual(unchecked.chatManager.calls.send.length, 0);
+
+      const full = build({ surface: 'chat' }, {
+        async send() { throw new Error('there are already 24 messages waiting'); },
+      });
+      await full.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: full.session.id,
+        requestId: 'full', workflow: 'gh-issue', text: 'Create an issue.',
+      });
+      const refused = lastOfType(full.sent, 'chat_builtin_workflow_result');
+      assert.strictEqual(refused.accepted, false);
+      assert.match(refused.message, /already 24 messages waiting/);
+    });
+  });
+
   describe('start_chat', function () {
     it('launches the runtime through the chat manager, not the PTY bridge', async function () {
       const { processor, session, chatManager, sent } = build();

@@ -73,6 +73,7 @@ import { askChannelFor, askEnvFor, createChatAdapter, supportsChat } from './reg
 import { FinishedJob, UsageAccountant } from './usage-accounting.js';
 import { UsageJobInput } from '../services/usage-store.js';
 import { projectNameFor, tokenTotal } from '../../shared/usage-records.js';
+import { builtInWorkflowInstructions } from './builtin-workflows.js';
 
 /**
  * One chat conversation, owned by the server.
@@ -2288,7 +2289,13 @@ export class ChatSession {
    * scheduled by the event stream and a turn arriving in that gap must not
    * overtake the ones already waiting.
    */
-  async send(turn: UserTurn): Promise<void> {
+  async send(turn: UserTurn): Promise<'accepted' | 'queued'> {
+    // The WebSocket admission checks this too, but the queue may wait while a
+    // different screen turns Plan mode on. Keep the final gate beside delivery
+    // so a previously accepted workflow never contradicts that safety mode.
+    if (turn.workflow && this.planMode) {
+      throw new Error('Turn Plan mode off before starting a workflow that can create a GitHub issue.');
+    }
     // A conversation being replaced has no adapter for a moment, and refusing
     // here is what put the "this chat is not running" recovery offer in front
     // of someone who had just cleared and started typing. It is starting, not
@@ -2296,7 +2303,7 @@ export class ChatSession {
     // goes out when the new process reports idle.
     if (this.restarting) {
       this.enqueue(turn);
-      return;
+      return 'queued';
     }
 
     if (!this.adapter || !this.adapter.alive) {
@@ -2309,9 +2316,9 @@ export class ChatSession {
     // answer ran, and anything queued behind it goes to a process that is
     // about to be replaced. Taking it now is also what makes the button and
     // the three spellings one behaviour rather than four.
-    if (isClearingCommand(turn.text)) {
+    if (!turn.workflow && isClearingCommand(turn.text)) {
       await this.deliver(turn);
-      return;
+      return 'accepted';
     }
 
     // `adapterReady` matters here as much as in the drain: pressing Enter the
@@ -2327,7 +2334,7 @@ export class ChatSession {
       // an adapter still letting go of the previous process would wait for a
       // drain that nothing was ever going to trigger.
       if (this.state === 'idle' && !ready) this.drainQueue();
-      return;
+      return 'queued';
     }
 
     try {
@@ -2339,10 +2346,18 @@ export class ChatSession {
       // of the queue — same failure, same recovery, whichever path it took.
       const message = error instanceof Error ? error.message : String(error);
       this.failQueuedTurn(
-        { id: `queued-${crypto.randomUUID()}`, text: turn.text, attachments: turn.attachments, ts: Date.now() },
+        {
+          id: `queued-${crypto.randomUUID()}`,
+          text: turn.text,
+          attachments: turn.attachments,
+          workflow: turn.workflow,
+          ts: Date.now(),
+        },
         message,
       );
+      return 'queued';
     }
+    return 'accepted';
   }
 
   /**
@@ -2363,6 +2378,7 @@ export class ChatSession {
       id: `queued-${crypto.randomUUID()}`,
       text: turn.text,
       attachments: turn.attachments,
+      workflow: turn.workflow,
       ts: Date.now(),
     });
     this.publishQueue();
@@ -2475,7 +2491,10 @@ export class ChatSession {
         return false;
       }
 
-      await this.deliver({ text: turn.text, attachments: turn.attachments }, steering ?? undefined);
+      await this.deliver(
+        { text: turn.text, attachments: turn.attachments, workflow: turn.workflow },
+        steering ?? undefined,
+      );
       return true;
     } catch (error: unknown) {
       // Back in the line with the reason on it, exactly like a turn that failed
@@ -2578,7 +2597,7 @@ export class ChatSession {
 
     // `deliver` moves the state to `thinking` before it awaits anything, so by
     // the time this promise is pending the guard above already holds on its own.
-    this.deliver({ text: next.text, attachments: next.attachments })
+    this.deliver({ text: next.text, attachments: next.attachments, workflow: next.workflow })
       .catch((error: unknown) => {
         // Silent when a clear is under way: the turn failed because the
         // process it was for is being replaced, which is what the user asked
@@ -2692,6 +2711,9 @@ export class ChatSession {
     if (!this.adapter || !this.adapter.alive) {
       throw new ChatNotRunningError();
     }
+    if (turn.workflow && this.planMode) {
+      throw new Error('Turn Plan mode off before starting a workflow that can create a GitHub issue.');
+    }
 
     this.planSubmittedThisTurn = false;
     this.planResponseBlocks.clear();
@@ -2718,6 +2740,7 @@ export class ChatSession {
       id: messageId,
       role: 'user',
       turnId,
+      ...(turn.workflow ? { workflow: turn.workflow } : {}),
       ...(continuesTurnId ? { steer: true as const } : {}),
     });
     this.ingest({
@@ -2744,7 +2767,7 @@ export class ChatSession {
     // process would still remember everything said before it. A real reset
     // means a new process with no resume id, the same thing a manual "start
     // fresh" relaunch already does.
-    if (isClearingCommand(turn.text)) {
+    if (!turn.workflow && isClearingCommand(turn.text)) {
       await this.restart();
       return;
     }
@@ -2768,7 +2791,10 @@ export class ChatSession {
     // `/review` is not a command any more — it runs as prose, and the history
     // is spent on a turn that was never going to read it. It waits for
     // something the model is actually being asked.
-    const command = isSlashCommand(turn.text);
+    // Bundled workflows are ordinary user requests even when their first
+    // character happens to be `/`; never let a runtime reinterpret them as a
+    // native command or let command-only paths omit their guidance.
+    const command = !turn.workflow && isSlashCommand(turn.text);
     if (command && this.planMode) {
       const name = turn.text.trim().split(/\s+/, 1)[0]!.toLowerCase();
       if (!PLAN_SAFE_SLASH_COMMANDS.has(name)) {
@@ -2794,7 +2820,17 @@ export class ChatSession {
           ? questionFallbackDirective()
           : null
       : null;
-    const runtimeText = [questionInstruction, planInstruction, carried, turn.text]
+    const workflowInstruction = turn.workflow
+      ? [
+          `[BEGIN APP-OWNED ${turn.workflow.toUpperCase()} WORKFLOW]`,
+          builtInWorkflowInstructions(turn.workflow),
+          `[END APP-OWNED ${turn.workflow.toUpperCase()} WORKFLOW]`,
+        ].join('\n')
+      : null;
+    const runtimeUserRequest = turn.workflow
+      ? `[BEGIN USER REQUEST]\n${turn.text}\n[END USER REQUEST]`
+      : turn.text;
+    const runtimeText = [questionInstruction, workflowInstruction, planInstruction, carried, runtimeUserRequest]
       .filter(Boolean)
       .join('\n\n');
     await this.adapter.send(runtimeText === turn.text ? turn : { ...turn, text: runtimeText });

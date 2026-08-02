@@ -8,6 +8,7 @@ import {
   ChatSnapshot,
   ChatTurnIndexEntry,
   ChatUsage,
+  BuiltInWorkflowId,
   PlanDocument,
   QueuedTurn,
   NO_CHAT_CAPABILITIES,
@@ -51,6 +52,13 @@ function readPlanDocument(raw: unknown): PlanDocument | null {
 
 export interface ChatControllerOptions {
   send: (message: Record<string, unknown>) => void;
+  /**
+   * Whether the connected server advertised app-owned workflow admission.
+   *
+   * Registry-owned controllers always provide this explicitly. It remains
+   * optional for isolated component/tests that do not have a socket handshake.
+   */
+  builtInWorkflows?: boolean;
   /** Called when the surface should redraw for a reason outside the transcript. */
   onChange?: () => void;
   /**
@@ -114,6 +122,23 @@ export interface ModelSwitchResult {
 export interface EffortSwitchResult {
   applied: 'live' | 'sent' | 'pending' | 'cleared' | 'refused';
   message: string;
+}
+
+/** The server accepted a built-in workflow for immediate delivery or its FIFO queue. */
+export type BuiltInWorkflowStartResult = 'accepted' | 'queued';
+
+interface PendingBuiltInWorkflow {
+  workflow: BuiltInWorkflowId;
+  resolve: (result: BuiltInWorkflowStartResult) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+export function createBuiltInWorkflowRequestId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `workflow-${crypto.randomUUID()}`;
+  }
+  return `workflow-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 /**
@@ -368,6 +393,10 @@ export class ChatController {
   private planMode = false;
   private planDocument: PlanDocument | null = null;
   private planResult: PlanActionFeedback | null = null;
+  /** Admission promises for popup submissions, keyed by their wire request id. */
+  private workflowRequests = new Map<string, PendingBuiltInWorkflow>();
+  /** False on a real socket until its handshake advertises the protocol. */
+  private builtInWorkflows: boolean;
 
   /**
    * The composer, as the server last numbered it.
@@ -413,7 +442,12 @@ export class ChatController {
   constructor(
     readonly sessionId: string,
     private readonly options: ChatControllerOptions,
-  ) {}
+  ) {
+    // Standalone controllers predate feature negotiation and are still useful
+    // in embedders/tests. The registry passes an explicit false before a real
+    // socket has completed its handshake, so production never guesses.
+    this.builtInWorkflows = options.builtInWorkflows ?? true;
+  }
 
   /**
    * Every message type this class answers to, for whoever routes to it.
@@ -444,6 +478,7 @@ export class ChatController {
     'chat_plan_result',
     'chat_plan_accept_result',
     'chat_plan_reject_result',
+    'chat_builtin_workflow_result',
     'chat_turn_index',
     'chat_turn_index_failed',
     'chat_turn_spend',
@@ -784,6 +819,33 @@ export class ChatController {
         return true;
       }
 
+      case 'chat_builtin_workflow_result': {
+        const requestId = typeof message.requestId === 'string' ? message.requestId : '';
+        const pending = this.workflowRequests.get(requestId);
+        if (!pending) return true;
+        this.workflowRequests.delete(requestId);
+        clearTimeout(pending.timer);
+        if (message.workflow !== pending.workflow) {
+          pending.reject(new Error('The server answered for a different guided workflow.'));
+          return true;
+        }
+        const status = message.status;
+        if (
+          message.accepted === true
+          && (status === 'accepted' || status === 'queued')
+          && message.sessionId === this.sessionId
+        ) {
+          pending.resolve(status);
+        } else {
+          pending.reject(new Error(
+            typeof message.message === 'string' && message.message
+              ? message.message
+              : 'The guided workflow could not be started.',
+          ));
+        }
+        return true;
+      }
+
       case 'chat_page_failed': {
         // The read threw server-side. The error itself is surfaced by the
         // shell's own error path; all this owes the user is the button back.
@@ -918,6 +980,45 @@ export class ChatController {
     this.send({ type: 'chat_send', text: trimmed, attachments, fromComposer });
   }
 
+  /**
+   * Start an app-bundled guided workflow without changing this conversation's
+   * composer draft. The popup owns its field until the server explicitly says
+   * the turn was accepted or queued.
+   */
+  startBuiltInWorkflow(
+    workflow: BuiltInWorkflowId,
+    prompt: string,
+    requestId = createBuiltInWorkflowRequestId(),
+  ): Promise<BuiltInWorkflowStartResult> {
+    if (!this.builtInWorkflows) {
+      return Promise.reject(new Error(
+        'This server does not support guided workflows. Update or restart the server, then try again.',
+      ));
+    }
+    if (this.workflowRequests.has(requestId)) {
+      return Promise.reject(new Error('This guided workflow request is already being submitted.'));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const pending = this.workflowRequests.get(requestId);
+        if (!pending) return;
+        this.workflowRequests.delete(requestId);
+        pending.reject(new Error('The guided workflow request timed out. Please try again.'));
+      }, 30_000);
+      this.workflowRequests.set(requestId, { workflow, resolve, reject, timer });
+      this.send({ type: 'chat_start_builtin_workflow', requestId, workflow, text: prompt });
+    });
+  }
+
+  /**
+   * Release the server's dedupe entry only after the caller has completed its
+   * local success handoff and will no longer retry this request id.
+   */
+  acknowledgeBuiltInWorkflow(workflow: BuiltInWorkflowId, requestId: string): void {
+    if (!this.builtInWorkflows || !requestId) return;
+    this.send({ type: 'chat_builtin_workflow_ack', requestId, workflow });
+  }
+
   /** What this conversation's composer holds, as far as this browser knows. */
   get draftValue(): ChatDraft {
     return this.draft;
@@ -959,6 +1060,18 @@ export class ChatController {
   /** Whether this server carries the composer between screens at all. */
   get draftSyncAvailable(): boolean {
     return this.draftSync;
+  }
+
+  /** Whether this server accepts correlated app-owned workflow turns. */
+  get builtInWorkflowsAvailable(): boolean {
+    return this.builtInWorkflows;
+  }
+
+  /** Told by the registry whenever a handshake (including a reconnect) arrives. */
+  setBuiltInWorkflowSupport(enabled: boolean): void {
+    if (this.builtInWorkflows === enabled) return;
+    this.builtInWorkflows = enabled;
+    this.options.onChange?.();
   }
 
   /** Told by the registry once the server's feature list has arrived. */
@@ -1426,6 +1539,11 @@ export class ChatController {
     this.draftTimer = null;
     this.draftPending = null;
     this.draftListeners.clear();
+    for (const pending of this.workflowRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('The conversation closed before the guided workflow was started.'));
+    }
+    this.workflowRequests.clear();
   }
 
   /**

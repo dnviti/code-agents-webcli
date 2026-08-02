@@ -686,6 +686,13 @@ export interface ChatMessage {
   usage?: ChatUsage;
   /** Model that produced this message, when reported. */
   model?: string;
+  /**
+   * App-owned workflow that produced this user turn.
+   *
+   * Kept as metadata so retry can restore the runtime-only guidance without
+   * putting a slash invocation or the bundled instructions in the transcript.
+   */
+  workflow?: BuiltInWorkflowId;
   /** True while the runtime is still appending to this message. */
   streaming?: boolean;
   /**
@@ -995,6 +1002,8 @@ export type ChatEvent =
       role: ChatRole;
       turnId: string;
       model?: string;
+      /** Internal app-owned workflow intent, set only on the recorded user prompt. */
+      workflow?: BuiltInWorkflowId;
       /**
        * Set on a user message that was delivered *into* the turn already
        * running, rather than waiting for its own (#86).
@@ -1289,10 +1298,30 @@ export interface ChatAttachment {
   path?: string;
 }
 
+/**
+ * App-owned guided workflows.
+ *
+ * These names are a wire contract, not slash commands. The server keeps the
+ * workflow identity beside a turn so it can add the bundled instructions only
+ * at runtime while the transcript continues to contain exactly what the user
+ * wrote.
+ */
+export const BUILT_IN_WORKFLOW_IDS = ['gh-issue'] as const;
+export type BuiltInWorkflowId = typeof BUILT_IN_WORKFLOW_IDS[number];
+
+/** The one-field workflow prompt is intentionally bounded before it reaches a runtime. */
+export const MAX_BUILT_IN_WORKFLOW_PROMPT = 20_000;
+
+export function isBuiltInWorkflowId(value: unknown): value is BuiltInWorkflowId {
+  return typeof value === 'string' && (BUILT_IN_WORKFLOW_IDS as readonly string[]).includes(value);
+}
+
 /** A user turn on its way to the runtime. */
 export interface UserTurn {
   text: string;
   attachments?: ChatAttachment[];
+  /** Internal intent for an app-bundled workflow; never rendered as user text. */
+  workflow?: BuiltInWorkflowId;
 }
 
 /**
@@ -1336,6 +1365,8 @@ export interface QueuedTurn {
   id: string;
   text: string;
   attachments?: ChatAttachment[];
+  /** Preserves runtime-only bundled guidance through queueing and retry. */
+  workflow?: BuiltInWorkflowId;
   ts: number;
   /**
    * Why the last attempt to hand this turn over failed.
