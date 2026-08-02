@@ -114,22 +114,50 @@ export interface WrappedCommand {
   args: string[];
   /** The environment the *spawn* gets — not the environment the program sees. */
   env: Record<string, string>;
+  /**
+   * An identity-bound stop handle for a long-lived command inside a container.
+   *
+   * Killing `docker exec` or `kubectl exec` only proves that the local client
+   * went away. It does not prove that the command it started in the container
+   * did. Runtime launches opt into this handle and must await it before an
+   * environment may be reclaimed, rebuilt or moved.
+   */
+  processControl?: WrappedProcessControl;
+}
+
+export interface WrappedProcessControl {
+  /**
+   * TERM, then KILL, the exact tracked process and resolve only once its remote
+   * identity can no longer be found. Reject when that cannot be verified.
+   */
+  stop(): Promise<void>;
 }
 
 export interface WrapOptions {
   cwd?: string;
+  /**
+   * `host` is the long-standing default. `container` is explicit for a
+   * project session whose cwd is in the image layer (for example `/tmp`), so
+   * an absolute string is never guessed as one namespace or the other.
+   */
+  cwdKind?: 'host' | 'container';
   /** Variables the program should see. In container mode these become `-e` flags. */
   env?: Record<string, string>;
   /** Whether the wrapped process needs a TTY (`exec -t`). PTY spawns do; pipes do not. */
   tty?: boolean;
+  /**
+   * Track this long-lived process inside a container so its death can be
+   * verified independently of the local engine client.
+   */
+  trackProcess?: boolean;
 }
 
 /**
  * Where one user's processes run and where their files live.
  *
- * `homeDir` is always a *host* path: the file browser, editor, uploads and git
- * keep using ordinary `fs`, because the container's home is a bind mount of that
- * directory rather than a copy inside an image layer.
+ * `homeDir` is always a host-backed path. Generic filesystem consumers may use
+ * ordinary `fs` only for host-kind cwd values; an explicit container-kind cwd
+ * can point anywhere in the image and must use the engine-backed project API.
  */
 export interface UserEnvironment {
   readonly kind: 'host' | 'container';

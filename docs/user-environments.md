@@ -133,9 +133,13 @@ whose job is creating pods.
 
 Storage is the part that needs planning: see below.
 
-The base image must contain the agent CLIs you want available and a shell. The
-default, `docker.io/library/node:22-bookworm`, has Node and `bash` but no agent
-CLIs; install them with `--container-setup` or build your own image.
+The base image must be Linux, expose a readable `/proc`, and contain `sh`,
+`setsid`, and the agent CLIs you want available. The server uses those operating-
+system facilities to identify and stop terminal and agent process trees before
+an environment can be reclaimed. The default,
+`docker.io/library/node:22-bookworm`, supplies the runtime facilities, Node and
+`bash`, but no agent CLIs; install them with `--container-setup` or build your
+own image.
 
 ## Turning it on
 
@@ -238,6 +242,19 @@ Two further directories are mounted into every environment: the app's own
 installation directory, read-only, and the directory its chat sockets live in.
 That is how tool approvals and the model's questions still reach your browser
 from a runtime that is not on this host. Neither contains user data.
+
+## Projects and persistent homes
+
+[Projects](projects.md) use their own containers and disposable `/workspace`
+worktrees, but each project container also mounts the same persistent home as
+the owner's per-user environment. That is why a project container can be
+stopped, rebuilt, or reclaimed without costing the user their shell setup,
+agent sign-ins, or tooling installed in that home.
+
+The project checkout is deliberately not part of that home. It is re-cloned on
+a rebuild, with uncommitted repository changes preserved to a WIP branch first
+when possible. Files elsewhere in the project container are transient too.
+For the full lifetime and preservation rules, see [Projects](projects.md).
 
 ## Names
 

@@ -195,6 +195,31 @@ describe('session tab state', function () {
     );
   });
 
+  it('retains and refreshes the project cwd namespace in tab and header state', function () {
+    const { m } = manager();
+    m.addTab(
+      'project-tab', 'Project', 'idle', '/host/projects/alpha', false,
+      undefined, 'project-a', 'Alpha', 'host',
+    );
+    assert.strictEqual(shellTab('project-tab').projectId, 'project-a');
+    assert.strictEqual(shellTab('project-tab').projectWorkingDirKind, 'host');
+
+    // A join after choosing an image-layer folder updates an existing tab; it
+    // must not keep the host discriminator from the earlier list response.
+    m.addTab(
+      'project-tab', 'Project', 'idle', '/tmp/work', false,
+      undefined, 'project-a', 'Alpha', 'container',
+    );
+    assert.strictEqual(m.activeSessions.get('project-tab').workingDir, '/tmp/work');
+    assert.strictEqual(shellTab('project-tab').projectWorkingDirKind, 'container');
+
+    m.updateHeaderInfo('project-tab');
+    const connection = mod.shellStore.getSnapshot().connection;
+    assert.strictEqual(connection.workingDir, '/tmp/work');
+    assert.strictEqual(connection.projectId, 'project-a');
+    assert.strictEqual(connection.projectWorkingDirKind, 'container');
+  });
+
   it('raises unread when a background session goes quiet, and clears it on switch', async function () {
     const { m } = manager();
     m.addTab('active', 'active', 'idle', null, false);

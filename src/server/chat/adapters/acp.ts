@@ -451,7 +451,7 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
         t: 'session',
         nativeSessionId: this.nativeSessionId || undefined,
         model: this.model,
-        cwd: this.options.workingDir,
+        cwd: this.runtimeWorkingDir,
         capabilities: this.capabilities,
       });
       // What the agent itself said it is thinking at, before this app has asked
@@ -531,7 +531,7 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
       try {
         const loaded = await this.call('session/load', {
           sessionId: resumeId,
-          cwd: this.options.workingDir,
+          cwd: this.runtimeWorkingDir,
           mcpServers: this.mcpServers(),
         });
         this.nativeSessionId = resumeId;
@@ -545,7 +545,7 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     try {
       const created = record(
         await this.call('session/new', {
-          cwd: this.options.workingDir,
+          cwd: this.runtimeWorkingDir,
           mcpServers: this.mcpServers(),
         }),
       );

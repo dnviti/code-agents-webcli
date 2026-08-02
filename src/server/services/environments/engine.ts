@@ -25,6 +25,8 @@ export type EngineRunner = (
   args: string[],
   /** Written to the child's stdin and closed. Used to feed manifests to `kubectl apply`. */
   input?: string,
+  /** Cancels the underlying engine client process, not only its awaiting caller. */
+  signal?: AbortSignal,
 ) => Promise<RunResult>;
 
 export interface CreateContainerSpec {
@@ -44,6 +46,8 @@ export interface CreateContainerSpec {
 
 export interface ContainerDescription {
   name: string;
+  /** Immutable Docker/Podman container ID or Kubernetes Pod UID. */
+  identity: string;
   status: string;
   image: string;
   labels: Record<string, string>;
@@ -51,9 +55,14 @@ export interface ContainerDescription {
 
 export interface ExecSpec {
   name: string;
+  /** Prefer this immutable identity when the engine supports it. */
+  identity?: string;
   cwd?: string;
   env?: Record<string, string>;
   tty?: boolean;
+  signal?: AbortSignal;
+  /** Optional stdin sent to the in-container command, never encoded in argv. */
+  input?: string;
 }
 
 /** What one environment is currently consuming, as far as the engine can say. */
@@ -84,10 +93,18 @@ export interface EnvironmentEngine {
    * had to build a new one, which is what decides if the setup command runs.
    */
   ensure(spec: CreateContainerSpec): Promise<{ created: boolean }>;
+  /**
+   * Project-safe ensure: the name must still resolve to this exact identity.
+   * The returned identity is the one created or retained by this operation,
+   * so a caller can reject a delete/recreate race before issuing any command.
+   */
+  ensureIdentity(spec: CreateContainerSpec, expected: ContainerDescription | null): Promise<{ created: boolean; identity: string }>;
   create(spec: CreateContainerSpec): Promise<void>;
   start(name: string): Promise<void>;
   stop(name: string): Promise<void>;
   remove(name: string): Promise<void>;
+  stopIdentity(description: ContainerDescription): Promise<void>;
+  removeIdentity(description: ContainerDescription): Promise<void>;
   status(name: string): Promise<string | null>;
   /**
    * Describe one exact object, returning null only when it does not exist.
@@ -115,9 +132,18 @@ export interface EnvironmentEngine {
   usage(name: string): Promise<ResourceUsage | null>;
 }
 
-export const defaultRunner: EngineRunner = (file, args, input) =>
+/** Docker/Podman states in which the container cannot execute user work. */
+const QUIESCENT_CONTAINER_STATES = new Set([
+  'configured', 'created', 'dead', 'exited', 'initialized', 'stopped',
+]);
+
+export function isQuiescentContainerStatus(status: string): boolean {
+  return QUIESCENT_CONTAINER_STATES.has(status.toLowerCase());
+}
+
+export const defaultRunner: EngineRunner = (file, args, input, signal) =>
   new Promise((resolve, reject) => {
-    const child = execFile(file, args, { maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+    const child = execFile(file, args, { maxBuffer: 8 * 1024 * 1024, signal }, (error, stdout, stderr) => {
       if (error) {
         reject(Object.assign(error, { stdout, stderr }));
         return;
@@ -129,6 +155,9 @@ export const defaultRunner: EngineRunner = (file, args, input) =>
       child.stdin?.end(input);
     }
   });
+
+/** Inspection failed for a reason other than a confirmed native not-found. */
+export class EnvironmentInspectionError extends Error {}
 
 export function validateIdentityLabels(
   spec: CreateContainerSpec,
@@ -278,7 +307,7 @@ export class ContainerEngine implements EnvironmentEngine {
     for (const [key, value] of Object.entries(spec.env || {})) {
       args.push('--env', `${key}=${value}`);
     }
-    args.push(spec.name, command, ...commandArgs);
+    args.push(spec.identity || spec.name, command, ...commandArgs);
     return args;
   }
 
@@ -293,6 +322,36 @@ export class ContainerEngine implements EnvironmentEngine {
       await this.start(spec.name);
     }
     return { created: false };
+  }
+
+  async ensureIdentity(spec: CreateContainerSpec, expected: ContainerDescription | null): Promise<{ created: boolean; identity: string }> {
+    const current = await this.describeStrict(spec.name);
+    if (expected) {
+      if (!current || current.identity !== expected.identity) {
+        throw new EnvironmentInspectionError(`container '${spec.name}' was replaced before ensure`);
+      }
+      validateIdentityLabels(spec, current);
+      if (current.status !== 'running') {
+        await this.run(this.binary, [...this.hostArgs, 'start', expected.identity]);
+        const after = await this.describeStrict(spec.name);
+        if (!after || after.identity !== expected.identity || after.status !== 'running') {
+          throw new EnvironmentInspectionError(`container '${spec.name}' changed identity or did not start`);
+        }
+      }
+      return { created: false, identity: expected.identity };
+    }
+    if (current) throw new EnvironmentInspectionError(`container '${spec.name}' appeared before creation`);
+    const { stdout } = await this.run(this.binary, this.createArgs(spec));
+    const identity = stdout.trim().split(/\s+/)[0] || '';
+    if (!identity) {
+      throw new EnvironmentInspectionError(`container '${spec.name}' was created without a verifiable identity`);
+    }
+    const created = await this.describeStrict(spec.name);
+    if (!created || created.identity !== identity || created.status !== 'running') {
+      throw new EnvironmentInspectionError(`container '${spec.name}' changed identity or did not start after creation`);
+    }
+    validateIdentityLabels(spec, created);
+    return { created: true, identity };
   }
 
   async create(spec: CreateContainerSpec): Promise<void> {
@@ -311,6 +370,34 @@ export class ContainerEngine implements EnvironmentEngine {
     await this.run(this.binary, [...this.hostArgs, 'rm', '--force', name]);
   }
 
+  async stopIdentity(description: ContainerDescription): Promise<void> {
+    try {
+      await this.run(this.binary, [...this.hostArgs, 'stop', '--time', '5', description.identity]);
+    } catch (error) {
+      if (!/no such (?:object|container)/i.test(errorText(error))) throw error;
+    }
+    const after = await this.describeStrict(description.name);
+    if (!after) return;
+    if (after.identity !== description.identity) throw new EnvironmentInspectionError(`container '${description.name}' was replaced during stop`);
+    if (!isQuiescentContainerStatus(after.status)) {
+      throw new EnvironmentInspectionError(
+        `container '${description.name}' is still potentially executable after stop (${after.status})`,
+      );
+    }
+  }
+
+  async removeIdentity(description: ContainerDescription): Promise<void> {
+    try {
+      await this.run(this.binary, [...this.hostArgs, 'rm', '--force', description.identity]);
+    } catch (error) {
+      if (!/no such (?:object|container)/i.test(errorText(error))) throw error;
+    }
+    const after = await this.describeStrict(description.name);
+    if (!after) return;
+    if (after.identity !== description.identity) throw new EnvironmentInspectionError(`container '${description.name}' was replaced during removal`);
+    throw new EnvironmentInspectionError(`container '${description.name}' still exists after removal`);
+  }
+
   /** `running`, `exited`, … or null when no such container exists. */
   async status(name: string): Promise<string | null> {
     try {
@@ -318,9 +405,13 @@ export class ContainerEngine implements EnvironmentEngine {
         ...this.hostArgs,
         'container', 'inspect', '--format', '{{.State.Status}}', name,
       ]);
-      return stdout.trim() || null;
-    } catch {
-      return null;
+      const status = stdout.trim();
+      if (!status) throw new EnvironmentInspectionError(`malformed status response for '${name}'`);
+      return status;
+    } catch (error) {
+      if (/no such (?:object|container)/i.test(errorText(error))) return null;
+      if (error instanceof EnvironmentInspectionError) throw error;
+      throw new EnvironmentInspectionError(`could not inspect status for '${name}': ${errorText(error).trim()}`);
     }
   }
 
@@ -337,24 +428,31 @@ export class ContainerEngine implements EnvironmentEngine {
       const { stdout } = await this.run(this.binary, [
         ...this.hostArgs,
         'container', 'inspect', '--format',
-        '{{.State.Status}}\t{{.Config.Image}}\t{{json .Config.Labels}}', name,
+        '{{.Id}}\t{{.State.Status}}\t{{.Config.Image}}\t{{json .Config.Labels}}', name,
       ]);
-      const [status, image, labelsJson] = stdout.trim().split('\t');
-      if (!status && !image && !labelsJson) {
-        throw new Error(`engine returned an empty description for '${name}'`);
+      const fields = stdout.trim().split('\t');
+      if (fields.length !== 4 || !fields[0] || !fields[1]) {
+        throw new EnvironmentInspectionError(`malformed inspection response for '${name}'`);
       }
-      let labels: Record<string, string> = {};
+      const [identity, status, image, labelsJson] = fields;
+      let labels: Record<string, string>;
       try {
         labels = JSON.parse(labelsJson || '{}') || {};
+        if (typeof labels !== 'object' || Array.isArray(labels)) {
+          throw new Error('labels are not an object');
+        }
       } catch (error) {
-        throw new Error(`engine returned invalid labels for '${name}': ${errorText(error)}`);
+        throw new EnvironmentInspectionError(
+          `malformed labels for '${name}': ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
-      return { name, status: status || 'unknown', image: image || '', labels };
+      return { name, identity, status, image: image || '', labels };
     } catch (error) {
-      if (containerObjectMissing(error)) {
-        return null;
-      }
-      throw error;
+      if (containerObjectMissing(error)) return null;
+      if (error instanceof EnvironmentInspectionError) throw error;
+      throw new EnvironmentInspectionError(
+        `could not inspect container '${name}': ${errorText(error).trim()}`,
+      );
     }
   }
 
@@ -368,7 +466,7 @@ export class ContainerEngine implements EnvironmentEngine {
 
   /** Run a one-shot command inside an environment and return its output. */
   async exec(spec: ExecSpec, command: string, commandArgs: string[]): Promise<RunResult> {
-    return this.run(this.binary, this.execArgs(spec, command, commandArgs));
+    return this.run(this.binary, this.execArgs(spec, command, commandArgs), spec.input, spec.signal);
   }
 
   /** Names of every environment this server manages, running or not. */

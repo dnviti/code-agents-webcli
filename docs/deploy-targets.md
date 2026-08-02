@@ -21,6 +21,11 @@ Each target has:
   default tier, whether users may choose, and flat CPU/memory limits;
 - an idle timeout and an optional setup command.
 
+Every target image must be Linux-based and provide `sh`, a readable `/proc`, and
+`setsid`. Terminals and agents use them to keep remote process lifecycles tied to
+project admission; an image missing one can be created, but cannot safely run a
+session.
+
 Secrets are encrypted in the database. The only place they appear on disk in
 plaintext is `<data-dir>/deploy-targets/<target-id>/`, and that is only so the
 engine CLI can read them.
@@ -38,6 +43,10 @@ runtime-profiles route uses.
 The engine prerequisites are the same as for a legacy install. Targets add a few
 caveats that the panel shows before you save.
 
+For every engine, the selected image must be Linux-based and include `sh`, a
+readable `/proc`, and `setsid`. This prerequisite is shown beside the image field
+and in each engine's caveats.
+
 ### Docker and Podman
 
 - The server's account must be able to reach the engine. For Docker that
@@ -54,6 +63,10 @@ caveats that the panel shows before you save.
   not reach the browser.** Their channel is a Unix socket on the server host;
   sharing the directory exposes its path but does not forward that socket to a
   different machine. Conversations that bypass approvals are unaffected.
+- Remote Docker and Podman targets can run per-user environments, but they
+  cannot host [projects](projects.md): project workspaces must also be visible
+  to the server-side file browser. Project creation fails loudly instead of
+  attaching a different directory from the remote host.
 - `env ls` and `env rm` on the server command line see only the legacy startup
   configuration, not the deploy-targets table. Use the web panel to check or
   remove targets.

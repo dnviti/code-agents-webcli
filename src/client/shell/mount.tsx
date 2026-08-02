@@ -92,11 +92,23 @@ export function mountShell(app: App): void {
   );
 }
 
-/** Past conversations in a folder, for the launcher's resume list. */
-async function fetchResumable(app: App, workingDir: string): Promise<ResumableConversation[]> {
-  const response = await app.authFetch(
-    `/api/sessions/resumable?dir=${encodeURIComponent(workingDir)}`,
-  );
+interface ResumableLocation {
+  workingDir: string;
+  projectId?: string | null;
+  workingDirKind?: 'host' | 'container';
+}
+
+/** Past conversations in one explicit folder namespace, for the launcher. */
+async function fetchResumable(
+  app: App,
+  location: ResumableLocation,
+): Promise<ResumableConversation[]> {
+  const query = new URLSearchParams({ dir: location.workingDir });
+  if (location.projectId) {
+    query.set('projectId', location.projectId);
+    query.set('workingDirKind', location.workingDirKind || 'host');
+  }
+  const response = await app.authFetch(`/api/sessions/resumable?${query}`);
   if (!response.ok) return [];
   const data = (await response.json()) as { conversations?: ResumableConversation[] };
   return Array.isArray(data.conversations) ? data.conversations : [];
@@ -133,6 +145,10 @@ async function resumeConversation(app: App, conversation: ResumableConversation)
         'idle',
         conversation.workingDir,
         false,
+        undefined,
+        conversation.projectId,
+        conversation.projectName,
+        conversation.workingDirKind,
       );
       // See `openStoredConversation`: until the server confirms the surface, this
       // tab's close button would delete the conversation rather than detach it.
@@ -246,6 +262,10 @@ async function openStoredConversation(
         conversation.running ? 'active' : 'idle',
         conversation.workingDir,
         false,
+        undefined,
+        conversation.projectId,
+        conversation.projectName,
+        conversation.workingDirKind,
       );
       // Said here rather than waited for. The server reports the surface on
       // `session_joined`, which is a round trip away, and a tab that reads as a
@@ -337,6 +357,10 @@ async function openBranch(app: App, conversation: BranchedConversation): Promise
         'idle',
         conversation.workingDir,
         false,
+        undefined,
+        conversation.projectId,
+        conversation.projectName,
+        conversation.projectWorkingDirKind,
       );
       await app.sessionTabManager.switchToTab(conversation.sessionId);
     } else {
@@ -412,7 +436,14 @@ function buildLauncher(app: App): React.ReactNode {
       shellStore.getSnapshot,
     );
 
-    const workingDir = app.selectedWorkingDir || app.currentFolderPath || '';
+    const active = state.tabs.find((tab) => tab.id === state.activeId);
+    const projectId = active?.projectId || null;
+    const workingDir = projectId
+      ? active?.workingDir || state.connection.workingDir || ''
+      : app.selectedWorkingDir || app.currentFolderPath || active?.workingDir || '';
+    const workingDirKind = projectId
+      ? active?.projectWorkingDirKind || 'host'
+      : 'host';
     const [conversations, setConversations] = React.useState<ResumableConversation[]>([]);
     const [loading, setLoading] = React.useState(false);
 
@@ -426,7 +457,7 @@ function buildLauncher(app: App): React.ReactNode {
       }
       let cancelled = false;
       setLoading(true);
-      fetchResumable(app, workingDir)
+      fetchResumable(app, { workingDir, projectId, workingDirKind })
         .then((list) => {
           if (!cancelled) setConversations(list);
         })
@@ -441,7 +472,7 @@ function buildLauncher(app: App): React.ReactNode {
       return () => {
         cancelled = true;
       };
-    }, [workingDir]);
+    }, [workingDir, projectId, workingDirKind]);
 
     return (
       <RuntimeLauncher
@@ -459,6 +490,52 @@ function buildLauncher(app: App): React.ReactNode {
   }
 
   return <LauncherHost />;
+}
+
+/** Create and focus a session whose workspace is resolved by the project manager. */
+async function createProjectSession(app: App, projectId: string): Promise<void> {
+  try {
+    const response = await app.authFetch('/api/sessions/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId }),
+    });
+    if (!response.ok) throw new Error('Failed to create project session');
+    const data = await response.json() as {
+      sessionId: string;
+      session?: {
+        name?: string;
+        workingDir?: string;
+        projectId?: string | null;
+        projectName?: string | null;
+        projectWorkingDirKind?: 'host' | 'container';
+      };
+    };
+    const sessionName = data.session?.name || 'Project session';
+    const workingDir = data.session?.workingDir || '';
+    app.startPromptRequested = true;
+    if (app.sessionTabManager) {
+      app.sessionTabManager.addTab(
+        data.sessionId,
+        sessionName,
+        'idle',
+        workingDir,
+        true,
+        undefined,
+        data.session?.projectId ?? projectId,
+        data.session?.projectName,
+        data.session?.projectWorkingDirKind,
+      );
+      await app.sessionTabManager.switchToTab(data.sessionId);
+    } else {
+      await app.joinSession(data.sessionId);
+    }
+    app.loadSessions();
+  } catch (error) {
+    app.startPromptRequested = false;
+    console.error('Failed to create project session:', error);
+    showError('Could not open a session for this project.');
+  }
 }
 
 /**
@@ -505,6 +582,7 @@ function buildActions(app: App): ShellActions {
     openSettings: () => app.showSettings(),
 
     createSession: (name, workingDir) => void createNewSession(app, name, workingDir),
+    openProjectSession: (projectId) => void createProjectSession(app, projectId),
     startShell: (shell) => startTerminalShell(app, shell),
     runCommand: (command) => runTerminalCommand(app, command),
 

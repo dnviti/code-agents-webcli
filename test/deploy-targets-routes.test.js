@@ -40,6 +40,7 @@ describe('deploy target routes', function () {
   let engineCalls;
   let enginesInManager;
   let createdConfigs;
+  let projectRefs;
 
   /** The engine the injected factory hands out; behavior set per test. */
   function fakeEngine() {
@@ -64,6 +65,7 @@ describe('deploy target routes', function () {
     createdConfigs = [];
     engineBehavior = { available: async () => true };
     enginesInManager = new Map();
+    projectRefs = new Map();
 
     const app = express();
     app.use(express.json());
@@ -84,6 +86,9 @@ describe('deploy target routes', function () {
         reloadDeployTargets: () => {
           reloadCount += 1;
         },
+        projectIdsForTarget: (id) => projectRefs.get(id) || [],
+        getDeploySetting: (key) => database.getSetting(key),
+        setDeploySetting: (key, value) => database.setSetting(key, value),
         getInstallerUserId: () => installerUserId,
       }),
     );
@@ -189,6 +194,8 @@ describe('deploy target routes', function () {
     assert.strictEqual(list.targets[0].id, target.id);
     assert.strictEqual(list.canEdit, true);
     assert.ok(list.engineCaveats.kubernetes.length > 0, 'k8s caveats ship with the list');
+    assert.match(list.engineCaveats.docker.join(' '), /Linux.*sh.*\/proc.*setsid/i);
+    assert.match(list.engineCaveats.podman.join(' '), /Linux.*sh.*\/proc.*setsid/i);
 
     const detail = await req('GET', `/api/admin/deploy-targets/${target.id}`);
     assert.strictEqual(detail.status, 200);
@@ -439,6 +446,54 @@ describe('deploy target routes', function () {
     const ok = await req('DELETE', `/api/admin/deploy-targets/${target.id}`);
     assert.strictEqual(ok.status, 200);
     assert.strictEqual(store.listTargets().length, 0);
+  });
+
+  it('fails closed and retains target credentials when runtime inspection fails', async function () {
+    const { target } = await (await createTarget({
+      hostSecret: { host: HOST, tls: TLS },
+    })).json();
+    // A failed list is unknown, not proof that the target is empty.
+    enginesInManager.set(target.id, {
+      kind: 'docker',
+      binary: 'docker',
+      list: async () => {
+        throw new Error(`cannot reach ${HOST}`);
+      },
+    });
+
+    const res = await req('DELETE', `/api/admin/deploy-targets/${target.id}`);
+    assert.strictEqual(res.status, 409);
+    const body = await res.json();
+    assert.strictEqual(body.error, 'target_runtime_unknown');
+    assert.ok(!JSON.stringify(body).includes(HOST), 'connection failures must not leak credentials');
+    assert.strictEqual(store.getTarget(target.id).hostSecret.host, HOST, 'the target and its credentials survive');
+    assert.strictEqual(reloadCount, 1, 'a failed inspection does not reload or remove the target');
+  });
+
+  it('inspects a target runtime even when the manager did not retain its engine', async function () {
+    const { target } = await (await createTarget()).json();
+    engineBehavior.list = async () => ['orphaned-container'];
+
+    const res = await req('DELETE', `/api/admin/deploy-targets/${target.id}`);
+    assert.strictEqual(res.status, 409);
+    assert.deepStrictEqual((await res.json()).containers, ['orphaned-container']);
+    assert.ok(store.getTarget(target.id), 'the target survives a container found by its direct runtime probe');
+  });
+
+  it('retains a target recorded by stopped or reclaimed projects', async function () {
+    const { target } = await (await createTarget()).json();
+    projectRefs.set(target.id, ['project-stopped']);
+
+    const changedConnection = await req('PUT', `/api/admin/deploy-targets/${target.id}`, {
+      hostSecret: { host: 'tcp://replacement.example:2376' },
+    });
+    assert.strictEqual(changedConnection.status, 409);
+    assert.deepStrictEqual((await changedConnection.json()).projects, ['project-stopped']);
+
+    const deleted = await req('DELETE', `/api/admin/deploy-targets/${target.id}`);
+    assert.strictEqual(deleted.status, 409);
+    assert.deepStrictEqual((await deleted.json()).projects, ['project-stopped']);
+    assert.ok(store.getTarget(target.id), 'durable project placement keeps its target row');
   });
 
   it('blocks connection edits while containers stand, but not renames or retunes', async function () {

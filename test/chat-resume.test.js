@@ -148,7 +148,17 @@ describe('resuming a conversation', function () {
 
       s.ingest({ t: 'state', state: 'exited' });
 
-      assert.deepStrictEqual(seen, [{ exited: true }]);
+      assert.deepStrictEqual(seen, [{ exited: true, restarting: false }]);
+    });
+
+    it('marks the old adapter exit during an in-place restart', function () {
+      const seen = [];
+      const { s } = session({ onLifecycle: (_id, change) => seen.push(change) });
+      s.restarting = true;
+
+      s.ingest({ t: 'state', state: 'exited' });
+
+      assert.deepStrictEqual(seen, [{ exited: true, restarting: true }]);
     });
 
     it('puts it in the snapshot, so a browser knows a resume is possible', async function () {

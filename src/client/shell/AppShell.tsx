@@ -17,6 +17,7 @@ import { PlanDialog } from './dialogs/PlanDialog';
 import { RenameDialog } from './dialogs/RenameDialog';
 import { RuntimeProfilesDialog } from './dialogs/RuntimeProfilesDialog';
 import { DeployTargetsDialog } from './dialogs/DeployTargetsDialog';
+import { ProjectsDialog } from './dialogs/ProjectsDialog';
 import { EnvironmentDialog, type EnvironmentInfo } from './dialogs/EnvironmentDialog';
 import { SessionsDialog } from './dialogs/SessionsDialog';
 import { ConversationsDialog } from './dialogs/ConversationsDialog';
@@ -87,6 +88,8 @@ export interface ShellActions {
   createSession(name: string, workingDir: string): void;
   startShell(shell: string): void;
   runCommand(command: string): void;
+  /** Create a session inside a project and focus it. */
+  openProjectSession(projectId: string): void;
 
   // Folder browser
   folderNavigate(path: string): void;
@@ -154,11 +157,18 @@ export interface AppShellProps {
 function tabItems(tabs: ShellTab[]): TabItem[] {
   return tabs.map((tab) => ({
     id: tab.id,
-    title: tab.title,
+    title: tab.projectName || tab.projectId ? (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{tab.title}</span>
+        <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--primary)', flex: '0 0 auto' }}>{tab.projectName || tab.projectId}</span>
+      </span>
+    ) : tab.title,
     status: tab.status,
     unread: tab.unread,
     attention: tab.attention,
-    tooltip: tab.workingDir ?? tab.title,
+    tooltip: tab.projectName || tab.projectId
+      ? `${tab.projectName || tab.projectId} · ${tab.workingDir ?? tab.title}`
+      : (tab.workingDir ?? tab.title),
   }));
 }
 
@@ -788,6 +798,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         onOpenDeployTargets={() => closeDialogs({ settings: false, deployTargets: true })}
         environmentsEnabled={environment.info?.enabled === true}
         onOpenEnvironment={() => closeDialogs({ settings: false, environment: true })}
+        onOpenProjects={() => closeDialogs({ settings: false, projects: true })}
         onPreview={actions.previewSettings}
         onSave={(next) => { actions.saveSettings(next); closeDialogs({ settings: false }); }}
         onClose={() => {
@@ -825,6 +836,15 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         onClose={() => closeDialogs({ environment: false })}
       />
 
+      <ProjectsDialog
+        open={state.dialogs.projects}
+        onClose={() => closeDialogs({ projects: false })}
+        onOpenProject={(projectId) => {
+          closeDialogs({ projects: false });
+          actions.openProjectSession(projectId);
+        }}
+      />
+
       <ChatSettingsDialog
         open={state.dialogs.chatSettings}
         settings={state.chatView}
@@ -851,6 +871,8 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         path={state.folder.path}
         parentPath={state.folder.parentPath}
         entries={state.folder.entries}
+        workingDirKind={state.folder.workingDirKind}
+        lifetime={state.folder.lifetime}
         showHidden={state.folder.showHidden}
         loading={state.folder.loading}
         creating={state.folder.creating}

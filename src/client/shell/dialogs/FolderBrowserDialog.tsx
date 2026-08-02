@@ -13,6 +13,8 @@ export interface FolderBrowserDialogProps {
   path: string | null;
   parentPath: string | null;
   entries: FolderEntry[];
+  workingDirKind: 'host' | 'container' | null;
+  lifetime: 'workspace' | 'owner_home' | 'disposable' | null;
   showHidden: boolean;
   loading: boolean;
   /** True while the inline "new folder" row is open. */
@@ -98,6 +100,8 @@ export function FolderBrowserDialog({
   path,
   parentPath,
   entries,
+  workingDirKind,
+  lifetime,
   showHidden,
   loading,
   creating,
@@ -158,6 +162,14 @@ export function FolderBrowserDialog({
     </>
   );
 
+  const lifetimeNotice = workingDirKind === 'container' && lifetime
+    ? lifetime === 'owner_home'
+      ? 'This folder is in the project owner’s home and survives project-container rebuilds.'
+      : lifetime === 'workspace'
+        ? 'This folder is in the workspace. A true rebuild clones the repository fresh; dirty repository work is preserved on a WIP branch, but a workspace without a repository is not preserved.'
+        : 'This folder is disposable container storage. It may disappear when the project container is rebuilt.'
+    : null;
+
   return (
     <Dialog open title="Select working directory" width={620} onClose={onClose} footer={footer}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -179,6 +191,25 @@ export function FolderBrowserDialog({
           <Icon name="folder-plus" size={15} />
         </IconButton>
       </div>
+
+      {lifetimeNotice ? (
+        <div
+          role="note"
+          style={{
+            marginTop: 10,
+            padding: '9px 11px',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius)',
+            background: lifetime === 'disposable' ? 'var(--destructive-muted, var(--muted))' : 'var(--muted)',
+            color: lifetime === 'disposable' ? 'var(--destructive)' : 'var(--muted-foreground)',
+            fontFamily: 'var(--font-sans)',
+            fontSize: 'var(--text-sm)',
+            lineHeight: 1.45,
+          }}
+        >
+          {lifetimeNotice}
+        </div>
+      ) : null}
 
       {creating ? (
         <div

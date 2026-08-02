@@ -32,6 +32,7 @@ npx --allow-git=all github:dnviti/code-agents-webcli
 | [Running as a service](running-as-a-service.md) | systemd, Docker and Compose, reverse proxies, ngrok |
 | [Per-user environments](user-environments.md) | Giving every signed-in user their own container, with persistent storage |
 | [Deploy targets](deploy-targets.md) | Managing multiple Docker, Podman or Kubernetes targets from the web UI |
+| [Projects](projects.md) | A disposable repository workspace per container, with durable user storage |
 | [Updating](updating.md) | The update banner, who may apply it, which installs can and cannot |
 
 ## Working on it

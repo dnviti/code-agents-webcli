@@ -1,4 +1,5 @@
 import { ChatAttachment, ChatDraft } from '../../shared/chat-events.js';
+import { storedAttachmentNameFromUrl } from '../services/attachment-store.js';
 import { SessionRecord } from '../types.js';
 
 /**
@@ -60,17 +61,6 @@ export interface DraftInput {
 }
 
 /**
- * Where this conversation's attachments are served from.
- *
- * Built the same way `attachmentUrl` builds it, and deliberately not imported
- * from there: this is a prefix rather than a whole address, and the file that
- * owns the route owns the whole one.
- */
-function attachmentPrefix(sessionId: string): string {
-  return `/api/sessions/${encodeURIComponent(sessionId)}/chat-attachments/`;
-}
-
-/**
  * Read an attachment off the wire, field by field.
  *
  * Never a cast. What arrives here is broadcast to the account's other screens
@@ -87,18 +77,15 @@ function readAttachment(raw: unknown, sessionId: string): ChatAttachment | null 
   const url = text(value.url);
   const name = text(value.name);
   if (!url || !name) return null;
-  // This conversation's own upload route and nothing else. Every attachment a
-  // composer can hold was put there by it — see routes/chat-attachments.ts — so
-  // nothing legitimate is refused, and what it stops is one of the account's
-  // tabs writing an address of its choosing into the `<img src>` of another.
-  if (!url.startsWith(attachmentPrefix(sessionId))) return null;
-  const path = text(value.path);
+  // This conversation's exact upload URL and one canonical stored-name segment,
+  // not merely a matching prefix. The store will resolve that identity again
+  // before a turn reaches a runtime.
+  if (!storedAttachmentNameFromUrl(url, sessionId)) return null;
   return {
     url,
     name,
     mime: text(value.mime) || 'application/octet-stream',
     size: typeof value.size === 'number' && Number.isFinite(value.size) ? value.size : 0,
-    ...(path ? { path } : {}),
   };
 }
 
@@ -127,6 +114,23 @@ export function readDraft(
   // its `.length` reports, and the cost this guards is what goes over the wire.
   if (Buffer.byteLength(text, 'utf8') > MAX_DRAFT_TEXT_BYTES) return null;
 
+  const read = readAttachments(attachments, sessionId);
+  if (!read) return null;
+
+  return { text, attachments: read };
+}
+
+/**
+ * Sanitize attachments on both draft and send frames.
+ *
+ * Most importantly, `path` never survives this boundary. A path is derived
+ * server-side from the owned URL immediately before the turn is sent; accepting
+ * the browser's copy would let a forged `/etc/passwd` reach an adapter.
+ */
+export function readAttachments(
+  attachments: unknown,
+  sessionId: string,
+): ChatAttachment[] | null {
   const list = Array.isArray(attachments) ? attachments : [];
   if (list.length > MAX_DRAFT_ATTACHMENTS) return null;
 
@@ -135,8 +139,7 @@ export function readDraft(
     const attachment = readAttachment(item, sessionId);
     if (attachment) read.push(attachment);
   }
-
-  return { text, attachments: read };
+  return read;
 }
 
 /** What this conversation's composer holds, or null if nothing has been typed. */

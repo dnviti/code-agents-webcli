@@ -196,6 +196,23 @@ describe('codex app-server adapter', function () {
       assert.strictEqual(only(h.events, 'session')[0].cwd, '/work');
     });
 
+    it('sends the translated runtime cwd to app-server', async function () {
+      const h = harness({
+        workingDir: '/host/projects/alpha',
+        cwdKind: 'host',
+        environment: {
+          kind: 'container',
+          toContainerPath(value) {
+            assert.strictEqual(value, '/host/projects/alpha');
+            return '/workspace/alpha';
+          },
+        },
+      });
+      await boot(h);
+      const start = h.sent.find((message) => message.method === 'thread/start');
+      assert.strictEqual(start.params.cwd, '/workspace/alpha');
+    });
+
     it('offers the models codex says it accepts, without waiting for them (#75)', async function () {
       const h = harness({});
       await boot(h);
@@ -1299,5 +1316,96 @@ describe('codex chat adapter (router)', function () {
       emit: () => {},
     });
     await assert.rejects(() => adapter.send({ text: 'hi' }), /not started/);
+  });
+
+  it('retains ownership of a failed app-server probe when verified teardown fails', async function () {
+    const originalPrimaryStart = CodexAppServerAdapter.prototype.start;
+    const originalPrimaryStop = CodexAppServerAdapter.prototype.stop;
+    const originalFallbackStart = CodexExecAdapter.prototype.start;
+    const originalWarn = console.warn;
+    let stopCalls = 0;
+    let fallbackStarts = 0;
+
+    CodexAppServerAdapter.prototype.start = async function () {
+      throw new Error('probe handshake failed');
+    };
+    CodexAppServerAdapter.prototype.stop = async function () {
+      stopCalls += 1;
+      if (stopCalls === 1) throw new Error('remote process close unverified');
+    };
+    CodexExecAdapter.prototype.start = async function () {
+      fallbackStarts += 1;
+    };
+    console.warn = () => {};
+
+    try {
+      const adapter = new CodexChatAdapter({
+        sessionId: 's1',
+        workingDir: '/work',
+        command: '/nonexistent',
+        emit: () => {},
+      });
+
+      await assert.rejects(() => adapter.start(), /remote process close unverified/);
+      assert.ok(adapter.delegate instanceof CodexAppServerAdapter);
+      assert.strictEqual(fallbackStarts, 0, 'fallback must not start beside an unverified probe');
+
+      // The failed probe remains reachable through the facade so a retained
+      // ChatSession can retry its teardown instead of leaking it.
+      await adapter.stop();
+      assert.strictEqual(stopCalls, 2);
+    } finally {
+      CodexAppServerAdapter.prototype.start = originalPrimaryStart;
+      CodexAppServerAdapter.prototype.stop = originalPrimaryStop;
+      CodexExecAdapter.prototype.start = originalFallbackStart;
+      console.warn = originalWarn;
+    }
+  });
+
+  it('transfers ownership to exec only after the app-server probe is verified gone', async function () {
+    const originalPrimaryStart = CodexAppServerAdapter.prototype.start;
+    const originalPrimaryStop = CodexAppServerAdapter.prototype.stop;
+    const originalFallbackStart = CodexExecAdapter.prototype.start;
+    const originalWarn = console.warn;
+    let releaseStop;
+    const stopped = new Promise((resolve) => {
+      releaseStop = resolve;
+    });
+    let fallbackStarts = 0;
+
+    CodexAppServerAdapter.prototype.start = async function () {
+      throw new Error('probe handshake failed');
+    };
+    CodexAppServerAdapter.prototype.stop = async function () {
+      await stopped;
+    };
+    CodexExecAdapter.prototype.start = async function () {
+      fallbackStarts += 1;
+    };
+    console.warn = () => {};
+
+    try {
+      const adapter = new CodexChatAdapter({
+        sessionId: 's1',
+        workingDir: '/work',
+        command: '/nonexistent',
+        emit: () => {},
+      });
+      const starting = adapter.start();
+      await flush();
+
+      assert.ok(adapter.delegate instanceof CodexAppServerAdapter);
+      assert.strictEqual(fallbackStarts, 0);
+
+      releaseStop();
+      await starting;
+      assert.ok(adapter.delegate instanceof CodexExecAdapter);
+      assert.strictEqual(fallbackStarts, 1);
+    } finally {
+      CodexAppServerAdapter.prototype.start = originalPrimaryStart;
+      CodexAppServerAdapter.prototype.stop = originalPrimaryStop;
+      CodexExecAdapter.prototype.start = originalFallbackStart;
+      console.warn = originalWarn;
+    }
   });
 });

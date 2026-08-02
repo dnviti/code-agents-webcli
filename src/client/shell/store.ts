@@ -24,6 +24,8 @@ export interface ShellTab {
   /** Which runtime this session is. Not yet plumbed through from the server. */
   kind: string;
   workingDir: string | null;
+  /** Namespace of workingDir for a project tab; absent means host. */
+  projectWorkingDirKind?: 'host' | 'container';
   unread: boolean;
   /**
    * Whether this conversation has stopped and is waiting on a person.
@@ -35,6 +37,8 @@ export interface ShellTab {
    * or idle.
    */
   attention: ConversationAttention | null;
+  projectId: string | null | undefined;
+  projectName: string | null | undefined;
   /**
    * Which surface this session runs on, fixed when it was started.
    *
@@ -100,6 +104,8 @@ export interface ShellChat {
 export interface ShellConnection {
   state: 'connected' | 'connecting' | 'disconnected';
   workingDir: string | null;
+  projectId?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
 }
 
 /**
@@ -117,6 +123,8 @@ export interface ShellDialogs {
   runtimeProfiles: boolean;
   /** Where containers run: the installer's deploy target editor. */
   deployTargets: boolean;
+  /** The user's project containers and lifecycle controls. */
+  projects: boolean;
   /** The per-user environment size picker; only reachable when the server has environments. */
   environment: boolean;
   newSession: boolean;
@@ -147,6 +155,8 @@ export interface ShellDialogs {
 export interface FolderEntry {
   name: string;
   path: string;
+  workingDirKind?: 'host' | 'container';
+  lifetime?: 'workspace' | 'owner_home' | 'disposable';
 }
 
 export interface FolderState {
@@ -154,6 +164,8 @@ export interface FolderState {
   path: string | null;
   parentPath: string | null;
   entries: FolderEntry[];
+  workingDirKind: 'host' | 'container' | null;
+  lifetime: 'workspace' | 'owner_home' | 'disposable' | null;
   showHidden: boolean;
   loading: boolean;
   /** True while the inline "new folder" row is open. */
@@ -289,6 +301,7 @@ const INITIAL: ShellState = {
     settings: false,
     runtimeProfiles: false,
     deployTargets: false,
+    projects: false,
     environment: false,
     newSession: false,
     terminalOptions: false,
@@ -305,6 +318,8 @@ const INITIAL: ShellState = {
     path: null,
     parentPath: null,
     entries: [],
+    workingDirKind: null,
+    lifetime: null,
     showHidden: false,
     loading: false,
     creating: false,

@@ -72,7 +72,7 @@ export class OmpBridge extends BaseBridge {
     // flag"), so passing it blind would turn "runs in the wrong directory" into
     // "does not start at all" on a build that predates it. Everywhere else argv
     // stays exactly as it was.
-    if (this.isHomeDirectory(options.workingDir) && this.supportsAllowHome()) {
+    if (this.isHomeDirectory(options) && this.supportsAllowHome()) {
       args.push('--allow-home');
     }
 
@@ -92,7 +92,16 @@ export class OmpBridge extends BaseBridge {
    * normalisation says "not home" and the flag would be dropped exactly when it
    * is needed.
    */
-  private isHomeDirectory(workingDir?: string): boolean {
+  private isHomeDirectory(options: StartSessionOptions): boolean {
+    const workingDir = options.workingDir;
+    if (
+      options.cwdKind === 'container'
+      && options.environment?.kind === 'container'
+      && workingDir
+    ) {
+      return path.posix.normalize(workingDir)
+        === path.posix.normalize(options.environment.containerHome);
+    }
     const home = process.env.HOME;
     if (!home || !workingDir) {
       return false;

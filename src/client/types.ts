@@ -81,6 +81,8 @@ export interface SessionInfo {
   name: string;
   status: 'idle' | 'active' | 'error' | 'disconnected';
   workingDir: string | null;
+  /** Namespace of workingDir for a project session; absent means host. */
+  projectWorkingDirKind?: 'host' | 'container';
   lastAccessed: number;
   lastActivity: number;
   unreadOutput: boolean;
@@ -150,6 +152,8 @@ export interface SessionCreateResponse {
   session: {
     name: string;
     workingDir: string;
+    projectId?: string | null;
+    projectName?: string | null;
   };
 }
 
@@ -173,14 +177,23 @@ export interface SessionListItem {
    * is the same direction every other unknown in this rule takes.
    */
   bypassPermissions?: boolean;
+  /** Project identity, when this session was opened from a project workspace. */
+  projectId?: string | null;
+  projectName?: string | null;
+  /** Namespace of workingDir for a project session; absent means host. */
+  projectWorkingDirKind?: 'host' | 'container';
 }
 
 export interface FolderData {
   currentPath: string;
   parentPath: string | null;
+  workingDirKind?: 'host' | 'container';
+  lifetime?: 'workspace' | 'owner_home' | 'disposable';
   folders: Array<{
     name: string;
     path: string;
+    workingDirKind?: 'host' | 'container';
+    lifetime?: 'workspace' | 'owner_home' | 'disposable';
   }>;
 }
 
@@ -202,6 +215,10 @@ export interface WsSessionCreatedMessage {
   sessionId: string;
   sessionName: string;
   workingDir: string;
+  /** Absent only when connected to a server predating project sessions. */
+  projectId?: string | null;
+  projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
 }
 
 export interface WsSessionJoinedMessage {
@@ -209,6 +226,10 @@ export interface WsSessionJoinedMessage {
   sessionId: string;
   sessionName: string;
   workingDir: string;
+  /** Absent only when connected to a server predating project sessions. */
+  projectId?: string | null;
+  projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
   active: boolean;
   outputBuffer?: string[];
   lastAgent?: AgentKind;
@@ -237,6 +258,7 @@ export interface WsChatStartedMessage {
   agent: AgentKind;
   runtimeLabel: string;
   workingDir?: string;
+  projectWorkingDirKind?: 'host' | 'container';
   capabilities?: unknown;
   bypassPermissions?: boolean;
 }
@@ -403,6 +425,9 @@ export interface WsSessionOpenedMessage {
   surface: 'terminal' | 'chat';
   active: boolean;
   bypassPermissions: boolean;
+  projectId?: string | null;
+  projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
 }
 
 /**
@@ -493,6 +518,25 @@ export interface WsEnvironmentTierChangedMessage {
   outcome: string;
 }
 
+/** Broadcast: a project this user owns changed state. */
+export interface WsProjectUpdatedMessage {
+  type: 'project_updated';
+  project: {
+    id: string;
+    name: string;
+    state: string;
+    stateDetail?: string | null;
+    lastActivityAt?: string;
+    hasActiveWork?: boolean;
+  };
+}
+
+/** Broadcast: a project this user owns was deleted. */
+export interface WsProjectRemovedMessage {
+  type: 'project_removed';
+  projectId: string;
+}
+
 export type WsMessage =
   | WsConnectedMessage
   | WsSessionCreatedMessage
@@ -519,6 +563,8 @@ export type WsMessage =
   | WsUpdateDoneMessage
   | WsUpdateRestartingMessage
   | WsEnvironmentTierChangedMessage
+  | WsProjectUpdatedMessage
+  | WsProjectRemovedMessage
   | WsChatStartedMessage
   | WsChatSnapshotMessage
   | WsChatEventMessage

@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 import WebSocket from 'ws';
 import {
   SessionRecord,
@@ -34,6 +35,17 @@ import {
   announceSessionTabClosed,
   announceSessionTabsReordered,
 } from '../websocket/handler.js';
+import {
+  canonicalProjectContainerWorkingDir,
+  canonicalProjectWorkingDir,
+  classifyProjectContainerPath,
+  projectWorkingDirOrDefault,
+  restoreProjectWorkingDir,
+  releaseProjectSessionLease,
+  type ProjectSessionEnvironmentResult,
+  type ProjectSessionLease,
+  type ProjectsSessionApi,
+} from '../services/projects/working-dir.js';
 
 /**
  * How many past conversations one folder offers.
@@ -69,6 +81,38 @@ const DESCRIBE_CONCURRENCY = 16;
 /** Long enough for any label worth reading on a tab, short enough to store freely. */
 const MAX_NAME_LENGTH = 200;
 
+/**
+ * Process-local coordination for the one race persistence cannot express:
+ * creating a hidden child while its owning conversation is being retired.
+ *
+ * `retireProjectSessions()` is called with a freshly assembled deps object, so
+ * the shared sessions map is the stable identity that lets it join the same
+ * gate as the HTTP router.
+ */
+interface SessionRouteCoordination {
+  pendingOwnedCreates: Map<string, Set<Promise<void>>>;
+  retiringTrees: WeakMap<SessionRecord, Promise<boolean>>;
+  destroyedSessions: WeakMap<SessionRecord, Promise<void>>;
+}
+
+const sessionRouteCoordinations = new WeakMap<
+  Map<string, SessionRecord>,
+  SessionRouteCoordination
+>();
+
+function coordinationFor(deps: SessionRoutesDeps): SessionRouteCoordination {
+  let coordination = sessionRouteCoordinations.get(deps.claudeSessions);
+  if (!coordination) {
+    coordination = {
+      pendingOwnedCreates: new Map(),
+      retiringTrees: new WeakMap(),
+      destroyedSessions: new WeakMap(),
+    };
+    sessionRouteCoordinations.set(deps.claudeSessions, coordination);
+  }
+  return coordination;
+}
+
 export interface SessionRoutesDeps {
   claudeSessions: Map<string, SessionRecord>;
   webSocketConnections: Map<string, WebSocketInfo>;
@@ -84,8 +128,15 @@ export interface SessionRoutesDeps {
     workingDir: string;
     connections?: string[];
     ownerSessionId?: string;
+    projectId?: string | null;
+    projectWorkingDirKind?: 'host' | 'container';
   }): SessionRecord;
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
+  /**
+   * Stop whichever process owns this record. The real composition root routes
+   * chats through ChatSessionManager and terminals through their bridge.
+   */
+  stopSessionRuntime?(session: SessionRecord): Promise<void>;
   /** `false` means the SQLite write was attempted but did not commit. */
   saveSessionsToDisk(): Promise<boolean | void>;
   transcriptStore: TranscriptStoreLike;
@@ -111,7 +162,18 @@ export interface SessionRoutesDeps {
   activeProfileFor?(runtime: string): { profileName: string; model?: string } | null;
   sessionStore: {
     getSessionMetadata(): Promise<any>;
+    /** Write-through for the runtime active flag. Optional for tests. */
+    setActive?(id: string, active: boolean): Promise<void>;
+    /** Boot reset for stale active flags. Optional for tests. */
+    resetActiveFlags?(): Promise<void>;
   };
+  /**
+   * Optional project manager seam. When absent, project-aware create is not
+   * available and project-less sessions behave exactly as today. (#168)
+   */
+  projectsManager?: ProjectsSessionApi;
+  /** Release runtime, join and subscription leases before deleting a record. */
+  releaseProjectSessionResources?(sessionId: string): void;
   /**
    * Optional so the hand-built deps literals in the existing tests keep
    * compiling; the server always supplies one.
@@ -195,23 +257,74 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       return;
     }
 
-    // The same check every other path in this app goes through. A directory
-    // that fails it cannot have had a session in it anyway, so this is about
-    // refusing to answer questions about the rest of the disk.
-    const validation = deps.validatePath(requested, user.id);
-    if (!validation.valid || !validation.path) {
-      res.status(403).json({ error: 'That folder is outside the allowed base' });
+    const hasProjectId = Object.prototype.hasOwnProperty.call(req.query, 'projectId');
+    if (hasProjectId && (typeof req.query.projectId !== 'string' || !req.query.projectId.trim())) {
+      res.status(400).json({ error: 'A project id must be a non-empty string' });
       return;
+    }
+    const projectId = typeof req.query.projectId === 'string'
+      ? req.query.projectId.trim()
+      : '';
+    const requestedKind = typeof req.query.workingDirKind === 'string'
+      ? req.query.workingDirKind
+      : undefined;
+
+    let canonicalDir = requested;
+    let workingDirKind: 'host' | 'container' = 'host';
+    if (projectId) {
+      if (requestedKind !== 'host' && requestedKind !== 'container') {
+        res.status(400).json({ error: 'A project folder namespace is required' });
+        return;
+      }
+      const project = deps.projectsManager?.getForUser(user.id, projectId);
+      if (!project) {
+        // Same answer for an absent project and another user's project.
+        res.status(404).json({ error: 'Project not found' });
+        return;
+      }
+      workingDirKind = requestedKind;
+      // This endpoint reads no filesystem data: it matches an exact directory
+      // against this user's already-owned records. Still require an absolute,
+      // unambiguous name so a relative container path cannot alias another
+      // folder after a later cwd change.
+      if (requested.includes('\0') || (workingDirKind === 'container'
+        ? !requested.startsWith('/')
+        : !path.isAbsolute(requested))) {
+        res.status(400).json({ error: 'An absolute project folder is required' });
+        return;
+      }
+      canonicalDir = workingDirKind === 'container'
+        ? path.posix.normalize(requested)
+        : path.resolve(requested);
+    } else {
+      if (requestedKind !== undefined) {
+        res.status(400).json({ error: 'A folder namespace requires a project' });
+        return;
+      }
+      // Legacy/host folders keep the same host confinement they have always
+      // used. Project folders are authorised by project identity above because
+      // their bind mount intentionally sits outside the user's legacy base.
+      const validation = deps.validatePath(requested, user.id);
+      if (!validation.valid || !validation.path) {
+        res.status(403).json({ error: 'That folder is outside the allowed base' });
+        return;
+      }
+      canonicalDir = validation.path;
     }
 
     const candidates = chatRecords(deps, user.id)
-      .filter((session) => session.workingDir === validation.path)
+      .filter((session) => session.workingDir === canonicalDir)
+      .filter((session) => (session.projectId || '') === projectId)
+      .filter((session) => !projectId
+        || (session.projectWorkingDirKind ?? 'host') === workingDirKind)
       .slice(0, MAX_RESUMABLE);
 
     const conversations = await describeAll(deps, candidates);
 
     res.json({
-      dir: validation.path,
+      dir: canonicalDir,
+      projectId: projectId || null,
+      workingDirKind,
       conversations: conversations.filter((entry) => entry.events > 0),
     });
   });
@@ -256,14 +369,25 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     // every group's contents arrive in order behind it.
     const groups = new Map<string, ConversationProject>();
     for (const conversation of conversations) {
-      const existing = groups.get(conversation.workingDir);
+      // JSON framing makes the tuple unambiguous even when a path itself
+      // contains punctuation. Project, namespace and cwd are all part of the
+      // identity: `/workspace` in project A is unrelated to `/workspace` in B.
+      const groupKey = JSON.stringify([
+        conversation.projectId || null,
+        conversation.workingDirKind || 'host',
+        conversation.workingDir,
+      ]);
+      const existing = groups.get(groupKey);
       if (existing) {
         existing.conversations.push(conversation);
         continue;
       }
-      groups.set(conversation.workingDir, {
+      groups.set(groupKey, {
+        key: groupKey,
+        projectId: conversation.projectId || null,
+        workingDirKind: conversation.workingDirKind || 'host',
         dir: conversation.workingDir,
-        name: projectName(conversation.workingDir),
+        name: conversation.projectName || projectName(conversation.workingDir),
         lastActivity: conversation.lastActivity,
         conversations: [conversation],
       });
@@ -308,6 +432,11 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         lastAgent: session.lastAgent,
         runtimeLabel: session.runtimeLabel,
         workingDir: session.workingDir,
+        projectId: session.projectId,
+        projectName: session.projectId
+          ? deps.projectsManager?.getForUser(session.ownerUserId, session.projectId)?.name || null
+          : null,
+        projectWorkingDirKind: session.projectWorkingDirKind,
         connectedClients: session.connections.size,
         lastActivity: session.lastActivity,
         surface: session.surface || 'terminal',
@@ -563,7 +692,6 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       }
     },
   );
-
   router.post('/api/sessions/create', async (req: Request, res: Response): Promise<void> => {
     const user = requireUser(res);
     if (!user) {
@@ -571,7 +699,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       return;
     }
 
-    const { name, workingDir, ownerSessionId } = req.body;
+    const { name, workingDir, ownerSessionId, projectId, projectWorkingDirKind } = req.body;
     const sessionId = randomUUID();
 
     // The name is bound into a SQLite statement on every autosave, and SQLite
@@ -591,6 +719,25 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       });
       return;
     }
+    if (projectId !== undefined && projectId !== null && typeof projectId !== 'string') {
+      res.status(400).json({ error: 'invalid_project_id', message: 'Project id must be a string' });
+      return;
+    }
+    if (typeof projectId === 'string' && projectId.trim().length === 0) {
+      res.status(400).json({ error: 'invalid_project_id', message: 'Project id cannot be empty' });
+      return;
+    }
+    if (
+      projectWorkingDirKind !== undefined
+      && projectWorkingDirKind !== 'host'
+      && projectWorkingDirKind !== 'container'
+    ) {
+      res.status(400).json({
+        error: 'invalid_project_working_dir_kind',
+        message: 'Project working directory kind must be host or container',
+      });
+      return;
+    }
 
     // A session can declare that it belongs to a conversation, which is what
     // keeps it out of the listings and ties its lifetime to that conversation's.
@@ -598,6 +745,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     // would let one request hide a session from its own owner's tab strip, or
     // attach it to somebody else's teardown.
     let owner: string | undefined;
+    let ownerRecord: SessionRecord | undefined;
     if (ownerSessionId !== undefined && ownerSessionId !== null) {
       if (typeof ownerSessionId !== 'string') {
         res.status(400).json({
@@ -614,92 +762,286 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         });
         return;
       }
-      owner = parent.id;
-    }
-
-    let validWorkingDir = (deps.getUserBaseFolder?.(user.id) ?? deps.baseFolder);
-    if (workingDir) {
-      const validation = deps.validatePath(workingDir, user.id);
-      if (!validation.valid) {
-        res.status(403).json({
-          error: validation.error,
-          message: 'Cannot create session with working directory outside the allowed area',
+      if (parent.retiring) {
+        res.status(409).json({
+          error: 'owner_session_retiring',
+          message: 'That conversation is being deleted',
         });
         return;
       }
-      validWorkingDir = validation.path!;
-    } else {
-      const selected = deps.getSelectedWorkingDir(user.id);
-      validWorkingDir = selected && deps.validatePath(selected, user.id).valid
-        ? selected
-        : (deps.getUserBaseFolder?.(user.id) ?? deps.baseFolder);
+      owner = parent.id;
+      ownerRecord = parent;
     }
 
-    const release = await acquireTabMutation(user.id);
-    let session: SessionRecord;
+    const submittedProjectId = typeof projectId === 'string' ? projectId.trim() : undefined;
+    const inheritedProjectId = ownerRecord?.projectId || undefined;
+    if (
+      ownerRecord
+      && projectId !== undefined
+      && (projectId === null ? undefined : submittedProjectId) !== inheritedProjectId
+    ) {
+      res.status(400).json({
+        error: 'owner_project_mismatch',
+        message: 'A conversation terminal must use the conversation project',
+      });
+      return;
+    }
+    const effectiveProjectId = ownerRecord ? inheritedProjectId : submittedProjectId;
+    if (projectWorkingDirKind !== undefined && !effectiveProjectId) {
+      res.status(400).json({
+        error: 'project_working_dir_without_project',
+        message: 'A container working directory requires a project',
+      });
+      return;
+    }
+    if (projectWorkingDirKind !== undefined && !workingDir) {
+      res.status(400).json({
+        error: 'project_working_dir_kind_without_path',
+        message: 'A project working directory kind requires a working directory',
+      });
+      return;
+    }
+
+    // Register before the first await. A deletion marks the owner retiring and
+    // drains this promise before it scans children, so this request either
+    // commits in full and is found by that scan or observes retirement and
+    // commits nothing.
+    const completeOwnedCreate = owner
+      ? trackOwnedSessionCreate(coordinationFor(deps), owner)
+      : undefined;
+    let projectLease: ProjectSessionLease | undefined;
     try {
-      if (owner) {
-        const currentParent = getOwnedSession(deps.claudeSessions, owner, user);
-        if (!currentParent || currentParent.surface !== 'chat') {
+      let persistedProjectId: string | undefined;
+      let persistedProjectName: string | null = null;
+      let preparedProject:
+        | Extract<ProjectSessionEnvironmentResult, { ok: true }>
+        | undefined;
+      let validWorkingDir = (deps.getUserBaseFolder?.(user.id) ?? deps.baseFolder);
+      let validWorkingDirKind: 'host' | 'container' | undefined;
+      let projectWorkingDirLifetime: 'workspace' | 'owner_home' | 'disposable' | undefined;
+      if (effectiveProjectId) {
+        // Check owner scope before provisioning anything. A guessed id must not
+        // start another user's project or disclose whether it can be started.
+        const projects = deps.projectsManager;
+        const ownedProject = projects?.getForUser(user.id, effectiveProjectId);
+        if (!projects || !ownedProject) {
+          res.status(404).json({ error: 'project_not_found', message: 'Project not found' });
+          return;
+        }
+
+        const prepared = await projects.ensureForSession(user.id, effectiveProjectId);
+        if (!prepared.ok) {
+          if (prepared.reason === 'not_found') {
+            res.status(404).json({ error: 'project_not_found', message: 'Project not found' });
+          } else if (prepared.reason === 'run_limit') {
+            res.status(409).json({ error: 'run_limit', running: prepared.running || [] });
+          } else if (prepared.reason === 'shutting_down') {
+            res.status(503).json({
+              error: 'project_unavailable',
+              detail: prepared.detail || 'The project service is shutting down',
+            });
+          } else {
+            res.status(409).json({
+              error: prepared.reason === 'building' ? 'project_building' : 'project_unavailable',
+              detail: prepared.detail,
+            });
+          }
+          return;
+        }
+        projectLease = {
+          ownerUserId: user.id,
+          projectId: effectiveProjectId,
+          leaseId: prepared.leaseId,
+        };
+        persistedProjectId = effectiveProjectId;
+        persistedProjectName = ownedProject.name || null;
+        preparedProject = prepared;
+        if (ownerRecord?.projectId === effectiveProjectId && !workingDir) {
+          // A split terminal stays in its conversation's exact namespace. A
+          // disposable container path that vanished on rebuild safely falls
+          // back to the current checkout and changes its discriminator too.
+          const inherited = await restoreProjectWorkingDir(
+            projects,
+            prepared,
+            ownerRecord.workingDir,
+            ownerRecord.projectWorkingDirKind,
+          );
+          validWorkingDir = inherited.workingDir;
+          validWorkingDirKind = inherited.kind;
+        } else {
+          validWorkingDir = await projectWorkingDirOrDefault(prepared);
+          validWorkingDirKind = 'host';
+        }
+      }
+
+      if (workingDir) {
+        if (persistedProjectId && preparedProject) {
+          const requestedKind = projectWorkingDirKind
+            ?? ownerRecord?.projectWorkingDirKind
+            ?? 'host';
+          const confined = requestedKind === 'container'
+            ? await canonicalProjectContainerWorkingDir(
+                deps.projectsManager!,
+                preparedProject,
+                workingDir,
+              )
+            : await canonicalProjectWorkingDir(
+                preparedProject.allowedWorkingDirs,
+                workingDir,
+              );
+          if (!confined) {
+            res.status(403).json({
+              error: 'invalid_project_working_dir',
+              message: requestedKind === 'container'
+                ? 'That directory does not exist in the project container'
+                : 'That host directory is not mounted into this project',
+            });
+            return;
+          }
+          validWorkingDir = confined;
+          validWorkingDirKind = requestedKind;
+        } else {
+          const validation = deps.validatePath(workingDir, user.id);
+          if (!validation.valid) {
+            res.status(403).json({
+              error: validation.error,
+              message: 'Cannot create session with working directory outside the allowed area',
+            });
+            return;
+          }
+          validWorkingDir = validation.path!;
+        }
+      } else if (!persistedProjectId) {
+        const selected = deps.getSelectedWorkingDir(user.id);
+        validWorkingDir = selected && deps.validatePath(selected, user.id).valid
+          ? selected
+          : (deps.getUserBaseFolder?.(user.id) ?? deps.baseFolder);
+      }
+
+      if (preparedProject && validWorkingDirKind === 'container') {
+        projectWorkingDirLifetime = classifyProjectContainerPath(
+          preparedProject.containerAccess,
+          validWorkingDir,
+        );
+      }
+
+      // The owner was authorised before project provisioning and cwd
+      // canonicalisation, both of which may await. Bind the child to the exact
+      // same owned record at commit time; an id removed and reused meanwhile is
+      // not the conversation this request was allowed to join.
+      if (ownerRecord) {
+        const currentOwner = deps.claudeSessions.get(ownerRecord.id);
+        if (
+          currentOwner !== ownerRecord
+          || currentOwner.ownerUserId !== user.id
+          || currentOwner.surface !== 'chat'
+          || currentOwner.retiring
+        ) {
           res.status(409).json({
-            error: 'owner_session_changed',
-            message: 'That conversation is no longer available',
+            error: 'owner_session_retiring',
+            message: 'That conversation is being deleted',
           });
           return;
         }
       }
-      // Allocate and insert inside the same account turn as visibility/order.
-      // Otherwise a close that later rolls back can leave this new tab sharing
-      // its tentative append position.
-      session = deps.createSessionRecord({
-        id: sessionId,
-        ownerUserId: user.id,
-        name,
-        workingDir: validWorkingDir,
-        ownerSessionId: owner,
-      });
-      if (!owner) session.tabOrder = nextAccountTabOrder(deps.claudeSessions, user.id);
-      deps.claudeSessions.set(sessionId, session);
 
-      let saved = false;
+      const release = await acquireTabMutation(user.id);
+      let session: SessionRecord;
       try {
-        saved = (await deps.saveSessionsToDisk()) !== false;
-      } catch (error) {
-        console.error('Failed to persist new session:', error);
-      }
-      if (!saved) {
-        deps.claudeSessions.delete(sessionId);
-        res.status(503).json({
-          error: 'session_not_saved',
-          message: 'The new session could not be saved',
+        // Project preparation may await for long enough that the owner is
+        // retired or replaced. Revalidate the exact record under the same
+        // account turn that allocates tab membership and persists it.
+        if (ownerRecord) {
+          const currentOwner = deps.claudeSessions.get(ownerRecord.id);
+          if (
+            currentOwner !== ownerRecord
+            || currentOwner.ownerUserId !== user.id
+            || currentOwner.surface !== 'chat'
+            || currentOwner.retiring
+          ) {
+            res.status(409).json({
+              error: 'owner_session_retiring',
+              message: 'That conversation is being deleted',
+            });
+            return;
+          }
+        }
+
+        // Allocate and insert inside the same account turn as visibility/order.
+        // Otherwise a close that later rolls back can leave this new tab sharing
+        // its tentative append position.
+        session = deps.createSessionRecord({
+          id: sessionId,
+          ownerUserId: user.id,
+          name,
+          workingDir: validWorkingDir,
+          ownerSessionId: owner,
+          projectId: persistedProjectId,
+          projectWorkingDirKind: persistedProjectId ? validWorkingDirKind : undefined,
         });
-        return;
+        if (!owner) session.tabOrder = nextAccountTabOrder(deps.claudeSessions, user.id);
+        deps.claudeSessions.set(sessionId, session);
+
+        // Keep both the project admission lease and the account tab turn until
+        // the association is durable. A refused SQLite save commits nothing and
+        // must not leak a visible tab or transcript.
+        let saved = false;
+        try {
+          saved = (await deps.saveSessionsToDisk()) !== false;
+        } catch (error) {
+          console.error('Failed to persist new session:', error);
+        }
+        if (!saved) {
+          deps.claudeSessions.delete(sessionId);
+          res.status(503).json({
+            error: 'session_not_saved',
+            message: 'The new session could not be saved',
+          });
+          return;
+        }
+
+        void deps.transcriptStore.ensureTranscript(session);
+        // Every screen this person has open, including the one that asked — which
+        // adds the tab from this response and folds the announcement into it. A
+        // shell created *inside* a conversation announces nothing; see the helper.
+        announceSessionOpened(
+          session,
+          deps.webSocketConnections,
+          persistedProjectId ? persistedProjectName : undefined,
+        );
+      } finally {
+        release();
       }
 
-      void deps.transcriptStore.ensureTranscript(session);
-      // Every screen this person has open, including the one that asked — which
-      // adds the tab from this response and folds the announcement into it. A
-      // shell created *inside* a conversation announces nothing; see the helper.
-      announceSessionOpened(session, deps.webSocketConnections);
+      if (deps.dev) {
+        console.log(`Created new session: ${sessionId} for GitHub user ${user.githubLogin}`);
+      }
+
+      res.json({
+        success: true,
+        sessionId,
+        session: {
+          id: sessionId,
+          name: session.name,
+          workingDir: session.workingDir,
+          projectId: session.projectId,
+          projectName: persistedProjectName,
+          projectWorkingDirKind: session.projectWorkingDirKind,
+          projectWorkingDirLifetime,
+          lastAgent: session.lastAgent,
+          runtimeLabel: session.runtimeLabel,
+        },
+      });
     } finally {
-      release();
+      // Creating an inactive record is not active project work. The lease only
+      // closes the admission-vs-stop race while the record and its cwd are
+      // validated and persisted; runtime and socket paths take their own.
+      try {
+        releaseProjectSessionLease(deps.projectsManager, projectLease);
+      } finally {
+        completeOwnedCreate?.();
+      }
     }
-
-    if (deps.dev) {
-      console.log(`Created new session: ${sessionId} for GitHub user ${user.githubLogin}`);
-    }
-
-    res.json({
-      success: true,
-      sessionId,
-      session: {
-        id: sessionId,
-        name: session.name,
-        workingDir: session.workingDir,
-        lastAgent: session.lastAgent,
-        runtimeLabel: session.runtimeLabel,
-      },
-    });
   });
 
   /**
@@ -779,6 +1121,10 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         ownerUserId: user.id,
         name: branchName(source, cut.turn.index),
         workingDir: source.workingDir,
+        // A branch is a continuation in the same checkout. Losing this would
+        // make its next launch silently fall back to the user's environment.
+        projectId: source.projectId,
+        projectWorkingDirKind: source.projectWorkingDirKind,
       });
       // The conversation this one came from, running the same agent in the same
       // place. Not `agent`, which says a process is up: nothing is running here
@@ -841,6 +1187,9 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       }
       await store.setOpeningContext(ref, plan.context);
 
+      const branchProjectName = branch.projectId
+        ? deps.projectsManager?.getForUser(branch.ownerUserId, branch.projectId)?.name || null
+        : null;
       const release = await acquireTabMutation(user.id);
       try {
         // Creating the record happened before the durable branch log was built,
@@ -868,7 +1217,11 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         void deps.transcriptStore.ensureTranscript(branch);
         // A branch is a conversation that now exists, so it reaches the user's
         // other screens on the same terms as one started from scratch.
-        announceSessionOpened(branch, deps.webSocketConnections);
+        announceSessionOpened(
+          branch,
+          deps.webSocketConnections,
+          branch.projectId ? branchProjectName : undefined,
+        );
       } finally {
         release();
       }
@@ -878,6 +1231,9 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
         sessionId,
         name: branch.name,
         workingDir: branch.workingDir,
+        projectId: branch.projectId,
+        projectName: branchProjectName,
+        projectWorkingDirKind: branch.projectWorkingDirKind,
         runtime: branch.lastAgent,
         turnIndex: cut.turn.index,
         turns: plan.turns,
@@ -918,6 +1274,8 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
       lastAgent: session.lastAgent,
       runtimeLabel: session.runtimeLabel,
       workingDir: session.workingDir,
+      projectId: session.projectId,
+      projectWorkingDirKind: session.projectWorkingDirKind,
       connectedClients: session.connections.size,
       lastActivity: session.lastActivity,
     });
@@ -931,47 +1289,27 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
     }
 
     const sessionId = req.params.sessionId as string;
-    const release = await acquireTabMutation(user.id);
-    try {
-      const session = getOwnedSession(deps.claudeSessions, sessionId, user);
-      if (!session) {
-        res.status(404).json({ error: 'Session not found' });
-        return;
-      }
-
-      // Stage membership removal first, but stop processes/delete logs/announce
-      // only after SQLite accepts it. A concurrent list waits on this turn and
-      // therefore sees either the whole deletion or none of it.
-      const originalIds = Array.from(deps.claudeSessions.keys());
-      // Children first, as before: their ptys must be torn down before the
-      // conversation that is their only route of access.
-      const removed = [
-        ...Array.from(deps.claudeSessions.values())
-          .filter((candidate) => candidate.ownerSessionId === sessionId),
-        session,
-      ];
-      for (const candidate of removed) deps.claudeSessions.delete(candidate.id);
-
-      let saved = false;
-      try {
-        saved = (await deps.saveSessionsToDisk()) !== false;
-      } catch (error) {
-        console.error('Failed to persist session deletion:', error);
-      }
-      if (!saved) {
-        restoreSessionMapOrder(deps.claudeSessions, removed, originalIds);
-        res.status(503).json({
-          error: 'session_delete_not_saved',
-          message: 'The session could not be deleted',
-        });
-        return;
-      }
-
-      for (const candidate of removed) destroySession(deps, candidate);
-      res.json({ success: true, message: 'Session deleted' });
-    } finally {
-      release();
+    const session = getOwnedSession(deps.claudeSessions, sessionId, user);
+    if (!session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
     }
+
+    // Close child admission before looking for children. A create that already
+    // passed owner validation is drained, then either appears in this cascade
+    // or rolls itself back; a later create sees `retiring` and is rejected.
+    // Concurrent deletes join the same cascade instead of tearing records down
+    // twice.
+    const saved = await retireSessionTree(deps, session, () => acquireTabMutation(user.id));
+    if (!saved) {
+      res.status(503).json({
+        error: 'session_delete_not_saved',
+        message: 'The session could not be deleted',
+      });
+      return;
+    }
+
+    res.json({ success: true, message: 'Session deleted' });
   });
 
   /**
@@ -1068,24 +1406,235 @@ function restoreSessionMapOrder(
   for (const [id, session] of staged) sessions.set(id, session);
 }
 
-/**
- * End one session: its process, its sockets, its record and everything stored
- * for it.
- *
- * Its own function because a delete is no longer one session — a conversation
- * takes the shells opened inside it with it — and doing that inline would mean
- * two copies of a teardown where a missed line leaks a pty.
- *
- * Not responsible for persisting the map: the caller saves once for the whole
- * cascade rather than once per session torn down.
- */
-function destroySession(deps: SessionRoutesDeps, session: SessionRecord): void {
-  if (session.active && session.agent) {
-    const bridge = deps.getRuntimeBridge(session.agent);
-    if (bridge) {
-      void bridge.stopSession(session.id);
-    }
+/** Record one child create from owner validation through persistence/rollback. */
+function trackOwnedSessionCreate(
+  coordination: SessionRouteCoordination,
+  ownerSessionId: string,
+): () => void {
+  let resolveCompletion!: () => void;
+  const completion = new Promise<void>((resolve) => {
+    resolveCompletion = resolve;
+  });
+  let pending = coordination.pendingOwnedCreates.get(ownerSessionId);
+  if (!pending) {
+    pending = new Set();
+    coordination.pendingOwnedCreates.set(ownerSessionId, pending);
   }
+  pending.add(completion);
+
+  let completed = false;
+  return () => {
+    if (completed) return;
+    completed = true;
+    pending!.delete(completion);
+    if (pending!.size === 0) coordination.pendingOwnedCreates.delete(ownerSessionId);
+    resolveCompletion();
+  };
+}
+
+/** Await every create that was admitted before these owners began retiring. */
+async function drainOwnedSessionCreates(
+  coordination: SessionRouteCoordination,
+  ownerSessionIds: Set<string>,
+): Promise<void> {
+  for (;;) {
+    const pending = new Set<Promise<void>>();
+    for (const ownerSessionId of ownerSessionIds) {
+      for (const completion of coordination.pendingOwnedCreates.get(ownerSessionId) || []) {
+        pending.add(completion);
+      }
+    }
+    if (pending.size === 0) return;
+    await Promise.all(pending);
+  }
+}
+
+/**
+ * Close admission, drain it, then follow owner links to a fixed point.
+ *
+ * The loop matters for future child surfaces that may themselves own a child:
+ * each newly found record is marked before its own in-flight creates are
+ * drained, so no generation can materialise behind the scan.
+ */
+async function collectRetiringSessionTree(
+  deps: SessionRoutesDeps,
+  roots: SessionRecord[],
+): Promise<Set<string>> {
+  const coordination = coordinationFor(deps);
+  const ids = new Set<string>();
+  for (const root of roots) {
+    root.retiring = true;
+    ids.add(root.id);
+  }
+
+  for (;;) {
+    await drainOwnedSessionCreates(coordination, ids);
+    let changed = false;
+    for (const session of deps.claudeSessions.values()) {
+      if (!session.ownerSessionId || !ids.has(session.ownerSessionId) || ids.has(session.id)) {
+        continue;
+      }
+      session.retiring = true;
+      ids.add(session.id);
+      changed = true;
+    }
+    if (!changed) return ids;
+  }
+}
+
+/** One user delete cascade, shared by concurrent requests for the same root. */
+function retireSessionTree(
+  deps: SessionRoutesDeps,
+  root: SessionRecord,
+  acquireTabMutation: () => Promise<() => void>,
+): Promise<boolean> {
+  const coordination = coordinationFor(deps);
+  const existing = coordination.retiringTrees.get(root);
+  if (existing) return existing;
+
+  // This assignment is deliberately before the async collector's first yield:
+  // a create arriving immediately after DELETE cannot pass owner validation.
+  root.retiring = true;
+  const retirement = (async (): Promise<boolean> => {
+    const ids = await collectRetiringSessionTree(deps, [root]);
+    const release = await acquireTabMutation();
+    try {
+      const originalIds = Array.from(deps.claudeSessions.keys());
+      const descendants = Array.from(deps.claudeSessions.values())
+        .filter((session) => session !== root && ids.has(session.id));
+      const removed = [...descendants, root];
+      for (const session of removed) deps.claudeSessions.delete(session.id);
+
+      let saved = false;
+      try {
+        saved = (await deps.saveSessionsToDisk()) !== false;
+      } catch (error) {
+        console.error('Failed to persist session deletion:', error);
+      }
+      if (!saved) {
+        restoreSessionMapOrder(deps.claudeSessions, removed, originalIds);
+        for (const session of removed) session.retiring = false;
+        return false;
+      }
+
+      // Persistence is the irreversible boundary. Only after SQLite accepts
+      // the removal may runtimes, logs and client-visible membership be torn
+      // down; a refused save restores the exact Map order above.
+      for (const session of descendants) await destroySessionOnce(deps, session);
+      await destroySessionOnce(deps, root);
+      return true;
+    } finally {
+      release();
+    }
+  })();
+  coordination.retiringTrees.set(root, retirement);
+  void retirement.then(
+    () => coordination.retiringTrees.delete(root),
+    () => coordination.retiringTrees.delete(root),
+  );
+  return retirement;
+}
+
+/** Share physical teardown when a child delete and a parent/project cascade meet. */
+function destroySessionOnce(
+  deps: SessionRoutesDeps,
+  session: SessionRecord,
+): Promise<void> {
+  const coordination = coordinationFor(deps);
+  const existing = coordination.destroyedSessions.get(session);
+  if (existing) return existing;
+
+  const destruction = destroySession(deps, session);
+  coordination.destroyedSessions.set(session, destruction);
+  // A failed stop must remain retryable. Successful promises stay associated
+  // with the record object so a stale concurrent cascade cannot tear it down a
+  // second time after another request removed it from the map.
+  void destruction.catch(() => {
+    if (coordination.destroyedSessions.get(session) === destruction) {
+      coordination.destroyedSessions.delete(session);
+    }
+  });
+  return destruction;
+}
+
+/**
+ * Retire every session a deleted project owns, including shells whose only
+ * link is their owning project conversation. The project manager calls this
+ * before it destroys the project row; clearing `projectId` would turn a stale
+ * tab into a legacy-host session on its next launch.
+ */
+export async function retireProjectSessions(
+  deps: SessionRoutesDeps,
+  projectId: string,
+): Promise<string[]> {
+  const roots = Array.from(deps.claudeSessions.values())
+    .filter((session) => session.projectId === projectId);
+  // Mark every project record synchronously, before the first drain yields.
+  // Project deletion can therefore neither miss a child create already in
+  // flight nor admit a new one while it is collecting the owned-session tree.
+  for (const session of roots) session.retiring = true;
+  const ids = await collectRetiringSessionTree(deps, roots);
+  const sessions = Array.from(deps.claudeSessions.values())
+    .filter((session) => ids.has(session.id));
+  if (sessions.length === 0) return [];
+
+  // A project cascade can remove several tabs at once. Hold each affected
+  // account's tab turn in stable order while the shared session snapshot is
+  // staged and persisted.
+  const releases: Array<() => void> = [];
+  try {
+    if (deps.tabCoordinator) {
+      const ownerIds = [...new Set(sessions.map((session) => session.ownerUserId))]
+        .sort((left, right) => left - right);
+      for (const ownerUserId of ownerIds) {
+        releases.push(await deps.tabCoordinator.acquire(ownerUserId));
+      }
+    }
+
+    const originalIds = Array.from(deps.claudeSessions.keys());
+    for (const session of sessions) deps.claudeSessions.delete(session.id);
+    try {
+      const saved = (await deps.saveSessionsToDisk()) !== false;
+      if (!saved) throw new Error('The project session deletion could not be saved');
+    } catch (error) {
+      restoreSessionMapOrder(deps.claudeSessions, sessions, originalIds);
+      for (const session of sessions) session.retiring = false;
+      throw error;
+    }
+
+    for (const session of sessions) await destroySessionOnce(deps, session);
+  } finally {
+    for (let index = releases.length - 1; index >= 0; index -= 1) releases[index]();
+  }
+  return sessions.map((session) => session.id);
+}
+
+/**
+ * End one session: await its process, then remove its sockets, record and
+ * stored transcript/history. The caller persists once for the whole cascade.
+ */
+async function destroySession(deps: SessionRoutesDeps, session: SessionRecord): Promise<void> {
+  if (deps.stopSessionRuntime) {
+    // The unified hook also closes launch admission and drains a start that is
+    // still awaiting an environment/adapter while `active` is false. Calling
+    // it unconditionally is what prevents deletion from orphaning that launch.
+    await deps.stopSessionRuntime(session);
+  } else if (session.active && session.agent) {
+    // Compatibility for embedders/tests that predate the unified hook. Chat
+    // sessions require the hook; a bridge is only a correct fallback for the
+    // terminal surface.
+    if (session.surface === 'chat') {
+      throw new Error('Cannot retire an active chat session without a chat stop hook');
+    }
+    const bridge = deps.getRuntimeBridge(session.agent);
+    if (!bridge) throw new Error(`Cannot stop runtime ${session.agent}`);
+    await bridge.stopSession(session.id);
+  }
+
+  // Runtime teardown above releases the process lease. Clear every remaining
+  // join/subscription lease before the record disappears, otherwise a socket
+  // can keep a deleted project permanently protected from lifecycle work.
+  deps.releaseProjectSessionResources?.(session.id);
 
   // Whoever was driving this session is no longer driving anything. Only them:
   // a screen that merely had a tab for it was never attached, and clearing a
@@ -1106,8 +1655,10 @@ function destroySession(deps: SessionRoutesDeps, session: SessionRecord): void {
   // Without this the headless emulator for a deleted session would live for
   // as long as the process does.
   deps.disposeRecorder(session.id);
-  void deps.transcriptStore.deleteTranscript(session);
-  void deps.historyStore.deleteHistory(session);
+  await Promise.all([
+    deps.transcriptStore.deleteTranscript(session),
+    deps.historyStore.deleteHistory(session),
+  ]);
   // Subsystems that registered their own cleanup (pasted images, and
   // whatever comes next) rather than each appending a line here.
   deps.sessionTeardown?.dispose(session);
@@ -1221,6 +1772,13 @@ async function summarise(
     runtimeLabel: session.runtimeLabel,
     lastActivity: new Date(activityMs(session)).toISOString(),
     workingDir: session.workingDir,
+    projectId: session.projectId || null,
+    projectName: session.projectId
+      ? deps.projectsManager?.getForUser(session.ownerUserId, session.projectId)?.name || null
+      : null,
+    workingDirKind: session.projectId
+      ? session.projectWorkingDirKind ?? 'host'
+      : 'host',
     events: stats?.cursor ?? 0,
     firstMessage: description?.firstMessage ?? null,
     // The record first, then the log: the record is authoritative and the head

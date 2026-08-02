@@ -1,8 +1,11 @@
 const assert = require('assert');
 const express = require('express');
+const fs = require('fs');
 const http = require('http');
+const os = require('os');
+const path = require('path');
 
-const { createSessionRoutes } = require('../dist/server/routes/sessions.js');
+const { createSessionRoutes, retireProjectSessions } = require('../dist/server/routes/sessions.js');
 
 // A terminal opened inside a conversation belongs to that conversation.
 //
@@ -24,6 +27,7 @@ let currentUser;
 let tornDown;
 let deletedTranscripts;
 let stoppedRuntimes;
+let saveSessions;
 
 function record(id, over = {}) {
   return {
@@ -87,7 +91,7 @@ before(async function () {
           stoppedRuntimes.push(id);
         },
       }),
-      saveSessionsToDisk: async () => {},
+      saveSessionsToDisk: async () => { await saveSessions?.(); },
       transcriptStore: {
         ensureTranscript: async () => {},
         deleteTranscript: async (session) => {
@@ -156,6 +160,7 @@ describe('terminals opened inside a conversation', function () {
     tornDown = [];
     deletedTranscripts = [];
     stoppedRuntimes = [];
+    saveSessions = null;
   });
 
   it('is not offered as a standalone session to any client', async function () {
@@ -205,6 +210,164 @@ describe('terminals opened inside a conversation', function () {
       second.body.sessionId,
     ].sort());
     assert.strictEqual(tornDown.length, 3);
+  });
+
+  it('drains an in-flight child create before deleting its conversation', async function () {
+    conversation('chat-race');
+    let announceSave;
+    let releaseSave;
+    const saveStarted = new Promise((resolve) => { announceSave = resolve; });
+    const saveGate = new Promise((resolve) => { releaseSave = resolve; });
+    let gated = true;
+    saveSessions = async () => {
+      if (!gated) return;
+      gated = false;
+      announceSave();
+      await saveGate;
+    };
+
+    const creating = post({ ownerSessionId: 'chat-race' });
+    await saveStarted;
+    const child = Array.from(sessions.values())
+      .find((session) => session.ownerSessionId === 'chat-race');
+    assert.ok(child, 'the child is inserted before its durable save');
+
+    const firstDelete = remove('chat-race');
+    const secondDelete = remove('chat-race');
+    while (!sessions.get('chat-race').retiring) await new Promise(setImmediate);
+
+    const lateCreate = await post({ ownerSessionId: 'chat-race' });
+    assert.strictEqual(lateCreate.status, 409);
+    assert.strictEqual(lateCreate.body.error, 'owner_session_retiring');
+
+    releaseSave();
+    const [created, deletedOnce, deletedTwice] = await Promise.all([
+      creating,
+      firstDelete,
+      secondDelete,
+    ]);
+    assert.strictEqual(created.status, 200);
+    assert.strictEqual(deletedOnce, 200);
+    assert.strictEqual(deletedTwice, 200);
+    assert.strictEqual(sessions.has('chat-race'), false);
+    assert.strictEqual(sessions.has(child.id), false, 'the committed child cannot miss the scan');
+    assert.strictEqual(
+      tornDown.filter((id) => id === child.id).length,
+      1,
+      'concurrent deletes share child teardown',
+    );
+    assert.strictEqual(
+      tornDown.filter((id) => id === 'chat-race').length,
+      1,
+      'concurrent deletes share parent teardown',
+    );
+  });
+
+  it('revalidates an owned create before project retirement can miss it', async function () {
+    const checkout = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'project-owned-create-'));
+    const parent = record('project-parent', {
+      surface: 'chat',
+      projectId: 'project-1',
+      projectWorkingDirKind: 'host',
+      workingDir: checkout,
+    });
+    const projectSessions = new Map([[parent.id, parent]]);
+    let announceEnsure;
+    let releaseEnsure;
+    const ensureStarted = new Promise((resolve) => { announceEnsure = resolve; });
+    const ensureGate = new Promise((resolve) => { releaseEnsure = resolve; });
+    const released = [];
+    const projectEnvironment = {
+      kind: 'host',
+      name: null,
+      homeDir: checkout,
+      containerHome: checkout,
+      shells: [],
+      mounts: [],
+      nodePath: process.execPath,
+      toContainerPath: (value) => value,
+      toHostPath: (value) => value,
+      wrap: (command, args, options = {}) => ({ command, args, env: options.env || {} }),
+    };
+    const projectsManager = {
+      getForUser: () => ({ id: 'project-1', name: 'Project' }),
+      ensureForSession: async () => {
+        announceEnsure();
+        await ensureGate;
+        return {
+          ok: true,
+          environment: projectEnvironment,
+          workingDir: checkout,
+          allowedWorkingDirs: [checkout],
+          containerAccess: {
+            projectId: 'project-1', ownerUserId: USER.id, containerName: 'project-1',
+            containerIdentity: 'immutable-1', root: '/', workspaceRoot: '/workspace',
+            ownerHomeRoot: '/home/owner',
+          },
+          leaseId: 'owned-create-1',
+        };
+      },
+      releaseSessionLease: (_owner, _project, leaseId) => {
+        released.push(leaseId);
+        return true;
+      },
+      touchActivity: () => {},
+    };
+    const deps = {
+      claudeSessions: projectSessions,
+      webSocketConnections: new Map(),
+      baseFolder: checkout,
+      dev: false,
+      validatePath: (target) => ({ valid: true, path: target }),
+      getSelectedWorkingDir: () => null,
+      createSessionRecord: (params) => record(params.id, params),
+      getRuntimeBridge: () => null,
+      stopSessionRuntime: async () => {},
+      saveSessionsToDisk: async () => {},
+      transcriptStore: {
+        ensureTranscript: async () => {},
+        deleteTranscript: async () => {},
+      },
+      historyStore: { deleteHistory: async () => {} },
+      getScreenSnapshot: () => [],
+      disposeRecorder: () => {},
+      sessionStore: { getSessionMetadata: async () => ({}) },
+      projectsManager,
+    };
+    const projectApp = express();
+    projectApp.use(express.json());
+    projectApp.use((_req, res, next) => {
+      res.locals.authContext = { user: USER, authSessionId: 'a' };
+      next();
+    });
+    projectApp.use(createSessionRoutes(deps));
+    const projectServer = http.createServer(projectApp);
+    await new Promise((resolve) => projectServer.listen(0, '127.0.0.1', resolve));
+    const projectBase = `http://127.0.0.1:${projectServer.address().port}`;
+
+    try {
+      const responsePromise = fetch(`${projectBase}/api/sessions/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ownerSessionId: parent.id }),
+      });
+      await ensureStarted;
+
+      const retirement = retireProjectSessions(deps, 'project-1');
+      assert.strictEqual(parent.retiring, true, 'project retirement closes owner admission first');
+      releaseEnsure();
+
+      const response = await responsePromise;
+      const body = await response.json();
+      assert.strictEqual(response.status, 409);
+      assert.strictEqual(body.error, 'owner_session_retiring');
+      assert.deepStrictEqual(await retirement, [parent.id]);
+      assert.deepStrictEqual([...projectSessions.keys()], []);
+      assert.deepStrictEqual(released, ['owned-create-1']);
+    } finally {
+      await new Promise((resolve) => projectServer.close(resolve));
+      await fs.promises.rm(checkout, { recursive: true, force: true });
+    }
   });
 
   it('stops the process it was holding when the conversation is deleted', async function () {

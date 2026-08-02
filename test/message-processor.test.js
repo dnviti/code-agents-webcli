@@ -15,6 +15,7 @@ describe('MessageProcessor', function() {
     const session = createSessionRecord({
       id: 'session-1',
       ownerUserId: 7,
+      projectId: 'project-1',
       outputBuffer: ['recent output'],
     });
 
@@ -48,6 +49,33 @@ describe('MessageProcessor', function() {
       },
       saveSessionsToDisk() {
         return Promise.resolve();
+      },
+      projectsManager: {
+        getForUser() {
+          return { id: 'project-1', name: 'Project One' };
+        },
+        ensureForSession() {
+          return Promise.resolve({
+            ok: true,
+            environment: {
+              kind: 'host', name: null, homeDir: '/tmp', containerHome: '/tmp',
+              shells: [], mounts: [], nodePath: process.execPath,
+              toContainerPath: (value) => value,
+              toHostPath: (value) => value,
+              wrap: (command, args, options = {}) => ({ command, args, env: options.env || {} }),
+            },
+            workingDir: '/tmp',
+            allowedWorkingDirs: ['/tmp'],
+            containerAccess: {
+              projectId: 'project-1', ownerUserId: 7, containerName: 'project-1',
+              containerIdentity: 'project-1-id', root: '/', workspaceRoot: '/workspace',
+              ownerHomeRoot: '/home/tester',
+            },
+            leaseId: 'lease-1',
+          });
+        },
+        releaseSessionLease() { return true; },
+        touchActivity() {},
       },
       historyStore: {
         append() {},
@@ -101,6 +129,18 @@ describe('MessageProcessor', function() {
     const joinedMessage = sentMessages.find((message) => message.type === 'session_joined');
     assert(joinedMessage);
     assert.deepStrictEqual(joinedMessage.outputBuffer, ['saved transcript']);
+    assert.strictEqual(joinedMessage.projectId, 'project-1');
+    assert.strictEqual(joinedMessage.projectName, 'Project One');
+
+    processor.deps.createSessionRecord = (params) => createSessionRecord({
+      ...params,
+      projectId: 'project-1',
+    });
+    await processor.createAndJoinSession('ws-1', 'Created', '/tmp');
+    const createdMessage = sentMessages.find((message) => message.type === 'session_created');
+    assert(createdMessage);
+    assert.strictEqual(createdMessage.projectId, 'project-1');
+    assert.strictEqual(createdMessage.projectName, 'Project One');
   });
 });
 

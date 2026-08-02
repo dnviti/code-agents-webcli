@@ -16,6 +16,9 @@ export interface BranchedConversation {
   sessionId: string;
   name: string;
   workingDir: string;
+  projectId?: string | null;
+  projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
   /** The agent the conversation it came from was running, or null if it never ran one. */
   runtime: string | null;
   /** Which turn of the original this was cut at, for what the user is told. */

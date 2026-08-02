@@ -77,6 +77,11 @@ function SessionCard({
         >
           {session.customName || session.name}
         </div>
+        {session.projectName || session.projectId ? (
+          <div style={{ marginTop: 3, fontSize: isPhone ? PHONE_TEXT.meta : 'var(--text-2xs)', color: 'var(--primary)' }}>
+            Project: {session.projectName || session.projectId}
+          </div>
+        ) : null}
         <div
           style={{
             marginTop: 2,

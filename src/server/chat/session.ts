@@ -116,10 +116,18 @@ export interface ChatSessionDeps {
    * `nativeSessionId` is null for a conversation that no longer has one, which
    * is a fact the record has to be able to hold: leaving out the field says
    * "nothing to report about the id", and a clear has something to report (#43).
+   * `restarting` distinguishes that clear's old adapter exit from a natural
+   * exit. Project runtime admission must span the replacement launch rather
+   * than opening a stop/reclaim race between the two processes.
    */
   onLifecycle?: (
     sessionId: string,
-    change: { nativeSessionId?: string | null; exited?: boolean; bypassing?: boolean },
+    change: {
+      nativeSessionId?: string | null;
+      exited?: boolean;
+      bypassing?: boolean;
+      restarting?: boolean;
+    },
   ) => void;
   /**
    * The approval mode a conversation started from inside this one should run in.
@@ -188,6 +196,13 @@ export interface ChatUsageSink {
 export interface ChatSessionStartOptions {
   runtime: string;
   workingDir: string;
+  /** Whether workingDir is already an absolute path inside the container. */
+  cwdKind?: 'host' | 'container';
+  /** Lease-bound filesystem callbacks for an isolated project runtime. */
+  fileAccess?: {
+    readFile(filePath: string): Promise<string>;
+    writeFile(filePath: string, contents: string): Promise<void>;
+  };
   model?: string;
   /**
    * Reasoning-effort level to launch at, spelled the way this runtime spells it.
@@ -217,6 +232,12 @@ export interface ChatSessionStartOptions {
    * what every caller passed before per-user environments existed.
    */
   environment?: UserEnvironment;
+  /**
+   * Last-moment launch admission check. Called synchronously immediately
+   * before the adapter can spawn, closing a DELETE-vs-start race across the
+   * store, broker and command-discovery awaits above it.
+   */
+  cancelled?: () => boolean;
   /**
    * The capability ladder this conversation is running on, when it is running
    * on one.
@@ -614,8 +635,8 @@ export class ChatSession {
   /**
    * Which process the events arriving here belong to.
    *
-   * `stop()` signals the child and returns without waiting for it, so a
-   * replaced adapter goes on emitting for as long as its process takes to die
+   * `stop()` signals the child and waits for verified closure, but a replaced
+   * adapter can still emit while that asynchronous teardown is in progress
    * — and what it emits last is `state: exited`. Landing that in the log after
    * the replacement is already running told every browser, and the session
    * record, that a live conversation had ended: the pane went read-only over a
@@ -626,6 +647,22 @@ export class ChatSession {
    * with and anything from an older one is dropped rather than believed.
    */
   private adapterGeneration = 0;
+
+  /**
+   * An adapter may report `state: exited` while its `start()` promise is still
+   * deciding whether startup succeeded. Publishing that as a completed
+   * lifecycle transition immediately is unsafe: a rejected ladder probe is
+   * followed by another adapter in the same session, and its exit would release
+   * the project admission the fallback is about to reuse.
+   *
+   * The event still updates this session's observable state immediately. Only
+   * the record/lease notification is deferred until `start()` resolves. If
+   * startup rejects, the generation is invalidated before the failed adapter is
+   * stopped, so neither that event nor a delayed process-close event can be
+   * mistaken for the lifecycle of its replacement.
+   */
+  private adapterStarting = false;
+  private adapterExitedWhileStarting = false;
 
   /**
    * True while a conversation is being replaced by a new one in place.
@@ -657,6 +694,16 @@ export class ChatSession {
 
   get live(): boolean {
     return Boolean(this.adapter?.alive);
+  }
+
+  /**
+   * Whether this session still owns an adapter, including one whose local
+   * engine client exited but whose container process could not be verified
+   * stopped. Manager teardown uses this stronger fact than `live` so a failed
+   * stop never drops the only handle capable of retrying it.
+   */
+  get ownsAdapter(): boolean {
+    return this.adapter !== null;
   }
 
   get currentState(): ChatState {
@@ -881,7 +928,12 @@ export class ChatSession {
       home: options.environment?.kind === 'container'
         ? options.environment.homeDir
         : env.HOME || process.env.HOME,
-      workingDir: options.workingDir,
+      // A container-only path may coincidentally exist on the server (notably
+      // `/tmp`) but is a different namespace. Never scan that host directory
+      // for commands belonging to this project.
+      workingDir: options.cwdKind === 'container'
+        ? options.environment?.homeDir || ''
+        : options.workingDir,
     });
     const installedCommands = installed.commands;
 
@@ -892,6 +944,7 @@ export class ChatSession {
     const adapter = createChatAdapter(options.runtime, {
       sessionId: this.ref.id,
       workingDir: options.workingDir,
+      cwdKind: options.cwdKind,
       installedCommands,
       // Kept out of `commands`: absolute paths are launch metadata for Codex,
       // not capabilities a browser or transcript should ever receive.
@@ -1016,16 +1069,40 @@ export class ChatSession {
       this.deps.onLifecycle?.(this.ref.id, { nativeSessionId: null });
     }
 
+    // There is deliberately no await between this check and adapter.start():
+    // every adapter reaches its spawn synchronously. A retiring/deleted record
+    // therefore cannot materialise a child after its owner drained launch.
+    if (options.cancelled?.()) {
+      await this.stop();
+      throw new Error('chat launch cancelled because the session is closing');
+    }
+
     this.setState('starting');
+    this.adapterStarting = true;
+    this.adapterExitedWhileStarting = false;
 
     try {
       await adapter.start();
     } catch (error: unknown) {
+      this.adapterStarting = false;
+      this.adapterExitedWhileStarting = false;
+      // Make every later event from this failed launch stale before verified
+      // teardown begins; otherwise its eventual `exited` can release a
+      // replacement's lease.
+      this.adapterGeneration++;
       const message = error instanceof Error ? error.message : String(error);
       this.ingest({ t: 'error', message: `could not start ${options.runtime}: ${message}`, fatal: true });
       this.setState('error');
       await this.stop();
       throw error;
+    }
+    this.adapterStarting = false;
+    if (this.adapterExitedWhileStarting) {
+      this.adapterExitedWhileStarting = false;
+      this.deps.onLifecycle?.(this.ref.id, {
+        exited: true,
+        restarting: this.restarting,
+      });
     }
 
     // The adapter's static declaration is a floor, not an override: a runtime
@@ -1289,7 +1366,14 @@ export class ChatSession {
       // as "A process is already running in this session" — a lie the user
       // could only escape by making a new tab.
       if (stamped.state === 'exited') {
-        this.deps.onLifecycle?.(this.ref.id, { exited: true });
+        if (this.adapterStarting) {
+          this.adapterExitedWhileStarting = true;
+        } else {
+          this.deps.onLifecycle?.(this.ref.id, {
+            exited: true,
+            restarting: this.restarting,
+          });
+        }
       }
     }
     if (stamped.t === 'turn_end' && this.state !== 'error' && this.state !== 'exited') {
@@ -2230,8 +2314,10 @@ export class ChatSession {
     // Anything typed *after* the clear still arrives — `restarting` parks it
     // and the fresh process is handed it as soon as it reports idle — which is
     // the case #89 exists to protect.
+    let oldRuntimeStopped = false;
     try {
       await this.stop();
+      oldRuntimeStopped = true;
       // Stale until the new process's own `init` event reports its id — cleared
       // up front so nothing reads the old conversation's id in the meantime.
       // The record hears it too, but from inside `start`, once the log this
@@ -2255,7 +2341,12 @@ export class ChatSession {
       // already written the failure into the transcript and moved the state to
       // `error`; the record has to hear it too, or the tab goes on claiming a
       // process that never started and refuses the relaunch that would fix it.
-      this.deps.onLifecycle?.(this.ref.id, { exited: true });
+      // If teardown itself could not prove the old process gone, admission has
+      // to remain closed. Only a verified stop followed by a failed replacement
+      // is an exited conversation.
+      if (oldRuntimeStopped) {
+        this.deps.onLifecycle?.(this.ref.id, { exited: true, restarting: false });
+      }
       throw error;
     } finally {
       this.restarting = false;
@@ -2961,13 +3052,17 @@ export class ChatSession {
     this.accountant = null;
 
     const adapter = this.adapter;
-    this.adapter = null;
-    if (adapter) {
-      await adapter.stop().catch(() => undefined);
+    try {
+      if (adapter) {
+        // Resolving is a lifecycle guarantee: the local child and, for a
+        // container, its identity-bound remote process group are both gone.
+        await adapter.stop();
+        if (this.adapter === adapter) this.adapter = null;
+      }
+    } finally {
+      this.broker?.close();
+      this.broker = null;
     }
-
-    this.broker?.close();
-    this.broker = null;
   }
 }
 

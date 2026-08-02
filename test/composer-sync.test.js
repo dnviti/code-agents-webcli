@@ -236,7 +236,7 @@ describe('carrying an unsent message between somebody’s screens', function () 
       text: 'what is wrong here',
       attachments: [
         {
-          url: `${PREFIX}abc123-shot.png`,
+          url: `${PREFIX}abcdef012345-shot.png`,
           name: 'shot.png',
           mime: 'image/png',
           size: 4096,
@@ -250,7 +250,7 @@ describe('carrying an unsent message between somebody’s screens', function () 
     assert.strictEqual(draftOf(arrived).attachments[0].name, 'shot.png');
     assert.strictEqual(
       draftOf(arrived).attachments[0].url,
-      `${PREFIX}abc123-shot.png`,
+      `${PREFIX}abcdef012345-shot.png`,
       'the url is the only thing a second screen can fetch the picture with',
     );
   });
@@ -411,7 +411,7 @@ describe('what a composer will and will not carry', function () {
     const input = readDraft(
       'look at this',
       [
-        { url: `${PREFIX}abc-a.png`, name: 'a.png', mime: 'image/png', size: 10, path: '/tmp/a.png', pretendField: 'x' },
+        { url: `${PREFIX}abcdef012345-a.png`, name: 'a.png', mime: 'image/png', size: 10, path: '/etc/passwd', pretendField: 'x' },
         { name: 'no url' },
         'not an object',
         null,
@@ -421,16 +421,16 @@ describe('what a composer will and will not carry', function () {
 
     assert.strictEqual(input.attachments.length, 1);
     assert.deepStrictEqual(input.attachments[0], {
-      url: `${PREFIX}abc-a.png`,
+      url: `${PREFIX}abcdef012345-a.png`,
       name: 'a.png',
       mime: 'image/png',
       size: 10,
-      path: '/tmp/a.png',
     });
+    assert.ok(!('path' in input.attachments[0]), 'a browser-supplied host path is never carried');
   });
 
   it('fills in what an attachment did not say rather than carrying undefined', function () {
-    const input = readDraft('', [{ url: `${PREFIX}abc-a.bin`, name: 'a.bin' }], 'chat-1');
+    const input = readDraft('', [{ url: `${PREFIX}abcdef012345-a.bin`, name: 'a.bin' }], 'chat-1');
     assert.strictEqual(input.attachments[0].mime, 'application/octet-stream');
     assert.strictEqual(input.attachments[0].size, 0);
     assert.ok(!('path' in input.attachments[0]), 'a path nobody sent must not be invented');
@@ -472,8 +472,8 @@ describe('what a composer will and will not carry', function () {
       'x',
       [
         { url: `${PREFIX}${'a'.repeat(9000)}`, name: 'huge.png' },
-        { url: `${PREFIX}ok.png`, name: 'n'.repeat(9000) },
-        { url: `${PREFIX}fine.png`, name: 'fine.png', path: 'p'.repeat(9000) },
+        { url: `${PREFIX}abcdef012345-ok.png`, name: 'n'.repeat(9000) },
+        { url: `${PREFIX}abcdef012345-fine.png`, name: 'fine.png', path: 'p'.repeat(9000) },
       ],
       'chat-1',
     );
@@ -488,8 +488,8 @@ describe('what a composer will and will not carry', function () {
       'x',
       [
         { url: 'https://example.com/beacon.gif', name: 'beacon.gif' },
-        { url: '/api/sessions/chat-9/chat-attachments/abc-other.png', name: 'other.png' },
-        { url: `${PREFIX}abc-mine.png`, name: 'mine.png' },
+        { url: '/api/sessions/chat-9/chat-attachments/abcdef012345-other.png', name: 'other.png' },
+        { url: `${PREFIX}abcdef012345-mine.png`, name: 'mine.png' },
       ],
       'chat-1',
     );
@@ -784,7 +784,7 @@ describe('a browser typing into a shared composer', function () {
 
   it('stays quiet while the composer empties itself after a send', async function () {
     const { controller, sent } = client();
-    const file = { url: `${PREFIX}abc-shot.png`, name: 'shot.png', mime: 'image/png', size: 10 };
+    const file = { url: `${PREFIX}abcdef012345-shot.png`, name: 'shot.png', mime: 'image/png', size: 10 };
     controller.publishDraft('look at this', [file]);
     controller.flushDraft();
 

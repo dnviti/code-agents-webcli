@@ -96,6 +96,7 @@ before(function () {
   app.use(
     createWorkspaceRoutes({
       claudeSessions: sessions,
+      saveSessionsToDisk: async () => {},
       // The server's own base-folder check. The base here is the temp
       // directory, which is what these fixtures live under — the real server
       // uses the user's home or the folder-mode root.

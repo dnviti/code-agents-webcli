@@ -13,8 +13,14 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { ContainerEngine, EnvironmentEngine, ResourceUsage } from './engine.js';
+import {
+  ContainerDescription,
+  ContainerEngine,
+  EnvironmentEngine,
+  ResourceUsage,
+} from './engine.js';
 import { KubernetesEngine } from './kubernetes.js';
+import { trackContainerProcess } from './process-control.js';
 import { TARGET_LABEL, containerHomeFor, environmentName, targetLabelValue } from './naming.js';
 import {
   AUTO_TIER,
@@ -41,6 +47,16 @@ export const TIER_LABEL = 'com.code-agents-webcli.tier';
 export const USER_ID_LABEL = 'com.code-agents-webcli.user-id';
 export const LOGIN_LABEL = 'com.code-agents-webcli.login';
 export { TARGET_LABEL };
+
+const OWNER_HOME_MAP_DIR = '.owner-homes';
+
+interface OwnerHomeIdentity {
+  /** Existing user-container name and legacy host-directory basename. */
+  name: string;
+  hostPath: string;
+  /** Kept immutable because tools often persist absolute paths under $HOME. */
+  containerPath: string;
+}
 
 /** Which deploy target an `ensureFor` should place new work on. */
 export interface ActiveTargetResolution {
@@ -137,12 +153,15 @@ export class ContainerEnvironment implements UserEnvironment {
   /** Resolved through the image's PATH: the host's binary is not in there. */
   readonly nodePath = 'node';
   private readonly engine: EnvironmentEngine;
+  /** Immutable engine/container identity; names may be reused after rebuild. */
+  readonly identity: string;
 
   constructor(options: {
     name: string;
     homeDir: string;
     containerHome: string;
     engine: EnvironmentEngine;
+    identity: string;
     shells?: readonly string[];
     mounts?: readonly Mount[];
   }) {
@@ -150,6 +169,7 @@ export class ContainerEnvironment implements UserEnvironment {
     this.homeDir = options.homeDir;
     this.containerHome = options.containerHome;
     this.engine = options.engine;
+    this.identity = options.identity;
     this.shells = options.shells || [];
     this.mounts = options.mounts
       || [{ hostPath: options.homeDir, containerPath: options.containerHome }];
@@ -192,17 +212,48 @@ export class ContainerEnvironment implements UserEnvironment {
   }
 
   wrap(command: string, args: string[], options: WrapOptions = {}): WrappedCommand {
-    const cwd = options.cwd ? this.toContainerPath(options.cwd) : this.containerHome;
+    let cwd = this.containerHome;
+    if (options.cwd) {
+      if (options.cwdKind === 'container') {
+        if (options.cwd.includes('\0') || !path.posix.isAbsolute(options.cwd)) {
+          throw new Error('Container cwd must be an absolute path');
+        }
+        cwd = path.posix.normalize(options.cwd);
+      } else {
+        cwd = this.toContainerPath(options.cwd);
+      }
+    }
+    const tracked = options.trackProcess
+      ? trackContainerProcess(
+          this.engine,
+          this.name,
+          this.identity,
+          command,
+          args,
+          options.tty === true,
+        )
+      : null;
     const execArgs = this.engine.execArgs(
-      { name: this.name, cwd, env: options.env, tty: options.tty },
-      command,
-      args,
+      {
+        name: this.name,
+        identity: this.identity,
+        cwd,
+        env: options.env,
+        tty: options.tty,
+      },
+      tracked?.command || command,
+      tracked?.args || args,
     );
     // The spawn itself gets this process's environment: it is running the
     // engine client, not the user's program. Everything the user's program
     // should see was turned into `--env` flags above, which is also what keeps
     // the server's own secrets out of the container.
-    return { command: this.engine.binary, args: execArgs, env: mergedEnv() };
+    return {
+      command: this.engine.binary,
+      args: execArgs,
+      env: mergedEnv(),
+      processControl: tracked?.processControl,
+    };
   }
 }
 
@@ -400,6 +451,58 @@ export class EnvironmentManager {
   }
 
   /**
+   * Resolve a project container's recorded placement.  Unlike user ensures,
+   * this deliberately never consults the active target: moving the active
+   * target must not make an existing project's container run somewhere else.
+   */
+  projectTarget(targetId: string | null): ActiveTargetResolution & { engine: EnvironmentEngine } {
+    const key = targetId || 'legacy';
+    const config = key === 'legacy' ? this.configForKey(key) : this.configs.get(key);
+    const engine = key === 'legacy' ? this.engineForKey(key) : this.engines.get(key);
+    if (!config || !engine) {
+      throw new Error(`recorded deploy target '${key}' is no longer reachable`);
+    }
+    if (config.engine !== 'kubernetes' && config.hostArgs?.length) {
+      throw new Error(`project workspaces do not support remote ${config.engine} bind mounts`);
+    }
+    return { key, config, engine };
+  }
+
+  /** The only placement used for a new project. */
+  activeProjectTarget(): ActiveTargetResolution & { engine: EnvironmentEngine } {
+    const active = this.resolveActiveTarget();
+    if (!active) {
+      throw new Error('no active deploy target: an administrator must activate one before new work can start');
+    }
+    if (!active.config.enabled) {
+      throw new Error('project environments are disabled: configure and activate a deploy target first');
+    }
+    if (active.config.engine !== 'kubernetes' && active.config.hostArgs?.length) {
+      throw new Error(`project workspaces do not support remote ${active.config.engine} bind mounts`);
+    }
+    return { ...active, engine: this.engineForKey(active.key) };
+  }
+
+  /**
+   * The durable owner-home path as seen from one target.  Projects mount this
+   * alongside their own workspace so rebuilding a project never costs a user
+   * their sign-in or home-directory state.
+   */
+  ownerHomeOnTarget(owner: EnvironmentOwner, targetId: string | null): {
+    hostPath: string;
+    containerPath: string;
+  } {
+    const target = this.projectTarget(targetId);
+    const identity = this.ownerHomeForConfig(target.config, owner);
+    return { hostPath: identity.hostPath, containerPath: identity.containerPath };
+  }
+
+  /** Durable root shared by project workspaces placed on one target. */
+  projectStorageRoot(targetId: string | null): string {
+    return path.join(this.projectTarget(targetId).config.rootDir, 'projects');
+  }
+
+  /**
    * Install a new set of targets.
    *
    * Engines that still own known containers are retained even when the new
@@ -470,6 +573,11 @@ export class EnvironmentManager {
     return this.intendedTier(this.resolveActiveTarget()?.config || this.config, userId);
   }
 
+  /** Resolve a user's tier against a recorded target, never today's active one. */
+  intendedTierOnTarget(userId: number, targetId: string | null): EnvironmentTier | null {
+    return this.intendedTier(this.projectTarget(targetId).config, userId);
+  }
+
   private intendedTier(config: ContainerConfig, userId: number): EnvironmentTier | null {
     return resolveTier(
       config.tiers,
@@ -507,11 +615,13 @@ export class EnvironmentManager {
   }
 
   nameFor(owner: EnvironmentOwner): string {
-    return environmentName(this.config.namePrefix, owner);
+    const config = this.resolveActiveTarget()?.config || this.config;
+    return this.ownerHomeForConfig(config, owner).name;
   }
 
   homeDirFor(owner: EnvironmentOwner): string {
-    return path.join(this.config.rootDir, this.nameFor(owner));
+    const config = this.resolveActiveTarget()?.config || this.config;
+    return this.ownerHomeForConfig(config, owner).hostPath;
   }
 
   /**
@@ -553,7 +663,7 @@ export class EnvironmentManager {
       return this.hostEnvironment;
     }
 
-    const name = environmentName(placement.config.namePrefix, owner);
+    const name = this.ownerHomeForConfig(placement.config, owner).name;
     const priorTarget = this.containerTarget.get(name);
     const priorPlacement = this.containerPlacement.get(name);
 
@@ -585,7 +695,7 @@ export class EnvironmentManager {
         const running = this.ready.get(owner.id);
         if (running) {
           try {
-            await this.engineForContainer(running.name).stop(running.name);
+            await this.stopReadyEnvironment(owner.id, running);
           } catch (error) {
             const detail = error instanceof Error ? `: ${error.message}` : '';
             throw new Error(
@@ -626,16 +736,18 @@ export class EnvironmentManager {
     }
 
     while (true) {
-      const name = environmentName(active.config.namePrefix, owner);
+      // Empty targets table plus disabled startup flags is the historical host
+      // path. Check before resolving the durable owner home: that resolution
+      // creates its identity mapping on disk, while disabled installations
+      // must remain entirely side-effect free.
+      if (!active.config.enabled) {
+        return null;
+      }
+
+      const name = this.ownerHomeForConfig(active.config, owner).name;
       const known = this.containerPlacement.get(name);
       if (known) {
         return { ...known, config: this.configForContainer(name) };
-      }
-
-      // Empty targets table plus disabled startup flags is the historical host
-      // path. It must not probe the synthetic legacy engine at all.
-      if (!active.config.enabled) {
-        return null;
       }
 
       if (!this.multiTarget) {
@@ -657,7 +769,7 @@ export class EnvironmentManager {
       if (!current.config.enabled) {
         return null;
       }
-      if (environmentName(current.config.namePrefix, owner) !== name) {
+      if (this.ownerHomeForConfig(current.config, owner).name !== name) {
         active = current;
         continue;
       }
@@ -923,15 +1035,65 @@ export class EnvironmentManager {
     this.lastUsed.set(userId, this.now());
   }
 
+  private ownsUserContainer(
+    description: ContainerDescription,
+    userId: number,
+    targetKey: string,
+  ): boolean {
+    const target = description.labels[TARGET_LABEL];
+    return description.labels[MANAGED_LABEL] === 'true'
+      && description.labels[USER_ID_LABEL] === String(userId)
+      // The exact engine route has already been established by all-target
+      // discovery. Pre-target containers may have no target label (or the
+      // legacy one); a present modern label must still agree with that route.
+      && (
+        !target
+        || target === targetLabelValue('legacy')
+        || target === targetLabelValue(targetKey)
+      );
+  }
+
+  /** Re-resolve a ready environment without trusting its reusable name. */
+  private async readyDescription(
+    userId: number,
+    environment: ContainerEnvironment,
+  ): Promise<ContainerDescription | null> {
+    if (!environment.identity) {
+      throw new Error(`Environment ${environment.name}: immutable identity is unavailable`);
+    }
+    const targetKey = this.containerTarget.get(environment.name) || 'legacy';
+    const described = await this.engineForContainer(environment.name)
+      .describeStrict(environment.name);
+    if (!described) return null;
+    if (described.identity !== environment.identity) {
+      throw new Error(`Environment ${environment.name}: same-name container was replaced`);
+    }
+    if (!this.ownsUserContainer(described, userId, targetKey)) {
+      throw new Error(`Environment ${environment.name}: ownership labels changed`);
+    }
+    return described;
+  }
+
+  private async stopReadyEnvironment(
+    userId: number,
+    environment: ContainerEnvironment,
+  ): Promise<boolean> {
+    const described = await this.readyDescription(userId, environment);
+    if (!described) return false;
+    await this.engineForContainer(environment.name).stopIdentity(described);
+    return true;
+  }
+
   private async provision(
     owner: EnvironmentOwner,
     active: ResolvedPlacement,
   ): Promise<UserEnvironment> {
     const config = active.config;
     const engine = active.engine;
-    const name = environmentName(config.namePrefix, owner);
-    const homeDir = path.join(config.rootDir, name);
-    const containerHome = containerHomeFor(owner);
+    const identity = this.ownerHomeForConfig(config, owner);
+    const name = identity.name;
+    const homeDir = identity.hostPath;
+    const containerHome = identity.containerPath;
 
     // 0700: the isolation claim has to hold on the host too, not only inside
     // the container. Created before the container so the bind mount never
@@ -949,7 +1111,21 @@ export class EnvironmentManager {
     // and has emptied the catalog.
     const tier = this.intendedTier(config, owner.id);
 
-    const { created } = await engine.ensure({
+    const described = await engine.describeStrict(name);
+    const ready = this.ready.get(owner.id);
+    if (ready) {
+      if (!ready.identity || ready.name !== name) {
+        throw new Error(`Environment ${name}: ready environment identity is inconsistent`);
+      }
+      if (described && described.identity !== ready.identity) {
+        throw new Error(`Environment ${name}: same-name container was replaced before ensure`);
+      }
+    }
+    if (described && !this.ownsUserContainer(described, owner.id, active.key)) {
+      throw new Error(`Environment ${name}: same-name container has mismatched ownership labels`);
+    }
+
+    const ensured = await engine.ensureIdentity({
       name,
       image: config.image,
       mounts,
@@ -972,16 +1148,21 @@ export class EnvironmentManager {
         USER: owner.githubLogin,
         TERM: 'xterm-256color',
       },
-    });
+    }, described);
 
-    if (created && config.setupCommand) {
+    if (ensured.created && config.setupCommand) {
       // Per creation, not per user: a setup command installs into the image's
       // filesystem, which is exactly the half that a rebuild throws away.
       // Failure is reported and tolerated — an environment without the extras
       // is still a usable environment.
       try {
         await engine.exec(
-          { name, cwd: containerHome, env: { HOME: containerHome } },
+          {
+            name,
+            identity: ensured.identity,
+            cwd: containerHome,
+            env: { HOME: containerHome },
+          },
           'sh',
           ['-c', config.setupCommand],
         );
@@ -992,12 +1173,26 @@ export class EnvironmentManager {
 
     // Probed after any setup command, because installing a nicer shell is one
     // of the things a setup command is for.
+    const shells = await this.probeShells(name, ensured.identity, engine);
+    // Setup and shell probing are deliberately tolerant, but replacement is
+    // not. Re-inspect after them so their caught errors cannot conceal a pod or
+    // container that changed underneath this provision.
+    const verified = await engine.describeStrict(name);
+    if (
+      !verified
+      || verified.identity !== ensured.identity
+      || !this.ownsUserContainer(verified, owner.id, active.key)
+    ) {
+      throw new Error(`Environment ${name}: identity or ownership changed during provisioning`);
+    }
+
     const environment = new ContainerEnvironment({
       name,
+      identity: ensured.identity,
       homeDir,
       containerHome,
       engine,
-      shells: await this.probeShells(name, engine),
+      shells,
       mounts,
     });
 
@@ -1011,15 +1206,107 @@ export class EnvironmentManager {
   }
 
   /**
+   * Resolve the durable owner home from an immutable user-id pointer.
+   *
+   * The pointed-to path deliberately keeps the original login-derived shape:
+   * existing #167 containers can keep their mount and their in-container HOME
+   * unchanged. The pointer filename, not the mutable login, is the identity.
+   * When upgrading an existing installation after a login rename, a single
+   * validated legacy directory is discovered. Multiple candidates fail closed.
+   */
+  private ownerHomeForConfig(config: ContainerConfig, owner: EnvironmentOwner): OwnerHomeIdentity {
+    if (!Number.isSafeInteger(owner.id) || owner.id <= 0) {
+      throw new Error('environment owner id must be a positive integer');
+    }
+    const root = path.resolve(config.rootDir);
+    const mapDir = path.join(root, OWNER_HOME_MAP_DIR);
+    const pointerPath = path.join(mapDir, `${owner.id}.json`);
+    const readPointer = (): OwnerHomeIdentity | null => {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(pointerPath, 'utf8')) as {
+          name?: unknown;
+          containerPath?: unknown;
+        };
+        return this.validateOwnerHomeIdentity(root, owner.id, parsed.name, parsed.containerPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw new Error(`owner home mapping for user ${owner.id} is invalid: ${(error as Error).message}`);
+      }
+    };
+    const recorded = readPointer();
+    if (recorded) return recorded;
+
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    const suffix = `-${owner.id}`;
+    const candidates = fs.readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name !== OWNER_HOME_MAP_DIR && entry.name.endsWith(suffix))
+      .map((entry) => entry.name);
+    if (candidates.length > 1) {
+      throw new Error(`owner home mapping for user ${owner.id} is ambiguous`);
+    }
+
+    fs.mkdirSync(mapDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(mapDir, 0o700);
+
+    const name = candidates[0] || environmentName(config.namePrefix, owner);
+    const legacyContainerName = name.startsWith(`${config.namePrefix}-`)
+      ? name.slice(config.namePrefix.length + 1)
+      : null;
+    const containerPath = legacyContainerName && legacyContainerName.endsWith(suffix)
+      ? `/home/${legacyContainerName}`
+      : containerHomeFor(owner);
+    const identity = this.validateOwnerHomeIdentity(root, owner.id, name, containerPath);
+    const payload = `${JSON.stringify({ version: 1, name, containerPath })}\n`;
+    try {
+      fs.writeFileSync(pointerPath, payload, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const raced = readPointer();
+      if (!raced) throw new Error(`owner home mapping for user ${owner.id} disappeared during creation`);
+      return raced;
+    }
+    return identity;
+  }
+
+  private validateOwnerHomeIdentity(
+    root: string,
+    ownerId: number,
+    rawName: unknown,
+    rawContainerPath: unknown,
+  ): OwnerHomeIdentity {
+    if (typeof rawName !== 'string' || path.basename(rawName) !== rawName || rawName === OWNER_HOME_MAP_DIR) {
+      throw new Error('host directory is not a safe root child');
+    }
+    const suffix = `-${ownerId}`;
+    if (!rawName.endsWith(suffix) || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(rawName)) {
+      throw new Error('host directory does not belong to this immutable user id');
+    }
+    if (
+      typeof rawContainerPath !== 'string'
+      || path.posix.dirname(rawContainerPath) !== '/home'
+      || !path.posix.basename(rawContainerPath).endsWith(suffix)
+    ) {
+      throw new Error('container home does not belong to this immutable user id');
+    }
+    const hostPath = path.resolve(root, rawName);
+    if (path.dirname(hostPath) !== root) throw new Error('host directory escapes its target root');
+    return { name: rawName, hostPath, containerPath: rawContainerPath };
+  }
+
+  /**
    * Which of the shells this app supports actually exist in an image.
    *
    * One exec at creation rather than a probe per terminal start, and ordered by
    * preference so the caller can take the first. `sh` is appended unconditionally
    * as the last resort: a container without it could not have run the probe.
    */
-  private async probeShells(name: string, engine: EnvironmentEngine = this.engine): Promise<string[]> {
+  private async probeShells(
+    name: string,
+    identity: string,
+    engine: EnvironmentEngine = this.engine,
+  ): Promise<string[]> {
     try {
-      const { stdout } = await engine.exec({ name }, 'sh', [
+      const { stdout } = await engine.exec({ name, identity }, 'sh', [
         '-c',
         'for s in zsh bash sh; do command -v "$s" >/dev/null 2>&1 && echo "$s"; done',
       ]);
@@ -1069,9 +1356,9 @@ export class EnvironmentManager {
         continue;
       }
       try {
-        const status = await engine.status(environment.name);
-        if (status === 'running') {
-          await engine.stop(environment.name);
+        const described = await this.readyDescription(userId, environment);
+        if (described && described.status === 'running') {
+          await engine.stopIdentity(described);
           stopped.push(environment.name);
         }
         // Dropped from `ready` but not from disk: the next `ensureFor` starts
@@ -1143,14 +1430,35 @@ export class EnvironmentManager {
    * revoking access is supposed to mean.
    */
   async remove(name: string, options: { purgeData?: boolean } = {}): Promise<void> {
+    if (!name || path.basename(name) !== name) {
+      throw new Error('Environment name must be one safe path component');
+    }
     if (this.multiTarget && !this.containerPlacement.has(name)) {
       throw new Error(
         `cannot safely remove unknown environment '${name}': its deploy target has not been verified`,
       );
     }
+    const targetKey = this.targetKeyForContainer(name);
     const engine = this.engineForContainer(name);
     const config = this.configForContainer(name);
-    await engine.remove(name);
+    const ready = Array.from(this.ready.entries())
+      .find(([, environment]) => environment.name === name);
+    const described = ready
+      ? await this.readyDescription(ready[0], ready[1])
+      : await engine.describeStrict(name);
+    if (described) {
+      if (!ready) {
+        const userId = Number(described.labels[USER_ID_LABEL]);
+        if (!Number.isSafeInteger(userId)
+          || userId <= 0
+          || described.name !== name
+          || !name.endsWith(`-${userId}`)
+          || !this.ownsUserContainer(described, userId, targetKey)) {
+          throw new Error(`Environment ${name}: refusing to remove a container not owned as a user environment`);
+        }
+      }
+      await engine.removeIdentity(described);
+    }
     this.containerTarget.delete(name);
     this.containerPlacement.delete(name);
 
@@ -1185,7 +1493,18 @@ export class EnvironmentManager {
       return null;
     }
     try {
-      return await this.engineForContainer(environment.name).usage(environment.name);
+      const described = await this.readyDescription(userId, environment);
+      if (!described) return null;
+      const engine = this.engineForContainer(environment.name);
+      const target = engine.kind === 'kubernetes' ? environment.name : described.identity;
+      const usage = await engine.usage(target);
+      // Kubernetes metrics are name-addressed, so verify that the result still
+      // belongs to the pod we queried before exposing it.
+      if (engine.kind === 'kubernetes') {
+        const after = await this.readyDescription(userId, environment);
+        if (!after) return null;
+      }
+      return usage;
     } catch {
       return null;
     }
@@ -1222,7 +1541,14 @@ export class EnvironmentManager {
 
     const engine = this.engineForContainer(environment.name);
     try {
-      if (await engine.resize(environment.name, tier.cpus, tier.memory)) {
+      const described = await this.readyDescription(userId, environment);
+      // Docker and Podman accept their immutable container id everywhere a
+      // name is accepted. Kubernetes' resize subresource is name-addressed;
+      // defer there instead of risking a same-name replacement.
+      const resizeTarget = engine.kind === 'kubernetes' ? null : described?.identity;
+      if (resizeTarget && await engine.resize(resizeTarget, tier.cpus, tier.memory)) {
+        const after = await this.readyDescription(userId, environment);
+        if (!after) throw new Error(`Environment ${environment.name}: disappeared during resize`);
         this.appliedTier.set(userId, tier);
         this.pendingRebuild.delete(userId);
         return 'applied';
@@ -1236,7 +1562,7 @@ export class EnvironmentManager {
       return 'deferred';
     }
 
-    await engine.stop(environment.name);
+    await this.stopReadyEnvironment(userId, environment);
     this.ready.delete(userId);
     this.appliedTier.delete(userId);
     this.pendingRebuild.delete(userId);
@@ -1329,16 +1655,16 @@ export class EnvironmentManager {
     if (!environment) {
       return false;
     }
-    await this.engineForContainer(environment.name).stop(environment.name);
+    await this.stopReadyEnvironment(userId, environment);
     this.ready.delete(userId);
     return true;
   }
 
   /** Stop everything this server started, without touching any data. */
   async stopAll(): Promise<void> {
-    for (const environment of this.ready.values()) {
+    for (const [userId, environment] of this.ready) {
       try {
-        await this.engineForContainer(environment.name).stop(environment.name);
+        await this.stopReadyEnvironment(userId, environment);
       } catch {
         // A shutdown path: an environment that will not stop is the operator's
         // problem to see in `ps`, not a reason to hang the server's exit.
