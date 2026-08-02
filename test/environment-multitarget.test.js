@@ -8,6 +8,7 @@ const {
   createContainerConfig,
   MANAGED_LABEL,
   TARGET_LABEL,
+  USER_ID_LABEL,
 } = require('../dist/server/services/environments/index.js');
 
 // Deploy targets place each user's container on one of several engines, and
@@ -30,6 +31,7 @@ function fakeEngine(kind, overrides = {}) {
     async remove(name) { calls.push({ op: 'remove', name }); },
     async status() { return 'running'; },
     async describe() { return null; },
+    async describeStrict(name) { return this.describe(name); },
     async exec() { return { stdout: 'sh\n', stderr: '' }; },
     execArgs: (spec, command, args) => ['exec', spec.name, command, ...args],
     async list() { return []; },
@@ -56,6 +58,7 @@ function forbiddenEngine() {
     remove: fail('remove'),
     status: fail('status'),
     describe: fail('describe'),
+    describeStrict: fail('describeStrict'),
     exec: fail('exec'),
     execArgs: fail('execArgs'),
     list: fail('list'),
@@ -111,6 +114,19 @@ function multiManager() {
     configs,
   });
   return { manager, state, engines, configs };
+}
+
+function managedDescription(name, targetKey, userId = 1) {
+  return {
+    name,
+    status: 'running',
+    image: 'img',
+    labels: {
+      [MANAGED_LABEL]: 'true',
+      [USER_ID_LABEL]: String(userId),
+      ...(targetKey ? { [TARGET_LABEL]: targetKey } : {}),
+    },
+  };
 }
 
 describe('multi-target environments', function () {
@@ -169,6 +185,319 @@ describe('multi-target environments', function () {
     assert.strictEqual(engines.get(TARGET_B).calls.filter((c) => c.op === 'ensure').length, 1);
   });
 
+  it('rediscovers an existing container on its original target after a restart', async function () {
+    const { manager, state, engines } = multiManager();
+    const owner = { id: 1, githubLogin: 'ada' };
+    const name = manager.nameFor(owner);
+    state.activeKey = TARGET_B;
+    engines.get(TARGET_A).list = async () => [name];
+    engines.get(TARGET_A).describe = async () => managedDescription(name, TARGET_A);
+
+    const env = await manager.ensureFor(owner);
+
+    assert.strictEqual(env.name, name);
+    assert.strictEqual(manager.targetKeyForContainer(name), TARGET_A);
+    assert.strictEqual(
+      engines.get(TARGET_A).calls.filter((call) => call.op === 'ensure').length,
+      1,
+      'the pre-restart container is re-ensured on the target that owns it',
+    );
+    assert.strictEqual(
+      engines.get(TARGET_B).calls.filter((call) => call.op === 'ensure').length,
+      0,
+      'the newly active target receives no same-named copy',
+    );
+  });
+
+  it('single-flights restart discovery for concurrent ensures of one user', async function () {
+    const { manager, state, engines } = multiManager();
+    const owner = { id: 1, githubLogin: 'ada' };
+    const name = manager.nameFor(owner);
+    state.activeKey = TARGET_B;
+
+    let releaseScan;
+    let markScanEntered;
+    const scanGate = new Promise((resolve) => { releaseScan = resolve; });
+    const scanEntered = new Promise((resolve) => { markScanEntered = resolve; });
+    let scans = 0;
+    engines.get(TARGET_A).list = async () => {
+      scans += 1;
+      markScanEntered();
+      await scanGate;
+      return [name];
+    };
+    engines.get(TARGET_A).describe = async () => managedDescription(name, TARGET_A);
+
+    const first = manager.ensureFor(owner);
+    await scanEntered;
+    const second = manager.ensureFor(owner);
+    releaseScan();
+    const [firstEnvironment, secondEnvironment] = await Promise.all([first, second]);
+
+    assert.strictEqual(scans, 1, 'both callers share the all-target discovery');
+    assert.strictEqual(firstEnvironment, secondEnvironment);
+    assert.strictEqual(
+      engines.get(TARGET_A).calls.filter((call) => call.op === 'ensure').length,
+      1,
+      'both callers share provisioning too',
+    );
+    assert.strictEqual(engines.get(TARGET_B).calls.filter((call) => call.op === 'ensure').length, 0);
+  });
+
+  it('deduplicates legacy and seeded-target views of the same container', async function () {
+    const { manager, state, engines } = multiManager();
+    const owner = { id: 1, githubLogin: 'ada' };
+    const name = manager.nameFor(owner);
+    state.activeKey = TARGET_B;
+
+    // A legacy startup engine and the target seeded from it can point at the
+    // same daemon. Both see the same object, whose durable label identifies
+    // one logical placement rather than two duplicate containers.
+    for (const key of ['legacy', TARGET_A]) {
+      engines.get(key).list = async () => [name];
+      engines.get(key).describe = async () => managedDescription(name, TARGET_A);
+    }
+
+    await manager.ensureFor(owner);
+
+    assert.strictEqual(manager.targetKeyForContainer(name), TARGET_A);
+    assert.strictEqual(engines.get(TARGET_A).calls.filter((call) => call.op === 'ensure').length, 1);
+    assert.strictEqual(engines.get('legacy').calls.filter((call) => call.op === 'ensure').length, 0);
+    assert.strictEqual(engines.get(TARGET_B).calls.filter((call) => call.op === 'ensure').length, 0);
+  });
+
+  it('keeps old unlabeled containers on the persisted seeded target after a reload', async function () {
+    const { manager, state, engines, configs } = multiManager();
+    const owner = { id: 1, githubLogin: 'ada' };
+    const name = manager.nameFor(owner);
+    state.activeKey = TARGET_B;
+
+    // The server's rebuilt maps contain database targets only. Legacy is a
+    // synthetic route the manager must preserve itself across this reload.
+    manager.reloadTargets({
+      engines: new Map([[TARGET_A, engines.get(TARGET_A)], [TARGET_B, engines.get(TARGET_B)]]),
+      configs: new Map([[TARGET_A, configs.get(TARGET_A)], [TARGET_B, configs.get(TARGET_B)]]),
+      activeKey: TARGET_B,
+    });
+
+    // Before deploy-target labels existed, both the startup engine and the
+    // target seeded from it could see this managed object, but its logical
+    // placement follows the persisted target, which remains valid even if the
+    // startup flags are removed on a later restart.
+    for (const key of ['legacy', TARGET_A]) {
+      engines.get(key).list = async () => [name];
+      engines.get(key).describe = async () => managedDescription(name, null);
+    }
+
+    await manager.ensureFor(owner);
+
+    assert.strictEqual(manager.reachableEngines().get('legacy'), engines.get('legacy'));
+    assert.strictEqual(manager.targetKeyForContainer(name), TARGET_A);
+    assert.strictEqual(engines.get('legacy').calls.filter((call) => call.op === 'ensure').length, 0);
+    assert.strictEqual(engines.get(TARGET_A).calls.filter((call) => call.op === 'ensure').length, 1);
+    assert.strictEqual(engines.get(TARGET_B).calls.filter((call) => call.op === 'ensure').length, 0);
+  });
+
+  it('routes an unlabeled upgrade container through the seeded target when legacy is disabled', async function () {
+    const legacyConfig = { ...createContainerConfig({}, {}), rootDir: tmpRoot() };
+    const legacyEngine = fakeEngine('docker');
+    const targetA = targetConfig({ engine: 'podman' });
+    const targetB = targetConfig();
+    const engineA = fakeEngine('podman');
+    const engineB = fakeEngine('docker');
+    const owner = { id: 1, githubLogin: 'ada' };
+    const name = 'cawc-ada-1';
+    engineA.list = async () => [name];
+    engineA.describe = async () => managedDescription(name, null);
+
+    const manager = new EnvironmentManager({
+      config: legacyConfig,
+      engine: legacyEngine,
+      hostHome: '/srv/work',
+      resolveActive: () => ({ key: TARGET_B, config: targetB, name: TARGET_B }),
+      engines: new Map([[TARGET_A, engineA], [TARGET_B, engineB]]),
+      configs: new Map([[TARGET_A, targetA], [TARGET_B, targetB]]),
+    });
+
+    await manager.ensureFor(owner);
+
+    assert.strictEqual(manager.targetKeyForContainer(name), TARGET_A);
+    assert.strictEqual(engineA.calls.filter((call) => call.op === 'ensure').length, 1);
+    assert.strictEqual(engineB.calls.filter((call) => call.op === 'ensure').length, 0);
+    assert.strictEqual(legacyEngine.calls.length, 0, 'disabled legacy is neither searched nor used');
+  });
+
+  it('commits an observed engine snapshot when targets reload during discovery', async function () {
+    const { manager, state, engines, configs } = multiManager();
+    const owner = { id: 1, githubLogin: 'ada' };
+    const name = manager.nameFor(owner);
+    state.activeKey = TARGET_B;
+
+    let releaseScan;
+    let markScanEntered;
+    const scanGate = new Promise((resolve) => { releaseScan = resolve; });
+    const scanEntered = new Promise((resolve) => { markScanEntered = resolve; });
+    const engineA = engines.get(TARGET_A);
+    engineA.list = async () => {
+      markScanEntered();
+      await scanGate;
+      return [name];
+    };
+    engineA.describe = async () => managedDescription(name, TARGET_A);
+
+    const pending = manager.ensureFor(owner);
+    await scanEntered;
+    manager.reloadTargets({
+      engines: new Map([[TARGET_B, engines.get(TARGET_B)]]),
+      configs: new Map([[TARGET_B, configs.get(TARGET_B)]]),
+      activeKey: TARGET_B,
+    });
+    releaseScan();
+    await pending;
+
+    assert.strictEqual(manager.targetKeyForContainer(name), TARGET_A);
+    assert.strictEqual(engineA.calls.filter((call) => call.op === 'ensure').length, 1);
+    assert.strictEqual(engines.get(TARGET_B).calls.filter((call) => call.op === 'ensure').length, 0);
+    assert.strictEqual(manager.reachableEngines().get(TARGET_A), engineA);
+  });
+
+  it('rejects a container whose target label disagrees with the engine that found it', async function () {
+    const { manager, engines } = multiManager();
+    const owner = { id: 1, githubLogin: 'ada' };
+    const name = manager.nameFor(owner);
+    engines.get(TARGET_B).list = async () => [name];
+    engines.get(TARGET_B).describe = async () => managedDescription(name, TARGET_A);
+
+    await assert.rejects(manager.ensureFor(owner), /labeled for deploy target.*found on/);
+    assert.strictEqual(engines.get(TARGET_A).calls.filter((call) => call.op === 'ensure').length, 0);
+    assert.strictEqual(engines.get(TARGET_B).calls.filter((call) => call.op === 'ensure').length, 0);
+  });
+
+  it('rejects same-named containers on different logical targets', async function () {
+    const { manager, engines } = multiManager();
+    const owner = { id: 1, githubLogin: 'ada' };
+    const name = manager.nameFor(owner);
+    for (const key of [TARGET_A, TARGET_B]) {
+      engines.get(key).list = async () => [name];
+      engines.get(key).describe = async () => managedDescription(name, key);
+    }
+
+    await assert.rejects(manager.ensureFor(owner), /exists on multiple deploy targets/);
+    assert.strictEqual(engines.get(TARGET_A).calls.filter((call) => call.op === 'ensure').length, 0);
+    assert.strictEqual(engines.get(TARGET_B).calls.filter((call) => call.op === 'ensure').length, 0);
+  });
+
+  it('rejects same-named containers on old and replacement endpoints for one target', async function () {
+    const { manager, engines, configs } = multiManager();
+
+    // Give target A a trusted live placement so its exact old engine remains
+    // searchable after an administrator edits A to point at a new endpoint.
+    await manager.ensureFor({ id: 1, githubLogin: 'ada' });
+    const oldEngineA = engines.get(TARGET_A);
+    const replacementEngineA = fakeEngine('docker');
+    manager.reloadTargets({
+      engines: new Map([
+        ['legacy', engines.get('legacy')],
+        [TARGET_A, replacementEngineA],
+        [TARGET_B, engines.get(TARGET_B)],
+      ]),
+      configs,
+      activeKey: TARGET_A,
+    });
+
+    const owner = { id: 2, githubLogin: 'bob' };
+    const name = manager.nameFor(owner);
+    for (const engine of [oldEngineA, replacementEngineA]) {
+      engine.list = async () => [name];
+      engine.describe = async () => managedDescription(name, TARGET_A, owner.id);
+    }
+
+    await assert.rejects(
+      manager.ensureFor(owner),
+      /exists on multiple engine endpoints for deploy target/,
+    );
+    assert.strictEqual(oldEngineA.calls.filter((call) => call.op === 'ensure').length, 1);
+    assert.strictEqual(replacementEngineA.calls.filter((call) => call.op === 'ensure').length, 0);
+  });
+
+  it('rejects a discovered same-name container owned by another user', async function () {
+    const { manager, engines } = multiManager();
+    const owner = { id: 1, githubLogin: 'ada' };
+    const name = manager.nameFor(owner);
+    engines.get(TARGET_A).list = async () => [name];
+    engines.get(TARGET_A).describe = async () => managedDescription(name, TARGET_A, 2);
+
+    await assert.rejects(manager.ensureFor(owner), /belongs to another user/);
+    assert.strictEqual(engines.get(TARGET_A).calls.filter((call) => call.op === 'ensure').length, 0);
+  });
+
+  it('fails closed when an inactive target cannot be searched after restart', async function () {
+    const { manager, state, engines } = multiManager();
+    state.activeKey = TARGET_B;
+    engines.get(TARGET_A).list = async () => {
+      throw new Error('target is offline');
+    };
+
+    await assert.rejects(
+      manager.ensureFor({ id: 1, githubLogin: 'ada' }),
+      /cannot safely place environment.*target is offline/,
+    );
+    assert.strictEqual(
+      engines.get(TARGET_B).calls.filter((call) => call.op === 'ensure').length,
+      0,
+      'absence on the offline target was not provable, so no duplicate is created',
+    );
+  });
+
+  it('does not adopt an unmanaged same-name object on the active target', async function () {
+    const { manager, engines } = multiManager();
+    const owner = { id: 1, githubLogin: 'ada' };
+    const name = manager.nameFor(owner);
+    engines.get(TARGET_A).describe = async () => ({
+      name,
+      status: 'running',
+      image: 'unrelated',
+      labels: {},
+    });
+
+    await assert.rejects(manager.ensureFor(owner), /is not managed by this server/);
+    assert.strictEqual(engines.get(TARGET_A).calls.filter((call) => call.op === 'ensure').length, 0);
+  });
+
+  it('revalidates ownership even after a route has been learned', async function () {
+    const { manager, engines } = multiManager();
+    const owner = { id: 1, githubLogin: 'ada' };
+    const name = manager.nameFor(owner);
+    const engineA = engines.get(TARGET_A);
+    await manager.ensureFor(owner);
+    const ensuredBefore = engineA.calls.filter((call) => call.op === 'ensure').length;
+
+    // Simulate an operator replacing the object behind a still-known name.
+    engineA.describe = async () => ({
+      name,
+      status: 'running',
+      image: 'unrelated',
+      labels: {},
+    });
+
+    await assert.rejects(manager.ensureFor(owner), /is not managed by this server/);
+    assert.strictEqual(engineA.calls.filter((call) => call.op === 'ensure').length, ensuredBefore);
+  });
+
+  it('treats a strict collision-inspection failure as an error, not absence', async function () {
+    const { manager, engines } = multiManager();
+    const engineA = engines.get(TARGET_A);
+    engineA.describe = async () => {
+      throw new Error('inspect authentication failed');
+    };
+
+    await assert.rejects(
+      manager.ensureFor({ id: 1, githubLogin: 'ada' }),
+      /inspect authentication failed/,
+    );
+    assert.strictEqual(engineA.calls.filter((call) => call.op === 'ensure').length, 0);
+  });
+
   it('keeps operating existing containers on the engine that placed them', async function () {
     const { manager, state, engines } = multiManager();
     const env = await manager.ensureFor({ id: 1, githubLogin: 'ada' });
@@ -192,33 +521,26 @@ describe('multi-target environments', function () {
     assert.strictEqual(manager.targetKeyForContainer(env.name), 'legacy');
   });
 
-  it('learns container ownership from the target label when listing', async function () {
+  it('does not trust listing labels as routes for destructive operations', async function () {
     const { manager, state, engines } = multiManager();
     engines.get(TARGET_A).list = async () => ['cawc-ada-1'];
     engines.get(TARGET_A).describe = async (name) => ({
       name,
       status: 'running',
       image: 'img',
-      labels: { [TARGET_LABEL]: TARGET_A },
-    });
-    // A container old enough to predate the label belongs to the legacy engine.
-    engines.get('legacy').list = async () => ['cawc-cid-3'];
-    engines.get('legacy').describe = async (name) => ({
-      name,
-      status: 'running',
-      image: 'img',
-      labels: {},
+      // The object was observed through A but claims B. list() is an operator
+      // view and must not let that unverified claim steer a later remove().
+      labels: { [TARGET_LABEL]: TARGET_B },
     });
 
     const list = await manager.list();
-    assert.deepStrictEqual(list.map((e) => e.name).sort(), ['cawc-ada-1', 'cawc-cid-3']);
-    assert.strictEqual(manager.targetKeyForContainer('cawc-ada-1'), TARGET_A);
-    assert.strictEqual(manager.targetKeyForContainer('cawc-cid-3'), 'legacy');
+    assert.deepStrictEqual(list.map((e) => e.name), ['cawc-ada-1']);
     assert.strictEqual(state.activeKey, TARGET_A);
 
-    await manager.remove('cawc-cid-3');
-    assert.strictEqual(engines.get('legacy').calls.filter((c) => c.op === 'remove').length, 1);
-    assert.strictEqual(engines.get(TARGET_A).calls.filter((c) => c.op === 'remove').length, 0);
+    await assert.rejects(manager.remove('cawc-ada-1'), /deploy target has not been verified/);
+    for (const engine of engines.values()) {
+      assert.strictEqual(engine.calls.filter((call) => call.op === 'remove').length, 0);
+    }
   });
 
   it('throws when targets exist but none is active, and touches nothing', async function () {
@@ -331,27 +653,61 @@ describe('multi-target environments', function () {
     assert.strictEqual(engines.get(TARGET_A).calls.filter((c) => c.op === 'ensure').length, 0);
   });
 
+  it('refreshes target policy while retaining the exact engine route', async function () {
+    const { manager, engines, configs } = multiManager();
+    const owner = { id: 1, githubLogin: 'ada' };
+    await manager.ensureFor(owner);
+
+    const originalEngine = engines.get(TARGET_A);
+    const replacementEngine = fakeEngine('docker');
+    const refreshedConfig = { ...configs.get(TARGET_A), image: 'example/new-policy:2' };
+    manager.reloadTargets({
+      engines: new Map([
+        ['legacy', engines.get('legacy')],
+        [TARGET_A, replacementEngine],
+        [TARGET_B, engines.get(TARGET_B)],
+      ]),
+      configs: new Map([
+        ['legacy', configs.get('legacy')],
+        [TARGET_A, refreshedConfig],
+        [TARGET_B, configs.get(TARGET_B)],
+      ]),
+      activeKey: TARGET_A,
+    });
+    originalEngine.calls.length = 0;
+
+    await manager.ensureFor(owner);
+
+    const ensured = originalEngine.calls.find((call) => call.op === 'ensure');
+    assert.strictEqual(ensured.spec.image, 'example/new-policy:2');
+    assert.strictEqual(
+      replacementEngine.calls.filter((call) => call.op === 'ensure').length,
+      0,
+      'existing work keeps its exact endpoint even as its policy is refreshed',
+    );
+  });
+
   it('does not misroute an ensure that is in flight across a reload', async function () {
     const { manager, state, engines, configs } = multiManager();
 
     // Target A's engine answers ensure slowly, so the reload below lands
     // while the container is still being created.
     let release;
+    let markEnsureEntered;
     const gate = new Promise((resolve) => { release = resolve; });
+    const ensureEntered = new Promise((resolve) => { markEnsureEntered = resolve; });
     const engineA = engines.get(TARGET_A);
     engineA.ensure = async (spec) => {
       engineA.calls.push({ op: 'ensure', spec });
+      markEnsureEntered();
       await gate;
       return { created: true };
     };
 
     const pending = manager.ensureFor({ id: 1, githubLogin: 'ada' });
     // Let the ensure reach the gate: the placement must already be registered
-    // by then, or the reload would strand the half-created container. The
-    // wait is polled because the provision does real fs work before ensure.
-    for (let i = 0; i < 100 && !engineA.calls.some((c) => c.op === 'ensure'); i += 1) {
-      await new Promise((resolve) => setImmediate(resolve));
-    }
+    // by then, or the reload would strand the half-created container.
+    await ensureEntered;
     assert.strictEqual(engineA.calls.filter((c) => c.op === 'ensure').length, 1);
 
     state.activeKey = TARGET_B;
@@ -442,6 +798,21 @@ describe('multi-target environments', function () {
       const env = await manager.ensureFor({ id: 1, githubLogin: 'ada' });
       assert.strictEqual(env.kind, 'host');
       assert.strictEqual(manager.existing(1).kind, 'host');
+    });
+
+    it('does not let an operator listing reactivate a disabled legacy container', async function () {
+      const config = createContainerConfig({}, {});
+      const engine = fakeEngine('docker');
+      const name = 'cawc-ada-1';
+      engine.list = async () => [name];
+      engine.describe = async () => managedDescription(name, null);
+      const manager = new EnvironmentManager({ config, engine, hostHome: '/srv/work' });
+
+      await manager.list();
+      const env = await manager.ensureFor({ id: 1, githubLogin: 'ada' });
+
+      assert.strictEqual(env.kind, 'host');
+      assert.strictEqual(engine.calls.filter((call) => call.op === 'ensure').length, 0);
     });
   });
 });

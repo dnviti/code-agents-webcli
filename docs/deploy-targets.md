@@ -45,6 +45,15 @@ caveats that the panel shows before you save.
   the host.
 - A remote host needs the host URL; TLS requires the CA, certificate and key
   PEMs. The panel stores them encrypted and never shows them back.
+- Per-user homes and the server's helper directories are bind-mounted by their
+  absolute server paths. A remote engine host must therefore see the server's
+  data directory (and every configured extra mount) through shared storage at
+  those exact same paths; without it, environment creation cannot produce a
+  usable home.
+- **Tool approvals and agent questions from a remote Docker or Podman host do
+  not reach the browser.** Their channel is a Unix socket on the server host;
+  sharing the directory exposes its path but does not forward that socket to a
+  different machine. Conversations that bypass approvals are unaffected.
 - `env ls` and `env rm` on the server command line see only the legacy startup
   configuration, not the deploy-targets table. Use the web panel to check or
   remove targets.

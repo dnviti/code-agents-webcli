@@ -37,6 +37,8 @@ export interface CreateContainerSpec {
   cpus: string | null;
   memory: string | null;
   labels: Record<string, string>;
+  /** Labels whose exact values must match before an existing object is adopted. */
+  identityLabels?: readonly string[];
   env: Record<string, string>;
 }
 
@@ -87,6 +89,12 @@ export interface EnvironmentEngine {
   stop(name: string): Promise<void>;
   remove(name: string): Promise<void>;
   status(name: string): Promise<string | null>;
+  /**
+   * Describe one exact object, returning null only when it does not exist.
+   * Transport, authentication and parse failures are errors, never absence.
+   */
+  describeStrict(name: string): Promise<ContainerDescription | null>;
+  /** Best-effort description for operator/status views. */
   describe(name: string): Promise<ContainerDescription | null>;
   exec(spec: ExecSpec, command: string, commandArgs: string[]): Promise<RunResult>;
   /** Argv for running a command inside an environment, for pty and pipe spawns alike. */
@@ -121,6 +129,33 @@ export const defaultRunner: EngineRunner = (file, args, input) =>
       child.stdin?.end(input);
     }
   });
+
+export function validateIdentityLabels(
+  spec: CreateContainerSpec,
+  described: ContainerDescription,
+): void {
+  for (const key of spec.identityLabels || []) {
+    if (described.labels[key] !== spec.labels[key]) {
+      throw new Error(
+        `environment '${spec.name}' has an incompatible ownership label '${key}'`,
+      );
+    }
+  }
+}
+
+function errorText(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error || '');
+  }
+  const detail = error as Error & { stdout?: unknown; stderr?: unknown };
+  return [error.message, detail.stdout, detail.stderr]
+    .filter((value): value is string => typeof value === 'string')
+    .join('\n');
+}
+
+function containerObjectMissing(error: unknown): boolean {
+  return /no such (?:object|container)|no container with name or id/i.test(errorText(error));
+}
 
 /**
  * Whether bind mounts need an SELinux relabel suffix.
@@ -248,12 +283,13 @@ export class ContainerEngine implements EnvironmentEngine {
   }
 
   async ensure(spec: CreateContainerSpec): Promise<{ created: boolean }> {
-    const status = await this.status(spec.name);
-    if (!status) {
+    const described = await this.describeStrict(spec.name);
+    if (!described) {
       await this.create(spec);
       return { created: true };
     }
-    if (status !== 'running') {
+    validateIdentityLabels(spec, described);
+    if (described.status !== 'running') {
       await this.start(spec.name);
     }
     return { created: false };
@@ -280,7 +316,7 @@ export class ContainerEngine implements EnvironmentEngine {
     try {
       const { stdout } = await this.run(this.binary, [
         ...this.hostArgs,
-        'inspect', '--format', '{{.State.Status}}', name,
+        'container', 'inspect', '--format', '{{.State.Status}}', name,
       ]);
       return stdout.trim() || null;
     } catch {
@@ -296,20 +332,35 @@ export class ContainerEngine implements EnvironmentEngine {
    * emits Go's `map[k:v k:v]`. `inspect` with an explicit `json` template says
    * the same thing on both.
    */
-  async describe(name: string): Promise<ContainerDescription | null> {
+  async describeStrict(name: string): Promise<ContainerDescription | null> {
     try {
       const { stdout } = await this.run(this.binary, [
         ...this.hostArgs,
-        'inspect', '--format', '{{.State.Status}}\t{{.Config.Image}}\t{{json .Config.Labels}}', name,
+        'container', 'inspect', '--format',
+        '{{.State.Status}}\t{{.Config.Image}}\t{{json .Config.Labels}}', name,
       ]);
       const [status, image, labelsJson] = stdout.trim().split('\t');
+      if (!status && !image && !labelsJson) {
+        throw new Error(`engine returned an empty description for '${name}'`);
+      }
       let labels: Record<string, string> = {};
       try {
         labels = JSON.parse(labelsJson || '{}') || {};
-      } catch {
-        labels = {};
+      } catch (error) {
+        throw new Error(`engine returned invalid labels for '${name}': ${errorText(error)}`);
       }
       return { name, status: status || 'unknown', image: image || '', labels };
+    } catch (error) {
+      if (containerObjectMissing(error)) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async describe(name: string): Promise<ContainerDescription | null> {
+    try {
+      return await this.describeStrict(name);
     } catch {
       return null;
     }
