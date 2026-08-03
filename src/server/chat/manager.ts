@@ -109,7 +109,7 @@ export class ChatSessionManager {
       throw new Error('a chat is already running in this session');
     }
     if (existing) {
-      await existing.stop();
+      await existing.stop({ preserveHandoffs: Boolean(options.resumeSessionId) });
       this.sessions.delete(record.id);
     }
 
@@ -467,30 +467,32 @@ export class ChatSessionManager {
     return this.sessions.get(sessionId)?.respondPermission(requestId, optionId) ?? false;
   }
 
-  answerQuestion(
+  async answerQuestion(
     sessionId: string,
     requestId: string,
     optionIds: string[],
     skipped = false,
     text?: string,
-  ): boolean {
-    return (
-      this.sessions.get(sessionId)?.answerQuestion(requestId, optionIds, skipped, text) ?? false
-    );
+  ): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    return session ? session.answerQuestion(requestId, optionIds, skipped, text) : false;
   }
 
-  async stop(sessionId: string): Promise<void> {
+  async stop(
+    sessionId: string,
+    options: { preserveHandoffs?: boolean } = {},
+  ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    await session.stop();
+    await session.stop(options);
     if (this.sessions.get(sessionId) === session) {
       this.sessions.delete(sessionId);
     }
   }
 
-  async stopAll(): Promise<void> {
+  async stopAll(options: { preserveHandoffs?: boolean } = {}): Promise<void> {
     const ids = Array.from(this.sessions.keys());
-    await Promise.all(ids.map((id) => this.stop(id)));
+    await Promise.all(ids.map((id) => this.stop(id, options)));
   }
 
   private require(sessionId: string): ChatSession {

@@ -741,6 +741,18 @@ async function checkAQuestionIsAnsweredByClicking(): Promise<void> {
     JSON.stringify(singleAnswer?.optionIds),
   );
 
+  // The card remains interactive only until this correlated acknowledgement.
+  // A durable resolution later remains the source of record for every screen.
+  for (const answer of answers) {
+    controller.handle({
+      type: 'chat_question_answer_ack',
+      sessionId: 'browser-check',
+      submissionId: answer.submissionId,
+      accepted: true,
+    } as never);
+  }
+  await wait(100);
+
   await wait(200);
   const after = Array.from(host.querySelectorAll('[data-question-card]')) as HTMLElement[];
   // The card must not vanish on being answered: scrolling back past a decision
@@ -1516,7 +1528,10 @@ async function checkTypedWordsThatDidNotLandAreNotShownAsAnswered(): Promise<voi
     host.style.cssText = 'width:900px;height:700px;position:absolute;top:0;left:0;display:flex';
     document.body.appendChild(host);
 
-    const controller = new ChatController('browser-check', { send: () => {} } as never);
+    // `false` is the real connection contract for a frame attempted while the
+    // WebSocket is closed. The card must stay pending until a durable event
+    // proves that some answer landed.
+    const controller = new ChatController('browser-check', { send: () => false } as never);
     controller.handle({
       type: 'chat_snapshot',
       sessionId: 'browser-check',
@@ -1580,6 +1595,12 @@ async function checkTypedWordsThatDidNotLandAreNotShownAsAnswered(): Promise<voi
       .find((button) => (button.textContent || '').trim() === 'Send')
       ?.click();
     await wait(200);
+
+    check(
+      'an answer attempted while disconnected leaves the original card answerable',
+      !!host.querySelector('[data-question-card="live"]')
+        && !host.querySelector('[data-question-answer-sending="true"]'),
+    );
 
     controller.transcript.apply({
       t: 'question_resolved', seq: 900, ts: 1,

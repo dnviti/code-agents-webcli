@@ -153,7 +153,7 @@ export class PermissionBroker {
    * share: the session's request id is created after this point and is never
    * sent back down the socket.
    */
-  private readonly askedQuestions = new Map<string, AbortController>();
+  private readonly askedQuestions = new Map<net.Socket, Map<string, AbortController>>();
 
   constructor(private readonly socketDir: string) {}
 
@@ -246,8 +246,8 @@ export class PermissionBroker {
 
   private accept(socket: net.Socket): void {
     this.open.add(socket);
-    socket.on('close', () => this.open.delete(socket));
-    socket.on('error', () => this.open.delete(socket));
+    socket.on('close', () => this.releaseSocket(socket));
+    socket.on('error', () => this.releaseSocket(socket));
 
     let buffer = '';
     socket.setEncoding('utf8');
@@ -261,6 +261,15 @@ export class PermissionBroker {
         this.handle(socket, line);
       }
     });
+  }
+
+  /** A caller going away cancels only the questions that arrived on its socket. */
+  private releaseSocket(socket: net.Socket): void {
+    this.open.delete(socket);
+    const questions = this.askedQuestions.get(socket);
+    if (!questions) return;
+    this.askedQuestions.delete(socket);
+    for (const abort of questions.values()) abort.abort();
   }
 
   private handle(socket: net.Socket, line: string): void {
@@ -299,7 +308,15 @@ export class PermissionBroker {
         return;
       }
       const abort = new AbortController();
-      this.askedQuestions.set(id, abort);
+      let questions = this.askedQuestions.get(socket);
+      if (!questions) {
+        questions = new Map();
+        this.askedQuestions.set(socket, questions);
+      }
+      // Reusing an id on one connection supersedes only that connection's old
+      // call. Another runtime-side client may legitimately mint the same id.
+      questions.get(id)?.abort();
+      questions.set(id, abort);
       handlers
         .question(question, abort.signal)
         .then(reply)
@@ -307,7 +324,9 @@ export class PermissionBroker {
           reply({ labels: [], error: describeError(error) });
         })
         .finally(() => {
-          this.askedQuestions.delete(id);
+          const current = this.askedQuestions.get(socket);
+          if (current?.get(id) === abort) current.delete(id);
+          if (current?.size === 0) this.askedQuestions.delete(socket);
         });
       return;
     }
@@ -317,8 +336,10 @@ export class PermissionBroker {
     // side, and writing to it would be answering nobody. What it is for is the
     // card, which the session takes down when the signal fires.
     if (payload.kind === 'cancel') {
-      this.askedQuestions.get(id)?.abort();
-      this.askedQuestions.delete(id);
+      const questions = this.askedQuestions.get(socket);
+      questions?.get(id)?.abort();
+      questions?.delete(id);
+      if (questions?.size === 0) this.askedQuestions.delete(socket);
       return;
     }
 
@@ -372,11 +393,9 @@ export class PermissionBroker {
   close(): void {
     for (const socket of this.open) {
       socket.destroy();
+      this.releaseSocket(socket);
     }
     this.open.clear();
-    // Dropped rather than aborted: the session stopping is what closes this, and
-    // it takes its own cards down as it goes. Firing the signals here would ask
-    // it to do the same job twice.
     this.askedQuestions.clear();
 
     if (this.server) {

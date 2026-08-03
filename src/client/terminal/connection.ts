@@ -157,6 +157,9 @@ export class WebSocketConnection {
           this.clearPongTimeout();
           this.app.socket = null;
           publishConnection('disconnected');
+          if (typeof this.app.handleChatConnectionLost === 'function') {
+            this.app.handleChatConnectionLost();
+          }
 
           if (!settled) {
             fail(new Error('WebSocket closed before connection was established'));
@@ -209,10 +212,13 @@ export class WebSocketConnection {
     });
   }
 
-  send(data: Record<string, unknown>): void {
+  /** Returns false when no open socket could have carried this frame. */
+  send(data: Record<string, unknown>): boolean {
     if (this.app.socket && this.app.socket.readyState === WebSocket.OPEN) {
       this.app.socket.send(JSON.stringify(data));
+      return true;
     }
+    return false;
   }
 
   startHeartbeat(): void {
@@ -242,6 +248,9 @@ export class WebSocketConnection {
     this.app.socket = null;
     this.connectPromise = null;
     publishConnection('disconnected');
+    if (typeof this.app.handleChatConnectionLost === 'function') {
+      this.app.handleChatConnectionLost();
+    }
 
     if (socket) {
       try {

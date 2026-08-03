@@ -15,6 +15,7 @@ import {
   PlanDocument,
   QueuedTurn,
   QuestionOption,
+  QuestionContinuation,
   QuestionRequest,
   SlashCommand,
   UserTurn,
@@ -58,7 +59,12 @@ import {
   TierReply,
   permissionHookSettings,
 } from './permission-broker.js';
-import { ASK_SOCKET_ENV, TIER_ENABLED_ENV, askMcpConfig } from './ask-mcp.js';
+import {
+  ASK_SOCKET_ENV,
+  QUESTION_TOOL_ENABLED_ENV,
+  TIER_ENABLED_ENV,
+  askMcpConfig,
+} from './ask-mcp.js';
 import { writePiAskExtension } from './pi-ask-extension.js';
 import { FileCallbackBroker, FileCallbackEndpoint } from './file-callback.js';
 import {
@@ -68,8 +74,14 @@ import {
   writeFileMcpBridge,
 } from './file-mcp-bridge.js';
 import { UserEnvironment } from '../services/environments/types.js';
-import { ChatStoreLike, ChatSessionRef } from './store.js';
-import { askChannelFor, askEnvFor, createChatAdapter, supportsChat } from './registry.js';
+import { ChatStoreLike, ChatSessionRef, chatStoreAppendOutcome } from './store.js';
+import {
+  askChannelFor,
+  askEnvFor,
+  createChatAdapter,
+  questionDeliveryFor,
+  supportsChat,
+} from './registry.js';
 import { FinishedJob, UsageAccountant } from './usage-accounting.js';
 import { UsageJobInput } from '../services/usage-store.js';
 import { projectNameFor, tokenTotal } from '../../shared/usage-records.js';
@@ -296,11 +308,21 @@ interface PendingApproval {
   resolve?: (answer: PermissionAnswer) => void;
 }
 
-/** A question put to the browser, and the tool call waiting on the answer. */
-interface PendingQuestion {
+interface PendingToolQuestion {
+  kind: 'tool';
   request: QuestionRequest;
   resolve: (reply: QuestionReply) => void;
+  phase?: 'open' | 'resolving';
 }
+
+/** A durable question whose model turn ended before the browser was asked. */
+interface PendingHandoffQuestion {
+  kind: 'structured_handoff';
+  request: QuestionRequest;
+  phase?: 'open' | 'resolving';
+}
+
+type PendingQuestion = PendingToolQuestion | PendingHandoffQuestion;
 
 /**
  * Event kinds a resuming runtime may re-emit from history.
@@ -476,31 +498,67 @@ function questionFallbackDirective(): string {
   return [
     '[Interactive-question fallback for this Web conversation.]',
     'If you need a user decision and the ask_user_question tool is unavailable, stop instead of guessing.',
-    `Return exactly ${QUESTION_FALLBACK_OPEN}{"question":"...","header":"2-4 words","multiSelect":false,"options":[{"label":"...","description":"..."}]}${QUESTION_FALLBACK_CLOSE}.`,
+    `Return exactly ${QUESTION_FALLBACK_OPEN}{"version":1,"question":"...","header":"2-4 words","multiSelect":false,"options":[{"label":"...","description":"..."}]}${QUESTION_FALLBACK_CLOSE}.`,
     'The Web interface will show the choices and send the answer in a continuation. Use ordinary prose when no decision is needed.',
   ].join(' ');
 }
 
 function responseQuestionEnvelope(
   markdown: string,
-): { question: QuestionAsk; start: number; end: number } | null {
+): { question?: QuestionAsk; error?: string; start: number; end: number } | null {
   const start = markdown.lastIndexOf(QUESTION_FALLBACK_OPEN);
   if (start < 0) return null;
   const from = start + QUESTION_FALLBACK_OPEN.length;
   const end = markdown.indexOf(QUESTION_FALLBACK_CLOSE, from);
-  if (end < 0) return null;
+  if (end < 0) {
+    return {
+      error: 'the structured question envelope was not closed',
+      start,
+      end: markdown.length,
+    };
+  }
   try {
     const value = JSON.parse(markdown.slice(from, end).trim());
-    return value && typeof value === 'object' && !Array.isArray(value)
-      ? { question: value as QuestionAsk, start, end: end + QUESTION_FALLBACK_CLOSE.length }
-      : null;
+    const version = value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as { version?: unknown }).version
+      : undefined;
+    const envelopeEnd = end + QUESTION_FALLBACK_CLOSE.length;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return { error: 'the structured question payload was not an object', start, end: envelopeEnd };
+    }
+    // An unversioned envelope can still be in flight from a prompt issued by
+    // the previous server release. Treat that one shape as legacy v1; every
+    // newly advertised envelope carries an explicit version and every present
+    // unsupported version is rejected.
+    if (version !== undefined && version !== 1) {
+      return { error: `structured question version ${String(version)} is not supported`, start, end: envelopeEnd };
+    }
+    return { question: value as QuestionAsk, start, end: envelopeEnd };
   } catch {
-    return null;
+    return {
+      error: 'the structured question payload was not valid JSON',
+      start,
+      end: end + QUESTION_FALLBACK_CLOSE.length,
+    };
   }
 }
 
-function responseQuestion(markdown: string): QuestionAsk | null {
-  return responseQuestionEnvelope(markdown)?.question ?? null;
+/** Remove every private envelope, including malformed or unterminated ones. */
+function stripResponseQuestionEnvelopes(markdown: string): string {
+  let visible = '';
+  let cursor = 0;
+  while (cursor < markdown.length) {
+    const start = markdown.indexOf(QUESTION_FALLBACK_OPEN, cursor);
+    if (start < 0) return `${visible}${markdown.slice(cursor)}`.trim();
+    visible += markdown.slice(cursor, start);
+    const close = markdown.indexOf(
+      QUESTION_FALLBACK_CLOSE,
+      start + QUESTION_FALLBACK_OPEN.length,
+    );
+    if (close < 0) return visible.trim();
+    cursor = close + QUESTION_FALLBACK_CLOSE.length;
+  }
+  return visible.trim();
 }
 
 function questionContinuation(question: string, answer: QuestionReply): string {
@@ -542,6 +600,28 @@ export class ChatSession {
   private limits: AccountLimits | null = null;
   private readonly pending = new Map<string, PendingApproval>();
   private readonly questions = new Map<string, PendingQuestion>();
+  /** Answered handoffs durably waiting to become one internal runtime turn. */
+  private readonly questionContinuations = new Map<string, QuestionContinuation>();
+  /** Serialises open/answer/abandon commits without holding a runtime send open. */
+  private questionTransitionTail: Promise<void> = Promise.resolve();
+  private questionTransitionRunning = false;
+  private readonly questionTransitionQueue: Array<{
+    operation: () => Promise<unknown>;
+    resolve: (value: unknown) => void;
+    reject: (reason?: unknown) => void;
+  }> = [];
+  /** Single-flight dispatches, keyed by the durable continuation id. */
+  private readonly questionDispatches = new Map<string, Promise<void>>();
+  /** Claimed outboxes this process knows never reached adapter.send(). */
+  private readonly knownUnsentQuestionContinuations = new Set<string>();
+  /** Adapter events held while a continuation terminal record owns the next seq. */
+  /** Raw runtime events held while one durable protocol event owns the next seq. */
+  private durableEventBuffer: AdapterEvent[] | null = null;
+  /** Set synchronously so a frame arriving after Stop cannot enter the FIFO. */
+  private acceptingQuestionTransitions = true;
+  private questionStopIntent: 'preserve' | 'abandon' | null = null;
+  /** Invalidates a scheduled handoff continuation when Stop/restart wins. */
+  private questionContinuationGeneration = 0;
   /**
    * The rung this conversation runs on, and the whole ladder behind it.
    *
@@ -594,9 +674,9 @@ export class ChatSession {
    * by which point nothing can still be waiting to claim one.
    */
   private askCalls: Array<{ toolId: string; question?: string }> = [];
-  /** True once this session actually handed a runtime the question tool. */
-  private questionsEnabled = false;
-  /** Structured final-response fallback for runtimes with no injectable tool channel. */
+  /** True once this session actually handed a verified timer-free runtime the question tool. */
+  private questionToolEnabled = false;
+  /** Structured end-turn handoff for runtimes whose tool wait is finite or unverified. */
   private questionFallbackEnabled = false;
   /** Plan mode is available even when a runtime falls back to its final markdown response. */
   private planEnabled = false;
@@ -891,8 +971,10 @@ export class ChatSession {
     this.bypass = Boolean(options.bypassPermissions);
     this.planMode = options.startFresh ? false : options.planMode === true;
     this.planEnabled = true;
-    this.questionsEnabled = false;
+    this.questionToolEnabled = false;
     this.questionFallbackEnabled = false;
+    this.acceptingQuestionTransitions = true;
+    this.questionStopIntent = null;
     this.planDocumentCache = undefined;
     this.planResponseBlocks.clear();
     this.fallbackTextBlocks.clear();
@@ -962,13 +1044,15 @@ export class ChatSession {
     const wantsHook = !this.bypass && options.runtime === 'claude' && fs.existsSync(this.deps.hookScript);
     const askScript = this.deps.askScript;
     const askChannel = askChannelFor(options.runtime);
+    const questionToolRequested = questionDeliveryFor(options.runtime) === 'blocking_tool';
     // The MCP server has to exist on disk before it can be handed to anybody.
     // pi's channel is exempt because there is nothing to hand over: its tool is
     // a generated extension that carries its own client to the socket.
-    const wantsAsk = askChannel === 'extension'
+    const wantsCcwebTools = askChannel === 'extension'
       ? true
       : Boolean(askChannel) && Boolean(askScript) && fs.existsSync(askScript!);
     let askMcpServer: ChatAdapterOptions['askMcpServer'];
+    let ccwebToolsWired = false;
 
     // The rung, recorded before anything can be escalated from it. Held on the
     // session rather than read from the profile on demand, because the profile
@@ -986,7 +1070,7 @@ export class ChatSession {
       environment ? environment.toContainerPath(hostPath) : hostPath
     );
     const nodePath = environment ? environment.nodePath : process.execPath;
-    const useFileTools = wantsAsk && environment?.kind === 'container';
+    const useFileTools = wantsCcwebTools && environment?.kind === 'container';
     let fileEndpoint: FileCallbackEndpoint | null = null;
     let fileBridge = '';
 
@@ -1017,7 +1101,7 @@ export class ChatSession {
       }
     }
 
-    const wantsSocketTools = !useFileTools && (wantsAsk || wantsTierExtension);
+    const wantsSocketTools = !useFileTools && (wantsCcwebTools || wantsTierExtension);
     let runtimeSocketPath = '';
     if (wantsHook || wantsSocketTools) {
       // One shared directory, not one per session. A directory named after the
@@ -1044,6 +1128,7 @@ export class ChatSession {
     }
 
     const laddered = Boolean(this.ladder);
+    env[QUESTION_TOOL_ENABLED_ENV] = questionToolRequested ? '1' : '0';
     const runtimeFileDirectory = fileEndpoint ? asSeenByRuntime(fileEndpoint.directory) : '';
     const runtimeFileBridge = fileBridge ? asSeenByRuntime(fileBridge) : '';
     if (fileEndpoint) {
@@ -1060,23 +1145,30 @@ export class ChatSession {
       env[TIER_ENABLED_ENV] = '1';
     }
 
-    if (wantsAsk) Object.assign(env, askEnvFor(options.runtime));
-    if (wantsAsk && askChannel === 'cli' && (fileEndpoint || (!useFileTools && runtimeSocketPath))) {
+    if (wantsCcwebTools) Object.assign(env, askEnvFor(options.runtime));
+    if (wantsCcwebTools && askChannel === 'cli' && (fileEndpoint || (!useFileTools && runtimeSocketPath))) {
       const config = fileEndpoint
         ? fileMcpConfig(runtimeFileBridge, runtimeFileDirectory, fileEndpoint.token, nodePath, laddered)
-        : askMcpConfig(asSeenByRuntime(askScript!), runtimeSocketPath, nodePath, laddered);
+        : askMcpConfig(
+            asSeenByRuntime(askScript!),
+            runtimeSocketPath,
+            nodePath,
+            laddered,
+            questionToolRequested,
+          );
       extraArgs.push('--mcp-config', config);
-      extraArgs.push('--allowedTools', ASK_QUESTION_TOOL_NAME);
+      if (questionToolRequested) extraArgs.push('--allowedTools', ASK_QUESTION_TOOL_NAME);
       extraArgs.push('--allowedTools', SUBMIT_PLAN_TOOL_NAME);
       if (laddered) extraArgs.push('--allowedTools', TIER_TOOL_NAME);
-      this.questionsEnabled = true;
+      ccwebToolsWired = true;
     }
-    if (wantsAsk && askChannel === 'config' && (fileEndpoint || (!useFileTools && runtimeSocketPath))) {
+    if (wantsCcwebTools && askChannel === 'config' && (fileEndpoint || (!useFileTools && runtimeSocketPath))) {
       const script = fileEndpoint ? runtimeFileBridge : asSeenByRuntime(askScript!);
       if (!fileEndpoint) env[ASK_SOCKET_ENV] = runtimeSocketPath;
       if (laddered) env[TIER_ENABLED_ENV] = '1';
       const forwardedMcpEnv = [
         ...(fileEndpoint ? [FILE_CALLBACK_DIR_ENV, FILE_CALLBACK_TOKEN_ENV] : [ASK_SOCKET_ENV]),
+        QUESTION_TOOL_ENABLED_ENV,
         ...(laddered ? [TIER_ENABLED_ENV] : []),
       ];
       // Codex app-server accepts the same dotted TOML overrides as `codex -c`.
@@ -1092,9 +1184,9 @@ export class ChatSession {
         '-c',
         `mcp_servers.${ASK_MCP_SERVER}.env_vars=${JSON.stringify(forwardedMcpEnv)}`,
       );
-      this.questionsEnabled = true;
+      ccwebToolsWired = true;
     }
-    if (wantsAsk && askChannel === 'extension' && (fileEndpoint || (!useFileTools && runtimeSocketPath))) {
+    if (wantsCcwebTools && askChannel === 'extension' && (fileEndpoint || (!useFileTools && runtimeSocketPath))) {
       const extensionRoot = fileEndpoint ? fileEndpoint.directory : options.workingDir;
       const written = writePiAskExtension(extensionRoot);
       if (written) {
@@ -1109,10 +1201,10 @@ export class ChatSession {
         }
         extraArgs.push('-e', extensionPath);
         extraArgs.push('--exclude-tools', 'question');
-        this.questionsEnabled = true;
+        ccwebToolsWired = true;
       }
     }
-    if (wantsAsk && askChannel === 'protocol' && (fileEndpoint || (!useFileTools && runtimeSocketPath))) {
+    if (wantsCcwebTools && askChannel === 'protocol' && (fileEndpoint || (!useFileTools && runtimeSocketPath))) {
       askMcpServer = fileEndpoint
         ? {
             name: ASK_MCP_SERVER,
@@ -1121,6 +1213,7 @@ export class ChatSession {
             env: {
               [FILE_CALLBACK_DIR_ENV]: runtimeFileDirectory,
               [FILE_CALLBACK_TOKEN_ENV]: fileEndpoint.token,
+              [QUESTION_TOOL_ENABLED_ENV]: questionToolRequested ? '1' : '0',
               ...(laddered ? { [TIER_ENABLED_ENV]: '1' } : {}),
             },
           }
@@ -1130,15 +1223,17 @@ export class ChatSession {
             args: [asSeenByRuntime(askScript!)],
             env: {
               [ASK_SOCKET_ENV]: runtimeSocketPath,
+              [QUESTION_TOOL_ENABLED_ENV]: questionToolRequested ? '1' : '0',
               ...(laddered ? { [TIER_ENABLED_ENV]: '1' } : {}),
             },
           };
-      this.questionsEnabled = true;
+      ccwebToolsWired = true;
     }
-    // A few CLIs expose no session-scoped MCP/extension hook. They still get
-    // the same durable QuestionCard flow through a structured final-response
-    // handoff, and the continuation is sent only after the user answers.
-    this.questionFallbackEnabled = !this.questionsEnabled;
+    // Tool availability and question availability are deliberately separate:
+    // timed runtimes keep submit_plan/tier over the ccweb server but never see
+    // the blocking ask tool. Their model turn ends in a durable handoff instead.
+    this.questionToolEnabled = questionToolRequested && ccwebToolsWired;
+    this.questionFallbackEnabled = !this.questionToolEnabled;
 
     // What this session could run, read off disk before the runtime is even
     // spawned, so the command menu has something true in it from the moment the
@@ -1352,6 +1447,10 @@ export class ChatSession {
       const message = error instanceof Error ? error.message : String(error);
       this.ingest({ t: 'error', message: `could not start ${options.runtime}: ${message}`, fatal: true });
       this.setState('error');
+      // A handoff kept across shutdown is actionable only if this runtime can
+      // resume. Once that attempt has definitively failed, leave an explicit
+      // abandoned outcome instead of a durable card no future caller owns.
+      if (options.resumeSessionId) await this.restorePendingQuestions(false);
       await this.stop();
       throw error;
     }
@@ -1374,7 +1473,7 @@ export class ChatSession {
     // about what this session wired up, not about what the runtime can parse.
     // The same adapter has it or does not depending on whether the MCP server
     // was built and found.
-    if ((this.questionsEnabled || this.questionFallbackEnabled) && this.capabilities) {
+    if ((this.questionToolEnabled || this.questionFallbackEnabled) && this.capabilities) {
       this.capabilities = { ...this.capabilities, questions: true };
       this.ingest({ t: 'capabilities', capabilities: { questions: true } });
     }
@@ -1418,7 +1517,92 @@ export class ChatSession {
       });
     }
 
-    this.setState('idle');
+    const restoredQuestion = await this.restorePendingQuestions(
+      !options.startFresh && Boolean(options.resumeSessionId) && adapter.alive,
+    );
+    this.setState(restoredQuestion ? 'awaiting_answer' : 'idle');
+    if (!restoredQuestion) {
+      for (const continuationId of this.questionContinuations.keys()) {
+        this.dispatchQuestionContinuation(continuationId);
+      }
+    }
+  }
+
+  /**
+   * Reconcile questions that survived in the durable event log.
+   *
+   * Only structured handoffs are resumable: their original model turn already
+   * ended, so the request itself is everything needed to send a continuation.
+   * A tool question belonged to a promise in the dead process and must become
+   * honest, non-actionable history instead of a button wired to nothing.
+   */
+  private async restorePendingQuestions(canResume: boolean): Promise<boolean> {
+    // A few embedders (and older test doubles) implement the original
+    // append/read/stat store contract but do not expose snapshots. Recovery is
+    // optional for those stores; treating the missing method as an empty
+    // snapshot keeps ordinary session startup backward-compatible.
+    const snapshotFn = this.deps.store.snapshot;
+    if (typeof snapshotFn !== 'function') return false;
+    const snapshot = await snapshotFn.call(this.deps.store, this.ref);
+    const continuations = snapshot.pendingQuestionContinuations || [];
+    const answeredRequestIds = new Set(
+      continuations.map((continuation) => continuation.request.requestId),
+    );
+    let restored = false;
+    for (const request of snapshot.pendingQuestions || []) {
+      // A committed answer/outbox wins over an older request frame in a
+      // repaired or mixed-version log. It is no longer anybody's to answer.
+      if (answeredRequestIds.has(request.requestId)) continue;
+      if (
+        canResume
+        && request.origin === 'structured_handoff'
+        && !this.questions.has(request.requestId)
+      ) {
+        this.questions.set(request.requestId, {
+          kind: 'structured_handoff',
+          request,
+          phase: 'open',
+        });
+        restored = true;
+        continue;
+      }
+      await this.ingest({
+        t: 'question_resolved',
+        requestId: request.requestId,
+        toolId: request.toolId,
+        optionIds: [],
+        abandoned: true,
+      }, true);
+    }
+    for (const continuation of continuations) {
+      if (continuation.dispatching) {
+        // There is no universal idempotency or history-query contract across
+        // the supported runtimes. The previous process durably crossed its
+        // pre-send boundary and may have handed this turn over before dying;
+        // blindly replaying it is the one action known to be capable of
+        // starting the continuation twice.
+        await this.ingest({
+          t: 'question_continuation',
+          requestId: continuation.request.requestId,
+          continuationId: continuation.continuationId,
+          outcome: 'abandoned',
+          reason: 'delivery may already have reached the runtime before restart; it was not retried',
+        }, true);
+        continue;
+      }
+      if (canResume) {
+        this.questionContinuations.set(continuation.continuationId, continuation);
+        continue;
+      }
+      await this.ingest({
+        t: 'question_continuation',
+        requestId: continuation.request.requestId,
+        continuationId: continuation.continuationId,
+        outcome: 'abandoned',
+        reason: 'the runtime conversation could not be resumed',
+      }, true);
+    }
+    return restored;
   }
 
   /**
@@ -1551,15 +1735,25 @@ export class ChatSession {
   }
 
   private async handleFallbackResponse(markdown: string): Promise<void> {
-    const question = this.questionFallbackEnabled ? responseQuestion(markdown) : null;
-    if (question) {
+    const envelope = this.questionFallbackEnabled ? responseQuestionEnvelope(markdown) : null;
+    if (envelope) {
+      if (!envelope.question) {
+        await this.continueAfterFallbackQuestion('', {
+          labels: [],
+          error: envelope.error || 'the structured question was invalid',
+        });
+        return;
+      }
+      const question = envelope.question;
       const prompt = typeof question.question === 'string' ? question.question.trim() : '';
-      const answer = await this.askQuestion(question);
-      // Stop/interrupt resolves every waiting question so its card can settle.
-      // That resolution is not an answer to send: starting a continuation here
-      // would undo Stop by launching a fresh internal turn after cancellation.
-      if (cancelledFallbackAnswer(answer)) return;
-      await this.continueAfterFallbackQuestion(prompt, answer);
+      const error = await this.openHandoffQuestion(question);
+      // Invalid envelopes have no card to wait on. Give the runtime the same
+      // prose fallback a rejected tool call would have received; valid ones
+      // return here and are continued by answerQuestion, possibly after a
+      // process restart.
+      if (error && !cancelledFallbackAnswer(error)) {
+        await this.continueAfterFallbackQuestion(prompt, error);
+      }
       return;
     }
     if (this.planMode && !this.planSubmittedThisTurn) {
@@ -1576,21 +1770,26 @@ export class ChatSession {
   private async continueAfterFallbackQuestion(
     question: string,
     answer: QuestionReply,
-  ): Promise<void> {
-    if (!this.adapter?.alive) {
+    generation = this.questionContinuationGeneration,
+    continuationId?: string,
+  ): Promise<'delivered' | 'deferred' | 'failed'> {
+    const adapter = this.adapter;
+    if (generation !== this.questionContinuationGeneration) return 'deferred';
+    if (!adapter?.alive) {
       this.ingest({
         t: 'error',
         message: 'The question was answered, but the runtime stopped before the answer could be delivered.',
       });
       if (this.state === 'awaiting_answer') this.setState('idle');
-      return;
+      return 'failed';
     }
 
     this.planSubmittedThisTurn = false;
     this.planResponseBlocks.clear();
     this.fallbackTextBlocks.clear();
     this.planResponseCandidate = '';
-    this.turnInFlightId = `turn-${crypto.randomUUID()}`;
+    const continuationTurnId = `turn-${crypto.randomUUID()}`;
+    this.turnInFlightId = continuationTurnId;
     this.ownUserMessageId = `internal-${crypto.randomUUID()}`;
     this.droppedUserEchoes.clear();
     const planInstruction = this.planMode
@@ -1608,13 +1807,243 @@ export class ChatSession {
     this.replaying = false;
     this.setState('thinking');
     try {
-      await this.adapter.send({ text });
+      // Codex exec and Antigravity declare the turn complete from stdout while
+      // their one-shot child is still exiting. `alive` intentionally remains
+      // true between turns, so wait on the adapter's explicit readiness gate
+      // before handing it the continuation.
+      const deadline = Date.now() + QUEUE_READY_TIMEOUT_MS;
+      while (
+        generation === this.questionContinuationGeneration
+        && this.adapter === adapter
+        && adapter.alive
+        && adapter.readyForTurn === false
+        && Date.now() < deadline
+      ) {
+        await new Promise<void>((resolve) => setTimeout(resolve, QUEUE_READY_POLL_MS));
+      }
+      // Stop/restart owns the state from this point. Returning silently is what
+      // prevents an answer queued a few milliseconds earlier from undoing it.
+      if (
+        generation !== this.questionContinuationGeneration
+        || this.adapter !== adapter
+      ) {
+        if (this.turnInFlightId === continuationTurnId) {
+          this.turnInFlightId = null;
+          this.ownUserMessageId = null;
+          this.droppedUserEchoes.clear();
+        }
+        return 'deferred';
+      }
+      if (!adapter.alive || adapter.readyForTurn === false) {
+        throw new Error(`the ${this.runtime || 'agent'} process was not ready for the answer continuation`);
+      }
+      if (continuationId) {
+        let claimed = false;
+        try {
+          claimed = await this.markQuestionContinuationDispatching(continuationId, generation);
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          this.ingest({
+            t: 'error',
+            message: `The answer was saved but could not be prepared for delivery: ${detail}`,
+          });
+          if (this.turnInFlightId === continuationTurnId) this.turnInFlightId = null;
+          if (generation === this.questionContinuationGeneration) this.ownUserMessageId = null;
+          if (generation === this.questionContinuationGeneration) this.setState('idle');
+          return 'deferred';
+        }
+        if (!claimed) {
+          if (this.turnInFlightId === continuationTurnId) this.turnInFlightId = null;
+          if (generation === this.questionContinuationGeneration) this.ownUserMessageId = null;
+          return 'deferred';
+        }
+        // The durable write yielded. Stop may have won while it was in flight;
+        // in that case the explicit lifecycle path owns the claimed outbox and
+        // no runtime call is started behind its back.
+        if (
+          generation !== this.questionContinuationGeneration
+          || this.adapter !== adapter
+          || !adapter.alive
+          || this.questionStopIntent !== null
+        ) {
+          // No call to adapter.send has happened, so this process knows the
+          // durable claim is not ambiguous. Put it back to pending before a
+          // preserving shutdown hands recovery the outbox; otherwise recovery
+          // would discard an answer that was provably never sent.
+          this.knownUnsentQuestionContinuations.add(continuationId);
+          try {
+            await this.markQuestionContinuationPending(continuationId);
+          } catch (error: unknown) {
+            const detail = error instanceof Error ? error.message : String(error);
+            console.warn(`chat ${this.ref.id}: could not withdraw unsent continuation claim: ${detail}`);
+          }
+          if (this.turnInFlightId === continuationTurnId) this.turnInFlightId = null;
+          if (generation === this.questionContinuationGeneration) this.ownUserMessageId = null;
+          return 'deferred';
+        }
+      }
+      await adapter.send({ text });
+      // Once send accepted the turn, a concurrent graceful Stop must record it
+      // as delivered rather than leave an outbox entry that a restart repeats.
+      return 'delivered';
     } catch (error: unknown) {
-      this.turnInFlightId = null;
-      this.ownUserMessageId = null;
+      if (this.turnInFlightId === continuationTurnId) this.turnInFlightId = null;
+      if (generation === this.questionContinuationGeneration) this.ownUserMessageId = null;
+      if (
+        generation !== this.questionContinuationGeneration
+        || this.adapter !== adapter
+        || !adapter.alive
+      ) {
+        return 'deferred';
+      }
       const detail = error instanceof Error ? error.message : String(error);
       this.ingest({ t: 'error', message: `The answer could not be delivered: ${detail}` });
-      this.setState('idle');
+      if (generation === this.questionContinuationGeneration) this.setState('idle');
+      return 'failed';
+    }
+  }
+
+  /**
+   * Commit the pre-send boundary for an accepted answer.
+   *
+   * A cold process that sees this marker cannot know which side of the
+   * following runtime call the old process reached. It therefore records an
+   * explicit uncertain/abandoned outcome instead of silently issuing a second
+   * model turn. Pending entries, which have no marker, remain safe to resume.
+   */
+  private markQuestionContinuationDispatching(
+    continuationId: string,
+    generation: number,
+  ): Promise<boolean> {
+    return this.mutateQuestions(async () => {
+      const continuation = this.questionContinuations.get(continuationId);
+      if (
+        !continuation
+        || continuation.dispatching
+        || generation !== this.questionContinuationGeneration
+        || this.questionStopIntent !== null
+      ) {
+        return false;
+      }
+      await this.ingest({
+        t: 'question_continuation_dispatching',
+        requestId: continuation.request.requestId,
+        continuationId,
+      }, true);
+      continuation.dispatching = true;
+      return true;
+    });
+  }
+
+  /** Return a claimed outbox to pending while this process still knows no send occurred. */
+  private markQuestionContinuationPending(continuationId: string): Promise<void> {
+    return this.mutateQuestions(async () => {
+      const continuation = this.questionContinuations.get(continuationId);
+      if (!continuation?.dispatching) return;
+      await this.ingest({
+        t: 'question_continuation_pending',
+        requestId: continuation.request.requestId,
+        continuationId,
+      }, true);
+      delete continuation.dispatching;
+      this.knownUnsentQuestionContinuations.delete(continuationId);
+    });
+  }
+
+  /** Start one durable outbox item at most once in this process. */
+  private dispatchQuestionContinuation(
+    continuationId: string,
+    generation = this.questionContinuationGeneration,
+  ): void {
+    if (this.questionContinuations.get(continuationId)?.dispatching) return;
+    if (this.questionDispatches.has(continuationId)) return;
+    const task = this.runQuestionContinuation(continuationId, generation)
+      .catch((error: unknown) => {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(`chat ${this.ref.id}: question continuation failed: ${detail}`);
+      })
+      .finally(() => {
+        if (this.questionDispatches.get(continuationId) === task) {
+          this.questionDispatches.delete(continuationId);
+        }
+      });
+    this.questionDispatches.set(continuationId, task);
+  }
+
+  /**
+   * Runtime delivery deliberately lives outside `questionTransitionTail`.
+   * Stop can cancel readiness polling without deadlocking behind the process it
+   * must tear down; only the outbox's terminal commit re-enters the FIFO.
+   */
+  private async runQuestionContinuation(
+    continuationId: string,
+    generation: number,
+  ): Promise<void> {
+    const continuation = this.questionContinuations.get(continuationId);
+    if (
+      !continuation
+      || continuation.dispatching
+      || this.questionStopIntent !== null
+      || generation !== this.questionContinuationGeneration
+      || !this.adapter?.alive
+    ) {
+      return;
+    }
+    const result = await this.continueAfterFallbackQuestion(
+      continuation.request.question,
+      {
+        labels: [...continuation.answer.labels],
+        text: continuation.answer.text,
+        skipped: continuation.answer.skipped,
+      },
+      generation,
+      continuationId,
+    );
+    if (result === 'deferred') return;
+    await this.finishQuestionContinuation(
+      continuationId,
+      result === 'delivered' ? 'delivered' : 'abandoned',
+      result === 'failed' ? 'the answer continuation could not be delivered' : undefined,
+    );
+  }
+
+  /** Commit one outbox terminal record, then and only then forget its payload. */
+  private finishQuestionContinuation(
+    continuationId: string,
+    outcome: 'delivered' | 'abandoned',
+    reason?: string,
+  ): Promise<void> {
+    return this.mutateQuestions(async () => {
+      const continuation = this.questionContinuations.get(continuationId);
+      if (!continuation) return;
+      // `ingest` stamps this terminal record once and retries those exact
+      // bytes. Retrying separate ingest calls changed the timestamp and made a
+      // committed-but-unacknowledged first append impossible to recognise.
+      await this.ingest({
+        t: 'question_continuation',
+        requestId: continuation.request.requestId,
+        continuationId,
+        outcome,
+        ...(reason ? { reason } : null),
+      }, true, 3);
+      this.questionContinuations.delete(continuationId);
+      this.knownUnsentQuestionContinuations.delete(continuationId);
+      this.drainQueue();
+    });
+  }
+
+  /** Terminalise all accepted continuations while the question FIFO is held. */
+  private async abandonQuestionContinuationsNow(reason: string): Promise<void> {
+    for (const [continuationId, continuation] of [...this.questionContinuations]) {
+      await this.ingest({
+        t: 'question_continuation',
+        requestId: continuation.request.requestId,
+        continuationId,
+        outcome: 'abandoned',
+        reason,
+      }, true);
+      this.questionContinuations.delete(continuationId);
+      this.knownUnsentQuestionContinuations.delete(continuationId);
     }
   }
 
@@ -1684,7 +2113,7 @@ export class ChatSession {
         continue;
       }
       recognised = held.text;
-      const visible = `${held.text.slice(0, envelope.start)}${held.text.slice(envelope.end)}`.trim();
+      const visible = stripResponseQuestionEnvelopes(held.text);
       if (visible) {
         flush([{
           t: 'block_start',
@@ -1706,12 +2135,15 @@ export class ChatSession {
   /**
    * Stamp, persist, broadcast.
    *
-   * Ordering matters and is deliberate: the log is written before the socket
-   * sees anything, so a browser can never hold an event the server would not
-   * replay after a restart. The reverse order would make a reconnect look like
-   * history had been rewritten.
+   * Most streaming events retain the historical fire-and-forget write path.
+   * Protocol transitions that are acknowledged as durable pass `durable` and
+   * are not broadcast until their exact store write has completed.
    */
-  private ingest(event: AdapterEvent): void {
+  private ingest(event: AdapterEvent, durable = false, durableWriteAttempts = 1): void | Promise<void> {
+    if (!durable && this.durableEventBuffer) {
+      this.durableEventBuffer.push(event);
+      return;
+    }
     // Dropped before the sequence number is spent, so a resumed conversation
     // does not leave a hole in its own numbering for events that were never
     // written. See `replaying`.
@@ -1725,6 +2157,19 @@ export class ChatSession {
 
     if (!this.flushingFallbackText && this.interceptFallbackQuestionText(event)) {
       return;
+    }
+
+    // Every durable question transition reserves one sequence number until its
+    // canonical JSONL outcome is known. Adapter callbacks are synchronous and
+    // can arrive while the append promise is pending; letting them stamp the
+    // following seq made a failed durable write impossible to retry without a
+    // gap. Hold those raw events and replay them after commit/known rollback.
+    const deferred = durable ? [] as AdapterEvent[] : null;
+    if (durable) {
+      if (this.durableEventBuffer) {
+        return Promise.reject(new Error('another durable chat event is still being persisted'));
+      }
+      this.durableEventBuffer = deferred;
     }
 
     this.seq += 1;
@@ -1810,7 +2255,7 @@ export class ChatSession {
       // server and false in every browser. Whether the model can ask a question
       // is a fact about what this session wired up; the runtime introducing
       // itself knows nothing about it and must not be able to unset it.
-      if ((this.questionsEnabled || this.questionFallbackEnabled) && !stamped.capabilities.questions) {
+      if ((this.questionToolEnabled || this.questionFallbackEnabled) && !stamped.capabilities.questions) {
         stamped.capabilities = { ...stamped.capabilities, questions: true };
       }
       if (this.planEnabled && !stamped.capabilities.planMode) {
@@ -1843,6 +2288,23 @@ export class ChatSession {
             restarting: this.restarting,
           });
         }
+      }
+      if (stamped.state === 'exited' || stamped.state === 'error') {
+        // A blocked tool promise belongs to the process that just died. A
+        // structured handoff can survive only when this runtime published a
+        // native conversation id and a resume capability; otherwise keeping
+        // its card would offer an answer no future process can receive.
+        const resumable = Boolean(
+          this.nativeSessionId
+          && (this.capabilities?.resume === true || this.adapter?.capabilities.resume === true),
+        );
+        queueMicrotask(() => {
+          if (resumable) {
+            this.abandonToolQuestions('the agent stopped waiting for an answer');
+          } else {
+            this.abandonQuestionsAfterUnresumableExit();
+          }
+        });
       }
     }
     if (
@@ -1924,10 +2386,13 @@ export class ChatSession {
         // `askQuestion` records the resolver before it emits this event, and
         // overwriting the entry here would throw away the only thing that can
         // unblock the waiting tool call.
-        this.questions.set(stamped.request.requestId, { request: stamped.request, resolve: existing.resolve });
+        this.questions.set(stamped.request.requestId, { ...existing, request: stamped.request });
       }
     }
-    if (stamped.t === 'question_resolved') {
+    // Durability-sensitive lifecycle transitions own this map in their FIFO.
+    // Deleting here, before append resolves, made a failed write lose the only
+    // object that could roll the card back to answerable.
+    if (stamped.t === 'question_resolved' && !durable) {
       this.questions.delete(stamped.requestId);
     }
     if (stamped.t === 'permission') {
@@ -1950,53 +2415,121 @@ export class ChatSession {
     this.noteContext(stamped);
     this.noteSpend(stamped);
 
+    let persistence: Promise<void> | null = null;
+    const appendOnce = (): void | Promise<void> => this.deps.store.append(this.ref, [stamped]);
     try {
-      this.deps.store.append(this.ref, [stamped]);
+      if (durable && durableWriteAttempts > 1) {
+        persistence = (async () => {
+          let lastError: unknown;
+          for (let attempt = 0; attempt < durableWriteAttempts; attempt += 1) {
+            try {
+              await appendOnce();
+              return;
+            } catch (error: unknown) {
+              lastError = error;
+            }
+          }
+          throw lastError;
+        })();
+      } else {
+        const appended = appendOnce();
+        if (appended && typeof (appended as Promise<void>).then === 'function') {
+          persistence = Promise.resolve(appended);
+        }
+      }
     } catch (error: unknown) {
+      if (durable) {
+        const outcome = chatStoreAppendOutcome(error);
+        if (outcome === 'not_committed' && this.seq === stamped.seq) {
+          this.seq -= 1;
+        }
+        if (outcome === 'not_committed' && deferred) {
+          if (this.durableEventBuffer === deferred) this.durableEventBuffer = null;
+          for (const held of deferred) this.ingest(held);
+        }
+        return Promise.reject(error);
+      }
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`chat ${this.ref.id}: could not persist an event: ${message}`);
     }
 
-    this.deps.broadcast(this.ref.id, { type: 'chat_event', sessionId: this.ref.id, event: stamped });
+    const publish = (): void => {
+      this.deps.broadcast(this.ref.id, { type: 'chat_event', sessionId: this.ref.id, event: stamped });
 
-    if (fallbackPlan) {
-      queueMicrotask(() => {
-        void this.handleFallbackResponse(fallbackPlan)
-          .catch((error: unknown) => {
-            const detail = error instanceof Error ? error.message : String(error);
-            this.ingest({ t: 'error', message: `The response could not be handled: ${detail}` });
-          })
-          .finally(() => {
-            this.fallbackResponses = Math.max(0, this.fallbackResponses - 1);
-            this.drainQueue();
-          });
-      });
-    } else if (missingPlan) {
-      queueMicrotask(() => {
-        if (!this.planMode || this.planSubmittedThisTurn) return;
-        this.ingest({
-          t: 'error',
-          message: 'The planning turn ended without a reviewable plan. Plan mode is still on; send another planning message to retry.',
+      if (fallbackPlan) {
+        queueMicrotask(() => {
+          void this.handleFallbackResponse(fallbackPlan)
+            .catch((error: unknown) => {
+              const detail = error instanceof Error ? error.message : String(error);
+              this.ingest({ t: 'error', message: `The response could not be handled: ${detail}` });
+            })
+            .finally(() => {
+              this.fallbackResponses = Math.max(0, this.fallbackResponses - 1);
+              this.drainQueue();
+            });
         });
+      } else if (missingPlan) {
+        queueMicrotask(() => {
+          if (!this.planMode || this.planSubmittedThisTurn) return;
+          this.ingest({
+            t: 'error',
+            message: 'The planning turn ended without a reviewable plan. Plan mode is still on; send another planning message to retry.',
+          });
+        });
+      }
+
+      // After the log and the socket, and wrapped: accounting is a bystander to
+      // this conversation and must never be able to stop one. A dropped record is
+      // a hole in a report; a throw here would be a chat that stops mid-turn.
+      try {
+        this.accountant?.observe(stamped);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`chat ${this.ref.id}: could not account for an event: ${message}`);
+      }
+
+      // Last, and only after the event is on the wire: this is where a turn that
+      // ended hands the runtime to whatever was typed while it ran. Doing it here
+      // rather than on a timer means the line advances the instant the state
+      // says it may, and the events of the next turn are numbered after the ones
+      // that closed the last.
+      this.drainQueue();
+    };
+
+    const releaseDurableBarrier = (safe: boolean): void => {
+      if (!durable || !deferred || !safe) return;
+      if (this.durableEventBuffer === deferred) this.durableEventBuffer = null;
+      for (const held of deferred) this.ingest(held);
+    };
+
+    if (durable && persistence) {
+      return persistence.catch((error: unknown) => {
+        // ChatStore rejects only when the canonical JSONL batch did not commit.
+        // Question transitions admit no later lifecycle event ahead of this
+        // barrier, so reclaim the sequence number when it is still the tip and
+        // let a retry remain contiguous after torn bytes are repaired.
+        const outcome = chatStoreAppendOutcome(error);
+        if (outcome === 'not_committed' && this.seq === stamped.seq) {
+          this.seq -= 1;
+        }
+        // Unknown means the record may already own this seq. Keep the barrier
+        // and buffered events quarantined for cold-store reconciliation.
+        releaseDurableBarrier(outcome === 'not_committed');
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`chat ${this.ref.id}: could not durably persist an event: ${message}`);
+        throw error;
+      }).then(() => {
+        try {
+          publish();
+        } finally {
+          releaseDurableBarrier(true);
+        }
       });
     }
-
-    // After the log and the socket, and wrapped: accounting is a bystander to
-    // this conversation and must never be able to stop one. A dropped record is
-    // a hole in a report; a throw here would be a chat that stops mid-turn.
-    try {
-      this.accountant?.observe(stamped);
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`chat ${this.ref.id}: could not account for an event: ${message}`);
-    }
-
-    // Last, and only after the event is on the wire: this is where a turn that
-    // ended hands the runtime to whatever was typed while it ran. Doing it here
-    // rather than on a timer means the line advances the instant the state
-    // says it may, and the events of the next turn are numbered after the ones
-    // that closed the last.
-    this.drainQueue();
+    if (!durable && persistence) void persistence.catch(() => undefined);
+    publish();
+    releaseDurableBarrier(true);
+    return durable ? Promise.resolve() : undefined;
   }
 
   private setState(state: ChatState): void {
@@ -2556,7 +3089,13 @@ export class ChatSession {
    * would come straight back here.
    */
   private drainQueue(): void {
-    if (this.draining || this.fallbackResponses > 0 || this.queue.length === 0) return;
+    if (
+      this.draining
+      || this.fallbackResponses > 0
+      || this.questions.size > 0
+      || this.questionContinuations.size > 0
+      || this.queue.length === 0
+    ) return;
 
     // A dead session cannot work through its backlog, and leaving the turns
     // on screen forever would suggest it might.
@@ -2814,7 +3353,7 @@ export class ChatSession {
       ? planModeDirective(Boolean(await this.planDocument()))
       : null;
     const questionInstruction = !command
-      ? this.questionsEnabled
+      ? this.questionToolEnabled
         ? questionToolDirective()
         : this.questionFallbackEnabled
           ? questionFallbackDirective()
@@ -2956,40 +3495,40 @@ export class ChatSession {
    */
   private async cancelTurnInFlight(): Promise<void> {
     if (!this.adapter) return;
+    this.acceptingQuestionTransitions = false;
+    this.questionStopIntent = 'abandon';
+    this.questionContinuationGeneration += 1;
     // Said before the interrupt rather than after it, because the answer to it
     // can arrive during the await — and on Claude the answer *is* the report
     // this window exists to swallow. Same reasoning as `staleTurnEndUntil`,
     // which `sendQueuedNow` sets one line before calling this.
     this.interruptedErrorUntil = Date.now() + INTERRUPT_ACK_WINDOW_MS;
-    await this.adapter.interrupt();
-    // Anything still waiting on a person is moot once the turn is cancelled,
-    // and leaving the cards on screen would invite answers that go nowhere.
-    for (const [requestId, approval] of this.pending) {
-      approval.resolve?.({ allow: false, reason: 'the turn was interrupted' });
-      this.ingest({ t: 'permission_resolved', requestId, optionId: 'reject_once', allowed: false });
-    }
-    this.pending.clear();
-    // A question is moot once the turn it belongs to is cancelled, and a card
-    // left on screen would invite an answer with nothing left to receive it.
-    //
-    // Recorded as abandoned rather than skipped, which it never was: the user
-    // pressed stop, and stopping a turn is not the same act as reading a
-    // question and declining to answer it. Drawn as "skipped without answering"
-    // it read as an accusation — in the conversation that prompted #174 it was
-    // the *only* thing on screen about two cards whose tool calls had died ten
-    // minutes earlier, so the record blamed the user for the runtime's timeout.
-    for (const [requestId, entry] of this.questions) {
-      entry.resolve({ labels: [], error: 'the turn was interrupted' });
-      this.ingest({
-        t: 'question_resolved',
-        requestId,
-        toolId: entry.request.toolId,
-        optionIds: [],
-        abandoned: true,
+    try {
+      this.adapter.cancelPendingSendAcceptance?.('the turn was interrupted before acceptance was confirmed');
+      await this.adapter.interrupt();
+      // Anything still waiting on a person is moot once the turn is cancelled,
+      // and leaving the cards on screen would invite answers that go nowhere.
+      for (const [requestId, approval] of this.pending) {
+        approval.resolve?.({ allow: false, reason: 'the turn was interrupted' });
+        this.ingest({ t: 'permission_resolved', requestId, optionId: 'reject_once', allowed: false });
+      }
+      this.pending.clear();
+      // Anything admitted before Stop is linearised first. Readiness waiters
+      // see the intent/generation and withdraw; a send that already crossed its
+      // final gate is allowed to commit delivered before termination continues.
+      await this.questionTransitionTail.catch(() => undefined);
+      await Promise.allSettled([...this.questionDispatches.values()]);
+      await this.mutateQuestions(async () => {
+        for (const [requestId, entry] of [...this.questions]) {
+          await this.abandonQuestionNow(requestId, entry, 'the turn was interrupted');
+        }
+        await this.abandonQuestionContinuationsNow('the turn was interrupted');
       });
+      this.setState('idle');
+    } finally {
+      this.questionStopIntent = null;
+      this.acceptingQuestionTransitions = true;
     }
-    this.questions.clear();
-    this.setState('idle');
   }
 
   /**
@@ -3363,42 +3902,131 @@ export class ChatSession {
    * screen and blocking the turn behind it.
    */
   private askQuestion(ask: QuestionAsk, signal?: AbortSignal): Promise<QuestionReply> {
+    const built = this.buildQuestionRequest(ask, 'tool');
+    if ('error' in built) {
+      return Promise.resolve({ labels: [], error: built.error });
+    }
+    if (!this.acceptingQuestionTransitions) {
+      return Promise.resolve({ labels: [], error: 'the session was stopped' });
+    }
+
+    return new Promise<QuestionReply>((resolve) => {
+      const { request } = built;
+      this.questions.set(request.requestId, {
+        kind: 'tool',
+        request,
+        resolve,
+        phase: 'open',
+      });
+      // This path owns a live tool waiter and has to expose it synchronously:
+      // the broker can cancel in the same tick. Its resolution/termination is
+      // still serialised and durable; a cold restart reconciles the unresumable
+      // opener as abandoned.
+      this.ingest({ t: 'question', request });
+      this.setState('awaiting_answer');
+      signal?.addEventListener(
+        'abort',
+        () => { void this.abandonQuestion(request.requestId, 'the agent stopped waiting for an answer'); },
+        { once: true },
+      );
+    });
+  }
+
+  /**
+   * Open a question after the model has deliberately ended its turn.
+   *
+   * There is no promise to keep alive: origin plus the request itself are the
+   * continuation record, which is why this variant can be reconstructed after
+   * a server restart while a blocked MCP call cannot.
+   */
+  private async openHandoffQuestion(ask: QuestionAsk): Promise<QuestionReply | null> {
+    const built = this.buildQuestionRequest(ask, 'structured_handoff');
+    if ('error' in built) return { labels: [], error: built.error };
+    // Admission is decided before the FIFO yields. Stop waits for work already
+    // admitted and rejects only calls that arrive after its synchronous gate.
+    if (!this.acceptingQuestionTransitions) {
+      return { labels: [], error: 'the session was stopped' };
+    }
+    return this.mutateQuestions(async () => {
+      const { request } = built;
+      try {
+        // A browser must not receive an indefinitely actionable card until the
+        // request is in the restart log that will rebuild that same card.
+        await this.ingest({ t: 'question', request }, true);
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return { labels: [], error: `the question could not be saved: ${detail}` };
+      }
+      this.questions.set(request.requestId, {
+        kind: 'structured_handoff',
+        request,
+        phase: 'open',
+      });
+      this.setState('awaiting_answer');
+      return null;
+    });
+  }
+
+  /** Put every question lifecycle commit behind one per-session boundary. */
+  private mutateQuestions<T>(operation: () => Promise<T>): Promise<T> {
+    // The first operation starts synchronously. Besides avoiding a needless
+    // tick, this preserves invocation order against a store snapshot requested
+    // immediately after opening a handoff: append is enqueued before snapshot.
+    const queued = new Promise<T>((resolve, reject) => {
+      this.questionTransitionQueue.push({
+        operation,
+        resolve: resolve as (value: unknown) => void,
+        reject,
+      });
+      this.runNextQuestionTransition();
+    });
+    this.questionTransitionTail = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  private runNextQuestionTransition(): void {
+    if (this.questionTransitionRunning) return;
+    const next = this.questionTransitionQueue.shift();
+    if (!next) return;
+    this.questionTransitionRunning = true;
+    let result: Promise<unknown>;
+    try {
+      result = Promise.resolve(next.operation());
+    } catch (error: unknown) {
+      result = Promise.reject(error);
+    }
+    void result.then(next.resolve, next.reject).finally(() => {
+      this.questionTransitionRunning = false;
+      this.runNextQuestionTransition();
+    });
+  }
+
+  /** Validate one model-authored payload and mint the durable browser request. */
+  private buildQuestionRequest(
+    ask: QuestionAsk,
+    origin: 'tool' | 'structured_handoff',
+  ): { request: QuestionRequest } | { error: string } {
     const question = typeof ask.question === 'string' ? ask.question.trim() : '';
     const options = normalizeQuestionOptions(ask.options);
 
     if (!question || options.length === 0) {
-      return Promise.resolve({
-        labels: [],
-        error: 'the question needs a question and at least one option',
-      });
+      return { error: 'the question needs a question and at least one option' };
     }
 
-    return new Promise<QuestionReply>((resolve) => {
-      const requestId = `ask-${crypto.randomUUID()}`;
-      const request: QuestionRequest = {
-        requestId,
+    const request: QuestionRequest = {
+        requestId: `ask-${crypto.randomUUID()}`,
+        origin,
         // Claimed, not merely read: a second question must not attach itself to
         // the same tool block, which would draw two cards in one place and
         // leave the later one unanswerable.
-        toolId: this.claimAskCall(question),
+        ...(origin === 'tool' ? { toolId: this.claimAskCall(question) } : {}),
         question,
         header: typeof ask.header === 'string' && ask.header.trim() ? ask.header.trim() : undefined,
         multiSelect: ask.multiSelect === true,
         options,
         ts: Date.now(),
-      };
-      this.questions.set(requestId, { request, resolve });
-      this.ingest({ t: 'question', request });
-      this.setState('awaiting_answer');
-      // The caller giving up is the other way this ends. Registered after the
-      // card exists so the listener has something to take down, and harmless
-      // if it never fires — the abort controller goes when the call does.
-      signal?.addEventListener(
-        'abort',
-        () => this.abandonQuestion(requestId, 'the agent stopped waiting for an answer'),
-        { once: true },
-      );
-    });
+    };
+    return { request };
   }
 
   /**
@@ -3407,41 +4035,93 @@ export class ChatSession {
    * Returns false for a question this session does not have, which is what a
    * second browser answering one that has already been answered looks like.
    */
-  answerQuestion(
+  async answerQuestion(
     requestId: string,
     optionIds: string[],
     skipped = false,
     text?: string,
-  ): boolean {
+  ): Promise<boolean> {
     const entry = this.questions.get(requestId);
-    if (!entry) return false;
+    if (!entry || entry.phase === 'resolving' || !this.acceptingQuestionTransitions) return false;
+    // A handoff may remain durable while its dead process is waiting to be
+    // resumed. Do not consume the only answer before there is an adapter able
+    // to receive the continuation; the browser acknowledgement tells the user
+    // to retry after recovery instead.
+    if (entry.kind === 'structured_handoff' && !this.adapter?.alive) return false;
 
-    // Filtered against the offered options rather than trusted: the ids come
-    // from a browser, and the labels they resolve to are about to be handed
-    // straight to the model as fact.
-    const picked = entry.request.options.filter((option) => optionIds.includes(option.optionId));
-    // The one part of an answer that is *not* filtered against the options,
-    // because it is by definition not one of them. Bounded at the wire; here it
-    // only has to be non-empty to count as having been answered.
-    const own = typeof text === 'string' ? text.trim() : '';
-    const answered = !skipped && (picked.length > 0 || own.length > 0);
+    // First writer claims the request before yielding. A second browser frame
+    // therefore loses immediately even while the winner is waiting on disk.
+    entry.phase = 'resolving';
+    const continuationGeneration = this.questionContinuationGeneration;
 
-    entry.resolve({
-      labels: picked.map((option) => option.label),
-      text: answered && own ? own : undefined,
-      skipped: !answered,
+    return this.mutateQuestions(async () => {
+      // The entry can only disappear ahead of us if a legacy embedding mutated
+      // the map directly. Treat that as a stale submission, never a new answer.
+      if (this.questions.get(requestId) !== entry) return false;
+
+      // Filtered against the offered options rather than trusted: the ids come
+      // from a browser, and the labels they resolve to are about to be handed
+      // straight to the model as fact.
+      const picked = entry.request.options.filter((option) => optionIds.includes(option.optionId));
+      // The one part of an answer that is *not* filtered against the options,
+      // because it is by definition not one of them. Bounded at the wire; here
+      // it only has to be non-empty to count as having been answered.
+      const own = typeof text === 'string' ? text.trim() : '';
+      const answered = !skipped && (picked.length > 0 || own.length > 0);
+
+      const reply: QuestionReply = {
+        labels: picked.map((option) => option.label),
+        text: answered && own ? own : undefined,
+        skipped: !answered,
+      };
+      const continuation: QuestionContinuation | undefined = entry.kind === 'structured_handoff'
+        ? {
+            continuationId: `continue-${crypto.randomUUID()}`,
+            request: {
+              ...entry.request,
+              options: entry.request.options.map((option) => ({ ...option })),
+            },
+            answer: {
+              optionIds: picked.map((option) => option.optionId),
+              labels: [...reply.labels],
+              ...(reply.text ? { text: reply.text } : null),
+              ...(reply.skipped ? { skipped: true } : null),
+            },
+          }
+        : undefined;
+      try {
+        await this.ingest({
+          t: 'question_resolved',
+          requestId,
+          toolId: entry.request.toolId,
+          optionIds: picked.map((option) => option.optionId),
+          text: answered && own ? own : undefined,
+          skipped: !answered,
+          ...(continuation ? { continuation } : null),
+        }, true);
+      } catch {
+        // No browser saw the resolution and no positive acknowledgement will
+        // be sent. The phase rolls back; Stop, if already admitted, will close
+        // the still-durable request in FIFO order.
+        entry.phase = 'open';
+        if (this.state !== 'awaiting_answer') this.setState('awaiting_answer');
+        return false;
+      }
+
+      // The blocked tool and the continuation are released only after the exact
+      // resolution event is on disk. A positive browser acknowledgement can now
+      // truthfully mean the submission survived a restart boundary.
+      this.questions.delete(requestId);
+      if (this.isToolQuestion(entry)) entry.resolve(reply);
+      if (continuation) {
+        this.questionContinuations.set(continuation.continuationId, continuation);
+        queueMicrotask(() => this.dispatchQuestionContinuation(
+          continuation.continuationId,
+          continuationGeneration,
+        ));
+      }
+      return true;
     });
-
-    this.questions.delete(requestId);
-    this.ingest({
-      t: 'question_resolved',
-      requestId,
-      toolId: entry.request.toolId,
-      optionIds: picked.map((option) => option.optionId),
-      text: answered && own ? own : undefined,
-      skipped: !answered,
-    });
-    return true;
   }
 
   /** The pending questions asked by one tool call, usually none or one. */
@@ -3464,24 +4144,94 @@ export class ChatSession {
    * screen if you conflate them and they say opposite things about the user.
    */
   private abandonQuestionsFor(toolId: string, reason = 'the agent stopped waiting for an answer'): void {
-    for (const requestId of this.questionsFor(toolId)) {
-      this.abandonQuestion(requestId, reason);
-    }
+    void this.abandonQuestions(reason, (entry) => entry.request.toolId === toolId);
+  }
+
+  /** Settle only questions whose live tool caller can no longer exist. */
+  private abandonToolQuestions(reason: string): void {
+    void this.abandonQuestions(reason, (entry) => this.isToolQuestion(entry));
+  }
+
+  /** A dead, non-resumable runtime can own neither waiters nor an outbox. */
+  private abandonQuestionsAfterUnresumableExit(): void {
+    this.questionContinuationGeneration += 1;
+    void Promise.allSettled([...this.questionDispatches.values()]).then(() => (
+      this.mutateQuestions(async () => {
+        for (const [requestId, entry] of [...this.questions]) {
+          await this.abandonQuestionNow(
+            requestId,
+            entry,
+            'the runtime conversation could not be resumed',
+          );
+        }
+        await this.abandonQuestionContinuationsNow(
+          'the runtime conversation could not be resumed',
+        );
+      })
+    )).catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn(`chat ${this.ref.id}: could not abandon unresumable questions: ${detail}`);
+    });
+  }
+
+  /**
+   * Recognize both the discriminated shape and the pre-discriminator live
+   * waiter shape. The latter cannot be recovered from disk, but it can still
+   * exist in an embedding that populated the in-memory map before upgrading.
+   */
+  private isToolQuestion(entry: PendingQuestion): entry is PendingToolQuestion {
+    return entry.kind === 'tool'
+      || typeof (entry as unknown as { resolve?: unknown }).resolve === 'function';
   }
 
   /** The same for one question, which is how a cancelled call arrives. */
-  private abandonQuestion(requestId: string, reason: string): void {
-    const entry = this.questions.get(requestId);
-    if (!entry) return;
-    entry.resolve({ labels: [], error: reason });
-    this.questions.delete(requestId);
-    this.ingest({
-      t: 'question_resolved',
-      requestId,
-      toolId: entry.request.toolId,
-      optionIds: [],
-      abandoned: true,
+  private abandonQuestion(requestId: string, reason: string): Promise<void> {
+    return this.mutateQuestions(async () => {
+      const entry = this.questions.get(requestId);
+      if (entry) await this.abandonQuestionNow(requestId, entry, reason);
     });
+  }
+
+  /** Batch termination; must not call the public enqueuing helper recursively. */
+  private abandonQuestions(
+    reason: string,
+    predicate: (entry: PendingQuestion) => boolean = () => true,
+  ): Promise<void> {
+    return this.mutateQuestions(async () => {
+      for (const [requestId, entry] of [...this.questions]) {
+        if (predicate(entry)) await this.abandonQuestionNow(requestId, entry, reason);
+      }
+    });
+  }
+
+  /** One durable close while `questionTransitionTail` is held. */
+  private async abandonQuestionNow(
+    requestId: string,
+    entry: PendingQuestion,
+    reason: string,
+  ): Promise<void> {
+    try {
+      await this.ingest({
+        t: 'question_resolved',
+        requestId,
+        toolId: entry.request.toolId,
+        optionIds: [],
+        abandoned: true,
+      }, true);
+    } catch (error: unknown) {
+      // A tool caller that is already gone must never stay blocked on a logging
+      // failure. A handoff stays in memory so a failed Stop can be retried.
+      if (this.isToolQuestion(entry)) {
+        entry.resolve({ labels: [], error: reason });
+        this.questions.delete(requestId);
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn(`chat ${this.ref.id}: question abandonment was not durable: ${detail}`);
+      if (this.isToolQuestion(entry)) return;
+      throw error;
+    }
+    if (this.isToolQuestion(entry)) entry.resolve({ labels: [], error: reason });
+    this.questions.delete(requestId);
     // Nothing left to wait for. Said here rather than left to the next event,
     // because a conversation that goes on reporting `awaiting_answer` with no
     // card to answer is one whose composer stays out of the user's way.
@@ -3670,7 +4420,7 @@ export class ChatSession {
         if (!this.adapter?.alive || !this.adapterReady) {
           throw new Error(`the ${this.runtime || 'agent'} process was not ready for another turn`);
         }
-        const questionInstruction = this.questionsEnabled
+        const questionInstruction = this.questionToolEnabled
           ? questionToolDirective()
           : this.questionFallbackEnabled
             ? questionFallbackDirective()
@@ -3811,7 +4561,20 @@ export class ChatSession {
       state: this.live ? snapshot.state : 'exited',
       capabilities: this.capabilities || snapshot.capabilities,
       pendingPermissions: Array.from(this.pending.values()).map((entry) => entry.request),
-      pendingQuestions: Array.from(this.questions.values()).map((entry) => entry.request),
+      pendingQuestions: [
+        ...(snapshot.pendingQuestions || []),
+        ...Array.from(this.questions.values()).map((entry) => entry.request),
+      ].filter((request, index, all) => (
+        all.findIndex((candidate) => candidate.requestId === request.requestId) === index
+      )),
+      pendingQuestionContinuations: [
+        ...(snapshot.pendingQuestionContinuations || []),
+        ...Array.from(this.questionContinuations.values()),
+      ].filter((continuation, index, all) => (
+        all.findIndex((candidate) => (
+          candidate.continuationId === continuation.continuationId
+        )) === index
+      )),
       questionHistory: [
         ...(snapshot.questionHistory || []),
         ...Array.from(this.questions.values())
@@ -3834,7 +4597,11 @@ export class ChatSession {
     }));
   }
 
-  async stop(): Promise<void> {
+  async stop({ preserveHandoffs = false }: { preserveHandoffs?: boolean } = {}): Promise<void> {
+    this.acceptingQuestionTransitions = false;
+    this.questionStopIntent = preserveHandoffs ? 'preserve' : 'abandon';
+    this.questionContinuationGeneration += 1;
+    this.adapter?.cancelPendingSendAcceptance?.('the session stopped before acceptance was confirmed');
     for (const [, approval] of this.pending) {
       approval.resolve?.({ allow: false, reason: 'the session was stopped' });
     }
@@ -3846,17 +4613,33 @@ export class ChatSession {
     // Written to the log as well as resolved, which it was not before: a browser
     // already watching this conversation is told the card is over, instead of
     // going on offering buttons until something makes it rejoin and rebuild.
-    for (const [requestId, entry] of this.questions) {
-      entry.resolve({ labels: [], error: 'the session was stopped' });
-      this.ingest({
-        t: 'question_resolved',
-        requestId,
-        toolId: entry.request.toolId,
-        optionIds: [],
-        abandoned: true,
-      });
+    await this.questionTransitionTail.catch(() => undefined);
+    await Promise.allSettled([...this.questionDispatches.values()]);
+    if (preserveHandoffs) {
+      // A withdrawal may have lost one transient store write while Stop was
+      // already waiting on its dispatch task. Retry it here and do not clear
+      // the in-memory fact if durability is still unavailable: returning a
+      // successful shutdown would make recovery discard a provably unsent
+      // accepted answer as ambiguous.
+      for (const continuationId of [...this.knownUnsentQuestionContinuations]) {
+        await this.markQuestionContinuationPending(continuationId);
+      }
     }
+    await this.mutateQuestions(async () => {
+      for (const [requestId, entry] of [...this.questions]) {
+        if (preserveHandoffs && entry.kind === 'structured_handoff') continue;
+        await this.abandonQuestionNow(requestId, entry, 'the session was stopped');
+      }
+      if (!preserveHandoffs) {
+        await this.abandonQuestionContinuationsNow('the session was stopped');
+      }
+    });
+    // Preserved handoffs remain in the event log, not in a process that is
+    // about to die. The replacement session rehydrates them after its adapter
+    // has successfully resumed.
     this.questions.clear();
+    this.questionContinuations.clear();
+    this.knownUnsentQuestionContinuations.clear();
     this.clearQueue();
 
     // Before the adapter goes: a turn that was still running when someone hit

@@ -275,6 +275,15 @@ export interface WsChatEventMessage {
   event: unknown;
 }
 
+/** Correlated acceptance of one browser's question-answer submission. */
+export interface WsChatQuestionAnswerAckMessage {
+  type: 'chat_question_answer_ack';
+  sessionId: string;
+  requestId: string;
+  submissionId: string;
+  accepted: boolean;
+}
+
 /**
  * What this conversation's composer holds, on every screen watching it.
  *
@@ -568,6 +577,7 @@ export type WsMessage =
   | WsChatStartedMessage
   | WsChatSnapshotMessage
   | WsChatEventMessage
+  | WsChatQuestionAnswerAckMessage
   | WsChatDraftMessage
   | WsChatPageMessage
   | WsChatPageFailedMessage;

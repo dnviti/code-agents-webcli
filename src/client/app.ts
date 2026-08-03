@@ -405,12 +405,19 @@ export class App {
     this.wsConnection.disconnect();
   }
 
-  send(data: Record<string, unknown>): void {
-    this.wsConnection.send(data);
+  send(data: Record<string, unknown>): boolean {
+    return this.wsConnection.send(data);
   }
 
   handleMessage(message: WsMessage): void {
     this.messageHandler.handle(message);
+  }
+
+  /** Let cards whose answer socket disappeared become interactive again. */
+  handleChatConnectionLost(): void {
+    for (const sessionId of this.chats.ids()) {
+      this.chats.get(sessionId)?.connectionLost();
+    }
   }
 
   fitTerminal(): void {

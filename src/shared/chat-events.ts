@@ -747,6 +747,9 @@ export interface QuestionOption {
   description?: string;
 }
 
+/** How a question is waiting for its answer. */
+export type QuestionOrigin = 'tool' | 'structured_handoff';
+
 /**
  * A question the model asked, waiting on a person.
  *
@@ -760,6 +763,12 @@ export interface QuestionOption {
  */
 export interface QuestionRequest {
   requestId: string;
+  /**
+   * Tool calls have a live resolver in the current process. A structured
+   * handoff ended the model turn before asking and can therefore be restored
+   * from the durable log after a restart. Missing is a legacy recorded event.
+   */
+  origin?: QuestionOrigin;
   /**
    * The tool call that asked, when it could be identified.
    *
@@ -776,6 +785,34 @@ export interface QuestionRequest {
   multiSelect: boolean;
   options: QuestionOption[];
   ts: number;
+}
+
+/**
+ * The durable outbox entry created when a structured handoff is answered.
+ *
+ * It repeats the bounded, validated content needed for the internal turn so a
+ * restart never has to reconstruct model input from a card that is no longer
+ * pending. The matching `question_continuation` event removes it once delivery
+ * has either been accepted by the runtime or deliberately abandoned.
+ */
+export interface QuestionContinuation {
+  continuationId: string;
+  /**
+   * The runtime handoff has crossed its durable pre-send boundary.
+   *
+   * Optional for logs written before this state existed. A recovered entry in
+   * this state is deliberately not sent again unless an adapter can
+   * authoritatively reconcile it: the previous process may have handed it to
+   * the runtime before dying.
+   */
+  dispatching?: true;
+  request: QuestionRequest;
+  answer: {
+    optionIds: string[];
+    labels: string[];
+    text?: string;
+    skipped?: boolean;
+  };
 }
 
 /** What a chat session is doing right now, for the header indicator. */
@@ -1159,6 +1196,38 @@ export type ChatEvent =
        * for a card they were never able to answer (#174).
        */
       abandoned?: boolean;
+      /**
+       * Present only for an answered structured handoff. Its presence is the
+       * durable outbox marker: the answer is acknowledged only after this
+       * payload and the resolution are one committed log record.
+       */
+      continuation?: QuestionContinuation;
+    }
+  | {
+      /** Durable pre-send claim for one structured-handoff continuation. */
+      t: 'question_continuation_dispatching';
+      seq: number;
+      ts: number;
+      requestId: string;
+      continuationId: string;
+    }
+  | {
+      /** The live process withdrew a pre-send claim before invoking the adapter. */
+      t: 'question_continuation_pending';
+      seq: number;
+      ts: number;
+      requestId: string;
+      continuationId: string;
+    }
+  | {
+      /** Terminal record for the structured-handoff continuation outbox. */
+      t: 'question_continuation';
+      seq: number;
+      ts: number;
+      requestId: string;
+      continuationId: string;
+      outcome: 'delivered' | 'abandoned';
+      reason?: string;
     }
   | { t: 'state'; seq: number; ts: number; state: ChatState }
   | { t: 'error'; seq: number; ts: number; message: string; fatal?: boolean }
@@ -1426,6 +1495,12 @@ export interface ChatSnapshot {
    * that predates this should read as "none pending", not as malformed.
    */
   pendingQuestions?: QuestionRequest[];
+  /**
+   * Answered structured handoffs whose internal continuation has not reached a
+   * terminal record yet. Server-internal, but carried by the shared snapshot
+   * shape so recovery uses the same replay contract as every other chat fact.
+   */
+  pendingQuestionContinuations?: QuestionContinuation[];
   /**
    * Questions retained for history, including structured-response fallback
    * questions that have no tool block to own their answered card.

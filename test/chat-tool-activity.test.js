@@ -205,11 +205,12 @@ for (const entry of RUNTIMES) {
     // for its reply — the line carrying the turn's spend — to be delivered to
     // anything at all. Feeding the capture without it drops the one message
     // that says what the turn cost.
-    await adapter.send({ text: 'do the thing' });
+    const sending = adapter.send({ text: 'do the thing' });
     for (const line of lines.slice(2)) {
       adapter.handleMessage(line);
       await flush();
     }
+    await sending;
   };
 }
 

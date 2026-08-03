@@ -51,7 +51,8 @@ function readPlanDocument(raw: unknown): PlanDocument | null {
  */
 
 export interface ChatControllerOptions {
-  send: (message: Record<string, unknown>) => void;
+  /** `false` means an open socket did not carry this message. */
+  send: (message: Record<string, unknown>) => boolean | void;
   /**
    * Whether the connected server advertised app-owned workflow admission.
    *
@@ -132,6 +133,18 @@ interface PendingBuiltInWorkflow {
   resolve: (result: BuiltInWorkflowStartResult) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+}
+
+interface PendingQuestionAnswer {
+  requestId: string;
+  resolve: (accepted: boolean) => void;
+}
+
+export function createQuestionAnswerSubmissionId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `answer-${crypto.randomUUID()}`;
+  }
+  return `answer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 export function createBuiltInWorkflowRequestId(): string {
@@ -395,6 +408,8 @@ export class ChatController {
   private planResult: PlanActionFeedback | null = null;
   /** Admission promises for popup submissions, keyed by their wire request id. */
   private workflowRequests = new Map<string, PendingBuiltInWorkflow>();
+  /** Answer frames awaiting the server's correlated acknowledgement. */
+  private questionAnswers = new Map<string, PendingQuestionAnswer>();
   /** False on a real socket until its handshake advertises the protocol. */
   private builtInWorkflows: boolean;
 
@@ -479,6 +494,7 @@ export class ChatController {
     'chat_plan_accept_result',
     'chat_plan_reject_result',
     'chat_builtin_workflow_result',
+    'chat_question_answer_ack',
     'chat_turn_index',
     'chat_turn_index_failed',
     'chat_turn_spend',
@@ -763,6 +779,15 @@ export class ChatController {
           this.transcript.setBypassing(event.bypassing === true);
           this.options.onChange?.();
         }
+        return true;
+      }
+
+      case 'chat_question_answer_ack': {
+        const submissionId = typeof message.submissionId === 'string' ? message.submissionId : '';
+        const pending = this.questionAnswers.get(submissionId);
+        if (!pending || message.sessionId !== this.sessionId) return true;
+        this.questionAnswers.delete(submissionId);
+        pending.resolve(message.accepted === true);
         return true;
       }
 
@@ -1234,8 +1259,44 @@ export class ChatController {
    * words — and travels beside the picks rather than as one of them, because
    * the ids name options the question offered and this is the part it did not.
    */
-  answerQuestion(requestId: string, optionIds: string[], skipped = false, text?: string): void {
-    this.send({ type: 'chat_question_answer', requestId, optionIds, skipped, text });
+  answerQuestion(
+    requestId: string,
+    optionIds: string[],
+    skipped = false,
+    text?: string,
+  ): Promise<boolean> {
+    const submissionId = createQuestionAnswerSubmissionId();
+    return new Promise((resolve) => {
+      this.questionAnswers.set(submissionId, { requestId, resolve });
+      const sent = this.send({
+        type: 'chat_question_answer', requestId, optionIds, skipped, text, submissionId,
+      });
+      // Undefined remains compatible with isolated controllers and older
+      // embedders. A real closed socket returns false and cannot look accepted.
+      if (sent === false) this.settleQuestionAnswer(submissionId, false);
+    });
+  }
+
+  /** Reject unacknowledged answers when their socket goes away; never retry. */
+  connectionLost(): void {
+    for (const submissionId of Array.from(this.questionAnswers.keys())) {
+      this.settleQuestionAnswer(submissionId, false);
+    }
+  }
+
+  private settleQuestionAnswer(submissionOrRequestId: string, accepted: boolean): void {
+    const direct = this.questionAnswers.get(submissionOrRequestId);
+    if (direct) {
+      this.questionAnswers.delete(submissionOrRequestId);
+      direct.resolve(accepted);
+      return;
+    }
+    for (const [submissionId, pending] of this.questionAnswers) {
+      if (pending.requestId !== submissionOrRequestId) continue;
+      this.questionAnswers.delete(submissionId);
+      // A durable resolution is authoritative; the card reads it from the log.
+      pending.resolve(accepted);
+    }
   }
 
   respondPermission(requestId: string, optionId: string): void {
@@ -1516,8 +1577,8 @@ export class ChatController {
   }
 
   /** Every outgoing message names its session; a browser drives several. */
-  private send(message: Record<string, unknown>): void {
-    this.options.send({ ...message, sessionId: this.sessionId });
+  private send(message: Record<string, unknown>): boolean | void {
+    return this.options.send({ ...message, sessionId: this.sessionId });
   }
 
   /**
@@ -1544,6 +1605,7 @@ export class ChatController {
       pending.reject(new Error('The conversation closed before the guided workflow was started.'));
     }
     this.workflowRequests.clear();
+    this.connectionLost();
   }
 
   /**

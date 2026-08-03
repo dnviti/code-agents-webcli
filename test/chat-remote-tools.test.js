@@ -53,7 +53,7 @@ function containerEnvironment(home) {
 }
 
 describe('the shared-home tools in remote Web-chat runtimes', function () {
-  it('wires questions and Plan submission through every supported launch shape', async function () {
+  it('wires Plan tools everywhere but exposes blocking questions only on pi', async function () {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-chat-tools-'));
     const socketDir = path.join(root, 'sockets');
     const realFactory = registry.createChatAdapter;
@@ -107,9 +107,12 @@ describe('the shared-home tools in remote Web-chat runtimes', function () {
         const adapter = created[created.length - 1];
         assert.strictEqual(session.currentCapabilities.questions, true, `${runtime} questions`);
         assert.strictEqual(session.currentCapabilities.planMode, true, `${runtime} Plan mode`);
+        const blocking = runtime === 'pi';
+        assert.strictEqual(registry.questionDeliveryFor(runtime), blocking ? 'blocking_tool' : 'structured_handoff');
+        assert.strictEqual(session.questionFallbackEnabled, !blocking, `${runtime} delivery mode`);
+        assert.strictEqual(adapter.options.env.CCWEB_QUESTION_TOOL_ENABLED, blocking ? '1' : '0');
 
         if (runtime === 'antigravity') {
-          assert.strictEqual(session.questionFallbackEnabled, true);
           assert.strictEqual(adapter.options.env.CCWEB_CALLBACK_DIR, undefined);
         } else {
           assert.match(adapter.options.env.CCWEB_CALLBACK_DIR, /^\/home\/remote-user\/\.ccweb-callback\//);
@@ -121,7 +124,7 @@ describe('the shared-home tools in remote Web-chat runtimes', function () {
           assert.ok(at >= 0);
           const config = JSON.parse(adapter.options.extraArgs[at + 1]).mcpServers.ccweb;
           assert.match(config.args[0], /^\/home\/remote-user\/\.ccweb-callback\/.+\/ccweb-mcp\.mjs$/);
-          assert.ok(adapter.options.extraArgs.includes(ASK_QUESTION_TOOL_NAME));
+          assert.ok(!adapter.options.extraArgs.includes(ASK_QUESTION_TOOL_NAME));
           assert.ok(adapter.options.extraArgs.includes(SUBMIT_PLAN_TOOL_NAME));
         } else if (runtime === 'codex') {
           assert.ok(adapter.options.extraArgs.some((arg) => String(arg).startsWith('mcp_servers.ccweb.command=')));
@@ -131,7 +134,7 @@ describe('the shared-home tools in remote Web-chat runtimes', function () {
           );
           assert.deepStrictEqual(
             JSON.parse(forwarded.slice(forwarded.indexOf('=') + 1)),
-            ['CCWEB_CALLBACK_DIR', 'CCWEB_CALLBACK_TOKEN'],
+            ['CCWEB_CALLBACK_DIR', 'CCWEB_CALLBACK_TOKEN', 'CCWEB_QUESTION_TOOL_ENABLED'],
           );
           assert.ok(
             !adapter.options.extraArgs.some((arg) => String(arg).includes(adapter.options.env.CCWEB_CALLBACK_TOKEN)),
@@ -140,6 +143,7 @@ describe('the shared-home tools in remote Web-chat runtimes', function () {
         } else if (['grok', 'kimi', 'omp'].includes(runtime)) {
           assert.strictEqual(adapter.options.askMcpServer.name, 'ccweb');
           assert.match(adapter.options.askMcpServer.args[0], /^\/home\/remote-user\/\.ccweb-callback\/.+\/ccweb-mcp\.mjs$/);
+          assert.strictEqual(adapter.options.askMcpServer.env.CCWEB_QUESTION_TOOL_ENABLED, '0');
         } else if (runtime === 'pi') {
           const at = adapter.options.extraArgs.indexOf('-e');
           assert.ok(at >= 0);
@@ -147,8 +151,10 @@ describe('the shared-home tools in remote Web-chat runtimes', function () {
         }
 
         await session.send({ text: 'Choose the safest approach.' });
-        if (runtime === 'antigravity') {
+        if (!blocking) {
           assert.match(adapter.sent[0], /Interactive-question fallback/);
+          assert.match(adapter.sent[0], /<ccweb-question>/);
+          assert.doesNotMatch(adapter.sent[0], /call the .*ask_user_question tool/);
         } else {
           assert.match(adapter.sent[0], /both Default and Plan mode/);
           assert.match(adapter.sent[0], /ask_user_question tool/);

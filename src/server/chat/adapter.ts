@@ -142,6 +142,17 @@ export interface ChatAdapter {
   /** Queue a user turn. Resolves when the runtime has accepted it, not when it replies. */
   send(turn: UserTurn): Promise<void>;
   /**
+   * Withdraw a `send()` that is still waiting for proof the runtime accepted it.
+   *
+   * Most transports acknowledge a turn directly, or accept it synchronously,
+   * and do not need this hook. ACP v1 keeps its prompt request open for the
+   * whole turn, so its adapter uses the first turn-specific protocol activity
+   * as the acknowledgement. Lifecycle code can release that narrow waiter
+   * before stopping the process instead of waiting for output that can no
+   * longer be useful.
+   */
+  cancelPendingSendAcceptance?(reason: string): void;
+  /**
    * False while a `send()` would be refused, even though the last turn is over.
    *
    * Absent means "always ready", which is true of every adapter driving one
@@ -313,6 +324,13 @@ export abstract class BaseChatAdapter implements ChatAdapter {
   /** Hook for a handshake that must complete before the session is usable. */
   protected async handshake(): Promise<void> {}
 
+  /**
+   * Settle protocol work that can no longer receive a response after an
+   * unexpected child failure. Stateful transports override this; one-shot
+   * adapters have no request waiters to release.
+   */
+  protected onUnexpectedExit(_error: Error): void {}
+
   protected emit(event: AdapterEvent): void {
     const stamped = { ...event, ts: event.ts ?? Date.now() } as AdapterEvent;
     const lifecycle = this.childLifecycle;
@@ -468,6 +486,7 @@ export abstract class BaseChatAdapter implements ChatAdapter {
     });
 
     child.on('error', (error: Error) => {
+      if (!this.stopped) this.onUnexpectedExit(error);
       this.emit({ t: 'error', message: `${this.runtime}: ${error.message}`, fatal: true });
       this.emit({ t: 'state', state: 'error' });
       const lifecycle = this.childLifecycle?.child === child
@@ -490,6 +509,9 @@ export abstract class BaseChatAdapter implements ChatAdapter {
       }
       const detail = this.stderrTail.trim();
       const how = signal ? `signal ${signal}` : `code ${code}`;
+      this.onUnexpectedExit(new Error(
+        detail ? `${this.runtime} exited (${how}): ${detail}` : `${this.runtime} exited (${how})`,
+      ));
       this.emit({
         t: 'error',
         message: detail
@@ -744,6 +766,8 @@ export abstract class BaseChatAdapter implements ChatAdapter {
  */
 export abstract class JsonRpcChatAdapter extends BaseChatAdapter {
   private nextId = 1;
+  /** Once the child is gone, no later fallback RPC may create a fresh waiter. */
+  private transportClosedError: Error | null = null;
   private readonly pending = new Map<
     number,
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
@@ -752,11 +776,18 @@ export abstract class JsonRpcChatAdapter extends BaseChatAdapter {
   protected readonly permissionWaiters = new Map<string, number | string>();
 
   protected call(method: string, params?: unknown): Promise<unknown> {
+    if (this.transportClosedError) return Promise.reject(this.transportClosedError);
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.pending.set(id, { resolve, reject });
       this.writeLine({ jsonrpc: '2.0', id, method, params });
     });
+  }
+
+  protected override onUnexpectedExit(error: Error): void {
+    if (!this.transportClosedError) this.transportClosedError = error;
+    for (const [, waiter] of this.pending) waiter.reject(this.transportClosedError);
+    this.pending.clear();
   }
 
   protected notify(method: string, params?: unknown): void {
@@ -815,10 +846,7 @@ export abstract class JsonRpcChatAdapter extends BaseChatAdapter {
   async stop(): Promise<void> {
     // Reject anything still in flight so callers awaiting a turn do not hang
     // forever on a process that is going away.
-    for (const [, waiter] of this.pending) {
-      waiter.reject(new Error(`${this.runtime} session stopped`));
-    }
-    this.pending.clear();
+    this.onUnexpectedExit(new Error(`${this.runtime} session stopped`));
     await super.stop();
   }
 }

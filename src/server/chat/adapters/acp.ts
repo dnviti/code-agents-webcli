@@ -386,6 +386,22 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   /** The last level announced, so a re-read does not re-emit the same one. */
   private reportedEffort?: string | null;
   private turnId: string | null = null;
+  /**
+   * ACP v1 answers `session/prompt` only when the whole turn ends, not when it
+   * accepts the prompt. Keep a separate acceptance waiter so `send()` can obey
+   * the adapter contract without waiting for the model's complete reply.
+   */
+  private promptAcceptance: {
+    turnId: string;
+    resolve: () => void;
+    reject: (error: Error) => void;
+  } | null = null;
+  /** The ACP v1 prompt RPC remains live until its whole turn settles. */
+  private promptRpcTurnId: string | null = null;
+  /** Exact runtime echo of the outstanding prompt, accumulated across chunks. */
+  private promptEcho: { turnId: string; expected: string; received: string; valid: boolean } | null = null;
+  /** Tool ids already introduced, used to distinguish a new update-only call from a stale patch. */
+  private readonly knownToolIds = new Set<string>();
   private turnStartedAt = 0;
   private current: OpenMessage | null = null;
   private counter = 0;
@@ -853,6 +869,9 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
       this.emit({ t: 'error', message: `${this.runtime}: no ACP session, so the turn was not sent` });
       return;
     }
+    if (this.promptRpcTurnId) {
+      throw new Error(`${this.runtime}: the previous ACP prompt is still in flight`);
+    }
 
     const turnId = `${this.runtime}-turn-${++this.counter}`;
     this.turnId = turnId;
@@ -880,9 +899,54 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     }
 
     this.emit({ t: 'state', state: 'thinking' });
-    this.call('session/prompt', { sessionId: this.nativeSessionId, prompt })
-      .then((result) => this.finishTurn(turnId, result))
-      .catch((error: unknown) => this.failTurn(turnId, error));
+    return new Promise<void>((resolve, reject) => {
+      this.promptAcceptance = { turnId, resolve, reject };
+      this.promptRpcTurnId = turnId;
+      this.promptEcho = { turnId, expected: turn.text, received: '', valid: true };
+      void this.call('session/prompt', { sessionId: this.nativeSessionId, prompt })
+        .then((result) => {
+          // A silent turn may produce no update at all. Its successful response
+          // is both the first proof of acceptance and the end of the turn.
+          this.acceptPrompt(turnId);
+          this.finishTurn(turnId, result);
+          this.finishPromptRpc(turnId);
+        })
+        .catch((error: unknown) => {
+          // Before any turn activity, an RPC error means the prompt was never
+          // accepted and `send()` must reject. After activity it is a failed
+          // accepted turn, which `failTurn` records without changing the
+          // already-settled acceptance promise.
+          const rejectedBeforeAcceptance = this.rejectPrompt(turnId, error);
+          if (rejectedBeforeAcceptance) {
+            // Let every promise continuation waiting on send() put the refused
+            // turn back at the head of its queue before turn_end makes the
+            // session idle and drains that queue. The readiness sentinel stays
+            // held through that deferred terminalization, so a synchronous
+            // retry cannot start a successor prompt first.
+            setImmediate(() => {
+              this.failTurn(turnId, error);
+              this.finishPromptRpc(turnId);
+            });
+          } else {
+            this.failTurn(turnId, error);
+            this.finishPromptRpc(turnId);
+          }
+        });
+    });
+  }
+
+  get readyForTurn(): boolean {
+    // `session/cancel` has no acknowledgement of its own. Keep the next turn
+    // parked until the old prompt RPC settles, or its late completion can
+    // close the new turn's adapter-global message and emit the wrong turn_end.
+    return this.promptRpcTurnId === null;
+  }
+
+  cancelPendingSendAcceptance(reason: string): void {
+    const pending = this.promptAcceptance;
+    if (!pending) return;
+    this.promptAcceptance = null;
+    pending.reject(new Error(reason));
   }
 
   /**
@@ -1135,6 +1199,11 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     method: string,
     params: Record<string, unknown>,
   ): void {
+    // A request made while a prompt is outstanding (permission, filesystem,
+    // or a newer request kind) can only happen after the agent accepted that
+    // prompt. Resolve before handling it, since handling may itself await the
+    // browser or filesystem for an arbitrary amount of time.
+    this.acceptPrompt(this.turnId);
     switch (method) {
       case 'session/request_permission':
         this.handlePermissionRequest(id, params);
@@ -1177,6 +1246,36 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     this.emitContextUsed(num(record(params._meta).totalTokens));
     const update = record(params.update);
     const kind = str(update.sessionUpdate);
+    const sameSession = str(params.sessionId) === this.nativeSessionId;
+    if (kind === 'user_message_chunk' && sameSession) {
+      this.acceptMatchingPromptEcho(contentText(record(update.content)));
+    }
+    const updateToolId = kind === 'tool_call_update' ? str(update.toolCallId) : '';
+    const newUpdateOnlyTool = Boolean(
+      sameSession
+      && this.promptRpcTurnId
+      && updateToolId
+      && !this.knownToolIds.has(updateToolId)
+      && (
+        str(record(params._meta).promptId)
+        || update.rawInput !== undefined
+        || str(update.title)
+        || str(update.kind)
+      ),
+    );
+    // ACP also sends session-level updates outside turns (commands, context
+    // usage, mode/config changes). Only activity that could have been caused
+    // by this prompt proves it was accepted; a delayed handshake/menu update
+    // must not turn a later RPC rejection into a false success.
+    if (
+      kind === 'agent_message_chunk'
+      || kind === 'agent_thought_chunk'
+      || kind === 'tool_call'
+      || kind === 'plan'
+      || newUpdateOnlyTool
+    ) {
+      this.acceptPrompt(this.turnId);
+    }
 
     switch (kind) {
       case 'agent_message_chunk':
@@ -1186,13 +1285,16 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
         this.appendChunk('thinking', 'assistant', str(update.messageId), contentText(record(update.content)));
         return;
       case 'user_message_chunk':
-        // Only seen on a replayed session; our own turns are emitted by send().
+        // Some agents replay history here; Grok also echoes the live prompt as
+        // its first current-turn event. Only the exact correlation above is an
+        // acceptance acknowledgement.
         this.appendChunk('text', 'user', str(update.messageId), contentText(record(update.content)));
         return;
       case 'tool_call':
         this.handleToolCall(update);
         return;
       case 'tool_call_update':
+        if (updateToolId) this.knownToolIds.add(updateToolId);
         this.handleToolCallUpdate(update);
         return;
       case 'available_commands_update':
@@ -1313,6 +1415,7 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
   private handleToolCall(update: Record<string, unknown>): void {
     const toolId = str(update.toolCallId);
     if (!toolId) return;
+    this.knownToolIds.add(toolId);
 
     // ACP has no separate tool name: the title is what the agent calls it, and
     // opencode's titles ("read") are exactly that. The id is the last resort.
@@ -1603,6 +1706,46 @@ export class AcpChatAdapter extends JsonRpcChatAdapter {
     this.closeBlock(message);
     this.current = null;
     this.emit({ t: 'msg_end', msgId: message.id, stopReason, usage });
+  }
+
+  private acceptPrompt(turnId: string | null): void {
+    const pending = this.promptAcceptance;
+    if (!turnId || !pending || pending.turnId !== turnId) return;
+    this.promptAcceptance = null;
+    pending.resolve();
+  }
+
+  private acceptMatchingPromptEcho(chunk: string): void {
+    const echo = this.promptEcho;
+    if (
+      !echo
+      || !echo.valid
+      || !this.promptRpcTurnId
+      || echo.turnId !== this.promptRpcTurnId
+      || !chunk
+    ) return;
+    const candidate = echo.received + chunk;
+    if (!echo.expected.startsWith(candidate)) {
+      echo.valid = false;
+      return;
+    }
+    echo.received = candidate;
+    if (candidate === echo.expected) this.acceptPrompt(echo.turnId);
+  }
+
+  private rejectPrompt(turnId: string, error: unknown): boolean {
+    const pending = this.promptAcceptance;
+    if (!pending || pending.turnId !== turnId) return false;
+    this.promptAcceptance = null;
+    pending.reject(error instanceof Error ? error : new Error(String(error)));
+    return true;
+  }
+
+  private finishPromptRpc(turnId: string): void {
+    if (this.promptRpcTurnId === turnId) {
+      this.promptRpcTurnId = null;
+      this.promptEcho = null;
+    }
   }
 
   private finishTurn(turnId: string, result: unknown): void {

@@ -437,6 +437,30 @@ describe('file callback broker', function () {
     await delay(30);
     assert.deepStrictEqual(fs.readdirSync(path.join(endpoint.directory, 'requests')), []);
   });
+
+  it('does not clean an active question just because it outlives orphan cleanup', async function () {
+    broker = new FileCallbackBroker(home, {
+      pollMs: 5,
+      cleanupAfterMs: 25,
+      requestTimeoutMs: 20,
+    });
+    let release;
+    let started;
+    const waiting = new Promise((resolve) => { release = resolve; });
+    const startedPromise = new Promise((resolve) => { started = resolve; });
+    const endpoint = await broker.listen(async () => {
+      started();
+      await waiting;
+      return 'answered';
+    });
+
+    const pending = requestFileCallback(endpoint, 'question', {}, { pollMs: 5, timeoutMs: 20 });
+    await startedPromise;
+    await delay(80);
+    assert.ok(fs.readdirSync(path.join(endpoint.directory, 'requests')).some((entry) => entry.endsWith('.json')));
+    release();
+    assert.strictEqual(await pending, 'answered');
+  });
 });
 
 describe('generated file MCP bridge', function () {
@@ -536,7 +560,20 @@ describe('generated file MCP bridge', function () {
     assert.deepStrictEqual(JSON.parse(config).mcpServers.ccweb.env, { CCWEB_TIER_LADDER: '1' });
   });
 
-  it('lists questionnaire and plan tools, then delivers both through the broker', async function () {
+  it('keeps plan and tier tools available when the question tool is disabled', async function () {
+    broker = new FileCallbackBroker(home, { pollMs: 5 });
+    const endpoint = await broker.listen(async () => ({ accepted: true }));
+    const rpc = await launch(endpoint, { CCWEB_TIER_LADDER: '1' });
+
+    const tools = await rpc.request({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} });
+    assert.deepStrictEqual(tools.result.tools.map((tool) => tool.name), ['submit_plan', 'request_model_tier']);
+    const unavailable = await rpc.request({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: {
+      name: 'ask_user_question', arguments: {},
+    } });
+    assert.strictEqual(unavailable.error.code, -32601);
+  });
+
+  it('lists questionnaire and plan tools when explicitly enabled, then delivers both through the broker', async function () {
     broker = new FileCallbackBroker(home, { pollMs: 5 });
     const calls = [];
     const endpoint = await broker.listen(async (request) => {
@@ -545,7 +582,7 @@ describe('generated file MCP bridge', function () {
         ? { labels: ['Remote'], text: 'because' }
         : { accepted: true, detail: 'Plan accepted.' };
     });
-    const rpc = await launch(endpoint);
+    const rpc = await launch(endpoint, { CCWEB_QUESTION_TOOL_ENABLED: '1' });
 
     await rpc.request({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } });
     const tools = await rpc.request({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
@@ -566,13 +603,14 @@ describe('generated file MCP bridge', function () {
   it('returns a prose fallback MCP error promptly when the callback host is unavailable', async function () {
     const directory = path.join(home, 'unavailable');
     for (const name of ['requests', 'replies', 'cancelled']) fs.mkdirSync(path.join(directory, name), { recursive: true });
-    const rpc = await launch({ directory, token: 'test-token' });
+    const rpc = await launch({ directory, token: 'test-token' }, { CCWEB_QUESTION_TOOL_ENABLED: '1' });
     const reply = await rpc.request({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: {
       name: 'ask_user_question', arguments: { question: 'Which?', options: ['A', 'B'] },
     } });
     assert.strictEqual(reply.result.isError, true);
     assert.match(reply.result.content[0].text, /Ask in prose instead/);
     assert.match(reply.result.content[0].text, /unavailable/);
+    assert.ok(fs.readdirSync(path.join(directory, 'cancelled')).some((entry) => entry.endsWith('.cancel')));
   });
 
   it('delivers MCP cancellation to a broker handler instead of leaving its request live', async function () {
@@ -586,7 +624,7 @@ describe('generated file MCP bridge', function () {
       aborted = true;
       throw new Error('cancelled');
     });
-    const rpc = await launch(endpoint);
+    const rpc = await launch(endpoint, { CCWEB_QUESTION_TOOL_ENABLED: '1' });
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 22, method: 'tools/call', params: {
       name: 'ask_user_question', arguments: { question: 'Wait?', options: ['Yes', 'No'] },
     } })}\n`);

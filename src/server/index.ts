@@ -1322,7 +1322,10 @@ export class ClaudeCodeWebServer {
     // handle reachable even if a stale record says inactive. Retry every such
     // owner before releasing admission or clearing maps; rejection aborts
     // shutdown rather than orphaning an unverified container process.
-    await this.chatManager.stopAll();
+    // Structured question handoffs have no live tool call to settle. Preserve
+    // them across an orderly server restart so a resumed runtime can receive
+    // the answer when the user comes back.
+    await this.chatManager.stopAll({ preserveHandoffs: true });
 
     for (const sessionId of this.claudeSessions.keys()) {
       // Defensive and idempotent: covers an admission acquired immediately

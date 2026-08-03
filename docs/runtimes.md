@@ -162,19 +162,67 @@ these" is a real answer rather than a dead end. The same questionnaire is
 available in ordinary conversations and in Plan mode; it is not tied to either
 approval mode.
 
-| Runtime | How it is given the question tool | Verified against |
+| Runtime | Question delivery | Why |
 | --- | --- | --- |
-| Claude Code | an MCP server passed at spawn | a recorded headless session |
-| Codex | an MCP server added with session-local app-server configuration | the app-server configuration schema |
-| Grok Build, Kimi Code, Oh My Pi | an MCP server passed in the ACP handshake | live protocol captures |
-| pi | a generated extension loaded with `-e` | a live run |
-| Antigravity CLI | a structured response handoff, because its headless mode has no MCP or extension hook | its streamed final-response path |
+| Claude Code | structured handoff | no verified timer-free per-tool MCP setting |
+| Codex | structured handoff | MCP tool calls have a finite timeout and no verified disable sentinel |
+| Grok Build | structured handoff | no timer-free MCP guarantee has been verified |
+| Kimi Code | structured handoff | its client accepts only a finite maximum timeout |
+| Oh My Pi | structured handoff | nested-agent MCP calls retain an unavoidable finite ceiling |
+| Antigravity CLI | structured handoff | its headless mode has no MCP or extension hook |
+| pi | blocking tool through a generated `-e` extension | the whole app-owned callback path is timer-free |
+
+For a **structured handoff**, the model ends its turn with a private, versioned
+question envelope. The server removes that envelope from the transcript,
+validates it with the same option normalization as a tool question, and writes
+the normal question card to the durable conversation log. No runtime tool call
+is left open. Once the answer or skip has been recorded, the server starts one
+internal continuation turn carrying the chosen labels and any free text. This
+works the same way in Default and Plan mode; only the invisible transport
+between the two model turns differs.
+New prompts emit envelope version 1. An unversioned envelope already in flight
+from an older server is accepted as legacy version 1; any explicit unsupported
+version is rejected without exposing its private JSON in the transcript.
 
 An unanswered card is part of the durable conversation: navigating away,
-reloading or opening the conversation on another device does not discard it.
-Once answered or skipped, the card remains in history with that outcome. If the
-question channel cannot reach the Web server, the tool tells the agent to ask in
-ordinary prose instead of leaving the turn waiting forever.
+reloading, backgrounding the browser, losing the WebSocket, or opening the
+conversation on another device does not discard it. A recoverable server
+restart rehydrates a structured handoff when the runtime conversation can be
+resumed. Once answered or skipped, the card remains in history with that
+outcome and only the first accepted answer can start the continuation.
+The accepted answer and its stable continuation ID are committed as one outbox
+record before the browser receives a positive acknowledgement. An orderly
+shutdown either waits for a send that already crossed the runtime boundary or
+leaves that outbox pending for the resumed session; it never silently drops the
+answer. Duplicate browser submissions and repeated reconnect frames therefore
+cannot start a second internal turn.
+
+Before the outbox is sent, the server commits a second durable dispatch marker.
+Runtime transports do not expose a universal idempotency key or an authoritative
+way to ask whether that turn arrived. If a machine-level crash leaves a marked
+delivery without its terminal record, recovery therefore records an explicit
+abandoned/uncertain outcome and does **not** resend it blindly. This trades a
+visible, rare non-delivery for the stronger guarantee that recovery cannot
+silently start the same continuation twice. A runtime may retry that state
+automatically only after it gains verified idempotency or delivery
+reconciliation. Pending (not yet marked) outbox entries remain safe to resume;
+orderly restart, Stop, reconnect and duplicate-frame paths have no ambiguous
+window.
+
+Here, **indefinite** means elapsed wall-clock time never resolves a question.
+The card can still end because the user answers or skips, Stop/reset/deletion
+explicitly cancels it, the runtime session cannot be recovered, or the callback
+transport proves that its caller is gone. Those cases are recorded as answered,
+skipped, or abandoned—not as timeouts. A runtime is allowed to expose the
+blocking question tool only after its entire invocation path is verified to
+have this timer-free contract; structured handoff is the default for every new
+or unknown runtime.
+
+This deliberately does not use a huge duration as a stand-in for “forever.”
+Codex documents `tool_timeout_sec` as a duration with a finite default, while
+Claude's documented `MCP_TIMEOUT` controls server startup rather than a
+timer-free tool invocation. See the [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp#other-configuration-options)
+and [Claude Code MCP documentation](https://docs.anthropic.com/en/docs/claude-code/mcp).
 
 On a host-local session the MCP/extension bridge uses the session's private Unix
 socket. In Docker, Podman and Kubernetes environments it uses an owner-only
@@ -189,30 +237,15 @@ This is at-rest protection for the shared volume, not isolation from another
 process able to inspect the launched runtime's environment. No inbound container
 or pod port is opened.
 
-**The call blocks, and the app now makes sure it can.** Two of these CLIs put a
-timer on it that this app has to switch off, or the question expires with nobody
-having been asked:
-
-- **Oh My Pi** abandons *any* MCP call after 30 seconds. Measured: two cards in
-  one conversation died at 30.001s each, and the agent — told the tool had
-  failed — asked the same question again, and again, and eventually carried on
-  having guessed. There is no flag and no config key for it, and the ACP
-  handshake has nowhere to put one, so the app sets `OMP_MCP_TIMEOUT_MS=0` on
-  the process it starts. Its own subagents keep a separate 60-second ceiling
-  that nothing can override; a question asked from inside one still expires, and
-  the card says so rather than waiting.
-- **Kimi Code** does the same at 60 seconds. Its lever, `KIMI_MCP_TOOL_TIMEOUT_MS`,
-  accepts 1 to 2147483647 milliseconds and *silently discards* anything else —
-  so the app raises the ceiling to the maximum rather than passing the zero that
-  works for Oh My Pi and would land kimi back on its default.
-
 **pi asks through an extension**, because it has no MCP support and no ACP. The
 file is generated into the session's own `.pi/ccweb/`, is loaded by path, and
 registers nothing at all when it is loaded outside a session. The app also
 passes `--exclude-tools question`: the widely installed `pi-code` package
 registers a tool by that name which, in the mode this app drives, answers itself
 with "UI not available" without anybody being asked — and a model offered two
-question tools sometimes picks the one that cannot work.
+question tools sometimes picks the one that cannot work. The extension's local
+socket and remote shared-file callback paths have no elapsed-time deadline for
+questions; explicit cancellation and liveness loss still terminate them.
 
 **A card that can no longer be answered says so.** If the agent gives up, or the
 turn is stopped, or the conversation is closed, the card stops offering buttons

@@ -28,6 +28,7 @@ import {
   PlanItem,
   NoticeBlock,
   QuestionRequest,
+  QuestionContinuation,
   TextBlock,
   ThinkingBlock,
   ToolBlock,
@@ -71,6 +72,8 @@ export interface TranscriptState {
    * which is where scrolling back finds it.
    */
   pendingQuestions: QuestionRequest[];
+  /** Durable answered-handoff outbox, keyed by its stable dispatch id. */
+  pendingQuestionContinuations: Record<string, QuestionContinuation>;
   /**
    * Every question event still retained in the loaded log, including resolved
    * questions with no tool block from which a historical card could be rebuilt.
@@ -176,6 +179,7 @@ export function createTranscript(
     plan: [],
     pendingPermissions: [],
     pendingQuestions: [],
+    pendingQuestionContinuations: {},
     questionHistory: [],
     answeredQuestions: {},
     answeredQuestionText: {},
@@ -921,16 +925,25 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       );
       if (recorded < 0) state.questionHistory.push(event.request);
       else state.questionHistory[recorded] = event.request;
+      // Durable publication orders the request before its resolution, but a
+      // reconnect can still splice an older socket frame around a newer
+      // snapshot. Once a resolution owns this key, a late request is history,
+      // not a newly actionable card.
+      const answerKey = event.request.toolId ?? event.request.requestId;
+      const alreadyResolved = Object.prototype.hasOwnProperty.call(
+        state.answeredQuestions,
+        answerKey,
+      );
       const already = state.pendingQuestions.some(
         (pending) => pending.requestId === event.request.requestId,
       );
-      if (!already) {
+      if (!already && !alreadyResolved) {
         state.pendingQuestions.push(event.request);
       }
       // Not folded into `awaiting_permission`: the composer, the header and the
       // stop button all read this, and "waiting for approval" over a question
       // about which of three approaches to take is simply the wrong sentence.
-      state.state = 'awaiting_answer';
+      if (!alreadyResolved) state.state = 'awaiting_answer';
 
       // A normal ask tool already owns its card in the message that contains
       // the call. The structured-response fallback has no tool block at all,
@@ -957,7 +970,25 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
           (block) => block.kind === 'question'
             && block.request.requestId === event.request.requestId,
         );
-        if (!exists) message.blocks.push({ kind: 'question', request: event.request });
+        if (!exists) {
+          message.blocks.push({
+            kind: 'question',
+            request: event.request,
+            ...(alreadyResolved ? {
+              answer: {
+                optionIds: [...state.answeredQuestions[answerKey]],
+                ...(state.answeredQuestionText[answerKey]
+                  ? { text: state.answeredQuestionText[answerKey] }
+                  : null),
+                ...(state.answeredQuestions[answerKey].length === 0
+                  && !state.abandonedQuestions[answerKey]
+                  ? { skipped: true }
+                  : null),
+                ...(state.abandonedQuestions[answerKey] ? { abandoned: true } : null),
+              },
+            } : null),
+          });
+        }
         return { messageIndex, structural: false, meta: true, applied: true };
       }
 
@@ -970,7 +1001,23 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         turnId: state.currentTurnId ?? lastTurnId(state) ?? `question-${event.seq}`,
         role: 'assistant',
         ts: event.ts,
-        blocks: [{ kind: 'question', request: event.request }],
+        blocks: [{
+          kind: 'question',
+          request: event.request,
+          ...(alreadyResolved ? {
+            answer: {
+              optionIds: [...state.answeredQuestions[answerKey]],
+              ...(state.answeredQuestionText[answerKey]
+                ? { text: state.answeredQuestionText[answerKey] }
+                : null),
+              ...(state.answeredQuestions[answerKey].length === 0
+                && !state.abandonedQuestions[answerKey]
+                ? { skipped: true }
+                : null),
+              ...(state.abandonedQuestions[answerKey] ? { abandoned: true } : null),
+            },
+          } : null),
+        }],
       };
       state.index[message.id] = state.messages.length;
       state.messages.push(message);
@@ -1032,12 +1079,43 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       if (state.state === 'awaiting_answer' && state.pendingQuestions.length === 0) {
         state.state = 'running';
       }
+      if (event.continuation && !event.abandoned) {
+        state.pendingQuestionContinuations[event.continuation.continuationId] = {
+          ...event.continuation,
+          request: {
+            ...event.continuation.request,
+            options: event.continuation.request.options.map((option) => ({ ...option })),
+          },
+          answer: {
+            ...event.continuation.answer,
+            optionIds: [...event.continuation.answer.optionIds],
+            labels: [...event.continuation.answer.labels],
+          },
+        };
+      }
       return {
         messageIndex: resolvedMessageIndex,
         structural: false,
         meta: true,
         applied: true,
       };
+    }
+
+    case 'question_continuation_dispatching': {
+      const continuation = state.pendingQuestionContinuations[event.continuationId];
+      if (continuation) continuation.dispatching = true;
+      return { messageIndex: null, structural: false, meta: true, applied: true };
+    }
+
+    case 'question_continuation_pending': {
+      const continuation = state.pendingQuestionContinuations[event.continuationId];
+      if (continuation) delete continuation.dispatching;
+      return { messageIndex: null, structural: false, meta: true, applied: true };
+    }
+
+    case 'question_continuation': {
+      delete state.pendingQuestionContinuations[event.continuationId];
+      return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
     case 'state': {
@@ -1107,6 +1185,7 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         // longer on screen, and answering it would reach a turn that no longer
         // exists — the session resolves them at the same moment on its side.
         state.pendingQuestions = [];
+        state.pendingQuestionContinuations = {};
         state.questionHistory = [];
         state.answeredQuestions = {};
         state.answeredQuestionText = {};

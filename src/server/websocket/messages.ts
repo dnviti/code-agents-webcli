@@ -92,6 +92,8 @@ import { ProjectContainerFiles } from '../services/projects/container-files.js';
  * spawn on every future launch of the conversation.
  */
 const MAX_MODEL_NAME = 200;
+/** Bounded because this client-generated id is reflected in an acknowledgement. */
+const MAX_QUESTION_ANSWER_SUBMISSION_ID = 200;
 
 /**
  * How often a working session says so to the screens that are not attached to it.
@@ -360,7 +362,7 @@ export interface ChatManagerLike {
     optionIds: string[],
     skipped?: boolean,
     text?: string,
-  ): boolean;
+  ): boolean | Promise<boolean>;
   stop(sessionId: string): Promise<void>;
   readPage(
     record: SessionRecord,
@@ -387,6 +389,8 @@ interface IncomingMessage {
   fromLine?: number;
   count?: number;
   requestId?: string;
+  /** Client-generated id correlated with `chat_question_answer_ack`. */
+  submissionId?: string;
   /** Correlates an app-owned workflow request with its admission result. */
   workflow?: string;
   /**
@@ -624,7 +628,7 @@ export class MessageProcessor {
         break;
 
       case 'chat_question_answer':
-        this.handleChatQuestion(wsInfo, data);
+        await this.handleChatQuestion(wsInfo, data);
         break;
 
       case 'chat_history_request':
@@ -3704,13 +3708,35 @@ export class MessageProcessor {
    * arbitrary selection out of a set the model wrote. Routing both through one
    * handler would mean a browser could answer a question with an approval id.
    */
-  private handleChatQuestion(wsInfo: WebSocketInfo, data: IncomingMessage): void {
+  private async handleChatQuestion(wsInfo: WebSocketInfo, data: IncomingMessage): Promise<void> {
+    const submissionId = typeof data.submissionId === 'string' ? data.submissionId : '';
+    // Older browsers have no way to match this reply, so preserve their
+    // previous fire-and-forget handling instead of sending a meaningless ack.
+    const acknowledge = (accepted: boolean, sessionId = data.sessionId || ''): void => {
+      if (!submissionId || submissionId.length > MAX_QUESTION_ANSWER_SUBMISSION_ID) return;
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_question_answer_ack',
+        sessionId,
+        requestId: typeof data.requestId === 'string' ? data.requestId : '',
+        submissionId,
+        accepted,
+      });
+    };
+
+    if (submissionId && submissionId.length > MAX_QUESTION_ANSWER_SUBMISSION_ID) return;
+
     const manager = this.deps.chatManager;
     const session = this.chatSessionFor(wsInfo, data.sessionId);
-    if (!manager || !session) return;
+    if (!manager || !session) {
+      acknowledge(false);
+      return;
+    }
 
     const requestId = typeof data.requestId === 'string' ? data.requestId : '';
-    if (!requestId) return;
+    if (!requestId) {
+      acknowledge(false, session.id);
+      return;
+    }
 
     const optionIds = Array.isArray(data.optionIds)
       ? data.optionIds.filter((id): id is string => typeof id === 'string')
@@ -3722,7 +3748,14 @@ export class MessageProcessor {
       typeof data.text === 'string'
         ? data.text.trim().slice(0, MAX_QUESTION_ANSWER_TEXT)
         : undefined;
-    manager.answerQuestion(session.id, requestId, optionIds, data.skipped === true, text);
+    const accepted = await manager.answerQuestion(
+      session.id,
+      requestId,
+      optionIds,
+      data.skipped === true,
+      text,
+    );
+    acknowledge(accepted, session.id);
   }
 
   private async handleChatHistory(

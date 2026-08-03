@@ -41,7 +41,7 @@ export interface FileCallbackReply {
 export interface FileCallbackBrokerOptions {
   /** Polling is portable to NFS/claim-backed homes; fs.watch is not. */
   pollMs?: number;
-  /** A dead runtime request must not retain its handler forever. */
+  /** Optional ceiling for non-question/test operations; questions ignore it. */
   requestTimeoutMs?: number;
   /** Age at which orphaned requests/replies/cancellation markers are removed. */
   cleanupAfterMs?: number;
@@ -66,10 +66,9 @@ export type FileCallbackHandler = (
 const ID = /^[A-Za-z0-9_-]{12,128}$/;
 const ENDPOINT_NAME = /^[a-f0-9]{32}$/;
 const DEFAULT_POLL_MS = 200;
-// Just under Node's signed 32-bit timer ceiling: a human question may sit over
-// a weekend, while the heartbeat below still detects a dead server in seconds.
-const DEFAULT_TIMEOUT_MS = 2_147_000_000;
-const DEFAULT_CLEANUP_MS = DEFAULT_TIMEOUT_MS + 60 * 60_000;
+// Request timeouts are deliberately opt-in. A human question may remain open
+// indefinitely while heartbeat/liveness still detects a dead server promptly.
+const DEFAULT_CLEANUP_MS = 25 * 24 * 60 * 60_000;
 const HEARTBEAT_MS = 2_000;
 const HEARTBEAT_STALE_MS = 10_000;
 const MAX_LEASE_MS = 60_000;
@@ -379,15 +378,21 @@ async function safeCleanupFlat(
   directory: DirectoryRef,
   before?: number,
   hook?: FileCallbackTestHooks['afterDirectoryOpened'],
+  keep?: (entry: string) => boolean,
 ): Promise<void> {
   await withDirectory(directory, 'cleanup', async (opened) => {
-    await cleanupOpenedFlat(opened, before);
+    await cleanupOpenedFlat(opened, before, keep);
   }, hook);
 }
 
-async function cleanupOpenedFlat(opened: OpenDirectory, before?: number): Promise<void> {
+async function cleanupOpenedFlat(
+  opened: OpenDirectory,
+  before?: number,
+  keep?: (entry: string) => boolean,
+): Promise<void> {
   const entries = await fsp.readdir(opened.accessPath);
   for (const entry of entries) {
+    if (keep?.(entry)) continue;
     const file = childAccessPath(opened, entry);
     const stat = await fsp.lstat(file).catch(() => null);
     if (!stat || stat.isDirectory() || (before !== undefined && stat.mtimeMs >= before)) continue;
@@ -555,13 +560,13 @@ export class FileCallbackBroker {
   private polling = false;
   private compromised = false;
   private readonly pollMs: number;
-  private readonly requestTimeoutMs: number;
+  private readonly requestTimeoutMs: number | undefined;
   private readonly cleanupAfterMs: number;
   private readonly testHooks: FileCallbackTestHooks | undefined;
 
   constructor(private readonly sharedHome: string, options: FileCallbackBrokerOptions = {}) {
     this.pollMs = options.pollMs ?? DEFAULT_POLL_MS;
-    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.requestTimeoutMs = options.requestTimeoutMs;
     this.cleanupAfterMs = options.cleanupAfterMs ?? DEFAULT_CLEANUP_MS;
     this.testHooks = options.testHooks;
   }
@@ -736,6 +741,7 @@ export class FileCallbackBroker {
           layout.requests,
           Date.now() - this.cleanupAfterMs,
           this.testHooks?.afterDirectoryOpened,
+          (entry) => entry.endsWith('.json') && this.active.has(entry.slice(0, -5)),
         ),
         safeCleanupFlat(
           layout.replies,
@@ -783,8 +789,10 @@ export class FileCallbackBroker {
     };
     const cancelPoll = setInterval(() => { void checkCancellation(); }, this.pollMs);
     cancelPoll.unref();
-    const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
-    timeout.unref();
+    const timeout = request.kind === 'question' || this.requestTimeoutMs === undefined
+      ? null
+      : setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    timeout?.unref();
     try {
       const result = await Promise.race([
         handler(request, controller.signal),
@@ -799,7 +807,7 @@ export class FileCallbackBroker {
         : { error: error instanceof Error ? error.message : String(error) });
     } finally {
       clearInterval(cancelPoll);
-      clearTimeout(timeout);
+      if (timeout) clearTimeout(timeout);
       this.active.delete(request.id);
       await safeUnlink(layout.requests, requestFile).catch(() => undefined);
       await safeUnlink(layout.cancelled, cancelFile).catch(() => undefined);
@@ -822,6 +830,7 @@ export class FileCallbackBroker {
 
 export interface FileCallbackClientOptions {
   pollMs?: number;
+  /** Optional ceiling for non-question/test operations; questions ignore it. */
   timeoutMs?: number;
   signal?: AbortSignal;
   testHooks?: FileCallbackTestHooks;
@@ -887,8 +896,10 @@ export async function requestFileCallback(
   const cancel = path.join(layout.cancelled.path, cancelName(id));
   const heartbeat = path.join(layout.replies.path, 'heartbeat.json');
   const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs;
   let stopped = false;
+  let requestWritten = false;
+  let succeeded = false;
   const cancelRequest = () => {
     if (!stopped) {
       void atomicEncrypted(
@@ -902,27 +913,31 @@ export async function requestFileCallback(
     }
   };
   options.signal?.addEventListener('abort', cancelRequest, { once: true });
-  await atomicEncrypted(
-    layout.requests,
-    request,
-    endpoint.token,
-    aad('request', id),
-    { id, kind, payload, createdAt: Date.now() } satisfies FileCallbackRequest,
-    options.testHooks?.afterDirectoryOpened,
-  );
-  const initialPulse = await readEncrypted(
-    layout.replies,
-    heartbeat,
-    endpoint.token,
-    `${AAD_PREFIX}heartbeat`,
-    options.testHooks?.afterDirectoryOpened,
-  ) as { ts?: unknown } | null;
-  let lastPulse = typeof initialPulse?.ts === 'number' ? initialPulse.ts : null;
+  let lastPulse: number | null = null;
   let lastPulseChange = Date.now();
-  const deadline = Date.now() + timeoutMs;
+  // A generic legacy timeout must never become a human-think-time deadline.
+  // Tests and non-question operations may still opt into a finite ceiling.
+  const deadline = kind === 'question' || timeoutMs === undefined ? null : Date.now() + timeoutMs;
   let nextLivenessCheck = Date.now() + HEARTBEAT_STALE_MS;
   try {
-    while (Date.now() < deadline) {
+    requestWritten = true;
+    await atomicEncrypted(
+      layout.requests,
+      request,
+      endpoint.token,
+      aad('request', id),
+      { id, kind, payload, createdAt: Date.now() } satisfies FileCallbackRequest,
+      options.testHooks?.afterDirectoryOpened,
+    );
+    const initialPulse = await readEncrypted(
+      layout.replies,
+      heartbeat,
+      endpoint.token,
+      `${AAD_PREFIX}heartbeat`,
+      options.testHooks?.afterDirectoryOpened,
+    ) as { ts?: unknown } | null;
+    lastPulse = typeof initialPulse?.ts === 'number' ? initialPulse.ts : null;
+    while (deadline === null || Date.now() < deadline) {
       if (options.signal?.aborted) throw new Error('file callback cancelled');
       const raw = await readEncrypted(
         layout.replies,
@@ -936,6 +951,7 @@ export async function requestFileCallback(
         if (raw.id !== id) throw new Error('file callback received an invalid reply');
         if (raw.cancelled) throw new Error('file callback cancelled');
         if (raw.error) throw new Error(raw.error);
+        succeeded = true;
         return raw.result;
       }
       if (Date.now() >= nextLivenessCheck) {
@@ -963,7 +979,7 @@ export async function requestFileCallback(
   } finally {
     stopped = true;
     options.signal?.removeEventListener('abort', cancelRequest);
-    if (Date.now() >= deadline || options.signal?.aborted) {
+    if (requestWritten && !succeeded) {
       await atomicEncrypted(
         layout.cancelled,
         cancel,

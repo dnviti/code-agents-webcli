@@ -92,7 +92,12 @@ export interface MessageBubbleProps {
    * Must be referentially stable — this component is memoised, and a fresh
    * closure per render would re-render the whole transcript on every token.
    */
-  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean, text?: string) => void;
+  onAnswerQuestion?: (
+    requestId: string,
+    optionIds: string[],
+    skipped: boolean,
+    text?: string,
+  ) => Promise<boolean> | void;
 }
 
 export const MessageBubble = React.memo(function MessageBubble({
@@ -565,7 +570,12 @@ function BlockView({
   plain: boolean;
   caret: boolean;
   transcript: ChatTranscript;
-  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean, text?: string) => void;
+  onAnswerQuestion?: (
+    requestId: string,
+    optionIds: string[],
+    skipped: boolean,
+    text?: string,
+  ) => Promise<boolean> | void;
   onRetry?: () => void;
 }) {
   switch (block.kind) {
@@ -676,7 +686,12 @@ function QuestionBlock({
 }: {
   block: ToolBlock;
   transcript: ChatTranscript;
-  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean, text?: string) => void;
+  onAnswerQuestion?: (
+    requestId: string,
+    optionIds: string[],
+    skipped: boolean,
+    text?: string,
+  ) => Promise<boolean> | void;
 }): React.JSX.Element | null {
   const asked = askedQuestionFrom(block.input);
   // Still streaming its arguments in, or malformed. Nothing to draw yet — and

@@ -64,6 +64,7 @@ import { createInterface } from 'node:readline';
 
 const DIRECTORY = process.env.${FILE_CALLBACK_DIR_ENV};
 const TOKEN = process.env.${FILE_CALLBACK_TOKEN_ENV};
+const ASK_ENABLED = process.env.CCWEB_QUESTION_TOOL_ENABLED === '1';
 const TIERED = process.env.CCWEB_TIER_LADDER === '1';
 const LIVENESS_MS = Number(process.env.CCWEB_CALLBACK_LIVENESS_MS) || 10000;
 const ASK = ${JSON.stringify(ASK_TOOL_DEFINITION)};
@@ -80,28 +81,32 @@ async function request(kind, payload, signal) {
   const replyFile = path.join(layout.replies.path, id + '.json');
   const cancelFile = path.join(layout.cancelled.path, id + '.cancel');
   const heartbeatFile = path.join(layout.replies.path, 'heartbeat.json');
-  const initialHeartbeat = await callbackRead(
-    layout.replies, heartbeatFile, TOKEN, CALLBACK_AAD_PREFIX + 'heartbeat',
-  );
-  let lastHeartbeat = typeof initialHeartbeat?.ts === 'number' ? initialHeartbeat.ts : null;
+  let lastHeartbeat = null;
   let lastHeartbeatChange = Date.now();
-  await callbackAtomic(
-    layout.requests,
-    requestFile,
-    TOKEN,
-    callbackAad('request', id),
-    { id, kind, payload, createdAt: Date.now() },
-  );
-  const deadline = Date.now() + 2147000000;
+  let requestWritten = false;
+  let succeeded = false;
   let nextLivenessCheck = Date.now() + LIVENESS_MS;
   try {
-    while (Date.now() < deadline) {
+    const initialHeartbeat = await callbackRead(
+      layout.replies, heartbeatFile, TOKEN, CALLBACK_AAD_PREFIX + 'heartbeat',
+    );
+    lastHeartbeat = typeof initialHeartbeat?.ts === 'number' ? initialHeartbeat.ts : null;
+    requestWritten = true;
+    await callbackAtomic(
+      layout.requests,
+      requestFile,
+      TOKEN,
+      callbackAad('request', id),
+      { id, kind, payload, createdAt: Date.now() },
+    );
+    while (true) {
       if (signal?.aborted) throw new Error('the agent stopped waiting for an answer');
       const reply = await callbackRead(layout.replies, replyFile, TOKEN, callbackAad('reply', id));
       if (reply) {
         if (reply.id !== id) throw new Error('the callback returned an invalid reply');
         if (reply.cancelled) throw new Error('the agent stopped waiting for an answer');
         if (reply.error) throw new Error(reply.error);
+        succeeded = true;
         return reply.result;
       }
       if (Date.now() >= nextLivenessCheck) {
@@ -121,9 +126,8 @@ async function request(kind, payload, signal) {
       }
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
-    throw new Error('the browser did not answer before the callback timed out');
   } finally {
-    if (signal?.aborted || Date.now() >= deadline) {
+    if (requestWritten && !succeeded) {
       await callbackAtomic(
         layout.cancelled,
         cancelFile,
@@ -148,7 +152,23 @@ function answerText(answer) {
 
 const calls = new Map();
 const send = (message) => process.stdout.write(JSON.stringify(message) + '\\n');
-createInterface({ input: process.stdin }).on('line', (line) => {
+const cancelCalls = () => {
+  for (const controller of calls.values()) controller.abort();
+  calls.clear();
+};
+let shuttingDown = false;
+const cancelAndExit = () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  cancelCalls();
+  // Aborted request loops write their cancellation marker in finally on the
+  // next poll. The ceiling is teardown-only, never user think time.
+  setTimeout(() => process.exit(0), 1000);
+};
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.once(signal, cancelAndExit);
+const rpc = createInterface({ input: process.stdin });
+rpc.on('close', cancelCalls);
+rpc.on('line', (line) => {
   if (!line.trim()) return;
   let message;
   try { message = JSON.parse(line); } catch { return; }
@@ -158,14 +178,14 @@ createInterface({ input: process.stdin }).on('line', (line) => {
     return;
   }
   if (method === 'tools/list') {
-    send({ jsonrpc: '2.0', id, result: { tools: [ASK, PLAN, ...(TIERED ? [TIER] : [])] } });
+    send({ jsonrpc: '2.0', id, result: { tools: [...(ASK_ENABLED ? [ASK] : []), PLAN, ...(TIERED ? [TIER] : [])] } });
     return;
   }
   if (method === 'tools/call') {
     const controller = new AbortController();
     if (id !== undefined) calls.set(id, controller);
     const finish = () => { if (id !== undefined && calls.get(id) === controller) calls.delete(id); };
-    if (params?.name === '${ASK_QUESTION_TOOL}') {
+    if (params?.name === '${ASK_QUESTION_TOOL}' && ASK_ENABLED) {
       void request('question', params.arguments || {}, controller.signal).then((answer) => {
         if (controller.signal.aborted) return;
         const result = answerText(answer);

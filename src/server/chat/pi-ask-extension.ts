@@ -66,6 +66,18 @@ const CALLBACK_LIVENESS_MS = Number(process.env.CCWEB_CALLBACK_LIVENESS_MS) || 1
 
 ${FILE_CALLBACK_GENERATED_CLIENT_SOURCE}
 
+const ACTIVE_FILE_CANCELLATIONS = new Set<() => Promise<void>>();
+let FILE_CALLBACK_SHUTTING_DOWN = false;
+const cancelFileRequestsAndExit = () => {
+  if (FILE_CALLBACK_SHUTTING_DOWN) return;
+  FILE_CALLBACK_SHUTTING_DOWN = true;
+  void Promise.all(Array.from(ACTIVE_FILE_CANCELLATIONS, (cancel) => cancel()))
+    .finally(() => process.exit(0));
+};
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+  process.once(signal, cancelFileRequestsAndExit);
+}
+
 function askSocket(question: string, header: string | undefined, options: any[], multiSelect: boolean) {
   return new Promise<string>((resolve) => {
     const socket = net.createConnection(SOCKET as string);
@@ -171,23 +183,38 @@ async function fileRequest(kind: string, payload: any): Promise<any> {
   const id = crypto.randomBytes(16).toString("base64url");
   const requestFile = path.join(layout.requests.path, id + ".json");
   const replyFile = path.join(layout.replies.path, id + ".json");
+  const cancelFile = path.join(layout.cancelled.path, id + ".cancel");
   const heartbeatFile = path.join(layout.replies.path, "heartbeat.json");
-  const initialHeartbeat: any = await callbackRead(
-    layout.replies, heartbeatFile, CALLBACK_TOKEN, CALLBACK_AAD_PREFIX + "heartbeat",
-  );
-  let lastHeartbeat = typeof initialHeartbeat?.ts === "number" ? initialHeartbeat.ts : null;
+  let lastHeartbeat: number | null = null;
   let lastHeartbeatChange = Date.now();
-  await callbackAtomic(
-    layout.requests,
-    requestFile,
-    CALLBACK_TOKEN,
-    callbackAad("request", id),
-    { id, kind, payload, createdAt: Date.now() },
-  );
-  const deadline = Date.now() + 2147000000;
+  let requestWritten = false;
+  let succeeded = false;
+  const cancelRequest = async () => {
+    if (!requestWritten || succeeded) return;
+    await callbackAtomic(
+      layout.cancelled,
+      cancelFile,
+      CALLBACK_TOKEN,
+      callbackAad("cancel", id),
+      { id, cancelledAt: Date.now() },
+    ).catch(() => {});
+  };
+  ACTIVE_FILE_CANCELLATIONS.add(cancelRequest);
   let nextLivenessCheck = Date.now() + CALLBACK_LIVENESS_MS;
   try {
-    while (Date.now() < deadline) {
+    const initialHeartbeat: any = await callbackRead(
+      layout.replies, heartbeatFile, CALLBACK_TOKEN, CALLBACK_AAD_PREFIX + "heartbeat",
+    );
+    lastHeartbeat = typeof initialHeartbeat?.ts === "number" ? initialHeartbeat.ts : null;
+    requestWritten = true;
+    await callbackAtomic(
+      layout.requests,
+      requestFile,
+      CALLBACK_TOKEN,
+      callbackAad("request", id),
+      { id, kind, payload, createdAt: Date.now() },
+    );
+    while (true) {
       const reply: any = await callbackRead(
         layout.replies, replyFile, CALLBACK_TOKEN, callbackAad("reply", id),
       );
@@ -195,6 +222,7 @@ async function fileRequest(kind: string, payload: any): Promise<any> {
         if (reply.id !== id) throw new Error("invalid callback reply");
         if (reply.error) throw new Error(reply.error);
         if (reply.cancelled) throw new Error("the agent stopped waiting");
+        succeeded = true;
         return reply.result;
       }
       if (Date.now() >= nextLivenessCheck) {
@@ -214,8 +242,9 @@ async function fileRequest(kind: string, payload: any): Promise<any> {
       }
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
-    throw new Error("the browser did not answer before the callback timed out");
   } finally {
+    await cancelRequest();
+    ACTIVE_FILE_CANCELLATIONS.delete(cancelRequest);
     await callbackUnlink(layout.requests, requestFile).catch(() => {});
     await callbackUnlink(layout.replies, replyFile).catch(() => {});
   }

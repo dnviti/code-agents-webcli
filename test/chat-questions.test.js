@@ -2,6 +2,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const net = require('net');
 const { spawn } = require('child_process');
 const { PassThrough } = require('stream');
 
@@ -30,6 +31,7 @@ const {
   advertisedChatCapabilities,
   chatCapableRuntimes,
   createChatAdapter,
+  questionDeliveryFor,
 } = require('../dist/server/chat/registry.js');
 const { MessageProcessor } = require('../dist/server/websocket/messages.js');
 
@@ -124,7 +126,7 @@ async function eventuallyValue(read, what, ms = 1000) {
 describe('asking the user a choice-based question', function () {
   describe('the MCP tool the model actually calls', function () {
     /** Drive the real protocol over pipes, the way the runtime does. */
-    function drive(answers, tier) {
+    function drive(answers, tier, questionToolEnabled = true) {
       const input = new PassThrough();
       const output = new PassThrough();
       const lines = [];
@@ -160,6 +162,9 @@ describe('asking the user a choice-based question', function () {
             return tier(reason);
           }
           : undefined,
+        undefined,
+        undefined,
+        questionToolEnabled,
       );
 
       return {
@@ -224,6 +229,20 @@ describe('asking the user a choice-based question', function () {
       assert.deepStrictEqual(tool.inputSchema.required, ['question', 'options']);
     });
 
+    it('omits the blocking question tool when the session policy requires a handoff', async function () {
+      const mcp = drive(() => ({ labels: [] }), undefined, false);
+      mcp.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+      assert.deepStrictEqual((await mcp.next()).result.tools, []);
+
+      mcp.send({
+        jsonrpc: '2.0', id: 2, method: 'tools/call',
+        params: { name: 'ask_user_question', arguments: QUESTION },
+      });
+      const rejected = await mcp.next();
+      assert.ok(rejected.error, 'an unadvertised question tool must not remain callable');
+      assert.strictEqual(mcp.asked.length, 0);
+    });
+
     it('echoes the protocol version the client offered rather than pinning one', async function () {
       const mcp = drive(() => ({ labels: [] }));
       mcp.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2099-01-01' } });
@@ -249,7 +268,7 @@ describe('asking the user a choice-based question', function () {
       assert.notStrictEqual(reply.result.isError, true);
     });
 
-    it('works through a real Default-mode session and waits for the Web answer', async function () {
+    it('keeps Claude’s Plan channel but removes its timed question tool', async function () {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), 'default-question-mcp-'));
       const store = memoryStore();
       const sent = [];
@@ -291,33 +310,29 @@ describe('asking the user a choice-based question', function () {
           planMode: false,
         });
         await chat.send({ text: 'Help me choose an implementation.' });
-        assert.match(sent[0], /both Default and Plan mode/);
-        assert.match(sent[0], /ask_user_question tool/);
+        assert.match(sent[0], /Interactive-question fallback/);
+        assert.match(sent[0], /<ccweb-question>/);
 
         const at = adapterOptions.extraArgs.indexOf('--mcp-config');
-        assert.ok(at >= 0, 'Default mode must inject the questionnaire MCP server');
+        assert.ok(at >= 0, 'Default mode must retain the ccweb Plan server');
         const config = JSON.parse(adapterOptions.extraArgs[at + 1]).mcpServers.ccweb;
+        assert.strictEqual(config.env.CCWEB_QUESTION_TOOL_ENABLED, '0');
+        assert.ok(!adapterOptions.extraArgs.includes(ASK_QUESTION_TOOL_NAME));
         mcp = launchMcp(config.command, config.args, { ...process.env, ...config.env });
 
         mcp.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } });
         assert.strictEqual((await mcp.next()).result.serverInfo.name, 'ccweb');
         mcp.send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
-        assert.ok((await mcp.next()).result.tools.some((tool) => tool.name === 'ask_user_question'));
+        const tools = (await mcp.next()).result.tools;
+        assert.ok(!tools.some((tool) => tool.name === 'ask_user_question'));
+        assert.ok(tools.some((tool) => tool.name === 'submit_plan'));
 
         mcp.send({
           jsonrpc: '2.0', id: 3, method: 'tools/call',
           params: { name: 'ask_user_question', arguments: QUESTION },
         });
-        const request = await eventuallyValue(
-          () => store.events.find((event) => event.t === 'question')?.request,
-          'the questionnaire MCP call never reached the Web session',
-          5000,
-        );
-        assert.strictEqual(chat.answerQuestion(request.requestId, ['opt-1']), true);
-        const answer = await mcp.next();
-        assert.strictEqual(answer.id, 3);
-        assert.match(answer.result.content[0].text, /Patch it/);
-        assert.notStrictEqual(answer.result.isError, true);
+        assert.ok((await mcp.next()).error);
+        assert.ok(!store.events.some((event) => event.t === 'question'));
       } finally {
         mcp?.child.kill();
         await chat.stop();
@@ -326,7 +341,7 @@ describe('asking the user a choice-based question', function () {
       }
     });
 
-    it('forwards the Default-mode callback through Codex’s MCP environment allowlist', async function () {
+    it('forwards Codex’s question policy through the MCP environment allowlist', async function () {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-question-mcp-'));
       const store = memoryStore();
       let adapterOptions;
@@ -376,7 +391,7 @@ describe('asking the user a choice-based question', function () {
         const command = JSON.parse(overrides.get('mcp_servers.ccweb.command'));
         const args = JSON.parse(overrides.get('mcp_servers.ccweb.args'));
         const envVars = JSON.parse(overrides.get('mcp_servers.ccweb.env_vars'));
-        assert.deepStrictEqual(envVars, ['CCWEB_ASK_SOCKET']);
+        assert.deepStrictEqual(envVars, ['CCWEB_ASK_SOCKET', 'CCWEB_QUESTION_TOOL_ENABLED']);
 
         // Codex does not give an MCP child its own ambient CCWEB_* variables.
         // Reproduce that policy here, then copy only the names its `env_vars`
@@ -386,21 +401,12 @@ describe('asking the user a choice-based question', function () {
           Object.entries(process.env).filter(([name]) => !name.startsWith('CCWEB_')),
         );
         for (const name of envVars) childEnv[name] = adapterOptions.env[name];
+        assert.strictEqual(childEnv.CCWEB_QUESTION_TOOL_ENABLED, '0');
         mcp = launchMcp(command, args, childEnv);
-        mcp.send({
-          jsonrpc: '2.0', id: 1, method: 'tools/call',
-          params: { name: 'ask_user_question', arguments: QUESTION },
-        });
-        const request = await eventuallyValue(
-          () => store.events.find((event) => event.t === 'question')?.request,
-          'Codex did not forward its callback environment to the questionnaire MCP',
-          5000,
-        );
-        assert.strictEqual(chat.answerQuestion(request.requestId, ['opt-0']), true);
-        const answer = await mcp.next();
-        assert.strictEqual(answer.id, 1);
-        assert.match(answer.result.content[0].text, /Rewrite it/);
-        assert.notStrictEqual(answer.result.isError, true);
+        mcp.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+        const tools = (await mcp.next()).result.tools;
+        assert.ok(!tools.some((tool) => tool.name === 'ask_user_question'));
+        assert.ok(tools.some((tool) => tool.name === 'submit_plan'));
       } finally {
         mcp?.child.kill();
         await chat.stop();
@@ -630,7 +636,7 @@ describe('asking the user a choice-based question', function () {
       // back to the pinned region.
       assert.strictEqual(asked.toolId, 'toolu_42');
 
-      s.answerQuestion(asked.requestId, [asked.options[0].optionId]);
+      await s.answerQuestion(asked.requestId, [asked.options[0].optionId]);
       const resolved = store.events.find((e) => e.t === 'question_resolved');
       // Repeated on the resolution so a card rebuilt from the log alone can
       // still find its own answer.
@@ -699,7 +705,7 @@ describe('asking the user a choice-based question', function () {
       // record wholesale. Patched only on the session's own copy, the flag was
       // true on the server and false in every browser reading the same log.
       const { s, store } = session();
-      s.questionsEnabled = true;
+      s.questionToolEnabled = true;
       s.ingest({
         t: 'session',
         capabilities: { streaming: true, permissions: false },
@@ -834,6 +840,30 @@ describe('asking the user a choice-based question', function () {
       apply(state, { t: 'question', request });
       assert.strictEqual(state.pendingQuestions.length, 1);
     });
+
+    it('does not resurrect a resolved card when an older question frame arrives late', function () {
+      const state = createTranscript({});
+      const request = {
+        requestId: 'q-late',
+        origin: 'structured_handoff',
+        question: 'Already answered?',
+        multiSelect: false,
+        options: [{ optionId: 'opt-0', label: 'Yes' }],
+        ts: 1,
+      };
+      apply(state, {
+        t: 'question_resolved',
+        requestId: request.requestId,
+        optionIds: ['opt-0'],
+      });
+      apply(state, { t: 'question', request });
+
+      assert.deepStrictEqual(state.pendingQuestions, []);
+      assert.notStrictEqual(state.state, 'awaiting_answer');
+      const block = state.messages.flatMap((message) => message.blocks)
+        .find((candidate) => candidate.kind === 'question');
+      assert.deepStrictEqual(block.answer.optionIds, ['opt-0']);
+    });
   });
 
   describe('option ids', function () {
@@ -868,6 +898,7 @@ describe('asking the user a choice-based question', function () {
       assert.strictEqual(server.command, process.execPath);
       assert.deepStrictEqual(server.args, ['/opt/app/ask-mcp.js']);
       assert.strictEqual(server.env.CCWEB_ASK_SOCKET, '/tmp/s.sock');
+      assert.strictEqual(server.env.CCWEB_QUESTION_TOOL_ENABLED, '0');
     });
 
     it('knows which runtimes have a verified way to take the server', function () {
@@ -882,6 +913,14 @@ describe('asking the user a choice-based question', function () {
       assert.strictEqual(askChannelFor('pi'), 'extension');
       assert.strictEqual(askChannelFor('antigravity'), undefined);
       assert.strictEqual(askChannelFor('nonesuch'), undefined);
+    });
+
+    it('uses structured handoff conservatively and opts in only verified pi', function () {
+      for (const runtime of ['claude', 'codex', 'grok', 'kimi', 'omp', 'antigravity']) {
+        assert.strictEqual(questionDeliveryFor(runtime), 'structured_handoff', runtime);
+      }
+      assert.strictEqual(questionDeliveryFor('pi'), 'blocking_tool');
+      assert.strictEqual(questionDeliveryFor('nonesuch'), 'structured_handoff');
     });
 
     it('offers questions and Plan mode on every registered Web-chat runtime', function () {
@@ -1013,7 +1052,11 @@ describe('asking the user a choice-based question', function () {
     function runServer(socketPath, calls) {
       return new Promise((resolve) => {
         const child = spawn(process.execPath, [ASK_SERVER], {
-          env: { ...process.env, CCWEB_ASK_SOCKET: socketPath },
+          env: {
+            ...process.env,
+            CCWEB_ASK_SOCKET: socketPath,
+            CCWEB_QUESTION_TOOL_ENABLED: '1',
+          },
           stdio: ['pipe', 'pipe', 'pipe'],
         });
         const replies = [];
@@ -1097,6 +1140,45 @@ describe('asking the user a choice-based question', function () {
       // The one thing that must never happen here is silence.
       assert.strictEqual(reply.result.isError, true);
       assert.match(reply.result.content[0].text, /plain text/i);
+    });
+
+    it('scopes runtime disconnects and cancellations to the socket that asked', async function () {
+      broker = new PermissionBroker(path.join(root, 'sockets'));
+      const signals = new Map();
+      const socketPath = await broker.listen({
+        permission: async () => ({ allow: false }),
+        question: async (ask, signal) => {
+          signals.set(ask.question, signal);
+          return new Promise((resolve) => {
+            signal.addEventListener(
+              'abort',
+              () => resolve({ labels: [], error: 'caller closed' }),
+              { once: true },
+            );
+          });
+        },
+      });
+      const connect = () => new Promise((resolve, reject) => {
+        const socket = net.createConnection(socketPath, () => resolve(socket));
+        socket.once('error', reject);
+      });
+      const first = await connect();
+      const second = await connect();
+      try {
+        first.write(`${JSON.stringify({ id: 'same-id', kind: 'question', question: { question: 'first' } })}\n`);
+        second.write(`${JSON.stringify({ id: 'same-id', kind: 'question', question: { question: 'second' } })}\n`);
+        await eventuallyValue(() => signals.size === 2 ? signals : null, 'both socket questions were not received');
+
+        first.destroy();
+        await eventuallyValue(() => signals.get('first').aborted ? true : null, 'closing the first socket did not abort it');
+        assert.strictEqual(signals.get('second').aborted, false);
+
+        second.write(`${JSON.stringify({ id: 'same-id', kind: 'cancel' })}\n`);
+        await eventuallyValue(() => signals.get('second').aborted ? true : null, 'the second socket cancel was not scoped');
+      } finally {
+        first.destroy();
+        second.destroy();
+      }
     });
   });
 
@@ -1188,7 +1270,7 @@ describe('asking the user a choice-based question', function () {
         assert.notStrictEqual(reply.skipped, true, 'typing an answer is not skipping');
       });
 
-      it('writes them to the transcript beside the picks, not instead of them', function () {
+      it('writes them to the transcript beside the picks, not instead of them', async function () {
         const { s, store } = session();
         s.askQuestion({
           question: 'Which rules should I apply?',
@@ -1197,7 +1279,7 @@ describe('asking the user a choice-based question', function () {
         });
         const asked = store.events.find((e) => e.t === 'question').request;
 
-        s.answerQuestion(asked.requestId, [asked.options[0].optionId], false, '…and no tabs.');
+        await s.answerQuestion(asked.requestId, [asked.options[0].optionId], false, '…and no tabs.');
 
         const resolved = store.events.find((e) => e.t === 'question_resolved');
         assert.deepStrictEqual(resolved.optionIds, ['opt-0']);
@@ -1417,7 +1499,11 @@ describe('asking the user a choice-based question', function () {
         });
 
         const child = spawn(process.execPath, [ASK_SERVER], {
-          env: { ...process.env, CCWEB_ASK_SOCKET: socketPath },
+          env: {
+            ...process.env,
+            CCWEB_ASK_SOCKET: socketPath,
+            CCWEB_QUESTION_TOOL_ENABLED: '1',
+          },
           stdio: ['pipe', 'pipe', 'pipe'],
         });
         try {
@@ -1504,13 +1590,13 @@ describe('a question the agent stopped waiting for', function () {
   /** The tick the session defers its own resolution by, so ordering holds. */
   const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-  describe('the launch that stops it happening at all', function () {
-    it('tells each runtime to wait, in the only vocabulary each one has', function () {
-      // omp: 0 means "no client-side timeout" and is documented as such.
+  describe('timeouts on the remaining ccweb tools', function () {
+    it('keeps measured client settings for Plan/tier calls, not as a question guarantee', function () {
+      // Questions never use these clients now. OMP's setting still protects
+      // the remaining ccweb calls, including a human-gated tier request.
       assert.deepStrictEqual(askEnvFor('omp'), { OMP_MCP_TIMEOUT_MS: '0' });
-      // kimi: the same idea, and a trap. Its parser accepts 1…2147483647 and
-      // silently discards anything else — so 0 there is not "disabled", it is
-      // invalid, and it lands back on the 60s default it was meant to remove.
+      // Kimi has no disable sentinel, so this finite maximum applies only to
+      // those non-question calls; questions use the durable handoff instead.
       assert.deepStrictEqual(askEnvFor('kimi'), { KIMI_MCP_TOOL_TIMEOUT_MS: '2147483647' });
       assert.ok(Number(askEnvFor('kimi').KIMI_MCP_TOOL_TIMEOUT_MS) >= 1);
       // Nothing invented for the runtimes nobody has measured.
@@ -1564,7 +1650,7 @@ describe('a question the agent stopped waiting for', function () {
       // False is what the browser gets, and it is the truthful answer: omp
       // deletes the request id inside its own timeout callback, so a reply
       // written under it would have been dropped without a word.
-      assert.strictEqual(s.answerQuestion(asked.requestId, [asked.options[0].optionId]), false);
+      assert.strictEqual(await s.answerQuestion(asked.requestId, [asked.options[0].optionId]), false);
       const resolutions = store.events.filter((e) => e.t === 'question_resolved');
       assert.strictEqual(resolutions.length, 1, 'and no second resolution invents an answer');
     });

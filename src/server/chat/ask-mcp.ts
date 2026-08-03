@@ -45,6 +45,15 @@ import {
  */
 export const TIER_ENABLED_ENV = 'CCWEB_TIER_LADDER';
 
+/**
+ * Whether this particular server may advertise the blocking question tool.
+ *
+ * Missing means disabled in the spawned process. Timed runtimes still receive
+ * this server for Plan/tier tools, while their questions travel through the
+ * durable structured handoff owned by ChatSession.
+ */
+export const QUESTION_TOOL_ENABLED_ENV = 'CCWEB_QUESTION_TOOL_ENABLED';
+
 /** What the browser sends back once someone has answered. */
 export interface QuestionAnswer {
   /** Labels of the options picked, in the order they were offered. */
@@ -470,6 +479,9 @@ export function serveAsk(
   // all, which drive this over a real pair of pipes — keeps working unchanged.
   cancel?: (askId: string) => void,
   submitPlan?: (markdown: unknown) => Promise<PlanDecision>,
+  // Kept true for direct protocol callers and old tests. The spawned main
+  // passes the explicit session policy below, where a missing env var is false.
+  questionToolEnabled = true,
 ): void {
   const send = (message: unknown): void => {
     output.write(`${JSON.stringify(message)}\n`);
@@ -519,7 +531,7 @@ export function serveAsk(
 
     if (method === 'tools/list') {
       const tools = [
-        ASK_TOOL_DEFINITION,
+        ...(questionToolEnabled ? [ASK_TOOL_DEFINITION] : []),
         ...(requestTier ? [TIER_TOOL_DEFINITION] : []),
         ...(submitPlan ? [SUBMIT_PLAN_TOOL_DEFINITION] : []),
       ];
@@ -528,7 +540,7 @@ export function serveAsk(
     }
 
     if (method === 'tools/call') {
-      if (params?.name === ASK_QUESTION_TOOL) {
+      if (params?.name === ASK_QUESTION_TOOL && questionToolEnabled) {
         const requestId = typeof id === 'string' || typeof id === 'number' ? id : undefined;
         const call: InFlightAsk = { cancelled: false };
         if (requestId !== undefined) inFlight.set(requestId, call);
@@ -637,6 +649,7 @@ export function askMcpConfig(
   // all. The caller translates; the default is the host.
   nodePath: string = process.execPath,
   laddered = false,
+  questionToolEnabled = false,
 ): string {
   return JSON.stringify({
     mcpServers: {
@@ -645,6 +658,7 @@ export function askMcpConfig(
         args: [serverScript],
         env: {
           [ASK_SOCKET_ENV]: socketPath,
+          [QUESTION_TOOL_ENABLED_ENV]: questionToolEnabled ? '1' : '0',
           ...(laddered ? { [TIER_ENABLED_ENV]: '1' } : {}),
         },
       },
@@ -656,6 +670,7 @@ function main(): void {
   const socketPath = process.env[ASK_SOCKET_ENV];
   const channel = socketPath ? new AskChannel(socketPath) : null;
   const laddered = process.env[TIER_ENABLED_ENV] === '1';
+  const questionToolEnabled = process.env[QUESTION_TOOL_ENABLED_ENV] === '1';
   serveAsk(
     process.stdin,
     process.stdout,
@@ -666,6 +681,7 @@ function main(): void {
     laddered && channel ? (reason) => channel.requestTier(reason) : undefined,
     channel ? (askId) => channel.cancel(askId) : undefined,
     channel ? (markdown) => channel.submitPlan(markdown) : undefined,
+    questionToolEnabled,
   );
 }
 

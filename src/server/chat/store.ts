@@ -10,6 +10,8 @@ import {
   ChatUsage,
   NO_CHAT_CAPABILITIES,
   PlanDocument,
+  QuestionContinuation,
+  QuestionRequest,
 } from '../../shared/chat-events.js';
 import {
   applyChatEvent,
@@ -260,10 +262,23 @@ interface SessionState {
   limits?: AccountLimits | null;
   /** Highest seq already folded into `capabilities` and `limits`. */
   capabilitySeq: number;
+  /** Answered structured handoffs not yet terminally delivered/abandoned. */
+  questionContinuations?: Map<string, QuestionContinuation>;
+  /** Highest seq already folded into `questionContinuations`. */
+  questionContinuationSeq: number;
+  /** Unresolved question requests over the whole retained log. */
+  pendingQuestions?: Map<string, QuestionRequest>;
+  /** Highest seq already folded into `pendingQuestions`. */
+  pendingQuestionSeq: number;
 }
 
 export interface ChatStoreLike {
-  append(session: ChatSessionRef, events: ChatEvent[]): void;
+  /**
+   * Queue events for persistence. Real stores return the exact write promise
+   * so durability-sensitive protocol transitions can wait for it; legacy
+   * embedders may keep the original fire-and-forget `void` contract.
+   */
+  append(session: ChatSessionRef, events: ChatEvent[]): void | Promise<void>;
   stat(session: ChatSessionRef): Promise<ChatStats>;
   read(session: ChatSessionRef, fromSeq: number, count: number): Promise<ChatPage>;
   turnIndex(session: ChatSessionRef): Promise<ChatTurnIndex>;
@@ -283,6 +298,34 @@ export interface ChatStoreLike {
   setPlanDocument?(session: ChatSessionRef, plan: PlanDocument): Promise<void>;
   planDocument?(session: ChatSessionRef): Promise<PlanDocument | null>;
   clearPlanDocument?(session: ChatSessionRef): Promise<void>;
+}
+
+/**
+ * Whether a rejected append definitely left the canonical JSONL unchanged.
+ *
+ * `unknown` is deliberately different from an ordinary I/O failure: the log
+ * may already contain the event even though a later index/verification step
+ * failed. A caller must keep that event's sequence number reserved and retry
+ * the exact same bytes (or recover the store); reusing the number would split
+ * the live stream from the durable log.
+ */
+export type ChatStoreAppendOutcome = 'not_committed' | 'unknown';
+
+export class ChatStoreAppendError extends Error {
+  readonly outcome: ChatStoreAppendOutcome;
+  readonly original: unknown;
+
+  constructor(outcome: ChatStoreAppendOutcome, original: unknown, detail?: string) {
+    const message = original instanceof Error ? original.message : String(original);
+    super(detail ? `${detail}: ${message}` : message);
+    this.name = 'ChatStoreAppendError';
+    this.outcome = outcome;
+    this.original = original;
+  }
+}
+
+export function chatStoreAppendOutcome(error: unknown): ChatStoreAppendOutcome {
+  return error instanceof ChatStoreAppendError ? error.outcome : 'not_committed';
 }
 
 export class ChatStore implements ChatStoreLike {
@@ -486,6 +529,8 @@ export class ChatStore implements ChatStoreLike {
       usageSeq: 0,
       turnBoundarySeq: 0,
       capabilitySeq: 0,
+      questionContinuationSeq: 0,
+      pendingQuestionSeq: 0,
     };
 
     // Sized before the index is read, and unconditionally: it is what tells
@@ -495,7 +540,26 @@ export class ChatStore implements ChatStoreLike {
     const logStat = await fs.promises.stat(`${base}.jsonl`).catch(() => null);
     state.logSize = logStat ? logStat.size : 0;
 
+    // A retention swap commits JSONL first and its derived index second. If
+    // only the prepared index remains, JSONL already crossed that boundary;
+    // finish the idempotent second rename before reading either generation.
+    // When both temp files remain, the canonical log was never replaced and
+    // the old canonical pair is still the right one.
+    const [preparedIndex, preparedLog] = await Promise.all([
+      fs.promises.stat(`${base}.idx.tmp`).catch(() => null),
+      fs.promises.stat(`${base}.jsonl.tmp`).catch(() => null),
+    ]);
+    if (logStat && preparedIndex?.isFile() && !preparedLog) {
+      try {
+        await fs.promises.rename(`${base}.idx.tmp`, `${base}.idx`);
+        console.warn(`Completed interrupted chat retention index swap for ${base}.`);
+      } catch (error) {
+        console.warn(`Could not complete interrupted chat retention index swap for ${base}:`, error);
+      }
+    }
+
     let usable = false;
+    let truncateIndexTo: number | null = null;
     try {
       const header = Buffer.alloc(HEADER_BYTES);
       const handle = await fs.promises.open(`${base}.idx`, 'r');
@@ -507,6 +571,9 @@ export class ChatStore implements ChatStoreLike {
             state.firstSeq = Number(header.readBigUInt64BE(8));
             state.turnsDropped = Number(header.readBigUInt64BE(16));
             state.count = Math.floor((size - HEADER_BYTES) / ENTRY_BYTES);
+            if ((size - HEADER_BYTES) % ENTRY_BYTES !== 0) {
+              truncateIndexTo = HEADER_BYTES + state.count * ENTRY_BYTES;
+            }
             usable = true;
           }
         }
@@ -516,6 +583,38 @@ export class ChatStore implements ChatStoreLike {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         console.error(`Failed to read chat index ${base}.idx:`, error);
+      }
+    }
+
+    // A crash can tear the fixed-width derived index just as it can the log.
+    // Keeping the stray bytes would shift every recovered entry and make the
+    // next cold read interpret a hybrid offset as real. Drop only the partial
+    // entry; the complete JSONL records below rebuild what is missing.
+    if (truncateIndexTo !== null) {
+      await fs.promises.truncate(`${base}.idx`, truncateIndexTo);
+    }
+
+    // Retention commits the canonical JSONL and its derived index with two
+    // renames. A crash between them leaves a valid old index beside the new,
+    // shortened log. The first retained event is an inexpensive, authoritative
+    // generation check: if it disagrees with the header, discard the derived
+    // offsets and rebuild them from JSONL instead of serving ranges through a
+    // mismatched pair.
+    if (usable && state.logSize > 0) {
+      const loggedFirstSeq = await firstSeqInLog(base);
+      if (loggedFirstSeq !== null && loggedFirstSeq !== state.firstSeq) {
+        console.warn(
+          `Chat index for ${base} starts at ${state.firstSeq}, but the log starts at ${loggedFirstSeq}; rebuilding.`,
+        );
+        state.firstSeq = loggedFirstSeq;
+        state.count = 0;
+        // The interrupted replacement's header may be unavailable, so the
+        // exact number trimmed cannot be reconstructed from JSONL alone.
+        state.turnsDropped = 0;
+        await fs.promises.writeFile(
+          `${base}.idx`,
+          headerBuffer(state.firstSeq, state.turnsDropped),
+        );
       }
     }
 
@@ -577,8 +676,13 @@ export class ChatStore implements ChatStoreLike {
       scanFrom = entry.readUInt32LE(0);
     }
 
-    if (scanFrom > state.logSize) {
-      console.warn(`Chat index for ${base} points past the end of the log; keeping the log.`);
+    if (scanFrom >= state.logSize) {
+      console.warn(`Chat index for ${base} points past the end of the log; rebuilding it.`);
+      state.firstSeq = (await firstSeqInLog(base)) ?? 1;
+      state.count = 0;
+      state.turnsDropped = 0;
+      await fs.promises.writeFile(`${base}.idx`, headerBuffer(state.firstSeq, state.turnsDropped));
+      await this.repairIndex(base, state);
       return;
     }
 
@@ -630,36 +734,207 @@ export class ChatStore implements ChatStoreLike {
     console.warn(`Recovered ${recovered.length} unindexed chat event(s) for ${base}.`);
   }
 
-  append(session: ChatSessionRef, events: ChatEvent[]): void {
+  append(session: ChatSessionRef, events: ChatEvent[]): Promise<void> {
     if (events.length === 0) {
-      return;
+      return Promise.resolve();
     }
 
-    // This runs on the event emission path and returns nothing, so it must
-    // never throw: a rejected path or a full disk has to cost persistence,
-    // not the live conversation the browser is watching.
+    // This runs on the event emission path and never throws synchronously. Its
+    // returned promise is normally fire-and-forget, but durable protocol
+    // transitions await it before they are broadcast or acknowledged.
     let base: string;
     try {
       base = this.basePath(session);
     } catch (error) {
       console.error('Refusing to store chat events:', error);
-      return;
+      const rejected = Promise.reject(error);
+      // Most events deliberately retain the historical fire-and-forget path.
+      // Attach a handler here so callers that do not need a durability barrier
+      // do not create an unhandled rejection; callers that await the original
+      // promise still observe the failure.
+      void rejected.catch(() => undefined);
+      return rejected;
     }
 
-    void this.enqueue(base, async () => {
+    const write = this.enqueue(base, async () => {
+      let payload: string | null = null;
+      const attempt = {
+        logStart: null as number | null,
+        logRebaseStarted: false,
+        logRebased: false,
+      };
       try {
-        await this.appendNow(base, events);
+        // Keep the exact bytes handed to appendFile. If the derived index write
+        // fails after these bytes land, the JSONL suffix is the authoritative
+        // commit record and the caller must not retry the same durable event.
+        const records = events.map((event) => `${JSON.stringify(event)}\n`);
+        payload = records.join('');
+        await this.appendNow(base, events, records, payload, attempt);
       } catch (error) {
-        console.error(`Failed to append chat events for session ${session.id}:`, error);
         // The write may have half-landed. Drop the cached state so the next
         // operation re-reads from disk and reconciles, instead of computing
         // new offsets from a size that never happened.
         this.states.delete(base);
+
+        // The JSONL log is the durable artefact; the index is rebuilt from it.
+        // appendNow writes the whole batch to the log in one append before it
+        // touches the index, so an exact complete suffix means the transition
+        // committed even when the index append (or a later derived operation)
+        // reported failure. Resolving here prevents a durability-sensitive
+        // caller from retrying an event that recovery will subsequently see.
+        let committed = false;
+        let verificationError: unknown;
+        try {
+          committed = payload !== null && await this.logEndsWith(base, payload);
+        } catch (caught) {
+          verificationError = caught;
+          console.error(
+            `Failed to verify the chat log suffix for session ${session.id}:`,
+            caught,
+          );
+        }
+        if (committed) {
+          console.warn(
+            `Chat events for session ${session.id} reached the log despite a later append failure; `
+            + 'the index will be reconciled on the next operation.',
+          );
+          return;
+        }
+
+        // Retention rewrites the canonical JSONL and therefore invalidates the
+        // pre-append byte offset. Once that rename completed, the append is
+        // part of the new log generation even if the derived index rename (or
+        // suffix verification) failed afterward. Never truncate or reclaim it
+        // using an offset from the old generation.
+        if (attempt.logRebased) {
+          console.warn(
+            `Chat events for session ${session.id} committed through a retention log swap; `
+            + 'the index will be reconciled on the next operation.',
+          );
+          return;
+        }
+        if (attempt.logRebaseStarted) {
+          throw new ChatStoreAppendError(
+            'unknown',
+            error,
+            'chat store: append outcome is ambiguous because a retention log swap did not settle',
+          );
+        }
+
+        // A failed append may still have closed one or more complete JSON
+        // lines from this batch. Recovery quite correctly preserves complete
+        // records, but a durability barrier is all-or-nothing to its caller:
+        // retaining a prefix and then rejecting would make an exact batch retry
+        // out of order. Rewind to the pre-batch offset before reporting failure.
+        if (attempt.logStart !== null) {
+          let size: number;
+          try {
+            size = (await fs.promises.stat(`${base}.jsonl`)).size;
+          } catch (statError: unknown) {
+            throw new ChatStoreAppendError(
+              'unknown',
+              error,
+              `chat store: append outcome is ambiguous because the log could not be inspected (${String(statError)})`,
+            );
+          }
+          if (size > attempt.logStart) {
+            try {
+              await fs.promises.truncate(`${base}.jsonl`, attempt.logStart);
+            } catch (truncateError: unknown) {
+              // A transient verifier failure followed by a transient rollback
+              // failure used to report an unknown outcome even when the whole
+              // JSONL record had landed. Re-check before escalating: a caller
+              // can then treat this as committed and repair the derived index.
+              try {
+                if (payload !== null && await this.logEndsWith(base, payload)) {
+                  console.warn(
+                    `Chat events for session ${session.id} reached the log while rollback failed; `
+                    + 'the index will be reconciled on the next operation.',
+                  );
+                  return;
+                }
+              } catch (retryVerificationError: unknown) {
+                verificationError = verificationError ?? retryVerificationError;
+              }
+              throw new ChatStoreAppendError(
+                'unknown',
+                error,
+                `chat store: append outcome is ambiguous and the partial batch could not be rolled back (${String(truncateError)}${verificationError ? `; verification failed: ${String(verificationError)}` : ''})`,
+              );
+            }
+          } else if (verificationError !== undefined) {
+            // A failed verifier cannot establish that the unchanged-looking
+            // size belongs to the same file generation. Conservatively retain
+            // the sequence reservation rather than risk reusing a durable seq.
+            throw new ChatStoreAppendError(
+              'unknown',
+              error,
+              `chat store: append outcome is ambiguous because the log could not be verified (${String(verificationError)})`,
+            );
+          }
+        } else if (verificationError !== undefined) {
+          // This invocation did not reach its append, but it may be an exact
+          // retry after an earlier ambiguous invocation. Until the canonical
+          // log can be inspected, neither success nor sequence reuse is safe.
+          throw new ChatStoreAppendError(
+            'unknown',
+            error,
+            `chat store: append outcome is ambiguous because the log could not be verified (${String(verificationError)})`,
+          );
+        }
+
+        console.error(`Failed to append chat events for session ${session.id}:`, error);
+        throw new ChatStoreAppendError('not_committed', error);
       }
     });
+    void write.catch(() => undefined);
+    return write;
   }
 
-  private async appendNow(base: string, events: ChatEvent[]): Promise<void> {
+  /** Whether the log ends with every byte of the attempted append batch. */
+  private async logEndsWith(base: string, payload: string): Promise<boolean> {
+    const expected = Buffer.from(payload, 'utf8');
+    if (expected.length === 0) return false;
+
+    const handle = await fs.promises.open(`${base}.jsonl`, 'r').catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (!handle) return false;
+
+    try {
+      const { size } = await handle.stat();
+      if (size < expected.length) return false;
+
+      const actual = Buffer.allocUnsafe(expected.length);
+      let read = 0;
+      while (read < actual.length) {
+        const result = await handle.read(
+          actual,
+          read,
+          actual.length - read,
+          size - actual.length + read,
+        );
+        if (result.bytesRead === 0) return false;
+        read += result.bytesRead;
+      }
+      return actual.equals(expected);
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+
+  private async appendNow(
+    base: string,
+    events: ChatEvent[],
+    records: string[],
+    payload: string,
+    attempt: {
+      logStart: number | null;
+      logRebaseStarted: boolean;
+      logRebased: boolean;
+    },
+  ): Promise<void> {
     await fs.promises.mkdir(path.dirname(base), { recursive: true });
 
     const state = await this.loadState(base);
@@ -697,17 +972,15 @@ export class ChatStore implements ChatStoreLike {
     });
 
     const entries = Buffer.alloc(events.length * ENTRY_BYTES);
-    const payload: string[] = [];
     let offset = state.logSize;
 
     for (let index = 0; index < events.length; index++) {
       entries.writeUInt32LE(offset, index * ENTRY_BYTES);
-      const record = `${JSON.stringify(events[index])}\n`;
-      payload.push(record);
-      offset += Buffer.byteLength(record, 'utf8');
+      offset += Buffer.byteLength(records[index], 'utf8');
     }
 
-    await fs.promises.appendFile(`${base}.jsonl`, payload.join(''), 'utf8');
+    attempt.logStart = state.logSize;
+    await fs.promises.appendFile(`${base}.jsonl`, payload, 'utf8');
     await fs.promises.appendFile(`${base}.idx`, entries);
 
     state.count += events.length;
@@ -766,14 +1039,83 @@ export class ChatStore implements ChatStoreLike {
       }
     }
 
+    if (state.questionContinuations) {
+      for (const event of events) {
+        if (event.seq <= state.questionContinuationSeq) continue;
+        foldQuestionContinuation(state.questionContinuations, event);
+        state.questionContinuationSeq = event.seq;
+      }
+    }
+    if (state.pendingQuestions) {
+      for (const event of events) {
+        if (event.seq <= state.pendingQuestionSeq) continue;
+        foldPendingQuestion(state.pendingQuestions, event);
+        state.pendingQuestionSeq = event.seq;
+      }
+    }
+
     if (state.count > this.maxEvents || state.logSize > MAX_LOG_BYTES / 2) {
-      await this.trimHead(base, state);
+      await this.trimHead(base, state, attempt);
     }
   }
 
-  /** Drop the oldest `trimChunkEvents` events, once the log is over its cap. */
-  private async trimHead(base: string, state: SessionState): Promise<void> {
-    await this.dropOldest(base, state, this.trimChunkEvents);
+  /**
+   * Drop the oldest `trimChunkEvents` events, once the log is over its cap.
+   *
+   * A pending structured question and an undelivered answer outbox are durable
+   * protocol state, not replay history. Keep the record that establishes each
+   * unresolved fact on disk: the warm cache can remember it after a blind trim,
+   * but a restarted process cannot. Once the matching resolution/terminal
+   * record exists the pin disappears and ordinary retention can advance again.
+   */
+  private async trimHead(
+    base: string,
+    state: SessionState,
+    attempt?: { logRebaseStarted: boolean; logRebased: boolean },
+  ): Promise<void> {
+    const questionFloor = await this.questionRetentionFloor(base, state);
+    const beforeQuestion = questionFloor === null
+      ? this.trimChunkEvents
+      : Math.max(0, questionFloor - state.firstSeq);
+    await this.dropOldest(
+      base,
+      state,
+      Math.min(this.trimChunkEvents, beforeQuestion),
+      attempt,
+    );
+  }
+
+  /** Lowest log seq still needed to reconstruct a live question or outbox. */
+  private async questionRetentionFloor(base: string, state: SessionState): Promise<number | null> {
+    const questions = new Map<string, number>();
+    const continuations = new Map<string, number>();
+
+    await this.scanLog(base, state, (event) => {
+      if (event.t === 'question') {
+        questions.set(event.request.requestId, event.seq);
+        return;
+      }
+      if (event.t === 'question_resolved') {
+        questions.delete(event.requestId);
+        if (event.continuation && !event.abandoned) {
+          continuations.set(event.continuation.continuationId, event.seq);
+        }
+        return;
+      }
+      if (event.t === 'question_continuation') {
+        continuations.delete(event.continuationId);
+        return;
+      }
+      if (event.t === 'marker' && event.kind === 'cleared') {
+        questions.clear();
+        continuations.clear();
+      }
+    });
+
+    let floor: number | null = null;
+    for (const seq of questions.values()) floor = floor === null ? seq : Math.min(floor, seq);
+    for (const seq of continuations.values()) floor = floor === null ? seq : Math.min(floor, seq);
+    return floor;
   }
 
   /**
@@ -805,6 +1147,10 @@ export class ChatStore implements ChatStoreLike {
       state.capabilities = undefined;
       state.limits = undefined;
       state.capabilitySeq = 0;
+      state.pendingQuestions = undefined;
+      state.pendingQuestionSeq = 0;
+      state.questionContinuations = undefined;
+      state.questionContinuationSeq = 0;
       // The Plan document belongs to the discarded conversation. Keeping its
       // removal in this same per-session queue means an older in-flight save
       // cannot land after the truncation and resurrect it.
@@ -821,7 +1167,12 @@ export class ChatStore implements ChatStoreLike {
    * uses. Both files are replaced via rename, so a crash mid-trim leaves the
    * previous consistent pair in place.
    */
-  private async dropOldest(base: string, state: SessionState, count: number): Promise<void> {
+  private async dropOldest(
+    base: string,
+    state: SessionState,
+    count: number,
+    attempt?: { logRebaseStarted: boolean; logRebased: boolean },
+  ): Promise<void> {
     const drop = Math.min(count, state.count);
     if (drop <= 0) {
       return;
@@ -869,7 +1220,9 @@ export class ChatStore implements ChatStoreLike {
       `${base}.idx.tmp`,
       Buffer.concat([headerBuffer(state.firstSeq + drop, dropped), remaining]),
     );
+    if (attempt) attempt.logRebaseStarted = true;
     await fs.promises.rename(`${base}.jsonl.tmp`, `${base}.jsonl`);
+    if (attempt) attempt.logRebased = true;
     await fs.promises.rename(`${base}.idx.tmp`, `${base}.idx`);
 
     state.firstSeq += drop;
@@ -1501,6 +1854,52 @@ export class ChatStore implements ChatStoreLike {
   }
 
   /**
+   * Durable structured-answer outbox over the whole retained log.
+   *
+   * Unlike a card, a continuation may remain pending while several process
+   * lifecycle events are appended, so the tail replay is not an authority for
+   * whether it still needs delivery. The first snapshot scans once; later
+   * appends keep the small map current.
+   */
+  private async recoverableQuestionState(
+    base: string,
+    state: SessionState,
+    stats: ChatStats,
+  ): Promise<{
+    pendingQuestions: QuestionRequest[];
+    continuations: QuestionContinuation[];
+  }> {
+    if (
+      state.questionContinuations
+      && state.pendingQuestions
+      && state.questionContinuationSeq >= stats.cursor
+      && state.pendingQuestionSeq >= stats.cursor
+    ) {
+      return {
+        pendingQuestions: [...state.pendingQuestions.values()],
+        continuations: [...state.questionContinuations.values()],
+      };
+    }
+
+    const continuations = new Map<string, QuestionContinuation>();
+    const pendingQuestions = new Map<string, QuestionRequest>();
+    let seq = 0;
+    await this.scanLog(base, state, (event) => {
+      foldQuestionContinuation(continuations, event);
+      foldPendingQuestion(pendingQuestions, event);
+      if (event.seq > seq) seq = event.seq;
+    });
+    state.questionContinuations = continuations;
+    state.pendingQuestions = pendingQuestions;
+    state.questionContinuationSeq = Math.max(seq, stats.cursor);
+    state.pendingQuestionSeq = Math.max(seq, stats.cursor);
+    return {
+      pendingQuestions: [...pendingQuestions.values()],
+      continuations: [...continuations.values()],
+    };
+  }
+
+  /**
    * Every point in the log at which the open turn changed.
    *
    * What a windowed read needs and cannot work out for itself: a snapshot
@@ -1584,6 +1983,7 @@ export class ChatStore implements ChatStoreLike {
       // be a basis for a fact about the session. Anything the window does carry
       // is applied over this and lands on the same answer.
       const reports = await this.sessionRuntimeReports(base, state, stats);
+      const recoverableQuestions = await this.recoverableQuestionState(base, state, stats);
       const transcript = createTranscript({ ...reports.capabilities }, { limits: reports.limits });
       let at = 0;
       let open: string | null = null;
@@ -1612,6 +2012,11 @@ export class ChatStore implements ChatStoreLike {
         usage: await this.sessionUsage(base, state, stats),
         plan: transcript.plan,
         pendingPermissions: transcript.pendingPermissions,
+        // Structured question handoffs do not have a live tool promise. They
+        // are deliberately recoverable from the log so a server restart while
+        // the user is away does not turn the card into a dead control.
+        pendingQuestions: recoverableQuestions.pendingQuestions,
+        pendingQuestionContinuations: recoverableQuestions.continuations,
         questionHistory: transcript.questionHistory,
         // What was picked, for the questions that have been answered (#113).
         // The replay above folds `question_resolved` the same way a browser
@@ -1701,6 +2106,61 @@ export class ChatStore implements ChatStoreLike {
     });
     this.queues.delete(base);
   }
+}
+
+/** Fold the two outbox events without replaying the rest of the transcript. */
+function foldQuestionContinuation(
+  continuations: Map<string, QuestionContinuation>,
+  event: ChatEvent,
+): void {
+  if (event.t === 'question_resolved' && event.continuation && !event.abandoned) {
+    continuations.set(event.continuation.continuationId, {
+      ...event.continuation,
+      request: {
+        ...event.continuation.request,
+        options: event.continuation.request.options.map((option) => ({ ...option })),
+      },
+      answer: {
+        ...event.continuation.answer,
+        optionIds: [...event.continuation.answer.optionIds],
+        labels: [...event.continuation.answer.labels],
+      },
+    });
+    return;
+  }
+  if (event.t === 'question_continuation_dispatching') {
+    const continuation = continuations.get(event.continuationId);
+    if (continuation) continuation.dispatching = true;
+    return;
+  }
+  if (event.t === 'question_continuation_pending') {
+    const continuation = continuations.get(event.continuationId);
+    if (continuation) delete continuation.dispatching;
+    return;
+  }
+  if (event.t === 'question_continuation') {
+    continuations.delete(event.continuationId);
+    return;
+  }
+  if (event.t === 'marker' && event.kind === 'cleared') continuations.clear();
+}
+
+function foldPendingQuestion(
+  questions: Map<string, QuestionRequest>,
+  event: ChatEvent,
+): void {
+  if (event.t === 'question') {
+    questions.set(event.request.requestId, {
+      ...event.request,
+      options: event.request.options.map((option) => ({ ...option })),
+    });
+    return;
+  }
+  if (event.t === 'question_resolved') {
+    questions.delete(event.requestId);
+    return;
+  }
+  if (event.t === 'marker' && event.kind === 'cleared') questions.clear();
 }
 
 /**
