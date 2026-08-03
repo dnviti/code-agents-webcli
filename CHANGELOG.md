@@ -204,6 +204,12 @@
   actually decides something.
 
 ### Fixed
+- **Large Codex tool results no longer turn into “oversized line” errors.**
+  App-server can return a command's full captured output in one JSON record;
+  the WebUI discarded that record once an ordinary stdout split carried it
+  past a 1 MB partial-line guard, leaving the tool without its completion.
+  Chat runtimes now share a byte-bounded 16 MiB framer that preserves valid
+  multi-chunk records and cleanly resumes after a genuinely over-limit line.
 - **Closing a conversation tab now closes it on every device signed into the
   account.** Tab membership was the last part of the strip kept in browser
   storage, so closing a conversation on one screen left it open everywhere else

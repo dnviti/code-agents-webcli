@@ -2054,7 +2054,7 @@ export class CodexExecAdapter extends BaseChatAdapter {
 
   private spawnTurn(args: string[]): void {
     this.exited = false;
-    this.stdoutBuffer = '';
+    this.resetStdoutFraming();
 
     // Closed, not piped: the prompt is the last argv entry and nothing is
     // ever written here. Left as an open pipe, `codex exec` announces
@@ -2064,8 +2064,7 @@ export class CodexExecAdapter extends BaseChatAdapter {
     const child = this.launchChild(args, ['ignore', 'pipe', 'pipe']) as AdapterChild;
     this.child = child;
 
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => this.onTurnStdout(chunk));
+    child.stdout.on('data', (chunk: Buffer) => this.feedStdout(chunk, 'codex exec'));
 
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
@@ -2106,40 +2105,6 @@ export class CodexExecAdapter extends BaseChatAdapter {
     if (this.child !== child || this.exited) return;
     this.exited = true;
     await finish();
-  }
-
-  /**
-   * Not a call into BaseChatAdapter's own (private) line framing: that
-   * method is wired to the single child from `start()`, which this adapter
-   * never spawns -- see the class doc comment on the per-turn spawn.
-   */
-  private onTurnStdout(chunk: string): void {
-    this.stdoutBuffer += chunk;
-    let newline: number;
-    while ((newline = this.stdoutBuffer.indexOf('\n')) !== -1) {
-      const line = this.stdoutBuffer.slice(0, newline).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
-      if (!line) continue;
-
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        continue; // banner output, same tolerance as every other adapter here
-      }
-
-      try {
-        this.handleMessage(parsed);
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.emit({ t: 'error', message: `codex exec adapter failed to handle a message: ${message}` });
-      }
-    }
-
-    if (this.stdoutBuffer.length > 1_000_000) {
-      this.stdoutBuffer = '';
-      this.emit({ t: 'error', message: 'codex exec sent an oversized line; discarded the buffer' });
-    }
   }
 
   protected handleMessage(message: unknown): void {

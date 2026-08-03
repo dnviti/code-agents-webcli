@@ -28,9 +28,9 @@ const { applyChatEvent, createTranscript } = require('../dist/shared/chat-reduce
 // hand-written to fill that gap, on the assumption documented in the
 // `CodexExecAdapter` class comment.
 
-// handshake/handleMessage/handleNotification/handleServerRequest/buildArgs
-// are `protected` in TypeScript, a compile-time visibility rule only: at
-// runtime they are ordinary methods, so translation is driven directly
+// handshake/handleMessage/handleNotification/handleServerRequest/buildArgs and
+// feedStdout are `protected` in TypeScript, a compile-time visibility rule
+// only. The harness exposes the raw protocol seam and drives translation
 // without spawning a CLI.
 
 function fixture(name) {
@@ -47,10 +47,14 @@ function flush() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+class TestCodexAppServerAdapter extends CodexAppServerAdapter {
+  feedWire(chunk) { this.feedStdout(chunk); }
+}
+
 function harness(overrides) {
   const events = [];
   const sent = [];
-  const adapter = new CodexAppServerAdapter(
+  const adapter = new TestCodexAppServerAdapter(
     Object.assign(
       {
         sessionId: 'chat-1',
@@ -108,6 +112,79 @@ function transcriptOf(events) {
 }
 
 describe('codex app-server adapter', function () {
+  describe('stdout framing', function () {
+    it('completes a command whose record is above the former 1 MB limit', async function () {
+      const h = harness();
+      await boot(h);
+      h.events.length = 0;
+
+      const turnId = 'turn_large_output';
+      const itemId = 'item_large_output';
+      const output = 'x'.repeat(1_100_000);
+      const line = (value) => Buffer.from(`${JSON.stringify(value)}\n`, 'utf8');
+
+      h.adapter.feedWire(Buffer.concat([
+        line({
+          jsonrpc: '2.0',
+          method: 'turn/started',
+          params: { threadId: 'th_123', turn: { id: turnId, status: 'inProgress' } },
+        }),
+        line({
+          jsonrpc: '2.0',
+          method: 'item/started',
+          params: {
+            threadId: 'th_123',
+            turnId,
+            item: {
+              type: 'commandExecution',
+              id: itemId,
+              command: 'produce-output',
+              cwd: '/work',
+              status: 'inProgress',
+              aggregatedOutput: null,
+            },
+          },
+        }),
+      ]));
+      h.events.length = 0;
+
+      const completed = Buffer.from(JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'item/completed',
+        params: {
+          threadId: 'th_123',
+          turnId,
+          item: {
+            type: 'commandExecution',
+            id: itemId,
+            command: 'produce-output',
+            cwd: '/work',
+            status: 'completed',
+            aggregatedOutput: output,
+            exitCode: 0,
+            durationMs: 42,
+          },
+        },
+      }), 'utf8');
+
+      for (let offset = 0; offset < completed.length; offset += 64 * 1024) {
+        h.adapter.feedWire(completed.subarray(offset, offset + 64 * 1024));
+      }
+      assert.strictEqual(only(h.events, 'tool').length, 0, 'an incomplete record must not dispatch');
+      assert.strictEqual(only(h.events, 'error').length, 0, 'a valid partial record must not be discarded');
+
+      h.adapter.feedWire(Buffer.from('\n', 'utf8'));
+
+      const patch = only(h.events, 'tool').find((event) => event.toolId === itemId)?.patch;
+      assert.ok(patch, 'the completed command must patch its opened tool');
+      assert.strictEqual(patch.status, 'completed');
+      assert.strictEqual(patch.output.length, output.length);
+      assert.ok(patch.output === output, 'large command output changed during framing');
+      assert.strictEqual(patch.durationMs, 42);
+      assert.deepStrictEqual(only(h.events, 'error'), []);
+    });
+  });
+
   describe('capabilities', function () {
     it('claims what app-server structurally supports', function () {
       const { adapter } = harness();

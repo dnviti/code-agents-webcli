@@ -220,6 +220,19 @@ interface AdapterChildLifecycle {
 }
 
 /**
+ * Maximum serialized size of one runtime protocol record.
+ *
+ * Codex legitimately embeds multi-megabyte command output in a single JSON-RPC
+ * line. The old 1,000,000-character guard discarded those records whenever a
+ * pipe split them before their newline. Sixteen MiB leaves room for the
+ * runtime's bounded output plus JSON escaping while still bounding one
+ * session's incomplete record in memory.
+ */
+const MAX_PROTOCOL_LINE_BYTES = 16 * 1024 * 1024;
+const INITIAL_PROTOCOL_BUFFER_BYTES = 4 * 1024;
+const RETAINED_PROTOCOL_BUFFER_BYTES = 64 * 1024;
+
+/**
  * Shared plumbing for adapters that drive a child process over stdio.
  *
  * All four protocols are line-delimited JSON over stdout, so framing, stderr
@@ -235,7 +248,11 @@ export abstract class BaseChatAdapter implements ChatAdapter {
   abstract readonly capabilities: ChatCapabilities;
 
   protected child: AdapterChild | null = null;
-  protected stdoutBuffer = '';
+  private stdoutLine = Buffer.alloc(0);
+  private stdoutBytes = 0;
+  private discardingStdoutLine = false;
+  /** Overridden only by the framing harness so overflow recovery stays cheap to test. */
+  protected maxProtocolLineBytes = MAX_PROTOCOL_LINE_BYTES;
   protected stderrTail = '';
   protected stopped = false;
   protected exited = false;
@@ -440,8 +457,8 @@ export abstract class BaseChatAdapter implements ChatAdapter {
 
     this.child = child;
 
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => this.onStdout(chunk));
+    this.resetStdoutFraming();
+    child.stdout.on('data', (chunk: Buffer) => this.feedStdout(chunk));
 
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
@@ -486,12 +503,86 @@ export abstract class BaseChatAdapter implements ChatAdapter {
     await this.handshake();
   }
 
-  private onStdout(chunk: string): void {
-    this.stdoutBuffer += chunk;
-    let newline: number;
-    while ((newline = this.stdoutBuffer.indexOf('\n')) !== -1) {
-      const line = this.stdoutBuffer.slice(0, newline).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
+  /** Clear retained protocol bytes before a newly spawned stdout stream begins. */
+  protected resetStdoutFraming(): void {
+    this.clearStdoutLine(true);
+    this.discardingStdoutLine = false;
+  }
+
+  private clearStdoutLine(release = false): void {
+    this.stdoutBytes = 0;
+    if (release || this.stdoutLine.length > RETAINED_PROTOCOL_BUFFER_BYTES) {
+      this.stdoutLine = Buffer.alloc(0);
+    }
+  }
+
+  /** Copy input into bounded owned storage; never retain a caller's Buffer view. */
+  private appendStdoutSegment(segment: Buffer): void {
+    const required = this.stdoutBytes + segment.length;
+    if (required > this.stdoutLine.length) {
+      const initial = Math.min(this.maxProtocolLineBytes, INITIAL_PROTOCOL_BUFFER_BYTES);
+      const grown = this.stdoutLine.length > 0 ? this.stdoutLine.length * 2 : initial;
+      const capacity = Math.min(this.maxProtocolLineBytes, Math.max(required, grown));
+      const next = Buffer.allocUnsafe(capacity);
+      if (this.stdoutBytes > 0) {
+        this.stdoutLine.copy(next, 0, 0, this.stdoutBytes);
+      }
+      this.stdoutLine = next;
+    }
+
+    segment.copy(this.stdoutLine, this.stdoutBytes);
+    this.stdoutBytes = required;
+  }
+
+  /**
+   * Frame one runtime's UTF-8, newline-delimited JSON stream.
+   *
+   * Kept protected because the spawn-per-turn adapters own their stdout
+   * listener but speak the same wire format. Strings are accepted for focused
+   * protocol tests; production listeners leave stdout undecoded and pass exact
+   * bytes so a multibyte code point split across chunks remains intact.
+   */
+  protected feedStdout(chunk: Buffer | string, source = this.runtime): void {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
+    let offset = 0;
+
+    while (offset < bytes.length) {
+      if (this.discardingStdoutLine) {
+        const newline = bytes.indexOf(0x0a, offset);
+        if (newline === -1) return;
+        this.discardingStdoutLine = false;
+        offset = newline + 1;
+        continue;
+      }
+
+      const newline = bytes.indexOf(0x0a, offset);
+      const end = newline === -1 ? bytes.length : newline;
+      const segment = bytes.subarray(offset, end);
+
+      if (this.stdoutBytes + segment.length > this.maxProtocolLineBytes) {
+        this.clearStdoutLine();
+        this.emit({
+          t: 'error',
+          message: `${source} sent an oversized line; discarded the buffer`,
+        });
+        if (newline === -1) {
+          this.discardingStdoutLine = true;
+          return;
+        }
+        offset = newline + 1;
+        continue;
+      }
+
+      if (segment.length > 0) {
+        this.appendStdoutSegment(segment);
+      }
+      if (newline === -1) return;
+
+      const line = this.stdoutBytes > 0
+        ? this.stdoutLine.toString('utf8', 0, this.stdoutBytes).trim()
+        : '';
+      this.clearStdoutLine();
+      offset = newline + 1;
       if (!line) continue;
 
       let parsed: unknown;
@@ -510,19 +601,9 @@ export abstract class BaseChatAdapter implements ChatAdapter {
         const message = error instanceof Error ? error.message : String(error);
         this.emit({
           t: 'error',
-          message: `${this.runtime} adapter failed to handle a message: ${message}`,
+          message: `${source} adapter failed to handle a message: ${message}`,
         });
       }
-    }
-
-    // A runtime that never emits a newline would otherwise grow this without
-    // bound; past a megabyte the stream is not line-delimited JSON at all.
-    if (this.stdoutBuffer.length > 1_000_000) {
-      this.stdoutBuffer = '';
-      this.emit({
-        t: 'error',
-        message: `${this.runtime} sent an oversized line; discarded the buffer`,
-      });
     }
   }
 

@@ -590,7 +590,7 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
 
       this.child = child;
       this.exited = false;
-      this.stdoutBuffer = '';
+      this.resetStdoutFraming();
       this.stderrTail = '';
 
       let settled = false;
@@ -601,8 +601,7 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
         }
       };
 
-      child.stdout.setEncoding('utf8');
-      child.stdout.on('data', (chunk: string) => this.feedStdout(chunk));
+      child.stdout.on('data', (chunk: Buffer) => this.feedStdout(chunk, 'antigravity'));
 
       child.stderr.setEncoding('utf8');
       child.stderr.on('data', (chunk: string) => {
@@ -698,38 +697,6 @@ export class AntigravityChatAdapter extends BaseChatAdapter {
       message: detail ? `antigravity exited (${how}): ${detail}` : `antigravity exited (${how})`,
     });
     this.closeTurn('error');
-  }
-
-  /** Mirrors the base class's line framing, which is private there. */
-  private feedStdout(chunk: string): void {
-    this.stdoutBuffer += chunk;
-    let newline: number;
-    while ((newline = this.stdoutBuffer.indexOf('\n')) !== -1) {
-      const line = this.stdoutBuffer.slice(0, newline).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
-      if (!line) continue;
-
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        // agy prints the occasional plain-text notice on stdout; the same
-        // tolerance every other adapter here applies.
-        continue;
-      }
-
-      try {
-        this.handleMessage(parsed);
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.emit({ t: 'error', message: `antigravity adapter failed to handle a message: ${message}` });
-      }
-    }
-
-    if (this.stdoutBuffer.length > 1_000_000) {
-      this.stdoutBuffer = '';
-      this.emit({ t: 'error', message: 'antigravity sent an oversized line; discarded the buffer' });
-    }
   }
 
   protected handleMessage(raw: unknown): void {
