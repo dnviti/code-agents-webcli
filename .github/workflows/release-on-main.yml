@@ -187,7 +187,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm run desktop:dist -- ${{ matrix.args }}
+          # A tag checkout makes electron-builder publish implicitly unless this
+          # is disabled. The release job below is the sole asset publisher.
+          npm run desktop:dist -- ${{ matrix.args }} --publish never
 
           for pattern in ${{ matrix.required }}; do
             matches=(release/$pattern)
