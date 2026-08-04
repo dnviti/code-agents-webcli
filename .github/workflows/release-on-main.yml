@@ -222,6 +222,21 @@ jobs:
           case "${{ runner.os }}" in
             Linux)
               executable="release/linux-unpacked/code-agents-webcli"
+              sandbox="release/linux-unpacked/chrome-sandbox"
+              if [ ! -f "$sandbox" ]; then
+                echo "Could not find the packaged Chromium sandbox helper." >&2
+                exit 1
+              fi
+              # Chromium aborts instead of silently weakening its Linux
+              # sandbox unless this unpacked helper is root-owned and setuid.
+              # This changes only the disposable smoke-test directory; the
+              # AppImage and Flatpak artifacts were already built above.
+              sudo chown root:root "$sandbox"
+              sudo chmod 4755 "$sandbox"
+              if [ "$(stat -c '%U:%G %a' "$sandbox")" != "root:root 4755" ]; then
+                echo "The packaged Chromium sandbox helper is not configured securely." >&2
+                exit 1
+              fi
               output="$(xvfb-run -a "$executable")"
               ;;
             Windows)
