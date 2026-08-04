@@ -34,6 +34,16 @@ export async function loadConfig(app: App): Promise<void> {
         // experimental administration surface in a newer client bundle.
         containerizedEnvironmentsEnabled:
           cfg?.containerizedEnvironmentsEnabled === true,
+        // Older servers sent no list and keep the Unix choices already in the
+        // store. A new desktop Windows server reports PowerShell/cmd instead.
+        ...(Array.isArray(cfg?.supportedShells)
+          && cfg.supportedShells.length > 0
+          && cfg.supportedShells.every((value: unknown) => typeof value === 'string')
+          ? { terminalShells: cfg.supportedShells }
+          : {}),
+        // Safe inspection uses POSIX file-size/process controls. Older servers
+        // predate the flag and keep their historical enabled behavior.
+        repositoryInspectionSupported: cfg?.repositoryInspectionSupported !== false,
         // The approval preference belongs to the account, so this — the boot
         // request every page already makes — is where it arrives. Anything
         // other than a literal `true` is "ask", which covers an older server

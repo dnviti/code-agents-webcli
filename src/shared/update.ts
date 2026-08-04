@@ -42,6 +42,7 @@ export interface UpdateStatus {
 }
 
 export type UpdateMode =
+  | 'desktop'
   | 'systemd'
   | 'foreground'
   | 'ephemeral'
@@ -95,6 +96,11 @@ function describeInstalled(status: UpdateStatus): string {
 
 function refusalText(mode: UpdateMode): string | null {
   switch (mode) {
+    case 'desktop':
+      return (
+        'A newer desktop build is available. Download the installer for your system '
+        + 'from https://github.com/dnviti/code-agents-webcli/releases and install it over this version.'
+      );
     case 'ephemeral':
       return (
         'Running from the npx cache, so there is nothing to update in place — '

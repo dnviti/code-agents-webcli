@@ -91,6 +91,10 @@ describe('project server composition', function () {
       const config = await request('GET', '/api/config');
       assert.strictEqual(config.status, 200);
       assert.strictEqual(config.body.containerizedEnvironmentsEnabled, false);
+      assert.ok(
+        Array.isArray(config.body.supportedShells) && config.body.supportedShells.length > 0,
+        'the client must receive shell choices for the server operating system',
+      );
 
       assert.strictEqual((await request('GET', '/api/admin/deploy-targets')).status, 404);
       assert.strictEqual((await request('GET', '/api/admin/deploy-settings')).status, 404);

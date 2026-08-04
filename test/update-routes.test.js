@@ -163,6 +163,7 @@ describe('update routes', function () {
   });
 
   const refusals = [
+    ['desktop', 'desktop_install'],
     ['ephemeral', 'ephemeral_install'],
     ['container', 'container_install'],
     ['source', 'source_install'],

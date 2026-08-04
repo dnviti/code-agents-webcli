@@ -15,6 +15,14 @@ export type AgentKind =
 
 export interface ServerOptions {
   port?: number;
+  /** Programmatic bind address. The CLI intentionally has no equivalent flag. */
+  host?: string;
+  /**
+   * Desktop embedding is an API-only mode: it has no CLI flag or environment
+   * variable, so a network deployment cannot accidentally turn its TLS and
+   * OAuth protections off.
+   */
+  desktop?: DesktopServerOptions;
   dev?: boolean;
   https?: boolean;
   cert?: string;
@@ -38,6 +46,8 @@ export interface ServerOptions {
   allowedGitHubIds?: string;
   allowAnyGitHubUser?: boolean;
   dataDir?: string;
+  /** Root exposed by the host-mode workspace and terminal routes. */
+  baseFolder?: string;
   /** Give every signed-in user their own container. Off unless asked for. */
   containers?: boolean;
   containerEngine?: string;
@@ -55,6 +65,15 @@ export interface ServerOptions {
   kubeServiceAccount?: string;
   /** Base64/hex 32-byte key encrypting deploy-target secrets at rest. */
   encryptionKey?: string;
+}
+
+export interface DesktopServerOptions {
+  /** Opaque, high-entropy value owned by the desktop embedder. */
+  authToken: string;
+  /** Stable local account identifier, normally the operating-system username. */
+  username: string;
+  /** Human-facing name for Git identity and the account surface. */
+  name?: string | null;
 }
 
 export interface Aliases {
@@ -390,6 +409,8 @@ export interface PathValidation {
 
 export interface ServerState {
   port: number;
+  host: string | undefined;
+  desktop: DesktopServerOptions | null;
   dev: boolean;
   useHttps: boolean;
   certFile: string | undefined;

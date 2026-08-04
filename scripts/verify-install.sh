@@ -20,6 +20,11 @@
 # Usage: scripts/verify-install.sh [--keep]
 set -euo pipefail
 
+# `npm run` exports the caller's npm config as environment variables. Do not
+# let a developer's personal install-script allow-list become CLI policy for
+# the nested, deliberately unapproved install below.
+unset npm_config_allow_scripts NPM_CONFIG_ALLOW_SCRIPTS npm_config_userconfig NPM_CONFIG_USERCONFIG
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/cawcli-verify-install.XXXXXX")"
 KEEP=0
@@ -38,7 +43,9 @@ SOURCE_REPO="$WORK/source.git"
 PREFIX="$WORK/prefix"
 CACHE="$WORK/npm-cache"
 LOG="$WORK/install.log"
+USER_CONFIG="$WORK/empty-user-npmrc"
 mkdir -p "$SOURCE_REPO" "$PREFIX" "$CACHE"
+touch "$USER_CONFIG"
 
 echo "==> Snapshotting the tracked working tree"
 # Tracked + untracked-but-not-ignored, so uncommitted work is exercised too.
@@ -70,7 +77,10 @@ echo "    (isolated cache, no scripts pre-approved, nothing prebuilt)"
 printf '{"name":"install-verification","version":"1.0.0","private":true}\n' > "$PREFIX/package.json"
 
 set +e
-npm install \
+# A developer-level allowScripts entry would make this project-scoped install
+# fail on npm 12 before the package under test is even resolved. Use an empty
+# user config so the probe measures the repository, not the invoking machine.
+npm_config_userconfig="$USER_CONFIG" npm install \
   --prefix "$PREFIX" \
   --cache "$CACHE" \
   --allow-git=all \
@@ -98,7 +108,7 @@ fi
 echo "    nothing compiled"
 
 echo "==> Checking no blocked install scripts are pending"
-BLOCKED="$(npm install-scripts ls --prefix "$PREFIX" 2>/dev/null || true)"
+BLOCKED="$(npm_config_userconfig="$USER_CONFIG" npm install-scripts ls --prefix "$PREFIX" 2>/dev/null || true)"
 if printf '%s' "$BLOCKED" | grep -Eqi 'node-pty|better-sqlite3|blocked'; then
   echo "FAIL: the install left blocked scripts behind:"
   printf '%s\n' "$BLOCKED"

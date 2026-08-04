@@ -105,6 +105,28 @@ function mergedEnv(extra?: Record<string, string>): Record<string, string> {
 }
 
 /**
+ * Native Windows process creation cannot execute npm's `.cmd`/`.bat` shims
+ * directly. Route only those script types through ComSpec; real executables
+ * stay direct and container commands never pass through this host wrapper.
+ */
+export function wrapHostCommand(
+  command: string,
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): { command: string; args: string[] } {
+  if (platform !== 'win32' || !/\.(?:cmd|bat)$/i.test(command)) {
+    return { command, args };
+  }
+  return {
+    command: env.ComSpec || env.COMSPEC || 'cmd.exe',
+    // /d disables AutoRun, /s applies cmd's quoting rules, /v:off prevents
+    // delayed expansion from rewriting `!` inside a profile argument.
+    args: ['/d', '/s', '/v:off', '/c', command, ...args],
+  };
+}
+
+/**
  * The environment the server has always had: this machine, this account.
  *
  * Every method is the identity, so a call site that has been converted to go
@@ -138,7 +160,8 @@ export class HostEnvironment implements UserEnvironment {
   }
 
   wrap(command: string, args: string[], options: WrapOptions = {}): WrappedCommand {
-    return { command, args, env: mergedEnv(options.env) };
+    const launch = wrapHostCommand(command, args);
+    return { ...launch, env: mergedEnv(options.env) };
   }
 }
 

@@ -1,6 +1,5 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { execFileSync } from 'child_process';
 import { BaseBridge, StartSessionOptions } from './base.js';
 
 /**
@@ -127,7 +126,7 @@ export class OmpBridge extends BaseBridge {
 
     let supported = false;
     try {
-      const help = execFileSync(this.resolvedCommand, ['--help'], {
+      const help = this.resolvedCommandOutput(['--help'], {
         encoding: 'utf8',
         timeout: 20000,
         maxBuffer: 4 * 1024 * 1024,

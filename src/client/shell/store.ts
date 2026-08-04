@@ -253,6 +253,10 @@ export interface ShellState {
   logoutUrl: string | null;
   /** Operator-only feature gate reported by `/api/config`. */
   containerizedEnvironmentsEnabled: boolean;
+  /** Shells the server can launch on its host operating system. */
+  terminalShells: string[];
+  /** Whether repository-backed project creation is available on this server. */
+  repositoryInspectionSupported: boolean;
   /**
    * Whether this window can become an installed app.
    *
@@ -353,6 +357,8 @@ const INITIAL: ShellState = {
   user: null,
   logoutUrl: null,
   containerizedEnvironmentsEnabled: false,
+  terminalShells: ['zsh', 'bash', 'sh'],
+  repositoryInspectionSupported: true,
   install: 'unsupported',
   chatBypassPermissions: false,
   // Replaced by `applySettings` during boot, before the first render. On until

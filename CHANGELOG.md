@@ -3,6 +3,15 @@
 ## [6.0.0] - unreleased
 
 ### Added
+- **Code Agents Web CLI now has self-contained desktop downloads** for Linux
+  x64 (AppImage and Flatpak), Windows x64 (NSIS), and macOS Intel and Apple
+  Silicon (DMG) (#84). The local desktop window starts a loopback-only service
+  and a keyboard user without requiring a terminal, Node, GitHub OAuth, or a
+  separately managed server. Agents and their credentials remain the user's
+  own. Releases attach all native packages and `SHA256SUMS`; packages are
+  unsigned, and release updates are a notification and manual reinstall, never
+  a silent auto-update. See [Desktop app](docs/desktop.md).
+
 - **Installed desktop PWAs can use the native title bar for the session strip**
   (#183). On browsers that support Window Controls Overlay, the existing tabs
   and app actions occupy the browser-reported safe area beside the real native

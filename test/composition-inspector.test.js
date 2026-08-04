@@ -105,6 +105,16 @@ function localFixtureRunner(remoteUrl, source, requests) {
 }
 
 describe('static composition repository inspector', function () {
+  it('disables the POSIX-bounded repository surface explicitly on Windows', async function () {
+    const inspector = new RepositoryInspector({ platform: 'win32' });
+    await assert.rejects(
+      inspector.inspect({ repoUrl: 'https://example.test/owner/repository' }),
+      (error) => error instanceof RepositoryInspectionError
+        && error.code === 'unsupported_platform'
+        && /unavailable on Windows/.test(error.message),
+    );
+  });
+
   this.timeout(15_000);
 
   it('detects Node, Python and PHP at one exact OID without executing repository-controlled behavior', async function () {

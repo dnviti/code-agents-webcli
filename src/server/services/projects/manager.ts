@@ -3223,6 +3223,7 @@ function installationIds(
 function safeInspectionMessage(error: unknown): string {
   if (!(error instanceof RepositoryInspectionError)) return 'Repository inspection failed';
   switch (error.code) {
+    case 'unsupported_platform': return 'Repository inspection is unavailable on Windows; create a project without a repository or use a Linux server';
     case 'credential_required': return 'Repository credential is missing or invalid';
     case 'invalid_url': return 'Repository URL is not eligible for safe inspection';
     case 'invalid_repository': return 'Repository could not be inspected safely';

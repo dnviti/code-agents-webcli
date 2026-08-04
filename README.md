@@ -12,6 +12,10 @@ npx --allow-git=all github:dnviti/code-agents-webcli
 That is the whole install. Nothing compiles, nothing needs a C++ toolchain, and
 there is no second command.
 
+Prefer a local native window? Download the **[desktop app](docs/desktop.md)**
+for Linux, Windows or macOS. It is self-contained: no terminal, Node.js,
+separately running server or GitHub OAuth is needed to launch it.
+
 ---
 
 ## What it does
@@ -124,6 +128,7 @@ The image ships the web server only — the agent CLIs are not bundled. See
 
 | Guide | What is in it |
 | --- | --- |
+| [Desktop app](docs/desktop.md) | Native Linux, Windows and macOS downloads, local-only use, updates and troubleshooting |
 | [Installation](docs/installation.md) | Every install path, platform support, uninstalling, install troubleshooting |
 | [GitHub OAuth](docs/github-oauth.md) | Creating the OAuth App, the allow-list, the installer account |
 | [Configuration](docs/configuration.md) | Every CLI flag and environment variable, the setup wizard, where state is stored |

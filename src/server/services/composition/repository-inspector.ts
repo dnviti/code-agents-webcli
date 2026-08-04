@@ -38,6 +38,7 @@ export const DEFAULT_REPOSITORY_INSPECTION_LIMITS: RepositoryInspectionLimits = 
 });
 
 export type RepositoryInspectionErrorCode =
+  | 'unsupported_platform'
   | 'invalid_url'
   | 'credential_required'
   | 'repository_unavailable'
@@ -108,6 +109,8 @@ export interface RepositoryInspectorDependencies {
   readonly fetch?: InspectionFetch;
   readonly tempRoot?: string;
   readonly limits?: Partial<RepositoryInspectionLimits>;
+  /** Injectable so Windows's explicit unsupported path is testable on Unix. */
+  readonly platform?: NodeJS.Platform;
 }
 
 export interface InspectRepositoryOptions {
@@ -371,11 +374,13 @@ export class RepositoryInspector {
   private readonly fetch_: InspectionFetch;
   private readonly tempRoot: string;
   private readonly limits: RepositoryInspectionLimits;
+  private readonly platform: NodeJS.Platform;
 
   constructor(dependencies: RepositoryInspectorDependencies = {}) {
     this.runner = dependencies.runner || defaultGitRunner;
     this.fetch_ = dependencies.fetch || defaultFetch;
     this.tempRoot = resolve(dependencies.tempRoot || tmpdir());
+    this.platform = dependencies.platform || process.platform;
     this.limits = Object.freeze({
       ...DEFAULT_REPOSITORY_INSPECTION_LIMITS,
       ...dependencies.limits,
@@ -388,6 +393,15 @@ export class RepositoryInspector {
   }
 
   async inspect(options: InspectRepositoryOptions): Promise<RepositoryInspectionResult> {
+    if (this.platform === 'win32') {
+      // The isolated fetch relies on POSIX RLIMIT_FSIZE and deliberately
+      // minimal Unix process paths. Fail explicitly instead of exposing a
+      // repository launcher path that cannot complete safely on Windows.
+      throw new RepositoryInspectionError(
+        'unsupported_platform',
+        'Repository inspection is unavailable on Windows; create a project without a repository or use the server edition on Linux.',
+      );
+    }
     if (options.signal?.aborted) {
       throw new RepositoryInspectionError('cancelled', 'Repository inspection was cancelled');
     }

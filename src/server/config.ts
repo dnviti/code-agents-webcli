@@ -19,17 +19,23 @@ export function createConfig(options: ServerOptions): ServerState {
   };
 
   return {
-    port: options.port || 32352,
+    // Zero asks Node for an ephemeral port; desktop uses it to avoid colliding
+    // with a separately running CLI server.
+    port: options.port ?? 32352,
+    host: options.host,
+    desktop: options.desktop ?? null,
     dev: options.dev || false,
     // Not a choice any more: see the note in start(). `--https` is kept as an
     // accepted no-op so existing scripts and service units do not fail.
-    useHttps: true,
+    // Plain HTTP is safe only for the API-only desktop mode, which is bound to
+    // loopback and still requires its embedder-owned cookie token.
+    useHttps: options.desktop ? false : true,
     certFile: options.cert,
     keyFile: options.key,
     setup: options.setup || false,
     folderMode: options.folderMode !== false,
     selectedWorkingDir: null,
-    baseFolder: process.cwd(),
+    baseFolder: options.baseFolder || process.cwd(),
     publicBaseUrl: options.publicBaseUrl || process.env.PUBLIC_BASE_URL || null,
     githubClientId:
       options.githubClientId || process.env.GITHUB_OAUTH_CLIENT_ID || null,

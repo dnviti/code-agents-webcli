@@ -18,6 +18,25 @@ describe('ClaudeBridge', function() {
       assert(typeof bridge.resolvedCommand === 'string');
       assert(bridge.resolvedCommand.length > 0);
     });
+
+    it('uses where.exe and retains the real Windows npm shim path', function() {
+      const calls = [];
+      const windows = new ClaudeBridge({
+        platform: 'win32',
+        env: { USERPROFILE: 'C:\\Users\\alice' },
+        existsSync() { return false; },
+        execFileSync(file, args) {
+          calls.push([file, ...args]);
+          if (args[0] === 'claude') return 'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd\r\n';
+          throw new Error('missing');
+        },
+      });
+      assert.strictEqual(
+        windows.resolvedCommand,
+        'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd',
+      );
+      assert.ok(calls.every(([file]) => file === 'where.exe'));
+    });
   });
 
   describe('commandExists', function() {

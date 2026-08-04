@@ -6,6 +6,7 @@ const path = require('path');
 const {
   EnvironmentManager,
   HostEnvironment,
+  wrapHostCommand,
   createContainerConfig,
   defaultEnvironmentRoot,
 } = require('../dist/server/services/environments/index.js');
@@ -58,6 +59,33 @@ function response() {
 
 describe('an installation with no container engine configured', function () {
   describe('configuration', function () {
+    it('launches Windows npm command shims through ComSpec but keeps executables direct', function () {
+      assert.deepStrictEqual(
+        wrapHostCommand(
+          'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd',
+          ['--model', 'sonnet'],
+          'win32',
+          { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+        ),
+        {
+          command: 'C:\\Windows\\System32\\cmd.exe',
+          args: [
+            '/d', '/s', '/v:off', '/c',
+            'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd',
+            '--model', 'sonnet',
+          ],
+        },
+      );
+      assert.deepStrictEqual(
+        wrapHostCommand('C:\\Tools\\codex.exe', ['exec'], 'win32', {}),
+        { command: 'C:\\Tools\\codex.exe', args: ['exec'] },
+      );
+      assert.deepStrictEqual(
+        wrapHostCommand('/usr/bin/claude', [], 'linux', {}),
+        { command: '/usr/bin/claude', args: [] },
+      );
+    });
+
     it('is off when nothing is passed and nothing is in the environment', function () {
       assert.strictEqual(createContainerConfig({}, {}).enabled, false);
     });

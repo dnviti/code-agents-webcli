@@ -1038,6 +1038,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
 
       <ProjectsDialog
         open={state.dialogs.projects}
+        repositoryInspectionSupported={state.repositoryInspectionSupported}
         onClose={() => closeDialogs({ projects: false })}
         onOpenProject={(projectId) => {
           closeDialogs({ projects: false });
@@ -1071,6 +1072,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
 
       <TerminalOptionsDialog
         open={state.dialogs.terminalOptions}
+        shells={state.terminalShells}
         onShell={actions.startShell}
         onCommand={actions.runCommand}
         onClose={() => closeDialogs({ terminalOptions: false })}

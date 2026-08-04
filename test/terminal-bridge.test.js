@@ -98,6 +98,98 @@ describe('TerminalBridge', function() {
     assert.strictEqual(session.terminalMode, 'command');
   });
 
+  it('keeps Unix shell launch arguments unchanged', function() {
+    const config = bridge.buildLaunchConfig({
+      mode: 'command',
+      shell: 'sh',
+      command: 'printf ok',
+    });
+
+    assert.strictEqual(config.command, '/bin/sh');
+    assert.deepStrictEqual(config.args, ['-lc', 'printf ok']);
+  });
+
+  it('uses the injected Unix shell environment', function() {
+    const unixBridge = new TerminalBridge({
+      platform: 'linux',
+      env: { SHELL: '/custom/sh' },
+      existsSync(candidate) { return candidate === '/custom/sh'; },
+      execFileSync() { throw new Error('unreachable'); },
+    });
+
+    assert.strictEqual(unixBridge.resolveShell('sh'), '/custom/sh');
+  });
+
+  it('advertises one friendly Windows choice per shell family', function() {
+    const bridge = new TerminalBridge({ platform: 'win32' });
+    assert.deepStrictEqual(bridge.getSupportedShells(), ['pwsh', 'powershell', 'cmd']);
+  });
+
+  it('resolves PowerShell 7 on Windows without invoking Unix which', function() {
+    const resolverCalls = [];
+    const windowsBridge = new TerminalBridge({
+      platform: 'win32',
+      env: {},
+      existsSync() { return false; },
+      execFileSync(command, args) {
+        resolverCalls.push({ command, args });
+        if (command === 'where.exe' && args[0] === 'pwsh.exe') return '';
+        throw new Error('not found');
+      },
+    });
+
+    const config = windowsBridge.buildLaunchConfig({ mode: 'shell' });
+
+    assert.strictEqual(config.command, 'pwsh.exe');
+    assert.deepStrictEqual(config.args, ['-NoLogo']);
+    assert.deepStrictEqual(resolverCalls, [{ command: 'where.exe', args: ['pwsh.exe'] }]);
+  });
+
+  it('uses Windows PowerShell command arguments', function() {
+    const windowsBridge = new TerminalBridge({
+      platform: 'win32',
+      env: {},
+      existsSync(candidate) { return candidate === 'powershell.exe'; },
+      execFileSync() { throw new Error('unreachable'); },
+    });
+
+    const config = windowsBridge.buildLaunchConfig({
+      mode: 'command',
+      shell: 'powershell.exe',
+      command: 'Get-ChildItem',
+    });
+
+    assert.strictEqual(config.command, 'powershell.exe');
+    assert.deepStrictEqual(config.args, ['-NoLogo', '-Command', 'Get-ChildItem']);
+  });
+
+  it('uses ComSpec and cmd command arguments on Windows', function() {
+    const windowsBridge = new TerminalBridge({
+      platform: 'win32',
+      env: { ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+      existsSync(candidate) { return candidate === 'C:\\Windows\\System32\\cmd.exe'; },
+      execFileSync() { throw new Error('unreachable'); },
+    });
+
+    const interactive = windowsBridge.buildLaunchConfig({ mode: 'shell', shell: 'ComSpec' });
+    const command = windowsBridge.buildLaunchConfig({
+      mode: 'command', shell: 'cmd.exe', command: 'dir',
+    });
+
+    assert.strictEqual(interactive.command, 'C:\\Windows\\System32\\cmd.exe');
+    assert.deepStrictEqual(interactive.args, []);
+    assert.deepStrictEqual(command.args, ['/d', '/s', '/c', 'dir']);
+  });
+
+  it('lists supported Windows shells in resolution errors', function() {
+    const windowsBridge = new TerminalBridge({ platform: 'win32', env: {} });
+
+    assert.throws(
+      () => windowsBridge.buildLaunchConfig({ mode: 'shell', shell: 'zsh' }),
+      /Supported shells: pwsh\.exe \(pwsh\), powershell\.exe \(powershell\), cmd\.exe \(cmd, ComSpec\)/,
+    );
+  });
+
   it('uses the Bash shell advertised by a project container', function() {
     const config = bridge.buildLaunchConfig({
       mode: 'shell',
@@ -108,6 +200,19 @@ describe('TerminalBridge', function() {
     assert.strictEqual(config.command, 'bash');
     assert.deepStrictEqual(config.args, ['-i']);
     assert.strictEqual(config.runtimeLabel, 'bash');
+  });
+
+  it('uses Unix argv for a container shell from a Windows host', function() {
+    const windowsBridge = new TerminalBridge({ platform: 'win32', env: {} });
+    const environment = { kind: 'container', shells: ['bash'] };
+
+    const interactive = windowsBridge.buildLaunchConfig({ mode: 'shell', environment });
+    const command = windowsBridge.buildLaunchConfig({
+      mode: 'command', environment, command: 'echo ready',
+    });
+
+    assert.deepStrictEqual(interactive.args, ['-i']);
+    assert.deepStrictEqual(command.args, ['-lc', 'echo ready']);
   });
 
   it('rejects unsupported shells', function() {

@@ -1,12 +1,29 @@
 import { spawn as spawnPty, IPty } from '../services/pty.js';
 import * as path from 'path';
 import * as fs from 'fs';
-import { execFileSync } from 'child_process';
+import {
+  execFileSync as defaultExecFileSync,
+  type ExecFileSyncOptionsWithStringEncoding,
+} from 'child_process';
 import {
   UserEnvironment,
   WrappedProcessControl,
 } from '../services/environments/types.js';
-import { HostEnvironment } from '../services/environments/manager.js';
+import { HostEnvironment, wrapHostCommand } from '../services/environments/manager.js';
+
+type ExecFileText = (
+  file: string,
+  args: readonly string[],
+  options: ExecFileSyncOptionsWithStringEncoding,
+) => string;
+
+export interface BaseBridgeOptions {
+  /** Injectable for deterministic Windows resolution tests. */
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  existsSync?: (candidate: string) => boolean;
+  execFileSync?: ExecFileText;
+}
 
 export interface BridgeSession {
   process: IPty;
@@ -66,8 +83,16 @@ export interface StartSessionOptions {
 export abstract class BaseBridge {
   protected sessions: Map<string, BridgeSession> = new Map();
   protected resolvedCommand: string;
+  protected readonly platform: NodeJS.Platform;
+  protected readonly hostEnv: NodeJS.ProcessEnv;
+  private readonly pathExists: (candidate: string) => boolean;
+  private readonly execFile: ExecFileText;
 
-  constructor() {
+  constructor(options: BaseBridgeOptions = {}) {
+    this.platform = options.platform || process.platform;
+    this.hostEnv = options.env || process.env;
+    this.pathExists = options.existsSync || fs.existsSync;
+    this.execFile = options.execFileSync || defaultExecFileSync;
     this.resolvedCommand = this.findCommand(this.getCommandCandidates());
   }
 
@@ -145,9 +170,10 @@ export abstract class BaseBridge {
   protected findCommand(possibleCommands: string[]): string {
     for (const cmd of possibleCommands) {
       try {
-        if (fs.existsSync(cmd) || this.commandExists(cmd)) {
-          console.log(`Found ${this.getDisplayName()} command at: ${cmd}`);
-          return cmd;
+        const resolved = this.pathExists(cmd) ? cmd : this.locateCommand(cmd);
+        if (resolved) {
+          console.log(`Found ${this.getDisplayName()} command at: ${resolved}`);
+          return resolved;
         }
       } catch {
         continue;
@@ -162,12 +188,31 @@ export abstract class BaseBridge {
   }
 
   protected commandExists(command: string): boolean {
+    return this.locateCommand(command) !== null;
+  }
+
+  /** Resolve the real Windows shim path; a boolean is not enough to launch it. */
+  private locateCommand(command: string): string | null {
     try {
-      execFileSync('which', [command], { stdio: 'ignore' });
-      return true;
+      const output = this.execFile(
+        this.platform === 'win32' ? 'where.exe' : 'which',
+        [command],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+      );
+      if (this.platform !== 'win32') return command;
+      return String(output).split(/\r?\n/).map((line) => line.trim()).find(Boolean) || null;
     } catch {
-      return false;
+      return null;
     }
+  }
+
+  /** Run a synchronous probe through the same Windows shim rules as a session. */
+  protected resolvedCommandOutput(
+    args: string[],
+    options: ExecFileSyncOptionsWithStringEncoding,
+  ): string {
+    const launch = wrapHostCommand(this.resolvedCommand, args, this.platform, this.hostEnv);
+    return this.execFile(launch.command, launch.args, options);
   }
 
   async startSession(

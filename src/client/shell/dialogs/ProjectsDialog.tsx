@@ -27,6 +27,7 @@ import {
 
 export interface ProjectsDialogProps {
   open: boolean;
+  repositoryInspectionSupported: boolean;
   onClose(): void;
   onOpenProject(projectId: string): void;
 }
@@ -124,7 +125,7 @@ function projectEventLabel(event: BuildEvent): string {
 }
 
 /** Project lifecycle UI. It owns no server state: websocket changes and writes both re-read the list. */
-export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogProps): React.JSX.Element | null {
+export function ProjectsDialog({ open, repositoryInspectionSupported, onClose, onOpenProject }: ProjectsDialogProps): React.JSX.Element | null {
   const isPhone = usePhone();
   const [projects, setProjects] = React.useState<ProjectSummary[]>([]);
   const [hosts, setHosts] = React.useState<ConnectedHost[]>([]);
@@ -214,6 +215,9 @@ export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogP
   React.useEffect(() => {
     if (availability.defaultExecutionKind !== 'container') setLocalProjects(false);
   }, [availability.defaultExecutionKind]);
+  React.useEffect(() => {
+    if (!repositoryInspectionSupported) setRepoUrl('');
+  }, [repositoryInspectionSupported]);
   React.useEffect(() => {
     const changed = (): void => { if (open) void read(); };
     window.addEventListener('cc-projects-changed', changed);
@@ -583,7 +587,8 @@ export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogP
       {creating && !credentialHost ? (
         <div style={card}>
           <p><Input autoFocus aria-label="Project name" placeholder="Project name" value={name} onChange={(event) => setName(event.currentTarget.value)} /></p>
-          <p><Input aria-label="Repository URL" placeholder="https://github.com/owner/repo (optional)" value={repoUrl} onChange={(event) => setRepoUrl(event.currentTarget.value)} /></p>
+          <p><Input disabled={!repositoryInspectionSupported} aria-label="Repository URL" placeholder={repositoryInspectionSupported ? 'https://github.com/owner/repo (optional)' : 'Repository inspection is unavailable on Windows'} value={repoUrl} onChange={(event) => setRepoUrl(event.currentTarget.value)} /></p>
+          {!repositoryInspectionSupported ? <p role="status" style={{ color: 'var(--muted-foreground)' }}>Windows can create projects without a repository. Use a Linux server for safely inspected repository projects.</p> : null}
           {!repoUrl.trim() ? (
             <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 12 }}>
               <input type="checkbox" checked={acknowledgeDisposable} onChange={(event) => setAcknowledgeDisposable(event.currentTarget.checked)} />
@@ -641,7 +646,7 @@ export function ProjectsDialog({ open, onClose, onOpenProject }: ProjectsDialogP
                   <p><Button size="sm" variant="secondary" onClick={() => setEditingRepo(null)}>Cancel</Button>{' '}<Button size="sm" variant="primary" disabled={mutation.busy || !editingRepo.repoUrl.trim()} onClick={() => void updateRepository(project.id, editingRepo.repoUrl)}>Save and retry</Button></p>
                 </div>
               ) : (
-                <p><Button size="sm" variant="secondary" disabled={mutation.busy} onClick={() => void (inspectionRequired ? inspectProject(project.id) : retryProject(project.id))}>{inspectionRequired ? 'Inspect repository again' : 'Retry build'}</Button>{' '}<Button size="sm" variant="secondary" disabled={mutation.busy} onClick={() => setEditingRepo({ projectId: project.id, repoUrl: project.repoUrl || '' })}>Change repository</Button></p>
+                <p><Button size="sm" variant="secondary" disabled={mutation.busy || (inspectionRequired && !repositoryInspectionSupported)} onClick={() => void (inspectionRequired ? inspectProject(project.id) : retryProject(project.id))}>{inspectionRequired ? 'Inspect repository again' : 'Retry build'}</Button>{' '}<Button size="sm" variant="secondary" disabled={mutation.busy || !repositoryInspectionSupported} onClick={() => setEditingRepo({ projectId: project.id, repoUrl: project.repoUrl || '' })}>Change repository</Button></p>
               )
             ) : null}
             {(events[project.id] || []).slice(-4).map((event, index) => <p key={`${event.at}-${index}`} style={{ margin: '6px 0', fontSize: 'var(--text-xs)' }}><Icon name="loader-circle" size={12} /> {projectEventLabel(event)}{event.percent !== undefined ? ` · ${event.percent}%` : ''}</p>)}

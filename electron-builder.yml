@@ -1,0 +1,85 @@
+appId: io.github.dnviti.code-agents-webcli
+productName: Code Agents Web CLI
+copyright: Copyright © Daniele Viti
+
+directories:
+  output: release
+  buildResources: assets
+
+extraMetadata:
+  main: desktop/main.js
+
+files:
+  - desktop/**/*
+  - dist/**/*
+  # BrowserWindow needs a raster icon at runtime on Linux. Build resources are
+  # consumed by the packager but are not otherwise copied into app.asar.
+  - src/public/icons/icon-512.png
+  - package.json
+  - README.md
+  - LICENSE
+
+asar: true
+asarUnpack:
+  # @lydell/node-pty is N-API compatible with Electron, but dlopen cannot load
+  # a native library from inside an asar archive.
+  - node_modules/@lydell/**/prebuilds/**/*.node
+npmRebuild: false
+
+artifactName: Code-Agents-Web-CLI-${version}-${os}-${arch}.${ext}
+
+linux:
+  icon: icon.svg
+  category: Development
+  executableName: code-agents-webcli
+  syncDesktopName: true
+  synopsis: Run coding agents and real terminals locally
+  target:
+    - AppImage
+    - flatpak
+
+appImage:
+  category: Development
+  # electron-builder otherwise writes `--no-sandbox` into the desktop entry.
+  # The app refuses unsandboxed packaged starts, so keep normal launcher starts
+  # on Chromium's OS sandbox instead of silently weakening the renderer.
+  executableArgs: []
+
+flatpak:
+  runtime: org.freedesktop.Platform
+  sdk: org.freedesktop.Sdk
+  runtimeVersion: "24.08"
+  branch: stable
+  finishArgs:
+    - --share=ipc
+    - --share=network
+    - --socket=x11
+    - --socket=wayland
+    - --device=dri
+    - --filesystem=home
+    - --talk-name=org.freedesktop.Notifications
+
+win:
+  icon: icon.svg
+  executableName: code-agents-webcli
+  target:
+    - nsis
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Code Agents Web CLI
+
+mac:
+  icon: icon.svg
+  category: public.app-category.developer-tools
+  identity: null
+  hardenedRuntime: false
+  target:
+    - dmg
+
+dmg:
+  title: Code Agents Web CLI ${version}

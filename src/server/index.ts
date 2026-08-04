@@ -73,7 +73,7 @@ import {
 import { broadcastChat, broadcastToAllConnections, sendToUser } from './websocket/handler.js';
 import { ChatStore } from './chat/store.js';
 import { ChatSessionManager } from './chat/manager.js';
-import { AuthService } from './services/auth.js';
+import { AuthService, DESKTOP_AUTH_COOKIE_NAME } from './services/auth.js';
 import {
   APP_MOUNT,
   EnvironmentManager,
@@ -164,8 +164,10 @@ function appRootDir(): string {
 
 export class ClaudeCodeWebServer {
   private port: number;
+  private host: string | undefined;
   private dev: boolean;
   private useHttps: boolean;
+  private readonly desktop: ServerOptions['desktop'] | null;
   private certFile: string | undefined;
   private keyFile: string | undefined;
   private setup: boolean;
@@ -195,7 +197,7 @@ export class ClaudeCodeWebServer {
   private kimiBridge: BridgeInterface;
   private ompBridge: BridgeInterface;
   private antigravityBridge: BridgeInterface;
-  private terminalBridge: BridgeInterface;
+  private terminalBridge: TerminalBridge;
 
   private database: AppDatabase;
   private usageStore: UsageStore;
@@ -268,6 +270,11 @@ export class ClaudeCodeWebServer {
   constructor(options: ServerOptions = {}) {
     const config = createConfig(options);
     this.port = config.port;
+    this.host = config.host;
+    this.desktop = config.desktop;
+    if (this.desktop && this.host !== '127.0.0.1') {
+      throw new Error('Desktop mode must bind exactly to 127.0.0.1.');
+    }
     this.dev = config.dev;
     this.useHttps = config.useHttps;
     this.certFile = config.certFile;
@@ -513,6 +520,7 @@ export class ClaudeCodeWebServer {
       githubAppToken: config.githubAppToken,
       allowedGitHubIds: config.allowedGitHubIds,
       allowAnyGitHubUser: config.allowAnyGitHubUser,
+      desktop: this.desktop,
       onGitHubCredential: async (userId, accessToken) => {
         await this.projects.synchronizeHostCredentialReplacement(userId, 'github.com', () => {
           const host = this.projectStore.upsertConnectedHostOAuth(userId, 'github.com', accessToken);
@@ -1179,6 +1187,11 @@ export class ClaudeCodeWebServer {
    * and neither answer changes while the process is alive.
    */
   private getUpdateMode(): UpdateModeResult {
+    if (this.desktop) {
+      // A packaged app must never run npm over its own asar/resources tree.
+      // Desktop releases notify here and are replaced by their OS installer.
+      return { mode: 'desktop', packageDir: null };
+    }
     if (!this.updateMode) {
       this.updateMode = detectUpdateMode();
     }
@@ -1468,7 +1481,31 @@ export class ClaudeCodeWebServer {
   private setupExpress(): void {
     const publicDir = path.join(__dirname, '..', 'public');
 
-    this.app.use(cors());
+    if (this.desktop) {
+      this.app.use((req, res, next) => {
+        const expected = this.localUrl;
+        const origin = req.headers.origin;
+        const fetchSite = req.headers['sec-fetch-site'];
+        if (
+          !expected
+          || req.headers.host !== new URL(expected).host
+          || (origin !== undefined && origin !== expected)
+          // SameSite cookies intentionally ignore ports. Fetch Metadata does
+          // not: a browser page on another loopback port reports `same-site`,
+          // while this renderer reports `same-origin` (or `none` for its first
+          // top-level navigation). Non-browser embedder probes omit the header.
+          || (fetchSite !== undefined && fetchSite !== 'same-origin' && fetchSite !== 'none')
+        ) {
+          res.status(403).json({ error: 'desktop_origin_required' });
+          return;
+        }
+        next();
+      });
+    } else {
+      // Browser/server deployments retain their existing cross-origin read
+      // behavior. Desktop is a local capability endpoint and is exact-origin.
+      this.app.use(cors());
+    }
     this.app.use(express.json());
     this.app.use(this.authService.attachRequestContext());
 
@@ -1514,6 +1551,9 @@ export class ClaudeCodeWebServer {
       ...this.sessionRouteDeps(),
       folderMode: this.folderMode,
       aliases: this.aliases,
+      supportedShells: this.terminalBridge.getSupportedShells(),
+      logoutUrl: this.desktop ? null : '/auth/logout',
+      repositoryInspectionSupported: process.platform !== 'win32',
       containerizedEnvironmentsEnabled: this.containerizedEnvironmentsEnabled,
       isPathWithinBase: (targetPath: string, userId?: number) =>
         this.isPathWithinBase(targetPath, userId),
@@ -1610,6 +1650,7 @@ export class ClaudeCodeWebServer {
    * EADDRINUSE immediately after a success message.
    */
   async runSetupIfNeeded(): Promise<boolean> {
+    if (this.desktop) return true;
     const needsAuthSetup = this.setup || !this.authService.isConfigured();
     if (!needsAuthSetup) {
       return true;
@@ -1631,6 +1672,24 @@ export class ClaudeCodeWebServer {
     } finally {
       session.close();
     }
+  }
+
+  /** Actual loopback URL after start; useful when port: 0 was requested. */
+  get localUrl(): string | null {
+    const address = this.listener?.address();
+    if (!address || typeof address === 'string') return null;
+    return `${this.useHttps ? 'https' : 'http'}://${address.address}:${address.port}`;
+  }
+
+  /** Cookie metadata for an Electron/WebView session API to set before loading. */
+  get desktopAuthCookie(): { name: string; value: string; httpOnly: true; sameSite: 'strict' } | null {
+    if (!this.desktop) return null;
+    return {
+      name: DESKTOP_AUTH_COOKIE_NAME,
+      value: this.desktop.authToken,
+      httpOnly: true,
+      sameSite: 'strict',
+    };
   }
 
   async start(): Promise<http.Server | https.Server> {
@@ -1669,6 +1728,41 @@ export class ClaudeCodeWebServer {
     // Embedders may call start() directly without going through
     // runSetupIfNeeded(); this stays as the safety net.
     await this.authService.ensureConfiguredInteractive(false);
+
+    if (this.desktop) {
+      const server = http.createServer(this.app);
+      this.wss = new WebSocket.Server({ server });
+      this.wss.on('connection', (ws: WebSocket, req) => {
+        const expected = this.localUrl;
+        if (
+          !expected
+          || req.headers.host !== new URL(expected).host
+          || req.headers.origin !== expected
+        ) {
+          ws.close(4403, 'Desktop origin required');
+          return;
+        }
+        this.wsHandler.handleConnection(ws, req);
+      });
+      server.on('connection', (socket) => {
+        this.listenerSockets.add(socket);
+        socket.once('close', () => this.listenerSockets.delete(socket));
+      });
+      this.projects.startSweep();
+      return await new Promise((resolve, reject) => {
+        const onError = (error: Error): void => {
+          this.projects.stopSweep();
+          reject(error);
+        };
+        server.once('error', onError);
+        server.listen(this.port, this.host, () => {
+          server.off('error', onError);
+          this.server = server;
+          this.listener = server;
+          resolve(server);
+        });
+      });
+    }
 
     // HTTPS is not optional. A plain-http origin that is not localhost is not a
     // secure context, and the browser then withholds the service worker — so no
@@ -1720,7 +1814,7 @@ export class ClaudeCodeWebServer {
         reject(error);
       };
       server.once('error', onError);
-      server.listen(this.port, () => {
+      server.listen(this.port, this.host, () => {
         server.off('error', onError);
         this.server = secure;
         this.listener = server;

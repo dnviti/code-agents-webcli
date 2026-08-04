@@ -11,6 +11,7 @@ npx --allow-git=all github:dnviti/code-agents-webcli
 
 | | |
 | --- | --- |
+| **[Desktop app](desktop.md)** | Self-contained native Linux, Windows and macOS app: downloads, local-only operation, updates and troubleshooting. |
 | **[Installation](installation.md)** | Every install path, platform support, uninstalling, install troubleshooting |
 | **[GitHub OAuth](github-oauth.md)** | Creating the OAuth App, the allow-list, the installer account. You need this before anything works. |
 | **[Configuration](configuration.md)** | Every CLI flag and environment variable, the setup wizard, where state is stored |
