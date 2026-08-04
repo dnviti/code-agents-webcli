@@ -6,6 +6,7 @@ const path = require('node:path');
 const {
   CUSTOM_TITLE_BAR_HEIGHT,
   DEFAULT_WINDOW,
+  desktopPermissionAllowed,
   desktopWindowChrome,
   desktopCookie,
   isSafeExternalUrl,
@@ -39,6 +40,7 @@ describe('Electron desktop helpers', function () {
     }
     assert.match(builder, /--filesystem=home/);
     assert.match(builder, /asarUnpack:[\s\S]*@lydell/);
+    assert.match(builder, /asarUnpack:[\s\S]*dist\/public\/\*\*\/\*/);
     assert.match(builder, /appImage:[\s\S]*executableArgs:\s*\[\]/);
     assert.match(builder, /src\/public\/icons\/icon-512\.png/);
 
@@ -52,10 +54,26 @@ describe('Electron desktop helpers', function () {
     assert.match(release, /EXPECTED_TAG="v\$\{VERSION\}"/);
     assert.match(release, /git merge-base --is-ancestor "\$TAG_TARGET" origin\/main/);
     assert.match(release, /Smoke the native packaged application/);
+    assert.match(release, /find release -maxdepth 1 -type f -name ['"]\*\.AppImage['"]/);
+    assert.match(release, /xvfb-run -a "\$appimage" --headless/);
     assert.match(release, /sha256sum -c SHA256SUMS/);
     assert.match(release, /tag_name:\s*\$\{\{ needs\.verify\.outputs\.tag \}\}/);
     assert.match(release, /target_commitish:\s*\$\{\{ needs\.verify\.outputs\.commit_sha \}\}/);
     assert.match(release, /permissions:\s*\n\s*contents: write/);
+  });
+
+  it('grants clipboard access only to the embedded desktop origin', function () {
+    const local = 'http://127.0.0.1:43210';
+    for (const permission of [
+      'notifications',
+      'clipboard-read',
+      'clipboard-sanitized-write',
+    ]) {
+      assert.strictEqual(desktopPermissionAllowed(permission, `${local}/terminal`, local), true);
+      assert.strictEqual(desktopPermissionAllowed(permission, 'https://example.test', local), false);
+    }
+    assert.strictEqual(desktopPermissionAllowed('geolocation', local, local), false);
+    assert.strictEqual(desktopPermissionAllowed('clipboard-read', 'not a URL', local), false);
   });
 
   it('uses native-side controls in the PWA title bar and removes the Windows menu bar', function () {

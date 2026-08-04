@@ -237,7 +237,19 @@ jobs:
                 echo "The packaged Chromium sandbox helper is not configured securely." >&2
                 exit 1
               fi
-              output="$(xvfb-run -a "$executable")"
+              unpacked_output="$(xvfb-run -a "$executable")"
+              printf '%s\n' "$unpacked_output"
+              grep -F 'DESKTOP_SMOKE_OK' <<<"$unpacked_output"
+
+              # Exercise the real FUSE-mounted AppImage too. The unpacked app
+              # cannot catch nested ASAR/SquashFS path failures seen only under
+              # /tmp/.mount_* on an installed launch.
+              appimage="$(find release -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
+              if [ -z "$appimage" ] || [ ! -x "$appimage" ]; then
+                echo "Could not find an executable AppImage for smoke testing." >&2
+                exit 1
+              fi
+              output="$(xvfb-run -a "$appimage" --headless)"
               ;;
             Windows)
               executable="release/win-unpacked/code-agents-webcli.exe"
