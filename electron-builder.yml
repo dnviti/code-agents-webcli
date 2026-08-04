@@ -49,6 +49,9 @@ flatpak:
   runtime: org.freedesktop.Platform
   sdk: org.freedesktop.Sdk
   runtimeVersion: "24.08"
+  # electron-builder otherwise defaults the Electron base to 20.08, which is
+  # incompatible with the selected Freedesktop 24.08 runtime and SDK.
+  baseVersion: "24.08"
   branch: stable
   finishArgs:
     - --share=ipc
