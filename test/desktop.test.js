@@ -46,9 +46,16 @@ describe('Electron desktop helpers', function () {
       path.join(__dirname, '..', '.github', 'workflows', 'release-on-main.yml'),
       'utf8',
     );
+    assert.match(release, /push:\s*\n\s*tags:\s*\n\s*- ['"]v\*\.\*\.\*['"]/);
+    assert.match(release, /- ['"]!v\*\.\*\.\*-staging['"]/);
+    assert.doesNotMatch(release, /push:\s*\n\s*branches:/);
+    assert.match(release, /EXPECTED_TAG="v\$\{VERSION\}"/);
+    assert.match(release, /git merge-base --is-ancestor "\$TAG_TARGET" origin\/main/);
     assert.match(release, /Smoke the native packaged application/);
     assert.match(release, /sha256sum -c SHA256SUMS/);
-    assert.match(release, /target_commitish:\s*\$\{\{ github\.sha \}\}/);
+    assert.match(release, /tag_name:\s*\$\{\{ needs\.verify\.outputs\.tag \}\}/);
+    assert.match(release, /target_commitish:\s*\$\{\{ needs\.verify\.outputs\.commit_sha \}\}/);
+    assert.match(release, /permissions:\s*\n\s*contents: write/);
   });
 
   it('uses native-side controls in the PWA title bar and removes the Windows menu bar', function () {

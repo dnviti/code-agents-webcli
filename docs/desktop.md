@@ -20,6 +20,13 @@ desktop package is unsigned, so Windows SmartScreen and macOS Gatekeeper will
 show a warning. Only override that warning after checking that you downloaded
 the intended release and its checksum.
 
+Maintainers publish these packages by pushing a version tag such as `v6.0.0`
+from `main`. The tag must match the version in `package.json`; GitHub Actions
+then verifies the source, builds each package on its native operating system,
+runs the packaged smoke checks, and attaches all five installers plus
+`SHA256SUMS` to the GitHub Release for that exact tag. Rerunning the same tagged
+workflow repairs or replaces its assets without creating a different release.
+
 | Your computer | Download | Install or run |
 | --- | --- | --- |
 | Linux x64 | `*.AppImage` | Make it executable (`chmod +x <file>.AppImage`) and open it. No installation is needed. If it will not start, install FUSE/FUSE2 for your distribution or run it with `--appimage-extract-and-run`. |
@@ -37,10 +44,11 @@ instead: it is portable and does not add Flatpak sandboxing.
 ## Using the window
 
 Opening the app starts the loopback service and shows its local web interface in
-one window. The native menu offers the usual edit, view, window, help, and
-platform application commands; closing the window stops the local desktop
-session unless the operating system keeps the application running in its menu
-bar or dock.
+one window. Its personalized app bar replaces the ordinary window title bar;
+Windows keeps its native controls on the right and macOS keeps its traffic
+lights on the left. macOS still provides its platform application menu. Closing
+the window stops the local desktop session unless the operating system keeps
+the application running in its menu bar or dock.
 
 Use the same launcher, sessions, terminal, WebUI and local-project workflow as
 the server edition. It is deliberately a one-person, one-machine setup: do not
