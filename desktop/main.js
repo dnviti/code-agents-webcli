@@ -17,6 +17,7 @@ const {
 } = require('electron');
 const {
   CUSTOM_TITLE_BAR_HEIGHT,
+  desktopPermissionAllowed,
   desktopWindowChrome,
   desktopCookie,
   isSafeExternalUrl,
@@ -200,21 +201,11 @@ function installMenu() {
 }
 
 function installSessionPolicy(ses, origin) {
-  const normalizedOrigin = (value) => {
-    try {
-      return value ? new URL(value).origin : '';
-    } catch {
-      return '';
-    }
-  };
-  const permissionAllowed = (permission, requestingOrigin) =>
-    permission === 'notifications' && normalizedOrigin(requestingOrigin) === origin;
-
   ses.setPermissionCheckHandler((_webContents, permission, requestingOrigin) =>
-    permissionAllowed(permission, requestingOrigin));
+    desktopPermissionAllowed(permission, requestingOrigin, origin));
   ses.setPermissionRequestHandler((webContents, permission, callback, details) => {
-    const requestingOrigin = normalizedOrigin(details?.requestingUrl || webContents.getURL());
-    callback(permissionAllowed(permission, requestingOrigin));
+    const requestingOrigin = details?.requestingUrl || webContents.getURL();
+    callback(desktopPermissionAllowed(permission, requestingOrigin, origin));
   });
 }
 
@@ -367,7 +358,15 @@ async function smokeBridgeCommand(bridge, sessionId, options, marker) {
 
 async function runSmokeCheck(started) {
   const cookie = `${started.auth.name}=${encodeURIComponent(started.auth.value)}`;
-  const response = await fetch(`${started.url}/api/config`, { headers: { Cookie: cookie } });
+  const headers = { Cookie: cookie };
+  const page = await fetch(`${started.url}/`, { headers });
+  if (!page.ok) throw new Error(`Desktop smoke page failed with HTTP ${page.status}.`);
+  const html = await page.text();
+  if (!html.includes('<title>Code Agents Web CLI</title>')) {
+    throw new Error('Desktop smoke page did not contain the packaged browser shell.');
+  }
+
+  const response = await fetch(`${started.url}/api/config`, { headers });
   if (!response.ok) throw new Error(`Desktop smoke request failed with HTTP ${response.status}.`);
   const config = await response.json();
   if (!config.currentUser || !Array.isArray(config.supportedShells)) {

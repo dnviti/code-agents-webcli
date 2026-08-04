@@ -12,6 +12,11 @@ const DEFAULT_WINDOW = Object.freeze({
   isMaximized: false,
 });
 const CUSTOM_TITLE_BAR_HEIGHT = 40;
+const DESKTOP_PERMISSIONS = new Set([
+  'notifications',
+  'clipboard-read',
+  'clipboard-sanitized-write',
+]);
 
 /**
  * Let the web shell occupy the non-client area so Electron uses the same
@@ -147,6 +152,24 @@ function desktopCookie(baseUrl, token, name = 'code_agents_webcli_desktop_auth')
   };
 }
 
+function normalizedOrigin(value) {
+  try {
+    return value ? new URL(value).origin : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Grant the local desktop shell only the browser capabilities it actually
+ * uses. Clipboard access is needed by xterm's explicit copy/paste shortcuts;
+ * exact-origin matching keeps remote or embedded content denied.
+ */
+function desktopPermissionAllowed(permission, requestingOrigin, localOrigin) {
+  return DESKTOP_PERMISSIONS.has(permission)
+    && normalizedOrigin(requestingOrigin) === normalizedOrigin(localOrigin);
+}
+
 function mergePath(preferred, inherited, delimiter = path.delimiter) {
   const seen = new Set();
   return [preferred, inherited]
@@ -194,6 +217,7 @@ function loginShellPath(options = {}) {
 module.exports = {
   CUSTOM_TITLE_BAR_HEIGHT,
   DEFAULT_WINDOW,
+  desktopPermissionAllowed,
   desktopWindowChrome,
   desktopCookie,
   isSafeExternalUrl,
