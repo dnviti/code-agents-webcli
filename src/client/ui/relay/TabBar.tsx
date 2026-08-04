@@ -622,6 +622,7 @@ export function TabBar({
       {leading}
       <div
         ref={listRef}
+        data-window-drag="true"
         role="tablist"
         aria-label={ariaLabel}
         aria-orientation="horizontal"
@@ -690,7 +691,13 @@ export function TabBar({
           style={newStyle}
         >+</button>
       ) : null}
-      <div style={{ flex: tabsYieldFirst ? '0 0 8px' : 1, minWidth: 8 }} />
+      {/* The unoccupied run of the tab bar is useful native chrome in an
+          installed WCO window. Tabs and buttons remain no-drag regions, so a
+          session can still be selected or reordered normally. */}
+      <div
+        data-window-drag="true"
+        style={{ flex: tabsYieldFirst ? '0 0 8px' : 1, minWidth: 8 }}
+      />
       {trailing}
     </div>
   );

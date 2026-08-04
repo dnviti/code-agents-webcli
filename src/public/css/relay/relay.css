@@ -149,9 +149,10 @@
   display: none;
 }
 
-/* Window Controls Overlay: only the small brand is draggable. All session and
-   app controls retain ordinary pointer behaviour, and unsupported browsers see
-   none of these declarations because the root is published as hidden. */
+/* Window Controls Overlay: the small brand and unoccupied parts of the tab bar
+   are draggable. All session and app controls retain ordinary pointer
+   behaviour, and unsupported browsers see none of these declarations because
+   the root is published as hidden. */
 html[data-window-controls-overlay="visible"] [data-window-drag="true"] {
   -webkit-app-region: drag;
   app-region: drag;

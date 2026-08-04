@@ -146,7 +146,15 @@ describe('shell chrome', function () {
     assert.ok(/data-window-controls-overlay="visible"/.test(leftControls));
     assert.ok(/data-window-titlebar="true"/.test(leftControls));
     assert.ok(/data-window-safe-area="true"[^>]*left:138px[^>]*width:886px[^>]*height:40px/.test(leftControls));
-    assert.strictEqual((leftControls.match(/data-window-drag="true"/g) || []).length, 1);
+    const tabStrip = leftControls.match(/<div[^>]*role="tablist"[^>]*>/)?.[0] ?? '';
+    assert.ok(
+      /data-window-drag="true"/.test(tabStrip),
+      'the empty part of the tab strip moves the installed window',
+    );
+    assert.ok(
+      (leftControls.match(/data-window-drag="true"/g) || []).length >= 3,
+      'the brand and both possible empty tab-bar regions are draggable',
+    );
     assert.ok(/data-window-no-drag="true"/.test(leftControls));
     assert.strictEqual((leftControls.match(/role="tablist"/g) || []).length, 1);
 
