@@ -7,6 +7,8 @@
  */
 
 export type ProjectState =
+  | 'inspecting'
+  | 'composition_pending'
   | 'building'
   | 'running'
   | 'stopped'
@@ -21,6 +23,7 @@ export interface ProjectSummary {
   repoUrl: string | null;
   repoHost: string | null;
   targetId: string | null;
+  executionKind?: 'host' | 'container';
   /** Human-readable placement supplied by the server; null names legacy placement. */
   targetName?: string | null;
   state: ProjectState;
@@ -32,20 +35,44 @@ export interface ProjectSummary {
   lastPreservedCommit: string | null;
   /** Durable lifecycle history, including the exact WIP branch used to preserve work. */
   buildLog: BuildEvent[];
+  /** Desired active recipe. Null while a new project is awaiting first confirmation. */
+  compositionRevision: string | null;
+  /** Recipe applied to the retained runtime; null until a composed build succeeds. */
+  appliedCompositionRevision: string | null;
+}
+
+/** Project creation capability and the placement used by an ordinary create. */
+export interface ProjectAvailability {
+  available: boolean;
+  message?: string;
+  defaultExecutionKind?: 'host' | 'container';
+}
+
+/** Preserve placement capability while treating malformed optional fields as absent. */
+export function normalizeProjectAvailability(value: unknown): ProjectAvailability {
+  const input = value && typeof value === 'object'
+    ? value as Partial<ProjectAvailability>
+    : {};
+  const availability: ProjectAvailability = { available: input.available !== false };
+  if (typeof input.message === 'string') availability.message = input.message;
+  if (input.defaultExecutionKind === 'host' || input.defaultExecutionKind === 'container') {
+    availability.defaultExecutionKind = input.defaultExecutionKind;
+  }
+  return availability;
 }
 
 /** One row of the running list a 409 `run_limit` answer carries. */
 export interface RunningProjectInfo {
   id: string;
   name: string;
-  state?: ProjectState;
+  state: ProjectState;
   lastActivityAt: string;
   hasActiveWork: boolean;
 }
 
 /** One buffered build event streamed from /api/projects/:id/build. */
 export interface BuildEvent {
-  t: 'step' | 'progress' | 'state' | 'error' | 'preserve';
+  t: 'step' | 'progress' | 'state' | 'error' | 'preserve' | 'partial_install';
   step?: string;
   message?: string;
   percent?: number;

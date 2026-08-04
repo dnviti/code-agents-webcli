@@ -690,20 +690,15 @@ describe('multi-target environments', function () {
     }
   });
 
-  it('throws when targets exist but none is active, and touches nothing', async function () {
+  it('uses the host when targets exist but none is active, and touches no engine', async function () {
     const { manager, state } = multiManager();
     state.activeKey = null;
 
-    await assert.rejects(
-      manager.ensureFor({ id: 1, githubLogin: 'ada' }),
-      /no active deploy target/,
-    );
+    const env = await manager.ensureFor({ id: 1, githubLogin: 'ada' });
+    assert.strictEqual(env.kind, 'host');
   });
 
-  it('reports enabled when targets exist but none is active, so the loud error surfaces', async function () {
-    // The silent-host fallback: `enabled` answering false here would make the
-    // server's ensureEnvironment hand out the host environment, and the
-    // "no active deploy target" error would never reach anyone.
+  it('reports disabled-container mode when targets exist but none is active', async function () {
     const manager = new EnvironmentManager({
       config: createContainerConfig({}, {}), // legacy startup config disabled
       engine: forbiddenEngine(),
@@ -713,11 +708,8 @@ describe('multi-target environments', function () {
       configs: new Map(),
     });
 
-    assert.strictEqual(manager.enabled, true, 'unplaceable is not disabled');
-    await assert.rejects(
-      manager.ensureFor({ id: 1, githubLogin: 'ada' }),
-      /no active deploy target/,
-    );
+    assert.strictEqual(manager.enabled, false);
+    assert.strictEqual((await manager.ensureFor({ id: 1, githubLogin: 'ada' })).kind, 'host');
   });
 
   it('contacts no engine when the legacy resolution is disabled (empty targets table)', async function () {
@@ -741,7 +733,7 @@ describe('multi-target environments', function () {
     assert.strictEqual(manager.existing(1), env, 'existing() returns the host when disabled, as before');
   });
 
-  it('never falls back to the host engine when no target is active', async function () {
+  it('does not contact an engine when no target is active', async function () {
     const config = targetConfig();
     const manager = new EnvironmentManager({
       config,
@@ -751,10 +743,7 @@ describe('multi-target environments', function () {
       engines: new Map(),
       configs: new Map(),
     });
-    await assert.rejects(
-      manager.ensureFor({ id: 1, githubLogin: 'ada' }),
-      /no active deploy target/,
-    );
+    assert.strictEqual((await manager.ensureFor({ id: 1, githubLogin: 'ada' })).kind, 'host');
   });
 
   it('throws when the active target’s engine is unreachable', async function () {
@@ -908,13 +897,10 @@ describe('multi-target environments', function () {
     );
   });
 
-  it('treats an active key that names no target as no active target', async function () {
+  it('treats an active key that names no target as host-local mode', async function () {
     const { manager, state } = multiManager();
     state.activeKey = 'dangling-target-id';
-    await assert.rejects(
-      manager.ensureFor({ id: 1, githubLogin: 'ada' }),
-      /no active deploy target/,
-    );
+    assert.strictEqual((await manager.ensureFor({ id: 1, githubLogin: 'ada' })).kind, 'host');
   });
 
   describe('the legacy single-config path', function () {

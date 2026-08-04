@@ -1,23 +1,31 @@
 # Projects
 
-A **project** is a repository-shaped workspace: one project gets one dedicated
-container on an administrator-managed [deploy target](deploy-targets.md). The
-container belongs to the project, not to a tab or a terminal session. You can
-open several sessions in it; closing all of them, or closing the browser, does
-not remove the project or its container.
+A **project** is a repository-shaped workspace. With containerized environments
+explicitly enabled by the server operator and an active
+[deploy target](deploy-targets.md), it gets a dedicated container; with target
+**None**, it is a normal local workspace under
+`~/.cc-web/workspaces/<project-id>`. You can open several sessions in either
+kind, and closing the browser does not remove the project.
 
-Open **Settings → Projects** to create and manage projects. The target is chosen
-by the installation, not by the person creating the project. A project cannot
-run when there is no usable target; it fails with that reason rather than
-silently running on the server host.
+Open **Settings → Projects** to create and manage projects. New projects use the
+installation's active target by default. When that target is configured and
+available, turn on **Local Projects** to show, open and create projects on the
+server host instead. This is a per-user project choice; it does not change the
+active deploy target for anyone else. Selecting target **None** in the
+administrator settings still makes host-local placement the installation
+default. When the feature flag is off, projects are host-local and deploy-target
+configuration is unavailable.
 
 ## Create a project
 
 Give the project a name and, normally, an HTTP(S) Git repository URL.
-The app creates a container on the configured target and clones the repository
-inside it. The build view reports progress. It is safe to close that view:
-the build continues, and reopening it rejoins the same build instead of making
-another container.
+For a repository project, the app first inspects repository metadata and shows
+a [build recipe](project-composition.md#review-the-recipe-before-the-build).
+Choose the runtimes and review the forge tool before the first build. The app
+then creates the configured container, or uses the local machine's installed
+tools in host mode, and clones the inspected revision. The build view reports progress. It is safe
+to close that view: the build continues, and reopening it rejoins the same build
+instead of making another container.
 
 You may create a project with no repository for scratch work. Confirm the
 disposability notice before doing so: there is no upstream source and no place
@@ -43,6 +51,7 @@ data:
 | Location | What happens on a project rebuild or reclaim |
 | --- | --- |
 | Your persistent home directory mounted in the project container | Kept. Agent sign-ins, installed user tooling, shell configuration and other files stored there survive. |
+| Project overlay mounted at `/opt/code-agents-project` | Kept for this project only. Project-specific settings and additions survive; deleting the project removes the overlay. |
 | The repository checkout under `/workspace` | Disposable. A rebuild clones it afresh from its repository. |
 | Other paths in the project container outside your persistent home | Disposable. Do not use them as the only copy of important work. |
 
@@ -74,6 +83,14 @@ preservation** after fixing the cause, or explicitly choose the discard option
 to rebuild and lose the uncommitted checkout changes. Deleting a project is
 also explicit and removes its container and disposable worktree.
 
+Changing an existing project's build recipe is also a rebuild and takes this
+same preservation path. It does not replace the active recipe or container when
+preservation fails. The recipe includes the coding-agent CLIs the container can
+launch as well as repository languages and forge tooling. A recipe with an
+installation failure can still open the project as a partial install; retrying
+only failed items does not rebuild or discard work. See
+[Project composition and durable storage](project-composition.md).
+
 ## Running, stopping and reclaiming
 
 Project creation is unlimited. Running projects are limited per user by a value
@@ -93,9 +110,11 @@ container and checkout. Active agent work prevents both actions.
 
 ## Targets and storage requirements
 
-Projects run where their deploy target runs. They are not migrated merely
-because an administrator changes the active target, and the app never falls
-back to the server host when a target is unavailable.
+Each project keeps the placement chosen when it was created. Changing the
+active target or the **Local Projects** toggle does not migrate existing
+container or local projects. Selecting **None** places newly-created projects
+on the host by default; with a working target active, **Local Projects** applies
+the same host placement only to projects that user creates while it is on.
 
 The project worktree and the user's persistent home must be visible both to the
 server and to the project container. For Kubernetes, this requires the same

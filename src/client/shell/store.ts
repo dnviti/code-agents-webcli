@@ -14,6 +14,7 @@ import type { NotifySettings, SessionListItem } from '../types';
 import type { ConversationAttention } from '../../shared/chat-alerts';
 import type { ConfirmRequest } from '../ui/confirm';
 import { DEFAULT_CHAT_VIEW, type ChatViewSettings } from '../chat/view-settings';
+import type { WindowControlsOverlayState } from './window-controls-overlay';
 
 export type ShellTabStatus = 'running' | 'success' | 'error' | 'idle';
 
@@ -125,6 +126,8 @@ export interface ShellDialogs {
   deployTargets: boolean;
   /** The user's project containers and lifecycle controls. */
   projects: boolean;
+  /** Lightweight project-or-directory choice shown before creating a tab. */
+  workspaceChooser: boolean;
   /** The per-user environment size picker; only reachable when the server has environments. */
   environment: boolean;
   newSession: boolean;
@@ -213,6 +216,8 @@ export interface ShellState {
   theme: 'dark' | 'light';
   /** Set once at boot from `detectMobile()`; drives the bottom bar. */
   isMobile: boolean;
+  /** Browser-reported native-control-safe title-bar rectangle. */
+  windowControlsOverlay: WindowControlsOverlayState;
   /** Whether the on-screen terminal key strip is showing (mobile only). */
   keysVisible: boolean;
   /**
@@ -246,6 +251,8 @@ export interface ShellState {
   user: string | null;
   /** Sign-out URL, when the deployment has auth enabled. */
   logoutUrl: string | null;
+  /** Operator-only feature gate reported by `/api/config`. */
+  containerizedEnvironmentsEnabled: boolean;
   /**
    * Whether this window can become an installed app.
    *
@@ -295,6 +302,7 @@ const INITIAL: ShellState = {
   paletteOpen: false,
   theme: 'dark',
   isMobile: false,
+  windowControlsOverlay: { visible: false, x: 0, y: 0, width: 0, height: 0 },
   keysVisible: true,
   ctrlLatched: false,
   dialogs: {
@@ -302,6 +310,7 @@ const INITIAL: ShellState = {
     runtimeProfiles: false,
     deployTargets: false,
     projects: false,
+    workspaceChooser: false,
     environment: false,
     newSession: false,
     terminalOptions: false,
@@ -343,6 +352,7 @@ const INITIAL: ShellState = {
   banner: null,
   user: null,
   logoutUrl: null,
+  containerizedEnvironmentsEnabled: false,
   install: 'unsupported',
   chatBypassPermissions: false,
   // Replaced by `applySettings` during boot, before the first render. On until

@@ -41,6 +41,7 @@ describe('deploy target routes', function () {
   let enginesInManager;
   let createdConfigs;
   let projectRefs;
+  let routeDeps;
 
   /** The engine the injected factory hands out; behavior set per test. */
   function fakeEngine() {
@@ -73,8 +74,8 @@ describe('deploy target routes', function () {
       res.locals.authContext = { user: currentUser, authSessionId: null };
       next();
     });
-    app.use(
-      createDeployTargetRoutes({
+    routeDeps = {
+        deployTargetsEnabled: true,
         deployTargets: store,
         deployTargetDataDir: dataDir,
         createDeployEngine: (config) => {
@@ -89,9 +90,10 @@ describe('deploy target routes', function () {
         projectIdsForTarget: (id) => projectRefs.get(id) || [],
         getDeploySetting: (key) => database.getSetting(key),
         setDeploySetting: (key, value) => database.setSetting(key, value),
+        deleteDeploySetting: (key) => database.deleteSetting(key),
         getInstallerUserId: () => installerUserId,
-      }),
-    );
+      };
+    app.use(createDeployTargetRoutes(routeDeps));
 
     await new Promise((resolve) => {
       server = app.listen(0, '127.0.0.1', resolve);
@@ -124,12 +126,25 @@ describe('deploy target routes', function () {
     });
   }
 
+  it('returns 404 from every administration surface when the feature is disabled', async function () {
+    routeDeps.deployTargetsEnabled = false;
+    assert.strictEqual((await req('GET', '/api/admin/deploy-targets')).status, 404);
+    assert.strictEqual((await req('POST', '/api/admin/deploy-targets', { name: 'x', engine: 'docker' })).status, 404);
+    assert.strictEqual((await req('GET', '/api/admin/deploy-targets/active')).status, 404);
+    assert.strictEqual((await req('PUT', '/api/admin/deploy-targets/active', { targetId: null })).status, 404);
+    assert.strictEqual((await req('GET', '/api/admin/deploy-settings')).status, 404);
+    assert.strictEqual((await req('PUT', '/api/admin/deploy-settings', {})).status, 404);
+    assert.deepStrictEqual(store.listTargets(), []);
+  });
+
   it('answers 401 to an unauthenticated caller on every route', async function () {
     currentUser = null;
     assert.strictEqual((await req('GET', '/api/admin/deploy-targets')).status, 401);
     assert.strictEqual((await req('POST', '/api/admin/deploy-targets', {})).status, 401);
     assert.strictEqual((await req('GET', '/api/admin/deploy-targets/active')).status, 401);
     assert.strictEqual((await req('PUT', '/api/admin/deploy-targets/active', { targetId: null })).status, 401);
+    assert.strictEqual((await req('GET', '/api/admin/deploy-settings')).status, 401);
+    assert.strictEqual((await req('PUT', '/api/admin/deploy-settings', {})).status, 401);
     assert.strictEqual((await req('DELETE', '/api/admin/deploy-targets/x')).status, 401);
   });
 
@@ -141,6 +156,7 @@ describe('deploy target routes', function () {
 
     assert.strictEqual((await req('POST', '/api/admin/deploy-targets', { name: 'x', engine: 'docker' })).status, 403);
     assert.strictEqual((await req('PUT', '/api/admin/deploy-targets/active', { targetId: null })).status, 403);
+    assert.strictEqual((await req('GET', '/api/admin/deploy-settings')).status, 403);
   });
 
   it('answers 403 not_installer when no installer is pinned at all', async function () {
@@ -170,6 +186,72 @@ describe('deploy target routes', function () {
       Origin: baseUrl,
     });
     assert.strictEqual(withOrigin.status, 200);
+  });
+
+  it('persists storage warning settings and preserves omitted values', async function () {
+    const defaults = await (await req('GET', '/api/admin/deploy-settings')).json();
+    assert.strictEqual(defaults.usageWarnUserBytes, null);
+    assert.strictEqual(defaults.usageWarnAdminBytes, null);
+
+    const saved = await req('PUT', '/api/admin/deploy-settings', {
+      runLimitPerUser: 4,
+      idleStopMinutes: 30,
+      idleReclaimMinutes: 60,
+      usageWarnUserBytes: 1024,
+      usageWarnAdminBytes: 4096,
+    });
+    assert.strictEqual(saved.status, 200);
+    assert.deepStrictEqual(await saved.json(), {
+      runLimitPerUser: 4,
+      idleStopMinutes: 30,
+      idleReclaimMinutes: 60,
+      usageWarnUserBytes: 1024,
+      usageWarnAdminBytes: 4096,
+    });
+
+    await req('PUT', '/api/admin/deploy-settings', {
+      runLimitPerUser: 5,
+      idleStopMinutes: 40,
+      idleReclaimMinutes: 80,
+    });
+    let stored = await (await req('GET', '/api/admin/deploy-settings')).json();
+    assert.strictEqual(stored.usageWarnUserBytes, 1024);
+    assert.strictEqual(stored.usageWarnAdminBytes, 4096);
+
+    await req('PUT', '/api/admin/deploy-settings', {
+      runLimitPerUser: 5,
+      idleStopMinutes: 40,
+      idleReclaimMinutes: 80,
+      usageWarnUserBytes: null,
+      usageWarnAdminBytes: null,
+    });
+    stored = await (await req('GET', '/api/admin/deploy-settings')).json();
+    assert.strictEqual(stored.usageWarnUserBytes, null);
+    assert.strictEqual(stored.usageWarnAdminBytes, null);
+    assert.strictEqual(database.getSetting('deploy.usageWarnUserBytes'), null);
+    assert.strictEqual(database.getSetting('deploy.usageWarnAdminBytes'), null);
+  });
+
+  it('rejects invalid storage warning settings atomically', async function () {
+    database.setSetting('deploy.usageWarnUserBytes', '100');
+    database.setSetting('deploy.usageWarnAdminBytes', '200');
+    for (const [field, value] of [
+      ['usageWarnUserBytes', -1],
+      ['usageWarnAdminBytes', 1.5],
+      ['usageWarnUserBytes', 'not-bytes'],
+      ['usageWarnAdminBytes', Number.MAX_SAFE_INTEGER + 1],
+    ]) {
+      const response = await req('PUT', '/api/admin/deploy-settings', {
+        runLimitPerUser: 3,
+        idleStopMinutes: 30,
+        idleReclaimMinutes: 60,
+        [field]: value,
+      });
+      assert.strictEqual(response.status, 400, `${field}=${value} should be rejected`);
+      assert.strictEqual((await response.json()).error, 'invalid_settings');
+      assert.strictEqual(database.getSetting('deploy.usageWarnUserBytes'), '100');
+      assert.strictEqual(database.getSetting('deploy.usageWarnAdminBytes'), '200');
+    }
   });
 
   it('creates, lists, reads, updates and deletes a target', async function () {

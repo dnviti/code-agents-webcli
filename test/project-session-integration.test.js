@@ -6,7 +6,11 @@ const os = require('os');
 const path = require('path');
 
 const { SessionStore } = require('../dist/server/services/session-store.js');
-const { createSessionRoutes, retireProjectSessions } = require('../dist/server/routes/sessions.js');
+const {
+  createSessionRoutes,
+  retireProjectSessions,
+  suspendProjectSessions,
+} = require('../dist/server/routes/sessions.js');
 const { createWorkspaceRoutes } = require('../dist/server/routes/workspace.js');
 const { MessageProcessor } = require('../dist/server/websocket/messages.js');
 const { ChatSessionManager } = require('../dist/server/chat/manager.js');
@@ -922,6 +926,35 @@ describe('project session integration', function () {
     assert.deepStrictEqual(releasedResources.sort(), retired.slice().sort());
     assert(order.indexOf('stop:project-chat') < order.indexOf('release:project-chat'));
     assert(order.indexOf('release:project-chat') < order.indexOf('transcript:project-chat'));
+    assert.strictEqual(saves, 1);
+  });
+
+  it('suspends project runtimes without deleting their sessions or transcripts', async function () {
+    const sessions = new Map([
+      ['project-chat', record({ id: 'project-chat', projectId: 'project-1', surface: 'chat', active: true, agent: 'claude', connections: new Set(['ws-1']) })],
+      ['project-shell', record({ id: 'project-shell', ownerSessionId: 'project-chat', active: true, agent: 'terminal', connections: new Set(['ws-2']) })],
+      ['other-project', record({ id: 'other-project', projectId: 'project-2' })],
+    ]);
+    const stopped = []; const released = []; let saves = 0;
+    const suspended = await suspendProjectSessions({
+      claudeSessions: sessions, webSocketConnections: new Map(), baseFolder: os.tmpdir(), dev: false,
+      validatePath: () => ({ valid: true, path: os.tmpdir() }), getSelectedWorkingDir: () => null,
+      createSessionRecord: (params) => record(params), getRuntimeBridge: () => null,
+      stopSessionRuntime: async (session) => { stopped.push(session.id); session.active = false; session.agent = null; },
+      saveSessionsToDisk: async () => { saves++; },
+      transcriptStore: { ensureTranscript: async () => {} }, historyStore: {},
+      getScreenSnapshot: () => [], disposeRecorder: () => {},
+      sessionStore: { getSessionMetadata: async () => ({}) },
+      releaseProjectSessionResources: (sessionId) => { released.push(sessionId); },
+    }, 'project-1');
+
+    assert.deepStrictEqual(suspended.sort(), ['project-chat', 'project-shell']);
+    assert.deepStrictEqual(stopped.sort(), suspended.slice().sort());
+    assert.deepStrictEqual(released.sort(), suspended.slice().sort());
+    assert.deepStrictEqual([...sessions.keys()], ['project-chat', 'project-shell', 'other-project']);
+    assert.strictEqual(sessions.get('project-chat').connections.size, 0);
+    assert.strictEqual(sessions.get('project-shell').connections.size, 0);
+    assert.strictEqual(sessions.get('project-chat').retiring, false);
     assert.strictEqual(saves, 1);
   });
 

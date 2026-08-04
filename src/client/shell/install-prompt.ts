@@ -29,14 +29,18 @@ let deferred: InstallPromptEvent | null = null;
  * `beforeinstallprompt`, so without this an installed iOS app would still be
  * told it could be installed.
  */
-function isInstalled(): boolean {
+export function isInstalled(
+  targetWindow: Pick<Window, 'matchMedia'> = window,
+  targetNavigator: { standalone?: boolean } = navigator as { standalone?: boolean },
+): boolean {
   try {
-    if (window.matchMedia('(display-mode: standalone)').matches) return true;
-    if (window.matchMedia('(display-mode: minimal-ui)').matches) return true;
+    if (targetWindow.matchMedia('(display-mode: window-controls-overlay)').matches) return true;
+    if (targetWindow.matchMedia('(display-mode: standalone)').matches) return true;
+    if (targetWindow.matchMedia('(display-mode: minimal-ui)').matches) return true;
   } catch {
     // matchMedia is missing only in very old engines; fall through.
   }
-  return (navigator as { standalone?: boolean }).standalone === true;
+  return targetNavigator.standalone === true;
 }
 
 /**

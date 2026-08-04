@@ -8,6 +8,8 @@ export interface HealthRoutesDeps {
   folderMode: boolean;
   baseFolder: string;
   aliases: Aliases;
+  /** Whether containerized environments and deploy-target administration are exposed. */
+  containerizedEnvironmentsEnabled: boolean;
   getSelectedWorkingDir(userId: number): string | null;
   getUserPreferences(userId: number): UserPreferences;
 }
@@ -51,6 +53,7 @@ export function createHealthRoutes(deps: HealthRoutesDeps): Router {
       selectedWorkingDir: deps.getSelectedWorkingDir(authContext.user.id),
       baseFolder: deps.baseFolder,
       aliases: deps.aliases,
+      containerizedEnvironmentsEnabled: deps.containerizedEnvironmentsEnabled,
       currentUser: authContext.user,
       logoutUrl: '/auth/logout',
       // On the boot request rather than a second one of its own, so the first

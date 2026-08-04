@@ -70,12 +70,15 @@ cc-web --help
 
 ### Per-user environments
 
-Off unless you ask for it; see [Per-user environments](user-environments.md)
-for the prerequisites, where the data lives, and the operator commands.
+The entire containerized-environment and deploy-target capability is off by
+default. Set `CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED=true` before starting
+the server to expose it, then select a deploy target or use the legacy flags
+below. See [Per-user environments](user-environments.md) for the prerequisites,
+where the data lives, and the operator commands.
 
 | Flag | Default | What it does |
 | --- | --- | --- |
-| `--containers` | off | Give every signed-in user their own container. |
+| `--containers` | off | Request legacy per-user containers. Has no effect unless `CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED=true`. |
 | `--container-engine <engine>` | `docker` | `docker` or `podman`. |
 | `--container-image <image>` | `docker.io/library/node:22-bookworm` | Base image each environment starts from. |
 | `--container-cpus <n>` | unlimited | CPU limit per environment. |
@@ -93,7 +96,8 @@ cc-web env rm <name> [--purge-data]          # remove one, optionally with its d
 
 ### Deploy targets
 
-Once the feature is on, the place environments run is configured in the web UI
+After `CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED=true` is set and the server is
+restarted, the place environments run can be configured in the web UI
 as a set of deploy targets rather than through these flags. You can name
 several targets, switch the active one at runtime, and let each carry its own
 connection secrets. See [Deploy targets](deploy-targets.md).
@@ -184,7 +188,7 @@ Useful in a container or a unit file, where flags are awkward.
 | `GITHUB_ALLOWED_USER_IDS` | `--allowed-github-ids` | empty |
 | `GITHUB_ALLOW_ANY_USER` | `--allow-any-github-user` | `false` — only the exact string `true` enables it |
 | `CODE_AGENTS_WEBCLI_DATA_DIR` | `--data-dir` | `~/.code-agents-webcli` |
-| `CODE_AGENTS_WEBCLI_CONTAINERS` | `--containers` | `false` — only the exact string `true` enables it |
+| `CODE_AGENTS_WEBCLI_CONTAINERS` | `--containers` | `false` — requests legacy container mode after the feature gate is enabled |
 | `CODE_AGENTS_WEBCLI_CONTAINER_ENGINE` | `--container-engine` | `docker` |
 | `CODE_AGENTS_WEBCLI_CONTAINER_IMAGE` | `--container-image` | `docker.io/library/node:22-bookworm` |
 | `CODE_AGENTS_WEBCLI_CONTAINER_CPUS` | `--container-cpus` | unlimited |
@@ -198,6 +202,7 @@ These have **no flag** and can only be set through the environment:
 
 | Variable | Default | What it does |
 | --- | --- | --- |
+| `CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED` | `false` | Only the exact string `true` enables containerized environments and exposes deploy-target configuration. Stored targets are ignored while off. |
 | `CLAUDE_SESSION_HOURS` | `5` | Length of the rolling usage window, in hours. |
 | `CLAUDE_CONFIG_DIR` | `$HOME` | Where the Claude CLI keeps `.claude.json`. Read for a cached account reading, never for credentials. |
 | `DEBUG` | unset | If set, logs raw pseudo-terminal output per session. Extremely noisy, and independent of `--dev`. |

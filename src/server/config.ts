@@ -47,6 +47,10 @@ export function createConfig(options: ServerOptions): ServerState {
     dataDir: options.dataDir || process.env.CODE_AGENTS_WEBCLI_DATA_DIR || null,
     encryptionKey:
       options.encryptionKey || process.env.CODE_AGENTS_WEBCLI_ENCRYPTION_KEY || null,
+    // Deliberately environment-only: container execution and deploy-target
+    // administration remain dark until the operator opts this installation in.
+    containerizedEnvironmentsEnabled:
+      process.env.CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED === 'true',
     sessionDurationHours,
     aliases,
     startTime: Date.now(),

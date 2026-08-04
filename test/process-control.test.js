@@ -139,6 +139,8 @@ describe('tracked container process control', function() {
         () => output.includes('TRACKED_READY') && output.includes(shellPrompt),
         'interactive tracked-child startup',
       );
+      terminal.write("printf 'TRACKED_INPUT_%s\\n' READY\r");
+      await waitUntil(() => output.includes('TRACKED_INPUT_READY'), 'interactive terminal input');
 
       const [leader, start] = fs.readFileSync(controlFile, 'utf8').trim().split(/\s+/);
       let job;
@@ -206,8 +208,8 @@ describe('tracked container process control', function() {
     const controlFile = path.join(dir, 'runtime.pid');
     const doneFile = path.join(dir, 'runtime.done');
     const delayedAnchor = TRACKED_PROCESS_GROUP_WRAPPER.replace(
-      '"$@" <&0 >&1 2>&2 &',
-      'sleep 2\n"$@" <&0 >&1 2>&2 &',
+      'if [ "$tty" = "1" ]; then',
+      'if [ "$tty" = "1" ]; then\n  sleep 2',
     );
     let terminal;
     try {

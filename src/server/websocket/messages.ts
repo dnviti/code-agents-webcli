@@ -789,10 +789,12 @@ export class MessageProcessor {
   } {
     const manager = this.deps.projectsManager;
     if (!manager) throw new Error('Project filesystem access is not configured.');
+    const access = prepared.containerAccess;
+    if (!access) throw new Error('Local project files use normal host filesystem access.');
     const runtimeRoot = session.projectWorkingDirKind === 'container'
-      ? validateProjectContainerPath(prepared.containerAccess, session.workingDir)
+      ? validateProjectContainerPath(access, session.workingDir)
       : validateProjectContainerPath(
-          prepared.containerAccess,
+          access,
           prepared.environment.toContainerPath(session.workingDir),
         );
     const workspace = new ProjectContainerFiles(manager, prepared, runtimeRoot);
@@ -804,7 +806,7 @@ export class MessageProcessor {
     let temporary: ProjectContainerFiles | undefined;
     const filesFor = (filePath: string): ProjectContainerFiles => {
       if (!path.posix.isAbsolute(filePath)) return workspace;
-      const normalized = validateProjectContainerPath(prepared.containerAccess, filePath);
+      const normalized = validateProjectContainerPath(access, filePath);
       if (normalized === runtimeRoot || normalized.startsWith(`${runtimeRoot}/`)) return workspace;
       // Preserve ACP's scratch-file handoff, but in the project container's
       // `/tmp` namespace. It must never become the server's coincident `/tmp`.

@@ -18,10 +18,10 @@ export class FolderBrowser {
     this.app = app;
   }
 
-  async show(): Promise<void> {
+  async show(options: { host?: boolean } = {}): Promise<void> {
     const shell = shellStore.getSnapshot();
     const active = shell.tabs.find((tab) => tab.id === shell.activeId);
-    this.projectContext = active?.projectId
+    this.projectContext = !options.host && active?.projectId
       ? { projectId: active.projectId, sessionId: active.id }
       : null;
     this.currentProjectPath = null;

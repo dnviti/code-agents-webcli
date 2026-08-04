@@ -8,16 +8,30 @@ const { ClaudeCodeWebServer } = require('../dist/server/index.js');
 
 const ENCRYPTION_KEY = Buffer.alloc(32, 17).toString('base64');
 const COOKIE = 'code_agents_webcli_session';
+const FEATURE_ENV = 'CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED';
 
-async function makeHarness() {
+function createServer(options, featureEnabled) {
+  const previous = process.env[FEATURE_ENV];
+  if (featureEnabled) process.env[FEATURE_ENV] = 'true';
+  else delete process.env[FEATURE_ENV];
+  try {
+    return new ClaudeCodeWebServer(options);
+  } finally {
+    if (previous === undefined) delete process.env[FEATURE_ENV];
+    else process.env[FEATURE_ENV] = previous;
+  }
+}
+
+async function makeHarness({ featureEnabled = true, containers = false } = {}) {
   const dataDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'project-server-composition-'));
-  const appServer = new ClaudeCodeWebServer({
+  const appServer = createServer({
     dataDir,
     githubClientId: 'composition-client',
     githubClientSecret: 'composition-secret',
     allowedGitHubIds: 'composition-user',
     encryptionKey: ENCRYPTION_KEY,
-  });
+    containers,
+  }, featureEnabled);
   const owner = appServer.database.upsertGitHubUser({
     githubId: 'composition-user',
     githubLogin: 'composition-owner',
@@ -67,6 +81,32 @@ async function makeHarness() {
 describe('project server composition', function () {
   this.timeout(15_000);
 
+  it('keeps containerized environments and deploy-target configuration off by default', async function () {
+    const harness = await makeHarness({ featureEnabled: false, containers: true });
+    const { appServer, request } = harness;
+    try {
+      assert.strictEqual(appServer.containerizedEnvironmentsEnabled, false);
+      assert.strictEqual(appServer.environments.enabled, false, 'legacy flags cannot bypass the feature gate');
+
+      const config = await request('GET', '/api/config');
+      assert.strictEqual(config.status, 200);
+      assert.strictEqual(config.body.containerizedEnvironmentsEnabled, false);
+
+      assert.strictEqual((await request('GET', '/api/admin/deploy-targets')).status, 404);
+      assert.strictEqual((await request('GET', '/api/admin/deploy-settings')).status, 404);
+      assert.strictEqual(
+        (await request('POST', '/api/admin/deploy-targets', { name: 'hidden', engine: 'docker' })).status,
+        404,
+      );
+
+      const projects = await request('GET', '/api/projects');
+      assert.strictEqual(projects.status, 200);
+      assert.strictEqual(projects.body.availability.defaultExecutionKind, 'host');
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('mounts project/host/admin APIs and protects durable target references', async function () {
     const harness = await makeHarness();
     const { appServer, owner, request } = harness;
@@ -100,7 +140,13 @@ describe('project server composition', function () {
       });
       assert.deepStrictEqual(updated, {
         status: 200,
-        body: { runLimitPerUser: 2, idleStopMinutes: 5, idleReclaimMinutes: 10 },
+        body: {
+          runLimitPerUser: 2,
+          idleStopMinutes: 5,
+          idleReclaimMinutes: 10,
+          usageWarnUserBytes: null,
+          usageWarnAdminBytes: null,
+        },
       });
       const persisted = await request('GET', '/api/admin/deploy-settings');
       assert.deepStrictEqual(persisted.body, updated.body);

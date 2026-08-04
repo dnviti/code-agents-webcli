@@ -191,6 +191,66 @@ describe('connected-host routes', function () {
     assert.strictEqual((await res.json()).error, 'not_found');
   });
 
+  it('awaits live credential scrubbing before deleting the encrypted source row', async function () {
+    projectStore.upsertConnectedHostToken(OWNER.id, 'github.com', 'private');
+    const order = [];
+    const originalDelete = projectStore.deleteConnectedHost.bind(projectStore);
+    const scopedStore = Object.create(projectStore);
+    scopedStore.deleteConnectedHost = (...args) => { order.push('delete'); return originalDelete(...args); };
+    const app = makeApp({
+      projectStore: scopedStore,
+      disconnectHostCredentials: async (userId, host) => {
+        assert.strictEqual(userId, OWNER.id);
+        assert.strictEqual(host, 'github.com');
+        assert.strictEqual(projectStore.listConnectedHosts(OWNER.id).length, 1, 'source exists while scrub runs');
+        await Promise.resolve();
+        order.push('scrub');
+      },
+    }, OWNER);
+    serverInfo = await listen(app);
+    const response = await req(serverInfo.baseUrl, 'DELETE', '/api/connected-hosts/github.com');
+    assert.strictEqual(response.status, 204);
+    assert.deepStrictEqual(order, ['scrub', 'delete']);
+    assert.strictEqual(projectStore.listConnectedHosts(OWNER.id).length, 0);
+  });
+
+  it('keeps the encrypted row when live credential scrubbing fails', async function () {
+    projectStore.upsertConnectedHostToken(OWNER.id, 'github.com', 'must-remain-retryable');
+    const app = makeApp({
+      projectStore,
+      disconnectHostCredentials: async () => { throw new Error('must-remain-retryable'); },
+    }, OWNER);
+    serverInfo = await listen(app);
+    const response = await req(serverInfo.baseUrl, 'DELETE', '/api/connected-hosts/github.com');
+    assert.strictEqual(response.status, 503);
+    const body = await response.json();
+    assert.strictEqual(body.error, 'credential_scrub_failed');
+    assert.ok(!JSON.stringify(body).includes('must-remain-retryable'));
+    assert.strictEqual(projectStore.listConnectedHosts(OWNER.id).length, 1);
+    assert.strictEqual(projectStore.credentialFor(OWNER.id, 'github.com'), 'must-remain-retryable');
+  });
+
+  it('does not delete twice when lifecycle synchronization owns source deletion', async function () {
+    projectStore.upsertConnectedHostToken(OWNER.id, 'github.com', 'private');
+    let routeDeletes = 0;
+    const scopedStore = Object.create(projectStore);
+    scopedStore.deleteConnectedHost = (...args) => {
+      routeDeletes += 1;
+      return projectStore.deleteConnectedHost(...args);
+    };
+    const app = makeApp({
+      projectStore: scopedStore,
+      disconnectHostCredentials: async (userId, host) => {
+        assert.strictEqual(projectStore.deleteConnectedHost(userId, host), true);
+        return true;
+      },
+    }, OWNER);
+    serverInfo = await listen(app);
+    const response = await req(serverInfo.baseUrl, 'DELETE', '/api/connected-hosts/github.com');
+    assert.strictEqual(response.status, 204);
+    assert.strictEqual(routeDeletes, 0);
+  });
+
   it('validates create input', async function () {
     const app = appFor(OWNER);
     serverInfo = await listen(app);
@@ -229,5 +289,136 @@ describe('connected-host routes', function () {
     });
     assert.strictEqual(create.status, 200);
     assert.strictEqual((await create.json()).host.host, 'git.example.com:8443');
+  });
+
+  it('validates an explicitly selected forge through the bounded exact-host seam', async function () {
+    const calls = [];
+    const app = makeApp({
+      projectStore,
+      tokenValidator: { validate: async (input) => { calls.push(input); return { ok: true, scopes: ['repo'] }; } },
+    }, OWNER);
+    serverInfo = await listen(app);
+    const token = 'not-in-response';
+    const create = await req(serverInfo.baseUrl, 'POST', '/api/connected-hosts', {
+      host: 'github.com', token, forgeKind: 'github',
+    });
+    assert.strictEqual(create.status, 200);
+    assert.strictEqual(calls.length, 1);
+    assert.deepStrictEqual({
+      host: calls[0].host, url: calls[0].url, forgeKind: calls[0].forgeKind,
+      redirect: calls[0].redirect, timeoutMs: calls[0].timeoutMs, maxResponseBytes: calls[0].maxResponseBytes,
+    }, { host: 'github.com', url: 'https://github.com', forgeKind: 'github', redirect: 'error', timeoutMs: 5000, maxResponseBytes: 65536 });
+    const body = await create.json();
+    assert.strictEqual(body.host.validationStatus, 'valid');
+    assert.ok(!JSON.stringify(body).includes(token));
+  });
+
+  it('does not let delayed validation overwrite a newer credential generation', async function () {
+    let releaseValidation;
+    let validationStarted;
+    const started = new Promise((resolve) => { validationStarted = resolve; });
+    const gate = new Promise((resolve) => { releaseValidation = resolve; });
+    const app = makeApp({
+      projectStore,
+      tokenValidator: {
+        validate: async () => {
+          validationStarted();
+          await gate;
+          return { ok: true, scopes: ['repo'] };
+        },
+      },
+    }, OWNER);
+    serverInfo = await listen(app);
+
+    const staleRequest = req(serverInfo.baseUrl, 'POST', '/api/connected-hosts', {
+      host: 'github.com', token: 'superseded-token', forgeKind: 'github',
+    });
+    await started;
+    const replacement = projectStore.upsertConnectedHostToken(OWNER.id, 'github.com', 'current-token');
+    releaseValidation();
+
+    const response = await staleRequest;
+    assert.strictEqual(response.status, 409);
+    assert.strictEqual((await response.json()).error, 'credential_changed');
+    assert.strictEqual(projectStore.credentialFor(OWNER.id, 'github.com'), 'current-token');
+    const current = projectStore.listConnectedHosts(OWNER.id)[0];
+    assert.strictEqual(current.credentialRevision, replacement.credentialRevision);
+    assert.strictEqual(current.validationStatus, 'unvalidated');
+  });
+
+  it('keeps replacement validation and live refresh inside the integration critical section', async function () {
+    const order = [];
+    const app = makeApp({
+      projectStore,
+      tokenValidator: {
+        validate: async () => { order.push('validate'); return { ok: true }; },
+      },
+      synchronizeHostCredentialReplacement: async (userId, host, mutation) => {
+        assert.strictEqual(userId, OWNER.id);
+        assert.strictEqual(host, 'github.com');
+        order.push('lock');
+        const result = await mutation();
+        order.push(`refresh:${projectStore.credentialFor(userId, host)}`);
+        return result;
+      },
+    }, OWNER);
+    serverInfo = await listen(app);
+    const response = await req(serverInfo.baseUrl, 'POST', '/api/connected-hosts', {
+      host: 'github.com', token: 'replacement-token', forgeKind: 'github',
+    });
+    assert.strictEqual(response.status, 200);
+    assert.deepStrictEqual(order, ['lock', 'validate', 'refresh:replacement-token']);
+  });
+
+  it('records a safe invalid result and permits a replacement without exposing the token', async function () {
+    let attempts = 0;
+    const app = makeApp({
+      projectStore,
+      tokenValidator: { validate: async () => (++attempts === 1
+        ? { ok: false, status: 401, code: 'expired', message: 'Credential expired.' }
+        : { ok: true }) },
+    }, OWNER);
+    serverInfo = await listen(app);
+    const firstToken = 'first-private-token';
+    const failed = await req(serverInfo.baseUrl, 'POST', '/api/connected-hosts', {
+      host: 'gitlab.com', token: firstToken, forgeKind: 'gitlab',
+    });
+    assert.strictEqual(failed.status, 401);
+    const failedBody = await failed.json();
+    assert.deepStrictEqual(failedBody, { error: 'credential_invalid', code: 'expired', message: 'Credential expired.' });
+    assert.ok(!JSON.stringify(failedBody).includes(firstToken));
+    assert.strictEqual(projectStore.listConnectedHosts(OWNER.id)[0].validationStatus, 'invalid');
+    const replacement = await req(serverInfo.baseUrl, 'POST', '/api/connected-hosts', {
+      host: 'gitlab.com', token: 'replacement-private-token', forgeKind: 'gitlab',
+    });
+    assert.strictEqual(replacement.status, 200);
+    assert.strictEqual(projectStore.listConnectedHosts(OWNER.id)[0].validationStatus, 'valid');
+  });
+
+  it('redacts a credential echoed by a failing validation adapter', async function () {
+    const token = 'private-validator-token';
+    const app = makeApp({
+      projectStore,
+      tokenValidator: { validate: async () => ({ ok: false, status: 403, code: `bad-${token}`, message: `Remote rejected ${token}` }) },
+    }, OWNER);
+    serverInfo = await listen(app);
+    const response = await req(serverInfo.baseUrl, 'POST', '/api/connected-hosts', {
+      host: 'github.com', token, forgeKind: 'github',
+    });
+    assert.strictEqual(response.status, 401);
+    const body = await response.json();
+    assert.ok(!JSON.stringify(body).includes(token));
+    assert.ok(!JSON.stringify(projectStore.listConnectedHosts(OWNER.id)).includes(token));
+    assert.match(body.message, /\[redacted\]/);
+  });
+
+  it('rejects unavailable OAuth approval rather than pretending it is connected', async function () {
+    const app = appFor(OWNER);
+    serverInfo = await listen(app);
+    const response = await req(serverInfo.baseUrl, 'POST', '/api/connected-hosts', {
+      host: 'github.com', token: 'private', credentialKind: 'oauth',
+    });
+    assert.strictEqual(response.status, 501);
+    assert.strictEqual((await response.json()).error, 'oauth_approval_unavailable');
   });
 });

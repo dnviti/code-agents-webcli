@@ -584,6 +584,20 @@ describe('codex app-server effort', function () {
     assert.strictEqual(start.params.config, undefined);
   });
 
+  it('keeps effort selectable when model/list metadata is unavailable or still loading', async function () {
+    const h = harness({
+      environment: { kind: 'container', toContainerPath: (value) => `/container${value}` },
+    });
+    await boot(h);
+
+    assert.deepStrictEqual(
+      only(h.events, 'session')[0].capabilities.efforts.map((level) => level.value),
+      ['low', 'medium', 'high'],
+    );
+    await h.adapter.setEffort('high');
+    assert.strictEqual(only(h.events, 'effort').pop().effort, 'high');
+  });
+
   it('reports the level codex says the thread is on, not the one that was asked for', async function () {
     const h = harness({ effort: 'xhigh' });
     await boot(h, { reasoningEffort: 'low' });

@@ -1,6 +1,7 @@
 import express, { NextFunction, Request, Response, Router } from 'express';
 import { PathValidation, SessionRecord } from '../types.js';
 import {
+  AttachmentSessionRef,
   AttachmentStoreLike,
   DEFAULT_MAX_ATTACHMENT_BYTES,
   attachmentUrlFor,
@@ -81,15 +82,14 @@ function sessionFor(
   }
 
   // A project cwd can be a container path (`/tmp`, `/etc`, ...), whose string
-  // may also name an unrelated host path. This host-backed store cannot safely
-  // represent either project namespace without the manager's lease and path
-  // translation, so reject every project before validatePath or filesystem IO.
+  // may also name an unrelated host path. Never pass it through host path
+  // validation: the project-aware attachment store acquires the manager lease,
+  // restores the authoritative namespace and performs confinement there.
   if (
     (session.projectId !== undefined && session.projectId !== null)
     || session.projectWorkingDirKind !== undefined
   ) {
-    res.status(409).json({ error: 'unsupported_attachment_namespace' });
-    return null;
+    return Object.assign(session, { validatedDir: session.workingDir });
   }
 
   const validation = deps.validatePath(session.workingDir, session.ownerUserId);
@@ -99,6 +99,28 @@ function sessionFor(
   }
 
   return Object.assign(session, { validatedDir: validation.path });
+}
+
+function attachmentSessionRef(
+  session: SessionRecord & { validatedDir: string },
+): AttachmentSessionRef {
+  // Preserve the actual project record so an authoritative cwd repair made
+  // during manager admission is persisted on the same object. Non-project
+  // sessions still use the revalidated host path rather than the stale string
+  // from their record.
+  if (session.projectId) {
+    return Object.assign(session, {
+      projectId: session.projectId,
+      projectWorkingDirKind: session.projectWorkingDirKind,
+    });
+  }
+  return {
+    id: session.id,
+    ownerUserId: session.ownerUserId,
+    workingDir: session.validatedDir,
+    projectId: session.projectId,
+    projectWorkingDirKind: session.projectWorkingDirKind,
+  };
 }
 
 export function createChatAttachmentRoutes(deps: ChatAttachmentRoutesDeps): Router {
@@ -123,13 +145,7 @@ export function createChatAttachmentRoutes(deps: ChatAttachmentRoutesDeps): Rout
 
       try {
         const stored = await deps.attachmentStore.save(
-          {
-            id: session.id,
-            ownerUserId: session.ownerUserId,
-            workingDir: session.validatedDir,
-            projectId: session.projectId,
-            projectWorkingDirKind: session.projectWorkingDirKind,
-          },
+          attachmentSessionRef(session),
           { filename, declaredMime, bytes },
         );
 
@@ -185,13 +201,7 @@ export function createChatAttachmentRoutes(deps: ChatAttachmentRoutesDeps): Rout
 
       try {
         const { stream, serve, bytes } = await deps.attachmentStore.openForDownload(
-          {
-            id: session.id,
-            ownerUserId: session.ownerUserId,
-            workingDir: session.validatedDir,
-            projectId: session.projectId,
-            projectWorkingDirKind: session.projectWorkingDirKind,
-          },
+          attachmentSessionRef(session),
           req.params.name as string,
         );
 

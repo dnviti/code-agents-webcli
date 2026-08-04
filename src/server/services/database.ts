@@ -158,6 +158,12 @@ export class AppDatabase {
     return row ? mapUserRow(row) : null;
   }
 
+  /** Safe account metadata for maintenance/reporting jobs; never auth/session data. */
+  listUsers(): AuthenticatedUser[] {
+    const rows = this.db.prepare('SELECT * FROM users ORDER BY id ASC').all() as UserRow[];
+    return rows.map(mapUserRow);
+  }
+
   getUserSetting(userId: number, key: string): string | null {
     return this.getSetting(`user:${userId}:${key}`);
   }
@@ -509,6 +515,7 @@ export class AppDatabase {
         repo_url TEXT,
         repo_host TEXT,
         target_id TEXT REFERENCES deploy_targets(id),
+        execution_kind TEXT NOT NULL DEFAULT 'container',
         tier_id TEXT,
         state TEXT NOT NULL,
         state_detail TEXT,
@@ -522,6 +529,7 @@ export class AppDatabase {
         last_preserved_commit TEXT,
         last_preserved_branch TEXT,
         composition_revision TEXT,
+        applied_composition_revision TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -573,6 +581,71 @@ export class AppDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_connected_hosts_user
         ON connected_hosts(user_id);
+
+      /* Immutable, inspectable runtime recipes.  Revisions are UUIDs rather
+       * than a mutable JSON blob on projects so a confirmation can always say
+       * exactly which inspected tree it applied. */
+      CREATE TABLE IF NOT EXISTS project_compositions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        catalog_version TEXT NOT NULL,
+        detected_json TEXT NOT NULL,
+        chosen_json TEXT NOT NULL,
+        source_oid TEXT,
+        source_ref TEXT,
+        forge_kind TEXT,
+        forge_host TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_project_compositions_project
+        ON project_compositions(project_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_project_compositions_user
+        ON project_compositions(user_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS composition_installations (
+        id TEXT PRIMARY KEY,
+        composition_id TEXT NOT NULL REFERENCES project_compositions(id) ON DELETE CASCADE,
+        item_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'installing', 'installed', 'failed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        installed_version TEXT,
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(composition_id, item_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_composition_installations_composition
+        ON composition_installations(composition_id, status);
+
+      CREATE TABLE IF NOT EXISTS git_identities (
+        id TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_git_identities_global
+        ON git_identities(user_id) WHERE project_id IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_git_identities_project
+        ON git_identities(user_id, project_id) WHERE project_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS storage_usage_snapshots (
+        id TEXT PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        total_bytes INTEGER NOT NULL,
+        breakdown_json TEXT NOT NULL,
+        errors_json TEXT NOT NULL DEFAULT '[]',
+        free_bytes INTEGER,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_storage_usage_snapshots_user
+        ON storage_usage_snapshots(user_id, created_at DESC);
     `);
 
     // The project a session runs inside. Nullable, and a null is load-bearing:
@@ -595,6 +668,39 @@ export class AppDatabase {
     // collision suffix. Keep the exact recovery ref across later build-log
     // resets and server restarts.
     this.addColumnIfMissing('projects', 'last_preserved_branch', 'TEXT');
+    // A legacy project has no applied recipe.  Keeping this nullable makes the
+    // distinction visible instead of pretending its old container was built
+    // from a revision it never saw.
+    this.addColumnIfMissing('projects', 'applied_composition_revision', 'TEXT');
+
+    // Connected-host secrets remain in credential_encrypted.  These columns
+    // are deliberately metadata-only and safe for list/admin responses.
+    this.addColumnIfMissing('connected_hosts', 'forge_kind', 'TEXT');
+    this.addColumnIfMissing('connected_hosts', 'credential_kind', 'TEXT');
+    this.addColumnIfMissing('connected_hosts', 'validation_status', 'TEXT');
+    this.addColumnIfMissing('connected_hosts', 'last_validated_at', 'TEXT');
+    this.addColumnIfMissing('connected_hosts', 'validation_error_code', 'TEXT');
+    this.addColumnIfMissing('connected_hosts', 'validation_error_message', 'TEXT');
+    this.addColumnIfMissing('connected_hosts', 'credential_revision', 'INTEGER NOT NULL DEFAULT 0');
+    // Old rows were all manual tokens. Backfill display/preference metadata
+    // without touching (or decrypting) the credential itself.
+    this.db.exec(`
+      UPDATE connected_hosts
+         SET credential_kind = kind
+       WHERE credential_kind IS NULL AND kind IN ('token', 'oauth');
+      UPDATE connected_hosts
+         SET validation_status = 'unvalidated'
+       WHERE validation_status IS NULL AND credential_encrypted IS NOT NULL;
+      UPDATE connected_hosts
+         SET credential_revision = 1
+       WHERE credential_revision = 0 AND credential_encrypted IS NOT NULL;
+
+      CREATE TRIGGER IF NOT EXISTS project_compositions_immutable
+      BEFORE UPDATE ON project_compositions
+      BEGIN
+        SELECT RAISE(ABORT, 'project composition revisions are immutable');
+      END;
+    `);
 
     // Which surface a session runs on. Added after the fact, so it is nullable
     // and a null reads as 'terminal' — every row that predates chat mode is a
@@ -625,6 +731,11 @@ export class AppDatabase {
     // The model this conversation overrides its runtime/profile default with.
     // Nullable and null-by-default: every row written before this column
     // existed has no override recorded, which is exactly what a null means.
+    // Local projects were introduced after project containers. Existing rows
+    // are containers by definition; new rows opt into host execution
+    // explicitly when the administrator selects no deploy target.
+    this.addColumnIfMissing('projects', 'execution_kind', "TEXT NOT NULL DEFAULT 'container'");
+
     this.addColumnIfMissing('runtime_sessions', 'chat_model_override', 'TEXT');
 
     // The model this conversation is fixed to, written from what its last launch

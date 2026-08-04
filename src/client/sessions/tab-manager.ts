@@ -1370,7 +1370,7 @@ export class SessionTabManager {
 
   createNewSession(): void {
     this.app.isCreatingNewSession = true;
-    void this.app.folderBrowser.show();
+    shellStore.patchSlice('dialogs', { workspaceChooser: true });
   }
 
   // ---------------------------------------------------------------------------

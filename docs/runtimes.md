@@ -5,8 +5,12 @@ way they start.
 
 ## Supported runtimes
 
-None of these are bundled. The app runs whatever is already installed on the
-host, and a missing CLI only matters when you press its button.
+None of these are bundled into the application image. Host and non-project
+sessions run whatever is already installed. A project container can instead
+install Claude Code, Codex, pi, Grok Build, Qwen Code, Kimi Code or Oh My Pi
+from its reviewed [build recipe](project-composition.md); those pinned installs
+and their sign-ins live in the user's persistent home. Cursor Agent and
+Antigravity CLI still require a manual install in that home.
 
 | Runtime | Default label | Binary | Also searched in |
 | --- | --- | --- | --- |

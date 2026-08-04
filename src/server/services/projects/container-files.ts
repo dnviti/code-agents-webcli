@@ -166,18 +166,21 @@ const MAX_ACP_TEXT_BYTES = 8 * 1024 * 1024;
 export class ProjectContainerFiles {
   readonly root: string;
   private readonly node: string;
+  private readonly access: NonNullable<PreparedProject['containerAccess']>;
 
   constructor(
     private readonly manager: ProjectsSessionApi,
     readonly prepared: PreparedProject,
     root: string,
   ) {
-    this.root = validateProjectContainerPath(prepared.containerAccess, root);
+    if (!prepared.containerAccess) throw new Error('project is running on the host');
+    this.access = prepared.containerAccess;
+    this.root = validateProjectContainerPath(this.access, root);
     this.node = prepared.environment.nodePath;
   }
 
   lifetime(value: string): ProjectContainerPathLifetime {
-    return classifyProjectContainerPath(this.prepared.containerAccess, value);
+    return classifyProjectContainerPath(this.access, value);
   }
 
   /** Lexically confine a request to this browser/session root. */
@@ -185,7 +188,7 @@ export class ProjectContainerFiles {
     let candidate: string;
     try {
       candidate = validateProjectContainerPath(
-        this.prepared.containerAccess,
+        this.access,
         path.posix.resolve(this.root, requested || '.'),
       );
     } catch {
@@ -212,7 +215,7 @@ export class ProjectContainerFiles {
   async realpath(value: string): Promise<string | null> {
     let requested: string;
     try {
-      requested = validateProjectContainerPath(this.prepared.containerAccess, value);
+      requested = validateProjectContainerPath(this.access, value);
     } catch {
       return null;
     }
@@ -220,12 +223,12 @@ export class ProjectContainerFiles {
       const result = await execProjectContainerCommand(
         this.manager,
         this.prepared,
-        this.prepared.containerAccess.root,
+        this.access.root,
         this.node,
         ['-e', REALPATH_SCRIPT, requested],
       );
       return validateProjectContainerPath(
-        this.prepared.containerAccess,
+        this.access,
         result.stdout.trim(),
       );
     } catch (error) {
@@ -336,7 +339,7 @@ export class ProjectContainerFiles {
       throw error;
     }
     return validateProjectContainerPath(
-      this.prepared.containerAccess,
+      this.access,
       result.stdout.trim(),
     );
   }
@@ -372,6 +375,23 @@ export class ProjectContainerFiles {
     }
     const destination = await this.confineWritable(requested);
     await this.writeFile(destination.path, bytes, destination.exclusive);
+  }
+
+  /**
+   * Write arbitrary bytes beneath the session root with the same symlink-aware
+   * parent creation used by ACP text writes.
+   *
+   * Chat attachments need this path rather than `writeFile` directly: their
+   * private `.cc-web/attachments` directory may not exist yet, and every
+   * component must be admitted before the binary stream is opened.
+   */
+  async writeBinary(requested: string, bytes: Buffer): Promise<string> {
+    if (bytes.length > MAX_BUFFERED_WRITE_BYTES) {
+      throw new Error('project container file exceeds the buffered write limit');
+    }
+    const destination = await this.confineWritable(requested);
+    await this.writeFile(destination.path, bytes, destination.exclusive);
+    return destination.path;
   }
 
   private async confineWritable(
@@ -464,8 +484,8 @@ export class ProjectContainerFiles {
     range: { start: number; end: number } | null,
   ): Promise<void> {
     const child = await this.manager.spawnSessionFileCommand(
-      this.prepared.containerAccess.ownerUserId,
-      this.prepared.containerAccess.projectId,
+      this.access.ownerUserId,
+      this.access.projectId,
       this.prepared.leaseId,
       {
         operation: 'read',
@@ -544,8 +564,8 @@ export class ProjectContainerFiles {
       throw new Error('project container file exceeds the buffered write limit');
     }
     const child = await this.manager.spawnSessionFileCommand(
-      this.prepared.containerAccess.ownerUserId,
-      this.prepared.containerAccess.projectId,
+      this.access.ownerUserId,
+      this.access.projectId,
       this.prepared.leaseId,
       { operation: 'write', path: value, exclusive },
     );

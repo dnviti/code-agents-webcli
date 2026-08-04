@@ -462,13 +462,15 @@ export interface TabBarProps {
   trailing?: React.ReactNode;
   /** Accessible name for the tab strip, for pages that render more than one. */
   ariaLabel?: string;
+  /** Native title bars reserve fixed actions first; tabs take the remainder. */
+  tabsYieldFirst?: boolean;
   style?: React.CSSProperties;
 }
 
 export function TabBar({
   tabs = [], activeId, onSelect, onClose, onNew, onReorder, dragPayload,
   onTabContextMenu, onTabDoubleClick, onTabAuxClose, leading, trailing,
-  ariaLabel = 'Tabs', style,
+  ariaLabel = 'Tabs', tabsYieldFirst = false, style,
 }: TabBarProps): React.JSX.Element {
   const [hoverNew, setHoverNew] = React.useState(false);
   const [hoverOverflow, setHoverOverflow] = React.useState(false);
@@ -581,7 +583,8 @@ export function TabBar({
     display: 'flex', alignItems: 'stretch', height: 36, background: 'var(--tab-bar)', borderBottom: '1px solid var(--border)', ...style,
   };
   const listStyle: React.CSSProperties = {
-    display: 'flex', alignItems: 'stretch', minWidth: 0, overflowX: 'auto', overflowY: 'hidden',
+    display: 'flex', alignItems: 'stretch', flex: tabsYieldFirst ? '1 1 0' : undefined,
+    minWidth: 0, overflowX: 'auto', overflowY: 'hidden',
     // The strip is one row tall; a horizontal scrollbar inside it would eat a
     // third of its height. Keep native two-axis gesture negotiation so a
     // horizontal swipe moves the tabs while a vertical swipe can still belong
@@ -687,7 +690,7 @@ export function TabBar({
           style={newStyle}
         >+</button>
       ) : null}
-      <div style={{ flex: 1, minWidth: 8 }} />
+      <div style={{ flex: tabsYieldFirst ? '0 0 8px' : 1, minWidth: 8 }} />
       {trailing}
     </div>
   );

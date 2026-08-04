@@ -7,6 +7,9 @@ const os = require('os');
 const path = require('path');
 
 const { createWorkspaceRoutes } = require('../dist/server/routes/workspace.js');
+const { createChatAttachmentRoutes } = require('../dist/server/routes/chat-attachments.js');
+const { AttachmentStore } = require('../dist/server/services/attachment-store.js');
+const { ProjectAwareAttachmentStore } = require('../dist/server/services/project-attachment-store.js');
 const { MessageProcessor } = require('../dist/server/websocket/messages.js');
 
 const USER = {
@@ -276,6 +279,16 @@ async function startServer(sessions, manager) {
     res.locals.authContext = { user: USER, authSessionId: 'auth' };
     next();
   });
+  manager.attachmentStore = new ProjectAwareAttachmentStore(
+    new AttachmentStore(),
+    manager,
+    async () => { manager.saves += 1; },
+  );
+  app.use(createChatAttachmentRoutes({
+    claudeSessions: sessions,
+    attachmentStore: manager.attachmentStore,
+    validatePath: () => { throw new Error('project container path reached host validation'); },
+  }));
   app.use(createWorkspaceRoutes({
     claudeSessions: sessions,
     saveSessionsToDisk: async () => { manager.saves += 1; },
@@ -379,6 +392,35 @@ describe('arbitrary project container workspaces', function () {
     assert(manager.execs.some((entry) => entry.command === 'env' && entry.args.includes('git')));
     assert(manager.execs.some((entry) => entry.command === 'env' && entry.args.includes('gh')));
     assert(manager.execs.every((entry) => entry.userId === USER.id && entry.projectId === 'project-1'));
+    assert.strictEqual(manager.ensured.length, manager.released.length);
+  });
+
+  it('uploads, serves and resolves chat attachments inside the project container', async function () {
+    const uploaded = await fetch(
+      `${base}/api/sessions/session-1/chat-attachments?name=notes.txt`,
+      { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: Buffer.from('container attachment') },
+    );
+    assert.strictEqual(uploaded.status, 200);
+    const attachment = await uploaded.json();
+    assert.strictEqual(attachment.name, 'notes.txt');
+    assert.strictEqual(attachment.path.startsWith(`${containerPath}/.cc-web/attachments/`), true);
+    assert.strictEqual(fs.existsSync(path.join(hostTwin, '.cc-web', 'attachments')), false,
+      'an equal-looking host path must remain untouched');
+    assert.strictEqual(
+      fs.readFileSync(path.join(containerRoot, attachment.path.slice(1)), 'utf8'),
+      'container attachment',
+    );
+
+    const downloaded = await fetch(`${base}${attachment.url}`);
+    assert.strictEqual(downloaded.status, 200);
+    assert.strictEqual(await downloaded.text(), 'container attachment');
+
+    const resolved = await manager.attachmentStore.resolveForTurn(
+      sessions.get('session-1'),
+      { ...attachment, path: '/tmp/forged-host-path', name: 'forged.txt' },
+    );
+    assert.strictEqual(resolved.path, attachment.path);
+    assert.strictEqual(resolved.name, 'notes.txt');
     assert.strictEqual(manager.ensured.length, manager.released.length);
   });
 

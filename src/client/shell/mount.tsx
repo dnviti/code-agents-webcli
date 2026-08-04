@@ -72,6 +72,10 @@ export function mountShell(app: App): void {
     return;
   }
 
+  // The static title bar covers startup before React is ready. Remove it only
+  // once the real shell can take over, avoiding a blank native-control strip.
+  document.getElementById('bootTitlebar')?.remove();
+
   // Before applyTheme, so the very first call can already reach the terminal.
   themedApp = app;
   applyTheme(readStoredTheme());
@@ -531,8 +535,10 @@ async function createProjectSession(app: App, projectId: string): Promise<void> 
       await app.joinSession(data.sessionId);
     }
     app.loadSessions();
+    app.isCreatingNewSession = false;
   } catch (error) {
     app.startPromptRequested = false;
+    app.isCreatingNewSession = false;
     console.error('Failed to create project session:', error);
     showError('Could not open a session for this project.');
   }
@@ -583,6 +589,14 @@ function buildActions(app: App): ShellActions {
 
     createSession: (name, workingDir) => void createNewSession(app, name, workingDir),
     openProjectSession: (projectId) => void createProjectSession(app, projectId),
+    chooseNewTabDirectory: () => {
+      shellStore.patchSlice('dialogs', { workspaceChooser: false });
+      void app.folderBrowser.show({ host: true });
+    },
+    cancelNewTab: () => {
+      app.isCreatingNewSession = false;
+      shellStore.patchSlice('dialogs', { workspaceChooser: false });
+    },
     startShell: (shell) => startTerminalShell(app, shell),
     runCommand: (command) => runTerminalCommand(app, command),
 

@@ -4,6 +4,7 @@ import { Button } from '../../ui/relay/Button';
 import { Dialog } from '../../ui/relay/Dialog';
 import { Input } from '../../ui/relay/Input';
 import { Select } from '../../ui/relay/Select';
+import { usePhone } from '../../ui/touch';
 
 /**
  * Deploy targets: the places this server runs containers, edited by the
@@ -50,17 +51,30 @@ interface DeploySettings {
   runLimitPerUser: number;
   idleStopMinutes: number;
   idleReclaimMinutes: number;
+  usageWarnUserBytes: number | null;
+  usageWarnAdminBytes: number | null;
 }
 
 interface DeploySettingsForm {
   runLimitPerUser: string;
   idleStopMinutes: string;
   idleReclaimMinutes: string;
+  usageWarnUserGiB: string;
+  usageWarnAdminGiB: string;
 }
 
 export interface DeployTargetsDialogProps {
   open: boolean;
   onClose(): void;
+}
+
+export function warningGiBToBytes(gib: string): number | null | undefined {
+  if (!gib.trim()) return null;
+  const value = Number(gib);
+  const bytes = Math.round(value * (1024 ** 3));
+  return Number.isFinite(value) && value >= 0 && Number.isSafeInteger(bytes) && (value === 0 || bytes > 0)
+    ? bytes
+    : undefined;
 }
 
 const labelStyle: React.CSSProperties = {
@@ -162,6 +176,7 @@ export function DeployTargetsDialog({
   open,
   onClose,
 }: DeployTargetsDialogProps): React.JSX.Element {
+  const isPhone = usePhone();
   const [state, setState] = React.useState<LoadState | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [notice, setNotice] = React.useState<string | null>(null);
@@ -200,6 +215,8 @@ export function DeployTargetsDialog({
           runLimitPerUser: String(settings.runLimitPerUser),
           idleStopMinutes: String(settings.idleStopMinutes),
           idleReclaimMinutes: String(settings.idleReclaimMinutes),
+          usageWarnUserGiB: settings.usageWarnUserBytes === null ? '' : String(settings.usageWarnUserBytes / (1024 ** 3)),
+          usageWarnAdminGiB: settings.usageWarnAdminBytes === null ? '' : String(settings.usageWarnAdminBytes / (1024 ** 3)),
         });
       })
       .catch((err: Error) => setError(`Could not load deploy targets: ${err.message}`));
@@ -335,12 +352,21 @@ export function DeployTargetsDialog({
 
   const saveDeploySettings = (): void => {
     if (!settingsForm) return;
+    const usageWarnUserBytes = warningGiBToBytes(settingsForm.usageWarnUserGiB);
+    const usageWarnAdminBytes = warningGiBToBytes(settingsForm.usageWarnAdminGiB);
+    if (usageWarnUserBytes === undefined || usageWarnAdminBytes === undefined) {
+      setError('Storage warning points must be zero or a positive number of GiB, or blank to disable. Fractions are allowed.');
+      return;
+    }
     const settings: DeploySettings = {
       runLimitPerUser: Number(settingsForm.runLimitPerUser),
       idleStopMinutes: Number(settingsForm.idleStopMinutes),
       idleReclaimMinutes: Number(settingsForm.idleReclaimMinutes),
+      usageWarnUserBytes,
+      usageWarnAdminBytes,
     };
-    if (Object.values(settings).some((value) => !Number.isInteger(value) || value <= 0)) {
+    if ([settings.runLimitPerUser, settings.idleStopMinutes, settings.idleReclaimMinutes]
+      .some((value) => !Number.isInteger(value) || value <= 0)) {
       setError('Project limits and idle windows must be positive whole numbers.');
       return;
     }
@@ -351,7 +377,10 @@ export function DeployTargetsDialog({
     setBusy(true);
     setError(null);
     request('/api/admin/deploy-settings', 'PUT', settings)
-      .then(() => setNotice('Project lifecycle settings saved.'))
+      .then(() => {
+        setNotice('Project lifecycle settings saved.');
+        load();
+      })
       .catch((err: Error) => setError(err.message))
       .finally(() => setBusy(false));
   };
@@ -386,7 +415,7 @@ export function DeployTargetsDialog({
           {error}
         </div>
       ) : null}
-      {notice ? <div style={{ ...noteStyle, marginBottom: 12 }}>{notice}</div> : null}
+      {notice ? <div role="status" style={{ ...noteStyle, marginBottom: 12 }}>{notice}</div> : null}
 
       {!state && !error ? <div style={noteStyle}>Loading…</div> : null}
 
@@ -400,13 +429,13 @@ export function DeployTargetsDialog({
               value={state.activeTargetId ?? ''}
               onChange={(e) => setActive(e.target.value)}
               options={[
-                { value: '', label: 'None — new work cannot start' },
+                { value: '', label: 'None — run new work on this machine' },
                 ...state.targets.map((t) => ({ value: t.id, label: t.name })),
               ]}
             />
             <div style={{ ...noteStyle, marginTop: 4 }}>
-              Switching moves new work only: environments already running stay on the target
-              they started on until they stop.
+              Switching changes new work only. None uses local host execution; existing
+              project placement never changes.
             </div>
           </div>
 
@@ -422,7 +451,7 @@ export function DeployTargetsDialog({
               <div style={{ fontFamily: 'var(--font-sans)', fontSize: 'var(--text-ui)', marginBottom: 8 }}>
                 Project lifecycle
               </div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 10 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: isPhone ? '1fr' : 'repeat(3, minmax(0, 1fr))', gap: 10 }}>
                 <div>
                   <div style={labelStyle}>Running projects per user</div>
                   <Input
@@ -463,7 +492,47 @@ export function DeployTargetsDialog({
               <div style={{ ...noteStyle, margin: '8px 0' }}>
                 The limit is per user. Idle projects stop with their worktree intact; reclaimed projects rebuild from their repository.
               </div>
-              <Button variant="secondary" disabled={readOnly || busy} onClick={saveDeploySettings}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: 10, marginTop: 12 }}>
+                <div>
+                  <div style={labelStyle}>Warn user at GiB</div>
+                  <Input
+                    aria-label="User storage warning in GiB"
+                    type="number"
+                    min="0"
+                    step="any"
+                    aria-invalid={warningGiBToBytes(settingsForm.usageWarnUserGiB) === undefined}
+                    invalid={warningGiBToBytes(settingsForm.usageWarnUserGiB) === undefined}
+                    aria-describedby="storage-warning-help"
+                    placeholder="Disabled"
+                    disabled={readOnly}
+                    value={settingsForm.usageWarnUserGiB}
+                    onChange={(event) => setSettingsForm({ ...settingsForm, usageWarnUserGiB: event.target.value })}
+                  />
+                </div>
+                <div>
+                  <div style={labelStyle}>Warn administrator at GiB</div>
+                  <Input
+                    aria-label="Administrator storage warning in GiB"
+                    type="number"
+                    min="0"
+                    step="any"
+                    aria-invalid={warningGiBToBytes(settingsForm.usageWarnAdminGiB) === undefined}
+                    invalid={warningGiBToBytes(settingsForm.usageWarnAdminGiB) === undefined}
+                    aria-describedby="storage-warning-help"
+                    placeholder="Disabled"
+                    disabled={readOnly}
+                    value={settingsForm.usageWarnAdminGiB}
+                    onChange={(event) => setSettingsForm({ ...settingsForm, usageWarnAdminGiB: event.target.value })}
+                  />
+                </div>
+              </div>
+              <div id="storage-warning-help" style={{ ...noteStyle, margin: '8px 0' }}>
+                Enter zero to warn on any measured usage, a positive number (fractions are allowed), or leave it blank to disable that warning. Warning points are informational: storage is never quota-enforced, and passing either point does not stop work.
+              </div>
+              {(warningGiBToBytes(settingsForm.usageWarnUserGiB) === undefined || warningGiBToBytes(settingsForm.usageWarnAdminGiB) === undefined) ? (
+                <div role="alert" style={{ ...noteStyle, color: 'var(--destructive)', marginBottom: 8 }}>Use zero, a positive number of GiB, or leave the field blank.</div>
+              ) : null}
+              <Button variant="secondary" disabled={readOnly || busy || warningGiBToBytes(settingsForm.usageWarnUserGiB) === undefined || warningGiBToBytes(settingsForm.usageWarnAdminGiB) === undefined} onClick={saveDeploySettings}>
                 Save project settings
               </Button>
             </section>
@@ -473,7 +542,7 @@ export function DeployTargetsDialog({
             <div style={{ ...noteStyle, marginBottom: 16 }}>
               {state.legacyContainersEnabled
                 ? 'No targets yet — the startup configuration still decides where containers run. Add a target to manage placement from here.'
-                : 'No targets yet. Add one to run projects in containers. Project work never falls back to this machine.'}
+                : 'No targets yet. Add one to run projects in containers, or keep None to run them on this machine.'}
             </div>
           ) : null}
 

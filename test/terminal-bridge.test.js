@@ -98,6 +98,18 @@ describe('TerminalBridge', function() {
     assert.strictEqual(session.terminalMode, 'command');
   });
 
+  it('uses the Bash shell advertised by a project container', function() {
+    const config = bridge.buildLaunchConfig({
+      mode: 'shell',
+      shell: 'sh',
+      environment: { kind: 'container', shells: ['bash'] },
+    });
+
+    assert.strictEqual(config.command, 'bash');
+    assert.deepStrictEqual(config.args, ['-i']);
+    assert.strictEqual(config.runtimeLabel, 'bash');
+  });
+
   it('rejects unsupported shells', function() {
     assert.throws(() => {
       bridge.buildLaunchConfig({ mode: 'shell', shell: 'fish' });

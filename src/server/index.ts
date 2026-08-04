@@ -18,7 +18,11 @@ import {
 } from './types.js';
 import { createConfig, createUsageAnalyticsOptions } from './config.js';
 import { registerRoutes } from './routes/index.js';
-import { retireProjectSessions, type SessionRoutesDeps } from './routes/sessions.js';
+import {
+  retireProjectSessions,
+  suspendProjectSessions,
+  type SessionRoutesDeps,
+} from './routes/sessions.js';
 import {
   ResolvedProfile,
   resolveConversationRung,
@@ -55,7 +59,8 @@ import { TranscriptStore } from './services/transcript-store.js';
 import { HistoryStore } from './services/history-store.js';
 import { SessionTeardownRegistry } from './services/session-teardown.js';
 import { PasteStore } from './services/paste-store.js';
-import { AttachmentStore } from './services/attachment-store.js';
+import { AttachmentStore, type AttachmentStoreLike } from './services/attachment-store.js';
+import { ProjectAwareAttachmentStore } from './services/project-attachment-store.js';
 import { readBuildInfo } from './services/build-info.js';
 import { UpdateChecker } from './services/update-check.js';
 import { ensureCertificates, createHttpsOnlyPort, caCertificateHandler } from './services/tls.js';
@@ -83,6 +88,11 @@ import { EncryptionKeyRing } from './services/encryption.js';
 import { DeployTargetStore } from './services/deploy-targets.js';
 import { ProjectStore } from './services/projects/store.js';
 import { ProjectManager } from './services/projects/manager.js';
+import { ProjectEnvironmentManager } from './services/projects/environment.js';
+import { RepositoryInspector } from './services/composition/repository-inspector.js';
+import { DefaultCompositionRuntime } from './services/composition/runtime.js';
+import { StorageUsageManager } from './services/storage-usage-manager.js';
+import { ConnectedHostValidator } from './services/connected-host-validator.js';
 import { UsageReader } from './services/usage-reader.js';
 import { UsageAnalytics } from './services/usage-analytics.js';
 import { readCachedClaudeAccount } from './services/claude-account.js';
@@ -195,7 +205,7 @@ export class ClaudeCodeWebServer {
   private chatManager: ChatSessionManager;
   private historyStore: HistoryStore;
   private pasteStore: PasteStore;
-  private attachmentStore: AttachmentStore;
+  private attachmentStore: AttachmentStoreLike;
   private runtimeProfiles: RuntimeProfileStore;
   private userPreferences: UserPreferenceStore;
   private tierContext: TierWriterContext;
@@ -225,10 +235,13 @@ export class ClaudeCodeWebServer {
   private wsHandler: WebSocketHandler;
   private messageProcessor: MessageProcessor;
   private environments: EnvironmentManager;
+  private readonly containerizedEnvironmentsEnabled: boolean;
   private encryptionKeyRing: EncryptionKeyRing;
   private deployTargets: DeployTargetStore;
   private projectStore: ProjectStore;
   private projects: ProjectManager;
+  private storageUsage: StorageUsageManager;
+  private connectedHostValidator: ConnectedHostValidator;
   /** The startup-flag configuration: the 'legacy' entry in the target maps. */
   private legacyContainerConfig: ContainerConfig;
   /** Mounts every environment gets, targets included: app code and the socket dir. */
@@ -267,6 +280,7 @@ export class ClaudeCodeWebServer {
     this.aliases = config.aliases;
     this.startTime = config.startTime;
     this.isShuttingDown = config.isShuttingDown;
+    this.containerizedEnvironmentsEnabled = config.containerizedEnvironmentsEnabled;
 
     this.autoSaveInterval = null;
     this.server = null;
@@ -308,6 +322,7 @@ export class ClaudeCodeWebServer {
       { hostPath: path.join(this.database.storageDir, 'cs'), containerPath: SOCKET_MOUNT },
     ];
     const containerConfig = createContainerConfig({
+      featureEnabled: this.containerizedEnvironmentsEnabled,
       containers: options.containers,
       containerEngine: options.containerEngine,
       containerImage: options.containerImage,
@@ -346,16 +361,20 @@ export class ClaudeCodeWebServer {
       database: this.database,
       keyRing: this.encryptionKeyRing,
     });
-    this.deployTargets.seedLegacyTarget(
-      containerConfig,
-      this.database.getInstallerUserId() ?? undefined,
-    );
-    // Plaintext materialization (kubeconfig, TLS PEMs) exists only to drive
-    // engines; it is refreshed here so an edit made offline still reaches the
-    // engine after a restart.
-    this.deployTargets.materializeAllSecrets();
+    this.projectStore.failInterruptedCompositionInstallations();
+    if (this.containerizedEnvironmentsEnabled) {
+      this.deployTargets.seedLegacyTarget(
+        containerConfig,
+        this.database.getInstallerUserId() ?? undefined,
+      );
+      // Plaintext materialization (kubeconfig, TLS PEMs) exists only to drive
+      // engines; it is refreshed here so an edit made offline still reaches the
+      // engine after a restart.
+      this.deployTargets.materializeAllSecrets();
+    }
 
-    const targetsExist = this.deployTargets.listTargets().length > 0;
+    const targetsExist = this.containerizedEnvironmentsEnabled
+      && this.deployTargets.listTargets().length > 0;
     if (containerConfig.enabled || targetsExist) {
       ensureRoot(containerConfig.enabled
         ? containerConfig.rootDir
@@ -369,6 +388,7 @@ export class ClaudeCodeWebServer {
     this.deployTargetMaps = this.buildDeployTargetMaps();
     this.environments = new EnvironmentManager({
       config: containerConfig,
+      featureEnabled: this.containerizedEnvironmentsEnabled,
       hostHome: this.baseFolder,
       // Read on every provision rather than cached: the user may change it
       // from another window between two of their own sessions.
@@ -493,6 +513,20 @@ export class ClaudeCodeWebServer {
       githubAppToken: config.githubAppToken,
       allowedGitHubIds: config.allowedGitHubIds,
       allowAnyGitHubUser: config.allowAnyGitHubUser,
+      onGitHubCredential: async (userId, accessToken) => {
+        await this.projects.synchronizeHostCredentialReplacement(userId, 'github.com', () => {
+          const host = this.projectStore.upsertConnectedHostOAuth(userId, 'github.com', accessToken);
+          this.projectStore.setConnectedHostValidation({
+            userId,
+            host: 'github.com',
+            kind: 'oauth',
+            expectedCredentialRevision: host.credentialRevision,
+            forgeKind: 'github',
+            status: 'valid',
+            scopes: ['read:user', 'user:email'],
+          });
+        });
+      },
     });
     // Installer rights follow the allow-list: a stored account that can no
     // longer sign in must not hold them, or the installer-only screens are
@@ -583,10 +617,66 @@ export class ClaudeCodeWebServer {
       deleteProjectSessions: async (projectId: string) => {
         await retireProjectSessions(this.sessionRouteDeps(), projectId);
       },
+      suspendProjectSessions: async (projectId: string) => {
+        await suspendProjectSessions(this.sessionRouteDeps(), projectId);
+      },
       // Durable active flags and atomic admission leases live in ProjectStore.
       // This closes the remaining process-local observation gaps.
       hasLiveProjectWork: (projectId: string) => this.hasLiveProjectWork(projectId),
+      repositoryInspector: new RepositoryInspector({
+        tempRoot: path.join(this.database.storageDir, 'tmp'),
+      }),
+      compositionRuntime: new DefaultCompositionRuntime(this.projectStore),
     });
+    this.attachmentStore = new ProjectAwareAttachmentStore(
+      this.attachmentStore,
+      this.projects,
+      () => this.saveSessionsToDisk(),
+    );
+    const projectPaths = new ProjectEnvironmentManager(this.environments);
+    this.storageUsage = new StorageUsageManager({
+      database: this.database,
+      store: this.projectStore,
+      paths: {
+        ownerHomePath: (user) => {
+          try {
+            const active = this.environments.activeProjectTarget();
+            const targetId = active.key === 'legacy' ? null : active.key;
+            return this.environments.ownerHomeOnTarget(user, targetId).hostPath;
+          } catch {
+            // Durable homes remain reportable after the last project or while
+            // an administrator is between active targets.
+            return this.environments.ownerHomeOnTarget(user, null).hostPath;
+          }
+        },
+        ownerHomePaths: (user, ownedProjects) => {
+          // A durable home can outlive the user's last project on a target.
+          // Enumerate configured placements as well as recorded projects; a
+          // current-project-only scan would silently lose those retained bytes.
+          const targetIds = new Set<string | null>([
+            null,
+            ...this.deployTargets.listTargets().map((target) => target.id),
+            ...ownedProjects.map((project) => project.targetId),
+          ]);
+          const homes = new Set<string>();
+          for (const targetId of targetIds) {
+            try {
+              homes.add(this.environments.ownerHomeOnTarget(user, targetId).hostPath);
+            } catch {
+              // Unreachable/deleted target placements remain represented by a
+              // project's own path when resolvable; unknown roots cannot be
+              // guessed safely from browser or stale metadata.
+            }
+          }
+          return [...homes];
+        },
+        projectPaths: (project, user) => ({
+          workspacePath: projectPaths.worktreePath(project, user),
+          overlayPath: projectPaths.overlayPath(project),
+        }),
+      },
+    });
+    this.connectedHostValidator = new ConnectedHostValidator();
 
     this.messageProcessor = new MessageProcessor({
       dev: this.dev,
@@ -618,16 +708,22 @@ export class ClaudeCodeWebServer {
       transcriptStore: this.transcriptStore,
       historyStore: this.historyStore,
       chatManager: this.chatManager,
-      resolveChatAttachment: (session, attachment) => this.attachmentStore.resolveForTurn(
-        {
-          id: session.id,
-          ownerUserId: session.ownerUserId,
-          workingDir: session.workingDir,
-          projectId: session.projectId,
-          projectWorkingDirKind: session.projectWorkingDirKind,
-        },
-        attachment,
-      ),
+      resolveChatAttachment: (session, attachment) =>
+        this.attachmentStore.resolveForTurn(
+          session.projectId
+            ? Object.assign(session, {
+                projectId: session.projectId,
+                projectWorkingDirKind: session.projectWorkingDirKind,
+              })
+            : {
+                id: session.id,
+                ownerUserId: session.ownerUserId,
+                workingDir: session.workingDir,
+                projectId: session.projectId,
+                projectWorkingDirKind: session.projectWorkingDirKind,
+              },
+          attachment,
+        ),
       usageReader: this.usageReader,
       usageAnalytics: this.usageAnalytics,
     });
@@ -744,9 +840,8 @@ export class ClaudeCodeWebServer {
    *
    * An empty targets table resolves to the startup configuration under the
    * well-known 'legacy' key — the pre-feature behavior, down to the engine.
-   * A table with no active target resolves to null, which the manager turns
-   * into a loud "no active deploy target" error rather than a quiet fallback
-   * onto this machine.
+   * A table with no active target resolves to null: the administrator has
+   * selected host-local execution for new work.
    */
   private resolveActiveDeployTarget(): ActiveTargetResolution | null {
     // Read from the cached maps, not the store: this runs on every `enabled`
@@ -782,6 +877,15 @@ export class ClaudeCodeWebServer {
   } {
     const engines = new Map<string, EnvironmentEngine>();
     const configs = new Map<string, ContainerConfig>();
+    if (!this.containerizedEnvironmentsEnabled) {
+      return {
+        engines,
+        configs,
+        activeKey: 'legacy',
+        targetsExist: false,
+        targetNames: new Map(),
+      };
+    }
     const targets = this.deployTargets.listTargets();
     for (const summary of targets) {
       try {
@@ -1410,6 +1514,7 @@ export class ClaudeCodeWebServer {
       ...this.sessionRouteDeps(),
       folderMode: this.folderMode,
       aliases: this.aliases,
+      containerizedEnvironmentsEnabled: this.containerizedEnvironmentsEnabled,
       isPathWithinBase: (targetPath: string, userId?: number) =>
         this.isPathWithinBase(targetPath, userId),
       ensureEnvironment: (userId?: number) => this.ensureEnvironment(userId),
@@ -1437,6 +1542,7 @@ export class ClaudeCodeWebServer {
       selfUpdate: this.selfUpdate,
       getUpdateMode: () => this.getUpdateMode(),
       getInstallerUserId: () => this.database.getInstallerUserId(),
+      deployTargetsEnabled: this.containerizedEnvironmentsEnabled,
       deployTargets: this.deployTargets,
       deployTargetDataDir: this.database.storageDir,
       createDeployEngine: (deployConfig) => createEngine(deployConfig),
@@ -1449,17 +1555,30 @@ export class ClaudeCodeWebServer {
       projectIdsForTarget: (targetId: string) => this.projectStore.projectIdsForTarget(targetId),
       getDeploySetting: (key: string) => this.database.getSetting(key),
       setDeploySetting: (key: string, value: string) => this.database.setSetting(key, value),
+      deleteDeploySetting: (key: string) => this.database.deleteSetting(key),
       manager: this.projects,
       projectStore: this.projectStore,
+      storageUsage: this.storageUsage,
+      tokenValidator: this.connectedHostValidator,
+      synchronizeHostCredentialReplacement: (userId, host, mutation) =>
+        this.projects.synchronizeHostCredentialReplacement(userId, host, mutation),
+      disconnectHostCredentials: async (userId: number, host: string) => {
+        const result = await this.projects.disconnectHostCredentials(userId, host);
+        if (!result.ok) throw new Error(result.detail || result.reason);
+        return true;
+      },
+      providerDefault: (user) => this.projectAuthorFor(user.id),
       targetNameFor: (project) => this.projects.targetNameFor(project),
       projectAvailability: () => {
         try {
-          this.environments.activeProjectTarget();
-          return { available: true };
+          return {
+            available: true,
+            defaultExecutionKind: this.environments.newProjectPlacement().kind,
+          };
         } catch (error) {
           return {
             available: false,
-            message: error instanceof Error ? error.message : String(error),
+            message: error instanceof Error ? error.message : 'Project placement is unavailable.',
           };
         }
       },
@@ -1520,7 +1639,13 @@ export class ClaudeCodeWebServer {
     // truth to decide whether a project may be stopped or swapped. (#168)
     await this.sessionStore.resetActiveFlags();
     await this.loadPersistedSessions();
-    await this.projects.reconcileOnBoot();
+    if (this.containerizedEnvironmentsEnabled) {
+      await this.projects.reconcileOnBoot();
+    } else {
+      // Reconciliation scans every reachable deploy engine and can retire
+      // recorded runtimes. A dark feature must not contact those engines.
+      this.projectStore.clearSessionLeases();
+    }
 
     // A marker left behind means a previous update was killed part-way — host
     // reboot, OOM, an outside restart — so the global prefix may be half

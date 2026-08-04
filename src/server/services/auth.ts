@@ -20,6 +20,8 @@ interface AuthServiceOptions {
   githubAppToken: string | null;
   allowedGitHubIds: string[];
   allowAnyGitHubUser?: boolean;
+  /** Persist the user's own OAuth credential for GitHub CLI/repository reuse. */
+  onGitHubCredential?(userId: number, accessToken: string): Promise<void> | void;
 }
 
 interface GitHubAccessTokenResponse {
@@ -54,6 +56,7 @@ export class AuthService {
   private githubAppToken: string | null;
   private allowedGitHubIds: string[];
   private readonly allowAnyGitHubUser: boolean;
+  private readonly onGitHubCredential?: AuthServiceOptions['onGitHubCredential'];
 
   constructor(options: AuthServiceOptions) {
     this.database = options.database;
@@ -66,6 +69,7 @@ export class AuthService {
     this.githubAppToken = options.githubAppToken;
     this.allowedGitHubIds = options.allowedGitHubIds;
     this.allowAnyGitHubUser = options.allowAnyGitHubUser === true;
+    this.onGitHubCredential = options.onGitHubCredential;
 
     this.loadPersistedSettings();
 
@@ -321,6 +325,7 @@ export class AuthService {
         avatarUrl: githubUser.avatar_url,
         email: githubUser.email,
       });
+      await this.onGitHubCredential?.(user.id, accessToken);
 
       const authSessionId = randomUUID();
       this.database.createAuthSession(
@@ -673,8 +678,32 @@ function renderPage(title: string, body: string): string {
           try {
             if (localStorage.getItem('cc-web-relay-theme') === 'light') {
               document.documentElement.classList.add('light');
+              document.querySelector('meta[name="theme-color"]').setAttribute('content', '#ffffff');
             }
           } catch (e) { /* private mode; dark is the default anyway */ }
+        })();
+        // Auth, setup and recovery pages do not mount the app bundle, so they
+        // publish WCO geometry themselves and keep doing so while the user
+        // toggles the overlay from the browser menu.
+        (function () {
+          var overlay = navigator.windowControlsOverlay;
+          if (!overlay || typeof overlay.getTitlebarAreaRect !== 'function') return;
+          function sync(event) {
+            var visible = overlay.visible === true;
+            document.documentElement.dataset.windowControlsOverlay = visible ? 'visible' : 'hidden';
+            if (!visible) return;
+            var rect;
+            try { rect = (event && event.titlebarAreaRect) || overlay.getTitlebarAreaRect(); }
+            catch (e) { document.documentElement.dataset.windowControlsOverlay = 'hidden'; return; }
+            var style = document.documentElement.style;
+            style.setProperty('--window-controls-x', Math.max(0, rect.x || 0) + 'px');
+            style.setProperty('--window-controls-y', Math.max(0, rect.y || 0) + 'px');
+            style.setProperty('--window-controls-width', Math.max(0, rect.width || 0) + 'px');
+            style.setProperty('--window-controls-height', Math.max(0, rect.height || 0) + 'px');
+            style.setProperty('--window-controls-bottom', Math.max(0, (rect.y || 0) + (rect.height || 0)) + 'px');
+          }
+          try { overlay.addEventListener('geometrychange', sync); } catch (e) { return; }
+          sync();
         })();
       </script>
       <style>
@@ -686,6 +715,9 @@ function renderPage(title: string, body: string): string {
              viewport. These pages are a centred card that must be able to
              scroll on a short window. */
           overflow: auto;
+        }
+        html[data-window-controls-overlay="visible"] body {
+          padding-top: calc(var(--window-controls-bottom) + 24px);
         }
         .card {
           width: min(460px, 100%);
@@ -782,6 +814,14 @@ function renderPage(title: string, body: string): string {
       </style>
     </head>
     <body>
+      <div id="authTitlebar" class="boot-titlebar" aria-hidden="true">
+        <div class="boot-titlebar-safe" data-window-no-drag="true">
+          <div class="boot-titlebar-brand" data-window-drag="true">
+            <img src="/icons/icon.svg" alt="" width="16" height="16" />
+            <span>Code Agents</span>
+          </div>
+        </div>
+      </div>
       <main class="card">
         <div class="mark">
           <img src="/icons/icon.svg" alt="" width="20" height="20" />

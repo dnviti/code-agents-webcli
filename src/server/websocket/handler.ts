@@ -84,19 +84,38 @@ export class WebSocketHandler {
     };
     this.deps.webSocketConnections.set(wsId, wsInfo);
 
-    ws.on('message', async (message: WebSocket.RawData) => {
-      try {
-        const data = JSON.parse(message.toString());
-        await this.messageProcessor.handleMessage(wsId, data);
-      } catch (error) {
-        if (this.deps.dev) {
-          console.error('Error handling message:', error);
+    // A socket opened with ?sessionId= is not ready to drive that session just
+    // because its transport is open. Project admission can await container and
+    // lease checks before joinSession attaches claudeSessionId. Browsers send
+    // resize/start frames as soon as onopen fires, so let those frames queue
+    // behind the initial join instead of answering a healthy terminal with
+    // "No session joined".
+    let initialJoin: Promise<void> = Promise.resolve();
+
+    // EventEmitter does not await an async listener. Without an explicit
+    // per-socket queue, start_chat, a Plan-mode switch and the prompt typed
+    // immediately after it all run concurrently: the prompt can reach the chat
+    // manager before either prerequisite has finished and is then rejected as
+    // though the conversation were not running. Preserve WebSocket wire order;
+    // a failed frame is handled inside its own task so later frames still run.
+    let inboundMessages: Promise<void> = Promise.resolve();
+
+    ws.on('message', (message: WebSocket.RawData) => {
+      inboundMessages = inboundMessages.then(async () => {
+        try {
+          await initialJoin;
+          const data = JSON.parse(message.toString());
+          await this.messageProcessor.handleMessage(wsId, data);
+        } catch (error) {
+          if (this.deps.dev) {
+            console.error('Error handling message:', error);
+          }
+          sendToWebSocket(ws, {
+            type: 'error',
+            message: 'Failed to process message',
+          });
         }
-        sendToWebSocket(ws, {
-          type: 'error',
-          message: 'Failed to process message',
-        });
-      }
+      });
     });
 
     ws.on('close', () => {
@@ -133,7 +152,7 @@ export class WebSocketHandler {
     // the whole process down.
     if (claudeSessionId) {
       if (this.deps.claudeSessions.has(claudeSessionId)) {
-        void this.messageProcessor.joinSession(wsId, claudeSessionId).catch((error) => {
+        initialJoin = this.messageProcessor.joinSession(wsId, claudeSessionId).catch((error) => {
           console.error(`Failed to auto-join session ${claudeSessionId}:`, error);
           sendToWebSocket(ws, {
             type: 'error',

@@ -15,6 +15,8 @@ export const DEFAULT_IMAGE = 'docker.io/library/node:22-bookworm';
 export const DEFAULT_NAME_PREFIX = 'cawc';
 
 export interface ContainerConfigInput {
+  /** Server-level feature gate. False wins over legacy flags and environment. */
+  featureEnabled?: boolean;
   containers?: boolean;
   containerEngine?: string;
   containerImage?: string;
@@ -53,7 +55,8 @@ export function createContainerConfig(
   input: ContainerConfigInput = {},
   env: NodeJS.ProcessEnv = process.env,
 ): ContainerConfig {
-  const enabled = input.containers === true || env.CODE_AGENTS_WEBCLI_CONTAINERS === 'true';
+  const enabled = input.featureEnabled !== false
+    && (input.containers === true || env.CODE_AGENTS_WEBCLI_CONTAINERS === 'true');
 
   const cpus = input.containerCpus || env.CODE_AGENTS_WEBCLI_CONTAINER_CPUS || null;
   const memory = input.containerMemory || env.CODE_AGENTS_WEBCLI_CONTAINER_MEMORY || null;

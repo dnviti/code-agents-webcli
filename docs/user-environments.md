@@ -10,16 +10,19 @@ Turning on **per-user environments** gives every signed-in account its own
 container, named after them, with a home directory that survives the container
 being destroyed and rebuilt.
 
-**The feature is off unless you ask for it.** An installation that enables
+**The feature is off unless you explicitly opt the server in with
+`CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED=true`.** An installation that enables
 nothing needs no Docker, no Podman and no `kubectl` — none of them is a
 dependency, none is looked for at startup, and none is ever invoked. Terminals,
 agents, files and git run directly on the machine the server runs on, in the
 account that started it, exactly as they always have. Nothing is created in the
 data directory, and the size picker does not appear in Settings.
 
-Enabling it is one flag, and turning it off again is removing that flag: the
-server goes straight back to running on the host. The environments and their
-data stay on disk until an operator removes them.
+The dedicated environment variable is the feature gate. Legacy `--containers`
+and `CODE_AGENTS_WEBCLI_CONTAINERS=true` choose legacy container placement only
+after that gate is enabled; by themselves they do nothing. Turning the feature
+off again makes new work run on the host. Stored deploy targets are ignored and
+their secrets are not materialized, while existing data stays on disk.
 
 If any deploy targets exist in the database, the active target wins over the
 startup flags. With an empty targets table, the flags behave exactly as
@@ -50,7 +53,7 @@ lets their own load pick for them. The choice lives in *Settings → Workspace
 environment*.
 
 ```bash
-cc-web --containers \
+CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED=true cc-web --containers \
        --container-tiers "small=1,1g;medium=2,2g;large=4,4g" \
        --container-default-tier medium
 ```
@@ -121,7 +124,7 @@ namespace you name. Each user's environment is one Pod with `restartPolicy:
 Never` running a container that sleeps; the server execs into it.
 
 ```bash
-cc-web --containers --container-engine kubernetes \
+CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED=true cc-web --containers --container-engine kubernetes \
        --kube-context my-cluster \
        --kube-namespace workspaces \
        --kube-storage-claim cawc-environments
@@ -133,10 +136,11 @@ whose job is creating pods.
 
 Storage is the part that needs planning: see below.
 
-The base image must be Linux, expose a readable `/proc`, and contain `sh`,
-`setsid`, and the agent CLIs you want available. The server uses those operating-
-system facilities to identify and stop terminal and agent process trees before
-an environment can be reclaimed. The default,
+The base image must be Linux, expose a readable `/proc`, and contain `sh`, CA
+certificates, Git, `setsid`, and the agent CLIs you want available. The server
+uses those operating-system facilities to identify and stop terminal and agent
+process trees before an environment can be reclaimed; project composition also
+uses CA certificates and Git to clone a repository. The default,
 `docker.io/library/node:22-bookworm`, supplies the runtime facilities, Node and
 `bash`, but no agent CLIs; install them with `--container-setup` or build your
 own image.
@@ -144,7 +148,7 @@ own image.
 ## Turning it on
 
 ```bash
-cc-web --containers --container-engine podman \
+CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED=true cc-web --containers --container-engine podman \
        --container-image ghcr.io/your-org/agents:latest \
        --container-cpus 2 --container-memory 4g \
        --container-idle-minutes 30
@@ -152,7 +156,8 @@ cc-web --containers --container-engine podman \
 
 | Flag | Environment variable | Meaning |
 | --- | --- | --- |
-| `--containers` | `CODE_AGENTS_WEBCLI_CONTAINERS=true` | Enable the feature. Off by default. |
+| — | `CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED=true` | Enable containerized environments and deploy-target configuration. Environment-only and off by default. |
+| `--containers` | `CODE_AGENTS_WEBCLI_CONTAINERS=true` | Request legacy per-user containers after the feature gate is enabled. |
 | `--container-engine <engine>` | `CODE_AGENTS_WEBCLI_CONTAINER_ENGINE` | `docker` (default), `podman` or `kubernetes`. |
 | `--container-image <image>` | `CODE_AGENTS_WEBCLI_CONTAINER_IMAGE` | Base image. Default `docker.io/library/node:22-bookworm`. |
 | `--container-cpus <n>` | `CODE_AGENTS_WEBCLI_CONTAINER_CPUS` | CPU limit per environment. Unlimited if unset. |
@@ -260,10 +265,19 @@ the owner's per-user environment. That is why a project container can be
 stopped, rebuilt, or reclaimed without costing the user their shell setup,
 agent sign-ins, or tooling installed in that home.
 
+During project recipe review the user can select managed agent runtimes. Their
+pinned executables are installed into this same home, so the first project
+container does not depend on an agent CLI being present in the administrator's
+base image and every later project reuses the install and its authentication.
+
 The project checkout is deliberately not part of that home. It is re-cloned on
 a rebuild, with uncommitted repository changes preserved to a WIP branch first
 when possible. Files elsewhere in the project container are transient too.
 For the full lifetime and preservation rules, see [Projects](projects.md).
+Project-specific configuration lives in a separate overlay mounted only for its
+project; it survives rebuild/reclaim but is deleted with the project. See
+[Project composition and durable storage](project-composition.md) for the
+complete owner-home, overlay, workspace, forge-credential, and storage model.
 
 ## Names
 

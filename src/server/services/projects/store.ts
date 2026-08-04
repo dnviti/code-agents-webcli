@@ -19,6 +19,8 @@ import { SqliteDatabase } from '../sqlite.js';
 /** Every state a project row can be in. `blocked` means preservation failed
  * and the rebuild or reclaim that needed it is held until the user decides. */
 export type ProjectState =
+  | 'inspecting'
+  | 'composition_pending'
   | 'building'
   | 'running'
   | 'stopped'
@@ -45,7 +47,7 @@ export interface ProjectContainerInfo {
 
 /** One buffered build event, persisted so a reopened tab rejoins the build. */
 export interface BuildEvent {
-  t: 'step' | 'progress' | 'state' | 'error' | 'preserve';
+  t: 'step' | 'progress' | 'state' | 'error' | 'preserve' | 'partial_install';
   step?: string;
   message?: string;
   percent?: number;
@@ -63,6 +65,8 @@ export interface Project {
   repoHost: string | null;
   /** The deploy target it was placed on; null means the legacy engine. */
   targetId: string | null;
+  /** Host projects are ordinary local workspaces; container is the legacy/default placement. */
+  executionKind: 'host' | 'container';
   tierId: string | null;
   state: ProjectState;
   stateDetail: string | null;
@@ -74,6 +78,8 @@ export interface Project {
   lastPreservedCommit: string | null;
   lastPreservedBranch: string | null;
   compositionRevision: string | null;
+  /** Revision applied to the currently retained runtime; null for legacy rows. */
+  appliedCompositionRevision: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -84,8 +90,66 @@ export interface CreateProjectInput {
   repoUrl?: string | null;
   repoHost?: string | null;
   targetId?: string | null;
+  executionKind?: 'host' | 'container';
   tierId?: string | null;
+  /** Opt-in so existing callers retain the historical stopped-on-create contract. */
+  initialState?: Extract<ProjectState, 'inspecting' | 'composition_pending' | 'stopped'>;
 }
+
+export type CompositionInstallationStatus = 'pending' | 'installing' | 'installed' | 'failed';
+
+export interface ProjectComposition {
+  id: string;
+  projectId: string;
+  userId: number;
+  catalogVersion: string;
+  detected: unknown;
+  chosen: unknown;
+  sourceOid: string | null;
+  sourceRef: string | null;
+  forgeKind: string | null;
+  forgeHost: string | null;
+  createdAt: string;
+}
+
+export interface CompositionInstallation {
+  id: string;
+  compositionId: string;
+  itemId: string;
+  status: CompositionInstallationStatus;
+  attempts: number;
+  installedVersion: string | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GitIdentity {
+  id: string;
+  userId: number;
+  projectId: string | null;
+  name: string;
+  email: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface StorageUsageSnapshot {
+  id: string;
+  userId: number | null;
+  totalBytes: number;
+  breakdown: StorageUsageBreakdown;
+  errors: string[];
+  freeBytes: number | null;
+  createdAt: string;
+}
+/** Scanner-owned category map.  Unknown categories survive a round trip so
+ * future scanner versions do not need a schema migration merely to report. */
+export interface StorageUsageBreakdown {
+  [category: string]: StorageUsageValue;
+}
+export type StorageUsageValue = number | string | boolean | null | StorageUsageBreakdown | StorageUsageValue[];
 
 /** One row of the running list a 409 `run_limit` answer carries. */
 export interface RunningProjectInfo {
@@ -104,6 +168,7 @@ export type StartAttempt =
       reason:
         | 'not_found'
         | 'invalid_state'
+        | 'composition_conflict'
         | 'stop_candidate_invalid'
         | 'stop_candidate_busy'
         | 'run_limit';
@@ -124,11 +189,27 @@ export interface ConnectedHost {
   userId: number;
   host: string;
   kind: string;
+  forgeKind: string | null;
+  credentialKind: 'token' | 'oauth' | null;
+  validationStatus: ConnectedHostValidationStatus | null;
+  lastValidatedAt: string | null;
+  validationErrorCode: string | null;
+  validationErrorMessage: string | null;
+  credentialRevision: number;
   scopes: string[];
   expiresAt: string | null;
   lastUsedAt: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export type ConnectedHostValidationStatus = 'unvalidated' | 'valid' | 'invalid';
+
+/** One decrypted credential bound to the durable generation that produced it. */
+export interface ConnectedCredential {
+  token: string;
+  kind: 'token' | 'oauth';
+  revision: number;
 }
 
 /** How many build events a project row keeps; older ones drop off the front. */
@@ -137,6 +218,8 @@ const BUILD_LOG_LIMIT = 200;
 const SETTING_RUN_LIMIT = 'deploy.runLimitPerUser';
 const SETTING_IDLE_STOP = 'deploy.idleStopMinutes';
 const SETTING_IDLE_RECLAIM = 'deploy.idleReclaimMinutes';
+const SETTING_USAGE_WARN_USER = 'deploy.usageWarnUserBytes';
+const SETTING_USAGE_WARN_ADMIN = 'deploy.usageWarnAdminBytes';
 
 export const DEFAULT_RUN_LIMIT_PER_USER = 3;
 export const DEFAULT_IDLE_STOP_MINUTES = 60;
@@ -195,11 +278,11 @@ export class ProjectStore {
     this.db.raw
       .prepare(
         `INSERT INTO projects (
-          id, owner_user_id, name, repo_url, repo_host, target_id, tier_id,
+          id, owner_user_id, name, repo_url, repo_host, target_id, execution_kind, tier_id,
           state, state_detail, container_json, rebuild_required, build_log_json,
           last_activity_at, last_preserved_commit, last_preserved_branch, composition_revision,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'stopped', 'created, not built yet', NULL, 0, NULL, ?, NULL, NULL, NULL, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL, ?, NULL, NULL, NULL, ?, ?)`,
       )
       .run(
         id,
@@ -208,7 +291,10 @@ export class ProjectStore {
         input.repoUrl ?? null,
         input.repoHost ?? null,
         input.targetId ?? null,
+        input.executionKind ?? 'container',
         input.tierId ?? null,
+        input.initialState ?? 'stopped',
+        input.initialState ? 'awaiting composition' : 'created, not built yet',
         now,
         now,
         now,
@@ -326,6 +412,101 @@ export class ProjectStore {
       .run(branch, commit, new Date().toISOString(), id);
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Immutable composition revisions                                     */
+  /* ------------------------------------------------------------------ */
+
+  createCompositionDraft(input: {
+    projectId: string; userId: number; catalogVersion: string; detected: unknown; chosen: unknown;
+    sourceOid?: string | null; sourceRef?: string | null; forgeKind?: string | null; forgeHost?: string | null;
+    installations?: Array<{ itemId: string; status?: CompositionInstallationStatus }>;
+  }): ProjectComposition | null {
+    return immediateTransaction(this.db.raw, () => {
+      if (!this.getProjectForUser(input.projectId, input.userId)) return null;
+      const id = randomUUID(); const now = new Date().toISOString();
+      this.db.raw.prepare(`INSERT INTO project_compositions (id, project_id, user_id, catalog_version, detected_json, chosen_json, source_oid, source_ref, forge_kind, forge_host, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, input.projectId, input.userId, input.catalogVersion, JSON.stringify(input.detected), JSON.stringify(input.chosen), input.sourceOid ?? null, input.sourceRef ?? null, input.forgeKind ?? null, input.forgeHost ?? null, now);
+      for (const item of input.installations ?? []) this.upsertCompositionInstallation(id, item.itemId, { status: item.status ?? 'pending' });
+      return this.getCompositionForUser(id, input.userId);
+    });
+  }
+
+  /** Name used by route/provisioning callers: every save creates a new immutable revision. */
+  saveCompositionDraft(input: {
+    projectId: string; userId: number; catalogVersion: string; detected: unknown; chosen: unknown;
+    sourceOid?: string | null; sourceRef?: string | null; forgeKind?: string | null; forgeHost?: string | null;
+    installations?: Array<{ itemId: string; status?: CompositionInstallationStatus }>;
+  }): ProjectComposition | null { return this.createCompositionDraft(input); }
+
+  getCompositionForUser(compositionId: string, userId: number): ProjectComposition | null {
+    const row = this.db.raw.prepare('SELECT * FROM project_compositions WHERE id = ? AND user_id = ?').get(compositionId, userId) as CompositionRow | undefined;
+    return row ? toComposition(row) : null;
+  }
+
+  getProjectComposition(projectId: string, userId: number, revision?: string | null): ProjectComposition | null {
+    const row = revision
+      ? this.db.raw.prepare('SELECT * FROM project_compositions WHERE id = ? AND project_id = ? AND user_id = ?').get(revision, projectId, userId)
+      : this.db.raw.prepare('SELECT * FROM project_compositions WHERE project_id = ? AND user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1').get(projectId, userId);
+    return row ? toComposition(row as CompositionRow) : null;
+  }
+
+  /** Activate only if the project still points at the revision the editor read. */
+  activateComposition(input: { projectId: string; userId: number; expectedCurrentRevision: string | null; revision: string; applyNow?: boolean }): boolean {
+    return immediateTransaction(this.db.raw, () => {
+      const revision = this.db.raw.prepare('SELECT 1 FROM project_compositions WHERE id = ? AND project_id = ? AND user_id = ?').get(input.revision, input.projectId, input.userId);
+      if (!revision) return false;
+      const result = this.db.raw.prepare(`UPDATE projects SET composition_revision = ?, applied_composition_revision = CASE WHEN ? THEN ? ELSE applied_composition_revision END, updated_at = ?
+        WHERE id = ? AND owner_user_id = ? AND composition_revision IS ?`).run(input.revision, input.applyNow ? 1 : 0, input.revision, new Date().toISOString(), input.projectId, input.userId, input.expectedCurrentRevision);
+      return result.changes > 0;
+    });
+  }
+
+  markCompositionApplied(projectId: string, userId: number, revision: string): boolean {
+    const result = this.db.raw.prepare('UPDATE projects SET applied_composition_revision = ?, updated_at = ? WHERE id = ? AND owner_user_id = ? AND composition_revision = ?').run(revision, new Date().toISOString(), projectId, userId, revision);
+    return result.changes > 0;
+  }
+
+  listCompositionInstallations(compositionId: string, userId: number): CompositionInstallation[] {
+    const rows = this.db.raw.prepare(`SELECT i.* FROM composition_installations i INNER JOIN project_compositions c ON c.id = i.composition_id WHERE i.composition_id = ? AND c.user_id = ? ORDER BY i.created_at, i.rowid`).all(compositionId, userId) as CompositionInstallationRow[];
+    return rows.map(toCompositionInstallation);
+  }
+
+  /** Recipes with work currently inside the shared owner/tool/version lock. */
+  listInstallingCompositionsForUser(userId: number): ProjectComposition[] {
+    const rows = this.db.raw.prepare(`SELECT DISTINCT c.*
+      FROM project_compositions c
+      INNER JOIN composition_installations i ON i.composition_id = c.id
+      WHERE c.user_id = ? AND i.status = 'installing'`).all(userId) as CompositionRow[];
+    return rows.map(toComposition);
+  }
+
+  /** A process restart is the only way an installation can stay `installing`. */
+  failInterruptedCompositionInstallations(): number {
+    const now = new Date().toISOString();
+    const result = this.db.raw.prepare(`UPDATE composition_installations
+      SET status = 'failed', installed_version = NULL,
+          error_code = 'INSTALL_INTERRUPTED',
+          error_message = 'Installation was interrupted by a server restart',
+          updated_at = ?
+      WHERE status = 'installing'`).run(now);
+    return result.changes;
+  }
+
+  upsertCompositionInstallation(compositionId: string, itemId: string, patch: Partial<Pick<CompositionInstallation, 'status' | 'installedVersion' | 'errorCode' | 'errorMessage'>> & { incrementAttempts?: boolean }): CompositionInstallation | null {
+    const now = new Date().toISOString();
+    this.db.raw.prepare(`INSERT INTO composition_installations (id, composition_id, item_id, status, attempts, installed_version, error_code, error_message, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(composition_id, item_id) DO UPDATE SET status = COALESCE(excluded.status, composition_installations.status), attempts = composition_installations.attempts + ?, installed_version = excluded.installed_version, error_code = excluded.error_code, error_message = excluded.error_message, updated_at = excluded.updated_at`)
+      .run(randomUUID(), compositionId, itemId, patch.status ?? 'pending', patch.incrementAttempts ? 1 : 0, patch.installedVersion ?? null, patch.errorCode ?? null, patch.errorMessage ?? null, now, now, patch.incrementAttempts ? 1 : 0);
+    const row = this.db.raw.prepare('SELECT * FROM composition_installations WHERE composition_id = ? AND item_id = ?').get(compositionId, itemId) as CompositionInstallationRow | undefined;
+    return row ? toCompositionInstallation(row) : null;
+  }
+
+  updateCompositionInstallationForUser(input: { compositionId: string; userId: number; itemId: string; patch: Partial<Pick<CompositionInstallation, 'status' | 'installedVersion' | 'errorCode' | 'errorMessage'>> & { incrementAttempts?: boolean } }): CompositionInstallation | null {
+    if (!this.getCompositionForUser(input.compositionId, input.userId)) return null;
+    return this.upsertCompositionInstallation(input.compositionId, input.itemId, input.patch);
+  }
+
   deleteProject(id: string): void {
     this.db.raw.prepare('DELETE FROM projects WHERE id = ?').run(id);
   }
@@ -398,6 +579,15 @@ export class ProjectStore {
     fromStates: ProjectState[];
     limit: number;
     stopProjectId?: string;
+    /**
+     * Confirming a recipe and reserving its runtime slot are one decision.
+     * Keeping the CAS in this transaction prevents a rejected start from
+     * leaving a newly selected recipe active on an unstarted project.
+     */
+    activateComposition?: {
+      revision: string;
+      expectedCurrentRevision: string | null;
+    };
   }): StartAttempt {
     return immediateTransaction(this.db.raw, (): StartAttempt => {
       const row = this.db.raw
@@ -408,6 +598,22 @@ export class ProjectStore {
       }
       if (!input.fromStates.includes(row.state)) {
         return { ok: false, reason: 'invalid_state' };
+      }
+
+      if (input.activateComposition) {
+        const revision = this.db.raw
+          .prepare(
+            `SELECT 1 FROM project_compositions
+             WHERE id = ? AND project_id = ? AND user_id = ?`,
+          )
+          .get(input.activateComposition.revision, input.projectId, input.ownerUserId);
+        const current = this.db.raw
+          .prepare('SELECT composition_revision FROM projects WHERE id = ? AND owner_user_id = ?')
+          .get(input.projectId, input.ownerUserId) as { composition_revision: string | null } | undefined;
+        if (!revision || !current
+          || current.composition_revision !== input.activateComposition.expectedCurrentRevision) {
+          return { ok: false, reason: 'composition_conflict' };
+        }
       }
 
       let stopCandidate: string | null = null;
@@ -441,14 +647,47 @@ export class ProjectStore {
       }
 
       const now = new Date().toISOString();
-      this.db.raw
-        .prepare(
-          `UPDATE projects SET state = ?, state_detail = NULL, last_activity_at = ?, updated_at = ?
-           WHERE id = ?`,
-        )
-        .run(input.toState, now, now, input.projectId);
+      if (input.activateComposition) {
+        this.db.raw
+          .prepare(
+            `UPDATE projects
+             SET state = ?, state_detail = NULL, composition_revision = ?,
+                 last_activity_at = ?, updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(input.toState, input.activateComposition.revision, now, now, input.projectId);
+      } else {
+        this.db.raw
+          .prepare(
+            `UPDATE projects SET state = ?, state_detail = NULL, last_activity_at = ?, updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(input.toState, now, now, input.projectId);
+      }
       return { ok: true };
     });
+  }
+
+  /** Best-effort CAS used only when the physical half of a reserved swap fails. */
+  restoreCompositionActivation(input: {
+    projectId: string;
+    userId: number;
+    expectedRevision: string;
+    previousRevision: string | null;
+  }): boolean {
+    const result = this.db.raw
+      .prepare(
+        `UPDATE projects SET composition_revision = ?, updated_at = ?
+         WHERE id = ? AND owner_user_id = ? AND composition_revision = ?`,
+      )
+      .run(
+        input.previousRevision,
+        new Date().toISOString(),
+        input.projectId,
+        input.userId,
+        input.expectedRevision,
+      );
+    return result.changes > 0;
   }
 
   /** Whether any session row says work is live in this project. */
@@ -520,6 +759,8 @@ export class ProjectStore {
     projectId: string;
     ownerUserId: number;
     idleBefore?: Date;
+    /** An explicit user stop may close admission before attached sessions drain. */
+    allowActiveWork?: boolean;
   }): LifecycleClaim {
     return immediateTransaction(this.db.raw, (): LifecycleClaim => {
       const project = this.getProjectForUser(input.projectId, input.ownerUserId);
@@ -528,7 +769,9 @@ export class ProjectStore {
       if (input.idleBefore && project.lastActivityAt > input.idleBefore.toISOString()) {
         return { ok: false, reason: 'not_idle' };
       }
-      if (this.projectHasActiveSessions(project.id)) return { ok: false, reason: 'active_work' };
+      if (!input.allowActiveWork && this.projectHasActiveSessions(project.id)) {
+        return { ok: false, reason: 'active_work' };
+      }
       this.setState(project.id, 'reclaiming', 'Stopping project environment');
       return { ok: true, project };
     });
@@ -588,7 +831,16 @@ export class ProjectStore {
     const rows = this.db.raw
       .prepare('SELECT * FROM connected_hosts WHERE user_id = ? ORDER BY created_at ASC')
       .all(userId) as ConnectedHostRow[];
-    return rows.map(toConnectedHost);
+    const byHost = new Map<string, ConnectedHost>();
+    for (const row of rows.map(toConnectedHost)) {
+      const prior = byHost.get(row.host);
+      // A user-supplied token is the visible/preferred record; the sign-in
+      // credential remains a fallback and is never allowed to overwrite it.
+      if (!prior || (prior.credentialKind === 'oauth' && row.credentialKind === 'token')) {
+        byHost.set(row.host, row);
+      }
+    }
+    return [...byHost.values()];
   }
 
   /**
@@ -612,10 +864,16 @@ export class ProjectStore {
       .prepare(
         `INSERT INTO connected_hosts (
           id, user_id, host, kind, identity_id, credential_encrypted,
-          scopes_json, expires_at, last_used_at, created_at, updated_at
-        ) VALUES (?, ?, ?, 'token', NULL, ?, NULL, NULL, NULL, ?, ?)
+          scopes_json, expires_at, last_used_at, forge_kind, credential_kind,
+          validation_status, credential_revision, created_at, updated_at
+        ) VALUES (?, ?, ?, 'token', NULL, ?, NULL, NULL, NULL, NULL, 'token', 'unvalidated', 1, ?, ?)
         ON CONFLICT(user_id, host, kind) DO UPDATE SET
           credential_encrypted = excluded.credential_encrypted,
+          credential_kind = excluded.credential_kind,
+          forge_kind = NULL, scopes_json = NULL, expires_at = NULL,
+          last_validated_at = NULL, validation_status = 'unvalidated', validation_error_code = NULL,
+          validation_error_message = NULL,
+          credential_revision = COALESCE(connected_hosts.credential_revision, 0) + 1,
           updated_at = excluded.updated_at`,
       )
       .run(randomUUID(), userId, normalized, encrypted, now, now);
@@ -625,10 +883,53 @@ export class ProjectStore {
     return toConnectedHost(row);
   }
 
+  /** GitHub sign-in fallback, kept separate so it never replaces an owner's PAT. */
+  upsertConnectedHostOAuth(userId: number, host: string, token: string): ConnectedHost {
+    const normalized = (host || '').trim().toLowerCase();
+    if (!normalized || !token) throw new Error('connected host requires a host and credential');
+    const now = new Date().toISOString();
+    const encrypted = this.keyRing.encrypt(token);
+    this.db.raw.prepare(`INSERT INTO connected_hosts (
+      id, user_id, host, kind, identity_id, credential_encrypted,
+      scopes_json, expires_at, last_used_at, forge_kind, credential_kind,
+      validation_status, credential_revision, created_at, updated_at
+    ) VALUES (?, ?, ?, 'oauth', NULL, ?, NULL, NULL, NULL, 'github', 'oauth', 'valid', 1, ?, ?)
+    ON CONFLICT(user_id, host, kind) DO UPDATE SET credential_encrypted = excluded.credential_encrypted,
+      forge_kind = 'github', credential_kind = 'oauth', validation_status = 'valid',
+      scopes_json = NULL, expires_at = NULL, last_validated_at = NULL,
+      validation_error_code = NULL, validation_error_message = NULL,
+      credential_revision = COALESCE(connected_hosts.credential_revision, 0) + 1,
+      updated_at = excluded.updated_at`).run(randomUUID(), userId, normalized, encrypted, now, now);
+    const row = this.db.raw.prepare('SELECT * FROM connected_hosts WHERE user_id = ? AND host = ? AND kind = ?')
+      .get(userId, normalized, 'oauth') as ConnectedHostRow;
+    return toConnectedHost(row);
+  }
+
+  /** Store only safe validation metadata; token material never leaves credentialFor. */
+  setConnectedHostValidation(input: { userId: number; host: string; kind?: 'token' | 'oauth'; expectedCredentialRevision?: number; forgeKind?: string | null; status: ConnectedHostValidationStatus; errorCode?: string | null; errorMessage?: string | null; scopes?: string[]; expiresAt?: string | null }): boolean {
+    const now = new Date().toISOString();
+    const result = this.db.raw.prepare(`UPDATE connected_hosts SET
+      forge_kind = CASE WHEN ? THEN ? ELSE forge_kind END,
+      validation_status = ?, last_validated_at = ?, validation_error_code = ?, validation_error_message = ?,
+      scopes_json = CASE WHEN ? THEN ? ELSE scopes_json END,
+      expires_at = CASE WHEN ? THEN ? ELSE expires_at END,
+      updated_at = ? WHERE user_id = ? AND host = ? AND kind = ?
+      AND (? = 0 OR credential_revision = ?)`)
+      .run(input.forgeKind !== undefined ? 1 : 0, input.forgeKind ?? null, input.status, now, input.errorCode ?? null, input.errorMessage ?? null,
+        input.scopes !== undefined ? 1 : 0, input.scopes === undefined ? null : JSON.stringify(input.scopes),
+        input.expiresAt !== undefined ? 1 : 0, input.expiresAt ?? null,
+        now, input.userId, input.host.trim().toLowerCase(), input.kind ?? 'token',
+        input.expectedCredentialRevision === undefined ? 0 : 1,
+        input.expectedCredentialRevision ?? -1);
+    return result.changes > 0;
+  }
+
   deleteConnectedHost(userId: number, host: string, kind = 'token'): boolean {
-    const result = this.db.raw
-      .prepare('DELETE FROM connected_hosts WHERE user_id = ? AND host = ? AND kind = ?')
-      .run(userId, host.trim().toLowerCase(), kind);
+    const result = kind === 'token'
+      ? this.db.raw.prepare('DELETE FROM connected_hosts WHERE user_id = ? AND host = ?')
+        .run(userId, host.trim().toLowerCase())
+      : this.db.raw.prepare('DELETE FROM connected_hosts WHERE user_id = ? AND host = ? AND kind = ?')
+        .run(userId, host.trim().toLowerCase(), kind);
     return result.changes > 0;
   }
 
@@ -639,15 +940,42 @@ export class ProjectStore {
    * two places (clone, preservation push), and both ask for one host's token
    * at the moment they need it.
    */
-  credentialFor(userId: number, host: string, kind = 'token'): string | null {
-    const row = this.db.raw
+  credentialKindFor(userId: number, host: string): 'token' | 'oauth' | null {
+    const rows = this.db.raw.prepare(`SELECT kind FROM connected_hosts
+      WHERE user_id = ? AND host = ? AND credential_encrypted IS NOT NULL
+      ORDER BY CASE kind WHEN 'token' THEN 0 WHEN 'oauth' THEN 1 ELSE 2 END
+      LIMIT 1`).get(userId, host.trim().toLowerCase()) as { kind: string } | undefined;
+    return rows?.kind === 'token' || rows?.kind === 'oauth' ? rows.kind : null;
+  }
+
+  credentialRecordFor(userId: number, host: string, kind = 'token'): ConnectedCredential | null {
+    type CredentialRow = {
+      credential_encrypted: string | null;
+      validation_status: string | null;
+      expires_at: string | null;
+      credential_revision: number;
+    };
+    const normalized = host.trim().toLowerCase();
+    let row = this.db.raw
       .prepare(
-        'SELECT credential_encrypted FROM connected_hosts WHERE user_id = ? AND host = ? AND kind = ?',
+        'SELECT credential_encrypted, validation_status, expires_at, credential_revision FROM connected_hosts WHERE user_id = ? AND host = ? AND kind = ?',
       )
-      .get(userId, host.trim().toLowerCase(), kind) as
-      | { credential_encrypted: string | null }
-      | undefined;
-    if (!row?.credential_encrypted) {
+      .get(userId, normalized, kind) as CredentialRow | undefined;
+    let usedKind = kind;
+    // A present manual credential is the owner's explicit choice. If it is
+    // known bad, do not silently substitute the sign-in credential.
+    if (row && !usableCredentialRow(row)) {
+      if (credentialExpired(row.expires_at)) this.markCredentialExpired(userId, normalized, kind, row.credential_revision);
+      return null;
+    }
+    if (!row?.credential_encrypted && kind === 'token') {
+      row = this.db.raw.prepare(
+        'SELECT credential_encrypted, validation_status, expires_at, credential_revision FROM connected_hosts WHERE user_id = ? AND host = ? AND kind = ?',
+      ).get(userId, normalized, 'oauth') as CredentialRow | undefined;
+      usedKind = 'oauth';
+    }
+    if (!row?.credential_encrypted || !usableCredentialRow(row)) {
+      if (row && credentialExpired(row.expires_at)) this.markCredentialExpired(userId, normalized, usedKind, row.credential_revision);
       return null;
     }
     const token = this.keyRing.decrypt(row.credential_encrypted);
@@ -655,9 +983,94 @@ export class ProjectStore {
       .prepare(
         'UPDATE connected_hosts SET last_used_at = ? WHERE user_id = ? AND host = ? AND kind = ?',
       )
-      .run(new Date().toISOString(), userId, host.trim().toLowerCase(), kind);
-    return token;
+      .run(new Date().toISOString(), userId, normalized, usedKind);
+    return {
+      token,
+      kind: usedKind as 'token' | 'oauth',
+      revision: row.credential_revision,
+    };
   }
+
+  credentialFor(userId: number, host: string, kind = 'token'): string | null {
+    return this.credentialRecordFor(userId, host, kind)?.token || null;
+  }
+
+  private markCredentialExpired(userId: number, host: string, kind: string, revision: number): void {
+    const now = new Date().toISOString();
+    this.db.raw.prepare(`UPDATE connected_hosts SET validation_status = 'invalid',
+      last_validated_at = ?, validation_error_code = 'credential_expired',
+      validation_error_message = 'The stored credential has expired', updated_at = ?
+      WHERE user_id = ? AND host = ? AND kind = ? AND credential_revision = ?`)
+      .run(now, now, userId, host, kind, revision);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Git identities and storage reporting                                */
+  /* ------------------------------------------------------------------ */
+
+  upsertGitIdentity(input: { userId: number; projectId?: string | null; name: string; email: string }): GitIdentity {
+    if (!input.name.trim() || !input.email.trim()) throw new Error('git identity requires a name and email');
+    if (input.projectId && !this.getProjectForUser(input.projectId, input.userId)) throw new Error('project not found');
+    const now = new Date().toISOString(); const projectId = input.projectId ?? null;
+    const existing = this.db.raw.prepare('SELECT id FROM git_identities WHERE user_id = ? AND project_id IS ?').get(input.userId, projectId) as { id: string } | undefined;
+    if (existing) this.db.raw.prepare('UPDATE git_identities SET name = ?, email = ?, updated_at = ? WHERE id = ?').run(input.name.trim(), input.email.trim(), now, existing.id);
+    else this.db.raw.prepare('INSERT INTO git_identities (id, user_id, project_id, name, email, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(randomUUID(), input.userId, projectId, input.name.trim(), input.email.trim(), now, now);
+    return this.getGitIdentity(input.userId, projectId) as GitIdentity;
+  }
+
+  getGitIdentity(userId: number, projectId: string | null = null): GitIdentity | null {
+    const row = this.db.raw.prepare('SELECT * FROM git_identities WHERE user_id = ? AND project_id IS ?').get(userId, projectId) as GitIdentityRow | undefined;
+    return row ? toGitIdentity(row) : null;
+  }
+
+  /** Project override, then global override, then caller-provided provider default. */
+  resolveGitIdentity(input: { userId: number; projectId?: string | null; providerDefault?: { name: string; email: string } | null }): { identity: GitIdentity | { name: string; email: string; source: 'provider' } | null; source: 'project' | 'global' | 'provider' | 'incomplete' } {
+    const project = input.projectId ? this.getGitIdentity(input.userId, input.projectId) : null;
+    if (project) return { identity: project, source: 'project' };
+    const global = this.getGitIdentity(input.userId);
+    if (global) return { identity: global, source: 'global' };
+    if (input.providerDefault?.name.trim() && input.providerDefault.email.trim()) return { identity: { ...input.providerDefault, source: 'provider' }, source: 'provider' };
+    return { identity: null, source: 'incomplete' };
+  }
+
+  recordStorageUsageSnapshot(input: { userId?: number | null; totalBytes: number; breakdown: StorageUsageBreakdown; errors?: string[]; freeBytes?: number | null }): StorageUsageSnapshot {
+    if (!Number.isFinite(input.totalBytes) || input.totalBytes < 0) throw new Error('storage total must be a non-negative number');
+    return immediateTransaction(this.db.raw, () => {
+      const id = randomUUID(); const now = new Date().toISOString(); const userId = input.userId ?? null;
+      this.db.raw.prepare('INSERT INTO storage_usage_snapshots (id, user_id, total_bytes, breakdown_json, errors_json, free_bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(id, userId, Math.max(0, Math.floor(input.totalBytes)), JSON.stringify(input.breakdown), JSON.stringify(input.errors ?? []), input.freeBytes ?? null, now);
+      // Refresh is user-triggerable. Retain useful history without allowing a
+      // caller to grow the application database indefinitely.
+      this.db.raw.prepare(`DELETE FROM storage_usage_snapshots
+        WHERE user_id IS ? AND rowid NOT IN (
+          SELECT rowid FROM storage_usage_snapshots
+          WHERE user_id IS ? ORDER BY created_at DESC, rowid DESC LIMIT 100
+        )`).run(userId, userId);
+      return this.getStorageUsageSnapshot(id) as StorageUsageSnapshot;
+    });
+  }
+
+  getStorageUsageSnapshot(id: string): StorageUsageSnapshot | null {
+    const row = this.db.raw.prepare('SELECT * FROM storage_usage_snapshots WHERE id = ?').get(id) as StorageUsageSnapshotRow | undefined;
+    return row ? toStorageUsageSnapshot(row) : null;
+  }
+
+  latestStorageUsageSnapshot(userId?: number | null): StorageUsageSnapshot | null {
+    const row = userId == null ? this.db.raw.prepare('SELECT * FROM storage_usage_snapshots WHERE user_id IS NULL ORDER BY created_at DESC, rowid DESC LIMIT 1').get() : this.db.raw.prepare('SELECT * FROM storage_usage_snapshots WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1').get(userId);
+    return row ? toStorageUsageSnapshot(row as StorageUsageSnapshotRow) : null;
+  }
+
+  listStorageUsageSnapshots(userId?: number | null, limit = 50): StorageUsageSnapshot[] {
+    const safeLimit = Math.max(1, Math.min(500, Math.floor(limit)));
+    const rows = userId == null
+      ? this.db.raw.prepare('SELECT * FROM storage_usage_snapshots WHERE user_id IS NULL ORDER BY created_at DESC, rowid DESC LIMIT ?').all(safeLimit)
+      : this.db.raw.prepare('SELECT * FROM storage_usage_snapshots WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?').all(userId, safeLimit);
+    return (rows as StorageUsageSnapshotRow[]).map(toStorageUsageSnapshot);
+  }
+
+  usageWarnUserBytes(): number | null { return nonNegativeIntSetting(this.db.getSetting(SETTING_USAGE_WARN_USER)); }
+  usageWarnAdminBytes(): number | null { return nonNegativeIntSetting(this.db.getSetting(SETTING_USAGE_WARN_ADMIN)); }
+  setUsageWarnUserBytes(bytes: number | null): void { setOptionalByteSetting(this.db, SETTING_USAGE_WARN_USER, bytes); }
+  setUsageWarnAdminBytes(bytes: number | null): void { setOptionalByteSetting(this.db, SETTING_USAGE_WARN_ADMIN, bytes); }
 
   /* ------------------------------------------------------------------ */
   /* Policy settings (admin-editable app_settings, with defaults)        */
@@ -681,6 +1094,29 @@ function positiveIntSetting(raw: string | null, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
+function nonNegativeIntSetting(raw: string | null): number | null {
+  if (raw === null || !raw.trim()) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+function setOptionalByteSetting(db: AppDatabase, key: string, bytes: number | null): void { if (bytes == null) db.deleteSetting(key); else if (Number.isFinite(bytes) && bytes >= 0) db.setSetting(key, String(Math.floor(bytes))); else throw new Error('usage warning must be a non-negative number'); }
+
+function credentialExpired(value: string | null): boolean {
+  if (!value) return false;
+  const time = Date.parse(value);
+  return !Number.isFinite(time) || time <= Date.now();
+}
+
+function usableCredentialRow(row: {
+  credential_encrypted: string | null;
+  validation_status: string | null;
+  expires_at: string | null;
+}): boolean {
+  return Boolean(row.credential_encrypted)
+    && row.validation_status !== 'invalid'
+    && !credentialExpired(row.expires_at);
+}
+
 interface ProjectRow {
   id: string;
   owner_user_id: number;
@@ -688,6 +1124,7 @@ interface ProjectRow {
   repo_url: string | null;
   repo_host: string | null;
   target_id: string | null;
+  execution_kind: string | null;
   tier_id: string | null;
   state: string;
   state_detail: string | null;
@@ -698,6 +1135,7 @@ interface ProjectRow {
   last_preserved_commit: string | null;
   last_preserved_branch: string | null;
   composition_revision: string | null;
+  applied_composition_revision: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -710,6 +1148,7 @@ function toProject(row: ProjectRow): Project {
     repoUrl: row.repo_url,
     repoHost: row.repo_host,
     targetId: row.target_id,
+    executionKind: row.execution_kind === 'host' ? 'host' : 'container',
     tierId: row.tier_id,
     state: row.state as ProjectState,
     stateDetail: row.state_detail,
@@ -720,6 +1159,7 @@ function toProject(row: ProjectRow): Project {
     lastPreservedCommit: row.last_preserved_commit,
     lastPreservedBranch: row.last_preserved_branch,
     compositionRevision: row.composition_revision,
+    appliedCompositionRevision: row.applied_composition_revision,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -730,6 +1170,13 @@ interface ConnectedHostRow {
   user_id: number;
   host: string;
   kind: string;
+  forge_kind: string | null;
+  credential_kind: string | null;
+  validation_status: string | null;
+  last_validated_at: string | null;
+  validation_error_code: string | null;
+  validation_error_message: string | null;
+  credential_revision: number | null;
   credential_encrypted: string | null;
   scopes_json: string | null;
   expires_at: string | null;
@@ -744,6 +1191,13 @@ function toConnectedHost(row: ConnectedHostRow): ConnectedHost {
     userId: row.user_id,
     host: row.host,
     kind: row.kind,
+    forgeKind: row.forge_kind,
+    credentialKind: row.credential_kind as ConnectedHost['credentialKind'],
+    validationStatus: row.validation_status as ConnectedHostValidationStatus | null,
+    lastValidatedAt: row.last_validated_at,
+    validationErrorCode: row.validation_error_code,
+    validationErrorMessage: row.validation_error_message,
+    credentialRevision: row.credential_revision ?? 0,
     scopes: parseJson<string[]>(row.scopes_json, []),
     expiresAt: row.expires_at,
     lastUsedAt: row.last_used_at,
@@ -751,6 +1205,33 @@ function toConnectedHost(row: ConnectedHostRow): ConnectedHost {
     updatedAt: row.updated_at,
   };
 }
+
+interface CompositionRow {
+  id: string; project_id: string; user_id: number; catalog_version: string; detected_json: string;
+  chosen_json: string; source_oid: string | null; source_ref: string | null; forge_kind: string | null;
+  forge_host: string | null; created_at: string;
+}
+function toComposition(row: CompositionRow): ProjectComposition {
+  return { id: row.id, projectId: row.project_id, userId: row.user_id, catalogVersion: row.catalog_version,
+    detected: parseJson(row.detected_json, {}), chosen: parseJson(row.chosen_json, {}), sourceOid: row.source_oid,
+    sourceRef: row.source_ref, forgeKind: row.forge_kind, forgeHost: row.forge_host, createdAt: row.created_at };
+}
+
+interface CompositionInstallationRow {
+  id: string; composition_id: string; item_id: string; status: string; attempts: number; installed_version: string | null;
+  error_code: string | null; error_message: string | null; created_at: string; updated_at: string;
+}
+function toCompositionInstallation(row: CompositionInstallationRow): CompositionInstallation {
+  return { id: row.id, compositionId: row.composition_id, itemId: row.item_id, status: row.status as CompositionInstallationStatus,
+    attempts: row.attempts, installedVersion: row.installed_version, errorCode: row.error_code, errorMessage: row.error_message,
+    createdAt: row.created_at, updatedAt: row.updated_at };
+}
+
+interface GitIdentityRow { id: string; user_id: number; project_id: string | null; name: string; email: string; created_at: string; updated_at: string; }
+function toGitIdentity(row: GitIdentityRow): GitIdentity { return { id: row.id, userId: row.user_id, projectId: row.project_id, name: row.name, email: row.email, createdAt: row.created_at, updatedAt: row.updated_at }; }
+
+interface StorageUsageSnapshotRow { id: string; user_id: number | null; total_bytes: number; breakdown_json: string; errors_json: string | null; free_bytes: number | null; created_at: string; }
+function toStorageUsageSnapshot(row: StorageUsageSnapshotRow): StorageUsageSnapshot { return { id: row.id, userId: row.user_id, totalBytes: row.total_bytes, breakdown: parseJson<StorageUsageBreakdown>(row.breakdown_json, {}), errors: parseJson<string[]>(row.errors_json, []), freeBytes: row.free_bytes, createdAt: row.created_at }; }
 
 function parseJson<T>(raw: string | null, fallback: T): T {
   if (!raw) {

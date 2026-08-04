@@ -1,8 +1,9 @@
 /** The project-shaped container: a durable owner home plus a disposable workspace. */
 
 import fsp from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
-import { ContainerEnvironment, EnvironmentManager, LOGIN_LABEL, MANAGED_LABEL, TIER_LABEL, USER_ID_LABEL } from '../environments/manager.js';
+import { ContainerEnvironment, EnvironmentManager, HostEnvironment, LOGIN_LABEL, MANAGED_LABEL, TIER_LABEL, USER_ID_LABEL } from '../environments/manager.js';
 import { EnvironmentEngine, RunResult } from '../environments/engine.js';
 import { trackContainerProcess } from '../environments/process-control.js';
 import { PROJECT_LABEL, projectContainerName, TARGET_LABEL, targetLabelValue } from '../environments/naming.js';
@@ -11,6 +12,41 @@ import { Project } from './store.js';
 import { repoBaseName } from './clone.js';
 
 export const PROJECT_WORKSPACE = '/workspace';
+export const PROJECT_OVERLAY = '/opt/code-agents-project';
+export const FORGE_SCRATCH = '/run/code-agents-forge';
+
+/** Portable app-owned root used by host-local projects. */
+export function localProjectWorkspaceRoot(homeDir = os.homedir(), pathApi: Pick<typeof path, 'join'> = path): string {
+  return pathApi.join(homeDir, '.cc-web', 'workspaces');
+}
+
+/** Secret-free, application-owned paths exposed in container metadata. */
+export function projectContainerEnvironment(containerHome: string, login: string): Record<string, string> {
+  const miseData = `${containerHome}/.local/share/code-agents/mise`;
+  const miseShims = `${miseData}/shims`;
+  return {
+    HOME: containerHome,
+    USER: login,
+    TERM: 'xterm-256color',
+    PATH: `${miseShims}:${containerHome}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
+    MISE_DATA_DIR: miseData,
+    MISE_CACHE_DIR: `${containerHome}/.cache/code-agents/mise`,
+    MISE_STATE_DIR: `${containerHome}/.local/state/code-agents/mise`,
+    MISE_CONFIG_DIR: `${PROJECT_OVERLAY}/mise`,
+    MISE_CONFIG_FILE: `${PROJECT_OVERLAY}/mise.toml`,
+    MISE_SHIMS_DIR: miseShims,
+    MISE_AUTO_INSTALL: '0',
+    // App-generated project config includes the user's durable ~/.gitconfig
+    // and may layer a project-only identity without mutating repository data.
+    GIT_CONFIG_GLOBAL: `${PROJECT_OVERLAY}/gitconfig`,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GH_CONFIG_DIR: `${FORGE_SCRATCH}/gh`,
+    GLAB_CONFIG_DIR: `${FORGE_SCRATCH}/glab`,
+    // tea itself reads XDG_CONFIG_HOME; its app-owned launcher points there.
+    // This metadata value names that same tmpfs file without containing a token.
+    TEA_CONFIG: `${FORGE_SCRATCH}/xdg/tea/config.yml`,
+  };
+}
 
 export interface ProjectEnvironmentResult {
   environment: UserEnvironment;
@@ -91,12 +127,23 @@ export class ProjectContainerStateUnknownError extends Error {
 export type ProjectCheckoutState = 'valid' | 'empty_or_absent' | 'unsafe';
 
 export class ProjectEnvironmentManager {
-  constructor(private readonly environments: EnvironmentManager) {}
+  constructor(
+    private readonly environments: EnvironmentManager,
+    private readonly localWorkspaceRoot = localProjectWorkspaceRoot(),
+  ) {}
 
   worktreePath(project: Project, _owner: EnvironmentOwner): string {
+    if (project.executionKind === 'host') {
+      return path.join(this.localWorkspaceRoot, project.id);
+    }
     // Sibling of owner homes: mounting the persistent home into project A must
     // not reveal project B through /home/<owner>/projects/B.
     return path.join(this.environments.projectStorageRoot(project.targetId), project.id);
+  }
+
+  ownerHomePath(project: Project, owner: EnvironmentOwner): string {
+    if (project.executionKind === 'host') return os.homedir();
+    return this.environments.ownerHomeOnTarget(owner, project.targetId).hostPath;
   }
 
   checkoutPath(project: Project, owner: EnvironmentOwner): string {
@@ -106,6 +153,90 @@ export class ProjectEnvironmentManager {
 
   checkoutContainerPath(project: Project): string {
     return project.repoUrl ? `${PROJECT_WORKSPACE}/${repoBaseName(project.repoUrl)}` : PROJECT_WORKSPACE;
+  }
+
+  /** Project-only durable settings, deliberately outside every owner home. */
+  overlayPath(project: Project): string {
+    if (project.executionKind === 'host') {
+      return path.join(os.homedir(), '.cc-web', 'project-overlays', project.id);
+    }
+    return path.join(
+      this.environments.projectTarget(project.targetId).config.rootDir,
+      'project-overlays',
+      project.id,
+    );
+  }
+
+  /** Stable host roots consumed by lifecycle cleanup and storage reporting. */
+  durablePaths(project: Project, owner: EnvironmentOwner): {
+    ownerHome: string;
+    workspace: string;
+    overlay: string;
+  } {
+    return {
+      ownerHome: this.ownerHomePath(project, owner),
+      workspace: this.worktreePath(project, owner),
+      overlay: this.overlayPath(project),
+    };
+  }
+
+  /** Integration calls this only after the owner-scoped project row is deleted. */
+  async removeOverlay(project: Project): Promise<void> {
+    await fsp.rm(this.overlayPath(project), { recursive: true, force: true });
+  }
+
+  /**
+   * Resolve an already-running project without any lifecycle mutation.
+   *
+   * Composition retry uses this path so retrying failed tools cannot preserve,
+   * wipe, recreate, start, or clone a project as an accidental side effect.
+   */
+  async existing(project: Project, owner: EnvironmentOwner): Promise<ProjectEnvironmentResult | null> {
+    if (!project.container) return null;
+    if (owner.id !== project.ownerUserId) {
+      throw new ProjectContainerOwnershipError('project owner does not match the requested environment');
+    }
+    const target = this.environments.projectTarget(project.targetId);
+    const owned = await this.ownedDescription(project, target.engine);
+    if (!owned) return null;
+    const ownerHome = this.environments.ownerHomeOnTarget(owner, project.targetId);
+    const root = this.worktreePath(project, owner);
+    const overlay = this.overlayPath(project);
+    const mounts: Mount[] = [
+      { hostPath: ownerHome.hostPath, containerPath: ownerHome.containerPath },
+      { hostPath: root, containerPath: PROJECT_WORKSPACE },
+      { hostPath: overlay, containerPath: PROJECT_OVERLAY },
+      ...target.config.extraMounts,
+    ];
+    const environment = new ContainerEnvironment({
+      name: owned.description.name,
+      identity: owned.description.identity,
+      homeDir: ownerHome.hostPath,
+      containerHome: ownerHome.containerPath,
+      engine: owned.engine,
+      // Project compatibility requires Bash. Ignore legacy shell metadata so
+      // an existing project created when this path advertised only `sh` is
+      // upgraded immediately without rebuilding its container.
+      shells: ['bash'],
+      mounts: [mounts[1], mounts[2], mounts[0], ...mounts.slice(3)],
+    });
+    return {
+      environment,
+      engine: owned.engine,
+      workingDir: this.checkoutPath(project, owner),
+      allowedWorkingDirs: [root, ownerHome.hostPath],
+      containerAccess: {
+        projectId: project.id,
+        ownerUserId: project.ownerUserId,
+        containerName: owned.description.name,
+        containerIdentity: owned.description.identity,
+        root: '/',
+        workspaceRoot: PROJECT_WORKSPACE,
+        ownerHomeRoot: ownerHome.containerPath,
+      },
+      containerName: owned.description.name,
+      created: false,
+    };
   }
 
   async hasValidCheckout(project: Project, owner: EnvironmentOwner): Promise<boolean> {
@@ -142,15 +273,19 @@ export class ProjectEnvironmentManager {
   }
 
   async ensure(project: Project, owner: EnvironmentOwner): Promise<ProjectEnvironmentResult> {
+    if (project.executionKind === 'host') throw new Error('host projects do not have a container runtime');
     // A saved target is authoritative.  projectTarget intentionally refuses a
     // missing target instead of quietly selecting today's active machine.
     const target = this.environments.projectTarget(project.targetId);
     const ownerHome = this.environments.ownerHomeOnTarget(owner, project.targetId);
     const root = this.worktreePath(project, owner);
+    const overlay = this.overlayPath(project);
     await fsp.mkdir(ownerHome.hostPath, { recursive: true, mode: 0o700 });
     await fsp.chmod(ownerHome.hostPath, 0o700);
     await fsp.mkdir(root, { recursive: true, mode: 0o700 });
     await fsp.chmod(root, 0o700);
+    await fsp.mkdir(overlay, { recursive: true, mode: 0o700 });
+    await fsp.chmod(overlay, 0o700);
 
     const name = project.container?.name || projectContainerName(target.config.namePrefix, project);
     const tier = project.tierId
@@ -159,6 +294,7 @@ export class ProjectEnvironmentManager {
     const mounts: Mount[] = [
       { hostPath: ownerHome.hostPath, containerPath: ownerHome.containerPath },
       { hostPath: root, containerPath: PROJECT_WORKSPACE },
+      { hostPath: overlay, containerPath: PROJECT_OVERLAY },
       ...target.config.extraMounts,
     ];
     // A fresh project's deterministic name can still be occupied by a
@@ -180,7 +316,8 @@ export class ProjectEnvironmentManager {
         name,
         image: project.container?.image || target.config.image,
         mounts,
-        containerHome: PROJECT_WORKSPACE,
+        memoryMounts: [{ containerPath: FORGE_SCRATCH, mode: 0o700 }],
+        containerHome: ownerHome.containerPath,
         cpus: tier ? tier.cpus : target.config.cpus,
         memory: tier ? tier.memory : target.config.memory,
         labels: {
@@ -191,7 +328,7 @@ export class ProjectEnvironmentManager {
           [TARGET_LABEL]: targetLabelValue(target.key),
           ...(tier ? { [TIER_LABEL]: tier.id } : {}),
         },
-        env: { HOME: ownerHome.containerPath, USER: owner.githubLogin, TERM: 'xterm-256color' },
+        env: projectContainerEnvironment(ownerHome.containerPath, owner.githubLogin),
       }, described);
     } catch (error) {
       let after = null;
@@ -246,10 +383,10 @@ export class ProjectEnvironmentManager {
       homeDir: ownerHome.hostPath,
       containerHome: ownerHome.containerPath,
       engine: target.engine,
-      shells: ['sh'],
+      shells: ['bash'],
       // Keep the workspace translation first so an explicitly configured
       // overlapping mount cannot shadow the isolated /workspace mapping.
-      mounts: [mounts[1], mounts[0], ...mounts.slice(2)],
+      mounts: [mounts[1], mounts[2], mounts[0], ...mounts.slice(3)],
     });
     return {
       environment,
@@ -267,6 +404,23 @@ export class ProjectEnvironmentManager {
       },
       containerName: name,
       created: result.created,
+    };
+  }
+
+  /** Prepare a host-local workspace without creating or contacting an engine. */
+  async ensureLocal(project: Project, owner: EnvironmentOwner): Promise<{
+    environment: UserEnvironment;
+    workingDir: string;
+    allowedWorkingDirs: string[];
+  }> {
+    if (project.executionKind !== 'host') throw new Error('project is not host-local');
+    const root = this.worktreePath(project, owner);
+    await fsp.mkdir(root, { recursive: true, mode: 0o700 });
+    await fsp.chmod(root, 0o700).catch(() => undefined);
+    return {
+      environment: new HostEnvironment(os.homedir()),
+      workingDir: this.checkoutPath(project, owner),
+      allowedWorkingDirs: [root],
     };
   }
 

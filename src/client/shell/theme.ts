@@ -75,6 +75,16 @@ export function watchSystemTheme(apply: (theme: RelayTheme) => void): () => void
  */
 export function setThemeMode(theme: RelayTheme): void {
   document.documentElement.classList.toggle('light', theme === 'light');
+  // In an installed WCO window this meta colour paints the native caption
+  // buttons and the area behind them, so it must follow the in-app toggle.
+  try {
+    const colour = getComputedStyle(document.documentElement)
+      .getPropertyValue('--background')
+      .trim();
+    if (colour) document.querySelector('meta[name="theme-color"]')?.setAttribute('content', colour);
+  } catch {
+    // Test DOMs and older engines may not expose computed styles.
+  }
   shellStore.setState({ theme });
   try {
     localStorage.setItem(THEME_STORAGE_KEY, theme);

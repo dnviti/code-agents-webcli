@@ -12,6 +12,14 @@ import { requireUser } from './helpers.js';
 import type { AuthenticatedUser } from '../types.js';
 import type { Project, RunningProjectInfo } from '../services/projects/store.js';
 import type { UserEnvironment } from '../services/environments/types.js';
+import { getCompositionCatalog } from '../services/composition/catalog.js';
+import type {
+  CompositionConfirmResult,
+  CompositionCreateResult,
+  CompositionReadResult,
+  CompositionRetryResult,
+  CompositionSaveResult,
+} from '../services/projects/manager.js';
 
 export type CreateResult =
   | { ok: true; project: Project; state: 'building' | 'running' }
@@ -24,7 +32,7 @@ export type CreateResult =
 
 export type StartResult =
   | { ok: true; state: 'building' | 'running' }
-  | { ok: false; reason: 'not_found' | 'invalid_state' | 'blocked' | 'shutting_down'; detail?: string }
+  | { ok: false; reason: 'not_found' | 'conflict' | 'invalid_state' | 'blocked' | 'shutting_down'; detail?: string }
   | { ok: false; reason: 'run_limit'; running: RunningProjectInfo[] };
 
 export type SimpleResult =
@@ -49,12 +57,18 @@ export type SessionEnvResult =
  */
 export interface ProjectsRoutesManager {
   readonly events: EventEmitter;
-  createAndStart(ownerUserId: number, input: { name: string; repoUrl?: string | null }): Promise<CreateResult>;
+  createAndStart(ownerUserId: number, input: { name: string; repoUrl?: string | null; local?: boolean }): Promise<CreateResult>;
+  createForComposition?(ownerUserId: number, input: { name: string; repoUrl?: string | null; local?: boolean }): Promise<CompositionCreateResult>;
+  getComposition?(ownerUserId: number, projectId: string): CompositionReadResult;
+  saveComposition?(ownerUserId: number, projectId: string, input: { expectedRevision: string | null; runtimes: Array<{ runtimeId: string; version: string }>; agents?: Array<{ runtimeId: string; version: string }>; forgeKind?: string | null }): Promise<CompositionSaveResult>;
+  confirmComposition?(ownerUserId: number, projectId: string, input: { revision: string; expectedRevision: string | null; acknowledgeRebuild: boolean; stopProjectId?: string }): Promise<CompositionConfirmResult>;
+  retryComposition?(ownerUserId: number, projectId: string): Promise<CompositionRetryResult>;
+  reinspectComposition?(ownerUserId: number, projectId: string): Promise<CompositionReadResult> | CompositionReadResult;
   start(ownerUserId: number, projectId: string, opts?: { stopProjectId?: string }): Promise<StartResult>;
-  stop(ownerUserId: number, projectId: string): Promise<SimpleResult>;
+  stop(ownerUserId: number, projectId: string, opts?: { stopActive?: boolean }): Promise<SimpleResult>;
   retry(ownerUserId: number, projectId: string): Promise<StartResult>;
   update(ownerUserId: number, projectId: string, input: { name?: string; repoUrl?: string | null }): Promise<UpdateResult>;
-  remove(ownerUserId: number, projectId: string, opts?: { force?: boolean }): Promise<SimpleResult>;
+  remove(ownerUserId: number, projectId: string, opts?: { force?: boolean; stopActive?: boolean }): Promise<SimpleResult>;
   release(ownerUserId: number, projectId: string, opts?: { discard?: boolean }): Promise<SimpleResult>;
   listForUser(ownerUserId: number): Array<Project & { hasActiveWork: boolean; targetName?: string | null }>;
   getForUser(ownerUserId: number, projectId: string): Project | null;
@@ -68,7 +82,12 @@ export interface ProjectsRoutesDeps {
   manager: ProjectsRoutesManager;
   /** Human-readable placement without exposing target connection details. */
   targetNameFor?(project: Project): string | null;
-  projectAvailability?(): { available: boolean; message?: string };
+  projectAvailability?(): {
+    available: boolean;
+    message?: string;
+    /** Placement used when a create does not explicitly request local mode. */
+    defaultExecutionKind?: 'host' | 'container';
+  };
 }
 
 function isSameOrigin(req: Request): boolean {
@@ -141,6 +160,7 @@ export function createProjectRoutes(deps: ProjectsRoutesDeps): Router {
     const repoUrl = body.repoUrl === undefined || body.repoUrl === null
       ? null
       : typeof body.repoUrl === 'string' ? body.repoUrl.trim() : undefined;
+    const local = body.local === undefined ? false : body.local;
 
     if (!name) {
       res.status(400).json({ error: 'validation', message: 'name is required.' });
@@ -150,8 +170,14 @@ export function createProjectRoutes(deps: ProjectsRoutesDeps): Router {
       res.status(400).json({ error: 'validation', message: 'repoUrl must be a string or omitted.' });
       return;
     }
+    if (typeof local !== 'boolean') {
+      res.status(400).json({ error: 'validation', message: 'local must be a boolean or omitted.' });
+      return;
+    }
 
-    const result = await deps.manager.createAndStart(user.id, { name, repoUrl });
+    const result = deps.manager.createForComposition
+      ? await deps.manager.createForComposition(user.id, { name, repoUrl, local })
+      : await deps.manager.createAndStart(user.id, { name, repoUrl, local });
     if (!result.ok) {
       if (result.reason === 'shutting_down') {
         shuttingDown(res, result.message);
@@ -194,6 +220,161 @@ export function createProjectRoutes(deps: ProjectsRoutesDeps): Router {
       return;
     }
     res.json({ project: projectView(deps, project) });
+  });
+
+  router.get('/api/projects/:id/composition', (req: Request, res: Response): void => {
+    const user = requireAuth(req, res, false);
+    if (!user) return;
+    if (!deps.manager.getComposition) {
+      res.status(503).json({ error: 'composition_unavailable' });
+      return;
+    }
+    const result = deps.manager.getComposition(user.id, paramId(req));
+    if (!result.ok) {
+      notFound(res);
+      return;
+    }
+    res.json({
+      catalog: getCompositionCatalog(),
+      project: projectView(deps, result.project),
+      composition: result.composition,
+    });
+  });
+
+  router.put('/api/projects/:id/composition', async (req: Request, res: Response): Promise<void> => {
+    const user = requireAuth(req, res, true);
+    if (!user) return;
+    if (!deps.manager.saveComposition) {
+      res.status(503).json({ error: 'composition_unavailable' });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const expectedRevision = body.expectedCurrentRevision === null || typeof body.expectedCurrentRevision === 'string'
+      ? body.expectedCurrentRevision
+      : undefined;
+    if (expectedRevision === undefined || !Array.isArray(body.runtimes)) {
+      res.status(400).json({ error: 'validation', message: 'expectedCurrentRevision and runtimes are required.' });
+      return;
+    }
+    const runtimes: Array<{ runtimeId: string; version: string }> = [];
+    for (const item of body.runtimes) {
+      if (!item || typeof item !== 'object') {
+        res.status(400).json({ error: 'validation', message: 'Each runtime must have an id and version.' });
+        return;
+      }
+      const runtime = item as Record<string, unknown>;
+      if (typeof runtime.runtimeId !== 'string' || typeof runtime.version !== 'string') {
+        res.status(400).json({ error: 'validation', message: 'Each runtime must have an id and version.' });
+        return;
+      }
+      runtimes.push({ runtimeId: runtime.runtimeId, version: runtime.version });
+    }
+    const agents: Array<{ runtimeId: string; version: string }> = [];
+    if (body.agents !== undefined && !Array.isArray(body.agents)) {
+      res.status(400).json({ error: 'validation', message: 'agents must be an array.' });
+      return;
+    }
+    for (const item of (body.agents as unknown[] | undefined) || []) {
+      if (!item || typeof item !== 'object') {
+        res.status(400).json({ error: 'validation', message: 'Each agent runtime must have an id and version.' });
+        return;
+      }
+      const agent = item as Record<string, unknown>;
+      if (typeof agent.runtimeId !== 'string' || typeof agent.version !== 'string') {
+        res.status(400).json({ error: 'validation', message: 'Each agent runtime must have an id and version.' });
+        return;
+      }
+      agents.push({ runtimeId: agent.runtimeId, version: agent.version });
+    }
+    if (body.forgeKind !== undefined && body.forgeKind !== null && typeof body.forgeKind !== 'string') {
+      res.status(400).json({ error: 'validation', message: 'forgeKind must be a string or null.' });
+      return;
+    }
+    const result = await deps.manager.saveComposition(user.id, paramId(req), {
+      expectedRevision,
+      runtimes,
+      ...(body.agents !== undefined ? { agents } : {}),
+      ...(body.forgeKind !== undefined ? { forgeKind: body.forgeKind as string | null } : {}),
+    });
+    if (!result.ok) {
+      if (result.reason === 'not_found') return notFound(res);
+      res.status(result.reason === 'conflict' || result.reason === 'invalid_state' ? 409 : 400).json({
+        error: result.reason,
+        message: result.detail,
+      });
+      return;
+    }
+    res.json({ composition: result.composition });
+  });
+
+  router.post('/api/projects/:id/composition/confirm', async (req: Request, res: Response): Promise<void> => {
+    const user = requireAuth(req, res, true);
+    if (!user) return;
+    if (!deps.manager.confirmComposition) {
+      res.status(503).json({ error: 'composition_unavailable' });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (typeof body.revision !== 'string'
+      || (body.expectedRevision !== null && typeof body.expectedRevision !== 'string')
+      || typeof body.acknowledgeRebuild !== 'boolean'
+      || (body.stopProjectId !== undefined && typeof body.stopProjectId !== 'string')) {
+      res.status(400).json({ error: 'validation', message: 'revision, expectedRevision and acknowledgeRebuild are required.' });
+      return;
+    }
+    const result = await deps.manager.confirmComposition(user.id, paramId(req), {
+      revision: body.revision,
+      expectedRevision: body.expectedRevision as string | null,
+      acknowledgeRebuild: body.acknowledgeRebuild,
+      ...(typeof body.stopProjectId === 'string' ? { stopProjectId: body.stopProjectId } : {}),
+    });
+    if (!result.ok) {
+      if (result.reason === 'not_found') return notFound(res);
+      if (result.reason === 'shutting_down') return shuttingDown(res, result.detail);
+      if (result.reason === 'run_limit') {
+        res.status(409).json({ error: 'run_limit', running: result.running });
+        return;
+      }
+      res.status(result.reason === 'identity_required' ? 422 : 409).json({
+        error: result.reason,
+        message: result.detail,
+        ...('composition' in result && result.composition ? { composition: result.composition } : {}),
+      });
+      return;
+    }
+    res.status(202).json({ state: result.state });
+  });
+
+  router.post('/api/projects/:id/composition/retry', async (req: Request, res: Response): Promise<void> => {
+    const user = requireAuth(req, res, true);
+    if (!user) return;
+    if (!deps.manager.retryComposition) {
+      res.status(503).json({ error: 'composition_unavailable' });
+      return;
+    }
+    const result = await deps.manager.retryComposition(user.id, paramId(req));
+    if (!result.ok) {
+      if (result.reason === 'not_found') return notFound(res);
+      if (result.reason === 'shutting_down') return shuttingDown(res, result.detail);
+      res.status(409).json({ error: result.reason, message: result.detail });
+      return;
+    }
+    res.status(202).json({ installations: result.installations });
+  });
+
+  router.post('/api/projects/:id/composition/inspect', async (req: Request, res: Response): Promise<void> => {
+    const user = requireAuth(req, res, true);
+    if (!user) return;
+    if (!deps.manager.reinspectComposition) {
+      res.status(503).json({ error: 'composition_unavailable' });
+      return;
+    }
+    const result = await deps.manager.reinspectComposition(user.id, paramId(req));
+    if (!result.ok) {
+      notFound(res);
+      return;
+    }
+    res.status(202).json({ project: projectView(deps, result.project), composition: result.composition });
   });
 
   router.put('/api/projects/:id', async (req: Request, res: Response): Promise<void> => {
@@ -250,7 +431,8 @@ export function createProjectRoutes(deps: ProjectsRoutesDeps): Router {
 
     const body = (req.body ?? {}) as Record<string, unknown>;
     const force = body.force === true;
-    const result = await deps.manager.remove(user.id, paramId(req), { force });
+    const stopActive = body.stopActive === true;
+    const result = await deps.manager.remove(user.id, paramId(req), { force, stopActive });
     if (!result.ok) {
       if (result.reason === 'shutting_down') {
         shuttingDown(res, result.detail);
@@ -334,7 +516,8 @@ export function createProjectRoutes(deps: ProjectsRoutesDeps): Router {
     const user = requireAuth(req, res, true);
     if (!user) return;
 
-    const result = await deps.manager.stop(user.id, paramId(req));
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const result = await deps.manager.stop(user.id, paramId(req), { stopActive: body.stopActive === true });
     if (!result.ok) {
       if (result.reason === 'shutting_down') {
         shuttingDown(res, result.detail);
@@ -389,7 +572,7 @@ export function createProjectRoutes(deps: ProjectsRoutesDeps): Router {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    const terminalStates = new Set(['running', 'stopped', 'failed', 'unavailable', 'blocked']);
+    const terminalStates = new Set(['composition_pending', 'running', 'stopped', 'failed', 'unavailable', 'blocked']);
     const queued: unknown[] = [];
     let replaying = true;
     let ended = false;

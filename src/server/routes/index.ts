@@ -13,22 +13,25 @@ import { createUsageRoutes, UsageRoutesDeps } from './usage.js';
 import { createDeployTargetRoutes, DeployTargetRoutesDeps } from './deploy-targets.js';
 import { createProjectRoutes, ProjectsRoutesDeps } from './projects.js';
 import { createConnectedHostRoutes, ConnectedHostRoutesDeps } from './connected-hosts.js';
+import { createGitIdentityRoutes, GitIdentityRoutesDeps } from './git-identity.js';
+import { createStorageUsageRoutes, StorageUsageRoutesDeps } from './storage-usage.js';
 
-export interface RegisterRoutesDeps
-  extends HealthRoutesDeps,
-    SessionRoutesDeps,
-    FolderRoutesDeps,
-    UpdateRoutesDeps,
-    PasteRoutesDeps,
-    ChatAttachmentRoutesDeps,
-    ProfileRoutesDeps,
-    PreferenceRoutesDeps,
-    WorkspaceRoutesDeps,
-    UsageRoutesDeps,
-    EnvironmentRoutesDeps,
-    DeployTargetRoutesDeps,
-    ProjectsRoutesDeps,
-    ConnectedHostRoutesDeps {}
+export type RegisterRoutesDeps = HealthRoutesDeps
+  & SessionRoutesDeps
+  & FolderRoutesDeps
+  & UpdateRoutesDeps
+  & PasteRoutesDeps
+  & ChatAttachmentRoutesDeps
+  & ProfileRoutesDeps
+  & PreferenceRoutesDeps
+  & WorkspaceRoutesDeps
+  & UsageRoutesDeps
+  & EnvironmentRoutesDeps
+  & DeployTargetRoutesDeps
+  & ProjectsRoutesDeps
+  & ConnectedHostRoutesDeps
+  & GitIdentityRoutesDeps
+  & StorageUsageRoutesDeps;
 
 export function registerRoutes(app: Express, deps: RegisterRoutesDeps): void {
   app.use(createHealthRoutes(deps));
@@ -45,4 +48,6 @@ export function registerRoutes(app: Express, deps: RegisterRoutesDeps): void {
   app.use(createDeployTargetRoutes(deps));
   app.use(createProjectRoutes(deps));
   app.use(createConnectedHostRoutes(deps));
+  app.use(createGitIdentityRoutes(deps));
+  app.use(createStorageUsageRoutes(deps));
 }

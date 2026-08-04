@@ -77,7 +77,7 @@ export type ProjectSessionEnvironmentResult =
       environment: UserEnvironment;
       workingDir: string;
       allowedWorkingDirs: string[];
-      containerAccess: ProjectContainerAccessLike;
+      containerAccess?: ProjectContainerAccessLike;
       leaseId: string;
     }
   | {
@@ -169,6 +169,7 @@ export async function execProjectContainerCommand(
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   timeout.unref?.();
   try {
+    if (!result.containerAccess) throw new Error('project is running on the host');
     return await manager.execInSessionContainer(
       result.containerAccess.ownerUserId,
       result.containerAccess.projectId,
@@ -353,6 +354,7 @@ export async function canonicalProjectContainerWorkingDir(
   result: Extract<ProjectSessionEnvironmentResult, { ok: true }>,
   requested: string,
 ): Promise<string | null> {
+  if (!result.containerAccess) return null;
   let candidate: string;
   try {
     candidate = validateProjectContainerPath(result.containerAccess, requested);
@@ -379,6 +381,7 @@ export async function projectHostWorkingDirToContainer(
   result: Extract<ProjectSessionEnvironmentResult, { ok: true }>,
   requested: string,
 ): Promise<string | null> {
+  if (!result.containerAccess) return null;
   const host = await canonicalProjectWorkingDir(result.allowedWorkingDirs, requested);
   if (!host) return null;
   try {

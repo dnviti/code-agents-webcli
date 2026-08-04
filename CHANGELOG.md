@@ -3,6 +3,41 @@
 ## [6.0.0] - unreleased
 
 ### Added
+- **Installed desktop PWAs can use the native title bar for the session strip**
+  (#183). On browsers that support Window Controls Overlay, the existing tabs
+  and app actions occupy the browser-reported safe area beside the real native
+  controls, with only the **Code Agents** brand acting as a drag region. The
+  layout follows live overlay geometry, compacts actions at narrow widths,
+  covers signed-out, setup, error and offline screens, and falls back silently
+  to the ordinary standalone or browser layout everywhere else.
+
+- **Containerized environments and deploy-target configuration are now behind
+  an operator feature flag.** They are disabled by default and can only be
+  enabled with `CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED=true`; legacy
+  container flags cannot bypass the gate.
+
+- **Local Projects can be used alongside an active deploy target.** The project
+  manager and new-tab workspace chooser now offer a per-user **Local Projects**
+  toggle. It shows and creates host-local workspaces without changing the
+  installation's active target or moving any existing project.
+
+- **Projects now review a repository-derived build recipe before the first
+  container is created** (#169). The recipe can combine Node.js, Python, Go,
+  Rust, Java and .NET and lets the user select pinned Claude Code, Codex, pi,
+  Grok, Qwen, Kimi and Oh My Pi agent runtimes. Selected agents are installed
+  into the durable owner home, including their Node or Python foundation when
+  the repository did not select it, so a fresh container can actually launch
+  them and later rebuilds retain their sign-ins, settings and skills. The recipe
+  is retained as an immutable project revision and uses
+  the normal preservation gate before an existing project is rebuilt. Each
+  runtime and forge-tool installation reports independently: a project remains
+  usable with a truthful partial-install status, and retrying failures never
+  rebuilds or discards its workspace. User tooling and agent state persist in
+  the owner home, project-only settings in an isolated project overlay, and the
+  repository checkout remains disposable. Storage is measured and warned about
+  for users and installers, but is never a quota or an admission check. See
+  [Project composition and durable storage](docs/project-composition.md).
+
 - **Plan mode is back as a complete WebUI workflow on every chat runtime**
   (#179). The Plan control sits beside the model and effort controls on desktop
   and phone, and belongs to the conversation rather than the browser: its state

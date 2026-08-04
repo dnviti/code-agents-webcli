@@ -7,19 +7,43 @@ import path from 'node:path';
 import { EnvironmentManager, MANAGED_LABEL, USER_ID_LABEL } from '../environments/manager.js';
 import { EnvironmentOwner, UserEnvironment, WrappedProcessControl } from '../environments/types.js';
 import { DeployTargetStore } from '../deploy-targets.js';
-import { checkRepositoryAccess, cloneRepository, FetchLike } from './clone.js';
+import { checkRepositoryAccess, cloneRepository, cloneRepositoryOnHost, CloneSourceChangedError, FetchLike, hostRepositoryHasChanges } from './clone.js';
 import {
   ProjectContainerAccess,
   ProjectContainerOwnershipError,
   ProjectContainerStateUnknownError,
+  ProjectEnvironmentResult,
   ProjectEnvironmentManager,
   ProjectTrackedSpawnDescriptor,
+  FORGE_SCRATCH,
   validateProjectContainerPath,
 } from './environment.js';
 import { EnvironmentEngine, RunResult, isQuiescentContainerStatus } from '../environments/engine.js';
 import { preserveProjectWork } from './preserve.js';
-import { BuildEvent, Project, ProjectState, ProjectStore, RunningProjectInfo } from './store.js';
+import {
+  BuildEvent,
+  CompositionInstallation,
+  ConnectedCredential,
+  Project,
+  ProjectComposition,
+  ProjectState,
+  ProjectStore,
+  RunningProjectInfo,
+} from './store.js';
 import { PROJECT_LABEL, TARGET_LABEL, projectContainerName, targetLabelValue } from '../environments/naming.js';
+import {
+  AgentRuntimeId,
+  COMPOSITION_CATALOG_VERSION,
+  RuntimeId,
+  getAgentRuntimeCatalogEntry,
+  getCompositionCatalog,
+  isConservativeRuntimeVersion,
+} from '../composition/catalog.js';
+import {
+  RepositoryInspectionError,
+  RepositoryInspectionResult,
+  RepositoryInspector,
+} from '../composition/repository-inspector.js';
 import {
   ProjectSessionFileCommand,
   ProjectSessionFileProcess,
@@ -42,13 +66,13 @@ export type CreateResult =
   | { ok: false; reason: 'run_limit'; project: Project; running: RunningProjectInfo[] };
 export type StartResult =
   | { ok: true; state: 'building' | 'running' }
-  | { ok: false; reason: 'not_found' | 'invalid_state' | 'blocked' | 'shutting_down'; detail?: string }
+  | { ok: false; reason: 'not_found' | 'conflict' | 'invalid_state' | 'blocked' | 'shutting_down'; detail?: string }
   | { ok: false; reason: 'run_limit'; running: RunningProjectInfo[] };
 export type SimpleResult =
   | { ok: true }
   | { ok: false; reason: 'not_found' | 'invalid_state' | 'preserve_failed' | 'shutting_down'; detail?: string };
 export type SessionEnvResult =
-  | { ok: true; environment: UserEnvironment; workingDir: string; allowedWorkingDirs: string[]; containerAccess: ProjectContainerAccess; leaseId: string }
+  | { ok: true; environment: UserEnvironment; workingDir: string; allowedWorkingDirs: string[]; containerAccess?: ProjectContainerAccess; leaseId: string }
   | { ok: false; reason: 'not_found' | 'run_limit' | 'failed' | 'building' | 'shutting_down'; running?: RunningProjectInfo[]; detail?: string };
 export type UpdateResult =
   | { ok: true; project: Project }
@@ -56,6 +80,73 @@ export type UpdateResult =
   | { ok: false; reason: 'validation'; message: string }
   | { ok: false; reason: 'credential_required'; host: string }
   | { ok: false; reason: 'repo_unreachable'; message: string };
+
+export interface CompositionChoice {
+  runtimes: Array<{ runtimeId: RuntimeId; version: string }>;
+  agents: Array<{ runtimeId: AgentRuntimeId; version: string }>;
+  forgeKind?: 'github' | 'gitlab' | 'gitea' | 'forgejo' | null;
+}
+
+export interface CompositionView {
+  revision: string | null;
+  activeRevision: string | null;
+  appliedRevision: string | null;
+  detected: RepositoryInspectionResult | null;
+  chosen: CompositionChoice | null;
+  installations: CompositionInstallation[];
+  identity: { name: string; email: string } | null;
+  identitySource: 'project' | 'global' | 'provider' | 'incomplete';
+  forge: { kind: string; host: string; connected: boolean; validationStatus: string | null } | null;
+}
+
+export type CompositionCreateResult =
+  | { ok: true; project: Project }
+  | { ok: false; reason: 'validation' | 'repo_unreachable' | 'no_target' | 'shutting_down'; message: string }
+  | { ok: false; reason: 'credential_required'; host: string };
+
+export type CompositionReadResult =
+  | { ok: true; project: Project; composition: CompositionView }
+  | { ok: false; reason: 'not_found' };
+
+export type CompositionSaveResult =
+  | { ok: true; composition: CompositionView }
+  | { ok: false; reason: 'not_found' | 'conflict' | 'invalid_state' | 'validation'; detail?: string };
+
+export type CompositionConfirmResult =
+  | { ok: true; state: 'building' | 'running' }
+  | { ok: false; reason: 'not_found' | 'conflict' | 'invalid_state' | 'preserve_failed' | 'source_changed' | 'identity_required' | 'blocked' | 'shutting_down'; detail?: string; composition?: CompositionView }
+  | { ok: false; reason: 'run_limit'; running: RunningProjectInfo[] };
+
+export type CompositionRetryResult =
+  | { ok: true; installations: CompositionInstallation[] }
+  | { ok: false; reason: 'not_found' | 'invalid_state' | 'shutting_down'; detail?: string };
+
+export interface CompositionRuntimeContext {
+  project: Project;
+  composition: ProjectComposition;
+  chosen: CompositionChoice;
+  containerName: string;
+  containerIdentity: string;
+  engine: EnvironmentEngine;
+  ownerHomeHost: string;
+  ownerHomeContainer: string;
+  projectOverlayHost: string;
+  checkoutContainerPath: string;
+  credential: string | null;
+  credentialKind: 'token' | 'oauth' | null;
+  credentialRevision: number | null;
+  identity: { name: string; email: string };
+  globalIdentity: { name: string; email: string };
+  projectIdentity: { name: string; email: string } | null;
+}
+
+export interface CompositionRuntimeAdapter {
+  prepare(context: CompositionRuntimeContext): Promise<{ installations: CompositionInstallation[] }>;
+  configureGit(context: CompositionRuntimeContext): Promise<void>;
+  retryFailed(context: CompositionRuntimeContext): Promise<{ installations: CompositionInstallation[] }>;
+  /** Re-materialize only forge auth in an existing verified runtime. */
+  refreshForgeCredential?(context: CompositionRuntimeContext): Promise<void>;
+}
 
 interface RecoveryEntry {
   recovery: ProjectSessionProcessRecovery;
@@ -89,12 +180,20 @@ export interface ProjectManagerDeps {
   ownerFor?(userId: number): EnvironmentOwner | null;
   /** Retire every project session (runtime and in-memory) before its FK row goes. */
   deleteProjectSessions?(projectId: string, ownerUserId: number): Promise<void> | void;
+  /** Stop attached runtimes and detach their live claims without deleting history. */
+  suspendProjectSessions?(projectId: string, ownerUserId: number): Promise<void> | void;
   /** Attached clients, commands or agent turns not yet represented by DB active=1. */
   hasLiveProjectWork?(projectId: string): boolean;
   fetch?: FetchLike;
   preflightTimeoutMs?: number;
   cloneTimeoutMs?: number;
   preserveTimeoutMs?: number;
+  /** Static inspection is optional only for legacy/unit-test construction. */
+  repositoryInspector?: Pick<RepositoryInspector, 'inspect'>;
+  /** Runtime application remains behind an injected, identity-bound adapter. */
+  compositionRuntime?: CompositionRuntimeAdapter;
+  /** Test/embedding override; the server default is the OS user's ~/.cc-web/workspaces. */
+  localWorkspaceRoot?: string;
 }
 
 export class ProjectManager {
@@ -103,19 +202,472 @@ export class ProjectManager {
   private readonly now: () => Date;
   private sweep: NodeJS.Timeout | null = null;
   private readonly lifecycleTails = new Map<string, Promise<void>>();
+  /** Serialize every plaintext use and mutation for one owner/forge host. */
+  private readonly credentialTails = new Map<string, Promise<void>>();
   private readonly builds = new Map<string, Promise<void>>();
-  private readonly creations = new Set<Promise<CreateResult>>();
+  private readonly creations = new Set<Promise<unknown>>();
+  private readonly inspections = new Map<string, Promise<void>>();
   private readonly issuedLeases = new Map<string, IssuedSessionLease>();
+  private readonly issuedHostLeases = new Map<string, { ownerUserId: number; projectId: string }>();
   private readonly leaseWaiters = new Set<() => void>();
   private sweepTask: Promise<void> | null = null;
   private shuttingDown = false;
 
   constructor(private readonly deps: ProjectManagerDeps) {
-    this.projects = new ProjectEnvironmentManager(deps.environments);
+    this.projects = new ProjectEnvironmentManager(deps.environments, deps.localWorkspaceRoot);
     this.now = deps.now || (() => new Date());
   }
 
-  createAndStart(ownerUserId: number, input: { name: string; repoUrl?: string | null }): Promise<CreateResult> {
+  /**
+   * Stage a project for composition review. Repository inspection is detached
+   * from the request, but remains tracked for orderly shutdown. Crucially this
+   * path does not ask an environment engine to create or start anything.
+   */
+  createForComposition(
+    ownerUserId: number,
+    input: { name: string; repoUrl?: string | null; local?: boolean },
+  ): Promise<CompositionCreateResult> {
+    if (this.shuttingDown) {
+      return Promise.resolve({ ok: false, reason: 'shutting_down', message: 'Project manager is shutting down' });
+    }
+    const task = this.createForCompositionActive(ownerUserId, input);
+    this.trackCreation(task);
+    return task;
+  }
+
+  private async createForCompositionActive(
+    ownerUserId: number,
+    input: { name: string; repoUrl?: string | null; local?: boolean },
+  ): Promise<CompositionCreateResult> {
+    const name = input.name.trim();
+    if (!name) return { ok: false, reason: 'validation', message: 'Project name is required' };
+    const repoUrl = input.repoUrl?.trim() || null;
+    let targetId: string | null;
+    let tierId: string | null;
+    const placement = input.local
+      ? { kind: 'host' as const }
+      : this.deps.environments.newProjectPlacement();
+    const executionKind = placement.kind;
+    if (placement.kind === 'host') {
+      targetId = null;
+      tierId = null;
+    } else {
+      targetId = placement.target.key === 'legacy' ? null : placement.target.key;
+      tierId = this.deps.environments.intendedTierOnTarget(ownerUserId, targetId)?.id || null;
+    }
+
+    let host: string | null = null;
+    if (repoUrl) {
+      if (!this.deps.repositoryInspector) {
+        return { ok: false, reason: 'validation', message: 'Repository inspection is unavailable' };
+      }
+      if (!repoUrl.toLowerCase().startsWith('https://')) {
+        return { ok: false, reason: 'validation', message: 'Repository inspection requires HTTPS' };
+      }
+      let access = await this.preflight(repoUrl);
+      if (!access.ok && access.reason === 'credential_required' && access.host) {
+        const credentialHost = access.host;
+        access = await this.exclusiveCredentialFor(ownerUserId, credentialHost, async () => {
+          const credential = this.connectedCredentialFor(ownerUserId, credentialHost);
+          if (!credential) return access;
+          const checked = await this.preflight(repoUrl, credential.token);
+          if (!checked.ok && checked.reason === 'credential_required') {
+            this.markCredentialRejected(ownerUserId, credentialHost, credential);
+          }
+          return checked;
+        });
+      }
+      if (!access.ok) {
+        if (access.reason === 'credential_required' && access.host) {
+          return { ok: false, reason: 'credential_required', host: access.host };
+        }
+        if (access.reason === 'validation') {
+          return { ok: false, reason: 'validation', message: access.message };
+        }
+        return { ok: false, reason: 'repo_unreachable', message: access.message };
+      }
+      host = access.host;
+    }
+
+    const project = this.deps.store.createProject({
+      ownerUserId,
+      name,
+      repoUrl,
+      repoHost: host,
+      targetId,
+      executionKind,
+      tierId,
+      initialState: repoUrl ? 'inspecting' : 'composition_pending',
+    });
+    this.deps.store.resetBuildLog(project.id);
+    if (repoUrl) {
+      this.event(project, {
+        t: 'state', state: 'inspecting', percent: 0, message: 'Inspecting repository without executing its code',
+      });
+      this.trackInspection(ownerUserId, project.id);
+    } else {
+      const draft = this.saveDetectedDraft(project, null);
+      if (!draft) {
+        this.deps.store.setState(project.id, 'failed', 'Could not create the initial build recipe');
+      } else {
+        this.deps.store.setState(project.id, 'composition_pending', 'Choose the tools for this project');
+        this.event(this.deps.store.getProject(project.id) as Project, {
+          t: 'state', state: 'composition_pending', percent: 100, message: 'Build recipe is ready for review',
+        });
+      }
+    }
+    return { ok: true, project: this.deps.store.getProject(project.id) || project };
+  }
+
+  getComposition(ownerUserId: number, projectId: string): CompositionReadResult {
+    const project = this.deps.store.getProjectForUser(projectId, ownerUserId);
+    if (!project) return { ok: false, reason: 'not_found' };
+    return { ok: true, project, composition: this.compositionView(project) };
+  }
+
+  saveComposition(
+    ownerUserId: number,
+    projectId: string,
+    input: { expectedRevision: string | null; runtimes: Array<{ runtimeId: string; version: string }>; agents?: Array<{ runtimeId: string; version: string }>; forgeKind?: string | null },
+  ): Promise<CompositionSaveResult> {
+    if (this.shuttingDown) {
+      return Promise.resolve({ ok: false, reason: 'invalid_state', detail: 'Project manager is shutting down' });
+    }
+    return this.exclusiveFor([projectId], async () => {
+      const project = this.deps.store.getProjectForUser(projectId, ownerUserId);
+      if (!project) return { ok: false, reason: 'not_found' };
+      if (['inspecting', 'building', 'reclaiming', 'blocked'].includes(project.state)) {
+        return { ok: false, reason: 'invalid_state', detail: 'Project composition cannot be edited in its current state' };
+      }
+      const previous = this.deps.store.getProjectComposition(project.id, ownerUserId);
+      if ((previous?.id || null) !== input.expectedRevision) {
+        return { ok: false, reason: 'conflict', detail: 'The build recipe changed in another request' };
+      }
+      const chosen = validateCompositionChoice(input);
+      if (!chosen.ok) return chosen;
+      const detected = inspectionFrom(previous?.detected);
+      const forgeHost = previous?.forgeHost || project.repoHost;
+      if (forgeHost && !chosen.choice.forgeKind && !knownPublicForge(forgeHost)) {
+        return { ok: false, reason: 'validation', detail: 'Choose the forge used by this repository host' };
+      }
+      const knownForge = knownPublicForge(forgeHost);
+      if (knownForge && chosen.choice.forgeKind && chosen.choice.forgeKind !== knownForge) {
+        return { ok: false, reason: 'validation', detail: `The forge for ${forgeHost} is ${knownForge}` };
+      }
+      const forgeKind = chosen.choice.forgeKind || knownForge;
+      const draft = this.deps.store.saveCompositionDraft({
+        projectId: project.id,
+        userId: ownerUserId,
+        catalogVersion: previous?.catalogVersion || COMPOSITION_CATALOG_VERSION,
+        detected: detected || emptyInspection(),
+        chosen: { ...chosen.choice, forgeKind },
+        sourceOid: previous?.sourceOid,
+        sourceRef: previous?.sourceRef,
+        forgeKind,
+        forgeHost,
+        installations: installationIds(chosen.choice, forgeKind).map((itemId) => ({ itemId })),
+      });
+      if (!draft) return { ok: false, reason: 'not_found' };
+      if (project.state === 'composition_pending') {
+        this.deps.store.setState(project.id, 'composition_pending', 'Build recipe saved; confirm it to build');
+      }
+      this.publish(this.deps.store.getProject(project.id) as Project);
+      return { ok: true, composition: this.compositionView(this.deps.store.getProject(project.id) as Project) };
+    });
+  }
+
+  confirmComposition(
+    ownerUserId: number,
+    projectId: string,
+    input: { revision: string; expectedRevision: string | null; acknowledgeRebuild: boolean; stopProjectId?: string },
+  ): Promise<CompositionConfirmResult> {
+    if (this.shuttingDown) {
+      return Promise.resolve({ ok: false, reason: 'shutting_down', detail: 'Project manager is shutting down' });
+    }
+    return this.exclusiveFor(
+      [projectId, ...(input.stopProjectId ? [input.stopProjectId] : [])],
+      () => this.confirmCompositionLocked(ownerUserId, projectId, input),
+    );
+  }
+
+  private async confirmCompositionLocked(
+    ownerUserId: number,
+    projectId: string,
+    input: { revision: string; expectedRevision: string | null; acknowledgeRebuild: boolean; stopProjectId?: string },
+  ): Promise<CompositionConfirmResult> {
+    let project = this.deps.store.getProjectForUser(projectId, ownerUserId);
+    if (!project) return { ok: false, reason: 'not_found' };
+    if (['inspecting', 'building', 'reclaiming'].includes(project.state)) {
+      return { ok: false, reason: 'invalid_state', detail: 'Project lifecycle work is still in progress' };
+    }
+    if (project.state === 'blocked') {
+      return { ok: false, reason: 'blocked', detail: project.stateDetail || undefined };
+    }
+    const revision = this.deps.store.getCompositionForUser(input.revision, ownerUserId);
+    if (!revision || revision.projectId !== project.id) return { ok: false, reason: 'not_found' };
+    if (project.compositionRevision !== input.expectedRevision) {
+      return { ok: false, reason: 'conflict', detail: 'The active build recipe changed in another request' };
+    }
+    const latest = this.deps.store.getProjectComposition(project.id, ownerUserId);
+    if (latest?.id !== revision.id) {
+      return { ok: false, reason: 'conflict', detail: 'A newer build recipe is available' };
+    }
+    // Confirmation is idempotent once this exact recipe is already running.
+    // In particular, never relabel an existing live runtime as stopped and
+    // enqueue a second build around it.
+    if (project.state === 'running'
+      && project.compositionRevision === revision.id
+      && project.appliedCompositionRevision === revision.id) {
+      return { ok: true, state: 'running' };
+    }
+    if (this.hasActiveWork(project.id)) {
+      return { ok: false, reason: 'invalid_state', detail: 'Project has active work; close it before rebuilding' };
+    }
+    const chosen = compositionChoiceFrom(revision.chosen);
+    if (!chosen) return { ok: false, reason: 'invalid_state', detail: 'The saved build recipe is invalid' };
+    const identity = this.resolvedIdentity(project);
+    if (!identity.identity) {
+      return { ok: false, reason: 'identity_required', detail: 'Set a valid Git name and email before building' };
+    }
+
+    if (project.repoUrl && revision.sourceOid) {
+      if (!this.deps.repositoryInspector) {
+        return { ok: false, reason: 'invalid_state', detail: 'Repository inspection is unavailable' };
+      }
+      let current: RepositoryInspectionResult;
+      const inspectionProject = project;
+      try {
+        current = await this.exclusiveCredentialFor(ownerUserId, inspectionProject.repoHost, async () => {
+          const credential = this.credentialRecordFor(inspectionProject);
+          try {
+            return await this.deps.repositoryInspector!.inspect({
+              repoUrl: inspectionProject.repoUrl!,
+              credential: credential?.token || null,
+            });
+          } catch (error) {
+            if (error instanceof RepositoryInspectionError
+              && error.code === 'credential_required'
+              && inspectionProject.repoHost) {
+              this.markCredentialRejected(ownerUserId, inspectionProject.repoHost, credential);
+            }
+            throw error;
+          }
+        });
+      } catch (error) {
+        return { ok: false, reason: 'invalid_state', detail: safeInspectionMessage(error) };
+      }
+      if (current.sourceOid !== revision.sourceOid) {
+        this.saveDetectedDraft(project, current, chosen);
+        if (project.state !== 'running') {
+          this.deps.store.setState(project.id, 'composition_pending', 'Repository changed; review the refreshed build recipe');
+        } else {
+          this.deps.store.setState(project.id, 'running', 'Repository changed; the current container remains active until the refreshed recipe is confirmed');
+        }
+        project = this.deps.store.getProject(project.id) as Project;
+        this.event(project, {
+          t: 'state', state: project.state, message: 'Repository changed after inspection; review the refreshed build recipe',
+        });
+        return {
+          ok: false,
+          reason: 'source_changed',
+          detail: 'Repository changed after inspection; review the refreshed build recipe',
+          composition: this.compositionView(project),
+        };
+      }
+    }
+
+    const alreadyBuilt = project.state !== 'composition_pending';
+    if (alreadyBuilt && revision.id !== project.appliedCompositionRevision && !input.acknowledgeRebuild) {
+      return { ok: false, reason: 'invalid_state', detail: 'Confirm that changing this recipe rebuilds the project container' };
+    }
+    if (alreadyBuilt && revision.id !== project.appliedCompositionRevision) {
+      const reclaimed = await this.reclaim(project, false);
+      if (!reclaimed.ok) {
+        return { ok: false, reason: reclaimed.reason, detail: reclaimed.detail };
+      }
+      // Reclaim has already preserved and removed the old workspace. The next
+      // build should create directly around that empty root, not repeat it.
+      this.deps.store.setRebuildRequired(project.id, false);
+      project = this.deps.store.getProject(project.id) as Project;
+    }
+    const started = await this.startLocked(ownerUserId, project.id, {
+      stopProjectId: input.stopProjectId,
+      fromStates: project.state === 'composition_pending'
+        ? ['composition_pending']
+        : ['stopped', 'failed', 'unavailable'],
+      activateComposition: {
+        revision: revision.id,
+        expectedCurrentRevision: input.expectedRevision,
+      },
+    });
+    if (!started.ok) return started;
+    return started;
+  }
+
+  async reinspectComposition(ownerUserId: number, projectId: string): Promise<CompositionReadResult> {
+    if (this.shuttingDown) return { ok: false, reason: 'not_found' };
+    const existingTask = this.inspections.get(projectId);
+    if (existingTask) return { ok: false, reason: 'not_found' };
+
+    // Admission, the state decision, and the final draft write all stay behind
+    // the same lifecycle lock. A confirm/build queued on either side therefore
+    // cannot be relabelled by a stale `keepRuntimeActive` snapshot.
+    let resolveAdmission!: (admitted: boolean) => void;
+    let admissionSettled = false;
+    const admission = new Promise<boolean>((resolve) => { resolveAdmission = resolve; });
+    const settleAdmission = (admitted: boolean): void => {
+      if (admissionSettled) return;
+      admissionSettled = true;
+      resolveAdmission(admitted);
+    };
+    const task = this.exclusiveFor([projectId], async (): Promise<void> => {
+      try {
+        const project = this.deps.store.getProjectForUser(projectId, ownerUserId);
+        if (!project?.repoUrl || ['inspecting', 'building', 'reclaiming'].includes(project.state)) return;
+        const keepRuntimeActive = project.state === 'running';
+        if (keepRuntimeActive) {
+          this.event(project, {
+            t: 'step', state: 'running', step: 'inspection', percent: 0,
+            message: 'Refreshing build recipe while the current container stays active',
+          });
+        } else {
+          this.deps.store.setState(project.id, 'inspecting', 'Refreshing repository inspection');
+          this.deps.store.resetBuildLog(project.id);
+          this.event(this.deps.store.getProject(project.id) as Project, {
+            t: 'state', state: 'inspecting', percent: 0, message: 'Refreshing build recipe',
+          });
+        }
+        settleAdmission(true);
+        await this.inspectProject(ownerUserId, project.id, keepRuntimeActive, true);
+      } finally {
+        settleAdmission(false);
+      }
+    });
+    this.inspections.set(projectId, task);
+    void task.finally(() => {
+      if (this.inspections.get(projectId) === task) this.inspections.delete(projectId);
+    }).catch(() => undefined);
+    if (!(await admission)) return { ok: false, reason: 'not_found' };
+    const refreshed = this.deps.store.getProjectForUser(projectId, ownerUserId);
+    if (!refreshed) return { ok: false, reason: 'not_found' };
+    return { ok: true, project: refreshed, composition: this.compositionView(refreshed) };
+  }
+
+  retryComposition(ownerUserId: number, projectId: string): Promise<CompositionRetryResult> {
+    if (this.shuttingDown) {
+      return Promise.resolve({ ok: false, reason: 'shutting_down', detail: 'Project manager is shutting down' });
+    }
+    return this.exclusiveFor([projectId], async () => {
+      const project = this.deps.store.getProjectForUser(projectId, ownerUserId);
+      if (!project) return { ok: false, reason: 'not_found' };
+      if (project.state !== 'running' || !project.compositionRevision || !this.deps.compositionRuntime) {
+        return { ok: false, reason: 'invalid_state', detail: 'Only a running composed project can retry failed tools' };
+      }
+      const composition = this.deps.store.getProjectComposition(
+        project.id,
+        ownerUserId,
+        project.compositionRevision,
+      );
+      const chosen = compositionChoiceFrom(composition?.chosen);
+      if (!composition || !chosen) {
+        return { ok: false, reason: 'invalid_state', detail: 'Active build recipe is unavailable' };
+      }
+      const failed = this.deps.store.listCompositionInstallations(composition.id, ownerUserId)
+        .filter((item) => item.status === 'failed');
+      if (!failed.length) return { ok: true, installations: [] };
+      let result: { installations: CompositionInstallation[] };
+      try {
+        const prepared = await this.projects.existing(project, this.owner(ownerUserId));
+        if (!prepared) {
+          return { ok: false, reason: 'invalid_state', detail: 'The existing project container is unavailable; rebuild it instead' };
+        }
+        result = await this.exclusiveCredentialFor(
+          ownerUserId,
+          composition.forgeHost,
+          () => this.deps.compositionRuntime!.retryFailed(
+            this.runtimeContext(project, composition, chosen, prepared),
+          ),
+        );
+      } catch {
+        const detail = 'Failed setup could not be retried in the existing project container';
+        this.deps.store.setState(project.id, 'running', detail);
+        this.event(this.deps.store.getProject(project.id) as Project, {
+          t: 'partial_install', state: 'running', message: detail,
+        });
+        return { ok: false, reason: 'invalid_state', detail };
+      }
+      const stillFailed = result.installations.filter((item) => item.status === 'failed');
+      if (stillFailed.length) {
+        this.event(project, {
+          t: 'partial_install',
+          state: 'running',
+          message: `Some tools still need attention: ${stillFailed.map((item) => item.itemId).join(', ')}`,
+        });
+      } else {
+        this.deps.store.setState(project.id, 'running');
+        this.event(project, {
+          t: 'progress', state: 'running', percent: 100, message: 'All selected tools are installed',
+        });
+      }
+      return { ok: true, installations: result.installations };
+    });
+  }
+
+  /**
+   * Keep an encrypted credential replacement and every live tmpfs copy in one
+   * generation-ordered critical section. Routes supply only the storage and
+   * validation mutation; lifecycle ownership remains here.
+   */
+  synchronizeHostCredentialReplacement<T>(
+    ownerUserId: number,
+    hostInput: string,
+    mutation: () => Promise<T> | T,
+  ): Promise<T> {
+    if (this.shuttingDown) {
+      return Promise.reject(new Error('Project manager is shutting down'));
+    }
+    const host = hostInput.trim().toLowerCase();
+    const projectIds = this.deps.store.listProjectsForUser(ownerUserId)
+      .filter((project) => this.projectMayUseForgeHost(project, ownerUserId, host))
+      .map((project) => project.id);
+    return this.exclusiveFor(projectIds, () =>
+      this.exclusiveCredentialFor(ownerUserId, host, async () => {
+        const result = await mutation();
+        await this.refreshHostCredentialsLocked(ownerUserId, host, true);
+        return result;
+      }));
+  }
+
+  /** Remove live tmpfs copies and their encrypted source as one host operation. */
+  disconnectHostCredentials(ownerUserId: number, hostInput: string): Promise<SimpleResult> {
+    if (this.shuttingDown) {
+      return Promise.resolve({ ok: false, reason: 'shutting_down', detail: 'Project manager is shutting down' });
+    }
+    const host = hostInput.trim().toLowerCase();
+    const projectIds = this.deps.store.listProjectsForUser(ownerUserId)
+      .filter((project) => this.projectMayUseForgeHost(project, ownerUserId, host))
+      .map((project) => project.id);
+    return this.exclusiveFor(projectIds, () =>
+      this.exclusiveCredentialFor(ownerUserId, host, async (): Promise<SimpleResult> => {
+        if (!this.deps.store.listConnectedHosts(ownerUserId).some((entry) => entry.host === host)) {
+          return { ok: false, reason: 'not_found' };
+        }
+        try {
+          await this.refreshHostCredentialsLocked(ownerUserId, host, false);
+        } catch {
+          return {
+            ok: false,
+            reason: 'invalid_state',
+            detail: 'Could not clear this live forge login; stop affected projects and try again',
+          };
+        }
+        return this.deps.store.deleteConnectedHost(ownerUserId, host)
+          ? { ok: true }
+          : { ok: false, reason: 'not_found' };
+      }));
+  }
+
+  createAndStart(ownerUserId: number, input: { name: string; repoUrl?: string | null; local?: boolean }): Promise<CreateResult> {
     if (this.shuttingDown) {
       return Promise.resolve({ ok: false, reason: 'shutting_down', message: 'Project manager is shutting down' });
     }
@@ -128,25 +680,37 @@ export class ProjectManager {
     return task;
   }
 
-  private async createAndStartActive(ownerUserId: number, input: { name: string; repoUrl?: string | null }): Promise<CreateResult> {
+  private async createAndStartActive(ownerUserId: number, input: { name: string; repoUrl?: string | null; local?: boolean }): Promise<CreateResult> {
     const name = input.name.trim();
     if (!name) return { ok: false, reason: 'validation', message: 'Project name is required' };
     const repoUrl = input.repoUrl?.trim() || null;
     let targetId: string | null;
     let tierId: string | null;
-    try {
-      const target = this.deps.environments.activeProjectTarget();
-      targetId = target.key === 'legacy' ? null : target.key;
+    const placement = input.local
+      ? { kind: 'host' as const }
+      : this.deps.environments.newProjectPlacement();
+    const executionKind = placement.kind;
+    if (placement.kind === 'host') {
+      targetId = null;
+      tierId = null;
+    } else {
+      targetId = placement.target.key === 'legacy' ? null : placement.target.key;
       tierId = this.deps.environments.intendedTierOnTarget(ownerUserId, targetId)?.id || null;
-    } catch (error) {
-      return { ok: false, reason: 'no_target', message: (error as Error).message };
     }
     let host: string | null = null;
     if (repoUrl) {
       let access = await this.preflight(repoUrl);
       if (!access.ok && access.reason === 'credential_required' && access.host) {
-        const credential = this.deps.store.credentialFor(ownerUserId, access.host);
-        if (credential) access = await this.preflight(repoUrl, credential);
+        const credentialHost = access.host;
+        access = await this.exclusiveCredentialFor(ownerUserId, credentialHost, async () => {
+          const credential = this.connectedCredentialFor(ownerUserId, credentialHost);
+          if (!credential) return access;
+          const checked = await this.preflight(repoUrl, credential.token);
+          if (!checked.ok && checked.reason === 'credential_required') {
+            this.markCredentialRejected(ownerUserId, credentialHost, credential);
+          }
+          return checked;
+        });
       }
       if (!access.ok) {
         if (access.reason === 'credential_required' && access.host) {
@@ -159,7 +723,7 @@ export class ProjectManager {
       }
       host = access.host;
     }
-    const project = this.deps.store.createProject({ ownerUserId, name, repoUrl, repoHost: host, targetId, tierId });
+    const project = this.deps.store.createProject({ ownerUserId, name, repoUrl, repoHost: host, targetId, executionKind, tierId });
     const started = await this.exclusiveFor(
       [project.id],
       () => this.startLocked(ownerUserId, project.id, {}),
@@ -180,7 +744,15 @@ export class ProjectManager {
     );
   }
 
-  private async startLocked(ownerUserId: number, projectId: string, opts: { stopProjectId?: string }): Promise<StartResult> {
+  private async startLocked(
+    ownerUserId: number,
+    projectId: string,
+    opts: {
+      stopProjectId?: string;
+      fromStates?: ProjectState[];
+      activateComposition?: { revision: string; expectedCurrentRevision: string | null };
+    },
+  ): Promise<StartResult> {
     const existing = this.deps.store.getProjectForUser(projectId, ownerUserId);
     if (!existing) return { ok: false, reason: 'not_found' };
     if (existing.state === 'blocked') return { ok: false, reason: 'blocked', detail: existing.stateDetail || undefined };
@@ -195,8 +767,10 @@ export class ProjectManager {
       return { ok: false, reason: 'invalid_state', detail: 'swap project has active work' };
     }
     const attempt = this.deps.store.tryStartCounted({
-      projectId, ownerUserId, toState: 'building', fromStates: ['stopped', 'failed', 'unavailable'],
+      projectId, ownerUserId, toState: 'building',
+      fromStates: opts.fromStates || ['stopped', 'failed', 'unavailable'],
       limit: this.deps.store.runLimitPerUser(), stopProjectId: opts.stopProjectId,
+      activateComposition: opts.activateComposition,
     });
     if (!attempt.ok) {
       if (attempt.reason === 'run_limit') {
@@ -206,15 +780,29 @@ export class ProjectManager {
         }));
         return { ok: false, reason: 'run_limit', running };
       }
+      if (attempt.reason === 'composition_conflict') {
+        return { ok: false, reason: 'conflict', detail: 'The active build recipe changed in another request' };
+      }
       return { ok: false, reason: attempt.reason === 'not_found' ? 'not_found' : 'invalid_state' };
     }
+    const restoreComposition = (): void => {
+      if (!opts.activateComposition) return;
+      this.deps.store.restoreCompositionActivation({
+        projectId,
+        userId: ownerUserId,
+        expectedRevision: opts.activateComposition.revision,
+        previousRevision: opts.activateComposition.expectedCurrentRevision,
+      });
+    };
     if (opts.stopProjectId) {
       if (!swapped) {
+        restoreComposition();
         this.deps.store.setState(projectId, priorProjectState, priorProjectDetail);
         return { ok: false, reason: 'invalid_state' };
       }
       if (this.deps.hasLiveProjectWork?.(swapped.id)) {
         this.deps.store.setState(swapped.id, priorSwapState || 'running', priorSwapDetail || null);
+        restoreComposition();
         this.deps.store.setState(projectId, priorProjectState, priorProjectDetail);
         this.publish(this.deps.store.getProject(swapped.id) as Project);
         this.publish(this.deps.store.getProject(projectId) as Project);
@@ -228,6 +816,7 @@ export class ProjectManager {
         // the physical half of the swap.  If it fails, restore both rows before
         // allowing any replacement build to start or the cap would be fiction.
         this.deps.store.setState(swapped.id, priorSwapState || 'running', priorSwapDetail || null);
+        restoreComposition();
         this.deps.store.setState(projectId, priorProjectState, priorProjectDetail);
         this.publish(this.deps.store.getProject(swapped.id) as Project);
         this.publish(this.deps.store.getProject(projectId) as Project);
@@ -241,29 +830,70 @@ export class ProjectManager {
     return { ok: true, state: 'building' };
   }
 
-  async stop(ownerUserId: number, projectId: string): Promise<SimpleResult> {
+  async stop(
+    ownerUserId: number,
+    projectId: string,
+    opts: { stopActive?: boolean } = {},
+  ): Promise<SimpleResult> {
     if (this.shuttingDown) return { ok: false, reason: 'shutting_down', detail: 'Project manager is shutting down' };
     if (this.builds.has(projectId)) {
       return { ok: false, reason: 'invalid_state', detail: 'project build is still in progress' };
     }
-    return this.exclusiveFor([projectId], () => this.stopLocked(ownerUserId, projectId));
+    return this.exclusiveFor(
+      [projectId],
+      () => this.stopLocked(ownerUserId, projectId, undefined, opts.stopActive === true),
+    );
   }
 
-  private async stopLocked(ownerUserId: number, projectId: string, idleBefore?: Date): Promise<SimpleResult> {
-    if (this.deps.hasLiveProjectWork?.(projectId)) {
+  private async stopLocked(
+    ownerUserId: number,
+    projectId: string,
+    idleBefore?: Date,
+    stopActive = false,
+  ): Promise<SimpleResult> {
+    if (!stopActive && this.deps.hasLiveProjectWork?.(projectId)) {
       return { ok: false, reason: 'invalid_state', detail: 'project has active work' };
     }
-    const claim = this.deps.store.tryClaimStop({ projectId, ownerUserId, idleBefore });
+    const claim = this.deps.store.tryClaimStop({
+      projectId,
+      ownerUserId,
+      idleBefore,
+      allowActiveWork: stopActive,
+    });
     if (!claim.ok) {
       return { ok: false, reason: claim.reason === 'not_found' ? 'not_found' : 'invalid_state', detail: claim.reason };
     }
     const project = claim.project;
-    if (this.deps.hasLiveProjectWork?.(projectId)) {
+    if (stopActive && this.hasActiveWork(projectId)) {
+      if (!this.deps.suspendProjectSessions) {
+        this.deps.store.setState(project.id, 'running', project.stateDetail);
+        this.publish(this.deps.store.getProject(project.id) as Project);
+        return { ok: false, reason: 'invalid_state', detail: 'active project sessions cannot be suspended safely' };
+      }
+      try {
+        await this.deps.suspendProjectSessions(projectId, ownerUserId);
+      } catch (error) {
+        this.deps.store.setState(project.id, 'running', project.stateDetail);
+        this.publish(this.deps.store.getProject(project.id) as Project);
+        return {
+          ok: false,
+          reason: 'invalid_state',
+          detail: `project sessions could not be stopped: ${(error as Error).message}`,
+        };
+      }
+    }
+    if (this.hasActiveWork(projectId)) {
       this.deps.store.setState(project.id, 'running', project.stateDetail);
       this.publish(this.deps.store.getProject(project.id) as Project);
       return { ok: false, reason: 'invalid_state', detail: 'project has active work' };
     }
     try {
+      if (project.executionKind === 'host') {
+        this.deps.store.setState(project.id, 'stopped');
+        this.deps.store.touchActivity(project.id, this.now());
+        this.publish(this.deps.store.getProject(project.id) as Project);
+        return { ok: true };
+      }
       const stopped = await this.projects.stop(project);
       const missingDockerRuntime = stopped === 'absent'
         && Boolean(project.container)
@@ -284,7 +914,11 @@ export class ProjectManager {
     }
   }
 
-  async remove(ownerUserId: number, projectId: string, opts: { force?: boolean } = {}): Promise<SimpleResult> {
+  async remove(
+    ownerUserId: number,
+    projectId: string,
+    opts: { force?: boolean; stopActive?: boolean } = {},
+  ): Promise<SimpleResult> {
     if (this.shuttingDown) return { ok: false, reason: 'shutting_down', detail: 'Project manager is shutting down' };
     const current = this.deps.store.getProjectForUser(projectId, ownerUserId);
     // A settled `reclaiming` row is a recovery request, not an in-flight
@@ -296,7 +930,11 @@ export class ProjectManager {
     return this.exclusiveFor([projectId], () => this.removeLocked(ownerUserId, projectId, opts));
   }
 
-  private async removeLocked(ownerUserId: number, projectId: string, opts: { force?: boolean }): Promise<SimpleResult> {
+  private async removeLocked(
+    ownerUserId: number,
+    projectId: string,
+    opts: { force?: boolean; stopActive?: boolean },
+  ): Promise<SimpleResult> {
     const project = this.deps.store.getProjectForUser(projectId, ownerUserId);
     if (!project) return { ok: false, reason: 'not_found' };
     if (project.state === 'building' || this.builds.has(projectId)) {
@@ -306,7 +944,7 @@ export class ProjectManager {
       return { ok: false, reason: 'invalid_state', detail: 'project runtime ownership is unverified; wait for a complete boot reconciliation' };
     }
     if (project.state === 'blocked' && !opts.force) return { ok: false, reason: 'preserve_failed', detail: project.stateDetail || undefined };
-    if (this.hasActiveWork(project.id)) {
+    if (this.hasActiveWork(project.id) && !opts.stopActive) {
       return { ok: false, reason: 'invalid_state', detail: 'project has active work' };
     }
     // Sessions are not detached to the legacy environment.  Retiring them is
@@ -316,10 +954,47 @@ export class ProjectManager {
     if (!this.deps.deleteProjectSessions) {
       return { ok: false, reason: 'invalid_state', detail: 'project sessions cannot be retired safely' };
     }
+    if (this.hasActiveWork(project.id)) {
+      if (!this.deps.suspendProjectSessions) {
+        return { ok: false, reason: 'invalid_state', detail: 'active project sessions cannot be suspended safely' };
+      }
+      const priorState = project.state;
+      const priorDetail = project.stateDetail;
+      this.deps.store.setState(project.id, 'reclaiming', 'Stopping active project sessions before deletion');
+      this.publish(this.deps.store.getProject(project.id) as Project);
+      try {
+        await this.deps.suspendProjectSessions(project.id, ownerUserId);
+      } catch (error) {
+        this.deps.store.setState(project.id, priorState, priorDetail);
+        this.publish(this.deps.store.getProject(project.id) as Project);
+        return {
+          ok: false,
+          reason: 'invalid_state',
+          detail: `project sessions could not be stopped: ${(error as Error).message}`,
+        };
+      }
+      if (this.hasActiveWork(project.id)) {
+        this.deps.store.setState(project.id, priorState, priorDetail);
+        this.publish(this.deps.store.getProject(project.id) as Project);
+        return {
+          ok: false,
+          reason: 'invalid_state',
+          detail: 'project still has active work after its sessions were stopped',
+        };
+      }
+    }
     const reclaimed = await this.reclaim(project, opts.force === true, async () => {
       await this.deps.deleteProjectSessions?.(project.id, ownerUserId);
     });
     if (!reclaimed.ok) return reclaimed;
+    try {
+      await this.projects.removeOverlay(project);
+    } catch (error) {
+      const detail = `project overlay could not be removed: ${(error as Error).message}`;
+      this.deps.store.setState(project.id, 'stopped', detail);
+      this.publish(this.deps.store.getProject(project.id) as Project);
+      return { ok: false, reason: 'invalid_state', detail };
+    }
     this.deps.store.deleteProject(project.id);
     try { this.deps.broadcast(ownerUserId, { type: 'project_removed', projectId: project.id }); } catch (error) {
       console.error('Project removal broadcast failed:', error);
@@ -373,6 +1048,7 @@ export class ProjectManager {
   }
 
   targetNameFor(project: Project): string | null {
+    if (project.executionKind === 'host') return 'Local machine';
     if (!project.targetId) return 'Legacy';
     return this.deps.deployTargets.getTarget(project.targetId)?.name || null;
   }
@@ -406,10 +1082,21 @@ export class ProjectManager {
     const nextRepo = input.repoUrl === undefined ? project.repoUrl : (input.repoUrl?.trim() || null);
     let repoHost = project.repoHost;
     if (input.repoUrl !== undefined && nextRepo) {
+      if (!nextRepo.toLowerCase().startsWith('https://')) {
+        return { ok: false, reason: 'validation', message: 'Repository inspection requires HTTPS' };
+      }
       let access = await this.preflight(nextRepo);
       if (!access.ok && access.reason === 'credential_required' && access.host) {
-        const credential = this.deps.store.credentialFor(ownerUserId, access.host);
-        if (credential) access = await this.preflight(nextRepo, credential);
+        const credentialHost = access.host;
+        access = await this.exclusiveCredentialFor(ownerUserId, credentialHost, async () => {
+          const credential = this.connectedCredentialFor(ownerUserId, credentialHost);
+          if (!credential) return access;
+          const checked = await this.preflight(nextRepo, credential.token);
+          if (!checked.ok && checked.reason === 'credential_required') {
+            this.markCredentialRejected(ownerUserId, credentialHost, credential);
+          }
+          return checked;
+        });
       }
       if (!access.ok) {
         if (access.reason === 'validation') return { ok: false, reason: 'validation', message: access.message };
@@ -431,7 +1118,18 @@ export class ProjectManager {
       ...(input.repoUrl !== undefined ? { repoUrl: nextRepo, repoHost } : {}),
     });
     if (input.repoUrl !== undefined && nextRepo !== project.repoUrl) {
-      this.deps.store.setState(project.id, 'stopped', 'Repository updated; ready to start');
+      if (nextRepo) {
+        this.deps.store.setState(project.id, 'inspecting', 'Repository updated; refreshing the build recipe');
+        this.deps.store.resetBuildLog(project.id);
+        this.event(this.deps.store.getProject(project.id) as Project, {
+          t: 'state', state: 'inspecting', percent: 0, message: 'Inspecting the updated repository',
+        });
+        this.trackInspection(ownerUserId, project.id);
+      } else {
+        const withoutRepository = this.deps.store.getProject(project.id) as Project;
+        this.saveDetectedDraft(withoutRepository, null);
+        this.deps.store.setState(project.id, 'composition_pending', 'Repository removed; review the build recipe');
+      }
     }
     const updated = this.deps.store.getProject(project.id) as Project;
     this.publish(updated);
@@ -457,6 +1155,12 @@ export class ProjectManager {
         return { ok: false, reason: lease.reason === 'not_found' ? 'not_found' : 'failed', detail: 'project session admission closed' };
       }
       try {
+        if (project.executionKind === 'host') {
+          const result = await this.projects.ensureLocal(project, this.owner(ownerUserId));
+          this.deps.store.touchActivity(project.id, this.now());
+          this.issuedHostLeases.set(lease.leaseId, { ownerUserId, projectId });
+          return { ok: true, ...result, leaseId: lease.leaseId };
+        }
         const result = await this.projects.ensure(project, this.owner(ownerUserId));
         // A DB-running project whose recorded runtime disappeared is a true
         // rebuild, not a normal stopped resume. Do not attach it just because
@@ -522,6 +1226,14 @@ export class ProjectManager {
    * connection or runtime could be killed by a project stop.
    */
   releaseSessionLease(ownerUserId: number, projectId: string, leaseId: string): boolean {
+    const host = this.issuedHostLeases.get(leaseId);
+    if (host) {
+      if (host.ownerUserId !== ownerUserId || host.projectId !== projectId) return false;
+      const released = this.deps.store.releaseSessionLease(projectId, ownerUserId, leaseId);
+      this.issuedHostLeases.delete(leaseId);
+      this.resolveLeaseWaiters();
+      return released;
+    }
     const issued = this.issuedLeases.get(leaseId);
     if (!issued || issued.ownerUserId !== ownerUserId || issued.projectId !== projectId) {
       return this.deps.store.releaseSessionLease(projectId, ownerUserId, leaseId);
@@ -831,6 +1543,16 @@ export class ProjectManager {
     // Boot integration calls this after old runtimes are gone and before any
     // new project attachment is admitted; process-local leases cannot survive.
     this.deps.store.clearSessionLeases();
+    // A crash can leave a syntactically valid `.git` directory before clone's
+    // exact-OID fetch/checkout/verification finishes. Never infer that such a
+    // workspace is the inspected tree merely because repository metadata now
+    // exists: every interrupted build must wipe and reconstruct it on retry.
+    for (const project of this.deps.store.listProjectsInState('building')) {
+      this.deps.store.setRebuildRequired(project.id, true);
+      if (project.executionKind === 'host') {
+        this.deps.store.setState(project.id, 'stopped', 'Local build was interrupted; start the project to retry');
+      }
+    }
     const reconciled = new Set<string>();
     // A crash can happen after the engine creates a deterministic runtime but
     // before its name reaches SQLite. Do not rely on the broad label scan to
@@ -838,6 +1560,7 @@ export class ProjectManager {
     // name for interrupted, counted rows, then let the identity-bound pass
     // below prove it absent, owned, foreign, or unreachable.
     for (const project of this.deps.store.listProjectsInState('building', 'running', 'reclaiming')) {
+      if (project.executionKind === 'host') continue;
       if (project.container) continue;
       try {
         const target = this.deps.environments.projectTarget(project.targetId);
@@ -888,6 +1611,7 @@ export class ProjectManager {
           if (!described) continue;
           const id = described.labels[PROJECT_LABEL];
           const project = id ? this.deps.store.getProject(id) : null;
+          if (project?.executionKind === 'host') continue;
           if (project) {
             // A project label identifies a workspace, not the authority to
             // use it. Check placement before the managed-label early return:
@@ -1149,6 +1873,10 @@ export class ProjectManager {
       this.deps.store.setState(project.id, 'stopped', 'Interrupted by server restart; start again to rebuild');
       this.publish(this.deps.store.getProject(project.id) as Project);
     }
+    for (const project of this.deps.store.listProjectsInState('inspecting')) {
+      this.deps.store.setState(project.id, 'unavailable', 'Repository inspection was interrupted; inspect it again');
+      this.publish(this.deps.store.getProject(project.id) as Project);
+    }
     // Only sweep after direct project reconciliation too. A successful broad
     // list is insufficient if an identity-bound inspection later became
     // uncertain; it could still be holding the shared workspace mount.
@@ -1178,11 +1906,14 @@ export class ProjectManager {
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
     this.stopSweep();
-    while (this.creations.size || this.builds.size || this.lifecycleTails.size || this.sweepTask) {
+    while (this.creations.size || this.inspections.size || this.builds.size
+      || this.lifecycleTails.size || this.credentialTails.size || this.sweepTask) {
       const pending = new Set<Promise<unknown>>([
         ...this.creations.values(),
+        ...this.inspections.values(),
         ...this.builds.values(),
         ...this.lifecycleTails.values(),
+        ...this.credentialTails.values(),
         ...(this.sweepTask ? [this.sweepTask] : []),
       ]);
       await Promise.allSettled(pending);
@@ -1221,16 +1952,21 @@ export class ProjectManager {
     // Routes/runtime finalizers are allowed to release after admission closes.
     // SQLite must remain open until every lease this manager handed out has
     // either completed that finally path or been explicitly retired.
-    while (this.issuedLeases.size) await this.waitForLeaseChange();
+    while (this.issuedLeases.size || this.issuedHostLeases.size) await this.waitForLeaseChange();
   }
 
   private async build(ownerUserId: number, projectId: string): Promise<void> {
     const project = this.deps.store.getProjectForUser(projectId, ownerUserId);
     if (!project) return;
+    if (project.executionKind === 'host') {
+      await this.buildLocal(project);
+      return;
+    }
     this.event(project, { t: 'step', step: 'container', percent: 15, message: 'Preparing project environment' });
     let workingProject: Project | null = null;
     let failureState: ProjectState = 'failed';
     let failureEvent: 'error' | 'preserve' = 'error';
+    let checkoutReplacementStarted = false;
     try {
       const owner = this.owner(ownerUserId);
       const initialCheckout = project.repoUrl
@@ -1254,17 +1990,21 @@ export class ProjectManager {
         if (requiresWorkspaceRebuild && hadValidCheckout) {
           this.event(current, { t: 'preserve', message: 'Preserving work before replacing the project container' });
           try {
-            const result = await preserveProjectWork({
-              engine: this.deps.environments.projectTarget(current.targetId).engine,
-              containerName: prepared.containerName,
-              containerIdentity: prepared.containerAccess.containerIdentity,
-              repoContainerPath: this.projects.checkoutContainerPath(current),
-              repoUrl: current.repoUrl,
-              author: this.deps.authorFor(current.ownerUserId),
-              credential: this.credentialFor(current),
-              now: this.now,
-              timeoutMs: this.deps.preserveTimeoutMs,
-            });
+            const result = await this.exclusiveCredentialFor(
+              current.ownerUserId,
+              current.repoHost,
+              () => preserveProjectWork({
+                engine: this.deps.environments.projectTarget(current.targetId).engine,
+                containerName: prepared.containerName,
+                containerIdentity: prepared.containerAccess.containerIdentity,
+                repoContainerPath: this.projects.checkoutContainerPath(current),
+                repoUrl: current.repoUrl!,
+                author: this.preservationAuthor(current),
+                credential: this.credentialRecordFor(current)?.token || null,
+                now: this.now,
+                timeoutMs: this.deps.preserveTimeoutMs,
+              }),
+            );
             if (result.preserved) this.recordPreservation(current.id, result);
           } catch (error) {
             failureState = 'blocked';
@@ -1285,40 +2025,125 @@ export class ProjectManager {
         workingProject = { ...current, container: { name: prepared.containerName } };
         this.deps.store.setContainer(current.id, workingProject.container);
       }
+      let composition: ProjectComposition | null = null;
+      let installationResults: CompositionInstallation[] = [];
+      if (current.compositionRevision) {
+        composition = this.deps.store.getProjectComposition(
+          current.id,
+          current.ownerUserId,
+          current.compositionRevision,
+        );
+        const chosen = compositionChoiceFrom(composition?.chosen);
+        if (!composition || !chosen) throw new Error('Active build recipe is unavailable');
+        if (!this.deps.compositionRuntime) throw new Error('Project composition runtime is unavailable');
+        this.event(current, {
+          t: 'step', step: 'tooling', percent: 30, message: 'Installing the selected project tools',
+        });
+        await this.exclusiveCredentialFor(current.ownerUserId, composition.forgeHost, async () => {
+          // Read the generation only after entering the host critical section;
+          // a long tool install can no longer publish a superseded credential.
+          const context = this.runtimeContext(current, composition!, chosen, prepared);
+          const applied = await this.deps.compositionRuntime!.prepare(context);
+          installationResults = applied.installations;
+          await this.deps.compositionRuntime!.configureGit(context);
+        });
+      }
       if (current.repoUrl && (requiresWorkspaceRebuild || !(await this.projects.hasValidCheckout(current, owner)))) {
-        let access = await this.preflight(current.repoUrl);
-        if (!access.ok && access.reason === 'credential_required') {
-          const credential = this.credentialFor(current);
-          if (credential) access = await this.preflight(current.repoUrl, credential);
-        }
-        if (!access.ok) {
-          failureState = access.reason === 'repo_gone' ? 'unavailable' : 'failed';
-          throw new Error(access.message);
-        }
-        // `git clone` leaves its destination behind on many failures. Its mere
-        // existence is not proof of a checkout; only .git is.
-        await this.projects.clearCheckout(current, owner);
-        this.event(current, { t: 'step', step: 'clone', percent: 45, message: 'Cloning repository' });
-        const credential = this.credentialFor(current);
-        await cloneRepository({
-          engine: this.deps.environments.projectTarget(current.targetId).engine,
-          containerName: prepared.containerName,
-          containerIdentity: prepared.containerAccess.containerIdentity,
-          repoUrl: current.repoUrl,
-          destination: this.projects.checkoutContainerPath(current),
-          credential,
-          timeoutMs: this.deps.cloneTimeoutMs,
+        await this.exclusiveCredentialFor(current.ownerUserId, current.repoHost, async () => {
+          let access = await this.preflight(current.repoUrl!);
+          const credential = this.credentialRecordFor(current);
+          if (!access.ok && access.reason === 'credential_required' && credential) {
+            access = await this.preflight(current.repoUrl!, credential.token);
+          }
+          if (!access.ok) {
+            if (credential && access.reason === 'credential_required' && current.repoHost) {
+              this.markCredentialRejected(current.ownerUserId, current.repoHost, credential);
+            }
+            failureState = access.reason === 'repo_gone' ? 'unavailable' : 'failed';
+            throw new Error(access.message);
+          }
+          // `git clone` leaves its destination behind on many failures. Its
+          // mere existence is not proof of an exact checkout. Persist the
+          // replacement intent before touching bytes so a crash or a failed
+          // cleanup cannot turn a partial `.git` directory into boot evidence.
+          this.deps.store.setRebuildRequired(current.id, true);
+          checkoutReplacementStarted = true;
+          await this.projects.clearCheckout(current, owner);
+          this.event(current, { t: 'step', step: 'clone', percent: 45, message: 'Cloning repository' });
+          await cloneRepository({
+            engine: this.deps.environments.projectTarget(current.targetId).engine,
+            containerName: prepared.containerName,
+            containerIdentity: prepared.containerAccess.containerIdentity,
+            repoUrl: current.repoUrl!,
+            destination: this.projects.checkoutContainerPath(current),
+            credential: credential?.token || null,
+            expectedOid: composition?.sourceOid || undefined,
+            timeoutMs: this.deps.cloneTimeoutMs,
+          });
         });
         if (!(await this.projects.hasValidCheckout(current, owner))) {
           throw new Error('Repository clone completed without a valid .git checkout');
         }
+        checkoutReplacementStarted = false;
       }
-      this.deps.store.setState(project.id, 'running');
+      const failedInstallations = installationResults.filter((item) => item.status === 'failed');
+      if (failedInstallations.length) {
+        this.event(current, {
+          t: 'partial_install',
+          percent: 90,
+          message: `Project is usable, but some tools failed: ${failedInstallations.map((item) => item.itemId).join(', ')}`,
+        });
+      }
+      if (composition && !this.deps.store.markCompositionApplied(project.id, ownerUserId, composition.id)) {
+        throw new Error('Active build recipe changed before its result could be recorded');
+      }
+      this.deps.store.setState(
+        project.id,
+        'running',
+        failedInstallations.length
+          ? `Some selected tools could not be installed: ${failedInstallations.map((item) => item.itemId).join(', ')}`
+          : null,
+      );
       this.deps.store.setRebuildRequired(project.id, false);
       this.deps.store.touchActivity(project.id, this.now());
-      this.event(this.deps.store.getProject(project.id) as Project, { t: 'state', state: 'running', percent: 100, message: 'Project ready' });
+      this.event(this.deps.store.getProject(project.id) as Project, {
+        t: 'state',
+        state: 'running',
+        percent: 100,
+        message: failedInstallations.length ? 'Project ready with tool installation warnings' : 'Project ready',
+      });
     } catch (error) {
       const message = (error as Error).message;
+      if (error instanceof CloneSourceChangedError) {
+        try {
+          if (checkoutReplacementStarted) {
+            await this.projects.clearCheckout(project, this.owner(ownerUserId));
+            checkoutReplacementStarted = false;
+          }
+          if (workingProject) await this.projects.stop(workingProject);
+        } catch (cleanupError) {
+          const detail = `${message}; project container cleanup could not be verified: ${(cleanupError as Error).message}`;
+          this.deps.store.setState(project.id, 'reclaiming', detail);
+          this.event(this.deps.store.getProject(project.id) as Project, {
+            t: 'error', state: 'reclaiming', message: detail,
+          });
+          return;
+        }
+        this.deps.store.setState(project.id, 'composition_pending', message);
+        this.event(this.deps.store.getProject(project.id) as Project, {
+          t: 'state', state: 'composition_pending', message,
+        });
+        return;
+      }
+      if (checkoutReplacementStarted) {
+        try {
+          await this.projects.clearCheckout(project, this.owner(ownerUserId));
+          checkoutReplacementStarted = false;
+        } catch {
+          failureState = 'blocked';
+          failureEvent = 'preserve';
+        }
+      }
       if (error instanceof ProjectContainerStateUnknownError || error instanceof ProjectContainerOwnershipError) {
         const containerName = error instanceof ProjectContainerStateUnknownError
           ? error.containerName
@@ -1352,6 +2177,60 @@ export class ProjectManager {
     }
   }
 
+  /** Build the default-installation form of a project: a normal host folder. */
+  private async buildLocal(project: Project): Promise<void> {
+    const owner = this.owner(project.ownerUserId);
+    let replacementStarted = false;
+    try {
+      await this.projects.ensureLocal(project, owner);
+      const current = this.deps.store.getProject(project.id) as Project;
+      const composition = current.compositionRevision
+        ? this.deps.store.getProjectComposition(current.id, current.ownerUserId, current.compositionRevision)
+        : null;
+      // A host project has no disposable runtime layer. Recipe changes and an
+      // interrupted app process never justify deleting a valid local checkout.
+      if (current.repoUrl && !(await this.projects.hasValidCheckout(current, owner))) {
+        await this.exclusiveCredentialFor(current.ownerUserId, current.repoHost, async () => {
+          let access = await this.preflight(current.repoUrl!);
+          const credential = this.credentialRecordFor(current);
+          if (!access.ok && access.reason === 'credential_required' && credential) {
+            access = await this.preflight(current.repoUrl!, credential.token);
+          }
+          if (!access.ok) throw new Error(access.message);
+          this.deps.store.setRebuildRequired(current.id, true);
+          replacementStarted = true;
+          await this.projects.clearCheckout(current, owner);
+          this.event(current, { t: 'step', step: 'clone', percent: 45, message: 'Cloning repository into the local workspace' });
+          await cloneRepositoryOnHost({
+            repoUrl: current.repoUrl!,
+            destination: this.projects.checkoutPath(current, owner),
+            credential: credential?.token || null,
+            expectedOid: composition?.sourceOid || undefined,
+            timeoutMs: this.deps.cloneTimeoutMs,
+          });
+        });
+        replacementStarted = false;
+      }
+      if (composition && !this.deps.store.markCompositionApplied(project.id, project.ownerUserId, composition.id)) {
+        throw new Error('Active build recipe changed before its result could be recorded');
+      }
+      this.deps.store.setContainer(project.id, null);
+      this.deps.store.setRebuildRequired(project.id, false);
+      this.deps.store.setState(project.id, 'running');
+      this.deps.store.touchActivity(project.id, this.now());
+      this.event(this.deps.store.getProject(project.id) as Project, {
+        t: 'state', state: 'running', percent: 100, message: 'Local project ready',
+      });
+    } catch (error) {
+      if (replacementStarted) await this.projects.clearCheckout(project, owner).catch(() => undefined);
+      const message = (error as Error).message;
+      this.deps.store.setState(project.id, error instanceof CloneSourceChangedError ? 'composition_pending' : 'failed', message);
+      this.event(this.deps.store.getProject(project.id) as Project, {
+        t: 'error', state: error instanceof CloneSourceChangedError ? 'composition_pending' : 'failed', message,
+      });
+    }
+  }
+
   private async snapshotBeforeRepositoryChange(project: Project): Promise<SimpleResult> {
     const owner = this.owner(project.ownerUserId);
     if (!project.repoUrl) {
@@ -1365,6 +2244,15 @@ export class ProjectManager {
       return { ok: false, reason: 'preserve_failed', detail };
     }
     if (checkout !== 'valid') return { ok: true };
+    if (project.executionKind === 'host') {
+      try {
+        if (!await hostRepositoryHasChanges(this.projects.checkoutPath(project, owner))) return { ok: true };
+      } catch (error) {
+        return { ok: false, reason: 'preserve_failed', detail: `Could not verify local repository state: ${(error as Error).message}` };
+      }
+      const detail = 'Local repository has uncommitted work; commit or push it before changing the repository, or discard explicitly';
+      return { ok: false, reason: 'preserve_failed', detail };
+    }
     const priorState = project.state;
     const priorDetail = project.stateDetail;
     let workingProject: Project | null = null;
@@ -1374,17 +2262,21 @@ export class ProjectManager {
       const prepared = await this.projects.ensure(project, owner);
       workingProject = { ...project, container: { name: prepared.containerName } };
       this.deps.store.setContainer(project.id, workingProject.container);
-      const result = await preserveProjectWork({
-        engine: this.deps.environments.projectTarget(project.targetId).engine,
-        containerName: prepared.containerName,
-        containerIdentity: prepared.containerAccess.containerIdentity,
-        repoContainerPath: this.projects.checkoutContainerPath(project),
-        repoUrl: project.repoUrl,
-        author: this.deps.authorFor(project.ownerUserId),
-        credential: this.credentialFor(project),
-        now: this.now,
-        timeoutMs: this.deps.preserveTimeoutMs,
-      });
+      const result = await this.exclusiveCredentialFor(
+        project.ownerUserId,
+        project.repoHost,
+        () => preserveProjectWork({
+          engine: this.deps.environments.projectTarget(project.targetId).engine,
+          containerName: prepared.containerName,
+          containerIdentity: prepared.containerAccess.containerIdentity,
+          repoContainerPath: this.projects.checkoutContainerPath(project),
+          repoUrl: project.repoUrl!,
+          author: this.preservationAuthor(project),
+          credential: this.credentialRecordFor(project)?.token || null,
+          now: this.now,
+          timeoutMs: this.deps.preserveTimeoutMs,
+        }),
+      );
       if (result.preserved) this.recordPreservation(project.id, result);
       await this.projects.stop(workingProject);
       this.deps.store.setState(project.id, priorState, priorDetail);
@@ -1448,6 +2340,9 @@ export class ProjectManager {
       });
       return { ok: false, reason: 'preserve_failed', detail };
     }
+    if (project.executionKind === 'host') {
+      return this.reclaimLocal(project, discard, beforeDestroy, alreadyClaimed, validCheckout);
+    }
     if (!alreadyClaimed) this.deps.store.setState(project.id, 'reclaiming');
     if (!alreadyClaimed) this.deps.store.setRebuildRequired(project.id, true);
     this.publish(this.deps.store.getProject(project.id) as Project);
@@ -1463,16 +2358,21 @@ export class ProjectManager {
         workingProject = { ...project, container: { name: prepared.containerName } };
         preparedForPreservation = true;
         this.deps.store.setContainer(project.id, workingProject.container);
-        const credential = this.credentialFor(project);
-        const result = await preserveProjectWork({
-          engine: this.deps.environments.projectTarget(project.targetId).engine,
-          containerName: prepared.containerName,
-          containerIdentity: prepared.containerAccess.containerIdentity,
-          repoContainerPath: this.projects.checkoutContainerPath(project),
-          repoUrl: project.repoUrl,
-          author: this.deps.authorFor(project.ownerUserId), credential, now: this.now,
-          timeoutMs: this.deps.preserveTimeoutMs,
-        });
+        const result = await this.exclusiveCredentialFor(
+          project.ownerUserId,
+          project.repoHost,
+          () => preserveProjectWork({
+            engine: this.deps.environments.projectTarget(project.targetId).engine,
+            containerName: prepared.containerName,
+            containerIdentity: prepared.containerAccess.containerIdentity,
+            repoContainerPath: this.projects.checkoutContainerPath(project),
+            repoUrl: project.repoUrl!,
+            author: this.preservationAuthor(project),
+            credential: this.credentialRecordFor(project)?.token || null,
+            now: this.now,
+            timeoutMs: this.deps.preserveTimeoutMs,
+          }),
+        );
         if (result.preserved) this.recordPreservation(project.id, result);
       } catch (error) {
         const message = (error as Error).message;
@@ -1551,6 +2451,48 @@ export class ProjectManager {
       }
       this.deps.store.setState(project.id, state, detail);
       this.event(this.deps.store.getProject(project.id) as Project, { t: 'error', state, message: detail });
+      return { ok: false, reason: 'invalid_state', detail };
+    }
+  }
+
+  private async reclaimLocal(
+    project: Project,
+    discard: boolean,
+    beforeDestroy: (() => Promise<void>) | undefined,
+    alreadyClaimed: boolean,
+    validCheckout: boolean,
+  ): Promise<SimpleResult> {
+    if (!discard && project.repoUrl && validCheckout) {
+      try {
+        if (await hostRepositoryHasChanges(this.projects.checkoutPath(project, this.owner(project.ownerUserId)))) {
+          const detail = 'Local repository has uncommitted work; commit or push it before removing the workspace, or discard explicitly';
+          this.deps.store.setState(project.id, 'blocked', detail);
+          this.event(this.deps.store.getProject(project.id) as Project, { t: 'preserve', state: 'blocked', message: detail });
+          return { ok: false, reason: 'preserve_failed', detail };
+        }
+      } catch (error) {
+        const detail = `Could not verify local repository state: ${(error as Error).message}`;
+        this.deps.store.setState(project.id, 'blocked', detail);
+        return { ok: false, reason: 'preserve_failed', detail };
+      }
+    }
+    if (!alreadyClaimed) {
+      this.deps.store.setState(project.id, 'reclaiming');
+      this.deps.store.setRebuildRequired(project.id, true);
+    }
+    this.publish(this.deps.store.getProject(project.id) as Project);
+    try {
+      await beforeDestroy?.();
+      await this.wipe(project);
+      this.deps.store.setContainer(project.id, null);
+      this.deps.store.setState(project.id, 'stopped');
+      this.deps.store.touchActivity(project.id, this.now());
+      this.publish(this.deps.store.getProject(project.id) as Project);
+      return { ok: true };
+    } catch (error) {
+      const detail = (error as Error).message;
+      this.deps.store.setState(project.id, 'reclaiming', detail);
+      this.event(this.deps.store.getProject(project.id) as Project, { t: 'error', state: 'reclaiming', message: detail });
       return { ok: false, reason: 'invalid_state', detail };
     }
   }
@@ -1685,9 +2627,145 @@ export class ProjectManager {
     this.leaseWaiters.clear();
   }
 
-  private credentialFor(project: Project): string | null {
+  private credentialRecordFor(project: Project): ConnectedCredential | null {
     if (!project.repoHost) return null;
-    return this.deps.store.credentialFor(project.ownerUserId, project.repoHost);
+    return this.connectedCredentialFor(project.ownerUserId, project.repoHost);
+  }
+
+  /**
+   * Compatibility seam for pre-composition ProjectStore adapters. Production
+   * always supplies the generation-aware accessor; older integrations expose
+   * only the token accessor and therefore cannot participate in validation CAS.
+   */
+  private connectedCredentialFor(ownerUserId: number, host: string): ConnectedCredential | null {
+    const store = this.deps.store as Partial<ProjectStore>;
+    if (typeof store.credentialRecordFor === 'function') {
+      return store.credentialRecordFor.call(this.deps.store, ownerUserId, host);
+    }
+    if (typeof store.credentialFor !== 'function') return null;
+    const token = store.credentialFor.call(this.deps.store, ownerUserId, host);
+    return token ? { token, kind: 'token', revision: 0 } : null;
+  }
+
+  private credentialFor(project: Project): string | null {
+    return this.credentialRecordFor(project)?.token || null;
+  }
+
+  private projectMayUseForgeHost(project: Project, ownerUserId: number, host: string): boolean {
+    if (project.repoHost === host) return true;
+    const revisionIds = new Set([
+      project.compositionRevision,
+      project.appliedCompositionRevision,
+      this.deps.store.getProjectComposition(project.id, ownerUserId)?.id || null,
+    ].filter((revision): revision is string => Boolean(revision)));
+    for (const revisionId of revisionIds) {
+      const composition = this.deps.store.getProjectComposition(project.id, ownerUserId, revisionId);
+      if (composition?.forgeHost === host) return true;
+    }
+    return false;
+  }
+
+  private markCredentialRejected(
+    ownerUserId: number,
+    host: string,
+    credential: ConnectedCredential | null,
+  ): void {
+    if (!credential) return;
+    const setValidation = (this.deps.store as Partial<ProjectStore>).setConnectedHostValidation;
+    if (typeof setValidation !== 'function') return;
+    setValidation.call(this.deps.store, {
+      userId: ownerUserId,
+      host,
+      kind: credential.kind,
+      expectedCredentialRevision: credential.revision,
+      status: 'invalid',
+      errorCode: 'credential_rejected',
+      errorMessage: 'The repository host rejected this credential; replace it to continue',
+    });
+  }
+
+  private async refreshHostCredentialsLocked(
+    ownerUserId: number,
+    host: string,
+    rematerialize: boolean,
+  ): Promise<void> {
+    // The owner/host credential lock is the generation barrier. A project that
+    // has not passed its credential section cannot materialize the old token;
+    // one that passed it before this replacement may still be `building` and
+    // must be included even if it was created after the lifecycle snapshot.
+    // Exact-identity inspection/scrubbing fails closed if that runtime changes.
+    const affected = this.deps.store.listProjectsForUser(ownerUserId)
+      .filter((project) => this.projectMayUseForgeHost(project, ownerUserId, host));
+    const running: Array<{ project: Project; prepared: ProjectEnvironmentResult }> = [];
+    let scrubFailed = false;
+
+    for (const project of affected) {
+      try {
+        // Only a physically executing runtime can consume its memory-backed
+        // login. Stopped runtimes are scrubbed before any later authentication.
+        if (await this.projects.status(project) !== 'running') continue;
+        const prepared = await this.projects.existing(project, this.owner(ownerUserId));
+        if (!prepared) throw new Error('running project ownership could not be verified');
+        running.push({ project, prepared });
+      } catch {
+        // Keep inspecting the other lifecycle-locked projects. One unavailable
+        // engine must not leave an otherwise reachable old token untouched.
+        scrubFailed = true;
+      }
+    }
+
+    // Scrub every verified runtime before attempting any login. If one scrub
+    // fails, still try all the others, then fail closed without materializing a
+    // mix of old and new credentials across the owner.
+    for (const { prepared } of running) {
+      try {
+        await this.scrubForgeCredential(prepared);
+      } catch {
+        scrubFailed = true;
+      }
+    }
+    if (scrubFailed) throw new Error('Could not clear every live forge credential');
+    if (!rematerialize || !this.deps.compositionRuntime?.refreshForgeCredential) return;
+
+    let refreshFailed = false;
+    for (const { project, prepared } of running) {
+      try {
+        const revisionIds = [project.compositionRevision, project.appliedCompositionRevision]
+          .filter((revision, index, all): revision is string => Boolean(revision) && all.indexOf(revision) === index);
+        for (const revisionId of revisionIds) {
+          const composition = this.deps.store.getProjectComposition(project.id, ownerUserId, revisionId);
+          const chosen = compositionChoiceFrom(composition?.chosen);
+          if (!composition || composition.forgeHost !== host || !chosen?.forgeKind) continue;
+          await this.deps.compositionRuntime.refreshForgeCredential(
+            this.runtimeContext(project, composition, chosen, prepared),
+          );
+          break;
+        }
+      } catch {
+        // Old material is already gone everywhere. Continue so a failure in one
+        // project does not unnecessarily leave another without the new login.
+        refreshFailed = true;
+      }
+    }
+    if (refreshFailed) throw new Error('Could not refresh every live forge credential');
+  }
+
+  private async scrubForgeCredential(prepared: ProjectEnvironmentResult): Promise<void> {
+    await prepared.engine.exec(
+      {
+        name: prepared.containerName,
+        identity: prepared.containerAccess.containerIdentity,
+      },
+      'rm',
+      [
+        '-rf', '--',
+        `${FORGE_SCRATCH}/home`,
+        `${FORGE_SCRATCH}/xdg`,
+        `${FORGE_SCRATCH}/gh`,
+        `${FORGE_SCRATCH}/glab`,
+        `${FORGE_SCRATCH}/tea`,
+      ],
+    );
   }
 
   private hasActiveWork(projectId: string): boolean {
@@ -1708,6 +2786,233 @@ export class ProjectManager {
     const owner = this.deps.ownerFor?.(userId);
     if (!owner) throw new Error(`project owner ${userId} is unavailable for environment placement`);
     return owner;
+  }
+
+  private trackCreation<T>(task: Promise<T>): void {
+    this.creations.add(task);
+    void task.finally(() => this.creations.delete(task)).catch(() => undefined);
+  }
+
+  private trackInspection(
+    ownerUserId: number,
+    projectId: string,
+    keepRuntimeActive = false,
+    preserveChoice = false,
+  ): void {
+    if (this.inspections.has(projectId)) return;
+    const task = this.exclusiveFor(
+      [projectId],
+      () => this.inspectProject(ownerUserId, projectId, keepRuntimeActive, preserveChoice),
+    );
+    this.inspections.set(projectId, task);
+    void task.finally(() => {
+      if (this.inspections.get(projectId) === task) this.inspections.delete(projectId);
+    }).catch(() => undefined);
+  }
+
+  /** Exposed for deterministic integration tests and orderly shutdown. */
+  async waitForInspection(projectId: string): Promise<void> {
+    await this.inspections.get(projectId);
+  }
+
+  private async inspectProject(
+    ownerUserId: number,
+    projectId: string,
+    keepRuntimeActive = false,
+    preserveChoice = false,
+  ): Promise<void> {
+    const project = this.deps.store.getProjectForUser(projectId, ownerUserId);
+    if (!project || !project.repoUrl) return;
+    if (!this.deps.repositoryInspector) {
+      this.deps.store.setState(project.id, 'failed', 'Repository inspection is unavailable');
+      this.event(this.deps.store.getProject(project.id) as Project, {
+        t: 'error', state: 'failed', message: 'Repository inspection is unavailable',
+      });
+      return;
+    }
+    try {
+      const result = await this.exclusiveCredentialFor(ownerUserId, project.repoHost, async () => {
+        const credential = this.credentialRecordFor(project);
+        try {
+          return await this.deps.repositoryInspector!.inspect({
+            repoUrl: project.repoUrl!,
+            credential: credential?.token || null,
+          });
+        } catch (error) {
+          if (error instanceof RepositoryInspectionError
+            && error.code === 'credential_required'
+            && project.repoHost) {
+            this.markCredentialRejected(ownerUserId, project.repoHost, credential);
+          }
+          throw error;
+        }
+      });
+      const previousChoice = preserveChoice
+        ? compositionChoiceFrom(
+            this.deps.store.getProjectComposition(project.id, ownerUserId)?.chosen,
+          )
+        : null;
+      if (!this.saveDetectedDraft(project, result, previousChoice || undefined)) {
+        throw new Error('Could not save the inspected build recipe');
+      }
+      const nextState: ProjectState = keepRuntimeActive ? 'running' : 'composition_pending';
+      const detail = keepRuntimeActive
+        ? 'A refreshed build recipe is ready; the current container remains active until you confirm it'
+        : 'Review the detected build recipe';
+      this.deps.store.setState(project.id, nextState, detail);
+      this.event(this.deps.store.getProject(project.id) as Project, {
+        t: 'state', state: nextState, percent: 100,
+        message: keepRuntimeActive
+          ? 'Refreshed build recipe is ready; the current container is unchanged'
+          : 'Build recipe is ready for review',
+      });
+    } catch (error) {
+      const message = safeInspectionMessage(error);
+      const state: ProjectState = keepRuntimeActive
+        ? 'running'
+        : error instanceof RepositoryInspectionError
+          && ['repository_unavailable', 'timed_out'].includes(error.code)
+          ? 'unavailable'
+          : 'failed';
+      this.deps.store.setState(project.id, state, message);
+      this.event(this.deps.store.getProject(project.id) as Project, {
+        t: 'error', state, message,
+      });
+    }
+  }
+
+  private saveDetectedDraft(
+    project: Project,
+    detected: RepositoryInspectionResult | null,
+    rememberedChoice?: CompositionChoice,
+  ): ProjectComposition | null {
+    const runtimes = rememberedChoice?.runtimes || detected?.detectedRuntimes.map((runtime) => ({
+      runtimeId: runtime.runtimeId,
+      version: runtime.selectedVersion,
+    })) || [];
+    const forgeKind = rememberedChoice?.forgeKind
+      || detected?.forgeHint?.kind
+      || knownPublicForge(project.repoHost);
+    const choice: CompositionChoice = {
+      runtimes: runtimes.map((runtime) => ({ ...runtime })),
+      agents: rememberedChoice?.agents?.map((agent) => ({ ...agent })) || [],
+      forgeKind,
+    };
+    return this.deps.store.saveCompositionDraft({
+      projectId: project.id,
+      userId: project.ownerUserId,
+      catalogVersion: detected?.catalogVersion || COMPOSITION_CATALOG_VERSION,
+      detected: detected || emptyInspection(),
+      chosen: choice,
+      sourceOid: detected?.sourceOid,
+      sourceRef: detected?.sourceRef,
+      forgeKind,
+      forgeHost: detected?.forgeHint?.host || project.repoHost,
+      installations: installationIds(choice, forgeKind).map((itemId) => ({ itemId })),
+    });
+  }
+
+  private resolvedIdentity(project: Project): ReturnType<ProjectStore['resolveGitIdentity']> {
+    let providerDefault: { name: string; email: string } | null = null;
+    try { providerDefault = this.deps.authorFor(project.ownerUserId); } catch { /* Deleted owners remain incomplete. */ }
+    const resolveIdentity = (this.deps.store as Partial<ProjectStore>).resolveGitIdentity;
+    if (typeof resolveIdentity === 'function') {
+      return resolveIdentity.call(this.deps.store, {
+        userId: project.ownerUserId,
+        projectId: project.id,
+        providerDefault,
+      });
+    }
+    return providerDefault
+      ? { identity: { ...providerDefault, source: 'provider' }, source: 'provider' }
+      : { identity: null, source: 'incomplete' };
+  }
+
+  /** The same project-aware resolver feeds both runtime git and preservation. */
+  private preservationAuthor(project: Project): { name: string; email: string } {
+    const resolved = this.resolvedIdentity(project);
+    if (!resolved.identity) throw new Error('Git identity is incomplete');
+    return { name: resolved.identity.name, email: resolved.identity.email };
+  }
+
+  private runtimeContext(
+    project: Project,
+    composition: ProjectComposition,
+    chosen: CompositionChoice,
+    prepared: ProjectEnvironmentResult,
+  ): CompositionRuntimeContext {
+    let providerDefault: { name: string; email: string } | null = null;
+    try { providerDefault = this.deps.authorFor(project.ownerUserId); } catch { /* Reported as incomplete below. */ }
+    const global = this.deps.store.resolveGitIdentity({
+      userId: project.ownerUserId,
+      providerDefault,
+    });
+    const resolved = this.deps.store.resolveGitIdentity({
+      userId: project.ownerUserId,
+      projectId: project.id,
+      providerDefault,
+    });
+    if (!global.identity || !resolved.identity) throw new Error('Git identity is incomplete');
+    const projectIdentity = this.deps.store.getGitIdentity(project.ownerUserId, project.id);
+    const connectedCredential = composition.forgeHost
+      ? this.connectedCredentialFor(project.ownerUserId, composition.forgeHost)
+      : null;
+    return {
+      project,
+      composition,
+      chosen,
+      containerName: prepared.containerName,
+      containerIdentity: prepared.containerAccess.containerIdentity,
+      engine: prepared.engine,
+      ownerHomeHost: prepared.environment.homeDir,
+      ownerHomeContainer: prepared.environment.containerHome,
+      projectOverlayHost: this.projects.overlayPath(project),
+      checkoutContainerPath: this.projects.checkoutContainerPath(project),
+      credential: connectedCredential?.token || null,
+      credentialKind: connectedCredential?.kind || null,
+      credentialRevision: connectedCredential?.revision ?? null,
+      identity: { name: resolved.identity.name, email: resolved.identity.email },
+      globalIdentity: { name: global.identity.name, email: global.identity.email },
+      projectIdentity: projectIdentity
+        ? { name: projectIdentity.name, email: projectIdentity.email }
+        : null,
+    };
+  }
+
+  private compositionView(project: Project): CompositionView {
+    const latest = this.deps.store.getProjectComposition(project.id, project.ownerUserId);
+    const resolved = this.resolvedIdentity(project);
+    const chosen = compositionChoiceFrom(latest?.chosen);
+    const host = latest?.forgeHost || project.repoHost;
+    const connectedHost = host
+      ? this.deps.store.listConnectedHosts(project.ownerUserId).find((candidate) => candidate.host === host)
+      : null;
+    return {
+      revision: latest?.id || null,
+      activeRevision: project.compositionRevision,
+      appliedRevision: project.appliedCompositionRevision,
+      detected: inspectionFrom(latest?.detected),
+      chosen,
+      installations: latest
+        ? this.deps.store.listCompositionInstallations(latest.id, project.ownerUserId)
+        : [],
+      identity: resolved.identity
+        ? { name: resolved.identity.name, email: resolved.identity.email }
+        : null,
+      identitySource: resolved.source,
+      forge: host && latest?.forgeKind
+        ? {
+            kind: latest.forgeKind,
+            host,
+            connected: Boolean(connectedHost)
+              && connectedHost?.validationStatus !== 'invalid'
+              && (!connectedHost?.expiresAt
+                || (Number.isFinite(Date.parse(connectedHost.expiresAt))
+                  && Date.parse(connectedHost.expiresAt) > this.now().getTime())),
+            validationStatus: connectedHost?.validationStatus || null,
+          }
+        : null,
+    };
   }
 
   /** Persist and surface the exact collision-resolved ref a user can recover. */
@@ -1767,11 +3072,163 @@ export class ProjectManager {
     });
   }
 
+  /** Serialize source mutations and every plaintext use for one owner/host. */
+  private exclusiveCredentialFor<T>(
+    ownerUserId: number,
+    hostInput: string | null,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    if (!hostInput) return Promise.resolve().then(work);
+    const key = `${ownerUserId}\0${hostInput.trim().toLowerCase()}`;
+    const predecessor = this.credentialTails.get(key) || Promise.resolve();
+    let release!: () => void;
+    const tail = new Promise<void>((resolve) => { release = resolve; });
+    this.credentialTails.set(key, tail);
+    return predecessor.then(work).finally(() => {
+      release();
+      if (this.credentialTails.get(key) === tail) this.credentialTails.delete(key);
+    });
+  }
+
   private emitSafely(eventName: string, payload: unknown): void {
     for (const listener of this.events.rawListeners(eventName)) {
       try { listener.call(this.events, payload); } catch (error) {
         console.error(`Project ${eventName} listener failed:`, error);
       }
     }
+  }
+}
+
+type ChoiceValidation =
+  | { ok: true; choice: CompositionChoice }
+  | { ok: false; reason: 'validation'; detail: string };
+
+function validateCompositionChoice(input: {
+  runtimes: Array<{ runtimeId: string; version: string }>;
+  agents?: Array<{ runtimeId: string; version: string }>;
+  forgeKind?: string | null;
+}): ChoiceValidation {
+  if (!Array.isArray(input.runtimes) || input.runtimes.length > getCompositionCatalog().runtimes.length) {
+    return { ok: false, reason: 'validation', detail: 'Runtime selection is invalid' };
+  }
+  const supported = new Set<RuntimeId>(getCompositionCatalog().runtimes.map((entry) => entry.id));
+  const seen = new Set<RuntimeId>();
+  const runtimes: CompositionChoice['runtimes'] = [];
+  for (const candidate of input.runtimes) {
+    if (!candidate || !supported.has(candidate.runtimeId as RuntimeId)) {
+      return { ok: false, reason: 'validation', detail: 'Runtime selection contains an unsupported entry' };
+    }
+    const runtimeId = candidate.runtimeId as RuntimeId;
+    if (seen.has(runtimeId) || typeof candidate.version !== 'string'
+      || !isConservativeRuntimeVersion(candidate.version)) {
+      return { ok: false, reason: 'validation', detail: 'Runtime versions must be unique conservative numeric literals' };
+    }
+    seen.add(runtimeId);
+    runtimes.push({ runtimeId, version: candidate.version });
+  }
+  const inputAgents = input.agents || [];
+  const agentCatalog = getCompositionCatalog().agents;
+  if (!Array.isArray(inputAgents) || inputAgents.length > agentCatalog.length) {
+    return { ok: false, reason: 'validation', detail: 'Agent runtime selection is invalid' };
+  }
+  const supportedAgents = new Set<AgentRuntimeId>(agentCatalog.map((entry) => entry.id));
+  const seenAgents = new Set<AgentRuntimeId>();
+  const agents: CompositionChoice['agents'] = [];
+  for (const candidate of inputAgents) {
+    if (!candidate || !supportedAgents.has(candidate.runtimeId as AgentRuntimeId)) {
+      return { ok: false, reason: 'validation', detail: 'Agent runtime selection contains an unsupported entry' };
+    }
+    const runtimeId = candidate.runtimeId as AgentRuntimeId;
+    const definition = getAgentRuntimeCatalogEntry(runtimeId);
+    if (seenAgents.has(runtimeId) || candidate.version !== definition.defaultVersion) {
+      return { ok: false, reason: 'validation', detail: 'Agent runtime versions must match the catalog pin' };
+    }
+    seenAgents.add(runtimeId);
+    agents.push({ runtimeId, version: candidate.version });
+  }
+  const forgeKind = input.forgeKind ?? null;
+  if (forgeKind !== null && !['github', 'gitlab', 'gitea', 'forgejo'].includes(forgeKind)) {
+    return { ok: false, reason: 'validation', detail: 'Forge selection is invalid' };
+  }
+  return {
+    ok: true,
+    choice: {
+      runtimes,
+      agents,
+      forgeKind: forgeKind as CompositionChoice['forgeKind'],
+    },
+  };
+}
+
+function compositionChoiceFrom(value: unknown): CompositionChoice | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as { runtimes?: unknown; agents?: unknown; forgeKind?: unknown };
+  if (!Array.isArray(raw.runtimes)) return null;
+  const result = validateCompositionChoice({
+    runtimes: raw.runtimes as Array<{ runtimeId: string; version: string }>,
+    agents: Array.isArray(raw.agents)
+      ? raw.agents as Array<{ runtimeId: string; version: string }>
+      : [],
+    forgeKind: typeof raw.forgeKind === 'string' || raw.forgeKind === null
+      ? raw.forgeKind
+      : undefined,
+  });
+  return result.ok ? result.choice : null;
+}
+
+function inspectionFrom(value: unknown): RepositoryInspectionResult | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Partial<RepositoryInspectionResult>;
+  if (raw.catalogVersion !== COMPOSITION_CATALOG_VERSION
+    || typeof raw.sourceOid !== 'string'
+    || typeof raw.sourceRef !== 'string'
+    || !Array.isArray(raw.detectedRuntimes)) return null;
+  return raw as RepositoryInspectionResult;
+}
+
+function emptyInspection(): Record<string, unknown> {
+  return {
+    catalogVersion: COMPOSITION_CATALOG_VERSION,
+    sourceOid: null,
+    sourceRef: null,
+    forgeHint: null,
+    detectedRuntimes: [],
+  };
+}
+
+function knownPublicForge(host: string | null | undefined): CompositionChoice['forgeKind'] {
+  const hostname = (host || '').split(':')[0].toLowerCase();
+  if (hostname === 'github.com') return 'github';
+  if (hostname === 'gitlab.com') return 'gitlab';
+  return null;
+}
+
+function installationIds(
+  choice: CompositionChoice,
+  forgeKind: CompositionChoice['forgeKind'],
+): string[] {
+  const ids: string[] = choice.runtimes.map((runtime) => runtime.runtimeId);
+  const selectedLanguages = new Set(choice.runtimes.map((runtime) => runtime.runtimeId));
+  const requirements = new Set(choice.agents.map((agent) => getAgentRuntimeCatalogEntry(agent.runtimeId).requires));
+  for (const requirement of requirements) {
+    if (!selectedLanguages.has(requirement)) ids.push(`agent-foundation-${requirement}`);
+  }
+  ids.push(...choice.agents.map((agent) => `agent-${agent.runtimeId}`));
+  if (forgeKind === 'github') ids.push('gh');
+  else if (forgeKind === 'gitlab') ids.push('glab');
+  else if (forgeKind === 'gitea' || forgeKind === 'forgejo') ids.push('tea');
+  return ids;
+}
+
+function safeInspectionMessage(error: unknown): string {
+  if (!(error instanceof RepositoryInspectionError)) return 'Repository inspection failed';
+  switch (error.code) {
+    case 'credential_required': return 'Repository credential is missing or invalid';
+    case 'invalid_url': return 'Repository URL is not eligible for safe inspection';
+    case 'invalid_repository': return 'Repository could not be inspected safely';
+    case 'limit_exceeded': return 'Repository inspection exceeded a safety limit';
+    case 'timed_out': return 'Repository inspection timed out';
+    case 'cancelled': return 'Repository inspection was cancelled';
+    default: return 'Repository is currently unavailable for inspection';
   }
 }
