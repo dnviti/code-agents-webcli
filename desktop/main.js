@@ -471,7 +471,9 @@ async function boot() {
       fs.rmSync(smokeRoot, { recursive: true, force: true });
     }
     shutdownComplete = true;
-    app.quit();
+    // Smoke mode has already shut down every resource it owns. Exit directly
+    // so AppImage's FUSE launcher cannot keep CI waiting on Electron teardown.
+    app.exit(0);
     return;
   }
 

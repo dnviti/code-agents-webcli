@@ -252,7 +252,8 @@ jobs:
                 exit 1
               fi
               set +e
-              output="$(xvfb-run -a "$appimage" --headless 2>&1)"
+              output="$(timeout --signal=TERM --kill-after=10s 120s \
+                xvfb-run -a "$appimage" --headless 2>&1)"
               appimage_status=$?
               set -e
               if [ "$appimage_status" -ne 0 ]; then
