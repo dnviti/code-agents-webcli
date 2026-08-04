@@ -1,5 +1,10 @@
 # Changelog
 
+## [6.1.0] - 2026-08-04
+
+### Changed
+- Prepare release 6.1.0.
+
 ## [6.0.0] - unreleased
 
 ### Added
