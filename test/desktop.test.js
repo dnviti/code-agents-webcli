@@ -30,7 +30,10 @@ describe('Electron desktop helpers', function () {
     assert.match(main, /setWindowOpenHandler/);
     assert.match(main, /setPermissionRequestHandler/);
     assert.match(main, /will-redirect/);
-    assert.match(main, /hasSwitch\('no-sandbox'\)/);
+    assert.match(
+      main,
+      /if \(app\.isPackaged && app\.commandLine\.hasSwitch\('no-sandbox'\)\) \{[\s\S]{0,160}throw new Error\([\s\S]{0,160}refuses to run without Chromium sandboxing/,
+    );
     assert.match(main, /\.\.\.desktopWindowChrome\(\)/);
     assert.match(main, /Menu\.setApplicationMenu\(null\)/);
     assert.match(main, /\.removeMenu\(\)/);
@@ -52,16 +55,25 @@ describe('Electron desktop helpers', function () {
     assert.match(release, /push:\s*\n\s*tags:\s*\n\s*- ['"]v\*\.\*\.\*['"]/);
     assert.match(release, /- ['"]!v\*\.\*\.\*-staging['"]/);
     assert.doesNotMatch(release, /push:\s*\n\s*branches:/);
+    assert.match(release, /- os: ubuntu-24\.04/);
     assert.match(release, /EXPECTED_TAG="v\$\{VERSION\}"/);
     assert.match(release, /git merge-base --is-ancestor "\$TAG_TARGET" origin\/main/);
     assert.match(release, /Smoke the native packaged application/);
     assert.match(release, /apt-get install --yes[^\n]*libfuse2t64/);
     assert.match(release, /find release -maxdepth 1 -type f -name ['"]\*\.AppImage['"]/);
+    assert.match(release, /if ! unshare -Ur true 2>\/dev\/null; then/);
+    assert.match(release, /\/proc\/sys\/kernel\/apparmor_restrict_unprivileged_userns/);
+    assert.match(release, /The runner cannot provide Chromium's user-namespace sandbox/);
     assert.match(
       release,
       /timeout --signal=TERM --kill-after=10s 120s[\s\\]*xvfb-run -a "\$appimage" --headless/,
     );
+    assert.doesNotMatch(
+      release,
+      /xvfb-run[\s\S]{0,160}"\$appimage"[\s\\]*--no-sandbox/,
+    );
     assert.match(release, /appimage_status=\$\?/);
+    assert.match(release, /AppImage` — Linux x64[^\n]*unprivileged user namespaces/);
     assert.match(release, /sha256sum -c SHA256SUMS/);
     assert.match(release, /tag_name:\s*\$\{\{ needs\.verify\.outputs\.tag \}\}/);
     assert.match(release, /target_commitish:\s*\$\{\{ needs\.verify\.outputs\.commit_sha \}\}/);

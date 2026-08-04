@@ -132,7 +132,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # The AppImage smoke repair below targets Ubuntu 24.04's AppArmor
+          # user-namespace policy and its libfuse2t64 package name.
+          - os: ubuntu-24.04
             label: Linux x64
             args: --linux AppImage flatpak --x64
             required: "*.AppImage *.flatpak"
@@ -251,6 +253,24 @@ jobs:
                 echo "Could not find an executable AppImage for smoke testing." >&2
                 exit 1
               fi
+              # electron-builder's AppRun probes user namespaces and adds
+              # --no-sandbox when Ubuntu 24.04's AppArmor restriction blocks
+              # them. Keep the production safety check intact: relax only the
+              # disposable runner restriction, then fail closed unless the
+              # same probe used by AppRun succeeds.
+              if ! unshare -Ur true 2>/dev/null; then
+                if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+                  echo 0 | sudo tee \
+                    /proc/sys/kernel/apparmor_restrict_unprivileged_userns >/dev/null
+                fi
+                if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+                  echo 1 | sudo tee /proc/sys/kernel/unprivileged_userns_clone >/dev/null
+                fi
+              fi
+              if ! unshare -Ur true 2>/dev/null; then
+                echo "The runner cannot provide Chromium's user-namespace sandbox." >&2
+                exit 1
+              fi
               set +e
               output="$(timeout --signal=TERM --kill-after=10s 120s \
                 xvfb-run -a "$appimage" --headless 2>&1)"
@@ -361,7 +381,7 @@ jobs:
             Automated desktop release for ${{ needs.verify.outputs.tag }}.
 
             Desktop downloads (all are unsigned):
-            - `*.AppImage` — Linux x64, portable; make it executable and run it.
+            - `*.AppImage` — Linux x64, portable; mounted launches require FUSE2 and Chromium sandboxing requires unprivileged user namespaces.
             - `*.flatpak` — Linux x64, sandboxed Flatpak bundle.
             - `*.exe` — Windows x64 NSIS installer.
             - `*-x64.dmg` — macOS Intel (x64).
