@@ -80,6 +80,7 @@ export interface ChatViewProps {
   runtime: string;
   runtimeLabel: string;
   workingDir: string;
+  serverName?: string;
   isMobile?: boolean;
   /**
    * The account's approval preference, which is what a conversation *started*
@@ -171,6 +172,7 @@ export function ChatView({
   runtime,
   runtimeLabel,
   workingDir,
+  serverName,
   isMobile = false,
   approvalPreference = false,
   onOpenSettings,
@@ -226,10 +228,13 @@ export function ChatView({
     [transcript, version],
   );
   const exited = chatState === 'exited';
+  const transportUnavailable = !controller.connectionAvailable;
   const unavailable = controller.unavailableReason;
   const workflowUnavailableReason = !controller.builtInWorkflowsAvailable
     ? 'This server does not support guided workflows.'
-    : unavailable?.message
+    : transportUnavailable
+      ? `${serverName || 'This server'} is unavailable. Reconnect it to use server actions.`
+      : unavailable?.message
       ?? (exited
         ? 'This conversation has ended.'
         : !transcript.live
@@ -511,7 +516,7 @@ export function ChatView({
       // Named as the composer's own send, which is what empties the shared
       // draft: a turn sent again from the transcript goes through the same
       // method and must leave a half-written message alone. See sendTurn.
-      controller.sendTurn(text, attachments, { fromComposer: true });
+      if (!controller.sendTurn(text, attachments, { fromComposer: true })) return;
       // Emptied here, before the composer empties itself. It clears the text and
       // the files one after the other, and each of those is a publishable state
       // — so without this the account's other screens would watch the message
@@ -1277,7 +1282,7 @@ export function ChatView({
                     answered={request ? undefined : transcript.answerFor(answerKey)}
                     ownWords={request ? undefined : transcript.answerTextFor(answerKey)}
                     abandoned={!request && transcript.abandonedFor(answerKey)}
-                    onAnswer={answerQuestion}
+                    onAnswer={transportUnavailable ? undefined : answerQuestion}
                   />;
                 })}
               </div>
@@ -1293,7 +1298,7 @@ export function ChatView({
                 style={{ display: 'grid', gap: 'var(--space-2)', maxHeight: '50vh', overflowY: 'auto' }}
               >
                 {pending.map((request) => (
-                  <PermissionCard key={request.requestId} request={request} onRespond={respond} />
+                  <PermissionCard key={request.requestId} request={request} onRespond={respond} busy={transportUnavailable} />
                 ))}
               </div>
             ) : null}
@@ -1307,7 +1312,7 @@ export function ChatView({
               // used to disable it too, which meant the one moment you most
               // want to type the follow-up — while the agent waits on you — was
               // the one moment you could not. It queues instead.
-              disabled={exited || Boolean(unavailable)}
+              disabled={exited || Boolean(unavailable) || transportUnavailable}
               placeholder={placeholderFor(chatState, runtimeLabel, isMobile)}
               queued={transcript.queuedTurns}
               onCancelQueued={cancelQueued}
@@ -1473,7 +1478,7 @@ export function ChatView({
         onClose={() => setEditing(null)}
         isMobile={isMobile}
       />
-      {planOpen ? <PlanDocDialog plan={controller.planDocumentValue} planMode={controller.planModeValue} disabled={planLocked} feedback={controller.planFeedback?.message || null} retryAction={controller.planFeedback?.accepted === false && controller.planFeedback.action !== 'mode' ? controller.planFeedback.action : null} onAccept={(revision) => { setPlanAction('accept'); controller.acceptPlan(revision); }} onReject={(revision) => { setPlanAction('reject'); controller.rejectPlan(revision); }} onClose={() => setPlanOpen(false)} /> : null}
+      {planOpen ? <PlanDocDialog plan={controller.planDocumentValue} planMode={controller.planModeValue} disabled={planLocked || !controller.connectionAvailable} feedback={controller.planFeedback?.message || null} retryAction={controller.planFeedback?.accepted === false && controller.planFeedback.action !== 'mode' ? controller.planFeedback.action : null} serverName={serverName} onAccept={(revision) => { setPlanAction('accept'); controller.acceptPlan(revision); }} onReject={(revision) => { setPlanAction('reject'); controller.rejectPlan(revision); }} onClose={() => setPlanOpen(false)} /> : null}
     </section>
     </PhoneContext.Provider>
   );

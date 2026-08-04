@@ -2,6 +2,7 @@ import * as React from 'react';
 
 import type { AppSettings, NotifySettings, TerminalFontFamilyId, ThemePresetId } from '../../types';
 import type { InstallState } from '../store';
+import type { ServerTarget } from '../../controller/types';
 import { Button } from '../../ui/relay/Button';
 import { Dialog } from '../../ui/relay/Dialog';
 import { Select } from '../../ui/relay/Select';
@@ -60,6 +61,11 @@ export interface SettingsDialogProps {
   onOpenEnvironment(): void;
   /** Open project containers and their lifecycle controls. */
   onOpenProjects(): void;
+  /** Present only in the desktop controller; browser/PWA keeps its install flow. */
+  controllerTargets?: ServerTarget[];
+  onOpenServerManager?: () => void;
+  /** Electron owns its package installation, so a PWA install offer is meaningless there. */
+  isElectronController?: boolean;
 }
 
 /**
@@ -159,9 +165,16 @@ export function SettingsDialog({
   environmentsEnabled,
   onOpenEnvironment,
   onOpenProjects,
+  controllerTargets,
+  onOpenServerManager,
+  isElectronController,
 }: SettingsDialogProps): React.JSX.Element | null {
   const [draft, setDraft] = React.useState<AppSettings>(settings);
   const isPhone = usePhone();
+  // The current controller bootstrap only exists in Electron. The explicit
+  // flag lets a browser-hosted test or future browser controller say otherwise
+  // without making the presence of server data hide a browser feature.
+  const electronController = isElectronController ?? controllerTargets !== undefined;
 
   // Keyed on `open` alone, deliberately: while the dialog is open the caller is
   // being fed previews and re-renders with them, so following `settings` here
@@ -433,7 +446,15 @@ export function SettingsDialog({
         </SettingRow>
       ) : null}
 
-      <SettingRow
+      {controllerTargets ? <SettingRow
+        label="Servers"
+        description={`${controllerTargets.length} configured server${controllerTargets.length === 1 ? '' : 's'}. Manage connections, sign-in and certificate trust on this desktop.`}
+        style={electronController ? { borderBottom: 'none', paddingBottom: 0 } : undefined}
+      >
+        <Button variant="secondary" onClick={onOpenServerManager} disabled={!onOpenServerManager}>Manage servers</Button>
+      </SettingRow> : null}
+
+      {!electronController ? <SettingRow
         label="Install app"
         description={INSTALL_COPY[install].description}
         style={{ borderBottom: 'none', paddingBottom: 0 }}
@@ -467,7 +488,7 @@ export function SettingsDialog({
             {install === 'unsupported' ? 'Not offered' : null}
           </span>
         )}
-      </SettingRow>
+      </SettingRow> : null}
     </Dialog>
   );
 }

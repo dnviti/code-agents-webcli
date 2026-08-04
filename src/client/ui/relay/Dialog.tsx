@@ -113,6 +113,32 @@ function matchesFocusVisible(element: Element): boolean {
 // dialog nested inside another dialog's children alike.
 const openPanels: HTMLElement[] = [];
 
+// Keep the selector deliberately native: it covers the controls this app uses
+// without treating every element with a click handler as keyboard-reachable.
+// The latter is an especially easy way for a focus trap to get stuck on a
+// decorative element after a harmless visual refactor.
+const FOCUSABLE = [
+  'a[href]', 'area[href]', 'button:not([disabled])', 'input:not([disabled])',
+  'select:not([disabled])', 'textarea:not([disabled])', 'summary',
+  '[contenteditable="true"]', '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
+function tabStops(panel: HTMLElement): HTMLElement[] {
+  return Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((element) => (
+    !element.hidden
+    && element.getAttribute('aria-hidden') !== 'true'
+    && element.tabIndex >= 0
+  ));
+}
+
+function retainFocus(panel: HTMLElement, backwards = false): void {
+  const stops = tabStops(panel);
+  const next = backwards ? stops.at(-1) : stops[0];
+  // A dialog with explanatory text only is still a real modal. Its panel is
+  // intentionally focusable so Tab cannot escape to controls behind it.
+  (next ?? panel).focus();
+}
+
 function isTopmostPanel(panel: HTMLElement): boolean {
   for (const other of openPanels) {
     if (other === panel) continue;
@@ -238,12 +264,11 @@ export function Dialog({
     };
   }, [open]);
 
-  // Escape closes. The component had no key handling at all before this, so
-  // there is no duplicate handler to collide with. It routes through the close
-  // button's own click rather than calling onClose directly: onClose is typed as
-  // a MouseEventHandler and there is no honest MouseEvent to hand it from a
-  // keystroke, and reusing the button keeps every close path identical. No close
-  // button means the caller gave no way to close, and Escape respects that.
+  // The modal owns keyboard focus. Escape and Tab are kept together because the
+  // same topmost check matters for both when dialogs are stacked: the inner
+  // dialog must trap focus without the outer one stealing it back. `focusin`
+  // closes the remaining hole (scripted focus, browser chrome returning focus,
+  // or a click on a non-closing backdrop) that a Tab-only trap would leave.
   React.useEffect(() => {
     if (!open) return;
     const panel = panelRef.current;
@@ -251,21 +276,40 @@ export function Dialog({
 
     openPanels.push(panel);
     const onKeyDown = (event: KeyboardEvent) => {
+      if (!isTopmostPanel(panel)) return;
+      if (event.key === 'Tab') {
+        const stops = tabStops(panel);
+        const active = document.activeElement;
+        const current = stops.indexOf(active as HTMLElement);
+        const escapingBack = event.shiftKey && (current <= 0 || !panel.contains(active));
+        const escapingForward = !event.shiftKey && (current === -1 || current === stops.length - 1);
+        if (escapingBack || escapingForward) {
+          event.preventDefault();
+          event.stopPropagation();
+          retainFocus(panel, event.shiftKey);
+        }
+        return;
+      }
       if (event.key !== 'Escape') return;
       // A stacked dialog is modal over the one beneath it, so Escape belongs to
       // the top panel alone — and it stays swallowed there even when that panel
       // has no close button to run.
-      if (!isTopmostPanel(panel)) return;
       const button = closeRef.current;
       if (!button) return;
       event.stopPropagation();
       button.click();
     };
+    const onFocusIn = (event: FocusEvent) => {
+      if (!isTopmostPanel(panel) || panel.contains(event.target as Node | null)) return;
+      retainFocus(panel);
+    };
     document.addEventListener('keydown', onKeyDown);
+    document.addEventListener('focusin', onFocusIn, true);
     return () => {
       const index = openPanels.indexOf(panel);
       if (index !== -1) openPanels.splice(index, 1);
       document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('focusin', onFocusIn, true);
     };
   }, [open]);
 

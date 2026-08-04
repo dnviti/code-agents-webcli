@@ -62,6 +62,13 @@ import { PasteStore } from './services/paste-store.js';
 import { AttachmentStore, type AttachmentStoreLike } from './services/attachment-store.js';
 import { ProjectAwareAttachmentStore } from './services/project-attachment-store.js';
 import { readBuildInfo } from './services/build-info.js';
+import {
+  createServerIdentity,
+  normalizeDiscoverableAddress,
+  registerServerIdentityRoute,
+  type ServerIdentity,
+} from './services/server-identity.js';
+import { LanDiscoveryResponder } from './services/lan-discovery.js';
 import { UpdateChecker } from './services/update-check.js';
 import { ensureCertificates, createHttpsOnlyPort, caCertificateHandler } from './services/tls.js';
 import {
@@ -175,6 +182,8 @@ export class ClaudeCodeWebServer {
   private folderMode: boolean;
   private baseFolder: string;
   private publicBaseUrl: string | null;
+  private readonly serverIdentity: ServerIdentity;
+  private readonly lanDiscovery: LanDiscoveryResponder;
   private sessionDurationHours: number;
   private aliases: Aliases;
 
@@ -283,6 +292,21 @@ export class ClaudeCodeWebServer {
     this.folderMode = config.folderMode;
     this.baseFolder = config.baseFolder;
     this.publicBaseUrl = config.publicBaseUrl;
+    this.serverIdentity = createServerIdentity({
+      serverName: config.serverName,
+      // `publicDiscoverableUrl` is the deliberately explicit contract. The
+      // OAuth base URL remains a compatibility fallback for existing hosted
+      // installations, and localhost is safe but never advertised over LAN.
+      address: config.publicDiscoverableUrl
+        || normalizeDiscoverableAddress(config.publicBaseUrl)
+        || `https://localhost:${config.port}`,
+      version: readBuildInfo().version,
+    });
+    this.lanDiscovery = new LanDiscoveryResponder({
+      enabled: !config.desktop && config.lanDiscoverable && config.publicDiscoverableUrl !== null,
+      identity: this.serverIdentity,
+      onError: (error) => console.warn(`LAN discovery responder error: ${error.message}`),
+    });
     this.sessionDurationHours = config.sessionDurationHours;
     this.aliases = config.aliases;
     this.startTime = config.startTime;
@@ -1399,6 +1423,7 @@ export class ClaudeCodeWebServer {
       this.environmentScale = null;
     }
     this.updateChecker.stop();
+    this.lanDiscovery.stop();
 
     if (this.wss) {
       // Stop already-connected clients from creating more work while the rest
@@ -1507,6 +1532,7 @@ export class ClaudeCodeWebServer {
       this.app.use(cors());
     }
     this.app.use(express.json());
+    registerServerIdentityRoute(this.app, this.serverIdentity);
     this.app.use(this.authService.attachRequestContext());
 
     this.app.get('/login', this.authService.handleLoginPage);
@@ -1759,6 +1785,9 @@ export class ClaudeCodeWebServer {
           server.off('error', onError);
           this.server = server;
           this.listener = server;
+          // This only binds an opt-in responder. It never probes the LAN or
+          // sends a packet until another device sends the exact protocol request.
+          this.lanDiscovery.start();
           resolve(server);
         });
       });
@@ -1818,6 +1847,8 @@ export class ClaudeCodeWebServer {
         server.off('error', onError);
         this.server = secure;
         this.listener = server;
+        // The HTTP(S) listener is live before discovery can advertise it.
+        this.lanDiscovery.start();
         resolve(secure);
       });
     });

@@ -6,6 +6,7 @@ import type { GitChange } from '../../shared/git-status.js';
 // signatures are written in have to be brought in as well — without this the
 // re-export compiles and every use of them here is an unresolved name.
 import type { GitHubItem, GitHubOverview } from '../../shared/github-items.js';
+import { controllerFetch } from '../controller/transport.js';
 
 /**
  * The browser's half of the workspace routes.
@@ -93,7 +94,7 @@ export interface SaveResult {
 }
 
 async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url, { headers: { Accept: 'application/json' } });
+  const response = await controllerFetch(url, { headers: { Accept: 'application/json' } });
 
   if (!response.ok) {
     // A 404 that is not JSON is Express's own "no such route", not this API
@@ -162,7 +163,7 @@ export async function saveFile(
   content: string,
   mtimeMs: number,
 ): Promise<SaveResult> {
-  const response = await fetch(`/api/workspace/${encodeURIComponent(sessionId)}/file`, {
+  const response = await controllerFetch(`/api/workspace/${encodeURIComponent(sessionId)}/file`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({ path: filePath, content, mtimeMs }),
@@ -356,7 +357,7 @@ export async function uploadIntoWorkspace(
   const query = new URLSearchParams({ dir: directory || '.', name: file.name });
   if (options.overwrite) query.set('overwrite', '1');
 
-  const response = await fetch(
+  const response = await controllerFetch(
     `/api/workspace/${encodeURIComponent(sessionId)}/upload?${query.toString()}`,
     {
       method: 'POST',

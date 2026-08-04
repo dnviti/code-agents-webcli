@@ -343,6 +343,8 @@ export class ChatController {
 
   /** Set while the conversation is readable but has nothing running it. */
   private unavailable: ChatUnavailable | null = null;
+  /** False while the owning server transport is unavailable. History stays readable. */
+  private transportConnected = true;
 
   /**
    * The model override this conversation is carrying, independent of what the
@@ -950,6 +952,10 @@ export class ChatController {
     };
   }
 
+  get connectionAvailable(): boolean {
+    return this.transportConnected;
+  }
+
   /**
    * Put a runtime back on this conversation.
    *
@@ -965,12 +971,12 @@ export class ChatController {
    * exactly the thing that used to be wrong after a restart.
    */
   relaunch(agentKind: string, options: { resume: boolean }): void {
+    if (!this.transportConnected) return;
     this.unavailable = null;
     this.options.onChange?.();
-    this.options.send({
+    this.send({
       type: 'start_chat',
       agentKind,
-      sessionId: this.sessionId,
       options: { resume: options.resume },
     });
   }
@@ -988,9 +994,9 @@ export class ChatController {
     text: string,
     attachments: ChatAttachment[] = [],
     { fromComposer = false }: { fromComposer?: boolean } = {},
-  ): void {
+  ): boolean {
     const trimmed = text.trim();
-    if (!trimmed && !attachments.length) return;
+    if ((!trimmed && !attachments.length) || !this.transportConnected) return false;
     if (fromComposer) {
       // Whatever was waiting for the publish interval is about to be wrong: the
       // composer is empty from this moment on every screen, and a trailing frame
@@ -1002,7 +1008,7 @@ export class ChatController {
       this.draftPending = null;
       this.draftPublished = { text: '', attachments: [] };
     }
-    this.send({ type: 'chat_send', text: trimmed, attachments, fromComposer });
+    return this.send({ type: 'chat_send', text: trimmed, attachments, fromComposer }) !== false;
   }
 
   /**
@@ -1278,10 +1284,19 @@ export class ChatController {
   }
 
   /** Reject unacknowledged answers when their socket goes away; never retry. */
-  connectionLost(): void {
+  connectionLost(notify = true): void {
+    const changed = this.transportConnected;
+    this.transportConnected = false;
     for (const submissionId of Array.from(this.questionAnswers.keys())) {
       this.settleQuestionAnswer(submissionId, false);
     }
+    if (changed && notify) this.options.onChange?.();
+  }
+
+  connectionRestored(): void {
+    if (this.transportConnected) return;
+    this.transportConnected = true;
+    this.options.onChange?.();
   }
 
   private settleQuestionAnswer(submissionOrRequestId: string, accepted: boolean): void {
@@ -1578,6 +1593,7 @@ export class ChatController {
 
   /** Every outgoing message names its session; a browser drives several. */
   private send(message: Record<string, unknown>): boolean | void {
+    if (!this.transportConnected) return false;
     return this.options.send({ ...message, sessionId: this.sessionId });
   }
 
@@ -1605,7 +1621,7 @@ export class ChatController {
       pending.reject(new Error('The conversation closed before the guided workflow was started.'));
     }
     this.workflowRequests.clear();
-    this.connectionLost();
+    this.connectionLost(false);
   }
 
   /**

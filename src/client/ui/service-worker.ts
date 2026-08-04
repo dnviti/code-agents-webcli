@@ -52,6 +52,7 @@ async function promptForUpdate(worker: ServiceWorker): Promise<void> {
     description:
       'Reload to update Code Agents Web CLI. Running agent sessions keep going on the server and will still be here afterwards.',
     confirmLabel: 'Reload',
+    scope: 'desktop',
     cancelLabel: 'Not now',
   });
 

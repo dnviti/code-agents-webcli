@@ -2,6 +2,24 @@
 
 ## [6.1.0] - 2026-08-04
 
+### Added
+- **The installed desktop app is now one controller for Local computer and any
+  practical number of saved remote CODE AGENTS servers** (#187). Sessions and
+  recent conversations are combined with server labels and explicit targeting;
+  New Session always confirms its server; background status and attention stay
+  connected; and a local startup failure no longer prevents access to saved
+  remotes. Server management includes exact-HTTPS identity verification,
+  automatic retry and last contact, dedicated per-server GitHub sign-in,
+  metadata-only offline session state, and opt-in user-triggered LAN discovery.
+  Invalid-certificate approval is pinned to one exact server and certificate,
+  is confirmed before a failing new address is saved, remains visibly insecure,
+  and stops for renewed approval if the certificate changes. Existing local
+  data stays in place and a one-time bounded bridge carries supported renderer
+  display and chat-effort preferences to the permanent controller origin while
+  excluding old permission grants and session assignments. The ordinary
+  browser/PWA remains a single-server application. See [Desktop
+  app](docs/desktop.md).
+
 ### Changed
 - Prepare release 6.1.0.
 

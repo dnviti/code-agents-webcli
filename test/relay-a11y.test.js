@@ -171,6 +171,19 @@ describe('Relay accessibility guards', function () {
     }
   });
 
+  it('contains Tab and programmatic focus in the topmost stacked dialog', function () {
+    // Effects do not run in server rendering, so this is deliberately a
+    // narrow implementation guard for the browser-only modal contract. It
+    // protects both directions of Tab, the focusin escape hatch, and the
+    // topmost check that stops an outer dialog stealing focus from an inner one.
+    const source = fs.readFileSync(path.join(ROOT, 'src/client/ui/relay/Dialog.tsx'), 'utf8');
+    assert.match(source, /event\.key === 'Tab'/, 'Tab must be handled by the modal');
+    assert.match(source, /retainFocus\(panel, event\.shiftKey\)/, 'Shift+Tab must wrap backwards');
+    assert.match(source, /document\.addEventListener\('focusin', onFocusIn, true\)/, 'programmatic focus must be contained too');
+    assert.match(source, /if \(!isTopmostPanel\(panel\)/, 'only the topmost dialog may own focus');
+    assert.match(source, /previous\?\.focus\(\)/, 'closing must restore its prior focus target');
+  });
+
   it('does not offer a New tab button with nothing behind it', function () {
     // Same defect as the sidebar "+": a focusable control announcing itself as
     // "New tab" that does nothing when activated.

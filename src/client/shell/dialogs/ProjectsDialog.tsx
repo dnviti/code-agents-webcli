@@ -10,6 +10,7 @@ import { Switch } from '../../ui/relay/Switch';
 import { Tabs } from '../../ui/relay/Tabs';
 import { showConfirm } from '../../ui/confirm';
 import { usePhone } from '../../ui/touch';
+import { controllerFetch, getControllerSnapshot } from '../../controller/transport';
 import { ProjectCompositionPanel } from './ProjectCompositionPanel';
 import { WorkspaceDataPanel } from './WorkspaceDataPanel';
 import {
@@ -61,7 +62,7 @@ function message(result: { status: number; data: unknown }): string {
 }
 
 async function request(url: string, method = 'GET', body?: unknown): Promise<{ ok: true; data: unknown } | { ok: false; status: number; data: unknown }> {
-  const response = await fetch(url, {
+  const response = await controllerFetch(url, {
     method, credentials: 'same-origin',
     headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -242,7 +243,9 @@ export function ProjectsDialog({ open, repositoryInspectionSupported, onClose, o
     }
     for (const projectId of building) {
       if (sourcesRef.current.has(projectId) || terminalBuildsRef.current.has(projectId)) continue;
-      const source = new EventSource(`/api/projects/${encodeURIComponent(projectId)}/build`, { withCredentials: true });
+      const selected = getControllerSnapshot().selectedServerId;
+      const query = selected ? `?serverId=${encodeURIComponent(selected)}` : '';
+      const source = new EventSource(`/api/projects/${encodeURIComponent(projectId)}/build${query}`, { withCredentials: true });
       const receive = (raw: MessageEvent<string>): void => {
         try {
           const event = JSON.parse(raw.data) as BuildEvent;

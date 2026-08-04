@@ -1,6 +1,27 @@
 import { ServerOptions, ServerState, Aliases } from './types.js';
+import { normalizeDiscoverableAddress, normalizeServerName } from './services/server-identity.js';
 
 export function createConfig(options: ServerOptions): ServerState {
+  const requestedDiscoverableUrl = options.publicDiscoverableUrl
+    || process.env.CODE_AGENTS_WEBCLI_PUBLIC_DISCOVERABLE_URL
+    || null;
+  const publicDiscoverableUrl = normalizeDiscoverableAddress(requestedDiscoverableUrl);
+  if (requestedDiscoverableUrl && !publicDiscoverableUrl) {
+    throw new Error('Public discoverable URL must be an HTTPS origin without a path, query, fragment, or credentials.');
+  }
+  const lanDiscoverable = options.lanDiscoverable === true
+    || process.env.CODE_AGENTS_WEBCLI_LAN_DISCOVERABLE === 'true';
+  if (lanDiscoverable && !publicDiscoverableUrl) {
+    throw new Error(
+      'LAN discovery requires --public-discoverable-url <https-origin> or '
+      + 'CODE_AGENTS_WEBCLI_PUBLIC_DISCOVERABLE_URL.',
+    );
+  }
+  const serverName = normalizeServerName(
+    options.serverName
+    ?? process.env.CODE_AGENTS_WEBCLI_SERVER_NAME
+    ?? 'CODE AGENTS server',
+  );
   const sessionDurationHours = parseFloat(
     process.env.CLAUDE_SESSION_HOURS || String(options.sessionHours || 5)
   );
@@ -37,6 +58,11 @@ export function createConfig(options: ServerOptions): ServerState {
     selectedWorkingDir: null,
     baseFolder: options.baseFolder || process.cwd(),
     publicBaseUrl: options.publicBaseUrl || process.env.PUBLIC_BASE_URL || null,
+    // Do not use os.hostname(): the identity endpoint is public before login,
+    // and an operator should choose whether their host name is disclosed.
+    serverName,
+    publicDiscoverableUrl,
+    lanDiscoverable,
     githubClientId:
       options.githubClientId || process.env.GITHUB_OAUTH_CLIENT_ID || null,
     githubClientSecret:
