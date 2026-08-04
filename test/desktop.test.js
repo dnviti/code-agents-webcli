@@ -35,6 +35,7 @@ describe('Electron desktop helpers', function () {
     assert.match(main, /Menu\.setApplicationMenu\(null\)/);
     assert.match(main, /\.removeMenu\(\)/);
     assert.match(main, /did-change-theme-color/);
+    assert.match(main, /shutdownComplete = true;[\s\S]{0,240}app\.exit\(0\);\s*return;/);
     for (const target of ['AppImage', 'flatpak', 'nsis', 'dmg']) {
       assert.match(builder, new RegExp(`\\b${target}\\b`));
     }
@@ -56,7 +57,10 @@ describe('Electron desktop helpers', function () {
     assert.match(release, /Smoke the native packaged application/);
     assert.match(release, /apt-get install --yes[^\n]*libfuse2t64/);
     assert.match(release, /find release -maxdepth 1 -type f -name ['"]\*\.AppImage['"]/);
-    assert.match(release, /xvfb-run -a "\$appimage" --headless/);
+    assert.match(
+      release,
+      /timeout --signal=TERM --kill-after=10s 120s[\s\\]*xvfb-run -a "\$appimage" --headless/,
+    );
     assert.match(release, /appimage_status=\$\?/);
     assert.match(release, /sha256sum -c SHA256SUMS/);
     assert.match(release, /tag_name:\s*\$\{\{ needs\.verify\.outputs\.tag \}\}/);
