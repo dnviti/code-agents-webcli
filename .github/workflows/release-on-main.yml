@@ -177,7 +177,9 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes flatpak flatpak-builder xvfb xauth
+          # Ubuntu 24.04 renamed AppImage's FUSE 2 compatibility library to
+          # libfuse2t64. It is required to exercise the actual mounted artifact.
+          sudo apt-get install --yes flatpak flatpak-builder libfuse2t64 xvfb xauth
           # electron-builder updates these refs without privilege escalation,
           # so install them for the runner user instead of system-wide.
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
@@ -249,7 +251,14 @@ jobs:
                 echo "Could not find an executable AppImage for smoke testing." >&2
                 exit 1
               fi
-              output="$(xvfb-run -a "$appimage" --headless)"
+              set +e
+              output="$(xvfb-run -a "$appimage" --headless 2>&1)"
+              appimage_status=$?
+              set -e
+              if [ "$appimage_status" -ne 0 ]; then
+                printf '%s\n' "$output" >&2
+                exit "$appimage_status"
+              fi
               ;;
             Windows)
               executable="release/win-unpacked/code-agents-webcli.exe"
