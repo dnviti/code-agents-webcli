@@ -178,13 +178,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes flatpak flatpak-builder xvfb xauth
-          sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-          sudo flatpak install --noninteractive flathub \
+          # electron-builder updates these refs without privilege escalation,
+          # so install them for the runner user instead of system-wide.
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user --noninteractive flathub \
             org.freedesktop.Platform//24.08 \
-            org.freedesktop.Sdk//24.08
+            org.freedesktop.Sdk//24.08 \
+            org.electronjs.Electron2.BaseApp//24.08
 
       - name: Build desktop packages
         shell: bash
+        env:
+          # @malept/flatpak-bundler otherwise suppresses the command output that
+          # explains Flatpak failures; it is not loaded by the other targets.
+          DEBUG: "@malept/flatpak-bundler"
         run: |
           set -euo pipefail
           # A tag checkout makes electron-builder publish implicitly unless this
