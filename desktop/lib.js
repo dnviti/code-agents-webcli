@@ -11,6 +11,38 @@ const DEFAULT_WINDOW = Object.freeze({
   height: 820,
   isMaximized: false,
 });
+const CUSTOM_TITLE_BAR_HEIGHT = 40;
+
+/**
+ * Let the web shell occupy the non-client area so Electron uses the same
+ * title bar as the installed PWA. Windows and Linux need explicit colours for
+ * their caption-button overlay; macOS supplies its own traffic-light styling.
+ */
+function desktopWindowChrome(platform = process.platform) {
+  return {
+    titleBarStyle: 'hidden',
+    titleBarOverlay: platform === 'darwin'
+      ? true
+      : {
+          color: '#0a0a0a',
+          symbolColor: '#fafafa',
+          height: CUSTOM_TITLE_BAR_HEIGHT,
+        },
+    ...(platform === 'darwin' ? {} : { autoHideMenuBar: true }),
+  };
+}
+
+/** Pick whichever caption-symbol colour has stronger contrast with #rrggbb. */
+function titleBarSymbolColor(background) {
+  const match = /^#([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(background || '');
+  if (!match) return '#fafafa';
+  const linear = match.slice(1).map((channel) => {
+    const value = Number.parseInt(channel, 16) / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  const luminance = 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+  return luminance > 0.179 ? '#0a0a0a' : '#fafafa';
+}
 
 function finiteInteger(value) {
   return Number.isFinite(value) ? Math.round(value) : null;
@@ -152,7 +184,9 @@ function loginShellPath(options = {}) {
 }
 
 module.exports = {
+  CUSTOM_TITLE_BAR_HEIGHT,
   DEFAULT_WINDOW,
+  desktopWindowChrome,
   desktopCookie,
   isSafeExternalUrl,
   loginShellPath,
@@ -160,5 +194,6 @@ module.exports = {
   normalizeWindowState,
   readWindowState,
   shutdownAfterStartupFailure,
+  titleBarSymbolColor,
   writeWindowState,
 };

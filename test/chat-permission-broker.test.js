@@ -4,7 +4,11 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { PermissionBroker, permissionHookSettings } = require('../dist/server/chat/permission-broker.js');
+const {
+  PermissionBroker,
+  permissionHookSettings,
+  windowsPermissionPipePath,
+} = require('../dist/server/chat/permission-broker.js');
 
 // This exercises the real pair: the broker listening on a unix socket and the
 // actual hook script the CLI spawns, talking to each other over that socket
@@ -204,6 +208,18 @@ describe('chat permission broker', function () {
   });
 
   describe('socket hygiene', function () {
+    it('uses the Windows named-pipe namespace instead of a filesystem socket', function () {
+      const pipe = windowsPermissionPipePath('00112233445566778899aabbccddeeff');
+      assert.strictEqual(
+        pipe,
+        '\\\\.\\pipe\\code-agents-webcli-00112233445566778899aabbccddeeff',
+      );
+      assert.ok(!pipe.endsWith('.sock'));
+
+      const settings = JSON.parse(permissionHookSettings('C:\\app\\hook.js', pipe));
+      assert.strictEqual(settings.env.CCWEB_PERMISSION_SOCKET, pipe);
+    });
+
     it('creates the socket private to this user and removes it on close', async function () {
       broker = new PermissionBroker(path.join(root, 'sockets'));
       const socketPath = await broker.listen({ permission: async () => ({ allow: true }), question: NO_QUESTIONS });

@@ -2,6 +2,7 @@
 
 const { randomBytes } = require('node:crypto');
 const fs = require('node:fs');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 
@@ -15,11 +16,14 @@ const {
   shell,
 } = require('electron');
 const {
+  CUSTOM_TITLE_BAR_HEIGHT,
+  desktopWindowChrome,
   desktopCookie,
   isSafeExternalUrl,
   loginShellPath,
   readWindowState,
   shutdownAfterStartupFailure,
+  titleBarSymbolColor,
   writeWindowState,
 } = require('./lib.js');
 
@@ -48,6 +52,10 @@ function terminalBridgeClass() {
 
 function baseBridgeClass() {
   return require('../dist/server/bridges/base.js').BaseBridge;
+}
+
+function permissionBrokerClass() {
+  return require('../dist/server/chat/permission-broker.js').PermissionBroker;
 }
 
 function localIdentity() {
@@ -113,6 +121,14 @@ function scheduleWindowStateSave(filename) {
 }
 
 function installMenu() {
+  // The web shell owns the desktop chrome on Windows and Linux. Leaving an
+  // application menu installed would reserve a second bar and let Alt bring it
+  // back over the custom title bar.
+  if (process.platform !== 'darwin') {
+    Menu.setApplicationMenu(null);
+    return;
+  }
+
   const appMenu = process.platform === 'darwin'
     ? [{
         label: APP_NAME,
@@ -238,6 +254,7 @@ async function createWindow() {
   const icon = path.join(__dirname, '..', 'src', 'public', 'icons', 'icon-512.png');
   mainWindow = new BrowserWindow({
     ...bounds,
+    ...desktopWindowChrome(),
     minWidth: 720,
     minHeight: 520,
     show: false,
@@ -253,6 +270,18 @@ async function createWindow() {
       webviewTag: false,
     },
   });
+  if (process.platform !== 'darwin') {
+    const chromeWindow = mainWindow;
+    chromeWindow.removeMenu();
+    chromeWindow.webContents.on('did-change-theme-color', (_event, color) => {
+      if (!color || chromeWindow.isDestroyed()) return;
+      chromeWindow.setTitleBarOverlay({
+        color,
+        symbolColor: titleBarSymbolColor(color),
+        height: CUSTOM_TITLE_BAR_HEIGHT,
+      });
+    });
+  }
   if (isMaximized) mainWindow.maximize();
 
   protectNavigation(mainWindow, localOrigin);
@@ -351,6 +380,52 @@ async function runSmokeCheck(started) {
     mode: 'command',
     command: 'echo DESKTOP_PTY_OK',
   }, 'DESKTOP_PTY_OK');
+
+  const PermissionBroker = permissionBrokerClass();
+  const broker = new PermissionBroker(path.join(workingDir, 'ipc-smoke'));
+  try {
+    const endpoint = await broker.listen({
+      permission: async () => ({ allow: true, reason: 'DESKTOP_IPC_OK' }),
+      question: async () => ({ labels: [], skipped: true }),
+      tier: async () => ({ granted: false, detail: 'not used by smoke' }),
+    });
+    await new Promise((resolve, reject) => {
+      const socket = net.createConnection(endpoint);
+      let response = '';
+      const timeout = setTimeout(() => {
+        socket.destroy();
+        reject(new Error('Desktop IPC smoke timed out.'));
+      }, 10_000);
+      socket.setEncoding('utf8');
+      socket.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      socket.once('connect', () => {
+        socket.write(`${JSON.stringify({
+          id: 'desktop-ipc-smoke',
+          ask: { toolName: 'smoke', toolInput: {} },
+        })}\n`);
+      });
+      socket.on('data', (chunk) => {
+        response += chunk;
+        const newline = response.indexOf('\n');
+        if (newline < 0) return;
+        clearTimeout(timeout);
+        const reply = JSON.parse(response.slice(0, newline));
+        socket.destroy();
+        if (reply.id !== 'desktop-ipc-smoke' || reply.allow !== true
+          || reply.reason !== 'DESKTOP_IPC_OK') {
+          reject(new Error(`Desktop IPC smoke returned ${JSON.stringify(reply)}.`));
+          return;
+        }
+        resolve();
+      });
+    });
+  } finally {
+    broker.close();
+  }
+  console.log(`DESKTOP_IPC_OK ${process.platform === 'win32' ? 'named-pipe' : 'unix-socket'}`);
 
   if (process.platform === 'win32') {
     const shim = path.join(workingDir, 'desktop-agent-smoke.cmd');

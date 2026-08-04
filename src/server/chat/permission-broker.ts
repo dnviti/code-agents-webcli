@@ -16,11 +16,10 @@ import * as path from 'path';
  * and it is the mechanism this broker exposes to the browser.
  *
  * The hook itself is a short-lived process the CLI spawns, so it needs a way to
- * reach the session that owns the conversation. That is this: a unix socket per
- * chat session, in the app's own data directory, mode 0600. A socket rather
- * than a loopback port because there is no port to collide with, nothing to
- * firewall, and the filesystem already expresses "only this user" — which is
- * the entire access rule we want.
+ * reach the session that owns the conversation. That is this: a local IPC
+ * endpoint per chat session — a mode-0600 Unix socket on Unix and a randomly
+ * named pipe on Windows. Local IPC rather than a loopback port means there is
+ * no port to collide with and nothing to firewall.
  */
 
 export interface PermissionAsk {
@@ -139,6 +138,13 @@ function socketPathFits(candidate: string): boolean {
   return Buffer.byteLength(candidate, 'utf8') <= MAX_SOCKET_PATH_BYTES;
 }
 
+/** Windows cannot bind a filesystem `.sock`; Node maps this namespace to named pipes. */
+export function windowsPermissionPipePath(
+  nonce = crypto.randomBytes(16).toString('hex'),
+): string {
+  return `\\\\.\\pipe\\code-agents-webcli-${nonce}`;
+}
+
 export class PermissionBroker {
   private server: net.Server | null = null;
   private socketPath = '';
@@ -190,7 +196,9 @@ export class PermissionBroker {
       });
     });
 
-    fs.chmodSync(this.socketPath, 0o600);
+    // A Windows named pipe has no filesystem entry to chmod. Its 128-bit
+    // random name is the capability handed only to this session's children.
+    if (process.platform !== 'win32') fs.chmodSync(this.socketPath, 0o600);
     server.on('error', () => {
       // A listener error after startup means the socket is unusable; the hook
       // will fail closed on its next connect, which is the safe direction.
@@ -211,6 +219,8 @@ export class PermissionBroker {
    * start at all with a message about an invalid argument.
    */
   private reservePath(): string {
+    if (process.platform === 'win32') return windowsPermissionPipePath();
+
     // 8 random bytes rather than the session id: the id is knowable by anyone
     // who can list the user's sessions, and while the directory mode already
     // stops another account from connecting, there is no reason to make the
@@ -403,7 +413,7 @@ export class PermissionBroker {
       this.server = null;
     }
 
-    if (this.socketPath) {
+    if (this.socketPath && process.platform !== 'win32') {
       try {
         fs.unlinkSync(this.socketPath);
       } catch {

@@ -4,7 +4,9 @@ const os = require('node:os');
 const path = require('node:path');
 
 const {
+  CUSTOM_TITLE_BAR_HEIGHT,
   DEFAULT_WINDOW,
+  desktopWindowChrome,
   desktopCookie,
   isSafeExternalUrl,
   loginShellPath,
@@ -12,6 +14,7 @@ const {
   normalizeWindowState,
   readWindowState,
   shutdownAfterStartupFailure,
+  titleBarSymbolColor,
   writeWindowState,
 } = require('../desktop/lib.js');
 
@@ -27,6 +30,10 @@ describe('Electron desktop helpers', function () {
     assert.match(main, /setPermissionRequestHandler/);
     assert.match(main, /will-redirect/);
     assert.match(main, /hasSwitch\('no-sandbox'\)/);
+    assert.match(main, /\.\.\.desktopWindowChrome\(\)/);
+    assert.match(main, /Menu\.setApplicationMenu\(null\)/);
+    assert.match(main, /\.removeMenu\(\)/);
+    assert.match(main, /did-change-theme-color/);
     for (const target of ['AppImage', 'flatpak', 'nsis', 'dmg']) {
       assert.match(builder, new RegExp(`\\b${target}\\b`));
     }
@@ -42,6 +49,31 @@ describe('Electron desktop helpers', function () {
     assert.match(release, /Smoke the native packaged application/);
     assert.match(release, /sha256sum -c SHA256SUMS/);
     assert.match(release, /target_commitish:\s*\$\{\{ github\.sha \}\}/);
+  });
+
+  it('uses the PWA title bar in desktop windows and removes the Windows menu bar', function () {
+    const overlay = {
+      color: '#0a0a0a',
+      symbolColor: '#fafafa',
+      height: CUSTOM_TITLE_BAR_HEIGHT,
+    };
+    assert.deepStrictEqual(desktopWindowChrome('win32'), {
+      titleBarStyle: 'hidden',
+      titleBarOverlay: overlay,
+      autoHideMenuBar: true,
+    });
+    assert.deepStrictEqual(desktopWindowChrome('linux'), {
+      titleBarStyle: 'hidden',
+      titleBarOverlay: overlay,
+      autoHideMenuBar: true,
+    });
+    assert.deepStrictEqual(desktopWindowChrome('darwin'), {
+      titleBarStyle: 'hidden',
+      titleBarOverlay: true,
+    });
+    assert.strictEqual(titleBarSymbolColor('#ffffff'), '#0a0a0a');
+    assert.strictEqual(titleBarSymbolColor('#0a0a0a'), '#fafafa');
+    assert.strictEqual(titleBarSymbolColor('not-a-colour'), '#fafafa');
   });
 
   it('restores valid window geometry and drops positions on removed displays', function () {
