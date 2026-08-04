@@ -3,6 +3,7 @@ import * as React from 'react';
 import { Button } from '../ui/relay/Button';
 import { Dialog } from '../ui/relay/Dialog';
 import { Icon } from '../ui/relay/Icon';
+import { SessionStateIcon, sessionStateVisual } from '../ui/SessionStateIcon';
 import { PHONE_TEXT, TOUCH_TARGET, usePhone } from '../ui/touch';
 import { IconButton } from '../ui/relay/IconButton';
 import type { ShellTab } from './store';
@@ -18,32 +19,6 @@ export interface TabSwitcherSheetProps {
   onAllSessions(): void;
   onClose(): void;
 }
-
-/**
- * The row's leading dot.
- *
- * Waiting comes before running for the same reason it does in the tab strip:
- * `status` is the server's "the process is alive", which stays true of an agent
- * that stopped to ask something an hour ago. A green dot beside the words
- * "Waiting for approval" is the row disagreeing with itself.
- */
-function statusColor(tab: ShellTab): string {
-  if (tab.status === 'error') return 'var(--destructive)';
-  if (tab.attention) return ATTENTION[tab.attention].color;
-  return tab.status === 'running' ? 'var(--ansi-green)' : 'var(--muted-foreground)';
-}
-
-/**
- * What a stopped conversation says here.
- *
- * The sheet is the whole of the cross-session view on a phone — there is no tab
- * strip — so this is where "which of these is waiting for me" has to be
- * answerable, and it is written out rather than left to a colour.
- */
-const ATTENTION: Record<'approval' | 'question', { label: string; color: string }> = {
-  approval: { label: 'Waiting for approval', color: 'var(--warning)' },
-  question: { label: 'Asked you a question', color: 'var(--info)' },
-};
 
 /** Last path segment; `/` keeps a label when the session sits at the root. */
 function folderLabel(workingDir: string): string {
@@ -67,6 +42,7 @@ function TabRow({
   // screen, on the one surface where it is the only thing that answers the
   // question.
   const isPhone = usePhone();
+  const state = sessionStateVisual(tab);
 
   return (
     <div
@@ -82,15 +58,11 @@ function TabRow({
         borderRadius: 'var(--radius)',
       }}
     >
-      <span
-        aria-hidden="true"
-        style={{
-          width: 7,
-          height: 7,
-          flex: '0 0 auto',
-          borderRadius: 'var(--radius-full)',
-          background: statusColor(tab),
-        }}
+      <SessionStateIcon
+        status={tab.status}
+        unread={tab.unread}
+        attention={tab.attention}
+        size={15}
       />
       {/* The row is the switch target, not just the text: on a phone the whole
           card has to be the button, or switching means aiming. */}
@@ -131,43 +103,29 @@ function TabRow({
             {tab.title}
           </span>
           {tab.attention ? (
-            // In place of the unread dot rather than beside it: a conversation
-            // that has stopped for an approval has unread output by
-            // construction, and two dots would be one fact drawn twice.
             <span
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
-                gap: 4,
                 flex: '0 0 auto',
                 fontSize: isPhone ? PHONE_TEXT.label : 'var(--text-sm)',
-                color: ATTENTION[tab.attention].color,
+                color: state.color,
                 whiteSpace: 'nowrap',
               }}
             >
-              <span
-                aria-hidden="true"
-                style={{
-                  width: 6,
-                  height: 6,
-                  borderRadius: 'var(--radius-full)',
-                  background: ATTENTION[tab.attention].color,
-                }}
-              />
-              {ATTENTION[tab.attention].label}
+              {state.label}
             </span>
           ) : tab.unread ? (
             <span
-              role="img"
-              aria-label="Unread output"
               style={{
-                width: 6,
-                height: 6,
                 flex: '0 0 auto',
-                borderRadius: 'var(--radius-full)',
-                background: 'var(--primary)',
+                fontSize: isPhone ? PHONE_TEXT.label : 'var(--text-sm)',
+                color: state.state === 'success' ? state.color : 'var(--primary)',
+                whiteSpace: 'nowrap',
               }}
-            />
+            >
+              {state.state === 'success' ? 'Completed' : 'New output'}
+            </span>
           ) : null}
         </span>
         {tab.workingDir ? (
@@ -207,8 +165,8 @@ function TabRow({
  * narrow strip that eats vertical space and turns switching into target
  * practice. On mobile the strip is not rendered at all and sessions live in
  * this bottom sheet instead — full-width rows a thumb can hit, the active
- * session ringed, unread output dotted, close per row, and the two ways to
- * get more sessions (a fresh one, or the server-wide list) at the bottom.
+ * session ringed, state shown by icon and colour, close per row, and the two
+ * ways to get more sessions (a fresh one, or the server-wide list) at the bottom.
  */
 export function TabSwitcherSheet({
   open,

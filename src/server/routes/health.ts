@@ -8,6 +8,14 @@ export interface HealthRoutesDeps {
   folderMode: boolean;
   baseFolder: string;
   aliases: Aliases;
+  /** Shell choices valid on this host OS; the desktop Windows build differs. */
+  supportedShells: readonly string[];
+  /** Desktop's local identity is host-managed and has no sign-out action. */
+  logoutUrl: string | null;
+  /** Safe repository inspection currently requires POSIX process limits. */
+  repositoryInspectionSupported: boolean;
+  /** Whether containerized environments and deploy-target administration are exposed. */
+  containerizedEnvironmentsEnabled: boolean;
   getSelectedWorkingDir(userId: number): string | null;
   getUserPreferences(userId: number): UserPreferences;
 }
@@ -51,8 +59,11 @@ export function createHealthRoutes(deps: HealthRoutesDeps): Router {
       selectedWorkingDir: deps.getSelectedWorkingDir(authContext.user.id),
       baseFolder: deps.baseFolder,
       aliases: deps.aliases,
+      supportedShells: deps.supportedShells,
+      containerizedEnvironmentsEnabled: deps.containerizedEnvironmentsEnabled,
       currentUser: authContext.user,
-      logoutUrl: '/auth/logout',
+      logoutUrl: deps.logoutUrl,
+      repositoryInspectionSupported: deps.repositoryInspectionSupported,
       // On the boot request rather than a second one of its own, so the first
       // paint of the launcher already knows which mode its chat button is about
       // to produce. A preference fetched afterwards would leave an interval in

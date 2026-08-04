@@ -108,6 +108,14 @@ before(async function () {
       disposeRecorder: () => {},
       getSelectedWorkingDir: () => null,
       sessionStore: { getSessionMetadata: async () => ({}) },
+      projectsManager: {
+        getForUser: (ownerUserId, projectId) => {
+          if (ownerUserId !== USER.id) return null;
+          if (projectId === 'project-a') return { id: projectId, name: 'Alpha project' };
+          if (projectId === 'project-b') return { id: projectId, name: 'Beta project' };
+          return null;
+        },
+      },
       chatStore,
     }),
   );
@@ -175,6 +183,34 @@ describe('listing every conversation by project', function () {
     assert.deepStrictEqual(byDir['/projects/beta'], ['beta uno']);
   });
 
+  it('never collapses identical container paths across projects or namespaces', async function () {
+    await conversation('project-a-container', 'alpha container', {
+      projectId: 'project-a', projectWorkingDirKind: 'container', workingDir: '/workspace',
+    });
+    await conversation('project-b-container', 'beta container', {
+      projectId: 'project-b', projectWorkingDirKind: 'container', workingDir: '/workspace',
+    });
+    await conversation('project-a-host', 'alpha host', {
+      projectId: 'project-a', projectWorkingDirKind: 'host', workingDir: '/workspace',
+    });
+
+    const got = await list();
+    assert.strictEqual(got.body.projects.length, 3);
+    assert.strictEqual(new Set(got.body.projects.map((project) => project.key)).size, 3);
+    const identities = got.body.projects.map((project) => [
+      project.projectId, project.workingDirKind, project.dir, project.name,
+    ]);
+    assert.deepStrictEqual(identities, [
+      ['project-a', 'container', '/workspace', 'Alpha project'],
+      ['project-b', 'container', '/workspace', 'Beta project'],
+      ['project-a', 'host', '/workspace', 'Alpha project'],
+    ]);
+    for (const project of got.body.projects) {
+      assert.strictEqual(project.conversations[0].projectId, project.projectId);
+      assert.strictEqual(project.conversations[0].workingDirKind, project.workingDirKind);
+    }
+  });
+
   it('names a group by the folder’s leaf and keeps the whole path', async function () {
     await conversation('leaf', 'in una cartella', { workingDir: '/projects/alpha/services/api' });
 
@@ -225,6 +261,22 @@ describe('listing every conversation by project', function () {
     const [project] = (await list()).body.projects;
     assert.strictEqual(project.conversations[0].running, false);
     assert.strictEqual(project.conversations[0].canResume, true);
+  });
+
+  it('keeps a conversation whose tab is closed available to reopen', async function () {
+    // Tab membership and conversation lifetime are deliberately separate. If
+    // the full conversation list applied the strip's `tabOpen` filter too, the
+    // act of closing a tab would remove the only route that can bring it back.
+    await conversation('closed-tab', 'riapri questa conversazione', {
+      tabOpen: false,
+    });
+
+    const got = await list();
+    const ids = got.body.projects.flatMap((project) =>
+      project.conversations.map((entry) => entry.id),
+    );
+
+    assert.deepStrictEqual(ids, ['closed-tab']);
   });
 
   it('says which conversations are running right now', async function () {

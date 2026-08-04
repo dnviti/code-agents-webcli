@@ -111,6 +111,7 @@ function reset(extra) {
       plan: null,
       toasts: [],
       banner: null,
+      windowControlsOverlay: { visible: false, x: 0, y: 0, width: 0, height: 0 },
       sessionList: [],
       paletteOpen: false,
       install: 'unsupported',
@@ -137,6 +138,81 @@ function tab(id, over) {
 }
 
 describe('shell chrome', function () {
+  it('reserves macOS left and Windows right controls in live WCO geometry', function () {
+    const leftControls = render(reset({
+      tabs: [tab('a'), tab('b')], activeId: 'a',
+      windowControlsOverlay: { visible: true, x: 138, y: 0, width: 886, height: 40 },
+    }));
+    assert.ok(/data-window-controls-overlay="visible"/.test(leftControls));
+    assert.ok(/data-window-titlebar="true"/.test(leftControls));
+    assert.ok(/data-window-safe-area="true"[^>]*left:138px[^>]*width:886px[^>]*height:40px/.test(leftControls));
+    const tabStrip = leftControls.match(/<div[^>]*role="tablist"[^>]*>/)?.[0] ?? '';
+    assert.ok(
+      /data-window-drag="true"/.test(tabStrip),
+      'the empty part of the tab strip moves the installed window',
+    );
+    assert.ok(
+      (leftControls.match(/data-window-drag="true"/g) || []).length >= 3,
+      'the brand and both possible empty tab-bar regions are draggable',
+    );
+    assert.ok(/data-window-no-drag="true"/.test(leftControls));
+    assert.strictEqual((leftControls.match(/role="tablist"/g) || []).length, 1);
+
+    const rightControls = render(reset({
+      tabs: [tab('a')], activeId: 'a',
+      windowControlsOverlay: { visible: true, x: 0, y: 2, width: 920, height: 42 },
+    }));
+    assert.ok(/data-window-safe-area="true"[^>]*left:0[^>]*top:2px[^>]*width:920px/.test(rightControls));
+  });
+
+  it('collapses fixed title-bar actions before a narrow native safe area overflows', function () {
+    const html = render(reset({
+      tabs: [tab('a'), tab('b')], activeId: 'a', user: 'alice', logoutUrl: '/logout',
+      windowControlsOverlay: { visible: true, x: 0, y: 0, width: 560, height: 40 },
+    }));
+
+    assert.ok(/aria-label="More title bar actions"/.test(html), 'one overflow trigger remains');
+    assert.ok(!/aria-label="New tab"/.test(html), 'the fixed new button moves into overflow');
+    assert.ok(!/aria-label="Command palette"/.test(html), 'fixed app actions move into overflow');
+    assert.ok(/flex:1 1 0/.test(html), 'the tabs yield space before fixed controls');
+
+    const ultraNarrow = render(reset({
+      tabs: [tab('a'), tab('b')], activeId: 'a',
+      windowControlsOverlay: { visible: true, x: 120, y: 0, width: 180, height: 40 },
+    }));
+    assert.ok(!/role="tablist"/.test(ultraNarrow), 'tabs move behind All tabs at the final priority');
+    assert.ok(/data-window-drag="true"/.test(ultraNarrow), 'the shrinkable drag brand remains');
+    assert.ok(/aria-haspopup="menu"/.test(ultraNarrow), 'the action overflow remains keyboard-described');
+    assert.ok(/clip-path:inset\(-100vh 0 -100vh 0\)/.test(ultraNarrow), 'painting is clipped to the safe columns');
+  });
+
+  it('keeps WCO desktop chrome on touch-capable Windows but preserves mobile fallback', function () {
+    const touchDesktop = render(reset({
+      tabs: [tab('a')], activeId: 'a', isMobile: true,
+      windowControlsOverlay: { visible: true, x: 0, y: 0, width: 760, height: 40 },
+    }));
+    assert.ok(/data-window-drag="true"/.test(touchDesktop), 'the desktop drag handle remains');
+    assert.ok(/role="tablist"/.test(touchDesktop), 'the desktop tab bar remains');
+
+    const phone = render(reset({ tabs: [tab('a')], activeId: 'a', isMobile: true }));
+    assert.ok(!/data-window-titlebar="true"/.test(phone));
+    assert.ok(!/role="tablist"/.test(phone));
+  });
+
+  it('keeps update notices below the integrated title bar', function () {
+    const html = render(reset({
+      tabs: [tab('a')], activeId: 'a',
+      windowControlsOverlay: { visible: true, x: 0, y: 0, width: 900, height: 40 },
+      banner: {
+        tone: 'info', text: 'An update is ready', actionLabel: null,
+        showLog: false, logOpen: false, log: '', dismissible: true,
+      },
+    }));
+    const titleBar = html.indexOf('data-window-titlebar="true"');
+    const update = html.indexOf('role="status"');
+    assert.ok(titleBar >= 0 && update > titleBar, 'the update row follows the native title bar');
+  });
+
   it('renders exactly one tab strip and no side panel', function () {
     const html = render(reset({ tabs: [tab('a'), tab('b')], activeId: 'a' }));
 
@@ -249,18 +325,41 @@ describe('shell chrome', function () {
     }));
 
     assert.ok(html.includes('aria-current="true"'), 'the active session is marked');
-    assert.ok(html.includes('aria-label="Unread output"'), 'unread activity is visible');
+    assert.ok(html.includes('New output'), 'unread activity is visible while work continues');
     assert.ok(html.includes('aria-label="Close b"'), 'every session can be closed from the sheet');
     assert.ok(html.includes('New session'), 'a new session is one tap away');
     assert.ok(html.includes('All sessions'), 'the server-wide list stays reachable');
   });
 
-  it('renders a running session with the online dot and an idle one without a warning', function () {
+  it('renders distinct working and idle state icons without a false warning', function () {
     const idle = render(reset({ tabs: [tab('a')], activeId: 'a' }));
     assert.ok(!/var\(--warning\)/.test(idle), 'an idle session must not paint a warning');
+    assert.ok(/data-tab-state="idle"/.test(idle), 'an idle session uses the idle icon');
 
     const running = render(reset({ tabs: [tab('a', { status: 'running' })], activeId: 'a' }));
-    assert.ok(/var\(--ansi-green\)/.test(running), 'a running session paints the online dot');
+    assert.ok(/data-tab-state="working"/.test(running), 'a running session uses the working icon');
+    assert.ok(/var\(--ansi-cyan\)/.test(running), 'the working icon uses the working colour');
+  });
+
+  it('keeps project context on a successful project tab', function () {
+    const html = render(reset({
+      tabs: [tab('project-session', {
+        title: 'Fix project tabs',
+        status: 'success',
+        workingDir: '/workspace/code-agents-webcli',
+        projectId: 'project-1',
+        projectName: 'Code Agents WebCLI',
+      })],
+      activeId: 'project-session',
+    }));
+
+    assert.ok(/>Fix project tabs<\/span>/.test(html), 'the session title remains visible');
+    assert.ok(/>Code Agents WebCLI<\/span>/.test(html), 'the project label remains visible');
+    assert.ok(
+      html.includes('title="Code Agents WebCLI · /workspace/code-agents-webcli"'),
+      'the project-aware tab title remains present',
+    );
+    assert.ok(/data-tab-state="success"/.test(html), 'the completed state remains successful');
   });
 
   it('mounts the connection overlay over the terminal, not over the tabs', function () {
@@ -331,6 +430,24 @@ describe('shell chrome', function () {
         `${state} must explain instead of offering a button that cannot work`,
       );
     }
+  });
+
+  it('only exposes deploy-target configuration after the server feature flag is on', function () {
+    const dialogs = {
+      settings: true, newSession: false, terminalOptions: false,
+      sessions: false, more: false, rename: null,
+    };
+    const disabled = render(reset({
+      dialogs,
+      containerizedEnvironmentsEnabled: false,
+    }));
+    assert.ok(!/Deploy targets/.test(disabled));
+
+    const enabled = render(reset({
+      dialogs,
+      containerizedEnvironmentsEnabled: true,
+    }));
+    assert.ok(/Deploy targets/.test(enabled));
   });
 
   // Reaching this server at http://192.168.x.x:32352 — the normal way to use it

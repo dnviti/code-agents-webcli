@@ -89,11 +89,12 @@ function acpRun(name, runtime) {
     await done;
     // The prompt goes out before the updates, as it did on the wire: the
     // captured turn result is the reply to it, and carries the token counts.
-    await adapter.send({ text: 'go' });
+    const sending = adapter.send({ text: 'go' });
     for (const line of lines.slice(2)) {
       adapter.handleMessage(line);
       await flush();
     }
+    await sending;
     return events;
   };
 }

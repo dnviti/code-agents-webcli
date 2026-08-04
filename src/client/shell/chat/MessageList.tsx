@@ -72,7 +72,7 @@ export interface MessageListProps {
   showThinking?: boolean;
   showToolCalls?: boolean;
   /** Answer a question the model asked, from its card in the conversation. */
-  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
+  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean, text?: string) => void;
 }
 
 /** How close to the top still counts as asking for the previous page. */

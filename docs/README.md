@@ -11,6 +11,7 @@ npx --allow-git=all github:dnviti/code-agents-webcli
 
 | | |
 | --- | --- |
+| **[Desktop app](desktop.md)** | Self-contained native Linux, Windows and macOS app: downloads, local-only operation, updates and troubleshooting. |
 | **[Installation](installation.md)** | Every install path, platform support, uninstalling, install troubleshooting |
 | **[GitHub OAuth](github-oauth.md)** | Creating the OAuth App, the allow-list, the installer account. You need this before anything works. |
 | **[Configuration](configuration.md)** | Every CLI flag and environment variable, the setup wizard, where state is stored |
@@ -30,6 +31,10 @@ npx --allow-git=all github:dnviti/code-agents-webcli
 | --- | --- |
 | [HTTPS and certificates](https-and-certificates.md) | Why HTTPS-only, the local CA, trusting it per device, using your own certificate |
 | [Running as a service](running-as-a-service.md) | systemd, Docker and Compose, reverse proxies, ngrok |
+| [Per-user environments](user-environments.md) | Giving every signed-in user their own container, with persistent storage |
+| [Deploy targets](deploy-targets.md) | Managing multiple Docker, Podman or Kubernetes targets from the web UI |
+| [Projects](projects.md) | A disposable repository workspace per container, with durable user storage |
+| [Project composition and durable storage](project-composition.md) | Repository-derived runtime recipes, forge tooling, rebuilds and storage warnings |
 | [Updating](updating.md) | The update banner, who may apply it, which installs can and cannot |
 
 ## Working on it

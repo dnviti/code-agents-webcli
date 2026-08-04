@@ -40,6 +40,9 @@ interface TabRecord {
    * user is looking at a different one.
    */
   surface: 'terminal' | 'chat';
+  projectId?: string | null;
+  projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
   /**
    * Where this tab falls in the order they were opened on this screen.
    *
@@ -73,6 +76,9 @@ export interface ListedSession {
   surface?: 'terminal' | 'chat';
   customName?: string | null;
   bypassPermissions?: boolean;
+  projectId?: string | null;
+  projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
 }
 
 /**
@@ -113,45 +119,67 @@ function recallActiveTab(): string | null {
   return null;
 }
 
-/**
- * Which conversations this browser has been told to take off the screen.
- *
- * Closing a conversation no longer deletes it (#127), which on its own would
- * have made closing useless: the strip is rebuilt from `/api/sessions/list` on
- * every page load, so every conversation ever started would come back on the
- * next reload and the strip would still grow forever — the exact complaint, with
- * the one remedy removed.
- *
- * In the browser rather than on the server because it is a fact about a screen,
- * not about a conversation: another device's strip is not this one's. Browser-wide
- * rather than per-window so a reload keeps what was closed, which is the whole
- * point of storing it at all.
- *
- * Only ever conversations. A terminal is still ended when its tab closes, so
- * there is nothing to remember about it — and remembering one would hide a
- * session that is genuinely still there from the only list that offers it.
- */
-const CLOSED_TABS_KEY = 'cc-web-closed-conversations';
+function sameOrder(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((id, index) => id === right[index]);
+}
 
-function readClosed(): Set<string> {
+/**
+ * The browser-local close list written by builds before tab membership belonged
+ * to the account.
+ *
+ * New builds normally read it only during startup migration. It also becomes
+ * the temporary authority when a newly loaded client is still talking to a
+ * server from before the account-level tab endpoint existed. That compatibility
+ * mode ends as soon as a tab write reaches a server that supports the endpoint.
+ */
+const LEGACY_CLOSED_TABS_KEY = 'cc-web-closed-conversations';
+
+function readLegacyClosedTabs(): Set<string> {
   try {
-    const raw = localStorage.getItem(CLOSED_TABS_KEY);
-    const parsed = raw ? JSON.parse(raw) : null;
+    const raw = localStorage.getItem(LEGACY_CLOSED_TABS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
     return new Set(Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string') : []);
   } catch {
-    // No storage, or something else wrote nonsense here. Showing every
-    // conversation is the honest fallback: it is what the app did before this.
     return new Set();
   }
 }
 
-function writeClosed(ids: Set<string>): void {
+function writeLegacyClosedTabs(ids: Set<string>): void {
   try {
-    if (ids.size === 0) localStorage.removeItem(CLOSED_TABS_KEY);
-    else localStorage.setItem(CLOSED_TABS_KEY, JSON.stringify(Array.from(ids)));
+    if (ids.size === 0) localStorage.removeItem(LEGACY_CLOSED_TABS_KEY);
+    else localStorage.setItem(LEGACY_CLOSED_TABS_KEY, JSON.stringify(Array.from(ids)));
   } catch {
-    // Private mode, a full quota, storage switched off. The tab closes either
-    // way; it simply comes back on the next reload.
+    // A blocked store cannot be migrated. On an old server the close still
+    // lasts for this page; it simply cannot survive a reload.
+  }
+}
+
+type TabVisibilityMutationResult =
+  | { kind: 'synced'; open: boolean }
+  | { kind: 'unsupported' };
+
+class TabVisibilityMutationError extends Error {
+  constructor(message: string, readonly endpointAvailable: boolean) {
+    super(message);
+    this.name = 'TabVisibilityMutationError';
+  }
+}
+
+/**
+ * Tell an old server's missing route from the new route saying the session is
+ * missing. Express' route-level 404 is JSON; its default "Cannot PATCH" 404 is
+ * HTML. A generic JSON 404 from an older deployment is treated as unsupported
+ * too, while the current server's exact ownership-safe answer remains an error.
+ */
+async function tabVisibilityEndpointUnsupported(response: Response): Promise<boolean> {
+  if (response.status === 405) return true;
+  if (response.status !== 404) return false;
+
+  try {
+    const body = await response.json() as { error?: unknown };
+    return body?.error !== 'Session not found';
+  } catch {
+    return true;
   }
 }
 
@@ -177,6 +205,32 @@ export class SessionTabManager {
   notificationsEnabled: boolean;
   /** How many tabs this screen has ever opened; see `TabRecord.openedSeq`. */
   private tabsOpened = 0;
+  /** Invalidates a session-list photograph when membership changed in flight. */
+  private membershipRevision = 0;
+  /**
+   * One write chain per session.
+   *
+   * Closing and immediately reopening are two HTTP requests. Without a queue,
+   * the faster request can reach the server first and the slower close can win
+   * afterwards, leaving every screen in the opposite state to the last click.
+   */
+  private readonly tabMutations = new Map<string, Promise<TabVisibilityMutationResult>>();
+  /** Local closes that the account endpoint has not answered yet. */
+  private readonly pendingTabCloses = new Set<string>();
+  /** Opens held back until a pending close's server order can be reconciled. */
+  private readonly opensDuringPendingClose = new Set<string>();
+  /** Serializes rapid drags so their HTTP arrival order matches user intent. */
+  private tabOrderMutationTail: Promise<void> = Promise.resolve();
+  /** Older own broadcasts cannot rewind the newest optimistic drag. */
+  private pendingTabOrderMutations = 0;
+  /**
+   * Whether this page has discovered a server from before account tab syncing.
+   *
+   * The flag is deliberately learned from the write itself instead of a version
+   * number. During a rolling restart the HTML and server can briefly come from
+   * different releases; endpoint behaviour is the capability that matters.
+   */
+  private usingLegacyTabVisibility = false;
 
   constructor(app: App) {
     this.app = app;
@@ -224,7 +278,9 @@ export class SessionTabManager {
 
         notification.onclick = () => {
           window.focus();
-          this.switchToTab(sessionId);
+          void this.reopenAndSwitch(sessionId).catch((error) => {
+            console.error('Failed to open notification target:', error);
+          });
           notification.close();
         };
 
@@ -278,27 +334,51 @@ export class SessionTabManager {
    */
   syncShell(): void {
     const tabs: ShellTab[] = this.getOrderedTabIds()
-      .map((id) => {
+      .map((id): ShellTab | null => {
         const session = this.activeSessions.get(id);
         const record = this.tabs.get(id);
         if (!session || !record) return null;
+
+        // A chat process stays alive between turns so it can accept the next
+        // message. The session endpoint therefore reports `active: true` even
+        // while the conversation itself is ready, which made a completed chat
+        // spin forever in the tab beside a header that correctly said Ready.
+        // Once a controller exists, its transcript is the same authority the
+        // header uses and must win over the process-liveness fallback.
+        const transcript = record.surface === 'chat'
+          ? this.app.chats.get?.(id)?.transcript
+          : undefined;
+        const chatState = transcript?.chatState;
+        const hasCompletedReply = chatState === 'idle'
+          && Boolean(transcript?.messages.some((message) => message.role === 'assistant'));
+        const status: ShellTab['status'] =
+          session.hasError || session.status === 'error' || chatState === 'error'
+            ? 'error'
+            : chatState === 'starting' || chatState === 'thinking' || chatState === 'running'
+              ? 'running'
+              : hasCompletedReply
+                ? 'success'
+                : chatState
+                  ? 'idle'
+                  : session.status === 'active'
+                    ? 'running'
+                    : 'idle';
+
         return {
           id,
           title: record.displayName,
           surface: record.surface,
-          status:
-            session.hasError || session.status === 'error'
-              ? 'error'
-              : session.status === 'active'
-                ? 'running'
-                : 'idle',
+          status,
           // Not yet tracked per session; the server's SessionRecord.agent would
           // have to be plumbed through the list endpoint first.
           kind: '',
           workingDir: session.workingDir,
+          projectWorkingDirKind: session.projectWorkingDirKind,
           unread: session.unreadOutput,
           attention: session.attention ?? null,
-        } satisfies ShellTab;
+          projectId: record.projectId,
+          projectName: record.projectName,
+        };
       })
       .filter((tab): tab is ShellTab => tab !== null);
 
@@ -318,10 +398,72 @@ export class SessionTabManager {
    * order predates it.
    */
   applyOrder(ids: string[]): void {
-    const known = ids.filter((id) => this.tabs.has(id));
-    const missing = this.tabOrder.filter((id) => this.tabs.has(id) && !known.includes(id));
-    this.tabOrder = [...known, ...missing];
+    const next = this.mergeTabOrder(ids);
+    if (sameOrder(next, this.tabOrder)) return;
+
+    // The drag is immediate; persistence follows in its serialized turn. A
+    // socket event or reconnect list can then apply the same order without
+    // sending it back and creating an echo loop.
+    this.membershipRevision++;
+    this.setTabOrder(next);
+    this.persistTabOrder(next);
+  }
+
+  /** Apply the account authority's order without echoing another PATCH. */
+  applyRemoteOrder(ids: string[]): void {
+    this.membershipRevision++;
+    if (this.pendingTabOrderMutations > 0) return;
+    this.setTabOrder(this.mergeTabOrder(ids));
+  }
+
+  /** Merge an older strip snapshot without losing tabs it did not know yet. */
+  private mergeTabOrder(ids: string[]): string[] {
+    const known: string[] = [];
+    const seen = new Set<string>();
+    for (const id of ids) {
+      if (!this.tabs.has(id) || seen.has(id)) continue;
+      seen.add(id);
+      known.push(id);
+    }
+    const missing = this.tabOrder.filter((id) => this.tabs.has(id) && !seen.has(id));
+    return [...known, ...missing];
+  }
+
+  private setTabOrder(ids: string[]): void {
+    this.tabOrder = [...ids];
     this.syncShell();
+  }
+
+  private persistTabOrder(sessionIds: string[]): void {
+    this.pendingTabOrderMutations++;
+    const mutation = this.tabOrderMutationTail
+      .catch(() => undefined)
+      .then(async () => {
+        const response = await this.app.authFetch('/api/sessions/tabs/order', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionIds }),
+        });
+        if (!response.ok) throw new Error(`Tab order was refused (${response.status})`);
+      });
+
+    this.tabOrderMutationTail = mutation;
+    void mutation.then(
+      () => this.finishTabOrderMutation(),
+      (error) => {
+        console.error('Failed to save tab order:', error);
+        this.finishTabOrderMutation();
+      },
+    );
+  }
+
+  private finishTabOrderMutation(): void {
+    this.pendingTabOrderMutations--;
+    if (this.pendingTabOrderMutations !== 0) return;
+    // The final list settles successful HTTP vs WebSocket delivery as well as
+    // failures: an older own broadcast may have arrived while a newer drag was
+    // pending, and the socket carrying the newer event may then have dropped.
+    void this.reconcile();
   }
 
   updateTabHistory(sessionId: string): void {
@@ -340,7 +482,7 @@ export class SessionTabManager {
 
   async init(): Promise<void> {
     this.setupKeyboardShortcuts();
-    await this.loadSessions();
+    await this.loadSessions({ migrateLegacyClosedTabs: true });
     this.syncShell();
   }
 
@@ -373,23 +515,72 @@ export class SessionTabManager {
   // Session loading
   // ---------------------------------------------------------------------------
 
-  async loadSessions(): Promise<unknown[]> {
-    try {
-      const response = await fetch('/api/sessions/list');
-      const data = await response.json();
-      const all: Array<Record<string, never>> = data.sessions || [];
+  /**
+   * Read one account-strip snapshot that was not overtaken while in flight.
+   *
+   * HTTP and WebSocket delivery are independent. A close can arrive over the
+   * socket while an older `/list` response is still crossing the network; that
+   * response is discarded in full and retried. Yield after a short burst so a
+   * deliberately busy account cannot monopolise the browser's microtask queue.
+   */
+  private async stableSessionList(): Promise<{
+    listed: ListedSession[];
+    asked: number;
+  } | null> {
+    let invalidations = 0;
+    // Keep the age of the original question across retries. A tab created while
+    // any attempt was in flight is younger than this reconciliation as a whole,
+    // not suddenly old because the first photograph was invalidated.
+    const asked = this.tabsOpened;
+    for (;;) {
+      const revision = this.membershipRevision;
+      try {
+        const response = await this.app.authFetch('/api/sessions/list');
+        if (!response.ok) return null;
+        const data = await response.json();
+        if (this.membershipRevision !== revision) {
+          invalidations++;
+          if (invalidations % 4 === 0) {
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          }
+          continue;
+        }
+        return {
+          listed: Array.isArray(data?.sessions) ? (data.sessions as ListedSession[]) : [],
+          asked,
+        };
+      } catch {
+        return null;
+      }
+    }
+  }
 
-      // A conversation this browser closed stays closed. Pruned against what the
-      // server actually reported at the same time, so the memory cannot outlive
-      // the conversations it is about and grow without limit.
-      const closed = readClosed();
-      const sessions = all.filter((raw) => {
-        const session = raw as unknown as { id: string; surface?: 'terminal' | 'chat' };
-        return !(session.surface === 'chat' && closed.has(session.id));
-      });
-      const live = new Set(all.map((raw) => (raw as unknown as { id: string }).id));
-      const kept = new Set(Array.from(closed).filter((id) => live.has(id)));
-      if (kept.size !== closed.size) writeClosed(kept);
+  async loadSessions(
+    { migrateLegacyClosedTabs = false }: { migrateLegacyClosedTabs?: boolean } = {},
+  ): Promise<unknown[]> {
+    try {
+      let snapshot = await this.stableSessionList();
+      if (!snapshot) throw new Error('Failed to load sessions');
+
+      // The server owns tab visibility for the account. A conversation closed
+      // on any screen is absent here on every screen, including after a reload.
+      // If an old browser-local close list exists, transfer it first and then
+      // take a new photograph. That second read handles every outcome without
+      // guessing: applied closes are absent, ignored stale tombstones remain
+      // present, and an old server is filtered by the compatibility set below.
+      if (migrateLegacyClosedTabs && readLegacyClosedTabs().size > 0) {
+        await this.migrateLegacyClosedTabs();
+        snapshot = await this.stableSessionList();
+        if (!snapshot) throw new Error('Failed to reload sessions after tab migration');
+      }
+
+      const compatibilityClosed = this.usingLegacyTabVisibility
+        ? readLegacyClosedTabs()
+        : new Set<string>();
+      const sessions = snapshot.listed.filter((session) => (
+        !this.pendingTabCloses.has(session.id)
+        && !(session.surface === 'chat' && compatibilityClosed.has(session.id))
+      ));
 
       sessions.forEach((raw, index: number) => {
         const session = raw as unknown as ListedSession;
@@ -399,10 +590,10 @@ export class SessionTabManager {
           sessionData.lastAccessed = Date.now() - (sessions.length - index) * 1000;
         }
       });
-
-      if (this.app.isMobile) {
-        this.reorderTabsByLastAccessed();
-      }
+      // The list is already in account order. This is deliberately true on
+      // mobile too: screen width may change how the strip scrolls, never where
+      // another device says a tab belongs.
+      this.setTabOrder(this.mergeTabOrder(sessions.map((session) => session.id)));
 
       return sessions;
     } catch (error) {
@@ -420,33 +611,42 @@ export class SessionTabManager {
    * remembered from before the drop — a session started elsewhere still absent,
    * one ended elsewhere still there.
    *
-   * The listing is the authority, with two deliberate exceptions. A conversation
-   * this screen closed stays closed, because that is what closing one means
-   * (#127). And a tab younger than the question is kept whatever the answer
-   * says: it was created after the listing was asked for, so its absence is the
-   * age of the answer rather than a fact about the session.
+   * The listing is the authority, with one deliberate exception. A tab younger
+   * than the question is kept whatever the answer says: it was created after the
+   * listing was asked for, so its absence is the age of the answer rather than a
+   * fact about the session.
    */
-  async reconcile(): Promise<void> {
-    const asked = this.tabsOpened;
+  async reconcile(): Promise<boolean> {
+    let snapshot = await this.stableSessionList();
+    // Offline, unauthenticated, or the server is coming back up. The strip is
+    // left exactly as it is: a failed question is not evidence anything left.
+    if (!snapshot) return false;
 
-    let listed: ListedSession[];
-    try {
-      const response = await fetch('/api/sessions/list');
-      if (!response.ok) return;
-      const data = await response.json();
-      listed = Array.isArray(data?.sessions) ? (data.sessions as ListedSession[]) : [];
-    } catch {
-      // Offline, or the server is coming back up. The strip is left exactly as
-      // it is: a failed question is not evidence that anything has gone.
-      return;
+    // A reconnect is also the first opportunity to finish a close that fell
+    // back while the old server was still running. If the restart brought up a
+    // supporting server, these writes migrate the temporary browser state and
+    // the returned IDs filter the pre-migration list photograph. If it is still
+    // the old server, they remain local and are filtered the same way.
+    if (this.usingLegacyTabVisibility && readLegacyClosedTabs().size > 0) {
+      await this.migrateLegacyClosedTabs();
+      // Never apply the pre-migration photograph. On a new server the migration
+      // changed durable membership; on an old one a session may still have been
+      // created or deleted while the capability probe was in flight.
+      snapshot = await this.stableSessionList();
+      if (!snapshot) return false;
     }
+    const compatibilityClosed = this.usingLegacyTabVisibility
+      ? readLegacyClosedTabs()
+      : new Set<string>();
+    const visible = snapshot.listed.filter((session) => (
+      !this.pendingTabCloses.has(session.id)
+      && !(session.surface === 'chat' && compatibilityClosed.has(session.id))
+    ));
 
-    const closed = readClosed();
     const live = new Set<string>();
 
-    for (const session of listed) {
+    for (const session of visible) {
       live.add(session.id);
-      if (session.surface === 'chat' && closed.has(session.id)) continue;
       const known = this.tabs.has(session.id);
       this.adopt(session);
       if (known) {
@@ -460,17 +660,12 @@ export class SessionTabManager {
     }
 
     for (const record of Array.from(this.tabs.values())) {
-      if (live.has(record.id) || record.openedSeq > asked) continue;
+      if (live.has(record.id) || record.openedSeq > snapshot.asked) continue;
       this.closeSession(record.id, { skipServerRequest: true });
     }
 
-    // After the removals, not before: closing a conversation's tab is what
-    // writes it into the closed set, so pruning first would leave the ones this
-    // reconcile just took off the strip behind — a note about a conversation
-    // that no longer exists, kept until some later pass happened to notice.
-    const remembered = readClosed();
-    const kept = new Set(Array.from(remembered).filter((id) => live.has(id)));
-    if (kept.size !== remembered.size) writeClosed(kept);
+    this.setTabOrder(this.mergeTabOrder(visible.map((session) => session.id)));
+    return true;
   }
 
   /**
@@ -494,6 +689,9 @@ export class SessionTabManager {
       session.workingDir,
       false,
       session.customName ?? undefined,
+      session.projectId,
+      session.projectName,
+      session.projectWorkingDirKind,
     );
 
     if (session.surface !== 'chat') return;
@@ -516,16 +714,32 @@ export class SessionTabManager {
    * never takes it over. Somebody starting a conversation on their laptop is not
    * asking the phone in their pocket to change what it is displaying.
    *
-   * A conversation this screen has closed is not reopened by it. Closing one
-   * means "take this off my screen" (#127), and an announcement is not a reason
-   * to overrule that — it would also arrive every time the conversation changed
-   * surface, which is to say every time it was relaunched anywhere.
+   * The announcement is also how a conversation reopened on one screen returns
+   * to every other one. It folds into an existing tab when this screen already
+   * has it and otherwise adopts it without changing this window's active tab.
    */
   applyRemoteOpen(session: ListedSession): void {
-    if (!this.tabs.has(session.id) && session.surface === 'chat' && readClosed().has(session.id)) {
+    // Even an idempotent announcement makes an older reconcile response stale:
+    // it says the server has processed an explicit open after that list began.
+    this.membershipRevision++;
+    // The close this window just asked for outranks an older open announcement
+    // or an old-server runtime announcement while the capability probe is in
+    // flight. A refusal removes this guard and reconciles; an explicit reopen
+    // removes it before queuing its newer intent.
+    if (this.pendingTabCloses.has(session.id)) {
+      this.opensDuringPendingClose.add(session.id);
       return;
     }
+    if (this.usingLegacyTabVisibility && readLegacyClosedTabs().has(session.id)) return;
     this.adopt(session);
+  }
+
+  /** Apply an account-wide close without sending the same mutation back. */
+  applyRemoteClose(sessionId: string): void {
+    // Bumped even when this screen has no such tab. A stale list already in
+    // flight may still contain it, and must not put it back after this event.
+    this.membershipRevision++;
+    this.closeSession(sessionId, { skipServerRequest: true });
   }
 
   /**
@@ -556,15 +770,48 @@ export class SessionTabManager {
     workingDir: string | null = null,
     autoSwitch = true,
     customName?: string,
+    projectId?: string | null,
+    projectName?: string | null,
+    projectWorkingDirKind?: 'host' | 'container',
   ): void {
-    if (this.tabs.has(sessionId)) return;
-
-    // Whatever the reason for a tab appearing — a fresh session, a branch, or a
-    // conversation picked out of the list — it is now on the screen, so the note
-    // that it was taken off has to go. Left behind, reopening a conversation
-    // would work until the next reload and then quietly vanish again.
-    const closed = readClosed();
-    if (closed.delete(sessionId)) writeClosed(closed);
+    const existing = this.tabs.get(sessionId);
+    if (existing) {
+      // Announcements race the create response and the initial session list.
+      // A later payload may be the first one carrying project identity, so an
+      // existing tab must absorb metadata instead of freezing its first shape.
+      let changed = false;
+      if (projectId !== undefined && existing.projectId !== projectId) {
+        existing.projectId = projectId;
+        changed = true;
+      }
+      if (projectName !== undefined && existing.projectName !== projectName) {
+        existing.projectName = projectName;
+        changed = true;
+      }
+      if (
+        projectWorkingDirKind !== undefined
+        && existing.projectWorkingDirKind !== projectWorkingDirKind
+      ) {
+        existing.projectWorkingDirKind = projectWorkingDirKind;
+        changed = true;
+      }
+      const active = this.activeSessions.get(sessionId);
+      if (active && workingDir !== null && active.workingDir !== workingDir) {
+        active.workingDir = workingDir;
+        changed = true;
+      }
+      if (
+        active
+        && projectWorkingDirKind !== undefined
+        && active.projectWorkingDirKind !== projectWorkingDirKind
+      ) {
+        active.projectWorkingDirKind = projectWorkingDirKind;
+        changed = true;
+      }
+      if (changed) this.syncShell();
+      return;
+    }
+    this.membershipRevision++;
 
     const isDefaultSessionName = sessionName.startsWith('Session ') && sessionName.includes(':');
     const folderName = workingDir ? workingDir.split('/').pop() || '/' : null;
@@ -578,6 +825,9 @@ export class SessionTabManager {
       displayName,
       customName,
       surface: 'terminal',
+      projectId,
+      projectName,
+      projectWorkingDirKind,
       openedSeq: ++this.tabsOpened,
     });
     if (!this.tabOrder.includes(sessionId)) {
@@ -591,6 +841,7 @@ export class SessionTabManager {
       name: customName || sessionName,
       status,
       workingDir,
+      projectWorkingDirKind,
       lastAccessed: Date.now(),
       lastActivity: Date.now(),
       unreadOutput: false,
@@ -681,12 +932,86 @@ export class SessionTabManager {
     this.syncShell();
   }
 
+  /**
+   * Put a stored conversation back on the account's tab strip.
+   *
+   * The server answers by broadcasting the ordinary `session_opened` message,
+   * so every screen adopts the same tab. This method deliberately does not
+   * select it: which tab is active remains a property of each window, and the
+   * caller that initiated the reopen switches only its own window afterwards.
+   */
+  async reopenSession(sessionId: string): Promise<boolean> {
+    const alreadyOnThisScreen = this.tabs.has(sessionId);
+    // An explicit reopen is newer than this window's own pending/local close.
+    this.pendingTabCloses.delete(sessionId);
+    this.opensDuringPendingClose.delete(sessionId);
+    this.membershipRevision++;
+    const intentRevision = this.membershipRevision;
+    const result = await this.mutateTabVisibility(sessionId, true);
+
+    // A reopen is explicit user intent in both versions. Clear an old local
+    // tombstone after either a real account write or the compatibility no-op so
+    // it cannot hide the tab again on this page or the next one.
+    const legacyClosed = readLegacyClosedTabs();
+    if (legacyClosed.delete(sessionId)) writeLegacyClosedTabs(legacyClosed);
+    if (legacyClosed.size === 0) this.usingLegacyTabVisibility = false;
+
+    if (result.kind === 'unsupported') return true;
+    if (!result.open) return false;
+
+    // Every supported open is followed by the sorted account snapshot. This
+    // covers both kinds of stale client: one that retained the tab at an old
+    // position, and a disconnected one that missed an earlier open/order and
+    // has no local copy even though the server says this open is idempotent.
+    // `reconcile` never changes this window's selected tab.
+    const reconciled = await this.reconcile();
+
+    if (reconciled) return this.tabs.has(sessionId);
+
+    // A WebSocket membership event that landed around the HTTP answer is newer
+    // than the intent's starting point. In that case the reconciled membership,
+    // not the older successful response, decides whether a caller may draw it.
+    if (this.membershipRevision !== intentRevision) return this.tabs.has(sessionId);
+    // If the list itself was unavailable immediately after the successful
+    // write, let the caller use the success; the next reconnect fixes order.
+    return alreadyOnThisScreen || result.open;
+  }
+
+  /** Reopen a missing notification target, then select it in this window only. */
+  async reopenAndSwitch(sessionId: string): Promise<void> {
+    // A terminal tab has no non-destructive reopen endpoint. Conversation
+    // targets always restate account state, including a stale local tab from a
+    // close announcement this window missed while disconnected.
+    const known = this.tabs.get(sessionId);
+    if (known?.surface !== 'terminal') {
+      const open = await this.reopenSession(sessionId);
+      if (!open) return;
+    }
+    // The server broadcasts `session_opened`, but a disconnected socket cannot
+    // hear it. Reconcile deterministically obtains and adopts the same record.
+    if (!this.tabs.has(sessionId)) await this.reconcile();
+    await this.switchToTab(sessionId);
+  }
+
   closeSession(sessionId: string, { skipServerRequest = false } = {}): void {
     const record = this.tabs.get(sessionId);
     if (!record) return;
+    this.membershipRevision++;
+
+    // A fallback switch is asynchronous: closing A can start joining B, then a
+    // close for B can arrive before its `session_joined` answer. Settle and
+    // forget that request now so the vanished tab cannot remain the app's
+    // pending destination (and so the switch promise does not hang until its
+    // timeout). A late answer is rejected by MessageHandler as an orphan.
+    if (this.app.pendingJoinSessionId === sessionId) {
+      const resolve = this.app.pendingJoinResolve;
+      this.app.pendingJoinResolve = null;
+      this.app.pendingJoinSessionId = null;
+      resolve?.();
+    }
 
     /**
-     * Closing a conversation takes it off this screen, and no more.
+     * Closing a conversation takes it off the account's tab strip, and no more.
      *
      * It used to delete it: the tab was the only route back to a conversation,
      * so the one way to shorten a strip that grows forever was to destroy
@@ -702,11 +1027,6 @@ export class SessionTabManager {
      * conversations, in the one place it would create.
      */
     const detachOnly = record.surface === 'chat';
-    if (detachOnly) {
-      const closed = readClosed();
-      closed.add(sessionId);
-      writeClosed(closed);
-    }
 
     const orderedIds = this.getOrderedTabIds();
     const closedIndex = orderedIds.indexOf(sessionId);
@@ -743,10 +1063,51 @@ export class SessionTabManager {
 
     this.syncShell();
 
-    if (!skipServerRequest && !detachOnly) {
-      fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' }).catch(
-        (err) => console.error('Failed to delete session:', err),
-      );
+    if (!skipServerRequest) {
+      if (detachOnly) {
+        this.pendingTabCloses.add(sessionId);
+        void this.mutateTabVisibility(sessionId, false)
+          .then((result) => {
+            const legacyClosed = readLegacyClosedTabs();
+            if (result.kind === 'unsupported') legacyClosed.add(sessionId);
+            else legacyClosed.delete(sessionId);
+            writeLegacyClosedTabs(legacyClosed);
+            if (legacyClosed.size === 0) this.usingLegacyTabVisibility = false;
+            this.pendingTabCloses.delete(sessionId);
+            if (this.opensDuringPendingClose.delete(sessionId)) {
+              // HTTP and WebSocket are separate ordered streams. The ignored
+              // open may have been either side of this close on the server;
+              // the durable list is the only unambiguous final answer.
+              void this.reconcile();
+            }
+          })
+          .catch((err) => {
+            this.pendingTabCloses.delete(sessionId);
+            this.opensDuringPendingClose.delete(sessionId);
+            console.error('Failed to close conversation tab:', err);
+            // Optimism was wrong: ask the authority and put the tab back if the
+            // server supports syncing but refused this write. A missing route is
+            // handled above as the old browser-local behaviour instead.
+            void this.reconcile();
+          });
+      } else {
+        void this.app.authFetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+          .then(async (response) => {
+            if (response.ok) return;
+            console.error(`Failed to delete session: server returned ${response.status}`);
+            const reconciled = await this.reconcile();
+            // A refused deletion means the terminal still exists. If closing it
+            // left this window blank, put that restored tab back in front; this
+            // is local focus recovery, not account-wide selection sync.
+            if (reconciled && !this.activeTabId && this.tabs.has(sessionId)) {
+              await this.switchToTab(sessionId);
+            }
+          })
+          .catch(async (error) => {
+            console.error('Failed to delete session:', error);
+            await this.reconcile();
+          });
+      }
     }
 
     if (this.activeTabId === sessionId) {
@@ -770,6 +1131,139 @@ export class SessionTabManager {
         this.syncShell();
       }
     }
+  }
+
+  /** Queue one account-level tab mutation behind earlier writes for this id. */
+  private mutateTabVisibility(
+    sessionId: string,
+    open: boolean,
+    { legacy = false }: { legacy?: boolean } = {},
+  ): Promise<TabVisibilityMutationResult> {
+    const previous = this.tabMutations.get(sessionId);
+    const mutation = (previous ? previous.catch(() => undefined) : Promise.resolve())
+      // A failed earlier intent must not prevent a newer one from being tried.
+      .then(async (): Promise<TabVisibilityMutationResult> => {
+        const response = await this.app.authFetch(`/api/sessions/${encodeURIComponent(sessionId)}/tab`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(legacy ? { open, legacy: true } : { open }),
+        });
+        if (!response.ok) {
+          if (await tabVisibilityEndpointUnsupported(response)) {
+            this.usingLegacyTabVisibility = true;
+            return { kind: 'unsupported' };
+          }
+          throw new TabVisibilityMutationError(
+            open
+              ? 'That conversation could not be reopened'
+              : 'The server refused to close that conversation tab',
+            response.status >= 400 && response.status < 500,
+          );
+        }
+        let body: { open?: unknown } = {};
+        try {
+          body = await response.json() as { open?: unknown };
+        } catch {
+          // The first supporting builds did not need a response field. Their
+          // successful write still means the requested state won.
+        }
+        return {
+          kind: 'synced',
+          open: typeof body.open === 'boolean' ? body.open : open,
+        };
+      });
+
+    this.tabMutations.set(sessionId, mutation);
+    void mutation.then(
+      () => {
+        if (this.tabMutations.get(sessionId) === mutation) this.tabMutations.delete(sessionId);
+      },
+      () => {
+        if (this.tabMutations.get(sessionId) === mutation) this.tabMutations.delete(sessionId);
+      },
+    );
+    return mutation;
+  }
+
+  /**
+   * Move the old browser-local close list to the account before first paint.
+   *
+   * Only IDs the endpoint recognizes for this account are removed. The old key
+   * was shared by every account using the same browser profile, so a missing ID
+   * might still belong to another account. A supporting server leaves those
+   * unknown values harmlessly in place for that account to claim later.
+   *
+   * An ordinary failed write likewise stays in the legacy key for one retry on
+   * the next page load, but does not hide the server-open tab on this one. The
+   * one exception is a missing endpoint: while that old server is running, the
+   * key deliberately retains the pre-sync browser-local behaviour.
+   */
+  private async migrateLegacyClosedTabs(): Promise<Set<string>> {
+    const remaining = readLegacyClosedTabs();
+    if (remaining.size === 0) {
+      // Also clears malformed/non-array legacy values, whose parsed set is empty.
+      writeLegacyClosedTabs(remaining);
+      return new Set();
+    }
+
+    const migrated = new Set<string>();
+    const wasUsingLegacy = this.usingLegacyTabVisibility;
+    let attempted = false;
+    let sawUnsupported = false;
+    let sawFailure = false;
+    let sawSupportedResponse = false;
+
+    const migrateOne = async (sessionId: string): Promise<void> => {
+      attempted = true;
+      this.membershipRevision++;
+      try {
+        const result = await this.mutateTabVisibility(sessionId, false, { legacy: true });
+        // An old server cannot absorb the tombstone yet. Keep it for the local
+        // fallback and retry it after the server restarts; a supporting server
+        // owns the state now, so the browser copy can be retired. The response's
+        // final state matters: a stale tombstone ignored after an explicit
+        // account reopen must not hide the conversation in this first list.
+        if (result.kind === 'synced') {
+          sawSupportedResponse = true;
+          remaining.delete(sessionId);
+          if (!result.open) migrated.add(sessionId);
+        } else {
+          sawUnsupported = true;
+          migrated.add(sessionId);
+        }
+      } catch (error) {
+        sawFailure = true;
+        if (error instanceof TabVisibilityMutationError && error.endpointAvailable) {
+          sawSupportedResponse = true;
+        }
+        // A legacy key was shared by every account on the origin. Missing,
+        // foreign and no-longer-chat IDs are expected leftovers, not failures
+        // worth logging on every page load; they stay for the account they may
+        // belong to. Network and server failures still deserve a diagnostic.
+        if (!(error instanceof TabVisibilityMutationError && error.endpointAvailable)) {
+          console.warn(`Could not migrate closed tab ${sessionId}:`, error);
+        }
+      }
+    };
+
+    // The old key is user-editable origin storage and can be arbitrarily large.
+    // Each accepted ID persists the session map, so do not turn a corrupted key
+    // into hundreds of simultaneous full-database writes at startup.
+    const ids = Array.from(remaining);
+    for (let index = 0; index < ids.length; index += 4) {
+      await Promise.all(ids.slice(index, index + 4).map(migrateOne));
+    }
+
+    writeLegacyClosedTabs(remaining);
+    if (attempted) {
+      // A startup migration that gets an ordinary 5xx still leaves the server
+      // authoritative, as before. Once this page has positively identified an
+      // old server, however, a transient failure during its post-restart retry
+      // must not make locally closed tabs spring back onto the strip.
+      this.usingLegacyTabVisibility = sawUnsupported
+        || (sawFailure && wasUsingLegacy && !sawSupportedResponse);
+    }
+    return migrated;
   }
 
   /**
@@ -876,7 +1370,7 @@ export class SessionTabManager {
 
   createNewSession(): void {
     this.app.isCreatingNewSession = true;
-    void this.app.folderBrowser.show();
+    shellStore.patchSlice('dialogs', { workspaceChooser: true });
   }
 
   // ---------------------------------------------------------------------------
@@ -917,13 +1411,25 @@ export class SessionTabManager {
    * been closed, or ended on another device, falls back to the first tab, which
    * is what the app has always done.
    */
-  initialTabId(): string | null {
+  async initialTabId(): Promise<string | null> {
     // A window opened by acting on a notification, when there was no window to
     // bring forward. It outranks the remembered tab: the user asked for this
     // conversation a second ago, and the remembered one is where they happened
     // to be last time. Read once — see `takeRequestedConversation` — so a
     // reload does not drag them back here.
     const requested = takeRequestedConversation();
+    if (requested && !this.tabs.has(requested)) {
+      try {
+        const reopened = await this.reopenSession(requested);
+        // A cold-started page has not established its websocket yet, so it
+        // cannot rely on the `session_opened` broadcast to supply the tab.
+        // Read the now-open account strip before deciding where to land.
+        if (reopened && !this.tabs.has(requested)) await this.reconcile();
+      } catch (error) {
+        console.error('Failed to reopen requested conversation:', error);
+        showNotification('That conversation could not be opened');
+      }
+    }
     if (requested && this.tabs.has(requested)) return requested;
 
     const remembered = recallActiveTab();
@@ -947,7 +1453,12 @@ export class SessionTabManager {
     if (!session) return;
     const { connection } = shellStore.getSnapshot();
     shellStore.setState({
-      connection: { ...connection, workingDir: session.workingDir },
+      connection: {
+        ...connection,
+        workingDir: session.workingDir,
+        projectId: this.tabs.get(sessionId)?.projectId,
+        projectWorkingDirKind: session.projectWorkingDirKind,
+      },
     });
   }
 

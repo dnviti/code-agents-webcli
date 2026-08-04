@@ -1,11 +1,13 @@
 import type { IncomingMessage } from 'node:http';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { PromptSession } from '../setup/prompts.js';
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
-import type { AuthContext, AuthenticatedUser } from '../types.js';
+import type { AuthContext, AuthenticatedUser, DesktopServerOptions } from '../types.js';
 import { AppDatabase } from './database.js';
 
 const AUTH_COOKIE_NAME = 'code_agents_webcli_session';
+/** Separate from OAuth sessions so a desktop token cannot be mistaken for one. */
+export const DESKTOP_AUTH_COOKIE_NAME = 'code_agents_webcli_desktop_auth';
 const OAUTH_STATE_COOKIE_NAME = 'code_agents_webcli_oauth_state';
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
 
@@ -20,6 +22,9 @@ interface AuthServiceOptions {
   githubAppToken: string | null;
   allowedGitHubIds: string[];
   allowAnyGitHubUser?: boolean;
+  desktop?: DesktopServerOptions | null;
+  /** Persist the user's own OAuth credential for GitHub CLI/repository reuse. */
+  onGitHubCredential?(userId: number, accessToken: string): Promise<void> | void;
 }
 
 interface GitHubAccessTokenResponse {
@@ -54,6 +59,8 @@ export class AuthService {
   private githubAppToken: string | null;
   private allowedGitHubIds: string[];
   private readonly allowAnyGitHubUser: boolean;
+  private readonly onGitHubCredential?: AuthServiceOptions['onGitHubCredential'];
+  private readonly desktop: { token: Buffer; user: AuthenticatedUser } | null;
 
   constructor(options: AuthServiceOptions) {
     this.database = options.database;
@@ -66,10 +73,15 @@ export class AuthService {
     this.githubAppToken = options.githubAppToken;
     this.allowedGitHubIds = options.allowedGitHubIds;
     this.allowAnyGitHubUser = options.allowAnyGitHubUser === true;
+    this.onGitHubCredential = options.onGitHubCredential;
+    this.desktop = options.desktop ? createDesktopAuth(this.database, options.desktop) : null;
 
-    this.loadPersistedSettings();
+    // Desktop mode must never discover a prior OAuth configuration and then
+    // route its local account through GitHub. Its only credential is the
+    // embedder-provided cookie token.
+    if (!this.desktop) this.loadPersistedSettings();
 
-    if (this.allowedGitHubIds.length === 0) {
+    if (!this.desktop && this.allowedGitHubIds.length === 0) {
       if (this.allowAnyGitHubUser) {
         console.warn(
           '\nWARNING: --allow-any-github-user is set and no allow-list is configured.\n' +
@@ -96,7 +108,7 @@ export class AuthService {
   }
 
   isConfigured(): boolean {
-    return Boolean(this.githubClientId && this.githubClientSecret);
+    return this.desktop !== null || Boolean(this.githubClientId && this.githubClientSecret);
   }
 
   /**
@@ -109,6 +121,8 @@ export class AuthService {
     force = false,
     session?: PromptSession,
   ): Promise<boolean> {
+    // There is deliberately no OAuth setup fall-through in desktop mode.
+    if (this.desktop) return false;
     if (!force && this.isConfigured()) {
       return false;
     }
@@ -204,6 +218,14 @@ export class AuthService {
   }
 
   getAuthContextFromIncomingMessage(message: Pick<IncomingMessage, 'headers'>): AuthContext {
+    if (this.desktop) {
+      const token = parseCookies(message.headers.cookie)[DESKTOP_AUTH_COOKIE_NAME];
+      if (!token || !sameToken(token, this.desktop.token)) {
+        return { user: null, authSessionId: null };
+      }
+      return { user: this.desktop.user, authSessionId: null };
+    }
+
     this.database.pruneExpiredAuthSessions();
 
     const cookies = parseCookies(message.headers.cookie);
@@ -234,6 +256,12 @@ export class AuthService {
   }
 
   handleLoginPage = (req: Request, res: Response): void => {
+    if (this.desktop) {
+      // A loopback address is not authentication. The desktop shell must set
+      // its HttpOnly cookie before navigating here; this page never starts OAuth.
+      res.status(401).send('Desktop authentication is required.');
+      return;
+    }
     if (!this.isConfigured()) {
       res.status(503).send(renderSetupRequiredPage());
       return;
@@ -250,6 +278,10 @@ export class AuthService {
   };
 
   handleGitHubLogin = (req: Request, res: Response): void => {
+    if (this.desktop) {
+      res.status(404).end();
+      return;
+    }
     if (!this.isConfigured()) {
       res.status(503).send(renderSetupRequiredPage());
       return;
@@ -281,6 +313,10 @@ export class AuthService {
 
   handleGitHubCallback = async (req: Request, res: Response): Promise<void> => {
     try {
+      if (this.desktop) {
+        res.status(404).end();
+        return;
+      }
       if (!this.isConfigured()) {
         res.status(503).send(renderSetupRequiredPage());
         return;
@@ -321,6 +357,7 @@ export class AuthService {
         avatarUrl: githubUser.avatar_url,
         email: githubUser.email,
       });
+      await this.onGitHubCredential?.(user.id, accessToken);
 
       const authSessionId = randomUUID();
       this.database.createAuthSession(
@@ -359,6 +396,12 @@ export class AuthService {
   };
 
   handleLogout = (req: Request, res: Response): void => {
+    if (this.desktop) {
+      // The embedder owns this cookie; a web route must not pretend it can
+      // revoke an OS-managed capability.
+      res.status(405).send('Desktop authentication is managed by the host application.');
+      return;
+    }
     const authContext = this.getAuthContextFromResponseLocals(res);
     if (authContext.authSessionId) {
       this.database.deleteAuthSession(authContext.authSessionId);
@@ -510,6 +553,7 @@ export class AuthService {
    * out of settings a second time would let the two drift apart.
    */
   isGitHubUserAllowed(githubId: string): boolean {
+    if (this.desktop) return githubId === this.desktop.user.githubId;
     // Fail closed. An empty allow-list used to mean "allow every GitHub account
     // on earth", and since any signed-in user can spawn PTY processes on the
     // host, that made an exposed instance equivalent to unauthenticated RCE.
@@ -519,6 +563,30 @@ export class AuthService {
     }
     return this.allowedGitHubIds.includes(githubId);
   }
+}
+
+function createDesktopAuth(database: AppDatabase, options: DesktopServerOptions): { token: Buffer; user: AuthenticatedUser } {
+  if (!options.authToken || !options.username.trim()) {
+    throw new Error('Desktop mode requires a non-empty authToken and username.');
+  }
+  // This is a local account, not an asserted GitHub identity. Persisting it
+  // gives every existing ownership and installer check its normal user record.
+  const username = options.username.trim();
+  return {
+    token: Buffer.from(options.authToken),
+    user: database.upsertGitHubUser({
+      githubId: `desktop:${username}`,
+      githubLogin: username,
+      githubName: options.name?.trim() || username,
+      avatarUrl: null,
+      email: null,
+    }),
+  };
+}
+
+function sameToken(candidate: string, expected: Buffer): boolean {
+  const received = Buffer.from(candidate);
+  return received.length === expected.length && timingSafeEqual(received, expected);
 }
 
 function parseCookies(cookieHeader?: string): Record<string, string> {
@@ -673,8 +741,32 @@ function renderPage(title: string, body: string): string {
           try {
             if (localStorage.getItem('cc-web-relay-theme') === 'light') {
               document.documentElement.classList.add('light');
+              document.querySelector('meta[name="theme-color"]').setAttribute('content', '#ffffff');
             }
           } catch (e) { /* private mode; dark is the default anyway */ }
+        })();
+        // Auth, setup and recovery pages do not mount the app bundle, so they
+        // publish WCO geometry themselves and keep doing so while the user
+        // toggles the overlay from the browser menu.
+        (function () {
+          var overlay = navigator.windowControlsOverlay;
+          if (!overlay || typeof overlay.getTitlebarAreaRect !== 'function') return;
+          function sync(event) {
+            var visible = overlay.visible === true;
+            document.documentElement.dataset.windowControlsOverlay = visible ? 'visible' : 'hidden';
+            if (!visible) return;
+            var rect;
+            try { rect = (event && event.titlebarAreaRect) || overlay.getTitlebarAreaRect(); }
+            catch (e) { document.documentElement.dataset.windowControlsOverlay = 'hidden'; return; }
+            var style = document.documentElement.style;
+            style.setProperty('--window-controls-x', Math.max(0, rect.x || 0) + 'px');
+            style.setProperty('--window-controls-y', Math.max(0, rect.y || 0) + 'px');
+            style.setProperty('--window-controls-width', Math.max(0, rect.width || 0) + 'px');
+            style.setProperty('--window-controls-height', Math.max(0, rect.height || 0) + 'px');
+            style.setProperty('--window-controls-bottom', Math.max(0, (rect.y || 0) + (rect.height || 0)) + 'px');
+          }
+          try { overlay.addEventListener('geometrychange', sync); } catch (e) { return; }
+          sync();
         })();
       </script>
       <style>
@@ -686,6 +778,9 @@ function renderPage(title: string, body: string): string {
              viewport. These pages are a centred card that must be able to
              scroll on a short window. */
           overflow: auto;
+        }
+        html[data-window-controls-overlay="visible"] body {
+          padding-top: calc(var(--window-controls-bottom) + 24px);
         }
         .card {
           width: min(460px, 100%);
@@ -782,6 +877,14 @@ function renderPage(title: string, body: string): string {
       </style>
     </head>
     <body>
+      <div id="authTitlebar" class="boot-titlebar" aria-hidden="true">
+        <div class="boot-titlebar-safe" data-window-no-drag="true">
+          <div class="boot-titlebar-brand" data-window-drag="true">
+            <img src="/icons/icon.svg" alt="" width="16" height="16" />
+            <span>Code Agents</span>
+          </div>
+        </div>
+      </div>
       <main class="card">
         <div class="mark">
           <img src="/icons/icon.svg" alt="" width="20" height="20" />

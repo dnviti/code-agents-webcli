@@ -199,13 +199,14 @@ describe('what a conversation event means to somebody not watching it', function
       await flush();
       await done;
 
-      await h.adapter.send({ text: 'Read the file probe.txt…' });
+      const sending = h.adapter.send({ text: 'Read the file probe.txt…' });
       const prompt = h.sent.find((message) => message.method === 'session/prompt');
       h.events.length = 0;
       for (const line of lines.slice(2, 18)) {
         h.adapter.handleMessage(line);
         await flush();
       }
+      await sending;
       h.adapter.handleMessage(Object.assign({}, lines[18], { id: prompt.id }));
       await flush();
 

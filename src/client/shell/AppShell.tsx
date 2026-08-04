@@ -3,8 +3,9 @@ import * as React from 'react';
 import type { AppSettings } from '../types';
 import { Badge } from '../ui/relay/Badge';
 import { CommandPalette, type CommandPaletteGroup } from '../ui/relay/CommandPalette';
-import { Icon } from '../ui/relay/Icon';
+import { Icon, type IconName } from '../ui/relay/Icon';
 import { PhoneContext } from '../ui/touch';
+import { visualViewportKeyboardInset } from '../ui/keyboard-viewport';
 import { IconButton } from '../ui/relay/IconButton';
 import { StatusBar, type StatusBarSegment } from '../ui/relay/StatusBar';
 import { TabBar, type TabItem } from '../ui/relay/TabBar';
@@ -15,6 +16,10 @@ import { NewSessionDialog } from './dialogs/NewSessionDialog';
 import { PlanDialog } from './dialogs/PlanDialog';
 import { RenameDialog } from './dialogs/RenameDialog';
 import { RuntimeProfilesDialog } from './dialogs/RuntimeProfilesDialog';
+import { DeployTargetsDialog } from './dialogs/DeployTargetsDialog';
+import { ProjectsDialog } from './dialogs/ProjectsDialog';
+import { WorkspaceChooserDialog } from './dialogs/WorkspaceChooserDialog';
+import { EnvironmentDialog, type EnvironmentInfo } from './dialogs/EnvironmentDialog';
 import { SessionsDialog } from './dialogs/SessionsDialog';
 import { ConversationsDialog } from './dialogs/ConversationsDialog';
 import { ChatSettingsDialog } from './dialogs/ChatSettingsDialog';
@@ -84,6 +89,10 @@ export interface ShellActions {
   createSession(name: string, workingDir: string): void;
   startShell(shell: string): void;
   runCommand(command: string): void;
+  /** Create a session inside a project and focus it. */
+  openProjectSession(projectId: string): void;
+  chooseNewTabDirectory(): void;
+  cancelNewTab(): void;
 
   // Folder browser
   folderNavigate(path: string): void;
@@ -151,16 +160,216 @@ export interface AppShellProps {
 function tabItems(tabs: ShellTab[]): TabItem[] {
   return tabs.map((tab) => ({
     id: tab.id,
-    title: tab.title,
-    status: tab.status === 'running' ? 'running' : tab.status === 'error' ? 'error' : 'idle',
+    title: tab.projectName || tab.projectId ? (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{tab.title}</span>
+        <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--primary)', flex: '0 0 auto' }}>{tab.projectName || tab.projectId}</span>
+      </span>
+    ) : tab.title,
+    status: tab.status,
     unread: tab.unread,
     attention: tab.attention,
-    tooltip: tab.workingDir ?? tab.title,
+    tooltip: tab.projectName || tab.projectId
+      ? `${tab.projectName || tab.projectId} · ${tab.workingDir ?? tab.title}`
+      : (tab.workingDir ?? tab.title),
   }));
+}
+
+interface TitleBarOverflowProps {
+  onNew(): void;
+  onAllTabs(): void;
+  onPalette(): void;
+  onTheme(): void;
+  onUsage(): void;
+  onSettings(): void;
+  logoutUrl: string | null;
+}
+
+/** Keep every header action reachable when native controls leave a narrow safe area. */
+function TitleBarOverflow(props: TitleBarOverflowProps): React.JSX.Element {
+  const [open, setOpen] = React.useState(false);
+  const rootRef = React.useRef<HTMLDivElement | null>(null);
+  const firstRef = React.useRef<HTMLButtonElement | null>(null);
+  const menuId = React.useId();
+
+  React.useEffect(() => {
+    if (!open) return;
+    firstRef.current?.focus();
+    const dismiss = (event: MouseEvent): void => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const escape = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      setOpen(false);
+      window.requestAnimationFrame(() => {
+        rootRef.current?.querySelector<HTMLButtonElement>('button')?.focus();
+      });
+    };
+    document.addEventListener('mousedown', dismiss, true);
+    window.addEventListener('keydown', escape, true);
+    return () => {
+      document.removeEventListener('mousedown', dismiss, true);
+      window.removeEventListener('keydown', escape, true);
+    };
+  }, [open]);
+
+  const run = (action: () => void): void => { setOpen(false); action(); };
+  const navigateMenu = (event: React.KeyboardEvent<HTMLDivElement>): void => {
+    const items = Array.from(
+      event.currentTarget.querySelectorAll<HTMLElement>('[role="menuitem"]'),
+    );
+    if (items.length === 0) return;
+    const current = items.indexOf(document.activeElement as HTMLElement);
+    let target: number | null = null;
+    if (event.key === 'ArrowDown') target = (current + 1) % items.length;
+    else if (event.key === 'ArrowUp') target = (current - 1 + items.length) % items.length;
+    else if (event.key === 'Home') target = 0;
+    else if (event.key === 'End') target = items.length - 1;
+    if (target === null) return;
+    event.preventDefault();
+    items[target]?.focus();
+  };
+  const rows: Array<{ label: string; icon: IconName; action: () => void }> = [
+    { label: 'New session', icon: 'plus', action: props.onNew },
+    { label: 'All tabs', icon: 'layout-list', action: props.onAllTabs },
+    { label: 'Command palette', icon: 'command', action: props.onPalette },
+    { label: 'Toggle theme', icon: 'monitor', action: props.onTheme },
+    { label: 'Usage', icon: 'gauge', action: props.onUsage },
+    { label: 'Settings', icon: 'settings', action: props.onSettings },
+  ];
+
+  return (
+    <div ref={rootRef} style={{ position: 'relative', flex: '0 0 auto' }} data-window-no-drag="true">
+      <IconButton
+        label="More title bar actions"
+        size="sm"
+        active={open}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <Icon name="ellipsis" />
+      </IconButton>
+      {open ? (
+        <div
+          id={menuId}
+          role="menu"
+          aria-label="Title bar actions"
+          onKeyDown={navigateMenu}
+          style={{
+            position: 'absolute', top: 'calc(100% + 2px)', right: 0,
+            width: 190, maxWidth: 'var(--window-controls-width)',
+            padding: 4, zIndex: 'var(--z-dropdown)' as unknown as number,
+            border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+            background: 'var(--popover)', boxShadow: 'var(--shadow-popover)',
+          }}
+        >
+          {rows.map((row, index) => (
+            <button
+              key={row.label}
+              ref={index === 0 ? firstRef : undefined}
+              type="button"
+              role="menuitem"
+              onClick={() => run(row.action)}
+              style={{
+                width: '100%', minHeight: 30, display: 'flex', alignItems: 'center', gap: 8,
+                padding: '0 8px', color: 'var(--foreground)', cursor: 'pointer',
+                borderRadius: 'var(--radius)', textAlign: 'left',
+              }}
+            >
+              <Icon name={row.icon} size={13} />{row.label}
+            </button>
+          ))}
+          {props.logoutUrl ? (
+            <a
+              href={props.logoutUrl}
+              role="menuitem"
+              style={{
+                minHeight: 30, display: 'flex', alignItems: 'center', gap: 8,
+                padding: '0 8px', color: 'var(--foreground)', textDecoration: 'none',
+              }}
+            ><Icon name="log-out" size={13} />Sign out</a>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 function closeDialogs(patch: Parameters<typeof shellStore.patchSlice<'dialogs'>>[1]): void {
   shellStore.patchSlice('dialogs', patch);
+}
+
+/**
+ * The user's environment, read when a dialog that shows it opens.
+ *
+ * Read on demand rather than kept live: the size changes rarely, and polling it
+ * from every open tab would cost a request a second across a whole
+ * installation to show a line that almost never moves. The one case that *does*
+ * move on its own — automatic sizing — announces itself over the socket.
+ */
+function useEnvironment(visible: boolean): {
+  info: EnvironmentInfo | null;
+  error: string | null;
+  busy: boolean;
+  notice: string | null;
+  apply(tier: string): Promise<void>;
+} {
+  const [info, setInfo] = React.useState<EnvironmentInfo | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const [notice, setNotice] = React.useState<string | null>(null);
+
+  const read = React.useCallback(async (): Promise<void> => {
+    try {
+      const response = await fetch('/api/environment', { credentials: 'same-origin' });
+      if (!response.ok) throw new Error(String(response.status));
+      setInfo((await response.json()) as EnvironmentInfo);
+      setError(null);
+    } catch {
+      setError('Could not read your environment from the server.');
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (visible) void read();
+  }, [visible, read]);
+
+  // A size the server changed on its own must not leave a stale one on screen.
+  React.useEffect(() => {
+    const onChanged = (): void => { void read(); };
+    window.addEventListener('cc-environment-changed', onChanged);
+    return () => window.removeEventListener('cc-environment-changed', onChanged);
+  }, [read]);
+
+  const apply = React.useCallback(async (tier: string): Promise<void> => {
+    setBusy(true);
+    setNotice(null);
+    try {
+      const response = await fetch('/api/environment/tier', {
+        method: 'PUT',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tier }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setError(payload.message || 'The size could not be changed.');
+        return;
+      }
+      setError(null);
+      setNotice(payload.message || 'Saved.');
+      await read();
+    } catch {
+      setError('The size could not be changed.');
+    } finally {
+      setBusy(false);
+    }
+  }, [read]);
+
+  return { info, error, busy, notice, apply };
 }
 
 export function AppShell({ terminalNode, actions, launcher }: AppShellProps): React.JSX.Element {
@@ -171,6 +380,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
   );
 
   const active = state.tabs.find((t) => t.id === state.activeId) || null;
+  const environment = useEnvironment(state.dialogs.settings || state.dialogs.environment);
 
   // The chat surface is decided by the server and published into the store; the
   // controller is carried as an opaque handle because its transcript mutates
@@ -179,6 +389,14 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
   const keyboardUp = useKeyboardUp(state.isMobile);
   const chatController = state.chat.controller as ChatController | null;
   const [menu, setMenu] = React.useState<{ id: string; x: number; y: number } | null>(null);
+  const titleBarGeometry = state.windowControlsOverlay;
+  const integratedTitleBar = titleBarGeometry.visible
+    && titleBarGeometry.width > 0
+    && titleBarGeometry.height > 0;
+  // Native caption buttons can consume most of the title bar at narrow widths
+  // or large OS scaling. Collapse fixed actions before they crowd that area.
+  const compactTitleBar = integratedTitleBar && titleBarGeometry.width < 680;
+  const minimalTitleBar = integratedTitleBar && titleBarGeometry.width < 220;
 
   /**
    * The right-click menu's file actions, present only when there is a project.
@@ -228,7 +446,15 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
   // around it, and xterm only reflows when it is told to.
   React.useEffect(() => {
     actions.fitTerminal();
-  }, [actions, state.isMobile, state.keysVisible, state.banner !== null]);
+  }, [
+    actions,
+    state.isMobile,
+    state.keysVisible,
+    state.banner !== null,
+    titleBarGeometry.visible,
+    titleBarGeometry.height,
+    titleBarGeometry.y,
+  ]);
 
   const paletteGroups: CommandPaletteGroup[] = [
     {
@@ -491,13 +717,18 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
 
 
   // No brand on a phone. It cost about a third of a 390px tab strip to say
-  // something the user already knows, and the working directory that stood
-  // there instead only repeated the tab title. The tabs get the room.
-  const brand = state.isMobile ? null : (
+  // something the user already knows. A touch-capable desktop in WCO mode is
+  // the exception: the brand is the intentionally small drag handle.
+  const brand = state.isMobile && !integratedTitleBar ? null : (
     <div
       aria-hidden="true"
+      data-window-drag="true"
       style={{
-        display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px', flex: '0 0 auto',
+        display: 'flex', alignItems: 'center', gap: 8,
+        padding: integratedTitleBar ? '0 8px' : '0 12px',
+        flex: integratedTitleBar ? '0 1 132px' : '0 0 auto',
+        minWidth: integratedTitleBar ? 0 : undefined,
+        overflow: integratedTitleBar ? 'hidden' : undefined,
         borderRight: '1px solid var(--border)', color: 'var(--muted-foreground)',
       }}
     >
@@ -506,7 +737,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         style={{
           fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)',
           letterSpacing: 'var(--tracking-caps)', textTransform: 'uppercase',
-          whiteSpace: 'nowrap',
+          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', minWidth: 0,
         }}
       >
         Code Agents
@@ -514,9 +745,9 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
     </div>
   );
 
-  const barActions = (
+  const fullBarActions = (
     <div style={{ display: 'flex', alignItems: 'center', gap: 2, padding: '0 6px', flex: '0 0 auto' }}>
-      {state.isMobile ? null : (
+      {state.isMobile && !integratedTitleBar ? null : (
         <>
           {state.user ? <Badge>@{state.user}</Badge> : null}
           <IconButton label="Command palette" size="sm" onClick={() => shellStore.setState({ paletteOpen: true })}>
@@ -533,7 +764,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       <IconButton label="Settings" size="sm" onClick={actions.openSettings}>
         <Icon name="settings" />
       </IconButton>
-      {state.logoutUrl && !state.isMobile ? (
+      {state.logoutUrl && (!state.isMobile || integratedTitleBar) ? (
         <a
           href={state.logoutUrl}
           title="Sign out"
@@ -549,6 +780,86 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
     </div>
   );
 
+  const barActions = compactTitleBar ? (
+    <TitleBarOverflow
+      onNew={actions.newTab}
+      onAllTabs={() => closeDialogs({ tabs: true })}
+      onPalette={() => shellStore.setState({ paletteOpen: true })}
+      onTheme={toggleTheme}
+      onUsage={() => closeDialogs({ usage: true })}
+      onSettings={actions.openSettings}
+      logoutUrl={state.logoutUrl}
+    />
+  ) : fullBarActions;
+
+  const sessionBar = minimalTitleBar ? (
+    <div style={{ display: 'flex', alignItems: 'stretch', width: '100%', minWidth: 0 }}>
+      {brand}
+      <div style={{ flex: 1, minWidth: 0 }} />
+      {barActions}
+    </div>
+  ) : (!state.isMobile || integratedTitleBar) ? (
+    <TabBar
+      tabs={tabItems(state.tabs)}
+      activeId={state.activeId ?? undefined}
+      ariaLabel="Sessions"
+      onSelect={actions.selectTab}
+      onClose={actions.closeTab}
+      onNew={compactTitleBar ? undefined : () => actions.newTab()}
+      onReorder={actions.reorderTabs}
+      dragPayload={(id) => ({
+        'application/x-session-id': id,
+        'x-source-pane': '-1',
+      })}
+      onTabDoubleClick={(id) => closeDialogs({ rename: id })}
+      onTabAuxClose={actions.closeTab}
+      onTabContextMenu={(id, x, y) => setMenu({ id, x, y })}
+      leading={brand}
+      trailing={barActions}
+      tabsYieldFirst={integratedTitleBar}
+      style={{
+        height: integratedTitleBar ? '100%' : 38,
+        width: integratedTitleBar ? '100%' : undefined,
+        minWidth: 0,
+        flex: integratedTitleBar ? '1 1 auto' : '0 0 auto',
+        borderBottom: integratedTitleBar ? 'none' : undefined,
+      }}
+    />
+  ) : null;
+
+  const titleBar = integratedTitleBar ? (
+    <div
+      data-window-titlebar="true"
+      style={{
+        position: 'relative',
+        flex: `0 0 ${titleBarGeometry.y + titleBarGeometry.height}px`,
+        width: '100%',
+        background: 'var(--background)',
+        borderBottom: '1px solid var(--border)',
+        zIndex: 65,
+      }}
+    >
+      <div
+        data-window-safe-area="true"
+        data-window-no-drag="true"
+        style={{
+          position: 'absolute',
+          left: titleBarGeometry.x,
+          top: titleBarGeometry.y,
+          width: titleBarGeometry.width,
+          height: titleBarGeometry.height,
+          display: 'flex',
+          minWidth: 0,
+          // Menus may open below the strip, but nothing may ever paint into
+          // the native-control columns to either side of this safe rectangle.
+          clipPath: 'inset(-100vh 0 -100vh 0)',
+        }}
+      >
+        {sessionBar}
+      </div>
+    </div>
+  ) : sessionBar;
+
   return (
     // The shell's phone answer, published to everything under it — including
     // the dialogs, which render here rather than inside any conversation and
@@ -557,6 +868,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
     // outside this shell still has to know. See ui/touch.ts.
     <PhoneContext.Provider value={state.isMobile}>
     <div
+      data-window-controls-overlay={integratedTitleBar ? 'visible' : 'hidden'}
       style={{
         // In flow rather than `position: absolute; inset: 0`. #app is a column
         // flex container with `position: relative`, so an absolute shell is
@@ -574,43 +886,14 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         overflow: 'hidden',
       }}
     >
+      {titleBar}
+
       <UpdateBannerView
         banner={state.banner}
         onAction={actions.updateAction}
         onToggleLog={actions.updateToggleLog}
         onDismiss={actions.updateDismiss}
       />
-
-      {/* One bar, not two. The title row was a second full-width strip whose
-          only unique content was a title the tab already shows, and on a phone
-          it cost a tenth of the viewport. */}
-      {/* On mobile the strip is gone entirely (issue #21): squeezed tabs are
-          untappable and the row costs vertical space the terminal needs.
-          Sessions are managed from the TabSwitcherSheet instead; everything
-          else the strip's trailing side carried (theme, settings, sign-out)
-          lives in the More sheet on a phone. */}
-      {state.isMobile ? null : (
-        <TabBar
-          tabs={tabItems(state.tabs)}
-          activeId={state.activeId ?? undefined}
-          ariaLabel="Sessions"
-          onSelect={actions.selectTab}
-          onClose={actions.closeTab}
-          onNew={() => actions.newTab()}
-          onReorder={actions.reorderTabs}
-          // Split view reads this off the drop; see split-container.ts.
-          dragPayload={(id) => ({
-            'application/x-session-id': id,
-            'x-source-pane': '-1',
-          })}
-          onTabDoubleClick={(id) => closeDialogs({ rename: id })}
-          onTabAuxClose={actions.closeTab}
-          onTabContextMenu={(id, x, y) => setMenu({ id, x, y })}
-          leading={brand}
-          trailing={barActions}
-          style={{ height: 38, flex: '0 0 auto' }}
-        />
-      )}
 
       <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
         {/*
@@ -711,6 +994,11 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         install={state.install}
         onInstall={() => void installHint()}
         onOpenRuntimeProfiles={() => closeDialogs({ settings: false, runtimeProfiles: true })}
+        onOpenDeployTargets={() => closeDialogs({ settings: false, deployTargets: true })}
+        deployTargetsEnabled={state.containerizedEnvironmentsEnabled}
+        environmentsEnabled={environment.info?.enabled === true}
+        onOpenEnvironment={() => closeDialogs({ settings: false, environment: true })}
+        onOpenProjects={() => closeDialogs({ settings: false, projects: true })}
         onPreview={actions.previewSettings}
         onSave={(next) => { actions.saveSettings(next); closeDialogs({ settings: false }); }}
         onClose={() => {
@@ -733,6 +1021,41 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         onClose={() => closeDialogs({ runtimeProfiles: false })}
       />
 
+      <DeployTargetsDialog
+        open={state.containerizedEnvironmentsEnabled && state.dialogs.deployTargets}
+        onClose={() => closeDialogs({ deployTargets: false })}
+      />
+
+      <EnvironmentDialog
+        open={state.dialogs.environment}
+        info={environment.info}
+        error={environment.error}
+        busy={environment.busy}
+        notice={environment.notice}
+        onApply={(tier) => void environment.apply(tier)}
+        onClose={() => closeDialogs({ environment: false })}
+      />
+
+      <ProjectsDialog
+        open={state.dialogs.projects}
+        repositoryInspectionSupported={state.repositoryInspectionSupported}
+        onClose={() => closeDialogs({ projects: false })}
+        onOpenProject={(projectId) => {
+          closeDialogs({ projects: false });
+          actions.openProjectSession(projectId);
+        }}
+      />
+
+      <WorkspaceChooserDialog
+        open={state.dialogs.workspaceChooser}
+        onProject={(projectId) => {
+          closeDialogs({ workspaceChooser: false });
+          actions.openProjectSession(projectId);
+        }}
+        onDirectory={actions.chooseNewTabDirectory}
+        onClose={actions.cancelNewTab}
+      />
+
       <ChatSettingsDialog
         open={state.dialogs.chatSettings}
         settings={state.chatView}
@@ -749,6 +1072,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
 
       <TerminalOptionsDialog
         open={state.dialogs.terminalOptions}
+        shells={state.terminalShells}
         onShell={actions.startShell}
         onCommand={actions.runCommand}
         onClose={() => closeDialogs({ terminalOptions: false })}
@@ -759,6 +1083,8 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         path={state.folder.path}
         parentPath={state.folder.parentPath}
         entries={state.folder.entries}
+        workingDirKind={state.folder.workingDirKind}
+        lifetime={state.folder.lifetime}
         showHidden={state.folder.showHidden}
         loading={state.folder.loading}
         creating={state.folder.creating}
@@ -981,10 +1307,18 @@ function useKeyboardUp(isMobile: boolean): boolean {
       setUp(false);
       return;
     }
-    const measure = (): void => setUp(window.innerHeight - viewport.height > 160);
+    const measure = (): void => setUp(visualViewportKeyboardInset(viewport) > 160);
     measure();
     viewport.addEventListener('resize', measure);
-    return () => viewport.removeEventListener('resize', measure);
+    viewport.addEventListener('scroll', measure);
+    document.addEventListener('focusin', measure);
+    document.addEventListener('focusout', measure);
+    return () => {
+      viewport.removeEventListener('resize', measure);
+      viewport.removeEventListener('scroll', measure);
+      document.removeEventListener('focusin', measure);
+      document.removeEventListener('focusout', measure);
+    };
   }, [isMobile]);
 
   return up;

@@ -96,6 +96,22 @@ describe('typing ahead while the agent works', function () {
     assert.strictEqual(s.queuedTurns.length, 0, 'nothing waits when nothing is running');
   });
 
+  it('keeps bundled workflow guidance out of the transcript and treats a slash prompt as prose', async function () {
+    const { s, adapter, store } = session();
+
+    await s.send({ text: '/clear is the issue title, not a command.', workflow: 'gh-issue' });
+
+    const userText = store.events.find((event) => event.t === 'block_start' && event.block?.kind === 'text');
+    const userStart = store.events.find((event) => event.t === 'msg_start' && event.role === 'user');
+    assert.strictEqual(userText.block.text, '/clear is the issue title, not a command.');
+    assert.strictEqual(userStart.workflow, 'gh-issue', 'retry metadata is recorded beside the visible prompt');
+    assert.match(adapter.sent[0], /GitHub Issue Writer/, 'the runtime receives the app-owned workflow instructions');
+    assert.match(adapter.sent[0], /\[BEGIN APP-OWNED GH-ISSUE WORKFLOW\]/);
+    assert.match(adapter.sent[0], /\[BEGIN USER REQUEST\]\n\/clear is the issue title, not a command\./);
+    assert.match(adapter.sent[0], /\/clear is the issue title, not a command\./);
+    assert.notStrictEqual(s.currentState, 'exited', 'a workflow prompt must never enter the /clear lifecycle path');
+  });
+
   it('queues rather than refusing a turn typed mid-run', async function () {
     const { s, adapter, broadcasts } = session();
     await s.send({ text: 'first' });
@@ -111,6 +127,18 @@ describe('typing ahead while the agent works', function () {
       ['second'],
       'every browser watching is told what is waiting',
     );
+  });
+
+  it('preserves workflow identity while queued so the later delivery still receives guidance', async function () {
+    const { s, adapter } = session();
+    await s.send({ text: 'first' });
+    await s.send({ text: 'create a GitHub issue', workflow: 'gh-issue' });
+
+    assert.strictEqual(s.queuedTurns[0].workflow, 'gh-issue');
+    s.ingest({ t: 'turn_end', turnId: 't1' });
+    await settle();
+
+    assert.match(adapter.sent[1], /GitHub Issue Writer/);
   });
 
   it('hands the next one over the moment the turn ends', async function () {
@@ -225,10 +253,11 @@ describe('typing ahead while the agent works', function () {
   it('carries the queue on the snapshot, so a reload sees the same line', async function () {
     const { s } = session();
     await s.send({ text: 'first' });
-    await s.send({ text: 'waiting' });
+    await s.send({ text: 'waiting', workflow: 'gh-issue' });
 
     const snapshot = await s.snapshot();
     assert.deepStrictEqual(snapshot.queued.map((t) => t.text), ['waiting']);
+    assert.strictEqual(snapshot.queued[0].workflow, 'gh-issue');
   });
 
   it('carries attachments through the queue intact', async function () {

@@ -311,6 +311,19 @@ function renderMessage(message: ChatMessage): string {
       case 'notice':
         parts.push(`(${block.text}${block.detail ? `: ${block.detail}` : ''})`);
         break;
+      case 'question': {
+        const selected = (block.answer?.optionIds ?? [])
+          .map((optionId) => block.request.options
+            .find((option) => option.optionId === optionId)?.label ?? optionId);
+        parts.push([
+          `(question: ${block.request.question})`,
+          selected.length ? `(answer: ${selected.join(', ')})` : '',
+          block.answer?.text ? `(own words: ${block.answer.text})` : '',
+          block.answer?.skipped ? '(skipped)' : '',
+          block.answer?.abandoned ? '(agent stopped waiting)' : '',
+        ].filter(Boolean).join('\n'));
+        break;
+      }
       // Reasoning is the model working, not the conversation. Plans replace
       // rather than accumulate and the last one said nothing about this turn.
       default:

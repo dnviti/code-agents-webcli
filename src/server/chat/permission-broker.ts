@@ -16,11 +16,10 @@ import * as path from 'path';
  * and it is the mechanism this broker exposes to the browser.
  *
  * The hook itself is a short-lived process the CLI spawns, so it needs a way to
- * reach the session that owns the conversation. That is this: a unix socket per
- * chat session, in the app's own data directory, mode 0600. A socket rather
- * than a loopback port because there is no port to collide with, nothing to
- * firewall, and the filesystem already expresses "only this user" — which is
- * the entire access rule we want.
+ * reach the session that owns the conversation. That is this: a local IPC
+ * endpoint per chat session — a mode-0600 Unix socket on Unix and a randomly
+ * named pipe on Windows. Local IPC rather than a loopback port means there is
+ * no port to collide with and nothing to firewall.
  */
 
 export interface PermissionAsk {
@@ -52,23 +51,71 @@ export interface QuestionAsk {
 /** What the browser answered, on its way back to the waiting tool call. */
 export interface QuestionReply {
   labels: string[];
+  /**
+   * What the user typed, when they answered in their own words rather than —
+   * or as well as — picking. Beside the labels because it is not one of them:
+   * a label is an option the model wrote, and this is the user's own sentence.
+   */
+  text?: string;
   skipped?: boolean;
   error?: string;
 }
 
 /**
- * The two things that dial into a session's socket.
+ * The agent asking to answer from a stronger model than its rung.
  *
- * One socket, two kinds of caller: the PreToolUse hook asking whether a tool may
- * run, and the MCP server asking the user a question. They are kept apart here
- * rather than being squeezed into one decider because the answers have nothing
- * in common — a boolean with a reason versus a list of chosen labels — and a
- * union that had to be narrowed at every call site would be worse than two
- * fields.
+ * `unknown` for the same reason `QuestionAsk` is: the shape is whatever the
+ * model passed to the tool, and the broker only routes.
+ */
+export interface TierAsk {
+  reason?: unknown;
+}
+
+/** What the session decided, on its way back to the waiting tool call. */
+export interface TierReply {
+  granted: boolean;
+  /** The rung now in force, when one was granted. */
+  tier?: string;
+  model?: string;
+  /** The sentence the model reads — a grant, a refusal, or why neither. */
+  detail: string;
+}
+
+export interface PlanAsk {
+  markdown?: unknown;
+}
+
+export interface PlanReply {
+  accepted: boolean;
+  revision?: number;
+  detail: string;
+}
+
+/**
+ * The three things that dial into a session's socket.
+ *
+ * One socket, three kinds of caller: the PreToolUse hook asking whether a tool
+ * may run, the MCP server asking the user a question, and the agent asking to
+ * move up a rung. They are kept apart here rather than being squeezed into one
+ * decider because the answers have nothing in common — a boolean with a reason,
+ * a list of chosen labels, a rung and a model — and a union that had to be
+ * narrowed at every call site would be worse than three fields.
  */
 export interface BrokerHandlers {
   permission: (ask: PermissionAsk) => Promise<PermissionAnswer>;
-  question: (ask: QuestionAsk) => Promise<QuestionReply>;
+  /**
+   * A question, and a signal that fires if the caller gives up on it.
+   *
+   * The signal is the honest half. A `tools/call` blocks a runtime's MCP client,
+   * and a client that has stopped waiting says so — kimi sends
+   * `notifications/cancelled`, which arrives here as a cancel line. Without it
+   * the card stayed on screen offering buttons whose answer had nowhere left to
+   * go (#174).
+   */
+  question: (ask: QuestionAsk, signal?: AbortSignal) => Promise<QuestionReply>;
+  tier: (ask: TierAsk) => Promise<TierReply>;
+  /** Complete Plan-mode markdown submitted by the model. */
+  plan?: (ask: PlanAsk) => Promise<PlanReply>;
 }
 
 /**
@@ -91,6 +138,13 @@ function socketPathFits(candidate: string): boolean {
   return Buffer.byteLength(candidate, 'utf8') <= MAX_SOCKET_PATH_BYTES;
 }
 
+/** Windows cannot bind a filesystem `.sock`; Node maps this namespace to named pipes. */
+export function windowsPermissionPipePath(
+  nonce = crypto.randomBytes(16).toString('hex'),
+): string {
+  return `\\\\.\\pipe\\code-agents-webcli-${nonce}`;
+}
+
 export class PermissionBroker {
   private server: net.Server | null = null;
   private socketPath = '';
@@ -98,6 +152,14 @@ export class PermissionBroker {
   private tempDir: string | null = null;
   private handlers: BrokerHandlers | null = null;
   private readonly open = new Set<net.Socket>();
+  /**
+   * Questions still in flight, so a later cancel line can find its own.
+   *
+   * Keyed by the id the caller minted, which is the only name the two sides
+   * share: the session's request id is created after this point and is never
+   * sent back down the socket.
+   */
+  private readonly askedQuestions = new Map<net.Socket, Map<string, AbortController>>();
 
   constructor(private readonly socketDir: string) {}
 
@@ -134,7 +196,9 @@ export class PermissionBroker {
       });
     });
 
-    fs.chmodSync(this.socketPath, 0o600);
+    // A Windows named pipe has no filesystem entry to chmod. Its 128-bit
+    // random name is the capability handed only to this session's children.
+    if (process.platform !== 'win32') fs.chmodSync(this.socketPath, 0o600);
     server.on('error', () => {
       // A listener error after startup means the socket is unusable; the hook
       // will fail closed on its next connect, which is the safe direction.
@@ -155,6 +219,8 @@ export class PermissionBroker {
    * start at all with a message about an invalid argument.
    */
   private reservePath(): string {
+    if (process.platform === 'win32') return windowsPermissionPipePath();
+
     // 8 random bytes rather than the session id: the id is knowable by anyone
     // who can list the user's sessions, and while the directory mode already
     // stops another account from connecting, there is no reason to make the
@@ -190,8 +256,8 @@ export class PermissionBroker {
 
   private accept(socket: net.Socket): void {
     this.open.add(socket);
-    socket.on('close', () => this.open.delete(socket));
-    socket.on('error', () => this.open.delete(socket));
+    socket.on('close', () => this.releaseSocket(socket));
+    socket.on('error', () => this.releaseSocket(socket));
 
     let buffer = '';
     socket.setEncoding('utf8');
@@ -207,8 +273,24 @@ export class PermissionBroker {
     });
   }
 
+  /** A caller going away cancels only the questions that arrived on its socket. */
+  private releaseSocket(socket: net.Socket): void {
+    this.open.delete(socket);
+    const questions = this.askedQuestions.get(socket);
+    if (!questions) return;
+    this.askedQuestions.delete(socket);
+    for (const abort of questions.values()) abort.abort();
+  }
+
   private handle(socket: net.Socket, line: string): void {
-    let payload: { id?: string; kind?: string; ask?: PermissionAsk; question?: QuestionAsk };
+    let payload: {
+      id?: string;
+      kind?: string;
+      ask?: PermissionAsk;
+      question?: QuestionAsk;
+      tier?: TierAsk;
+      plan?: PlanAsk;
+    };
     try {
       payload = JSON.parse(line);
     } catch {
@@ -218,7 +300,7 @@ export class PermissionBroker {
     const id = payload.id;
     if (!id) return;
 
-    const reply = (answer: PermissionAnswer | QuestionReply): void => {
+    const reply = (answer: PermissionAnswer | QuestionReply | TierReply | PlanReply): void => {
       if (socket.destroyed) return;
       socket.write(`${JSON.stringify({ id, ...answer })}\n`);
     };
@@ -235,12 +317,69 @@ export class PermissionBroker {
         reply({ labels: [], error: 'this session is not accepting questions' });
         return;
       }
+      const abort = new AbortController();
+      let questions = this.askedQuestions.get(socket);
+      if (!questions) {
+        questions = new Map();
+        this.askedQuestions.set(socket, questions);
+      }
+      // Reusing an id on one connection supersedes only that connection's old
+      // call. Another runtime-side client may legitimately mint the same id.
+      questions.get(id)?.abort();
+      questions.set(id, abort);
       handlers
-        .question(question)
+        .question(question, abort.signal)
         .then(reply)
         .catch((error: unknown) => {
           reply({ labels: [], error: describeError(error) });
+        })
+        .finally(() => {
+          const current = this.askedQuestions.get(socket);
+          if (current?.get(id) === abort) current.delete(id);
+          if (current?.size === 0) this.askedQuestions.delete(socket);
         });
+      return;
+    }
+
+    // The caller has stopped waiting for one of its own questions. No reply
+    // goes back: the `tools/call` this belongs to is already over on the other
+    // side, and writing to it would be answering nobody. What it is for is the
+    // card, which the session takes down when the signal fires.
+    if (payload.kind === 'cancel') {
+      const questions = this.askedQuestions.get(socket);
+      questions?.get(id)?.abort();
+      questions?.delete(id);
+      if (questions?.size === 0) this.askedQuestions.delete(socket);
+      return;
+    }
+
+    // A request to move up a rung. Failing closed like an approval rather than
+    // open like a question, and for the same reason an approval does: the thing
+    // being asked for costs real money on a more expensive model, so silence
+    // has to mean "no" — but with a sentence, because an agent told only "no"
+    // will ask again.
+    if (payload.kind === 'tier') {
+      if (!handlers) {
+        reply({ granted: false, detail: 'this conversation is not running on a ladder' });
+        return;
+      }
+      handlers
+        .tier(payload.tier ?? {})
+        .then(reply)
+        .catch((error: unknown) => {
+          reply({ granted: false, detail: `the request failed: ${describeError(error)}` });
+        });
+      return;
+    }
+
+    if (payload.kind === 'plan') {
+      if (!handlers?.plan) {
+        reply({ accepted: false, detail: 'this session is not accepting Plan documents' });
+        return;
+      }
+      handlers.plan(payload.plan ?? {}).then(reply).catch((error: unknown) => {
+        reply({ accepted: false, detail: `the plan could not be stored: ${describeError(error)}` });
+      });
       return;
     }
 
@@ -264,15 +403,17 @@ export class PermissionBroker {
   close(): void {
     for (const socket of this.open) {
       socket.destroy();
+      this.releaseSocket(socket);
     }
     this.open.clear();
+    this.askedQuestions.clear();
 
     if (this.server) {
       this.server.close();
       this.server = null;
     }
 
-    if (this.socketPath) {
+    if (this.socketPath && process.platform !== 'win32') {
       try {
         fs.unlinkSync(this.socketPath);
       } catch {
@@ -305,7 +446,12 @@ export class PermissionBroker {
  * the CLI kills a hook that overruns — a short timeout would silently turn "the
  * user stepped away" into "the tool was refused".
  */
-export function permissionHookSettings(hookScript: string, socketPath: string): string {
+export function permissionHookSettings(
+  hookScript: string,
+  socketPath: string,
+  /** See the note on `askMcpConfig`: the runtime may not be on this machine. */
+  nodePath: string = process.execPath,
+): string {
   return JSON.stringify({
     hooks: {
       PreToolUse: [
@@ -314,7 +460,7 @@ export function permissionHookSettings(hookScript: string, socketPath: string): 
           hooks: [
             {
               type: 'command',
-              command: `${process.execPath} ${JSON.stringify(hookScript)}`,
+              command: `${nodePath} ${JSON.stringify(hookScript)}`,
               timeout: 3600,
             },
           ],

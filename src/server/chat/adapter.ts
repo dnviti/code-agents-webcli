@@ -1,5 +1,8 @@
 import { spawn, ChildProcessByStdio, ChildProcessWithoutNullStreams } from 'child_process';
 import { Readable } from 'stream';
+import { UserEnvironment } from '../services/environments/types.js';
+import { HostEnvironment } from '../services/environments/manager.js';
+import { WrappedProcessControl } from '../services/environments/types.js';
 import {
   ChatCapabilities,
   ChatEvent,
@@ -31,8 +34,20 @@ export type AdapterEvent = ChatEvent extends infer Event
 export interface ChatAdapterOptions {
   sessionId: string;
   workingDir: string;
+  /** Whether workingDir is already an absolute path inside the container. */
+  cwdKind?: 'host' | 'container';
   /** Resolved executable for the runtime, from the existing bridge lookup. */
   command: string;
+  /**
+   * The runtime's plain command name, for when the resolved path is a path on
+   * a machine the process will not run on. Falls back to `command`.
+   */
+  commandName?: string;
+  /**
+   * Where this conversation's runtime runs. Absent means the host — which is
+   * what every caller passed before per-user environments existed.
+   */
+  environment?: UserEnvironment;
   /** Model from the active runtime profile, if any. */
   model?: string;
   /**
@@ -110,6 +125,13 @@ export interface ChatAdapterOptions {
    * descriptions for a runtime — Claude — that reports names bare.
    */
   installedCommands?: SlashCommand[];
+  /**
+   * Agent Skill manifests behind `installedCommands`, for runtimes whose wire
+   * protocol distinguishes invoking a skill from sending similarly shaped
+   * prompt text. Never copied into capabilities: these are absolute paths in
+   * the session owner's environment.
+   */
+  installedSkills?: Array<{ name: string; path: string }>;
 }
 
 export interface ChatAdapter {
@@ -119,6 +141,17 @@ export interface ChatAdapter {
   start(): Promise<void>;
   /** Queue a user turn. Resolves when the runtime has accepted it, not when it replies. */
   send(turn: UserTurn): Promise<void>;
+  /**
+   * Withdraw a `send()` that is still waiting for proof the runtime accepted it.
+   *
+   * Most transports acknowledge a turn directly, or accept it synchronously,
+   * and do not need this hook. ACP v1 keeps its prompt request open for the
+   * whole turn, so its adapter uses the first turn-specific protocol activity
+   * as the acknowledgement. Lifecycle code can release that narrow waiter
+   * before stopping the process instead of waiting for output that can no
+   * longer be useful.
+   */
+  cancelPendingSendAcceptance?(reason: string): void;
   /**
    * False while a `send()` would be refused, even though the last turn is over.
    *
@@ -140,6 +173,18 @@ export interface ChatAdapter {
   respondPermission(requestId: string, optionId: string): void;
   /** Switch model mid-session, for runtimes that allow it. */
   setModel?(model: string): Promise<void>;
+  /**
+   * Change the model the *next* turn runs on, for a runtime that cannot change
+   * the one already running.
+   *
+   * pi spawns one process per turn, so its model is an argv entry rather than
+   * anything a live session holds — there is nothing to ask, and the next
+   * `send()` simply builds a different command line. Separate from `setModel`
+   * because the difference is one the caller has to be able to state: an
+   * escalation that promised a stronger model *now* and delivered it next turn
+   * had the model attempting work it could not do (#171).
+   */
+  setModelNextTurn?(model: string): void;
   /**
    * Switch reasoning effort mid-session, for runtimes that allow it.
    *
@@ -171,6 +216,33 @@ export type AdapterChild =
   | ChildProcessWithoutNullStreams
   | ChildProcessByStdio<null, Readable, Readable>;
 
+interface AdapterChildLifecycle {
+  child: AdapterChild;
+  closed: boolean;
+  closedPromise: Promise<void>;
+  resolveClosed: () => void;
+  processControl?: WrappedProcessControl;
+  spawned: boolean;
+  spawnSettled: boolean;
+  spawnOutcome: Promise<boolean>;
+  resolveSpawnOutcome: (spawned: boolean) => void;
+  remoteVerified: boolean;
+  stopPromise: Promise<void> | null;
+}
+
+/**
+ * Maximum serialized size of one runtime protocol record.
+ *
+ * Codex legitimately embeds multi-megabyte command output in a single JSON-RPC
+ * line. The old 1,000,000-character guard discarded those records whenever a
+ * pipe split them before their newline. Sixteen MiB leaves room for the
+ * runtime's bounded output plus JSON escaping while still bounding one
+ * session's incomplete record in memory.
+ */
+const MAX_PROTOCOL_LINE_BYTES = 16 * 1024 * 1024;
+const INITIAL_PROTOCOL_BUFFER_BYTES = 4 * 1024;
+const RETAINED_PROTOCOL_BUFFER_BYTES = 64 * 1024;
+
 /**
  * Shared plumbing for adapters that drive a child process over stdio.
  *
@@ -187,15 +259,56 @@ export abstract class BaseChatAdapter implements ChatAdapter {
   abstract readonly capabilities: ChatCapabilities;
 
   protected child: AdapterChild | null = null;
-  protected stdoutBuffer = '';
+  private stdoutLine = Buffer.alloc(0);
+  private stdoutBytes = 0;
+  private discardingStdoutLine = false;
+  /** Overridden only by the framing harness so overflow recovery stays cheap to test. */
+  protected maxProtocolLineBytes = MAX_PROTOCOL_LINE_BYTES;
   protected stderrTail = '';
   protected stopped = false;
   protected exited = false;
+  private childLifecycle: AdapterChildLifecycle | null = null;
+  /**
+   * The cwd as the runtime itself sees it.
+   *
+   * Session records deliberately keep a host path for bind-mounted locations
+   * so server-owned file APIs can use it. Protocol handshakes run inside the
+   * container, however, and must receive the translated mount path. An
+   * explicitly container-local cwd is already in that namespace and is left
+   * unchanged. Resolve this once, after project admission supplied the exact
+   * environment, so every protocol and the actual spawn agree.
+   */
+  protected readonly runtimeWorkingDir: string;
 
-  constructor(protected readonly options: ChatAdapterOptions) {}
+  constructor(protected readonly options: ChatAdapterOptions) {
+    const environment = options.environment;
+    this.runtimeWorkingDir = environment?.kind === 'container'
+      && options.cwdKind !== 'container'
+      ? environment.toContainerPath(options.workingDir)
+      : options.workingDir;
+  }
 
   get alive(): boolean {
-    return Boolean(this.child) && !this.exited;
+    const lifecycle = this.childLifecycle;
+    return Boolean(this.child) && (
+      !this.exited
+      || Boolean(
+        lifecycle
+        && lifecycle.child === this.child
+        && (!lifecycle.closed || !lifecycle.remoteVerified),
+      )
+    );
+  }
+
+  /** A one-shot adapter may not replace this lifecycle until proof settles. */
+  protected childNeedsVerifiedClose(child: AdapterChild | null = this.child): boolean {
+    if (!child) return false;
+    const lifecycle = this.childLifecycle;
+    return Boolean(
+      lifecycle
+      && lifecycle.child === child
+      && (!lifecycle.closed || !lifecycle.remoteVerified),
+    );
   }
 
   /** Arguments for the spawn. */
@@ -211,8 +324,145 @@ export abstract class BaseChatAdapter implements ChatAdapter {
   /** Hook for a handshake that must complete before the session is usable. */
   protected async handshake(): Promise<void> {}
 
+  /**
+   * Settle protocol work that can no longer receive a response after an
+   * unexpected child failure. Stateful transports override this; one-shot
+   * adapters have no request waiters to release.
+   */
+  protected onUnexpectedExit(_error: Error): void {}
+
   protected emit(event: AdapterEvent): void {
-    this.options.emit({ ...event, ts: event.ts ?? Date.now() } as AdapterEvent);
+    const stamped = { ...event, ts: event.ts ?? Date.now() } as AdapterEvent;
+    const lifecycle = this.childLifecycle;
+    // An engine client can exit while its `docker exec`/`kubectl exec` command
+    // is still running remotely. `state: exited` releases project admission,
+    // so container-backed adapters may publish it only after the token-bound
+    // remote process group has been verified gone.
+    if (
+      stamped.t === 'state'
+      && stamped.state === 'exited'
+      && lifecycle
+      && (!lifecycle.closed || !lifecycle.remoteVerified)
+    ) {
+      void this.waitForVerifiedClose(lifecycle.child).then(() => {
+        this.options.emit(stamped);
+      }).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.options.emit({
+          t: 'error',
+          message: `${this.runtime}: ${message}`,
+          fatal: true,
+          ts: Date.now(),
+        });
+        this.options.emit({ t: 'state', state: 'error', ts: Date.now() });
+      });
+      return;
+    }
+    this.options.emit(stamped);
+  }
+
+  /**
+   * Spawn this runtime's CLI where the conversation's owner lives.
+   *
+   * Every adapter goes through here rather than calling `spawn` itself: the
+   * decision "host or this user's container" has exactly one right answer per
+   * session, and four copies of it is four chances for an agent to run on the
+   * host while the terminal beside it runs in a container.
+   *
+   * `stdio` still belongs to the caller — the runtimes disagree about whether
+   * stdin should be a pipe or closed, and that difference is load-bearing
+   * (see the notes at the codex and pi call sites).
+   */
+  protected launchChild(
+    args: string[],
+    stdio: ['pipe' | 'ignore', 'pipe', 'pipe'],
+  ): ChildProcessWithoutNullStreams {
+    const environment = this.options.environment;
+    // A container exec resolves the command through the image's PATH; the
+    // absolute path found on this host almost certainly is not in the image.
+    const command = environment && environment.kind === 'container'
+      ? this.options.commandName || this.options.command
+      : this.options.command;
+
+    const launch = (environment || new HostEnvironment(this.options.workingDir)).wrap(
+      command,
+      args,
+      {
+        cwd: this.options.workingDir,
+        cwdKind: this.options.cwdKind,
+        env: {
+          ...(this.options.env || {}),
+          // These CLIs check for a TTY to decide whether to draw a TUI and to
+          // colour their output. We want neither: chat mode reads the
+          // structured stream, and ANSI in a JSON string is noise the UI would
+          // have to strip.
+          NO_COLOR: '1',
+          TERM: 'dumb',
+          FORCE_COLOR: '0',
+        },
+        // Deliberately no tty: `exec -t` would give the CLI exactly the
+        // terminal it must not detect, and would merge stderr into stdout.
+        tty: false,
+        trackProcess: true,
+      },
+    );
+    if (environment?.kind === 'container' && !launch.processControl) {
+      throw new Error(
+        `${this.runtime}: container environment did not provide verified process control`,
+      );
+    }
+
+    const child = spawn(launch.command, launch.args, {
+      cwd: environment?.kind === 'container' ? undefined : this.options.workingDir,
+      env: launch.env,
+      stdio,
+    }) as ChildProcessWithoutNullStreams;
+    let resolveClosed!: () => void;
+    const closedPromise = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    let resolveSpawnOutcome!: (spawned: boolean) => void;
+    const spawnOutcome = new Promise<boolean>((resolve) => {
+      resolveSpawnOutcome = resolve;
+    });
+    const lifecycle: AdapterChildLifecycle = {
+      child,
+      closed: false,
+      closedPromise,
+      resolveClosed,
+      processControl: launch.processControl,
+      spawned: false,
+      spawnSettled: false,
+      spawnOutcome,
+      resolveSpawnOutcome,
+      remoteVerified: !launch.processControl,
+      stopPromise: null,
+    };
+    this.childLifecycle = lifecycle;
+    child.once('spawn', () => {
+      lifecycle.spawned = true;
+      lifecycle.spawnSettled = true;
+      lifecycle.resolveSpawnOutcome(true);
+    });
+    child.once('error', () => {
+      // An async spawn error before `spawn` proves the engine client never
+      // launched, so there cannot be a remote process/control file to verify.
+      if (!lifecycle.spawned) {
+        lifecycle.spawnSettled = true;
+        lifecycle.remoteVerified = true;
+        lifecycle.resolveSpawnOutcome(false);
+      }
+    });
+    const markClosed = (): void => {
+      if (lifecycle.closed) return;
+      lifecycle.closed = true;
+      lifecycle.resolveClosed();
+    };
+    // `exit` precedes stdio shutdown. A one-shot adapter may still receive the
+    // last stdout chunks after it, so only `close` authorises buffer reset,
+    // lifecycle replacement, or publication of `state: exited`.
+    child.once('close', markClosed);
+    return child;
   }
 
   async start(): Promise<void> {
@@ -221,25 +471,12 @@ export abstract class BaseChatAdapter implements ChatAdapter {
     }
 
     const args = this.buildArgs();
-    const child = spawn(this.options.command, args, {
-      cwd: this.options.workingDir,
-      env: {
-        ...process.env,
-        ...(this.options.env || {}),
-        // These CLIs check for a TTY to decide whether to draw a TUI and to
-        // colour their output. We want neither: chat mode reads the structured
-        // stream, and ANSI in a JSON string is noise the UI would have to strip.
-        NO_COLOR: '1',
-        TERM: 'dumb',
-        FORCE_COLOR: '0',
-      },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }) as ChildProcessWithoutNullStreams;
+    const child = this.launchChild(args, ['pipe', 'pipe', 'pipe']);
 
     this.child = child;
 
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => this.onStdout(chunk));
+    this.resetStdoutFraming();
+    child.stdout.on('data', (chunk: Buffer) => this.feedStdout(chunk));
 
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
@@ -249,9 +486,19 @@ export abstract class BaseChatAdapter implements ChatAdapter {
     });
 
     child.on('error', (error: Error) => {
-      this.exited = true;
+      if (!this.stopped) this.onUnexpectedExit(error);
       this.emit({ t: 'error', message: `${this.runtime}: ${error.message}`, fatal: true });
       this.emit({ t: 'state', state: 'error' });
+      const lifecycle = this.childLifecycle?.child === child
+        ? this.childLifecycle
+        : null;
+      if (lifecycle && !lifecycle.spawned) {
+        // ENOENT/EACCES before `spawn` proves there is no engine client and no
+        // remote command. Still wait for Node's `close` event before declaring
+        // the adapter gone so its stdio lifecycle cannot race replacement.
+        this.exited = true;
+        this.emit({ t: 'state', state: 'exited' });
+      }
     });
 
     child.on('exit', (code, signal) => {
@@ -262,6 +509,9 @@ export abstract class BaseChatAdapter implements ChatAdapter {
       }
       const detail = this.stderrTail.trim();
       const how = signal ? `signal ${signal}` : `code ${code}`;
+      this.onUnexpectedExit(new Error(
+        detail ? `${this.runtime} exited (${how}): ${detail}` : `${this.runtime} exited (${how})`,
+      ));
       this.emit({
         t: 'error',
         message: detail
@@ -275,12 +525,86 @@ export abstract class BaseChatAdapter implements ChatAdapter {
     await this.handshake();
   }
 
-  private onStdout(chunk: string): void {
-    this.stdoutBuffer += chunk;
-    let newline: number;
-    while ((newline = this.stdoutBuffer.indexOf('\n')) !== -1) {
-      const line = this.stdoutBuffer.slice(0, newline).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
+  /** Clear retained protocol bytes before a newly spawned stdout stream begins. */
+  protected resetStdoutFraming(): void {
+    this.clearStdoutLine(true);
+    this.discardingStdoutLine = false;
+  }
+
+  private clearStdoutLine(release = false): void {
+    this.stdoutBytes = 0;
+    if (release || this.stdoutLine.length > RETAINED_PROTOCOL_BUFFER_BYTES) {
+      this.stdoutLine = Buffer.alloc(0);
+    }
+  }
+
+  /** Copy input into bounded owned storage; never retain a caller's Buffer view. */
+  private appendStdoutSegment(segment: Buffer): void {
+    const required = this.stdoutBytes + segment.length;
+    if (required > this.stdoutLine.length) {
+      const initial = Math.min(this.maxProtocolLineBytes, INITIAL_PROTOCOL_BUFFER_BYTES);
+      const grown = this.stdoutLine.length > 0 ? this.stdoutLine.length * 2 : initial;
+      const capacity = Math.min(this.maxProtocolLineBytes, Math.max(required, grown));
+      const next = Buffer.allocUnsafe(capacity);
+      if (this.stdoutBytes > 0) {
+        this.stdoutLine.copy(next, 0, 0, this.stdoutBytes);
+      }
+      this.stdoutLine = next;
+    }
+
+    segment.copy(this.stdoutLine, this.stdoutBytes);
+    this.stdoutBytes = required;
+  }
+
+  /**
+   * Frame one runtime's UTF-8, newline-delimited JSON stream.
+   *
+   * Kept protected because the spawn-per-turn adapters own their stdout
+   * listener but speak the same wire format. Strings are accepted for focused
+   * protocol tests; production listeners leave stdout undecoded and pass exact
+   * bytes so a multibyte code point split across chunks remains intact.
+   */
+  protected feedStdout(chunk: Buffer | string, source = this.runtime): void {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
+    let offset = 0;
+
+    while (offset < bytes.length) {
+      if (this.discardingStdoutLine) {
+        const newline = bytes.indexOf(0x0a, offset);
+        if (newline === -1) return;
+        this.discardingStdoutLine = false;
+        offset = newline + 1;
+        continue;
+      }
+
+      const newline = bytes.indexOf(0x0a, offset);
+      const end = newline === -1 ? bytes.length : newline;
+      const segment = bytes.subarray(offset, end);
+
+      if (this.stdoutBytes + segment.length > this.maxProtocolLineBytes) {
+        this.clearStdoutLine();
+        this.emit({
+          t: 'error',
+          message: `${source} sent an oversized line; discarded the buffer`,
+        });
+        if (newline === -1) {
+          this.discardingStdoutLine = true;
+          return;
+        }
+        offset = newline + 1;
+        continue;
+      }
+
+      if (segment.length > 0) {
+        this.appendStdoutSegment(segment);
+      }
+      if (newline === -1) return;
+
+      const line = this.stdoutBytes > 0
+        ? this.stdoutLine.toString('utf8', 0, this.stdoutBytes).trim()
+        : '';
+      this.clearStdoutLine();
+      offset = newline + 1;
       if (!line) continue;
 
       let parsed: unknown;
@@ -299,19 +623,9 @@ export abstract class BaseChatAdapter implements ChatAdapter {
         const message = error instanceof Error ? error.message : String(error);
         this.emit({
           t: 'error',
-          message: `${this.runtime} adapter failed to handle a message: ${message}`,
+          message: `${source} adapter failed to handle a message: ${message}`,
         });
       }
-    }
-
-    // A runtime that never emits a newline would otherwise grow this without
-    // bound; past a megabyte the stream is not line-delimited JSON at all.
-    if (this.stdoutBuffer.length > 1_000_000) {
-      this.stdoutBuffer = '';
-      this.emit({
-        t: 'error',
-        message: `${this.runtime} sent an oversized line; discarded the buffer`,
-      });
     }
   }
 
@@ -335,29 +649,110 @@ export abstract class BaseChatAdapter implements ChatAdapter {
   async stop(): Promise<void> {
     this.stopped = true;
     const child = this.child;
-    if (!child || this.exited) return;
-
+    if (!child) return;
     try {
       // Absent for the one-shot adapters, which never opened one.
       child.stdin?.end();
     } catch {
-      // Already closed; the kill below is what actually matters.
+      // Already closed; verified teardown below is what actually matters.
     }
+    await this.terminateChild(child, 'SIGTERM');
+  }
 
-    child.kill('SIGTERM');
-    // Same escalation the PTY bridge uses, for the same reason: a runtime
-    // mid-tool-call can ignore SIGTERM, and a session that will not die blocks
-    // the id from being reused.
-    const escalate = setTimeout(() => {
-      if (!this.exited) {
+  /**
+   * Await one particular launch, not whichever child a later one stored.
+   * One-shot adapters call this from their exit/error handlers before making a
+   * turn idle or allowing the next process to replace its lifecycle handle.
+   */
+  protected async waitForVerifiedClose(child: AdapterChild): Promise<void> {
+    await this.settleChild(child);
+  }
+
+  /** Used by one-shot interrupt as well as whole-session stop. */
+  protected async terminateChild(
+    child: AdapterChild,
+    signal: NodeJS.Signals = 'SIGTERM',
+  ): Promise<void> {
+    await this.settleChild(child, signal);
+  }
+
+  private async settleChild(
+    child: AdapterChild,
+    signal?: NodeJS.Signals,
+  ): Promise<void> {
+    const lifecycle = this.childLifecycle?.child === child
+      ? this.childLifecycle
+      : null;
+    if (!lifecycle) {
+      throw new Error(`${this.runtime}: cannot verify the child process lifecycle`);
+    }
+    if (lifecycle.stopPromise) return lifecycle.stopPromise;
+
+    const attempt = (async () => {
+      if (signal && !lifecycle.closed) {
         try {
-          child.kill('SIGKILL');
+          child.kill(signal);
         } catch {
-          // Gone between the check and the call.
+          // The verified exit/close event below remains the authority.
         }
       }
-    }, 5000);
-    escalate.unref?.();
+
+      let escalate: ReturnType<typeof setTimeout> | null = null;
+      let closeTimeout: ReturnType<typeof setTimeout> | null = null;
+      const localStop = lifecycle.closed
+        ? Promise.resolve()
+        : Promise.race([
+            lifecycle.closedPromise,
+            new Promise<never>((_resolve, reject) => {
+              if (signal) {
+                escalate = setTimeout(() => {
+                  if (!lifecycle.closed) {
+                    try {
+                      child.kill('SIGKILL');
+                    } catch {
+                      // A concurrent exit won the race.
+                    }
+                  }
+                }, 5000);
+                escalate.unref?.();
+              }
+              closeTimeout = setTimeout(() => {
+                reject(new Error(
+                  `${this.runtime}: could not verify that the local runtime client closed`,
+                ));
+              }, 10_000);
+              closeTimeout.unref?.();
+            }),
+          ]).finally(() => {
+            if (escalate) clearTimeout(escalate);
+            if (closeTimeout) clearTimeout(closeTimeout);
+          });
+
+      // `spawn()` returning is not the `spawn` event. An immediate stop can
+      // arrive in that gap; wait for either successful spawn or the definitive
+      // pre-spawn error before deciding whether a remote command can exist.
+      const spawned = lifecycle.spawnSettled
+        ? lifecycle.spawned
+        : await lifecycle.spawnOutcome;
+      const remoteStop = spawned && lifecycle.processControl
+        ? lifecycle.processControl.stop()
+        : Promise.resolve();
+      const [localResult, remoteResult] = await Promise.allSettled([
+        localStop,
+        remoteStop,
+      ]);
+      if (remoteResult.status === 'rejected') throw remoteResult.reason;
+      if (localResult.status === 'rejected') throw localResult.reason;
+      lifecycle.remoteVerified = true;
+    })();
+
+    lifecycle.stopPromise = attempt;
+    try {
+      await attempt;
+    } catch (error) {
+      if (lifecycle.stopPromise === attempt) lifecycle.stopPromise = null;
+      throw error;
+    }
   }
 }
 
@@ -371,6 +766,8 @@ export abstract class BaseChatAdapter implements ChatAdapter {
  */
 export abstract class JsonRpcChatAdapter extends BaseChatAdapter {
   private nextId = 1;
+  /** Once the child is gone, no later fallback RPC may create a fresh waiter. */
+  private transportClosedError: Error | null = null;
   private readonly pending = new Map<
     number,
     { resolve: (value: unknown) => void; reject: (error: Error) => void }
@@ -379,11 +776,18 @@ export abstract class JsonRpcChatAdapter extends BaseChatAdapter {
   protected readonly permissionWaiters = new Map<string, number | string>();
 
   protected call(method: string, params?: unknown): Promise<unknown> {
+    if (this.transportClosedError) return Promise.reject(this.transportClosedError);
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.pending.set(id, { resolve, reject });
       this.writeLine({ jsonrpc: '2.0', id, method, params });
     });
+  }
+
+  protected override onUnexpectedExit(error: Error): void {
+    if (!this.transportClosedError) this.transportClosedError = error;
+    for (const [, waiter] of this.pending) waiter.reject(this.transportClosedError);
+    this.pending.clear();
   }
 
   protected notify(method: string, params?: unknown): void {
@@ -442,10 +846,7 @@ export abstract class JsonRpcChatAdapter extends BaseChatAdapter {
   async stop(): Promise<void> {
     // Reject anything still in flight so callers awaiting a turn do not hang
     // forever on a process that is going away.
-    for (const [, waiter] of this.pending) {
-      waiter.reject(new Error(`${this.runtime} session stopped`));
-    }
-    this.pending.clear();
+    this.onUnexpectedExit(new Error(`${this.runtime} session stopped`));
     await super.stop();
   }
 }

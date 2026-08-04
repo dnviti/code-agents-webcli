@@ -2,9 +2,11 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const net = require('net');
 const { spawn } = require('child_process');
 const { PassThrough } = require('stream');
 
+const registry = require('../dist/server/chat/registry.js');
 const { ChatSession } = require('../dist/server/chat/session.js');
 const { PermissionBroker } = require('../dist/server/chat/permission-broker.js');
 const { serveAsk, describeAnswer, ASK_TOOL_DEFINITION, askMcpConfig } = require('../dist/server/chat/ask-mcp.js');
@@ -17,9 +19,21 @@ const {
   looksLikeAskCall,
   askedQuestionFrom,
   normalizeQuestionOptions,
+  isOwnWordsOption,
+  splitOwnWordsOption,
+  OWN_WORDS_LABEL,
+  MAX_QUESTION_ANSWER_TEXT,
   ASK_QUESTION_TOOL_NAME,
 } = require('../dist/shared/chat-events.js');
-const { askChannelFor } = require('../dist/server/chat/registry.js');
+const {
+  askChannelFor,
+  askEnvFor,
+  advertisedChatCapabilities,
+  chatCapableRuntimes,
+  createChatAdapter,
+  questionDeliveryFor,
+} = require('../dist/server/chat/registry.js');
+const { MessageProcessor } = require('../dist/server/websocket/messages.js');
 
 // Choice-based questions from the model, end to end (issue #42).
 //
@@ -85,17 +99,34 @@ function session({ bypass = false } = {}) {
 }
 
 /** Resolve, or fail loudly rather than letting mocha time out with no clue. */
-function within(promise, what, ms = 1000) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(what)), ms)),
-  ]);
+async function within(promise, what, ms = 1000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(what)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function eventuallyValue(read, what, ms = 1000) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const value = read();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(what);
 }
 
 describe('asking the user a choice-based question', function () {
   describe('the MCP tool the model actually calls', function () {
     /** Drive the real protocol over pipes, the way the runtime does. */
-    function drive(answers) {
+    function drive(answers, tier, questionToolEnabled = true) {
       const input = new PassThrough();
       const output = new PassThrough();
       const lines = [];
@@ -117,13 +148,28 @@ describe('asking the user a choice-based question', function () {
       });
 
       const asked = [];
-      serveAsk(input, output, async (question) => {
-        asked.push(question);
-        return answers(question);
-      });
+      const tierAsked = [];
+      serveAsk(
+        input,
+        output,
+        async (question) => {
+          asked.push(question);
+          return answers(question);
+        },
+        tier
+          ? async (reason) => {
+            tierAsked.push(reason);
+            return tier(reason);
+          }
+          : undefined,
+        undefined,
+        undefined,
+        questionToolEnabled,
+      );
 
       return {
         asked,
+        tierAsked,
         lines,
         send(message) {
           input.write(`${JSON.stringify(message)}\n`);
@@ -140,11 +186,40 @@ describe('asking the user a choice-based question', function () {
       };
     }
 
+    function launchMcp(command, args, env) {
+      const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+      const queued = [];
+      const waiting = [];
+      let buffer = '';
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        buffer += chunk;
+        let newline;
+        while ((newline = buffer.indexOf('\n')) !== -1) {
+          const reply = JSON.parse(buffer.slice(0, newline));
+          buffer = buffer.slice(newline + 1);
+          const resolve = waiting.shift();
+          if (resolve) resolve(reply);
+          else queued.push(reply);
+        }
+      });
+      return {
+        child,
+        send(message) { child.stdin.write(`${JSON.stringify(message)}\n`); },
+        next() {
+          return queued.length
+            ? Promise.resolve(queued.shift())
+            : within(new Promise((resolve) => waiting.push(resolve)), 'the Default-mode MCP server never replied', 5000);
+        },
+      };
+    }
+
     it('advertises exactly one tool, with a schema the model can fill in', async function () {
       const mcp = drive(() => ({ labels: [] }));
       mcp.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
 
       const reply = await mcp.next();
+      // One, because this session is not on a capability ladder. See below.
       assert.strictEqual(reply.result.tools.length, 1);
       const [tool] = reply.result.tools;
       assert.ok(isAskQuestionTool(tool.name));
@@ -152,6 +227,20 @@ describe('asking the user a choice-based question', function () {
       // means the model can only ever ask single-choice questions.
       assert.ok(tool.inputSchema.properties.multiSelect);
       assert.deepStrictEqual(tool.inputSchema.required, ['question', 'options']);
+    });
+
+    it('omits the blocking question tool when the session policy requires a handoff', async function () {
+      const mcp = drive(() => ({ labels: [] }), undefined, false);
+      mcp.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+      assert.deepStrictEqual((await mcp.next()).result.tools, []);
+
+      mcp.send({
+        jsonrpc: '2.0', id: 2, method: 'tools/call',
+        params: { name: 'ask_user_question', arguments: QUESTION },
+      });
+      const rejected = await mcp.next();
+      assert.ok(rejected.error, 'an unadvertised question tool must not remain callable');
+      assert.strictEqual(mcp.asked.length, 0);
     });
 
     it('echoes the protocol version the client offered rather than pinning one', async function () {
@@ -179,6 +268,153 @@ describe('asking the user a choice-based question', function () {
       assert.notStrictEqual(reply.result.isError, true);
     });
 
+    it('keeps Claude’s Plan channel but removes its timed question tool', async function () {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'default-question-mcp-'));
+      const store = memoryStore();
+      const sent = [];
+      let adapterOptions;
+      let mcp;
+      const realFactory = registry.createChatAdapter;
+      registry.createChatAdapter = (runtime, options) => {
+        adapterOptions = options;
+        return {
+          runtime,
+          capabilities: { streaming: true, permissions: false, interrupt: true },
+          alive: true,
+          readyForTurn: true,
+          async start() {},
+          async send(turn) { sent.push(turn.text); },
+          async interrupt() {},
+          async stop() { this.alive = false; },
+          respondPermission() {},
+        };
+      };
+
+      const chat = new ChatSession(
+        { id: 's1', ownerUserId: 7 },
+        {
+          store,
+          socketDir: path.join(root, 'sockets'),
+          hookScript: path.join(root, 'missing-hook.js'),
+          askScript: ASK_SERVER,
+          broadcast: () => {},
+          resolveCommand: () => path.join(root, 'missing-runtime'),
+        },
+      );
+
+      try {
+        await chat.start({
+          runtime: 'claude',
+          workingDir: root,
+          bypassPermissions: true,
+          planMode: false,
+        });
+        await chat.send({ text: 'Help me choose an implementation.' });
+        assert.match(sent[0], /Interactive-question fallback/);
+        assert.match(sent[0], /<ccweb-question>/);
+
+        const at = adapterOptions.extraArgs.indexOf('--mcp-config');
+        assert.ok(at >= 0, 'Default mode must retain the ccweb Plan server');
+        const config = JSON.parse(adapterOptions.extraArgs[at + 1]).mcpServers.ccweb;
+        assert.strictEqual(config.env.CCWEB_QUESTION_TOOL_ENABLED, '0');
+        assert.ok(!adapterOptions.extraArgs.includes(ASK_QUESTION_TOOL_NAME));
+        mcp = launchMcp(config.command, config.args, { ...process.env, ...config.env });
+
+        mcp.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } });
+        assert.strictEqual((await mcp.next()).result.serverInfo.name, 'ccweb');
+        mcp.send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+        const tools = (await mcp.next()).result.tools;
+        assert.ok(!tools.some((tool) => tool.name === 'ask_user_question'));
+        assert.ok(tools.some((tool) => tool.name === 'submit_plan'));
+
+        mcp.send({
+          jsonrpc: '2.0', id: 3, method: 'tools/call',
+          params: { name: 'ask_user_question', arguments: QUESTION },
+        });
+        assert.ok((await mcp.next()).error);
+        assert.ok(!store.events.some((event) => event.t === 'question'));
+      } finally {
+        mcp?.child.kill();
+        await chat.stop();
+        registry.createChatAdapter = realFactory;
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it('forwards Codex’s question policy through the MCP environment allowlist', async function () {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-question-mcp-'));
+      const store = memoryStore();
+      let adapterOptions;
+      let mcp;
+      const realFactory = registry.createChatAdapter;
+      registry.createChatAdapter = (runtime, options) => {
+        adapterOptions = options;
+        return {
+          runtime,
+          capabilities: { streaming: true, permissions: false, interrupt: true },
+          alive: true,
+          readyForTurn: true,
+          async start() {},
+          async send() {},
+          async interrupt() {},
+          async stop() { this.alive = false; },
+          respondPermission() {},
+        };
+      };
+
+      const chat = new ChatSession(
+        { id: 's1', ownerUserId: 7 },
+        {
+          store,
+          socketDir: path.join(root, 'sockets'),
+          hookScript: path.join(root, 'missing-hook.js'),
+          askScript: ASK_SERVER,
+          broadcast: () => {},
+          resolveCommand: () => path.join(root, 'missing-runtime'),
+        },
+      );
+
+      try {
+        await chat.start({
+          runtime: 'codex',
+          workingDir: root,
+          bypassPermissions: true,
+          planMode: false,
+        });
+        const overrides = new Map();
+        for (let index = 0; index < adapterOptions.extraArgs.length - 1; index += 1) {
+          if (adapterOptions.extraArgs[index] !== '-c') continue;
+          const override = adapterOptions.extraArgs[index + 1];
+          const equals = override.indexOf('=');
+          overrides.set(override.slice(0, equals), override.slice(equals + 1));
+        }
+        const command = JSON.parse(overrides.get('mcp_servers.ccweb.command'));
+        const args = JSON.parse(overrides.get('mcp_servers.ccweb.args'));
+        const envVars = JSON.parse(overrides.get('mcp_servers.ccweb.env_vars'));
+        assert.deepStrictEqual(envVars, ['CCWEB_ASK_SOCKET', 'CCWEB_QUESTION_TOOL_ENABLED']);
+
+        // Codex does not give an MCP child its own ambient CCWEB_* variables.
+        // Reproduce that policy here, then copy only the names its `env_vars`
+        // setting allows. Without the setting this server answers immediately
+        // with "this session has no channel to the browser" and no card opens.
+        const childEnv = Object.fromEntries(
+          Object.entries(process.env).filter(([name]) => !name.startsWith('CCWEB_')),
+        );
+        for (const name of envVars) childEnv[name] = adapterOptions.env[name];
+        assert.strictEqual(childEnv.CCWEB_QUESTION_TOOL_ENABLED, '0');
+        mcp = launchMcp(command, args, childEnv);
+        mcp.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+        const tools = (await mcp.next()).result.tools;
+        assert.ok(!tools.some((tool) => tool.name === 'ask_user_question'));
+        assert.ok(tools.some((tool) => tool.name === 'submit_plan'));
+      } finally {
+        mcp?.child.kill();
+        await chat.stop();
+        registry.createChatAdapter = realFactory;
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
     it('passes the model’s own question through untouched', async function () {
       const mcp = drive(() => ({ labels: ['Rewrite it'] }));
       mcp.send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'ask_user_question', arguments: QUESTION } });
@@ -193,6 +429,76 @@ describe('asking the user a choice-based question', function () {
 
       const reply = await mcp.next();
       assert.ok(reply.error, 'an unknown tool should not come back as a result');
+    });
+
+    // The ladder tool rides this same server (#171), and is offered only to a
+    // conversation actually running on a rung.
+    it('offers the ladder tool as well when the session is on a rung', async function () {
+      const mcp = drive(() => ({ labels: [] }), () => ({ granted: false, detail: 'no' }));
+      mcp.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+
+      const reply = await mcp.next();
+      assert.deepStrictEqual(
+        reply.result.tools.map((t) => t.name).sort(),
+        ['ask_user_question', 'request_model_tier'],
+      );
+    });
+
+    it('hides the ladder tool from a session with no ladder', async function () {
+      // A tool whose one possible answer is "there is nothing to escalate to"
+      // costs a round trip and reads to the model as the user having said no.
+      const mcp = drive(() => ({ labels: [] }));
+      mcp.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+
+      const reply = await mcp.next();
+      assert.ok(!reply.result.tools.some((t) => t.name === 'request_model_tier'));
+    });
+
+    it('refuses the ladder tool rather than serving it unladdered', async function () {
+      const mcp = drive(() => ({ labels: [] }));
+      mcp.send({
+        jsonrpc: '2.0', id: 4, method: 'tools/call',
+        params: { name: 'request_model_tier', arguments: { reason: 'hard' } },
+      });
+
+      const reply = await mcp.next();
+      assert.ok(reply.error, 'a tool that was never advertised must not be served');
+    });
+
+    it('hands a refusal back as a result the model can act on, not an error', async function () {
+      // Marking it an error invites a retry of the one call whose entire cost
+      // is asking a person again.
+      const mcp = drive(
+        () => ({ labels: [] }),
+        () => ({ granted: false, detail: 'The user said no. Carry on.' }),
+      );
+      mcp.send({
+        jsonrpc: '2.0', id: 5, method: 'tools/call',
+        params: { name: 'request_model_tier', arguments: { reason: 'hard' } },
+      });
+
+      const reply = await mcp.next();
+      assert.strictEqual(reply.result.isError, false);
+      assert.match(reply.result.content[0].text, /said no/);
+    });
+
+    it('does not answer the ladder call until the user has', async function () {
+      let release;
+      const mcp = drive(
+        () => ({ labels: [] }),
+        () => new Promise((resolve) => { release = resolve; }),
+      );
+      mcp.send({
+        jsonrpc: '2.0', id: 6, method: 'tools/call',
+        params: { name: 'request_model_tier', arguments: { reason: 'hard' } },
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.strictEqual(mcp.lines.length, 0, 'the call must block on the decision');
+
+      release({ granted: true, tier: 'top', model: 't', detail: 'Approved.' });
+      const reply = await mcp.next();
+      assert.match(reply.result.content[0].text, /Approved/);
     });
   });
 
@@ -330,7 +636,7 @@ describe('asking the user a choice-based question', function () {
       // back to the pinned region.
       assert.strictEqual(asked.toolId, 'toolu_42');
 
-      s.answerQuestion(asked.requestId, [asked.options[0].optionId]);
+      await s.answerQuestion(asked.requestId, [asked.options[0].optionId]);
       const resolved = store.events.find((e) => e.t === 'question_resolved');
       // Repeated on the resolution so a card rebuilt from the log alone can
       // still find its own answer.
@@ -399,7 +705,7 @@ describe('asking the user a choice-based question', function () {
       // record wholesale. Patched only on the session's own copy, the flag was
       // true on the server and false in every browser reading the same log.
       const { s, store } = session();
-      s.questionsEnabled = true;
+      s.questionToolEnabled = true;
       s.ingest({
         t: 'session',
         capabilities: { streaming: true, permissions: false },
@@ -534,6 +840,30 @@ describe('asking the user a choice-based question', function () {
       apply(state, { t: 'question', request });
       assert.strictEqual(state.pendingQuestions.length, 1);
     });
+
+    it('does not resurrect a resolved card when an older question frame arrives late', function () {
+      const state = createTranscript({});
+      const request = {
+        requestId: 'q-late',
+        origin: 'structured_handoff',
+        question: 'Already answered?',
+        multiSelect: false,
+        options: [{ optionId: 'opt-0', label: 'Yes' }],
+        ts: 1,
+      };
+      apply(state, {
+        t: 'question_resolved',
+        requestId: request.requestId,
+        optionIds: ['opt-0'],
+      });
+      apply(state, { t: 'question', request });
+
+      assert.deepStrictEqual(state.pendingQuestions, []);
+      assert.notStrictEqual(state.state, 'awaiting_answer');
+      const block = state.messages.flatMap((message) => message.blocks)
+        .find((candidate) => candidate.kind === 'question');
+      assert.deepStrictEqual(block.answer.optionIds, ['opt-0']);
+    });
   });
 
   describe('option ids', function () {
@@ -568,17 +898,61 @@ describe('asking the user a choice-based question', function () {
       assert.strictEqual(server.command, process.execPath);
       assert.deepStrictEqual(server.args, ['/opt/app/ask-mcp.js']);
       assert.strictEqual(server.env.CCWEB_ASK_SOCKET, '/tmp/s.sock');
+      assert.strictEqual(server.env.CCWEB_QUESTION_TOOL_ENABLED, '0');
     });
 
     it('knows which runtimes have a verified way to take the server', function () {
-      // Only the ones this has actually been watched working on. A runtime that
-      // gets a flag nobody has seen it parse is a capability claim with nothing
-      // behind it.
+      // Only real injection points are named here. Antigravity has no such
+      // hook and is deliberately absent; ChatSession gives it the structured
+      // final-response handoff instead of inventing a flag.
       assert.strictEqual(askChannelFor('claude'), 'cli');
       assert.strictEqual(askChannelFor('kimi'), 'protocol');
       assert.strictEqual(askChannelFor('omp'), 'protocol');
-      assert.strictEqual(askChannelFor('codex'), undefined);
+      assert.strictEqual(askChannelFor('grok'), 'protocol');
+      assert.strictEqual(askChannelFor('codex'), 'config');
+      assert.strictEqual(askChannelFor('pi'), 'extension');
+      assert.strictEqual(askChannelFor('antigravity'), undefined);
       assert.strictEqual(askChannelFor('nonesuch'), undefined);
+    });
+
+    it('uses structured handoff conservatively and opts in only verified pi', function () {
+      for (const runtime of ['claude', 'codex', 'grok', 'kimi', 'omp', 'antigravity']) {
+        assert.strictEqual(questionDeliveryFor(runtime), 'structured_handoff', runtime);
+      }
+      assert.strictEqual(questionDeliveryFor('pi'), 'blocking_tool');
+      assert.strictEqual(questionDeliveryFor('nonesuch'), 'structured_handoff');
+    });
+
+    it('offers questions and Plan mode on every registered Web-chat runtime', function () {
+      assert.deepStrictEqual(
+        chatCapableRuntimes().sort(),
+        ['antigravity', 'claude', 'codex', 'grok', 'kimi', 'omp', 'pi'],
+      );
+      for (const runtime of chatCapableRuntimes()) {
+        const capabilities = advertisedChatCapabilities(runtime);
+        assert.strictEqual(capabilities.questions, true, `${runtime} questions`);
+        assert.strictEqual(capabilities.planMode, true, `${runtime} Plan mode`);
+      }
+    });
+
+    it('advertises and constructs Grok with the shared ACP question path', function () {
+      // Grok is an ACP client, so it must receive the exact descriptor that
+      // session/new already passes to kimi and omp. The descriptor itself is
+      // opaque to the registry: that keeps a later socket-to-file transport
+      // change in the session bridge, rather than splitting Grok from ACP.
+      assert.strictEqual(advertisedChatCapabilities('grok').questions, true);
+      const adapter = createChatAdapter('grok', {
+        sessionId: 'grok-question',
+        workingDir: '/work',
+        command: '/nonexistent',
+        askMcpServer: {
+          name: 'ccweb', command: '/usr/bin/node', args: ['/bridge.js'],
+          env: { CCWEB_ASK_SOCKET: '/tmp/ask.sock' },
+        },
+        emit() {},
+      });
+      assert.ok(adapter, 'Grok must remain a chat runtime');
+      assert.strictEqual(adapter.runtime, 'grok');
     });
 
     it('matches the namespaced name a runtime reports the call under', function () {
@@ -589,6 +963,8 @@ describe('asking the user a choice-based question', function () {
       // and an exact-name table would have silently failed for it while
       // passing for Claude.
       assert.ok(isAskQuestionTool('mcp__ccweb_ask_user_question'));
+      // Codex app-server joins the MCP server and tool with a dot.
+      assert.ok(isAskQuestionTool('ccweb.ask_user_question'));
       assert.ok(isAskQuestionTool(ASK_TOOL_DEFINITION.name));
       assert.ok(!isAskQuestionTool('Bash'));
       assert.ok(!isAskQuestionTool(undefined));
@@ -676,7 +1052,11 @@ describe('asking the user a choice-based question', function () {
     function runServer(socketPath, calls) {
       return new Promise((resolve) => {
         const child = spawn(process.execPath, [ASK_SERVER], {
-          env: { ...process.env, CCWEB_ASK_SOCKET: socketPath },
+          env: {
+            ...process.env,
+            CCWEB_ASK_SOCKET: socketPath,
+            CCWEB_QUESTION_TOOL_ENABLED: '1',
+          },
           stdio: ['pipe', 'pipe', 'pipe'],
         });
         const replies = [];
@@ -760,6 +1140,745 @@ describe('asking the user a choice-based question', function () {
       // The one thing that must never happen here is silence.
       assert.strictEqual(reply.result.isError, true);
       assert.match(reply.result.content[0].text, /plain text/i);
+    });
+
+    it('scopes runtime disconnects and cancellations to the socket that asked', async function () {
+      broker = new PermissionBroker(path.join(root, 'sockets'));
+      const signals = new Map();
+      const socketPath = await broker.listen({
+        permission: async () => ({ allow: false }),
+        question: async (ask, signal) => {
+          signals.set(ask.question, signal);
+          return new Promise((resolve) => {
+            signal.addEventListener(
+              'abort',
+              () => resolve({ labels: [], error: 'caller closed' }),
+              { once: true },
+            );
+          });
+        },
+      });
+      const connect = () => new Promise((resolve, reject) => {
+        const socket = net.createConnection(socketPath, () => resolve(socket));
+        socket.once('error', reject);
+      });
+      const first = await connect();
+      const second = await connect();
+      try {
+        first.write(`${JSON.stringify({ id: 'same-id', kind: 'question', question: { question: 'first' } })}\n`);
+        second.write(`${JSON.stringify({ id: 'same-id', kind: 'question', question: { question: 'second' } })}\n`);
+        await eventuallyValue(() => signals.size === 2 ? signals : null, 'both socket questions were not received');
+
+        first.destroy();
+        await eventuallyValue(() => signals.get('first').aborted ? true : null, 'closing the first socket did not abort it');
+        assert.strictEqual(signals.get('second').aborted, false);
+
+        second.write(`${JSON.stringify({ id: 'same-id', kind: 'cancel' })}\n`);
+        await eventuallyValue(() => signals.get('second').aborted ? true : null, 'the second socket cancel was not scoped');
+      } finally {
+        first.destroy();
+        second.destroy();
+      }
+    });
+  });
+
+  /**
+   * Answering in words the question did not offer.
+   *
+   * The option list is written by the model, so it cannot anticipate "none of
+   * these is quite right" — and the models know it, which is why they keep
+   * writing that option themselves. Clicking it sent the model its own words
+   * back ("The user selected: 'Let me explain in my own words'"), which answers
+   * nothing and costs a turn. The card offers a textarea instead, and what is
+   * typed into it travels the same path an option id does: through the same
+   * frame, the same session call, the same tool result, and into the same log.
+   */
+  describe('answering in the user’s own words', function () {
+    describe('the option a model writes for it', function () {
+      it('is recognised however the model phrased it', function () {
+        for (const label of [
+          'Let me explain in my own words',
+          'let me explain in my own words.',
+          'I’ll answer in my own words',
+          'Other',
+          'Other (please specify)',
+          'Other…',
+          'None of these',
+          'None of the above',
+          'Something else',
+          'Write my own answer',
+        ]) {
+          assert.ok(isOwnWordsOption(label), `${label} should be read as an invitation to type`);
+        }
+      });
+
+      it('is not confused with an option that is a real choice', function () {
+        for (const label of [
+          'Rewrite it',
+          'Patch it',
+          'Other users',
+          'None of these files have changed',
+          'Otherwise, stop',
+          'Own the deployment',
+        ]) {
+          assert.ok(!isOwnWordsOption(label), `${label} is a choice, not a textarea`);
+        }
+      });
+
+      it('is taken out of the list the card offers, so the row is not drawn twice', function () {
+        const options = normalizeQuestionOptions([
+          { label: 'Persistent storage', description: 'kept between sessions' },
+          { label: 'Fresh checkout each time' },
+          { label: 'Let me explain in my own words', description: 'None of these is quite right.' },
+        ]);
+        const { choices, invitation } = splitOwnWordsOption(options);
+        assert.deepStrictEqual(choices.map((o) => o.label), [
+          'Persistent storage',
+          'Fresh checkout each time',
+        ]);
+        // The model's own wording is kept for the row, rather than replaced with
+        // this app's: it wrote a gloss, and the card can say what it said.
+        assert.strictEqual(invitation.label, 'Let me explain in my own words');
+        assert.strictEqual(invitation.description, 'None of these is quite right.');
+      });
+
+      it('leaves the list alone when there would be nothing left to click', function () {
+        const options = normalizeQuestionOptions(['Other', 'None of the above']);
+        const { choices, invitation } = splitOwnWordsOption(options);
+        assert.strictEqual(invitation, undefined);
+        assert.deepStrictEqual(choices.map((o) => o.label), ['Other', 'None of the above']);
+      });
+
+      it('has a default wording for the questions that do not offer one', function () {
+        assert.ok(isOwnWordsOption(OWN_WORDS_LABEL), 'the card’s own row must match its own rule');
+      });
+    });
+
+    describe('the session', function () {
+      it('carries typed words back to the waiting tool call', async function () {
+        const { s, store } = session();
+        const waiting = s.askQuestion(QUESTION);
+        const asked = store.events.find((e) => e.t === 'question').request;
+
+        s.answerQuestion(asked.requestId, [], false, 'Keep the container, but rebuild it nightly.');
+
+        const reply = await within(waiting, 'the typed answer never came back');
+        assert.strictEqual(reply.text, 'Keep the container, but rebuild it nightly.');
+        // Not one of the labels: a label is an option the model wrote, and the
+        // whole point of this answer is that the model did not write it.
+        assert.deepStrictEqual(reply.labels, []);
+        assert.notStrictEqual(reply.skipped, true, 'typing an answer is not skipping');
+      });
+
+      it('writes them to the transcript beside the picks, not instead of them', async function () {
+        const { s, store } = session();
+        s.askQuestion({
+          question: 'Which rules should I apply?',
+          multiSelect: true,
+          options: ['semicolons', 'trailing commas'],
+        });
+        const asked = store.events.find((e) => e.t === 'question').request;
+
+        await s.answerQuestion(asked.requestId, [asked.options[0].optionId], false, '…and no tabs.');
+
+        const resolved = store.events.find((e) => e.t === 'question_resolved');
+        assert.deepStrictEqual(resolved.optionIds, ['opt-0']);
+        assert.strictEqual(resolved.text, '…and no tabs.');
+        assert.notStrictEqual(resolved.skipped, true);
+      });
+
+      it('is still a skip when the box was left empty', async function () {
+        const { s, store } = session();
+        const waiting = s.askQuestion(QUESTION);
+        const asked = store.events.find((e) => e.t === 'question').request;
+
+        // What an empty textarea sends: whitespace is not an answer, and a card
+        // that reported it as one would tell the model the user had spoken.
+        s.answerQuestion(asked.requestId, [], false, '   \n  ');
+
+        const reply = await within(waiting, 'the empty answer never came back');
+        assert.strictEqual(reply.skipped, true);
+        assert.strictEqual(reply.text, undefined);
+        assert.strictEqual(
+          store.events.find((e) => e.t === 'question_resolved').text,
+          undefined,
+        );
+      });
+
+      it('never lets a skip carry words with it', async function () {
+        const { s, store } = session();
+        const waiting = s.askQuestion(QUESTION);
+        const asked = store.events.find((e) => e.t === 'question').request;
+
+        // Skip wins over anything left in the box. Both reach the server on the
+        // same frame, and "they skipped, and here is what they said" is not a
+        // state the model should ever have to reconcile.
+        s.answerQuestion(asked.requestId, [], true, 'half a thought');
+
+        const reply = await within(waiting, 'the skip never came back');
+        assert.strictEqual(reply.skipped, true);
+        assert.strictEqual(reply.text, undefined);
+      });
+    });
+
+    describe('what the model is told', function () {
+      it('says the answer was the user’s own, not one of the options it wrote', function () {
+        const { text, isError } = describeAnswer({ labels: [], text: 'Rebuild it nightly.' });
+        assert.match(text, /own words/i);
+        assert.match(text, /"Rebuild it nightly\."/);
+        assert.strictEqual(isError, false);
+        // The failure this guards: an answer of nothing-but-words reaching the
+        // "they skipped it, do not ask again" branch, which would throw away
+        // the one thing the user actually said.
+        assert.ok(!/skipped/i.test(text));
+      });
+
+      it('reports typed words alongside the options that were picked', function () {
+        const { text } = describeAnswer({ labels: ['semicolons'], text: '…and no tabs.' });
+        assert.match(text, /"semicolons"/);
+        assert.match(text, /own words: "…and no tabs\."/);
+      });
+
+      it('still reads an answer of nothing at all as a skip', function () {
+        const { text } = describeAnswer({ labels: [] });
+        assert.match(text, /skipped/i);
+      });
+
+      it('tells the model not to write the option itself', function () {
+        // The tool description is the only place a model reads about the
+        // textarea. Left out, it keeps writing its own "Let me explain" option,
+        // which is the bug the card can only paper over.
+        assert.match(ASK_TOOL_DEFINITION.description, /free-text/i);
+        assert.match(ASK_TOOL_DEFINITION.description, /own words/i);
+      });
+    });
+
+    describe('the transcript reducer', function () {
+      let n = 0;
+      const apply = (state, event) => {
+        applyChatEvent(state, { seq: (n += 1), ts: Date.now(), ...event });
+        return state;
+      };
+      const ask = (state, requestId, toolId) =>
+        apply(state, {
+          t: 'question',
+          request: {
+            requestId, toolId, question: 'Which?', multiSelect: false,
+            options: [{ optionId: 'opt-0', label: 'A' }], ts: 1,
+          },
+        });
+
+      it('keeps the words, keyed by the call that asked', function () {
+        const state = createTranscript({});
+        ask(state, 'q1', 't1');
+        apply(state, {
+          t: 'question_resolved', requestId: 'q1', toolId: 't1', optionIds: [], text: 'neither, really',
+        });
+
+        assert.strictEqual(state.answeredQuestionText.t1, 'neither, really');
+        // An empty pick list *with* words is not a skip. The card reads these
+        // two together, and on the ids alone it would draw "Skipped without
+        // answering" over an answer the user typed.
+        assert.deepStrictEqual(state.answeredQuestions.t1, []);
+      });
+
+      it('takes them back off a question answered a second time by clicking', function () {
+        const state = createTranscript({});
+        ask(state, 'q2', 't2');
+        apply(state, { t: 'question_resolved', requestId: 'q2', toolId: 't2', optionIds: [], text: 'first go' });
+        ask(state, 'q2', 't2');
+        apply(state, { t: 'question_resolved', requestId: 'q2', toolId: 't2', optionIds: ['opt-0'] });
+
+        assert.strictEqual(state.answeredQuestionText.t2, undefined);
+        assert.deepStrictEqual(state.answeredQuestions.t2, ['opt-0']);
+      });
+
+      it('does not keep them for a question that was skipped', function () {
+        const state = createTranscript({});
+        ask(state, 'q3', 't3');
+        apply(state, {
+          t: 'question_resolved', requestId: 'q3', toolId: 't3', optionIds: [], text: 'x', skipped: true,
+        });
+        assert.strictEqual(state.answeredQuestionText.t3, undefined);
+      });
+
+      it('drops them with the conversation when it is cleared', function () {
+        const state = createTranscript({});
+        ask(state, 'q4', 't4');
+        apply(state, { t: 'question_resolved', requestId: 'q4', toolId: 't4', optionIds: [], text: 'said so' });
+        apply(state, { t: 'marker', kind: 'cleared' });
+        assert.deepStrictEqual(state.answeredQuestionText, {});
+      });
+    });
+
+    describe('the socket frame a browser sends', function () {
+      /** A processor with nothing wired but the one chat session under test. */
+      function processorWith(answers) {
+        const record = {
+          id: 's1', ownerUserId: 7, name: 'chat', created: new Date(), lastActivity: new Date(),
+          active: true, agent: 'claude', workingDir: '/tmp', connections: new Set(),
+          outputBuffer: [], maxBufferSize: 10,
+        };
+        const processor = new MessageProcessor({
+          dev: false,
+          claudeSessions: new Map([['s1', record]]),
+          webSocketConnections: new Map([
+            ['w1', {
+              id: 'w1', ws: { readyState: 1, send() {} }, userId: 7, githubLogin: 'tester',
+              claudeSessionId: 's1', chatSessionIds: new Set(['s1']), created: new Date(),
+            }],
+          ]),
+          baseFolder: '/tmp',
+          sessionDurationHours: 5,
+          aliases: {},
+          validatePath: () => ({ valid: true, path: '/tmp' }),
+          getSelectedWorkingDir: () => '/tmp',
+          createSessionRecord: () => record,
+          getRuntimeBridge: () => null,
+          saveSessionsToDisk: async () => {},
+          chatManager: {
+            answerQuestion(...args) {
+              answers.push(args);
+              return true;
+            },
+          },
+        });
+        return processor;
+      }
+
+      it('reaches the session as the answer, trimmed', async function () {
+        const answers = [];
+        await processorWith(answers).handleMessage('w1', {
+          type: 'chat_question_answer',
+          sessionId: 's1',
+          requestId: 'req-1',
+          optionIds: [],
+          skipped: false,
+          text: '  Keep the container.  ',
+        });
+
+        assert.deepStrictEqual(answers, [['s1', 'req-1', [], false, 'Keep the container.']]);
+      });
+
+      it('bounds what it will take, because a frame is not a promise', async function () {
+        const answers = [];
+        await processorWith(answers).handleMessage('w1', {
+          type: 'chat_question_answer',
+          sessionId: 's1',
+          requestId: 'req-1',
+          optionIds: [],
+          text: 'x'.repeat(MAX_QUESTION_ANSWER_TEXT + 500),
+        });
+
+        assert.strictEqual(answers[0][4].length, MAX_QUESTION_ANSWER_TEXT);
+      });
+
+      it('sends nothing at all for a frame that carries no words', async function () {
+        const answers = [];
+        await processorWith(answers).handleMessage('w1', {
+          type: 'chat_question_answer',
+          sessionId: 's1',
+          requestId: 'req-1',
+          optionIds: ['opt-0'],
+        });
+
+        assert.strictEqual(answers[0][4], undefined);
+      });
+    });
+
+    it('carries the words the whole way, over the real socket', async function () {
+      // Every layer above is tested at its own seam; this is the one that says
+      // they are wired to each other. A textarea whose contents stop at any hop
+      // is a card that looks like it works and answers the model with silence.
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'askwords-'));
+      const broker = new PermissionBroker(path.join(root, 'sockets'));
+      try {
+        const socketPath = await broker.listen({
+          permission: async () => ({ allow: false }),
+          question: async () => ({ labels: [], text: 'A container per project, not per session.' }),
+        });
+
+        const child = spawn(process.execPath, [ASK_SERVER], {
+          env: {
+            ...process.env,
+            CCWEB_ASK_SOCKET: socketPath,
+            CCWEB_QUESTION_TOOL_ENABLED: '1',
+          },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        try {
+          const reply = await within(
+            new Promise((resolve) => {
+              let buffer = '';
+              child.stdout.setEncoding('utf8');
+              child.stdout.on('data', (chunk) => {
+                buffer += chunk;
+                const at = buffer.indexOf('\n');
+                if (at !== -1) resolve(JSON.parse(buffer.slice(0, at)));
+              });
+              child.stdin.write(`${JSON.stringify({
+                jsonrpc: '2.0', id: 1, method: 'tools/call',
+                params: { name: 'ask_user_question', arguments: QUESTION },
+              })}\n`);
+            }),
+            'the spawned MCP server never answered',
+            5000,
+          );
+          assert.match(reply.result.content[0].text, /A container per project, not per session\./);
+          assert.match(reply.result.content[0].text, /own words/i);
+          assert.notStrictEqual(reply.result.isError, true);
+        } finally {
+          child.kill();
+        }
+      } finally {
+        broker.close();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+});
+
+// A question nobody could answer (#174).
+//
+// The incident that produced this: a conversation on omp put two identical
+// cards on screen and the agent went on without either. Reconstructed from the
+// logs afterwards, three separate things had gone wrong.
+//
+// omp's MCP client abandons every `tools/call` after 30 seconds — a sensible
+// ceiling for a tool that computes something and a nonsense one for the tool
+// whose whole purpose is to wait for a person. Nothing on this side learned the
+// call had died, so both cards stayed live and clickable for the ten minutes
+// that followed, and a click would have gone into a request omp had already
+// dropped. And what the cards eventually said — "Skipped without answering" —
+// was written by the Stop button, blaming the user for a question they were
+// never in a position to answer.
+describe('a question the agent stopped waiting for', function () {
+  const ROOT_DIR = path.join(__dirname, '..');
+
+  function memoryStore() {
+    const events = [];
+    return {
+      events,
+      append(_ref, batch) { events.push(...batch); },
+      async stat() { return { firstSeq: 1, cursor: events.length }; },
+      async read() { return { events: [], firstSeq: 1, from: 1, cursor: events.length }; },
+      async snapshot() {
+        return {
+          sessionId: 's1', runtime: 'omp', messages: [], state: 'idle',
+          capabilities: {}, pendingPermissions: [], firstSeq: 1, replayFrom: 1,
+          cursor: events.length, live: true, bypassPermissions: false,
+        };
+      },
+    };
+  }
+
+  function bareSession() {
+    const store = memoryStore();
+    const s = new ChatSession(
+      { id: 's1', ownerUserId: 7 },
+      {
+        store,
+        socketDir: fs.mkdtempSync(path.join(os.tmpdir(), 'abandon-')),
+        hookScript: path.join(ROOT_DIR, 'does-not-exist.js'),
+        broadcast: () => {},
+        resolveCommand: () => 'omp',
+      },
+    );
+    return { s, store };
+  }
+
+  /** The tick the session defers its own resolution by, so ordering holds. */
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  describe('timeouts on the remaining ccweb tools', function () {
+    it('keeps measured client settings for Plan/tier calls, not as a question guarantee', function () {
+      // Questions never use these clients now. OMP's setting still protects
+      // the remaining ccweb calls, including a human-gated tier request.
+      assert.deepStrictEqual(askEnvFor('omp'), { OMP_MCP_TIMEOUT_MS: '0' });
+      // Kimi has no disable sentinel, so this finite maximum applies only to
+      // those non-question calls; questions use the durable handoff instead.
+      assert.deepStrictEqual(askEnvFor('kimi'), { KIMI_MCP_TOOL_TIMEOUT_MS: '2147483647' });
+      assert.ok(Number(askEnvFor('kimi').KIMI_MCP_TOOL_TIMEOUT_MS) >= 1);
+      // Nothing invented for the runtimes nobody has measured.
+      assert.deepStrictEqual(askEnvFor('claude'), {});
+      assert.deepStrictEqual(askEnvFor('nonesuch'), {});
+    });
+
+    it('is a copy, so one session cannot edit the table for the next', function () {
+      const first = askEnvFor('omp');
+      first.OMP_MCP_TIMEOUT_MS = '30000';
+      assert.strictEqual(askEnvFor('omp').OMP_MCP_TIMEOUT_MS, '0');
+    });
+  });
+
+  describe('the card that outlived its call', function () {
+    it('closes when the call that asked reports failed', async function () {
+      const { s, store } = bareSession();
+      const waiting = s.askQuestion({ ...QUESTION });
+      const asked = store.events.find((e) => e.t === 'question').request;
+      // The pairing that makes this possible: the pending question is filed
+      // under the tool call's id, and the failure patch carries the same one.
+      asked.toolId = 'write_20|fc_tmp_duo3u3bkp7';
+      s.questions.get(asked.requestId).request.toolId = asked.toolId;
+
+      s.ingest({
+        t: 'tool',
+        toolId: 'write_20|fc_tmp_duo3u3bkp7',
+        patch: { status: 'failed', error: 'MCP error: Request timeout after 30000ms' },
+      });
+      await settle();
+
+      const reply = await within(waiting, 'the blocked tool call was never released');
+      assert.ok(reply.error, 'the model is told, rather than left holding the call open');
+      assert.strictEqual(s.questions.size, 0);
+
+      const resolved = store.events.find((e) => e.t === 'question_resolved');
+      assert.ok(resolved, 'the card is taken down');
+      assert.strictEqual(resolved.abandoned, true);
+      assert.ok(!resolved.skipped, 'nobody skipped it — nobody was asked');
+    });
+
+    it('refuses an answer clicked after that point', async function () {
+      const { s, store } = bareSession();
+      s.askQuestion({ ...QUESTION });
+      const asked = store.events.find((e) => e.t === 'question').request;
+      s.questions.get(asked.requestId).request.toolId = 'call-1';
+
+      s.ingest({ t: 'tool', toolId: 'call-1', patch: { status: 'failed' } });
+      await settle();
+
+      // False is what the browser gets, and it is the truthful answer: omp
+      // deletes the request id inside its own timeout callback, so a reply
+      // written under it would have been dropped without a word.
+      assert.strictEqual(await s.answerQuestion(asked.requestId, [asked.options[0].optionId]), false);
+      const resolutions = store.events.filter((e) => e.t === 'question_resolved');
+      assert.strictEqual(resolutions.length, 1, 'and no second resolution invents an answer');
+    });
+
+    it('leaves the conversation running rather than waiting on nobody', async function () {
+      const { s, store } = bareSession();
+      s.askQuestion({ ...QUESTION });
+      const asked = store.events.find((e) => e.t === 'question').request;
+      s.questions.get(asked.requestId).request.toolId = 'call-1';
+      assert.strictEqual(s.state, 'awaiting_answer');
+
+      s.ingest({ t: 'tool', toolId: 'call-1', patch: { status: 'failed' } });
+      await settle();
+
+      assert.notStrictEqual(s.state, 'awaiting_answer');
+    });
+
+    it('says so after the patch that caused it, not before', async function () {
+      // Ordering, because the log is read back in sequence and a resolution
+      // numbered ahead of the failure that caused it reads as a card that
+      // closed for no reason. `ingest` is re-entrant-hostile; this is why the
+      // session defers.
+      const { s, store } = bareSession();
+      s.askQuestion({ ...QUESTION });
+      const asked = store.events.find((e) => e.t === 'question').request;
+      s.questions.get(asked.requestId).request.toolId = 'call-1';
+
+      s.ingest({ t: 'tool', toolId: 'call-1', patch: { status: 'failed' } });
+      await settle();
+
+      const failure = store.events.findIndex((e) => e.t === 'tool' && e.patch.status === 'failed');
+      const resolved = store.events.findIndex((e) => e.t === 'question_resolved');
+      assert.ok(failure >= 0 && resolved > failure, 'the failure is recorded first');
+    });
+
+    it('leaves a call that succeeded alone', async function () {
+      // A question tool call *completes* precisely when somebody answered it,
+      // and the answer has already been recorded by the time the status lands.
+      const { s, store } = bareSession();
+      s.askQuestion({ ...QUESTION });
+      const asked = store.events.find((e) => e.t === 'question').request;
+      s.questions.get(asked.requestId).request.toolId = 'call-1';
+
+      s.ingest({ t: 'tool', toolId: 'call-1', patch: { status: 'completed' } });
+      await settle();
+
+      assert.strictEqual(s.questions.size, 1, 'the card is still live');
+      assert.ok(!store.events.some((e) => e.t === 'question_resolved'));
+    });
+
+    it('leaves another call’s question alone', async function () {
+      const { s, store } = bareSession();
+      s.askQuestion({ ...QUESTION });
+      const asked = store.events.find((e) => e.t === 'question').request;
+      s.questions.get(asked.requestId).request.toolId = 'call-1';
+
+      s.ingest({ t: 'tool', toolId: 'some-other-call', patch: { status: 'failed' } });
+      await settle();
+
+      assert.strictEqual(s.questions.size, 1);
+    });
+
+    it('takes the card down when the conversation is closed', async function () {
+      const { s, store } = bareSession();
+      const waiting = s.askQuestion({ ...QUESTION });
+      await s.stop();
+
+      const reply = await within(waiting, 'the tool call was never released');
+      assert.ok(reply.error);
+      // The event is the point: resolving the promise unblocks the runtime, and
+      // does nothing for a browser already watching, which went on offering
+      // buttons until something made it rebuild from scratch.
+      const resolved = store.events.find((e) => e.t === 'question_resolved');
+      assert.ok(resolved, 'a browser already watching is told too');
+      assert.strictEqual(resolved.abandoned, true);
+    });
+  });
+
+  describe('the client’s record of it', function () {
+    it('is a different fact from a skip, and survives a rejoin', function () {
+      const state = createTranscript({});
+      applyChatEvent(state, {
+        t: 'question', seq: 1, ts: 1,
+        request: { requestId: 'q1', toolId: 't1', question: 'which?', options: [] },
+      });
+      applyChatEvent(state, {
+        t: 'question_resolved', seq: 2, ts: 2, requestId: 'q1', toolId: 't1',
+        optionIds: [], abandoned: true,
+      });
+
+      // Both are recorded: an empty list of picks is what the card draws, and
+      // the flag is what tells it which sentence to draw underneath.
+      assert.deepStrictEqual(state.answeredQuestions.t1, []);
+      assert.strictEqual(state.abandonedQuestions.t1, true);
+      assert.deepStrictEqual(state.pendingQuestions, []);
+    });
+
+    it('is cleared when the same question is asked again and answered', function () {
+      // The retry in the incident: the agent asked the identical question a
+      // second time. A stale "nobody could answer this" left under a card that
+      // was answered on the retry would be the same wrong sentence in the other
+      // direction.
+      const state = createTranscript({});
+      applyChatEvent(state, {
+        t: 'question_resolved', seq: 1, ts: 1, requestId: 'q1', toolId: 't1',
+        optionIds: [], abandoned: true,
+      });
+      applyChatEvent(state, {
+        t: 'question_resolved', seq: 2, ts: 2, requestId: 'q2', toolId: 't1',
+        optionIds: ['opt-0'],
+      });
+
+      assert.deepStrictEqual(state.answeredQuestions.t1, ['opt-0']);
+      assert.strictEqual(state.abandonedQuestions.t1, undefined);
+    });
+
+    it('goes back to nothing on /clear, with the cards it belongs to', function () {
+      const state = createTranscript({});
+      applyChatEvent(state, {
+        t: 'question_resolved', seq: 1, ts: 1, requestId: 'q1', toolId: 't1',
+        optionIds: [], abandoned: true,
+      });
+      applyChatEvent(state, { t: 'marker', seq: 2, ts: 2, kind: 'cleared', detail: '' });
+      assert.deepStrictEqual(state.abandonedQuestions, {});
+    });
+  });
+
+  describe('the cancel an MCP client sends', function () {
+    it('reaches the session as an abandonment, and answers nothing', async function () {
+      // kimi does send `notifications/cancelled` when it gives up; omp does
+      // not. Swallowed here until now, at the `id === undefined` guard that
+      // exists for notifications generally.
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const cancelled = [];
+      const written = [];
+      let resolveAsk;
+      output.on('data', (chunk) => written.push(String(chunk)));
+
+      serveAsk(
+        input,
+        output,
+        (_question, onSent) => new Promise((resolve) => {
+          resolveAsk = resolve;
+          onSent?.('ask-42');
+        }),
+        undefined,
+        (askId) => {
+          cancelled.push(askId);
+          // Production AskChannel.cancel resolves the promise as part of
+          // tearing the question down. The response must still stay silent.
+          resolveAsk({ labels: [], error: 'the agent stopped waiting for an answer' });
+        },
+      );
+
+      input.write(`${JSON.stringify({
+        jsonrpc: '2.0', id: 7, method: 'tools/call',
+        params: { name: 'ask_user_question', arguments: QUESTION },
+      })}\n`);
+      await settle();
+      input.write(`${JSON.stringify({
+        jsonrpc: '2.0', method: 'notifications/cancelled',
+        params: { requestId: 7, reason: 'Request timeout after 60000ms' },
+      })}\n`);
+      await settle();
+
+      assert.deepStrictEqual(cancelled, ['ask-42'], 'the question it names, not some other one');
+      assert.ok(
+        !written.some((line) => line.includes('"id":7')),
+        'a cancelled request wants no reply — the call is already over at the other end',
+      );
+    });
+
+    it('ignores a cancel for a call it never had', async function () {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const cancelled = [];
+      serveAsk(input, output, () => new Promise(() => {}), undefined, (id) => cancelled.push(id));
+
+      input.write(`${JSON.stringify({
+        jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 99 },
+      })}\n`);
+      await settle();
+
+      assert.deepStrictEqual(cancelled, []);
+    });
+
+    it('keeps numeric and string request ids distinct', async function () {
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const cancelled = [];
+      const resolvers = new Map();
+      const written = [];
+      output.on('data', (chunk) => written.push(String(chunk)));
+
+      serveAsk(
+        input,
+        output,
+        (question, onSent) => new Promise((resolve) => {
+          const askId = `ask-${question.question}`;
+          resolvers.set(askId, resolve);
+          onSent?.(askId);
+        }),
+        undefined,
+        (askId) => {
+          cancelled.push(askId);
+          resolvers.get(askId)({ labels: [], error: 'cancelled' });
+        },
+      );
+
+      for (const [id, question] of [[7, 'number'], ['7', 'string']]) {
+        input.write(`${JSON.stringify({
+          jsonrpc: '2.0', id, method: 'tools/call',
+          params: { name: 'ask_user_question', arguments: { ...QUESTION, question } },
+        })}\n`);
+      }
+      await settle();
+      input.write(`${JSON.stringify({
+        jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 7 },
+      })}\n`);
+      await settle();
+      resolvers.get('ask-string')({ labels: ['Patch it'] });
+      await settle();
+
+      assert.deepStrictEqual(cancelled, ['ask-number']);
+      const responses = written.join('').trim().split('\n').filter(Boolean).map(JSON.parse);
+      assert.strictEqual(responses.length, 1, 'only the uncancelled call receives a response');
+      assert.strictEqual(responses[0].id, '7');
     });
   });
 });

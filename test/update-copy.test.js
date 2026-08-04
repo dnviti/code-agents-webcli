@@ -87,6 +87,13 @@ describe('describeUpdate', function () {
     assert.match(view.text, /docker pull/);
   });
 
+  it('points a desktop install at release installers', function () {
+    const view = describeUpdate(response({ mode: 'desktop', canTrigger: false }));
+    assert.strictEqual(view.action, null);
+    assert.match(view.text, /newer desktop build/);
+    assert.match(view.text, /github\.com\/dnviti\/code-agents-webcli\/releases/);
+  });
+
   it('points a source checkout at git pull', function () {
     // A clean dev clone: state is 'behind' and dirty is false, so only the mode
     // stops a global install that would not replace the running code.

@@ -11,14 +11,28 @@ import { showError } from './overlay';
 
 export class FolderBrowser {
   private app: App;
+  private projectContext: { projectId: string; sessionId: string } | null = null;
+  private currentProjectPath: string | null = null;
 
   constructor(app: App) {
     this.app = app;
   }
 
-  async show(): Promise<void> {
-    shellStore.patchSlice('folder', { open: true, creating: false });
-    await this.loadFolders(this.app.currentFolderPath);
+  async show(options: { host?: boolean } = {}): Promise<void> {
+    const shell = shellStore.getSnapshot();
+    const active = shell.tabs.find((tab) => tab.id === shell.activeId);
+    this.projectContext = !options.host && active?.projectId
+      ? { projectId: active.projectId, sessionId: active.id }
+      : null;
+    this.currentProjectPath = null;
+    shellStore.patchSlice('folder', {
+      open: true,
+      creating: false,
+      ...(this.projectContext
+        ? { path: null, parentPath: null, entries: [], workingDirKind: 'container', lifetime: null }
+        : {}),
+    });
+    await this.loadFolders(this.projectContext ? null : this.app.currentFolderPath);
   }
 
   close(): void {
@@ -31,6 +45,10 @@ export class FolderBrowser {
     const params = new URLSearchParams();
     if (path) params.append('path', path);
     if (showHidden) params.append('showHidden', 'true');
+    if (this.projectContext) {
+      params.set('projectId', this.projectContext.projectId);
+      params.set('sessionId', this.projectContext.sessionId);
+    }
 
     shellStore.patchSlice('folder', { loading: true });
 
@@ -42,11 +60,14 @@ export class FolderBrowser {
       }
 
       const data: FolderData = await response.json();
-      this.app.currentFolderPath = data.currentPath;
+      if (this.projectContext) this.currentProjectPath = data.currentPath;
+      else this.app.currentFolderPath = data.currentPath;
       shellStore.patchSlice('folder', {
         path: data.currentPath,
         parentPath: data.parentPath,
         entries: data.folders,
+        workingDirKind: data.workingDirKind || (this.projectContext ? 'container' : 'host'),
+        lifetime: data.lifetime || null,
         loading: false,
       });
     } catch (error: unknown) {
@@ -62,7 +83,7 @@ export class FolderBrowser {
 
   async setShowHidden(showHidden: boolean): Promise<void> {
     shellStore.patchSlice('folder', { showHidden });
-    await this.loadFolders(this.app.currentFolderPath);
+    await this.loadFolders(this.currentPath());
   }
 
   async navigateToParent(): Promise<void> {
@@ -106,8 +127,9 @@ export class FolderBrowser {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          parentPath: this.app.currentFolderPath || '/',
+          parentPath: this.currentPath() || '/',
           folderName: name,
+          ...(this.projectContext ? { projectId: this.projectContext.projectId } : {}),
         }),
       });
 
@@ -117,7 +139,7 @@ export class FolderBrowser {
       }
 
       this.hideCreateFolderInput();
-      await this.loadFolders(this.app.currentFolderPath);
+      await this.loadFolders(this.currentPath());
     } catch (error: unknown) {
       const msg = error instanceof Error ? error.message : String(error);
       console.error('Failed to create folder:', error);
@@ -126,12 +148,13 @@ export class FolderBrowser {
   }
 
   async selectCurrentFolder(): Promise<void> {
-    if (!this.app.currentFolderPath) {
+    const currentPath = this.currentPath();
+    if (!currentPath) {
       showError('No folder selected');
       return;
     }
 
-    this.app.selectedWorkingDir = this.app.currentFolderPath;
+    if (!this.projectContext) this.app.selectedWorkingDir = currentPath;
 
     if (!this.app.currentClaudeSessionId || this.app.isCreatingNewSession) {
       await this.createSessionForSelectedFolderAndPrompt();
@@ -143,8 +166,14 @@ export class FolderBrowser {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          path: this.app.currentFolderPath,
-          sessionId: this.app.currentClaudeSessionId,
+          path: currentPath,
+          sessionId: this.projectContext?.sessionId || this.app.currentClaudeSessionId,
+          ...(this.projectContext
+            ? {
+                projectId: this.projectContext.projectId,
+                projectWorkingDirKind: 'container',
+              }
+            : {}),
         }),
       });
 
@@ -163,7 +192,9 @@ export class FolderBrowser {
   }
 
   private async createSessionForSelectedFolderAndPrompt(): Promise<void> {
-    const workingDir = this.app.selectedWorkingDir || this.app.currentFolderPath;
+    const workingDir = this.projectContext
+      ? this.currentProjectPath
+      : this.app.selectedWorkingDir || this.app.currentFolderPath;
     if (!workingDir) {
       showError('No folder selected');
       return;
@@ -175,14 +206,23 @@ export class FolderBrowser {
       const response = await this.app.authFetch('/api/sessions/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: defaultName, workingDir }),
+        body: JSON.stringify({
+          name: defaultName,
+          workingDir,
+          ...(this.projectContext
+            ? {
+                projectId: this.projectContext.projectId,
+                projectWorkingDirKind: 'container',
+              }
+            : {}),
+        }),
       });
 
       if (!response.ok) throw new Error('Failed to create session');
 
       const data = await response.json();
       this.close();
-      this.app.selectedWorkingDir = data.session.workingDir;
+      if (!this.projectContext) this.app.selectedWorkingDir = data.session.workingDir;
       this.app.startPromptRequested = true;
 
       if (this.app.sessionTabManager) {
@@ -192,6 +232,10 @@ export class FolderBrowser {
           'idle',
           data.session.workingDir,
           false,
+          undefined,
+          data.session.projectId ?? this.projectContext?.projectId,
+          data.session.projectName,
+          data.session.projectWorkingDirKind || (this.projectContext ? 'container' : undefined),
         );
         await this.app.sessionTabManager.switchToTab(data.sessionId);
       } else {
@@ -204,5 +248,9 @@ export class FolderBrowser {
       console.error('Failed to create session for selected folder:', error);
       showError('Failed to create session');
     }
+  }
+
+  private currentPath(): string | null {
+    return this.projectContext ? this.currentProjectPath : this.app.currentFolderPath;
   }
 }

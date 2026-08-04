@@ -7,6 +7,9 @@ const { AcpChatAdapter } = require('../dist/server/chat/adapters/acp.js');
 const { ClaudeChatAdapter } = require('../dist/server/chat/adapters/claude.js');
 const { CodexAppServerAdapter } = require('../dist/server/chat/adapters/codex.js');
 const { PiChatAdapter } = require('../dist/server/chat/adapters/pi.js');
+const {
+  AntigravityChatAdapter,
+} = require('../dist/server/chat/adapters/antigravity.js');
 const { UsageAccountant } = require('../dist/server/chat/usage-accounting.js');
 const { applyChatEvent, createTranscript } = require('../dist/shared/chat-reducer.js');
 const {
@@ -147,6 +150,30 @@ const RUNTIMES = [
     fixture: 'acp-grok.jsonl',
     acp: true,
   },
+  {
+    // agy 1.1.8, `--print --output-format stream-json`, asked to read a file,
+    // edit it and create another. The capture holds a run_command, a
+    // replace_file_content and a write_to_file.
+    runtime: 'antigravity',
+    fixture: 'antigravity-tool-turn.jsonl',
+    async drive(emit) {
+      const adapter = new AntigravityChatAdapter({
+        sessionId: 'chat-1',
+        workingDir: '/work',
+        command: '/nonexistent',
+        emit,
+      });
+      // `start()` is skipped rather than stubbed: it would spawn `agy models`
+      // for the picker, which is the one thing in this adapter that is not a
+      // pure function of the capture. What `send()` sets up before the first
+      // line arrives is set here instead, which is exactly the two fields
+      // below — the same shape as the `writeLine` stub the codex entry uses.
+      adapter.currentTurnId = 'turn-1';
+      adapter.turnInFlight = true;
+      userTurn(emit, 'turn-1');
+      for (const line of fixture('antigravity-tool-turn.jsonl')) adapter.handleMessage(line);
+    },
+  },
 ];
 
 for (const entry of RUNTIMES) {
@@ -178,11 +205,12 @@ for (const entry of RUNTIMES) {
     // for its reply — the line carrying the turn's spend — to be delivered to
     // anything at all. Feeding the capture without it drops the one message
     // that says what the turn cost.
-    await adapter.send({ text: 'do the thing' });
+    const sending = adapter.send({ text: 'do the thing' });
     for (const line of lines.slice(2)) {
       adapter.handleMessage(line);
       await flush();
     }
+    await sending;
   };
 }
 
@@ -477,9 +505,13 @@ describe('a runtime reporting its own commands does not drop what is installed',
     // On the event too, not just on the session's copy: the browser builds its
     // menu from the log, so a merge applied only locally is a menu that differs
     // between the server and every client reading it.
+    // The one carrying commands. A pi session now also announces that it can
+    // ask questions (#174), which is a `capabilities` event of its own and
+    // arrives first — taking whichever came first found that one and read it as
+    // a command list that had lost everything.
     const reported = broadcast
       .map((message) => message.event)
-      .find((event) => event && event.t === 'capabilities');
+      .find((event) => event && event.t === 'capabilities' && event.capabilities.commands);
     assert.deepStrictEqual(
       (reported.capabilities.commands || []).map((command) => command.name),
       ['compact', 'commit'],

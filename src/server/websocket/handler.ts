@@ -26,6 +26,9 @@ export const SERVER_FEATURES = [
   // Carry the unsent composer — the half-typed prompt and the files already
   // attached to it — between every screen the account has open (#163).
   'chat_draft',
+  // Admit an app-bundled guided workflow with a correlated result, so a popup
+  // closes only after the server has taken ownership of its prompt.
+  'chat_builtin_workflow',
 ] as const;
 
 export class WebSocketHandler {
@@ -81,19 +84,38 @@ export class WebSocketHandler {
     };
     this.deps.webSocketConnections.set(wsId, wsInfo);
 
-    ws.on('message', async (message: WebSocket.RawData) => {
-      try {
-        const data = JSON.parse(message.toString());
-        await this.messageProcessor.handleMessage(wsId, data);
-      } catch (error) {
-        if (this.deps.dev) {
-          console.error('Error handling message:', error);
+    // A socket opened with ?sessionId= is not ready to drive that session just
+    // because its transport is open. Project admission can await container and
+    // lease checks before joinSession attaches claudeSessionId. Browsers send
+    // resize/start frames as soon as onopen fires, so let those frames queue
+    // behind the initial join instead of answering a healthy terminal with
+    // "No session joined".
+    let initialJoin: Promise<void> = Promise.resolve();
+
+    // EventEmitter does not await an async listener. Without an explicit
+    // per-socket queue, start_chat, a Plan-mode switch and the prompt typed
+    // immediately after it all run concurrently: the prompt can reach the chat
+    // manager before either prerequisite has finished and is then rejected as
+    // though the conversation were not running. Preserve WebSocket wire order;
+    // a failed frame is handled inside its own task so later frames still run.
+    let inboundMessages: Promise<void> = Promise.resolve();
+
+    ws.on('message', (message: WebSocket.RawData) => {
+      inboundMessages = inboundMessages.then(async () => {
+        try {
+          await initialJoin;
+          const data = JSON.parse(message.toString());
+          await this.messageProcessor.handleMessage(wsId, data);
+        } catch (error) {
+          if (this.deps.dev) {
+            console.error('Error handling message:', error);
+          }
+          sendToWebSocket(ws, {
+            type: 'error',
+            message: 'Failed to process message',
+          });
         }
-        sendToWebSocket(ws, {
-          type: 'error',
-          message: 'Failed to process message',
-        });
-      }
+      });
     });
 
     ws.on('close', () => {
@@ -130,7 +152,7 @@ export class WebSocketHandler {
     // the whole process down.
     if (claudeSessionId) {
       if (this.deps.claudeSessions.has(claudeSessionId)) {
-        void this.messageProcessor.joinSession(wsId, claudeSessionId).catch((error) => {
+        initialJoin = this.messageProcessor.joinSession(wsId, claudeSessionId).catch((error) => {
           console.error(`Failed to auto-join session ${claudeSessionId}:`, error);
           sendToWebSocket(ws, {
             type: 'error',
@@ -151,25 +173,10 @@ export class WebSocketHandler {
   }
 
   cleanupConnection(wsId: string): void {
-    const wsInfo = this.deps.webSocketConnections.get(wsId);
-    if (!wsInfo) return;
-
-    wsInfo.chatSessionIds.clear();
-
-    // Remove from session if joined
-    if (wsInfo.claudeSessionId) {
-      const session = this.deps.claudeSessions.get(wsInfo.claudeSessionId);
-      if (session) {
-        session.connections.delete(wsId);
-        session.lastActivity = new Date();
-
-        if (session.connections.size === 0 && this.deps.dev) {
-          console.log(`No more connections to session ${wsInfo.claudeSessionId}`);
-        }
-      }
-    }
-
-    this.deps.webSocketConnections.delete(wsId);
+    // MessageProcessor owns the non-persisted project lease maps. Routing both
+    // close and error through the same idempotent hook prevents either event
+    // from leaving an attachment claim behind.
+    this.messageProcessor.cleanupConnection(wsId);
   }
 }
 
@@ -222,8 +229,12 @@ export function sendToUser(
 export function announceSessionOpened(
   session: SessionRecord,
   webSocketConnections: Map<string, WebSocketInfo>,
+  projectName?: string | null,
 ): void {
-  if (session.ownerSessionId) return;
+  // A runtime relaunch re-announces its metadata through this same helper. That
+  // must not turn a conversation the account closed back into a tab; only the
+  // explicit tab-open route changes this durable state.
+  if (session.ownerSessionId || session.tabOpen === false) return;
 
   sendToUser(
     session.ownerUserId,
@@ -233,12 +244,55 @@ export function announceSessionOpened(
       name: session.name,
       customName: session.customName ?? null,
       workingDir: session.workingDir,
+      projectId: session.projectId,
+      ...(projectName !== undefined ? { projectName } : {}),
+      projectWorkingDirKind: session.projectWorkingDirKind,
       surface: session.surface || 'terminal',
       active: session.active,
       // So a conversation that appears on a second screen states the mode it is
       // really in from its first paint, the same way a tab restored on page
       // load does.
       bypassPermissions: session.chatBypassPermissions === true,
+    },
+    webSocketConnections,
+  );
+}
+
+/**
+ * Tell every screen belonging to an account to remove one tab.
+ *
+ * Distinct from `announceSessionClosed`: a tab close preserves the conversation,
+ * transcript, runtime and any shells it owns. A client that treated this as
+ * `session_deleted` would erase local conversation state for a record that is
+ * still available from the conversation list.
+ */
+export function announceSessionTabClosed(
+  session: SessionRecord,
+  webSocketConnections: Map<string, WebSocketInfo>,
+): void {
+  if (session.ownerSessionId) return;
+
+  sendToUser(
+    session.ownerUserId,
+    {
+      type: 'session_tab_closed',
+      sessionId: session.id,
+    },
+    webSocketConnections,
+  );
+}
+
+/** Tell only this account's screens the authoritative order of its open tabs. */
+export function announceSessionTabsReordered(
+  userId: number,
+  sessionIds: string[],
+  webSocketConnections: Map<string, WebSocketInfo>,
+): void {
+  sendToUser(
+    userId,
+    {
+      type: 'session_tabs_reordered',
+      sessionIds,
     },
     webSocketConnections,
   );

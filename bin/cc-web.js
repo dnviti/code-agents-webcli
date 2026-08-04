@@ -80,11 +80,105 @@ program
   .option('--qwen-alias <name>', 'display alias for Qwen Code (default: env QWEN_ALIAS or "Qwen")')
   .option('--kimi-alias <name>', 'display alias for Kimi Code (default: env KIMI_ALIAS or "Kimi")')
   .option('--omp-alias <name>', 'display alias for Oh My Pi (default: env OMP_ALIAS or "Oh My Pi")')
+  .option('--antigravity-alias <name>', 'display alias for Antigravity CLI (default: env ANTIGRAVITY_ALIAS or "Antigravity")')
   .option('--ngrok-auth-token <token>', 'ngrok auth token to open a public tunnel')
   .option('--ngrok-domain <domain>', 'ngrok reserved domain to use for the tunnel')
-  .parse();
+  .option('--containers', 'give every signed-in user their own isolated container')
+  .option('--container-engine <engine>', 'docker or podman (default: docker)')
+  .option('--container-image <image>', 'base image each user environment starts from')
+  .option('--container-cpus <cpus>', 'CPU limit per user environment, e.g. 2')
+  .option('--container-memory <size>', 'memory limit per user environment, e.g. 2g')
+  .option('--container-idle-minutes <minutes>', 'stop an environment after this long idle (0 = never)')
+  .option('--container-setup <command>', 'shell run once inside each newly created environment')
+  .option('--container-tiers <spec>', 'sizes users may pick, e.g. "small=1,1g;medium=2,2g;large=4,4g"')
+  .option('--container-default-tier <id>', 'size a user who has never chosen gets')
+  .option('--no-container-user-tier-choice', 'stop users choosing their own size')
+  .option('--kube-context <name>', 'kubectl context to create environments in')
+  .option('--kube-namespace <name>', 'namespace for the environment pods (default: default)')
+  .option('--kube-storage-claim <name>', 'ReadWriteMany claim holding every user home')
+  .option('--kube-service-account <name>', 'service account for the environment pods')
+  .option('--encryption-key <key>', 'base64 or hex 32-byte key encrypting deploy-target secrets at rest');
 
-const options = program.opts();
+/**
+ * Operator commands for the per-user environments.
+ *
+ * Deliberately outside the running server: an operator revoking somebody's
+ * access needs to remove their environment whether or not the server is up,
+ * and the container engine — not the app — is the authority on what exists.
+ */
+function environmentManager() {
+  const {
+    EnvironmentManager,
+    createContainerConfig,
+  } = require('../dist/server/services/environments/index.js');
+  const opts = program.opts();
+  const config = createContainerConfig({
+    containers: true,
+    containerEngine: opts.containerEngine,
+    dataDir: opts.dataDir,
+    kubeContext: opts.kubeContext,
+    kubeNamespace: opts.kubeNamespace,
+    kubeStorageClaim: opts.kubeStorageClaim,
+  });
+  return { manager: new EnvironmentManager({ config, hostHome: process.cwd() }), engine: config.engine };
+}
+
+/** Turn a missing engine binary into a sentence instead of a spawn errno. */
+async function withEngine(work) {
+  const { manager, engine } = environmentManager();
+  try {
+    return await work(manager);
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      console.error(
+        `${engine} is not installed on this machine, or is not on PATH. `
+        + 'Install it, or name the other engine with --container-engine.',
+      );
+      process.exit(1);
+    }
+    throw error;
+  }
+}
+
+const environments = program
+  .command('env')
+  .description('list and remove per-user container environments');
+
+environments
+  .command('ls')
+  .description('list environments with their owners')
+  .action(async () => {
+    const list = await withEngine((manager) => manager.list());
+    if (!list.length) {
+      console.log('No per-user environments exist.');
+      return;
+    }
+    console.log(['NAME', 'OWNER', 'USER ID', 'STATUS', 'IMAGE'].join('\t'));
+    for (const item of list) {
+      console.log([
+        item.name,
+        item.githubLogin || '?',
+        item.userId ?? '?',
+        item.status,
+        item.image,
+      ].join('\t'));
+    }
+  });
+
+environments
+  .command('rm <name>')
+  .description('remove an environment')
+  .option('--purge-data', "also delete the user's persistent home directory")
+  .action(async (name, commandOptions) => {
+    await withEngine((manager) => manager.remove(name, {
+      purgeData: commandOptions.purgeData === true,
+    }));
+    console.log(
+      commandOptions.purgeData
+        ? `Removed ${name} and deleted its data.`
+        : `Removed ${name}. Its data is still on disk; pass --purge-data to delete it too.`,
+    );
+  });
 
 async function openUrl(url) {
   const { default: open } = await import('open');
@@ -92,6 +186,9 @@ async function openUrl(url) {
 }
 
 async function main() {
+  // Read after parsing, not before: this is the object commander fills in.
+  const options = program.opts();
+
   try {
     const port = parseInt(options.port, 10);
     
@@ -129,6 +226,29 @@ async function main() {
       qwenAlias: options.qwenAlias || process.env.QWEN_ALIAS || 'Qwen',
       kimiAlias: options.kimiAlias || process.env.KIMI_ALIAS || 'Kimi',
       ompAlias: options.ompAlias || process.env.OMP_ALIAS || 'Oh My Pi',
+      antigravityAlias:
+        options.antigravityAlias || process.env.ANTIGRAVITY_ALIAS || 'Antigravity',
+      // Per-user container environments. Absent means the historical
+      // behaviour: everything runs on this host, as this account.
+      containers: options.containers === true,
+      containerEngine: options.containerEngine,
+      containerImage: options.containerImage,
+      containerCpus: options.containerCpus,
+      containerMemory: options.containerMemory,
+      containerIdleMinutes: options.containerIdleMinutes !== undefined
+        ? Number(options.containerIdleMinutes)
+        : undefined,
+      containerSetupCommand: options.containerSetup,
+      containerTiers: options.containerTiers,
+      containerDefaultTier: options.containerDefaultTier,
+      // commander turns `--no-x` into `x: false`, so this is only ever false
+      // when the operator asked for it.
+      containerUserTierChoice: options.containerUserTierChoice,
+      kubeContext: options.kubeContext,
+      kubeNamespace: options.kubeNamespace,
+      kubeStorageClaim: options.kubeStorageClaim,
+      kubeServiceAccount: options.kubeServiceAccount,
+      encryptionKey: options.encryptionKey,
       folderMode: true // Always use folder mode
     };
 
@@ -151,10 +271,30 @@ async function main() {
       ['Qwen', serverOptions.qwenAlias],
       ['Kimi', serverOptions.kimiAlias],
       ['Oh My Pi', serverOptions.ompAlias],
+      ['Antigravity', serverOptions.antigravityAlias],
     ]
       .map(([name, alias]) => `${name} → "${alias}"`)
       .join(', ');
     console.log(`Aliases: ${aliasBanner}`);
+    const deployTargetsEnabled =
+      process.env.CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED === 'true';
+    const legacyContainersRequested =
+      serverOptions.containers || process.env.CODE_AGENTS_WEBCLI_CONTAINERS === 'true';
+    if (deployTargetsEnabled && legacyContainersRequested) {
+      const engine = serverOptions.containerEngine
+        || process.env.CODE_AGENTS_WEBCLI_CONTAINER_ENGINE
+        || 'docker';
+      console.log(
+        engine === 'kubernetes'
+          ? `Environments: one pod per user, in namespace ${serverOptions.kubeNamespace || process.env.CODE_AGENTS_WEBCLI_KUBE_NAMESPACE || 'default'}`
+          : `Environments: one container per user, via ${engine}`,
+      );
+    } else if (legacyContainersRequested) {
+      console.warn(
+        'Containerized environments are disabled. Set '
+        + 'CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED=true to enable them.',
+      );
+    }
 
     const appServer = new ClaudeCodeWebServer(serverOptions);
 
@@ -270,4 +410,16 @@ async function main() {
   }
 }
 
-main();
+// Starting the server is the root command's own action, not something done
+// after parsing. Once a program has subcommands, commander answers a bare
+// invocation with the help text unless the root has an action of its own — so
+// leaving this out stopped `cc-web` from starting at all, which is the one
+// thing it must always do.
+program.action(() => main());
+
+// parseAsync, not parse: the `env` subcommands do real work and their actions
+// are async.
+program.parseAsync().catch((error) => {
+  console.error(error.message);
+  process.exit(1);
+});

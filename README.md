@@ -1,9 +1,9 @@
 # Code Agents Web CLI
 
-Run Claude Code, Codex, Cursor Agent, pi, Grok, Qwen, Kimi, Oh My Pi and plain
-shells from a browser — on your phone, on a tablet, from another machine on your
-network. One Node process, GitHub sign-in, real terminals, sessions that survive
-a reload.
+Run Claude Code, Codex, Cursor Agent, pi, Grok, Qwen, Kimi, Oh My Pi,
+Antigravity CLI and plain shells from a browser — on your phone, on a tablet,
+from another machine on your network. One Node process, GitHub sign-in, real
+terminals, sessions that survive a reload.
 
 ```bash
 npx --allow-git=all github:dnviti/code-agents-webcli
@@ -12,12 +12,24 @@ npx --allow-git=all github:dnviti/code-agents-webcli
 That is the whole install. Nothing compiles, nothing needs a C++ toolchain, and
 there is no second command.
 
+Prefer a local native window? Download the **[desktop app](docs/desktop.md)**
+for Linux, Windows or macOS. It is self-contained: no terminal, Node.js,
+separately running server or GitHub OAuth is needed to launch it.
+
 ---
 
 ## What it does
 
-- **Real terminals, not a chat box.** Full pseudo-terminals over WebSocket with
-  xterm.js — TUIs, colours, Ctrl-C, the lot.
+- **Real terminals, not just a chat box.** Full pseudo-terminals over WebSocket
+  with xterm.js — TUIs, colours, Ctrl-C, the lot.
+- **Or a structured conversation, when you want one.** The **WebUI (beta)**
+  opens most of the same agents as message bubbles, tool-call cards, diffs and
+  permission prompts instead of a raw TUI, with a trace panel beside it and a
+  GitHub panel that knows what a PR or issue is linked to.
+- **Plan first, then implement.** A durable Plan mode works with every WebUI
+  runtime, keeps numbered revisions for review, and starts implementation only
+  when the latest one is accepted. Agents can ask single-choice, multi-choice or
+  free-text questions in both ordinary and planning turns.
 - **Whatever agent you already use.** Eight agent CLIs plus plain shell sessions.
   Each is optional; the app only ever runs what is on the host's `PATH`.
 - **Multi-user, properly isolated.** GitHub OAuth, an explicit allow-list, and
@@ -35,6 +47,31 @@ there is no second command.
   capability tiers, configured in the UI.
 - **HTTPS everywhere**, with a certificate authority the server generates itself
   so LAN devices get a secure context.
+
+## Screenshots
+
+<table>
+<tr>
+<td width="50%">
+<img src="assets/screenshots/launcher.png" alt="Picking a runtime">
+Pick a runtime — terminal or WebUI — for the folder you're in.
+</td>
+<td width="50%">
+<img src="assets/screenshots/webui-chat.png" alt="The WebUI">
+The WebUI: message bubbles, tool cards, a live trace panel.
+</td>
+</tr>
+<tr>
+<td width="50%">
+<img src="assets/screenshots/github-panel.png" alt="The GitHub panel">
+Issues and pull requests, with who they're assigned to and what they're linked to.
+</td>
+<td width="50%">
+<img src="assets/screenshots/mobile.png" alt="On a phone" width="260">
+The same conversation, built for the phone it will actually be used on.
+</td>
+</tr>
+</table>
 
 ## Before you start
 
@@ -91,6 +128,7 @@ The image ships the web server only — the agent CLIs are not bundled. See
 
 | Guide | What is in it |
 | --- | --- |
+| [Desktop app](docs/desktop.md) | Native Linux, Windows and macOS downloads, local-only use, updates and troubleshooting |
 | [Installation](docs/installation.md) | Every install path, platform support, uninstalling, install troubleshooting |
 | [GitHub OAuth](docs/github-oauth.md) | Creating the OAuth App, the allow-list, the installer account |
 | [Configuration](docs/configuration.md) | Every CLI flag and environment variable, the setup wizard, where state is stored |
@@ -98,6 +136,7 @@ The image ships the web server only — the agent CLIs are not bundled. See
 | [Using the terminal](docs/terminal.md) | Scrollback and history, copy/paste, images, mobile, the PWA |
 | [HTTPS and certificates](docs/https-and-certificates.md) | Why HTTPS-only, the local CA, trusting it per device, using your own certificate |
 | [Running as a service](docs/running-as-a-service.md) | systemd, Docker and Compose, reverse proxies, ngrok |
+| [Per-user environments](docs/user-environments.md) | Giving every signed-in user their own container, with persistent storage |
 | [Updating](docs/updating.md) | The update banner, who may apply it, which installs can and cannot |
 | [Usage analytics](docs/analytics.md) | What the usage screens read and how the numbers are derived |
 | [Usage accounting](docs/usage-accounting.md) | The durable per-user job history and dashboard: what is recorded, per-agent honesty, the API |

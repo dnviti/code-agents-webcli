@@ -129,6 +129,69 @@ describe('acp chat adapter', function () {
       const h = harness({ extraArgs: ['--config', '/tmp/x.yml'] });
       assert.deepStrictEqual(h.adapter.buildArgs(), ['acp', '--config', '/tmp/x.yml']);
     });
+
+    it('uses the runtime-visible cwd in ACP handshakes', async function () {
+      const environment = {
+        kind: 'container',
+        toContainerPath(value) {
+          assert.strictEqual(value, '/host/projects/alpha');
+          return '/workspace/alpha';
+        },
+      };
+      const h = harness({ workingDir: '/host/projects/alpha', cwdKind: 'host', environment });
+      await boot(h, fixture('acp-omp'));
+
+      const opened = h.sent.find((message) => message.method === 'session/new');
+      assert.strictEqual(opened.params.cwd, '/workspace/alpha');
+      assert.strictEqual(only(h.events, 'session')[0].cwd, '/workspace/alpha');
+    });
+
+    it('does not translate an explicitly container-local ACP cwd', async function () {
+      const environment = {
+        kind: 'container',
+        toContainerPath() { throw new Error('container cwd must not be translated as a host path'); },
+      };
+      const h = harness({ workingDir: '/tmp/work', cwdKind: 'container', environment });
+      await boot(h, fixture('acp-omp'));
+      const opened = h.sent.find((message) => message.method === 'session/new');
+      assert.strictEqual(opened.params.cwd, '/tmp/work');
+    });
+
+    it('hands the question bridge to an ACP session in its protocol shape', async function () {
+      const h = harness({
+        runtime: 'grok',
+        askMcpServer: {
+          name: 'ccweb',
+          command: '/usr/bin/node',
+          args: ['/bridge.js'],
+          env: { CCWEB_ASK_SOCKET: '/tmp/ask.sock' },
+        },
+      });
+      await boot(h, fixture('acp-omp'));
+      const opened = h.sent.find((message) => message.method === 'session/new');
+      assert.deepStrictEqual(opened.params.mcpServers, [{
+        name: 'ccweb',
+        command: '/usr/bin/node',
+        args: ['/bridge.js'],
+        env: [{ name: 'CCWEB_ASK_SOCKET', value: '/tmp/ask.sock' }],
+      }]);
+    });
+
+    it('does not create a fresh RPC waiter after the transport dies during resume', async function () {
+      const h = harness({ resumeSessionId: 'native-session-to-resume' });
+      const opening = h.adapter.handshake();
+      h.adapter.handleMessage(fixture('acp-omp')[0]);
+      await flush();
+      assert.ok(h.sent.some((message) => message.method === 'session/load'));
+
+      h.adapter.onUnexpectedExit(new Error('ACP transport vanished during resume'));
+      await assert.rejects(opening, /ACP transport vanished during resume/);
+      assert.strictEqual(
+        h.sent.some((message) => message.method === 'session/new'),
+        false,
+        'the fallback must reject before registering a waiter on a dead transport',
+      );
+    });
   });
 
   describe('streaming messages', function () {
@@ -242,7 +305,7 @@ describe('acp chat adapter', function () {
       await boot(h, fixture('acp-omp'));
       h.events.length = 0;
 
-      await h.adapter.send({
+      const sending = h.adapter.send({
         text: 'hello there',
         attachments: [{ url: '/files/a.png', path: '/tmp/a.png', mime: 'image/png', name: 'a.png', size: 1 }],
       });
@@ -265,6 +328,290 @@ describe('acp chat adapter', function () {
         { type: 'resource_link', uri: 'file:///tmp/a.png', name: 'a.png', mimeType: 'image/png' },
       ], 'the prompt and its attachments still reach the agent');
       assert.strictEqual(only(h.events, 'state')[0].state, 'thinking');
+      h.adapter.handleMessage({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+      await sending;
+    });
+  });
+
+  describe('prompt acceptance', function () {
+    it('resolves on the first turn update without waiting for the final prompt reply', async function () {
+      const h = harness();
+      await boot(h, fixture('acp-omp'));
+
+      let accepted = false;
+      const sending = h.adapter.send({ text: 'go' });
+      sending.then(() => { accepted = true; });
+      await flush();
+      assert.strictEqual(accepted, false, 'writing the request alone is not runtime acceptance');
+
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: '019f994c-6f83-7000-aa56-89bb51fff42f',
+          update: {
+            sessionUpdate: 'agent_thought_chunk',
+            content: { type: 'text', text: 'Working' },
+          },
+        },
+      });
+      await sending;
+      assert.strictEqual(accepted, true, 'turn activity proves the runtime accepted the prompt');
+      assert.strictEqual(only(h.events, 'turn_end').length, 0, 'acceptance is not turn completion');
+
+      const prompt = h.sent.find((message) => message.method === 'session/prompt');
+      h.adapter.handleMessage({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+      await flush();
+    });
+
+    it('does not mistake a delayed session-level update for prompt acceptance', async function () {
+      const h = harness();
+      await boot(h, fixture('acp-omp'));
+
+      let accepted = false;
+      const sending = h.adapter.send({ text: 'go' });
+      sending.then(() => { accepted = true; }, () => undefined);
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: '019f994c-6f83-7000-aa56-89bb51fff42f',
+          update: { sessionUpdate: 'available_commands_update', availableCommands: [] },
+        },
+      });
+      await flush();
+      assert.strictEqual(accepted, false);
+
+      const rejected = assert.rejects(sending, /prompt refused/);
+      const prompt = h.sent.find((message) => message.method === 'session/prompt');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: prompt.id,
+        error: { code: -32000, message: 'prompt refused' },
+      });
+      await rejected;
+      await flush();
+    });
+
+    it('accepts Grok’s exact live prompt echo from the captured wire', async function () {
+      const lines = fixture('acp-grok');
+      const h = harness({ runtime: 'grok' });
+      await boot(h, lines);
+      const echo = lines.find((line) => line.params?.update?.sessionUpdate === 'user_message_chunk');
+      const text = echo.params.update.content.text;
+
+      const sending = h.adapter.send({ text });
+      h.adapter.handleMessage(echo);
+      await sending;
+
+      const prompt = h.sent.find((message) => message.method === 'session/prompt');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0', id: prompt.id,
+        error: { code: -32000, message: 'failed after the runtime persisted the prompt' },
+      });
+      await flush();
+      assert.strictEqual(only(h.events, 'turn_end').pop().stopReason, 'error');
+    });
+
+    it('does not accept a replayed user chunk that differs from the outstanding prompt', async function () {
+      const h = harness();
+      await boot(h, fixture('acp-omp'));
+      const sending = h.adapter.send({ text: 'the new prompt' });
+      h.adapter.handleMessage({
+        jsonrpc: '2.0', method: 'session/update',
+        params: {
+          sessionId: '019f994c-6f83-7000-aa56-89bb51fff42f',
+          update: {
+            sessionUpdate: 'user_message_chunk',
+            content: { type: 'text', text: 'an older replayed prompt' },
+          },
+        },
+      });
+      const prompt = h.sent.find((message) => message.method === 'session/prompt');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0', id: prompt.id,
+        error: { code: -32000, message: 'new prompt refused' },
+      });
+      await assert.rejects(sending, /new prompt refused/);
+      await flush();
+    });
+
+    it('accepts a newly introduced update-only tool call as current-turn activity', async function () {
+      const h = harness();
+      await boot(h, fixture('acp-omp'));
+      const sending = h.adapter.send({ text: 'use a tool' });
+      h.adapter.handleMessage({
+        jsonrpc: '2.0', method: 'session/update',
+        params: {
+          sessionId: '019f994c-6f83-7000-aa56-89bb51fff42f',
+          _meta: { promptId: 'current-prompt' },
+          update: {
+            sessionUpdate: 'tool_call_update', toolCallId: 'update-only-current-tool',
+            title: 'Reading current.txt', kind: 'read', rawInput: { path: 'current.txt' },
+          },
+        },
+      });
+      await sending;
+
+      const prompt = h.sent.find((message) => message.method === 'session/prompt');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0', id: prompt.id,
+        error: { code: -32000, message: 'tool failed later' },
+      });
+      await flush();
+    });
+
+    it('rejects send when the prompt RPC fails before any turn activity', async function () {
+      const h = harness();
+      await boot(h, fixture('acp-omp'));
+
+      const sending = h.adapter.send({ text: 'go' });
+      let rejectedBeforeTurnEnd = false;
+      sending.catch(() => { rejectedBeforeTurnEnd = only(h.events, 'turn_end').length === 0; });
+      const rejected = assert.rejects(sending, /prompt refused/);
+      const prompt = h.sent.find((message) => message.method === 'session/prompt');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: prompt.id,
+        error: { code: -32000, message: 'prompt refused' },
+      });
+      await rejected;
+      assert.strictEqual(rejectedBeforeTurnEnd, true, 'the caller must recover its queue before turn_end drains it');
+      assert.strictEqual(h.adapter.readyForTurn, false, 'readiness stays gated through deferred failure events');
+      await assert.rejects(
+        h.adapter.send({ text: 'too early' }),
+        /previous ACP prompt is still in flight/,
+      );
+      await flush();
+
+      assert.strictEqual(only(h.events, 'turn_end').pop().stopReason, 'error');
+      assert.strictEqual(h.adapter.readyForTurn, true);
+    });
+
+    it('treats a server request as acceptance before the request itself is answered', async function () {
+      const h = harness();
+      await boot(h, fixture('acp-omp'));
+
+      const sending = h.adapter.send({ text: 'go' });
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: 'agent-call-1',
+        method: 'future/request',
+        params: {},
+      });
+      await sending;
+      assert.strictEqual(
+        h.sent.find((message) => message.id === 'agent-call-1').error.code,
+        -32601,
+      );
+
+      const prompt = h.sent.find((message) => message.method === 'session/prompt');
+      h.adapter.handleMessage({ jsonrpc: '2.0', id: prompt.id, result: { stopReason: 'end_turn' } });
+      await flush();
+    });
+
+    it('lets lifecycle code withdraw an acceptance waiter without claiming delivery', async function () {
+      const h = harness();
+      await boot(h, fixture('acp-omp'));
+
+      const sending = h.adapter.send({ text: 'go' });
+      const rejected = assert.rejects(sending, /session is stopping/);
+      h.adapter.cancelPendingSendAcceptance('session is stopping');
+      await rejected;
+
+      // Settle the still-live protocol call so the harness leaves no dangling
+      // request. The turn failure remains separate from send acceptance.
+      const prompt = h.sent.find((message) => message.method === 'session/prompt');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: prompt.id,
+        error: { code: -32000, message: 'cancelled' },
+      });
+      await flush();
+    });
+
+    it('keeps the next prompt parked until a cancelled prompt RPC settles', async function () {
+      const h = harness();
+      await boot(h, fixture('acp-omp'));
+
+      const first = h.adapter.send({ text: 'first' });
+      const rejected = assert.rejects(first, /session is stopping/);
+      h.adapter.cancelPendingSendAcceptance('session is stopping');
+      await rejected;
+      assert.strictEqual(h.adapter.readyForTurn, false);
+      await assert.rejects(h.adapter.send({ text: 'second' }), /previous ACP prompt is still in flight/);
+
+      const prompt = h.sent.find((message) => message.method === 'session/prompt');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: prompt.id,
+        error: { code: -32000, message: 'cancelled' },
+      });
+      await flush();
+      assert.strictEqual(h.adapter.readyForTurn, true);
+    });
+
+    it('holds readiness through every close event from an interrupted prompt', async function () {
+      const h = harness();
+      await boot(h, fixture('acp-omp'));
+      const readinessDuringClose = [];
+      const emit = h.adapter.options.emit;
+      h.adapter.options.emit = (event) => {
+        if (event.t === 'block_end' || event.t === 'msg_end' || event.t === 'turn_end') {
+          readinessDuringClose.push(h.adapter.readyForTurn);
+        }
+        emit(event);
+      };
+
+      const first = h.adapter.send({ text: 'first' });
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: '019f994c-6f83-7000-aa56-89bb51fff42f',
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'partial answer' },
+          },
+        },
+      });
+      await first;
+      await h.adapter.interrupt();
+
+      const firstPrompt = h.sent.find((message) => message.method === 'session/prompt');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0', id: firstPrompt.id, result: { stopReason: 'cancelled' },
+      });
+      await flush();
+
+      assert.ok(readinessDuringClose.length >= 3);
+      assert.ok(readinessDuringClose.every((ready) => ready === false));
+      assert.strictEqual(only(h.events, 'block_end').length, 1);
+      assert.strictEqual(only(h.events, 'msg_end').length, 1);
+      assert.strictEqual(h.adapter.readyForTurn, true);
+
+      const second = h.adapter.send({ text: 'second' });
+      const prompts = h.sent.filter((message) => message.method === 'session/prompt');
+      assert.strictEqual(prompts.length, 2);
+      h.adapter.handleMessage({
+        jsonrpc: '2.0', id: prompts[1].id, result: { stopReason: 'end_turn' },
+      });
+      await second;
+      await flush();
+    });
+
+    it('rejects an in-flight prompt when the ACP transport exits unexpectedly', async function () {
+      const h = harness();
+      await boot(h, fixture('acp-omp'));
+
+      const sending = h.adapter.send({ text: 'will the transport survive?' });
+      h.adapter.onUnexpectedExit(new Error('ACP child exited unexpectedly'));
+      await assert.rejects(sending, /ACP child exited unexpectedly/);
+      assert.strictEqual(h.adapter.readyForTurn, false, 'failure events still own the old prompt gate');
+      await flush();
+
+      assert.strictEqual(h.adapter.readyForTurn, true);
+      assert.strictEqual(only(h.events, 'turn_end').pop().stopReason, 'error');
     });
   });
 
@@ -466,8 +813,9 @@ describe('acp chat adapter', function () {
       const rest = await boot(h, fixture('acp-omp'));
       // The prompt goes out before the updates, exactly as it did on the wire:
       // the captured turn result is the reply to it.
-      await h.adapter.send({ text: 'go' });
+      const sending = h.adapter.send({ text: 'go' });
       await feed(h, rest);
+      await sending;
 
       const end = only(h.events, 'msg_end').pop();
       assert.strictEqual(end.stopReason, 'end_turn');
@@ -488,12 +836,14 @@ describe('acp chat adapter', function () {
       // kimi ended its turn without saying anything; the numbers still count.
       const h = harness();
       await boot(h, fixture('acp-kimi'));
-      await h.adapter.send({ text: 'go' });
+      const sending = h.adapter.send({ text: 'go' });
+      const prompt = h.sent.find((message) => message.method === 'session/prompt');
       h.adapter.handleMessage({
         jsonrpc: '2.0',
-        id: 3,
+        id: prompt.id,
         result: { stopReason: 'end_turn', usage: { inputTokens: 12 } },
       });
+      await sending;
       await flush();
 
       const turn = only(h.events, 'turn_end').pop();
@@ -578,8 +928,9 @@ describe('acp chat adapter', function () {
         { t: 'block_start', msgId: `user-${'0'.repeat(8)}-0000-0000-0000-${'0'.repeat(12)}`, index: 0, block: { kind: 'text', text: 'What is the magic word?' } },
         { t: 'msg_end', msgId: `user-${'0'.repeat(8)}-0000-0000-0000-${'0'.repeat(12)}` },
       ];
-      await h.adapter.send({ text: 'What is the magic word?' });
+      const sending = h.adapter.send({ text: 'What is the magic word?' });
       await feed(h, rest);
+      await sending;
 
       const state = createTranscript(only(h.events, 'session')[0].capabilities);
       [...asked, ...h.events].forEach((event, index) => applyChatEvent(state, { ...event, seq: index + 1 }));

@@ -5,8 +5,12 @@ way they start.
 
 ## Supported runtimes
 
-None of these are bundled. The app runs whatever is already installed on the
-host, and a missing CLI only matters when you press its button.
+None of these are bundled into the application image. Host and non-project
+sessions run whatever is already installed. A project container can instead
+install Claude Code, Codex, pi, Grok Build, Qwen Code, Kimi Code or Oh My Pi
+from its reviewed [build recipe](project-composition.md); those pinned installs
+and their sign-ins live in the user's persistent home. Cursor Agent and
+Antigravity CLI still require a manual install in that home.
 
 | Runtime | Default label | Binary | Also searched in |
 | --- | --- | --- | --- |
@@ -18,6 +22,7 @@ host, and a missing CLI only matters when you press its button.
 | Qwen Code | Qwen | `qwen` | `~/.local/bin/`, `/usr/local/bin/`, `/usr/bin/` |
 | Kimi Code | Kimi | `kimi` | `~/.kimi-code/bin/`, `~/.local/bin/`, `/usr/local/bin/`, `/usr/bin/` |
 | Oh My Pi | Oh My Pi | `omp` | `~/.local/bin/`, `~/.bun/bin/`, `/usr/local/bin/`, `/usr/bin/` |
+| Antigravity CLI | Antigravity | `agy` | `~/.local/bin/`, `~/.gemini/antigravity-cli/bin/`, `/usr/local/bin/`, `/usr/bin/` |
 | Terminal | Terminal | your `$SHELL` | falls back to `zsh`, `bash`, `sh` |
 
 Those explicit directories are searched **in addition to** `PATH`, and searched
@@ -39,6 +44,7 @@ CLI's own flag:
 | Grok Build | `--always-approve` |
 | Qwen Code, Kimi Code | `--yolo` |
 | Oh My Pi | `--auto-approve` |
+| Antigravity CLI | `--dangerously-skip-permissions` |
 | Cursor Agent, pi | *none* — neither CLI has a real equivalent, so the option is not offered |
 
 These do what they say. An agent launched this way edits files and runs commands
@@ -57,6 +63,19 @@ so the folder you picked is the folder the agent sees. It checks your `omp`
 actually has the flag first, because `omp` exits on an unrecognised one; on an
 older build you get a warning in the server log rather than a silent relocation.
 
+**Antigravity CLI** asks "Do you trust the contents of this project?" the first
+time it sees a folder, and does nothing at all until it is answered. The app
+answers it, the same way it answers Claude's.
+
+**Antigravity CLI in the WebUI** runs its shell tools in a scratch directory of
+its own — `~/.gemini/antigravity-cli/scratch` — rather than in the folder you
+picked, whatever directory the process itself was started in. Asked to read a
+file that was sitting right there, it reported that no such file existed. The
+app passes `--new-project`, which puts it back in the folder you chose; that
+project is scoped to the one invocation and does not appear in your
+`~/.gemini/projects.json`. The terminal surface does not have the problem and
+does not get the flag.
+
 ## The WebUI (beta)
 
 Alongside the terminal, most runtimes can open as a **chat** surface: the CLI is
@@ -68,7 +87,7 @@ Launch it with the **WebUI (Beta)** button on the runtime's card in the launcher
 
 | Runtime | WebUI |
 | --- | --- |
-| Claude Code, Codex, Grok Build, pi, Kimi Code, Oh My Pi | Available |
+| Claude Code, Codex, Grok Build, pi, Kimi Code, Oh My Pi, Antigravity CLI | Available |
 | Qwen Code, Cursor Agent | Not offered — no verified structured mode yet, so they open in the terminal only |
 | Terminal | Not applicable — a shell has no conversation to show |
 
@@ -77,6 +96,35 @@ session: driving a TUI through a pseudo-terminal and streaming a headless
 protocol are different processes, so there is nothing to switch between.
 
 It is beta, and labelled as such in the UI.
+
+### Plan mode
+
+Every WebUI runtime has a **Plan** control beside the model and effort controls.
+Turn it on before sending a request when you want the agent to investigate and
+propose work without implementing it. The control stays with the conversation,
+including across reloads, devices and server restarts; changing it is disabled
+while a turn is active so the rule cannot change underneath work already in
+flight.
+
+The agent submits a complete Markdown plan to a dedicated review dialog. Plans
+are numbered revisions: a revision replaces the previous document, and only the
+latest can be accepted or rejected. Closing the dialog changes nothing.
+
+- **Accept plan** turns Plan mode off and immediately starts an internal
+  implementation turn with the accepted revision. It does not manufacture a
+  user message, and the runtime's normal approval policy still applies.
+- **Reject plan** keeps Plan mode on and keeps the document for reference, then
+  returns focus to the composer so you can describe the revision you want.
+- Turning Plan mode off while idle keeps the latest document. Starting a new
+  conversation clears both the mode and the document.
+
+Runtime slash commands that could start work outside this contract are refused
+while Plan mode is on. Model and effort selection remain available, as do the
+app's new-conversation commands, which clear the Plan state as described above.
+
+If a runtime cannot load the submission tool, its final planning response is
+captured as the Plan document instead. A storage or delivery failure leaves the
+control available and reports the failure so the plan can be retried.
 
 ### Tool activity
 
@@ -92,6 +140,7 @@ CLIs is driven differently and describes its own work differently.
 | pi | `tool_execution_start` / `tool_execution_end` | a recorded turn |
 | Grok Build | ACP `tool_call` / `tool_call_update` | a live run against 0.2.112 |
 | Kimi Code, Oh My Pi | ACP `tool_call` / `tool_call_update` | live runs |
+| Antigravity CLI | `step_update` steps of type `tool` and `subagent` | a live run against 1.1.8 |
 
 Nothing is shown that the agent did not report doing. Where an agent reports a
 tool by name only, the card carries the name and its status and nothing else —
@@ -107,6 +156,200 @@ properly. Grok reports the identical work over ACP, so that is the entry point
 the app uses. It brings permission prompts, a model list and per-turn cost with
 it, and sessions recorded under the old mode still open — Grok kept the record
 all along; only its headless output was silent about it.
+
+### Questions the agent asks you
+
+An agent that needs a decision only you can make puts a **card** in the
+conversation with the options it wants you to choose between, and stops until
+you answer. There is always a free-text box beside the options, so "none of
+these" is a real answer rather than a dead end. The same questionnaire is
+available in ordinary conversations and in Plan mode; it is not tied to either
+approval mode.
+
+| Runtime | Question delivery | Why |
+| --- | --- | --- |
+| Claude Code | structured handoff | no verified timer-free per-tool MCP setting |
+| Codex | structured handoff | MCP tool calls have a finite timeout and no verified disable sentinel |
+| Grok Build | structured handoff | no timer-free MCP guarantee has been verified |
+| Kimi Code | structured handoff | its client accepts only a finite maximum timeout |
+| Oh My Pi | structured handoff | nested-agent MCP calls retain an unavoidable finite ceiling |
+| Antigravity CLI | structured handoff | its headless mode has no MCP or extension hook |
+| pi | blocking tool through a generated `-e` extension | the whole app-owned callback path is timer-free |
+
+For a **structured handoff**, the model ends its turn with a private, versioned
+question envelope. The server removes that envelope from the transcript,
+validates it with the same option normalization as a tool question, and writes
+the normal question card to the durable conversation log. No runtime tool call
+is left open. Once the answer or skip has been recorded, the server starts one
+internal continuation turn carrying the chosen labels and any free text. This
+works the same way in Default and Plan mode; only the invisible transport
+between the two model turns differs.
+New prompts emit envelope version 1. An unversioned envelope already in flight
+from an older server is accepted as legacy version 1; any explicit unsupported
+version is rejected without exposing its private JSON in the transcript.
+
+An unanswered card is part of the durable conversation: navigating away,
+reloading, backgrounding the browser, losing the WebSocket, or opening the
+conversation on another device does not discard it. A recoverable server
+restart rehydrates a structured handoff when the runtime conversation can be
+resumed. Once answered or skipped, the card remains in history with that
+outcome and only the first accepted answer can start the continuation.
+The accepted answer and its stable continuation ID are committed as one outbox
+record before the browser receives a positive acknowledgement. An orderly
+shutdown either waits for a send that already crossed the runtime boundary or
+leaves that outbox pending for the resumed session; it never silently drops the
+answer. Duplicate browser submissions and repeated reconnect frames therefore
+cannot start a second internal turn.
+
+Before the outbox is sent, the server commits a second durable dispatch marker.
+Runtime transports do not expose a universal idempotency key or an authoritative
+way to ask whether that turn arrived. If a machine-level crash leaves a marked
+delivery without its terminal record, recovery therefore records an explicit
+abandoned/uncertain outcome and does **not** resend it blindly. This trades a
+visible, rare non-delivery for the stronger guarantee that recovery cannot
+silently start the same continuation twice. A runtime may retry that state
+automatically only after it gains verified idempotency or delivery
+reconciliation. Pending (not yet marked) outbox entries remain safe to resume;
+orderly restart, Stop, reconnect and duplicate-frame paths have no ambiguous
+window.
+
+Here, **indefinite** means elapsed wall-clock time never resolves a question.
+The card can still end because the user answers or skips, Stop/reset/deletion
+explicitly cancels it, the runtime session cannot be recovered, or the callback
+transport proves that its caller is gone. Those cases are recorded as answered,
+skipped, or abandoned—not as timeouts. A runtime is allowed to expose the
+blocking question tool only after its entire invocation path is verified to
+have this timer-free contract; structured handoff is the default for every new
+or unknown runtime.
+
+This deliberately does not use a huge duration as a stand-in for “forever.”
+Codex documents `tool_timeout_sec` as a duration with a finite default, while
+Claude's documented `MCP_TIMEOUT` controls server startup rather than a
+timer-free tool invocation. See the [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp#other-configuration-options)
+and [Claude Code MCP documentation](https://docs.anthropic.com/en/docs/claude-code/mcp).
+
+On a host-local session the MCP/extension bridge uses the session's private Unix
+socket. In Docker, Podman and Kubernetes environments it uses an owner-only
+callback endpoint in the user's shared home. Requests, replies, cancellation
+markers and the liveness lease are written atomically as authenticated,
+encrypted per-session envelopes; the decryption secret is passed only to the
+runtime's launch environment and is not stored in that directory. The server rejects
+replaced or symlinked transport paths, keeps every child operation beneath a
+verified open directory descriptor, cleans up stale crash artifacts without
+following links, and removes the endpoint when the conversation process closes.
+This is at-rest protection for the shared volume, not isolation from another
+process able to inspect the launched runtime's environment. No inbound container
+or pod port is opened.
+
+**pi asks through an extension**, because it has no MCP support and no ACP. The
+file is generated into the session's own `.pi/ccweb/`, is loaded by path, and
+registers nothing at all when it is loaded outside a session. The app also
+passes `--exclude-tools question`: the widely installed `pi-code` package
+registers a tool by that name which, in the mode this app drives, answers itself
+with "UI not available" without anybody being asked — and a model offered two
+question tools sometimes picks the one that cannot work. The extension's local
+socket and remote shared-file callback paths have no elapsed-time deadline for
+questions; explicit cancellation and liveness loss still terminate them.
+
+**A card that can no longer be answered says so.** If the agent gives up, or the
+turn is stopped, or the conversation is closed, the card stops offering buttons
+and reads *"The agent stopped waiting for an answer"* — which is a different
+statement from *"Skipped without answering"*, and the app no longer prints the
+second one over the first. A question you skip on purpose still reads as
+skipped.
+
+### Antigravity CLI: what was checked, and what was not
+
+The whole runtime is driven through one entry point — `agy --print
+--output-format stream-json` — and everything the WebUI claims about it was read
+off live runs of agy 1.1.8 rather than from a schema. Each turn is its own
+process; `--conversation <id>` is what carries the conversation between them.
+
+Watched working:
+
+| Claim | How |
+| --- | --- |
+| Replies arrive as they are produced | a step arrives `ACTIVE` with the opening of the reply and `DONE` with the rest, and the two concatenate into the run's own final text |
+| Commands, edits and searches show as cards, with output, duration and errors | a turn that read a file, edited it and created another |
+| Work it hands to an agent of its own appears in **Agents** | a delegation reported as a `subagent` step, carrying the role and the prompt it was given |
+| Tokens per turn, thinking and cached input included | the run's own totals, checked against the sum of its steps line by line |
+| A refusal explains itself | the auto-denial, in the conversation, naming the command and the way to allow it |
+| The model list is the CLI's own | `agy models`, one id per line |
+| Reopening a conversation and carrying on in it | the app restarted, the conversation resumed, and the agent answered from history without going back to the file |
+| The folder you picked is the folder it works in | `pwd` and a file read, in a directory agy had never seen |
+| A first launch in an unseen folder reaches a usable session | the terminal surface, past the trust question, with the prompt drawn |
+| An attached file reaches the agent | a PNG dropped into the composer, opened by the agent with `view_file` at the path it was saved to, and the product name read out of the pixels |
+| A skill picked from the `/` menu runs | `/release-check` in a project holding `.agents/skills/release-check/SKILL.md`, answered with that skill's own token |
+| A skill above the working directory is found | the same, invoked from `<repo>/packages/web` against a skill at `<repo>/.agents/skills/` |
+
+Not offered, because the runtime does not provide it:
+
+| Not offered | Why |
+| --- | --- |
+| Diffs | `replace_file_content` reports its `TargetFile` and nothing else — no old text, no new text, no hunk. A diff here would be one this app computed, not one the agent reported. |
+| Cost | Nothing in `init`, in any step or in the result prices a turn. The meter says *cost not reported* rather than showing a zero. |
+| Approval prompts | Headless, it cannot stop and ask. See [Approval mode](#approval-mode). |
+| A plan or todo list | No step type carries one. |
+| Its own slash commands | Forty of them, all belonging to its terminal UI, and it interprets none in this mode. `/agents` — which the CLI answers instantly at its own prompt — went to the model instead and came back with 18,441 tokens of prose *about* subagents. The menu offers what an Antigravity conversation can really run instead: your skills, and this app's own `/clear`, `/new` and `/reset`. |
+| An account or plan reading | Its terminal UI shows the plan in its header; none of that reaches the headless stream. |
+
+**Attachments reach it by path.** agy has no attachment flag and no `@file`
+mention syntax — `@notes.txt` in a prompt arrives at the model as literal text.
+What it does have is a working directory it can read, and every upload this app
+accepts is written *inside* that directory, at `.cc-web/attachments/`. So the
+paths are named at the end of the prompt and the agent opens them with its own
+tools. That covers images as well as text: a PNG attached in the composer was
+opened with `view_file` and the product name and version read out of the pixels.
+
+**The `/` menu lists your skills and this app's commands, not agy's.** agy's own
+forty are absent on purpose — it interprets none of them in this mode, and
+offering one would spend a turn's tokens producing a paragraph about what it
+would have done.
+
+What it *does* act on is a **skill** named in the prompt, and that is what the
+menu is for. A skill written to `.agents/skills/release-check/SKILL.md` and
+picked from the menu made agy open that `SKILL.md` and answer with the token the
+skill specifies.
+
+Every directory the menu reads was checked by planting a skill in it and asking
+agy which ones it could see. All four spellings of the workspace root it
+documents — `.agents`, `_agents`, `.agent`, `_agent` — are live, as is a
+`plugins/<name>/skills/` folder under any of them (agy does **not** namespace a
+plugin's skills, so they appear under their own names). The workspace roots are
+searched **up to the repository root**, the way agy searches them, so a skill at
+the top of a monorepo is on the menu of a session opened three directories down.
+Personally-installed skills come from `~/.gemini/config/skills` and
+`~/.gemini/config/plugins`.
+
+Two things are deliberately left off. agy's own **built-in** skills, because
+only one of the three is actually live — `/antigravity_guide` answers from the
+skill, `/permissioned-github` answers "no such skill", and
+`/agy-customizations` quietly opens the wrong file — and two undeliverable
+entries to gain one documentation skill is the wrong trade. And skills reached
+through agy's **`skills.json` / `plugins.json`** pointer files, which can name
+any directory on disk and chain through `inherits`: those work in agy and will
+not appear here. That is the menu under-reporting, which is the safe direction,
+but it is worth knowing if your project uses one.
+
+`~/.agents/skills` is not on the list either, though pi and grok both read it —
+agy's personal root is `~/.gemini/config`. The exception is a home directory
+that is itself a git repository with the session opened underneath it: there the
+workspace walk passes through `~/.agents` and those skills *do* appear, which is
+correct, because agy loads them there too.
+
+Alongside them, `/clear`, `/new` and `/reset`: this app intercepts those itself
+and never sends them to any runtime, so they work here exactly as they do
+everywhere else.
+
+**Not verified: what a sign-in failure looks like.** The credentials on the
+machine this was built on could not be taken away for a test — clearing `HOME`
+was not enough, and the runs kept succeeding. A run that fails for any reason
+reports `status: "ERROR"` with the CLI's own sentence, and the app puts that
+sentence in the conversation verbatim (a bad model id, which *is* reproducible,
+comes through that way and reads *"model zzz is not recognized as a known model
+…"* followed by the list it does have). A sign-in failure is expected to arrive
+on the same channel, but nobody here has watched one, and this is the sentence
+saying so.
 
 ### Watching a workflow
 
@@ -165,6 +408,7 @@ checked one at a time, because one of them working says nothing about the rest.
 | Grok Build | the reasoning text, as ACP thought chunks | its recorded traffic — its own API was erroring when this was written |
 | Claude Code | **the size only** — every thinking block on the wire is empty, with a signature beside it and a running token estimate on a side channel | a live run at `--effort high`, 2.1.220 |
 | Codex | its reasoning summary, where the model produces one. Where the trace is encrypted and nothing was summarised, nothing | its own schema and 22,987 recorded reasoning items, all of them encrypted — the account was over its usage limit |
+| Antigravity CLI | **the size only** — every step's usage carries a `thinking_tokens` count and no event anywhere carries a word of the reasoning | a live run on `gemini-3.1-pro-low`, 1.1.8 |
 
 **An entry never expands onto an empty panel.** Where the text is missing the
 entry says which of the three silences it is: still reasoning, reasoning the
@@ -185,8 +429,10 @@ button beside it — lists what the conversation can run, from the moment it
 opens rather than after a first message has been sent.
 
 **What the runtime says about itself wins.** The ACP agents (Grok Build, Kimi
-Code, Oh My Pi) volunteer their list as the session starts; Claude Code sends
-its own with the first turn. When that list arrives it *replaces* the stand-in.
+Code, Oh My Pi) volunteer their list as the session starts; Codex is asked for
+its enabled skills through `skills/list`; Claude Code sends its own list with
+the first turn. When that list arrives it *replaces* the stand-in in the
+adapter.
 
 For Claude Code that is the end of it. Its list names everything it accepts —
 your skills, your project commands and every enabled plugin's among them — so
@@ -201,17 +447,20 @@ menu a few milliseconds after the conversation opened. There — and only for th
 runtimes that leave their skills out of their own list — what was found on disk
 is added back after the runtime has had its say.
 
-Until that list arrives — and permanently, for Codex and pi, which never report
-one — the menu is only what is installed for the session, read from the
-directories each runtime's own installer writes into:
+Until that list arrives — and permanently for pi and Codex's older exec
+fallback, which cannot report one — the menu is what is installed for the
+session, read from the directories each runtime's own installer writes into.
+Codex also always offers the app-owned `/clear`, `/new` and `/reset`, including
+on a machine with no installed skills:
 
 | Runtime | Read from |
 | --- | --- |
 | Claude Code | `.claude/skills` and `.claude/commands` in the project and in your home, plus the skills and commands of every enabled plugin |
 | Grok Build | `.grok/skills`, `.grok/commands`, `.agents/skills`, and — as Grok itself does by default — your `~/.claude` directories |
 | pi | `.pi/skills` and `.agents/skills` in the project, `~/.pi/agent/skills` and `~/.agents/skills` in your home |
-| Codex | `~/.codex/skills` and `~/.codex/prompts`, and `.codex/skills` in the project |
+| Codex | App-server's effective list (shared Agent Skills, enabled plugins and system skills included); fallback: `.codex/skills` and `.agents/skills` in the project, `~/.codex/skills`, `~/.agents/skills`, `~/.codex/prompts`, and Codex's system skills |
 | Kimi Code, Oh My Pi | Nothing — both report their own list before the menu can be opened |
+| Antigravity CLI | `skills/` and `plugins/` under `.agents`, `_agents`, `.agent` or `_agent` in the project **and in every directory up to the repository root**, and the same two under `~/.gemini/config` |
 
 Each entry carries the description its author wrote in the skill's frontmatter.
 An entry whose author wrote none is shown with none: a sentence invented here
@@ -229,7 +478,7 @@ The chip beside the composer both names the model in force and changes it. It
 always accepts a typed name as well as offering whatever the runtime published,
 because a model name can only be judged by trying it.
 
-Three things can decide the model a conversation opens on, and they are consulted
+Four things can decide the model a conversation opens on, and they are consulted
 in this order:
 
 | Layer | Set from | Applies to |
@@ -237,9 +486,13 @@ in this order:
 | **This conversation** | picking a model in the chip, or typing `/model <name>` | this conversation only, until it is cleared |
 | **Your standing choice** | the same pick — a model you choose is remembered for that agent | every **new** chat you open on that agent |
 | **The active runtime profile** | Settings → Runtime profiles, installer-only | every new chat on that agent, for everybody |
+| **The profile's ladder rung** | the same page: which rung **Runs on** names | every chat on that agent, for everybody — see [Which rung the conversation runs on](#which-rung-the-conversation-runs-on) |
 
-Below all three, the CLI is launched with no model flag at all and uses its own
+Below all four, the CLI is launched with no model flag at all and uses its own
 default.
+
+The chip names the rung beside the model when a ladder is what chose it, and the
+line above the list says which of the four layers it came from.
 
 **The picker says which of them is in force**, in a line above the list and on
 the chip's hover, so a model pinned by a profile is visible as a pin rather than
@@ -263,9 +516,17 @@ the model its launch actually used, and that is what it comes back on: a
 relaunch, a resume from the launcher and the recovery banner's restart all return
 to the model that conversation was already using — including across a server
 restart, which is the moment every open conversation gets relaunched. Changing
-your standing choice, or the active profile, affects the next new chat and
-nothing that is open, and a conversation that launched with no model flag at all
-keeps that answer too.
+your standing choice, or the active profile's **Model**, affects the next new
+chat and nothing that is open, and a conversation that launched with no model
+flag at all keeps that answer too.
+
+A **ladder rung is the exception**, and deliberately so: it is the profile's
+standing answer to "which model runs this conversation" rather than an unrelated
+edit, so a conversation running on a rung re-reads it on every launch and an
+edited ladder also reaches conversations that are already open. That exception is
+also what moves conversations older than the ladder onto it — all of them
+recorded "launched with no model flag", and honouring that would have meant the
+ladder never reached one of them.
 
 The chip names that recorded model rather than the default, which is the
 difference between describing this conversation and describing the next one. When
@@ -276,9 +537,11 @@ A **branch** opens on the model its source was actually running, for the same
 reason: the context estimate that decided whether the branch fits was measured
 against that model's window.
 
-Two deliberate omissions. A **terminal** session is unaffected: it runs the CLI's
-own interface, where the model is yours to change inside the tool and nothing
-here could keep a preference in step with it. And the **launcher screen** — the
+Two deliberate omissions. A **terminal** session takes no standing choice: it
+runs the CLI's own interface, where the model is yours to change inside the tool
+and nothing here could keep a preference in step with it. (A profile's model and
+its ladder rung *are* applied at launch — that is the one thing decided before
+the interface exists.) And the **launcher screen** — the
 one before a chat has started — has no model control, so the source line is only
 readable once the conversation is open.
 
@@ -303,6 +566,19 @@ translated, and no level is offered that the agent would refuse.
 | Kimi Code | `off` `on` | an ACP config option | yes |
 | Oh My Pi | `off` `auto` `low` `high` `max` | an ACP config option | yes |
 | pi | `off` `minimal` `low` `medium` `high` `xhigh` `max` | `--thinking`, on the next turn's process | from the next turn |
+| Antigravity CLI | `low` `medium` `high`, and only the ones the model in use has an id for | usually the model id itself — see below | from the next turn |
+
+**Antigravity spells the level inside the model name, so the control switches
+models.** Its `--effort` flag exists and takes `low`, `medium` or `high` — but it
+is refused whenever a model is named: `--model gemini-3.6-flash-low --effort
+high` answers *"conflicts with --effort=high"*, and `--model claude-sonnet-4-6
+--effort high` answers *"--effort is not supported for model"*. What `agy models`
+publishes instead is one id per level — `gemini-3.6-flash-high`, `-medium`,
+`-low`. So the levels offered are exactly the sibling ids agy printed, and
+picking one moves the conversation onto that model for its next turn.
+`gemini-3.1-pro` has only `high` and `low` ids, so only those two are offered;
+`claude-sonnet-4-6` has none, so no control appears at all. A conversation that
+pins no model gets the flag itself, which is the one case agy accepts it in.
 
 **The button is not there when there is nothing to offer.** Grok on its default
 model publishes no ladder, so no control appears — rather than one that could
@@ -421,8 +697,29 @@ conversation runs its tools without asking whichever mode the rule computes.
 Its opening line says `this runtime cannot ask` instead of claiming a boundary
 that is not there.
 
+**Antigravity CLI is the other exception, and it is a sharper one.** Driven
+headlessly the CLI *cannot stop and ask*: a tool that needs the `command`
+permission is refused on the spot and the run continues around it. It is not
+that nobody answered — nobody was asked. So the choice has to be made when the
+conversation starts, and the two modes mean:
+
+- **Ask first** — shell commands are refused as they come up and the turn carries
+  on without them. Each refusal gets its own entry in the conversation naming
+  what was refused and how to allow it, so it never arrives as an unexplained
+  failure. File edits inside the workspace are *not* affected: they go through in
+  this mode, which was measured rather than assumed.
+- **Approvals bypassed** — `--dangerously-skip-permissions`, and nothing is
+  refused.
+
+`--mode accept-edits` and `--mode plan` are deliberately not wired to anything.
+Both parse and neither changes what actually happens: three runs of the same
+"write this file" prompt — no flag, `accept-edits`, `plan` — all reported
+`request-review` and all three wrote the file.
+
 The terminal surface's own **No prompts** button is a separate, per-launch
-choice on a different surface, and is not covered by this preference.
+choice on a different surface, and is not covered by this preference. In the
+terminal Antigravity *can* ask, and does: it shows its own four-way approval
+prompt inline, the way it does outside this app.
 
 ### Closing a conversation, and deleting one
 
@@ -610,7 +907,7 @@ is tied to a vendor: a model is an opaque string passed through untouched, so
 anything your CLI accepts — a hosted model, a gateway id, a local endpoint —
 works.
 
-A profile targets one runtime and carries four things, all optional:
+A profile targets one runtime and carries five things, all optional:
 
 | Field | What it does |
 | --- | --- |
@@ -618,6 +915,7 @@ A profile targets one runtime and carries four things, all optional:
 | **Extra arguments** | Appended after the app's own flags, so they win on CLIs where the last flag wins |
 | **Environment** | Injected into the spawned process |
 | **Capability tiers** | `floor` / `mid` / `high` / `top`, written into the runtime's own config |
+| **Runs on** | Which of those four rungs the conversation itself answers from. Defaults to `mid` — see [Which rung the conversation runs on](#which-rung-the-conversation-runs-on) |
 
 Pick which profile is active per runtime; **None** launches the CLI exactly as a
 shell would.
@@ -676,22 +974,93 @@ Only runtimes that can delegate to sub-agents have somewhere to put these:
 Every other runtime says so in the UI rather than accepting values that would go
 nowhere.
 
-**Neither writer touches your own configuration.** For pi that is worth spelling
-out, because the obvious place to write — `~/.pi/agent/agents/` — is exactly
-where a hand-written ladder lives, and there is no flag to point pi elsewhere. So
-the app uses pi's own precedence instead: agents resolve from `~/.claude/agents`,
-then `~/.pi/agent/agents`, then the project's `.claude/agents`, then the
-project's `.pi/agents`, with later directories winning on name conflicts.
-Writing into the session's project means the app's tiers **override** yours for
-that session while your files stay byte-for-byte intact, keep applying to every
-pi session you run outside this app, and any agent the app does not define — a
-`planner`, a `reviewer` — still loads from your directory.
+For pi, the *location* is worth spelling out. The obvious place to write —
+`~/.pi/agent/agents/` — is exactly where a hand-written ladder lives, and there
+is no flag to point pi elsewhere. So the app uses pi's own precedence instead:
+agents resolve from `~/.claude/agents`, then `~/.pi/agent/agents`, then the
+project's `.claude/agents`, then the project's `.pi/agents`, with later
+directories winning on name conflicts. Writing into the session's project means
+the app's tiers override yours *for that session* while your home directory
+stays byte-for-byte intact, keeps applying to every pi session you run outside
+this app, and any agent the app does not define — a `planner`, a `reviewer` —
+still loads from there.
 
-Two safety rules: generated files carry a `managed-by: code-agents-webcli`
-marker, and **a file without that marker is never overwritten** — if a project
-already has its own `.pi/agents/mid.md`, the app leaves it alone and tells you
-it did. And the generated directory carries its own `.gitignore`, so it never
-shows up in `git status`.
+The generated directory carries its own `.gitignore`, so it never shows up in
+`git status`.
+
+### Which rung the conversation runs on
+
+The four rungs above configure the helpers an agent delegates to. **Runs on**
+names the rung the conversation *itself* answers from — the model that replies
+to what you type. It defaults to `mid`.
+
+That rung's model is used unless something outranks it. In order:
+
+1. A model you picked in this conversation.
+2. Your standing model for that runtime — what you last picked and kept.
+3. A model typed into the profile's **Model** box.
+4. **The rung.**
+5. The runtime's own default, if the ladder cannot answer.
+
+Where a ladder is configured and one of the first three is deciding instead, the
+profile says so rather than letting a filled-in ladder look like a working one.
+Every conversation names the model it is on, the rung that model sits on, and
+which of those five supplied it.
+
+If the rung you chose is blank, the nearest filled one is used — downwards when
+two are equally near, because a ladder that cannot answer should not answer
+expensively. If a provider refuses the rung's model, the session starts on the
+runtime's own default and says so; it is then not on a rung at all, so there is
+no rung to move up from either. If the ladder cannot be written through at all,
+the session still starts, and the header says the ladder was not applied. Either
+way the reason stays on screen for the rest of the conversation, on every screen
+watching it rather than only the one that started it.
+
+A ladder decides on the **first launch after upgrading**: nothing has to be
+re-ticked or re-saved, and conversations that predate this move onto it when
+they are next relaunched. Saving a profile also reaches conversations that are
+already open, interrupting a turn in progress — only the ones actually running
+on the rung, and only when the rung has changed.
+
+Terminal sessions started from the app run on the ladder in the same way.
+Escalation, below, is a conversation asking you a question, so it is chat only:
+a terminal runs the CLI's own interface, which this app has no channel into.
+
+### Moving up a rung
+
+An agent that meets work beyond the model it is on can ask to answer from the
+next rung up. The request reaches you as an ordinary approval, with the agent's
+own one-line reason, and nothing moves until you allow it. Once the turn that
+prompted it ends, the conversation goes back to its usual rung — a task that
+spans turns asks again, which keeps the approval the real control on what this
+spends.
+
+**In a conversation with approvals bypassed, the move happens without asking**,
+along with everything else that mode stops asking about.
+
+Runtimes that take an MCP server get the tool that way. pi has no MCP support at
+all, so it gets the same tool as a generated extension in the session's
+`.pi/ccweb/`, loaded with `-e`. Where a runtime cannot change model mid-turn —
+pi runs one process per turn — the agent is told the stronger model picks up on
+its next turn, rather than being told it is already on it.
+
+### The profile wins
+
+**A runtime configuration file this app manages is replaced, even if you wrote
+it.** Earlier versions did the opposite: a file without the
+`managed-by: code-agents-webcli` marker was left alone and the tier was reported
+as not applied. That was reversed deliberately. A ladder that decides which model
+answers every turn, silently doing nothing because of a file left in a project a
+year ago, is a worse failure than an overwrite.
+
+So: the profile is the single source of truth for the runtimes it covers. What
+was there is copied once to `<file>.bak` beside it and the replacement is
+reported in the dialog, but **nothing in the app restores it** — if you maintain
+a ladder outside this app for use outside this app, keep it somewhere the app
+does not write, which for pi means your home directory rather than the project.
+
+Escalation also spends real money on a more expensive model. The approval step is
+the control on that.
 
 ## Working directories
 
@@ -700,6 +1069,18 @@ record, the transcript and pasted-image paths all refer to. The file browser is
 bounded by the working directory chosen during
 [setup](configuration.md#first-run-setup) — only that directory and its
 subdirectories are reachable.
+
+**What an agent may read and write is that same boundary**, not the one folder
+the conversation started in. It matters for the ACP agents (Kimi Code, Oh My Pi,
+Grok Build), which do not open files themselves: they ask the app to, and the
+app decides. Confined to the session's own directory, a conversation working
+across a git worktree of its own repository — one directory over, and somewhere
+the folder picker would happily have sent it — had every read of it refused,
+while the agent's own shell read the same file freely and wrote it back through
+a script. What is still refused is unchanged: anything outside the browsable
+area, and anything belonging to another account. The OS temp directory stays
+reachable, because an agent's write tool and its own shell hand files to each
+other through it.
 
 Every session on the host runs as the **same OS user** — the one running the
 server. There is no per-user sandbox. See

@@ -19,10 +19,12 @@ function createSessionRecord(params = {}) {
     lastActivity: new Date(),
     active: params.active ?? false,
     agent: params.agent ?? null,
-    lastAgent: null,
+    lastAgent: params.lastAgent ?? null,
     runtimeLabel: null,
     surface: params.surface,
+    nativeChatSessionId: params.nativeChatSessionId,
     chatBypassPermissions: params.chatBypassPermissions,
+    chatPlanMode: params.chatPlanMode,
     terminalOptions: null,
     stopRequested: false,
     workingDir: params.workingDir || '/tmp/project',
@@ -167,7 +169,7 @@ function build(sessionOverrides = {}, managerOverrides = {}, deps = {}) {
     getSelectedWorkingDir: () => '/tmp',
     createSessionRecord,
     getRuntimeBridge: () => null,
-    saveSessionsToDisk: () => Promise.resolve(),
+    saveSessionsToDisk: deps.saveSessionsToDisk || (() => Promise.resolve()),
     resolveRuntimeProfile: () => null,
     chatManager,
     transcriptStore: {
@@ -194,6 +196,238 @@ function build(sessionOverrides = {}, managerOverrides = {}, deps = {}) {
 const lastOfType = (sent, type) => sent.filter((m) => m.type === type).pop();
 
 describe('chat wiring', function () {
+  describe('built-in guided workflows', function () {
+    it('admits the GitHub issue workflow through the active chat and reports a correlated queue result', async function () {
+      const { processor, session, chatManager, sent } = build({}, {
+        async send(sessionId, turn) {
+          this.calls.send.push({ sessionId, turn });
+          return 'queued';
+        },
+      });
+      session.surface = 'chat';
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: session.id, requestId: 'workflow-1',
+        workflow: 'gh-issue', text: '/clear should be described, not executed.',
+      });
+
+      assert.deepStrictEqual(chatManager.calls.send, [{
+        sessionId: session.id,
+        turn: { text: '/clear should be described, not executed.', workflow: 'gh-issue' },
+      }]);
+      assert.deepStrictEqual(lastOfType(sent, 'chat_builtin_workflow_result'), {
+        type: 'chat_builtin_workflow_result', sessionId: session.id, requestId: 'workflow-1',
+        workflow: 'gh-issue', accepted: true, status: 'queued', message: 'The guided workflow is queued.',
+      });
+    });
+
+    it('replays a successful admission for the same request id without sending the workflow twice', async function () {
+      let sends = 0;
+      const { processor, session, sent } = build({ surface: 'chat' }, {
+        async send() {
+          sends += 1;
+          return 'accepted';
+        },
+      });
+      const frame = {
+        type: 'chat_start_builtin_workflow', sessionId: session.id, requestId: 'lost-ack',
+        workflow: 'gh-issue', text: 'Create an issue for lost search filters.',
+      };
+
+      await processor.handleMessage('ws-1', frame);
+      const realNow = Date.now;
+      try {
+        Date.now = () => realNow() + 365 * 24 * 60 * 60 * 1000;
+        await processor.handleMessage('ws-1', frame);
+      } finally {
+        Date.now = realNow;
+      }
+
+      assert.strictEqual(
+        sends,
+        1,
+        'a retained prompt retried long after a lost acknowledgement must not create a second turn',
+      );
+      const results = sent.filter((message) =>
+        message.type === 'chat_builtin_workflow_result' && message.requestId === 'lost-ack');
+      assert.strictEqual(results.length, 2);
+      assert.ok(results.every((result) => result.accepted && result.status === 'accepted'));
+
+      await processor.handleMessage('ws-1', { ...frame, text: 'A different issue.' });
+      assert.strictEqual(sends, 1);
+      assert.match(lastOfType(sent, 'chat_builtin_workflow_result').message, /different prompt/);
+    });
+
+    it('shares an in-flight admission and lets a rejected id be retried', async function () {
+      let release;
+      let sends = 0;
+      const gate = new Promise((resolve) => { release = resolve; });
+      const concurrent = build({ surface: 'chat' }, {
+        async send() {
+          sends += 1;
+          await gate;
+          return 'queued';
+        },
+      });
+      const frame = {
+        type: 'chat_start_builtin_workflow', sessionId: concurrent.session.id, requestId: 'concurrent',
+        workflow: 'gh-issue', text: 'Create an issue.',
+      };
+      const first = concurrent.processor.handleMessage('ws-1', frame);
+      const second = concurrent.processor.handleMessage('ws-1', frame);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.strictEqual(sends, 1);
+      await concurrent.processor.handleMessage('ws-1', {
+        type: 'chat_builtin_workflow_ack', sessionId: concurrent.session.id,
+        requestId: 'concurrent', workflow: 'gh-issue',
+      });
+      release();
+      await Promise.all([first, second]);
+      assert.strictEqual(
+        concurrent.sent.filter((message) => message.requestId === 'concurrent').length,
+        2,
+      );
+      await concurrent.processor.handleMessage('ws-1', frame);
+      assert.strictEqual(sends, 1, 'an acknowledgement sent before acceptance cannot defeat dedupe');
+
+      let attempts = 0;
+      const retryable = build({ surface: 'chat' }, {
+        async send() {
+          attempts += 1;
+          if (attempts === 1) throw new Error('queue full');
+          return 'accepted';
+        },
+      });
+      const retryFrame = {
+        type: 'chat_start_builtin_workflow', sessionId: retryable.session.id, requestId: 'retry-rejection',
+        workflow: 'gh-issue', text: 'Create an issue.',
+      };
+      await retryable.processor.handleMessage('ws-1', retryFrame);
+      await retryable.processor.handleMessage('ws-1', retryFrame);
+      assert.strictEqual(attempts, 2, 'a refusal must not poison the correlation id');
+      const retryResults = retryable.sent.filter((message) => message.requestId === 'retry-rejection');
+      assert.deepStrictEqual(retryResults.map((result) => result.accepted), [false, true]);
+    });
+
+    it('releases a successful dedupe entry only after the owning client acknowledges it', async function () {
+      let sends = 0;
+      const { processor, session } = build({ surface: 'chat' }, {
+        async send() {
+          sends += 1;
+          return 'accepted';
+        },
+      });
+      const frame = {
+        type: 'chat_start_builtin_workflow', sessionId: session.id, requestId: 'ack-cleanup',
+        workflow: 'gh-issue', text: 'Create an issue.',
+      };
+      await processor.handleMessage('ws-1', frame);
+      await processor.handleMessage('ws-1', frame);
+      assert.strictEqual(sends, 1, 'unacknowledged retries remain deduplicated');
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_builtin_workflow_ack', sessionId: session.id,
+        requestId: 'ack-cleanup', workflow: 'not-a-workflow',
+      });
+      await processor.handleMessage('ws-1', frame);
+      assert.strictEqual(sends, 1, 'an invalid acknowledgement cannot release the entry');
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_builtin_workflow_ack', sessionId: session.id,
+        requestId: 'ack-cleanup', workflow: 'gh-issue',
+      });
+      await processor.handleMessage('ws-1', frame);
+      assert.strictEqual(sends, 2, 'an acknowledged id no longer consumes retained admission capacity');
+    });
+
+    it('rejects blank prompts, Plan mode, and unknown workflows before they reach the chat manager', async function () {
+      const { processor, session, chatManager, sent } = build({ surface: 'chat', chatPlanMode: true });
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: session.id, requestId: 'blank', workflow: 'gh-issue', text: '   ',
+      });
+      await processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: session.id, requestId: 'plan', workflow: 'gh-issue', text: 'Create an issue.',
+      });
+      await processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: session.id, requestId: 'unknown', workflow: 'not-a-workflow', text: 'Create an issue.',
+      });
+
+      assert.strictEqual(chatManager.calls.send.length, 0);
+      const results = sent.filter((message) => message.type === 'chat_builtin_workflow_result');
+      assert.match(results.find((result) => result.requestId === 'blank').message, /Describe the issue/);
+      assert.match(results.find((result) => result.requestId === 'plan').message, /Plan mode off/);
+      assert.match(results.find((result) => result.requestId === 'unknown').message, /unavailable/);
+    });
+
+    it('rejects oversized prompts and conversations the caller cannot own or drive', async function () {
+      const oversized = build({ surface: 'chat' });
+      await oversized.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: oversized.session.id,
+        requestId: 'oversized', workflow: 'gh-issue', text: 'x'.repeat(20_001),
+      });
+      assert.match(lastOfType(oversized.sent, 'chat_builtin_workflow_result').message, /20,000 characters/);
+      assert.strictEqual(oversized.chatManager.calls.send.length, 0);
+
+      const padded = build({ surface: 'chat' });
+      await padded.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: padded.session.id,
+        requestId: 'padded', workflow: 'gh-issue', text: `${' '.repeat(20_001)}issue`,
+      });
+      assert.match(lastOfType(padded.sent, 'chat_builtin_workflow_result').message, /20,000 characters/);
+      assert.strictEqual(padded.chatManager.calls.send.length, 0);
+
+      const foreign = build({ surface: 'chat', ownerUserId: 99 });
+      await foreign.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: foreign.session.id,
+        requestId: 'foreign', workflow: 'gh-issue', text: 'Create an issue.',
+      });
+      assert.match(lastOfType(foreign.sent, 'chat_builtin_workflow_result').message, /unavailable/);
+      assert.strictEqual(foreign.chatManager.calls.send.length, 0);
+
+      const terminal = build({ surface: 'terminal' });
+      await terminal.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: terminal.session.id,
+        requestId: 'terminal', workflow: 'gh-issue', text: 'Create an issue.',
+      });
+      assert.match(lastOfType(terminal.sent, 'chat_builtin_workflow_result').message, /unavailable/);
+      assert.strictEqual(terminal.chatManager.calls.send.length, 0);
+    });
+
+    it('keeps the popup open when liveness cannot be confirmed or the queue refuses the turn', async function () {
+      const stopped = build({ surface: 'chat' }, {
+        async snapshot() { return { live: false }; },
+      });
+      await stopped.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: stopped.session.id,
+        requestId: 'stopped', workflow: 'gh-issue', text: 'Create an issue.',
+      });
+      assert.match(lastOfType(stopped.sent, 'chat_builtin_workflow_result').message, /not running/);
+      assert.strictEqual(stopped.chatManager.calls.send.length, 0);
+
+      const unchecked = build({ surface: 'chat' }, {
+        async snapshot() { throw new Error('store offline'); },
+      });
+      await unchecked.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: unchecked.session.id,
+        requestId: 'unchecked', workflow: 'gh-issue', text: 'Create an issue.',
+      });
+      assert.match(lastOfType(unchecked.sent, 'chat_builtin_workflow_result').message, /could not be checked/);
+      assert.strictEqual(unchecked.chatManager.calls.send.length, 0);
+
+      const full = build({ surface: 'chat' }, {
+        async send() { throw new Error('there are already 24 messages waiting'); },
+      });
+      await full.processor.handleMessage('ws-1', {
+        type: 'chat_start_builtin_workflow', sessionId: full.session.id,
+        requestId: 'full', workflow: 'gh-issue', text: 'Create an issue.',
+      });
+      const refused = lastOfType(full.sent, 'chat_builtin_workflow_result');
+      assert.strictEqual(refused.accepted, false);
+      assert.match(refused.message, /already 24 messages waiting/);
+    });
+  });
+
   describe('start_chat', function () {
     it('launches the runtime through the chat manager, not the PTY bridge', async function () {
       const { processor, session, chatManager, sent } = build();
@@ -217,6 +451,30 @@ describe('chat wiring', function () {
       assert.strictEqual(session.surface, 'chat');
       assert.strictEqual(session.active, true);
       assert.strictEqual(session.agent, 'claude');
+    });
+
+    it('passes a persisted plan mode into a resumed launch', async function () {
+      const { processor, chatManager } = build({
+        surface: 'chat', agent: 'claude', lastAgent: 'claude', chatPlanMode: true,
+        nativeChatSessionId: 'native-1',
+      });
+
+      await processor.startChat('ws-1', 'claude', { resume: true });
+
+      assert.strictEqual(chatManager.calls.start[0].options.planMode, true);
+    });
+
+    it('clears a persisted plan mode before starting a fresh conversation', async function () {
+      const { processor, session, chatManager, sent } = build({
+        surface: 'chat', agent: 'claude', lastAgent: 'claude', chatPlanMode: true,
+        nativeChatSessionId: 'native-1',
+      });
+
+      await processor.startChat('ws-1', 'claude', { resume: false });
+
+      assert.strictEqual(chatManager.calls.start[0].options.planMode, false);
+      assert.strictEqual(session.chatPlanMode, false);
+      assert.strictEqual(lastOfType(sent, 'chat_started').planMode, false);
     });
 
     it('refuses a runtime with no verified chat adapter, and says why', async function () {
@@ -662,7 +920,12 @@ describe('chat wiring', function () {
 
     it('carries the profile default across when the override is cleared', async function () {
       const { processor, chatManager } = build({ surface: 'chat' });
-      processor.deps.resolveRuntimeProfile = () => ({ profileName: 'p', model: 'profile-default' });
+      // Through the read-only accessor, deliberately. The other one writes the
+      // profile's tier files to disk on every call, and picking a model from
+      // the chip is a question about this conversation rather than a launch —
+      // asking it that way rewrote the project's `.pi/agents/*.md` on every
+      // click (#171).
+      processor.deps.activeProfileFor = () => ({ profileName: 'p', model: 'profile-default' });
 
       await processor.handleMessage('ws-1', { type: 'chat_set_model', model: '' });
 
@@ -1096,6 +1359,175 @@ describe('chat wiring', function () {
       const { processor, sent } = build({ surface: undefined });
       await processor.joinSession('ws-1', 'session-1');
       assert.strictEqual(lastOfType(sent, 'session_joined').surface, 'terminal');
+    });
+  });
+
+  describe('the durable plan lifecycle', function () {
+    it('persists an idle mode switch and broadcasts the manager’s response', async function () {
+      let saves = 0;
+      const { processor, session, sent } = build(
+        { surface: 'chat', chatPlanMode: false },
+        {
+          async setPlanMode(id, on) {
+            assert.strictEqual(id, 'session-1');
+            assert.strictEqual(on, true);
+            return { planMode: true, changed: true, detail: 'Plan mode is on.' };
+          },
+        },
+        { saveSessionsToDisk: async () => { saves += 1; } },
+      );
+
+      await processor.handleMessage('ws-1', { type: 'chat_set_plan_mode', sessionId: 'session-1', planMode: true });
+
+      assert.strictEqual(session.chatPlanMode, true);
+      assert.strictEqual(saves, 1, 'the next launch must inherit the accepted mode');
+      assert.deepStrictEqual(lastOfType(sent, 'chat_plan_mode'), {
+        type: 'chat_plan_mode', sessionId: 'session-1', planMode: true, changed: true, message: 'Plan mode is on.',
+      });
+    });
+
+    it('awaits persistence when the live mode lifecycle mutates the record before returning', async function () {
+      let saves = 0;
+      let held;
+      const { processor, session } = build(
+        { surface: 'chat', chatPlanMode: false },
+        {
+          async setPlanMode(_id, on) {
+            held.chatPlanMode = on;
+            return { planMode: on, changed: true, detail: 'Plan mode changed live.' };
+          },
+        },
+        { saveSessionsToDisk: async () => { saves += 1; } },
+      );
+      held = session;
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_set_plan_mode', sessionId: 'session-1', planMode: true,
+      });
+
+      assert.strictEqual(session.chatPlanMode, true);
+      assert.strictEqual(saves, 1, 'the already-mutated record still needs an awaited disk save');
+    });
+
+    it('routes accept and reject with only the revision the user reviewed', async function () {
+      const calls = [];
+      const { processor, sent } = build(
+        { surface: 'chat', chatPlanMode: true },
+        {
+          async acceptPlan(id, revision) {
+            calls.push(['accept', id, revision]);
+            return { accepted: true, action: 'accept', planMode: false, revision, detail: 'Implementing revision 3.' };
+          },
+          async rejectPlan(id, revision) {
+            calls.push(['reject', id, revision]);
+            return { accepted: true, action: 'reject', planMode: true, revision, detail: 'Plan remains open.' };
+          },
+        },
+      );
+
+      await processor.handleMessage('ws-1', { type: 'chat_accept_plan', sessionId: 'session-1', revision: 3 });
+      await processor.handleMessage('ws-1', { type: 'chat_reject_plan', sessionId: 'session-1', revision: 4 });
+
+      assert.deepStrictEqual(calls, [['accept', 'session-1', 3], ['reject', 'session-1', 4]]);
+      const actions = sent.filter((message) => message.type === 'chat_plan_action');
+      assert.deepStrictEqual(actions.map(({ action, accepted, planMode, revision }) => ({ action, accepted, planMode, revision })), [
+        { action: 'accept', accepted: true, planMode: false, revision: 3 },
+        { action: 'reject', accepted: true, planMode: true, revision: 4 },
+      ]);
+    });
+
+    it('resumes a stopped conversation and immediately accepts its durable plan', async function () {
+      const starts = [];
+      const accepts = [];
+      let running = false;
+      let saves = 0;
+      const { processor, session, sent } = build(
+        {
+          surface: 'chat', active: false, agent: null, lastAgent: 'claude',
+          nativeChatSessionId: 'native-plan-7', chatPlanMode: true,
+        },
+        {
+          async snapshot(record) {
+            return {
+              sessionId: record.id,
+              runtime: 'claude',
+              live: running,
+              planDocument: { markdown: '# Durable plan', revision: 7, ts: 10 },
+              messages: [], state: 'idle', capabilities: {}, pendingPermissions: [],
+              firstSeq: 0, cursor: 0, bypassPermissions: false,
+            };
+          },
+          async start(record, options) {
+            starts.push({ record, options });
+            running = true;
+            return {
+              runtimeKind: options.runtime,
+              currentCapabilities: { planMode: true },
+              bypassing: false,
+              live: true,
+            };
+          },
+          async acceptPlan(id, revision) {
+            accepts.push({ id, revision, running });
+            if (!running) return null;
+            return {
+              accepted: true, action: 'accept', planMode: false, revision,
+              detail: `Plan revision ${revision} accepted. Implementation started.`,
+            };
+          },
+        },
+        { saveSessionsToDisk: async () => { saves += 1; } },
+      );
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_accept_plan', sessionId: 'session-1', revision: 7,
+      });
+
+      assert.strictEqual(starts.length, 1, 'Accept must relaunch the stopped conversation');
+      assert.strictEqual(starts[0].options.resumeSessionId, 'native-plan-7');
+      assert.strictEqual(starts[0].options.startFresh, false);
+      assert.strictEqual(starts[0].options.planMode, true, 'the durable plan must survive relaunch');
+      assert.deepStrictEqual(accepts, [{ id: 'session-1', revision: 7, running: true }]);
+      assert.strictEqual(session.active, true);
+      assert.strictEqual(session.chatPlanMode, false);
+      assert.strictEqual(saves, 2, 'the relaunch and accepted mode must both be durable');
+      assert.deepStrictEqual(lastOfType(sent, 'chat_plan_action'), {
+        type: 'chat_plan_action', sessionId: 'session-1', action: 'accept',
+        accepted: true, planMode: false, revision: 7,
+        message: 'Plan revision 7 accepted. Implementation started.',
+      });
+    });
+
+    it('does not relaunch a stopped conversation for a stale plan revision', async function () {
+      let starts = 0;
+      let accepts = 0;
+      const { processor, sent } = build(
+        {
+          surface: 'chat', active: false, agent: null, lastAgent: 'claude',
+          chatPlanMode: true,
+        },
+        {
+          async snapshot() {
+            return {
+              runtime: 'claude', live: false,
+              planDocument: { markdown: '# Newer plan', revision: 8, ts: 11 },
+            };
+          },
+          async start() { starts += 1; throw new Error('must not start'); },
+          async acceptPlan() { accepts += 1; throw new Error('must not accept'); },
+        },
+      );
+
+      await processor.handleMessage('ws-1', {
+        type: 'chat_accept_plan', sessionId: 'session-1', revision: 7,
+      });
+
+      assert.strictEqual(starts, 0);
+      assert.strictEqual(accepts, 0);
+      const action = lastOfType(sent, 'chat_plan_action');
+      assert.strictEqual(action.accepted, false);
+      assert.strictEqual(action.revision, 8);
+      assert.match(action.message, /stale/i);
     });
   });
 

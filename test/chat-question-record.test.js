@@ -43,7 +43,7 @@ const OPTIONS = [
  * was given, and the turn ending — in the order and with the shapes
  * `ChatSession` writes them.
  */
-function asked(picks, { skipped = false } = {}) {
+function asked(picks, { skipped = false, text } = {}) {
   let seq = 0;
   const next = () => (seq += 1);
   return [
@@ -68,12 +68,32 @@ function asked(picks, { skipped = false } = {}) {
     },
     {
       t: 'question_resolved', seq: next(), ts: 7,
-      requestId: 'req-1', toolId: TOOL_ID, optionIds: picks, skipped,
+      requestId: 'req-1', toolId: TOOL_ID, optionIds: picks, text, skipped,
     },
     { t: 'tool', seq: next(), ts: 8, toolId: TOOL_ID, patch: { status: 'completed', output: 'The user chose: Rewrite it' } },
     { t: 'msg_end', seq: next(), ts: 9, msgId: 'a1' },
     { t: 'turn_end', seq: next(), ts: 10, turnId: 't1', stopReason: 'end_turn' },
   ];
+}
+
+function fallbackAsked(picks, { skipped = false, text } = {}) {
+  const request = {
+    requestId: 'fallback-req-1',
+    question: 'Which fallback path should I take?',
+    multiSelect: false,
+    options: OPTIONS,
+    ts: 1,
+  };
+  return {
+    request,
+    events: [
+      { t: 'question', seq: 1, ts: 1, request },
+      {
+        t: 'question_resolved', seq: 2, ts: 2,
+        requestId: request.requestId, optionIds: picks, text, skipped,
+      },
+    ],
+  };
 }
 
 describe('an answered question survives being left and come back to (#113)', function () {
@@ -125,6 +145,40 @@ describe('an answered question survives being left and come back to (#113)', fun
       store.append(ref, asked(['opt-0']).slice(0, 6));
       const snapshot = await store.snapshot(ref, {});
       assert.deepStrictEqual(snapshot.answeredQuestions, {});
+    });
+
+    it('carries the words for a question answered in the user’s own', async function () {
+      // The same failure as #113 one layer along: the words are in the log and
+      // the reducer folds them, and a snapshot with nowhere to put them would
+      // redraw the card as one the user had skipped — beside an agent that had
+      // plainly acted on what they wrote.
+      store.append(ref, asked([], { text: 'A container per project, not per session.' }));
+      const snapshot = await store.snapshot(ref, {});
+      assert.strictEqual(
+        snapshot.answeredQuestionText[TOOL_ID],
+        'A container per project, not per session.',
+      );
+      assert.deepStrictEqual(snapshot.answeredQuestions[TOOL_ID], []);
+    });
+
+    it('says nothing about words for a question answered by clicking', async function () {
+      store.append(ref, asked(['opt-1']));
+      const snapshot = await store.snapshot(ref, {});
+      assert.deepStrictEqual(snapshot.answeredQuestionText, {});
+    });
+
+    it('retains an answered fallback question that has no tool block of its own', async function () {
+      const fallback = fallbackAsked(['opt-1']);
+      store.append(ref, fallback.events);
+      const snapshot = await store.snapshot(ref, {});
+      assert.deepStrictEqual(snapshot.questionHistory, [fallback.request]);
+      assert.deepStrictEqual(snapshot.answeredQuestions[fallback.request.requestId], ['opt-1']);
+      assert.deepStrictEqual(snapshot.pendingQuestions || [], []);
+      assert.deepStrictEqual(snapshot.messages[0].blocks[0], {
+        kind: 'question',
+        request: fallback.request,
+        answer: { optionIds: ['opt-1'] },
+      }, 'the fallback decision has a chronological, self-contained transcript block');
     });
   });
 
@@ -215,6 +269,66 @@ describe('an answered question survives being left and come back to (#113)', fun
         ['opt-2'],
         'scrolling back far enough to reach a decision has to show the decision',
       );
+    });
+
+    it('keeps the words a question was answered with across a rejoin', function () {
+      const controller = new mod.ChatController('s1', { send: () => {} });
+      controller.handle(snapshot({}));
+      for (const event of asked([], { text: 'neither — rebuild it nightly' })) {
+        controller.transcript.apply(event);
+      }
+      assert.strictEqual(controller.transcript.answerTextFor(TOOL_ID), 'neither — rebuild it nightly');
+
+      controller.handle(
+        snapshot({
+          messages: controller.transcript.messages,
+          answeredQuestions: { [TOOL_ID]: [] },
+          answeredQuestionText: { [TOOL_ID]: 'neither — rebuild it nightly' },
+          cursor: 10,
+        }),
+      );
+      assert.strictEqual(
+        controller.transcript.answerTextFor(TOOL_ID),
+        'neither — rebuild it nightly',
+        'without this the card comes back reading as one nobody answered',
+      );
+    });
+
+    it('keeps a resolved no-tool fallback question through live resolution and reload', function () {
+      const fallback = fallbackAsked(['opt-1']);
+      const controller = new mod.ChatController('s1', { send: () => {} });
+      controller.handle(snapshot({}));
+      controller.transcript.apply(fallback.events[0]);
+      controller.transcript.apply(fallback.events[1]);
+      assert.strictEqual(controller.transcript.pendingQuestions.length, 0);
+      assert.deepStrictEqual(controller.transcript.questionHistory, [fallback.request]);
+      assert.deepStrictEqual(controller.transcript.answerFor(fallback.request.requestId), ['opt-1']);
+      assert.deepStrictEqual(controller.transcript.messages[0].blocks[0].answer, {
+        optionIds: ['opt-1'],
+      });
+
+      controller.handle(snapshot({
+        messages: controller.transcript.messages,
+        pendingQuestions: [],
+        questionHistory: [fallback.request],
+        answeredQuestions: { [fallback.request.requestId]: ['opt-1'] },
+        cursor: 2,
+      }));
+      assert.deepStrictEqual(controller.transcript.questionHistory, [fallback.request]);
+      assert.deepStrictEqual(controller.transcript.answerFor(fallback.request.requestId), ['opt-1']);
+    });
+
+    it('keeps them for a question that arrives by scrolling back through history', function () {
+      const controller = new mod.ChatController('s1', { send: () => {} });
+      controller.handle(snapshot({ firstSeq: 11, replayFrom: 11, cursor: 20 }));
+      controller.handle({
+        type: 'chat_page',
+        sessionId: 's1',
+        events: asked([], { text: 'none of those' }),
+        firstSeq: 1,
+        from: 1,
+      });
+      assert.strictEqual(controller.transcript.answerTextFor(TOOL_ID), 'none of those');
     });
   });
 });

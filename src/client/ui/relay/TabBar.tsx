@@ -1,5 +1,8 @@
 import * as React from 'react';
 
+import { SessionStateIcon } from '../SessionStateIcon';
+import { Icon } from './Icon';
+
 export type TabStatus = 'running' | 'error' | (string & {});
 
 export interface TabItem {
@@ -18,12 +21,6 @@ export interface TabItem {
   /** Shown on hover; the strip truncates titles aggressively. */
   tooltip?: string;
 }
-
-/** What the dot means when a tab is waiting, said in words as well as colour. */
-const ATTENTION_LABEL: Record<'approval' | 'question', string> = {
-  approval: 'Waiting for approval',
-  question: 'Asked you a question',
-};
 
 // `matches(':focus-visible')` throws a SyntaxError on engines that do not know the
 // pseudo-class, and an exception thrown out of a React event handler takes the
@@ -82,22 +79,6 @@ function Tab({
 
   const closeVisible = hover || active || focusWithin;
 
-  // Waiting outranks running, which is not the obvious order and is the whole
-  // point. `status` here does not mean "the agent is working": for a
-  // conversation it is the server's `active` flag, which means the process is
-  // alive and is true of an agent that has been stopped for an approval since
-  // yesterday. So a blocked conversation whose tab was joined, or whose page
-  // was reloaded, painted a working green dot while the very same element told
-  // a screen reader it was waiting for approval.
-  //
-  // It outranks unread for a different reason: unread is cleared by looking at
-  // the tab, and this is not — the dot goes when the approval is answered, not
-  // when it is noticed.
-  const dot = tab.status === 'error' ? 'var(--destructive)'
-    : tab.attention === 'approval' ? 'var(--warning)'
-      : tab.attention === 'question' ? 'var(--info)'
-        : tab.status === 'running' ? 'var(--ansi-green)'
-          : tab.unread ? 'var(--primary)' : 'var(--muted-foreground)';
   const activeShadow = active ? 'inset 0 2px 0 var(--foreground)' : '';
   const wrapperStyle: React.CSSProperties = {
     position: 'relative', display: 'flex', alignItems: 'center', gap: 8, padding: '0 8px 0 12px',
@@ -111,14 +92,6 @@ function Tab({
     boxShadow: focusVisible
       ? (activeShadow ? activeShadow + ', var(--shadow-focus)' : 'var(--shadow-focus)')
       : (activeShadow || 'none'),
-  };
-  const dotStyle: React.CSSProperties = {
-    width: 6, height: 6, flex: '0 0 auto', borderRadius: 'var(--radius-full)', background: dot,
-    // And nothing pulses while it is stopped: the pulse is what reads as
-    // progress, on a session that is making none until somebody answers it.
-    animation: tab.status === 'running' && !tab.attention
-      ? 'relay-pulse 1.6s ease-in-out infinite'
-      : 'none',
   };
   const labelStyle: React.CSSProperties = {
     flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-sm)',
@@ -216,16 +189,12 @@ function Tab({
       onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
       style={wrapperStyle}
     >
-      {tab.status ? (
-        // Named when it is carrying something, unnamed when it is only
-        // decoration: a dot announced as "idle" on every tab in the strip is
-        // noise, and a waiting session that says nothing at all is the failure
-        // this row is here to prevent.
-        tab.attention ? (
-          <span role="img" aria-label={ATTENTION_LABEL[tab.attention]} style={dotStyle} />
-        ) : (
-          <span style={dotStyle} />
-        )
+      {tab.status || tab.unread || tab.attention ? (
+        <SessionStateIcon
+          status={tab.status}
+          unread={tab.unread}
+          attention={tab.attention}
+        />
       ) : null}
       <span style={labelStyle}>{tab.title}</span>
       <button
@@ -239,6 +208,230 @@ function Tab({
       >✕</button>
     </div>
   );
+}
+
+interface TabOverflowMenuProps {
+  id: string;
+  tabs: TabItem[];
+  activeId?: string;
+  triggerRef: React.RefObject<HTMLButtonElement | null>;
+  onSelect: (id: string) => void;
+  onDismiss: (restoreFocus?: boolean) => void;
+}
+
+/**
+ * Every open tab in one compact, stable list.
+ *
+ * This deliberately lists all tabs rather than trying to calculate which
+ * pixels are currently hidden. A menu whose contents change while the strip is
+ * wheeled is disorienting; the open-tab order is the useful invariant.
+ */
+function TabOverflowMenu({
+  id, tabs, activeId, triggerRef, onSelect, onDismiss,
+}: TabOverflowMenuProps): React.JSX.Element {
+  const menuRef = React.useRef<HTMLDivElement | null>(null);
+  const itemRefs = React.useRef<Array<HTMLButtonElement | null>>([]);
+  const [hoveredId, setHoveredId] = React.useState<string | null>(null);
+  const activeIndex = Math.max(0, tabs.findIndex((tab) => tab.id === activeId));
+
+  React.useEffect(() => {
+    // Focus follows the menu open, landing on the current session so keyboard
+    // use starts from the same place as pointer use.
+    itemRefs.current[activeIndex]?.focus();
+    const onPointerDown = (event: MouseEvent): void => {
+      const target = event.target as Node;
+      if (menuRef.current?.contains(target) || triggerRef.current?.contains(target)) return;
+      onDismiss(false);
+    };
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      onDismiss(true);
+    };
+
+    // Capture makes an outside control that stops propagation behave like any
+    // other outside click. Escape is captured for the same reason: the active
+    // surface beneath the menu must not also consume it.
+    document.addEventListener('mousedown', onPointerDown, true);
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown, true);
+      window.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [activeIndex, onDismiss, triggerRef]);
+
+  const focusItem = (index: number): void => {
+    const count = tabs.length;
+    if (count === 0) return;
+    itemRefs.current[(index + count) % count]?.focus();
+  };
+
+  const onMenuKeyDown = (event: React.KeyboardEvent<HTMLDivElement>): void => {
+    const index = itemRefs.current.findIndex((item) => item === document.activeElement);
+    const target = index >= 0 ? index : activeIndex;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowRight') {
+      event.preventDefault();
+      focusItem(target + 1);
+    } else if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') {
+      event.preventDefault();
+      focusItem(target - 1);
+    } else if (event.key === 'Home') {
+      event.preventDefault();
+      focusItem(0);
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      focusItem(tabs.length - 1);
+    }
+  };
+
+  return (
+    <div
+      ref={menuRef}
+      id={id}
+      role="menu"
+      aria-label="Open tabs"
+      onKeyDown={onMenuKeyDown}
+      style={{
+        position: 'absolute',
+        top: 'calc(100% + 2px)',
+        right: 0,
+        width: 280,
+        maxWidth: 'min(360px, calc(100vw - 16px))',
+        maxHeight: 'min(420px, calc(100vh - 52px))',
+        overflowY: 'auto',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 1,
+        padding: 'var(--space-1)',
+        background: 'var(--popover)',
+        border: '1px solid var(--border)',
+        borderRadius: 'var(--radius)',
+        boxShadow: 'var(--shadow-popover)',
+        animation: 'relay-scale-in var(--duration-fast) var(--ease-out)',
+        zIndex: 'var(--z-dropdown)' as unknown as number,
+      }}
+    >
+      {tabs.map((tab, index) => {
+        const selected = tab.id === activeId;
+        return (
+          <button
+            ref={(element) => { itemRefs.current[index] = element; }}
+            key={tab.id}
+            type="button"
+            role="menuitemradio"
+            aria-checked={selected}
+            tabIndex={index === activeIndex ? 0 : -1}
+            title={tab.tooltip}
+            onMouseEnter={() => setHoveredId(tab.id)}
+            onMouseLeave={() => setHoveredId(null)}
+            onClick={() => {
+              onDismiss(true);
+              onSelect(tab.id);
+            }}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              width: '100%',
+              minHeight: 30,
+              padding: '0 8px',
+              background: selected || hoveredId === tab.id ? 'var(--accent)' : 'transparent',
+              border: 'none',
+              borderRadius: 'var(--radius)',
+              color: selected ? 'var(--foreground)' : 'var(--muted-foreground)',
+              font: 'inherit',
+              fontFamily: 'var(--font-mono)',
+              fontSize: 'var(--text-xs)',
+              textAlign: 'left',
+              cursor: 'pointer',
+            }}
+          >
+            <SessionStateIcon
+              status={tab.status}
+              unread={tab.unread}
+              attention={tab.attention}
+              size={13}
+            />
+            <span
+              style={{
+                flex: 1,
+                minWidth: 0,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                fontWeight: tab.unread && !selected
+                  ? 'var(--font-semibold)' as React.CSSProperties['fontWeight']
+                  : undefined,
+              }}
+            >
+              {tab.title ?? tab.id}
+            </span>
+            {selected ? <Icon name="check" size={12} /> : null}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Whether the session row has more tabs than it can currently show.
+ *
+ * The control this enables is outside `ref`, so revealing it can only make an
+ * already-overflowing strip narrower. It cannot become part of its own
+ * measurement and blink in and out at the threshold.
+ */
+function useTabStripOverflow(
+  ref: React.RefObject<HTMLElement | null>,
+  contentKey: string,
+): boolean {
+  const [overflowing, setOverflowing] = React.useState(false);
+
+  React.useEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+
+    // Fractional zoom can report a fraction of a pixel of overflow for a row
+    // that visually fits. One pixel of slack keeps the affordance honest.
+    const measure = (): void => setOverflowing(element.scrollWidth > element.clientWidth + 1);
+    measure();
+    window.addEventListener('resize', measure);
+
+    if (typeof ResizeObserver === 'undefined') {
+      return () => window.removeEventListener('resize', measure);
+    }
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    // The flex item can keep the same observed content box while its parent is
+    // negotiating space with leading/trailing controls. Watching the bar as
+    // well makes any change in the actual width budget a measurement trigger.
+    if (element.parentElement) observer.observe(element.parentElement);
+    for (const child of Array.from(element.children)) observer.observe(child);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, [contentKey, ref]);
+
+  return overflowing;
+}
+
+function scrollTabStripWithWheel(strip: HTMLElement, event: WheelEvent): void {
+  if (strip.scrollWidth <= strip.clientWidth + 1 || event.deltaY === 0) return;
+  // Horizontal or diagonal input is already natively correct. Leaving it
+  // alone preserves the fine-grained movement and momentum of a trackpad;
+  // only a vertical-only mouse wheel is remapped into this horizontal row.
+  if (Math.abs(event.deltaX) > 0.01) return;
+
+  const scale = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? strip.clientWidth : 1;
+  const maximum = Math.max(0, strip.scrollWidth - strip.clientWidth);
+  const next = Math.max(0, Math.min(maximum, strip.scrollLeft + event.deltaY * scale));
+  // At either end the page keeps its normal vertical wheel behaviour instead
+  // of trapping the pointer over a strip that cannot move any farther.
+  if (next === strip.scrollLeft) return;
+  event.preventDefault();
+  strip.scrollLeft = next;
 }
 
 export interface TabBarProps {
@@ -269,17 +462,24 @@ export interface TabBarProps {
   trailing?: React.ReactNode;
   /** Accessible name for the tab strip, for pages that render more than one. */
   ariaLabel?: string;
+  /** Native title bars reserve fixed actions first; tabs take the remainder. */
+  tabsYieldFirst?: boolean;
   style?: React.CSSProperties;
 }
 
 export function TabBar({
   tabs = [], activeId, onSelect, onClose, onNew, onReorder, dragPayload,
   onTabContextMenu, onTabDoubleClick, onTabAuxClose, leading, trailing,
-  ariaLabel = 'Tabs', style,
+  ariaLabel = 'Tabs', tabsYieldFirst = false, style,
 }: TabBarProps): React.JSX.Element {
   const [hoverNew, setHoverNew] = React.useState(false);
+  const [hoverOverflow, setHoverOverflow] = React.useState(false);
+  const [overflowFocusVisible, setOverflowFocusVisible] = React.useState(false);
+  const [overflowMenuOpen, setOverflowMenuOpen] = React.useState(false);
   const tabRefs = React.useRef<Array<HTMLDivElement | null>>([]);
   const listRef = React.useRef<HTMLDivElement | null>(null);
+  const overflowButtonRef = React.useRef<HTMLButtonElement | null>(null);
+  const overflowMenuId = React.useId();
 
   // The order shown while a drag is in flight. Null the rest of the time, so the
   // strip renders straight from props and cannot drift from the owner's list.
@@ -293,6 +493,31 @@ export function TabBar({
     // A tab that arrived or left mid-drag would otherwise vanish from the strip.
     return ordered.length === tabs.length ? ordered : tabs;
   }, [tabs, dragOrder]);
+
+  const overflowing = useTabStripOverflow(listRef, shown.map((tab) => tab.id).join('\u0000'));
+
+  const dismissOverflowMenu = React.useCallback((restoreFocus = false): void => {
+    setOverflowMenuOpen(false);
+    if (restoreFocus) overflowButtonRef.current?.focus();
+  }, []);
+
+  // A resize or a close from another device can make every tab fit while the
+  // chooser is open. The chooser cannot outlive the overflow-only button that
+  // owns it.
+  React.useEffect(() => {
+    if (!overflowing) setOverflowMenuOpen(false);
+  }, [overflowing]);
+
+  React.useEffect(() => {
+    const strip = listRef.current;
+    if (!strip) return;
+    const onWheel = (event: WheelEvent): void => scrollTabStripWithWheel(strip, event);
+    // React delegates wheel events passively in modern browsers. This one must
+    // be non-passive because remapping a vertical wheel without cancelling the
+    // original would move the page and the tab row at the same time.
+    strip.addEventListener('wheel', onWheel, { passive: false });
+    return () => strip.removeEventListener('wheel', onWheel);
+  }, []);
 
   const activeIndex = shown.findIndex((t) => t.id === activeId);
   // With no active tab the strip would otherwise have no tab stop at all.
@@ -358,21 +583,46 @@ export function TabBar({
     display: 'flex', alignItems: 'stretch', height: 36, background: 'var(--tab-bar)', borderBottom: '1px solid var(--border)', ...style,
   };
   const listStyle: React.CSSProperties = {
-    display: 'flex', alignItems: 'stretch', minWidth: 0, overflowX: 'auto', overflowY: 'hidden',
+    display: 'flex', alignItems: 'stretch', flex: tabsYieldFirst ? '1 1 0' : undefined,
+    minWidth: 0, overflowX: 'auto', overflowY: 'hidden',
     // The strip is one row tall; a horizontal scrollbar inside it would eat a
-    // third of its height. Wheel and touch scrolling still work.
+    // third of its height. Keep native two-axis gesture negotiation so a
+    // horizontal swipe moves the tabs while a vertical swipe can still belong
+    // to the surrounding page. The WebKit property preserves momentum on
+    // older iOS browsers, and containment prevents a swipe at either end from
+    // becoming browser back/forward navigation.
     scrollbarWidth: 'none',
+    touchAction: 'pan-x pan-y pinch-zoom',
+    WebkitOverflowScrolling: 'touch',
+    overscrollBehaviorX: 'contain',
   };
   const newStyle: React.CSSProperties = {
     width: 34, flex: '0 0 auto', border: 'none', borderRight: '1px solid var(--border)',
     background: hoverNew ? 'var(--accent)' : 'transparent', color: 'var(--muted-foreground)',
     cursor: 'pointer', fontSize: 16, lineHeight: 1,
   };
+  const overflowStyle: React.CSSProperties = {
+    width: 34,
+    height: '100%',
+    flex: '0 0 auto',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    border: 'none',
+    borderRight: '1px solid var(--border)',
+    background: overflowMenuOpen || hoverOverflow ? 'var(--accent)' : 'transparent',
+    color: overflowMenuOpen ? 'var(--foreground)' : 'var(--muted-foreground)',
+    cursor: 'pointer',
+    outline: 'none',
+    boxShadow: overflowFocusVisible ? 'var(--shadow-focus)' : 'none',
+  };
+
   return (
     <div style={barStyle}>
       {leading}
       <div
         ref={listRef}
+        data-window-drag="true"
         role="tablist"
         aria-label={ariaLabel}
         aria-orientation="horizontal"
@@ -396,6 +646,40 @@ export function TabBar({
           />
         ))}
       </div>
+      {/* Outside the measured scroller on purpose. If it took part in the
+          measurement, showing the button could make the row overflow and
+          hiding it could make the row fit, causing an endless oscillation. */}
+      {overflowing && onSelect ? (
+        <div style={{ position: 'relative', flex: '0 0 auto', height: '100%' }}>
+          <button
+            ref={overflowButtonRef}
+            type="button"
+            aria-label="All open tabs"
+            title="All open tabs"
+            aria-haspopup="menu"
+            aria-expanded={overflowMenuOpen}
+            aria-controls={overflowMenuOpen ? overflowMenuId : undefined}
+            onClick={() => setOverflowMenuOpen((open) => !open)}
+            onMouseEnter={() => setHoverOverflow(true)}
+            onMouseLeave={() => setHoverOverflow(false)}
+            onFocus={(event) => setOverflowFocusVisible(matchesFocusVisible(event.currentTarget))}
+            onBlur={() => setOverflowFocusVisible(false)}
+            style={overflowStyle}
+          >
+            <Icon name="layout-list" size={14} />
+          </button>
+          {overflowMenuOpen ? (
+            <TabOverflowMenu
+              id={overflowMenuId}
+              tabs={shown}
+              activeId={activeId}
+              triggerRef={overflowButtonRef}
+              onSelect={onSelect}
+              onDismiss={dismissOverflowMenu}
+            />
+          ) : null}
+        </div>
+      ) : null}
       {/* Rendered only when there is something to do. Without a handler it was
           still a focusable control announcing itself as "New tab" and doing
           nothing when activated — the same defect as the sidebar's "+". */}
@@ -407,7 +691,13 @@ export function TabBar({
           style={newStyle}
         >+</button>
       ) : null}
-      <div style={{ flex: 1, minWidth: 8 }} />
+      {/* The unoccupied run of the tab bar is useful native chrome in an
+          installed WCO window. Tabs and buttons remain no-drag regions, so a
+          session can still be selected or reordered normally. */}
+      <div
+        data-window-drag="true"
+        style={{ flex: tabsYieldFirst ? '0 0 8px' : 1, minWidth: 8 }}
+      />
       {trailing}
     </div>
   );

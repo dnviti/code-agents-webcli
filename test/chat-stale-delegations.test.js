@@ -128,7 +128,7 @@ describe('a delegation nothing will report on again (#139)', function () {
       await flush();
     }
     await done;
-    await adapter.send({ text: 'what is the magic word' });
+    const sending = adapter.send({ text: 'what is the magic word' });
     for (const line of lines.slice(2)) {
       const update = line?.params?.update;
       const backgrounded =
@@ -138,6 +138,7 @@ describe('a delegation nothing will report on again (#139)', function () {
       adapter.handleMessage(line);
       await flush();
     }
+    await sending;
 
     const state = fold(events);
     const open = toolBlocks(state);

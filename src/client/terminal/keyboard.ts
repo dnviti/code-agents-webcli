@@ -16,6 +16,8 @@
 //    viewport meta); iOS Safari, which overlays the keyboard without resizing
 //    anything, is handled here off visualViewport.
 
+import { visualViewportKeyboardInset } from '../ui/keyboard-viewport';
+
 /** The helper textarea the user last typed into (main terminal or a split). */
 let activeTextarea: HTMLTextAreaElement | null = null;
 
@@ -85,11 +87,11 @@ export function watchKeyboardInset(appEl: HTMLElement, onChange: () => void): vo
     // visual viewport by the same mechanism, and squeezing the app because
     // someone zoomed is the bug this guard exists to prevent.
     const focused = document.activeElement;
-    const typing =
+    const terminalTyping =
       focused instanceof HTMLTextAreaElement &&
       focused.classList.contains('xterm-helper-textarea');
-    const inset = window.innerHeight - viewport.height;
-    if (typing && inset > KEYBOARD_MIN_INSET_PX) {
+    const inset = terminalTyping ? visualViewportKeyboardInset(viewport) : 0;
+    if (inset > KEYBOARD_MIN_INSET_PX) {
       appEl.style.height = `${viewport.height}px`;
       appEl.style.transform = `translateY(${viewport.offsetTop}px)`;
     } else {

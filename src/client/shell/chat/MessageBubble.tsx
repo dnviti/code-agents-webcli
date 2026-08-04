@@ -8,6 +8,7 @@ import {
   NoticeBlock,
   ToolBlock,
   askedQuestionFrom,
+  withoutQuestionFallbackEnvelope,
 } from '../../../shared/chat-events.js';
 import {
   blockDraws,
@@ -91,7 +92,12 @@ export interface MessageBubbleProps {
    * Must be referentially stable — this component is memoised, and a fresh
    * closure per render would re-render the whole transcript on every token.
    */
-  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
+  onAnswerQuestion?: (
+    requestId: string,
+    optionIds: string[],
+    skipped: boolean,
+    text?: string,
+  ) => Promise<boolean> | void;
 }
 
 export const MessageBubble = React.memo(function MessageBubble({
@@ -564,7 +570,12 @@ function BlockView({
   plain: boolean;
   caret: boolean;
   transcript: ChatTranscript;
-  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
+  onAnswerQuestion?: (
+    requestId: string,
+    optionIds: string[],
+    skipped: boolean,
+    text?: string,
+  ) => Promise<boolean> | void;
   onRetry?: () => void;
 }) {
   switch (block.kind) {
@@ -594,7 +605,7 @@ function BlockView({
         // or a diff — which are not in the selector — keeps the width its
         // content needs; a descendant selector would have capped them too.
         <div className="chat-prose" style={{ minWidth: 0 }}>
-          <Markdown text={block.text} />
+          <Markdown text={withoutQuestionFallbackEnvelope(block.text)} />
           {caret ? <Caret /> : null}
         </div>
       );
@@ -622,6 +633,28 @@ function BlockView({
 
     case 'plan':
       return <PlanPanel items={block.items} />;
+
+    case 'question': {
+      const recorded = block.request;
+      const request = transcript.pendingQuestions.find(
+        (pending) => pending.requestId === recorded.requestId,
+      );
+      const answerKey = recorded.toolId ?? recorded.requestId;
+      const durable = block.answer;
+      return (
+        <QuestionCard
+          request={request}
+          question={recorded.question}
+          header={recorded.header}
+          multiSelect={recorded.multiSelect}
+          options={recorded.options}
+          answered={request ? undefined : (transcript.answerFor(answerKey) ?? durable?.optionIds)}
+          ownWords={request ? undefined : (transcript.answerTextFor(answerKey) ?? durable?.text)}
+          abandoned={!request && (transcript.abandonedFor(answerKey) || durable?.abandoned)}
+          onAnswer={onAnswerQuestion}
+        />
+      );
+    }
 
     case 'image':
       return <ImageView block={block} />;
@@ -653,7 +686,12 @@ function QuestionBlock({
 }: {
   block: ToolBlock;
   transcript: ChatTranscript;
-  onAnswerQuestion?: (requestId: string, optionIds: string[], skipped: boolean) => void;
+  onAnswerQuestion?: (
+    requestId: string,
+    optionIds: string[],
+    skipped: boolean,
+    text?: string,
+  ) => Promise<boolean> | void;
 }): React.JSX.Element | null {
   const asked = askedQuestionFrom(block.input);
   // Still streaming its arguments in, or malformed. Nothing to draw yet — and
@@ -671,10 +709,19 @@ function QuestionBlock({
       multiSelect={asked.multiSelect}
       options={asked.options}
       answered={answered}
+      // The other half of an answer, for a question answered in free text: the
+      // ids alone would come back as an empty list, which is what a skip looks
+      // like, and the card would say nobody answered a question that was.
+      ownWords={request ? undefined : transcript.answerTextFor(block.toolId)}
       // The fallback for a card rebuilt from a snapshot, where the resolution
       // event was folded away before this browser ever saw it: the tool result
       // is the model's own copy of the answer and is still in the block.
       answerText={!request && !answered ? block.output : undefined}
+      // Whether anybody was ever in a position to answer. An empty list of
+      // picks says "no options were chosen" and nothing about why; this is the
+      // difference between a question its user declined and one whose agent had
+      // already stopped listening (#174).
+      abandoned={!request && transcript.abandonedFor(block.toolId)}
       onAnswer={onAnswerQuestion}
     />
   );
@@ -684,6 +731,10 @@ function QuestionBlock({
 const NOTICE_GLYPH: Partial<Record<NoticeBlock['notice'], string>> = {
   interrupted: 'square',
   branched: 'git-branch',
+  // A rung change, up or down. One glyph for both directions: the detail beside
+  // it names the rung, and two arrows would encode as a symbol the one thing
+  // the sentence already says out loud.
+  model: 'chevrons-up-down',
 };
 
 /**
@@ -913,6 +964,9 @@ export function plainText(message: ChatMessage): string {
     .join('\n\n');
 }
 
+/** Keep the private no-MCP wire envelope out of rendered and copied history. */
+export { withoutQuestionFallbackEnvelope };
+
 /** Plain text of a whole message, for the copy button. */
 export function messageText(message: ChatMessage): string {
   const parts: string[] = [];
@@ -921,7 +975,9 @@ export function messageText(message: ChatMessage): string {
       case 'text':
         // Reasoning is deliberately left out: copying a message is copying the
         // answer, not the working.
-        parts.push(message.role === 'user' ? block.text : markdownText(block.text));
+        parts.push(message.role === 'user'
+          ? block.text
+          : markdownText(withoutQuestionFallbackEnvelope(block.text)));
         break;
       case 'error':
         parts.push(block.text);
@@ -938,6 +994,15 @@ export function messageText(message: ChatMessage): string {
         break;
       case 'image':
         parts.push(block.alt ? `${block.alt} (${block.url})` : block.url);
+        break;
+      case 'question':
+        parts.push([
+          block.request.question,
+          ...block.request.options.map((option) => option.label),
+          ...((block.answer?.optionIds ?? []).map((optionId) =>
+            block.request.options.find((option) => option.optionId === optionId)?.label ?? optionId)),
+          block.answer?.text ?? '',
+        ].join('\n'));
         break;
       default:
         break;

@@ -4,6 +4,7 @@ import {
 } from '../../shared/chat-events.js';
 import { ChatAdapter, ChatAdapterOptions } from './adapter.js';
 import { AcpChatAdapter } from './adapters/acp.js';
+import { AntigravityChatAdapter } from './adapters/antigravity.js';
 import { ClaudeChatAdapter } from './adapters/claude.js';
 import { CodexChatAdapter } from './adapters/codex.js';
 import { PiChatAdapter } from './adapters/pi.js';
@@ -32,32 +33,45 @@ import { PiChatAdapter } from './adapters/pi.js';
 export type ChatAdapterFactory = (options: ChatAdapterOptions) => ChatAdapter;
 
 /**
- * How a runtime is handed the MCP server that asks the user questions.
+ * How a runtime is handed ccweb's session-scoped tools.
  *
  * `cli` — as a `--mcp-config` argument at spawn (claude).
  * `protocol` — in the handshake, as part of `session/new` (ACP agents).
+ * `extension` — as a generated file loaded with `-e` (pi), which has no MCP of
+ *   its own and no ACP. A different road to the same place: the tool has the
+ *   same name, dials the same socket and draws the same card.
+ * `config` — as process-local `-c mcp_servers...` overrides (codex app-server).
  *
- * Absent means the runtime has no verified way to accept one, and it simply
- * reports `questions: false` rather than being handed a flag nobody has watched
- * it parse.
- *
- * A wired channel is not a promise the model will use it. kimi accepts the
- * server, spawns it and exposes the tool — verified — but ships a native
- * `AskUserQuestion` of its own that it often reaches for first, and that one
- * answers itself with "the user dismissed this" without anybody being asked.
- * Nothing here can redirect it: refusing the native call through the permission
- * channel just ends the turn, because ACP carries no reason back to the model.
- * Wiring it anyway is still strictly better than not — when the model does pick
- * this tool the question reaches a person, and when it does not, the outcome is
- * the one kimi would have produced regardless.
+ * The channel may carry submit_plan and tier escalation without carrying the
+ * blocking question tool. `questionDelivery` below decides that independently.
+ * Absent means the runtime has no verified way to accept the tool channel;
+ * ChatSession still supplies questions through its structured end-turn handoff.
  */
-export type AskChannel = 'cli' | 'protocol';
+export type AskChannel = 'cli' | 'protocol' | 'extension' | 'config';
+
+/**
+ * How a runtime may ask a person for a decision.
+ *
+ * Blocking is opt-in: it promises that the whole runtime -> tool -> callback
+ * path has no elapsed-time ceiling. Every unknown or merely-large timeout uses
+ * the structured end-turn handoff instead, which keeps no tool call open while
+ * the person is away.
+ */
+export type QuestionDelivery = 'structured_handoff' | 'blocking_tool';
 
 interface RuntimeChatEntry {
   factory: ChatAdapterFactory;
   /** What the launcher shows before a session exists. */
   advertised: Partial<ChatCapabilities>;
   askChannel?: AskChannel;
+  /** Defaults to structured_handoff; only a verified timer-free path opts in. */
+  questionDelivery?: QuestionDelivery;
+  /**
+   * Environment retained for the other ccweb tool calls on this client.
+   * This is never the question-delivery guarantee: finite or unverified MCP
+   * clients do not receive ask_user_question at all.
+   */
+  askEnv?: Record<string, string>;
 }
 
 /**
@@ -75,6 +89,7 @@ function acp(
   return {
     factory: (options) => new AcpChatAdapter({ ...options, runtime, acpArgs }),
     askChannel: 'protocol',
+    questionDelivery: 'structured_handoff',
     advertised: {
       streaming: true,
       thinking: true,
@@ -92,6 +107,7 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
   claude: {
     factory: (options) => new ClaudeChatAdapter(options),
     askChannel: 'cli',
+    questionDelivery: 'structured_handoff',
     advertised: {
       streaming: true,
       thinking: true,
@@ -106,6 +122,8 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
   },
   codex: {
     factory: (options) => new CodexChatAdapter(options),
+    askChannel: 'config',
+    questionDelivery: 'structured_handoff',
     advertised: {
       streaming: true,
       thinking: true,
@@ -115,6 +133,7 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
       interrupt: true,
       resume: true,
       usage: true,
+      questions: true,
     },
   },
   /**
@@ -137,9 +156,11 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
    * process, and one leader behind every session on a multi-user installation
    * is a state-sharing boundary nobody chose.
    *
-   * `askChannel` stays unset. Grok accepts `mcpServers` on `session/new`, but
-   * nobody has watched a question from it reach this app's socket, and this
-   * table does not advertise what has not been seen working.
+   * Grok takes the same inline MCP-server descriptor as the other ACP agents.
+   * The descriptor is deliberately transport-agnostic: `ChatSession` supplies
+   * the command, arguments and environment, so it can point at either the local
+   * socket bridge or the authenticated, encrypted shared-file bridge without
+   * the registry acquiring a second, runtime-specific launch path.
    */
   grok: {
     factory: (options) =>
@@ -162,14 +183,37 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
       resume: true,
       usage: true,
       cost: true,
+      // The ACP `session/new` schema accepts the same mcpServers list as the
+      // verified kimi/omp path. The live Grok capture records MCP startup and
+      // server-status notifications; keeping this capability here makes the
+      // pre-launch UI agree with the session wiring below.
+      questions: true,
     },
+    askChannel: 'protocol',
+    questionDelivery: 'structured_handoff',
   },
+  /**
+   * pi, which asks its questions through an extension rather than a server.
+   *
+   * `questions` is advertised on the strength of the channel this app supplies
+   * it, not of anything pi ships: the tool arrives as a generated `-e` file (see
+   * `pi-ask-extension.ts`), registers itself only when the session put a socket
+   * in the environment, and draws the same card every other runtime's questions
+   * draw. Watched working before it was written down here, which is the rule
+   * this table is kept by.
+   *
+   * `permissions` stays false and is unrelated: pi has no per-call approval
+   * channel to offer, and asking the user a question is not approving a tool.
+   */
   pi: {
     factory: (options) => new PiChatAdapter(options),
+    askChannel: 'extension',
+    questionDelivery: 'blocking_tool',
     advertised: {
       streaming: true,
       thinking: true,
       toolCalls: true,
+      questions: true,
       usage: true,
       cost: true,
     },
@@ -179,19 +223,85 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
   // neither tokens nor money. The adapter narrows the *running* session's
   // capabilities the same way (`NO_SPEND_REPORTING` in acp.ts); this row is
   // what the pre-session table says, and the two must not disagree.
-  kimi: acp('kimi', ['acp'], { usage: false, cost: false }),
-  omp: acp('omp', ['acp']),
+  /**
+   * Kimi's MCP client accepts only a finite timeout. Questions therefore use
+   * structured handoff. Its maximum remains scoped to submit_plan and the
+   * optional tier tool, whose ACP descriptor has no per-server timeout field.
+   */
+  kimi: {
+    ...acp('kimi', ['acp'], { usage: false, cost: false }),
+    askEnv: { KIMI_MCP_TOOL_TIMEOUT_MS: '2147483647' },
+  },
+  /**
+   * OMP's top-level MCP timeout can be disabled, but nested agents retain a
+   * finite ceiling. That makes the end-to-end path ineligible for blocking
+   * questions. The setting remains only for submit_plan and tier requests.
+   */
+  omp: {
+    ...acp('omp', ['acp']),
+    askEnv: { OMP_MCP_TIMEOUT_MS: '0' },
+  },
+  /**
+   * Antigravity CLI, driven as `agy --print --output-format stream-json`.
+   *
+   * No ACP: `--experimental-acp` is rejected outright by 1.1.8's flag parser and
+   * there is no `acp` subcommand — `agy acp` falls through to the interactive
+   * TUI and dies looking for a `/dev/tty`. Its structured mode is the print one,
+   * and every row below was read off a live capture of it (see the adapter).
+   *
+   * `permissions: false` is the honest half of this entry and the one worth
+   * reading twice. Headless, agy *cannot* stop and ask: a tool needing approval
+   * is denied on the spot and the run carries on around it. There is no channel
+   * to offer a person, so nothing here pretends there is — the choice is made at
+   * launch, said on the card, and each refusal is explained in the conversation.
+   *
+   * Agy exposes no session-scoped MCP/extension flag, so its questionnaire uses
+   * the structured final-response fallback owned by ChatSession.
+   */
+  antigravity: {
+    factory: (options) => new AntigravityChatAdapter(options),
+    questionDelivery: 'structured_handoff',
+    advertised: {
+      streaming: true,
+      thinking: true,
+      toolCalls: true,
+      interrupt: true,
+      resume: true,
+      attachments: true,
+      usage: true,
+      questions: true,
+    },
+  },
 };
 
 /**
  * How this runtime takes the question server, or undefined if it does not.
  *
- * Only the runtimes it has actually been watched working on: claude and the ACP
- * agents. Codex, pi and grok are one probe away, and get `questions: false`
- * until someone runs it.
+ * Only channels actually supported by the runtime are named here. A runtime
+ * with no entry is handled by ChatSession's structured-response fallback.
  */
 export function askChannelFor(runtime: string): AskChannel | undefined {
   return RUNTIMES[runtime]?.askChannel;
+}
+
+/**
+ * The conservative question policy for this runtime.
+ *
+ * Kept separate from askChannelFor: Codex, Claude and ACP runtimes still need
+ * the ccweb tool server for Plan submission and tier requests even though the
+ * timed question tool itself is deliberately absent.
+ */
+export function questionDeliveryFor(runtime: string): QuestionDelivery {
+  return RUNTIMES[runtime]?.questionDelivery ?? 'structured_handoff';
+}
+
+/**
+ * Client settings retained for the non-question tools on ccweb's MCP server.
+ * They are applied to the runtime process and never make a runtime eligible
+ * for `blocking_tool`; that decision requires a timer-free end-to-end path.
+ */
+export function askEnvFor(runtime: string): Record<string, string> {
+  return { ...(RUNTIMES[runtime]?.askEnv || {}) };
 }
 
 /** Whether this runtime can be driven as a chat at all. */
@@ -224,7 +334,14 @@ export function chatCapableRuntimes(): string[] {
 export function advertisedChatCapabilities(runtime: string): ChatCapabilities {
   const entry = RUNTIMES[runtime];
   if (!entry) return { ...NO_CHAT_CAPABILITIES };
-  return { ...NO_CHAT_CAPABILITIES, ...entry.advertised };
+  return {
+    ...NO_CHAT_CAPABILITIES,
+    ...entry.advertised,
+    // Both are app-supplied capabilities. A runtime without an injectable tool
+    // channel uses the normalized response fallback after it starts.
+    questions: true,
+    planMode: true,
+  };
 }
 
 export function createChatAdapter(

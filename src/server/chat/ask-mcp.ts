@@ -28,12 +28,44 @@
 
 import * as net from 'net';
 import { createInterface } from 'readline';
-import { ASK_MCP_SERVER, ASK_QUESTION_TOOL } from '../../shared/chat-events.js';
+import {
+  ASK_MCP_SERVER,
+  ASK_QUESTION_TOOL,
+  SUBMIT_PLAN_TOOL,
+  SUBMIT_PLAN_TOOL_DESCRIPTION,
+  TIER_TOOL,
+} from '../../shared/chat-events.js';
+
+/**
+ * Whether this server should offer the ladder tool at all.
+ *
+ * Set by the session at spawn, and only for a conversation actually running on
+ * a rung. An env var rather than an argument because the runtime composes the
+ * argv, not us — the same reason the socket path arrives this way.
+ */
+export const TIER_ENABLED_ENV = 'CCWEB_TIER_LADDER';
+
+/**
+ * Whether this particular server may advertise the blocking question tool.
+ *
+ * Missing means disabled in the spawned process. Timed runtimes still receive
+ * this server for Plan/tier tools, while their questions travel through the
+ * durable structured handoff owned by ChatSession.
+ */
+export const QUESTION_TOOL_ENABLED_ENV = 'CCWEB_QUESTION_TOOL_ENABLED';
 
 /** What the browser sends back once someone has answered. */
 export interface QuestionAnswer {
   /** Labels of the options picked, in the order they were offered. */
   labels: string[];
+  /**
+   * What the user wrote, when they answered in their own words.
+   *
+   * The card always offers this alongside the options, so it arrives on its own
+   * for "none of these is quite right" and beside `labels` for "these two, and
+   * here is the caveat". Either way it is a real answer and not a skip.
+   */
+  text?: string;
   /** True when the user declined to answer rather than picking nothing. */
   skipped?: boolean;
   /** Set when the question could not be put to anyone. */
@@ -55,7 +87,9 @@ export const ASK_TOOL_DEFINITION = {
     'make and the plausible answers are known up front — which of several approaches to take, ' +
     'which of several candidate files or issues to act on, or any yes/no that would change what ' +
     'you do next. Prefer it over asking in prose: the user answers by clicking, so there is no ' +
-    'wording to guess at. This call blocks until they answer.',
+    'wording to guess at. This call blocks until they answer. Do not add an "other", "none of ' +
+    'these" or "let me explain in my own words" option: the card always offers a free-text box ' +
+    'alongside your options, and whatever the user types there comes back as their answer.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -108,21 +142,83 @@ export const ASK_TOOL_DEFINITION = {
   },
 } as const;
 
+/** What the session sends back once a rung request has been decided. */
+export interface TierDecision {
+  granted: boolean;
+  tier?: string;
+  model?: string;
+  detail: string;
+}
+
+/**
+ * The escalation tool, as the model sees it.
+ *
+ * The description carries the cost, because that is the whole judgement being
+ * asked for: a model that reaches for this on every turn turns a ladder built to
+ * control spending into a ladder that only ever runs at the top.
+ */
+export const TIER_TOOL_DEFINITION = {
+  name: TIER_TOOL,
+  description:
+    'Ask to answer this task from the next model up your capability ladder, and wait for the ' +
+    'user to approve. Use it only when the work in front of you is genuinely beyond the model ' +
+    'you are on — subtle debugging, ambiguous architecture, security-sensitive logic, review of ' +
+    'code that matters — and not for work that is merely long or tedious. The stronger model ' +
+    'costs the user real money, they are asked before it is used, and the conversation returns ' +
+    'to its usual rung once this turn ends. This call blocks until they decide. If it is ' +
+    'refused, carry on with the model you have rather than asking again.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      reason: {
+        type: 'string',
+        description:
+          'One sentence on what makes this task too hard for the model you are on. The user ' +
+          'reads this and nothing else before deciding, so name the specific difficulty.',
+      },
+    },
+    required: ['reason'],
+  },
+} as const;
+
+export interface PlanDecision {
+  accepted: boolean;
+  revision?: number;
+  detail: string;
+}
+
+export const SUBMIT_PLAN_TOOL_DEFINITION = {
+  name: SUBMIT_PLAN_TOOL,
+  description: SUBMIT_PLAN_TOOL_DESCRIPTION,
+  inputSchema: {
+    type: 'object',
+    properties: {
+      markdown: {
+        type: 'string',
+        description: 'The complete latest plan as markdown, not a diff against an earlier revision.',
+      },
+    },
+    required: ['markdown'],
+  },
+} as const;
+
 /**
  * The client half of the session socket.
  *
- * One connection, reopened if it drops. A question is matched to its reply by
- * id because the socket is per-session rather than per-call, and a model that
- * asks two things in one turn would otherwise read the wrong answer.
+ * One connection, reopened if it drops. A call is matched to its reply by id
+ * because the socket is per-session rather than per-call, and a model that asks
+ * two things in one turn would otherwise read the wrong answer.
  */
 class AskChannel {
   private socket: net.Socket | null = null;
   private nextId = 0;
   private readonly waiting = new Map<string, (answer: QuestionAnswer) => void>();
+  private readonly waitingTier = new Map<string, (decision: TierDecision) => void>();
+  private readonly waitingPlan = new Map<string, (decision: PlanDecision) => void>();
 
   constructor(private readonly socketPath: string) {}
 
-  ask(question: unknown): Promise<QuestionAnswer> {
+  ask(question: unknown, onSent?: (id: string) => void): Promise<QuestionAnswer> {
     return new Promise((resolve) => {
       const id = `ask-${process.pid}-${(this.nextId += 1)}`;
       let socket: net.Socket;
@@ -134,6 +230,9 @@ class AskChannel {
       }
 
       this.waiting.set(id, resolve);
+      // Handed straight back, so the server can name this question again if the
+      // runtime cancels the call it belongs to.
+      onSent?.(id);
       const write = (): void => {
         socket.write(`${JSON.stringify({ id, kind: 'question', question })}\n`);
       };
@@ -142,6 +241,78 @@ class AskChannel {
       } else {
         write();
       }
+    });
+  }
+
+  /**
+   * Say that nobody is waiting for this answer any more.
+   *
+   * One line down the same socket and no reply expected: the `tools/call` that
+   * asked has been cancelled by the runtime, so there is nothing left to answer.
+   * The session takes the card down when it arrives — before this, a cancelled
+   * call left a live card that could only send an answer into a closed request.
+   */
+  cancel(id: string): void {
+    const pending = this.waiting.get(id);
+    if (!pending) return;
+    this.waiting.delete(id);
+    pending({ labels: [], error: 'the agent stopped waiting for an answer' });
+    try {
+      const socket = this.connect();
+      const write = (): void => {
+        socket.write(`${JSON.stringify({ id, kind: 'cancel' })}\n`);
+      };
+      if (socket.pending) {
+        socket.once('connect', write);
+      } else {
+        write();
+      }
+    } catch {
+      // No socket to tell. The session is gone or going, and it clears its own
+      // cards on the way out.
+    }
+  }
+
+  requestTier(reason: unknown): Promise<TierDecision> {
+    return new Promise((resolve) => {
+      const id = `tier-${process.pid}-${(this.nextId += 1)}`;
+      let socket: net.Socket;
+      try {
+        socket = this.connect();
+      } catch (error: unknown) {
+        resolve({ granted: false, detail: describe(error) });
+        return;
+      }
+
+      this.waitingTier.set(id, resolve);
+      const write = (): void => {
+        socket.write(`${JSON.stringify({ id, kind: 'tier', tier: { reason } })}\n`);
+      };
+      if (socket.pending) {
+        socket.once('connect', write);
+      } else {
+        write();
+      }
+    });
+  }
+
+  submitPlan(markdown: unknown): Promise<PlanDecision> {
+    return new Promise((resolve) => {
+      const id = `plan-${process.pid}-${(this.nextId += 1)}`;
+      let socket: net.Socket;
+      try {
+        socket = this.connect();
+      } catch (error: unknown) {
+        resolve({ accepted: false, detail: describe(error) });
+        return;
+      }
+
+      this.waitingPlan.set(id, resolve);
+      const write = (): void => {
+        socket.write(`${JSON.stringify({ id, kind: 'plan', plan: { markdown } })}\n`);
+      };
+      if (socket.pending) socket.once('connect', write);
+      else write();
     });
   }
 
@@ -160,19 +331,54 @@ class AskChannel {
         const line = buffer.slice(0, at).trim();
         buffer = buffer.slice(at + 1);
         if (!line) continue;
-        let reply: { id?: string; labels?: unknown; skipped?: boolean; error?: string };
+        let reply: {
+          id?: string;
+          labels?: unknown;
+          text?: unknown;
+          skipped?: boolean;
+          error?: string;
+        };
         try {
           reply = JSON.parse(line);
         } catch {
           continue;
         }
-        // Approval traffic shares this socket; anything not addressed to a
-        // question we asked belongs to the hook and is not ours to consume.
-        const pending = reply.id ? this.waiting.get(reply.id) : undefined;
-        if (!pending || !reply.id) continue;
+        if (!reply.id) continue;
+
+        const pendingPlan = this.waitingPlan.get(reply.id);
+        if (pendingPlan) {
+          this.waitingPlan.delete(reply.id);
+          const decision = reply as unknown as Partial<PlanDecision>;
+          pendingPlan({
+            accepted: decision.accepted === true,
+            revision: typeof decision.revision === 'number' ? decision.revision : undefined,
+            detail: typeof decision.detail === 'string' ? decision.detail : 'no answer was given',
+          });
+          continue;
+        }
+
+        // Three kinds of traffic share this socket, and each id is minted by
+        // whichever map is waiting on it — so an id in neither belongs to the
+        // approval hook and is not ours to consume.
+        const pendingTier = this.waitingTier.get(reply.id);
+        if (pendingTier) {
+          this.waitingTier.delete(reply.id);
+          const decision = reply as unknown as Partial<TierDecision>;
+          pendingTier({
+            granted: decision.granted === true,
+            tier: typeof decision.tier === 'string' ? decision.tier : undefined,
+            model: typeof decision.model === 'string' ? decision.model : undefined,
+            detail: typeof decision.detail === 'string' ? decision.detail : 'no answer was given',
+          });
+          continue;
+        }
+
+        const pending = this.waiting.get(reply.id);
+        if (!pending) continue;
         this.waiting.delete(reply.id);
         pending({
           labels: Array.isArray(reply.labels) ? reply.labels.map(String) : [],
+          text: typeof reply.text === 'string' && reply.text ? reply.text : undefined,
           skipped: reply.skipped === true,
           error: reply.error,
         });
@@ -186,6 +392,14 @@ class AskChannel {
       for (const [id, resolve] of this.waiting) {
         this.waiting.delete(id);
         resolve({ labels: [], error: reason });
+      }
+      for (const [id, resolve] of this.waitingTier) {
+        this.waitingTier.delete(id);
+        resolve({ granted: false, detail: reason });
+      }
+      for (const [id, resolve] of this.waitingPlan) {
+        this.waitingPlan.delete(id);
+        resolve({ accepted: false, detail: reason });
       }
     };
     socket.on('error', () => fail('the browser could not be reached to ask this question'));
@@ -209,7 +423,7 @@ export function describeAnswer(answer: QuestionAnswer): { text: string; isError:
       isError: true,
     };
   }
-  if (answer.skipped || answer.labels.length === 0) {
+  if (answer.skipped || (answer.labels.length === 0 && !answer.text)) {
     return {
       text:
         'The user skipped this question without choosing. Do not ask it again — ' +
@@ -218,10 +432,26 @@ export function describeAnswer(answer: QuestionAnswer): { text: string; isError:
       isError: false,
     };
   }
-  return {
-    text: `The user selected: ${answer.labels.map((label) => `"${label}"`).join(', ')}`,
-    isError: false,
-  };
+  const selected = `The user selected: ${answer.labels.map((label) => `"${label}"`).join(', ')}`;
+  // Their own words are the answer when nothing was picked, and a correction to
+  // what was picked when something was. Said explicitly either way: the model
+  // has to know this sentence is the user's and not one of the options it
+  // wrote, because it is the half of the answer it could not anticipate.
+  if (answer.text && answer.labels.length === 0) {
+    return {
+      text:
+        'The user picked none of the options and answered in their own words: ' +
+        `"${answer.text}". Treat this as their answer and continue from it.`,
+      isError: false,
+    };
+  }
+  if (answer.text) {
+    return {
+      text: `${selected} — and added, in their own words: "${answer.text}"`,
+      isError: false,
+    };
+  }
+  return { text: selected, isError: false };
 }
 
 interface Rpc {
@@ -239,11 +469,38 @@ interface Rpc {
 export function serveAsk(
   input: NodeJS.ReadableStream,
   output: NodeJS.WritableStream,
-  ask: (question: unknown) => Promise<QuestionAnswer>,
+  ask: (question: unknown, onSent?: (id: string) => void) => Promise<QuestionAnswer>,
+  // Optional so a runtime whose session has no ladder simply never advertises
+  // the tool: an escalation the app cannot grant is worse than one the model
+  // never knew about, because the refusal costs a round trip and reads to the
+  // model as the user saying no.
+  requestTier?: (reason: unknown) => Promise<TierDecision>,
+  // Last rather than beside `ask`, so every existing caller — the tests above
+  // all, which drive this over a real pair of pipes — keeps working unchanged.
+  cancel?: (askId: string) => void,
+  submitPlan?: (markdown: unknown) => Promise<PlanDecision>,
+  // Kept true for direct protocol callers and old tests. The spawned main
+  // passes the explicit session policy below, where a missing env var is false.
+  questionToolEnabled = true,
 ): void {
   const send = (message: unknown): void => {
     output.write(`${JSON.stringify(message)}\n`);
   };
+
+  /**
+   * Questions still blocking a `tools/call`, from the client's request id to
+   * ours.
+   *
+   * The two numbering schemes never meet anywhere else — the client names the
+   * JSON-RPC request, this process names the question on the session socket —
+   * and `notifications/cancelled` speaks only the first. Without the pairing
+   * there is no way to say *which* question the runtime has given up on.
+   */
+  interface InFlightAsk {
+    askId?: string;
+    cancelled: boolean;
+  }
+  const inFlight = new Map<string | number, InFlightAsk>();
 
   createInterface({ input }).on('line', (line: string) => {
     if (!line.trim()) return;
@@ -273,19 +530,94 @@ export function serveAsk(
     }
 
     if (method === 'tools/list') {
-      send({ jsonrpc: '2.0', id, result: { tools: [ASK_TOOL_DEFINITION] } });
+      const tools = [
+        ...(questionToolEnabled ? [ASK_TOOL_DEFINITION] : []),
+        ...(requestTier ? [TIER_TOOL_DEFINITION] : []),
+        ...(submitPlan ? [SUBMIT_PLAN_TOOL_DEFINITION] : []),
+      ];
+      send({ jsonrpc: '2.0', id, result: { tools } });
       return;
     }
 
     if (method === 'tools/call') {
-      if (params?.name !== ASK_QUESTION_TOOL) {
-        send({ jsonrpc: '2.0', id, error: { code: -32601, message: `no tool named ${String(params?.name)}` } });
+      if (params?.name === ASK_QUESTION_TOOL && questionToolEnabled) {
+        const requestId = typeof id === 'string' || typeof id === 'number' ? id : undefined;
+        const call: InFlightAsk = { cancelled: false };
+        if (requestId !== undefined) inFlight.set(requestId, call);
+        void ask(params?.arguments, (askId) => {
+          call.askId = askId;
+          // A very fast client can cancel before the question has reached the
+          // session and supplied its id. Complete that deferred teardown here.
+          if (call.cancelled) cancel?.(askId);
+        }).then((answer) => {
+          if (requestId !== undefined) {
+            // Do not let an old, slow call delete a newer call that reused the
+            // same request id after cancellation.
+            if (inFlight.get(requestId) === call) inFlight.delete(requestId);
+          }
+          if (call.cancelled) return;
+          const { text, isError } = describeAnswer(answer);
+          send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError } });
+        });
         return;
       }
-      void ask(params?.arguments).then((answer) => {
-        const { text, isError } = describeAnswer(answer);
-        send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }], isError } });
-      });
+      if (params?.name === TIER_TOOL && requestTier) {
+        const reason = (params?.arguments as { reason?: unknown } | undefined)?.reason;
+        void requestTier(reason).then((decision) => {
+          send({
+            jsonrpc: '2.0',
+            id,
+            result: {
+              content: [{ type: 'text', text: decision.detail }],
+              // Never an error result, even refused. A refusal is an answer the
+              // model is meant to act on — carry on at the rung you are on —
+              // and marking it an error invites a retry of the one call whose
+              // whole cost is asking a person again.
+              isError: false,
+            },
+          });
+        });
+        return;
+      }
+      if (params?.name === SUBMIT_PLAN_TOOL && submitPlan) {
+        const markdown = (params?.arguments as { markdown?: unknown } | undefined)?.markdown;
+        void submitPlan(markdown).then((decision) => {
+          send({
+            jsonrpc: '2.0',
+            id,
+            result: {
+              content: [{ type: 'text', text: decision.detail }],
+              isError: !decision.accepted,
+            },
+          });
+        });
+        return;
+      }
+      send({ jsonrpc: '2.0', id, error: { code: -32601, message: `no tool named ${String(params?.name)}` } });
+      return;
+    }
+
+    // The client has given up on a call it made. MCP's own way of saying it, and
+    // the one signal that a question can no longer be answered — kimi sends it
+    // on its request timeout, and any client sends it when the user cancels the
+    // turn. Swallowed here until now, which left the card on screen collecting
+    // clicks for a request that had already been dropped at the other end
+    // (#174). No reply: a notification wants none, and the call it names is
+    // over.
+    if (method === 'notifications/cancelled') {
+      const rawRequestId = (params as { requestId?: unknown } | undefined)?.requestId;
+      const requestId = typeof rawRequestId === 'string' || typeof rawRequestId === 'number'
+        ? rawRequestId
+        : undefined;
+      const call = requestId === undefined ? undefined : inFlight.get(requestId);
+      if (call && requestId !== undefined) {
+        // Mark it before `cancel`: production cancellation resolves `ask` for
+        // cleanup, and its promise continuation must see that the client has
+        // already ended the call and suppress the late JSON-RPC response.
+        call.cancelled = true;
+        inFlight.delete(requestId);
+        if (call.askId) cancel?.(call.askId);
+      }
       return;
     }
 
@@ -308,13 +640,27 @@ export const ASK_SOCKET_ENV = 'CCWEB_ASK_SOCKET';
  * this app is not the only thing using that CLI, and a session-scoped capability
  * should not outlive the session or appear in anyone else's tool list.
  */
-export function askMcpConfig(serverScript: string, socketPath: string): string {
+export function askMcpConfig(
+  serverScript: string,
+  socketPath: string,
+  // Both paths are read by the *runtime*, which may not be running on this
+  // machine: in a per-user container the script and socket arrive through bind
+  // mounts under different paths, and this host's node binary is not there at
+  // all. The caller translates; the default is the host.
+  nodePath: string = process.execPath,
+  laddered = false,
+  questionToolEnabled = false,
+): string {
   return JSON.stringify({
     mcpServers: {
       [ASK_MCP_SERVER]: {
-        command: process.execPath,
+        command: nodePath,
         args: [serverScript],
-        env: { [ASK_SOCKET_ENV]: socketPath },
+        env: {
+          [ASK_SOCKET_ENV]: socketPath,
+          [QUESTION_TOOL_ENABLED_ENV]: questionToolEnabled ? '1' : '0',
+          ...(laddered ? { [TIER_ENABLED_ENV]: '1' } : {}),
+        },
       },
     },
   });
@@ -323,10 +669,19 @@ export function askMcpConfig(serverScript: string, socketPath: string): string {
 function main(): void {
   const socketPath = process.env[ASK_SOCKET_ENV];
   const channel = socketPath ? new AskChannel(socketPath) : null;
-  serveAsk(process.stdin, process.stdout, (question) =>
-    channel
-      ? channel.ask(question)
-      : Promise.resolve({ labels: [], error: 'this session has no channel to the browser' }),
+  const laddered = process.env[TIER_ENABLED_ENV] === '1';
+  const questionToolEnabled = process.env[QUESTION_TOOL_ENABLED_ENV] === '1';
+  serveAsk(
+    process.stdin,
+    process.stdout,
+    (question, onSent) =>
+      channel
+        ? channel.ask(question, onSent)
+        : Promise.resolve({ labels: [], error: 'this session has no channel to the browser' }),
+    laddered && channel ? (reason) => channel.requestTier(reason) : undefined,
+    channel ? (askId) => channel.cancel(askId) : undefined,
+    channel ? (markdown) => channel.submitPlan(markdown) : undefined,
+    questionToolEnabled,
   );
 }
 

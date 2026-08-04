@@ -19,6 +19,7 @@ export async function loadConfig(app: App): Promise<void> {
           qwen: cfg.aliases.qwen || 'Qwen',
           kimi: cfg.aliases.kimi || 'Kimi',
           omp: cfg.aliases.omp || 'Oh My Pi',
+          antigravity: cfg.aliases.antigravity || 'Antigravity',
           terminal: 'Terminal',
         };
       }
@@ -29,6 +30,20 @@ export async function loadConfig(app: App): Promise<void> {
       shellStore.setState({
         user: cfg?.currentUser?.githubLogin ?? null,
         logoutUrl: cfg?.logoutUrl ?? null,
+        // Missing is false so an older server cannot accidentally expose an
+        // experimental administration surface in a newer client bundle.
+        containerizedEnvironmentsEnabled:
+          cfg?.containerizedEnvironmentsEnabled === true,
+        // Older servers sent no list and keep the Unix choices already in the
+        // store. A new desktop Windows server reports PowerShell/cmd instead.
+        ...(Array.isArray(cfg?.supportedShells)
+          && cfg.supportedShells.length > 0
+          && cfg.supportedShells.every((value: unknown) => typeof value === 'string')
+          ? { terminalShells: cfg.supportedShells }
+          : {}),
+        // Safe inspection uses POSIX file-size/process controls. Older servers
+        // predate the flag and keep their historical enabled behavior.
+        repositoryInspectionSupported: cfg?.repositoryInspectionSupported !== false,
         // The approval preference belongs to the account, so this — the boot
         // request every page already makes — is where it arrives. Anything
         // other than a literal `true` is "ask", which covers an older server
@@ -52,6 +67,7 @@ export function getAlias(app: App, kind: AgentKind | string): string {
   if (kind === 'qwen') return 'Qwen';
   if (kind === 'kimi') return 'Kimi';
   if (kind === 'omp') return 'Oh My Pi';
+  if (kind === 'antigravity') return 'Antigravity';
   if (kind === 'terminal') return 'Terminal';
   return 'Claude';
 }
@@ -108,6 +124,12 @@ export function getRuntimeStartMessage(
     return options.dangerouslySkipPermissions
       ? `Starting ${getAlias(app, 'omp')} (auto-approving every tool call)...`
       : `Starting ${getAlias(app, 'omp')}...`;
+  }
+
+  if (kind === 'antigravity') {
+    return options.dangerouslySkipPermissions
+      ? `Starting ${getAlias(app, 'antigravity')} (auto-approving every tool permission)...`
+      : `Starting ${getAlias(app, 'antigravity')}...`;
   }
 
   if (kind === 'terminal') {

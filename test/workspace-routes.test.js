@@ -96,6 +96,7 @@ before(function () {
   app.use(
     createWorkspaceRoutes({
       claudeSessions: sessions,
+      saveSessionsToDisk: async () => {},
       // The server's own base-folder check. The base here is the temp
       // directory, which is what these fixtures live under — the real server
       // uses the user's home or the folder-mode root.
@@ -815,6 +816,247 @@ describe('workspace routes', function () {
         assert.ok(Array.isArray(body.prs));
         assert.ok(Array.isArray(body.issues));
       }
+    });
+  });
+
+  /**
+   * The same routes against a `gh` this test wrote.
+   *
+   * The parser has its own unit tests; what needs a route is the half that
+   * cannot be checked without one — that the commands are asked for the fields
+   * the panel now draws, that a reference into another repository is carried
+   * through to `-R`, and that the second call behind the reader is allowed to
+   * fail without taking the issue with it. Every answer below is real `gh`
+   * output for this repository, replayed by a script on PATH.
+   */
+  describe('github, with a gh that answers', function () {
+    let shimDir;
+    let originalPath;
+
+    const ISSUE = {
+      assignees: [{ login: 'dnviti', name: 'Daniele Viti' }],
+      author: { login: 'dnviti', is_bot: false, name: 'Daniele Viti' },
+      blockedBy: { nodes: [], totalCount: 0 },
+      closedByPullRequestsReferences: [
+        { number: 151, url: 'https://github.com/dnviti/code-agents-webcli/pull/151', repository: { name: 'code-agents-webcli', owner: { login: 'dnviti' } } },
+      ],
+      labels: [{ name: 'bug', color: 'd73a4a' }],
+      milestone: { number: 1, title: '6.0.0' },
+      number: 134,
+      parent: { number: 100, title: 'The epic', state: 'OPEN', url: 'https://github.com/dnviti/code-agents-webcli/issues/100', repository: { nameWithOwner: 'dnviti/code-agents-webcli' } },
+      state: 'OPEN',
+      subIssuesSummary: { completed: 1, percentCompleted: 50, total: 2 },
+      title: 'Approval mode is not applied consistently',
+      updatedAt: '2026-07-30T19:36:42Z',
+      url: 'https://github.com/dnviti/code-agents-webcli/issues/134',
+    };
+
+    const PULL = {
+      assignees: [{ login: 'dnviti', name: 'Daniele Viti' }],
+      author: { login: 'dnviti', is_bot: false },
+      baseRefName: 'main',
+      closingIssuesReferences: [
+        { number: 134, url: 'https://github.com/dnviti/code-agents-webcli/issues/134', repository: { name: 'code-agents-webcli', owner: { login: 'dnviti' } } },
+      ],
+      headRefName: 'fix/approval',
+      isDraft: false,
+      number: 151,
+      reviewDecision: 'APPROVED',
+      state: 'OPEN',
+      statusCheckRollup: [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SUCCESS', name: 'Verify Node 22' }],
+      title: 'fix: approval mode',
+      url: 'https://github.com/dnviti/code-agents-webcli/pull/151',
+    };
+
+    const TIMELINE = {
+      data: {
+        repository: {
+          issueOrPullRequest: {
+            __typename: 'Issue',
+            timelineItems: {
+              nodes: [
+                {
+                  willCloseTarget: false,
+                  source: {
+                    __typename: 'PullRequest', number: 149, title: 'chore: release branch',
+                    url: 'https://github.com/dnviti/code-agents-webcli/pull/149', state: 'MERGED',
+                    isDraft: false, repository: { nameWithOwner: 'dnviti/code-agents-webcli' },
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+    };
+
+    /** Every argv the route handed `gh`, in order. */
+    function calls() {
+      const log = path.join(shimDir, 'calls.log');
+      if (!fs.existsSync(log)) return [];
+      return fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    }
+
+    before(function () {
+      shimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gh-shim-'));
+      const shim = `#!/usr/bin/env node
+const fs = require('fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(path.join(shimDir, 'calls.log'))}, JSON.stringify(args) + '\\n');
+const say = (value) => { process.stdout.write(JSON.stringify(value)); process.exit(0); };
+if (args[0] === '--version') { process.stdout.write('gh version 2.96.0\\n'); process.exit(0); }
+if (args[0] === 'auth') process.exit(0);
+if (args[0] === 'repo') say({ nameWithOwner: 'dnviti/code-agents-webcli', url: 'https://github.com/dnviti/code-agents-webcli' });
+if (args[0] === 'api') {
+  if (process.env.GH_SHIM_NO_GRAPHQL === '1') { process.stderr.write('no scope\\n'); process.exit(1); }
+  say(${JSON.stringify(TIMELINE)});
+}
+const fields = args[args.indexOf('--json') + 1] || '';
+if (args[1] === 'list') {
+  // A gh too old for the sub-issue fields refuses the whole command.
+  if (process.env.GH_SHIM_OLD === '1' && /subIssuesSummary|statusCheckRollup/.test(fields)) {
+    process.stderr.write('Unknown JSON field: "subIssuesSummary"\\n');
+    process.exit(1);
+  }
+  if (process.env.GH_SHIM_LIST_FAIL === '1') {
+    process.stderr.write('could not reach github.com\\n');
+    process.exit(1);
+  }
+}
+if (args[0] === 'issue') say(args[1] === 'list' ? [${JSON.stringify(ISSUE)}] : ${JSON.stringify(ISSUE)});
+if (args[0] === 'pr') say(args[1] === 'list' ? [${JSON.stringify(PULL)}] : ${JSON.stringify(PULL)});
+process.exit(1);
+`;
+      fs.writeFileSync(path.join(shimDir, 'gh'), shim, { mode: 0o755 });
+      originalPath = process.env.PATH;
+      process.env.PATH = `${shimDir}${path.delimiter}${originalPath}`;
+    });
+
+    after(function () {
+      process.env.PATH = originalPath;
+      for (const key of ['GH_SHIM_NO_GRAPHQL', 'GH_SHIM_OLD', 'GH_SHIM_LIST_FAIL']) delete process.env[key];
+      fs.rmSync(shimDir, { recursive: true, force: true });
+    });
+
+    beforeEach(function () {
+      fs.rmSync(path.join(shimDir, 'calls.log'), { force: true });
+      for (const key of ['GH_SHIM_NO_GRAPHQL', 'GH_SHIM_OLD', 'GH_SHIM_LIST_FAIL']) delete process.env[key];
+    });
+
+    it('asks for the fields the panel draws, and hands them over', async function () {
+      // `refresh=1`: the overview is cached for half a minute, and the test
+      // above has already filled that cache with a `gh` that did not exist.
+      const { status, body } = await get('/api/workspace/session-1/github?refresh=1');
+      assert.strictEqual(status, 200);
+      assert.strictEqual(body.available, true, JSON.stringify(body));
+
+      const issueList = calls().find((argv) => argv[0] === 'issue' && argv[1] === 'list');
+      const prList = calls().find((argv) => argv[0] === 'pr' && argv[1] === 'list');
+      for (const field of ['assignees', 'parent', 'subIssuesSummary', 'closedByPullRequestsReferences', 'blockedBy']) {
+        assert.ok(issueList.join(' ').includes(field), `issue list never asked for ${field}`);
+      }
+      for (const field of ['assignees', 'closingIssuesReferences', 'reviewDecision', 'statusCheckRollup']) {
+        assert.ok(prList.join(' ').includes(field), `pr list never asked for ${field}`);
+      }
+
+      const issue = body.issues[0];
+      assert.deepStrictEqual(issue.assignees, [{ login: 'dnviti', name: 'Daniele Viti' }]);
+      assert.strictEqual(issue.parent.number, 100);
+      assert.strictEqual(issue.childrenTotal, 2);
+      assert.strictEqual(issue.childrenDone, 1);
+      assert.deepStrictEqual(issue.references.map((one) => [one.kind, one.number]), [['pr', 151]]);
+
+      const pull = body.prs[0];
+      assert.deepStrictEqual(pull.assignees, [{ login: 'dnviti', name: 'Daniele Viti' }]);
+      assert.strictEqual(pull.reviewDecision, 'APPROVED');
+      assert.deepStrictEqual(pull.checks, { total: 1, passed: 1, failed: 0, pending: 0, state: 'passing' });
+      assert.deepStrictEqual(pull.references.map((one) => [one.kind, one.number, one.relation]), [['issue', 134, 'closes']]);
+
+      // The node ids and repository objects `gh` wraps all of this in are of no
+      // use to a browser and are most of the bytes.
+      assert.ok(!JSON.stringify(body).includes('databaseId'));
+    });
+
+    it('reads one issue with its timeline beside it', async function () {
+      const { status, body } = await get('/api/workspace/session-1/github/issue/134');
+      assert.strictEqual(status, 200);
+      assert.strictEqual(body.item.kind, 'issue');
+      assert.strictEqual(body.item.parent.number, 100);
+      assert.deepStrictEqual(
+        body.item.references.map((one) => [one.number, one.relation]),
+        [[149, 'mentions'], [151, 'closed-by']],
+      );
+      assert.ok(calls().some((argv) => argv[0] === 'api' && argv[1] === 'graphql'));
+    });
+
+    it('still reads the issue when the timeline cannot be had', async function () {
+      // `gh api` needs a token scope `gh issue view` does not, and half an
+      // answer here is still a whole issue on screen.
+      process.env.GH_SHIM_NO_GRAPHQL = '1';
+      const { status, body } = await get('/api/workspace/session-1/github/issue/134');
+      assert.strictEqual(status, 200);
+      assert.deepStrictEqual(body.item.references.map((one) => one.number), [151]);
+    });
+
+    it('reads a reference that points into another repository from there', async function () {
+      const { status } = await get('/api/workspace/session-1/github/issue/5?repo=other%2Fproject');
+      assert.strictEqual(status, 200);
+      const view = calls().find((argv) => argv[0] === 'issue' && argv[1] === 'view');
+      assert.ok(view.includes('-R') && view.includes('other/project'), view.join(' '));
+      const api = calls().find((argv) => argv[0] === 'api');
+      assert.ok(api.includes('owner=other') && api.includes('name=project'), api.join(' '));
+    });
+
+    it('falls back to the older fields when gh does not know the new ones', async function () {
+      // gh refuses the whole command over one field it has never heard of, and
+      // half of these arrived in 2.94. A server on an older one must still get
+      // its list, minus the facts that list cannot carry.
+      process.env.GH_SHIM_OLD = '1';
+      const { body } = await get('/api/workspace/session-1/github?refresh=1');
+      assert.strictEqual(body.available, true, JSON.stringify(body));
+      assert.strictEqual(body.issues.length, 1);
+      assert.ok(!body.issuesError, JSON.stringify(body.issuesError));
+      assert.deepStrictEqual(body.issues[0].assignees, [{ login: 'dnviti', name: 'Daniele Viti' }]);
+      // Asked twice: the full list first, then the one it can answer.
+      const asked = calls().filter((argv) => argv[0] === 'issue' && argv[1] === 'list');
+      assert.strictEqual(asked.length, 2);
+      assert.ok(!asked[1].join(' ').includes('subIssuesSummary'));
+    });
+
+    it('says a list could not be read rather than that nothing is open', async function () {
+      process.env.GH_SHIM_LIST_FAIL = '1';
+      const { body } = await get('/api/workspace/session-1/github?refresh=1');
+      assert.strictEqual(body.available, true);
+      assert.deepStrictEqual(body.issues, []);
+      assert.match(body.issuesError, /github\.com/);
+      assert.match(body.prsError, /github\.com/);
+
+      // And the failure is not pinned for the half-minute the good answer gets:
+      // a rate limit or a dropped network clears on its own, and the refresh
+      // control has to be able to find that out.
+      delete process.env.GH_SHIM_LIST_FAIL;
+      const again = await get('/api/workspace/session-1/github');
+      assert.strictEqual(again.body.issues.length, 1);
+      assert.ok(!again.body.issuesError);
+    });
+
+    it('does not let a repository named after a number become one', async function () {
+      // `gh api -F` reads its value as JSON, so `-F name=2048` is the number
+      // 2048 against a String! variable, and the whole timeline is lost.
+      const { status } = await get('/api/workspace/session-1/github/issue/5?repo=gabrielecirulli%2F2048');
+      assert.strictEqual(status, 200);
+      const api = calls().find((argv) => argv[0] === 'api');
+      assert.ok(api.includes('-f') && api.includes('name=2048'), api.join(' '));
+      assert.ok(!api.includes('-F') || api.indexOf('-F') === api.indexOf('number=5') - 1, api.join(' '));
+    });
+
+    it('refuses a repository name that is not one', async function () {
+      // Silently reading this repository's #5 instead would look like success.
+      for (const bad of ['--json', 'not a repo', 'owner/name/extra', '../../etc']) {
+        const { status } = await get(`/api/workspace/session-1/github/issue/5?repo=${encodeURIComponent(bad)}`);
+        assert.strictEqual(status, 400, `${bad} was accepted`);
+      }
+      assert.deepStrictEqual(calls(), [], 'gh was run for a repository that is not one');
     });
   });
 });

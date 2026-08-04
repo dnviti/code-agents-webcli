@@ -4,13 +4,36 @@ import {
   ChatDraft,
   ChatEvent,
   ChatModelDefault,
+  ChatModelOrigin,
   ChatSnapshot,
   ChatTurnIndexEntry,
   ChatUsage,
+  BuiltInWorkflowId,
+  PlanDocument,
   QueuedTurn,
   NO_CHAT_CAPABILITIES,
 } from '../../shared/chat-events.js';
+import { ModelTier, isModelTier } from '../../shared/runtime-profiles.js';
 import { ChatTranscript } from './transcript.js';
+
+export interface PlanActionFeedback {
+  action: 'accept' | 'reject' | 'mode';
+  revision?: number;
+  accepted?: boolean;
+  changed?: boolean;
+  message: string;
+}
+
+function readPlanDocument(raw: unknown): PlanDocument | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Record<string, unknown>;
+  if (typeof value.markdown !== 'string' || !value.markdown.trim()) return null;
+  return {
+    markdown: value.markdown,
+    revision: typeof value.revision === 'number' && value.revision > 0 ? value.revision : 1,
+    ts: typeof value.ts === 'number' ? value.ts : 0,
+  };
+}
 
 /**
  * One conversation's half of the socket.
@@ -28,7 +51,15 @@ import { ChatTranscript } from './transcript.js';
  */
 
 export interface ChatControllerOptions {
-  send: (message: Record<string, unknown>) => void;
+  /** `false` means an open socket did not carry this message. */
+  send: (message: Record<string, unknown>) => boolean | void;
+  /**
+   * Whether the connected server advertised app-owned workflow admission.
+   *
+   * Registry-owned controllers always provide this explicitly. It remains
+   * optional for isolated component/tests that do not have a socket handshake.
+   */
+  builtInWorkflows?: boolean;
   /** Called when the surface should redraw for a reason outside the transcript. */
   onChange?: () => void;
   /**
@@ -94,6 +125,35 @@ export interface EffortSwitchResult {
   message: string;
 }
 
+/** The server accepted a built-in workflow for immediate delivery or its FIFO queue. */
+export type BuiltInWorkflowStartResult = 'accepted' | 'queued';
+
+interface PendingBuiltInWorkflow {
+  workflow: BuiltInWorkflowId;
+  resolve: (result: BuiltInWorkflowStartResult) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface PendingQuestionAnswer {
+  requestId: string;
+  resolve: (accepted: boolean) => void;
+}
+
+export function createQuestionAnswerSubmissionId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `answer-${crypto.randomUUID()}`;
+  }
+  return `answer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+export function createBuiltInWorkflowRequestId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `workflow-${crypto.randomUUID()}`;
+  }
+  return `workflow-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 /**
  * Read a `modelDefault` off the wire, or nothing.
  *
@@ -107,13 +167,51 @@ function readModelDefault(raw: unknown): ChatModelDefault | null {
   if (!raw || typeof raw !== 'object') return null;
   const value = raw as Record<string, unknown>;
   const source = value.source;
-  if (source !== 'personal' && source !== 'profile' && source !== 'runtime') return null;
+  if (source !== 'personal' && source !== 'profile' && source !== 'ladder' && source !== 'runtime') {
+    return null;
+  }
   return {
     model: typeof value.model === 'string' && value.model ? value.model : null,
     source,
     ...(typeof value.profileName === 'string' && value.profileName
       ? { profileName: value.profileName }
       : {}),
+    ...readTiers(value),
+  };
+}
+
+/** The rung fields, shared by a default and by a conversation's own origin. */
+function readTiers(value: Record<string, unknown>): { tier?: ModelTier; requestedTier?: ModelTier } {
+  const tier = isModelTier(value.tier) ? value.tier : undefined;
+  const requestedTier = isModelTier(value.requestedTier) ? value.requestedTier : undefined;
+  return { ...(tier ? { tier } : {}), ...(requestedTier ? { requestedTier } : {}) };
+}
+
+/**
+ * Read the origin of the model *this* conversation is on.
+ *
+ * The same shape as a default plus `override`, which no default can be: the
+ * person in this conversation picked it. Read field by field for the same
+ * reason — a server that predates #171 says nothing, and half an answer to
+ * "where did this model come from" is worse than admitting it does not know.
+ */
+function readModelOrigin(raw: unknown): ChatModelOrigin | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Record<string, unknown>;
+  const source = value.source;
+  if (
+    source !== 'override' && source !== 'personal' && source !== 'profile'
+    && source !== 'ladder' && source !== 'runtime'
+  ) {
+    return null;
+  }
+  return {
+    model: typeof value.model === 'string' && value.model ? value.model : null,
+    source,
+    ...(typeof value.profileName === 'string' && value.profileName
+      ? { profileName: value.profileName }
+      : {}),
+    ...readTiers(value),
   };
 }
 
@@ -284,6 +382,10 @@ export class ChatController {
    * distinction only matters on the server, where the launch is resolved.
    */
   private modelPinned: string | null = null;
+  /** Where the model this conversation is on came from, or null when unsaid. */
+  private modelOrigin: ChatModelOrigin | null = null;
+  /** Why the ladder was not applied, when it was not. */
+  private ladderError: string | null = null;
   /** What the server reported happened to the last model change requested. */
   private modelResult: ModelSwitchResult | null = null;
 
@@ -300,6 +402,16 @@ export class ChatController {
   private effortOverride: string | null = null;
   /** What the server reported happened to the last effort change requested. */
   private effortResult: EffortSwitchResult | null = null;
+  /** Conversation-scoped plan state, never inferred from transcript todo items. */
+  private planMode = false;
+  private planDocument: PlanDocument | null = null;
+  private planResult: PlanActionFeedback | null = null;
+  /** Admission promises for popup submissions, keyed by their wire request id. */
+  private workflowRequests = new Map<string, PendingBuiltInWorkflow>();
+  /** Answer frames awaiting the server's correlated acknowledgement. */
+  private questionAnswers = new Map<string, PendingQuestionAnswer>();
+  /** False on a real socket until its handshake advertises the protocol. */
+  private builtInWorkflows: boolean;
 
   /**
    * The composer, as the server last numbered it.
@@ -345,7 +457,12 @@ export class ChatController {
   constructor(
     readonly sessionId: string,
     private readonly options: ChatControllerOptions,
-  ) {}
+  ) {
+    // Standalone controllers predate feature negotiation and are still useful
+    // in embedders/tests. The registry passes an explicit false before a real
+    // socket has completed its handshake, so production never guesses.
+    this.builtInWorkflows = options.builtInWorkflows ?? true;
+  }
 
   /**
    * Every message type this class answers to, for whoever routes to it.
@@ -370,6 +487,14 @@ export class ChatController {
     'chat_unavailable',
     'chat_model_result',
     'chat_effort_result',
+    'chat_plan_mode',
+    'chat_plan_document',
+    'chat_plan_action',
+    'chat_plan_result',
+    'chat_plan_accept_result',
+    'chat_plan_reject_result',
+    'chat_builtin_workflow_result',
+    'chat_question_answer_ack',
     'chat_turn_index',
     'chat_turn_index_failed',
     'chat_turn_spend',
@@ -406,8 +531,16 @@ export class ChatController {
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
         this.modelDefault = readModelDefault(message.modelDefault);
         this.modelPinned = typeof message.modelPinned === 'string' ? message.modelPinned : null;
+        this.modelOrigin = readModelOrigin(message.modelOrigin);
+        this.ladderError =
+          typeof message.ladderError === 'string' && message.ladderError
+            ? message.ladderError
+            : null;
         this.effortOverride =
           typeof message.effortOverride === 'string' ? message.effortOverride : null;
+        const planSnapshot = snapshot as ChatSnapshot & { planMode?: unknown; planDocument?: unknown };
+        this.planMode = planSnapshot.planMode === true || message.planMode === true;
+        this.planDocument = readPlanDocument(planSnapshot.planDocument ?? message.planDocument);
         // The composer rides on the join, so a conversation opened on a second
         // screen opens at the sentence the first one is in the middle of. A
         // server with nothing to say about it — one that predates this, or one
@@ -493,8 +626,14 @@ export class ChatController {
           typeof message.modelOverride === 'string' ? message.modelOverride : null;
         this.modelDefault = readModelDefault(message.modelDefault);
         this.modelPinned = typeof message.modelPinned === 'string' ? message.modelPinned : null;
+        this.modelOrigin = readModelOrigin(message.modelOrigin);
+        this.ladderError =
+          typeof message.ladderError === 'string' && message.ladderError
+            ? message.ladderError
+            : null;
         this.effortOverride =
           typeof message.effortOverride === 'string' ? message.effortOverride : null;
+        this.planMode = message.planMode === true;
         this.options.onChange?.();
         return true;
       }
@@ -537,6 +676,58 @@ export class ChatController {
         this.effortResult = {
           applied,
           message: String(message.message || ''),
+        };
+        this.options.onChange?.();
+        return true;
+      }
+
+      case 'chat_plan_mode': {
+        this.planMode = message.planMode === true;
+        this.planResult = {
+          action: 'mode',
+          changed: message.changed !== false,
+          message: String(message.message || message.detail || ''),
+        };
+        this.options.onChange?.();
+        return true;
+      }
+
+      case 'chat_plan_document': {
+        // Null is a meaningful value here: `/clear` uses it to remove the
+        // retained document. Nullish coalescing would turn that into undefined
+        // and leave an old plan painted indefinitely.
+        const raw = Object.prototype.hasOwnProperty.call(message, 'plan')
+          ? message.plan
+          : message.planDocument;
+        const plan = readPlanDocument(raw);
+        if (raw === null) {
+          this.planDocument = null;
+          this.planResult = null;
+        } else if (plan) {
+          if (plan.revision !== this.planDocument?.revision) this.planResult = null;
+          this.planDocument = plan;
+        }
+        this.options.onChange?.();
+        return true;
+      }
+
+      case 'chat_plan_action':
+      case 'chat_plan_result':
+      case 'chat_plan_accept_result':
+      case 'chat_plan_reject_result': {
+        const action = message.action === 'reject' || type === 'chat_plan_reject_result' ? 'reject' : 'accept';
+        const raw = Object.prototype.hasOwnProperty.call(message, 'plan')
+          ? message.plan
+          : message.planDocument;
+        const plan = readPlanDocument(raw);
+        if (raw === null) this.planDocument = null;
+        if (plan) this.planDocument = plan;
+        if (typeof message.planMode === 'boolean') this.planMode = message.planMode;
+        this.planResult = {
+          action,
+          revision: typeof message.revision === 'number' ? message.revision : undefined,
+          accepted: message.accepted !== false && message.ok !== false,
+          message: String(message.message || message.detail || ''),
         };
         this.options.onChange?.();
         return true;
@@ -588,6 +779,15 @@ export class ChatController {
           this.transcript.setBypassing(event.bypassing === true);
           this.options.onChange?.();
         }
+        return true;
+      }
+
+      case 'chat_question_answer_ack': {
+        const submissionId = typeof message.submissionId === 'string' ? message.submissionId : '';
+        const pending = this.questionAnswers.get(submissionId);
+        if (!pending || message.sessionId !== this.sessionId) return true;
+        this.questionAnswers.delete(submissionId);
+        pending.resolve(message.accepted === true);
         return true;
       }
 
@@ -644,6 +844,33 @@ export class ChatController {
         return true;
       }
 
+      case 'chat_builtin_workflow_result': {
+        const requestId = typeof message.requestId === 'string' ? message.requestId : '';
+        const pending = this.workflowRequests.get(requestId);
+        if (!pending) return true;
+        this.workflowRequests.delete(requestId);
+        clearTimeout(pending.timer);
+        if (message.workflow !== pending.workflow) {
+          pending.reject(new Error('The server answered for a different guided workflow.'));
+          return true;
+        }
+        const status = message.status;
+        if (
+          message.accepted === true
+          && (status === 'accepted' || status === 'queued')
+          && message.sessionId === this.sessionId
+        ) {
+          pending.resolve(status);
+        } else {
+          pending.reject(new Error(
+            typeof message.message === 'string' && message.message
+              ? message.message
+              : 'The guided workflow could not be started.',
+          ));
+        }
+        return true;
+      }
+
       case 'chat_page_failed': {
         // The read threw server-side. The error itself is surfaced by the
         // shell's own error path; all this owes the user is the button back.
@@ -685,7 +912,15 @@ export class ChatController {
     // The scratch folded any `question_resolved` in this page correctly; hand
     // those over too, or a question scrolled in from history comes back with
     // every option unticked (#113).
-    this.transcript.prepend(scratch.messages, firstSeq, from, scratch.answeredQuestions);
+    this.transcript.prepend(
+      scratch.messages,
+      firstSeq,
+      from,
+      scratch.answeredQuestions,
+      scratch.answeredQuestionText,
+      scratch.abandonedQuestions,
+      scratch.questionHistory,
+    );
   }
 
   /**
@@ -770,6 +1005,45 @@ export class ChatController {
     this.send({ type: 'chat_send', text: trimmed, attachments, fromComposer });
   }
 
+  /**
+   * Start an app-bundled guided workflow without changing this conversation's
+   * composer draft. The popup owns its field until the server explicitly says
+   * the turn was accepted or queued.
+   */
+  startBuiltInWorkflow(
+    workflow: BuiltInWorkflowId,
+    prompt: string,
+    requestId = createBuiltInWorkflowRequestId(),
+  ): Promise<BuiltInWorkflowStartResult> {
+    if (!this.builtInWorkflows) {
+      return Promise.reject(new Error(
+        'This server does not support guided workflows. Update or restart the server, then try again.',
+      ));
+    }
+    if (this.workflowRequests.has(requestId)) {
+      return Promise.reject(new Error('This guided workflow request is already being submitted.'));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const pending = this.workflowRequests.get(requestId);
+        if (!pending) return;
+        this.workflowRequests.delete(requestId);
+        pending.reject(new Error('The guided workflow request timed out. Please try again.'));
+      }, 30_000);
+      this.workflowRequests.set(requestId, { workflow, resolve, reject, timer });
+      this.send({ type: 'chat_start_builtin_workflow', requestId, workflow, text: prompt });
+    });
+  }
+
+  /**
+   * Release the server's dedupe entry only after the caller has completed its
+   * local success handoff and will no longer retry this request id.
+   */
+  acknowledgeBuiltInWorkflow(workflow: BuiltInWorkflowId, requestId: string): void {
+    if (!this.builtInWorkflows || !requestId) return;
+    this.send({ type: 'chat_builtin_workflow_ack', requestId, workflow });
+  }
+
   /** What this conversation's composer holds, as far as this browser knows. */
   get draftValue(): ChatDraft {
     return this.draft;
@@ -811,6 +1085,18 @@ export class ChatController {
   /** Whether this server carries the composer between screens at all. */
   get draftSyncAvailable(): boolean {
     return this.draftSync;
+  }
+
+  /** Whether this server accepts correlated app-owned workflow turns. */
+  get builtInWorkflowsAvailable(): boolean {
+    return this.builtInWorkflows;
+  }
+
+  /** Told by the registry whenever a handshake (including a reconnect) arrives. */
+  setBuiltInWorkflowSupport(enabled: boolean): void {
+    if (this.builtInWorkflows === enabled) return;
+    this.builtInWorkflows = enabled;
+    this.options.onChange?.();
   }
 
   /** Told by the registry once the server's feature list has arrived. */
@@ -968,9 +1254,49 @@ export class ChatController {
    * `skipped` is explicit rather than inferred from an empty list: "I picked
    * none of these" and "I do not want to answer" reach the model as different
    * sentences, and the agent is blocked either way until one of them arrives.
+   *
+   * `text` is the third of those sentences — the user answering in their own
+   * words — and travels beside the picks rather than as one of them, because
+   * the ids name options the question offered and this is the part it did not.
    */
-  answerQuestion(requestId: string, optionIds: string[], skipped = false): void {
-    this.send({ type: 'chat_question_answer', requestId, optionIds, skipped });
+  answerQuestion(
+    requestId: string,
+    optionIds: string[],
+    skipped = false,
+    text?: string,
+  ): Promise<boolean> {
+    const submissionId = createQuestionAnswerSubmissionId();
+    return new Promise((resolve) => {
+      this.questionAnswers.set(submissionId, { requestId, resolve });
+      const sent = this.send({
+        type: 'chat_question_answer', requestId, optionIds, skipped, text, submissionId,
+      });
+      // Undefined remains compatible with isolated controllers and older
+      // embedders. A real closed socket returns false and cannot look accepted.
+      if (sent === false) this.settleQuestionAnswer(submissionId, false);
+    });
+  }
+
+  /** Reject unacknowledged answers when their socket goes away; never retry. */
+  connectionLost(): void {
+    for (const submissionId of Array.from(this.questionAnswers.keys())) {
+      this.settleQuestionAnswer(submissionId, false);
+    }
+  }
+
+  private settleQuestionAnswer(submissionOrRequestId: string, accepted: boolean): void {
+    const direct = this.questionAnswers.get(submissionOrRequestId);
+    if (direct) {
+      this.questionAnswers.delete(submissionOrRequestId);
+      direct.resolve(accepted);
+      return;
+    }
+    for (const [submissionId, pending] of this.questionAnswers) {
+      if (pending.requestId !== submissionOrRequestId) continue;
+      this.questionAnswers.delete(submissionId);
+      // A durable resolution is authoritative; the card reads it from the log.
+      pending.resolve(accepted);
+    }
   }
 
   respondPermission(requestId: string, optionId: string): void {
@@ -995,6 +1321,24 @@ export class ChatController {
    */
   get modelPinnedValue(): string | null {
     return this.modelPinned;
+  }
+
+  /**
+   * Where the model in force came from — the ladder, the profile, the account's
+   * standing choice, or the runtime's own default.
+   *
+   * Beside `modelDefaultValue` rather than replacing it: one says what this
+   * conversation is on, the other what the next one would open on, and using
+   * either for the other is how the chip came to name a standing choice that
+   * had never been applied to the conversation showing it (#135).
+   */
+  get modelOriginValue(): ChatModelOrigin | null {
+    return this.modelOrigin;
+  }
+
+  /** Why this conversation's ladder was not applied, when it was not. */
+  get ladderErrorValue(): string | null {
+    return this.ladderError;
   }
 
   /** What happened the last time this browser asked to change the model. */
@@ -1024,6 +1368,10 @@ export class ChatController {
     return this.effortResult;
   }
 
+  get planModeValue(): boolean { return this.planMode; }
+  get planDocumentValue(): PlanDocument | null { return this.planDocument; }
+  get planFeedback(): PlanActionFeedback | null { return this.planResult; }
+
   /**
    * Ask the server to change how hard this conversation thinks, or clear the
    * choice with an empty string.
@@ -1035,6 +1383,24 @@ export class ChatController {
    */
   setEffort(effort: string): void {
     this.send({ type: 'chat_set_effort', effort });
+  }
+
+  setPlanMode(planMode: boolean): void {
+    this.planResult = null;
+    this.options.onChange?.();
+    this.send({ type: 'chat_set_plan_mode', planMode });
+  }
+
+  acceptPlan(revision: number): void {
+    this.planResult = null;
+    this.options.onChange?.();
+    this.send({ type: 'chat_accept_plan', revision });
+  }
+
+  rejectPlan(revision: number): void {
+    this.planResult = null;
+    this.options.onChange?.();
+    this.send({ type: 'chat_reject_plan', revision });
   }
 
   /** Tell the server this browser wants this conversation's live events. */
@@ -1211,8 +1577,8 @@ export class ChatController {
   }
 
   /** Every outgoing message names its session; a browser drives several. */
-  private send(message: Record<string, unknown>): void {
-    this.options.send({ ...message, sessionId: this.sessionId });
+  private send(message: Record<string, unknown>): boolean | void {
+    return this.options.send({ ...message, sessionId: this.sessionId });
   }
 
   /**
@@ -1234,6 +1600,12 @@ export class ChatController {
     this.draftTimer = null;
     this.draftPending = null;
     this.draftListeners.clear();
+    for (const pending of this.workflowRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('The conversation closed before the guided workflow was started.'));
+    }
+    this.workflowRequests.clear();
+    this.connectionLost();
   }
 
   /**

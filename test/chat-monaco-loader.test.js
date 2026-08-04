@@ -18,6 +18,15 @@ const path = require('path');
 const ROOT = path.join(__dirname, '..');
 
 let bundle;
+const pendingDomTimers = new Set();
+
+function deferDom(callback) {
+  const timer = setTimeout(() => {
+    pendingDomTimers.delete(timer);
+    callback();
+  }, 0);
+  pendingDomTimers.add(timer);
+}
 
 before(function () {
   this.timeout(60000);
@@ -84,13 +93,13 @@ function fakeDom(options = {}) {
         nodes.head.push(node);
         if (node.tagName === 'LINK') {
           requests.push({ kind: 'style', href: node.href, node });
-          if (options.styleFails) setTimeout(() => node.onerror?.(), 0);
-          else setTimeout(() => { applied = true; node.onload?.(); }, 0);
+          if (options.styleFails) deferDom(() => node.onerror?.());
+          else deferDom(() => { applied = true; node.onload?.(); });
         }
         if (node.tagName === 'SCRIPT') {
           requests.push({ kind: 'script', src: node.src, node });
-          if (options.scriptFails) setTimeout(() => node.onerror?.(), 0);
-          else setTimeout(() => { global.window[GLOBAL] = MODULE; node.onload?.(); }, 0);
+          if (options.scriptFails) deferDom(() => node.onerror?.());
+          else deferDom(() => { global.window[GLOBAL] = MODULE; node.onload?.(); });
         }
         return node;
       },
@@ -154,6 +163,11 @@ describe('the editor chunk is not reported loaded without its stylesheet', funct
   });
 
   afterEach(function () {
+    // A failed request can settle Promise.all before its sibling timer fires.
+    // Do not let that fake request escape into the next suite after its globals
+    // have been restored.
+    for (const timer of pendingDomTimers) clearTimeout(timer);
+    pendingDomTimers.clear();
     global.document = saved.document;
     global.window = saved.window;
     global.getComputedStyle = saved.getComputedStyle;

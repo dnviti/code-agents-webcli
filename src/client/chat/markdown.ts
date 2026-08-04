@@ -43,6 +43,7 @@ export type InlineNode =
   | { type: 'strike'; children: InlineNode[] }
   | { type: 'codespan'; value: string }
   | { type: 'link'; href: string; title?: string; children: InlineNode[] }
+  | { type: 'filelink'; href: string; title?: string; children: InlineNode[] }
   | { type: 'image'; src: string; alt: string };
 
 const FENCE = /^(\s*)(`{3,}|~{3,})\s*([^\s`]*)\s*$/;
@@ -73,6 +74,18 @@ function safeHref(raw: string): string | null {
   // "foo:bar" could be anything, so anything unrecognised is refused.
   if (url.startsWith('//')) return null;
   return SAFE_SCHEME.test(url) ? url : null;
+}
+
+/**
+ * Windows file paths look like URL schemes to a browser. Preserve them as a
+ * distinct, inert node so a workspace-aware renderer can route them without
+ * ever making `c:` (or a UNC spelling) an ordinary navigable href.
+ */
+function safeFileHref(raw: string): string | null {
+  const path = raw.trim();
+  if (/^[A-Za-z]:[\\/]/.test(path)) return path;
+  if (/^(?:\\\\|\/\/)[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/.test(path)) return path;
+  return null;
 }
 
 function safeSrc(raw: string): string | null {
@@ -398,11 +411,19 @@ export function parseInline(input: string): InlineNode[] {
       const parsed = parseLink(input, i);
       if (parsed) {
         const href = safeHref(parsed.href);
+        const fileHref = href ? null : safeFileHref(parsed.href);
         flush();
         if (href) {
           nodes.push({
             type: 'link',
             href,
+            title: parsed.title,
+            children: parseInline(parsed.label),
+          });
+        } else if (fileHref) {
+          nodes.push({
+            type: 'filelink',
+            href: fileHref,
             title: parsed.title,
             children: parseInline(parsed.label),
           });
@@ -607,6 +628,7 @@ function inlineToText(nodes: InlineNode[]): string {
         case 'em':
         case 'strike':
         case 'link':
+        case 'filelink':
           return inlineToText(node.children);
         default:
           return '';

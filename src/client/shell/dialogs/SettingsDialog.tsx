@@ -50,6 +50,16 @@ export interface SettingsDialogProps {
   onInstall(): void;
   /** Open the runtime profile editor, which is its own dialog. */
   onOpenRuntimeProfiles(): void;
+  /** Open the deploy target editor, which is its own dialog. */
+  onOpenDeployTargets(): void;
+  /** Whether the operator opted this installation into deploy targets. */
+  deployTargetsEnabled: boolean;
+  /** Whether this server gives each user their own environment. */
+  environmentsEnabled: boolean;
+  /** Open the environment size picker, which is its own dialog. */
+  onOpenEnvironment(): void;
+  /** Open project containers and their lifecycle controls. */
+  onOpenProjects(): void;
 }
 
 /**
@@ -144,6 +154,11 @@ export function SettingsDialog({
   install,
   onInstall,
   onOpenRuntimeProfiles,
+  onOpenDeployTargets,
+  deployTargetsEnabled,
+  environmentsEnabled,
+  onOpenEnvironment,
+  onOpenProjects,
 }: SettingsDialogProps): React.JSX.Element | null {
   const [draft, setDraft] = React.useState<AppSettings>(settings);
   const isPhone = usePhone();
@@ -266,6 +281,12 @@ export function SettingsDialog({
       </SettingRow>
 
       <SettingRow
+        label="Projects"
+        description="Create and manage repository projects in their own containers."
+      >
+        <Button variant="secondary" size="sm" onClick={onOpenProjects}>Manage projects</Button>
+      </SettingRow>
+      <SettingRow
         label="Terminal font"
         description="Nerd Font entries add the powerline and icon glyphs prompts expect."
       >
@@ -386,6 +407,31 @@ export function SettingsDialog({
           Configure
         </Button>
       </SettingRow>
+
+      {deployTargetsEnabled ? (
+        <SettingRow
+          label="Deploy targets"
+          description="Choose where containers run: this machine, a remote Docker or Podman host, or a Kubernetes cluster. Only the account that installed this server can view or change them."
+        >
+          <Button variant="secondary" onClick={onOpenDeployTargets}>
+            Configure
+          </Button>
+        </SettingRow>
+      ) : null}
+
+      {/* Left out entirely rather than shown disabled: on a server that runs
+          everything on its own machine there is no environment to size, and a
+          greyed-out row would imply a feature that could be turned on here. */}
+      {environmentsEnabled ? (
+        <SettingRow
+          label="Workspace environment"
+          description="Your terminals, agents and files run in a container of your own. Choose how big it is, or let it follow your load."
+        >
+          <Button variant="secondary" onClick={onOpenEnvironment}>
+            Configure
+          </Button>
+        </SettingRow>
+      ) : null}
 
       <SettingRow
         label="Install app"

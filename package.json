@@ -1,7 +1,8 @@
 {
   "name": "code-agents-webcli",
-  "version": "5.3.4",
+  "version": "6.0.0",
   "description": "Multiuser web CLI for Claude Code, Codex, and terminal sessions",
+  "desktopName": "io.github.dnviti.code-agents-webcli.desktop",
   "main": "dist/server/index.js",
   "bin": {
     "code-agents-webcli": "bin/cc-web.js",
@@ -11,6 +12,9 @@
     "build": "node scripts/build.js",
     "prepare": "node scripts/build.js",
     "build:watch": "node scripts/build.js --watch",
+    "desktop": "npm run build && electron desktop/main.js",
+    "desktop:pack": "npm run build && electron-builder --dir",
+    "desktop:dist": "npm run build && electron-builder",
     "start": "npm run build && node bin/cc-web.js",
     "dev": "npm run build && node bin/cc-web.js --dev",
     "test": "npm run build && mocha --exit test/*.test.js",
@@ -72,6 +76,8 @@
     "@xterm/addon-web-links": "^0.12.0",
     "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
+    "electron": "43.2.0",
+    "electron-builder": "26.15.3",
     "esbuild": "^0.28.1",
     "mermaid": "^11.16.0",
     "mocha": "^11.7.5",

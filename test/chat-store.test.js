@@ -176,9 +176,289 @@ describe('ChatStore', function () {
       assert.strictEqual(page.firstSeq, 6, 'a client asking from seq 1 learns the true floor is 6');
       assert.strictEqual(page.events[0].seq, 6);
     });
+
+    it('pins an unresolved question across retention for warm and cold snapshots', async function () {
+      const options = { storageDir: dir, maxEvents: 4, trimChunkEvents: 3 };
+      const trimmed = new ChatStore(options);
+      const session = { id: 'pinned-question', ownerUserId: 1 };
+      const request = {
+        requestId: 'question-1',
+        origin: 'structured_handoff',
+        question: 'Keep waiting?',
+        multiSelect: false,
+        options: [{ optionId: 'yes', label: 'Yes' }],
+        ts: 1,
+      };
+
+      await trimmed.append(session, [{ t: 'question', seq: 1, ts: 1, request }]);
+      // Populate the store's full-log cache before retention runs, so the same
+      // assertion covers both the warm cache and reconstruction after restart.
+      assert.deepStrictEqual(
+        (await trimmed.snapshot(session)).pendingQuestions.map((entry) => entry.requestId),
+        [request.requestId],
+      );
+      await trimmed.append(session, makeEvents(2, 7, 2));
+
+      assert.strictEqual((await trimmed.stat(session)).firstSeq, 1, 'the live request pins its record');
+      assert.deepStrictEqual(
+        (await trimmed.snapshot(session)).pendingQuestions.map((entry) => entry.requestId),
+        [request.requestId],
+      );
+      assert.deepStrictEqual(
+        (await new ChatStore(options).snapshot(session)).pendingQuestions.map((entry) => entry.requestId),
+        [request.requestId],
+        'a restart reconstructs the request from the retained record',
+      );
+
+      await trimmed.append(session, [{
+        t: 'question_resolved',
+        seq: 9,
+        ts: 9,
+        requestId: request.requestId,
+        optionIds: [],
+        abandoned: true,
+      }]);
+
+      assert.ok((await trimmed.stat(session)).firstSeq > 1, 'the terminal resolution releases the pin');
+      assert.deepStrictEqual((await trimmed.snapshot(session)).pendingQuestions, []);
+      assert.deepStrictEqual((await new ChatStore(options).snapshot(session)).pendingQuestions, []);
+    });
+
+    it('pins an undelivered continuation across retention until its terminal record', async function () {
+      const options = { storageDir: dir, maxEvents: 4, trimChunkEvents: 3 };
+      const trimmed = new ChatStore(options);
+      const session = { id: 'pinned-continuation', ownerUserId: 1 };
+      const request = {
+        requestId: 'question-1',
+        origin: 'structured_handoff',
+        question: 'Continue?',
+        multiSelect: false,
+        options: [{ optionId: 'yes', label: 'Yes' }],
+        ts: 1,
+      };
+      const continuation = {
+        continuationId: 'continuation-1',
+        request,
+        answer: { optionIds: ['yes'], labels: ['Yes'] },
+      };
+
+      await trimmed.append(session, [
+        { t: 'question', seq: 1, ts: 1, request },
+        {
+          t: 'question_resolved',
+          seq: 2,
+          ts: 2,
+          requestId: request.requestId,
+          optionIds: ['yes'],
+          continuation,
+        },
+      ]);
+      assert.deepStrictEqual(
+        (await trimmed.snapshot(session)).pendingQuestionContinuations.map(
+          (entry) => entry.continuationId,
+        ),
+        [continuation.continuationId],
+      );
+      await trimmed.append(session, makeEvents(3, 6, 3));
+
+      assert.strictEqual((await trimmed.stat(session)).firstSeq, 2, 'the outbox record becomes the floor');
+      assert.deepStrictEqual(
+        (await trimmed.snapshot(session)).pendingQuestionContinuations.map(
+          (entry) => entry.continuationId,
+        ),
+        [continuation.continuationId],
+      );
+      assert.deepStrictEqual(
+        (await new ChatStore(options).snapshot(session)).pendingQuestionContinuations.map(
+          (entry) => entry.continuationId,
+        ),
+        [continuation.continuationId],
+        'a restart reconstructs the undelivered answer from the retained record',
+      );
+
+      await trimmed.append(session, [{
+        t: 'question_continuation',
+        seq: 9,
+        ts: 9,
+        requestId: request.requestId,
+        continuationId: continuation.continuationId,
+        outcome: 'delivered',
+      }]);
+
+      assert.ok((await trimmed.stat(session)).firstSeq > 2, 'delivery releases the outbox pin');
+      assert.deepStrictEqual((await trimmed.snapshot(session)).pendingQuestionContinuations, []);
+      assert.deepStrictEqual(
+        (await new ChatStore(options).snapshot(session)).pendingQuestionContinuations,
+        [],
+      );
+    });
+
+    it('rebuilds a stale index when retention swaps the log but its index rename fails', async function () {
+      const options = { storageDir: dir, maxEvents: 4, trimChunkEvents: 3 };
+      const trimmed = new ChatStore(options);
+      const session = { id: 'trim-swap-repair', ownerUserId: 1 };
+      const request = {
+        requestId: 'question-1', origin: 'structured_handoff', question: 'Continue?',
+        multiSelect: false, options: [{ optionId: 'yes', label: 'Yes' }], ts: 1,
+      };
+      const continuation = {
+        continuationId: 'continuation-1', request,
+        answer: { optionIds: ['yes'], labels: ['Yes'] },
+      };
+      await trimmed.append(session, [
+        { t: 'question', seq: 1, ts: 1, request },
+        {
+          t: 'question_resolved', seq: 2, ts: 2, requestId: request.requestId,
+          optionIds: ['yes'], continuation,
+        },
+        ...makeEvents(3, 6, 3),
+      ]);
+
+      const base = path.join(dir, '1', session.id);
+      const originalRename = fs.promises.rename;
+      const originalOpen = fs.promises.open;
+      let injected = false;
+      let verificationFailed = false;
+      fs.promises.rename = async function (from, to) {
+        if (
+          !injected
+          && String(from) === `${base}.idx.tmp`
+          && String(to) === `${base}.idx`
+        ) {
+          injected = true;
+          throw new Error('injected retention index rename failure');
+        }
+        return originalRename.call(fs.promises, from, to);
+      };
+      fs.promises.open = async function (file, ...args) {
+        if (injected && !verificationFailed && String(file) === `${base}.jsonl`) {
+          verificationFailed = true;
+          throw new Error('injected post-retention suffix verification failure');
+        }
+        return originalOpen.call(fs.promises, file, ...args);
+      };
+      try {
+        await assert.doesNotReject(() => trimmed.append(session, [{
+          t: 'question_continuation', seq: 9, ts: 9,
+          requestId: request.requestId,
+          continuationId: continuation.continuationId,
+          outcome: 'delivered',
+        }]));
+      } finally {
+        fs.promises.rename = originalRename;
+        fs.promises.open = originalOpen;
+      }
+      assert.strictEqual(injected, true);
+      assert.strictEqual(verificationFailed, true);
+
+      const cold = new ChatStore(options);
+      const stats = await cold.stat(session);
+      const page = await cold.read(session, 1, 100);
+      assert.ok(stats.firstSeq > 1, 'the shortened log must advertise its real floor');
+      assert.strictEqual(stats.cursor, 9);
+      assert.strictEqual(page.firstSeq, stats.firstSeq);
+      assert.deepStrictEqual(
+        page.events.map((event) => event.seq),
+        Array.from({ length: 10 - stats.firstSeq }, (_, index) => stats.firstSeq + index),
+      );
+      assert.deepStrictEqual((await cold.snapshot(session)).pendingQuestionContinuations, []);
+    });
   });
 
   describe('crash repair', function () {
+    it('treats a complete log append as committed when the derived index append fails', async function () {
+      const session = { id: 's1', ownerUserId: 1 };
+      await store.append(session, makeEvents(1, 3));
+
+      const base = path.join(dir, '1', 's1');
+      const idxSizeBefore = fs.statSync(`${base}.idx`).size;
+      const originalAppendFile = fs.promises.appendFile;
+      let injected = false;
+
+      fs.promises.appendFile = async function (file, ...args) {
+        if (!injected && String(file) === `${base}.idx`) {
+          injected = true;
+          throw new Error('injected index append failure');
+        }
+        return originalAppendFile.call(fs.promises, file, ...args);
+      };
+
+      try {
+        await assert.doesNotReject(() => store.append(session, makeEvents(4, 2)));
+      } finally {
+        fs.promises.appendFile = originalAppendFile;
+      }
+
+      assert.strictEqual(injected, true, 'the index append failure must have been exercised');
+      assert.strictEqual(
+        fs.statSync(`${base}.idx`).size,
+        idxSizeBefore,
+        'the failed index append should leave recovery work to the next operation',
+      );
+
+      const page = await store.read(session, 1, 100);
+      assert.deepStrictEqual(
+        page.events.map((event) => event.seq),
+        [1, 2, 3, 4, 5],
+      );
+      assert.ok(
+        fs.statSync(`${base}.idx`).size > idxSizeBefore,
+        'the next operation must rebuild index entries for the committed batch',
+      );
+
+      await store.append(session, makeEvents(6, 1));
+      const after = await store.read(session, 1, 100);
+      assert.deepStrictEqual(
+        after.events.map((event) => event.seq),
+        [1, 2, 3, 4, 5, 6],
+      );
+    });
+
+    it('drops a torn index entry before rebuilding from the canonical log', async function () {
+      const session = { id: 's1', ownerUserId: 1 };
+      await store.append(session, makeEvents(1, 3));
+      const base = path.join(dir, '1', 's1');
+      const completeSize = fs.statSync(`${base}.idx`).size;
+      fs.appendFileSync(`${base}.idx`, Buffer.from([0xaa, 0xbb]));
+
+      const cold = new ChatStore({ storageDir: dir });
+      const page = await cold.read(session, 1, 100);
+      assert.deepStrictEqual(page.events.map((event) => event.seq), [1, 2, 3]);
+      assert.strictEqual(fs.statSync(`${base}.idx`).size, completeSize);
+    });
+
+    it('truncates a partial log batch so the exact same seq can be retried', async function () {
+      const session = { id: 's1', ownerUserId: 1 };
+      await store.append(session, makeEvents(1, 3));
+      const base = path.join(dir, '1', 's1');
+      const originalAppendFile = fs.promises.appendFile;
+      let injected = false;
+
+      fs.promises.appendFile = async function (file, data, ...args) {
+        if (!injected && String(file) === `${base}.jsonl`) {
+          injected = true;
+          const bytes = Buffer.from(String(data), 'utf8');
+          await originalAppendFile.call(
+            fs.promises,
+            file,
+            bytes.subarray(0, Math.max(1, Math.floor(bytes.length / 2))),
+          );
+          throw new Error('injected partial log append');
+        }
+        return originalAppendFile.call(fs.promises, file, data, ...args);
+      };
+
+      try {
+        await assert.rejects(() => store.append(session, makeEvents(4, 2)), /partial log append/);
+      } finally {
+        fs.promises.appendFile = originalAppendFile;
+      }
+
+      await store.append(session, makeEvents(4, 2));
+      const page = await store.read(session, 1, 100);
+      assert.deepStrictEqual(page.events.map((event) => event.seq), [1, 2, 3, 4, 5]);
+    });
+
     it('recovers events the log has but the index does not', async function () {
       const session = { id: 's1', ownerUserId: 1 };
       store.append(session, makeEvents(1, 3));
@@ -652,6 +932,62 @@ describe('ChatStore', function () {
       assert.strictEqual(snapshot.cursor, 0);
       assert.strictEqual(snapshot.firstSeq, 1);
       assert.strictEqual(snapshot.live, false);
+    });
+
+    it('recovers pending questions and answer outboxes from beyond the replay tail', async function () {
+      const options = {
+        storageDir: dir,
+        snapshotReplayEvents: 2,
+        snapshotMaxScanEvents: 4,
+        snapshotMinMessages: 1,
+      };
+      const narrow = new ChatStore(options);
+      const request = {
+        requestId: 'old-answer', origin: 'structured_handoff',
+        question: 'Still deliver this?', multiSelect: false,
+        options: [{ optionId: 'opt-0', label: 'Yes' }], ts: 1,
+      };
+      const continuation = {
+        continuationId: 'continue-old-answer',
+        request,
+        answer: { optionIds: ['opt-0'], labels: ['Yes'] },
+      };
+      const events = [
+        { t: 'question', seq: 1, ts: 1, request },
+        {
+          t: 'question_resolved', seq: 2, ts: 2, requestId: request.requestId,
+          optionIds: ['opt-0'], continuation,
+        },
+      ];
+      for (let seq = 3; seq <= 20; seq += 1) {
+        events.push({ t: 'state', seq, ts: seq, state: seq % 2 ? 'starting' : 'idle' });
+      }
+      await narrow.append({ id: 'old-outbox', ownerUserId: 1 }, events);
+
+      const pendingRequest = {
+        requestId: 'old-question', origin: 'structured_handoff',
+        question: 'Still waiting?', multiSelect: false,
+        options: [{ optionId: 'opt-0', label: 'Yes' }], ts: 1,
+      };
+      const pendingEvents = [{ t: 'question', seq: 1, ts: 1, request: pendingRequest }];
+      for (let seq = 2; seq <= 20; seq += 1) {
+        pendingEvents.push({ t: 'state', seq, ts: seq, state: seq % 2 ? 'starting' : 'idle' });
+      }
+      await narrow.append({ id: 'old-question', ownerUserId: 1 }, pendingEvents);
+
+      const cold = new ChatStore(options);
+      const outboxSnapshot = await cold.snapshot({ id: 'old-outbox', ownerUserId: 1 });
+      assert.deepStrictEqual(
+        outboxSnapshot.pendingQuestionContinuations.map((entry) => entry.continuationId),
+        [continuation.continuationId],
+      );
+      assert.deepStrictEqual(outboxSnapshot.pendingQuestions, []);
+
+      const pendingSnapshot = await cold.snapshot({ id: 'old-question', ownerUserId: 1 });
+      assert.deepStrictEqual(
+        pendingSnapshot.pendingQuestions.map((entry) => entry.requestId),
+        [pendingRequest.requestId],
+      );
     });
   });
 

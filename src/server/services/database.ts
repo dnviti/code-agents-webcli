@@ -144,12 +144,24 @@ export class AppDatabase {
     return this.isEligibleInstaller ? this.isEligibleInstaller(githubId) : true;
   }
 
-  /** One account by id, or null once it has been deleted. */
+  /**
+   * One account by id, or null once it has been deleted.
+   *
+   * Also where a user id becomes something human-readable: a per-user
+   * environment is named after the login, and only the id travels through the
+   * session and socket layers.
+   */
   getUserById(userId: number): AuthenticatedUser | null {
     const row = this.db.prepare('SELECT * FROM users WHERE id = ?').get(userId) as
       | UserRow
       | undefined;
     return row ? mapUserRow(row) : null;
+  }
+
+  /** Safe account metadata for maintenance/reporting jobs; never auth/session data. */
+  listUsers(): AuthenticatedUser[] {
+    const rows = this.db.prepare('SELECT * FROM users ORDER BY id ASC').all() as UserRow[];
+    return rows.map(mapUserRow);
   }
 
   getUserSetting(userId: number, key: string): string | null {
@@ -456,6 +468,238 @@ export class AppDatabase {
 
       CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires_at
         ON auth_sessions(expires_at);
+
+      /*
+       * Deployment targets: where new user/project containers are placed. No
+       * target ⇒ host identity, so an empty table keeps the legacy behaviour
+       * exactly as today and the table can be created before any code reads it.
+       */
+      CREATE TABLE IF NOT EXISTS deploy_targets (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        engine TEXT NOT NULL,
+        image TEXT,
+        host_secret TEXT,
+        kubernetes_secret TEXT,
+        tiers_json TEXT,
+        default_tier TEXT,
+        allow_user_tier_choice INTEGER,
+        cpus TEXT,
+        memory TEXT,
+        setup_command TEXT,
+        idle_timeout_minutes INTEGER,
+        caveats_json TEXT NOT NULL DEFAULT '[]',
+        last_check_json TEXT,
+        created_by INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      /*
+       * Projects: a repo (or a name-only workspace) plus the container it
+       * builds into, owned by exactly one user. 'target_id' records where the
+       * project was placed and never changes afterwards; a null means the
+       * legacy startup-flag engine, so an installation that defines no deploy
+       * targets still gets projects exactly where its containers already run.
+       *
+       * 'container_json' holds what a restart needs to find the container
+       * again (name, shells); a null means there is no container — never
+       * built, or reclaimed — and the next start rebuilds from the worktree
+       * layout. 'build_log_json' is the ring buffer of build events a
+       * reopened tab replays to rejoin an in-flight build.
+       */
+      CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        repo_url TEXT,
+        repo_host TEXT,
+        target_id TEXT REFERENCES deploy_targets(id),
+        execution_kind TEXT NOT NULL DEFAULT 'container',
+        tier_id TEXT,
+        state TEXT NOT NULL,
+        state_detail TEXT,
+        container_json TEXT,
+        /* A durable lifecycle fact, not a human-readable state_detail: the
+         * retained checkout must be preserved, wiped and freshly cloned on
+         * the next build. */
+        rebuild_required INTEGER NOT NULL DEFAULT 0,
+        build_log_json TEXT,
+        last_activity_at TEXT NOT NULL,
+        last_preserved_commit TEXT,
+        last_preserved_branch TEXT,
+        composition_revision TEXT,
+        applied_composition_revision TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_projects_owner
+        ON projects(owner_user_id);
+
+      CREATE INDEX IF NOT EXISTS idx_projects_state
+        ON projects(state);
+
+      /*
+       * A lease exists only while a runtime or browser attachment is admitted
+       * to a project. Rows, rather than a mutable counter, make the refcount
+       * auditable and idempotently releasable. Lifecycle claims change the
+       * project state in the same BEGIN IMMEDIATE transaction that verifies
+       * this table is empty, closing admission before an engine stop begins.
+       */
+      CREATE TABLE IF NOT EXISTS project_session_leases (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        owner_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_project_session_leases_project
+        ON project_session_leases(project_id);
+
+      /*
+       * One credential per user per git host per kind: what clone and the
+       * preservation push authenticate with. Only kind = 'token' exists in
+       * this phase; OAuth kinds arrive with the provider work. The credential
+       * is encrypted with the installation key ring and is never selected
+       * back out in plaintext by any list endpoint.
+       */
+      CREATE TABLE IF NOT EXISTS connected_hosts (
+        id TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        host TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        identity_id TEXT,
+        credential_encrypted TEXT,
+        scopes_json TEXT,
+        expires_at TEXT,
+        last_used_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (user_id, host, kind)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_connected_hosts_user
+        ON connected_hosts(user_id);
+
+      /* Immutable, inspectable runtime recipes.  Revisions are UUIDs rather
+       * than a mutable JSON blob on projects so a confirmation can always say
+       * exactly which inspected tree it applied. */
+      CREATE TABLE IF NOT EXISTS project_compositions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        catalog_version TEXT NOT NULL,
+        detected_json TEXT NOT NULL,
+        chosen_json TEXT NOT NULL,
+        source_oid TEXT,
+        source_ref TEXT,
+        forge_kind TEXT,
+        forge_host TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_project_compositions_project
+        ON project_compositions(project_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_project_compositions_user
+        ON project_compositions(user_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS composition_installations (
+        id TEXT PRIMARY KEY,
+        composition_id TEXT NOT NULL REFERENCES project_compositions(id) ON DELETE CASCADE,
+        item_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'installing', 'installed', 'failed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        installed_version TEXT,
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(composition_id, item_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_composition_installations_composition
+        ON composition_installations(composition_id, status);
+
+      CREATE TABLE IF NOT EXISTS git_identities (
+        id TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_git_identities_global
+        ON git_identities(user_id) WHERE project_id IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_git_identities_project
+        ON git_identities(user_id, project_id) WHERE project_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS storage_usage_snapshots (
+        id TEXT PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        total_bytes INTEGER NOT NULL,
+        breakdown_json TEXT NOT NULL,
+        errors_json TEXT NOT NULL DEFAULT '[]',
+        free_bytes INTEGER,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_storage_usage_snapshots_user
+        ON storage_usage_snapshots(user_id, created_at DESC);
+    `);
+
+    // The project a session runs inside. Nullable, and a null is load-bearing:
+    // every row written before projects existed is a project-less session,
+    // which is today's behaviour and must keep meaning exactly that.
+    this.addColumnIfMissing('runtime_sessions', 'project_id', 'TEXT REFERENCES projects(id)');
+    // Null means every pre-project-session row and is interpreted as the
+    // legacy host path. A non-null discriminator prevents `/tmp` being guessed
+    // as a host path when a project terminal/file browser uses image storage.
+    this.addColumnIfMissing(
+      'runtime_sessions',
+      'project_working_dir_kind',
+      "TEXT CHECK (project_working_dir_kind IN ('host', 'container'))",
+    );
+    // A missing recorded environment is different from an ordinary stopped
+    // one (notably Kubernetes stops delete Pods). Keep that distinction as a
+    // durable fact so recovery never has to infer it from prose state_detail.
+    this.addColumnIfMissing('projects', 'rebuild_required', 'INTEGER NOT NULL DEFAULT 0');
+    // The commit alone is insufficient when preservation had to choose a
+    // collision suffix. Keep the exact recovery ref across later build-log
+    // resets and server restarts.
+    this.addColumnIfMissing('projects', 'last_preserved_branch', 'TEXT');
+    // A legacy project has no applied recipe.  Keeping this nullable makes the
+    // distinction visible instead of pretending its old container was built
+    // from a revision it never saw.
+    this.addColumnIfMissing('projects', 'applied_composition_revision', 'TEXT');
+
+    // Connected-host secrets remain in credential_encrypted.  These columns
+    // are deliberately metadata-only and safe for list/admin responses.
+    this.addColumnIfMissing('connected_hosts', 'forge_kind', 'TEXT');
+    this.addColumnIfMissing('connected_hosts', 'credential_kind', 'TEXT');
+    this.addColumnIfMissing('connected_hosts', 'validation_status', 'TEXT');
+    this.addColumnIfMissing('connected_hosts', 'last_validated_at', 'TEXT');
+    this.addColumnIfMissing('connected_hosts', 'validation_error_code', 'TEXT');
+    this.addColumnIfMissing('connected_hosts', 'validation_error_message', 'TEXT');
+    this.addColumnIfMissing('connected_hosts', 'credential_revision', 'INTEGER NOT NULL DEFAULT 0');
+    // Old rows were all manual tokens. Backfill display/preference metadata
+    // without touching (or decrypting) the credential itself.
+    this.db.exec(`
+      UPDATE connected_hosts
+         SET credential_kind = kind
+       WHERE credential_kind IS NULL AND kind IN ('token', 'oauth');
+      UPDATE connected_hosts
+         SET validation_status = 'unvalidated'
+       WHERE validation_status IS NULL AND credential_encrypted IS NOT NULL;
+      UPDATE connected_hosts
+         SET credential_revision = 1
+       WHERE credential_revision = 0 AND credential_encrypted IS NOT NULL;
+
+      CREATE TRIGGER IF NOT EXISTS project_compositions_immutable
+      BEFORE UPDATE ON project_compositions
+      BEGIN
+        SELECT RAISE(ABORT, 'project composition revisions are immutable');
+      END;
     `);
 
     // Which surface a session runs on. Added after the fact, so it is nullable
@@ -487,6 +731,11 @@ export class AppDatabase {
     // The model this conversation overrides its runtime/profile default with.
     // Nullable and null-by-default: every row written before this column
     // existed has no override recorded, which is exactly what a null means.
+    // Local projects were introduced after project containers. Existing rows
+    // are containers by definition; new rows opt into host execution
+    // explicitly when the administrator selects no deploy target.
+    this.addColumnIfMissing('projects', 'execution_kind', "TEXT NOT NULL DEFAULT 'container'");
+
     this.addColumnIfMissing('runtime_sessions', 'chat_model_override', 'TEXT');
 
     // The model this conversation is fixed to, written from what its last launch
@@ -503,10 +752,25 @@ export class AppDatabase {
     // null is what "chose no level" has always meant.
     this.addColumnIfMissing('runtime_sessions', 'chat_effort_override', 'TEXT');
 
+    // A conversation-level mode, not process state. Null on older rows reads as off.
+    this.addColumnIfMissing('runtime_sessions', 'chat_plan_mode', 'INTEGER');
+
     // The label the user chose for this session. Nullable and null-by-default:
     // a null is "never renamed", which is true of every row written before
     // renaming outlived the page that did it.
     this.addColumnIfMissing('runtime_sessions', 'custom_name', 'TEXT');
+
+    // Whether this session is in its owner's shared tab strip. Nullable for a
+    // backward-readable additive migration: every row from before tabs were
+    // account-scoped carries null, and null reads as the historical answer —
+    // open — while remaining distinguishable during the one-time migration of
+    // browser-local closes. INTEGER because SQLite has no boolean.
+    this.addColumnIfMissing('runtime_sessions', 'tab_open', 'INTEGER');
+
+    // The account-owned position of a standalone tab. Older rows remain null
+    // and retain their stable load order until the first explicit reorder.
+    // INTEGER is sufficient: positions are compact ordinals, not timestamps.
+    this.addColumnIfMissing('runtime_sessions', 'tab_order', 'INTEGER');
 
     // Which project — which working folder, by name — a recorded job ran in.
     // Nullable and null-by-default, and the null is load-bearing: work filed

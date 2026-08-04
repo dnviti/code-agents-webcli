@@ -116,6 +116,18 @@ describe('sending a queued message now', function () {
     assert.strictEqual(s.currentState, 'thinking', 'the agent is working on it, not idle');
   });
 
+  it('preserves a built-in workflow when its queued turn is promoted', async function () {
+    const { s, adapter, store } = session();
+    await s.send({ text: 'refactor the auth module' });
+    await s.send({ text: 'write up the regression', workflow: 'gh-issue' });
+
+    assert.strictEqual(await s.sendQueuedNow(s.queuedTurns[0].id), true);
+    assert.match(adapter.sent[1], /\[BEGIN APP-OWNED GH-ISSUE WORKFLOW\]/);
+    assert.match(adapter.sent[1], /write up the regression/);
+    const prompts = store.events.filter((event) => event.t === 'msg_start' && event.role === 'user');
+    assert.strictEqual(prompts[1].workflow, 'gh-issue');
+  });
+
   it('leaves the rest of the line waiting, in the order it was typed', async function () {
     const { s, adapter, broadcasts } = session();
     await s.send({ text: 'first' });
@@ -209,7 +221,13 @@ describe('sending a queued message now', function () {
 
     assert.ok(answered, 'the model is blocked until something comes back, even a refusal');
     assert.strictEqual(s.questions.size, 0);
-    assert.ok(store.events.some((e) => e.t === 'question_resolved' && e.requestId === 'q1' && e.skipped));
+    // Abandoned, not skipped. Cutting a turn short is something the *user* did
+    // to the turn; skipping is something they did to the question, and the card
+    // drew the second sentence over the first (#174).
+    const resolved = store.events.find((e) => e.t === 'question_resolved' && e.requestId === 'q1');
+    assert.ok(resolved, 'the card is taken down');
+    assert.strictEqual(resolved.abandoned, true);
+    assert.ok(!resolved.skipped, 'nobody skipped this — they were never asked');
   });
 
   it('sends once when the control is pressed twice', async function () {

@@ -34,6 +34,8 @@ export interface CodeEditorProps {
   onSave?: () => void;
   ariaLabel?: string;
   height?: React.CSSProperties['height'];
+  /** One-based line to reveal on the first paint. */
+  initialLine?: number;
 }
 
 /**
@@ -73,6 +75,7 @@ export function CodeEditor({
   onSave,
   ariaLabel = 'File contents',
   height = '100%',
+  initialLine,
 }: CodeEditorProps): React.JSX.Element {
   const textareaRef = React.useRef<HTMLTextAreaElement | null>(null);
   const preRef = React.useRef<HTMLPreElement | null>(null);
@@ -121,6 +124,34 @@ export function CodeEditor({
   // textarea's scroll without firing a scroll event, so the layers are realigned
   // whenever the text itself changes as well as on every scroll.
   React.useEffect(syncScroll, [value, syncScroll]);
+
+  React.useEffect(() => {
+    if (initialLine === undefined) return;
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    const line = Math.min(lineCount, Math.max(1, Math.trunc(initialLine) || 1));
+    let offset = 0;
+    for (let current = 1; current < line; current++) {
+      const newline = value.indexOf('\n', offset);
+      if (newline === -1) break;
+      offset = newline + 1;
+    }
+    textarea.setSelectionRange(offset, offset);
+
+    // Native textareas reveal a programmatic caret only once focused. This
+    // fallback must not steal focus from the dialog, so position its scroller
+    // directly and then move the highlight/gutter layers to match.
+    const measured = typeof getComputedStyle === 'function'
+      ? Number.parseFloat(getComputedStyle(textarea).lineHeight)
+      : Number.NaN;
+    const lineHeight = Number.isFinite(measured) ? measured : 18;
+    textarea.scrollTop = Math.max(0, (line - 1) * lineHeight - (textarea.clientHeight - lineHeight) / 2);
+    syncScroll();
+    // The value deliberately is not a dependency: typing after opening at a
+    // line must not snap the cursor back there on every keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialLine, syncScroll]);
 
   function onKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>): void {
     // `!event.altKey` is not cosmetic: AltGr reports as ctrl+alt on Windows and
@@ -279,6 +310,7 @@ export function CodeEditor({
           autoComplete="off"
           aria-label={ariaLabel}
           aria-readonly={readOnly || undefined}
+          data-initial-line={initialLine}
           style={{
             ...SHARED,
             position: 'relative',

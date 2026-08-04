@@ -81,6 +81,8 @@ export interface SessionInfo {
   name: string;
   status: 'idle' | 'active' | 'error' | 'disconnected';
   workingDir: string | null;
+  /** Namespace of workingDir for a project session; absent means host. */
+  projectWorkingDirKind?: 'host' | 'container';
   lastAccessed: number;
   lastActivity: number;
   unreadOutput: boolean;
@@ -107,6 +109,7 @@ export interface Aliases {
   qwen: string;
   kimi: string;
   omp: string;
+  antigravity: string;
   terminal: string;
 }
 
@@ -119,6 +122,7 @@ export type AgentKind =
   | 'qwen'
   | 'kimi'
   | 'omp'
+  | 'antigravity'
   | 'terminal';
 
 export interface PlanData {
@@ -148,6 +152,8 @@ export interface SessionCreateResponse {
   session: {
     name: string;
     workingDir: string;
+    projectId?: string | null;
+    projectName?: string | null;
   };
 }
 
@@ -171,14 +177,23 @@ export interface SessionListItem {
    * is the same direction every other unknown in this rule takes.
    */
   bypassPermissions?: boolean;
+  /** Project identity, when this session was opened from a project workspace. */
+  projectId?: string | null;
+  projectName?: string | null;
+  /** Namespace of workingDir for a project session; absent means host. */
+  projectWorkingDirKind?: 'host' | 'container';
 }
 
 export interface FolderData {
   currentPath: string;
   parentPath: string | null;
+  workingDirKind?: 'host' | 'container';
+  lifetime?: 'workspace' | 'owner_home' | 'disposable';
   folders: Array<{
     name: string;
     path: string;
+    workingDirKind?: 'host' | 'container';
+    lifetime?: 'workspace' | 'owner_home' | 'disposable';
   }>;
 }
 
@@ -200,6 +215,10 @@ export interface WsSessionCreatedMessage {
   sessionId: string;
   sessionName: string;
   workingDir: string;
+  /** Absent only when connected to a server predating project sessions. */
+  projectId?: string | null;
+  projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
 }
 
 export interface WsSessionJoinedMessage {
@@ -207,6 +226,10 @@ export interface WsSessionJoinedMessage {
   sessionId: string;
   sessionName: string;
   workingDir: string;
+  /** Absent only when connected to a server predating project sessions. */
+  projectId?: string | null;
+  projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
   active: boolean;
   outputBuffer?: string[];
   lastAgent?: AgentKind;
@@ -235,6 +258,7 @@ export interface WsChatStartedMessage {
   agent: AgentKind;
   runtimeLabel: string;
   workingDir?: string;
+  projectWorkingDirKind?: 'host' | 'container';
   capabilities?: unknown;
   bypassPermissions?: boolean;
 }
@@ -249,6 +273,15 @@ export interface WsChatEventMessage {
   type: 'chat_event';
   sessionId: string;
   event: unknown;
+}
+
+/** Correlated acceptance of one browser's question-answer submission. */
+export interface WsChatQuestionAnswerAckMessage {
+  type: 'chat_question_answer_ack';
+  sessionId: string;
+  requestId: string;
+  submissionId: string;
+  accepted: boolean;
 }
 
 /**
@@ -312,6 +345,7 @@ export interface WsRuntimeStartedMessage {
     | 'qwen_started'
     | 'kimi_started'
     | 'omp_started'
+    | 'antigravity_started'
     | 'terminal_started';
   agent?: AgentKind;
 }
@@ -326,6 +360,7 @@ export interface WsRuntimeStoppedMessage {
     | 'qwen_stopped'
     | 'kimi_stopped'
     | 'omp_stopped'
+    | 'antigravity_stopped'
     | 'terminal_stopped';
   agent?: AgentKind;
   runtimeLabel?: string;
@@ -359,6 +394,18 @@ export interface WsSessionDeletedMessage {
   message: string;
 }
 
+/** A conversation tab closed on one of this account's screens. */
+export interface WsSessionTabClosedMessage {
+  type: 'session_tab_closed';
+  sessionId: string;
+}
+
+/** The authoritative order of every currently open tab on this account. */
+export interface WsSessionTabsReorderedMessage {
+  type: 'session_tabs_reordered';
+  sessionIds: string[];
+}
+
 /**
  * Sent to every one of the user's sockets when a session is renamed, including
  * the one that asked, so a second window follows the new label without a reload.
@@ -387,6 +434,9 @@ export interface WsSessionOpenedMessage {
   surface: 'terminal' | 'chat';
   active: boolean;
   bypassPermissions: boolean;
+  projectId?: string | null;
+  projectName?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
 }
 
 /**
@@ -461,6 +511,41 @@ export interface WsUpdateRestartingMessage {
   type: 'update_restarting';
 }
 
+/**
+ * Automatic sizing moved this user's environment.
+ *
+ * Sent rather than left to be discovered: a machine that changes size under
+ * someone with no explanation reads as a fault, and the reason is exactly what
+ * makes it read as a feature instead.
+ */
+export interface WsEnvironmentTierChangedMessage {
+  type: 'environment_tier_changed';
+  tier: string;
+  previousTier: string;
+  reason: string;
+  /** `applied` now, or `deferred` until nothing is running. */
+  outcome: string;
+}
+
+/** Broadcast: a project this user owns changed state. */
+export interface WsProjectUpdatedMessage {
+  type: 'project_updated';
+  project: {
+    id: string;
+    name: string;
+    state: string;
+    stateDetail?: string | null;
+    lastActivityAt?: string;
+    hasActiveWork?: boolean;
+  };
+}
+
+/** Broadcast: a project this user owns was deleted. */
+export interface WsProjectRemovedMessage {
+  type: 'project_removed';
+  projectId: string;
+}
+
 export type WsMessage =
   | WsConnectedMessage
   | WsSessionCreatedMessage
@@ -473,6 +558,8 @@ export type WsMessage =
   | WsErrorMessage
   | WsInfoMessage
   | WsSessionDeletedMessage
+  | WsSessionTabClosedMessage
+  | WsSessionTabsReorderedMessage
   | WsSessionRenamedMessage
   | WsSessionOpenedMessage
   | WsSessionActivityMessage
@@ -484,9 +571,13 @@ export type WsMessage =
   | WsUpdateOutputMessage
   | WsUpdateDoneMessage
   | WsUpdateRestartingMessage
+  | WsEnvironmentTierChangedMessage
+  | WsProjectUpdatedMessage
+  | WsProjectRemovedMessage
   | WsChatStartedMessage
   | WsChatSnapshotMessage
   | WsChatEventMessage
+  | WsChatQuestionAnswerAckMessage
   | WsChatDraftMessage
   | WsChatPageMessage
   | WsChatPageFailedMessage;

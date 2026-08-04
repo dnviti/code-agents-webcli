@@ -1,9 +1,10 @@
 import express, { NextFunction, Request, Response, Router } from 'express';
-import { createReadStream } from 'node:fs';
 import { PathValidation, SessionRecord } from '../types.js';
 import {
+  AttachmentSessionRef,
   AttachmentStoreLike,
   DEFAULT_MAX_ATTACHMENT_BYTES,
+  attachmentUrlFor,
 } from '../services/attachment-store.js';
 import { getOwnedSession, requireUser } from './helpers.js';
 
@@ -33,7 +34,7 @@ export const ATTACHMENT_MAX_BYTES = DEFAULT_MAX_ATTACHMENT_BYTES;
 export interface ChatAttachmentRoutesDeps {
   claudeSessions: Map<string, SessionRecord>;
   attachmentStore: AttachmentStoreLike;
-  validatePath(targetPath: string): PathValidation;
+  validatePath(targetPath: string, userId?: number): PathValidation;
 }
 
 interface BodyParserError extends Error {
@@ -48,7 +49,7 @@ interface BodyParserError extends Error {
  * agreeing.
  */
 export function attachmentUrl(sessionId: string, storedName: string): string {
-  return `/api/sessions/${encodeURIComponent(sessionId)}/chat-attachments/${encodeURIComponent(storedName)}`;
+  return attachmentUrlFor(sessionId, storedName);
 }
 
 /** Same reasoning as the paste route's copy: SameSite=Lax is site-, not origin-scoped. */
@@ -80,13 +81,46 @@ function sessionFor(
     return null;
   }
 
-  const validation = deps.validatePath(session.workingDir);
+  // A project cwd can be a container path (`/tmp`, `/etc`, ...), whose string
+  // may also name an unrelated host path. Never pass it through host path
+  // validation: the project-aware attachment store acquires the manager lease,
+  // restores the authoritative namespace and performs confinement there.
+  if (
+    (session.projectId !== undefined && session.projectId !== null)
+    || session.projectWorkingDirKind !== undefined
+  ) {
+    return Object.assign(session, { validatedDir: session.workingDir });
+  }
+
+  const validation = deps.validatePath(session.workingDir, session.ownerUserId);
   if (!validation.valid || !validation.path) {
     res.status(403).json({ error: 'session_outside_base' });
     return null;
   }
 
   return Object.assign(session, { validatedDir: validation.path });
+}
+
+function attachmentSessionRef(
+  session: SessionRecord & { validatedDir: string },
+): AttachmentSessionRef {
+  // Preserve the actual project record so an authoritative cwd repair made
+  // during manager admission is persisted on the same object. Non-project
+  // sessions still use the revalidated host path rather than the stale string
+  // from their record.
+  if (session.projectId) {
+    return Object.assign(session, {
+      projectId: session.projectId,
+      projectWorkingDirKind: session.projectWorkingDirKind,
+    });
+  }
+  return {
+    id: session.id,
+    ownerUserId: session.ownerUserId,
+    workingDir: session.validatedDir,
+    projectId: session.projectId,
+    projectWorkingDirKind: session.projectWorkingDirKind,
+  };
 }
 
 export function createChatAttachmentRoutes(deps: ChatAttachmentRoutesDeps): Router {
@@ -111,11 +145,7 @@ export function createChatAttachmentRoutes(deps: ChatAttachmentRoutesDeps): Rout
 
       try {
         const stored = await deps.attachmentStore.save(
-          {
-            id: session.id,
-            ownerUserId: session.ownerUserId,
-            workingDir: session.validatedDir,
-          },
+          attachmentSessionRef(session),
           { filename, declaredMime, bytes },
         );
 
@@ -141,6 +171,12 @@ export function createChatAttachmentRoutes(deps: ChatAttachmentRoutesDeps): Rout
           case 'QUOTA_EXCEEDED':
             res.status(507).json({ error: 'quota_exceeded' });
             return;
+          case 'UNSUPPORTED_ATTACHMENT_NAMESPACE':
+            res.status(409).json({ error: 'unsupported_attachment_namespace' });
+            return;
+          case 'UNSAFE_ATTACHMENT_DIR':
+            res.status(403).json({ error: 'unsafe_attachment_dir' });
+            return;
           case 'EACCES':
           case 'EPERM':
             res.status(500).json({ error: 'write_failed', reason: 'permission' });
@@ -164,12 +200,8 @@ export function createChatAttachmentRoutes(deps: ChatAttachmentRoutesDeps): Rout
       if (!session) return;
 
       try {
-        const { absolutePath, serve, bytes } = await deps.attachmentStore.resolve(
-          {
-            id: session.id,
-            ownerUserId: session.ownerUserId,
-            workingDir: session.validatedDir,
-          },
+        const { stream, serve, bytes } = await deps.attachmentStore.openForDownload(
+          attachmentSessionRef(session),
           req.params.name as string,
         );
 
@@ -187,12 +219,12 @@ export function createChatAttachmentRoutes(deps: ChatAttachmentRoutesDeps): Rout
         // holding it would be the one place the ownership check does not run.
         res.setHeader('Cache-Control', 'private, max-age=3600');
 
-        createReadStream(absolutePath)
-          .on('error', () => {
-            if (!res.headersSent) res.status(500).json({ error: 'read_failed' });
-            else res.destroy();
-          })
-          .pipe(res);
+        stream.on('error', () => {
+          if (!res.headersSent) res.status(500).json({ error: 'read_failed' });
+          else res.destroy();
+        });
+        res.once('close', () => stream.destroy());
+        stream.pipe(res);
       } catch {
         res.status(404).json({ error: 'not_found' });
       }

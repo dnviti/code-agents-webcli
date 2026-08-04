@@ -28,6 +28,7 @@ import {
   PlanItem,
   NoticeBlock,
   QuestionRequest,
+  QuestionContinuation,
   TextBlock,
   ThinkingBlock,
   ToolBlock,
@@ -36,6 +37,7 @@ import {
   carriesTokens,
   isSessionMintedMessageId,
   mergeUsage,
+  withoutQuestionFallbackEnvelope,
 } from './chat-events.js';
 import { turnOutcomeOf } from './turn-outcome.js';
 import { openTurnAfter } from './turn-boundaries.js';
@@ -70,6 +72,13 @@ export interface TranscriptState {
    * which is where scrolling back finds it.
    */
   pendingQuestions: QuestionRequest[];
+  /** Durable answered-handoff outbox, keyed by its stable dispatch id. */
+  pendingQuestionContinuations: Record<string, QuestionContinuation>;
+  /**
+   * Every question event still retained in the loaded log, including resolved
+   * questions with no tool block from which a historical card could be rebuilt.
+   */
+  questionHistory: QuestionRequest[];
   /**
    * Answers already given, keyed by the tool call that asked.
    *
@@ -80,6 +89,26 @@ export interface TranscriptState {
    * call, which is answered from the pinned card instead.
    */
   answeredQuestions: Record<string, string[]>;
+  /**
+   * What was typed for the questions answered in the user's own words, keyed
+   * exactly as `answeredQuestions` is.
+   *
+   * Its own map rather than a sentinel id in that one, because the ids there
+   * are checked against the options the question offered — a typed answer
+   * belongs to none of them, and giving it one would put a tick on a choice
+   * nobody made.
+   */
+  answeredQuestionText: Record<string, string>;
+  /**
+   * Questions nobody was given the chance to answer, keyed exactly as
+   * `answeredQuestions` is.
+   *
+   * Its own map for the same reason the text has one: an empty list of picks
+   * already means "skipped", and a card the agent stopped waiting for is not a
+   * card its user declined. The card reads this to stop offering buttons that
+   * would send an answer nowhere.
+   */
+  abandonedQuestions: Record<string, true>;
   /** Lowest seq present. Non-zero once the log head has been trimmed. */
   firstSeq: number;
   /** Highest seq applied. Events at or below this are ignored as replays. */
@@ -150,7 +179,11 @@ export function createTranscript(
     plan: [],
     pendingPermissions: [],
     pendingQuestions: [],
+    pendingQuestionContinuations: {},
+    questionHistory: [],
     answeredQuestions: {},
+    answeredQuestionText: {},
+    abandonedQuestions: {},
     firstSeq: 0,
     cursor: 0,
     currentTurnId: null,
@@ -300,6 +333,12 @@ const NOTICES: Record<
   interrupted: { notice: 'interrupted', text: 'Interrupted to send' },
   branched: { notice: 'branched', text: 'Branched from an earlier conversation' },
   cleared: { notice: 'cleared', text: 'New conversation' },
+  // Only ever drawn for a change made *during* a conversation — an escalation
+  // granted, the rung it returns to, a profile edited under a running chat.
+  // Never at launch: which model a conversation opened on is a standing fact,
+  // and standing facts belong on the chip beside the composer, which is the
+  // lesson `approvals` above cost us (#134).
+  model: { notice: 'model', text: 'Model changed' },
 };
 
 /** Every token field a runtime can report, so a reset covers all of them. */
@@ -604,6 +643,7 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         blocks: [],
         streaming: true,
         model: event.model,
+        ...(event.workflow ? { workflow: event.workflow } : {}),
         ...(event.steer ? { steer: true as const } : {}),
       };
       state.index[event.id] = state.messages.length;
@@ -880,17 +920,113 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
     }
 
     case 'question': {
+      const recorded = state.questionHistory.findIndex(
+        (question) => question.requestId === event.request.requestId,
+      );
+      if (recorded < 0) state.questionHistory.push(event.request);
+      else state.questionHistory[recorded] = event.request;
+      // Durable publication orders the request before its resolution, but a
+      // reconnect can still splice an older socket frame around a newer
+      // snapshot. Once a resolution owns this key, a late request is history,
+      // not a newly actionable card.
+      const answerKey = event.request.toolId ?? event.request.requestId;
+      const alreadyResolved = Object.prototype.hasOwnProperty.call(
+        state.answeredQuestions,
+        answerKey,
+      );
       const already = state.pendingQuestions.some(
         (pending) => pending.requestId === event.request.requestId,
       );
-      if (!already) {
+      if (!already && !alreadyResolved) {
         state.pendingQuestions.push(event.request);
       }
       // Not folded into `awaiting_permission`: the composer, the header and the
       // stop button all read this, and "waiting for approval" over a question
       // about which of three approaches to take is simply the wrong sentence.
-      state.state = 'awaiting_answer';
-      return { messageIndex: null, structural: false, meta: true, applied: true };
+      if (!alreadyResolved) state.state = 'awaiting_answer';
+
+      // A normal ask tool already owns its card in the message that contains
+      // the call. The structured-response fallback has no tool block at all,
+      // so make the question itself a durable block on the assistant response
+      // that asked it. The raw private envelope in that response is hidden;
+      // this is the readable chronological replacement that survives replay.
+      const toolOwnsCard = event.request.toolId
+        ? state.toolIndex[event.request.toolId] !== undefined
+        : false;
+      if (toolOwnsCard) {
+        return { messageIndex: null, structural: false, meta: true, applied: true };
+      }
+
+      let messageIndex = -1;
+      for (let i = state.messages.length - 1; i >= 0; i -= 1) {
+        if (state.messages[i].role === 'assistant') {
+          messageIndex = i;
+          break;
+        }
+      }
+      if (messageIndex >= 0) {
+        const message = state.messages[messageIndex];
+        const exists = message.blocks.some(
+          (block) => block.kind === 'question'
+            && block.request.requestId === event.request.requestId,
+        );
+        if (!exists) {
+          message.blocks.push({
+            kind: 'question',
+            request: event.request,
+            ...(alreadyResolved ? {
+              answer: {
+                optionIds: [...state.answeredQuestions[answerKey]],
+                ...(state.answeredQuestionText[answerKey]
+                  ? { text: state.answeredQuestionText[answerKey] }
+                  : null),
+                ...(state.answeredQuestions[answerKey].length === 0
+                  && !state.abandonedQuestions[answerKey]
+                  ? { skipped: true }
+                  : null),
+                ...(state.abandonedQuestions[answerKey] ? { abandoned: true } : null),
+              },
+            } : null),
+          });
+        }
+        return { messageIndex, structural: false, meta: true, applied: true };
+      }
+
+      // Defensive route for a runtime that asks before it has emitted any
+      // assistant message. It still gets a transcript row and never falls back
+      // to a question that can only be found beside the composer.
+      const message: ChatMessage = {
+        id: `question-${event.request.requestId}`,
+        seq: event.seq,
+        turnId: state.currentTurnId ?? lastTurnId(state) ?? `question-${event.seq}`,
+        role: 'assistant',
+        ts: event.ts,
+        blocks: [{
+          kind: 'question',
+          request: event.request,
+          ...(alreadyResolved ? {
+            answer: {
+              optionIds: [...state.answeredQuestions[answerKey]],
+              ...(state.answeredQuestionText[answerKey]
+                ? { text: state.answeredQuestionText[answerKey] }
+                : null),
+              ...(state.answeredQuestions[answerKey].length === 0
+                && !state.abandonedQuestions[answerKey]
+                ? { skipped: true }
+                : null),
+              ...(state.abandonedQuestions[answerKey] ? { abandoned: true } : null),
+            },
+          } : null),
+        }],
+      };
+      state.index[message.id] = state.messages.length;
+      state.messages.push(message);
+      return {
+        messageIndex: state.messages.length - 1,
+        structural: true,
+        meta: true,
+        applied: true,
+      };
     }
 
     case 'question_resolved': {
@@ -901,12 +1037,84 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
       // Kept after the fact so the card keeps showing what was picked once the
       // request itself is gone, without waiting for the runtime to echo a tool
       // result back.
-      state.answeredQuestions[event.toolId ?? asked?.toolId ?? event.requestId] = event.skipped
-        ? []
-        : [...event.optionIds];
+      const key = event.toolId ?? asked?.toolId ?? event.requestId;
+      state.answeredQuestions[key] = event.skipped ? [] : [...event.optionIds];
+      // Written both ways round, because a card can resolve twice: a question
+      // the agent gave up on and then asked again lands on the same key, and a
+      // stale "nobody could answer this" under a freshly answered card would be
+      // the same wrong sentence in the other direction.
+      if (event.abandoned) {
+        state.abandonedQuestions[key] = true;
+      } else {
+        delete state.abandonedQuestions[key];
+      }
+      // Written unconditionally rather than only when there is text, so a
+      // re-answer — the same key resolving twice, which a retried turn does —
+      // cannot leave the previous answer's sentence standing under a card that
+      // was answered by clicking this time.
+      if (!event.skipped && event.text) {
+        state.answeredQuestionText[key] = event.text;
+      } else {
+        delete state.answeredQuestionText[key];
+      }
+      // A no-tool fallback owns a real chronological block. Put its outcome on
+      // that block as well as in the compatibility lookup maps so snapshots,
+      // branches and copied history remain self-contained.
+      let resolvedMessageIndex: number | null = null;
+      for (let i = state.messages.length - 1; i >= 0; i -= 1) {
+        const block = state.messages[i].blocks.find(
+          (candidate) => candidate.kind === 'question'
+            && candidate.request.requestId === event.requestId,
+        );
+        if (!block || block.kind !== 'question') continue;
+        block.answer = {
+          optionIds: [...event.optionIds],
+          ...(event.text ? { text: event.text } : null),
+          ...(event.skipped ? { skipped: true } : null),
+          ...(event.abandoned ? { abandoned: true } : null),
+        };
+        resolvedMessageIndex = i;
+        break;
+      }
       if (state.state === 'awaiting_answer' && state.pendingQuestions.length === 0) {
         state.state = 'running';
       }
+      if (event.continuation && !event.abandoned) {
+        state.pendingQuestionContinuations[event.continuation.continuationId] = {
+          ...event.continuation,
+          request: {
+            ...event.continuation.request,
+            options: event.continuation.request.options.map((option) => ({ ...option })),
+          },
+          answer: {
+            ...event.continuation.answer,
+            optionIds: [...event.continuation.answer.optionIds],
+            labels: [...event.continuation.answer.labels],
+          },
+        };
+      }
+      return {
+        messageIndex: resolvedMessageIndex,
+        structural: false,
+        meta: true,
+        applied: true,
+      };
+    }
+
+    case 'question_continuation_dispatching': {
+      const continuation = state.pendingQuestionContinuations[event.continuationId];
+      if (continuation) continuation.dispatching = true;
+      return { messageIndex: null, structural: false, meta: true, applied: true };
+    }
+
+    case 'question_continuation_pending': {
+      const continuation = state.pendingQuestionContinuations[event.continuationId];
+      if (continuation) delete continuation.dispatching;
+      return { messageIndex: null, structural: false, meta: true, applied: true };
+    }
+
+    case 'question_continuation': {
+      delete state.pendingQuestionContinuations[event.continuationId];
       return { messageIndex: null, structural: false, meta: true, applied: true };
     }
 
@@ -977,7 +1185,11 @@ export function applyChatEvent(state: TranscriptState, event: ChatEvent): Transc
         // longer on screen, and answering it would reach a turn that no longer
         // exists — the session resolves them at the same moment on its side.
         state.pendingQuestions = [];
+        state.pendingQuestionContinuations = {};
+        state.questionHistory = [];
         state.answeredQuestions = {};
+        state.answeredQuestionText = {};
+        state.abandonedQuestions = {};
         // And the approvals with them, for the same reason and one more: an
         // approval card is drawn above the composer rather than inside the
         // conversation, so it is the one piece of the old conversation that
@@ -1141,7 +1353,10 @@ export function applyAll(state: TranscriptState, events: ChatEvent[]): Transcrip
 export function messageText(message: ChatMessage): string {
   const parts: string[] = [];
   for (const block of message.blocks) {
-    parts.push(blockText(block));
+    const text = blockText(block);
+    parts.push(message.role === 'assistant' && block.kind === 'text'
+      ? withoutQuestionFallbackEnvelope(text)
+      : text);
   }
   return parts.filter(Boolean).join('\n');
 }
@@ -1159,6 +1374,14 @@ function blockText(block: ChatBlock): string {
       return block.items.map((item) => `- [${item.status}] ${item.text}`).join('\n');
     case 'image':
       return block.alt || '';
+    case 'question':
+      return [
+        block.request.question,
+        ...block.request.options.map((option) => option.label),
+        ...((block.answer?.optionIds ?? []).map((optionId) =>
+          block.request.options.find((option) => option.optionId === optionId)?.label ?? optionId)),
+        block.answer?.text ?? '',
+      ].join('\n');
     default:
       return '';
   }

@@ -14,20 +14,28 @@ export function createConfig(options: ServerOptions): ServerState {
     qwen: options.qwenAlias || process.env.QWEN_ALIAS || 'Qwen',
     kimi: options.kimiAlias || process.env.KIMI_ALIAS || 'Kimi',
     omp: options.ompAlias || process.env.OMP_ALIAS || 'Oh My Pi',
+    antigravity:
+      options.antigravityAlias || process.env.ANTIGRAVITY_ALIAS || 'Antigravity',
   };
 
   return {
-    port: options.port || 32352,
+    // Zero asks Node for an ephemeral port; desktop uses it to avoid colliding
+    // with a separately running CLI server.
+    port: options.port ?? 32352,
+    host: options.host,
+    desktop: options.desktop ?? null,
     dev: options.dev || false,
     // Not a choice any more: see the note in start(). `--https` is kept as an
     // accepted no-op so existing scripts and service units do not fail.
-    useHttps: true,
+    // Plain HTTP is safe only for the API-only desktop mode, which is bound to
+    // loopback and still requires its embedder-owned cookie token.
+    useHttps: options.desktop ? false : true,
     certFile: options.cert,
     keyFile: options.key,
     setup: options.setup || false,
     folderMode: options.folderMode !== false,
     selectedWorkingDir: null,
-    baseFolder: process.cwd(),
+    baseFolder: options.baseFolder || process.cwd(),
     publicBaseUrl: options.publicBaseUrl || process.env.PUBLIC_BASE_URL || null,
     githubClientId:
       options.githubClientId || process.env.GITHUB_OAUTH_CLIENT_ID || null,
@@ -43,6 +51,12 @@ export function createConfig(options: ServerOptions): ServerState {
       options.allowAnyGitHubUser === true ||
       process.env.GITHUB_ALLOW_ANY_USER === 'true',
     dataDir: options.dataDir || process.env.CODE_AGENTS_WEBCLI_DATA_DIR || null,
+    encryptionKey:
+      options.encryptionKey || process.env.CODE_AGENTS_WEBCLI_ENCRYPTION_KEY || null,
+    // Deliberately environment-only: container execution and deploy-target
+    // administration remain dark until the operator opts this installation in.
+    containerizedEnvironmentsEnabled:
+      process.env.CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED === 'true',
     sessionDurationHours,
     aliases,
     startTime: Date.now(),

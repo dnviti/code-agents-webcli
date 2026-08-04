@@ -253,11 +253,13 @@ describe('a queue is worked through even when every turn is instant (#89)', func
       async stop() {},
     };
 
-    await s.send({ text: 'keep me' });
+    const status = await s.send({ text: 'keep me', workflow: 'gh-issue' });
     await until(() => s.queuedTurns.length === 1, 'the undelivered message was not kept');
 
     const [held] = s.queuedTurns;
+    assert.strictEqual(status, 'queued', 'a recoverable failed handoff is not reported as already delivered');
     assert.strictEqual(held.text, 'keep me', 'the text is still here, so nothing has to be retyped');
+    assert.strictEqual(held.workflow, 'gh-issue', 'retry keeps the app-owned workflow guidance');
     assert.match(held.error, /nope/, 'and it says why it did not go');
     assert.strictEqual(held.attempts, 1);
     assert.strictEqual(s.currentState, 'idle', 'a failed handover must not leave the session claiming to work');
@@ -265,6 +267,13 @@ describe('a queue is worked through even when every turn is instant (#89)', func
       store.events.some((e) => e.t === 'error' && /could not send a queued message/i.test(e.message)),
       'the failure is reported, not swallowed',
     );
+
+    let retried = '';
+    s.adapter.send = async (turn) => { retried = turn.text; };
+    assert.strictEqual(s.retryQueued(held.id), true);
+    await until(() => Boolean(retried), 'the recoverable workflow was not retried');
+    assert.match(retried, /\[BEGIN APP-OWNED GH-ISSUE WORKFLOW\]/);
+    assert.match(retried, /keep me/);
   });
 
   it('holds the rest of the line behind a message that failed', async function () {

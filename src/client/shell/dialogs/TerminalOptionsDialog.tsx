@@ -7,12 +7,11 @@ import { Input } from '../../ui/relay/Input';
 
 export interface TerminalOptionsDialogProps {
   open: boolean;
+  shells: readonly string[];
   onShell(shell: string): void;
   onCommand(command: string): void;
   onClose(): void;
 }
-
-const SHELLS = ['zsh', 'bash', 'sh'];
 
 const labelStyle: React.CSSProperties = {
   fontFamily: 'var(--font-sans)',
@@ -37,6 +36,7 @@ const errorStyle: React.CSSProperties = {
 
 export function TerminalOptionsDialog({
   open,
+  shells,
   onShell,
   onCommand,
   onClose,
@@ -103,7 +103,7 @@ export function TerminalOptionsDialog({
         {/* auto-fit rather than a media query: these components are styled
             inline, where `@media` has nowhere to live. */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 8 }}>
-          {SHELLS.map((shell) => (
+          {shells.map((shell) => (
             <Button
               key={shell}
               variant="primary"

@@ -2,10 +2,15 @@ import * as React from 'react';
 import { ChatAttachment, ChatDraft, ChatState } from '../../../shared/chat-events.js';
 import { uploadAttachment } from '../../chat/attachments-api.js';
 import { branchConversation, type BranchedConversation } from '../../chat/branch-api.js';
-import { ChatController, type ChatUnavailable } from '../../chat/controller.js';
+import {
+  ChatController,
+  createBuiltInWorkflowRequestId,
+  type ChatUnavailable,
+} from '../../chat/controller.js';
 import { fetchStatus, findFiles } from '../../chat/workspace-api.js';
 import { activityEvents } from '../../chat/activity.js';
 import { loadEffortPreferences, rememberEffort } from '../../chat/effort-preference.js';
+import type { WorkspaceFileTarget } from '../../chat/file-links.js';
 import type { ChatTranscript } from '../../chat/transcript.js';
 import {
   groupTurns,
@@ -27,14 +32,17 @@ import { Icon } from '../../ui/relay/Icon.js';
 import { IconButton } from '../../ui/relay/IconButton.js';
 import { showNotification } from '../../ui/notifications.js';
 import { PhoneContext } from '../../ui/touch.js';
+import { visualViewportKeyboardInset } from '../../ui/keyboard-viewport.js';
 import { FloatingMenu } from '../FloatingMenu.js';
 import { KEY_STRIP_HEIGHT } from '../KeyStrip.js';
 import { Composer } from './Composer.js';
+import { FileEditorDialog } from './FileEditorDialog.js';
 import { MessageList, type MessageListHandle } from './MessageList.js';
 import { hasVisibleContent, messageText } from './MessageBubble.js';
 import { PermissionCard } from './PermissionCard.js';
 import { QuestionCard } from './QuestionCard.js';
 import { PlanPanel } from './PlanPanel.js';
+import { PlanDocDialog } from './PlanDocDialog.js';
 import { SessionHeader } from './SessionHeader.js';
 import { LiveStreamRibbon } from './StreamRibbon.js';
 import { TerminalSplit } from './TerminalSplit.js';
@@ -42,6 +50,7 @@ import { TracePanel } from './TracePanel.js';
 import { TranscriptSearch } from './TranscriptSearch.js';
 import { TurnIndex } from './TurnIndex.js';
 import { WorkspacePanel } from './WorkspacePanel.js';
+import { WorkspaceFileLinkContext } from './WorkspaceFileLinkContext.js';
 import { chatCommandFor, isTextEntry } from './keymap.js';
 
 /**
@@ -195,22 +204,42 @@ export function ChatView({
   const bypassPermissions = transcript.bypassing;
   const plan = transcript.plan;
   const pending = transcript.pendingPermissions;
-  // Only the questions that have nowhere else to be drawn. A question that
-  // names the call that asked it renders inside the conversation at that call,
-  // which is where it was asked; this is the safety net for one that could not
-  // be correlated, and without it that question would have no button anywhere
-  // and the turn behind it would never move.
+  // Only *pending* legacy/incomplete questions that have nowhere else to be
+  // drawn. Tool questions live at their call and structured-response fallbacks
+  // are folded into an assistant message as durable question blocks. Settled
+  // history never belongs in this assertive composer-adjacent safety net: in a
+  // paged conversation its original message may simply not be loaded yet.
   const strayQuestions = React.useMemo(
     () =>
       transcript.pendingQuestions.filter(
-        (request) => !request.toolId || !transcript.message(messageIdOfTool(transcript, request.toolId)),
+        (request) => {
+          if (request.toolId && transcript.message(messageIdOfTool(transcript, request.toolId))) {
+            return false;
+          }
+          return !transcript.messages.some((message) => message.blocks.some(
+            (block) => block.kind === 'question'
+              && block.request.requestId === request.requestId,
+          ));
+        },
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [transcript, version],
   );
   const exited = chatState === 'exited';
   const unavailable = controller.unavailableReason;
+  const workflowUnavailableReason = !controller.builtInWorkflowsAvailable
+    ? 'This server does not support guided workflows.'
+    : unavailable?.message
+      ?? (exited
+        ? 'This conversation has ended.'
+        : !transcript.live
+          ? 'This conversation is not running. Resume it before creating an issue.'
+          : null);
   const busy = transcript.busy;
+  const planLocked = transcript.live
+    && chatState !== 'idle'
+    && chatState !== 'exited'
+    && chatState !== 'error';
   // Wider than `busy`, which is only what the send button needs to know: a turn
   // that is waiting on an approval or a question is still a turn in flight, and
   // it is the one a queued correction most often needs to get in front of.
@@ -329,6 +358,8 @@ export function ChatView({
   // leave the timeline's effect with nothing to react to.
   const [focus, setFocus] = React.useState<{ id?: string; nonce: number }>({ nonce: 0 });
   const [indexSheet, setIndexSheet] = React.useState(false);
+  const [planOpen, setPlanOpen] = React.useState(false);
+  const [planAction, setPlanAction] = React.useState<'accept' | 'reject' | null>(null);
   const [planSheet, setPlanSheet] = React.useState(false);
   // A draft seed, not a controlled value: making the composer controlled would
   // re-render this component — and re-derive the turns and the whole activity
@@ -340,6 +371,39 @@ export function ChatView({
   // the draft is destroyed by looking at another chat for a moment — and without
   // the sync behind it, by picking up a different device (#163).
   const [draft, setDraft] = useSyncedDraft(controller);
+  // Unlike the synchronized composer, this popup draft is local to the active
+  // conversation. It lives above the conditional rail so closing the rail or
+  // crossing the phone breakpoint cannot destroy it.
+  const [issueDraft, setIssueDraft] = React.useState(() => ({
+    text: '',
+    requestId: createBuiltInWorkflowRequestId(),
+  }));
+  const setIssuePrompt = React.useCallback((text: string) => {
+    setIssueDraft((current) => current.text === text
+      ? current
+      : { text, requestId: createBuiltInWorkflowRequestId() });
+  }, []);
+  React.useEffect(() => {
+    setIssueDraft({ text: '', requestId: createBuiltInWorkflowRequestId() });
+  }, [controller.sessionId]);
+  // Shared by the transcript and both workspace tabs. Keeping it above the
+  // rail means a code link can open the same popup even while that rail is
+  // closed, and closing the rail no longer closes a file somebody is reading.
+  const [editing, setEditing] = React.useState<WorkspaceFileTarget | null>(null);
+
+  const planFeedback = controller.planFeedback;
+  React.useEffect(() => {
+    if (!planAction || !planFeedback || planFeedback.action !== planAction) return;
+    setPlanAction(null);
+    if (planFeedback.accepted !== true) return;
+    setPlanOpen(false);
+    if (planAction === 'reject') {
+      window.setTimeout(
+        () => root.current?.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message"]')?.focus(),
+        0,
+      );
+    }
+  }, [planAction, planFeedback]);
 
   const list = React.useRef<MessageListHandle | null>(null);
   const root = React.useRef<HTMLElement | null>(null);
@@ -347,6 +411,18 @@ export function ChatView({
   const width = useElementWidth(root);
   const keyboardInset = useKeyboardInset(isMobile);
   const branch = useBranch(controller.sessionId, version);
+
+  const openFile = React.useCallback((path: string) => {
+    setEditing({ path });
+  }, []);
+
+  const openLinkedFile = React.useCallback((target: WorkspaceFileTarget) => {
+    setEditing(target);
+  }, []);
+  const workspaceFileLinks = React.useMemo(
+    () => ({ workingDir, onOpen: openLinkedFile }),
+    [openLinkedFile, workingDir],
+  );
 
   const setView = React.useCallback(
     (patch: Partial<ChatViewSettings>) => onViewChange?.({ ...view, ...patch }),
@@ -458,14 +534,32 @@ export function ChatView({
     // want to be looking at its end, not wherever you had scrolled to.
     list.current?.pin();
   }, [controller]);
+  const startGitHubIssue = React.useCallback(
+    async (prompt: string, requestId: string) => {
+      // This is not composer submission: preserving that draft is important
+      // when the issue interview is queued behind a current turn.
+      await controller.startBuiltInWorkflow('gh-issue', prompt, requestId);
+      controller.cancelSeek();
+      setSeeking(null);
+      setSelectedTurnId(null);
+      list.current?.pin();
+      if (isMobile) setView({ panelOpen: false });
+      // At this point the popup handoff is complete and its success path will
+      // clear the retained prompt/id. The server may now release its dedupe
+      // entry; before this point a timeout or local failure must remain safe to
+      // retry with the same id.
+      controller.acknowledgeBuiltInWorkflow('gh-issue', requestId);
+    },
+    [controller, isMobile, setView],
+  );
   const loadMore = React.useCallback(() => controller.loadMore(), [controller]);
   const respond = React.useCallback(
     (requestId: string, optionId: string) => controller.respondPermission(requestId, optionId),
     [controller],
   );
   const answerQuestion = React.useCallback(
-    (requestId: string, optionIds: string[], skipped: boolean) =>
-      controller.answerQuestion(requestId, optionIds, skipped),
+    (requestId: string, optionIds: string[], skipped: boolean, text?: string) =>
+      controller.answerQuestion(requestId, optionIds, skipped, text),
     [controller],
   );
   const cancelQueued = React.useCallback(
@@ -689,6 +783,21 @@ export function ChatView({
       showNotification('There is no message to send again for this turn.');
       return;
     }
+    if (opener?.workflow) {
+      const requestId = createBuiltInWorkflowRequestId();
+      void controller.startBuiltInWorkflow(opener.workflow, text, requestId)
+        .then(() => {
+          list.current?.pin();
+          controller.acknowledgeBuiltInWorkflow(opener.workflow!, requestId);
+        })
+        .catch((error: unknown) => {
+          showNotification(
+            error instanceof Error ? error.message : 'That guided workflow could not be started again.',
+            'error',
+          );
+        });
+      return;
+    }
     controller.sendTurn(text, []);
     list.current?.pin();
   }, [turns, transcript, controller]);
@@ -901,6 +1010,7 @@ export function ChatView({
         state={chatState}
         exited={Boolean(unavailable)}
         bypassPermissions={bypassPermissions}
+        ladderError={controller.ladderErrorValue}
         showUsage={view.showUsage}
         terminalOpen={terminalOpen}
         railOpen={railOpen}
@@ -989,23 +1099,25 @@ export function ChatView({
             />
           ) : null}
 
-          <MessageList
-            ref={list}
-            transcript={transcript}
-            turns={turns}
-            currentTurnId={currentTurnId}
-            openTurnIds={openTurnIds}
-            onToggleTurn={toggleTurn}
-            onLoadMore={loadMore}
-            onShowWork={showWork}
-            onEditTurn={seedDraft}
-            onCopyTurn={copyTurn}
-            onForkTurn={branchTurn}
-            onRetry={retryTurn}
-            showThinking={view.showThinking}
-            showToolCalls={view.showToolCalls}
-            onAnswerQuestion={answerQuestion}
-          />
+          <WorkspaceFileLinkContext.Provider value={workspaceFileLinks}>
+            <MessageList
+              ref={list}
+              transcript={transcript}
+              turns={turns}
+              currentTurnId={currentTurnId}
+              openTurnIds={openTurnIds}
+              onToggleTurn={toggleTurn}
+              onLoadMore={loadMore}
+              onShowWork={showWork}
+              onEditTurn={seedDraft}
+              onCopyTurn={copyTurn}
+              onForkTurn={branchTurn}
+              onRetry={retryTurn}
+              showThinking={view.showThinking}
+              showToolCalls={view.showToolCalls}
+              onAnswerQuestion={answerQuestion}
+            />
+          </WorkspaceFileLinkContext.Provider>
 
           {terminalOpen ? (
             <div ref={terminalRegion} style={{ flex: '0 0 auto', minWidth: 0 }}>
@@ -1035,7 +1147,14 @@ export function ChatView({
               trace={trace}
               onSelectTab={(panelTab: ChatPanelId) => setView({ panelTab })}
               onClose={() => setView({ panelOpen: false })}
+              onOpenFile={openFile}
               isMobile
+              planMode={controller.planModeValue}
+              unavailableReason={workflowUnavailableReason}
+              issuePrompt={issueDraft.text}
+              issueRequestId={issueDraft.requestId}
+              onIssuePromptChange={setIssuePrompt}
+              onStartGitHubIssue={startGitHubIssue}
             />
           ) : null}
 
@@ -1143,17 +1262,24 @@ export function ChatView({
                 aria-live="assertive"
                 style={{ display: 'grid', gap: 'var(--space-2)', maxHeight: '50vh', overflowY: 'auto' }}
               >
-                {strayQuestions.map((request) => (
-                  <QuestionCard
-                    key={request.requestId}
+                {strayQuestions.map((recorded) => {
+                  const request = transcript.pendingQuestions.find(
+                    (pendingQuestion) => pendingQuestion.requestId === recorded.requestId,
+                  );
+                  const answerKey = recorded.toolId ?? recorded.requestId;
+                  return <QuestionCard
+                    key={recorded.requestId}
                     request={request}
-                    question={request.question}
-                    header={request.header}
-                    multiSelect={request.multiSelect}
-                    options={request.options}
+                    question={recorded.question}
+                    header={recorded.header}
+                    multiSelect={recorded.multiSelect}
+                    options={recorded.options}
+                    answered={request ? undefined : transcript.answerFor(answerKey)}
+                    ownWords={request ? undefined : transcript.answerTextFor(answerKey)}
+                    abandoned={!request && transcript.abandonedFor(answerKey)}
                     onAnswer={answerQuestion}
-                  />
-                ))}
+                  />;
+                })}
               </div>
             ) : null}
 
@@ -1240,6 +1366,11 @@ export function ChatView({
               // chat would open on, and it changes under an open conversation
               // every time the account's standing choice does.
               modelPinned={controller.modelPinnedValue}
+              // And which of four things chose it: the ladder and its rung, the
+              // profile, the account's standing choice, or the runtime itself.
+              // The three above each name a model; only this says why (#171).
+              modelOrigin={controller.modelOriginValue}
+              ladderError={controller.ladderErrorValue}
               // Apart from `model` above, because that one is the override *or*
               // whatever the runtime last reported and the picker has to tell
               // those two apart to say which it is describing.
@@ -1252,6 +1383,12 @@ export function ChatView({
               effort={controller.effortOverrideValue ?? transcript.effort}
               onSetEffort={setEffort}
               effortFeedback={controller.effortFeedback}
+              planMode={controller.planModeValue}
+              planLocked={planLocked}
+              onSetPlanMode={(on) => controller.setPlanMode(on)}
+              planFeedback={controller.planFeedback}
+              planDocument={controller.planDocumentValue}
+              onOpenPlan={() => setPlanOpen(true)}
               // Deliberately the same path as typing it: the button and the
               // three spellings have to end in one state, and the surest way
               // to keep them that way is for the button to *be* the command.
@@ -1273,6 +1410,13 @@ export function ChatView({
             onSelectTab={(panelTab: ChatPanelId) => setView({ panelTab })}
             onClose={() => setView({ panelOpen: false })}
             onResize={(panelWidth) => setView({ panelWidth })}
+            onOpenFile={openFile}
+            planMode={controller.planModeValue}
+            unavailableReason={workflowUnavailableReason}
+            issuePrompt={issueDraft.text}
+            issueRequestId={issueDraft.requestId}
+            onIssuePromptChange={setIssuePrompt}
+            onStartGitHubIssue={startGitHubIssue}
           />
         ) : null}
 
@@ -1316,6 +1460,20 @@ export function ChatView({
         ) : null}
 
       </div>
+      <FileEditorDialog
+        // A new target is a new editor lifecycle. Without the key, the previous
+        // file's contents and dirty badge can survive for a frame while the
+        // next request is in flight; a different location in the same file also
+        // needs its line-navigation effect to run again.
+        key={editing ? `${editing.path}:${editing.line ?? ''}` : 'none'}
+        open={editing !== null}
+        sessionId={controller.sessionId}
+        filePath={editing?.path ?? ''}
+        initialLine={editing?.line}
+        onClose={() => setEditing(null)}
+        isMobile={isMobile}
+      />
+      {planOpen ? <PlanDocDialog plan={controller.planDocumentValue} planMode={controller.planModeValue} disabled={planLocked} feedback={controller.planFeedback?.message || null} retryAction={controller.planFeedback?.accepted === false && controller.planFeedback.action !== 'mode' ? controller.planFeedback.action : null} onAccept={(revision) => { setPlanAction('accept'); controller.acceptPlan(revision); }} onReject={(revision) => { setPlanAction('reject'); controller.rejectPlan(revision); }} onClose={() => setPlanOpen(false)} /> : null}
     </section>
     </PhoneContext.Provider>
   );
@@ -1789,7 +1947,7 @@ function useKeyboardInset(isMobile: boolean): number {
     if (!viewport) return;
 
     const apply = () => {
-      const covered = window.innerHeight - viewport.height;
+      const covered = visualViewportKeyboardInset(viewport);
       if (covered <= KEYBOARD_MIN_INSET_PX) {
         setInset(0);
         return;
@@ -1800,9 +1958,13 @@ function useKeyboardInset(isMobile: boolean): number {
     apply();
     viewport.addEventListener('resize', apply);
     viewport.addEventListener('scroll', apply);
+    document.addEventListener('focusin', apply);
+    document.addEventListener('focusout', apply);
     return () => {
       viewport.removeEventListener('resize', apply);
       viewport.removeEventListener('scroll', apply);
+      document.removeEventListener('focusin', apply);
+      document.removeEventListener('focusout', apply);
     };
   }, [isMobile]);
 

@@ -38,6 +38,7 @@ import {
   startQwenSession as sessionsStartQwen,
   startKimiSession as sessionsStartKimi,
   startOmpSession as sessionsStartOmp,
+  startAntigravitySession as sessionsStartAntigravity,
   startTerminalSession as sessionsStartTerminal,
   closeSession as sessionsCloseSession,
 } from './sessions/actions';
@@ -68,6 +69,7 @@ import { pickImage, type ImagePasteTarget } from './terminal/paste';
 import { SplitContainer } from './splits/split-container';
 import { shellStore } from './shell/store';
 import { setupInstallPrompt } from './shell/install-prompt';
+import { setupWindowControlsOverlay } from './shell/window-controls-overlay';
 import { mountShell } from './shell/mount';
 import type { HistoryView, HistoryRange } from './terminal/history-view';
 
@@ -181,6 +183,7 @@ export class App {
       qwen: 'Qwen',
       kimi: 'Kimi',
       omp: 'Oh My Pi',
+      antigravity: 'Antigravity',
       terminal: 'Terminal',
     };
 
@@ -242,6 +245,7 @@ export class App {
     // replayed, so a listener attached after a network round trip is a listener
     // that can miss it outright.
     setupInstallPrompt();
+    setupWindowControlsOverlay();
     // Same reason: a notification outlives the page that raised it, so one can
     // be clicked while this window is still fetching its session list. The
     // worker posts once and does not retry — the id is held until the tab
@@ -277,13 +281,17 @@ export class App {
     this.splitContainer = new SplitContainer(this);
     this.splitContainer.setupDropZones();
 
-    if (this.sessionTabManager.tabs.size > 0) {
+    // Asked even when the first list is empty. A cold-start notification may
+    // name a conversation whose tab was closed, in which case choosing the
+    // initial tab first reopens it account-wide and obtains its description.
+    const initialTabId = await this.sessionTabManager.initialTabId();
+
+    if (initialTabId) {
       // The tab this browser was last on, or the first one if that session is
       // gone — not always the first one, which sent every reload back to the
       // start of the strip. A notification acted on during startup outranks
       // both, and is consumed here rather than switching twice.
-      const initialTabId = this.sessionTabManager.initialTabId();
-      if (initialTabId) await this.sessionTabManager.switchToTab(initialTabId);
+      await this.sessionTabManager.switchToTab(initialTabId);
       hideOverlay();
       // After the initial switch, so a click that landed mid-boot is the tab
       // this window opens on rather than one it moves off a moment later. A
@@ -306,7 +314,7 @@ export class App {
         // it from here, and nothing on the screen depends on this having
         // succeeded.
       });
-      void this.folderBrowser.show();
+      this.sessionTabManager.createNewSession();
     }
 
     window.addEventListener('resize', () => this.fitTerminal());
@@ -328,7 +336,10 @@ export class App {
       } catch {
         // Focusing is a courtesy; switching is the part that matters.
       }
-      void this.sessionTabManager.switchToTab(sessionId);
+      void this.sessionTabManager.reopenAndSwitch(sessionId).catch((error) => {
+        console.error('Failed to open conversation from notification:', error);
+        showNotification('That conversation could not be opened');
+      });
     });
     watchAttention(this);
   }
@@ -396,12 +407,19 @@ export class App {
     this.wsConnection.disconnect();
   }
 
-  send(data: Record<string, unknown>): void {
-    this.wsConnection.send(data);
+  send(data: Record<string, unknown>): boolean {
+    return this.wsConnection.send(data);
   }
 
   handleMessage(message: WsMessage): void {
     this.messageHandler.handle(message);
+  }
+
+  /** Let cards whose answer socket disappeared become interactive again. */
+  handleChatConnectionLost(): void {
+    for (const sessionId of this.chats.ids()) {
+      this.chats.get(sessionId)?.connectionLost();
+    }
   }
 
   fitTerminal(): void {
@@ -472,6 +490,10 @@ export class App {
 
   startOmpSession(options: RuntimeStartOptions = {}): Promise<void> {
     return sessionsStartOmp(this, options);
+  }
+
+  startAntigravitySession(options: RuntimeStartOptions = {}): Promise<void> {
+    return sessionsStartAntigravity(this, options);
   }
 
   startTerminalSession(options: RuntimeStartOptions = {}): Promise<void> {

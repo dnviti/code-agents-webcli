@@ -10,10 +10,19 @@ export type AgentKind =
   | 'qwen'
   | 'kimi'
   | 'omp'
+  | 'antigravity'
   | 'terminal';
 
 export interface ServerOptions {
   port?: number;
+  /** Programmatic bind address. The CLI intentionally has no equivalent flag. */
+  host?: string;
+  /**
+   * Desktop embedding is an API-only mode: it has no CLI flag or environment
+   * variable, so a network deployment cannot accidentally turn its TLS and
+   * OAuth protections off.
+   */
+  desktop?: DesktopServerOptions;
   dev?: boolean;
   https?: boolean;
   cert?: string;
@@ -29,6 +38,7 @@ export interface ServerOptions {
   qwenAlias?: string;
   kimiAlias?: string;
   ompAlias?: string;
+  antigravityAlias?: string;
   publicBaseUrl?: string;
   githubClientId?: string;
   githubClientSecret?: string;
@@ -36,6 +46,34 @@ export interface ServerOptions {
   allowedGitHubIds?: string;
   allowAnyGitHubUser?: boolean;
   dataDir?: string;
+  /** Root exposed by the host-mode workspace and terminal routes. */
+  baseFolder?: string;
+  /** Give every signed-in user their own container. Off unless asked for. */
+  containers?: boolean;
+  containerEngine?: string;
+  containerImage?: string;
+  containerCpus?: string;
+  containerMemory?: string;
+  containerIdleMinutes?: number;
+  containerSetupCommand?: string;
+  containerTiers?: string;
+  containerDefaultTier?: string;
+  containerUserTierChoice?: boolean;
+  kubeContext?: string;
+  kubeNamespace?: string;
+  kubeStorageClaim?: string;
+  kubeServiceAccount?: string;
+  /** Base64/hex 32-byte key encrypting deploy-target secrets at rest. */
+  encryptionKey?: string;
+}
+
+export interface DesktopServerOptions {
+  /** Opaque, high-entropy value owned by the desktop embedder. */
+  authToken: string;
+  /** Stable local account identifier, normally the operating-system username. */
+  username: string;
+  /** Human-facing name for Git identity and the account surface. */
+  name?: string | null;
 }
 
 export interface Aliases {
@@ -47,6 +85,7 @@ export interface Aliases {
   qwen: string;
   kimi: string;
   omp: string;
+  antigravity: string;
 }
 
 export interface SessionRecord {
@@ -68,6 +107,26 @@ export interface SessionRecord {
    */
   surface?: 'terminal' | 'chat';
   /**
+   * Whether this standalone session belongs in its owner's shared tab strip.
+   *
+   * Closing a conversation removes the tab without deleting the conversation,
+   * so that visibility has to outlive both the page and the server process. It
+   * is owned by the account, just like the session itself: every device sees the
+   * same answer. Absent means open, which preserves every record written before
+   * the field existed and keeps terminal sessions on their historical path
+   * (closing one deletes it outright).
+   */
+  tabOpen?: boolean;
+  /**
+   * This tab's position in its owner's shared strip.
+   *
+   * Nullable in storage so sessions written before account-wide ordering keep
+   * their stable Map/load order. New standalone sessions and every accepted
+   * reorder receive an explicit number; a genuinely reopened conversation is
+   * assigned after the current maximum.
+   */
+  tabOrder?: number;
+  /**
    * The conversation this session belongs to, when it is not a session of its
    * own.
    *
@@ -81,6 +140,26 @@ export interface SessionRecord {
    * without a backfill.
    */
   ownerSessionId?: string;
+  /**
+   * The project this session was created against, if any.
+   *
+   * Nullable and absent on every session written before projects existed, so
+   * `undefined` reads as "no project" and project-less sessions behave exactly
+   * as today. (#168)
+   */
+  projectId?: string | null;
+  /**
+   * Which namespace `workingDir` belongs to for a project session.
+   *
+   * `host` means one of the manager's bind-mounted persistent paths and
+   * `container` means an absolute path that exists only inside the project's
+   * disposable container filesystem. Absent is the backwards-compatible host
+   * interpretation for every row written before container-local cwd support.
+   * The distinction must be persisted: both namespaces use absolute strings,
+   * so inferring it from a path would be ambiguous and could launch work in a
+   * different directory than the one the user selected.
+   */
+  projectWorkingDirKind?: 'host' | 'container';
   /**
    * The runtime's own id for this conversation, when it reported one.
    *
@@ -160,6 +239,22 @@ export interface SessionRecord {
    */
   chatModelPinned?: string | null;
   /**
+   * Why this conversation's ladder is not in force, when it is not.
+   *
+   * A launch says this once and every later screen has to be able to hear it: a
+   * ladder that could not be written to disk, or a rung whose model the
+   * provider refused, leaves a conversation running on something other than the
+   * rung its profile names — and the badge that says so was being cleared by
+   * the next rejoin, reload or second tab, because the join had nothing to
+   * repeat. It stays on the record for that, beside the model the same launch
+   * resolved.
+   *
+   * Deliberately not persisted to disk. It is a fact about a running process:
+   * once the server has gone the conversation is not running on anything, and
+   * the next launch resolves the ladder again and says so itself.
+   */
+  chatLadderError?: string | null;
+  /**
    * The reasoning-effort level this conversation runs at, in the runtime's own
    * vocabulary.
    *
@@ -173,6 +268,8 @@ export interface SessionRecord {
    * exactly like every row written before this existed.
    */
   chatEffortOverride?: string;
+  /** Durable Plan-mode choice for this conversation. Absent reads as off. */
+  chatPlanMode?: boolean;
   /**
    * What is sitting in this conversation's composer, unsent.
    *
@@ -207,6 +304,12 @@ export interface SessionRecord {
   customName?: string;
   terminalOptions: TerminalOptions | null;
   stopRequested: boolean;
+  /**
+   * Transient deletion gate. Set before draining an in-flight launch so no
+   * process can materialise after its record and project lease are removed.
+   * Never persisted.
+   */
+  retiring?: boolean;
   /** Identifies the current PTY run so late callbacks from a previous run are ignored. */
   runId?: string;
   workingDir: string;
@@ -273,6 +376,10 @@ export interface SessionListItem {
   lastAgent: AgentKind | null;
   runtimeLabel: string | null;
   workingDir: string;
+  /** The project this tab is bound to, when it is not a legacy session. */
+  projectId?: string | null;
+  /** Namespace of workingDir for a project session; absent means host. */
+  projectWorkingDirKind?: 'host' | 'container';
   connectedClients: number;
   lastActivity: Date;
   /** Absent means terminal; the client needs it to watch chat sessions it is not driving. */
@@ -302,6 +409,8 @@ export interface PathValidation {
 
 export interface ServerState {
   port: number;
+  host: string | undefined;
+  desktop: DesktopServerOptions | null;
   dev: boolean;
   useHttps: boolean;
   certFile: string | undefined;
@@ -317,6 +426,9 @@ export interface ServerState {
   allowedGitHubIds: string[];
   allowAnyGitHubUser: boolean;
   dataDir: string | null;
+  encryptionKey: string | null;
+  /** Sole feature gate for containerized environments and deploy targets. */
+  containerizedEnvironmentsEnabled: boolean;
   sessionDurationHours: number;
   aliases: Aliases;
   startTime: number;

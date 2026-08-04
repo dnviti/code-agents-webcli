@@ -14,8 +14,9 @@ import type { NotifySettings, SessionListItem } from '../types';
 import type { ConversationAttention } from '../../shared/chat-alerts';
 import type { ConfirmRequest } from '../ui/confirm';
 import { DEFAULT_CHAT_VIEW, type ChatViewSettings } from '../chat/view-settings';
+import type { WindowControlsOverlayState } from './window-controls-overlay';
 
-export type ShellTabStatus = 'running' | 'error' | 'idle';
+export type ShellTabStatus = 'running' | 'success' | 'error' | 'idle';
 
 export interface ShellTab {
   id: string;
@@ -24,6 +25,8 @@ export interface ShellTab {
   /** Which runtime this session is. Not yet plumbed through from the server. */
   kind: string;
   workingDir: string | null;
+  /** Namespace of workingDir for a project tab; absent means host. */
+  projectWorkingDirKind?: 'host' | 'container';
   unread: boolean;
   /**
    * Whether this conversation has stopped and is waiting on a person.
@@ -35,6 +38,8 @@ export interface ShellTab {
    * or idle.
    */
   attention: ConversationAttention | null;
+  projectId: string | null | undefined;
+  projectName: string | null | undefined;
   /**
    * Which surface this session runs on, fixed when it was started.
    *
@@ -100,6 +105,8 @@ export interface ShellChat {
 export interface ShellConnection {
   state: 'connected' | 'connecting' | 'disconnected';
   workingDir: string | null;
+  projectId?: string | null;
+  projectWorkingDirKind?: 'host' | 'container';
 }
 
 /**
@@ -115,6 +122,14 @@ export interface ShellDialogs {
   settings: boolean;
   /** Per-runtime launch configuration: model, args, env, tiers. */
   runtimeProfiles: boolean;
+  /** Where containers run: the installer's deploy target editor. */
+  deployTargets: boolean;
+  /** The user's project containers and lifecycle controls. */
+  projects: boolean;
+  /** Lightweight project-or-directory choice shown before creating a tab. */
+  workspaceChooser: boolean;
+  /** The per-user environment size picker; only reachable when the server has environments. */
+  environment: boolean;
   newSession: boolean;
   terminalOptions: boolean;
   /** The session list, reachable from the mobile bar and the palette. */
@@ -143,6 +158,8 @@ export interface ShellDialogs {
 export interface FolderEntry {
   name: string;
   path: string;
+  workingDirKind?: 'host' | 'container';
+  lifetime?: 'workspace' | 'owner_home' | 'disposable';
 }
 
 export interface FolderState {
@@ -150,6 +167,8 @@ export interface FolderState {
   path: string | null;
   parentPath: string | null;
   entries: FolderEntry[];
+  workingDirKind: 'host' | 'container' | null;
+  lifetime: 'workspace' | 'owner_home' | 'disposable' | null;
   showHidden: boolean;
   loading: boolean;
   /** True while the inline "new folder" row is open. */
@@ -197,6 +216,8 @@ export interface ShellState {
   theme: 'dark' | 'light';
   /** Set once at boot from `detectMobile()`; drives the bottom bar. */
   isMobile: boolean;
+  /** Browser-reported native-control-safe title-bar rectangle. */
+  windowControlsOverlay: WindowControlsOverlayState;
   /** Whether the on-screen terminal key strip is showing (mobile only). */
   keysVisible: boolean;
   /**
@@ -230,6 +251,12 @@ export interface ShellState {
   user: string | null;
   /** Sign-out URL, when the deployment has auth enabled. */
   logoutUrl: string | null;
+  /** Operator-only feature gate reported by `/api/config`. */
+  containerizedEnvironmentsEnabled: boolean;
+  /** Shells the server can launch on its host operating system. */
+  terminalShells: string[];
+  /** Whether repository-backed project creation is available on this server. */
+  repositoryInspectionSupported: boolean;
   /**
    * Whether this window can become an installed app.
    *
@@ -279,11 +306,16 @@ const INITIAL: ShellState = {
   paletteOpen: false,
   theme: 'dark',
   isMobile: false,
+  windowControlsOverlay: { visible: false, x: 0, y: 0, width: 0, height: 0 },
   keysVisible: true,
   ctrlLatched: false,
   dialogs: {
     settings: false,
     runtimeProfiles: false,
+    deployTargets: false,
+    projects: false,
+    workspaceChooser: false,
+    environment: false,
     newSession: false,
     terminalOptions: false,
     sessions: false,
@@ -299,6 +331,8 @@ const INITIAL: ShellState = {
     path: null,
     parentPath: null,
     entries: [],
+    workingDirKind: null,
+    lifetime: null,
     showHidden: false,
     loading: false,
     creating: false,
@@ -322,6 +356,9 @@ const INITIAL: ShellState = {
   banner: null,
   user: null,
   logoutUrl: null,
+  containerizedEnvironmentsEnabled: false,
+  terminalShells: ['zsh', 'bash', 'sh'],
+  repositoryInspectionSupported: true,
   install: 'unsupported',
   chatBypassPermissions: false,
   // Replaced by `applySettings` during boot, before the first render. On until

@@ -31,6 +31,16 @@ export interface ConversationSummary {
   runtimeLabel: string | null;
   lastActivity: string;
   workingDir: string;
+  /**
+   * The real project boundary, when this conversation belongs to one.
+   *
+   * Two project containers may both call their checkout `/workspace`; the raw
+   * path is therefore never enough to identify, group, or authorise them.
+   */
+  projectId?: string | null;
+  projectName?: string | null;
+  /** Namespace of workingDir. Absent is the legacy host namespace. */
+  workingDirKind?: 'host' | 'container';
   /** How many events its log holds; zero means nothing was ever said. */
   events: number;
   /**
@@ -54,7 +64,13 @@ export interface ConversationSummary {
 
 /** The conversations belonging to one project folder, most recent first. */
 export interface ConversationProject {
-  /** The absolute working directory, which is the group's identity. */
+  /** Stable grouping identity; unlike dir, this includes project and namespace. */
+  key?: string;
+  /** The project boundary, or null for legacy folder-based conversations. */
+  projectId?: string | null;
+  /** Namespace of dir; absent is the legacy host namespace. */
+  workingDirKind?: 'host' | 'container';
+  /** The absolute working directory within the namespace named above. */
   dir: string;
   /** Its leaf, which is what the group is called on screen. */
   name: string;
@@ -114,6 +130,7 @@ export function matchesConversation(conversation: ConversationSummary, query: st
     conversation.firstMessage || '',
     conversation.name || '',
     conversation.workingDir || '',
+    conversation.projectName || '',
     conversation.runtimeLabel || '',
   ]
     .join('\n')

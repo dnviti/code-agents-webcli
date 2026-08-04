@@ -103,11 +103,12 @@ describe('one prompt makes one user turn (#129)', function () {
 
       const prompt = 'What is the magic word?';
       h.events.length = 0;
-      await h.adapter.send({ text: prompt });
+      const sending = h.adapter.send({ text: prompt });
       for (const line of lines.slice(2)) {
         h.adapter.handleMessage(line);
         await flush();
       }
+      await sending;
 
       const state = fold([...askedByTheSession(prompt), ...h.events]);
       const users = state.messages.filter((message) => message.role === 'user');
@@ -150,13 +151,20 @@ describe('one prompt makes one user turn (#129)', function () {
       const briefing = 'Here is everything that was said in the conversation this was branched from.';
       const prompt = 'carry on from there';
       h.events.length = 0;
-      await h.adapter.send({ text: `${briefing}\n\n${prompt}` });
+      const sending = h.adapter.send({ text: `${briefing}\n\n${prompt}` });
 
       const state = fold([...askedByTheSession(prompt), ...h.events]);
       assert.ok(
         !state.messages.some((message) => textOf(message).includes(briefing)),
         'the briefing is context for the agent, not a thing the user typed',
       );
+      const promptCall = h.sent.find((message) => message.method === 'session/prompt');
+      h.adapter.handleMessage({
+        jsonrpc: '2.0',
+        id: promptCall.id,
+        result: { stopReason: 'end_turn' },
+      });
+      await sending;
     });
   });
 
@@ -283,6 +291,15 @@ describe('one prompt makes one user turn (#129)', function () {
         2,
         'two real prompts are two messages, however identical their text',
       );
+    });
+
+    it('retains app-owned workflow intent without changing the visible prompt', function () {
+      const events = askedByTheSession('Describe the issue.');
+      events[0].workflow = 'gh-issue';
+      const state = fold(events);
+
+      assert.strictEqual(state.messages[0].workflow, 'gh-issue');
+      assert.strictEqual(textOf(state.messages[0]), 'Describe the issue.');
     });
   });
 });

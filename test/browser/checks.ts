@@ -16,6 +16,7 @@ import * as React from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { ChatController } from '../../src/client/chat/controller';
+import { AppShell, type ShellActions } from '../../src/client/shell/AppShell';
 import { forgetTerminals } from '../../src/client/chat/chat-terminal';
 import { ChatView } from '../../src/client/shell/chat/ChatView';
 import { TerminalSplit } from '../../src/client/shell/chat/TerminalSplit';
@@ -31,6 +32,7 @@ import { MoreSheet } from '../../src/client/shell/MoreSheet';
 import { ChatSettingsDialog } from '../../src/client/shell/dialogs/ChatSettingsDialog';
 import { SettingsDialog } from '../../src/client/shell/dialogs/SettingsDialog';
 import { DEFAULT_NOTIFICATIONS } from '../../src/client/ui/settings';
+import { EnvironmentDialog } from '../../src/client/shell/dialogs/EnvironmentDialog';
 import { SessionsDialog } from '../../src/client/shell/dialogs/SessionsDialog';
 import { ConversationsDialog } from '../../src/client/shell/dialogs/ConversationsDialog';
 import { UsageDashboardDialog } from '../../src/client/shell/dialogs/UsageDashboardDialog';
@@ -39,6 +41,7 @@ import { TabBar } from '../../src/client/ui/relay/TabBar';
 import { MonacoEditor } from '../../src/client/shell/chat/MonacoEditor';
 import { WorkflowPopup } from '../../src/client/shell/chat/WorkflowPopup';
 import { GitHubItemDialog } from '../../src/client/shell/chat/GitHubItemDialog';
+import { GitHubPanel } from '../../src/client/shell/chat/GitHubPanel';
 import { FileEditorDialog } from '../../src/client/shell/chat/FileEditorDialog';
 import { MessageBubble } from '../../src/client/shell/chat/MessageBubble';
 import { monacoStylesApplied } from '../../src/client/chat/monaco';
@@ -46,6 +49,8 @@ import { Toasts } from '../../src/client/shell/Toasts';
 import { shellStore } from '../../src/client/shell/store';
 import { FileTreePanel } from '../../src/client/shell/chat/FileTreePanel';
 import { TerminalSplit } from '../../src/client/shell/chat/TerminalSplit';
+import { disablePullToRefresh } from '../../src/client/ui/mobile';
+import { visualViewportKeyboardInset } from '../../src/client/ui/keyboard-viewport';
 
 /**
  * A real workflow run, as the adapter emitted it.
@@ -292,6 +297,8 @@ async function run(): Promise<void> {
   await wait(200);
   check('scrolling past the newest line returns to live', exited > 0 && !view.isOpen, `exited=${exited}`);
 
+  await checkAWindowSafeTabBarYieldsBeforeFixedControls();
+  await checkTheRealShellFollowsWindowControlGeometry();
   await checkModeQueriesDoNotKillTheTerminal();
   await checkAWorkflowPopupBehavesLikeTheFilePopup();
   await checkARunningWorkflowSaysWhatItIsDoing();
@@ -309,11 +316,17 @@ async function run(): Promise<void> {
   await checkSilentStepsLeaveNoRowButKeepTheirTrace();
   await checkNoRowIsDrawnWithNothingToRead();
   await checkAQuestionIsAnsweredByClicking();
+  await checkANoToolFallbackQuestionSurvivesReload();
+  await checkACardTheAgentGaveUpOnStopsOfferingAnAnswer();
+  await checkAQuestionCanBeAnsweredInYourOwnWords();
+  await checkTypedWordsThatDidNotLandAreNotShownAsAnswered();
+  await checkThePlanControlCanBeReviewedAndActedOn();
   await checkThePhoneLayoutIsUsable();
   await checkThePhoneReadsTheMessageFirst();
   await checkThePhoneShellSurfacesAreUsable();
   await checkTheConversationsTerminalCanBeDrivenFromAPhone();
   await checkALongTabNameStaysInsideTheStrip();
+  await checkAnOverflowingTabStripCanBeNavigated();
   await checkAnUnreportedFigureIsNeverDrawnAsZero();
   await checkTheUsageChartsAreInteractive();
   await checkAServerOlderThanThePageSaysSo();
@@ -323,7 +336,10 @@ async function run(): Promise<void> {
   await checkANewConversationCanBeStartedFromTheComposer();
   await checkTheFileEditorShowsTheFile();
   await checkAReadOnlyFileStaysReadOnly();
-  // After the two editor checks on purpose: this one opens a FileEditorDialog,
+  await checkAChatFileLinkOpensAtItsSourceLine();
+  await checkARetriedGuidedIssueKeepsItsWorkflow();
+  await checkTheGitHubPanelSaysWhoIsOnItAndWhatItLinksTo();
+  // After the editor checks on purpose: this one opens a FileEditorDialog,
   // and Monaco is a module-level singleton that does not survive being mounted
   // and torn down before they get to it.
   await checkALongPopupTitleStaysInsideItsWindow();
@@ -351,11 +367,371 @@ async function run(): Promise<void> {
   await checkAWaitingConversationIsVisibleWithoutOpeningIt();
   await checkEveryConversationCanBeFoundAndReopened();
   await checkAConversationSaysWhichApprovalModeItIsIn();
+  await checkTheEnvironmentSizePickerIsUsable();
 
   const pre = document.createElement('pre');
   pre.id = 'results';
   pre.textContent = results.join('\n');
   document.body.appendChild(pre);
+}
+
+/**
+ * The WCO safe rectangle is the only horizontal budget the app receives.
+ * Measure the same TabBar flex mode the integrated shell uses so a regression
+ * cannot let a long tab run push a fixed action underneath native controls.
+ */
+async function checkAWindowSafeTabBarYieldsBeforeFixedControls(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:560px;height:40px;position:absolute;top:0;left:0';
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  try {
+    root.render(React.createElement(TabBar, {
+      tabs: Array.from({ length: 8 }, (_, index) => ({
+        id: `wco-${index}`,
+        title: `A deliberately long session title ${index}`,
+      })),
+      activeId: 'wco-0',
+      onSelect: () => {},
+      tabsYieldFirst: true,
+      leading: React.createElement('div', {
+        'data-wco-fixed': 'brand',
+        style: { width: 124, flex: '0 0 124px' },
+      }),
+      trailing: React.createElement('button', {
+        type: 'button',
+        'data-wco-fixed': 'actions',
+        style: { width: 34, flex: '0 0 34px' },
+      }, 'More'),
+      style: { width: '100%', height: '100%', minWidth: 0 },
+    }));
+    await wait(80);
+
+    const bar = host.firstElementChild as HTMLElement | null;
+    const tabs = host.querySelector<HTMLElement>('[role="tablist"]');
+    const brand = host.querySelector<HTMLElement>('[data-wco-fixed="brand"]');
+    const actions = host.querySelector<HTMLElement>('[data-wco-fixed="actions"]');
+    const barRect = bar?.getBoundingClientRect();
+    const tabsRect = tabs?.getBoundingClientRect();
+    const brandRect = brand?.getBoundingClientRect();
+    const actionsRect = actions?.getBoundingClientRect();
+    const contained = Boolean(
+      barRect && tabsRect && brandRect && actionsRect
+      && brandRect.left >= barRect.left - 0.5
+      && actionsRect.right <= barRect.right + 0.5
+      && tabsRect.left >= brandRect.right - 0.5
+      && tabsRect.right <= actionsRect.left + 0.5
+      && tabsRect.width > 0,
+    );
+    check(
+      'the WCO tab run yields before fixed controls leave the safe rectangle',
+      contained,
+      barRect && tabsRect && actionsRect
+        ? `bar=${barRect.width}, tabs=${tabsRect.width}, actions.right=${actionsRect.right - barRect.left}`
+        : 'missing title-bar element',
+    );
+  } finally {
+    root.unmount();
+    host.remove();
+  }
+}
+
+/** The real shell, including its brand and compact action menu, inside the safe rect. */
+async function checkTheRealShellFollowsWindowControlGeometry(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:680px;height:400px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+  const terminalNode = document.createElement('main');
+  const invoked: string[] = [];
+  const actions = new Proxy({
+    readSettings: () => ({
+      fontSize: 14,
+      theme: 'github-dark',
+      terminalFontFamily: 'jetbrains-mono',
+      chatBypassPermissions: false,
+      notifications: DEFAULT_NOTIFICATIONS,
+    }),
+    newTab: () => invoked.push('new'),
+    loadConversations: async () => ({ projects: [], ungrouped: [] }),
+  }, {
+    get(target, key) {
+      if (key in target) return target[key as keyof typeof target];
+      return () => {};
+    },
+  }) as unknown as ShellActions;
+
+  shellStore.setState({
+    tabs: [
+      { id: 'wco-a', title: 'Alpha', kind: 'terminal', workingDir: null, status: 'idle', unread: false, attention: null },
+      { id: 'wco-b', title: 'Beta', kind: 'terminal', workingDir: null, status: 'idle', unread: false, attention: null },
+    ],
+    activeId: 'wco-a',
+    isMobile: false,
+    banner: null,
+    overlay: null,
+    chat: { active: false, sessionId: '', controller: null, runtime: '', runtimeLabel: '', workingDir: '' },
+    windowControlsOverlay: { visible: true, x: 0, y: 0, width: 560, height: 40 },
+  });
+
+  const root = createRoot(host);
+  try {
+    root.render(React.createElement(AppShell, { terminalNode, actions, launcher: null }));
+    await wait(100);
+
+    const safe = host.querySelector<HTMLElement>('[data-window-safe-area="true"]');
+    const hostRect = host.getBoundingClientRect();
+    const safeRect = safe?.getBoundingClientRect();
+    check(
+      'the real WCO shell stays inside a right-controls safe rectangle',
+      Boolean(safeRect && Math.abs(safeRect.left - hostRect.left) < 0.5
+        && Math.abs(safeRect.right - hostRect.left - 560) < 0.5),
+      safeRect ? `${safeRect.left - hostRect.left}–${safeRect.right - hostRect.left}` : 'missing safe area',
+    );
+
+    const more = host.querySelector<HTMLButtonElement>('[aria-label="More title bar actions"]');
+    more?.click();
+    await wait(30);
+    const menu = host.querySelector<HTMLElement>('[role="menu"][aria-label="Title bar actions"]');
+    check(
+      'the compact real title bar exposes every fixed action from one menu',
+      Boolean(menu && ['New session', 'All tabs', 'Command palette', 'Toggle theme', 'Usage', 'Settings']
+        .every((label) => menu.textContent?.includes(label))),
+      menu?.textContent || 'menu missing',
+    );
+    const newSession = Array.from(menu?.querySelectorAll<HTMLButtonElement>('button') || [])
+      .find((button) => button.textContent?.includes('New session'));
+    newSession?.click();
+    await wait(20);
+    check('a compact title-bar action invokes the shell action', invoked.includes('new'));
+
+    shellStore.setState({
+      windowControlsOverlay: { visible: false, x: 0, y: 0, width: 0, height: 0 },
+    });
+    await wait(40);
+    check(
+      'hiding WCO live restores ordinary chrome without losing the active tab',
+      !host.querySelector('[data-window-titlebar="true"]')
+        && host.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.includes('Alpha') === true,
+    );
+
+    shellStore.setState({
+      windowControlsOverlay: { visible: true, x: 120, y: 2, width: 440, height: 42 },
+    });
+    await wait(40);
+    const leftSafe = host.querySelector<HTMLElement>('[data-window-safe-area="true"]')?.getBoundingClientRect();
+    check(
+      'showing WCO live follows a left-controls rectangle without losing state',
+      Boolean(leftSafe
+        && Math.abs(leftSafe.left - hostRect.left - 120) < 0.5
+        && Math.abs(leftSafe.right - hostRect.left - 560) < 0.5
+        && host.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.includes('Alpha')),
+      leftSafe ? `${leftSafe.left - hostRect.left}–${leftSafe.right - hostRect.left}` : 'missing safe area',
+    );
+
+    shellStore.setState({
+      windowControlsOverlay: { visible: true, x: 120, y: 2, width: 180, height: 42 },
+    });
+    await wait(40);
+    check(
+      'an ultra-narrow real safe area keeps only the shrinkable brand and overflow action',
+      !host.querySelector('[role="tablist"]')
+        && Boolean(host.querySelector('[data-window-drag="true"]'))
+        && Boolean(host.querySelector('[aria-label="More title bar actions"]')),
+    );
+  } finally {
+    root.unmount();
+    host.remove();
+    shellStore.setState({
+      tabs: [], activeId: null,
+      windowControlsOverlay: { visible: false, x: 0, y: 0, width: 0, height: 0 },
+    });
+  }
+}
+
+/**
+ * A card whose question can no longer be delivered says so, and stops asking.
+ *
+ * Here rather than in a unit test because the defect was entirely a rendered
+ * one (#174). On omp the runtime abandoned the `tools/call` after 30 seconds
+ * while the card stayed on screen with live buttons for another ten minutes —
+ * every one of which would have sent an answer into a request the agent had
+ * already dropped — and the sentence it eventually showed, "Skipped without
+ * answering", blamed the user for a question they were never able to answer.
+ * Both halves of that are about what is on the glass, so both are checked
+ * there: the buttons are gone, and the sentence is the true one.
+ */
+async function checkACardTheAgentGaveUpOnStopsOfferingAnAnswer(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const sent: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('browser-check', {
+    send: (message: Record<string, unknown>) => {
+      sent.push(message);
+    },
+  } as never);
+
+  const ask = {
+    question: 'How should I proceed?',
+    header: 'Next move',
+    multiSelect: false,
+    options: [
+      { label: 'PR #167, then continue #168', description: 'Verify the suite, then open its PR' },
+      { label: 'Continue #168 only', description: 'Leave #167 un-PRd for now' },
+    ],
+  };
+
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check',
+      runtime: 'omp',
+      state: 'awaiting_answer',
+      capabilities: { streaming: true, toolCalls: true, questions: true },
+      messages: [
+        {
+          id: 'm1', seq: 1, turnId: 't1', role: 'assistant', ts: 1,
+          blocks: [{
+            kind: 'tool',
+            toolId: 'write_20|fc_tmp_duo3u3bkp7',
+            name: 'mcp__ccweb_ask_user_question',
+            toolKind: 'other',
+            status: 'running',
+            input: ask,
+          }],
+        },
+      ],
+      pendingPermissions: [],
+      pendingQuestions: [{
+        requestId: 'q-1',
+        toolId: 'write_20|fc_tmp_duo3u3bkp7',
+        question: ask.question,
+        header: ask.header,
+        multiSelect: false,
+        ts: 2,
+        options: [
+          { optionId: 'opt-0', label: ask.options[0].label, description: ask.options[0].description },
+          { optionId: 'opt-1', label: ask.options[1].label, description: ask.options[1].description },
+        ],
+      }],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 2,
+      live: true,
+      bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'omp',
+      runtimeLabel: 'Oh My Pi',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  const liveCard = host.querySelector('[data-question-card="live"]') as HTMLElement | null;
+  check('the question starts out as a live card', !!liveCard);
+  if (!liveCard) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  /**
+   * Buttons a person could actually press.
+   *
+   * Counted rather than trusting `data-question-card`, and by visibility and
+   * reachability rather than by presence: a control left in the tree at
+   * `opacity:0` or `pointer-events:none` still answers `querySelector`, and a
+   * geometry sweep drops it silently instead of failing.
+   */
+  const pressable = (card: HTMLElement): HTMLElement[] =>
+    Array.from(card.querySelectorAll<HTMLElement>('button')).filter((node) => {
+      const style = getComputedStyle(node);
+      const box = node.getBoundingClientRect();
+      return style.visibility !== 'hidden'
+        && style.display !== 'none'
+        && style.pointerEvents !== 'none'
+        && Number(style.opacity || '1') > 0.05
+        && box.width > 0
+        && box.height > 0
+        && node.tabIndex >= 0
+        && !(node as HTMLButtonElement).disabled;
+    });
+
+  check(
+    'a live card offers something to press',
+    pressable(liveCard).length >= 2,
+    `${pressable(liveCard).length} pressable`,
+  );
+
+  // What the runtime giving up looks like from the browser's side: the call
+  // that asked reports failed, and the session resolves the question against
+  // the same tool id — carrying `abandoned`, which is the whole difference
+  // between this and a skip.
+  controller.transcript.apply({
+    t: 'tool',
+    seq: 10,
+    ts: Date.now(),
+    toolId: 'write_20|fc_tmp_duo3u3bkp7',
+    patch: { status: 'failed', error: 'MCP error: Request timeout after 30000ms' },
+  } as never);
+  controller.transcript.apply({
+    t: 'question_resolved',
+    seq: 11,
+    ts: Date.now(),
+    requestId: 'q-1',
+    toolId: 'write_20|fc_tmp_duo3u3bkp7',
+    optionIds: [],
+    abandoned: true,
+  } as never);
+  await wait(250);
+  settle(document);
+
+  const card = host.querySelector('[data-question-card]') as HTMLElement | null;
+  check('the card is still in the conversation, as the record of what was asked', !!card);
+  if (!card) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  check(
+    'it no longer offers an answer nobody would receive',
+    pressable(card).length === 0,
+    `${pressable(card).length} still pressable`,
+  );
+  const text = card.textContent || '';
+  check(
+    'and it says the agent stopped waiting',
+    text.includes('stopped waiting'),
+    text.slice(-90),
+  );
+  check(
+    'rather than blaming the person who was never asked',
+    !text.includes('Skipped without answering'),
+    text.slice(-90),
+  );
+  check(
+    'the outcome is recorded as its own thing, not as a skip',
+    card.querySelector('[data-question-answer="abandoned"]') !== null,
+    card.querySelector('[data-question-answer]')?.getAttribute('data-question-answer') || 'none',
+  );
+  check(
+    'and nothing was sent on the way there',
+    sent.filter((message) => message.type === 'chat_question_answer').length === 0,
+  );
+
+  root.unmount();
+  host.remove();
 }
 
 /**
@@ -541,6 +917,18 @@ async function checkAQuestionIsAnsweredByClicking(): Promise<void> {
     JSON.stringify(singleAnswer?.optionIds),
   );
 
+  // The card remains interactive only until this correlated acknowledgement.
+  // A durable resolution later remains the source of record for every screen.
+  for (const answer of answers) {
+    controller.handle({
+      type: 'chat_question_answer_ack',
+      sessionId: 'browser-check',
+      submissionId: answer.submissionId,
+      accepted: true,
+    } as never);
+  }
+  await wait(100);
+
   await wait(200);
   const after = Array.from(host.querySelectorAll('[data-question-card]')) as HTMLElement[];
   // The card must not vanish on being answered: scrolling back past a decision
@@ -670,6 +1058,785 @@ async function checkAQuestionIsAnsweredByClicking(): Promise<void> {
 
   backRoot.unmount();
   host.remove();
+}
+
+/**
+ * A structured-response fallback has no tool bubble to own its question card.
+ *
+ * That is the path used when a runtime cannot call the questionnaire MCP: the
+ * server still records a real `QuestionRequest`, but its `toolId` is absent and
+ * the reducer gives it a durable question block in the assistant message that
+ * asked it. This drives that card through a combined picked-and-typed answer, then
+ * destroys both the view and controller and rebuilds them from the snapshot a
+ * reload receives. A card backed only by component state passes before the
+ * teardown and disappears, or comes back blank, afterwards.
+ */
+async function checkANoToolFallbackQuestionSurvivesReload(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const request = {
+    requestId: 'fallback-browser-question',
+    question: 'Which rollout safeguards should the fallback path use?',
+    header: 'Fallback rollout',
+    multiSelect: true,
+    ts: 1,
+    options: [
+      { optionId: 'opt-0', label: 'Canary tenants', description: 'Start with the internal cohort.' },
+      { optionId: 'opt-1', label: 'Feature flag', description: 'Keep an immediate off switch.' },
+    ],
+  };
+  const ownWords = 'Pause automatically if the questionnaire delivery rate drops.';
+  const sent: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('fallback-browser', {
+    send: (message: Record<string, unknown>) => sent.push(message),
+  } as never);
+
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'fallback-browser',
+    snapshot: {
+      sessionId: 'fallback-browser',
+      runtime: 'grok',
+      state: 'awaiting_answer',
+      capabilities: { streaming: true, questions: true, plan: true },
+      messages: [
+        {
+          id: 'fallback-assistant',
+          seq: 1,
+          turnId: 'fallback-turn',
+          role: 'assistant',
+          ts: 1,
+          blocks: [
+            { kind: 'text', text: 'I need one rollout detail before continuing.' },
+            { kind: 'question', request },
+          ],
+        },
+      ],
+      pendingPermissions: [],
+      pendingQuestions: [request],
+      questionHistory: [request],
+      queued: [],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 1,
+      live: true,
+      bypassPermissions: false,
+      planMode: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'grok',
+      runtimeLabel: 'Grok CLI',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+  settle(document);
+
+  const live = host.querySelector('[data-question-card="live"]') as HTMLElement | null;
+  check(
+    'a no-tool fallback question is a live card in the default-mode conversation',
+    Boolean(live)
+      && Boolean(live?.closest('[role="log"]'))
+      && Boolean(live?.closest('[data-message-id="fallback-assistant"]'))
+      && !live?.closest('[aria-label="Questions from the assistant"]'),
+    live ? (live.textContent || '').replace(/\s+/g, ' ').slice(0, 180) : 'no live fallback card',
+  );
+
+  const first = live?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+  first?.click();
+  (live?.querySelector('[data-question-own-words="closed"]') as HTMLElement | null)?.click();
+  await wait(150);
+  const area = live?.querySelector('textarea') as HTMLTextAreaElement | null;
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+  if (area) {
+    setter?.call(area, ownWords);
+    area.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  await wait(150);
+  const confirm = (Array.from(live?.querySelectorAll('button') ?? []) as HTMLButtonElement[])
+    .find((button) => (button.textContent || '').trim() === 'Confirm');
+  confirm?.click();
+  await wait(200);
+
+  const answer = sent.find((message) => message.type === 'chat_question_answer');
+  check(
+    'the no-tool fallback card sends its selected and typed answer by request id',
+    Boolean(answer)
+      && answer?.requestId === request.requestId
+      && JSON.stringify(answer?.optionIds) === '["opt-0"]'
+      && answer?.text === ownWords
+      && answer?.skipped === false,
+    JSON.stringify(answer ?? null),
+  );
+
+  // The durable answer the session writes after delivering the response. This
+  // supersedes the card's optimistic click state and is what every other
+  // browser — including this one after a reload — is meant to read.
+  controller.transcript.apply({
+    t: 'question_resolved',
+    seq: 2,
+    ts: 2,
+    requestId: request.requestId,
+    optionIds: ['opt-0'],
+    text: ownWords,
+    skipped: false,
+  } as never);
+  await wait(200);
+  settle(document);
+
+  const settled = host.querySelector('[data-question-card="answered"]') as HTMLElement | null;
+  const settledText = (settled?.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'the resolved no-tool fallback remains a readable answered card',
+    Boolean(settled)
+      && Boolean(settled?.closest('[role="log"]'))
+      && !settled?.closest('[aria-label="Questions from the assistant"]')
+      && settledText.includes(request.question)
+      && settledText.includes('Canary tenants')
+      && settledText.includes(ownWords)
+      && settled?.querySelectorAll('[data-question-option="chosen"]').length === 2,
+    settledText.slice(0, 260) || 'no answered fallback card',
+  );
+
+  root.unmount();
+  await wait(50);
+
+  const reloaded = new ChatController('fallback-browser', { send: () => {} } as never);
+  reloaded.handle({
+    type: 'chat_snapshot',
+    sessionId: 'fallback-browser',
+    snapshot: {
+      sessionId: 'fallback-browser',
+      runtime: 'grok',
+      state: 'idle',
+      capabilities: { streaming: true, questions: true, plan: true },
+      messages: [
+        {
+          id: 'fallback-assistant',
+          seq: 1,
+          turnId: 'fallback-turn',
+          role: 'assistant',
+          ts: 1,
+          blocks: [
+            { kind: 'text', text: 'I need one rollout detail before continuing.' },
+            {
+              kind: 'question',
+              request,
+              answer: {
+                optionIds: ['opt-0'],
+                text: ownWords,
+                skipped: false,
+              },
+            },
+          ],
+        },
+      ],
+      pendingPermissions: [],
+      pendingQuestions: [],
+      questionHistory: [request],
+      queued: [],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 2,
+      live: true,
+      bypassPermissions: false,
+      planMode: false,
+    },
+  } as never);
+
+  const reloadedRoot = createRoot(host);
+  reloadedRoot.render(
+    React.createElement(ChatView, {
+      controller: reloaded,
+      runtime: 'grok',
+      runtimeLabel: 'Grok CLI',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(350);
+  settle(document);
+
+  const cards = Array.from(host.querySelectorAll<HTMLElement>('[data-question-card]'));
+  const afterReload = cards[0] ?? null;
+  const afterReloadText = (afterReload?.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'a fresh controller rebuilds the fallback question and answer from its durable message block',
+    cards.length === 1
+      && afterReload?.getAttribute('data-question-card') === 'answered'
+      && Boolean(afterReload.closest('[role="log"]'))
+      && !afterReload.closest('[aria-label="Questions from the assistant"]')
+      && afterReloadText.includes(request.question)
+      && afterReloadText.includes('Canary tenants')
+      && afterReloadText.includes(ownWords)
+      && afterReload?.querySelectorAll('[data-question-option="chosen"]').length === 2
+      && afterReload.querySelectorAll('button').length === 0,
+    `${cards.length} cards :: ${afterReloadText.slice(0, 260) || 'no fallback card'}`,
+  );
+
+  reloadedRoot.unmount();
+  host.remove();
+}
+
+/**
+ * An option list the model wrote is not the only answer a question can have.
+ *
+ * Two defects, both only visible with a layout engine running and both from the
+ * same real conversation. The options a model writes are sentences — its own
+ * gloss on what picking one would mean — and `Button` sets `white-space:
+ * nowrap`, so every description ran off the right-hand edge of the card and
+ * kept going past the edge of the conversation. And the last option a model
+ * writes is routinely "Let me explain in my own words", which was a button like
+ * any other: clicking it answered the question with the string "Let me explain
+ * in my own words" and bought a wasted round trip.
+ *
+ * So: nothing inside the card may reach past its own border, and that row is a
+ * textarea whose contents are the answer. Asserted against the rendered card
+ * because both claims are about geometry and events, not about props.
+ */
+async function checkAQuestionCanBeAnsweredInYourOwnWords(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:900px;height:700px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+
+  const sent: Array<Record<string, unknown>> = [];
+  const controller = new ChatController('browser-check', {
+    send: (message: Record<string, unknown>) => {
+      sent.push(message);
+    },
+  } as never);
+
+  // The question from the conversation this was reported from, verbatim —
+  // including the option the model wrote for itself at the end.
+  const OPTIONS = [
+    {
+      label: 'Persistent storage, attached to each container',
+      description:
+        "The user's workspace lives outside the container and is attached to it, the way per-user " +
+        'environments already keep a home directory. Closing a session leaves the work where it was.',
+    },
+    {
+      label: 'Fresh checkout each time',
+      description:
+        'A session starts by pulling the project into a clean container. Anything not pushed is ' +
+        'gone when the session closes — explicit and cheap, but unforgiving.',
+    },
+    {
+      label: 'Let me explain in my own words',
+      description: 'None of these is quite right.',
+    },
+  ];
+  const ask = {
+    question: "When a session's container is destroyed, what happens to the work inside it?",
+    header: 'WHERE WORK LIVES',
+    multiSelect: false,
+    options: OPTIONS,
+  };
+
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check',
+      runtime: 'claude',
+      state: 'awaiting_answer',
+      capabilities: { streaming: true, questions: true },
+      messages: [
+        {
+          id: 'a1', seq: 1, turnId: 't1', role: 'assistant', ts: 1,
+          blocks: [
+            {
+              kind: 'tool', toolId: 'tool-own', name: 'mcp__ccweb__ask_user_question',
+              toolKind: 'other', status: 'running', input: ask,
+            },
+          ],
+        },
+      ],
+      pendingPermissions: [],
+      pendingQuestions: [
+        {
+          requestId: 'q-own', toolId: 'tool-own', ts: 1,
+          question: ask.question, header: ask.header, multiSelect: false,
+          options: OPTIONS.map((option, at) => ({ optionId: `opt-${at}`, ...option })),
+        },
+      ],
+      firstSeq: 1,
+      replayFrom: 1,
+      cursor: 1,
+      live: true,
+      bypassPermissions: false,
+    },
+  } as never);
+
+  const root = createRoot(host);
+  root.render(
+    React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: DEFAULT_CHAT_VIEW,
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  const card = host.querySelector('[data-question-card="live"]') as HTMLElement | null;
+  check('the live question renders as a card', !!card);
+  if (!card) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  // ------------------------------------------------------------------ wrapping
+  const cardBox = card.getBoundingClientRect();
+  const spilled = Array.from(card.querySelectorAll<HTMLElement>('*')).filter(
+    (node) => node.getBoundingClientRect().right > cardBox.right + 1,
+  );
+  check(
+    'no part of a question reaches past the edge of its own card',
+    spilled.length === 0,
+    spilled.length
+      ? spilled
+          .slice(0, 2)
+          .map((node) => `${(node.textContent || '').trim().slice(0, 28)} → ${Math.round(node.getBoundingClientRect().right)} of ${Math.round(cardBox.right)}`)
+          .join(' | ')
+      : `${Math.round(cardBox.width)}px wide`,
+  );
+
+  const optionButtons = Array.from(card.querySelectorAll('button')) as HTMLButtonElement[];
+  const persistent = optionButtons.find((button) =>
+    (button.textContent || '').includes('Persistent storage'),
+  );
+  check('the first option is its own control', !!persistent);
+  // `scrollWidth > clientWidth` is the layout engine saying "this did not fit".
+  // The bug was one line of text laid out at whatever width it wanted inside a
+  // box the width of the card, so this is the measurement that names it.
+  check(
+    'a long option lays itself out inside the width it was given',
+    !!persistent && persistent.scrollWidth <= persistent.clientWidth + 1,
+    persistent ? `${persistent.scrollWidth}px of content in ${persistent.clientWidth}px` : 'no option',
+  );
+  // And wrapped rather than merely clipped or pushed onto its own long line.
+  // Measured against the description's own type size, so this says "this
+  // paragraph occupies more than one line" rather than trusting a pixel count
+  // that a theme could move.
+  const description = Array.from(card.querySelectorAll<HTMLElement>('span')).find((span) =>
+    (span.textContent || '').startsWith("The user's workspace lives outside"),
+  );
+  const lineOf = (node: HTMLElement): number => parseFloat(getComputedStyle(node).fontSize) || 13;
+  check(
+    'and its description wraps onto as many lines as it needs',
+    !!description && description.getBoundingClientRect().height > lineOf(description) * 2.4,
+    description
+      ? `${Math.round(description.getBoundingClientRect().height)}px at ${lineOf(description)}px type`
+      : 'no description',
+  );
+
+  // ------------------------------------------------------- the free-text row
+  const ownRow = card.querySelector('[data-question-own-words]') as HTMLElement | null;
+  check('the card offers to take an answer in the user’s own words', !!ownRow);
+  check(
+    'and does not offer the model’s own version of it as well',
+    card.querySelectorAll('[data-question-own-words]').length === 1
+      && optionButtons.filter((button) => (button.textContent || '').includes('Let me explain')).length === 1,
+    `${card.querySelectorAll('[data-question-own-words]').length} rows`,
+  );
+  check(
+    'and keeps the wording the model chose for it',
+    (ownRow?.textContent || '').includes('Let me explain in my own words'),
+    (ownRow?.textContent || '').trim().slice(0, 48),
+  );
+
+  const explain = optionButtons.find((button) => (button.textContent || '').includes('Let me explain'));
+  if (explain) {
+    explain.click();
+    await wait(200);
+  }
+
+  // The defect, stated as the thing that must not happen: clicking that row
+  // used to answer the question with its own label and unblock the agent.
+  check(
+    'opening it does not answer the question with the label on it',
+    sent.filter((message) => message.type === 'chat_question_answer').length === 0,
+    `${sent.filter((message) => message.type === 'chat_question_answer').length} answers sent`,
+  );
+
+  const area = card.querySelector('textarea') as HTMLTextAreaElement | null;
+  check('opening it puts a textarea on the card', !!area);
+  check(
+    'which is big enough to write an explanation in',
+    !!area && isPainted(area) && area.getBoundingClientRect().height >= 40,
+    area ? `${Math.round(area.getBoundingClientRect().width)}x${Math.round(area.getBoundingClientRect().height)}` : 'no textarea',
+  );
+  if (!area) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+  setter?.call(area, 'A container per project, not per session.');
+  area.dispatchEvent(new Event('input', { bubbles: true }));
+  await wait(150);
+
+  const send = (Array.from(card.querySelectorAll('button')) as HTMLButtonElement[]).find(
+    (button) => (button.textContent || '').trim() === 'Send',
+  );
+  check('typed words can be sent', !!send && !send.disabled);
+  send?.click();
+  await wait(200);
+
+  const answer = sent.find((message) => message.type === 'chat_question_answer');
+  check('the answer reaches the server', !!answer);
+  check(
+    'and carries the words rather than an option id',
+    !!answer
+      && answer.text === 'A container per project, not per session.'
+      && JSON.stringify(answer.optionIds) === '[]',
+    `${JSON.stringify(answer?.text)} / ${JSON.stringify(answer?.optionIds)}`,
+  );
+  // The half that decides whether the agent hears anything at all: a typed
+  // answer travelling as a skip would reach the model as "they declined".
+  check('and is not sent as a skip', !!answer && answer.skipped === false, String(answer?.skipped));
+
+  // What the server writes back, and what a second browser would see.
+  controller.transcript.apply({
+    t: 'question_resolved',
+    seq: 900,
+    ts: 1,
+    requestId: 'q-own',
+    toolId: 'tool-own',
+    optionIds: [],
+    text: 'A container per project, not per session.',
+    skipped: false,
+  } as never);
+  await wait(200);
+
+  const settled = host.querySelector('[data-question-card="answered"]') as HTMLElement | null;
+  check('the card settles as answered', !!settled);
+  const settledText = (settled?.textContent || '').replace(/\s+/g, ' ');
+  check(
+    'and the answered card shows what was typed',
+    settledText.includes('A container per project, not per session.'),
+    settledText.slice(-80),
+  );
+  check(
+    'and never reads as a question nobody answered',
+    !settledText.includes('Skipped without answering'),
+    settledText.slice(-60),
+  );
+  check(
+    'and still lists the options the model offered',
+    settledText.includes('Persistent storage') && settledText.includes('Fresh checkout'),
+  );
+
+  root.unmount();
+  await wait(50);
+
+  // ------------------------------------------------- and on a pick-several
+  //
+  // Its own mount rather than a second card in the fixture above: a
+  // multi-select answers from the Confirm button under the whole card, so the
+  // claim is that one press carries the ticks *and* the sentence. A card that
+  // sent only one of them would look identical up to the click.
+  const multiSent: Array<Record<string, unknown>> = [];
+  const multi = new ChatController('browser-check', {
+    send: (message: Record<string, unknown>) => {
+      multiSent.push(message);
+    },
+  } as never);
+  const multiAsk = {
+    question: 'Which rules should I apply?',
+    multiSelect: true,
+    options: [{ label: 'semicolons' }, { label: 'trailing commas' }],
+  };
+  multi.handle({
+    type: 'chat_snapshot',
+    sessionId: 'browser-check',
+    snapshot: {
+      sessionId: 'browser-check', runtime: 'claude', state: 'awaiting_answer',
+      capabilities: { streaming: true, questions: true },
+      messages: [
+        {
+          id: 'a1', seq: 1, turnId: 't1', role: 'assistant', ts: 1,
+          blocks: [
+            {
+              kind: 'tool', toolId: 'tool-multi', name: 'mcp__ccweb__ask_user_question',
+              toolKind: 'other', status: 'running', input: multiAsk,
+            },
+          ],
+        },
+      ],
+      pendingPermissions: [],
+      pendingQuestions: [
+        {
+          requestId: 'q-multi', toolId: 'tool-multi', ts: 1,
+          question: multiAsk.question, multiSelect: true,
+          options: [
+            { optionId: 'opt-0', label: 'semicolons' },
+            { optionId: 'opt-1', label: 'trailing commas' },
+          ],
+        },
+      ],
+      firstSeq: 1, replayFrom: 1, cursor: 1, live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const multiRoot = createRoot(host);
+  multiRoot.render(
+    React.createElement(ChatView, {
+      controller: multi,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/tmp/project',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never),
+  );
+  await wait(400);
+
+  const multiCard = host.querySelector('[data-question-card="live"]') as HTMLElement | null;
+  const boxes = multiCard
+    ? (Array.from(multiCard.querySelectorAll('input[type="checkbox"]')) as HTMLInputElement[])
+    : [];
+  check(
+    'a pick-several question still ticks by option, and offers the words as well',
+    boxes.length === 2 && !!multiCard?.querySelector('[data-question-own-words]'),
+    `${boxes.length} boxes`,
+  );
+
+  const openWords = multiCard
+    ? (Array.from(multiCard.querySelectorAll('button')) as HTMLButtonElement[]).find((button) =>
+        (button.textContent || '').includes('own words'),
+      )
+    : undefined;
+  const multiConfirm = (): HTMLButtonElement | undefined =>
+    multiCard
+      ? (Array.from(multiCard.querySelectorAll('button')) as HTMLButtonElement[]).find(
+          (button) => (button.textContent || '').trim() === 'Confirm',
+        )
+      : undefined;
+
+  check('confirm is refused while nothing is ticked and nothing is typed', multiConfirm()?.disabled === true);
+
+  boxes[0]?.click();
+  openWords?.click();
+  await wait(200);
+  const multiArea = multiCard?.querySelector('textarea') as HTMLTextAreaElement | null;
+  if (multiArea) {
+    setter?.call(multiArea, '…but never in generated files.');
+    multiArea.dispatchEvent(new Event('input', { bubbles: true }));
+    await wait(150);
+  }
+  multiConfirm()?.click();
+  await wait(200);
+
+  const multiAnswer = multiSent.find((message) => message.type === 'chat_question_answer');
+  check(
+    'one confirm carries both the ticks and the words',
+    !!multiAnswer
+      && JSON.stringify(multiAnswer.optionIds) === '["opt-0"]'
+      && multiAnswer.text === '…but never in generated files.',
+    `${JSON.stringify(multiAnswer?.optionIds)} / ${JSON.stringify(multiAnswer?.text)}`,
+  );
+
+  multiRoot.unmount();
+  host.remove();
+}
+
+/**
+ * The card settles on the click, and must give that up the moment the session
+ * says something else.
+ *
+ * Reported from a real conversation: a sentence was typed into the card, the
+ * card drew it in green under "Answered in their own words", and the agent's
+ * very next line was "taking the skipped one" — it had been told the question
+ * was skipped. The words never reached it. The cause that day was a server
+ * older than the page it was serving, which dropped a field it had never heard
+ * of, but the shape is general: a second browser answering first, or a session
+ * that no longer holds the question, both end with a record that does not say
+ * what this browser sent. Optimistic state is right up to that point and a lie
+ * afterwards, so `question_resolved` — the same event the model's tool result
+ * was built from — wins outright over it.
+ *
+ * Asserted through the rendered card because the claim is about what a person
+ * reads off the screen, and the bug was invisible at every layer below it: the
+ * frame was correct, the reducer was correct, and the card still said the
+ * question had been answered in words nobody was given.
+ */
+async function checkTypedWordsThatDidNotLandAreNotShownAsAnswered(): Promise<void> {
+  const WORDS = 'We need gitlab, gitea and oidc as well, handled by those platforms.';
+  const OPTIONS = [
+    { label: 'A token per forge, kept in the user’s storage' },
+    { label: 'Install the tool, leave signing in to the user' },
+  ];
+  const ask = {
+    question: 'How should non-GitHub forges be authenticated?',
+    header: 'NON-GITHUB FORGES',
+    multiSelect: false,
+    options: OPTIONS,
+  };
+
+  // One mount per resolution, because the disagreement has to be the *first*
+  // thing the card hears after the click — a card that had already been told
+  // the truth once would pass this without the fix.
+  const answerThenResolveWith = async (
+    resolution: Record<string, unknown>,
+  ): Promise<{
+    text: string;
+    card: HTMLElement | null;
+    outcome: string | null | undefined;
+    teardown: () => void;
+  }> => {
+    const host = document.createElement('div');
+    host.style.cssText = 'width:900px;height:700px;position:absolute;top:0;left:0;display:flex';
+    document.body.appendChild(host);
+
+    // `false` is the real connection contract for a frame attempted while the
+    // WebSocket is closed. The card must stay pending until a durable event
+    // proves that some answer landed.
+    const controller = new ChatController('browser-check', { send: () => false } as never);
+    controller.handle({
+      type: 'chat_snapshot',
+      sessionId: 'browser-check',
+      snapshot: {
+        sessionId: 'browser-check',
+        runtime: 'claude',
+        state: 'awaiting_answer',
+        capabilities: { streaming: true, questions: true },
+        messages: [
+          {
+            id: 'a1', seq: 1, turnId: 't1', role: 'assistant', ts: 1,
+            blocks: [
+              {
+                kind: 'tool', toolId: 'tool-lost', name: 'mcp__ccweb__ask_user_question',
+                toolKind: 'other', status: 'running', input: ask,
+              },
+            ],
+          },
+        ],
+        pendingPermissions: [],
+        pendingQuestions: [
+          {
+            requestId: 'q-lost', toolId: 'tool-lost', ts: 1,
+            question: ask.question, header: ask.header, multiSelect: false,
+            options: OPTIONS.map((option, at) => ({ optionId: `opt-${at}`, ...option })),
+          },
+        ],
+        firstSeq: 1,
+        replayFrom: 1,
+        cursor: 1,
+        live: true,
+        bypassPermissions: false,
+      },
+    } as never);
+
+    const root = createRoot(host);
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir: '/tmp/project',
+        view: DEFAULT_CHAT_VIEW,
+        onViewChange: () => {},
+      } as never),
+    );
+    await wait(400);
+
+    const live = host.querySelector('[data-question-card="live"]') as HTMLElement | null;
+    const open = live?.querySelector('[data-question-own-words="closed"]') as HTMLElement | null;
+    open?.click();
+    await wait(150);
+    const area = live?.querySelector('textarea') as HTMLTextAreaElement | null;
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+    if (area) {
+      setter?.call(area, WORDS);
+      area.dispatchEvent(new Event('input', { bubbles: true }));
+      await wait(150);
+    }
+    (Array.from(live?.querySelectorAll('button') ?? []) as HTMLButtonElement[])
+      .find((button) => (button.textContent || '').trim() === 'Send')
+      ?.click();
+    await wait(200);
+
+    check(
+      'an answer attempted while disconnected leaves the original card answerable',
+      !!host.querySelector('[data-question-card="live"]')
+        && !host.querySelector('[data-question-answer-sending="true"]'),
+    );
+
+    controller.transcript.apply({
+      t: 'question_resolved', seq: 900, ts: 1,
+      requestId: 'q-lost', toolId: 'tool-lost',
+      ...resolution,
+    } as never);
+    await wait(250);
+
+    const card = host.querySelector('[data-question-card="answered"]') as HTMLElement | null;
+    return {
+      text: (card?.textContent || '').replace(/\s+/g, ' '),
+      card,
+      outcome: card?.querySelector('[data-question-answer]')?.getAttribute('data-question-answer'),
+      teardown: () => { root.unmount(); host.remove(); },
+    };
+  };
+
+  // ---------------------------------------------- the record says it was skipped
+  const skipped = await answerThenResolveWith({ optionIds: [], skipped: true });
+  check('a question answered in words still settles as a card', !!skipped.card);
+  check(
+    'a card whose words the session never took does not show them as the answer',
+    !skipped.text.includes(WORDS),
+    skipped.text.slice(0, 200) || 'no answered card',
+  );
+  check(
+    'and says so rather than letting the sentence vanish',
+    !!skipped.card?.querySelector('[data-question-answer-dropped]'),
+    skipped.text.slice(-160),
+  );
+  check(
+    'and reads as the skip the agent was actually told about',
+    skipped.outcome === 'skipped',
+    String(skipped.outcome),
+  );
+  skipped.teardown();
+  await wait(50);
+
+  // -------------------------------- the record says someone else picked an option
+  const overtaken = await answerThenResolveWith({ optionIds: ['opt-1'], skipped: false });
+  const chosenRows = Array.from(
+    overtaken.card?.querySelectorAll('[data-question-option="chosen"]') ?? [],
+  ).map((row) => (row.textContent || '').replace(/\s+/g, ' '));
+  check(
+    'a question answered elsewhere first shows that answer, not this browser’s',
+    chosenRows.length === 1 && chosenRows[0].includes('Install the tool'),
+    chosenRows.join(' | ').slice(0, 200) || 'nothing is marked as chosen',
+  );
+  check(
+    'and does not leave the words this browser sent standing beside it',
+    !overtaken.text.includes(WORDS)
+      && !!overtaken.card?.querySelector('[data-question-answer-dropped]'),
+    overtaken.text.slice(0, 200),
+  );
+  check(
+    'and still marks it as answered rather than skipped',
+    overtaken.outcome === 'chosen',
+    String(overtaken.outcome),
+  );
+  overtaken.teardown();
 }
 
 /**
@@ -3861,6 +5028,367 @@ async function checkThePhoneReadsTheMessageFirst(): Promise<void> {
   host.remove();
 }
 
+/**
+ * Plan mode is a conversation control, not a hidden slash command.
+ *
+ * This is deliberately a rendered check. The regression that prompted the
+ * feature was the button disappearing from the Web UI, and the two most
+ * important follow-on guarantees are geometric: the revision can be read and
+ * acted on without leaving the conversation, and the same route remains
+ * reachable once a phone has folded the composer's secondary controls away.
+ */
+async function checkThePlanControlCanBeReviewedAndActedOn(): Promise<void> {
+  const markdown = [
+    '# Deployment plan',
+    '',
+    '1. Preserve the current conversation state.',
+    '2. Verify the browser and server paths together.',
+    '3. Ship only after the checks pass.',
+  ].join('\n');
+  const plan = { markdown, revision: 4, ts: Date.now() };
+  const capabilities = {
+    streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+    questions: true, planMode: true, interrupt: true, resume: true, fork: false,
+    attachments: true, usage: true, cost: true, plan: false,
+    models: [{ name: 'claude-opus-4-6', value: 'claude-opus-4-6' }],
+  };
+  const snapshot = (
+    sessionId: string,
+    state: 'idle' | 'running',
+    document = plan,
+  ): Record<string, unknown> => ({
+    type: 'chat_snapshot',
+    sessionId,
+    planMode: true,
+    planDocument: document,
+    snapshot: {
+      sessionId,
+      runtime: 'claude',
+      state,
+      capabilities,
+      messages: [],
+      pendingPermissions: [],
+      pendingQuestions: [],
+      queued: [],
+      firstSeq: 0,
+      replayFrom: 0,
+      cursor: 0,
+      live: true,
+      bypassPermissions: false,
+      planMode: true,
+      planDocument: document,
+    },
+  });
+
+  const host = document.createElement('div');
+  host.style.cssText = 'width:960px;height:720px;position:absolute;top:0;left:0;display:flex;overflow:hidden';
+  document.body.appendChild(host);
+
+  const sent: Array<Record<string, unknown>> = [];
+  let redraw = (): void => {};
+  const controller = new ChatController('plan-browser-check', {
+    send: (message: unknown) => sent.push(message as Record<string, unknown>),
+    onChange: () => redraw(),
+  } as never);
+  controller.handle(snapshot('plan-browser-check', 'running') as never);
+
+  const root = createRoot(host);
+  const paint = (): void => {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude',
+        workingDir: '/tmp/project',
+        view: { ...DEFAULT_CHAT_VIEW, panelOpen: false },
+        onViewChange: () => {},
+      } as never),
+    );
+  };
+  paint();
+  redraw = paint;
+  await wait(300);
+  settle(document);
+
+  const planToggle = host.querySelector<HTMLButtonElement>('button[aria-label^="Plan mode"]');
+  const modelToggle = host.querySelector<HTMLElement>('[aria-label="Change model"]');
+  const planBox = planToggle?.getBoundingClientRect();
+  const modelBox = modelToggle?.getBoundingClientRect();
+  check(
+    'the desktop composer exposes a readable Plan control',
+    Boolean(planToggle)
+      && isPainted(planToggle!)
+      && (planToggle!.textContent || '').trim() === 'Plan on'
+      && (planBox?.width || 0) >= 54
+      && (planBox?.height || 0) >= 24,
+    planToggle && planBox
+      ? `${(planToggle.textContent || '').trim()} at ${Math.round(planBox.width)}x${Math.round(planBox.height)}`
+      : 'no Plan control',
+  );
+  check(
+    'the Plan control sits with the model controls',
+    Boolean(planBox)
+      && Boolean(modelBox)
+      && modelBox!.right <= planBox!.left + 1
+      && Math.abs((modelBox!.top + modelBox!.bottom) / 2 - (planBox!.top + planBox!.bottom) / 2) <= 3,
+    planBox && modelBox
+      ? `model ends ${Math.round(modelBox.right)}, Plan starts ${Math.round(planBox.left)}`
+      : 'one of the controls is missing',
+  );
+  check(
+    'an active planning turn disables the mode switch and explains why',
+    planToggle?.disabled === true
+      && (planToggle.title || '').includes('available when that turn ends'),
+    planToggle ? planToggle.title : 'no Plan control',
+  );
+
+  const review = host.querySelector<HTMLButtonElement>('[aria-label="Read the submitted plan"]');
+  check(
+    'the latest submitted plan has a review control',
+    Boolean(review) && isPainted(review!),
+    review ? (review.textContent || '').trim() : 'no review control',
+  );
+  review?.click();
+  await wait(200);
+  settle(document);
+
+  let dialog = host.querySelector<HTMLElement>('[role="dialog"]');
+  const dialogText = (dialog?.innerText || '').replace(/\s+/g, ' ');
+  check(
+    'the review dialog names the revision and renders the whole plan',
+    Boolean(dialog)
+      && /revision 4/i.test(dialogText)
+      && dialogText.includes('Deployment plan')
+      && dialogText.includes('Preserve the current conversation state')
+      && dialogText.includes('Ship only after the checks pass'),
+    dialogText.slice(0, 240) || 'no dialog',
+  );
+
+  const actionButton = (label: string): HTMLButtonElement | null =>
+    Array.from(dialog?.querySelectorAll<HTMLButtonElement>('button') || [])
+      .find((button) => (button.textContent || '').trim() === label) ?? null;
+  const rejectWhileBusy = actionButton('Reject plan');
+  const acceptWhileBusy = actionButton('Accept plan');
+  check(
+    'accepting and rejecting are disabled while the planning turn is active',
+    rejectWhileBusy?.disabled === true && acceptWhileBusy?.disabled === true,
+    `reject=${String(rejectWhileBusy?.disabled)} accept=${String(acceptWhileBusy?.disabled)}`,
+  );
+  check(
+    'the disabled plan actions say what must finish first',
+    dialogText.includes('Wait for the active turn to finish before accepting or rejecting this plan.'),
+    dialogText.slice(0, 240),
+  );
+
+  const sentBeforeClose = sent.length;
+  (dialog?.querySelector('[aria-label="Close"]') as HTMLElement | null)?.click();
+  await wait(120);
+  check(
+    'closing the plan review is inert',
+    host.querySelector('[role="dialog"]') === null
+      && sent.length === sentBeforeClose
+      && controller.planModeValue
+      && controller.planDocumentValue?.revision === 4,
+    `${sent.length - sentBeforeClose} messages, mode=${String(controller.planModeValue)}, revision=${String(controller.planDocumentValue?.revision)}`,
+  );
+
+  // The turn ends. The same revision can now be rejected, which keeps Plan
+  // mode on and returns the caret to the ordinary composer for feedback.
+  controller.handle({
+    type: 'chat_event',
+    sessionId: 'plan-browser-check',
+    event: { t: 'state', seq: 1, ts: Date.now(), state: 'idle' },
+  } as never);
+  await wait(120);
+  (host.querySelector('[aria-label="Read the submitted plan"]') as HTMLElement | null)?.click();
+  await wait(120);
+  dialog = host.querySelector<HTMLElement>('[role="dialog"]');
+  const reject = Array.from(dialog?.querySelectorAll<HTMLButtonElement>('button') || [])
+    .find((button) => (button.textContent || '').trim() === 'Reject plan');
+  reject?.click();
+  await wait(50);
+  const rejectMessage = sent[sent.length - 1];
+  check(
+    'Reject sends the revision being reviewed',
+    rejectMessage?.type === 'chat_reject_plan' && rejectMessage.revision === 4,
+    JSON.stringify(rejectMessage || null),
+  );
+  controller.handle({
+    type: 'chat_plan_action',
+    sessionId: 'plan-browser-check',
+    action: 'reject',
+    revision: 4,
+    accepted: true,
+    planMode: true,
+    plan,
+    message: 'Plan rejected. Add feedback in the composer.',
+  } as never);
+  await wait(180);
+  const field = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message"]');
+  check(
+    'a confirmed rejection closes review, keeps Plan mode, and focuses feedback',
+    host.querySelector('[role="dialog"]') === null
+      && controller.planModeValue
+      && document.activeElement === field,
+    `dialog=${String(Boolean(host.querySelector('[role="dialog"]')))} mode=${String(controller.planModeValue)} focus=${(document.activeElement as HTMLElement | null)?.getAttribute('aria-label') || 'none'}`,
+  );
+
+  // Acceptance is a distinct callback and names the same latest revision. The
+  // server response is authoritative for leaving Plan mode; the dialog only
+  // closes after that response arrives.
+  (host.querySelector('[aria-label="Read the submitted plan"]') as HTMLElement | null)?.click();
+  await wait(120);
+  dialog = host.querySelector<HTMLElement>('[role="dialog"]');
+  const accept = Array.from(dialog?.querySelectorAll<HTMLButtonElement>('button') || [])
+    .find((button) => (button.textContent || '').trim() === 'Accept plan');
+  accept?.click();
+  await wait(50);
+  const acceptMessage = sent[sent.length - 1];
+  check(
+    'Accept sends the revision being reviewed',
+    acceptMessage?.type === 'chat_accept_plan' && acceptMessage.revision === 4,
+    JSON.stringify(acceptMessage || null),
+  );
+  controller.handle({
+    type: 'chat_plan_action',
+    sessionId: 'plan-browser-check',
+    action: 'accept',
+    revision: 4,
+    accepted: true,
+    planMode: false,
+    plan,
+    message: 'Plan accepted. Implementation started.',
+  } as never);
+  await wait(150);
+  check(
+    'a confirmed acceptance closes review and leaves Plan mode',
+    host.querySelector('[role="dialog"]') === null
+      && !controller.planModeValue
+      && controller.planDocumentValue?.revision === 4,
+    `dialog=${String(Boolean(host.querySelector('[role="dialog"]')))} mode=${String(controller.planModeValue)}`,
+  );
+
+  root.unmount();
+  host.remove();
+
+  // A real phone viewport, not a 390px div in the desktop page. The review is
+  // fixed to the viewport, so only an iframe can prove its sheet stays inside a
+  // phone rather than silently measuring the desktop around the fixture.
+  const frame = document.createElement('iframe');
+  frame.style.cssText = 'width:390px;height:740px;position:absolute;top:0;left:0;border:0';
+  document.body.appendChild(frame);
+  const doc = frame.contentDocument as Document;
+  doc.open();
+  doc.write(
+    '<!doctype html><html style="height:100%"><head>'
+    + '<link rel="stylesheet" href="/css/relay/relay.css">'
+    + '<link rel="stylesheet" href="/css/main.css">'
+    + '</head><body style="margin:0;height:100%;display:flex;overflow:hidden"></body></html>',
+  );
+  doc.close();
+  await wait(150);
+
+  const phonePlan = { ...plan, revision: 9 };
+  let phoneRedraw = (): void => {};
+  const phoneController = new ChatController('plan-phone-check', {
+    send: () => {},
+    onChange: () => phoneRedraw(),
+  } as never);
+  phoneController.handle(snapshot('plan-phone-check', 'idle', phonePlan) as never);
+  const phoneRoot = createRoot(doc.body);
+  const paintPhone = (): void => phoneRoot.render(React.createElement(PhoneSurface, { controller: phoneController }));
+  paintPhone();
+  phoneRedraw = paintPhone;
+  await wait(400);
+  settle(doc);
+
+  const more = doc.querySelector<HTMLButtonElement>('[aria-label="Show the other controls"]');
+  check('the phone can reveal its secondary composer controls', Boolean(more) && isPainted(more!));
+  more?.click();
+  await wait(180);
+  settle(doc);
+
+  const phoneToggle = doc.querySelector<HTMLButtonElement>('button[aria-label^="Plan mode"]');
+  const phoneReview = doc.querySelector<HTMLButtonElement>('[aria-label="Read the submitted plan"]');
+  const viewportWidth = frame.contentWindow?.innerWidth || 390;
+  const viewportHeight = frame.contentWindow?.innerHeight || 740;
+  const inViewport = (node: Element): boolean => {
+    const box = node.getBoundingClientRect();
+    return box.left >= -1
+      && box.top >= -1
+      && box.right <= viewportWidth + 1
+      && box.bottom <= viewportHeight + 1;
+  };
+  check(
+    'the phone exposes Plan after expanding the other controls',
+    Boolean(phoneToggle)
+      && isPainted(phoneToggle!)
+      && inViewport(phoneToggle!)
+      && laidOutSize(phoneToggle!).width >= PHONE_TARGET
+      && laidOutSize(phoneToggle!).height >= PHONE_TARGET,
+    phoneToggle
+      ? `${Math.round(phoneToggle.getBoundingClientRect().left)}..${Math.round(phoneToggle.getBoundingClientRect().right)}, ${laidOutSize(phoneToggle).width}x${laidOutSize(phoneToggle).height}`
+      : 'no Plan control',
+  );
+  check(
+    'the phone can reach the submitted revision from the same expanded row',
+    Boolean(phoneReview)
+      && isPainted(phoneReview!)
+      && inViewport(phoneReview!)
+      && laidOutSize(phoneReview!).width >= PHONE_TARGET
+      && laidOutSize(phoneReview!).height >= PHONE_TARGET,
+    phoneReview
+      ? `${Math.round(phoneReview.getBoundingClientRect().left)}..${Math.round(phoneReview.getBoundingClientRect().right)}, ${laidOutSize(phoneReview).width}x${laidOutSize(phoneReview).height}`
+      : 'no review control',
+  );
+
+  phoneReview?.click();
+  await wait(180);
+  settle(doc);
+  const sheet = doc.querySelector<HTMLElement>('[role="dialog"]');
+  const sheetBox = sheet?.getBoundingClientRect();
+  const sheetText = (sheet?.innerText || '').replace(/\s+/g, ' ');
+  check(
+    'the phone review opens as a revisioned sheet inside the viewport',
+    Boolean(sheet)
+      && Boolean(sheetBox)
+      && sheetBox!.left >= -1
+      && sheetBox!.right <= viewportWidth + 1
+      && sheetBox!.top >= -1
+      && sheetBox!.bottom <= viewportHeight + 1
+      && /revision 9/i.test(sheetText),
+    sheetBox
+      ? `${Math.round(sheetBox.left)},${Math.round(sheetBox.top)} ${Math.round(sheetBox.width)}x${Math.round(sheetBox.height)} in ${viewportWidth}x${viewportHeight}`
+      : 'no sheet',
+  );
+  check(
+    'the phone plan sheet keeps its content and actions within its width',
+    Boolean(sheet)
+      && sheet!.scrollWidth <= sheet!.clientWidth + 1
+      && sheetText.includes('Deployment plan')
+      && sheetText.includes('Ship only after the checks pass'),
+    sheet ? `content ${sheet.scrollWidth}px in ${sheet.clientWidth}px` : 'no sheet',
+  );
+  const sheetActions = Array.from(sheet?.querySelectorAll<HTMLButtonElement>('button') || [])
+    .filter((button) => /^(Accept|Reject) plan$/.test((button.textContent || '').trim()));
+  const unreachable = sheetActions.filter(
+    (button) => !isPainted(button)
+      || !inViewport(button)
+      || laidOutSize(button).width < PHONE_TARGET
+      || laidOutSize(button).height < PHONE_TARGET,
+  );
+  check(
+    'both plan decisions remain reachable on the phone sheet',
+    sheetActions.length === 2 && unreachable.length === 0,
+    sheetActions.length
+      ? sheetActions.map((button) => `${(button.textContent || '').trim()}=${laidOutSize(button).width}x${laidOutSize(button).height}`).join(' | ')
+      : 'no decision buttons',
+  );
+
+  phoneRoot.unmount();
+  frame.remove();
+}
+
 async function checkThePhoneLayoutIsUsable(): Promise<void> {
   const host = document.createElement('div');
   document.body.appendChild(host);
@@ -4796,6 +6324,228 @@ async function checkALongTabNameStaysInsideTheStrip(): Promise<void> {
 
   sheetRoot.unmount();
   frame.remove();
+}
+
+/**
+ * A hidden scrollbar still needs two discoverable ways to reach what it hides:
+ * the wheel already under the pointer, and an explicit list for precise jumps.
+ * This needs a layout engine because the button is intentionally conditional on
+ * measured overflow rather than on an arbitrary tab count.
+ */
+async function checkAnOverflowingTabStripCanBeNavigated(): Promise<void> {
+  const tabs = [
+    { id: 'one', title: 'gateway', status: 'running' },
+    { id: 'two', title: 'deploy', status: 'idle', attention: 'approval' },
+    { id: 'three', title: 'documentation', status: 'idle', unread: true },
+    { id: 'four', title: 'tests', status: 'idle' },
+    { id: 'five', title: 'release', status: 'idle' },
+    { id: 'six', title: 'metrics', status: 'idle' },
+    { id: 'seven', title: 'cleanup', status: 'idle' },
+  ];
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1200px;position:absolute;top:0;left:0';
+  document.body.appendChild(host);
+
+  const root = createRoot(host);
+  let selected = '';
+  const render = (shown: typeof tabs): void => root.render(
+    React.createElement(TabBar, {
+      tabs: shown,
+      activeId: 'one',
+      onSelect: (id: string) => { selected = id; },
+      ariaLabel: 'Overflow sessions',
+    } as never),
+  );
+
+  render(tabs);
+  await wait(150);
+  check(
+    'the all-tabs control stays out of a tab strip that fits',
+    !host.querySelector('[aria-label="All open tabs"]'),
+    'wide strip',
+  );
+
+  host.style.width = '420px';
+  // Headless Chrome's virtual-time mode does not deliver ResizeObserver
+  // notifications for this synthetic host resize. A real viewport resize also
+  // emits this event, and the component keeps it as a fallback to the observer.
+  window.dispatchEvent(new Event('resize'));
+  await wait(150);
+  const strip = host.querySelector('[role="tablist"][aria-label="Overflow sessions"]') as HTMLElement;
+  const trigger = host.querySelector('[aria-label="All open tabs"]') as HTMLButtonElement | null;
+  check(
+    'an overflowing tab strip offers a list of every open tab',
+    Boolean(trigger),
+    trigger ? 'control shown' : `content ${strip?.scrollWidth}px in ${strip?.clientWidth}px`,
+  );
+
+  const stripStyles = window.getComputedStyle(strip);
+  // Chromium canonicalises `pan-x pan-y pinch-zoom` to its equivalent keyword,
+  // `manipulation`; other engines may preserve the three explicit tokens.
+  const allowsPanAndZoom = (touchAction: string): boolean => {
+    const values = touchAction.split(/\s+/);
+    return touchAction === 'manipulation'
+      || (values.includes('pan-x') && values.includes('pan-y') && values.includes('pinch-zoom'));
+  };
+  const bodyTouchAction = window.getComputedStyle(document.body).touchAction;
+  check(
+    'an overflowing tab strip accepts native horizontal touch swipes',
+    stripStyles.overflowX === 'auto'
+      && allowsPanAndZoom(stripStyles.touchAction)
+      && allowsPanAndZoom(bodyTouchAction)
+      && stripStyles.overscrollBehaviorX === 'contain',
+    `overflow=${stripStyles.overflowX} touch=${stripStyles.touchAction} body-touch=${bodyTouchAction} overscroll=${stripStyles.overscrollBehaviorX}`,
+  );
+
+  // A component can advertise native panning correctly and still have an
+  // ancestor cancel the gesture. The app-wide pull-to-refresh guard used to do
+  // exactly that whenever a mostly-horizontal finger drifted slightly down.
+  const touchEventAt = (
+    type: 'touchstart' | 'touchmove',
+    ...points: Array<[number, number]>
+  ): TouchEvent => {
+    const event = new Event(type, { bubbles: true, cancelable: true }) as TouchEvent;
+    Object.defineProperty(event, 'touches', {
+      value: points.map(([clientX, clientY], identifier) => ({ clientX, clientY, identifier })),
+    });
+    return event;
+  };
+  const removePullGuard = disablePullToRefresh();
+  strip.dispatchEvent(touchEventAt('touchstart', [300, 30]));
+  const jitter = touchEventAt('touchmove', [299, 32]);
+  strip.dispatchEvent(jitter);
+  const swipe = touchEventAt('touchmove', [180, 34]);
+  strip.dispatchEvent(swipe);
+  check(
+    'the pull-to-refresh guard leaves a horizontal tab swipe native after finger jitter',
+    !jitter.defaultPrevented && !swipe.defaultPrevented,
+    `jitter=${jitter.defaultPrevented} swipe=${swipe.defaultPrevented}`,
+  );
+
+  strip.dispatchEvent(touchEventAt('touchstart', [260, 40], [160, 40]));
+  const pinch = touchEventAt('touchmove', [280, 48], [140, 32]);
+  strip.dispatchEvent(pinch);
+  check(
+    'the pull-to-refresh guard leaves pinch zoom native over the tab strip',
+    !pinch.defaultPrevented,
+    `prevented=${pinch.defaultPrevented}`,
+  );
+
+  strip.dispatchEvent(touchEventAt('touchstart', [200, 30]));
+  strip.dispatchEvent(touchEventAt('touchmove', [201, 33]));
+  const downwardPull = touchEventAt('touchmove', [202, 52]);
+  strip.dispatchEvent(downwardPull);
+  check(
+    'the gesture guard still blocks a deliberate downward pull at the page top',
+    downwardPull.defaultPrevented,
+    `prevented=${downwardPull.defaultPrevented}`,
+  );
+  removePullGuard();
+
+  const textEntry = document.createElement('textarea');
+  document.body.appendChild(textEntry);
+  textEntry.focus();
+  const layoutHeight = window.innerHeight;
+  const pinchInset = visualViewportKeyboardInset(
+    { height: layoutHeight / 2, scale: 2 },
+    layoutHeight,
+    textEntry,
+  );
+  const keyboardInset = visualViewportKeyboardInset(
+    { height: layoutHeight - 300, scale: 1 },
+    layoutHeight,
+    textEntry,
+  );
+  check(
+    'pinch zoom is not mistaken for a software keyboard by mobile chrome or chat',
+    pinchInset === 0 && keyboardInset === 300,
+    `pinch=${pinchInset}px keyboard=${keyboardInset}px`,
+  );
+  textEntry.remove();
+
+  strip.scrollLeft = 0;
+  const vertical = new WheelEvent('wheel', { deltaY: 120, cancelable: true, bubbles: true });
+  strip.dispatchEvent(vertical);
+  check(
+    'a vertical mouse wheel moves an overflowing tab strip sideways',
+    strip.scrollLeft > 0 && vertical.defaultPrevented,
+    `left=${strip.scrollLeft} prevented=${vertical.defaultPrevented}`,
+  );
+
+  const horizontal = new WheelEvent('wheel', {
+    deltaX: 40,
+    deltaY: 2,
+    cancelable: true,
+    bubbles: true,
+  });
+  strip.dispatchEvent(horizontal);
+  check(
+    'horizontal trackpad input keeps its native scrolling path',
+    !horizontal.defaultPrevented,
+    `prevented=${horizontal.defaultPrevented}`,
+  );
+
+  trigger?.click();
+  await wait(80);
+  const menu = host.querySelector('[role="menu"][aria-label="Open tabs"]') as HTMLElement | null;
+  const rows = Array.from(menu?.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]') || []);
+  check(
+    'the overflow chooser lists every open tab in strip order',
+    rows.length === tabs.length && rows.map((row) => row.textContent?.trim()).join('|').includes('gateway|deploy'),
+    `${rows.length} rows`,
+  );
+  check(
+    'the overflow chooser carries waiting and completed cues',
+    Boolean(menu?.querySelector('[aria-label="Waiting for approval"]'))
+      && Boolean(menu?.querySelector('[aria-label="Completed"]')),
+    menu?.textContent || 'no menu',
+  );
+
+  rows[4]?.click();
+  await wait(40);
+  check(
+    'choosing from the all-tabs list selects that tab and closes the list',
+    selected === 'five' && !host.querySelector('[role="menu"][aria-label="Open tabs"]'),
+    `selected=${selected}`,
+  );
+
+  (host.querySelector('[aria-label="All open tabs"]') as HTMLButtonElement | null)?.click();
+  await wait(80);
+  const reopenedTrigger = host.querySelector('[aria-label="All open tabs"]') as HTMLButtonElement | null;
+  const activeRow = host.querySelector('[role="menuitemradio"][aria-checked="true"]');
+  check(
+    'the all-tabs menu puts keyboard focus on the current tab',
+    document.activeElement === activeRow,
+    document.activeElement ? describe(document.activeElement) : 'no focus',
+  );
+  window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  await wait(40);
+  check(
+    'Escape closes the all-tabs menu and returns focus to its button',
+    !host.querySelector('[role="menu"][aria-label="Open tabs"]') && document.activeElement === reopenedTrigger,
+    document.activeElement ? describe(document.activeElement) : 'no focus',
+  );
+
+  reopenedTrigger?.click();
+  await wait(40);
+  document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+  await wait(40);
+  check(
+    'a click outside closes the all-tabs menu',
+    !host.querySelector('[role="menu"][aria-label="Open tabs"]'),
+    'outside click',
+  );
+
+  render(tabs.slice(0, 2));
+  await wait(150);
+  check(
+    'the all-tabs control disappears as soon as the remaining tabs fit',
+    !host.querySelector('[aria-label="All open tabs"]'),
+    'two tabs remain',
+  );
+
+  root.unmount();
+  host.remove();
 }
 
 /** The floating menu with its own button already pressed. */
@@ -5844,6 +7594,7 @@ async function checkTheCommandMenuIsFullBeforeTheFirstMessage(): Promise<void> {
 async function checkTheFileEditorShowsTheFile(): Promise<void> {
   const lines = Array.from({ length: 200 }, (_, i) => `line-${i + 1} const value${i + 1} = ${i + 1};`);
   const text = lines.join('\n');
+  const initialLine = 150;
 
   const host = document.createElement('div');
   // Stacked above whatever earlier checks left on the page — the terminal from
@@ -5859,6 +7610,7 @@ async function checkTheFileEditorShowsTheFile(): Promise<void> {
       path: '/tmp/browser-check/sample.ts',
       language: 'ts',
       ariaLabel: 'Contents of sample.ts',
+      initialLine,
     } as never),
   );
 
@@ -5887,6 +7639,18 @@ async function checkTheFileEditorShowsTheFile(): Promise<void> {
 
   const rendered = onScreen();
   check('it renders the file, not an empty frame', rendered.length > 5, `${rendered.length} lines`);
+  check(
+    'a requested source line is revealed when Monaco opens',
+    rendered.some((line) => line.text === lines[initialLine - 1]),
+    rendered.slice(0, 4).map((line) => line.text.split(' ')[0]).join(','),
+  );
+
+  const activeLine = host.querySelector('.line-numbers.active-line-number') as HTMLElement | null;
+  check(
+    'and the cursor is placed on that source line',
+    activeLine?.textContent?.trim() === String(initialLine),
+    activeLine?.textContent?.trim() || 'no active line number',
+  );
 
   // The heart of the report. Every rendered line must be the line the file has
   // at that position — so a window that is complete but shuffled fails here.
@@ -6079,6 +7843,203 @@ async function checkAReadOnlyFileStaysReadOnly(): Promise<void> {
 
   root.unmount();
   host.remove();
+}
+
+/**
+ * An absolute source link in an agent reply stays inside the application.
+ *
+ * This is deliberately end-to-end through ChatView: the regression was a real
+ * anchor asking Express for `/home/.../registry.ts:228`, so unit-testing the
+ * parser or the editor alone cannot prove the browser navigation was stopped,
+ * the line suffix was removed from the file request, and Monaco received it.
+ */
+async function checkAChatFileLinkOpensAtItsSourceLine(): Promise<void> {
+  const workingDir = '/home/dev/projects/webcli';
+  const filePath = `${workingDir}/src/server/chat/registry.ts`;
+  const plainFilePath = `${workingDir}/README.md`;
+  const initialLine = 150;
+  const lines = Array.from({ length: 220 }, (_, i) => `registry-line-${i + 1} const entry${i + 1} = ${i + 1};`);
+  const content = lines.join('\n');
+
+  const controller = new ChatController('file-link-check', { send: () => {} });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'file-link-check',
+    snapshot: {
+      sessionId: 'file-link-check',
+      runtime: 'claude',
+      state: 'idle',
+      capabilities: {
+        streaming: true, thinking: true, toolCalls: true, diffs: true, permissions: true,
+        interrupt: true, resume: true, fork: false, attachments: true, usage: true,
+        cost: true, plan: true,
+      },
+      messages: [
+        {
+          id: 'u1', seq: 1, turnId: 't1', role: 'user', ts: 1,
+          blocks: [{ kind: 'text', text: 'Where is the registry entry?' }],
+        },
+        {
+          id: 'a1', seq: 2, turnId: 't1', role: 'assistant', ts: 2,
+          blocks: [{
+            kind: 'text',
+            text: `Open [registry.ts:${initialLine}](${filePath}:${initialLine}) or [README](${plainFilePath}). Keep [the website](https://example.com) external.`,
+          }],
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+
+  const requested: string[] = [];
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const raw = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+    const url = new URL(raw, window.location.href);
+    if (url.pathname.includes('/api/workspace/') && url.pathname.endsWith('/file')) {
+      const requestedPath = url.searchParams.get('path') || '';
+      requested.push(requestedPath);
+      const markdown = requestedPath === plainFilePath;
+      const body = markdown ? '# Project\n\nOpened in the normal preview.' : content;
+      return new Response(
+        JSON.stringify({
+          path: requestedPath,
+          name: markdown ? 'README.md' : 'registry.ts',
+          relativePath: markdown ? 'README.md' : 'src/server/chat/registry.ts',
+          size: body.length,
+          mtimeMs: 1,
+          language: markdown ? 'markdown' : 'typescript',
+          content: body,
+          binary: false,
+          tooLarge: false,
+          writable: false,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    return realFetch.call(window, input as RequestInfo, init);
+  }) as typeof window.fetch;
+
+  const host = document.createElement('div');
+  host.style.cssText = 'width:1100px;height:720px;position:absolute;top:0;left:0;display:flex;z-index:9999';
+  document.body.appendChild(host);
+  const root = createRoot(host);
+
+  try {
+    root.render(
+      React.createElement(ChatView, {
+        controller,
+        runtime: 'claude',
+        runtimeLabel: 'Claude Code',
+        workingDir,
+        view: { ...DEFAULT_CHAT_VIEW, panelOpen: false },
+        onViewChange: () => {},
+      } as never),
+    );
+    await wait(300);
+
+    const link = Array.from(host.querySelectorAll('a')).find(
+      (anchor) =>
+        anchor.dataset.workspaceFilePath === filePath
+        && anchor.dataset.workspaceFileLine === String(initialLine),
+    ) as HTMLAnchorElement | undefined;
+    check('an absolute source reference is rendered as a chat link', Boolean(link));
+    if (!link) return;
+
+    check(
+      'workspace links advertise a dialog instead of a new browser tab',
+      link.getAttribute('aria-haspopup') === 'dialog'
+        && link.getAttribute('target') === null
+        && link.getAttribute('href')?.startsWith('#workspace-file='),
+      link.outerHTML,
+    );
+    const external = Array.from(host.querySelectorAll('a')).find(
+      (anchor) => anchor.getAttribute('href') === 'https://example.com',
+    );
+    check(
+      'ordinary web links retain their external-link semantics',
+      external?.getAttribute('target') === '_blank'
+        && external.getAttribute('aria-haspopup') === null,
+      external?.outerHTML || 'no external link',
+    );
+
+    const middleClick = new MouseEvent('auxclick', {
+      bubbles: true,
+      cancelable: true,
+      button: 1,
+    });
+    link.dispatchEvent(middleClick);
+    check('middle-click cannot bypass workspace routing', middleClick.defaultPrevented);
+
+    const click = new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 });
+    link.dispatchEvent(click);
+    check('clicking the source reference stops browser navigation', click.defaultPrevented);
+
+    let ready = false;
+    for (let i = 0; i < 120 && !ready; i++) {
+      await wait(100);
+      ready = host.querySelector('[role="dialog"] [data-monaco-host="ready"]') !== null;
+    }
+
+    check(
+      'the file request removes the source-line suffix',
+      requested.length === 1 && requested[0] === filePath,
+      JSON.stringify(requested),
+    );
+    const dialog = host.querySelector('[role="dialog"]') as HTMLElement | null;
+    check(
+      'the existing file popup opens the referenced file while the workspace rail is closed',
+      Boolean(dialog) && (dialog?.textContent || '').includes('registry.ts'),
+      dialog ? (dialog.textContent || '').slice(0, 120) : 'no dialog',
+    );
+    check('that popup reaches the real Monaco editor', ready);
+
+    // Give Monaco a frame after creation to paint the model window around the
+    // cursor. The host's ready marker is set synchronously with editor.create.
+    await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    await wait(200);
+    const shown = Array.from(dialog?.querySelectorAll('.view-line') || [])
+      .map((node) => (node.textContent || '').replace(/ /g, ' ').trimEnd());
+    const active = dialog?.querySelector('.line-numbers.active-line-number') as HTMLElement | null;
+    check(
+      'the linked source line is visible in Monaco',
+      shown.includes(lines[initialLine - 1]),
+      shown.slice(0, 5).map((line) => line.split(' ')[0]).join(','),
+    );
+    check(
+      'and Monaco puts its cursor on that exact line',
+      active?.textContent?.trim() === String(initialLine),
+      active?.textContent?.trim() || 'no active line',
+    );
+
+    const close = Array.from(dialog?.querySelectorAll('button') || [])
+      .find((button) => button.textContent?.trim() === 'Close') as HTMLButtonElement | undefined;
+    close?.click();
+    await wait(150);
+
+    const plainLink = Array.from(host.querySelectorAll('a')).find(
+      (anchor) => anchor.dataset.workspaceFilePath === plainFilePath,
+    ) as HTMLAnchorElement | undefined;
+    plainLink?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 }));
+    for (let i = 0; i < 30 && requested.length < 2; i++) await wait(50);
+    const plainDialog = host.querySelector('[role="dialog"]') as HTMLElement | null;
+    check(
+      'a file link with no line opens through the same popup',
+      requested[1] === plainFilePath && Boolean(plainDialog),
+      JSON.stringify(requested),
+    );
+    check(
+      'and keeps the file editor’s normal preview behaviour',
+      (plainDialog?.textContent || '').includes('Opened in the normal preview.')
+        && plainDialog?.querySelector('[data-monaco-host]') === null,
+      (plainDialog?.textContent || '').slice(0, 120),
+    );
+  } finally {
+    root.unmount();
+    host.remove();
+    window.fetch = realFetch;
+  }
 }
 
 /**
@@ -11370,8 +13331,8 @@ function setInputValue(field: HTMLInputElement, value: string): void {
  * be refused, and on iOS outside an installed app it is not even offered, so
  * the marks inside the product are the only thing some people will ever get.
  *
- * It cannot be a unit test. Every claim here is about paint — that the waiting
- * dot resolves to a different colour from the unread dot, and that the phone
+ * It cannot be a unit test. Every claim here is about paint — that each state
+ * icon resolves to its own colour and motion, and that the phone
  * sheet, which is the *only* cross-session surface on a phone because the tab
  * strip is not rendered there at all, actually draws the words at a size an eye
  * can read. Without the app's own stylesheets every `var(--warning)` resolves
@@ -11396,6 +13357,7 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
         { id: 'asked', title: 'docs', status: 'running', unread: true, attention: 'question' },
         { id: 'unread', title: 'webcli', status: 'idle', unread: true },
         { id: 'quiet', title: 'notes', status: 'running' },
+        { id: 'failed', title: 'deploy', status: 'error' },
       ],
       activeId: 'quiet',
       onSelect: () => {},
@@ -11408,13 +13370,19 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
 
   const strip = host.querySelector('[role="tablist"][aria-label="Sessions"]') as HTMLElement;
   const tabs = Array.from(strip.querySelectorAll<HTMLElement>('[role="tab"]'));
-  const dotOf = (tab: HTMLElement): HTMLElement => tab.firstElementChild as HTMLElement;
-  const colourOf = (tab: HTMLElement): string => getComputedStyle(dotOf(tab)).backgroundColor;
+  const stateOf = (tab: HTMLElement): HTMLElement => (
+    tab.querySelector('[data-tab-state]') as HTMLElement
+  );
+  const glyphOf = (tab: HTMLElement): HTMLElement => (
+    stateOf(tab).querySelector('.ricon') as HTMLElement
+  );
+  const colourOf = (tab: HTMLElement): string => getComputedStyle(stateOf(tab)).color;
 
   const waiting = colourOf(tabs[0]);
   const asked = colourOf(tabs[1]);
   const unread = colourOf(tabs[2]);
   const quiet = colourOf(tabs[3]);
+  const failed = colourOf(tabs[4]);
 
   check(
     'a conversation waiting for approval is not painted as ordinary unread output',
@@ -11432,17 +13400,34 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
     `approval=${waiting} question=${asked} running=${quiet}`,
   );
   check(
-    'and nothing pulses while it waits',
-    getComputedStyle(dotOf(tabs[0])).animationName === 'none'
-      && getComputedStyle(dotOf(tabs[3])).animationName !== 'none',
-    `waiting=${getComputedStyle(dotOf(tabs[0])).animationName} running=${getComputedStyle(dotOf(tabs[3])).animationName}`,
+    'success and failure have distinct semantic colours',
+    unread !== quiet && failed !== unread && failed !== waiting && /rgb/.test(failed),
+    `success=${unread} error=${failed} working=${quiet}`,
   );
   check(
-    'and the waiting dot says so in words, not only in colour',
-    dotOf(tabs[0]).getAttribute('aria-label') === 'Waiting for approval'
-      && dotOf(tabs[1]).getAttribute('aria-label') === 'Asked you a question'
-      && dotOf(tabs[2]).getAttribute('aria-label') === null,
-    `${dotOf(tabs[0]).getAttribute('aria-label')} / ${dotOf(tabs[1]).getAttribute('aria-label')}`,
+    'only the working icon spins',
+    getComputedStyle(glyphOf(tabs[0])).animationName === 'none'
+      && getComputedStyle(glyphOf(tabs[3])).animationName === 'relay-spin',
+    `waiting=${getComputedStyle(glyphOf(tabs[0])).animationName} working=${getComputedStyle(glyphOf(tabs[3])).animationName}`,
+  );
+  check(
+    'each state uses the corresponding icon rather than a generic dot',
+    tabs.every((tab) => Boolean(glyphOf(tab).querySelector('svg')))
+      && stateOf(tabs[0]).dataset.tabState === 'waiting-approval'
+      && stateOf(tabs[1]).dataset.tabState === 'waiting-input'
+      && stateOf(tabs[2]).dataset.tabState === 'success'
+      && stateOf(tabs[3]).dataset.tabState === 'working'
+      && stateOf(tabs[4]).dataset.tabState === 'error',
+    tabs.map((tab) => stateOf(tab).dataset.tabState).join(' / '),
+  );
+  check(
+    'and every state says so in words, not only in colour',
+    stateOf(tabs[0]).getAttribute('aria-label') === 'Waiting for approval'
+      && stateOf(tabs[1]).getAttribute('aria-label') === 'Waiting for input'
+      && stateOf(tabs[2]).getAttribute('aria-label') === 'Completed'
+      && stateOf(tabs[3]).getAttribute('aria-label') === 'Working'
+      && stateOf(tabs[4]).getAttribute('aria-label') === 'Error',
+    tabs.map((tab) => stateOf(tab).getAttribute('aria-label')).join(' / '),
   );
 
   root.unmount();
@@ -11474,6 +13459,8 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
         tabs: [
           { id: 'waiting', title: 'infra', status: 'running', unread: true, attention: 'approval', workingDir: '/srv/infra' },
           { id: 'quiet', title: 'notes', status: 'running', unread: false, attention: null, workingDir: '/srv/notes' },
+          { id: 'complete', title: 'tests', status: 'idle', unread: true, attention: null, workingDir: '/srv/tests' },
+          { id: 'failed', title: 'deploy', status: 'error', unread: false, attention: null, workingDir: '/srv/deploy' },
         ],
         activeId: 'quiet',
         onSelect: () => {},
@@ -11498,7 +13485,680 @@ async function checkAWaitingConversationIsVisibleWithoutOpeningIt(): Promise<voi
     Boolean(said) && (said as { size: number }).size >= PHONE_MIN_TEXT,
     said ? `${said.size}px, floor ${PHONE_MIN_TEXT}px` : 'not drawn',
   );
+  const phoneStates = Array.from(doc.querySelectorAll<HTMLElement>('[data-tab-state]'))
+    .map((node) => node.dataset.tabState);
+  check(
+    'the phone session sheet uses the same state icons as the desktop strip',
+    ['waiting-approval', 'working', 'success', 'error']
+      .every((state) => phoneStates.includes(state)),
+    phoneStates.join(' / '),
+  );
 
   sheetRoot.unmount();
   frame.remove();
+}
+
+/**
+ * The environment size picker, rendered rather than reasoned about.
+ *
+ * Three states this dialog has that a screenshot of the happy path would not
+ * reach, and all three have been wrong in a settings dialog before: the size a
+ * user *chose* differing from the size their environment is *running at* (which
+ * is the normal state under automatic sizing), a change that is waiting for
+ * them to be idle, and a server where the whole feature is off. A picker that
+ * silently shows the wrong current size is the kind of thing people file bugs
+ * about.
+ */
+async function checkTheEnvironmentSizePickerIsUsable(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'position:absolute;top:0;left:0;width:900px;height:700px';
+  document.body.appendChild(host);
+
+  const tiers = [
+    { id: 'small', label: 'Small', cpus: '1', memory: '1g' },
+    { id: 'medium', label: 'Medium', cpus: '2', memory: '2g' },
+    { id: 'large', label: 'Large', cpus: '4', memory: '4g' },
+  ];
+
+  const applied: string[] = [];
+  const root = createRoot(host);
+
+  // 1. Automatic chosen, and the environment currently a size that is not the
+  //    default — exactly what automatic sizing produces.
+  root.render(
+    React.createElement(EnvironmentDialog, {
+      open: true,
+      info: {
+        enabled: true,
+        canChoose: true,
+        tiers,
+        defaultTier: 'medium',
+        tier: 'auto',
+        appliedTier: 'large',
+        intendedTier: 'large',
+        pendingTier: null,
+        running: true,
+      },
+      error: null,
+      busy: false,
+      notice: null,
+      onApply: (tier: string) => applied.push(tier),
+      onClose: () => {},
+    } as never),
+  );
+  await wait(200);
+
+  const select = document.querySelector('select[aria-label="Environment size"]') as HTMLSelectElement | null;
+  check('the size picker renders a select', !!select, select ? 'present' : 'missing');
+  if (!select) {
+    root.unmount();
+    host.remove();
+    return;
+  }
+
+  check(
+    'every configured size is offered, plus automatic',
+    select.options.length === tiers.length + 1,
+    Array.from(select.options).map((o) => o.value).join(','),
+  );
+  check(
+    'the picker shows what the user chose, not the default',
+    select.value === 'auto',
+    `value=${select.value}`,
+  );
+
+  // The distinction the whole panel exists for: chosen 'auto', running 'Large'.
+  // Scoped to the row rather than the dialog: every tier label also appears in
+  // the select's own options, so a dialog-wide search would pass on a panel
+  // that never showed the running size at all.
+  const runningRow = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"] *'))
+    .find((node) => /^Running at/.test(node.innerText || ''));
+  const runningText = runningRow?.innerText || '';
+  check(
+    'it also says what the environment is actually running at',
+    /Large/.test(runningText) && /4 cores/.test(runningText),
+    runningText.replace(/\s+/g, ' ').slice(0, 160) || 'no "Running at" row',
+  );
+  check(
+    'and does not claim it is running the size that was merely chosen',
+    !/\bSmall\b/.test(runningText),
+    runningText.replace(/\s+/g, ' ').slice(0, 160),
+  );
+
+  // Applying sends the selected id, not the running one.
+  select.value = 'small';
+  select.dispatchEvent(new Event('change', { bubbles: true }));
+  await wait(60);
+  const apply = Array.from(document.querySelectorAll('button')).find(
+    (button) => button.textContent?.includes('Apply size'),
+  ) as HTMLButtonElement | undefined;
+  check('there is an apply button', !!apply, apply ? apply.textContent || '' : 'missing');
+  apply?.click();
+  await wait(60);
+  check(
+    'applying sends the size the user picked',
+    applied.length === 1 && applied[0] === 'small',
+    JSON.stringify(applied),
+  );
+
+  // 2. A change waiting for the user to be idle has to be visible, or the
+  //    picker looks like it silently ignored them.
+  root.render(
+    React.createElement(EnvironmentDialog, {
+      open: true,
+      info: {
+        enabled: true, canChoose: true, tiers, defaultTier: 'medium',
+        tier: 'small', appliedTier: 'large', intendedTier: 'small',
+        pendingTier: 'small', running: true,
+      },
+      error: null, busy: false, notice: 'Saved.',
+      onApply: () => {}, onClose: () => {},
+    } as never),
+  );
+  await wait(200);
+
+  const waitingText = (document.querySelector('[role="dialog"]') as HTMLElement | null)?.innerText || '';
+  check(
+    'a size change that is waiting says so',
+    /waiting/i.test(waitingText),
+    waitingText.replace(/\s+/g, ' ').slice(0, 200),
+  );
+
+  // 3. Nothing offered on a server that has no environments, and no dead
+  //    control left enabled.
+  root.render(
+    React.createElement(EnvironmentDialog, {
+      open: true,
+      info: { enabled: false },
+      error: null, busy: false, notice: null,
+      onApply: () => {}, onClose: () => {},
+    } as never),
+  );
+  await wait(200);
+
+  check(
+    'a server without environments offers no size control',
+    !document.querySelector('select[aria-label="Environment size"]'),
+    'select absent',
+  );
+  const disabledApply = Array.from(document.querySelectorAll('button')).find(
+    (button) => button.textContent?.includes('Apply size'),
+  ) as HTMLButtonElement | undefined;
+  check(
+    'and its apply button cannot be pressed',
+    !disabledApply || disabledApply.disabled,
+    disabledApply ? `disabled=${disabledApply.disabled}` : 'no button',
+  );
+
+  // The dialog must still fit the window with every row on screen.
+  const panel = document.querySelector('[role="dialog"]') as HTMLElement | null;
+  if (panel) {
+    const box = panel.getBoundingClientRect();
+    check(
+      'the environment dialog fits on screen',
+      box.top >= 0 && box.bottom <= window.innerHeight,
+      `top=${Math.round(box.top)} bottom=${Math.round(box.bottom)} of ${window.innerHeight}`,
+    );
+  }
+
+  root.unmount();
+  host.remove();
+}
+
+/** Retrying the recorded prompt must restore its hidden app-owned workflow. */
+async function checkARetriedGuidedIssueKeepsItsWorkflow(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'position:absolute;top:0;left:0;width:960px;height:680px;display:flex';
+  document.body.appendChild(host);
+
+  const sent: Array<Record<string, unknown>> = [];
+  let controller!: ChatController;
+  controller = new ChatController('guided-retry-check', {
+    send: (message) => {
+      sent.push(message as Record<string, unknown>);
+      if (message.type !== 'chat_start_builtin_workflow') return;
+      queueMicrotask(() => controller.handle({
+        type: 'chat_builtin_workflow_result',
+        sessionId: 'guided-retry-check',
+        requestId: message.requestId,
+        workflow: 'gh-issue',
+        accepted: true,
+        status: 'accepted',
+        message: 'Started.',
+      }));
+    },
+  });
+  controller.handle({
+    type: 'chat_snapshot',
+    sessionId: 'guided-retry-check',
+    snapshot: {
+      sessionId: 'guided-retry-check', runtime: 'claude', state: 'idle',
+      capabilities: {},
+      messages: [
+        {
+          id: 'user-guided-retry', seq: 1, turnId: 'turn-guided-retry', role: 'user', ts: Date.now(),
+          workflow: 'gh-issue', blocks: [{ kind: 'text', text: 'The issue prompt to retry.' }],
+        },
+        {
+          id: 'assistant-guided-retry', seq: 2, turnId: 'turn-guided-retry', role: 'assistant', ts: Date.now(),
+          blocks: [{ kind: 'text', text: 'Let us specify it.' }],
+        },
+      ],
+      pendingPermissions: [], queued: [], firstSeq: 1, replayFrom: 1, cursor: 2,
+      live: true, bypassPermissions: false,
+    },
+  } as never);
+  sent.length = 0;
+
+  const root = createRoot(host);
+  try {
+    root.render(React.createElement(ChatView, {
+      controller,
+      runtime: 'claude',
+      runtimeLabel: 'Claude Code',
+      workingDir: '/home/dev/project',
+      branch: 'main',
+      view: { ...DEFAULT_CHAT_VIEW },
+      onViewChange: () => {},
+    } as never));
+    await wait(300);
+    settle(document);
+
+    const retry = host.querySelector<HTMLButtonElement>('[aria-label="Retry this turn"]');
+    retry?.click();
+    await wait(40);
+    const workflowStart = sent.find((message) => message.type === 'chat_start_builtin_workflow');
+    check(
+      'retrying a guided issue restores its workflow instead of sending ordinary chat',
+      Boolean(
+        workflowStart
+        && workflowStart.workflow === 'gh-issue'
+        && workflowStart.text === 'The issue prompt to retry.'
+        && !sent.some((message) => message.type === 'chat_send'),
+      ),
+      JSON.stringify(sent),
+    );
+  } finally {
+    root.unmount();
+    controller.dispose();
+    host.remove();
+  }
+}
+
+/**
+ * What the GitHub panel says beyond a title.
+ *
+ * The panel used to answer "what is open" and nothing else, which is the least
+ * of what a person opens it for: whether anyone has picked an issue up, which
+ * pull request is going to close it, whether it is one part of something
+ * larger. Those facts are now on the row and in the reader, and they are
+ * exactly the sort of thing static markup cannot check — the rows are drawn
+ * from a fetch, and a 320px rail is where three extra facts per row either fit
+ * or push the panel sideways.
+ *
+ * The reader is driven the way a person drives it: open an issue, follow the
+ * pull request that closes it, come back. Following a reference replaces what
+ * is on screen, and a reader that cannot get back to where it came from is a
+ * worse panel than one that never linked at all.
+ */
+async function checkTheGitHubPanelSaysWhoIsOnItAndWhatItLinksTo(): Promise<void> {
+  const REPO = 'dnviti/code-agents-webcli';
+  const link = (kind: 'issue' | 'pr', number: number, extra: Record<string, unknown> = {}) => ({
+    kind,
+    number,
+    url: `https://github.com/${REPO}/${kind === 'pr' ? 'pull' : 'issues'}/${number}`,
+    repo: REPO,
+    ...extra,
+  });
+
+  // The shape the route now serves: normalised, with every empty field absent.
+  const ISSUE = {
+    number: 134,
+    title: 'Approval mode is not applied consistently',
+    url: `https://github.com/${REPO}/issues/134`,
+    state: 'OPEN',
+    author: { login: 'dnviti' },
+    assignees: [{ login: 'ada' }],
+    labels: [{ name: 'bug' }],
+    milestone: '6.0.0',
+    parent: link('issue', 100, { title: 'Approvals, end to end', state: 'OPEN', relation: 'parent' }),
+    childrenTotal: 2,
+    childrenDone: 1,
+    blockedBy: [
+      link('issue', 77, { title: 'Decide the default', state: 'OPEN', relation: 'blocked-by' }),
+      // Closed this morning, and GitHub keeps the dependency. The row must stop
+      // saying "blocked" about it, or ready work gets skipped forever.
+      link('issue', 78, { title: 'Already settled', state: 'CLOSED', relation: 'blocked-by' }),
+    ],
+    references: [
+      link('pr', 151, { title: 'fix: approval mode', state: 'OPEN', relation: 'closed-by' }),
+      // Somewhere else entirely, where the number alone names the wrong thing.
+      {
+        kind: 'issue' as const,
+        number: 5,
+        url: 'https://github.com/another-organisation/a-rather-long-repository-name/issues/5',
+        repo: 'another-organisation/a-rather-long-repository-name',
+        title: 'The upstream bug this waits on',
+        state: 'OPEN',
+        relation: 'mentions' as const,
+      },
+    ],
+  };
+  const PULL = {
+    number: 151,
+    title: 'fix: approval mode',
+    url: `https://github.com/${REPO}/pull/151`,
+    state: 'OPEN',
+    isDraft: false,
+    author: { login: 'dnviti' },
+    assignees: [{ login: 'grace' }],
+    headRefName: 'fix/approval',
+    baseRefName: 'main',
+    reviewDecision: 'APPROVED',
+    checks: { total: 4, passed: 3, failed: 0, pending: 1, state: 'pending' },
+    references: [link('issue', 134, { title: 'Approval mode is not applied consistently', state: 'OPEN', relation: 'closes' })],
+  };
+
+  // Flipped for the last pass: what the panel says when `gh` refused to list.
+  let listRefused = false;
+  let issueStarts = 0;
+  let issuePrompt = '';
+  const issueRequestIds: string[] = [];
+  let refuseIssue = false;
+  const startIssue = async (prompt: string, requestId: string): Promise<void> => {
+    issueStarts += 1;
+    issuePrompt = prompt;
+    issueRequestIds.push(requestId);
+    if (refuseIssue) throw new Error('The queue is full; try again after a message runs.');
+  };
+  let setHarnessPlanMode: React.Dispatch<React.SetStateAction<boolean>> = () => undefined;
+  function GitHubIssueHarness(): React.JSX.Element {
+    const [prompt, setPrompt] = React.useState('');
+    const [planMode, setPlanMode] = React.useState(false);
+    setHarnessPlanMode = setPlanMode;
+    return React.createElement(GitHubPanel, {
+      sessionId: 's1', planMode, issuePrompt: prompt, issueRequestId: 'browser-guided-issue',
+      onIssuePromptChange: setPrompt, onStartIssue: startIssue,
+    });
+  }
+
+  const realFetch = window.fetch;
+  window.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+    const json = (value: unknown) =>
+      new Response(JSON.stringify(value), { status: 200, headers: { 'content-type': 'application/json' } });
+
+    if (url.includes('/github/issue/134')) {
+      return json({
+        kind: 'issue',
+        item: {
+          ...ISSUE,
+          kind: 'issue',
+          body: 'Three start paths disagree about the approval mode.',
+          createdAt: '2026-07-28T09:00:00Z',
+          children: [
+            link('issue', 135, { title: 'Persist the mode', state: 'CLOSED', relation: 'child' }),
+            link('issue', 136, { title: 'Say which mode is on', state: 'OPEN', relation: 'child' }),
+          ],
+          comments: [],
+        },
+      });
+    }
+    if (url.includes('/github/pr/151')) {
+      return json({ kind: 'pr', item: { ...PULL, kind: 'pr', body: 'Reads the mode from one place.', comments: [] } });
+    }
+    if (url.includes('/workspace/') && url.includes('/github')) {
+      return json(listRefused
+        ? {
+          available: true,
+          repo: { nameWithOwner: REPO },
+          prs: [PULL],
+          issues: [],
+          issuesError: 'Unknown JSON field: "subIssuesSummary"',
+        }
+        : { available: true, repo: { nameWithOwner: REPO }, prs: [PULL], issues: [ISSUE] });
+    }
+    return realFetch(input as RequestInfo);
+  }) as typeof window.fetch;
+
+  // The rail's own width, because "does it fit" is half of what is being asked.
+  const host = document.createElement('div');
+  host.style.cssText = 'position:absolute;top:0;left:0;width:320px;height:640px;'
+    + 'display:flex;flex-direction:column;overflow:hidden';
+  document.body.appendChild(host);
+  const root = createRoot(host);
+
+  try {
+    root.render(React.createElement(GitHubIssueHarness));
+    await wait(300);
+    settle(document);
+
+    const rowText = (host.innerText || '').replace(/\s+/g, ' ');
+    check(
+      'an issue row names who it is assigned to',
+      /ada/.test(rowText),
+      rowText.slice(0, 240),
+    );
+    check(
+      'an issue row says how many sub-issues are done',
+      /1\/2/.test(rowText),
+      rowText.slice(0, 240),
+    );
+    check(
+      'an issue row names the pull request that closes it',
+      /#151/.test(rowText),
+      rowText.slice(0, 240),
+    );
+    check(
+      'an issue row names what it is part of, and what blocks it',
+      /#100/.test(rowText) && /#77/.test(rowText),
+      rowText.slice(0, 240),
+    );
+    check(
+      'and stops counting a blocker that has been closed',
+      !/#78/.test(rowText),
+      rowText.slice(0, 240),
+    );
+    check(
+      'a pull request row names its assignee and its checks',
+      /grace/.test(rowText) && /3\/4/.test(rowText),
+      rowText.slice(0, 240),
+    );
+
+    // Three more facts per row is exactly how a 320px rail starts scrolling
+    // sideways. They wrap; they do not widen it.
+    check(
+      'the extra facts stay inside the rail',
+      host.scrollWidth <= host.clientWidth + 1,
+      `content ${host.scrollWidth}px in ${host.clientWidth}px`,
+    );
+
+    const createIssue = host.querySelector<HTMLButtonElement>('[aria-label^="Create GitHub issue"]');
+    createIssue?.focus();
+    createIssue?.click();
+    await wait(40);
+    settle(document);
+    let issueDialog = document.querySelector('[role="dialog"]') as HTMLElement | null;
+    let issueField = issueDialog?.querySelector<HTMLTextAreaElement>('textarea') || null;
+    check(
+      'the GitHub action opens the labelled guided-issue dialog and autofocuses its field',
+      Boolean(issueDialog && /Create GitHub issue/.test(issueDialog.innerText) && issueField && document.activeElement === issueField),
+      issueDialog?.innerText || 'no dialog',
+    );
+    check(
+      'the guided issue textarea shows a visible focus ring',
+      Boolean(issueField && getComputedStyle(issueField).boxShadow !== 'none'),
+      issueField ? getComputedStyle(issueField).boxShadow : 'no field',
+    );
+    setHarnessPlanMode(true);
+    await wait(40);
+    let startButton = Array.from(issueDialog?.querySelectorAll<HTMLButtonElement>('button') || []).find(
+      (button) => button.textContent?.trim() === 'Start',
+    );
+    check(
+      'an open guided-issue dialog follows a newly active Plan-mode gate',
+      Boolean(
+        startButton?.disabled
+        && issueDialog?.querySelector('[role="status"]')?.textContent?.includes('Turn off Plan mode'),
+      ),
+      `disabled=${startButton?.disabled} text=${issueDialog?.textContent || 'no dialog'}`,
+    );
+    setHarnessPlanMode(false);
+    await wait(40);
+    (Array.from(issueDialog?.querySelectorAll<HTMLButtonElement>('button') || []).find(
+      (button) => button.textContent?.trim() === 'Start',
+    ))?.click();
+    await wait(100);
+    settle(document);
+    check(
+      'an empty guided issue prompt stays open with an inline error',
+      issueStarts === 0
+        && Boolean(issueDialog?.querySelector('[role="alert"]')?.textContent?.includes('Describe the issue')),
+      issueDialog?.querySelector('[role="alert"]')?.textContent
+        || `invalid=${issueField?.getAttribute('aria-invalid')} text=${issueDialog?.textContent || 'no dialog'}`,
+    );
+    const setIssueField = (field: HTMLTextAreaElement | null, value: string): void => {
+      if (!field) return;
+      const descriptor = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+      descriptor?.set?.call(field, value);
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    setIssueField(issueField, 'Keep this unfinished issue brief.');
+    await wait(0);
+    (Array.from(issueDialog?.querySelectorAll<HTMLButtonElement>('button') || []).find(
+      (button) => button.textContent?.trim() === 'Cancel',
+    ))?.click();
+    await wait(40);
+    check(
+      'cancelling returns focus to the GitHub action',
+      document.activeElement === createIssue,
+      document.activeElement?.getAttribute('aria-label') || document.activeElement?.tagName || 'nothing focused',
+    );
+    createIssue?.focus();
+    createIssue?.click();
+    await wait(40);
+    issueDialog = document.querySelector('[role="dialog"]') as HTMLElement | null;
+    issueField = issueDialog?.querySelector<HTMLTextAreaElement>('textarea') || null;
+    check(
+      'a cancelled issue brief survives when the dialog is reopened',
+      issueField?.value === 'Keep this unfinished issue brief.',
+      JSON.stringify(issueField?.value || ''),
+    );
+    if (issueField) {
+      setIssueField(issueField, 'The settings page loses work\nwhen a request is queued.');
+      await wait(0);
+      refuseIssue = true;
+      (Array.from(issueDialog?.querySelectorAll<HTMLButtonElement>('button') || []).find(
+        (button) => button.textContent?.trim() === 'Start',
+      ))?.click();
+      await wait(100);
+      settle(document);
+    }
+    check(
+      'a refused issue start keeps the prompt and shows the correlated error',
+      issueStarts === 1
+        && issueField?.value.includes('\n')
+        && Boolean(issueDialog?.querySelector('[role="alert"]')?.textContent?.includes('queue is full')),
+      `${issueStarts} start(s): ${JSON.stringify(issuePrompt)} — invalid=${issueField?.getAttribute('aria-invalid')} text=${issueDialog?.textContent || 'no dialog'}`,
+    );
+    refuseIssue = false;
+    (Array.from(issueDialog?.querySelectorAll<HTMLButtonElement>('button') || []).find(
+      (button) => button.textContent?.trim() === 'Start',
+    ))?.click();
+    await wait(40);
+    check(
+      'retrying the guided issue prompt submits once and closes only after acceptance',
+      issueStarts === 2
+        && issuePrompt.includes('\n')
+        && issueRequestIds.length === 2
+        && issueRequestIds[0] === issueRequestIds[1]
+        && !document.querySelector('[role="dialog"]'),
+      `${issueStarts} start(s), ids=${JSON.stringify(issueRequestIds)}: ${JSON.stringify(issuePrompt)}`,
+    );
+    check(
+      'the GitHub issue handoff does not widen the narrow rail',
+      host.scrollWidth <= host.clientWidth + 1,
+      `content ${host.scrollWidth}px in ${host.clientWidth}px`,
+    );
+
+    // Open the issue the way a person does. Matched on the number the row
+    // opens with, not on one anywhere in it: the pull request's own row now
+    // says "#134" too, which is the point of the row and would send this check
+    // into the wrong reader.
+    const issueRow = Array.from(host.querySelectorAll<HTMLElement>('button')).find(
+      (button) => (button.innerText || '').trim().startsWith('#134'),
+    );
+    issueRow?.click();
+    await wait(300);
+    settle(document);
+
+    const dialog = document.querySelector('[role="dialog"]') as HTMLElement | null;
+    const readerText = (dialog?.innerText || '').replace(/\s+/g, ' ');
+    check(
+      'the reader says who the issue is assigned to',
+      /Assigned to/i.test(readerText) && /ada/.test(readerText),
+      readerText.slice(0, 300),
+    );
+    check(
+      'the reader names the pull request that closes it',
+      /Closed by/i.test(readerText) && /#151/.test(readerText),
+      readerText.slice(0, 300),
+    );
+    check(
+      'the reader names the issue this one is part of',
+      /Part of/i.test(readerText) && /#100/.test(readerText),
+      readerText.slice(0, 300),
+    );
+    check(
+      'the reader lists the sub-issues and what is blocking it',
+      /#135/.test(readerText) && /#136/.test(readerText) && /Blocked by/i.test(readerText),
+      readerText.slice(0, 300),
+    );
+
+    check(
+      'a reference into another repository says which repository',
+      /another-organisation\/a-rather-long-repository-name#5/.test(readerText),
+      readerText.slice(0, 400),
+    );
+
+    // The reader is a phone-width panel too, and a repository name is as long
+    // as somebody made it.
+    const links = Array.from(dialog?.querySelectorAll<HTMLElement>('button') || []).filter(
+      (button) => (button.getAttribute('title') || '').includes('#'),
+    );
+    const spilling = links.filter(
+      (row) => row.getBoundingClientRect().right > (dialog as HTMLElement).getBoundingClientRect().right + 0.5,
+    );
+    check(
+      'no reference runs out of the side of the reader',
+      spilling.length === 0,
+      spilling.length ? spilling.map((row) => String(row.getAttribute('title'))).join(' | ') : `${links.length} references`,
+    );
+
+    const bar = dialog?.querySelector('[role="progressbar"]') as HTMLElement | null;
+    check(
+      'the sub-issue progress is readable without seeing the bar',
+      bar?.getAttribute('aria-label') === '1 of 2 sub-issues done',
+      bar ? String(bar.getAttribute('aria-label')) : 'no progress bar',
+    );
+
+    // Follow the pull request out of the issue, then come back.
+    const follow = Array.from(dialog?.querySelectorAll<HTMLElement>('button') || []).find(
+      (button) => (button.getAttribute('title') || '').includes('#151'),
+    );
+    check('a reference in the reader can be followed', Boolean(follow), follow ? 'link found' : 'no link');
+    follow?.click();
+    await wait(300);
+    settle(document);
+
+    const pullText = ((document.querySelector('[role="dialog"]') as HTMLElement | null)?.innerText || '')
+      .replace(/\s+/g, ' ');
+    check(
+      'following a reference opens that pull request',
+      pullText.startsWith('#151') && /grace/.test(pullText),
+      pullText.slice(0, 300),
+    );
+    check(
+      'a followed reference can be left again',
+      Boolean(document.querySelector('[aria-label="Back"]')),
+      'back control',
+    );
+
+    (document.querySelector('[aria-label="Back"]') as HTMLElement | null)?.click();
+    await wait(300);
+    settle(document);
+    const backText = ((document.querySelector('[role="dialog"]') as HTMLElement | null)?.innerText || '')
+      .replace(/\s+/g, ' ');
+    check(
+      'and going back returns to the issue it was followed from',
+      backText.startsWith('#134') && !document.querySelector('[aria-label="Back"]'),
+      backText.slice(0, 200),
+    );
+
+    // A `gh` too old for the sub-issue fields refuses the whole command, and an
+    // empty section is indistinguishable from a repository with nothing open.
+    (document.querySelector('[aria-label="Close"], [aria-label="close"]') as HTMLElement | null)?.click();
+    listRefused = true;
+    root.render(React.createElement('div'));
+    await wait(60);
+    root.render(React.createElement(GitHubIssueHarness));
+    await wait(400);
+    settle(document);
+
+    const refusedText = (host.innerText || '').replace(/\s+/g, ' ');
+    check(
+      'a list gh refused does not read as a repository with no open issues',
+      !/No open issues/.test(refusedText) && /could not be listed/i.test(refusedText),
+      refusedText.slice(0, 300),
+    );
+    check(
+      'and the half that answered is still listed',
+      /#151/.test(refusedText) && /fix: approval mode/.test(refusedText),
+      refusedText.slice(0, 300),
+    );
+  } finally {
+    root.unmount();
+    host.remove();
+    window.fetch = realFetch;
+  }
 }

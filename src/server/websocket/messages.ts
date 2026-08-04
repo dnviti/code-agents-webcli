@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 import {
   AgentKind,
   Aliases,
@@ -11,6 +12,7 @@ import {
 import { TranscriptStoreLike } from '../services/transcript-store.js';
 import { HistoryStoreLike } from '../services/history-store.js';
 import { ScrollbackRecorder } from '../services/scrollback.js';
+import { AccountTabCoordinatorLike } from '../services/account-tab-coordinator.js';
 import {
   sendToWebSocket,
   broadcastChat,
@@ -19,10 +21,70 @@ import {
   announceSessionOpened,
 } from './handler.js';
 import { chatUnavailableReason, isChatRuntime } from '../../shared/chat-runtimes.js';
-import { ChatDraft, ChatModelDefault } from '../../shared/chat-events.js';
-import { applyDraft, clearDraft, draftOf, readDraft } from '../chat/drafts.js';
+import {
+  ChatAttachment,
+  ChatDraft,
+  ChatModelDefault,
+  ChatModelOrigin,
+  BuiltInWorkflowId,
+  MAX_BUILT_IN_WORKFLOW_PROMPT,
+  MAX_QUESTION_ANSWER_TEXT,
+  isBuiltInWorkflowId,
+} from '../../shared/chat-events.js';
+import { builtInWorkflowInstructions } from '../chat/builtin-workflows.js';
+import { LadderRung, ModelTier, ResolvedProfile } from '../../shared/runtime-profiles.js';
+
+/**
+ * The rung a *running* session is actually on, told as an origin.
+ *
+ * Null when nothing is running, or when what is running is not on a rung. The
+ * profile is only consulted for the name to put on it.
+ */
+function ladderOf(
+  manager: ChatManagerLike,
+  sessionId: string,
+  profile: ResolvedProfile | null,
+): ChatModelOrigin | null {
+  const rung = manager.ladderOf?.(sessionId);
+  if (!rung) return null;
+  // Which rung is running is the session's to answer; which rung was *asked
+  // for* is only ever the profile's, because falling to the nearest filled one
+  // happens while the profile is being resolved and the session is handed the
+  // answer rather than the question. Grafted on only while the two still
+  // describe the same resolution, so a conversation moved to another rung since
+  // does not inherit an explanation that belongs to a rung it left.
+  const requested =
+    profile?.ladder?.requested && profile.ladder.tier === rung.tier
+      ? profile.ladder.requested
+      : undefined;
+  return ladderOrigin(requested ? { ...rung, requested } : rung, profile);
+}
+
+/** One rung, told as an origin — the same three facts, said the way the UI reads them. */
+function ladderOrigin(rung: LadderRung, profile: ResolvedProfile | null): ChatModelOrigin {
+  return {
+    model: rung.model,
+    source: 'ladder',
+    ...(profile?.profileName ? { profileName: profile.profileName } : {}),
+    tier: rung.tier,
+    ...(rung.requested ? { requestedTier: rung.requested } : {}),
+  };
+}
+import { applyDraft, clearDraft, draftOf, readAttachments, readDraft } from '../chat/drafts.js';
 import { UserPreferences, resolveApprovalMode } from '../../shared/user-preferences.js';
 import { ChatNotRunningError } from '../chat/session.js';
+import { UserEnvironment } from '../services/environments/types.js';
+import { HostEnvironment } from '../services/environments/manager.js';
+import {
+  registerUnverifiedProjectProcess,
+  releaseProjectSessionLease,
+  restoreProjectWorkingDir,
+  validateProjectContainerPath,
+  type ProjectSessionEnvironmentResult,
+  type ProjectSessionLease,
+  type ProjectsSessionApi,
+} from '../services/projects/working-dir.js';
+import { ProjectContainerFiles } from '../services/projects/container-files.js';
 
 /**
  * The longest model name worth storing. Real ones are far shorter; this only
@@ -30,6 +92,8 @@ import { ChatNotRunningError } from '../chat/session.js';
  * spawn on every future launch of the conversation.
  */
 const MAX_MODEL_NAME = 200;
+/** Bounded because this client-generated id is reflected in an acknowledgement. */
+const MAX_QUESTION_ANSWER_SUBMISSION_ID = 200;
 
 /**
  * How often a working session says so to the screens that are not attached to it.
@@ -40,6 +104,24 @@ const MAX_MODEL_NAME = 200;
  * nothing measurable next to the output it stands in for.
  */
 const ACTIVITY_ANNOUNCE_MS = 1000;
+
+/** A bounded process-lifetime cache prevents arbitrary ids becoming retained state. */
+const MAX_BUILT_IN_WORKFLOW_ADMISSIONS = 512;
+const MAX_BUILT_IN_WORKFLOW_REQUEST_ID = 200;
+
+interface BuiltInWorkflowAdmissionResult {
+  accepted: boolean;
+  message: string;
+  status?: 'accepted' | 'queued';
+}
+
+interface BuiltInWorkflowAdmission {
+  workflow: BuiltInWorkflowId;
+  prompt: string;
+  promise: Promise<BuiltInWorkflowAdmissionResult>;
+  /** True only after the state-changing admission took ownership of the turn. */
+  accepted: boolean;
+}
 
 /**
  * Tidy a typed model name into something safe to keep.
@@ -81,7 +163,22 @@ export interface MessageProcessorDeps {
   baseFolder: string;
   sessionDurationHours: number;
   aliases: Aliases;
-  validatePath(targetPath: string): PathValidation;
+  validatePath(targetPath: string, userId?: number): PathValidation;
+  /**
+   * The root this user's paths are measured against; their own home with
+   * per-user environments on.
+   *
+   * Optional, and falling back to `baseFolder`: a deployment (or a test) that
+   * does not know about environments must keep behaving exactly as it did,
+   * which is the same promise the feature flag makes.
+   */
+  getUserBaseFolder?(userId?: number): string;
+  /** Prepare (creating or starting if needed) the environment a user's processes run in. */
+  ensureEnvironment?(userId?: number): Promise<UserEnvironment>;
+  /** Project sessions resolve only through this manager, never through a user environment. */
+  projectsManager?: ProjectsSessionApi;
+  /** Active-state DB truth for project run-limit checks. */
+  sessionStore?: { setActive(id: string, active: boolean): Promise<void> };
   getSelectedWorkingDir(userId: number): string | null;
   createSessionRecord(params: {
     id: string;
@@ -90,19 +187,16 @@ export interface MessageProcessorDeps {
     workingDir: string;
     connections?: string[];
   }): SessionRecord;
+  /** Shared with HTTP tab routes so creation cannot cross a tentative close/reorder. */
+  tabCoordinator?: AccountTabCoordinatorLike;
   getRuntimeBridge(agentKind: AgentKind): BridgeInterface | null;
-  saveSessionsToDisk(): Promise<void>;
+  saveSessionsToDisk(): Promise<boolean | void>;
   /**
    * Launch configuration for this runtime, already resolved from the active
    * profile: model, extra args and environment. Returns null when no profile
    * is active, which is the default and must stay a plain unmodified launch.
    */
-  resolveRuntimeProfile(agentKind: AgentKind, workingDir: string): {
-    profileName: string;
-    model?: string;
-    extraArgs?: string[];
-    env?: Record<string, string>;
-  } | null;
+  resolveRuntimeProfile(agentKind: AgentKind, workingDir?: string): ResolvedProfile | null;
   /**
    * The active profile for a runtime, read without writing anything.
    *
@@ -112,7 +206,7 @@ export interface MessageProcessorDeps {
    * and asking it through the other accessor would rewrite a runtime's config
    * every time a browser opened a tab.
    */
-  activeProfileFor?(runtime: string): { profileName: string; model?: string } | null;
+  activeProfileFor?(runtime: string): ResolvedProfile | null;
   /**
    * This account's standing model choice for a runtime, and the write that
    * records one. `null` from the setter forgets it.
@@ -151,6 +245,11 @@ export interface MessageProcessorDeps {
    * then answer with a plain "unavailable" rather than throwing.
    */
   chatManager?: ChatManagerLike;
+  /** Resolve one sanitized attachment URL to server-owned metadata and path. */
+  resolveChatAttachment?(
+    session: SessionRecord,
+    attachment: ChatAttachment,
+  ): Promise<ChatAttachment | null>;
   usageReader: {
     getCurrentSessionStats(): Promise<any>;
     calculateBurnRate(minutes: number): Promise<any>;
@@ -172,6 +271,11 @@ export interface ChatManagerLike {
     options: {
       runtime: string;
       workingDir: string;
+      cwdKind?: 'host' | 'container';
+      fileAccess?: {
+        readFile(filePath: string): Promise<string>;
+        writeFile(filePath: string, contents: string): Promise<void>;
+      };
       model?: string;
       effort?: string;
       extraArgs?: string[];
@@ -179,19 +283,74 @@ export interface ChatManagerLike {
       bypassPermissions?: boolean;
       resumeSessionId?: string;
       startFresh?: boolean;
+      planMode?: boolean;
+      /** Where the runtime runs; absent means this host. */
+      environment?: UserEnvironment;
+      /** Rechecked synchronously at the adapter's final pre-spawn boundary. */
+      cancelled?: () => boolean;
+      /** The rung this conversation runs on, and the ladder it can move up. */
+      ladder?: { tier: ModelTier; tiers: Partial<Record<ModelTier, string>> };
     },
-  ): Promise<{ runtimeKind: string; currentCapabilities: unknown; bypassing: boolean }>;
-  snapshot(record: SessionRecord): Promise<unknown>;
-  send(sessionId: string, turn: { text: string; attachments?: unknown[] }): Promise<void>;
+  ): Promise<{
+    runtimeKind: string;
+    currentCapabilities: unknown;
+    bypassing: boolean;
+    /** False when the adapter exited before start() finished resolving. */
+    live?: boolean;
+  }>;
+  /**
+   * The transcript, forwarded whole. `live` is the one field this layer reads
+   * for itself — whether a process is answering right now — because a join has
+   * to say what is in force and the record's own `active` flag is not the same
+   * question: it survives an adapter that died through its error path, and it
+   * is cleared by a probe abandoned in favour of a fallback that is running.
+   */
+  snapshot(record: SessionRecord): Promise<{
+    live?: boolean;
+    runtime?: string;
+    planMode?: boolean;
+    planDocument?: { markdown: string; revision: number; ts: number } | null;
+  }>;
+  send(
+    sessionId: string,
+    turn: { text: string; attachments?: unknown[]; workflow?: BuiltInWorkflowId },
+  ): Promise<'accepted' | 'queued'>;
   interrupt(sessionId: string): Promise<void>;
   /** Switch a live session's model. False when nothing is running, or the adapter cannot. */
   setModel(sessionId: string, model: string): Promise<boolean>;
   /** Carry a new model into the options an in-place `/clear` restart replays. */
   rememberModel(sessionId: string, model: string | undefined): void;
+  /** The rung a running session is on, or null when it is not on one. */
+  ladderOf?(sessionId: string): LadderRung | null;
   /** Switch a live session's reasoning effort. False when nothing is running, or the adapter cannot. */
   setEffort(sessionId: string, effort: string): Promise<boolean>;
   /** Carry a new effort level into the options an in-place `/clear` restart replays. */
   rememberEffort(sessionId: string, effort: string | undefined): void;
+  setPlanMode?(
+    sessionId: string,
+    on: boolean,
+  ): Promise<{ planMode: boolean; changed: boolean; detail: string } | null>;
+  rememberPlanMode?(sessionId: string, on: boolean): void;
+  acceptPlan?(
+    sessionId: string,
+    revision: number,
+  ): Promise<{
+    accepted: boolean;
+    action: 'accept' | 'reject';
+    planMode: boolean;
+    revision?: number;
+    detail: string;
+  } | null>;
+  rejectPlan?(
+    sessionId: string,
+    revision: number,
+  ): Promise<{
+    accepted: boolean;
+    action: 'accept' | 'reject';
+    planMode: boolean;
+    revision?: number;
+    detail: string;
+  } | null>;
   cancelQueued(sessionId: string, queuedId: string): boolean;
   /** Interrupt what is running and deliver one waiting turn immediately. */
   sendQueuedNow(sessionId: string, queuedId: string): Promise<boolean>;
@@ -202,7 +361,8 @@ export interface ChatManagerLike {
     requestId: string,
     optionIds: string[],
     skipped?: boolean,
-  ): boolean;
+    text?: string,
+  ): boolean | Promise<boolean>;
   stop(sessionId: string): Promise<void>;
   readPage(
     record: SessionRecord,
@@ -229,6 +389,16 @@ interface IncomingMessage {
   fromLine?: number;
   count?: number;
   requestId?: string;
+  /** Client-generated id correlated with `chat_question_answer_ack`. */
+  submissionId?: string;
+  /** Correlates an app-owned workflow request with its admission result. */
+  workflow?: string;
+  /**
+   * The one free-text field a frame carries: a turn on `chat_send`, and what
+   * the user typed in their own words on `chat_question_answer`. Shared rather
+   * than split in two, because the handler that reads it knows which message it
+   * is holding and a second name would only be the same string twice.
+   */
   text?: string;
   attachments?: unknown[];
   /**
@@ -260,6 +430,12 @@ interface IncomingMessage {
    * stored and replayed into every future launch.
    */
   effort?: string | null;
+  planMode?: boolean;
+  revision?: number;
+}
+
+interface HeldProjectSessionLease extends ProjectSessionLease {
+  sessionId: string;
 }
 
 export class MessageProcessor {
@@ -277,6 +453,29 @@ export class MessageProcessor {
    * bytes a second.
    */
   private activityAnnounced = new Map<string, number>();
+  /** Admission owned by a socket driving one session. */
+  private joinedProjectLeases = new Map<string, HeldProjectSessionLease>();
+  /** Admissions owned by background chat subscriptions, per socket/session. */
+  private subscribedProjectLeases = new Map<string, Map<string, HeldProjectSessionLease>>();
+  /** Admission owned by a live terminal or chat process. */
+  private runtimeProjectLeases = new Map<string, HeldProjectSessionLease>();
+  /** One launch at a time per record while `active` has not been set yet. */
+  private runtimeStarts = new Set<string>();
+  /** Completion signals shutdown can await before its final runtime stop pass. */
+  private runtimeStartDrains = new Map<string, { promise: Promise<void>; resolve(): void }>();
+  /** Coalesces exit callback, explicit stop and concurrent stop requests per run. */
+  private runtimeStops = new Map<
+    string,
+    { session: SessionRecord; runId: string | undefined; promise: Promise<void> }
+  >();
+  /**
+   * Successful workflow admissions keyed by owner, conversation and client id.
+   *
+   * The browser retries with the same id after a timeout. Keeping the in-flight
+   * promise as well as its answer makes both a concurrent retry and a lost
+   * acknowledgement exactly-once at the chat-manager boundary.
+   */
+  private builtInWorkflowAdmissions = new Map<string, BuiltInWorkflowAdmission>();
 
   constructor(deps: MessageProcessorDeps) {
     this.deps = deps;
@@ -293,6 +492,7 @@ export class MessageProcessor {
     const last = this.activityAnnounced.get(session.id) ?? 0;
     if (now - last < ACTIVITY_ANNOUNCE_MS) return;
     this.activityAnnounced.set(session.id, now);
+    if (session.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
     announceSessionActivity(session, true, this.deps.webSocketConnections);
   }
 
@@ -305,6 +505,7 @@ export class MessageProcessor {
    */
   private noteStopped(session: SessionRecord): void {
     this.activityAnnounced.delete(session.id);
+    if (session.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
     announceSessionActivity(session, false, this.deps.webSocketConnections);
   }
 
@@ -322,7 +523,7 @@ export class MessageProcessor {
         break;
 
       case 'leave_session':
-        await this.leaveSession(wsId);
+        await this.leaveSession(wsId, data.sessionId);
         break;
 
       case 'start_claude':
@@ -357,6 +558,10 @@ export class MessageProcessor {
         await this.startRuntime(wsId, 'omp', data.options || {});
         break;
 
+      case 'start_antigravity':
+        await this.startRuntime(wsId, 'antigravity', data.options || {});
+        break;
+
       case 'start_terminal':
         await this.startRuntime(wsId, 'terminal', data.options || {});
         break;
@@ -374,6 +579,14 @@ export class MessageProcessor {
         await this.handleChatSend(wsInfo, data);
         break;
 
+      case 'chat_start_builtin_workflow':
+        await this.handleChatStartBuiltInWorkflow(wsInfo, data);
+        break;
+
+      case 'chat_builtin_workflow_ack':
+        this.handleChatBuiltInWorkflowAck(wsInfo, data);
+        break;
+
       case 'chat_interrupt':
         await this.handleChatInterrupt(wsInfo, data);
         break;
@@ -384,6 +597,18 @@ export class MessageProcessor {
 
       case 'chat_set_effort':
         await this.handleChatSetEffort(wsInfo, data);
+        break;
+
+      case 'chat_set_plan_mode':
+        await this.handleChatSetPlanMode(wsInfo, data);
+        break;
+
+      case 'chat_accept_plan':
+        await this.handleChatPlanAction(wsInfo, data, 'accept');
+        break;
+
+      case 'chat_reject_plan':
+        await this.handleChatPlanAction(wsInfo, data, 'reject');
         break;
 
       case 'chat_queue_cancel':
@@ -403,7 +628,7 @@ export class MessageProcessor {
         break;
 
       case 'chat_question_answer':
-        this.handleChatQuestion(wsInfo, data);
+        await this.handleChatQuestion(wsInfo, data);
         break;
 
       case 'chat_history_request':
@@ -423,7 +648,7 @@ export class MessageProcessor {
         break;
 
       case 'chat_unsubscribe':
-        if (data.sessionId) wsInfo.chatSessionIds.delete(data.sessionId);
+        if (data.sessionId) this.unsubscribeChat(wsInfo, data.sessionId);
         break;
 
       case 'input':
@@ -474,6 +699,185 @@ export class MessageProcessor {
     }
   }
 
+  /** The user's own root, or the single shared one when environments are off. */
+  private userBaseFolder(userId?: number): string {
+    return this.deps.getUserBaseFolder?.(userId) ?? this.deps.baseFolder;
+  }
+
+  /** The environment a user's processes run in; this host when there are none. */
+  private async userEnvironment(userId?: number): Promise<UserEnvironment> {
+    return this.deps.ensureEnvironment
+      ? this.deps.ensureEnvironment(userId)
+      : new HostEnvironment(this.deps.baseFolder);
+  }
+
+  /**
+   * Resolve a record's actual execution environment. A persisted project id is
+   * an instruction, not a hint: falling back to the host or user environment
+   * here would run project work in the wrong checkout after a restart.
+   */
+  private async environmentForSession(
+    session: SessionRecord,
+  ): Promise<{
+    environment: UserEnvironment;
+    lease?: HeldProjectSessionLease;
+    project?: Extract<ProjectSessionEnvironmentResult, { ok: true }>;
+  }> {
+    if (!session.projectId) {
+      return { environment: await this.userEnvironment(session.ownerUserId) };
+    }
+
+    const manager = this.deps.projectsManager;
+    if (!manager) {
+      throw new Error('This project session cannot be resolved until project support is configured.');
+    }
+    const resolved = await manager.ensureForSession(session.ownerUserId, session.projectId);
+    if (!resolved.ok) {
+      const detail = resolved.detail ? `: ${resolved.detail}` : '';
+      throw new Error(`This project's environment is ${resolved.reason}${detail}`);
+    }
+    const lease: HeldProjectSessionLease = {
+      sessionId: session.id,
+      ownerUserId: session.ownerUserId,
+      projectId: session.projectId,
+      leaseId: resolved.leaseId,
+    };
+    try {
+      // Preserve any persisted cwd that is still canonically inside the
+      // workspace or owner home. Rebuilds and missing paths alone fall back to
+      // the manager's current checkout.
+      const cwd = await restoreProjectWorkingDir(
+        manager,
+        resolved,
+        session.workingDir,
+        session.projectWorkingDirKind,
+      );
+      const cwdChanged = session.workingDir !== cwd.workingDir
+        || session.projectWorkingDirKind !== cwd.kind;
+      session.workingDir = cwd.workingDir;
+      session.projectWorkingDirKind = cwd.kind;
+      manager.touchActivity(session.projectId);
+      // A rebuild can invalidate a disposable container cwd and move the
+      // authoritative session back to its host checkout. Persist that repair
+      // while the admission is still held; otherwise a quiet join or
+      // subscription fixes only this process and the next restart restores the
+      // stale namespace discriminator again.
+      if (cwdChanged) await this.deps.saveSessionsToDisk();
+      return { environment: resolved.environment, lease, project: resolved };
+    } catch (error) {
+      releaseProjectSessionLease(manager, lease);
+      throw error;
+    }
+  }
+
+  private releaseHeldProjectLease(lease: HeldProjectSessionLease | undefined): void {
+    releaseProjectSessionLease(this.deps.projectsManager, lease);
+  }
+
+  /**
+   * ACP filesystem access for a project always stays in the exact container
+   * named by the live runtime lease. This is also used for a host-kind checkout:
+   * the ACP process sees its mounted `/workspace/...` name, not the host mount
+   * source stored on the session record.
+   */
+  private projectChatFileAccess(
+    session: SessionRecord,
+    prepared: Extract<ProjectSessionEnvironmentResult, { ok: true }>,
+  ): {
+    readFile(filePath: string): Promise<string>;
+    writeFile(filePath: string, contents: string): Promise<void>;
+  } {
+    const manager = this.deps.projectsManager;
+    if (!manager) throw new Error('Project filesystem access is not configured.');
+    const access = prepared.containerAccess;
+    if (!access) throw new Error('Local project files use normal host filesystem access.');
+    const runtimeRoot = session.projectWorkingDirKind === 'container'
+      ? validateProjectContainerPath(access, session.workingDir)
+      : validateProjectContainerPath(
+          access,
+          prepared.environment.toContainerPath(session.workingDir),
+        );
+    const workspace = new ProjectContainerFiles(manager, prepared, runtimeRoot);
+    const runtimeLease: ProjectSessionLease = {
+      ownerUserId: session.ownerUserId,
+      projectId: session.projectId!,
+      leaseId: prepared.leaseId,
+    };
+    let temporary: ProjectContainerFiles | undefined;
+    const filesFor = (filePath: string): ProjectContainerFiles => {
+      if (!path.posix.isAbsolute(filePath)) return workspace;
+      const normalized = validateProjectContainerPath(access, filePath);
+      if (normalized === runtimeRoot || normalized.startsWith(`${runtimeRoot}/`)) return workspace;
+      // Preserve ACP's scratch-file handoff, but in the project container's
+      // `/tmp` namespace. It must never become the server's coincident `/tmp`.
+      if (normalized === '/tmp' || normalized.startsWith('/tmp/')) {
+        temporary ??= new ProjectContainerFiles(manager, prepared, '/tmp');
+        return temporary;
+      }
+      return workspace;
+    };
+    return {
+      readFile: async (filePath) => {
+        try {
+          return await filesFor(filePath).readText(filePath);
+        } catch (error) {
+          // Transfer an uncertain helper to the project manager before ACP can
+          // turn it into a protocol error and forget the local child. The
+          // manager blocks ordinary runtime-lease release until every recovery
+          // registered against this lease has verified or retired the exact
+          // container.
+          registerUnverifiedProjectProcess(manager, runtimeLease, error);
+          throw error;
+        }
+      },
+      writeFile: async (filePath, contents) => {
+        try {
+          await filesFor(filePath).writeText(filePath, contents);
+        } catch (error) {
+          registerUnverifiedProjectProcess(manager, runtimeLease, error);
+          throw error;
+        }
+      },
+    };
+  }
+
+  private releaseJoinedProjectLease(wsId: string): void {
+    const lease = this.joinedProjectLeases.get(wsId);
+    if (!lease) return;
+    this.joinedProjectLeases.delete(wsId);
+    this.releaseHeldProjectLease(lease);
+  }
+
+  private releaseSubscribedProjectLease(wsId: string, sessionId: string): void {
+    const bySession = this.subscribedProjectLeases.get(wsId);
+    const lease = bySession?.get(sessionId);
+    if (!lease) return;
+    bySession!.delete(sessionId);
+    if (bySession!.size === 0) this.subscribedProjectLeases.delete(wsId);
+    this.releaseHeldProjectLease(lease);
+  }
+
+  private releaseRuntimeProjectLease(sessionId: string): void {
+    const lease = this.runtimeProjectLeases.get(sessionId);
+    if (!lease) return;
+    this.runtimeProjectLeases.delete(sessionId);
+    this.releaseHeldProjectLease(lease);
+  }
+
+  private persistActive(session: SessionRecord, active: boolean): void {
+    void this.deps.sessionStore?.setActive(session.id, active);
+  }
+
+  private projectIdentity(session: SessionRecord): {
+    projectId: string | null;
+    projectName: string | null;
+  } {
+    const projectId = session.projectId || null;
+    if (!projectId) return { projectId: null, projectName: null };
+    const project = this.deps.projectsManager?.getForUser(session.ownerUserId, projectId);
+    return { projectId, projectName: project?.name || null };
+  }
+
   async createAndJoinSession(
     wsId: string,
     name?: string,
@@ -481,10 +885,11 @@ export class MessageProcessor {
   ): Promise<void> {
     const wsInfo = this.deps.webSocketConnections.get(wsId);
     if (!wsInfo) return;
+    const requestedFromSessionId = wsInfo.claudeSessionId;
 
-    let validWorkingDir = this.deps.baseFolder;
+    let validWorkingDir = this.userBaseFolder(wsInfo.userId);
     if (workingDir) {
-      const validation = this.deps.validatePath(workingDir);
+      const validation = this.deps.validatePath(workingDir, wsInfo.userId);
       if (!validation.valid) {
         sendToWebSocket(wsInfo.ws, {
           type: 'error',
@@ -494,37 +899,80 @@ export class MessageProcessor {
       }
       validWorkingDir = validation.path!;
     } else {
-      validWorkingDir = this.deps.getSelectedWorkingDir(wsInfo.userId) || this.deps.baseFolder;
+      const selected = this.deps.getSelectedWorkingDir(wsInfo.userId);
+      // A directory chosen before per-user environments were switched on can
+      // point outside the user's own home; re-checked here rather than trusted,
+      // so enabling the feature cannot leave anyone pointed at the host.
+      validWorkingDir = selected && this.deps.validatePath(selected, wsInfo.userId).valid
+        ? selected
+        : this.userBaseFolder(wsInfo.userId);
     }
 
-    const sessionId = randomUUID();
-    const session = this.deps.createSessionRecord({
-      id: sessionId,
-      ownerUserId: wsInfo.userId,
-      name,
-      workingDir: validWorkingDir,
-      connections: [wsId],
-    });
+    const release = this.deps.tabCoordinator
+      ? await this.deps.tabCoordinator.acquire(wsInfo.userId)
+      : () => {};
+    try {
+      // Waiting behind an account write gives this socket time to disconnect or
+      // choose a newer destination. A delayed create must not overwrite that
+      // newer join (nor create an unattached session for a dead socket).
+      const currentInfo = this.deps.webSocketConnections.get(wsId);
+      if (currentInfo !== wsInfo || wsInfo.claudeSessionId !== requestedFromSessionId) return;
 
-    this.deps.claudeSessions.set(sessionId, session);
-    wsInfo.claudeSessionId = sessionId;
-    void this.deps.transcriptStore.ensureTranscript(session);
+      const sessionId = randomUUID();
+      // Construct inside the account turn: the real factory allocates the
+      // append position from the live map, which is now guaranteed committed.
+      const session = this.deps.createSessionRecord({
+        id: sessionId,
+        ownerUserId: wsInfo.userId,
+        name,
+        workingDir: validWorkingDir,
+      });
 
-    this.deps.saveSessionsToDisk();
+      this.deps.claudeSessions.set(sessionId, session);
+      let saved = false;
+      try {
+        saved = (await this.deps.saveSessionsToDisk()) !== false;
+      } catch (error) {
+        console.error('Failed to persist socket-created session:', error);
+      }
+      if (!saved) {
+        this.deps.claudeSessions.delete(sessionId);
+        sendToWebSocket(wsInfo.ws, {
+          type: 'error',
+          message: 'The new session could not be saved',
+        });
+        return;
+      }
 
-    sendToWebSocket(wsInfo.ws, {
-      type: 'session_created',
-      sessionId,
-      sessionName: session.name,
-      workingDir: session.workingDir,
-      lastAgent: session.lastAgent,
-      runtimeLabel: session.runtimeLabel,
-    });
+      void this.deps.transcriptStore.ensureTranscript(session);
+      // Persistence itself can be deferred. Recheck once more before attaching:
+      // a newer join that won while SQLite was pending must stay the destination.
+      const intentStillCurrent =
+        this.deps.webSocketConnections.get(wsId) === wsInfo
+        && wsInfo.claudeSessionId === requestedFromSessionId;
+      if (intentStillCurrent) {
+        session.connections.add(wsId);
+        wsInfo.claudeSessionId = sessionId;
+        sendToWebSocket(wsInfo.ws, {
+          type: 'session_created',
+          sessionId,
+          sessionName: session.name,
+          workingDir: session.workingDir,
+          projectWorkingDirKind: session.projectWorkingDirKind,
+          lastAgent: session.lastAgent,
+          runtimeLabel: session.runtimeLabel,
+          ...this.projectIdentity(session),
+        });
+      }
 
-    // And every other screen this person has open. After `session_created`, so
-    // the socket that asked has already switched to it by the time the same
-    // fact comes back around as an announcement.
-    announceSessionOpened(session, this.deps.webSocketConnections);
+      // And every other screen this person has open. After `session_created`,
+      // so the asking socket has switched before the account announcement. If
+      // it moved meanwhile, this is deliberately the only message it receives:
+      // the new tab still exists account-wide but never steals that newer focus.
+      announceSessionOpened(session, this.deps.webSocketConnections);
+    } finally {
+      release();
+    }
   }
 
   async joinSession(wsId: string, claudeSessionId: string): Promise<void> {
@@ -551,72 +999,307 @@ export class MessageProcessor {
       return;
     }
 
+    let joinedLease: HeldProjectSessionLease | undefined;
+    if (session.projectId) {
+      try {
+        joinedLease = (await this.environmentForSession(session)).lease;
+      } catch (error) {
+        sendToWebSocket(wsInfo.ws, {
+          type: 'error',
+          message: error instanceof Error
+            ? error.message
+            : 'This project is not available right now.',
+        });
+        return;
+      }
+    }
+    if (this.deps.webSocketConnections.get(wsId) !== wsInfo) {
+      this.releaseHeldProjectLease(joinedLease);
+      return;
+    }
+
     // Leave current session if any
     if (wsInfo.claudeSessionId) {
       await this.leaveSession(wsId);
+    }
+    if (this.deps.webSocketConnections.get(wsId) !== wsInfo) {
+      this.releaseHeldProjectLease(joinedLease);
+      return;
     }
 
     // Join new session
     wsInfo.claudeSessionId = claudeSessionId;
     session.connections.add(wsId);
+    if (joinedLease) this.joinedProjectLeases.set(wsId, joinedLease);
     session.lastActivity = new Date();
     session.lastAccessed = Date.now();
 
-    const transcriptChunks = await this.deps.transcriptStore.readTranscriptChunks(session);
-    const replayBuffer =
-      transcriptChunks.length > 0 ? transcriptChunks : session.outputBuffer.slice(-200);
+    try {
+      const transcriptChunks = await this.deps.transcriptStore.readTranscriptChunks(session);
+      if (this.deps.webSocketConnections.get(wsId) !== wsInfo) {
+        throw new Error('WebSocket disconnected while joining the session');
+      }
+      const replayBuffer =
+        transcriptChunks.length > 0 ? transcriptChunks : session.outputBuffer.slice(-200);
 
-    // Tells the client how far back it can page. The replayed tail restores the
-    // live terminal; anything above it is fetched a screen at a time.
-    const history = await this.deps.historyStore.stat(session).catch(() => ({
-      firstLine: 0,
-      totalLines: 0,
-    }));
+      // Tells the client how far back it can page. The replayed tail restores the
+      // live terminal; anything above it is fetched a screen at a time.
+      const history = await this.deps.historyStore.stat(session).catch(() => ({
+        firstLine: 0,
+        totalLines: 0,
+      }));
 
-    // Send session info and replay buffer
-    sendToWebSocket(wsInfo.ws, {
-      type: 'session_joined',
-      history,
-      sessionId: claudeSessionId,
-      sessionName: session.name,
-      workingDir: session.workingDir,
-      active: session.active,
-      agent: session.agent,
-      lastAgent: session.lastAgent,
-      runtimeLabel: session.runtimeLabel,
-      surface: session.surface || 'terminal',
-      outputBuffer: replayBuffer,
-    });
+      // Joins for one socket can overlap because WebSocket message callbacks are
+      // async. If a newer join won while transcript/history reads were awaited,
+      // this answer is obsolete: emitting it would paint the old destination and
+      // prompt the client to leave the newer one as an "orphan".
+      if (wsInfo.claudeSessionId !== claudeSessionId || !session.connections.has(wsId)) return;
 
-    // A chat session's transcript is not in the PTY replay above — it is a
-    // separate event log — so it is sent as its own snapshot. Sent after
-    // session_joined so the client has already switched surfaces and has
-    // somewhere to put it. Subscribing here as well as sending the snapshot is
-    // what keeps the conversation live once the user moves to another tab.
-    if (session.surface === 'chat') {
-      await this.subscribeChat(wsInfo, claudeSessionId);
-    }
+      // Send session info and replay buffer
+      sendToWebSocket(wsInfo.ws, {
+        type: 'session_joined',
+        history,
+        sessionId: claudeSessionId,
+        sessionName: session.name,
+        workingDir: session.workingDir,
+        projectWorkingDirKind: session.projectWorkingDirKind,
+        active: session.active,
+        agent: session.agent,
+        lastAgent: session.lastAgent,
+        runtimeLabel: session.runtimeLabel,
+        surface: session.surface || 'terminal',
+        outputBuffer: replayBuffer,
+        ...this.projectIdentity(session),
+      });
 
-    if (this.deps.dev) {
-      console.log(`WebSocket ${wsId} joined Claude session ${claudeSessionId}`);
+      // A chat session's transcript is not in the PTY replay above — it is a
+      // separate event log — so it is sent as its own snapshot. Sent after
+      // session_joined so the client has already switched surfaces and has
+      // somewhere to put it. Subscribing here as well as sending the snapshot is
+      // what keeps the conversation live once the user moves to another tab.
+      if (session.surface === 'chat' && !(await this.subscribeChat(wsInfo, claudeSessionId))) {
+        throw new Error('Could not subscribe to the conversation');
+      }
+
+      if (this.deps.dev) {
+        console.log(`WebSocket ${wsId} joined Claude session ${claudeSessionId}`);
+      }
+    } catch (error) {
+      // Admission is ownership, not a best-effort side effect. If replay or the
+      // chat snapshot fails, roll back every mutation made for this join.
+      session.connections.delete(wsId);
+      if (wsInfo.claudeSessionId === claudeSessionId) wsInfo.claudeSessionId = null;
+      this.releaseJoinedProjectLease(wsId);
+      throw error;
     }
   }
 
-  async leaveSession(wsId: string): Promise<void> {
+  async leaveSession(wsId: string, expectedSessionId?: string): Promise<void> {
     const wsInfo = this.deps.webSocketConnections.get(wsId);
     if (!wsInfo || !wsInfo.claudeSessionId) return;
+    // A client rejecting a late join names the obsolete destination. If the
+    // socket has already joined something newer, that cleanup must not detach
+    // the winner.
+    if (expectedSessionId && wsInfo.claudeSessionId !== expectedSessionId) return;
 
     const session = this.deps.claudeSessions.get(wsInfo.claudeSessionId);
     if (session) {
       session.connections.delete(wsId);
       session.lastActivity = new Date();
+      if (session.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
     }
 
+    this.releaseJoinedProjectLease(wsId);
     wsInfo.claudeSessionId = null;
 
     sendToWebSocket(wsInfo.ws, {
       type: 'session_left',
     });
+  }
+
+  /**
+   * Drop every non-runtime claim owned by one socket. Called by both WebSocket
+   * `close` and `error`; deleting maps before release makes the double callback
+   * idempotent.
+   */
+  cleanupConnection(wsId: string): void {
+    const wsInfo = this.deps.webSocketConnections.get(wsId);
+    if (!wsInfo) {
+      this.releaseJoinedProjectLease(wsId);
+      const orphaned = this.subscribedProjectLeases.get(wsId);
+      if (orphaned) {
+        for (const sessionId of Array.from(orphaned.keys())) {
+          this.releaseSubscribedProjectLease(wsId, sessionId);
+        }
+      }
+      return;
+    }
+
+    for (const sessionId of Array.from(wsInfo.chatSessionIds)) {
+      this.unsubscribeChat(wsInfo, sessionId);
+    }
+    if (wsInfo.claudeSessionId) {
+      const session = this.deps.claudeSessions.get(wsInfo.claudeSessionId);
+      if (session) {
+        session.connections.delete(wsId);
+        session.lastActivity = new Date();
+        if (session.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
+      }
+    }
+    this.releaseJoinedProjectLease(wsId);
+    this.deps.webSocketConnections.delete(wsId);
+  }
+
+  /** Release every process/attachment claim associated with a retiring record. */
+  releaseProjectSessionResources(sessionId: string): void {
+    this.releaseRuntimeProjectLease(sessionId);
+
+    for (const [wsId, lease] of Array.from(this.joinedProjectLeases)) {
+      if (lease.sessionId !== sessionId) continue;
+      this.releaseJoinedProjectLease(wsId);
+      const wsInfo = this.deps.webSocketConnections.get(wsId);
+      if (wsInfo?.claudeSessionId === sessionId) wsInfo.claudeSessionId = null;
+    }
+    for (const [wsId, bySession] of Array.from(this.subscribedProjectLeases)) {
+      if (!bySession.has(sessionId)) continue;
+      this.releaseSubscribedProjectLease(wsId, sessionId);
+      this.deps.webSocketConnections.get(wsId)?.chatSessionIds.delete(sessionId);
+    }
+
+    // Defensive cleanup for sockets restored/constructed without a lease map.
+    for (const wsInfo of this.deps.webSocketConnections.values()) {
+      if (wsInfo.claudeSessionId === sessionId) wsInfo.claudeSessionId = null;
+      wsInfo.chatSessionIds.delete(sessionId);
+    }
+  }
+
+  /**
+   * Mirror chat-process lifecycle into the project admission layer.
+   *
+   * Terminal exits arrive through the bridge callbacks above. Chat exits are
+   * learned by ChatSessionManager in the composition root, which must call this
+   * hook whenever `change.exited` is present. A `/clear` marks its old adapter
+   * as a restarting exit, so the existing claim spans the replacement launch.
+   */
+  handleChatLifecycle(
+    sessionId: string,
+    change: { exited?: boolean; restarting?: boolean },
+  ): void {
+    if (change.exited === undefined) return;
+    const session = this.deps.claudeSessions.get(sessionId);
+    if (change.exited) {
+      if (change.restarting === true) {
+        // The old adapter is gone, but its replacement is already committed to
+        // start inside ChatSession.restart(). Keep the same admission across
+        // that hand-off so stop/reclaim never sees an unprotected gap.
+        if (session?.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
+        return;
+      }
+      this.releaseRuntimeProjectLease(sessionId);
+      if (session?.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
+      return;
+    }
+    if (!session?.projectId) return;
+    if (this.runtimeProjectLeases.has(sessionId)) {
+      this.deps.projectsManager?.touchActivity(session.projectId);
+      return;
+    }
+
+    // Every legitimate chat start acquires before spawning, and a restart
+    // retains that same lease above. Reaching a live process without one is an
+    // invariant failure: do not leave it running while an asynchronous
+    // re-admission races project stop/reclaim. The in-memory active flag keeps
+    // lifecycle claims closed until verified stop completes.
+    console.error(`Chat ${sessionId} became live without a project runtime lease; stopping it`);
+    session.active = true;
+    session.agent ||= session.lastAgent || 'claude';
+    this.persistActive(session, true);
+    const stop = this.deps.chatManager?.stop(sessionId);
+    if (!stop) {
+      console.error(`Chat ${sessionId} cannot be stopped: chat manager unavailable`);
+      return;
+    }
+    void stop.then(() => {
+      const current = this.deps.claudeSessions.get(sessionId);
+      if (!current) return;
+      current.active = false;
+      current.agent = null;
+      current.lastActivity = new Date();
+      this.persistActive(current, false);
+      this.noteStopped(current);
+    }).catch((error: unknown) => {
+      // The manager deliberately retains its adapter on rejection. Preserve
+      // the active record too so reclaim/delete remain closed and an explicit
+      // stop can retry the same identity-bound handle.
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`Could not verify that lease-less chat ${sessionId} stopped: ${detail}`);
+    });
+  }
+
+  /** Included by ProjectManager.hasLiveProjectWork during pre-lease launch admission. */
+  hasPendingProjectWork(projectId: string): boolean {
+    for (const sessionId of this.runtimeStarts) {
+      if (this.deps.claudeSessions.get(sessionId)?.projectId === projectId) return true;
+    }
+    return false;
+  }
+
+  private beginRuntimeStart(sessionId: string): boolean {
+    if (this.runtimeStarts.has(sessionId)) return false;
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => { resolve = done; });
+    this.runtimeStarts.add(sessionId);
+    this.runtimeStartDrains.set(sessionId, { promise, resolve });
+    return true;
+  }
+
+  private finishRuntimeStart(sessionId: string): void {
+    this.runtimeStarts.delete(sessionId);
+    const drain = this.runtimeStartDrains.get(sessionId);
+    if (!drain) return;
+    this.runtimeStartDrains.delete(sessionId);
+    drain.resolve();
+  }
+
+  private async drainRuntimeStart(sessionId: string): Promise<void> {
+    while (this.runtimeStartDrains.has(sessionId)) {
+      await this.runtimeStartDrains.get(sessionId)!.promise;
+    }
+  }
+
+  private launchIsCurrent(session: SessionRecord, runId: string): boolean {
+    return (
+      this.deps.claudeSessions.get(session.id) === session
+      && session.runId === runId
+      && session.retiring !== true
+    );
+  }
+
+  /**
+   * Close launch admission before a session record is deleted, drain anything
+   * already admitted, then stop the process it produced. If verification
+   * fails this rejects, leaving the record and every project lease intact.
+   */
+  async retireSessionRuntime(session: SessionRecord): Promise<void> {
+    if (this.deps.claudeSessions.get(session.id) !== session) return;
+    session.retiring = true;
+    await this.drainRuntimeStart(session.id);
+    if (this.deps.claudeSessions.get(session.id) !== session) return;
+    const chatOwned = session.surface === 'chat'
+      && this.deps.chatManager?.has(session.id) === true;
+    if ((session.active && session.agent) || chatOwned) {
+      await this.stopRuntime(
+        session.id,
+        session.agent || session.lastAgent || 'claude',
+      );
+    }
+  }
+
+  /** Wait until every launch already admitted by a WebSocket has settled. */
+  async drainPendingRuntimeStarts(): Promise<void> {
+    while (this.runtimeStartDrains.size > 0) {
+      await Promise.all(Array.from(this.runtimeStartDrains.values(), (entry) => entry.promise));
+    }
   }
 
   async startRuntime(
@@ -638,6 +1321,14 @@ export class MessageProcessor {
     const session = this.deps.claudeSessions.get(wsInfo.claudeSessionId);
     if (!session) return;
 
+    if (session.retiring) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: 'This session is being closed',
+      });
+      return;
+    }
+
     if (session.active) {
       sendToWebSocket(wsInfo.ws, {
         type: 'error',
@@ -655,9 +1346,18 @@ export class MessageProcessor {
       return;
     }
 
-    const sessionId = wsInfo.claudeSessionId;
-    const previousOutputBuffer = [...session.outputBuffer];
-    session.outputBuffer = [];
+    if (!this.beginRuntimeStart(session.id)) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: 'A process is already starting in this session',
+      });
+      return;
+    }
+
+    try {
+      const sessionId = wsInfo.claudeSessionId;
+      const previousOutputBuffer = [...session.outputBuffer];
+      session.outputBuffer = [];
 
     // Only these keys are accepted from the client. Spreading the raw client
     // object would let it override onOutput/onExit/onError (non-function values
@@ -692,9 +1392,19 @@ export class MessageProcessor {
     // that it is server-side configuration the client cannot forge. (`model`
     // is the one exception below: a conversation's own override is allowed to
     // beat it, but only for that conversation, never written back to the profile.)
-    const profile = this.deps.resolveRuntimeProfile(agentKind, session.workingDir);
+    const profile = this.deps.resolveRuntimeProfile(
+      agentKind,
+      session.projectWorkingDirKind === 'container' ? undefined : session.workingDir,
+    );
     if (profile) {
-      if (profile.model) safeOptions.model = profile.model;
+      // The rung behind the typed model, on the same terms as the chat launch:
+      // a ladder decides which model does the work, and a terminal started from
+      // this app is work being done. What it cannot have is the rest of #171 —
+      // escalation is a conversation asking a person a question, and a PTY
+      // running the CLI's own interface has no channel this app can put a
+      // question through. The rung it opens on is the rung it stays on.
+      const fromProfile = profile.model || profile.ladder?.model;
+      if (fromProfile) safeOptions.model = fromProfile;
       if (profile.extraArgs?.length) safeOptions.extraArgs = profile.extraArgs;
       if (profile.env && Object.keys(profile.env).length) safeOptions.env = profile.env;
       console.log(`Applying runtime profile "${profile.profileName}" to ${agentKind}`);
@@ -733,12 +1443,58 @@ export class MessageProcessor {
     // window where they saw runId undefined and dropped the event.
     const runId = randomUUID();
     const previousRunId = session.runId;
+    let runEnded = false;
     session.runId = runId;
 
+    // A session created before per-user environments were switched on points at
+    // a folder on the host, which this user's environment cannot see. Moved to
+    // their own root rather than refused: the alternative is a tab that can
+    // never be started again and no way to say why from inside it.
+    if (!session.projectId && !this.deps.validatePath(session.workingDir, wsInfo.userId).valid) {
+      session.workingDir = this.userBaseFolder(wsInfo.userId);
+    }
+
+    // Prepared before the pty, not alongside it: creating a container takes a
+    // moment the first time, and a bridge started against an environment that
+    // is not up yet fails with an engine error the user cannot act on.
+    let environment: UserEnvironment;
+    let runtimeLease: HeldProjectSessionLease | undefined;
+    try {
+      const prepared = await this.environmentForSession(session);
+      environment = prepared.environment;
+      runtimeLease = prepared.lease;
+      if (!this.launchIsCurrent(session, runId)) {
+        this.releaseHeldProjectLease(runtimeLease);
+        if (session.runId === runId) session.runId = previousRunId;
+        return;
+      }
+      if (runtimeLease) {
+        // An inactive record must not carry an old process lease. Delete first
+        // so an idempotent release cannot remove the new claim by mistake.
+        this.releaseRuntimeProjectLease(session.id);
+        this.runtimeProjectLeases.set(session.id, runtimeLease);
+      }
+    } catch (error) {
+      session.runId = previousRunId;
+      session.outputBuffer = previousOutputBuffer;
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: error instanceof Error
+          ? session.projectId
+            ? error.message
+            : `Your workspace environment could not be started: ${error.message}`
+          : 'Your workspace environment could not be started.',
+      });
+      return;
+    }
+
+    let runtimeMayBeAlive = false;
     try {
       const runtimeSession = (await bridge.startSession(sessionId, {
         ...safeOptions,
+        environment,
         workingDir: session.workingDir,
+        cwdKind: session.projectWorkingDirKind,
         onOutput: (data: string) => {
           const currentSession = this.deps.claudeSessions.get(sessionId);
           if (!currentSession || currentSession.runId !== runId) return;
@@ -764,10 +1520,13 @@ export class MessageProcessor {
           this.retireRecorder(currentSession);
 
           const stopRequested = currentSession.stopRequested;
+          runEnded = true;
           currentSession.active = false;
+          this.persistActive(currentSession, false);
           currentSession.agent = null;
           currentSession.stopRequested = false;
           currentSession.lastActivity = new Date();
+          this.releaseRuntimeProjectLease(sessionId);
 
           // Whether or not the exit was asked for, and whether or not anyone is
           // attached: the tab is bright on every screen that saw this session
@@ -794,10 +1553,13 @@ export class MessageProcessor {
           if (!currentSession || currentSession.runId !== runId) return;
 
           const stopRequested = currentSession.stopRequested;
+          runEnded = true;
           currentSession.active = false;
+          this.persistActive(currentSession, false);
           currentSession.agent = null;
           currentSession.stopRequested = false;
           currentSession.lastActivity = new Date();
+          this.releaseRuntimeProjectLease(sessionId);
 
           this.noteStopped(currentSession);
 
@@ -814,8 +1576,31 @@ export class MessageProcessor {
           }
         },
       })) as RuntimeSession;
+      runtimeMayBeAlive = true;
+
+      // DELETE/reclaim can begin while the bridge is spawning but before this
+      // promise resolves. Publish nothing from that launch: make the record an
+      // admission owner temporarily and synchronously drain the process through
+      // the same verified stop contract retirement will use.
+      if (!this.launchIsCurrent(session, runId)) {
+        session.active = true;
+        session.agent = agentKind;
+        session.stopRequested = true;
+        this.persistActive(session, true);
+        await this.stopRuntime(session.id, agentKind);
+        return;
+      }
+
+      // A bridge may report an immediate exit while `startSession()` is still
+      // resolving. Do not resurrect that finished run below — especially not
+      // in SQLite, where it would make a dead project look busy. (#168)
+      if (runEnded) {
+        if (session.runId === runId) session.runId = previousRunId;
+        return;
+      }
 
       session.active = true;
+      this.persistActive(session, true);
       session.agent = agentKind;
       session.lastAgent = agentKind;
       session.stopRequested = false;
@@ -867,6 +1652,16 @@ export class MessageProcessor {
       if (session.runId === runId) {
         session.runId = previousRunId;
       }
+      if (!runtimeMayBeAlive) {
+        this.persistActive(session, false);
+        this.releaseRuntimeProjectLease(sessionId);
+      } else {
+        // A failed verified stop is an admission failure, not an exited run.
+        // Keep the record and lease live so deletion/reclaim cannot pass it.
+        session.active = true;
+        session.agent = agentKind;
+        this.persistActive(session, true);
+      }
 
       const errorMessage = error instanceof Error ? error.message : String(error);
       if (this.deps.dev) {
@@ -883,20 +1678,96 @@ export class MessageProcessor {
         message,
       });
     }
+    } finally {
+      this.finishRuntimeStart(session.id);
+    }
   }
 
   async stopRuntime(sessionId: string, agentKind: AgentKind): Promise<void> {
     const session = this.deps.claudeSessions.get(sessionId);
-    if (!session || !session.active) return;
+    const runId = session?.runId;
+    const existing = this.runtimeStops.get(sessionId);
+    if (
+      existing
+      && existing.session === session
+      && existing.runId === runId
+    ) {
+      return existing.promise;
+    }
 
-    const bridge = this.deps.getRuntimeBridge(agentKind);
-    if (!bridge) return;
+    const attempt = this.stopRuntimeOnce(sessionId, agentKind, session, runId);
+    const entry = { session: session!, runId, promise: attempt };
+    if (session) this.runtimeStops.set(sessionId, entry);
+    try {
+      await attempt;
+    } finally {
+      if (this.runtimeStops.get(sessionId) === entry) {
+        this.runtimeStops.delete(sessionId);
+      }
+    }
+  }
+
+  private async stopRuntimeOnce(
+    sessionId: string,
+    agentKind: AgentKind,
+    session: SessionRecord | undefined,
+    runId: string | undefined,
+  ): Promise<void> {
+    if (!session) {
+      this.releaseRuntimeProjectLease(sessionId);
+      return;
+    }
+    const chatOwned = session.surface === 'chat'
+      && this.deps.chatManager?.has(sessionId) === true;
+    if (!session.active && !chatOwned) {
+      this.releaseRuntimeProjectLease(sessionId);
+      return;
+    }
+    if (chatOwned && !session.active) {
+      // Manager ownership is stronger evidence than a stale persisted flag.
+      // Restore the conservative record before an awaited retry so a rejected
+      // proof cannot leave reclaim/delete believing there is no live work.
+      session.active = true;
+      session.agent ||= session.lastAgent || agentKind;
+      this.persistActive(session, true);
+    }
 
     session.stopRequested = true;
-    await bridge.stopSession(sessionId);
+    if (session.surface === 'chat') {
+      if (!this.deps.chatManager) {
+        if (session.projectId || this.runtimeProjectLeases.has(sessionId)) {
+          throw new Error(`Cannot verify that project chat ${sessionId} stopped: manager unavailable`);
+        }
+      } else {
+        await this.deps.chatManager.stop(sessionId);
+      }
+    } else {
+      const bridge = this.deps.getRuntimeBridge(agentKind);
+      if (bridge) {
+        await bridge.stopSession(sessionId);
+      } else if (session.projectId || this.runtimeProjectLeases.has(sessionId)) {
+        // Losing the only terminal handle is not evidence that a container
+        // command ended. Keep the record and project admission closed so an
+        // operator/retry can recover it; host-only legacy records retain their
+        // historical no-handle cleanup below.
+        throw new Error(`Cannot verify that project terminal ${sessionId} stopped: bridge unavailable`);
+      }
+    }
+
+    // The verified exit callback may make this run inactive and allow a new
+    // launch before the awaiting stop continuation is scheduled. Never let the
+    // old continuation retire or release the replacement run.
+    if (
+      this.deps.claudeSessions.get(sessionId) !== session
+      || session.runId !== runId
+    ) {
+      return;
+    }
     session.active = false;
+    this.persistActive(session, false);
     session.agent = null;
     session.lastActivity = new Date();
+    this.releaseRuntimeProjectLease(sessionId);
 
     this.noteStopped(session);
 
@@ -928,6 +1799,7 @@ export class MessageProcessor {
         const bridge = this.deps.getRuntimeBridge(session.agent);
         if (bridge) {
           await bridge.sendInput(wsInfo.claudeSessionId, inputData);
+          this.noteActivity(session);
         }
       } catch (error: unknown) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -976,6 +1848,7 @@ export class MessageProcessor {
         const bridge = this.deps.getRuntimeBridge(session.agent);
         if (bridge) {
           await bridge.resize(wsInfo.claudeSessionId, session.termCols, session.termRows);
+          this.noteActivity(session);
         }
       } catch (error) {
         if (this.deps.dev) {
@@ -1121,12 +1994,18 @@ export class MessageProcessor {
   /**
    * Which model a *new* conversation on this runtime would open on, and why.
    *
-   * Two layers, in this order: the account's own standing choice, then the
-   * active profile. The personal one wins because a per-conversation override
-   * has always outranked the profile (see the launch below), so a profile was
-   * never a pin an installer could stop a user escaping — and because the only
-   * ordering under which the picker's "Use the default for this runtime" entry
-   * does anything is one where the thing it clears is above the profile.
+   * Three layers, in this order: the account's own standing choice, a model
+   * typed into the active profile, then that profile's ladder rung. The personal
+   * one wins because a per-conversation override has always outranked the
+   * profile (see the launch below), so a profile was never a pin an installer
+   * could stop a user escaping — and because the only ordering under which the
+   * picker's "Use the default for this runtime" entry does anything is one where
+   * the thing it clears is above the profile.
+   *
+   * The rung sits *below* the typed model, which #171 asks for in as many
+   * words: a ladder is what answers when nobody typed anything. Both of the
+   * layers above it are reported by name so the dialog can say which one is
+   * overriding a ladder somebody configured and cannot see working.
    *
    * Re-normalised on the way out. What comes back is a database row, and a
    * hand-edited one must not become an argv on every future launch.
@@ -1138,13 +2017,22 @@ export class MessageProcessor {
   private modelDefaultFor(
     runtime: string | null,
     userId: number,
-    profile: { profileName: string; model?: string } | null,
+    profile: ResolvedProfile | null,
   ): ChatModelDefault {
     const stored = runtime ? this.deps.getUserModelDefault?.(userId, runtime) || '' : '';
     const personal = stored ? normaliseModelName(stored) : undefined;
     if (personal) return { model: personal, source: 'personal' };
     if (profile?.model) {
       return { model: profile.model, source: 'profile', profileName: profile.profileName };
+    }
+    if (profile?.ladder) {
+      return {
+        model: profile.ladder.model,
+        source: 'ladder',
+        profileName: profile.profileName,
+        tier: profile.ladder.tier,
+        ...(profile.ladder.requested ? { requestedTier: profile.ladder.requested } : {}),
+      };
     }
     return { model: null, source: 'runtime' };
   }
@@ -1261,6 +2149,14 @@ export class MessageProcessor {
       : this.deps.claudeSessions.get(wsInfo.claudeSessionId);
     if (!session || session.ownerUserId !== wsInfo.userId) return;
 
+    if (session.retiring) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: 'This session is being closed',
+      });
+      return;
+    }
+
     if (!isChatRuntime(agentKind)) {
       sendToWebSocket(wsInfo.ws, {
         type: 'error',
@@ -1277,6 +2173,20 @@ export class MessageProcessor {
       });
       return;
     }
+
+    if (!this.beginRuntimeStart(session.id)) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: 'A process is already starting in this session',
+      });
+      return;
+    }
+
+    const runId = randomUUID();
+    const previousRunId = session.runId;
+    session.runId = runId;
+
+    try {
 
     // Nothing that shapes the launch is taken from the browser any more. Model,
     // arguments and environment come from the server-side profile below, for the
@@ -1317,7 +2227,7 @@ export class MessageProcessor {
 
     const profile = this.deps.resolveRuntimeProfile(
       agentKind as AgentKind,
-      session.workingDir,
+      session.projectWorkingDirKind === 'container' ? undefined : session.workingDir,
     );
     const modelDefault = this.modelDefaultFor(agentKind, wsInfo.userId, profile);
     // Read before `surface` is set below, because that is half of what it reads.
@@ -1357,6 +2267,49 @@ export class MessageProcessor {
     session.runtimeLabel = this.getRuntimeLabel(agentKind as AgentKind, session);
     session.lastActivity = new Date();
 
+    if (!session.projectId && !this.deps.validatePath(session.workingDir, session.ownerUserId).valid) {
+      // Same reasoning as the pty path above.
+      session.workingDir = this.userBaseFolder(session.ownerUserId);
+    }
+
+    let chatEnvironment: UserEnvironment;
+    let chatFileAccess:
+      | {
+          readFile(filePath: string): Promise<string>;
+          writeFile(filePath: string, contents: string): Promise<void>;
+        }
+      | undefined;
+    try {
+      const prepared = await this.environmentForSession(session);
+      chatEnvironment = prepared.environment;
+      if (!this.launchIsCurrent(session, runId)) {
+        this.releaseHeldProjectLease(prepared.lease);
+        if (session.runId === runId) session.runId = previousRunId;
+        return;
+      }
+      // The manager contract always supplies containerAccess. The runtime
+      // guard keeps older embedders/test doubles that predate project-local
+      // file delegation on their established host-only behaviour.
+      if (prepared.project?.containerAccess) {
+        chatFileAccess = this.projectChatFileAccess(session, prepared.project);
+      }
+      if (prepared.lease) {
+        this.releaseRuntimeProjectLease(session.id);
+        this.runtimeProjectLeases.set(session.id, prepared.lease);
+      }
+    } catch (error) {
+      if (session.runId === runId) session.runId = previousRunId;
+      sendToWebSocket(wsInfo.ws, {
+        type: 'error',
+        message: error instanceof Error
+          ? session.projectId
+            ? error.message
+            : `Your workspace environment could not be started: ${error.message}`
+          : 'Your workspace environment could not be started.',
+      });
+      return;
+    }
+
     /**
      * Which model this launch actually uses — resolved once, because the record
      * has to be told what it was.
@@ -1373,25 +2326,72 @@ export class MessageProcessor {
      * before pins existed — the profile, exactly as before #135.
      *
      * `pinned === undefined` is "nothing recorded"; a recorded `null` is the
-     * answer "it launched with no flag", and it has to outrank the profile or a
-     * profile configured mid-conversation would retcon a conversation that had
+     * answer "it launched with no flag", and it has to outrank the *profile* or
+     * a profile configured mid-conversation would retcon a conversation that had
      * deliberately run bare. That is why this is not a chain of `||`.
+     *
+     * The ladder is the one thing a `null` pin does not outrank, and #171 asks
+     * for that in as many words: "conversations that predate this change move
+     * onto the ladder the next time they are relaunched". Every one of them
+     * carries `null`, so honouring it here would mean the ladder never reached a
+     * single conversation that existed before the upgrade. The exception is
+     * narrow — it is only the rung, never `profile.model`, so the guarantee
+     * #135 bought is intact — and it cannot misfire afterwards: once a laddered
+     * runtime is launched, the rung *is* the model, so a fresh `null` pin can
+     * only be recorded for a profile that has no ladder to fall to.
      */
     const pinned = session.chatModelPinned;
-    const launchModel =
-      session.chatModelOverride
-      || (pinned !== undefined
-        ? pinned || undefined
-        : seedFromAccount
-          ? modelDefault.model || undefined
-          : profile?.model)
-      || undefined;
+    const ladder = profile?.ladder ?? null;
 
+    // The chain, resolved to a model *and* the layer that supplied it in one
+    // pass. Deriving the layer afterwards by comparing the answer to each
+    // candidate reads well and is wrong twice over: a pin that happens to equal
+    // the current rung is credited to the ladder — and then not pinned, so a
+    // string coincidence quietly enrolls a conversation in every future ladder
+    // edit — and a pin that matches nothing is credited to an override the user
+    // never made, which the picker renders as "chosen for this conversation
+    // only" with no way to clear it.
+    let decided: ChatModelOrigin;
+    if (session.chatModelOverride) {
+      decided = { model: session.chatModelOverride, source: 'override' };
+    } else if (pinned) {
+      // A continuation. It is on this model because it launched on it, whatever
+      // the layers below would say today.
+      decided = { model: pinned, source: 'override' };
+    } else if (pinned === null && ladder) {
+      decided = ladderOrigin(ladder, profile);
+    } else if (pinned === null) {
+      decided = { model: null, source: 'runtime' };
+    } else if (seedFromAccount && modelDefault.model) {
+      decided = { ...modelDefault };
+    } else if (profile?.model) {
+      decided = { model: profile.model, source: 'profile', profileName: profile.profileName };
+    } else if (ladder) {
+      decided = ladderOrigin(ladder, profile);
+    } else {
+      decided = { model: null, source: 'runtime' };
+    }
+
+    // Not const: a rung the provider refuses is retried bare below, and what
+    // the record and the browser are told has to be what actually started.
+    let launchModel = decided.model || undefined;
+    let modelOrigin = decided;
+    let ladderError = profile?.ladderError ?? null;
+
+    let chatMayBeAlive = false;
     try {
-      const chat = await manager.start(session, {
+      // Starting fresh is a new conversation even when the old one never
+      // produced an event. In that empty-log case ChatSession has no truncation
+      // boundary at which to report the reset back, so clear the durable record
+      // here as well and make the launch announcement agree with the process.
+      if (startFresh) session.chatPlanMode = false;
+      const startWith = async (model: string | undefined) => manager.start(session, {
         runtime: agentKind,
+        environment: chatEnvironment,
         workingDir: session.workingDir,
-        model: launchModel,
+        cwdKind: session.projectWorkingDirKind,
+        fileAccess: chatFileAccess,
+        model,
         // No profile fallback behind it: profiles are server-wide and keyed by
         // runtime, and an effort level is a per-conversation decision that has
         // never had a profile default to fall back to. Absent means the runtime
@@ -1399,12 +2399,90 @@ export class MessageProcessor {
         effort: session.chatEffortOverride,
         extraArgs: profile?.extraArgs,
         env: profile?.env,
+        // Only when the rung is what this conversation is actually running on.
+        // A profile-typed model or an account's standing choice outranks the
+        // ladder, and offering an escalation from a rung nobody is on would ask
+        // the user to approve a move that changes nothing they can see.
+        ladder:
+          modelOrigin.source === 'ladder' && profile?.ladder && profile.tiers
+            ? { tier: profile.ladder.tier, tiers: profile.tiers }
+            : undefined,
         bypassPermissions,
+        planMode: startFresh ? false : session.chatPlanMode === true,
         resumeSessionId,
         startFresh,
+        cancelled: () => (
+          this.deps.claudeSessions.get(session.id) !== session
+          || session.retiring === true
+        ),
       });
 
+      let chat;
+      try {
+        chat = await startWith(launchModel);
+      } catch (error: unknown) {
+        // A rung whose model the provider will not serve — retired, not on this
+        // account's plan, spelled for a gateway this install is not pointed at.
+        // The conversation carries on at the runtime's own default rather than
+        // refusing to open, and says which of the two it is on. Only for the
+        // ladder: a model somebody typed in themselves is a request to make,
+        // and quietly starting on a different one would answer their question
+        // wrongly rather than not at all.
+        if (modelOrigin.source !== 'ladder') throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`runtime profiles: ${agentKind} refused ${launchModel}: ${message}`);
+        // Corrected *before* the retry, not after it. `startWith` reads the
+        // origin to decide whether to install the ladder on the session, so a
+        // retry launched while it still said 'ladder' put the conversation on a
+        // rung it had just been refused: the escalation tool would be offered
+        // from a rung nobody is on, and a browser rejoining would be told by
+        // `ladderOf` that it is running the very model the provider would not
+        // serve — contradicting the launch, which said the opposite.
+        launchModel = undefined;
+        modelOrigin = { model: null, source: 'runtime' };
+        ladderError =
+          `${agentKind} would not start on the ${profile?.ladder?.tier} rung’s model `
+          + `(${message.trim()}), so this conversation is on its own default instead.`;
+        chat = await startWith(undefined);
+      }
+
+      chatMayBeAlive = chat.live !== false;
+
+      if (!this.launchIsCurrent(session, runId)) {
+        session.active = true;
+        session.agent = agentKind as AgentKind;
+        session.stopRequested = true;
+        this.persistActive(session, true);
+        await this.stopRuntime(session.id, agentKind as AgentKind);
+        return;
+      }
+
+      // Like a PTY bridge, a chat adapter can exit synchronously while its
+      // start promise is still resolving. The lifecycle callback has already
+      // marked the record inactive and released its project lease in that case;
+      // never resurrect either fact from the stale success value below.
+      if (
+        chat.live === false
+        || (session.projectId && !this.runtimeProjectLeases.has(session.id))
+      ) {
+        session.active = false;
+        session.agent = null;
+        session.lastActivity = new Date();
+        this.persistActive(session, false);
+        this.releaseRuntimeProjectLease(session.id);
+        sendToWebSocket(wsInfo.ws, {
+          type: 'chat_unavailable',
+          sessionId: session.id,
+          runtime: agentKind,
+          runtimeLabel: session.runtimeLabel || '',
+          canResume: Boolean(session.nativeChatSessionId),
+          message: `${this.getRuntimeLabel(agentKind as AgentKind, session)} exited while starting.`,
+        });
+        return;
+      }
+
       session.active = true;
+      this.persistActive(session, true);
       session.stopRequested = false;
       session.sessionStartTime = session.sessionStartTime || new Date();
       // Recorded on the record, not just handed to the process: the process is
@@ -1424,11 +2502,32 @@ export class MessageProcessor {
       // this conversation is fixed to. `null` rather than absent when there was
       // no flag — "the runtime's own default" is an answer, and it is the one a
       // profile added later must not be allowed to overwrite.
-      session.chatModelPinned = launchModel ?? null;
+      //
+      // A rung is deliberately *not* pinned. The pin exists so an unrelated
+      // profile edit cannot re-model a conversation already under way, but the
+      // rung is not an unrelated edit — it is the profile's standing answer to
+      // the question "which model runs this conversation", and #171 asks for a
+      // changed ladder to reach conversations that are already open. Recording
+      // `null` leaves the rung to be re-read on every relaunch, which is the
+      // same thing one restart later.
+      session.chatModelPinned = modelOrigin.source === 'ladder' ? null : launchModel ?? null;
+      // Beside it, and for the same reason: the browser that asked for the
+      // launch is told this in `chat_started`, and every other screen — a
+      // reload, a reconnect, a second tab — arrives at a `chat_snapshot`
+      // instead. Without it on the record the badge saying the ladder is not
+      // applied lasts exactly as long as the tab that watched it start.
+      session.chatLadderError = ladderError;
 
       // Before the broadcast, so the socket that asked for the launch is
-      // already a watcher when the very first event goes out.
-      wsInfo.chatSessionIds.add(session.id);
+      // already a watcher when the very first event goes out. The subscription
+      // owns its own admission: it can outlive both this runtime and the
+      // socket's foreground join.
+      await this.retainChatSubscription(wsInfo, session);
+
+      if (!this.launchIsCurrent(session, runId)) {
+        await this.stopRuntime(session.id, agentKind as AgentKind);
+        return;
+      }
 
       // The session already existed as a terminal on every other screen — this
       // is where it becomes a conversation, and a screen that still thinks it is
@@ -1436,7 +2535,11 @@ export class MessageProcessor {
       // at whatever it looked like when it was one. Re-announced rather than
       // given its own message: "here is a session, and here is what it is" is
       // one fact, and the client already folds a repeat into the tab it has.
-      announceSessionOpened(session, this.deps.webSocketConnections);
+      announceSessionOpened(
+        session,
+        this.deps.webSocketConnections,
+        this.projectIdentity(session).projectName,
+      );
 
       // `session.id`, not the socket's joined id: a relaunch names its own
       // conversation, and announcing it under the joined one would tell every
@@ -1449,6 +2552,7 @@ export class MessageProcessor {
           agent: agentKind,
           runtimeLabel: session.runtimeLabel,
           workingDir: session.workingDir,
+          projectWorkingDirKind: session.projectWorkingDirKind,
           capabilities: chat.currentCapabilities,
           bypassPermissions: chat.bypassing,
           modelOverride: session.chatModelOverride || null,
@@ -1463,7 +2567,15 @@ export class MessageProcessor {
           // picker can say where the model came from instead of leaving a
           // profile-pinned default indistinguishable from no default at all.
           modelDefault,
+          // And where *this* conversation's model came from, which is a
+          // different question the moment a ladder can answer either one.
+          modelOrigin,
+          // Said rather than swallowed: a ladder that could not be written
+          // through has not configured the delegated helpers, so a conversation
+          // that reported the rung anyway would be claiming half a feature.
+          ladderError,
           effortOverride: session.chatEffortOverride || null,
+          planMode: session.chatPlanMode === true,
         },
         this.deps.claudeSessions,
         this.deps.webSocketConnections,
@@ -1472,7 +2584,20 @@ export class MessageProcessor {
       await this.deps.saveSessionsToDisk();
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
-      session.active = false;
+      // A failed adapter start is safe to release only when ChatSession proved
+      // its child stopped and the manager dropped it. A retained manager entry
+      // is the fail-closed handle for an unverifiable container process.
+      chatMayBeAlive ||= manager.has(session.id);
+      if (chatMayBeAlive) {
+        session.active = true;
+        session.agent = agentKind as AgentKind;
+        this.persistActive(session, true);
+      } else {
+        session.active = false;
+        this.persistActive(session, false);
+        this.releaseRuntimeProjectLease(session.id);
+        if (session.runId === runId) session.runId = previousRunId;
+      }
       // Left on 'chat' deliberately: the conversation log for this session is
       // a chat log, and flipping the surface back would show the user an empty
       // terminal as the explanation for a failed chat launch.
@@ -1480,6 +2605,9 @@ export class MessageProcessor {
         type: 'error',
         message: `Could not start ${agentKind}: ${message}`,
       });
+    }
+    } finally {
+      this.finishRuntimeStart(session.id);
     }
   }
 
@@ -1491,21 +2619,74 @@ export class MessageProcessor {
    * make a second round trip for the transcript would leave a window in which
    * live events arrive for a conversation the client cannot place them in.
    */
-  async subscribeChat(wsInfo: WebSocketInfo, sessionId: string): Promise<void> {
+  private async retainChatSubscription(
+    wsInfo: WebSocketInfo,
+    session: SessionRecord,
+  ): Promise<boolean> {
+    const existing = this.subscribedProjectLeases.get(wsInfo.id)?.get(session.id);
+    if (wsInfo.chatSessionIds.has(session.id) && (!session.projectId || existing)) return true;
+
+    let lease: HeldProjectSessionLease | undefined;
+    if (session.projectId) {
+      try {
+        lease = (await this.environmentForSession(session)).lease;
+      } catch (error) {
+        wsInfo.chatSessionIds.delete(session.id);
+        sendToWebSocket(wsInfo.ws, {
+          type: 'error',
+          message: error instanceof Error
+            ? error.message
+            : 'This project is not available right now.',
+        });
+        return false;
+      }
+    }
+
+    if (this.deps.webSocketConnections.get(wsInfo.id) !== wsInfo) {
+      this.releaseHeldProjectLease(lease);
+      return false;
+    }
+
+    wsInfo.chatSessionIds.add(session.id);
+    if (lease) {
+      let bySession = this.subscribedProjectLeases.get(wsInfo.id);
+      if (!bySession) {
+        bySession = new Map();
+        this.subscribedProjectLeases.set(wsInfo.id, bySession);
+      }
+      bySession.set(session.id, lease);
+    }
+    return true;
+  }
+
+  private unsubscribeChat(wsInfo: WebSocketInfo, sessionId: string): void {
+    wsInfo.chatSessionIds.delete(sessionId);
+    this.releaseSubscribedProjectLease(wsInfo.id, sessionId);
+    const session = this.deps.claudeSessions.get(sessionId);
+    if (session?.projectId) this.deps.projectsManager?.touchActivity(session.projectId);
+  }
+
+  async subscribeChat(wsInfo: WebSocketInfo, sessionId: string): Promise<boolean> {
     const manager = this.deps.chatManager;
-    if (!manager || !sessionId) return;
+    if (!manager || !sessionId) return false;
 
     const session = this.deps.claudeSessions.get(sessionId);
     if (!session || session.ownerUserId !== wsInfo.userId) {
       sendToWebSocket(wsInfo.ws, { type: 'error', message: 'Session not found' });
-      return;
+      return false;
     }
-    if (session.surface !== 'chat') return;
+    if (session.surface !== 'chat') return false;
 
-    wsInfo.chatSessionIds.add(sessionId);
+    const alreadyRetained = wsInfo.chatSessionIds.has(sessionId)
+      && (!session.projectId
+        || this.subscribedProjectLeases.get(wsInfo.id)?.has(sessionId) === true);
+    if (!(await this.retainChatSubscription(wsInfo, session))) return false;
 
     try {
       const snapshot = await manager.snapshot(session);
+      const runtime = session.agent || session.lastAgent;
+      const active = this.deps.activeProfileFor?.(runtime || '') ?? null;
+      const modelDefault = this.modelDefaultFor(runtime, session.ownerUserId, active);
       sendToWebSocket(wsInfo.ws, {
         type: 'chat_snapshot',
         sessionId,
@@ -1523,11 +2704,59 @@ export class MessageProcessor {
         // can tell the picker why a model is in force. Resolved through the
         // read-only profile accessor — see the dep — since a join must not
         // rewrite a runtime's tier files.
-        modelDefault: this.modelDefaultFor(
-          session.agent || session.lastAgent,
-          session.ownerUserId,
-          this.deps.activeProfileFor?.(session.agent || session.lastAgent || '') ?? null,
-        ),
+        modelDefault,
+        // And where the model this conversation is on came from, which a join
+        // has to answer from the record: the process may be gone, and a rung is
+        // exactly the kind of provenance no runtime reports about itself.
+        //
+        // A pin of `null` under a laddered profile is the rung — that is what
+        // the launch records for one, so it can be re-read — and the origin has
+        // to reach the same conclusion the next launch will, or a reload would
+        // rename the model between one screen and the next.
+        //
+        // The rung comes from the *running* session rather than from the
+        // profile, and that distinction is the whole of #135 said again: a
+        // conversation that launched bare also carries a null pin, so reading
+        // the profile's current rung here would draw the chip as running a model
+        // the process is not on. A session that is not running has no rung in
+        // force to report, and says nothing rather than guessing one.
+        //
+        // Which is why the last branch is gated on the conversation being live.
+        // A null pin says "launched with no model flag" and nothing more: under
+        // a ladder that is what a rung records, so the two are indistinguishable
+        // once the process is gone. While it runs they are not — a rung answers
+        // through `ladderOf` above and never reaches here — but a stopped
+        // laddered conversation would otherwise be announced as running on the
+        // runtime's own default, which is a different model from the one it was
+        // on and from the one its next launch will use. A conversation whose
+        // model was chosen, or which is pinned to one, is still answered for
+        // when it is not running: those are facts the record holds outright.
+        //
+        // The snapshot's own liveness, not `session.active`. They disagree in
+        // both directions and the snapshot is the half that agrees with
+        // `ladderOf`, since both read the chat session: a process that died
+        // through the adapter's error path never reports `exited`, so the
+        // record still calls it active, and codex's abandoned handshake probe
+        // reports one for a conversation whose fallback is running fine.
+        modelOrigin: ladderOf(manager, sessionId, active)
+          ?? (session.chatModelOverride
+            ? { model: session.chatModelOverride, source: 'override' }
+            : session.chatModelPinned
+              ? { model: session.chatModelPinned, source: 'override' }
+              : session.chatModelPinned === null && snapshot.live
+                ? { model: null, source: 'runtime' }
+                : null),
+        // The same answer the launch gave, for a screen that was not there for
+        // it. A conversation that has launched under this server speaks for
+        // itself — including when it has nothing to report, which is why this
+        // tests for `undefined` rather than falsiness: a clean launch under a
+        // profile that has failed to write since must not inherit a failure
+        // that was not its own. One that has not launched here falls back to
+        // the profile, which is the same answer its next launch would give.
+        ladderError:
+          session.chatLadderError !== undefined
+            ? session.chatLadderError
+            : active?.ladderError ?? null,
         // Rides on the join for the same reason the model does: the snapshot
         // carries the runtime's own reported level only if it ever reported one,
         // and a conversation whose process has since died reports nothing at
@@ -1541,12 +2770,15 @@ export class MessageProcessor {
         // simply has not heard yet.
         draft: draftOf(session),
       });
+      return true;
     } catch (error: unknown) {
+      if (!alreadyRetained) this.unsubscribeChat(wsInfo, sessionId);
       const message = error instanceof Error ? error.message : String(error);
       sendToWebSocket(wsInfo.ws, {
         type: 'error',
         message: `Could not load the conversation: ${message}`,
       });
+      return false;
     }
   }
 
@@ -1626,7 +2858,20 @@ export class MessageProcessor {
     if (!manager || !session) return;
 
     const text = typeof data.text === 'string' ? data.text : '';
-    if (!text.trim() && !(data.attachments || []).length) return;
+    const candidates = readAttachments(data.attachments, session.id);
+    if (!candidates) return;
+    const verifiedAttachments = this.deps.resolveChatAttachment
+      ? (await Promise.all(candidates.map(async (attachment) => {
+          try {
+            return await this.deps.resolveChatAttachment!(session, attachment);
+          } catch {
+            return null;
+          }
+        }))).filter((attachment): attachment is ChatAttachment => attachment !== null)
+      : [];
+    // Checked after server-side resolution. A frame carrying only a forged or
+    // stale attachment path must never become a turn that reaches an adapter.
+    if (!text.trim() && verifiedAttachments.length === 0) return;
 
     // The runtime's own `/model` reaches the same decision by the other door,
     // so it has to leave the same trace. Without this the command is forwarded
@@ -1692,9 +2937,10 @@ export class MessageProcessor {
     try {
       await manager.send(session.id, {
         text,
-        attachments: Array.isArray(data.attachments) ? data.attachments : undefined,
+        attachments: verifiedAttachments.length ? verifiedAttachments : undefined,
       });
       session.lastActivity = new Date();
+      this.noteActivity(session);
       // The composer that held this turn is empty now, on every screen. The one
       // that sent it emptied its own box the moment the button was pressed;
       // without this the others would go on offering a prompt that has already
@@ -1736,6 +2982,182 @@ export class MessageProcessor {
 
       sendToWebSocket(wsInfo.ws, { type: 'error', message });
     }
+  }
+
+  /**
+   * Admit one app-owned guided workflow without borrowing the composer path.
+   *
+   * The browser needs a positive, correlated answer before it closes the
+   * popup. Ordinary chat sends deliberately do not have that handshake: their
+   * composer draft is cleared as soon as the server takes ownership. A workflow
+   * prompt is separate so an unrelated synchronized draft remains untouched.
+   */
+  private async handleChatStartBuiltInWorkflow(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const requestId = typeof data.requestId === 'string' ? data.requestId : '';
+    const requestedSessionId = typeof data.sessionId === 'string' ? data.sessionId : '';
+    const workflow = data.workflow;
+    const reply = (
+      accepted: boolean,
+      message: string,
+      status?: 'accepted' | 'queued',
+      sessionId = requestedSessionId,
+    ): void => {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_builtin_workflow_result',
+        sessionId,
+        requestId,
+        workflow,
+        accepted,
+        ...(status ? { status } : {}),
+        message,
+      });
+    };
+
+    if (!requestId) {
+      // A caller without a correlation id cannot safely close a popup. It is
+      // still told why on its socket for debugging/version-skew visibility.
+      reply(false, 'The workflow request was missing its correlation id.');
+      return;
+    }
+    if (requestId.length > MAX_BUILT_IN_WORKFLOW_REQUEST_ID) {
+      reply(false, 'The workflow request correlation id is too large.');
+      return;
+    }
+    if (!isBuiltInWorkflowId(workflow)) {
+      reply(false, 'That built-in workflow is unavailable.');
+      return;
+    }
+
+    const prompt = typeof data.text === 'string' ? data.text : '';
+    const trimmed = prompt.trim();
+    if (!trimmed) {
+      reply(false, 'Describe the issue before starting the guided workflow.');
+      return;
+    }
+    if (prompt.length > MAX_BUILT_IN_WORKFLOW_PROMPT) {
+      reply(
+        false,
+        `The workflow prompt is too large; the limit is ${MAX_BUILT_IN_WORKFLOW_PROMPT.toLocaleString('en-US')} characters.`,
+      );
+      return;
+    }
+
+    const manager = this.deps.chatManager;
+    const session = this.chatSessionFor(wsInfo, requestedSessionId);
+    if (!manager || !session || session.surface !== 'chat') {
+      reply(false, 'This conversation is unavailable.');
+      return;
+    }
+
+    const admissionKey = `${wsInfo.userId}:${session.id}:${requestId}`;
+    let admission = this.builtInWorkflowAdmissions.get(admissionKey);
+    if (admission && (admission.workflow !== workflow || admission.prompt !== trimmed)) {
+      reply(false, 'That workflow request id was already used for a different prompt.', undefined, session.id);
+      return;
+    }
+    if (!admission) {
+      if (this.builtInWorkflowAdmissions.size >= MAX_BUILT_IN_WORKFLOW_ADMISSIONS) {
+        reply(false, 'Too many guided workflow requests are being admitted. Please try again.', undefined, session.id);
+        return;
+      }
+      admission = {
+        workflow,
+        prompt: trimmed,
+        promise: this.admitBuiltInWorkflow(manager, session, workflow, trimmed),
+        accepted: false,
+      };
+      this.builtInWorkflowAdmissions.set(admissionKey, admission);
+    }
+
+    const result = await admission.promise;
+    // Rejections must be retryable with the same id once the underlying state
+    // changes (Plan mode off, queue space available, runtime resumed). Only a
+    // result that took ownership of the turn is safe to replay.
+    if (result.accepted) {
+      admission.accepted = true;
+    } else if (this.builtInWorkflowAdmissions.get(admissionKey) === admission) {
+      this.builtInWorkflowAdmissions.delete(admissionKey);
+    }
+    reply(result.accepted, result.message, result.status, session.id);
+  }
+
+  /** Perform the one state-changing admission shared by all duplicate frames. */
+  private async admitBuiltInWorkflow(
+    manager: ChatManagerLike,
+    session: SessionRecord,
+    workflow: BuiltInWorkflowId,
+    prompt: string,
+  ): Promise<BuiltInWorkflowAdmissionResult> {
+    if (session.chatPlanMode === true) {
+      return {
+        accepted: false,
+        message: 'Turn Plan mode off before starting a workflow that can create a GitHub issue.',
+      };
+    }
+
+    // Check the installed asset before a user message reaches the transcript.
+    // A missing package asset is actionable server configuration, not a prompt
+    // the agent should attempt to interpret without its required instructions.
+    try {
+      builtInWorkflowInstructions(workflow);
+    } catch (error: unknown) {
+      return { accepted: false, message: error instanceof Error ? error.message : String(error) };
+    }
+
+    const snapshot = await manager.snapshot(session).catch(() => null);
+    if (!snapshot) {
+      return { accepted: false, message: 'This conversation could not be checked. Please try again.' };
+    }
+    if (snapshot.live !== true) {
+      return {
+        accepted: false,
+        message: 'This conversation is not running. Resume it before starting the workflow.',
+      };
+    }
+    if (snapshot.planMode === true) {
+      return {
+        accepted: false,
+        message: 'Turn Plan mode off before starting a workflow that can create a GitHub issue.',
+      };
+    }
+
+    try {
+      const status = await manager.send(session.id, { text: prompt, workflow });
+      if (status !== 'accepted' && status !== 'queued') {
+        throw new Error('The conversation did not confirm whether the guided workflow started.');
+      }
+      session.lastActivity = new Date();
+      this.noteActivity(session);
+      return {
+        accepted: true,
+        status,
+        message: status === 'queued' ? 'The guided workflow is queued.' : 'The guided workflow started.',
+      };
+    } catch (error: unknown) {
+      return { accepted: false, message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /**
+   * Forget a successful admission once its browser has finished the local
+   * handoff and promises not to retry that correlation id.
+   *
+   * There is deliberately no reply. This frame is cleanup after the correlated
+   * result, not another operation the popup must wait for. If it is lost, the
+   * bounded cache keeps the safer failure mode: a later replay still dedupes.
+   */
+  private handleChatBuiltInWorkflowAck(wsInfo: WebSocketInfo, data: IncomingMessage): void {
+    const requestId = typeof data.requestId === 'string' ? data.requestId : '';
+    const workflow = data.workflow;
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!requestId || !isBuiltInWorkflowId(workflow) || !session) return;
+    const key = `${wsInfo.userId}:${session.id}:${requestId}`;
+    const admission = this.builtInWorkflowAdmissions.get(key);
+    if (!admission || admission.workflow !== workflow || !admission.accepted) return;
+    this.builtInWorkflowAdmissions.delete(key);
   }
 
   private async handleChatInterrupt(
@@ -1790,11 +3212,16 @@ export class MessageProcessor {
     // the next `/clear` reinstates the model the conversation opened with,
     // after the browser has already been told the switch was applied. Resolved
     // the way a launch resolves it, so clearing lands on the profile default.
-    const profile = this.deps.resolveRuntimeProfile(
-      session.agent as AgentKind,
-      session.workingDir,
+    //
+    // Through the read-only accessor. The other one writes the profile's tier
+    // files to disk every time it is called, and picking a model from the chip
+    // is a question about this conversation, not a launch — asking it that way
+    // rewrote the project's `.pi/agents/*.md` on every click (#171).
+    const profile = this.deps.activeProfileFor?.(session.agent || '') ?? null;
+    this.deps.chatManager?.rememberModel(
+      session.id,
+      model || profile?.model || profile?.ladder?.model,
     );
-    this.deps.chatManager?.rememberModel(session.id, model || profile?.model);
 
     /**
      * Every answer carries the default as it stands *after* this pick.
@@ -1824,10 +3251,19 @@ export class MessageProcessor {
 
     if (!model) {
       await this.rememberUserModel(session, undefined, false);
+      // What it actually falls back to, which a ladder changes: the rung is the
+      // profile's standing answer for this runtime, so clearing lands there
+      // rather than on the CLI's own default.
+      const cleared = this.deps.activeProfileFor?.(session.agent || '') ?? null;
+      const under = cleared?.model
+        ? `the "${cleared.profileName}" profile’s model, ${cleared.model}`
+        : cleared?.ladder
+          ? `the ${cleared.ladder.tier} rung of the "${cleared.profileName}" ladder, ${cleared.ladder.model}`
+          : 'the runtime default';
       answer(
         'cleared',
         null,
-        'Cleared the model override. The next session for this conversation will use the runtime default.',
+        `Cleared the model override. The next session for this conversation will use ${under}.`,
       );
       return;
     }
@@ -1908,6 +3344,175 @@ export class MessageProcessor {
    * Choosing a level before anything has launched is legitimate and lands in the
    * same saved-for-next-launch state a model choice does.
    */
+  private async handleChatSetPlanMode(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+  ): Promise<void> {
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    if (!session) return;
+
+    const requested = data.planMode === true;
+    // The live lifecycle updates the registry record synchronously. Capture
+    // the durable value first, otherwise comparing only after the call makes a
+    // real change look already saved and an app restart silently restores the
+    // previous mode.
+    const previousPlanMode = session.chatPlanMode;
+    const running = await this.deps.chatManager?.setPlanMode?.(session.id, requested) ?? null;
+    const result = running ?? {
+      planMode: requested,
+      changed: session.chatPlanMode === requested ? false : true,
+      detail: requested
+        ? 'Plan mode is on and will apply when this conversation runs.'
+        : 'Plan mode is off. The latest plan was kept.',
+    };
+
+    session.chatPlanMode = result.planMode;
+    if (previousPlanMode !== result.planMode) {
+      await this.deps.saveSessionsToDisk();
+    }
+    this.deps.chatManager?.rememberPlanMode?.(session.id, result.planMode);
+
+    broadcastChat(
+      session.id,
+      {
+        type: 'chat_plan_mode',
+        sessionId: session.id,
+        planMode: result.planMode,
+        changed: result.changed,
+        message: result.detail,
+      },
+      this.deps.claudeSessions,
+      this.deps.webSocketConnections,
+    );
+  }
+
+  private async handleChatPlanAction(
+    wsInfo: WebSocketInfo,
+    data: IncomingMessage,
+    action: 'accept' | 'reject',
+  ): Promise<void> {
+    const session = this.chatSessionFor(wsInfo, data.sessionId);
+    const manager = this.deps.chatManager;
+    if (!session || !manager) return;
+    // Accept may turn Plan mode off inside ChatSession before returning. The
+    // pre-action value is what tells us whether that mutation still needs its
+    // awaited registry save.
+    const previousPlanMode = session.chatPlanMode;
+
+    const revision = Number.isSafeInteger(data.revision) && Number(data.revision) > 0
+      ? Number(data.revision)
+      : 0;
+    let snapshot = action === 'accept'
+      ? await manager.snapshot(session).catch(() => null)
+      : null;
+    // Do not ask a retained, exited ChatSession to accept first. Its ordinary
+    // rejection says only that it is not live; the useful operation here is to
+    // bring the durable conversation back and deliver the implementation turn.
+    let result = action === 'accept' && snapshot?.live === false
+      ? null
+      : action === 'accept'
+        ? await manager.acceptPlan?.(session.id, revision) ?? null
+        : await manager.rejectPlan?.(session.id, revision) ?? null;
+
+    // A stopped conversation can keep/reject a plan. Accept is different: once
+    // the durable document and reviewed revision have been checked, relaunch
+    // the same conversation and immediately hand the plan to the live session.
+    if (!result) {
+      snapshot ??= await manager.snapshot(session).catch(() => null);
+      const plan = snapshot?.planDocument ?? null;
+      if (action === 'accept') {
+        if (!session.chatPlanMode) {
+          result = { accepted: false, action, planMode: false, detail: 'Plan mode is not active.' };
+        } else if (!plan) {
+          result = { accepted: false, action, planMode: true, detail: 'There is no plan to accept.' };
+        } else if (revision !== plan.revision) {
+          result = {
+            accepted: false,
+            action,
+            planMode: true,
+            revision: plan.revision,
+            detail: `Revision ${revision} is stale. Review revision ${plan.revision} before accepting.`,
+          };
+        } else if (!manager.acceptPlan) {
+          result = {
+            accepted: false,
+            action,
+            planMode: true,
+            revision: plan.revision,
+            detail: 'This server cannot start implementation from the Plan control.',
+          };
+        } else {
+          const runtime = session.lastAgent || session.agent || snapshot?.runtime || '';
+          if (!runtime) {
+            result = {
+              accepted: false,
+              action,
+              planMode: true,
+              revision: plan.revision,
+              detail: 'The conversation runtime is unknown, so implementation could not be started.',
+            };
+          } else {
+            // `resume: true` is continuation semantics even for a runtime that
+            // never supplied a native id: it preserves the durable Plan and the
+            // conversation's approval mode instead of treating this as Start
+            // fresh. When an id exists, startChat passes it through normally.
+            await this.startChat(wsInfo.id, runtime, { resume: true }, session.id);
+            result = await manager.acceptPlan(session.id, revision);
+            if (!result) {
+              result = {
+                accepted: false,
+                action,
+                planMode: true,
+                revision: plan.revision,
+                detail: 'The conversation could not be resumed to implement this plan. Retry Accept.',
+              };
+            }
+          }
+        }
+      } else if (!session.chatPlanMode) {
+        result = { accepted: false, action, planMode: false, detail: 'Plan mode is not active.' };
+      } else if (!plan) {
+        result = { accepted: false, action, planMode: true, detail: 'There is no plan to reject.' };
+      } else if (revision !== plan.revision) {
+        result = {
+          accepted: false,
+          action,
+          planMode: true,
+          revision: plan.revision,
+          detail: `Revision ${revision} is stale. Review revision ${plan.revision} instead.`,
+        };
+      } else {
+        result = {
+          accepted: true,
+          action,
+          planMode: true,
+          revision: plan.revision,
+          detail: `Plan revision ${plan.revision} rejected. Add feedback in the composer to request a revision.`,
+        };
+      }
+    }
+
+    session.chatPlanMode = result.planMode;
+    if (previousPlanMode !== result.planMode) {
+      await this.deps.saveSessionsToDisk();
+    }
+
+    broadcastChat(
+      session.id,
+      {
+        type: 'chat_plan_action',
+        sessionId: session.id,
+        action,
+        accepted: result.accepted,
+        planMode: result.planMode,
+        revision: result.revision,
+        message: result.detail,
+      },
+      this.deps.claudeSessions,
+      this.deps.webSocketConnections,
+    );
+  }
+
   private async handleChatSetEffort(
     wsInfo: WebSocketInfo,
     data: IncomingMessage,
@@ -2105,18 +3710,54 @@ export class MessageProcessor {
    * arbitrary selection out of a set the model wrote. Routing both through one
    * handler would mean a browser could answer a question with an approval id.
    */
-  private handleChatQuestion(wsInfo: WebSocketInfo, data: IncomingMessage): void {
+  private async handleChatQuestion(wsInfo: WebSocketInfo, data: IncomingMessage): Promise<void> {
+    const submissionId = typeof data.submissionId === 'string' ? data.submissionId : '';
+    // Older browsers have no way to match this reply, so preserve their
+    // previous fire-and-forget handling instead of sending a meaningless ack.
+    const acknowledge = (accepted: boolean, sessionId = data.sessionId || ''): void => {
+      if (!submissionId || submissionId.length > MAX_QUESTION_ANSWER_SUBMISSION_ID) return;
+      sendToWebSocket(wsInfo.ws, {
+        type: 'chat_question_answer_ack',
+        sessionId,
+        requestId: typeof data.requestId === 'string' ? data.requestId : '',
+        submissionId,
+        accepted,
+      });
+    };
+
+    if (submissionId && submissionId.length > MAX_QUESTION_ANSWER_SUBMISSION_ID) return;
+
     const manager = this.deps.chatManager;
     const session = this.chatSessionFor(wsInfo, data.sessionId);
-    if (!manager || !session) return;
+    if (!manager || !session) {
+      acknowledge(false);
+      return;
+    }
 
     const requestId = typeof data.requestId === 'string' ? data.requestId : '';
-    if (!requestId) return;
+    if (!requestId) {
+      acknowledge(false, session.id);
+      return;
+    }
 
     const optionIds = Array.isArray(data.optionIds)
       ? data.optionIds.filter((id): id is string => typeof id === 'string')
       : [];
-    manager.answerQuestion(session.id, requestId, optionIds, data.skipped === true);
+    // Free text the user typed instead of picking. Trimmed and bounded here
+    // rather than trusted: it is written to the conversation log and handed to
+    // the model, and this is the edge of the system that a browser writes to.
+    const text =
+      typeof data.text === 'string'
+        ? data.text.trim().slice(0, MAX_QUESTION_ANSWER_TEXT)
+        : undefined;
+    const accepted = await manager.answerQuestion(
+      session.id,
+      requestId,
+      optionIds,
+      data.skipped === true,
+      text,
+    );
+    acknowledge(accepted, session.id);
   }
 
   private async handleChatHistory(
@@ -2335,6 +3976,8 @@ export class MessageProcessor {
         return this.deps.aliases.kimi;
       case 'omp':
         return this.deps.aliases.omp;
+      case 'antigravity':
+        return this.deps.aliases.antigravity;
       case 'terminal':
         return session?.runtimeLabel || 'Terminal';
       case 'claude':
@@ -2359,6 +4002,8 @@ export class MessageProcessor {
         return 'Kimi Code';
       case 'omp':
         return 'Oh My Pi';
+      case 'antigravity':
+        return 'Antigravity CLI';
       case 'terminal':
         return 'terminal';
       case 'claude':

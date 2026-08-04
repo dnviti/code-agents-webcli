@@ -70,11 +70,12 @@ async function acpRun(name, runtime, options) {
     await flush();
   }
   await done;
-  await adapter.send({ text: 'go' });
+  const sending = adapter.send({ text: 'go' });
   for (const line of lines.slice(2)) {
     adapter.handleMessage(line);
     await flush();
   }
+  await sending;
   return { events, adapter };
 }
 

@@ -3,6 +3,7 @@
 import type { App } from '../app';
 import type { WsMessage } from '../types';
 import { showOverlay, hideOverlay, showError } from '../ui/overlay';
+import { showNotification } from '../ui/notifications';
 import {
   appendUpdateLog,
   applyUpdateStatus,
@@ -38,6 +39,27 @@ export class MessageHandler {
   }
 
   handle(message: WsMessage): void {
+    // A tab can disappear while its join is crossing the socket. In particular,
+    // closing active A starts a fallback join to B; an account-wide close for B
+    // can then remove it before the server's answer arrives. Nothing below may
+    // paint, replay, subscribe or select a session that no longer has a tab.
+    // The server has already attached this socket by the time it sends the
+    // answer, so explicitly leave it again before discarding the message.
+    if (
+      message.type === 'session_joined' &&
+      this.app.sessionTabManager &&
+      !this.app.sessionTabManager.tabs.has(message.sessionId)
+    ) {
+      if (this.app.pendingJoinSessionId === message.sessionId) {
+        const resolve = this.app.pendingJoinResolve;
+        this.app.pendingJoinResolve = null;
+        this.app.pendingJoinSessionId = null;
+        resolve?.();
+      }
+      this.app.send({ type: 'leave_session', sessionId: message.sessionId });
+      return;
+    }
+
     // The surface a session runs on is the server's decision, and it arrives
     // on exactly these two messages. Read before dispatching, because the chat
     // handler below consumes chat_started and the terminal path never sees it.
@@ -81,15 +103,27 @@ export class MessageHandler {
       } else {
         clearChatSurface();
       }
-    } else if (message.type === 'chat_event') {
-      this.reflectChatActivity(message);
     }
 
     // The chat surface owns its own message family. Offered them first so this
     // switch does not have to grow a case per chat event, and so an unknown
     // chat message stays inside the chat layer rather than reaching a terminal
     // handler that has no idea what to do with it.
-    if (this.app.chats.handle(message as unknown as Record<string, unknown>)) {
+    const chatHandled = this.app.chats.handle(message as unknown as Record<string, unknown>);
+
+    // Apply live state only after the controller has folded the event into the
+    // transcript. The tab derives chat status from that same transcript as the
+    // header, so reflecting `turn_end` before this point merely republished the
+    // old `running` state and left the spinner stuck beside a Ready header.
+    if (message.type === 'chat_event') {
+      this.reflectChatActivity(message);
+    } else if (message.type === 'chat_snapshot') {
+      // A snapshot is not an event, so reflectChatActivity never sees it. It is
+      // nevertheless the authoritative correction after a reload or rejoin.
+      this.app.sessionTabManager?.syncShell();
+    }
+
+    if (chatHandled) {
       return;
     }
 
@@ -122,6 +156,7 @@ export class MessageHandler {
       case 'qwen_started':
       case 'kimi_started':
       case 'omp_started':
+      case 'antigravity_started':
       case 'terminal_started':
         this.onRuntimeStarted(message);
         break;
@@ -134,6 +169,7 @@ export class MessageHandler {
       case 'qwen_stopped':
       case 'kimi_stopped':
       case 'omp_stopped':
+      case 'antigravity_stopped':
       case 'terminal_stopped':
         this.onRuntimeStopped(message);
         break;
@@ -166,6 +202,21 @@ export class MessageHandler {
         this.onSessionDeleted(message);
         break;
 
+      // Closing a conversation is not deleting it: the transcript and any
+      // running agent remain, but the tab leaves every screen on the account.
+      // The screen that asked already removed it optimistically, so this is
+      // deliberately idempotent there.
+      case 'session_tab_closed':
+        this.app.sessionTabManager?.applyRemoteClose(message.sessionId);
+        this.app.loadSessions();
+        break;
+
+      // Order belongs to the account, selection to this window. Applying this
+      // rearranges the strip without selecting a tab or echoing another write.
+      case 'session_tabs_reordered':
+        this.app.sessionTabManager?.applyRemoteOrder(message.sessionIds);
+        break;
+
       // Someone renamed this session — in another window, on another device, or
       // in this one, since the server tells every socket rather than assuming
       // the asker already knows.
@@ -185,6 +236,9 @@ export class MessageHandler {
           surface: message.surface,
           active: message.active,
           bypassPermissions: message.bypassPermissions,
+          projectId: message.projectId,
+          projectName: message.projectName,
+          projectWorkingDirKind: message.projectWorkingDirKind,
         });
         this.app.loadSessions();
         break;
@@ -223,6 +277,25 @@ export class MessageHandler {
 
       case 'update_restarting':
         onUpdateRestarting();
+        break;
+
+      case 'environment_tier_changed':
+        // Told once, in passing. The environment panel re-reads itself off the
+        // same event, so a dialog that happens to be open is never stale.
+        showNotification(
+          message.outcome === 'deferred'
+            ? `Your workspace will move to ${message.tier} once nothing is running (${message.reason}).`
+            : `Your workspace moved to ${message.tier} (${message.reason}).`,
+          'info',
+        );
+        window.dispatchEvent(new CustomEvent('cc-environment-changed'));
+        break;
+
+      case 'project_updated':
+      case 'project_removed':
+        // The projects dialog re-reads itself off this event, so an open panel
+        // never stays stale. No toast: these are frequent background churn.
+        window.dispatchEvent(new CustomEvent('cc-projects-changed'));
         break;
 
       case 'update_done':
@@ -329,7 +402,14 @@ export class MessageHandler {
     }
   }
 
-  private onSessionCreated(message: { sessionId: string; sessionName: string; workingDir: string }): void {
+  private onSessionCreated(message: {
+    sessionId: string;
+    sessionName: string;
+    workingDir: string;
+    projectId?: string | null;
+    projectName?: string | null;
+    projectWorkingDirKind?: 'host' | 'container';
+  }): void {
     this.app.currentClaudeSessionId = message.sessionId;
     this.app.currentClaudeSessionName = message.sessionName;
     this.app.loadSessions();
@@ -340,6 +420,11 @@ export class MessageHandler {
         message.sessionName,
         'idle',
         message.workingDir,
+        true,
+        undefined,
+        message.projectId,
+        message.projectName,
+        message.projectWorkingDirKind,
       );
       this.app.sessionTabManager.switchToTab(message.sessionId);
     }
@@ -354,6 +439,9 @@ export class MessageHandler {
     lastAgent?: string;
     runtimeLabel?: string;
     history?: { firstLine: number; totalLines: number };
+    projectId?: string | null;
+    projectName?: string | null;
+    projectWorkingDirKind?: 'host' | 'container';
   }): void {
     this.app.currentClaudeSessionId = message.sessionId;
     this.app.historyRange = message.history ?? { firstLine: 0, totalLines: 0 };
@@ -370,6 +458,17 @@ export class MessageHandler {
     this.scheduleTerminalRefit();
 
     if (this.app.sessionTabManager) {
+      this.app.sessionTabManager.addTab(
+        message.sessionId,
+        message.sessionName,
+        message.active ? 'active' : 'idle',
+        message.workingDir,
+        false,
+        undefined,
+        message.projectId,
+        message.projectName,
+        message.projectWorkingDirKind,
+      );
       this.app.sessionTabManager.updateTabStatus(
         message.sessionId,
         message.active ? 'active' : 'idle',

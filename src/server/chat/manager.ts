@@ -2,8 +2,16 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { ChatSnapshot, UserTurn } from '../../shared/chat-events.js';
+import { LadderRung, ModelTier } from '../../shared/runtime-profiles.js';
 import { SessionRecord } from '../types.js';
-import { ChatNotRunningError, ChatSession, ChatSessionStartOptions, ChatUsageSink } from './session.js';
+import {
+  ChatNotRunningError,
+  ChatSession,
+  ChatSessionStartOptions,
+  ChatUsageSink,
+  PlanActionResult,
+  PlanModeResult,
+} from './session.js';
 import { ModelCapacityLookup } from './model-capacity.js';
 import { ChatStore, ChatTurnIndex } from './store.js';
 
@@ -22,10 +30,18 @@ export interface ChatManagerDeps {
   storageDir: string;
   broadcast: (sessionId: string, message: Record<string, unknown>) => void;
   resolveCommand: (runtime: string) => string;
+  /** The runtime's plain CLI name, for environments that resolve it themselves. */
+  resolveCommandName?: (runtime: string) => string;
   /** Passed through to every session; see ChatSessionDeps.onLifecycle. */
   onLifecycle?: (
     sessionId: string,
-    change: { nativeSessionId?: string | null; exited?: boolean; bypassing?: boolean },
+    change: {
+      nativeSessionId?: string | null;
+      exited?: boolean;
+      bypassing?: boolean;
+      planMode?: boolean;
+      restarting?: boolean;
+    },
   ) => void;
   /**
    * The approval preference of a given user; see ChatSessionDeps.resolveBypass.
@@ -36,6 +52,15 @@ export interface ChatManagerDeps {
   chatBypassPreference?: (userId: number) => boolean;
   /** Passed through to every session; see ChatSessionDeps.usage. */
   usage?: ChatUsageSink;
+  /**
+   * The folder a given user is allowed to browse, and now the outer edge of
+   * what a conversation of theirs may read and write. See `confine`.
+   *
+   * Optional so a manager built without it — every test that does not care, and
+   * any embedder — keeps the older, tighter behaviour of the session directory
+   * alone rather than silently gaining a wider one.
+   */
+  userBaseFolder?: (userId: number) => string;
 }
 
 export class ChatSessionManager {
@@ -84,7 +109,7 @@ export class ChatSessionManager {
       throw new Error('a chat is already running in this session');
     }
     if (existing) {
-      await existing.stop();
+      await existing.stop({ preserveHandoffs: Boolean(options.resumeSessionId) });
       this.sessions.delete(record.id);
     }
 
@@ -97,9 +122,14 @@ export class ChatSessionManager {
         askScript: this.askScript,
         broadcast: this.deps.broadcast,
         resolveCommand: this.deps.resolveCommand,
-        readFile: (sessionId, filePath) => this.readFile(sessionId, filePath),
-        writeFile: (sessionId, filePath, contents) =>
-          this.writeFile(sessionId, filePath, contents),
+        resolveCommandName: this.deps.resolveCommandName,
+        readFile: options.fileAccess
+          ? (_sessionId, filePath) => options.fileAccess!.readFile(filePath)
+          : (sessionId, filePath) => this.readFile(sessionId, filePath, record.ownerUserId),
+        writeFile: options.fileAccess
+          ? (_sessionId, filePath, contents) => options.fileAccess!.writeFile(filePath, contents)
+          : (sessionId, filePath, contents) =>
+            this.writeFile(sessionId, filePath, contents, record.ownerUserId),
         onLifecycle: this.deps.onLifecycle,
         // Closed over this record's owner, so a conversation restarted from
         // inside itself resolves against the preference of the person whose
@@ -116,7 +146,12 @@ export class ChatSessionManager {
     try {
       await session.start(options);
     } catch (error) {
-      this.sessions.delete(record.id);
+      // `ChatSession.start` verifies teardown before dropping its adapter. If
+      // that proof failed, retain the session so admission remains closed and
+      // a later explicit stop can retry the identity-bound control path.
+      if (!session.ownsAdapter && this.sessions.get(record.id) === session) {
+        this.sessions.delete(record.id);
+      }
       throw error;
     }
 
@@ -132,10 +167,14 @@ export class ChatSessionManager {
    * the request arrives over a socket from a process we launched but do not
    * control, and "read /etc/shadow" is a perfectly well-formed request.
    */
-  private async readFile(sessionId: string, filePath: string): Promise<string> {
+  private async readFile(
+    sessionId: string,
+    filePath: string,
+    ownerUserId?: number,
+  ): Promise<string> {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error('no such chat session');
-    const resolved = this.confine(session.workingDir, filePath);
+    const resolved = this.confine(session.workingDir, filePath, ownerUserId);
     return fs.promises.readFile(resolved, 'utf8');
   }
 
@@ -143,33 +182,63 @@ export class ChatSessionManager {
     sessionId: string,
     filePath: string,
     contents: string,
+    ownerUserId?: number,
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error('no such chat session');
-    const resolved = this.confine(session.workingDir, filePath);
+    const resolved = this.confine(session.workingDir, filePath, ownerUserId);
     await fs.promises.mkdir(path.dirname(resolved), { recursive: true });
     await fs.promises.writeFile(resolved, contents, 'utf8');
   }
 
   /**
-   * Resolve a path and prove it stays inside the session's directory.
+   * Resolve a path and prove the agent is allowed to be there.
    *
    * `path.resolve` collapses `..` before the comparison, and the separator on
    * the prefix check stops `/home/u/project-secrets` passing as a child of
    * `/home/u/project`.
    *
-   * The OS temp directory is the one other allowed root. An agent's write
-   * tool and its own shell share the real filesystem, so a handoff like
-   * `gh issue create --body-file /tmp/notes.md` only works when the file the
-   * agent was told to write lands where its shell will look for it — and
-   * scratch space is what a temp dir is for.
+   * Three roots are allowed, and the widest of them is deliberate. The session's
+   * own directory is the obvious one. The OS temp directory is the second: an
+   * agent's write tool and its own shell share the real filesystem, so a handoff
+   * like `gh issue create --body-file /tmp/notes.md` only works when the file the
+   * agent was told to write lands where its shell will look for it, and scratch
+   * space is what a temp dir is for.
+   *
+   * The third is the owner's base folder — the same boundary the file browser
+   * enforces, so this allows exactly what its user could have pointed the
+   * conversation at in the first place. The session directory alone was too
+   * tight to be either safe or useful (#174): an agent working across a git
+   * worktree of its own repository, one directory over, had every read refused
+   * while its own shell read the same file freely, and answered by writing the
+   * file through a script instead. A boundary that stops only the polite path
+   * costs the user a screen of red errors and buys nothing. What this still
+   * refuses is what matters and is unchanged: another account's files, anything
+   * outside the browsable area, and `/etc` and its neighbours.
+   *
+   * Without `userBaseFolder` — an embedder that did not supply one, and every
+   * test that does not care — the older, tighter rule stands.
    */
-  private confine(workingDir: string, filePath: string): string {
+  private confine(workingDir: string, filePath: string, ownerUserId?: number): string {
     const root = path.resolve(workingDir);
     const resolved = path.resolve(root, filePath);
     if (resolved === root || resolved.startsWith(root + path.sep)) return resolved;
     if (this.insideTempDir(resolved)) return resolved;
-    throw new Error(`refusing to touch ${filePath}: outside the session directory`);
+    if (this.insideBaseFolder(resolved, ownerUserId)) return resolved;
+    throw new Error('outside the folders this conversation may use');
+  }
+
+  /** Whether a resolved path is inside the browsable area of its owner. */
+  private insideBaseFolder(resolved: string, ownerUserId?: number): boolean {
+    if (!this.deps.userBaseFolder || ownerUserId === undefined) return false;
+    try {
+      const base = path.resolve(this.deps.userBaseFolder(ownerUserId));
+      return resolved === base || resolved.startsWith(base + path.sep);
+    } catch {
+      // A base folder that cannot be resolved is not an invitation to allow the
+      // path: it is one fewer root, and the check simply fails.
+      return false;
+    }
   }
 
   private insideTempDir(resolved: string): boolean {
@@ -226,6 +295,11 @@ export class ChatSessionManager {
       ...snapshot,
       runtime: snapshot.runtime || record.lastAgent || '',
       nativeSessionId,
+      planMode: record.chatPlanMode === true,
+      planDocument: (await this.deps.store.planDocument?.({
+        id: record.id,
+        ownerUserId: record.ownerUserId,
+      })) ?? null,
     };
   }
 
@@ -281,9 +355,9 @@ export class ChatSessionManager {
       }));
   }
 
-  async send(sessionId: string, turn: UserTurn): Promise<void> {
+  async send(sessionId: string, turn: UserTurn): Promise<'accepted' | 'queued'> {
     const session = this.require(sessionId);
-    await session.send(turn);
+    return session.send(turn);
   }
 
   async interrupt(sessionId: string): Promise<void> {
@@ -302,6 +376,37 @@ export class ChatSessionManager {
     this.sessions.get(sessionId)?.rememberModel(model);
   }
 
+  /**
+   * The rung a running session is on, or null when it is not on one.
+   *
+   * Asked of the session rather than worked out from the profile, because the
+   * profile can have changed since the launch and a conversation that launched
+   * bare is indistinguishable from one on a rung by anything the record holds.
+   */
+  ladderOf(sessionId: string): LadderRung | null {
+    return this.sessions.get(sessionId)?.ladderRung ?? null;
+  }
+
+  /**
+   * Move a running conversation onto an edited ladder.
+   *
+   * Which sessions are on one is the session's own answer to give — the manager
+   * has no view of the profile a conversation launched under — so every live
+   * session on the runtime is offered the new ladder and the ones not running on
+   * a rung decline it.
+   */
+  async reapplyLadder(
+    runtime: string,
+    ladder: { tier: ModelTier; tiers: Partial<Record<ModelTier, string>> } | null,
+  ): Promise<string[]> {
+    const moved: string[] = [];
+    for (const [sessionId, session] of this.sessions) {
+      if (!session.live || session.runtimeKind !== runtime) continue;
+      if (await session.reapplyLadder(ladder)) moved.push(sessionId);
+    }
+    return moved;
+  }
+
   /** Switch a live session's reasoning effort. False when nothing is running, or the adapter cannot. */
   async setEffort(sessionId: string, effort: string): Promise<boolean> {
     const session = this.sessions.get(sessionId);
@@ -312,6 +417,29 @@ export class ChatSessionManager {
   /** Carry a new effort level into the options an in-place `/clear` restart replays. */
   rememberEffort(sessionId: string, effort: string | undefined): void {
     this.sessions.get(sessionId)?.rememberEffort(effort);
+  }
+
+  async setPlanMode(sessionId: string, on: boolean): Promise<PlanModeResult | null> {
+    const session = this.sessions.get(sessionId);
+    return session ? session.setPlanMode(on) : null;
+  }
+
+  rememberPlanMode(sessionId: string, on: boolean): void {
+    this.sessions.get(sessionId)?.rememberPlanMode(on);
+  }
+
+  async acceptPlan(sessionId: string, revision: number): Promise<PlanActionResult | null> {
+    const session = this.sessions.get(sessionId);
+    // A stopped ChatSession can still be retained in the map after its adapter
+    // exits. Treat it the same as a process lost across a server restart: the
+    // WebSocket layer must relaunch the conversation before Accept can keep its
+    // promise to begin implementation immediately.
+    return session?.live ? session.acceptPlan(revision) : null;
+  }
+
+  async rejectPlan(sessionId: string, revision: number): Promise<PlanActionResult | null> {
+    const session = this.sessions.get(sessionId);
+    return session ? session.rejectPlan(revision) : null;
   }
 
   /** Drop a turn that was typed ahead and has not run yet. */
@@ -339,25 +467,32 @@ export class ChatSessionManager {
     return this.sessions.get(sessionId)?.respondPermission(requestId, optionId) ?? false;
   }
 
-  answerQuestion(
+  async answerQuestion(
     sessionId: string,
     requestId: string,
     optionIds: string[],
     skipped = false,
-  ): boolean {
-    return this.sessions.get(sessionId)?.answerQuestion(requestId, optionIds, skipped) ?? false;
+    text?: string,
+  ): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    return session ? session.answerQuestion(requestId, optionIds, skipped, text) : false;
   }
 
-  async stop(sessionId: string): Promise<void> {
+  async stop(
+    sessionId: string,
+    options: { preserveHandoffs?: boolean } = {},
+  ): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    this.sessions.delete(sessionId);
-    await session.stop();
+    await session.stop(options);
+    if (this.sessions.get(sessionId) === session) {
+      this.sessions.delete(sessionId);
+    }
   }
 
-  async stopAll(): Promise<void> {
+  async stopAll(options: { preserveHandoffs?: boolean } = {}): Promise<void> {
     const ids = Array.from(this.sessions.keys());
-    await Promise.all(ids.map((id) => this.stop(id)));
+    await Promise.all(ids.map((id) => this.stop(id, options)));
   }
 
   private require(sessionId: string): ChatSession {

@@ -126,12 +126,13 @@ async function grokTurn(overrides) {
   const h = harness(Object.assign({}, GROK, overrides));
   const lines = fixture('acp-grok');
   await boot(h, lines[0], loadJson('acp-grok-session-new.json'));
-  await h.adapter.send({ text: 'Read the file probe.txt…' });
+  const sending = h.adapter.send({ text: 'Read the file probe.txt…' });
   const prompt = h.sent.find((message) => message.method === 'session/prompt');
   for (const line of lines.slice(2, 18)) {
     h.adapter.handleMessage(line);
     await flush();
   }
+  await sending;
   h.adapter.handleMessage(Object.assign({}, lines[18], { id: prompt.id }));
   await flush();
   return h;
@@ -318,12 +319,13 @@ describe('the per-model breakdown grok publishes at the end of a turn', function
     const [notification, reply] = fixture('acp-grok-turn-completed');
     const h = harness(GROK);
     await boot(h, fixture('acp-grok')[0], loadJson('acp-grok-session-new.json'));
-    await h.adapter.send({ text: 'go' });
+    const sending = h.adapter.send({ text: 'go' });
     const prompt = h.sent.find((message) => message.method === 'session/prompt');
 
     h.adapter.handleMessage(notification);
     await flush();
     h.adapter.handleMessage(Object.assign({}, reply, { id: prompt.id }));
+    await sending;
     await flush();
 
     assert.strictEqual(only(h.events, 'turn_end').length, 1);
@@ -402,11 +404,12 @@ describe('how much of grok’s context is occupied', function () {
         await flush();
       }
       await done;
-      await h.adapter.send({ text: 'go' });
+      const sending = h.adapter.send({ text: 'go' });
       for (const line of lines.slice(2)) {
         h.adapter.handleMessage(line);
         await flush();
       }
+      await sending;
 
       assert.strictEqual(only(h.events, 'usage').length, 1, `${runtime}: one report, as before`);
       const usage = replay(h.events).usage;

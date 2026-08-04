@@ -1,4 +1,3 @@
-import { spawn } from 'child_process';
 import { AdapterChild, BaseChatAdapter } from '../adapter.js';
 import {
   ChatCapabilities,
@@ -188,10 +187,26 @@ export class PiChatAdapter extends BaseChatAdapter {
    * (see the class comment) — `send()` calls it directly to build one turn's
    * full argv.
    */
+  /**
+   * The model the next turn runs on, once something has changed it.
+   *
+   * pi's model is an argv entry rather than anything a running session holds —
+   * one turn is one process — so a change is simply a different command line
+   * next time. There is no live switch to offer, which is why this is
+   * `setModelNextTurn` and not `setModel`: the caller has to be able to say
+   * which of the two it got, and a boolean could not (#171).
+   */
+  private nextTurnModel: string | undefined;
+
+  setModelNextTurn(model: string): void {
+    this.nextTurnModel = model;
+  }
+
   protected buildArgs(): string[] {
     const args = ['--mode', 'json'];
-    if (this.options.model) {
-      args.push('--model', this.options.model);
+    const model = this.nextTurnModel ?? this.options.model;
+    if (model) {
+      args.push('--model', model);
     }
     if (this.effort) {
       // The whole of the effort mechanism, for this runtime. One turn is one
@@ -225,7 +240,7 @@ export class PiChatAdapter extends BaseChatAdapter {
         // confirms it; until then the conversation shows none.
         model: this.reportedModel,
         nativeSessionId: this.nativeSessionId,
-        cwd: this.options.workingDir,
+        cwd: this.runtimeWorkingDir,
         capabilities: this.capabilities,
       });
     }
@@ -304,14 +319,20 @@ export class PiChatAdapter extends BaseChatAdapter {
    * over by `onAgentSettled` — a line of stdout that arrives first.
    */
   get readyForTurn(): boolean {
-    return !this.turnInFlight;
+    return !this.turnInFlight
+      && (!this.child || this.exited)
+      && !this.childNeedsVerifiedClose();
   }
 
   async send(turn: UserTurn): Promise<void> {
     if (this.stopped) {
       throw new Error('pi chat adapter is stopped');
     }
-    if (this.turnInFlight) {
+    if (
+      this.turnInFlight
+      || (this.child && !this.exited)
+      || this.childNeedsVerifiedClose()
+    ) {
       throw new Error('pi: a turn is already running on this session');
     }
 
@@ -325,28 +346,17 @@ export class PiChatAdapter extends BaseChatAdapter {
     const args = this.buildTurnArgs(turn);
 
     return new Promise<void>((resolve, reject) => {
-      const child = spawn(this.options.command, args, {
-        cwd: this.options.workingDir,
-        env: {
-          ...process.env,
-          ...(this.options.env || {}),
-          // Same reasoning as the base class: no TUI, no ANSI in the stream.
-          NO_COLOR: '1',
-          TERM: 'dumb',
-          FORCE_COLOR: '0',
-        },
-        // stdin is closed, not piped. The prompt arrives in argv via `-p`, so
-        // nothing is ever written here — and pi waits on stdin when it is a
-        // pipe that stays open, producing no output at all and never exiting.
-        // Measured: an open empty stdin yields 0 bytes and no exit; 'ignore'
-        // completes the same prompt in ~8s. A turn that never answers is
-        // exactly what this looked like from the browser.
-        stdio: ['ignore', 'pipe', 'pipe'],
-      }) as AdapterChild;
+      // stdin is closed, not piped. The prompt arrives in argv via `-p`, so
+      // nothing is ever written here — and pi waits on stdin when it is a
+      // pipe that stays open, producing no output at all and never exiting.
+      // Measured: an open empty stdin yields 0 bytes and no exit; 'ignore'
+      // completes the same prompt in ~8s. A turn that never answers is
+      // exactly what this looked like from the browser.
+      const child = this.launchChild(args, ['ignore', 'pipe', 'pipe']) as AdapterChild;
 
       this.child = child;
       this.exited = false;
-      this.stdoutBuffer = '';
+      this.resetStdoutFraming();
       this.stderrTail = '';
 
       let settled = false;
@@ -357,8 +367,7 @@ export class PiChatAdapter extends BaseChatAdapter {
         }
       };
 
-      child.stdout.setEncoding('utf8');
-      child.stdout.on('data', (chunk: string) => this.feedStdout(chunk));
+      child.stdout.on('data', (chunk: Buffer) => this.feedStdout(chunk, 'pi'));
 
       child.stderr.setEncoding('utf8');
       child.stderr.on('data', (chunk: string) => {
@@ -370,34 +379,65 @@ export class PiChatAdapter extends BaseChatAdapter {
       child.on('spawn', accept);
 
       child.on('error', (error: Error) => {
-        this.exited = true;
-        this.turnInFlight = false;
-        this.emit({ t: 'error', message: `pi: ${error.message}` });
-        this.emit({ t: 'state', state: 'idle' });
-        if (!settled) {
-          settled = true;
-          reject(error);
-        }
+        void (async () => {
+          try {
+            await this.waitForVerifiedClose(child);
+          } catch (verificationError: unknown) {
+            const message = verificationError instanceof Error
+              ? verificationError.message
+              : String(verificationError);
+            this.emit({ t: 'error', message: `pi: ${message}`, fatal: true });
+            if (!settled) {
+              settled = true;
+              reject(verificationError);
+            }
+            return;
+          }
+          if (this.child !== child || this.exited) return;
+          this.exited = true;
+          this.turnInFlight = false;
+          this.emit({ t: 'error', message: `pi: ${error.message}` });
+          this.emit({ t: 'state', state: 'idle' });
+          if (!settled) {
+            settled = true;
+            reject(error);
+          }
+        })();
       });
 
-      child.on('exit', (code, signal) => this.onTurnExit(code, signal));
+      child.on('exit', (code, signal) => {
+        void this.onTurnExit(child, code, signal);
+      });
     });
   }
 
   async interrupt(): Promise<void> {
-    if (!this.child || this.exited) return;
+    const child = this.child;
+    if (!child || !this.childNeedsVerifiedClose(child)) return;
     // pi's one-shot process has no cancel message; killing it is the only
     // way to stop mid-turn, and it ends only this turn — the session stays
     // usable for the next send(), which spawns a fresh process.
     this.turnInterrupted = true;
-    this.child.kill('SIGINT');
+    await this.terminateChild(child, 'SIGTERM');
   }
 
   respondPermission(_requestId: string, _optionId: string): void {
     // capabilities.permissions is false: nothing is ever pending to answer.
   }
 
-  private onTurnExit(code: number | null, signal: NodeJS.Signals | null): void {
+  private async onTurnExit(
+    child: AdapterChild,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): Promise<void> {
+    try {
+      await this.waitForVerifiedClose(child);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.emit({ t: 'error', message: `pi: ${message}`, fatal: true });
+      return;
+    }
+    if (this.child !== child || this.exited) return;
     this.exited = true;
     this.turnInFlight = false;
 
@@ -458,36 +498,6 @@ export class PiChatAdapter extends BaseChatAdapter {
     return args;
   }
 
-  /** Mirrors the base class's line framing; not reusable from here (private there, see class comment). */
-  private feedStdout(chunk: string): void {
-    this.stdoutBuffer += chunk;
-    let newline: number;
-    while ((newline = this.stdoutBuffer.indexOf('\n')) !== -1) {
-      const line = this.stdoutBuffer.slice(0, newline).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
-      if (!line) continue;
-
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        continue;
-      }
-
-      try {
-        this.handleMessage(parsed);
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.emit({ t: 'error', message: `pi adapter failed to handle a message: ${message}` });
-      }
-    }
-
-    if (this.stdoutBuffer.length > 1_000_000) {
-      this.stdoutBuffer = '';
-      this.emit({ t: 'error', message: 'pi sent an oversized line; discarded the buffer' });
-    }
-  }
-
   protected handleMessage(raw: unknown): void {
     if (typeof raw !== 'object' || raw === null) return;
     const event = raw as PiRawEvent;
@@ -534,7 +544,7 @@ export class PiChatAdapter extends BaseChatAdapter {
       nativeSessionId: this.nativeSessionId,
       // Same as in `start()`: what pi reported, which at this point is nothing.
       model: this.reportedModel,
-      cwd: typeof event.cwd === 'string' ? event.cwd : this.options.workingDir,
+      cwd: typeof event.cwd === 'string' ? event.cwd : this.runtimeWorkingDir,
       capabilities: this.capabilities,
     });
   }

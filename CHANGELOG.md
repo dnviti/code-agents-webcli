@@ -1,5 +1,379 @@
 # Changelog
 
+## [6.0.0] - unreleased
+
+### Added
+- **Code Agents Web CLI now has self-contained desktop downloads** for Linux
+  x64 (AppImage and Flatpak), Windows x64 (NSIS), and macOS Intel and Apple
+  Silicon (DMG) (#84). The local desktop window starts a loopback-only service
+  and a keyboard user without requiring a terminal, Node, GitHub OAuth, or a
+  separately managed server. Agents and their credentials remain the user's
+  own. Releases attach all native packages and `SHA256SUMS`; packages are
+  unsigned, and release updates are a notification and manual reinstall, never
+  a silent auto-update. See [Desktop app](docs/desktop.md).
+
+- **Installed desktop PWAs can use the native title bar for the session strip**
+  (#183). On browsers that support Window Controls Overlay, the existing tabs
+  and app actions occupy the browser-reported safe area beside the real native
+  controls, with only the **Code Agents** brand acting as a drag region. The
+  layout follows live overlay geometry, compacts actions at narrow widths,
+  covers signed-out, setup, error and offline screens, and falls back silently
+  to the ordinary standalone or browser layout everywhere else.
+
+- **Containerized environments and deploy-target configuration are now behind
+  an operator feature flag.** They are disabled by default and can only be
+  enabled with `CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED=true`; legacy
+  container flags cannot bypass the gate.
+
+- **Local Projects can be used alongside an active deploy target.** The project
+  manager and new-tab workspace chooser now offer a per-user **Local Projects**
+  toggle. It shows and creates host-local workspaces without changing the
+  installation's active target or moving any existing project.
+
+- **Projects now review a repository-derived build recipe before the first
+  container is created** (#169). The recipe can combine Node.js, Python, Go,
+  Rust, Java and .NET and lets the user select pinned Claude Code, Codex, pi,
+  Grok, Qwen, Kimi and Oh My Pi agent runtimes. Selected agents are installed
+  into the durable owner home, including their Node or Python foundation when
+  the repository did not select it, so a fresh container can actually launch
+  them and later rebuilds retain their sign-ins, settings and skills. The recipe
+  is retained as an immutable project revision and uses
+  the normal preservation gate before an existing project is rebuilt. Each
+  runtime and forge-tool installation reports independently: a project remains
+  usable with a truthful partial-install status, and retrying failures never
+  rebuilds or discards its workspace. User tooling and agent state persist in
+  the owner home, project-only settings in an isolated project overlay, and the
+  repository checkout remains disposable. Storage is measured and warned about
+  for users and installers, but is never a quota or an admission check. See
+  [Project composition and durable storage](docs/project-composition.md).
+
+- **Plan mode is back as a complete WebUI workflow on every chat runtime**
+  (#179). The Plan control sits beside the model and effort controls on desktop
+  and phone, and belongs to the conversation rather than the browser: its state
+  and latest complete Markdown document survive navigation, reloads, another
+  device and an app restart. Submitted plans are numbered revisions, with only
+  the latest actionable. Closing the review is inert; rejecting keeps Plan mode
+  and returns to the composer for feedback; accepting turns it off and starts
+  implementation immediately under the conversation's normal approval policy.
+  Changing mode or acting on a plan is locked while a turn is active, a new
+  conversation clears both mode and document, and failures keep the review
+  available to retry.
+
+- **The agent's questionnaire now works in Default and Plan mode on every WebUI
+  runtime and every deployment target** (#180). Claude, Codex, Grok, Kimi and
+  Oh My Pi receive the same MCP server through their supported session-local
+  channel; pi receives the equivalent generated extension; Antigravity uses a
+  structured final-response handoff because its headless CLI exposes no MCP or
+  extension hook. Single choice, multiple choice, free text and skip all use the
+  same durable card, and answered cards remain readable in history.
+
+  Containers on another Docker or Podman host and Kubernetes pods now relay
+  questions and Plan submissions through the shared per-user home. Every
+  request, reply, cancellation and liveness lease is an authenticated,
+  encrypted per-session envelope written atomically to an owner-only endpoint;
+  the secret itself is never stored there. The bridge refuses replaced or
+  symlinked transport paths, pins child operations to verified open directory
+  descriptors, and safely prunes stale crash artifacts. A broken channel tells
+  the agent to ask in prose rather than hanging. Tool approvals
+  remain Unix-socket based and therefore still do not cross a remote-host or pod
+  boundary.
+
+- **Every signed-in user can have their own machine.** Until now everyone who
+  signed in shared this one: the same account, the same home directory, the same
+  installed tools. One person's global install changed the environment for
+  everybody, anyone could read anyone else's files and agent credentials, and
+  nothing on the host said which process belonged to whom.
+
+  Turning on per-user environments gives every account its own container, named
+  after them so `docker ps` answers "whose is this?" at a glance, with a home
+  directory that survives the container being destroyed and rebuilt. A package
+  they install once is still there next time. Their terminals, agent runs, chat
+  runtimes, files, uploads and git all happen in there rather than on the host,
+  and CPU and memory limits stop one of them taking the whole machine. Idle
+  environments can be stopped to reclaim resources and come back on the next
+  sign-in with everything as it was.
+
+  Docker and Podman both work, chosen by configuration. `cc-web env ls` shows
+  what exists and whose it is; `cc-web env rm` removes one, with `--purge-data`
+  when revoking access should take the data too.
+
+  It is off unless an administrator asks for it, and an installation that does
+  not enable it behaves exactly as it did before. See
+  [Per-user environments](docs/user-environments.md).
+
+- **The same thing on a Kubernetes cluster.** Point the server at a cluster and
+  each user's environment becomes a Pod instead of a container on this machine,
+  created, reused, resized and removed the same way. Every user's home lives on
+  one shared ReadWriteMany claim, so the file browser, editor and uploads keep
+  working exactly as they do on a single machine.
+
+  Tool approvals still do not cross the pod boundary and automatic sizing needs
+  metrics-server to have anything to read. Model questions and Plan submissions
+  now use the shared home claim and do cross it.
+
+- **You choose how big your own environment is.** *Settings → Workspace
+  environment* offers the sizes your administrator defined — and **Automatic**,
+  which starts from the default, moves up when you have been working it hard for
+  a while, and back down when you have not. It tells you when it moves, and why.
+
+  A size change that can be applied to a running environment is applied at once;
+  one that needs the environment rebuilt waits until nothing is running in it,
+  because rebuilding under a working agent would end the run. The panel says
+  which of the two is happening.
+
+- **Antigravity CLI (`agy`) is a runtime like any other** (#133). Google's coding
+  CLI — the successor to Gemini CLI, which now refuses a personal account
+  outright and points at this one — has its own card in the launcher, opens as a
+  terminal or as a conversation, and carries the same controls, accounting and
+  recovery every other agent here does. It is renameable with
+  `--antigravity-alias` / `ANTIGRAVITY_ALIAS` like the rest, and it takes a
+  per-runtime profile (model, extra arguments, environment) like the rest.
+
+  Three of its habits are handled rather than passed on. It asks "Do you trust
+  the contents of this project?" the first time it sees a folder and then waits
+  forever; the app answers it, the way it already answers Claude's. Driven
+  headlessly it runs every shell tool in a scratch directory of its own — asked
+  to read a file that was sitting right there it reported no such file existed —
+  so the app passes `--new-project`, which puts it back in the folder you picked
+  without adding anything to your own project list. And its `--print-timeout`
+  defaults to five minutes, which cuts a real turn off mid-work; a conversation
+  is not a script, so the ceiling is the interrupt button instead.
+
+  What it will not do, it is not made to look like it does. Headless, it
+  **cannot stop and ask**: anything needing approval is refused on the spot and
+  the run carries on around it. So the mode is chosen when the conversation
+  starts, stated on the card, and each refusal gets its own entry naming what was
+  refused and what would have allowed it — never an unexplained failure. It
+  reports how much it thought and never a word of what, so the reasoning entry
+  says which silence that is instead of opening onto an empty panel. It prices
+  nothing, so the meter says *cost not reported*. It reports no diff for a file
+  edit, so none is drawn. `--mode accept-edits` and `--mode plan` are wired to
+  nothing, because three runs of the same prompt proved they change nothing.
+
+  Files can be attached. agy has no attachment flag and no `@file` mention
+  syntax, but every upload already lands *inside* the session's working
+  directory, and agy reads what it is pointed at — so the paths are named at the
+  end of the prompt and it opens them itself. Images included: a PNG attached in
+  the composer came back with the product name and version read out of the
+  pixels.
+
+  The `/` menu lists your **skills**, and this app's `/clear`, `/new` and
+  `/reset`. agy's own forty slash commands are deliberately not offered — it
+  interprets none of them in this mode, and `/agents` spent 18,441 tokens
+  producing a paragraph about subagents instead of listing them. A skill is the
+  opposite case and is why the menu exists: named in the prompt, agy goes and
+  reads its `SKILL.md` and does what it says.
+
+  Every directory the menu reads was checked by planting a skill in it and
+  asking agy which ones it could see. All four spellings of its workspace root
+  are live (`.agents`, `_agents`, `.agent`, `_agent`), each with a `skills/` and
+  a `plugins/` folder, and each searched **up to the repository root** the way
+  agy searches it — so a skill at the top of a monorepo reaches a session opened
+  three directories down. Personal skills come from `~/.gemini/config`. agy's
+  own built-ins are left off, because only one of the three is reachable and the
+  other two would be menu entries that do nothing.
+
+  The effort control is the interesting one: `--effort` is refused whenever a
+  model is named, and what `agy models` publishes instead is one model id per
+  level (`gemini-3.6-flash-high`, `-medium`, `-low`). So the levels offered are
+  exactly the sibling ids the CLI printed, and picking one moves the next turn
+  onto that model. A model with no level in its name offers no control at all.
+
+- **The GitHub panel says who is on it and what it is attached to.** It listed
+  open pull requests and issues by title and author, which is the least of what
+  anyone opens it for. Every row now also says who it is **assigned to**, and
+  each kind carries the facts particular to it: an issue names the **pull
+  requests that reference it**, the issue it is **part of**, how many of its
+  **sub-issues** are done, and anything **blocking** it; a pull request names the
+  issues it closes, its review decision, and whether its checks passed.
+
+  Opening one shows the same relationships in full — the sub-issues themselves
+  with a progress bar, the parent, the linked pull requests, what is blocking it,
+  who has been asked to review and what they said — and every one of them is a
+  link that opens *here*, with a way back to what it was followed from. A
+  reference into another repository is opened against that repository rather than
+  against this one's issue with the same number.
+
+  Linked pull requests are not only the ones GitHub linked itself. It creates
+  those from a closing keyword against the default branch, so a fix merged into a
+  release branch, or a pull request that says "part of #163", was invisible to
+  the panel; the item's own timeline is read alongside, and the two are merged.
+
+  Two of these fields need a `gh` newer than most distributions ship. A server
+  with an older one is asked again for what it can answer, so the panel keeps
+  working with fewer facts per row — and a list `gh` refuses outright now says
+  so, where before an empty section read as a repository with nothing open.
+
+- **A capability ladder now decides which model does the work.** Filling in a
+  profile's four rungs read like a decision about which model handles which kind
+  of work, and the settings page reported it applied. It was not that decision: a
+  ladder only ever configured the helpers an agent delegates to, and the
+  conversation you were actually talking to went on running whatever model the
+  tool would have picked by itself — frequently the most expensive one in play,
+  sometimes one not on the ladder at all — with nothing on screen to say so.
+
+  A profile now names the rung the conversation itself answers from, defaulting
+  to *mid*, and that rung's model is what replies. A model typed into the profile
+  and your own standing choice still outrank it, and where one of them is
+  deciding the profile says so instead of leaving a filled-in ladder looking like
+  a working one. Every conversation names the model in force, the rung it sits
+  on, and which of those chose it. A blank rung falls to the nearest filled one,
+  downwards when two are equally near. A rung a provider refuses falls back to
+  the runtime's own default and carries on; a ladder that cannot be applied at
+  all still starts the session, and says so in the header — and keeps saying so
+  on every screen watching that conversation, not only the one that started it.
+
+  Ladders you have already saved start deciding on the first launch after
+  upgrading — nothing to re-tick — and conversations older than this move onto
+  the ladder when they are next relaunched. Saving a profile also reaches
+  conversations that are already open, interrupting a turn in progress. Terminal
+  sessions started from the app run on the ladder the same way.
+
+- **And the agent can ask to move up a rung.** Work that turns out to be beyond
+  the model answering it is a real situation, and until now the only way through
+  it was to notice and switch by hand. The agent can now ask; the request reaches
+  you as an ordinary approval with its own one-line reason; nothing moves until
+  you allow it; and the conversation returns to its usual rung once that turn
+  ends. In a conversation with approvals bypassed it proceeds without asking,
+  along with everything else that mode stops asking about.
+
+- **A runtime's own configuration no longer wins over the app's.** This reverses
+  a rule the tier feature was built on. Until now a config file you wrote by hand
+  was never touched and the tier was reported as not applied; from this release
+  the profile is the single source of truth for the runtimes it covers, and such
+  a file is replaced. What was there is copied once to a `.bak` beside it and the
+  replacement is reported, but nothing in the app restores it — so a ladder you
+  maintain outside this app, for use outside it, wants to live somewhere the app
+  does not write. The trade was made knowingly, in favour of a ladder that
+  actually decides something.
+
+### Fixed
+- **Large Codex tool results no longer turn into “oversized line” errors.**
+  App-server can return a command's full captured output in one JSON record;
+  the WebUI discarded that record once an ordinary stdout split carried it
+  past a 1 MB partial-line guard, leaving the tool without its completion.
+  Chat runtimes now share a byte-bounded 16 MiB framer that preserves valid
+  multi-chunk records and cleanly resumes after a genuinely over-limit line.
+- **Closing a conversation tab now closes it on every device signed into the
+  account.** Tab membership was the last part of the strip kept in browser
+  storage, so closing a conversation on one screen left it open everywhere else
+  and each device accumulated a different set. Open and closed tabs now belong
+  to the account, survive a server restart, and are announced live to every
+  connected screen; reconnecting screens take the persisted answer instead of
+  republishing stale tabs. Order is shared too, while the selected tab remains
+  local to each window. Reopening from the conversation list does the same in
+  reverse. The conversation itself, its transcript and any running agent are
+  still preserved; only deleting removes them. Existing browser-local closures
+  are imported once on upgrade. An overflowing strip can now be moved with the
+  mouse wheel, swiped on a touch screen, or opened as a complete,
+  keyboard-accessible tab list.
+- **A question the agent asks you now reaches you, and waits** (#174). On Oh My
+  Pi it did neither. Its MCP client abandons any call after thirty seconds, and
+  the one tool whose entire purpose is to wait for a person is a call like any
+  other: the card appeared, the agent stopped listening half a minute later, and
+  the card stayed on screen — live, clickable and lying — for as long as the turn
+  ran. Ten and a half minutes, in the conversation this was reported from, during
+  which any click would have gone into a request the agent had already dropped.
+  Meanwhile the agent, told its question had failed, asked the same thing again,
+  drew a second card beside the first, and eventually carried on having guessed.
+
+  There is no flag and no setting for that timeout, and the handshake this app
+  uses has nowhere to put one, so the app now switches it off in the environment
+  it starts Oh My Pi with. Kimi Code had the same ceiling at sixty seconds and is
+  raised out of the way too — by a different value, because zero means "no
+  timeout" to one of them and "invalid, use the default" to the other.
+
+  And because a runtime can always stop listening for reasons of its own, a card
+  now ends when the call behind it does: the buttons go, and it says *the agent
+  stopped waiting for an answer*. That sentence used to read *skipped without
+  answering*, which said the user had been asked and declined — about two cards
+  they were never in a position to answer. Stopping a turn or closing a
+  conversation says the same true thing now, rather than the accusation.
+- **pi can ask you a question at all.** It had no way to, and it did not know
+  that: a widely installed pi package offers the model a question tool that, in
+  the mode this app runs pi in, answers itself with "UI not available" without
+  anybody being asked. The agent read that as a dead end and guessed, and all
+  anyone saw was a grey tool row. pi is now given a real question tool of its
+  own — the same card, the same free-text box, the same block until you answer —
+  and the broken one is kept out of its way.
+- **An agent can read the folder next door** (#174). A conversation could only
+  read and write inside the single folder it was started in, which is narrower
+  than the area its own file browser offers: a session in a repository could not
+  read a git worktree of that same repository sitting beside it, and filled the
+  conversation with red errors saying so. The refusals were also mostly pointless
+  — Oh My Pi recovers from a refused read by opening the file itself, so they
+  reported a failure that had not happened, once per attempt, with the path
+  printed twice. A refused *write* did fail, and the agent worked around that by
+  running a script that wrote the same file. What an agent may touch is now the
+  same boundary the file browser draws; everything outside it is refused exactly
+  as before, and a refusal is said once, in words that name the boundary.
+- **Stopping a turn no longer reads as the turn failing.** Claude reports a run
+  it was told to abandon exactly the way it reports one that broke — `is_error`,
+  subtype `error_during_execution` — so pressing stop, or correcting the agent by
+  sending ahead of it, left a red error card in the conversation reading "claude
+  ended the turn as error_during_execution", with a Retry button offering to run
+  again the very thing that had just been stopped.
+
+  A runtime's account of the run this app interrupted is no longer written down.
+  What stays is what the user did: the *Interrupted to send* line, and the turn's
+  own badge saying it did not get to finish. Only that one report is dropped, and
+  only while the interrupt is being acknowledged — a run that breaks on its own,
+  one that breaks after the interrupt has been answered, a message discarded with
+  the turn, and the process itself going away are all still reported.
+- **A question the model asks can be answered in your own words, and its text
+  stays inside the card.** Two defects in the same card, both from the same
+  conversation.
+
+  The options a model writes are sentences — its own gloss on what picking one
+  would mean — and the option rows were drawn with the button style, which does
+  not wrap. Every description ran off the right-hand edge of the card and kept
+  going past the edge of the conversation, so most of what the model wrote about
+  each choice simply could not be read. Option text now wraps, breaking inside a
+  long path or URL if it has to, and the card sizes itself to the column it is in
+  rather than to its widest line.
+
+  And every question now offers a free-text answer alongside the options.
+  "None of these is quite right" is a real answer that a list written in advance
+  cannot anticipate, which models know: they write a final *Let me explain in my
+  own words* option themselves — and clicking it answered the question with that
+  sentence, telling the model nothing and costing a round trip. That row is a
+  textarea now, and what is typed into it travels the way an option does, into
+  the same waiting tool call: the model is told the user answered in their own
+  words and what they said, and the answer is kept in the conversation the way a
+  pick is, so scrolling back past the decision still shows it. A pick-several
+  question takes both at once — tick what applies, add the caveat, confirm once.
+  A model that writes its own version of that option has it folded into this one
+  row rather than offered twice, and the tool description now says not to write
+  one at all.
+- **A question card no longer claims an answer the agent was never given.** The
+  card settles the moment it is clicked, without waiting for the round trip, and
+  it went on trusting that local copy for good. So when the answer did not land —
+  a sentence typed into a server that predated the free-text answer and dropped a
+  field it had never heard of, or a question a second window had already answered
+  — the card drew the words in green under *Answered in their own words* while
+  the agent, in the very next line, said it was taking the question as skipped.
+  Every layer under the card was right; the only thing that was wrong was the one
+  thing anybody could see.
+
+  The session's own record of an answer is what the model was handed, so it now
+  wins outright over the local copy the instant it arrives: the card shows what
+  the agent was actually told, and says so plainly when the words typed into it
+  were not part of it.
+- **`cc-web` started printing its help text instead of starting.** Adding the
+  `env` operator subcommands left the program without an action of its own, and
+  a command line with subcommands answers a bare invocation with help. Running
+  the server with no arguments — which is how almost everyone runs it — did
+  nothing at all. It now starts, and a test runs the real binary to keep it that
+  way.
+- **A model list is no longer lost to a probe waiting on stdin.** The command
+  each runtime is asked for its models with was run through `execFile`, which
+  leaves the child an open stdin pipe — and `agy models` waits on that pipe
+  forever. The picker said "this runtime hasn't listed models" about a runtime
+  that lists eleven, and took the full eight-second timeout to say it. The probe
+  now closes stdin, which it never wrote to: measured at 2.0s and the whole list,
+  against no output and no exit before. The same trap has already caught
+  `codex exec` and `pi -p` elsewhere in this codebase.
+
 ## [5.3.4] - 2026-07-30
 
 ### Fixed

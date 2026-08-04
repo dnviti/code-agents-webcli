@@ -80,6 +80,9 @@ export class ChatRegistry {
    */
   private draftSync = false;
 
+  /** Whether the server admits correlated app-owned workflow turns. */
+  private builtInWorkflows = false;
+
   constructor(private readonly options: ChatRegistryOptions) {}
 
   /** Apply the feature list from the server's `connected` message. */
@@ -89,10 +92,14 @@ export class ChatRegistry {
     const gained = next && !this.multiSession;
     this.multiSession = next;
     this.draftSync = list.includes('chat_draft');
+    this.builtInWorkflows = list.includes('chat_builtin_workflow');
     // Told to the conversations that already exist as well as to the ones built
     // after this: the handshake arrives after a reload has restored its tabs,
     // so the controllers are routinely older than the answer.
-    for (const controller of this.controllers.values()) controller.setDraftSync(this.draftSync);
+    for (const controller of this.controllers.values()) {
+      controller.setDraftSync(this.draftSync);
+      controller.setBuiltInWorkflowSupport(this.builtInWorkflows);
+    }
     // A reconnect to an upgraded server: pick up the conversations that were
     // opened while it could not carry them.
     if (gained) this.resubscribeAll();
@@ -112,6 +119,7 @@ export class ChatRegistry {
       onChange: () => this.options.onChange(sessionId),
       onEvent: (event) => this.options.onEvent?.(sessionId, event),
       origin: this.options.origin,
+      builtInWorkflows: this.builtInWorkflows,
     });
     controller.setDraftSync(this.draftSync);
     this.controllers.set(sessionId, controller);

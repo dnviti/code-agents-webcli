@@ -79,6 +79,15 @@ function withoutRuntimeUserEchoes(messages: ChatMessage[]): ChatMessage[] {
   );
 }
 
+/** Merge durable question records by request id while preserving their order. */
+function mergeQuestionHistory(...groups: QuestionRequest[][]): QuestionRequest[] {
+  const merged = new Map<string, QuestionRequest>();
+  for (const group of groups) {
+    for (const question of group) merged.set(question.requestId, question);
+  }
+  return [...merged.values()];
+}
+
 export class ChatTranscript {
   private state: TranscriptState;
   private listeners = new Set<Listener>();
@@ -213,13 +222,19 @@ export class ChatTranscript {
 
   /** Replace everything with a server snapshot, e.g. on join or reconnect. */
   hydrate(snapshot: ChatSnapshot): void {
+    const pendingQuestions = snapshot.pendingQuestions || [];
+    const questionHistory = mergeQuestionHistory(
+      snapshot.questionHistory ?? this.state.questionHistory,
+      pendingQuestions,
+    );
     this.state = createTranscript(snapshot.capabilities, {
       messages: snapshot.messages,
       state: snapshot.state,
       usage: snapshot.usage || {},
       plan: snapshot.plan || [],
       pendingPermissions: snapshot.pendingPermissions || [],
-      pendingQuestions: snapshot.pendingQuestions || [],
+      pendingQuestions,
+      questionHistory,
       // What was picked, for the questions already answered (#113). Falling
       // back to what is already held rather than to nothing: a server that
       // predates this field must not take the marks off a card this browser
@@ -228,6 +243,18 @@ export class ChatTranscript {
       answeredQuestions: snapshot.answeredQuestions
         ? { ...snapshot.answeredQuestions }
         : { ...this.state.answeredQuestions },
+      // Kept together with the picks: a snapshot that carries one carries the
+      // other, and falling back separately would let a rejoin show a question
+      // as answered by clicking when it was in fact answered in free text.
+      answeredQuestionText: snapshot.answeredQuestions
+        ? { ...(snapshot.answeredQuestionText || {}) }
+        : { ...this.state.answeredQuestionText },
+      // And which of them the agent had already stopped waiting for, kept on
+      // the same terms: a snapshot that speaks about answers speaks about
+      // these too, and an older server that says nothing leaves what is held.
+      abandonedQuestions: snapshot.answeredQuestions
+        ? { ...(snapshot.abandonedQuestions || {}) }
+        : { ...this.state.abandonedQuestions },
       firstSeq: snapshot.firstSeq,
       cursor: snapshot.cursor,
       // The turn the server's replay was still inside. Live events arriving
@@ -279,6 +306,9 @@ export class ChatTranscript {
     firstSeq: number,
     from?: number,
     answers?: Record<string, string[]>,
+    answerText?: Record<string, string>,
+    abandoned?: Record<string, true>,
+    questions?: QuestionRequest[],
   ): void {
     this.state.firstSeq = firstSeq;
     if (from !== undefined) {
@@ -293,6 +323,15 @@ export class ChatTranscript {
     // and the live map is the newer knowledge.
     if (answers) {
       this.state.answeredQuestions = { ...answers, ...this.state.answeredQuestions };
+    }
+    if (answerText) {
+      this.state.answeredQuestionText = { ...answerText, ...this.state.answeredQuestionText };
+    }
+    if (abandoned) {
+      this.state.abandonedQuestions = { ...abandoned, ...this.state.abandonedQuestions };
+    }
+    if (questions) {
+      this.state.questionHistory = mergeQuestionHistory(questions, this.state.questionHistory);
     }
 
     if (!messages.length) {
@@ -553,6 +592,11 @@ export class ChatTranscript {
     return this.state.pendingQuestions;
   }
 
+  /** Questions that still need a card after they stop being pending. */
+  get questionHistory(): QuestionRequest[] {
+    return this.state.questionHistory;
+  }
+
   /**
    * The question waiting on the given tool call, if that call is the one asking.
    *
@@ -569,6 +613,16 @@ export class ChatTranscript {
     return this.state.answeredQuestions[toolId];
   }
 
+  /** What was typed for that question, when it was answered in the user's own words. */
+  answerTextFor(toolId: string): string | undefined {
+    return this.state.answeredQuestionText[toolId];
+  }
+
+  /** Whether the agent had stopped waiting by the time that question ended. */
+  abandonedFor(toolId: string): boolean {
+    return this.state.abandonedQuestions[toolId] === true;
+  }
+
   /**
    * Every answer this transcript holds, keyed the way the reducer keys them.
    *
@@ -577,6 +631,16 @@ export class ChatTranscript {
    */
   get answeredQuestions(): Record<string, string[]> {
     return this.state.answeredQuestions;
+  }
+
+  /** The same, for the answers that were typed rather than picked. */
+  get answeredQuestionText(): Record<string, string> {
+    return this.state.answeredQuestionText;
+  }
+
+  /** The same, for the questions nobody was given the chance to answer. */
+  get abandonedQuestions(): Record<string, true> {
+    return this.state.abandonedQuestions;
   }
 
   get cursor(): number {

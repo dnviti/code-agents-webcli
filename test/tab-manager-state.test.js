@@ -23,7 +23,7 @@ let mod;
 
 const STUBBED = ['window', 'document', 'navigator', 'fetch', 'localStorage', 'sessionStorage'];
 
-/** Renames and the remembered tab both go out over the network / to storage. */
+/** Renames and tab visibility go over the network; the active tab uses storage. */
 let requests;
 let respondTo;
 /** The browser-wide store, and this window's own. */
@@ -62,6 +62,7 @@ function fakeApp() {
     currentClaudeSessionId: null,
     currentClaudeSessionName: null,
     getAlias: () => 'Claude',
+    authFetch: (url, init) => global.fetch(url, init),
     joinSession: async (id) => { joined.push(id); app.currentClaudeSessionId = id; },
     // Closing the last conversation's tab has to let go of it: the socket is
     // otherwise still attached to a conversation that has left the screen.
@@ -73,6 +74,7 @@ function fakeApp() {
     chats: {
       subscribed: [],
       dropped: [],
+      controllers: new Map(),
       // What the pane was told to show before any socket traffic: the session
       // list already knows each conversation's approval mode, and a pane that
       // opened claiming "asks first" over a bypassing one was #134.
@@ -86,6 +88,7 @@ function fakeApp() {
         this.calls.push(`subscribe:${id}`);
       },
       drop(id) { this.dropped.push(id); },
+      get(id) { return this.controllers.get(id); },
       ensure(id) {
         const chats = this;
         return {
@@ -192,6 +195,31 @@ describe('session tab state', function () {
     );
   });
 
+  it('retains and refreshes the project cwd namespace in tab and header state', function () {
+    const { m } = manager();
+    m.addTab(
+      'project-tab', 'Project', 'idle', '/host/projects/alpha', false,
+      undefined, 'project-a', 'Alpha', 'host',
+    );
+    assert.strictEqual(shellTab('project-tab').projectId, 'project-a');
+    assert.strictEqual(shellTab('project-tab').projectWorkingDirKind, 'host');
+
+    // A join after choosing an image-layer folder updates an existing tab; it
+    // must not keep the host discriminator from the earlier list response.
+    m.addTab(
+      'project-tab', 'Project', 'idle', '/tmp/work', false,
+      undefined, 'project-a', 'Alpha', 'container',
+    );
+    assert.strictEqual(m.activeSessions.get('project-tab').workingDir, '/tmp/work');
+    assert.strictEqual(shellTab('project-tab').projectWorkingDirKind, 'container');
+
+    m.updateHeaderInfo('project-tab');
+    const connection = mod.shellStore.getSnapshot().connection;
+    assert.strictEqual(connection.workingDir, '/tmp/work');
+    assert.strictEqual(connection.projectId, 'project-a');
+    assert.strictEqual(connection.projectWorkingDirKind, 'container');
+  });
+
   it('raises unread when a background session goes quiet, and clears it on switch', async function () {
     const { m } = manager();
     m.addTab('active', 'active', 'idle', null, false);
@@ -226,6 +254,34 @@ describe('session tab state', function () {
       false,
       'output in the foreground session is not something you missed',
     );
+  });
+
+  it('takes a chat tab state from the transcript, not from its still-live process', function () {
+    const { m, app } = manager();
+    m.addTab('chat', 'chat', 'active', null, false);
+    m.setTabSurface('chat', 'chat');
+
+    const transcript = {
+      chatState: 'idle',
+      messages: [{ role: 'user' }, { role: 'assistant' }],
+    };
+    app.chats.controllers.set('chat', { transcript });
+    m.syncShell();
+
+    assert.strictEqual(
+      shellTab('chat').status,
+      'success',
+      'a completed conversation does not inherit the process active flag',
+    );
+
+    transcript.chatState = 'thinking';
+    m.syncShell();
+    assert.strictEqual(shellTab('chat').status, 'running', 'new work restores the spinner');
+
+    transcript.chatState = 'idle';
+    transcript.messages = [];
+    m.syncShell();
+    assert.strictEqual(shellTab('chat').status, 'idle', 'a new empty conversation is only idle');
   });
 
   it('picks the most recently visited surviving tab when the active one closes', async function () {
@@ -311,18 +367,28 @@ describe('session tab state', function () {
    * the only way to shorten a strip that grows forever was to destroy something
    * you might want next week.
    */
-  it('does not delete a conversation when its tab is closed', function () {
+  it('closes a conversation for the account without deleting it', async function () {
     const { m } = manager();
     m.addTab('chat', 'chat', 'idle', '/repos/thing', false);
     m.setTabSurface('chat', 'chat');
 
     m.closeSession('chat');
+    await new Promise((resolve) => setImmediate(resolve));
 
-    assert.ok(!m.tabs.has('chat'), 'the tab is gone from this screen');
+    assert.ok(!m.tabs.has('chat'), 'the tab is removed optimistically');
     assert.deepStrictEqual(
       requests.filter((request) => request.init && request.init.method === 'DELETE'),
       [],
       'closing a conversation must not delete it: the list is how it is reached again',
+    );
+    const patches = requests.filter((request) => request.init && request.init.method === 'PATCH');
+    assert.strictEqual(patches.length, 1);
+    assert.ok(patches[0].url.endsWith('/api/sessions/chat/tab'), patches[0].url);
+    assert.deepStrictEqual(JSON.parse(patches[0].init.body), { open: false });
+    assert.strictEqual(
+      stored.get('cc-web-closed-conversations'),
+      undefined,
+      'visibility belongs to the account, not this browser profile',
     );
   });
 
@@ -338,6 +404,30 @@ describe('session tab state', function () {
     const deletes = requests.filter((request) => request.init && request.init.method === 'DELETE');
     assert.strictEqual(deletes.length, 1);
     assert.ok(deletes[0].url.endsWith('/api/sessions/term'), deletes[0].url);
+  });
+
+  it('restores a terminal and focus when the server refuses to delete it', async function () {
+    const terminal = { id: 'term', name: 'term', active: false, workingDir: '/repos/thing' };
+    respondTo = (_url, init) => init?.method === 'DELETE'
+      ? { ok: false, status: 503, json: async () => ({ error: 'session_delete_not_saved' }) }
+      : { ok: true, json: async () => ({ sessions: [terminal] }) };
+    const { m, app } = manager();
+    m.addTab('term', 'term', 'idle', '/repos/thing', false);
+    m.activeTabId = 'term';
+
+    const oldError = console.error;
+    console.error = () => {};
+    try {
+      m.closeSession('term');
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      console.error = oldError;
+    }
+
+    assert.ok(m.tabs.has('term'));
+    assert.strictEqual(m.activeTabId, 'term');
+    assert.deepStrictEqual(app.joined, ['term']);
   });
 
   it('stops following a closed conversation without ending it', function () {
@@ -370,28 +460,26 @@ describe('session tab state', function () {
     assert.strictEqual(app.left, 1, 'and the socket is told, so the server detaches too');
   });
 
-  /**
-   * A closed conversation stays closed across a reload.
-   *
-   * On its own, "closing no longer deletes" would have made closing useless: the
-   * strip is rebuilt from `/api/sessions/list` on every page load, so every
-   * conversation ever started would come back on the next reload — the original
-   * complaint with its one remedy removed.
-   */
-  it('leaves a closed conversation off the strip after a reload', async function () {
-    const sessions = [
+  it('takes tab visibility from the account when a new screen loads', async function () {
+    let sessions = [
       { id: 'kept', name: 'kept', active: false, workingDir: '/a', surface: 'chat' },
       { id: 'closed', name: 'closed', active: false, workingDir: '/b', surface: 'chat' },
     ];
-    respondTo = () => ({ ok: true, json: async () => ({ sessions }) });
+    respondTo = (_url, init) => {
+      if (init?.method === 'PATCH' && JSON.parse(init.body).open === false) {
+        sessions = sessions.filter((session) => session.id !== 'closed');
+      }
+      return { ok: true, json: async () => ({ sessions }) };
+    };
 
     const first = manager();
     await first.m.loadSessions();
     first.m.closeSession('closed');
+    await new Promise((resolve) => setImmediate(resolve));
     assert.ok(!first.m.tabs.has('closed'));
 
-    // A second manager is what a reload is: fresh state, same storage, the same
-    // answer from the server.
+    // A second manager stands in for another browser or device. It has no state
+    // in common with the first except the account-owned server answer.
     const reloaded = manager();
     await reloaded.m.loadSessions();
     assert.deepStrictEqual(
@@ -401,18 +489,33 @@ describe('session tab state', function () {
     );
   });
 
-  it('brings it back the moment it is reopened, and keeps it back', async function () {
-    const sessions = [{ id: 'chat', name: 'chat', active: false, workingDir: '/a', surface: 'chat' }];
-    respondTo = () => ({ ok: true, json: async () => ({ sessions }) });
+  it('reopens a conversation for every screen and keeps it open', async function () {
+    const chat = { id: 'chat', name: 'chat', active: false, workingDir: '/a', surface: 'chat' };
+    let open = true;
+    respondTo = (_url, init) => {
+      if (init?.method === 'PATCH') open = JSON.parse(init.body).open;
+      return { ok: true, json: async () => ({ sessions: open ? [chat] : [] }) };
+    };
 
     const first = manager();
     await first.m.loadSessions();
     first.m.closeSession('chat');
+    await new Promise((resolve) => setImmediate(resolve));
 
-    // What opening it from the conversation list does.
+    assert.strictEqual(open, false, 'the account now reports the tab closed');
+
+    // What opening it from the conversation list does: make the server state
+    // authoritative first, then draw and select the local copy.
     const reopening = manager();
+    await reopening.m.reopenSession('chat');
     reopening.m.addTab('chat', 'chat', 'idle', '/a', false);
     assert.ok(reopening.m.tabs.has('chat'));
+    assert.deepStrictEqual(
+      requests
+        .filter((request) => request.init?.method === 'PATCH')
+        .map((request) => JSON.parse(request.init.body)),
+      [{ open: false }, { open: true }],
+    );
 
     const reloaded = manager();
     await reloaded.m.loadSessions();
@@ -423,40 +526,423 @@ describe('session tab state', function () {
     );
   });
 
-  it('forgets a closed conversation the server no longer has', async function () {
-    // Otherwise the note outlives what it is about, and the list of ids this
-    // browser is hiding grows for as long as the browser profile lives.
-    let sessions = [{ id: 'gone', name: 'gone', active: false, workingDir: '/a', surface: 'chat' }];
-    respondTo = () => ({ ok: true, json: async () => ({ sessions }) });
+  it('serializes a close followed immediately by a reopen for the same conversation', async function () {
+    let finishClose;
+    const closeFinished = new Promise((resolve) => { finishClose = resolve; });
+    let open = true;
+    respondTo = async (_url, init) => {
+      if (!init?.method) {
+        return {
+          ok: true,
+          json: async () => ({
+            sessions: open
+              ? [{ id: 'chat', name: 'chat', active: false, workingDir: '/a', surface: 'chat' }]
+              : [],
+          }),
+        };
+      }
+      const requestedOpen = JSON.parse(init.body).open;
+      if (!requestedOpen) await closeFinished;
+      open = requestedOpen;
+      return { ok: true, json: async () => ({ success: true, open: requestedOpen }) };
+    };
 
-    const first = manager();
-    await first.m.loadSessions();
-    first.m.closeSession('gone');
-    assert.ok(stored.get('cc-web-closed-conversations'), 'the id is remembered while it exists');
+    const { m } = manager();
+    m.addTab('chat', 'chat', 'idle', '/a', false);
+    m.setTabSurface('chat', 'chat');
 
-    sessions = [];
-    const reloaded = manager();
-    await reloaded.m.loadSessions();
-    assert.strictEqual(
-      stored.get('cc-web-closed-conversations'),
-      undefined,
-      'a deleted conversation leaves nothing behind to hide',
+    m.closeSession('chat');
+    const reopened = m.reopenSession('chat');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.deepStrictEqual(
+      requests
+        .filter((request) => request.init?.method === 'PATCH')
+        .map((request) => JSON.parse(request.init.body)),
+      [{ open: false }],
+      'the reopen waits for the earlier close instead of racing it',
+    );
+
+    finishClose();
+    await reopened;
+    assert.deepStrictEqual(
+      requests
+        .filter((request) => request.init?.method === 'PATCH')
+        .map((request) => JSON.parse(request.init.body)),
+      [{ open: false }, { open: true }],
+      'the final server write matches the final user intent',
     );
   });
 
-  it('still shows a terminal whose tab was closed, because closing ended it', async function () {
-    // Remembering a terminal would hide a session that is genuinely still there
-    // from the only list that offers it. Closing one deletes it instead.
-    const sessions = [{ id: 'term', name: 'term', active: false, workingDir: '/a' }];
-    respondTo = () => ({ ok: true, json: async () => ({ sessions }) });
+  it('does not let an older open response override a newer close from another device', async function () {
+    let finishOpen;
+    const openResponse = new Promise((resolve) => { finishOpen = resolve; });
+    respondTo = (_url, init) => init?.method === 'PATCH'
+      ? openResponse
+      : { ok: true, json: async () => ({ sessions: [] }) };
 
-    const first = manager();
-    await first.m.loadSessions();
-    first.m.closeSession('term');
+    const { m } = manager();
+    const reopening = m.reopenSession('chat');
+    await Promise.resolve();
 
-    const reloaded = manager();
-    await reloaded.m.loadSessions();
-    assert.deepStrictEqual(reloaded.m.getOrderedTabIds(), ['term']);
+    // The server processed this screen's open, then another screen's close.
+    // WebSocket ordering is correct, but the older HTTP response is delayed.
+    m.applyRemoteOpen({
+      id: 'chat', name: 'chat', active: false, workingDir: '/a', surface: 'chat',
+    });
+    m.applyRemoteClose('chat');
+    finishOpen({
+      ok: true,
+      json: async () => ({ success: true, open: true, applied: true }),
+    });
+
+    assert.strictEqual(await reopening, false, 'the caller is told not to recreate the tab');
+    assert.ok(!m.tabs.has('chat'));
+    assert.deepStrictEqual(
+      requests.map((request) => request.init?.method ?? 'GET'),
+      ['PATCH', 'GET'],
+      'the ambiguous cross-transport order is settled from the account snapshot',
+    );
+  });
+
+  it('trusts a successful empty reconcile over an older open response', async function () {
+    respondTo = (_url, init) => init?.method === 'PATCH'
+      ? { ok: true, json: async () => ({ success: true, open: true, applied: true }) }
+      : { ok: true, json: async () => ({ sessions: [] }) };
+
+    const { m } = manager();
+
+    assert.strictEqual(
+      await m.reopenSession('chat'),
+      false,
+      'a newer close missed over WebSocket still wins through the authoritative list',
+    );
+    assert.ok(!m.tabs.has('chat'));
+  });
+
+  it('restates account state when a notification targets a stale local conversation tab', async function () {
+    const chat = { id: 'chat', name: 'chat', active: false, workingDir: '/a', surface: 'chat' };
+    respondTo = (_url, init) => init?.method === 'PATCH'
+      ? { ok: true, json: async () => ({ success: true, open: true, applied: true }) }
+      : { ok: true, json: async () => ({ sessions: [chat] }) };
+
+    const { m, app } = manager();
+    m.addTab('chat', 'chat', 'idle', '/a', false);
+    m.setTabSurface('chat', 'chat');
+
+    await m.reopenAndSwitch('chat');
+
+    assert.deepStrictEqual(
+      requests
+        .filter((request) => request.init?.method === 'PATCH')
+        .map((request) => JSON.parse(request.init.body)),
+      [{ open: true }],
+      'a local copy is not mistaken for an account-open tab',
+    );
+    assert.deepStrictEqual(app.joined, ['chat']);
+  });
+
+  it('restores an optimistically closed conversation when the server refuses the close', async function () {
+    const chat = { id: 'chat', name: 'chat', active: false, workingDir: '/a', surface: 'chat' };
+    respondTo = (_url, init) => init?.method === 'PATCH'
+      ? { ok: false, status: 500, json: async () => ({}) }
+      : { ok: true, json: async () => ({ sessions: [chat] }) };
+
+    const { m } = manager();
+    m.addTab('chat', 'chat', 'idle', '/a', false);
+    m.setTabSurface('chat', 'chat');
+
+    const oldError = console.error;
+    console.error = () => {};
+    try {
+      m.closeSession('chat');
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      console.error = oldError;
+    }
+
+    assert.ok(m.tabs.has('chat'), 'reconciliation puts back the server-open tab');
+    assert.deepStrictEqual(
+      requests.map((request) => request.init?.method ?? 'GET'),
+      ['PATCH', 'GET'],
+    );
+  });
+
+  it('keeps stored and resumable conversation navigation working against an old server', async function () {
+    // Both navigation paths await reopenSession before they add and select the
+    // conversation. During a rolling deployment, the new browser bundle can be
+    // served while the old process still answers requests and has no /tab route.
+    respondTo = (_url, init) => {
+      if (init?.method === 'PATCH') {
+        return {
+          ok: false,
+          status: 404,
+          // Express' default missing-route response is HTML, so JSON parsing
+          // fails. This distinguishes it from the new route's session 404.
+          json: async () => { throw new Error('Unexpected token <'); },
+        };
+      }
+      return { ok: true, json: async () => ({ sessions: [] }) };
+    };
+    stored.set('cc-web-closed-conversations', JSON.stringify(['chat']));
+
+    const { m, app } = manager();
+    await assert.doesNotReject(() => m.reopenSession('chat'));
+
+    // The remainder is the shared seam used by openStoredConversation and
+    // resumeConversation after their awaited reopen. It must still be reached.
+    m.addTab('chat', 'chat', 'idle', '/a', false);
+    m.setTabSurface('chat', 'chat');
+    await m.switchToTab('chat');
+
+    assert.deepStrictEqual(app.joined, ['chat']);
+    assert.strictEqual(
+      stored.get('cc-web-closed-conversations'),
+      undefined,
+      'the explicit reopen clears the old browser-local close too',
+    );
+  });
+
+  it('does not mistake the new tab endpoint\'s missing-session 404 for an old server', async function () {
+    respondTo = () => ({
+      ok: false,
+      status: 404,
+      json: async () => ({ error: 'Session not found' }),
+    });
+
+    const { m } = manager();
+    await assert.rejects(
+      () => m.reopenSession('gone'),
+      /could not be reopened/,
+      'a real new-server refusal must still stop navigation',
+    );
+  });
+
+  it('falls back to local closes until the old server restarts', async function () {
+    const chat = { id: 'chat', name: 'chat', active: false, workingDir: '/a', surface: 'chat' };
+    let supportsAccountTabs = false;
+    let accountOpen = true;
+    respondTo = (_url, init) => {
+      if (init?.method === 'PATCH') {
+        if (!supportsAccountTabs) {
+          return {
+            ok: false,
+            status: 404,
+            json: async () => { throw new Error('Unexpected token <'); },
+          };
+        }
+        accountOpen = JSON.parse(init.body).open;
+        return { ok: true, json: async () => ({ success: true, open: accountOpen }) };
+      }
+      return { ok: true, json: async () => ({ sessions: accountOpen ? [chat] : [] }) };
+    };
+
+    const { m } = manager();
+    m.addTab('chat', 'chat', 'idle', '/a', false);
+    m.setTabSurface('chat', 'chat');
+    m.closeSession('chat');
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.ok(!m.tabs.has('chat'), 'the old server does not immediately resurrect the close');
+    assert.deepStrictEqual(
+      JSON.parse(stored.get('cc-web-closed-conversations')),
+      ['chat'],
+      'the old browser-local behaviour is retained only as a rollout fallback',
+    );
+    assert.deepStrictEqual(
+      requests.map((request) => request.init?.method ?? 'GET'),
+      ['PATCH'],
+      'a missing route is not treated like a refused write and reconciled immediately',
+    );
+
+    await m.reconcile();
+    assert.ok(!m.tabs.has('chat'), 'an old-server reconnect still respects the local fallback');
+    assert.strictEqual(accountOpen, true, 'the unsupported endpoint changed no server state');
+
+    // The process now comes back on the supporting version. Reconciliation
+    // retries the tombstone, transfers ownership to the account, and retires it.
+    supportsAccountTabs = true;
+    await m.reconcile();
+    assert.strictEqual(accountOpen, false);
+    assert.strictEqual(stored.get('cc-web-closed-conversations'), undefined);
+
+    const otherDevice = manager();
+    await otherDevice.m.loadSessions();
+    assert.deepStrictEqual(
+      otherDevice.m.getOrderedTabIds(),
+      [],
+      'once the server supports it, the fallback close is visible on every device',
+    );
+  });
+
+  it('keeps an old-server close hidden while the missing-route response is still in flight', async function () {
+    const chat = { id: 'chat', name: 'chat', active: false, workingDir: '/a', surface: 'chat' };
+    let finishPatch;
+    const patchResponse = new Promise((resolve) => { finishPatch = resolve; });
+    respondTo = (_url, init) => init?.method === 'PATCH'
+      ? patchResponse
+      : { ok: true, json: async () => ({ sessions: [chat] }) };
+
+    const { m } = manager();
+    m.addTab('chat', 'chat', 'idle', '/a', false);
+    m.setTabSurface('chat', 'chat');
+    m.closeSession('chat');
+
+    await m.reconcile();
+    assert.ok(!m.tabs.has('chat'), 'a reconnect cannot re-adopt a close awaiting capability detection');
+
+    finishPatch({
+      ok: false,
+      status: 404,
+      json: async () => { throw new Error('Unexpected token <'); },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(JSON.parse(stored.get('cc-web-closed-conversations')), ['chat']);
+    assert.ok(!m.tabs.has('chat'));
+  });
+
+  it('reconciles an open that arrives while this device is still awaiting its earlier close', async function () {
+    const chat = { id: 'chat', name: 'chat', active: false, workingDir: '/a', surface: 'chat' };
+    let accountOpen = true;
+    let finishClose;
+    const closeResponse = new Promise((resolve) => { finishClose = resolve; });
+    respondTo = (_url, init) => {
+      if (init?.method === 'PATCH') {
+        accountOpen = false;
+        return closeResponse;
+      }
+      return {
+        ok: true,
+        json: async () => ({ sessions: accountOpen ? [chat] : [] }),
+      };
+    };
+
+    const { m } = manager();
+    m.addTab('chat', 'chat', 'idle', '/a', false);
+    m.setTabSurface('chat', 'chat');
+    m.closeSession('chat');
+    await Promise.resolve();
+
+    // The server has since processed a later explicit reopen from device B.
+    accountOpen = true;
+    m.applyRemoteOpen(chat);
+    assert.ok(!m.tabs.has('chat'), 'the pending local close is not flashed back prematurely');
+
+    // Device A's older HTTP response arrives last. Its body alone is stale; the
+    // ignored newer open forces a list reconciliation after the close settles.
+    finishClose({
+      ok: true,
+      json: async () => ({ success: true, open: false, applied: true }),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.ok(m.tabs.has('chat'), 'the server-final reopen is restored on this device too');
+    assert.deepStrictEqual(
+      requests.map((request) => request.init?.method ?? 'GET'),
+      ['PATCH', 'GET'],
+    );
+  });
+
+  it('migrates only legacy closed tabs that belong to the current account', async function () {
+    stored.set('cc-web-closed-conversations', JSON.stringify(['closed', 'another-account']));
+    const sessions = [
+      { id: 'kept', name: 'kept', active: false, workingDir: '/a', surface: 'chat' },
+      { id: 'closed', name: 'closed', active: false, workingDir: '/b', surface: 'chat' },
+    ];
+    let closedMigrated = false;
+    respondTo = (url, init) => {
+      if (!init?.method) {
+        return {
+          ok: true,
+          json: async () => ({ sessions: closedMigrated ? sessions.slice(0, 1) : sessions }),
+        };
+      }
+      if (url.endsWith('/closed/tab')) {
+        closedMigrated = true;
+        return {
+          ok: true,
+          json: async () => ({ success: true, open: false, applied: true }),
+        };
+      }
+      return {
+        ok: false,
+        status: 404,
+        json: async () => ({ error: 'Session not found' }),
+      };
+    };
+
+    const { m } = manager();
+    await m.init();
+
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['kept']);
+    assert.deepStrictEqual(
+      requests
+        .filter((request) => request.init?.method === 'PATCH')
+        .map((request) => JSON.parse(request.init.body)),
+      [{ open: false, legacy: true }, { open: false, legacy: true }],
+      'every legacy ID is probed because account-closed tabs are absent from the list',
+    );
+    assert.deepStrictEqual(
+      JSON.parse(stored.get('cc-web-closed-conversations')),
+      ['another-account'],
+      'an unknown ID may belong to another account using this browser',
+    );
+  });
+
+  it('does not let a stale legacy tombstone undo an explicit account reopen', async function () {
+    stored.set('cc-web-closed-conversations', JSON.stringify(['chat']));
+    const chat = {
+      id: 'chat',
+      name: 'chat',
+      active: false,
+      workingDir: '/a',
+      surface: 'chat',
+    };
+    respondTo = (_url, init) => init?.method === 'PATCH'
+      ? {
+        ok: true,
+        json: async () => ({ success: true, open: true, applied: false }),
+      }
+      : { ok: true, json: async () => ({ sessions: [chat] }) };
+
+    const { m } = manager();
+    await m.init();
+
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['chat']);
+    assert.deepStrictEqual(JSON.parse(requests[1].init.body), {
+      open: false,
+      legacy: true,
+    });
+    assert.strictEqual(
+      stored.get('cc-web-closed-conversations'),
+      undefined,
+      'an owned 2xx retires the stale local value even when it applies no close',
+    );
+  });
+
+  it('preserves legacy closed tabs when the account session list fails', async function () {
+    const legacy = JSON.stringify(['closed', 'another-account']);
+    stored.set('cc-web-closed-conversations', legacy);
+    respondTo = () => ({ ok: false, status: 500, json: async () => ({ sessions: [] }) });
+
+    const oldError = console.error;
+    console.error = () => {};
+    try {
+      const { m } = manager();
+      await m.init();
+    } finally {
+      console.error = oldError;
+    }
+
+    assert.strictEqual(stored.get('cc-web-closed-conversations'), legacy);
+    assert.strictEqual(
+      requests.filter((request) => request.init?.method === 'PATCH').length,
+      0,
+      'a failed list cannot establish which legacy IDs belong to this account',
+    );
   });
 
   it('does not let go when another tab takes over, because joining it detaches', async function () {
@@ -523,7 +1009,7 @@ describe('session tab state', function () {
     ]);
   });
 
-  it('applies a dragged order and keeps a tab that arrived mid-drag', function () {
+  it('applies a dragged order and keeps a tab that arrived mid-drag', async function () {
     const { m } = manager();
     m.addTab('a', 'a', 'idle', null, false);
     m.addTab('b', 'b', 'idle', null, false);
@@ -546,6 +1032,164 @@ describe('session tab state', function () {
       ['a', 'b', 'c'],
       'an id for a session that no longer exists is ignored',
     );
+    await new Promise((resolve) => setImmediate(resolve));
+  });
+
+  it('persists a dragged account order while keeping this window on its active tab', async function () {
+    respondTo = (_url, init) => init?.method === 'PATCH'
+      ? { ok: true, json: async () => ({ success: true, sessionIds: ['b', 'a'] }) }
+      : {
+          ok: true,
+          json: async () => ({
+            sessions: [
+              { id: 'b', name: 'b', active: false, workingDir: '/b', surface: 'chat' },
+              { id: 'a', name: 'a', active: false, workingDir: '/a', surface: 'chat' },
+            ],
+          }),
+        };
+    const { m } = manager();
+    m.addTab('a', 'a', 'idle', null, false);
+    m.addTab('b', 'b', 'idle', null, false);
+    m.activeTabId = 'a';
+    requests.length = 0;
+
+    m.applyOrder(['b', 'a']);
+
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['b', 'a'], 'the drag is optimistic');
+    assert.strictEqual(m.activeTabId, 'a', 'order never changes this window\'s selection');
+    await new Promise((resolve) => setImmediate(resolve));
+    const patches = requests.filter((request) => request.init?.method === 'PATCH');
+    assert.strictEqual(patches.length, 1);
+    assert.strictEqual(patches[0].url, '/api/sessions/tabs/order');
+    assert.deepStrictEqual(JSON.parse(patches[0].init.body), { sessionIds: ['b', 'a'] });
+
+    m.applyRemoteOrder(['a', 'b']);
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['a', 'b']);
+    assert.strictEqual(m.activeTabId, 'a');
+    assert.strictEqual(
+      requests.filter((request) => request.init?.method === 'PATCH').length,
+      1,
+      'a server order is applied without an echo PATCH',
+    );
+  });
+
+  it('sends rapid drag orders to the server in the order they happened', async function () {
+    let finishFirst;
+    const firstFinished = new Promise((resolve) => { finishFirst = resolve; });
+    let serverOrder = ['a', 'b'];
+    respondTo = async (_url, init) => {
+      if (!init?.method) {
+        return {
+          ok: true,
+          json: async () => ({
+            sessions: serverOrder.map((id) => ({
+              id, name: id, active: false, workingDir: `/${id}`, surface: 'chat',
+            })),
+          }),
+        };
+      }
+      const order = JSON.parse(init.body).sessionIds;
+      if (order[0] === 'b') await firstFinished;
+      serverOrder = order;
+      return { ok: true, json: async () => ({ success: true, sessionIds: order }) };
+    };
+
+    const { m } = manager();
+    m.addTab('a', 'a', 'idle', null, false);
+    m.addTab('b', 'b', 'idle', null, false);
+    m.applyOrder(['b', 'a']);
+    m.applyOrder(['a', 'b']);
+
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.strictEqual(requests.length, 1, 'the later drag waits behind persistence of the first');
+    // The first request's own socket event arrives after the second drag. It is
+    // older than the optimistic A,B intent and must not rewind the strip.
+    m.applyRemoteOrder(['b', 'a']);
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['a', 'b']);
+    finishFirst();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepStrictEqual(
+      requests
+        .filter((request) => request.init?.method === 'PATCH')
+        .map((request) => JSON.parse(request.init.body).sessionIds),
+      [['b', 'a'], ['a', 'b']],
+    );
+    assert.ok(
+      requests.some((request) => !request.init?.method),
+      'the drained local queue confirms final order from the authoritative list',
+    );
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['a', 'b']);
+  });
+
+  it('takes list order on first load and after an offline reconnect', async function () {
+    let sessions = [
+      { id: 'b', name: 'b', active: false, workingDir: '/b', surface: 'chat' },
+      { id: 'a', name: 'a', active: false, workingDir: '/a', surface: 'chat' },
+    ];
+    respondTo = () => ({ ok: true, json: async () => ({ sessions }) });
+
+    const { m } = manager();
+    await m.loadSessions();
+    m.activeTabId = 'b';
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['b', 'a']);
+
+    // This screen was offline for a drag on another device. The reconnect list
+    // is already server-sorted and changes order, never the local selection.
+    sessions = [sessions[1], sessions[0]];
+    await m.reconcile();
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['a', 'b']);
+    assert.strictEqual(m.activeTabId, 'b');
+    assert.deepStrictEqual(
+      requests.filter((request) => request.init?.method === 'PATCH'),
+      [],
+      'applying list order never writes it back',
+    );
+  });
+
+  it('moves a stale local copy to the server append position when it is reopened', async function () {
+    let sessions = [
+      { id: 'closed', name: 'closed', active: false, workingDir: '/closed', surface: 'chat' },
+      { id: 'keep', name: 'keep', active: false, workingDir: '/keep', surface: 'chat' },
+    ];
+    respondTo = (_url, init) => {
+      if (init?.method === 'PATCH') {
+        // The server knew `closed` was absent even though this window missed the
+        // close event. A genuine reopen appends it to the durable order.
+        sessions = [sessions[1], sessions[0]];
+        return { ok: true, json: async () => ({ success: true, open: true }) };
+      }
+      return { ok: true, json: async () => ({ sessions }) };
+    };
+
+    const { m } = manager();
+    await m.loadSessions();
+    m.activeTabId = 'keep';
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['closed', 'keep']);
+
+    assert.strictEqual(await m.reopenSession('closed'), true);
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['keep', 'closed']);
+    assert.strictEqual(m.activeTabId, 'keep', 'reopen order does not steal focus');
+  });
+
+  it('restores the existing server position when an idempotently open tab was missed', async function () {
+    const sessions = [
+      { id: 'missed', name: 'missed', active: false, workingDir: '/missed', surface: 'chat' },
+      { id: 'keep', name: 'keep', active: false, workingDir: '/keep', surface: 'chat' },
+    ];
+    respondTo = (_url, init) => init?.method === 'PATCH'
+      ? { ok: true, json: async () => ({ success: true, open: true, applied: true }) }
+      : { ok: true, json: async () => ({ sessions }) };
+
+    const { m } = manager();
+    // This disconnected screen knows Keep but missed the earlier open/order
+    // that placed Missed before it on the account.
+    m.addTab('keep', 'keep', 'idle', '/keep', false);
+    m.activeTabId = 'keep';
+
+    assert.strictEqual(await m.reopenSession('missed'), true);
+    assert.deepStrictEqual(m.getOrderedTabIds(), ['missed', 'keep']);
+    assert.strictEqual(m.activeTabId, 'keep');
   });
 
   // A rename that only lives in the page that typed it is the bug in #54: the
@@ -673,26 +1317,56 @@ describe('session tab state', function () {
       stored.set('cc-web-active-tab', 'a');
 
       assert.strictEqual(
-        m.initialTabId(),
+        await m.initialTabId(),
         'b',
         'this window\'s own memory wins over the browser-wide one',
       );
     });
 
-    it('opens on the remembered tab, and on the first one when it is gone', function () {
+    it('opens on the remembered tab, and on the first one when it is gone', async function () {
       const { m } = manager();
       m.addTab('a', 'a', 'idle', null, false);
       m.addTab('b', 'b', 'idle', null, false);
 
       stored.set('cc-web-active-tab', 'b');
-      assert.strictEqual(m.initialTabId(), 'b');
+      assert.strictEqual(await m.initialTabId(), 'b');
 
       // The remembered session was closed elsewhere, or ended with the server.
       stored.set('cc-web-active-tab', 'ghost');
-      assert.strictEqual(m.initialTabId(), 'a', 'a stale id falls back, it does not blank the app');
+      assert.strictEqual(await m.initialTabId(), 'a', 'a stale id falls back, it does not blank the app');
 
       stored.delete('cc-web-active-tab');
-      assert.strictEqual(m.initialTabId(), 'a', 'a first visit behaves as it always did');
+      assert.strictEqual(await m.initialTabId(), 'a', 'a first visit behaves as it always did');
+    });
+
+    it('reopens a closed notification target on a cold start with no tabs', async function () {
+      global.window.location = { href: 'https://webcli.test/?conversation=closed' };
+      const replaced = [];
+      global.window.history = { replaceState: (_state, _title, url) => replaced.push(url) };
+      const chat = {
+        id: 'closed',
+        name: 'closed',
+        active: false,
+        workingDir: '/a',
+        surface: 'chat',
+      };
+      let open = false;
+      respondTo = (_url, init) => {
+        if (init?.method === 'PATCH') open = JSON.parse(init.body).open;
+        return { ok: true, json: async () => ({ sessions: open ? [chat] : [] }) };
+      };
+
+      const { m } = manager();
+      const selected = await m.initialTabId();
+
+      assert.strictEqual(selected, 'closed');
+      assert.ok(m.tabs.has('closed'), 'the missing conversation is restored before selection');
+      assert.deepStrictEqual(
+        requests.map((request) => request.init?.method ?? 'GET'),
+        ['PATCH', 'GET'],
+      );
+      assert.deepStrictEqual(JSON.parse(requests[0].init.body), { open: true });
+      assert.deepStrictEqual(replaced, ['/'], 'the cold-start request is consumed once');
     });
   });
 });

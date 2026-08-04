@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
+  discoverInstalledCommands,
   listInstalledCommands,
   describeFrom,
 } = require('../dist/server/chat/installed-commands.js');
@@ -151,6 +152,145 @@ describe('installed skills and commands', function () {
     assert.deepStrictEqual(names(scan('claude')), ['claude-only']);
   });
 
+  it('uses Codex’s shared and system skill roots as a fallback for older builds', function () {
+    skill('project/.agents/skills/project-shared', 'name: project-shared');
+    skill('home/.agents/skills/user-shared', 'name: user-shared');
+    skill('home/.codex/skills/.system/system-skill', 'name: system-skill');
+    assert.deepStrictEqual(
+      names(scan('codex')),
+      ['project-shared', 'user-shared', 'system-skill'],
+    );
+  });
+
+  it('keeps skill paths in private discovery metadata, not public menu entries', function () {
+    skill('home/.codex/skills/release', 'name: release\ndescription: Prepare a release');
+    const found = discoverInstalledCommands('codex', { home: home(), workingDir: cwd() });
+    assert.deepStrictEqual(found.commands, [{ name: 'release', description: 'Prepare a release' }]);
+    assert.deepStrictEqual(found.skills, [{
+      name: 'release',
+      path: path.join(home(), '.codex/skills/release/SKILL.md'),
+    }]);
+    assert.ok(!JSON.stringify(found.commands).includes(home()), 'the browser-facing list has no absolute path');
+  });
+
+  it('reads all four of agy’s workspace root spellings', function () {
+    // agy's own docs name `.agents/` "or `.agent/`, `_agents/`, `_agent/`", and
+    // all four were probed against 1.1.8 by planting a skill in each and asking
+    // the agent which were available to it: all four came back AVAILABLE. A
+    // monorepo using `_agents/` had an empty menu until they were all here.
+    skill('project/.agents/skills/dot-agents', 'name: dot-agents');
+    skill('project/_agents/skills/under-agents', 'name: under-agents');
+    skill('project/.agent/skills/dot-agent', 'name: dot-agent');
+    skill('project/_agent/skills/under-agent', 'name: under-agent');
+    assert.deepStrictEqual(
+      names(scan('antigravity')).sort(),
+      ['dot-agent', 'dot-agents', 'under-agent', 'under-agents'],
+    );
+  });
+
+  it('reads agy’s global root as well as the project’s', function () {
+    skill('project/.agents/skills/project-one', 'name: project-one');
+    skill('home/.gemini/config/skills/global-one', 'name: global-one');
+    assert.deepStrictEqual(names(scan('antigravity')).sort(), ['global-one', 'project-one']);
+  });
+
+  it('reads a skill a plugin brought with it, under its own name', function () {
+    // `<root>/plugins/<plugin>/skills/<skill>/SKILL.md`, two levels below the
+    // directory the table names. Probed: available, and *not* namespaced — agy
+    // offers it as `plug-check`, not `toolkit:plug-check`.
+    write('project/.agents/plugins/toolkit/plugin.json', '{"name":"toolkit"}');
+    skill('project/.agents/plugins/toolkit/skills/plug-check', 'name: plug-check');
+    write('home/.gemini/config/plugins/globaltoolkit/plugin.json', '{"name":"globaltoolkit"}');
+    skill('home/.gemini/config/plugins/globaltoolkit/skills/gplug-check', 'name: gplug-check');
+    assert.deepStrictEqual(names(scan('antigravity')).sort(), ['gplug-check', 'plug-check']);
+  });
+
+  it('does not offer a skill nested deeper than agy will load one', function () {
+    // Probed: `skills/outer/inner/SKILL.md` came back MISSING. The default scan
+    // recurses three levels, which for agy would put a name on the menu the
+    // agent has no skill for.
+    skill('project/.agents/skills/outer/inner', 'name: nested-inner');
+    assert.deepStrictEqual(names(scan('antigravity')), []);
+  });
+
+  it('offers none of agy’s built-in skills, because two of the three are dead', function () {
+    // `/antigravity_guide` answers from the skill; `/permissioned-github`
+    // answers "no such skill" and `/agy-customizations` quietly opens the wrong
+    // file. Two undeliverable entries to gain one documentation skill is the
+    // trade #71 was filed over, so the directory has no row.
+    skill('home/.gemini/antigravity-cli/builtin/skills/antigravity_guide', 'name: antigravity-guide');
+    skill('home/.gemini/antigravity-cli/builtin/skills/permissioned-github', 'name: permissioned-github');
+    assert.deepStrictEqual(names(scan('antigravity')), []);
+  });
+
+  it('leaves the shared .agents skills of other runtimes off agy’s menu', function () {
+    // `~/.agents/skills` is a *user-scoped* root for pi and grok. It is not one
+    // for agy, whose user-scoped root is `~/.gemini/config/`. Probed: a skill
+    // placed there was not found from an unrelated working directory.
+    //
+    // The precise claim matters. agy treats `.agents` as a *workspace* root, so
+    // a home directory that is itself a git repository, with the session opened
+    // under it, does put those skills on the menu — and correctly, because agy
+    // loads them there too. This asserts the ordinary case, where `home/` is
+    // nowhere near the working directory's walk.
+    skill('home/.agents/skills/pi-shared', 'name: pi-shared');
+    assert.deepStrictEqual(names(scan('antigravity')), []);
+    // And the same directory really is read for the runtime that does read it,
+    // so this is a difference between runtimes rather than a broken scan.
+    assert.deepStrictEqual(names(scan('pi')), ['pi-shared']);
+  });
+
+  it('walks up to the repository root for agy, the way agy does', function () {
+    // agy's own docs: "the agent walks from your current working directory up to
+    // the repository root (e.g. the folder containing `.git`)". Watched working
+    // — a skill in `<repo>/.agents/skills/` was invoked by name from a session
+    // opened in `<repo>/packages/web`, and agy read it. Without this the menu
+    // silently omits every skill a monorepo keeps at its root.
+    skill('project/.agents/skills/at-the-root', 'name: at-the-root');
+    fs.mkdirSync(path.join(cwd(), '.git'), { recursive: true });
+    const deep = path.join(cwd(), 'packages', 'web');
+    fs.mkdirSync(deep, { recursive: true });
+    assert.deepStrictEqual(
+      names(listInstalledCommands('antigravity', { home: home(), workingDir: deep })),
+      ['at-the-root'],
+    );
+  });
+
+  it('lets a nearer skill shadow the ancestor’s of the same name', function () {
+    skill('project/.agents/skills/audit', 'name: audit\ndescription: Repo audit');
+    fs.mkdirSync(path.join(cwd(), '.git'), { recursive: true });
+    skill('project/packages/web/.agents/skills/audit', 'name: audit\ndescription: Package audit');
+    const deep = path.join(cwd(), 'packages', 'web');
+    assert.deepStrictEqual(
+      listInstalledCommands('antigravity', { home: home(), workingDir: deep }),
+      [{ name: 'audit', description: 'Package audit' }],
+    );
+  });
+
+  it('does not wander above a working directory with no repository over it', function () {
+    // No `.git` anywhere above: only the working directory is searched. Climbing
+    // to the filesystem root on the off chance would offer skills from whatever
+    // project happens to own `/tmp`, which the session has nothing to do with.
+    skill('project/.agents/skills/mine', 'name: mine');
+    skill('.agents/skills/stranger', 'name: stranger');
+    assert.deepStrictEqual(names(scan('antigravity')), ['mine']);
+  });
+
+  it('keeps enough directory budget for the personal roots after a deep walk', function () {
+    // Eight workspace rows against a deep tree is a hundred directory opens that
+    // find nothing, and the walk's budget is shared with everything after it. If
+    // a miss cost a unit, the global root at the end of the table would be
+    // starved and the menu would silently lose half its entries.
+    fs.mkdirSync(path.join(cwd(), '.git'), { recursive: true });
+    const deep = path.join(cwd(), ...Array.from({ length: 12 }, (_, i) => `level${i}`));
+    fs.mkdirSync(deep, { recursive: true });
+    skill('home/.gemini/config/skills/still-here', 'name: still-here');
+    assert.deepStrictEqual(
+      names(listInstalledCommands('antigravity', { home: home(), workingDir: deep })),
+      ['still-here'],
+    );
+  });
+
   it('offers nothing for a runtime that reports its own list at session start', function () {
     skill('home/.claude/skills/anything', 'name: anything');
     assert.deepStrictEqual(scan('kimi'), []);
@@ -287,7 +427,7 @@ describe('a session advertises what is installed for it', function () {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  async function startedSession(env) {
+  async function startedSession(env, runtime = 'pi') {
     const { ChatSession } = require('../dist/server/chat/session.js');
     const events = [];
     const session = new ChatSession(
@@ -304,7 +444,7 @@ describe('a session advertises what is installed for it', function () {
         resolveCommand: () => '/bin/cat',
       },
     );
-    await session.start({ runtime: 'pi', workingDir: path.join(dir, 'project'), env });
+    await session.start({ runtime, workingDir: path.join(dir, 'project'), env });
     return session;
   }
 
@@ -314,6 +454,33 @@ describe('a session advertises what is installed for it', function () {
     await session.stop();
     assert.deepStrictEqual(names(offered.commands || []), ['commit']);
     assert.strictEqual((offered.commands || [])[0].description, 'Write the commit message');
+  });
+
+  it('offers agy the app’s own commands and the user’s skills together', async function () {
+    // Two halves from two places, and the whole point is that neither eats the
+    // other: the adapter declares `/clear`, `/new` and `/reset` statically
+    // because agy interprets no command of its own, and the session merges the
+    // disk scan on top before the process starts. A regression in either
+    // direction — an adapter list that replaces the scan, or a scan that
+    // replaces the adapter list — leaves half the menu missing, and the empty
+    // half is invisible rather than wrong-looking.
+    const skillDir = path.join(dir, 'home/.gemini/config/skills/release-check');
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: release-check\ndescription: Run the release check\n---\n',
+    );
+
+    const session = await startedSession({ HOME: path.join(dir, 'home') }, 'antigravity');
+    const offered = session.capabilities;
+    await session.stop();
+
+    const offeredNames = names(offered.commands || []);
+    assert.deepStrictEqual(offeredNames, ['clear', 'new', 'reset', 'release-check']);
+    assert.strictEqual(
+      (offered.commands || []).find((c) => c.name === 'release-check').description,
+      'Run the release check',
+    );
   });
 
   it('reads the home of the session, never the server’s own', async function () {

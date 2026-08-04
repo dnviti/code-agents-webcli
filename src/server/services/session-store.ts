@@ -38,7 +38,12 @@ interface RuntimeSessionRow {
   chat_model_override: string | null;
   chat_model_pinned: string | null;
   chat_effort_override: string | null;
+  chat_plan_mode: number | null;
   custom_name: string | null;
+  tab_open: number | null;
+  tab_order: number | null;
+  project_id: string | null;
+  project_working_dir_kind: string | null;
 }
 
 export class SessionStore {
@@ -80,7 +85,12 @@ export class SessionStore {
           chat_model_override,
           chat_model_pinned,
           chat_effort_override,
-          custom_name
+          chat_plan_mode,
+          custom_name,
+          tab_open,
+          tab_order,
+          project_id,
+          project_working_dir_kind
         )
         VALUES (
           @id,
@@ -106,7 +116,12 @@ export class SessionStore {
           @chat_model_override,
           @chat_model_pinned,
           @chat_effort_override,
-          @custom_name
+          @chat_plan_mode,
+          @custom_name,
+          @tab_open,
+          @tab_order,
+          @project_id,
+          @project_working_dir_kind
         )
       `);
 
@@ -131,7 +146,10 @@ export class SessionStore {
         name: session.name || 'Unnamed Session',
         created_at: toIsoString(session.created),
         last_activity: toIsoString(session.lastActivity),
-        active: 0,
+        // The database is the run-limit authority. Keeping this in step with
+        // the runtime record also means an ordinary autosave cannot erase a
+        // live flag written by `setActive` between two ticks. (#168)
+        active: session.active ? 1 : 0,
         agent: null,
         last_agent: session.lastAgent,
         runtime_label: session.runtimeLabel,
@@ -200,10 +218,34 @@ export class SessionStore {
         // a server restart shows the chip at the runtime default while the
         // process it describes is still running at the level the user picked.
         chat_effort_override: session.chatEffortOverride || null,
+        chat_plan_mode: session.chatPlanMode === true ? 1 : 0,
         // The label the user chose. Without this a restart brings a session back
         // under the name it was created with, which is the one thing the user
         // renamed it to get away from.
         custom_name: session.customName || null,
+        // Closing a conversation is a tab operation, not deletion. Persist the
+        // account-owned visibility so every device and the next server process
+        // agree. NULL remains distinct from an explicit open: it marks a row
+        // written before account-wide tabs existed, which lets the one-time
+        // browser migration apply an old local close exactly once without a
+        // stale browser later overriding a newer reopen.
+        tab_open:
+          session.tabOpen === true ? 1 : session.tabOpen === false ? 0 : null,
+        // Null preserves the stable load order of rows written before shared
+        // ordering existed. Every explicit reorder writes compact ordinals.
+        tab_order: Number.isFinite(session.tabOrder) ? session.tabOrder : null,
+        // The project this session was created against, if any. Project-less
+        // sessions keep today's behaviour. (#168)
+        project_id: session.projectId ?? null,
+        // Absolute host and container paths share one string field, so this
+        // discriminator is the only safe way to interpret it after restart.
+        // A null remains the legacy host meaning for older rows.
+        project_working_dir_kind:
+          session.projectId
+          && (session.projectWorkingDirKind === 'host'
+            || session.projectWorkingDirKind === 'container')
+            ? session.projectWorkingDirKind
+            : null,
       }));
 
       replaceAll(rows);
@@ -244,7 +286,12 @@ export class SessionStore {
             chat_model_override,
             chat_model_pinned,
             chat_effort_override,
-            custom_name
+            chat_plan_mode,
+            custom_name,
+            tab_open,
+            tab_order,
+            project_id,
+            project_working_dir_kind
           FROM runtime_sessions
           ORDER BY created_at ASC
         `)
@@ -314,9 +361,24 @@ export class SessionStore {
           // chosen" rather than as an instruction to pass the runtime an empty
           // `--effort`, which every one of them would refuse.
           chatEffortOverride: row.chat_effort_override || undefined,
+          chatPlanMode: row.chat_plan_mode === 1,
           // An empty string reads as "never renamed" for the same reason: the
           // write side only ever stores a trimmed non-empty name or null.
           customName: row.custom_name || undefined,
+          // Preserve the migration marker. Everywhere that renders the strip
+          // treats undefined as open; only the conditional legacy-close route
+          // needs to distinguish it from a tab explicitly reopened later.
+          tabOpen:
+            row.tab_open === 1 ? true : row.tab_open === 0 ? false : undefined,
+          tabOrder: row.tab_order ?? undefined,
+          // Project-less sessions keep today's behaviour. (#168)
+          projectId: row.project_id ?? undefined,
+          projectWorkingDirKind:
+            row.project_working_dir_kind === 'container'
+              ? 'container'
+              : row.project_working_dir_kind === 'host'
+                ? 'host'
+                : undefined,
         });
       }
 
@@ -360,6 +422,36 @@ export class SessionStore {
         exists: false,
         error: error instanceof Error ? error.message : String(error),
       };
+    }
+  }
+
+  /**
+   * Write-through for the runtime's active flag.
+   *
+   * In-memory `active` is the runtime signal; the database copy is what the
+   * run-limit sweep reads inside its transaction, so every start/stop/exit
+   * must write through. Fire-and-forget: the WS flow never blocks on SQLite.
+   * (#168)
+   */
+  async setActive(id: string, active: boolean): Promise<void> {
+    try {
+      this.database.raw
+        .prepare('UPDATE runtime_sessions SET active = @active WHERE id = @id')
+        .run({ active: active ? 1 : 0, id });
+    } catch (error) {
+      console.error(`Failed to set active flag for session ${id}:`, error);
+    }
+  }
+
+  /**
+   * Reset every active flag at boot. A restart leaves no live processes, so
+   * any `active = 1` rows are stale. (#168)
+   */
+  async resetActiveFlags(): Promise<void> {
+    try {
+      this.database.raw.prepare('UPDATE runtime_sessions SET active = 0').run();
+    } catch (error) {
+      console.error('Failed to reset active flags:', error);
     }
   }
 }

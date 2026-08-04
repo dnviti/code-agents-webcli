@@ -20,6 +20,7 @@ before(function () {
     `export { renderToStaticMarkup } from 'react-dom/server';`,
     `export * as React from 'react';`,
     `export { Composer, placeByPickOrder } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/chat/Composer'))};`,
+    `export { PlanDocDialog } from ${JSON.stringify(path.join(ROOT, 'src/client/shell/chat/PlanDocDialog'))};`,
   ].join('\n');
 
   const out = path.join(os.tmpdir(), `chat-composer-${process.pid}.js`);
@@ -68,6 +69,18 @@ function render(props) {
   return renderToStaticMarkup(
     React.createElement(Composer, Object.assign({ onSend() {}, onInterrupt() {}, busy: false, capabilities: caps({}) }, props)),
   );
+}
+
+function renderPlan(props) {
+  const { renderToStaticMarkup, React, PlanDocDialog } = mod;
+  return renderToStaticMarkup(React.createElement(PlanDocDialog, {
+    plan: { markdown: '# Retained', revision: 2, ts: 1 },
+    planMode: true,
+    onAccept() {},
+    onReject() {},
+    onClose() {},
+    ...props,
+  }));
 }
 
 describe('Composer', function () {
@@ -235,6 +248,11 @@ describe('Composer', function () {
 
     const filtered = render({ capabilities: caps({ commands }), draft: '/comp' });
     assert.ok(filtered.includes('/compact') && !filtered.includes('/clear'), 'typing narrows the match list');
+
+    const whileBusy = render({ busy: true, capabilities: caps({ commands }), draft: '/' });
+    assert.ok(whileBusy.includes('role="listbox"'), 'working does not hide commands from the queued composer');
+    assert.ok(whileBusy.includes('aria-label="Slash commands and skills"'));
+    assert.ok(whileBusy.includes('aria-label="Queue this message"'), 'the selected command can be queued');
   });
 
   it('keeps sending available while the agent is busy, because a turn queues', function () {
@@ -514,6 +532,69 @@ describe('Composer', function () {
         );
       });
 
+      // The ladder (#171). A conversation running on a rung has to say which
+      // rung, because the whole reason somebody builds one is to control what
+      // each turn costs — and "which model" without "how expensive" is half the
+      // answer they were after.
+      it('names the rung on the chip itself, not only in the menu', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'gateway/mid-model',
+          modelOrigin: {
+            model: 'gateway/mid-model',
+            source: 'ladder',
+            profileName: 'Economy',
+            tier: 'mid',
+          },
+        });
+        assert.ok(html.includes('gateway/mid-model · mid'), 'the rung belongs beside the model');
+      });
+
+      it('says the model came from the ladder, and from which rung', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'gateway/mid-model',
+          modelOrigin: {
+            model: 'gateway/mid-model',
+            source: 'ladder',
+            profileName: 'Economy',
+            tier: 'mid',
+          },
+        });
+        assert.ok(
+          html.includes('Running on the mid rung of the &quot;Economy&quot; ladder.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      it('explains a rung it fell to rather than reporting one nobody chose', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'h',
+          modelOrigin: {
+            model: 'h', source: 'ladder', profileName: 'Economy', tier: 'high', requestedTier: 'mid',
+          },
+        });
+        assert.ok(
+          html.includes('mid is blank, so the nearest filled rung answered'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+      });
+
+      it('says when a standing choice is what is running, not the ladder', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'my/standing-choice',
+          modelOrigin: { model: 'my/standing-choice', source: 'personal' },
+          modelDefault: { model: 'my/standing-choice', source: 'personal' },
+        });
+        assert.ok(
+          html.includes('Running on your standing choice for this runtime.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+        assert.ok(!html.includes(' · mid'), 'no rung, because no rung decided this');
+      });
+
       // The pin and the default agreeing is the ordinary case, and it must not
       // produce a sentence telling the user something is staying put.
       it('says nothing about staying when the pin is the default', function () {
@@ -523,6 +604,40 @@ describe('Composer', function () {
           modelDefault: { model: 'profile-model', source: 'profile', profileName: 'House' },
         });
         assert.ok(!html.includes('Staying on'), html.match(/title="Model[^"]*"/)?.[0] || 'no title');
+      });
+
+      // A pin and a choice arrive under the same origin source, because the
+      // record cannot tell a model apart by where it came from once a
+      // conversation is fixed to it. Only one of them is something the user
+      // said, and the sentence has to be the one that is true — the picker
+      // "must not describe it as a choice" is the pin field's own rule.
+      it('does not call a model the conversation launched on a choice', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelPinned: 'from/the-profile',
+          modelOrigin: { model: 'from/the-profile', source: 'override' },
+          modelDefault: { model: 'something/else', source: 'profile', profileName: 'House' },
+        });
+        assert.ok(
+          html.includes('Staying on from/the-profile, the model it launched on.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
+        assert.ok(
+          !html.includes('Chosen for this conversation only'),
+          'nobody chose it, and there is nothing here to clear',
+        );
+      });
+
+      it('still calls a model the user picked a choice', function () {
+        const html = render({
+          capabilities: caps({}),
+          modelOverride: 'picked/in-this-chat',
+          modelOrigin: { model: 'picked/in-this-chat', source: 'override' },
+        });
+        assert.ok(
+          html.includes('Chosen for this conversation only.'),
+          html.match(/title="Model[^"]*"/)?.[0] || 'no model title',
+        );
       });
 
       // Version skew: a server that predates this says nothing, and the control
@@ -693,5 +808,38 @@ describe('Composer', function () {
     const long = render({ draft: 'x'.repeat(20000) });
     assert.ok(long.length > 0);
     assert.ok(long.includes('x'.repeat(200)), 'the long draft text itself is rendered, not truncated');
+  });
+
+  describe('Plan mode', function () {
+    it('keeps the Plan control beside the runtime controls and exposes the submitted plan', function () {
+      const html = render({
+        planMode: true,
+        onSetPlanMode() {},
+        planDocument: { markdown: '# Plan', revision: 3, ts: 1 },
+        onOpenPlan() {},
+      });
+      assert.ok(html.includes('aria-label="Plan mode is on'), 'the mode remains a labelled control');
+      assert.ok(html.includes('>Plan on<'), 'the on-state is readable on narrow/mobile rows too');
+      assert.ok(html.includes('aria-label="Read the submitted plan"'), 'the latest plan can be reopened');
+      assert.ok(html.indexOf('Plan mode is on') < html.indexOf('Approvals asked for'), 'it sits with model/runtime controls, before approval state');
+    });
+
+    it('shows plan mode off without hiding the control', function () {
+      const html = render({ planMode: false, onSetPlanMode() {} });
+      assert.ok(html.includes('aria-label="Plan mode — ask the agent to prepare a plan first"'));
+      assert.ok(html.includes('>Plan<'));
+    });
+
+    it('disables the mode control during an active planning turn and explains why', function () {
+      const html = render({ planMode: true, planLocked: true, onSetPlanMode() {} });
+      assert.match(html, /disabled=""[^>]*aria-pressed="true"/);
+      assert.ok(html.includes('available when that turn ends'));
+    });
+
+    it('keeps a retained plan read-only while Plan mode is off', function () {
+      const html = renderPlan({ planMode: false });
+      assert.strictEqual((html.match(/disabled=""/g) || []).length, 2);
+      assert.ok(html.includes('Turn Plan mode on before accepting or rejecting'));
+    });
   });
 });

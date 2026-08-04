@@ -24,6 +24,7 @@
  * that goes stale the week it ships.
  */
 
+import { ModelTier, ResolvedProfile } from './runtime-profiles.js';
 import { TurnOutcome } from './turn-outcome.js';
 
 export type { TurnOutcome };
@@ -118,6 +119,16 @@ export interface PlanItem {
   status: 'pending' | 'in_progress' | 'completed';
   /** Optional runtime-supplied priority; purely presentational. */
   priority?: string;
+}
+
+/** The latest complete plan submitted for a conversation. */
+export interface PlanDocument {
+  /** Complete markdown, never a patch against an earlier revision. */
+  markdown: string;
+  /** Monotonically increasing within one conversation. */
+  revision: number;
+  /** When this revision was submitted, in milliseconds since the epoch. */
+  ts: number;
 }
 
 export interface TextBlock {
@@ -388,10 +399,31 @@ export interface ErrorBlock {
  */
 export interface NoticeBlock {
   kind: 'notice';
-  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched';
+  notice: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'model';
   text: string;
   /** Optional detail — how much was reclaimed, what the summary covers. */
   detail?: string;
+}
+
+/**
+ * A durable question that had no tool-call block to render it.
+ *
+ * Native/MCP questions remain part of their `ToolBlock`. Structured-response
+ * fallback questions do not have one, so the shared reducer folds their
+ * question event into the assistant message as this block. That gives the
+ * answered card a chronological home in copied/reloaded conversation history
+ * instead of leaving it permanently pinned beside the composer.
+ */
+export interface InteractiveQuestionBlock {
+  kind: 'question';
+  request: QuestionRequest;
+  /** The durable outcome, filled when the matching resolution event arrives. */
+  answer?: {
+    optionIds: string[];
+    text?: string;
+    skipped?: boolean;
+    abandoned?: boolean;
+  };
 }
 
 export type ChatBlock =
@@ -401,7 +433,8 @@ export type ChatBlock =
   | ImageBlock
   | PlanBlock
   | ErrorBlock
-  | NoticeBlock;
+  | NoticeBlock
+  | InteractiveQuestionBlock;
 
 /**
  * Token and cost accounting for a message, turn or session.
@@ -653,6 +686,13 @@ export interface ChatMessage {
   usage?: ChatUsage;
   /** Model that produced this message, when reported. */
   model?: string;
+  /**
+   * App-owned workflow that produced this user turn.
+   *
+   * Kept as metadata so retry can restore the runtime-only guidance without
+   * putting a slash invocation or the bundled instructions in the transcript.
+   */
+  workflow?: BuiltInWorkflowId;
   /** True while the runtime is still appending to this message. */
   streaming?: boolean;
   /**
@@ -707,6 +747,9 @@ export interface QuestionOption {
   description?: string;
 }
 
+/** How a question is waiting for its answer. */
+export type QuestionOrigin = 'tool' | 'structured_handoff';
+
 /**
  * A question the model asked, waiting on a person.
  *
@@ -720,6 +763,12 @@ export interface QuestionOption {
  */
 export interface QuestionRequest {
   requestId: string;
+  /**
+   * Tool calls have a live resolver in the current process. A structured
+   * handoff ended the model turn before asking and can therefore be restored
+   * from the durable log after a restart. Missing is a legacy recorded event.
+   */
+  origin?: QuestionOrigin;
   /**
    * The tool call that asked, when it could be identified.
    *
@@ -736,6 +785,34 @@ export interface QuestionRequest {
   multiSelect: boolean;
   options: QuestionOption[];
   ts: number;
+}
+
+/**
+ * The durable outbox entry created when a structured handoff is answered.
+ *
+ * It repeats the bounded, validated content needed for the internal turn so a
+ * restart never has to reconstruct model input from a card that is no longer
+ * pending. The matching `question_continuation` event removes it once delivery
+ * has either been accepted by the runtime or deliberately abandoned.
+ */
+export interface QuestionContinuation {
+  continuationId: string;
+  /**
+   * The runtime handoff has crossed its durable pre-send boundary.
+   *
+   * Optional for logs written before this state existed. A recovered entry in
+   * this state is deliberately not sent again unless an adapter can
+   * authoritatively reconcile it: the previous process may have handed it to
+   * the runtime before dying.
+   */
+  dispatching?: true;
+  request: QuestionRequest;
+  answer: {
+    optionIds: string[];
+    labels: string[];
+    text?: string;
+    skipped?: boolean;
+  };
 }
 
 /** What a chat session is doing right now, for the header indicator. */
@@ -775,6 +852,8 @@ export interface ChatCapabilities {
    * existed still parses; absent reads as false everywhere it is consulted.
    */
   questions?: boolean;
+  /** The session can receive and persist a submitted Plan-mode document. */
+  planMode?: boolean;
   interrupt: boolean;
   /** A session can be resumed after the process is gone. */
   resume: boolean;
@@ -840,9 +919,53 @@ export interface ModelChoice {
  */
 export interface ChatModelDefault {
   model: string | null;
-  source: 'personal' | 'profile' | 'runtime';
-  /** Only ever set for `profile`, and only so the picker can name it. */
+  source: ModelDefaultSource;
+  /** Set for `profile` and `ladder`, and only so the picker can name it. */
   profileName?: string;
+  /** Only ever set for `ladder`: which rung of it this model sits on. */
+  tier?: ModelTier;
+  /**
+   * Only on a `ladder` whose chosen rung was blank, naming the rung that was
+   * asked for. The nearest filled one answered instead, and a person reading
+   * "high" beside a profile set to "mid" is owed the reason.
+   */
+  requestedTier?: ModelTier;
+}
+
+/**
+ * Where a model came from, cheapest explanation last.
+ *
+ * `ladder` is below `profile` deliberately and the issue says so outright: a
+ * model somebody typed into a profile, and an account's standing choice, both
+ * still beat the rung. The ladder is what answers when nobody typed anything.
+ */
+export type ModelDefaultSource = 'personal' | 'profile' | 'ladder' | 'runtime';
+
+/**
+ * What *this* conversation is running on, and why — as opposed to
+ * `ChatModelDefault`, which is what the next one would open on.
+ *
+ * The two were the same object until the ladder arrived, and conflating them is
+ * exactly how the chip came to name a standing choice that had never been
+ * applied to the conversation showing it (#135). They are separate now because
+ * the ladder makes the difference visible: a conversation pinned to `high` by a
+ * one-off escalation and a runtime whose *default* is `mid` are both true at
+ * once, and the picker has to say both.
+ *
+ * `override` is the source no default can have: the person in this conversation
+ * picked it out of the menu.
+ */
+export interface ChatModelOrigin {
+  model: string | null;
+  source: 'override' | ModelDefaultSource;
+  profileName?: string;
+  tier?: ModelTier;
+  requestedTier?: ModelTier;
+  /**
+   * Set while a conversation is answering above its usual rung, naming the rung
+   * it returns to. Its presence is what the UI reads as "this is temporary".
+   */
+  escalatedFrom?: ModelTier;
 }
 
 /**
@@ -916,6 +1039,8 @@ export type ChatEvent =
       role: ChatRole;
       turnId: string;
       model?: string;
+      /** Internal app-owned workflow intent, set only on the recorded user prompt. */
+      workflow?: BuiltInWorkflowId;
       /**
        * Set on a user message that was delivered *into* the turn already
        * running, rather than waiting for its own (#86).
@@ -1044,12 +1169,65 @@ export type ChatEvent =
       /** Every option the user picked, in the order the question offered them. */
       optionIds: string[];
       /**
+       * What the user typed instead of, or alongside, picking.
+       *
+       * The card always offers a free-text answer, because "none of these is
+       * quite right" is a real answer and an option list the model wrote cannot
+       * anticipate it. Recorded beside the picks rather than folded into them:
+       * an id names something the question offered, and this is the one part of
+       * the answer that it did not.
+       */
+      text?: string;
+      /**
        * True when the user chose to answer nothing.
        *
        * The model is still told — it is blocked and something has to come back —
        * but the transcript says "skipped" rather than inventing a selection.
        */
       skipped?: boolean;
+      /**
+       * True when nobody was given the chance: the call that asked died first.
+       *
+       * A different fact from `skipped`, and worth its own field because the two
+       * are opposite accusations. "Skipped" says a person saw the question and
+       * declined it. This says the agent stopped listening — its tool call timed
+       * out, the turn was cancelled, the session was closed — and an answer
+       * given now would reach nothing. Drawing that as a skip blamed the user
+       * for a card they were never able to answer (#174).
+       */
+      abandoned?: boolean;
+      /**
+       * Present only for an answered structured handoff. Its presence is the
+       * durable outbox marker: the answer is acknowledged only after this
+       * payload and the resolution are one committed log record.
+       */
+      continuation?: QuestionContinuation;
+    }
+  | {
+      /** Durable pre-send claim for one structured-handoff continuation. */
+      t: 'question_continuation_dispatching';
+      seq: number;
+      ts: number;
+      requestId: string;
+      continuationId: string;
+    }
+  | {
+      /** The live process withdrew a pre-send claim before invoking the adapter. */
+      t: 'question_continuation_pending';
+      seq: number;
+      ts: number;
+      requestId: string;
+      continuationId: string;
+    }
+  | {
+      /** Terminal record for the structured-handoff continuation outbox. */
+      t: 'question_continuation';
+      seq: number;
+      ts: number;
+      requestId: string;
+      continuationId: string;
+      outcome: 'delivered' | 'abandoned';
+      reason?: string;
     }
   | { t: 'state'; seq: number; ts: number; state: ChatState }
   | { t: 'error'; seq: number; ts: number; message: string; fatal?: boolean }
@@ -1158,7 +1336,7 @@ export type ChatEvent =
       t: 'marker';
       seq: number;
       ts: number;
-      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals';
+      kind: 'compacted' | 'cleared' | 'interrupted' | 'branched' | 'approvals' | 'model';
       detail?: string;
       /**
        * On an `approvals` marker: the mode the conversation actually started
@@ -1189,10 +1367,30 @@ export interface ChatAttachment {
   path?: string;
 }
 
+/**
+ * App-owned guided workflows.
+ *
+ * These names are a wire contract, not slash commands. The server keeps the
+ * workflow identity beside a turn so it can add the bundled instructions only
+ * at runtime while the transcript continues to contain exactly what the user
+ * wrote.
+ */
+export const BUILT_IN_WORKFLOW_IDS = ['gh-issue'] as const;
+export type BuiltInWorkflowId = typeof BUILT_IN_WORKFLOW_IDS[number];
+
+/** The one-field workflow prompt is intentionally bounded before it reaches a runtime. */
+export const MAX_BUILT_IN_WORKFLOW_PROMPT = 20_000;
+
+export function isBuiltInWorkflowId(value: unknown): value is BuiltInWorkflowId {
+  return typeof value === 'string' && (BUILT_IN_WORKFLOW_IDS as readonly string[]).includes(value);
+}
+
 /** A user turn on its way to the runtime. */
 export interface UserTurn {
   text: string;
   attachments?: ChatAttachment[];
+  /** Internal intent for an app-bundled workflow; never rendered as user text. */
+  workflow?: BuiltInWorkflowId;
 }
 
 /**
@@ -1236,6 +1434,8 @@ export interface QueuedTurn {
   id: string;
   text: string;
   attachments?: ChatAttachment[];
+  /** Preserves runtime-only bundled guidance through queueing and retry. */
+  workflow?: BuiltInWorkflowId;
   ts: number;
   /**
    * Why the last attempt to hand this turn over failed.
@@ -1273,6 +1473,10 @@ export interface ChatSnapshot {
   capabilities: ChatCapabilities;
   usage?: ChatUsage;
   plan?: PlanItem[];
+  /** Durable Plan-mode state, independent from the runtime's todo-plan output. */
+  planMode?: boolean;
+  /** The latest complete submitted plan, if the conversation has one. */
+  planDocument?: PlanDocument | null;
   /**
    * Where the account stood the last time the provider said anything about it.
    *
@@ -1292,6 +1496,17 @@ export interface ChatSnapshot {
    */
   pendingQuestions?: QuestionRequest[];
   /**
+   * Answered structured handoffs whose internal continuation has not reached a
+   * terminal record yet. Server-internal, but carried by the shared snapshot
+   * shape so recovery uses the same replay contract as every other chat fact.
+   */
+  pendingQuestionContinuations?: QuestionContinuation[];
+  /**
+   * Questions retained for history, including structured-response fallback
+   * questions that have no tool block to own their answered card.
+   */
+  questionHistory?: QuestionRequest[];
+  /**
    * Answers already given, keyed by the tool call that asked — falling back to
    * the request id when there was no call to pair with, exactly as the reducer
    * keys them.
@@ -1307,6 +1522,24 @@ export interface ChatSnapshot {
    * server that predates this should read as "none known", not as malformed.
    */
   answeredQuestions?: Record<string, string[]>;
+  /**
+   * Which of those were never anybody's to answer, keyed the same way.
+   *
+   * Carried across the join for the same reason the answers are: a card the
+   * agent gave up on says so, and a rejoin that dropped this fact would redraw
+   * it as a question its user had skipped.
+   */
+  abandonedQuestions?: Record<string, true>;
+  /**
+   * What was typed for the questions answered in the user's own words, keyed
+   * the same way `answeredQuestions` is.
+   *
+   * Separate from that map rather than squeezed into it because the two are
+   * different kinds of thing — ids the question offered, versus the sentence
+   * the user wrote — and a card that showed a typed answer as a tick against
+   * an option nobody picked would be inventing a selection.
+   */
+  answeredQuestionText?: Record<string, string>;
   /**
    * Turns typed ahead, still waiting. Optional so a snapshot replayed from the
    * store — which knows nothing about a live process — is not obliged to
@@ -1387,6 +1620,7 @@ export const NO_CHAT_CAPABILITIES: ChatCapabilities = {
   cost: false,
   plan: false,
   questions: false,
+  planMode: false,
 };
 
 /** The MCP server this app exposes to the runtimes it launches. */
@@ -1408,8 +1642,104 @@ export function isSessionMintedMessageId(id: string): boolean {
   return /^user-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
 }
 
-/** The one tool that server offers: put a multiple-choice question to the user. */
+/** Put a multiple-choice question to the user, and wait for the answer. */
 export const ASK_QUESTION_TOOL = 'ask_user_question';
+
+/** Private structured-response markers used only when a runtime has no tool hook. */
+export const QUESTION_FALLBACK_OPEN = '<ccweb-question>';
+export const QUESTION_FALLBACK_CLOSE = '</ccweb-question>';
+
+/**
+ * Remove the private no-MCP wire envelope from anything a person can read,
+ * copy, export or search. An incomplete envelope is hidden while streaming so
+ * its protocol JSON never flashes before the durable QuestionCard replaces it.
+ */
+export function withoutQuestionFallbackEnvelope(text: string): string {
+  let cursor = 0;
+  let cleaned = '';
+  let removed = false;
+  const appendVisible = (segment: string): void => {
+    // An envelope normally occupies its own line. Removing it leaves the
+    // newline before and after adjacent, which would invent a blank paragraph
+    // between prose that was one line apart. Collapse only that one boundary.
+    if (cleaned.endsWith('\n') && segment.startsWith('\r\n')) {
+      cleaned += segment.slice(2);
+    } else if (cleaned.endsWith('\n') && segment.startsWith('\n')) {
+      cleaned += segment.slice(1);
+    } else {
+      cleaned += segment;
+    }
+  };
+  // Each pass advances beyond a complete closing marker, so this is bounded by
+  // the input length without putting model-authored JSON through a regexp.
+  while (cursor < text.length) {
+    const start = text.indexOf(QUESTION_FALLBACK_OPEN, cursor);
+    if (start < 0) {
+      appendVisible(text.slice(cursor));
+      break;
+    }
+    removed = true;
+    appendVisible(text.slice(cursor, start));
+    const end = text.indexOf(
+      QUESTION_FALLBACK_CLOSE,
+      start + QUESTION_FALLBACK_OPEN.length,
+    );
+    // Hide an incomplete trailing envelope immediately while it streams.
+    if (end < 0) return cleaned.trimEnd();
+    cursor = end + QUESTION_FALLBACK_CLOSE.length;
+  }
+  return removed ? cleaned.trim() : text;
+}
+
+/** Submit the complete latest Plan-mode document to the Web client. */
+export const SUBMIT_PLAN_TOOL = 'submit_plan';
+
+/** What the submission tool is called after Claude-style MCP namespacing. */
+export const SUBMIT_PLAN_TOOL_NAME = `mcp__${ASK_MCP_SERVER}__${SUBMIT_PLAN_TOOL}`;
+
+/** Largest plan accepted by the durable store. */
+export const MAX_PLAN_TEXT = 200_000;
+
+export const SUBMIT_PLAN_TOOL_DESCRIPTION =
+  'Submit your complete implementation plan as markdown for the user to review. In Plan mode, '
+  + 'do this before making changes. Submit the complete revised document again whenever the plan '
+  + 'changes; the newest numbered revision replaces the previous one.';
+
+/** Instruction prepended only to the runtime copy of a Plan-mode user turn. */
+export function planModeDirective(hasPlan: boolean): string {
+  const revision = hasPlan
+    ? 'A plan already exists; submit the complete revised plan again if this turn changes it.'
+    : 'No plan has been submitted yet; do not finish this planning turn without submitting one.';
+  return [
+    '[Plan mode is active because the user selected it in the Web interface.]',
+    'Plan the work without implementing it. Do not edit files or run commands that change state.',
+    `Submit the complete plan as markdown with the ${SUBMIT_PLAN_TOOL} tool.`,
+    revision,
+  ].join(' ');
+}
+
+/** Internal turn sent after the user accepts the latest plan. */
+export function acceptedPlanDirective(plan: PlanDocument): string {
+  return [
+    `[The user accepted Plan revision ${plan.revision}. Plan mode is now off.]`,
+    'Implement the accepted plan now. Follow the normal permission and approval policy for every action.',
+    'The accepted plan follows:',
+    plan.markdown,
+  ].join('\n\n');
+}
+
+/**
+ * Ask to answer from the next model up the profile's capability ladder.
+ *
+ * Offered only to a session that is actually running on a rung — a runtime with
+ * no ladder never sees it, because a tool whose only possible answer is "there
+ * is nothing to escalate to" costs a round trip and reads to the model as the
+ * user having said no.
+ */
+export const TIER_TOOL = 'request_model_tier';
+
+/** What the ladder tool is called once a runtime has namespaced it. */
+export const TIER_TOOL_NAME = `mcp__${ASK_MCP_SERVER}__${TIER_TOOL}`;
 
 /**
  * What the tool is called once a runtime has namespaced it.
@@ -1464,13 +1794,104 @@ export function normalizeQuestionOptions(raw: unknown): QuestionOption[] {
   return options;
 }
 
+/**
+ * The card's own invitation to answer in free text.
+ *
+ * Wording matters more than it looks: this is the row a model reaches for on
+ * its own — it is what Claude writes as a final option, verbatim — so using the
+ * same sentence means a question that arrives with one folds into this row
+ * without the card appearing to offer the same thing twice.
+ */
+export const OWN_WORDS_LABEL = 'Let me explain in my own words';
+
+/**
+ * How much free text one answer may carry.
+ *
+ * The field is an explanation, not a message, and everything typed into it is
+ * written to the conversation log and handed to the model as a tool result. A
+ * ceiling well above any real answer keeps a hand-crafted socket frame from
+ * being an unbounded write.
+ */
+export const MAX_QUESTION_ANSWER_TEXT = 4000;
+
+/**
+ * Options a model writes when it means "or tell me something else".
+ *
+ * Matched rather than merely tolerated because picking one of these sends the
+ * model its own words back — "The user selected: 'Let me explain in my own
+ * words'" — which answers nothing and costs a round trip. The card turns such
+ * an option into the free-text row instead, so the click leads somewhere.
+ *
+ * Deliberately a short table of observed phrasings plus the one substring that
+ * is never anything else. Anything looser risks folding away a real choice, and
+ * the cost of missing one is only that the card's own row appears below it.
+ */
+const OWN_WORDS_LABELS = new Set([
+  'other',
+  'other please specify',
+  'other specify',
+  'something else',
+  'none of these',
+  'none of these fit',
+  'none of these are right',
+  'none of the above',
+  'let me explain',
+  'let me explain myself',
+  'let me describe it',
+  'i ll explain',
+  'i ll explain myself',
+  'write my own',
+  'write my own answer',
+  'type my own',
+  'type my own answer',
+]);
+
+/**
+ * Whether an option is an invitation to type rather than a choice to make.
+ *
+ * Punctuation and case are stripped first because the same option arrives as
+ * "Other…", "other (please specify)" and "Let me explain in my own words." from
+ * one model to the next.
+ */
+export function isOwnWordsOption(label: string): boolean {
+  const normalized = label
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+  if (!normalized) return false;
+  return normalized.includes('own words') || OWN_WORDS_LABELS.has(normalized);
+}
+
+/**
+ * Split an option list into the real choices and the model's own free-text row.
+ *
+ * Every match folds into the one row — a model that offers both "None of these"
+ * and "Let me explain in my own words" is offering the same thing twice — and
+ * the last of them names it, because that is the one a model writes after it
+ * has run out of real answers and so is the most explicit.
+ *
+ * Returns the list untouched when *every* option looks like an invitation to
+ * type: a card with nothing on it but a textarea is not the question the model
+ * asked, and the guard costs one comparison.
+ */
+export function splitOwnWordsOption(options: QuestionOption[]): {
+  choices: QuestionOption[];
+  invitation?: QuestionOption;
+} {
+  const choices = options.filter((option) => !isOwnWordsOption(option.label));
+  if (choices.length === options.length || choices.length === 0) return { choices: options };
+  const inviting = options.filter((option) => isOwnWordsOption(option.label));
+  return { choices, invitation: inviting[inviting.length - 1] };
+}
+
 export function isAskQuestionTool(name: string | undefined): boolean {
   if (!name) return false;
-  // Suffix match on a separator of either width. Claude namespaces MCP tools as
+  // Suffix match on the separators runtimes put between a server and its tool.
+  // Codex uses `ccweb.ask_user_question`; Claude namespaces MCP tools as
   // `mcp__<server>__<tool>`; omp reports the same tool as
   // `mcp__ccweb_ask_user_question`, with one underscore. Both were observed —
   // an exact-name table would have silently failed for one of them.
-  return name === ASK_QUESTION_TOOL || /(^|_)ask_user_question$/.test(name);
+  return name === ASK_QUESTION_TOOL || /(^|[._:/])ask_user_question$/.test(name);
 }
 
 /**

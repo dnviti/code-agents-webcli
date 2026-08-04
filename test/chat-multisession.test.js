@@ -5,7 +5,7 @@ const path = require('path');
 const WebSocket = require('ws');
 
 const { MessageProcessor } = require('../dist/server/websocket/messages.js');
-const { broadcastChat } = require('../dist/server/websocket/handler.js');
+const { broadcastChat, SERVER_FEATURES } = require('../dist/server/websocket/handler.js');
 
 // Opening a second web chat used to blank the first one. The cause was a pair
 // of one-at-a-time assumptions: the server bound each socket to exactly one
@@ -507,6 +507,29 @@ describe('the chat controller registry', function () {
     reg.drop('a');
 
     assert.deepStrictEqual(sent, []);
+  });
+
+  it('negotiates the built-in workflow protocol before a controller can use it', async function () {
+    assert.ok(SERVER_FEATURES.includes('chat_builtin_workflow'));
+    const { reg, sent } = registry({ features: [] });
+    const controller = reg.ensure('a');
+    assert.strictEqual(controller.builtInWorkflowsAvailable, false);
+    await assert.rejects(
+      controller.startBuiltInWorkflow('gh-issue', 'Create an issue.'),
+      /does not support guided workflows/,
+    );
+    assert.deepStrictEqual(sent, []);
+
+    reg.setFeatures(['chat_subscribe', 'chat_builtin_workflow']);
+    assert.strictEqual(controller.builtInWorkflowsAvailable, true);
+    const started = controller.startBuiltInWorkflow('gh-issue', 'Create an issue.', 'negotiated');
+    const request = sent.find((message) => message.type === 'chat_start_builtin_workflow');
+    assert.strictEqual(request.requestId, 'negotiated');
+    controller.handle({
+      type: 'chat_builtin_workflow_result', sessionId: 'a', requestId: 'negotiated',
+      workflow: 'gh-issue', accepted: true, status: 'accepted', message: 'Started.',
+    });
+    assert.strictEqual(await started, 'accepted');
   });
 
   it('picks the conversations up once a reconnect finds an upgraded server', function () {

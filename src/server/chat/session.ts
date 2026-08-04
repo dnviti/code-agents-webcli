@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as path from 'path';
 import {
   AccountLimits,
   ChatAttachment,
@@ -11,8 +12,10 @@ import {
   MAX_QUEUED_TURNS,
   PermissionOption,
   PermissionRequest,
+  PlanDocument,
   QueuedTurn,
   QuestionOption,
+  QuestionContinuation,
   QuestionRequest,
   SlashCommand,
   UserTurn,
@@ -26,26 +29,63 @@ import {
   askedQuestionFrom,
   normalizeQuestionOptions,
   ASK_MCP_SERVER,
+  ASK_QUESTION_TOOL,
   ASK_QUESTION_TOOL_NAME,
+  MAX_PLAN_TEXT,
+  SUBMIT_PLAN_TOOL_NAME,
+  TIER_TOOL_NAME,
+  QUESTION_FALLBACK_CLOSE,
+  QUESTION_FALLBACK_OPEN,
+  acceptedPlanDirective,
+  planModeDirective,
 } from '../../shared/chat-events.js';
+import {
+  LadderRung,
+  ModelTier,
+  nextRungUp,
+} from '../../shared/runtime-profiles.js';
 import { isClearingCommand, isSlashCommand, mergeSlashCommands } from '../../shared/slash-commands.js';
 import { installedModels } from './installed-models.js';
-import { enumeratesInstalledCommands, listInstalledCommands } from './installed-commands.js';
+import { discoverInstalledCommands, enumeratesInstalledCommands } from './installed-commands.js';
 import { AdapterEvent, ChatAdapter, ChatAdapterOptions } from './adapter.js';
 import {
   PermissionAsk,
   PermissionAnswer,
   PermissionBroker,
+  PlanAsk,
   QuestionAsk,
   QuestionReply,
+  TierAsk,
+  TierReply,
   permissionHookSettings,
 } from './permission-broker.js';
-import { ASK_SOCKET_ENV, askMcpConfig } from './ask-mcp.js';
-import { ChatStoreLike, ChatSessionRef } from './store.js';
-import { askChannelFor, createChatAdapter, supportsChat } from './registry.js';
+import {
+  ASK_SOCKET_ENV,
+  QUESTION_TOOL_ENABLED_ENV,
+  TIER_ENABLED_ENV,
+  askMcpConfig,
+} from './ask-mcp.js';
+import { writePiAskExtension } from './pi-ask-extension.js';
+import { FileCallbackBroker, FileCallbackEndpoint } from './file-callback.js';
+import {
+  FILE_CALLBACK_DIR_ENV,
+  FILE_CALLBACK_TOKEN_ENV,
+  fileMcpConfig,
+  writeFileMcpBridge,
+} from './file-mcp-bridge.js';
+import { UserEnvironment } from '../services/environments/types.js';
+import { ChatStoreLike, ChatSessionRef, chatStoreAppendOutcome } from './store.js';
+import {
+  askChannelFor,
+  askEnvFor,
+  createChatAdapter,
+  questionDeliveryFor,
+  supportsChat,
+} from './registry.js';
 import { FinishedJob, UsageAccountant } from './usage-accounting.js';
 import { UsageJobInput } from '../services/usage-store.js';
 import { projectNameFor, tokenTotal } from '../../shared/usage-records.js';
+import { builtInWorkflowInstructions } from './builtin-workflows.js';
 
 /**
  * One chat conversation, owned by the server.
@@ -81,6 +121,14 @@ export interface ChatSessionDeps {
   broadcast: (sessionId: string, message: Record<string, unknown>) => void;
   /** Resolve the executable for a runtime, from the existing bridge lookup. */
   resolveCommand: (runtime: string) => string;
+  /**
+   * The same lookup, stopping at the plain name.
+   *
+   * Optional so a caller that has not been updated still works: without it the
+   * resolved host path is used, which is correct on the host and only wrong
+   * for a runtime running somewhere else.
+   */
+  resolveCommandName?: (runtime: string) => string;
   /** Read a file for an agent that delegates filesystem access to its client. */
   readFile?: (sessionId: string, filePath: string) => Promise<string>;
   writeFile?: (sessionId: string, filePath: string, contents: string) => Promise<void>;
@@ -98,10 +146,19 @@ export interface ChatSessionDeps {
    * `nativeSessionId` is null for a conversation that no longer has one, which
    * is a fact the record has to be able to hold: leaving out the field says
    * "nothing to report about the id", and a clear has something to report (#43).
+   * `restarting` distinguishes that clear's old adapter exit from a natural
+   * exit. Project runtime admission must span the replacement launch rather
+   * than opening a stop/reclaim race between the two processes.
    */
   onLifecycle?: (
     sessionId: string,
-    change: { nativeSessionId?: string | null; exited?: boolean; bypassing?: boolean },
+    change: {
+      nativeSessionId?: string | null;
+      exited?: boolean;
+      bypassing?: boolean;
+      planMode?: boolean;
+      restarting?: boolean;
+    },
   ) => void;
   /**
    * The approval mode a conversation started from inside this one should run in.
@@ -170,6 +227,13 @@ export interface ChatUsageSink {
 export interface ChatSessionStartOptions {
   runtime: string;
   workingDir: string;
+  /** Whether workingDir is already an absolute path inside the container. */
+  cwdKind?: 'host' | 'container';
+  /** Lease-bound filesystem callbacks for an isolated project runtime. */
+  fileAccess?: {
+    readFile(filePath: string): Promise<string>;
+    writeFile(filePath: string, contents: string): Promise<void>;
+  };
   model?: string;
   /**
    * Reasoning-effort level to launch at, spelled the way this runtime spells it.
@@ -194,6 +258,48 @@ export interface ChatSessionStartOptions {
    * silently move the floor of a transcript nobody asked to close.
    */
   startFresh?: boolean;
+  /**
+   * Where this conversation's runtime runs. Absent means the host, which is
+   * what every caller passed before per-user environments existed.
+   */
+  environment?: UserEnvironment;
+  /**
+   * Last-moment launch admission check. Called synchronously immediately
+   * before the adapter can spawn, closing a DELETE-vs-start race across the
+   * store, broker and command-discovery awaits above it.
+   */
+  cancelled?: () => boolean;
+  /**
+   * The capability ladder this conversation is running on, when it is running
+   * on one.
+   *
+   * `tier` is the rung it opened at and returns to; `tiers` is the whole ladder,
+   * because escalation has to be able to find what is above the current rung
+   * and the profile is server-side configuration the session cannot re-read.
+   */
+  ladder?: { tier: ModelTier; tiers: Partial<Record<ModelTier, string>> };
+  /** Durable conversation-level Plan mode. */
+  planMode?: boolean;
+}
+
+export interface PlanModeResult {
+  planMode: boolean;
+  changed: boolean;
+  detail: string;
+}
+
+export interface PlanSubmissionResult {
+  accepted: boolean;
+  revision?: number;
+  detail: string;
+}
+
+export interface PlanActionResult {
+  accepted: boolean;
+  action: 'accept' | 'reject';
+  planMode: boolean;
+  revision?: number;
+  detail: string;
 }
 
 interface PendingApproval {
@@ -202,11 +308,21 @@ interface PendingApproval {
   resolve?: (answer: PermissionAnswer) => void;
 }
 
-/** A question put to the browser, and the tool call waiting on the answer. */
-interface PendingQuestion {
+interface PendingToolQuestion {
+  kind: 'tool';
   request: QuestionRequest;
   resolve: (reply: QuestionReply) => void;
+  phase?: 'open' | 'resolving';
 }
+
+/** A durable question whose model turn ended before the browser was asked. */
+interface PendingHandoffQuestion {
+  kind: 'structured_handoff';
+  request: QuestionRequest;
+  phase?: 'open' | 'resolving';
+}
+
+type PendingQuestion = PendingToolQuestion | PendingHandoffQuestion;
 
 /**
  * Event kinds a resuming runtime may re-emit from history.
@@ -261,6 +377,24 @@ const QUEUE_READY_TIMEOUT_MS = 15_000;
  * next queued message into work it has nothing to do with.
  */
 const INTERRUPT_ACK_WINDOW_MS = 5_000;
+
+/**
+ * Tool statuses that mean the call is over and nothing will be handed back to
+ * it.
+ *
+ * Read only against calls that asked a question, and only to close the card
+ * that belongs to one. `completed` is deliberately absent — an ask call
+ * completes precisely when somebody answered it, and that resolution has
+ * already happened by the time the status lands. `unknown` is here because the
+ * reducer writes it onto calls the runtime stopped talking about, which is the
+ * same fate arriving by a quieter route.
+ */
+const DEAD_TOOL_STATUS: ReadonlySet<string> = new Set([
+  'failed',
+  'denied',
+  'canceled',
+  'unknown',
+]);
 
 /**
  * Turn endings that are the turn being cut short rather than finishing.
@@ -345,9 +479,120 @@ export class QueueFullError extends Error {
   }
 }
 
+// These change only the live conversation's configuration. Every other
+// runtime command is opaque to this server and may execute a skill or mutate
+// the workspace, so it is refused while Plan mode's no-implementation promise
+// is in force. /clear, /new and /reset are handled as lifecycle commands before
+// this check and start a genuinely fresh conversation.
+const PLAN_SAFE_SLASH_COMMANDS = new Set(['/model', '/effort']);
+
+function questionToolDirective(): string {
+  return [
+    '[Interactive questions are available in this Web conversation in both Default and Plan mode.]',
+    `When the next step needs a user decision, call the ${ASK_QUESTION_TOOL} tool and wait for the answer instead of guessing or asking in prose.`,
+    'Use an ordinary response when no user decision is needed.',
+  ].join(' ');
+}
+
+function questionFallbackDirective(): string {
+  return [
+    '[Interactive-question fallback for this Web conversation.]',
+    'If you need a user decision and the ask_user_question tool is unavailable, stop instead of guessing.',
+    `Return exactly ${QUESTION_FALLBACK_OPEN}{"version":1,"question":"...","header":"2-4 words","multiSelect":false,"options":[{"label":"...","description":"..."}]}${QUESTION_FALLBACK_CLOSE}.`,
+    'The Web interface will show the choices and send the answer in a continuation. Use ordinary prose when no decision is needed.',
+  ].join(' ');
+}
+
+function responseQuestionEnvelope(
+  markdown: string,
+): { question?: QuestionAsk; error?: string; start: number; end: number } | null {
+  const start = markdown.lastIndexOf(QUESTION_FALLBACK_OPEN);
+  if (start < 0) return null;
+  const from = start + QUESTION_FALLBACK_OPEN.length;
+  const end = markdown.indexOf(QUESTION_FALLBACK_CLOSE, from);
+  if (end < 0) {
+    return {
+      error: 'the structured question envelope was not closed',
+      start,
+      end: markdown.length,
+    };
+  }
+  try {
+    const value = JSON.parse(markdown.slice(from, end).trim());
+    const version = value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as { version?: unknown }).version
+      : undefined;
+    const envelopeEnd = end + QUESTION_FALLBACK_CLOSE.length;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return { error: 'the structured question payload was not an object', start, end: envelopeEnd };
+    }
+    // An unversioned envelope can still be in flight from a prompt issued by
+    // the previous server release. Treat that one shape as legacy v1; every
+    // newly advertised envelope carries an explicit version and every present
+    // unsupported version is rejected.
+    if (version !== undefined && version !== 1) {
+      return { error: `structured question version ${String(version)} is not supported`, start, end: envelopeEnd };
+    }
+    return { question: value as QuestionAsk, start, end: envelopeEnd };
+  } catch {
+    return {
+      error: 'the structured question payload was not valid JSON',
+      start,
+      end: end + QUESTION_FALLBACK_CLOSE.length,
+    };
+  }
+}
+
+/** Remove every private envelope, including malformed or unterminated ones. */
+function stripResponseQuestionEnvelopes(markdown: string): string {
+  let visible = '';
+  let cursor = 0;
+  while (cursor < markdown.length) {
+    const start = markdown.indexOf(QUESTION_FALLBACK_OPEN, cursor);
+    if (start < 0) return `${visible}${markdown.slice(cursor)}`.trim();
+    visible += markdown.slice(cursor, start);
+    const close = markdown.indexOf(
+      QUESTION_FALLBACK_CLOSE,
+      start + QUESTION_FALLBACK_OPEN.length,
+    );
+    if (close < 0) return visible.trim();
+    cursor = close + QUESTION_FALLBACK_CLOSE.length;
+  }
+  return visible.trim();
+}
+
+function questionContinuation(question: string, answer: QuestionReply): string {
+  if (answer.error) {
+    return `[The interactive question could not be delivered: ${answer.error}. Ask the user in plain prose.]`;
+  }
+  if (answer.skipped || (answer.labels.length === 0 && !answer.text)) {
+    return `[The user skipped this question without answering: ${question}. Continue with the most reasonable option and state the assumption.]`;
+  }
+  const selected = answer.labels.length > 0 ? `Selected: ${answer.labels.join(', ')}.` : '';
+  const typed = answer.text ? `Their own words: ${answer.text}` : '';
+  return `[The user answered the interactive question "${question}". ${selected} ${typed}]`.trim();
+}
+
+/**
+ * Answers used to settle a question because its turn went away are terminal,
+ * not content for a new continuation turn.
+ *
+ * Kept deliberately narrower than "any error": a delivery failure while the
+ * runtime is still alive must still send the prose fallback below, otherwise
+ * the agent remains blocked with no way to ask again. These are the three
+ * reasons minted by this session when nobody can answer any more.
+ */
+function cancelledFallbackAnswer(answer: QuestionReply): boolean {
+  if (!answer.error) return false;
+  return answer.error === 'the turn was interrupted'
+    || answer.error === 'the session was stopped'
+    || answer.error === 'the agent stopped waiting for an answer';
+}
+
 export class ChatSession {
   private adapter: ChatAdapter | null = null;
   private broker: PermissionBroker | null = null;
+  private fileBroker: FileCallbackBroker | null = null;
   private seq = 0;
   private state: ChatState = 'starting';
   private capabilities: ChatCapabilities | null = null;
@@ -355,6 +600,61 @@ export class ChatSession {
   private limits: AccountLimits | null = null;
   private readonly pending = new Map<string, PendingApproval>();
   private readonly questions = new Map<string, PendingQuestion>();
+  /** Answered handoffs durably waiting to become one internal runtime turn. */
+  private readonly questionContinuations = new Map<string, QuestionContinuation>();
+  /** Serialises open/answer/abandon commits without holding a runtime send open. */
+  private questionTransitionTail: Promise<void> = Promise.resolve();
+  private questionTransitionRunning = false;
+  private readonly questionTransitionQueue: Array<{
+    operation: () => Promise<unknown>;
+    resolve: (value: unknown) => void;
+    reject: (reason?: unknown) => void;
+  }> = [];
+  /** Single-flight dispatches, keyed by the durable continuation id. */
+  private readonly questionDispatches = new Map<string, Promise<void>>();
+  /** Claimed outboxes this process knows never reached adapter.send(). */
+  private readonly knownUnsentQuestionContinuations = new Set<string>();
+  /** Adapter events held while a continuation terminal record owns the next seq. */
+  /** Raw runtime events held while one durable protocol event owns the next seq. */
+  private durableEventBuffer: AdapterEvent[] | null = null;
+  /** Set synchronously so a frame arriving after Stop cannot enter the FIFO. */
+  private acceptingQuestionTransitions = true;
+  private questionStopIntent: 'preserve' | 'abandon' | null = null;
+  /** Invalidates a scheduled handoff continuation when Stop/restart wins. */
+  private questionContinuationGeneration = 0;
+  /**
+   * The rung this conversation runs on, and the whole ladder behind it.
+   *
+   * Null for a conversation that is not on a ladder at all, which is what makes
+   * the escalation tool absent rather than present-and-always-refusing.
+   */
+  private ladder: { tier: ModelTier; tiers: Partial<Record<ModelTier, string>> } | null = null;
+  /**
+   * The rung this conversation has been lifted to for the turn in progress.
+   *
+   * Set the moment an escalation is granted and cleared when the turn ends —
+   * which is the observable reading of "once the task that prompted the move is
+   * finished". A task that spans turns asks again, and that is deliberate: the
+   * approval is the only control on what this spends, and a grant that outlived
+   * the work it was granted for would quietly become the conversation's model.
+   */
+  private escalation: {
+    from: ModelTier;
+    to: ModelTier;
+    model: string;
+    /**
+     * True while the grant has been made but the turn it applies to has not
+     * started — either because the runtime cannot change model mid-turn (pi
+     * runs one process per turn) or because the user answered after the turn
+     * that asked had already ended.
+     *
+     * Without it the very next `turn_end` — the one closing the turn the grant
+     * was *not* for — cancelled the escalation before the promised turn began,
+     * so the model was told it had moved up and then answered from the rung it
+     * started on.
+     */
+    startsNextTurn: boolean;
+  } | null = null;
   /**
    * Question tool calls the transcript has opened and nothing has claimed yet.
    *
@@ -374,8 +674,37 @@ export class ChatSession {
    * by which point nothing can still be waiting to claim one.
    */
   private askCalls: Array<{ toolId: string; question?: string }> = [];
-  /** True once this session actually handed a runtime the question tool. */
-  private questionsEnabled = false;
+  /** True once this session actually handed a verified timer-free runtime the question tool. */
+  private questionToolEnabled = false;
+  /** Structured end-turn handoff for runtimes whose tool wait is finite or unverified. */
+  private questionFallbackEnabled = false;
+  /** Plan mode is available even when a runtime falls back to its final markdown response. */
+  private planEnabled = false;
+  private planMode = false;
+  /** Undefined means the sidecar has not been read for this process yet. */
+  private planDocumentCache: PlanDocument | null | undefined;
+  /** Serialises tool and response-fallback submissions into numbered revisions. */
+  private planMutation: Promise<void> = Promise.resolve();
+  /** Invalidates a submission that was started by a conversation since cleared. */
+  private planGeneration = 0;
+  /** Keeps queued user turns behind response-fallback handling for the turn that just ended. */
+  private fallbackResponses = 0;
+  /** Text blocks in assistant messages emitted during the current planning turn. */
+  private readonly planResponseBlocks = new Map<string, Map<number, string>>();
+  /**
+   * Prefix-buffered fallback text. Holding only a possible `<ccweb-question>`
+   * prefix keeps ordinary replies streaming while preventing protocol JSON
+   * from ever becoming transcript content when the envelope is recognised.
+   */
+  private readonly fallbackTextBlocks = new Map<string, {
+    msgId: string;
+    index: number;
+    text: string;
+    events: AdapterEvent[];
+  }>();
+  private flushingFallbackText = false;
+  private planResponseCandidate = '';
+  private planSubmittedThisTurn = false;
   /**
    * Skills and project commands found on disk when this session launched.
    *
@@ -503,6 +832,26 @@ export class ChatSession {
    * rather than the turn ending. Null when nothing has been interrupted.
    */
   private staleTurnEndUntil: number | null = null;
+  /**
+   * Until when an `error` is the runtime's account of work this session told it
+   * to drop, rather than something that went wrong. Null when nothing has been
+   * interrupted.
+   *
+   * Claude reports an interrupted run as `is_error` with the subtype
+   * `error_during_execution`, so stopping a turn — or correcting it by sending
+   * ahead of it — put a red card reading "claude ended the turn as
+   * error_during_execution" in the conversation, with a Retry button offering
+   * to run again the thing the user had just stopped. Nothing failed: the run
+   * ended because it was told to. The record of that is the `interrupted`
+   * marker and the turn's own stop reason, both of which say it in the user's
+   * terms.
+   *
+   * A sibling of `staleTurnEndUntil` and set at the same moment, but a
+   * separate field because the two answer different questions — whether the
+   * turn is over, and whether anything went wrong — and an interrupt from the
+   * stop button ends the turn while still owing no explanation.
+   */
+  private interruptedErrorUntil: number | null = null;
   /** Runs the drain again once the adapter has finished letting go of the last turn. */
   private drainRetry: ReturnType<typeof setTimeout> | null = null;
   /** When the current wait for a ready adapter began; null when not waiting. */
@@ -511,8 +860,8 @@ export class ChatSession {
   /**
    * Which process the events arriving here belong to.
    *
-   * `stop()` signals the child and returns without waiting for it, so a
-   * replaced adapter goes on emitting for as long as its process takes to die
+   * `stop()` signals the child and waits for verified closure, but a replaced
+   * adapter can still emit while that asynchronous teardown is in progress
    * — and what it emits last is `state: exited`. Landing that in the log after
    * the replacement is already running told every browser, and the session
    * record, that a live conversation had ended: the pane went read-only over a
@@ -523,6 +872,22 @@ export class ChatSession {
    * with and anything from an older one is dropped rather than believed.
    */
   private adapterGeneration = 0;
+
+  /**
+   * An adapter may report `state: exited` while its `start()` promise is still
+   * deciding whether startup succeeded. Publishing that as a completed
+   * lifecycle transition immediately is unsafe: a rejected ladder probe is
+   * followed by another adapter in the same session, and its exit would release
+   * the project admission the fallback is about to reuse.
+   *
+   * The event still updates this session's observable state immediately. Only
+   * the record/lease notification is deferred until `start()` resolves. If
+   * startup rejects, the generation is invalidated before the failed adapter is
+   * stopped, so neither that event nor a delayed process-close event can be
+   * mistaken for the lifecycle of its replacement.
+   */
+  private adapterStarting = false;
+  private adapterExitedWhileStarting = false;
 
   /**
    * True while a conversation is being replaced by a new one in place.
@@ -554,6 +919,16 @@ export class ChatSession {
 
   get live(): boolean {
     return Boolean(this.adapter?.alive);
+  }
+
+  /**
+   * Whether this session still owns an adapter, including one whose local
+   * engine client exited but whose container process could not be verified
+   * stopped. Manager teardown uses this stronger fact than `live` so a failed
+   * stop never drops the only handle capable of retrying it.
+   */
+  get ownsAdapter(): boolean {
+    return this.adapter !== null;
   }
 
   get currentState(): ChatState {
@@ -590,16 +965,44 @@ export class ChatSession {
       throw new Error(`${options.runtime} has no chat adapter`);
     }
 
-    this.lastStartOptions = options;
+    this.lastStartOptions = options.startFresh ? { ...options, planMode: false } : options;
     this.runtime = options.runtime;
     this.cwd = options.workingDir;
     this.bypass = Boolean(options.bypassPermissions);
+    this.planMode = options.startFresh ? false : options.planMode === true;
+    this.planEnabled = true;
+    this.questionToolEnabled = false;
+    this.questionFallbackEnabled = false;
+    this.acceptingQuestionTransitions = true;
+    this.questionStopIntent = null;
+    this.planDocumentCache = undefined;
+    this.planResponseBlocks.clear();
+    this.fallbackTextBlocks.clear();
+    this.planResponseCandidate = '';
+    this.planSubmittedThisTurn = false;
+    if (options.startFresh) {
+      // Close the old generation before waiting for its last save. A callback
+      // that resumes after this point sees the mismatch and cannot recreate a
+      // document belonging to the conversation being cleared.
+      this.planGeneration += 1;
+      await this.planMutation.catch(() => undefined);
+      this.turnInFlightId = null;
+      this.ownUserMessageId = null;
+      this.droppedUserEchoes.clear();
+    }
     this.startedAt = Date.now();
     this.replaying = Boolean(options.resumeSessionId);
     if (options.resumeSessionId) this.nativeSessionId = options.resumeSessionId;
     // Restarting into an existing conversation: seq continues from the log so
     // a resumed session does not renumber events a browser already holds.
     const stats = await this.deps.store.stat(this.ref);
+    if (options.startFresh && stats.cursor === 0) {
+      // There is no truncation boundary for an empty log, but a sidecar can
+      // still exist (for example after a crash between its write and the next
+      // transcript event). Fresh always means both mode and document are gone.
+      await this.deps.store.clearPlanDocument?.(this.ref);
+      this.planDocumentCache = null;
+    }
     this.seq = Math.max(this.seq, stats.cursor);
     // A ceiling can only be taken down if something knows one is up, and this
     // object learns that by watching events go past — which a process that has
@@ -641,10 +1044,66 @@ export class ChatSession {
     const wantsHook = !this.bypass && options.runtime === 'claude' && fs.existsSync(this.deps.hookScript);
     const askScript = this.deps.askScript;
     const askChannel = askChannelFor(options.runtime);
-    const wantsAsk = Boolean(askChannel) && Boolean(askScript) && fs.existsSync(askScript!);
+    const questionToolRequested = questionDeliveryFor(options.runtime) === 'blocking_tool';
+    // The MCP server has to exist on disk before it can be handed to anybody.
+    // pi's channel is exempt because there is nothing to hand over: its tool is
+    // a generated extension that carries its own client to the socket.
+    const wantsCcwebTools = askChannel === 'extension'
+      ? true
+      : Boolean(askChannel) && Boolean(askScript) && fs.existsSync(askScript!);
     let askMcpServer: ChatAdapterOptions['askMcpServer'];
+    let ccwebToolsWired = false;
 
-    if (wantsHook || wantsAsk) {
+    // The rung, recorded before anything can be escalated from it. Held on the
+    // session rather than read from the profile on demand, because the profile
+    // is server-wide configuration that can change under a running conversation
+    // and this is a fact about the process that is about to start.
+    this.ladder = options.ladder ?? null;
+    this.escalation = null;
+    // pi is the runtime with a ladder and no MCP support at all, so its
+    // escalation tool arrives as a generated extension instead (see the tier
+    // writer). It still dials this socket, so the socket still has to be open.
+    const wantsTierExtension = Boolean(this.ladder) && options.runtime === 'pi';
+
+    const environment = options.environment;
+    const asSeenByRuntime = (hostPath: string): string => (
+      environment ? environment.toContainerPath(hostPath) : hostPath
+    );
+    const nodePath = environment ? environment.nodePath : process.execPath;
+    const useFileTools = wantsCcwebTools && environment?.kind === 'container';
+    let fileEndpoint: FileCallbackEndpoint | null = null;
+    let fileBridge = '';
+
+    if (useFileTools) {
+      try {
+        this.fileBroker = new FileCallbackBroker(environment.homeDir);
+        fileEndpoint = await this.fileBroker.listen(async (request, signal) => {
+          if (request.kind === 'question') {
+            return this.askQuestion((request.payload || {}) as QuestionAsk, signal);
+          }
+          if (request.kind === 'plan') {
+            const plan = (request.payload || {}) as PlanAsk;
+            return this.submitPlan({ markdown: plan.markdown, source: 'tool' });
+          }
+          if (request.kind === 'tier') {
+            return this.requestTier((request.payload || {}) as TierAsk);
+          }
+          throw new Error(`unsupported callback kind ${request.kind}`);
+        });
+        fileBridge = await writeFileMcpBridge(fileEndpoint.directory);
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(`chat ${this.ref.id}: could not create the shared-home tool channel: ${detail}`);
+        await this.fileBroker?.close().catch(() => undefined);
+        this.fileBroker = null;
+        fileEndpoint = null;
+        fileBridge = '';
+      }
+    }
+
+    const wantsSocketTools = !useFileTools && (wantsCcwebTools || wantsTierExtension);
+    let runtimeSocketPath = '';
+    if (wantsHook || wantsSocketTools) {
       // One shared directory, not one per session. A directory named after the
       // session id cost 37 bytes of a 103-byte path budget, which is what put
       // the socket over the kernel's limit; the random socket filename already
@@ -652,35 +1111,129 @@ export class ChatSession {
       this.broker = new PermissionBroker(this.deps.socketDir);
       const socketPath = await this.broker.listen({
         permission: (ask) => this.askUser(ask),
-        question: (ask) => this.askQuestion(ask),
+        question: (ask, signal) => this.askQuestion(ask, signal),
+        tier: (ask) => this.requestTier(ask),
+        plan: (ask: PlanAsk) => this.submitPlan({ markdown: ask.markdown, source: 'tool' }),
       });
+      runtimeSocketPath = asSeenByRuntime(socketPath);
+    }
 
-      if (wantsHook) {
-        extraArgs.push('--settings', permissionHookSettings(this.deps.hookScript, socketPath));
-        env.CCWEB_PERMISSION_SOCKET = socketPath;
+    if (wantsHook && runtimeSocketPath) {
+      extraArgs.push('--settings', permissionHookSettings(
+        asSeenByRuntime(this.deps.hookScript),
+        runtimeSocketPath,
+        nodePath,
+      ));
+      env.CCWEB_PERMISSION_SOCKET = runtimeSocketPath;
+    }
+
+    const laddered = Boolean(this.ladder);
+    env[QUESTION_TOOL_ENABLED_ENV] = questionToolRequested ? '1' : '0';
+    const runtimeFileDirectory = fileEndpoint ? asSeenByRuntime(fileEndpoint.directory) : '';
+    const runtimeFileBridge = fileBridge ? asSeenByRuntime(fileBridge) : '';
+    if (fileEndpoint) {
+      env[FILE_CALLBACK_DIR_ENV] = runtimeFileDirectory;
+      env[FILE_CALLBACK_TOKEN_ENV] = fileEndpoint.token;
+    }
+    if (wantsTierExtension) {
+      if (fileEndpoint) {
+        env[FILE_CALLBACK_DIR_ENV] = runtimeFileDirectory;
+        env[FILE_CALLBACK_TOKEN_ENV] = fileEndpoint.token;
+      } else if (runtimeSocketPath) {
+        env[ASK_SOCKET_ENV] = runtimeSocketPath;
       }
-      if (wantsAsk && askChannel === 'cli') {
-        extraArgs.push('--mcp-config', askMcpConfig(askScript!, socketPath));
-        // Named explicitly rather than relying on the hook to wave it through:
-        // with approvals bypassed there is no hook at all, and without this the
-        // one tool whose whole purpose is to ask the user something would be the
-        // one tool the runtime refused to run.
-        extraArgs.push('--allowedTools', ASK_QUESTION_TOOL_NAME);
-        this.questionsEnabled = true;
-      }
-      if (wantsAsk && askChannel === 'protocol') {
-        // ACP agents take their MCP servers in the handshake rather than on the
-        // command line, so this goes to the adapter and is sent with
-        // `session/new`. Same script, same socket, same tool.
-        askMcpServer = {
-          name: ASK_MCP_SERVER,
-          command: process.execPath,
-          args: [askScript!],
-          env: { [ASK_SOCKET_ENV]: socketPath },
-        };
-        this.questionsEnabled = true;
+      env[TIER_ENABLED_ENV] = '1';
+    }
+
+    if (wantsCcwebTools) Object.assign(env, askEnvFor(options.runtime));
+    if (wantsCcwebTools && askChannel === 'cli' && (fileEndpoint || (!useFileTools && runtimeSocketPath))) {
+      const config = fileEndpoint
+        ? fileMcpConfig(runtimeFileBridge, runtimeFileDirectory, fileEndpoint.token, nodePath, laddered)
+        : askMcpConfig(
+            asSeenByRuntime(askScript!),
+            runtimeSocketPath,
+            nodePath,
+            laddered,
+            questionToolRequested,
+          );
+      extraArgs.push('--mcp-config', config);
+      if (questionToolRequested) extraArgs.push('--allowedTools', ASK_QUESTION_TOOL_NAME);
+      extraArgs.push('--allowedTools', SUBMIT_PLAN_TOOL_NAME);
+      if (laddered) extraArgs.push('--allowedTools', TIER_TOOL_NAME);
+      ccwebToolsWired = true;
+    }
+    if (wantsCcwebTools && askChannel === 'config' && (fileEndpoint || (!useFileTools && runtimeSocketPath))) {
+      const script = fileEndpoint ? runtimeFileBridge : asSeenByRuntime(askScript!);
+      if (!fileEndpoint) env[ASK_SOCKET_ENV] = runtimeSocketPath;
+      if (laddered) env[TIER_ENABLED_ENV] = '1';
+      const forwardedMcpEnv = [
+        ...(fileEndpoint ? [FILE_CALLBACK_DIR_ENV, FILE_CALLBACK_TOKEN_ENV] : [ASK_SOCKET_ENV]),
+        QUESTION_TOOL_ENABLED_ENV,
+        ...(laddered ? [TIER_ENABLED_ENV] : []),
+      ];
+      // Codex app-server accepts the same dotted TOML overrides as `codex -c`.
+      // It deliberately gives MCP children only variables named in `env_vars`,
+      // rather than inheriting the app-server environment. Pass the names, not
+      // their values: the file callback token must never appear in process argv.
+      // These overrides live on this one process and never touch ~/.codex/config.toml.
+      extraArgs.push(
+        '-c',
+        `mcp_servers.${ASK_MCP_SERVER}.command=${JSON.stringify(nodePath)}`,
+        '-c',
+        `mcp_servers.${ASK_MCP_SERVER}.args=${JSON.stringify([script])}`,
+        '-c',
+        `mcp_servers.${ASK_MCP_SERVER}.env_vars=${JSON.stringify(forwardedMcpEnv)}`,
+      );
+      ccwebToolsWired = true;
+    }
+    if (wantsCcwebTools && askChannel === 'extension' && (fileEndpoint || (!useFileTools && runtimeSocketPath))) {
+      const extensionRoot = fileEndpoint ? fileEndpoint.directory : options.workingDir;
+      const written = writePiAskExtension(extensionRoot);
+      if (written) {
+        const extensionPath = fileEndpoint
+          ? asSeenByRuntime(path.join(extensionRoot, written))
+          : written;
+        if (fileEndpoint) {
+          env[FILE_CALLBACK_DIR_ENV] = runtimeFileDirectory;
+          env[FILE_CALLBACK_TOKEN_ENV] = fileEndpoint.token;
+        } else {
+          env[ASK_SOCKET_ENV] = runtimeSocketPath;
+        }
+        extraArgs.push('-e', extensionPath);
+        extraArgs.push('--exclude-tools', 'question');
+        ccwebToolsWired = true;
       }
     }
+    if (wantsCcwebTools && askChannel === 'protocol' && (fileEndpoint || (!useFileTools && runtimeSocketPath))) {
+      askMcpServer = fileEndpoint
+        ? {
+            name: ASK_MCP_SERVER,
+            command: nodePath,
+            args: [runtimeFileBridge],
+            env: {
+              [FILE_CALLBACK_DIR_ENV]: runtimeFileDirectory,
+              [FILE_CALLBACK_TOKEN_ENV]: fileEndpoint.token,
+              [QUESTION_TOOL_ENABLED_ENV]: questionToolRequested ? '1' : '0',
+              ...(laddered ? { [TIER_ENABLED_ENV]: '1' } : {}),
+            },
+          }
+        : {
+            name: ASK_MCP_SERVER,
+            command: nodePath,
+            args: [asSeenByRuntime(askScript!)],
+            env: {
+              [ASK_SOCKET_ENV]: runtimeSocketPath,
+              [QUESTION_TOOL_ENABLED_ENV]: questionToolRequested ? '1' : '0',
+              ...(laddered ? { [TIER_ENABLED_ENV]: '1' } : {}),
+            },
+          };
+      ccwebToolsWired = true;
+    }
+    // Tool availability and question availability are deliberately separate:
+    // timed runtimes keep submit_plan/tier over the ccweb server but never see
+    // the blocking ask tool. Their model turn ends in a durable handoff instead.
+    this.questionToolEnabled = questionToolRequested && ccwebToolsWired;
+    this.questionFallbackEnabled = !this.questionToolEnabled;
 
     // What this session could run, read off disk before the runtime is even
     // spawned, so the command menu has something true in it from the moment the
@@ -690,10 +1243,23 @@ export class ChatSession {
     // one. That is the whole of the isolation this needs: a session lists what
     // is installed for the person it belongs to, and never what is installed
     // for anybody else on the machine.
-    const installedCommands = listInstalledCommands(options.runtime, {
-      home: env.HOME || process.env.HOME,
-      workingDir: options.workingDir,
+    // In a container that home is the user's own: `homeDir` is the host path
+    // their container's home is a bind mount of, which is precisely what the
+    // ordinary `fs` reads in there can see. On the host it stays the account the
+    // runtime actually runs as, because a host environment's `homeDir` is the
+    // projects base folder and no runtime keeps its skills under that.
+    const installed = discoverInstalledCommands(options.runtime, {
+      home: options.environment?.kind === 'container'
+        ? options.environment.homeDir
+        : env.HOME || process.env.HOME,
+      // A container-only path may coincidentally exist on the server (notably
+      // `/tmp`) but is a different namespace. Never scan that host directory
+      // for commands belonging to this project.
+      workingDir: options.cwdKind === 'container'
+        ? options.environment?.homeDir || ''
+        : options.workingDir,
     });
+    const installedCommands = installed.commands;
 
     // Claimed before the adapter exists, so its `emit` closure below can be
     // told apart from the one belonging to a process this replaces.
@@ -702,8 +1268,14 @@ export class ChatSession {
     const adapter = createChatAdapter(options.runtime, {
       sessionId: this.ref.id,
       workingDir: options.workingDir,
+      cwdKind: options.cwdKind,
       installedCommands,
+      // Kept out of `commands`: absolute paths are launch metadata for Codex,
+      // not capabilities a browser or transcript should ever receive.
+      installedSkills: installed.skills,
       command: this.deps.resolveCommand(options.runtime),
+      commandName: this.deps.resolveCommandName?.(options.runtime),
+      environment: options.environment,
       model: options.model,
       effort: options.effort,
       extraArgs,
@@ -722,6 +1294,7 @@ export class ChatSession {
       // exit above all — is about a process nobody is talking to any more.
       emit: (event) => {
         if (generation !== this.adapterGeneration) return;
+        if (this.isInterruptedRunReport(event)) return;
         this.ingest(event);
       },
       readFile: this.deps.readFile
@@ -789,13 +1362,27 @@ export class ChatSession {
       // Awaited before the new process starts talking, and enqueued behind the
       // marker's own append: the truncation and the events either side of it
       // are ordered by the store's per-log queue, so nothing lands in a log
-      // that is being rewritten. Never fatal — a conversation must not fail to
-      // start because its predecessor could not be cleaned up.
+      // that is being rewritten. A log cleanup failure remains non-fatal, but
+      // the Plan sidecar is checked separately below: claiming a fresh Plan
+      // document while an old one remains durable would make it reappear after
+      // the next restart.
       try {
         await this.deps.store.truncateBefore(this.ref, this.seq);
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
         console.warn(`chat ${this.ref.id}: could not truncate the cleared conversation: ${message}`);
+      }
+      try {
+        await this.deps.store.clearPlanDocument?.(this.ref);
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : String(error);
+        this.ingest({
+          t: 'error',
+          message: `A fresh conversation could not be started because its saved Plan could not be cleared: ${detail}`,
+          fatal: true,
+        });
+        await this.stop();
+        throw error;
       }
       // And the branch history goes with it, if this conversation had one
       // waiting. `/clear` promises an agent that has never seen any of it, and
@@ -803,6 +1390,22 @@ export class ChatSession {
       // that promise broken in the most confusing possible way.
       this.carried = null;
       void this.deps.store.clearOpeningContext?.(this.ref);
+      this.planMode = false;
+      this.planDocumentCache = null;
+      this.lastStartOptions = { ...options, planMode: false };
+      this.deps.onLifecycle?.(this.ref.id, { planMode: false });
+      this.deps.broadcast(this.ref.id, {
+        type: 'chat_plan_mode',
+        sessionId: this.ref.id,
+        planMode: false,
+        changed: true,
+        message: 'Plan mode was cleared with the previous conversation.',
+      });
+      this.deps.broadcast(this.ref.id, {
+        type: 'chat_plan_document',
+        sessionId: this.ref.id,
+        plan: null,
+      });
 
       // Nor does anything go on naming the conversation that was just dropped. The
       // replacement announces an id of its own on its first turn and not
@@ -820,16 +1423,44 @@ export class ChatSession {
       this.deps.onLifecycle?.(this.ref.id, { nativeSessionId: null });
     }
 
+    // There is deliberately no await between this check and adapter.start():
+    // every adapter reaches its spawn synchronously. A retiring/deleted record
+    // therefore cannot materialise a child after its owner drained launch.
+    if (options.cancelled?.()) {
+      await this.stop();
+      throw new Error('chat launch cancelled because the session is closing');
+    }
+
     this.setState('starting');
+    this.adapterStarting = true;
+    this.adapterExitedWhileStarting = false;
 
     try {
       await adapter.start();
     } catch (error: unknown) {
+      this.adapterStarting = false;
+      this.adapterExitedWhileStarting = false;
+      // Make every later event from this failed launch stale before verified
+      // teardown begins; otherwise its eventual `exited` can release a
+      // replacement's lease.
+      this.adapterGeneration++;
       const message = error instanceof Error ? error.message : String(error);
       this.ingest({ t: 'error', message: `could not start ${options.runtime}: ${message}`, fatal: true });
       this.setState('error');
+      // A handoff kept across shutdown is actionable only if this runtime can
+      // resume. Once that attempt has definitively failed, leave an explicit
+      // abandoned outcome instead of a durable card no future caller owns.
+      if (options.resumeSessionId) await this.restorePendingQuestions(false);
       await this.stop();
       throw error;
+    }
+    this.adapterStarting = false;
+    if (this.adapterExitedWhileStarting) {
+      this.adapterExitedWhileStarting = false;
+      this.deps.onLifecycle?.(this.ref.id, {
+        exited: true,
+        restarting: this.restarting,
+      });
     }
 
     // The adapter's static declaration is a floor, not an override: a runtime
@@ -842,9 +1473,13 @@ export class ChatSession {
     // about what this session wired up, not about what the runtime can parse.
     // The same adapter has it or does not depending on whether the MCP server
     // was built and found.
-    if (this.questionsEnabled && this.capabilities) {
+    if ((this.questionToolEnabled || this.questionFallbackEnabled) && this.capabilities) {
       this.capabilities = { ...this.capabilities, questions: true };
       this.ingest({ t: 'capabilities', capabilities: { questions: true } });
+    }
+    if (this.planEnabled && this.capabilities) {
+      this.capabilities = { ...this.capabilities, planMode: true };
+      this.ingest({ t: 'capabilities', capabilities: { planMode: true } });
     }
 
     // Which approval mode this conversation is running in, said in the
@@ -882,7 +1517,124 @@ export class ChatSession {
       });
     }
 
-    this.setState('idle');
+    const restoredQuestion = await this.restorePendingQuestions(
+      !options.startFresh && Boolean(options.resumeSessionId) && adapter.alive,
+    );
+    this.setState(restoredQuestion ? 'awaiting_answer' : 'idle');
+    if (!restoredQuestion) {
+      for (const continuationId of this.questionContinuations.keys()) {
+        this.dispatchQuestionContinuation(continuationId);
+      }
+    }
+  }
+
+  /**
+   * Reconcile questions that survived in the durable event log.
+   *
+   * Only structured handoffs are resumable: their original model turn already
+   * ended, so the request itself is everything needed to send a continuation.
+   * A tool question belonged to a promise in the dead process and must become
+   * honest, non-actionable history instead of a button wired to nothing.
+   */
+  private async restorePendingQuestions(canResume: boolean): Promise<boolean> {
+    // A few embedders (and older test doubles) implement the original
+    // append/read/stat store contract but do not expose snapshots. Recovery is
+    // optional for those stores; treating the missing method as an empty
+    // snapshot keeps ordinary session startup backward-compatible.
+    const snapshotFn = this.deps.store.snapshot;
+    if (typeof snapshotFn !== 'function') return false;
+    const snapshot = await snapshotFn.call(this.deps.store, this.ref);
+    const continuations = snapshot.pendingQuestionContinuations || [];
+    const answeredRequestIds = new Set(
+      continuations.map((continuation) => continuation.request.requestId),
+    );
+    let restored = false;
+    for (const request of snapshot.pendingQuestions || []) {
+      // A committed answer/outbox wins over an older request frame in a
+      // repaired or mixed-version log. It is no longer anybody's to answer.
+      if (answeredRequestIds.has(request.requestId)) continue;
+      if (
+        canResume
+        && request.origin === 'structured_handoff'
+        && !this.questions.has(request.requestId)
+      ) {
+        this.questions.set(request.requestId, {
+          kind: 'structured_handoff',
+          request,
+          phase: 'open',
+        });
+        restored = true;
+        continue;
+      }
+      await this.ingest({
+        t: 'question_resolved',
+        requestId: request.requestId,
+        toolId: request.toolId,
+        optionIds: [],
+        abandoned: true,
+      }, true);
+    }
+    for (const continuation of continuations) {
+      if (continuation.dispatching) {
+        // There is no universal idempotency or history-query contract across
+        // the supported runtimes. The previous process durably crossed its
+        // pre-send boundary and may have handed this turn over before dying;
+        // blindly replaying it is the one action known to be capable of
+        // starting the continuation twice.
+        await this.ingest({
+          t: 'question_continuation',
+          requestId: continuation.request.requestId,
+          continuationId: continuation.continuationId,
+          outcome: 'abandoned',
+          reason: 'delivery may already have reached the runtime before restart; it was not retried',
+        }, true);
+        continue;
+      }
+      if (canResume) {
+        this.questionContinuations.set(continuation.continuationId, continuation);
+        continue;
+      }
+      await this.ingest({
+        t: 'question_continuation',
+        requestId: continuation.request.requestId,
+        continuationId: continuation.continuationId,
+        outcome: 'abandoned',
+        reason: 'the runtime conversation could not be resumed',
+      }, true);
+    }
+    return restored;
+  }
+
+  /**
+   * Whether this event is a runtime reporting the run this session stopped.
+   *
+   * Claude reports an interrupted run the same way it reports one that broke:
+   * `is_error`, subtype `error_during_execution`. So pressing stop — or
+   * correcting the agent by sending ahead of it — put a red card in the
+   * conversation reading "claude ended the turn as error_during_execution",
+   * with a Retry button offering to run again the very thing the user had just
+   * stopped. Nothing had gone wrong. The run ended because it was told to, and
+   * the honest record of that is the `interrupted` marker and the turn's own
+   * stop reason, both of which already say it in the user's terms.
+   *
+   * Asked of adapter events only — this is a filter on what a *runtime* says,
+   * and it must not touch what this session writes about the interrupt itself,
+   * which is written through `ingest` directly. Bounded twice over: by the same
+   * window `staleTurnEndUntil` uses, and by the `turn_end` that closes it, so
+   * at most one report is swallowed per interrupt and a failure that happens
+   * afterwards is a failure again.
+   *
+   * A fatal error is never dropped. That is the process itself going away,
+   * which is true whatever preceded it, and swallowing it would leave a dead
+   * conversation looking live.
+   */
+  private isInterruptedRunReport(event: AdapterEvent): boolean {
+    return (
+      event.t === 'error'
+      && event.fatal !== true
+      && this.interruptedErrorUntil !== null
+      && Date.now() <= this.interruptedErrorUntil
+    );
   }
 
   /**
@@ -927,14 +1679,471 @@ export class ChatSession {
   }
 
   /**
+   * Capture a final markdown response when a runtime cannot load the submit tool.
+   *
+   * This is the universal Plan-mode fallback: tool-capable runtimes submit over
+   * the callback channel, while a headless runtime can still return the plan as
+   * its ordinary final answer. The transcript remains readable and the same
+   * markdown is copied into the dedicated Plan control.
+   */
+  private capturePlanResponse(event: ChatEvent): string | null {
+    if (!this.planMode && !this.questionFallbackEnabled) return null;
+
+    if (event.t === 'msg_start' && event.role === 'assistant') {
+      this.planResponseBlocks.set(event.id, new Map());
+      return null;
+    }
+    if (event.t === 'block_start') {
+      const blocks = this.planResponseBlocks.get(event.msgId);
+      if (blocks && event.block.kind === 'text') blocks.set(event.index, event.block.text);
+      return null;
+    }
+    if (event.t === 'block_delta') {
+      const blocks = this.planResponseBlocks.get(event.msgId);
+      if (blocks?.has(event.index) && event.text) {
+        blocks.set(event.index, `${blocks.get(event.index) || ''}${event.text}`);
+      }
+      return null;
+    }
+    if (event.t === 'block_end') {
+      const blocks = this.planResponseBlocks.get(event.msgId);
+      const block = event.block as { kind?: string; text?: unknown } | undefined;
+      if (blocks?.has(event.index) && block?.kind === 'text' && typeof block.text === 'string') {
+        blocks.set(event.index, block.text);
+      }
+      return null;
+    }
+    if (event.t === 'msg_end') {
+      const blocks = this.planResponseBlocks.get(event.msgId);
+      if (blocks) {
+        this.planResponseBlocks.delete(event.msgId);
+        const markdown = [...blocks.entries()]
+          .sort(([left], [right]) => left - right)
+          .map(([, text]) => text)
+          .join('\n\n')
+          .trim();
+        if (markdown) this.planResponseCandidate = markdown;
+      }
+      return null;
+    }
+    if (event.t !== 'turn_end' || event.stale) return null;
+
+    const fallback = this.planResponseCandidate.trim();
+    this.planResponseBlocks.clear();
+    this.planResponseCandidate = '';
+    return fallback || null;
+  }
+
+  private async handleFallbackResponse(markdown: string): Promise<void> {
+    const envelope = this.questionFallbackEnabled ? responseQuestionEnvelope(markdown) : null;
+    if (envelope) {
+      if (!envelope.question) {
+        await this.continueAfterFallbackQuestion('', {
+          labels: [],
+          error: envelope.error || 'the structured question was invalid',
+        });
+        return;
+      }
+      const question = envelope.question;
+      const prompt = typeof question.question === 'string' ? question.question.trim() : '';
+      const error = await this.openHandoffQuestion(question);
+      // Invalid envelopes have no card to wait on. Give the runtime the same
+      // prose fallback a rejected tool call would have received; valid ones
+      // return here and are continued by answerQuestion, possibly after a
+      // process restart.
+      if (error && !cancelledFallbackAnswer(error)) {
+        await this.continueAfterFallbackQuestion(prompt, error);
+      }
+      return;
+    }
+    if (this.planMode && !this.planSubmittedThisTurn) {
+      const result = await this.submitPlan({ markdown, source: 'response' });
+      if (!result.accepted && this.planMode) {
+        this.ingest({
+          t: 'error',
+          message: `The planning response could not become a reviewable plan: ${result.detail} Plan mode is still on; send another planning message to retry.`,
+        });
+      }
+    }
+  }
+
+  private async continueAfterFallbackQuestion(
+    question: string,
+    answer: QuestionReply,
+    generation = this.questionContinuationGeneration,
+    continuationId?: string,
+  ): Promise<'delivered' | 'deferred' | 'failed'> {
+    const adapter = this.adapter;
+    if (generation !== this.questionContinuationGeneration) return 'deferred';
+    if (!adapter?.alive) {
+      this.ingest({
+        t: 'error',
+        message: 'The question was answered, but the runtime stopped before the answer could be delivered.',
+      });
+      if (this.state === 'awaiting_answer') this.setState('idle');
+      return 'failed';
+    }
+
+    this.planSubmittedThisTurn = false;
+    this.planResponseBlocks.clear();
+    this.fallbackTextBlocks.clear();
+    this.planResponseCandidate = '';
+    const continuationTurnId = `turn-${crypto.randomUUID()}`;
+    this.turnInFlightId = continuationTurnId;
+    this.ownUserMessageId = `internal-${crypto.randomUUID()}`;
+    this.droppedUserEchoes.clear();
+    const planInstruction = this.planMode
+      ? planModeDirective(Boolean(await this.planDocument()))
+      : null;
+    const questionInstruction = this.questionFallbackEnabled
+      ? questionFallbackDirective()
+      : null;
+    const text = [questionInstruction, planInstruction, questionContinuation(question, answer)]
+      .filter(Boolean)
+      .join('\n\n');
+    // This is a new internal turn just as surely as a composer delivery is.
+    // A resumed runtime may still be replaying its own transcript, but the
+    // answer and everything it produces must be recorded from this point on.
+    this.replaying = false;
+    this.setState('thinking');
+    try {
+      // Codex exec and Antigravity declare the turn complete from stdout while
+      // their one-shot child is still exiting. `alive` intentionally remains
+      // true between turns, so wait on the adapter's explicit readiness gate
+      // before handing it the continuation.
+      const deadline = Date.now() + QUEUE_READY_TIMEOUT_MS;
+      while (
+        generation === this.questionContinuationGeneration
+        && this.adapter === adapter
+        && adapter.alive
+        && adapter.readyForTurn === false
+        && Date.now() < deadline
+      ) {
+        await new Promise<void>((resolve) => setTimeout(resolve, QUEUE_READY_POLL_MS));
+      }
+      // Stop/restart owns the state from this point. Returning silently is what
+      // prevents an answer queued a few milliseconds earlier from undoing it.
+      if (
+        generation !== this.questionContinuationGeneration
+        || this.adapter !== adapter
+      ) {
+        if (this.turnInFlightId === continuationTurnId) {
+          this.turnInFlightId = null;
+          this.ownUserMessageId = null;
+          this.droppedUserEchoes.clear();
+        }
+        return 'deferred';
+      }
+      if (!adapter.alive || adapter.readyForTurn === false) {
+        throw new Error(`the ${this.runtime || 'agent'} process was not ready for the answer continuation`);
+      }
+      if (continuationId) {
+        let claimed = false;
+        try {
+          claimed = await this.markQuestionContinuationDispatching(continuationId, generation);
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          this.ingest({
+            t: 'error',
+            message: `The answer was saved but could not be prepared for delivery: ${detail}`,
+          });
+          if (this.turnInFlightId === continuationTurnId) this.turnInFlightId = null;
+          if (generation === this.questionContinuationGeneration) this.ownUserMessageId = null;
+          if (generation === this.questionContinuationGeneration) this.setState('idle');
+          return 'deferred';
+        }
+        if (!claimed) {
+          if (this.turnInFlightId === continuationTurnId) this.turnInFlightId = null;
+          if (generation === this.questionContinuationGeneration) this.ownUserMessageId = null;
+          return 'deferred';
+        }
+        // The durable write yielded. Stop may have won while it was in flight;
+        // in that case the explicit lifecycle path owns the claimed outbox and
+        // no runtime call is started behind its back.
+        if (
+          generation !== this.questionContinuationGeneration
+          || this.adapter !== adapter
+          || !adapter.alive
+          || this.questionStopIntent !== null
+        ) {
+          // No call to adapter.send has happened, so this process knows the
+          // durable claim is not ambiguous. Put it back to pending before a
+          // preserving shutdown hands recovery the outbox; otherwise recovery
+          // would discard an answer that was provably never sent.
+          this.knownUnsentQuestionContinuations.add(continuationId);
+          try {
+            await this.markQuestionContinuationPending(continuationId);
+          } catch (error: unknown) {
+            const detail = error instanceof Error ? error.message : String(error);
+            console.warn(`chat ${this.ref.id}: could not withdraw unsent continuation claim: ${detail}`);
+          }
+          if (this.turnInFlightId === continuationTurnId) this.turnInFlightId = null;
+          if (generation === this.questionContinuationGeneration) this.ownUserMessageId = null;
+          return 'deferred';
+        }
+      }
+      await adapter.send({ text });
+      // Once send accepted the turn, a concurrent graceful Stop must record it
+      // as delivered rather than leave an outbox entry that a restart repeats.
+      return 'delivered';
+    } catch (error: unknown) {
+      if (this.turnInFlightId === continuationTurnId) this.turnInFlightId = null;
+      if (generation === this.questionContinuationGeneration) this.ownUserMessageId = null;
+      if (
+        generation !== this.questionContinuationGeneration
+        || this.adapter !== adapter
+        || !adapter.alive
+      ) {
+        return 'deferred';
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      this.ingest({ t: 'error', message: `The answer could not be delivered: ${detail}` });
+      if (generation === this.questionContinuationGeneration) this.setState('idle');
+      return 'failed';
+    }
+  }
+
+  /**
+   * Commit the pre-send boundary for an accepted answer.
+   *
+   * A cold process that sees this marker cannot know which side of the
+   * following runtime call the old process reached. It therefore records an
+   * explicit uncertain/abandoned outcome instead of silently issuing a second
+   * model turn. Pending entries, which have no marker, remain safe to resume.
+   */
+  private markQuestionContinuationDispatching(
+    continuationId: string,
+    generation: number,
+  ): Promise<boolean> {
+    return this.mutateQuestions(async () => {
+      const continuation = this.questionContinuations.get(continuationId);
+      if (
+        !continuation
+        || continuation.dispatching
+        || generation !== this.questionContinuationGeneration
+        || this.questionStopIntent !== null
+      ) {
+        return false;
+      }
+      await this.ingest({
+        t: 'question_continuation_dispatching',
+        requestId: continuation.request.requestId,
+        continuationId,
+      }, true);
+      continuation.dispatching = true;
+      return true;
+    });
+  }
+
+  /** Return a claimed outbox to pending while this process still knows no send occurred. */
+  private markQuestionContinuationPending(continuationId: string): Promise<void> {
+    return this.mutateQuestions(async () => {
+      const continuation = this.questionContinuations.get(continuationId);
+      if (!continuation?.dispatching) return;
+      await this.ingest({
+        t: 'question_continuation_pending',
+        requestId: continuation.request.requestId,
+        continuationId,
+      }, true);
+      delete continuation.dispatching;
+      this.knownUnsentQuestionContinuations.delete(continuationId);
+    });
+  }
+
+  /** Start one durable outbox item at most once in this process. */
+  private dispatchQuestionContinuation(
+    continuationId: string,
+    generation = this.questionContinuationGeneration,
+  ): void {
+    if (this.questionContinuations.get(continuationId)?.dispatching) return;
+    if (this.questionDispatches.has(continuationId)) return;
+    const task = this.runQuestionContinuation(continuationId, generation)
+      .catch((error: unknown) => {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(`chat ${this.ref.id}: question continuation failed: ${detail}`);
+      })
+      .finally(() => {
+        if (this.questionDispatches.get(continuationId) === task) {
+          this.questionDispatches.delete(continuationId);
+        }
+      });
+    this.questionDispatches.set(continuationId, task);
+  }
+
+  /**
+   * Runtime delivery deliberately lives outside `questionTransitionTail`.
+   * Stop can cancel readiness polling without deadlocking behind the process it
+   * must tear down; only the outbox's terminal commit re-enters the FIFO.
+   */
+  private async runQuestionContinuation(
+    continuationId: string,
+    generation: number,
+  ): Promise<void> {
+    const continuation = this.questionContinuations.get(continuationId);
+    if (
+      !continuation
+      || continuation.dispatching
+      || this.questionStopIntent !== null
+      || generation !== this.questionContinuationGeneration
+      || !this.adapter?.alive
+    ) {
+      return;
+    }
+    const result = await this.continueAfterFallbackQuestion(
+      continuation.request.question,
+      {
+        labels: [...continuation.answer.labels],
+        text: continuation.answer.text,
+        skipped: continuation.answer.skipped,
+      },
+      generation,
+      continuationId,
+    );
+    if (result === 'deferred') return;
+    await this.finishQuestionContinuation(
+      continuationId,
+      result === 'delivered' ? 'delivered' : 'abandoned',
+      result === 'failed' ? 'the answer continuation could not be delivered' : undefined,
+    );
+  }
+
+  /** Commit one outbox terminal record, then and only then forget its payload. */
+  private finishQuestionContinuation(
+    continuationId: string,
+    outcome: 'delivered' | 'abandoned',
+    reason?: string,
+  ): Promise<void> {
+    return this.mutateQuestions(async () => {
+      const continuation = this.questionContinuations.get(continuationId);
+      if (!continuation) return;
+      // `ingest` stamps this terminal record once and retries those exact
+      // bytes. Retrying separate ingest calls changed the timestamp and made a
+      // committed-but-unacknowledged first append impossible to recognise.
+      await this.ingest({
+        t: 'question_continuation',
+        requestId: continuation.request.requestId,
+        continuationId,
+        outcome,
+        ...(reason ? { reason } : null),
+      }, true, 3);
+      this.questionContinuations.delete(continuationId);
+      this.knownUnsentQuestionContinuations.delete(continuationId);
+      this.drainQueue();
+    });
+  }
+
+  /** Terminalise all accepted continuations while the question FIFO is held. */
+  private async abandonQuestionContinuationsNow(reason: string): Promise<void> {
+    for (const [continuationId, continuation] of [...this.questionContinuations]) {
+      await this.ingest({
+        t: 'question_continuation',
+        requestId: continuation.request.requestId,
+        continuationId,
+        outcome: 'abandoned',
+        reason,
+      }, true);
+      this.questionContinuations.delete(continuationId);
+      this.knownUnsentQuestionContinuations.delete(continuationId);
+    }
+  }
+
+  /**
+   * Hold only text that can still be the structured fallback envelope.
+   * Ordinary prose is released as soon as its prefix differs, retaining normal
+   * streaming. A recognised envelope is converted into a question event later
+   * and never written or broadcast as assistant-facing protocol JSON.
+   */
+  private interceptFallbackQuestionText(event: AdapterEvent): boolean {
+    if (!this.questionFallbackEnabled) return false;
+    const keyOf = (msgId: string, index: number): string => `${msgId}\u0000${index}`;
+    const flush = (events: AdapterEvent[]): void => {
+      this.flushingFallbackText = true;
+      try {
+        for (const held of events) this.ingest(held);
+      } finally {
+        this.flushingFallbackText = false;
+      }
+    };
+    const canStillBeEnvelope = (text: string): boolean => {
+      const trimmed = text.trimStart();
+      return !trimmed || QUESTION_FALLBACK_OPEN.startsWith(trimmed)
+        || trimmed.startsWith(QUESTION_FALLBACK_OPEN);
+    };
+
+    if (event.t === 'block_start' && event.block.kind === 'text') {
+      const text = event.block.text || '';
+      if (!canStillBeEnvelope(text)) return false;
+      this.fallbackTextBlocks.set(keyOf(event.msgId, event.index), {
+        msgId: event.msgId,
+        index: event.index,
+        text,
+        events: [event],
+      });
+      return true;
+    }
+
+    if (event.t === 'block_delta' || event.t === 'block_end') {
+      const key = keyOf(event.msgId, event.index);
+      const held = this.fallbackTextBlocks.get(key);
+      if (!held) return false;
+      held.events.push(event);
+      if (event.t === 'block_delta' && event.text) held.text += event.text;
+      if (event.t === 'block_end') {
+        const text = (event.block as { text?: unknown } | undefined)?.text;
+        if (typeof text === 'string') held.text = text;
+      }
+      if (canStillBeEnvelope(held.text)) return true;
+      this.fallbackTextBlocks.delete(key);
+      flush(held.events);
+      return true;
+    }
+
+    if (event.t !== 'msg_end') return false;
+    const heldForMessage = [...this.fallbackTextBlocks.entries()]
+      .filter(([, held]) => held.msgId === event.msgId)
+      .sort(([, left], [, right]) => left.index - right.index);
+    if (heldForMessage.length === 0) return false;
+
+    let recognised: string | null = null;
+    for (const [key, held] of heldForMessage) {
+      this.fallbackTextBlocks.delete(key);
+      const envelope = responseQuestionEnvelope(held.text);
+      if (!envelope) {
+        flush(held.events);
+        continue;
+      }
+      recognised = held.text;
+      const visible = stripResponseQuestionEnvelopes(held.text);
+      if (visible) {
+        flush([{
+          t: 'block_start',
+          msgId: held.msgId,
+          index: held.index,
+          block: { kind: 'text', text: visible },
+        }]);
+      }
+    }
+    flush([event]);
+    // `msg_end` normally derives the candidate from the blocks just flushed.
+    // Put the private envelope back only in the server-side candidate after it
+    // has been persisted, so fallback handling sees it while the transcript
+    // never does.
+    if (recognised) this.planResponseCandidate = recognised;
+    return true;
+  }
+
+  /**
    * Stamp, persist, broadcast.
    *
-   * Ordering matters and is deliberate: the log is written before the socket
-   * sees anything, so a browser can never hold an event the server would not
-   * replay after a restart. The reverse order would make a reconnect look like
-   * history had been rewritten.
+   * Most streaming events retain the historical fire-and-forget write path.
+   * Protocol transitions that are acknowledged as durable pass `durable` and
+   * are not broadcast until their exact store write has completed.
    */
-  private ingest(event: AdapterEvent): void {
+  private ingest(event: AdapterEvent, durable = false, durableWriteAttempts = 1): void | Promise<void> {
+    if (!durable && this.durableEventBuffer) {
+      this.durableEventBuffer.push(event);
+      return;
+    }
     // Dropped before the sequence number is spent, so a resumed conversation
     // does not leave a hole in its own numbering for events that were never
     // written. See `replaying`.
@@ -946,12 +2155,59 @@ export class ChatSession {
       return;
     }
 
+    if (!this.flushingFallbackText && this.interceptFallbackQuestionText(event)) {
+      return;
+    }
+
+    // Every durable question transition reserves one sequence number until its
+    // canonical JSONL outcome is known. Adapter callbacks are synchronous and
+    // can arrive while the append promise is pending; letting them stamp the
+    // following seq made a failed durable write impossible to retry without a
+    // gap. Hold those raw events and replay them after commit/known rollback.
+    const deferred = durable ? [] as AdapterEvent[] : null;
+    if (durable) {
+      if (this.durableEventBuffer) {
+        return Promise.reject(new Error('another durable chat event is still being persisted'));
+      }
+      this.durableEventBuffer = deferred;
+    }
+
     this.seq += 1;
     const stamped = {
       ...event,
       seq: this.seq,
       ts: (event as { ts?: number }).ts ?? Date.now(),
     } as ChatEvent;
+
+    if (stamped.t === 'turn_end') {
+      // Decide whether this is the acknowledgement of an interrupted half-turn
+      // before any Plan fallback consumes it. A stale ending is not evidence
+      // that the corrected planning turn failed to submit a document.
+      this.interruptedErrorUntil = null;
+      const acknowledging =
+        this.staleTurnEndUntil !== null
+        && Date.now() <= this.staleTurnEndUntil
+        && this.turnInFlightId !== null;
+      if (acknowledging) {
+        this.staleTurnEndUntil = null;
+        stamped.stale = true;
+      } else {
+        this.staleTurnEndUntil = null;
+        this.turnInFlightId = null;
+        this.ownUserMessageId = null;
+        this.droppedUserEchoes.clear();
+      }
+    }
+
+    const fallbackPlan = this.capturePlanResponse(stamped);
+    const stopReason = stamped.t === 'turn_end' ? (stamped.stopReason || '').toLowerCase() : '';
+    const missingPlan = stamped.t === 'turn_end'
+      && !stamped.stale
+      && this.planMode
+      && !this.planSubmittedThisTurn
+      && !fallbackPlan
+      && !/(interrupt|abort|cancel|blocked)/.test(stopReason);
+    if (fallbackPlan) this.fallbackResponses += 1;
 
     // What is installed on disk is not the runtime's to forget — unless the
     // runtime is one that lists it itself.
@@ -973,7 +2229,11 @@ export class ChatSession {
     // replayed later, so a merge applied only to the local copy would be a menu
     // that differs between the server and every client reading it.
     if (this.installedCommands.length > 0 && !enumeratesInstalledCommands(this.runtime)) {
-      if (stamped.t === 'session' && stamped.capabilities.commands) {
+      // A missing property means the runtime said nothing, not that it
+      // positively reported an empty catalogue. Seed the session event too;
+      // otherwise a wrapper that announces fresh capabilities can erase the
+      // stand-in merely by omitting `commands`.
+      if (stamped.t === 'session') {
         stamped.capabilities = {
           ...stamped.capabilities,
           commands: mergeSlashCommands(stamped.capabilities.commands, this.installedCommands),
@@ -987,41 +2247,6 @@ export class ChatSession {
       }
     }
 
-    if (stamped.t === 'turn_end') {
-      // The first `turn_end` after an interrupt sent to make room for a message
-      // is the runtime letting go of the half it was told to abandon — not this
-      // turn ending. The turn is running again, on the correction that caused
-      // the interrupt, and every reader downstream is told so on the event
-      // itself rather than left to work it out (#86).
-      //
-      // One deep, time-bounded, and only while a turn is actually open: the
-      // runtimes here answer in milliseconds, and a `turn_end` arriving after
-      // that window is the redirected work finishing, which really does end the
-      // turn. Every one of those bounds is there to fail in the same safe
-      // direction — an ending taken for an acknowledgement would leave the turn
-      // open and fold the next queued message into it, and a queued message is
-      // its own turn by definition, delivered only once this one is over.
-      const acknowledging =
-        this.staleTurnEndUntil !== null
-        && Date.now() <= this.staleTurnEndUntil
-        && this.turnInFlightId !== null;
-      if (acknowledging) {
-        this.staleTurnEndUntil = null;
-        stamped.stale = true;
-      } else {
-        this.staleTurnEndUntil = null;
-        // The turn a steer would join, and only for as long as there is one to
-        // join. Cleared here rather than where the state changes because
-        // `turn_end` is the one event every runtime agrees means "that turn is
-        // over", and a stale id would make the next message look like a
-        // continuation of work that had already finished — which is the count
-        // going wrong in the other direction.
-        this.turnInFlightId = null;
-        this.ownUserMessageId = null;
-        this.droppedUserEchoes.clear();
-      }
-    }
-
     if (stamped.t === 'session') {
       // Patched on the event itself, not just on the copy kept here. Every
       // reader of this log — this session, the browser's reducer, a snapshot
@@ -1030,8 +2255,11 @@ export class ChatSession {
       // server and false in every browser. Whether the model can ask a question
       // is a fact about what this session wired up; the runtime introducing
       // itself knows nothing about it and must not be able to unset it.
-      if (this.questionsEnabled && !stamped.capabilities.questions) {
+      if ((this.questionToolEnabled || this.questionFallbackEnabled) && !stamped.capabilities.questions) {
         stamped.capabilities = { ...stamped.capabilities, questions: true };
+      }
+      if (this.planEnabled && !stamped.capabilities.planMode) {
+        stamped.capabilities = { ...stamped.capabilities, planMode: true };
       }
       if (stamped.nativeSessionId) {
         this.nativeSessionId = stamped.nativeSessionId;
@@ -1052,15 +2280,60 @@ export class ChatSession {
       // as "A process is already running in this session" — a lie the user
       // could only escape by making a new tab.
       if (stamped.state === 'exited') {
-        this.deps.onLifecycle?.(this.ref.id, { exited: true });
+        if (this.adapterStarting) {
+          this.adapterExitedWhileStarting = true;
+        } else {
+          this.deps.onLifecycle?.(this.ref.id, {
+            exited: true,
+            restarting: this.restarting,
+          });
+        }
+      }
+      if (stamped.state === 'exited' || stamped.state === 'error') {
+        // A blocked tool promise belongs to the process that just died. A
+        // structured handoff can survive only when this runtime published a
+        // native conversation id and a resume capability; otherwise keeping
+        // its card would offer an answer no future process can receive.
+        const resumable = Boolean(
+          this.nativeSessionId
+          && (this.capabilities?.resume === true || this.adapter?.capabilities.resume === true),
+        );
+        queueMicrotask(() => {
+          if (resumable) {
+            this.abandonToolQuestions('the agent stopped waiting for an answer');
+          } else {
+            this.abandonQuestionsAfterUnresumableExit();
+          }
+        });
       }
     }
-    if (stamped.t === 'turn_end' && this.state !== 'error' && this.state !== 'exited') {
+    if (
+      stamped.t === 'turn_end'
+      && !stamped.stale
+      && this.state !== 'error'
+      && this.state !== 'exited'
+    ) {
       // Mirrors the reducer, which does exactly this. Not emitted as a `state`
       // event: the log already carries turn_end, and every reader of that log
       // reaches the same conclusion from it. Emitting a second event would put
       // the same fact in twice.
       this.state = 'idle';
+    }
+    // `stale` is the interrupt acknowledgement a steer produces, and it closes
+    // no turn — the reducer excludes it from turn accounting for the same
+    // reason. Ending an escalation on one cancels a grant the user has paid for
+    // while the redirected turn is still running.
+    if (stamped.t === 'turn_end' && !stamped.stale && this.escalation) {
+      if (this.escalation.startsNextTurn) {
+        // This is the turn the grant was *not* for. The promised one starts now.
+        this.escalation = { ...this.escalation, startsNextTurn: false };
+      } else {
+        // The task that prompted the move up is over. Not awaited: `ingest` is
+        // synchronous for every one of its callers, and the switch back is a
+        // request to a runtime that may take its time answering. The marker it
+        // emits arrives after this event, which is the order it happened in.
+        void this.endEscalation();
+      }
     }
     if (stamped.t === 'capabilities' && this.capabilities) {
       this.capabilities = { ...this.capabilities, ...stamped.capabilities };
@@ -1085,6 +2358,24 @@ export class ChatSession {
     if (stamped.t === 'tool' && stamped.patch.input !== undefined) {
       this.noteAskCall(stamped.toolId, stamped.patch.name, stamped.patch.input);
     }
+    // The call that asked has ended without an answer, so the question ends too.
+    // This is the whole of the fix for a card that outlived its own tool call by
+    // ten minutes (#174): an agent whose MCP client gives up on the call says so
+    // right here, in a patch carrying the very id the question was filed under,
+    // and until now nothing read it. A click after this point could never have
+    // reached the model — the runtime has already dropped the request — so the
+    // card stops offering one.
+    //
+    // Deferred rather than resolved on the spot, for the reason `noteSpend`
+    // spells out below: `ingest` is running, and a second `ingest` from inside
+    // it would number and broadcast the resolution *ahead* of the patch that
+    // caused it. A microtask is the smallest wait that puts it after.
+    if (stamped.t === 'tool' && DEAD_TOOL_STATUS.has(stamped.patch.status as string)) {
+      const dead = stamped.toolId;
+      if (this.questionsFor(dead).length > 0) {
+        queueMicrotask(() => this.abandonQuestionsFor(dead));
+      }
+    }
     if (stamped.t === 'turn_end') {
       this.askCalls = [];
     }
@@ -1095,10 +2386,13 @@ export class ChatSession {
         // `askQuestion` records the resolver before it emits this event, and
         // overwriting the entry here would throw away the only thing that can
         // unblock the waiting tool call.
-        this.questions.set(stamped.request.requestId, { request: stamped.request, resolve: existing.resolve });
+        this.questions.set(stamped.request.requestId, { ...existing, request: stamped.request });
       }
     }
-    if (stamped.t === 'question_resolved') {
+    // Durability-sensitive lifecycle transitions own this map in their FIFO.
+    // Deleting here, before append resolves, made a failed write lose the only
+    // object that could roll the card back to answerable.
+    if (stamped.t === 'question_resolved' && !durable) {
       this.questions.delete(stamped.requestId);
     }
     if (stamped.t === 'permission') {
@@ -1121,31 +2415,121 @@ export class ChatSession {
     this.noteContext(stamped);
     this.noteSpend(stamped);
 
+    let persistence: Promise<void> | null = null;
+    const appendOnce = (): void | Promise<void> => this.deps.store.append(this.ref, [stamped]);
     try {
-      this.deps.store.append(this.ref, [stamped]);
+      if (durable && durableWriteAttempts > 1) {
+        persistence = (async () => {
+          let lastError: unknown;
+          for (let attempt = 0; attempt < durableWriteAttempts; attempt += 1) {
+            try {
+              await appendOnce();
+              return;
+            } catch (error: unknown) {
+              lastError = error;
+            }
+          }
+          throw lastError;
+        })();
+      } else {
+        const appended = appendOnce();
+        if (appended && typeof (appended as Promise<void>).then === 'function') {
+          persistence = Promise.resolve(appended);
+        }
+      }
     } catch (error: unknown) {
+      if (durable) {
+        const outcome = chatStoreAppendOutcome(error);
+        if (outcome === 'not_committed' && this.seq === stamped.seq) {
+          this.seq -= 1;
+        }
+        if (outcome === 'not_committed' && deferred) {
+          if (this.durableEventBuffer === deferred) this.durableEventBuffer = null;
+          for (const held of deferred) this.ingest(held);
+        }
+        return Promise.reject(error);
+      }
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`chat ${this.ref.id}: could not persist an event: ${message}`);
     }
 
-    this.deps.broadcast(this.ref.id, { type: 'chat_event', sessionId: this.ref.id, event: stamped });
+    const publish = (): void => {
+      this.deps.broadcast(this.ref.id, { type: 'chat_event', sessionId: this.ref.id, event: stamped });
 
-    // After the log and the socket, and wrapped: accounting is a bystander to
-    // this conversation and must never be able to stop one. A dropped record is
-    // a hole in a report; a throw here would be a chat that stops mid-turn.
-    try {
-      this.accountant?.observe(stamped);
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`chat ${this.ref.id}: could not account for an event: ${message}`);
+      if (fallbackPlan) {
+        queueMicrotask(() => {
+          void this.handleFallbackResponse(fallbackPlan)
+            .catch((error: unknown) => {
+              const detail = error instanceof Error ? error.message : String(error);
+              this.ingest({ t: 'error', message: `The response could not be handled: ${detail}` });
+            })
+            .finally(() => {
+              this.fallbackResponses = Math.max(0, this.fallbackResponses - 1);
+              this.drainQueue();
+            });
+        });
+      } else if (missingPlan) {
+        queueMicrotask(() => {
+          if (!this.planMode || this.planSubmittedThisTurn) return;
+          this.ingest({
+            t: 'error',
+            message: 'The planning turn ended without a reviewable plan. Plan mode is still on; send another planning message to retry.',
+          });
+        });
+      }
+
+      // After the log and the socket, and wrapped: accounting is a bystander to
+      // this conversation and must never be able to stop one. A dropped record is
+      // a hole in a report; a throw here would be a chat that stops mid-turn.
+      try {
+        this.accountant?.observe(stamped);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`chat ${this.ref.id}: could not account for an event: ${message}`);
+      }
+
+      // Last, and only after the event is on the wire: this is where a turn that
+      // ended hands the runtime to whatever was typed while it ran. Doing it here
+      // rather than on a timer means the line advances the instant the state
+      // says it may, and the events of the next turn are numbered after the ones
+      // that closed the last.
+      this.drainQueue();
+    };
+
+    const releaseDurableBarrier = (safe: boolean): void => {
+      if (!durable || !deferred || !safe) return;
+      if (this.durableEventBuffer === deferred) this.durableEventBuffer = null;
+      for (const held of deferred) this.ingest(held);
+    };
+
+    if (durable && persistence) {
+      return persistence.catch((error: unknown) => {
+        // ChatStore rejects only when the canonical JSONL batch did not commit.
+        // Question transitions admit no later lifecycle event ahead of this
+        // barrier, so reclaim the sequence number when it is still the tip and
+        // let a retry remain contiguous after torn bytes are repaired.
+        const outcome = chatStoreAppendOutcome(error);
+        if (outcome === 'not_committed' && this.seq === stamped.seq) {
+          this.seq -= 1;
+        }
+        // Unknown means the record may already own this seq. Keep the barrier
+        // and buffered events quarantined for cold-store reconciliation.
+        releaseDurableBarrier(outcome === 'not_committed');
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`chat ${this.ref.id}: could not durably persist an event: ${message}`);
+        throw error;
+      }).then(() => {
+        try {
+          publish();
+        } finally {
+          releaseDurableBarrier(true);
+        }
+      });
     }
-
-    // Last, and only after the event is on the wire: this is where a turn that
-    // ended hands the runtime to whatever was typed while it ran. Doing it here
-    // rather than on a timer means the line advances the instant the state
-    // says it may, and the events of the next turn are numbered after the ones
-    // that closed the last.
-    this.drainQueue();
+    if (!durable && persistence) void persistence.catch(() => undefined);
+    publish();
+    releaseDurableBarrier(true);
+    return durable ? Promise.resolve() : undefined;
   }
 
   private setState(state: ChatState): void {
@@ -1438,7 +2822,13 @@ export class ChatSession {
    * scheduled by the event stream and a turn arriving in that gap must not
    * overtake the ones already waiting.
    */
-  async send(turn: UserTurn): Promise<void> {
+  async send(turn: UserTurn): Promise<'accepted' | 'queued'> {
+    // The WebSocket admission checks this too, but the queue may wait while a
+    // different screen turns Plan mode on. Keep the final gate beside delivery
+    // so a previously accepted workflow never contradicts that safety mode.
+    if (turn.workflow && this.planMode) {
+      throw new Error('Turn Plan mode off before starting a workflow that can create a GitHub issue.');
+    }
     // A conversation being replaced has no adapter for a moment, and refusing
     // here is what put the "this chat is not running" recovery offer in front
     // of someone who had just cleared and started typing. It is starting, not
@@ -1446,7 +2836,7 @@ export class ChatSession {
     // goes out when the new process reports idle.
     if (this.restarting) {
       this.enqueue(turn);
-      return;
+      return 'queued';
     }
 
     if (!this.adapter || !this.adapter.alive) {
@@ -1459,9 +2849,9 @@ export class ChatSession {
     // answer ran, and anything queued behind it goes to a process that is
     // about to be replaced. Taking it now is also what makes the button and
     // the three spellings one behaviour rather than four.
-    if (isClearingCommand(turn.text)) {
+    if (!turn.workflow && isClearingCommand(turn.text)) {
       await this.deliver(turn);
-      return;
+      return 'accepted';
     }
 
     // `adapterReady` matters here as much as in the drain: pressing Enter the
@@ -1477,7 +2867,7 @@ export class ChatSession {
       // an adapter still letting go of the previous process would wait for a
       // drain that nothing was ever going to trigger.
       if (this.state === 'idle' && !ready) this.drainQueue();
-      return;
+      return 'queued';
     }
 
     try {
@@ -1489,10 +2879,18 @@ export class ChatSession {
       // of the queue — same failure, same recovery, whichever path it took.
       const message = error instanceof Error ? error.message : String(error);
       this.failQueuedTurn(
-        { id: `queued-${crypto.randomUUID()}`, text: turn.text, attachments: turn.attachments, ts: Date.now() },
+        {
+          id: `queued-${crypto.randomUUID()}`,
+          text: turn.text,
+          attachments: turn.attachments,
+          workflow: turn.workflow,
+          ts: Date.now(),
+        },
         message,
       );
+      return 'queued';
     }
+    return 'accepted';
   }
 
   /**
@@ -1513,6 +2911,7 @@ export class ChatSession {
       id: `queued-${crypto.randomUUID()}`,
       text: turn.text,
       attachments: turn.attachments,
+      workflow: turn.workflow,
       ts: Date.now(),
     });
     this.publishQueue();
@@ -1625,7 +3024,10 @@ export class ChatSession {
         return false;
       }
 
-      await this.deliver({ text: turn.text, attachments: turn.attachments }, steering ?? undefined);
+      await this.deliver(
+        { text: turn.text, attachments: turn.attachments, workflow: turn.workflow },
+        steering ?? undefined,
+      );
       return true;
     } catch (error: unknown) {
       // Back in the line with the reason on it, exactly like a turn that failed
@@ -1687,7 +3089,13 @@ export class ChatSession {
    * would come straight back here.
    */
   private drainQueue(): void {
-    if (this.draining || this.queue.length === 0) return;
+    if (
+      this.draining
+      || this.fallbackResponses > 0
+      || this.questions.size > 0
+      || this.questionContinuations.size > 0
+      || this.queue.length === 0
+    ) return;
 
     // A dead session cannot work through its backlog, and leaving the turns
     // on screen forever would suggest it might.
@@ -1728,7 +3136,7 @@ export class ChatSession {
 
     // `deliver` moves the state to `thinking` before it awaits anything, so by
     // the time this promise is pending the guard above already holds on its own.
-    this.deliver({ text: next.text, attachments: next.attachments })
+    this.deliver({ text: next.text, attachments: next.attachments, workflow: next.workflow })
       .catch((error: unknown) => {
         // Silent when a clear is under way: the turn failed because the
         // process it was for is being replaced, which is what the user asked
@@ -1842,6 +3250,14 @@ export class ChatSession {
     if (!this.adapter || !this.adapter.alive) {
       throw new ChatNotRunningError();
     }
+    if (turn.workflow && this.planMode) {
+      throw new Error('Turn Plan mode off before starting a workflow that can create a GitHub issue.');
+    }
+
+    this.planSubmittedThisTurn = false;
+    this.planResponseBlocks.clear();
+    this.fallbackTextBlocks.clear();
+    this.planResponseCandidate = '';
 
     // Before the first ingest, not after: the user's own message goes through
     // the same gate, and clearing this late would swallow the very turn that
@@ -1863,6 +3279,7 @@ export class ChatSession {
       id: messageId,
       role: 'user',
       turnId,
+      ...(turn.workflow ? { workflow: turn.workflow } : {}),
       ...(continuesTurnId ? { steer: true as const } : {}),
     });
     this.ingest({
@@ -1889,7 +3306,7 @@ export class ChatSession {
     // process would still remember everything said before it. A real reset
     // means a new process with no resume id, the same thing a manual "start
     // fresh" relaunch already does.
-    if (isClearingCommand(turn.text)) {
+    if (!turn.workflow && isClearingCommand(turn.text)) {
       await this.restart();
       return;
     }
@@ -1913,8 +3330,49 @@ export class ChatSession {
     // `/review` is not a command any more — it runs as prose, and the history
     // is spent on a turn that was never going to read it. It waits for
     // something the model is actually being asked.
-    const carried = isSlashCommand(turn.text) ? null : await this.openingContext();
-    await this.adapter.send(carried ? { ...turn, text: `${carried}\n\n${turn.text}` } : turn);
+    // Bundled workflows are ordinary user requests even when their first
+    // character happens to be `/`; never let a runtime reinterpret them as a
+    // native command or let command-only paths omit their guidance.
+    const command = !turn.workflow && isSlashCommand(turn.text);
+    if (command && this.planMode) {
+      const name = turn.text.trim().split(/\s+/, 1)[0]!.toLowerCase();
+      if (!PLAN_SAFE_SLASH_COMMANDS.has(name)) {
+        const blockedTurnId = this.turnInFlightId;
+        this.ingest({
+          t: 'error',
+          message: `${name} was not run because Plan mode only allows planning. Turn Plan mode off before running runtime commands.`,
+        });
+        if (blockedTurnId) {
+          this.ingest({ t: 'turn_end', turnId: blockedTurnId, stopReason: 'blocked' });
+        }
+        return;
+      }
+    }
+    const carried = command ? null : await this.openingContext();
+    const planInstruction = !command && this.planMode
+      ? planModeDirective(Boolean(await this.planDocument()))
+      : null;
+    const questionInstruction = !command
+      ? this.questionToolEnabled
+        ? questionToolDirective()
+        : this.questionFallbackEnabled
+          ? questionFallbackDirective()
+          : null
+      : null;
+    const workflowInstruction = turn.workflow
+      ? [
+          `[BEGIN APP-OWNED ${turn.workflow.toUpperCase()} WORKFLOW]`,
+          builtInWorkflowInstructions(turn.workflow),
+          `[END APP-OWNED ${turn.workflow.toUpperCase()} WORKFLOW]`,
+        ].join('\n')
+      : null;
+    const runtimeUserRequest = turn.workflow
+      ? `[BEGIN USER REQUEST]\n${turn.text}\n[END USER REQUEST]`
+      : turn.text;
+    const runtimeText = [questionInstruction, workflowInstruction, planInstruction, carried, runtimeUserRequest]
+      .filter(Boolean)
+      .join('\n\n');
+    await this.adapter.send(runtimeText === turn.text ? turn : { ...turn, text: runtimeText });
 
     // Only once it has actually gone. A delivery that threw is put back in the
     // line and tried again, and the retry has to carry what this attempt never
@@ -1959,8 +3417,10 @@ export class ChatSession {
     // Anything typed *after* the clear still arrives — `restarting` parks it
     // and the fresh process is handed it as soon as it reports idle — which is
     // the case #89 exists to protect.
+    let oldRuntimeStopped = false;
     try {
       await this.stop();
+      oldRuntimeStopped = true;
       // Stale until the new process's own `init` event reports its id — cleared
       // up front so nothing reads the old conversation's id in the meantime.
       // The record hears it too, but from inside `start`, once the log this
@@ -1984,7 +3444,12 @@ export class ChatSession {
       // already written the failure into the transcript and moved the state to
       // `error`; the record has to hear it too, or the tab goes on claiming a
       // process that never started and refuses the relaunch that would fix it.
-      this.deps.onLifecycle?.(this.ref.id, { exited: true });
+      // If teardown itself could not prove the old process gone, admission has
+      // to remain closed. Only a verified stop followed by a failed replacement
+      // is an exited conversation.
+      if (oldRuntimeStopped) {
+        this.deps.onLifecycle?.(this.ref.id, { exited: true, restarting: false });
+      }
       throw error;
     } finally {
       this.restarting = false;
@@ -2030,28 +3495,40 @@ export class ChatSession {
    */
   private async cancelTurnInFlight(): Promise<void> {
     if (!this.adapter) return;
-    await this.adapter.interrupt();
-    // Anything still waiting on a person is moot once the turn is cancelled,
-    // and leaving the cards on screen would invite answers that go nowhere.
-    for (const [requestId, approval] of this.pending) {
-      approval.resolve?.({ allow: false, reason: 'the turn was interrupted' });
-      this.ingest({ t: 'permission_resolved', requestId, optionId: 'reject_once', allowed: false });
-    }
-    this.pending.clear();
-    // A question is moot once the turn it belongs to is cancelled, and a card
-    // left on screen would invite an answer with nothing left to receive it.
-    for (const [requestId, entry] of this.questions) {
-      entry.resolve({ labels: [], error: 'the turn was interrupted' });
-      this.ingest({
-        t: 'question_resolved',
-        requestId,
-        toolId: entry.request.toolId,
-        optionIds: [],
-        skipped: true,
+    this.acceptingQuestionTransitions = false;
+    this.questionStopIntent = 'abandon';
+    this.questionContinuationGeneration += 1;
+    // Said before the interrupt rather than after it, because the answer to it
+    // can arrive during the await — and on Claude the answer *is* the report
+    // this window exists to swallow. Same reasoning as `staleTurnEndUntil`,
+    // which `sendQueuedNow` sets one line before calling this.
+    this.interruptedErrorUntil = Date.now() + INTERRUPT_ACK_WINDOW_MS;
+    try {
+      this.adapter.cancelPendingSendAcceptance?.('the turn was interrupted before acceptance was confirmed');
+      await this.adapter.interrupt();
+      // Anything still waiting on a person is moot once the turn is cancelled,
+      // and leaving the cards on screen would invite answers that go nowhere.
+      for (const [requestId, approval] of this.pending) {
+        approval.resolve?.({ allow: false, reason: 'the turn was interrupted' });
+        this.ingest({ t: 'permission_resolved', requestId, optionId: 'reject_once', allowed: false });
+      }
+      this.pending.clear();
+      // Anything admitted before Stop is linearised first. Readiness waiters
+      // see the intent/generation and withdraw; a send that already crossed its
+      // final gate is allowed to commit delivered before termination continues.
+      await this.questionTransitionTail.catch(() => undefined);
+      await Promise.allSettled([...this.questionDispatches.values()]);
+      await this.mutateQuestions(async () => {
+        for (const [requestId, entry] of [...this.questions]) {
+          await this.abandonQuestionNow(requestId, entry, 'the turn was interrupted');
+        }
+        await this.abandonQuestionContinuationsNow('the turn was interrupted');
       });
+      this.setState('idle');
+    } finally {
+      this.questionStopIntent = null;
+      this.acceptingQuestionTransitions = true;
     }
-    this.questions.clear();
-    this.setState('idle');
   }
 
   /**
@@ -2122,6 +3599,260 @@ export class ChatSession {
   }
 
   /**
+   * The agent asking to answer this task from the next model up its ladder.
+   *
+   * Put to the user as an ordinary approval, because that is exactly what it
+   * is: the app gating the agent, with allow and deny the only two meanings an
+   * answer can have. It draws the card the browser already has, travels the
+   * message the browser already handles, and is recorded in the transcript with
+   * every other decision the conversation made — none of which a bespoke
+   * request type would have got for free.
+   *
+   * The grant lasts until the turn ends. See `escalation`.
+   */
+  private async requestTier(ask: TierAsk): Promise<TierReply> {
+    const ladder = this.ladder;
+    if (!ladder) {
+      return { granted: false, detail: 'this conversation is not running on a capability ladder.' };
+    }
+    // From the rung in force, not the rung it started on: two grants in one turn
+    // would otherwise both offer the same step up, and the second would look to
+    // the user like a request that had already been approved.
+    const from = this.escalation?.to ?? ladder.tier;
+    const next = nextRungUp({ tiers: ladder.tiers }, from);
+    if (!next) {
+      return {
+        granted: false,
+        detail:
+          `You are already on the ${from} rung, which is the highest one this profile fills in. `
+          + 'Carry on with the model you have.',
+      };
+    }
+
+    const reason = typeof ask.reason === 'string' ? ask.reason.trim() : '';
+    const granted = this.bypass
+      ? true
+      : await this.askEscalation(from, next.tier, next.model, reason);
+
+    if (!granted) {
+      return {
+        granted: false,
+        detail:
+          `The user did not approve moving up to the ${next.tier} rung. `
+          + 'Carry on with the model you have, and do not ask again this turn.',
+      };
+    }
+
+    const applied = await this.applyModel(next.model);
+    if (applied === 'no') {
+      // Nothing was changed, so nothing is claimed. A model told it moved up
+      // when it did not will attempt work it cannot do, and the user will be
+      // shown a rung the process was never on.
+      return {
+        granted: false,
+        detail:
+          `The user approved moving up to the ${next.tier} rung, but this runtime cannot change `
+          + 'its model without being restarted, so nothing moved. Carry on with the model you '
+          + 'have and say that the stronger one could not be reached.',
+      };
+    }
+
+    // A grant made while nothing is running belongs to the turn that has not
+    // started yet — the same case as a runtime that can only switch between
+    // turns, and it arises whenever a blocked tool call is abandoned while the
+    // card is still up.
+    const startsNextTurn = applied === 'next-turn' || this.state === 'idle';
+    this.escalation = { from, to: next.tier, model: next.model, startsNextTurn };
+    this.ingest({
+      t: 'marker',
+      kind: 'model',
+      detail: startsNextTurn
+        ? `moving up to the ${next.tier} rung for the next turn — ${next.model}`
+        : `moved up to the ${next.tier} rung — ${next.model}`,
+    });
+
+    return {
+      granted: true,
+      tier: next.tier,
+      model: next.model,
+      detail: startsNextTurn
+        ? `Approved. The ${next.tier} rung (${next.model}) takes effect on your next turn — the `
+          + 'model answering right now cannot be changed mid-turn. Finish or stop here, and the '
+          + `stronger model picks it up. The conversation returns to ${from} after that turn.`
+        : `Approved. You are now answering from the ${next.tier} rung (${next.model}). `
+          + `The conversation returns to ${from} when this turn ends.`,
+    };
+  }
+
+  /**
+   * Put a model in front of the agent, by whichever route its runtime has.
+   *
+   * Three answers, because there are three outcomes and collapsing them to a
+   * boolean is how the escalation came to promise a rung it never reached:
+   * `live` (the running process took it), `next-turn` (the runtime spawns per
+   * turn, so the next one will), and `no` (nothing changed).
+   */
+  private async applyModel(model: string): Promise<'live' | 'next-turn' | 'no'> {
+    const adapter = this.adapter;
+    if (!adapter?.alive) return 'no';
+    if (adapter.setModel) {
+      await adapter.setModel(model);
+      return 'live';
+    }
+    if (adapter.setModelNextTurn) {
+      adapter.setModelNextTurn(model);
+      return 'next-turn';
+    }
+    return 'no';
+  }
+
+  /**
+   * Put an escalation to the user and wait.
+   *
+   * Deliberately not routed through `askUser`: that one has a bypass short
+   * circuit and a tool-name exemption, neither of which means anything here, and
+   * the request has no tool call behind it to gate.
+   */
+  private askEscalation(
+    from: ModelTier,
+    to: ModelTier,
+    model: string,
+    reason: string,
+  ): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const requestId = `tier-${crypto.randomUUID()}`;
+      const request: PermissionRequest = {
+        requestId,
+        title: `Answer from the ${to} rung instead of ${from}?`,
+        toolKind: 'other',
+        input: { rung: to, model },
+        reason: reason || 'The agent gave no reason.',
+        // Two options, not the usual three. The standing "Allow for this
+        // session" would be a lie on the one control in the app that governs
+        // spending: a grant lasts one turn by design, so a user who clicked it
+        // believing the expensive model was authorised session-wide would have
+        // been told the opposite of the truth.
+        options: [
+          { optionId: 'allow_once', kind: 'allow_once', name: 'Allow, for this turn' },
+          { optionId: 'reject_once', kind: 'reject_once', name: 'Stay on this rung' },
+        ],
+        ts: Date.now(),
+      };
+      this.pending.set(requestId, {
+        request,
+        resolve: (answer) => resolve(answer.allow),
+      });
+      this.ingest({ t: 'permission', request });
+      this.setState('awaiting_permission');
+    });
+  }
+
+  /**
+   * The rung this conversation is actually on, or null when it is not on one.
+   *
+   * The escalated rung while an escalation is in force: what a browser joining
+   * mid-turn has to be told is what the process is answering from, not what it
+   * will go back to.
+   */
+  get ladderRung(): LadderRung | null {
+    if (!this.ladder || !this.live) return null;
+    const escalation = this.escalation;
+    if (escalation && !escalation.startsNextTurn) {
+      return { tier: escalation.to, model: escalation.model };
+    }
+    const model = this.ladder.tiers[this.ladder.tier];
+    return model ? { tier: this.ladder.tier, model } : null;
+  }
+
+  /**
+   * Move this conversation onto an edited ladder, mid-conversation.
+   *
+   * Returns false — meaning "not mine" — for a conversation that is not running
+   * on a rung: one pinned by a model somebody typed, or by an account's standing
+   * choice, was never the ladder's to decide and must not be re-modelled by an
+   * edit to it.
+   *
+   * The turn in progress is interrupted, which #171 asks for outright. It is
+   * destructive and deliberately so: the alternative is a conversation that goes
+   * on answering from the model the profile no longer names, for as long as the
+   * turn runs, with the settings page reporting the change as applied.
+   */
+  async reapplyLadder(
+    ladder: { tier: ModelTier; tiers: Partial<Record<ModelTier, string>> } | null,
+  ): Promise<boolean> {
+    if (!this.ladder) return false;
+
+    if (!ladder) {
+      // The ladder is gone — the profile was deleted, deactivated, or had its
+      // rungs cleared. Nothing to switch *to*: this conversation keeps the model
+      // it is on until it is relaunched, which is when the runtime's own default
+      // takes over. Said out loud rather than left to be discovered.
+      this.ladder = null;
+      this.escalation = null;
+      this.ingest({
+        t: 'marker',
+        kind: 'model',
+        detail: 'the ladder this conversation was on is gone; it keeps this model until relaunched',
+      });
+      return true;
+    }
+
+    const model = ladder.tiers[ladder.tier];
+    const unchanged = model
+      && !this.escalation
+      && this.ladder.tier === ladder.tier
+      && this.ladder.tiers[this.ladder.tier] === model;
+    this.ladder = ladder;
+    // Nothing the user would see. Interrupting a turn to change nothing is the
+    // worst possible reading of "takes effect immediately".
+    if (unchanged) return false;
+    if (!model) return false;
+
+    if (this.state !== 'idle') await this.interrupt().catch(() => undefined);
+    // Any escalation belonged to the ladder that has just been replaced.
+    this.escalation = null;
+    const applied = await this.applyModel(model).catch(() => 'no' as const);
+    this.ingest({
+      t: 'marker',
+      kind: 'model',
+      detail: applied === 'no'
+        // Said, not swallowed. The turn was cut short and the model did not
+        // change, which is the worst of both and the user is owed the reason.
+        ? `the profile changed to the ${ladder.tier} rung, ${model} — this runtime cannot take it `
+          + 'without a restart, so this conversation stays on its model until then'
+        : applied === 'next-turn'
+          ? `the profile changed — the next turn runs on the ${ladder.tier} rung, ${model}`
+          : `the profile changed — now on the ${ladder.tier} rung, ${model}`,
+    });
+    return applied !== 'no';
+  }
+
+  /**
+   * Put the conversation back on the rung it belongs to.
+   *
+   * Called when a turn ends, which is the whole lifetime of a grant. Failing to
+   * switch back is not treated as an error: the next turn's launch resolves the
+   * model again from the ladder, so the worst case is one extra turn at the
+   * higher rung rather than a conversation stranded there.
+   */
+  private async endEscalation(): Promise<void> {
+    const escalation = this.escalation;
+    const ladder = this.ladder;
+    if (!escalation || !ladder) return;
+    this.escalation = null;
+
+    const back = ladder.tiers[escalation.from];
+    const applied = back ? await this.applyModel(back).catch(() => 'no' as const) : 'no';
+    this.ingest({
+      t: 'marker',
+      kind: 'model',
+      detail: applied === 'no'
+        ? `the ${escalation.to} rung ends here; the next launch resolves the ladder again`
+        : `back on the ${escalation.from} rung — ${back}`,
+    });
+  }
+
+  /**
    * Remember a tool call that might be a question, or fill in what it asks.
    *
    * Called for every tool block, so the cheap name check comes first. A call
@@ -2170,35 +3901,132 @@ export class ChatSession {
    * with an error the model can read is better than putting an empty card on
    * screen and blocking the turn behind it.
    */
-  private askQuestion(ask: QuestionAsk): Promise<QuestionReply> {
+  private askQuestion(ask: QuestionAsk, signal?: AbortSignal): Promise<QuestionReply> {
+    const built = this.buildQuestionRequest(ask, 'tool');
+    if ('error' in built) {
+      return Promise.resolve({ labels: [], error: built.error });
+    }
+    if (!this.acceptingQuestionTransitions) {
+      return Promise.resolve({ labels: [], error: 'the session was stopped' });
+    }
+
+    return new Promise<QuestionReply>((resolve) => {
+      const { request } = built;
+      this.questions.set(request.requestId, {
+        kind: 'tool',
+        request,
+        resolve,
+        phase: 'open',
+      });
+      // This path owns a live tool waiter and has to expose it synchronously:
+      // the broker can cancel in the same tick. Its resolution/termination is
+      // still serialised and durable; a cold restart reconciles the unresumable
+      // opener as abandoned.
+      this.ingest({ t: 'question', request });
+      this.setState('awaiting_answer');
+      signal?.addEventListener(
+        'abort',
+        () => { void this.abandonQuestion(request.requestId, 'the agent stopped waiting for an answer'); },
+        { once: true },
+      );
+    });
+  }
+
+  /**
+   * Open a question after the model has deliberately ended its turn.
+   *
+   * There is no promise to keep alive: origin plus the request itself are the
+   * continuation record, which is why this variant can be reconstructed after
+   * a server restart while a blocked MCP call cannot.
+   */
+  private async openHandoffQuestion(ask: QuestionAsk): Promise<QuestionReply | null> {
+    const built = this.buildQuestionRequest(ask, 'structured_handoff');
+    if ('error' in built) return { labels: [], error: built.error };
+    // Admission is decided before the FIFO yields. Stop waits for work already
+    // admitted and rejects only calls that arrive after its synchronous gate.
+    if (!this.acceptingQuestionTransitions) {
+      return { labels: [], error: 'the session was stopped' };
+    }
+    return this.mutateQuestions(async () => {
+      const { request } = built;
+      try {
+        // A browser must not receive an indefinitely actionable card until the
+        // request is in the restart log that will rebuild that same card.
+        await this.ingest({ t: 'question', request }, true);
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return { labels: [], error: `the question could not be saved: ${detail}` };
+      }
+      this.questions.set(request.requestId, {
+        kind: 'structured_handoff',
+        request,
+        phase: 'open',
+      });
+      this.setState('awaiting_answer');
+      return null;
+    });
+  }
+
+  /** Put every question lifecycle commit behind one per-session boundary. */
+  private mutateQuestions<T>(operation: () => Promise<T>): Promise<T> {
+    // The first operation starts synchronously. Besides avoiding a needless
+    // tick, this preserves invocation order against a store snapshot requested
+    // immediately after opening a handoff: append is enqueued before snapshot.
+    const queued = new Promise<T>((resolve, reject) => {
+      this.questionTransitionQueue.push({
+        operation,
+        resolve: resolve as (value: unknown) => void,
+        reject,
+      });
+      this.runNextQuestionTransition();
+    });
+    this.questionTransitionTail = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  private runNextQuestionTransition(): void {
+    if (this.questionTransitionRunning) return;
+    const next = this.questionTransitionQueue.shift();
+    if (!next) return;
+    this.questionTransitionRunning = true;
+    let result: Promise<unknown>;
+    try {
+      result = Promise.resolve(next.operation());
+    } catch (error: unknown) {
+      result = Promise.reject(error);
+    }
+    void result.then(next.resolve, next.reject).finally(() => {
+      this.questionTransitionRunning = false;
+      this.runNextQuestionTransition();
+    });
+  }
+
+  /** Validate one model-authored payload and mint the durable browser request. */
+  private buildQuestionRequest(
+    ask: QuestionAsk,
+    origin: 'tool' | 'structured_handoff',
+  ): { request: QuestionRequest } | { error: string } {
     const question = typeof ask.question === 'string' ? ask.question.trim() : '';
     const options = normalizeQuestionOptions(ask.options);
 
     if (!question || options.length === 0) {
-      return Promise.resolve({
-        labels: [],
-        error: 'the question needs a question and at least one option',
-      });
+      return { error: 'the question needs a question and at least one option' };
     }
 
-    return new Promise<QuestionReply>((resolve) => {
-      const requestId = `ask-${crypto.randomUUID()}`;
-      const request: QuestionRequest = {
-        requestId,
+    const request: QuestionRequest = {
+        requestId: `ask-${crypto.randomUUID()}`,
+        origin,
         // Claimed, not merely read: a second question must not attach itself to
         // the same tool block, which would draw two cards in one place and
         // leave the later one unanswerable.
-        toolId: this.claimAskCall(question),
+        ...(origin === 'tool' ? { toolId: this.claimAskCall(question) } : {}),
         question,
         header: typeof ask.header === 'string' && ask.header.trim() ? ask.header.trim() : undefined,
         multiSelect: ask.multiSelect === true,
         options,
         ts: Date.now(),
-      };
-      this.questions.set(requestId, { request, resolve });
-      this.ingest({ t: 'question', request });
-      this.setState('awaiting_answer');
-    });
+    };
+    return { request };
   }
 
   /**
@@ -2207,30 +4035,209 @@ export class ChatSession {
    * Returns false for a question this session does not have, which is what a
    * second browser answering one that has already been answered looks like.
    */
-  answerQuestion(requestId: string, optionIds: string[], skipped = false): boolean {
+  async answerQuestion(
+    requestId: string,
+    optionIds: string[],
+    skipped = false,
+    text?: string,
+  ): Promise<boolean> {
     const entry = this.questions.get(requestId);
-    if (!entry) return false;
+    if (!entry || entry.phase === 'resolving' || !this.acceptingQuestionTransitions) return false;
+    // A handoff may remain durable while its dead process is waiting to be
+    // resumed. Do not consume the only answer before there is an adapter able
+    // to receive the continuation; the browser acknowledgement tells the user
+    // to retry after recovery instead.
+    if (entry.kind === 'structured_handoff' && !this.adapter?.alive) return false;
 
-    // Filtered against the offered options rather than trusted: the ids come
-    // from a browser, and the labels they resolve to are about to be handed
-    // straight to the model as fact.
-    const picked = entry.request.options.filter((option) => optionIds.includes(option.optionId));
-    const answered = !skipped && picked.length > 0;
+    // First writer claims the request before yielding. A second browser frame
+    // therefore loses immediately even while the winner is waiting on disk.
+    entry.phase = 'resolving';
+    const continuationGeneration = this.questionContinuationGeneration;
 
-    entry.resolve({
-      labels: picked.map((option) => option.label),
-      skipped: !answered,
+    return this.mutateQuestions(async () => {
+      // The entry can only disappear ahead of us if a legacy embedding mutated
+      // the map directly. Treat that as a stale submission, never a new answer.
+      if (this.questions.get(requestId) !== entry) return false;
+
+      // Filtered against the offered options rather than trusted: the ids come
+      // from a browser, and the labels they resolve to are about to be handed
+      // straight to the model as fact.
+      const picked = entry.request.options.filter((option) => optionIds.includes(option.optionId));
+      // The one part of an answer that is *not* filtered against the options,
+      // because it is by definition not one of them. Bounded at the wire; here
+      // it only has to be non-empty to count as having been answered.
+      const own = typeof text === 'string' ? text.trim() : '';
+      const answered = !skipped && (picked.length > 0 || own.length > 0);
+
+      const reply: QuestionReply = {
+        labels: picked.map((option) => option.label),
+        text: answered && own ? own : undefined,
+        skipped: !answered,
+      };
+      const continuation: QuestionContinuation | undefined = entry.kind === 'structured_handoff'
+        ? {
+            continuationId: `continue-${crypto.randomUUID()}`,
+            request: {
+              ...entry.request,
+              options: entry.request.options.map((option) => ({ ...option })),
+            },
+            answer: {
+              optionIds: picked.map((option) => option.optionId),
+              labels: [...reply.labels],
+              ...(reply.text ? { text: reply.text } : null),
+              ...(reply.skipped ? { skipped: true } : null),
+            },
+          }
+        : undefined;
+      try {
+        await this.ingest({
+          t: 'question_resolved',
+          requestId,
+          toolId: entry.request.toolId,
+          optionIds: picked.map((option) => option.optionId),
+          text: answered && own ? own : undefined,
+          skipped: !answered,
+          ...(continuation ? { continuation } : null),
+        }, true);
+      } catch {
+        // No browser saw the resolution and no positive acknowledgement will
+        // be sent. The phase rolls back; Stop, if already admitted, will close
+        // the still-durable request in FIFO order.
+        entry.phase = 'open';
+        if (this.state !== 'awaiting_answer') this.setState('awaiting_answer');
+        return false;
+      }
+
+      // The blocked tool and the continuation are released only after the exact
+      // resolution event is on disk. A positive browser acknowledgement can now
+      // truthfully mean the submission survived a restart boundary.
+      this.questions.delete(requestId);
+      if (this.isToolQuestion(entry)) entry.resolve(reply);
+      if (continuation) {
+        this.questionContinuations.set(continuation.continuationId, continuation);
+        queueMicrotask(() => this.dispatchQuestionContinuation(
+          continuation.continuationId,
+          continuationGeneration,
+        ));
+      }
+      return true;
     });
+  }
 
+  /** The pending questions asked by one tool call, usually none or one. */
+  private questionsFor(toolId: string): string[] {
+    const ids: string[] = [];
+    for (const [requestId, entry] of this.questions) {
+      if (entry.request.toolId === toolId) ids.push(requestId);
+    }
+    return ids;
+  }
+
+  /**
+   * End the questions a dead tool call was waiting on, and say so.
+   *
+   * The counterpart to `answerQuestion` for the case where nobody got to
+   * answer. The waiting promise is still resolved — the MCP server on the other
+   * end of the socket is holding a `tools/call` open, and abandoning it in
+   * silence would strand that process rather than the card — but what goes into
+   * the transcript is `abandoned`, not `skipped`. The two look identical on
+   * screen if you conflate them and they say opposite things about the user.
+   */
+  private abandonQuestionsFor(toolId: string, reason = 'the agent stopped waiting for an answer'): void {
+    void this.abandonQuestions(reason, (entry) => entry.request.toolId === toolId);
+  }
+
+  /** Settle only questions whose live tool caller can no longer exist. */
+  private abandonToolQuestions(reason: string): void {
+    void this.abandonQuestions(reason, (entry) => this.isToolQuestion(entry));
+  }
+
+  /** A dead, non-resumable runtime can own neither waiters nor an outbox. */
+  private abandonQuestionsAfterUnresumableExit(): void {
+    this.questionContinuationGeneration += 1;
+    void Promise.allSettled([...this.questionDispatches.values()]).then(() => (
+      this.mutateQuestions(async () => {
+        for (const [requestId, entry] of [...this.questions]) {
+          await this.abandonQuestionNow(
+            requestId,
+            entry,
+            'the runtime conversation could not be resumed',
+          );
+        }
+        await this.abandonQuestionContinuationsNow(
+          'the runtime conversation could not be resumed',
+        );
+      })
+    )).catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn(`chat ${this.ref.id}: could not abandon unresumable questions: ${detail}`);
+    });
+  }
+
+  /**
+   * Recognize both the discriminated shape and the pre-discriminator live
+   * waiter shape. The latter cannot be recovered from disk, but it can still
+   * exist in an embedding that populated the in-memory map before upgrading.
+   */
+  private isToolQuestion(entry: PendingQuestion): entry is PendingToolQuestion {
+    return entry.kind === 'tool'
+      || typeof (entry as unknown as { resolve?: unknown }).resolve === 'function';
+  }
+
+  /** The same for one question, which is how a cancelled call arrives. */
+  private abandonQuestion(requestId: string, reason: string): Promise<void> {
+    return this.mutateQuestions(async () => {
+      const entry = this.questions.get(requestId);
+      if (entry) await this.abandonQuestionNow(requestId, entry, reason);
+    });
+  }
+
+  /** Batch termination; must not call the public enqueuing helper recursively. */
+  private abandonQuestions(
+    reason: string,
+    predicate: (entry: PendingQuestion) => boolean = () => true,
+  ): Promise<void> {
+    return this.mutateQuestions(async () => {
+      for (const [requestId, entry] of [...this.questions]) {
+        if (predicate(entry)) await this.abandonQuestionNow(requestId, entry, reason);
+      }
+    });
+  }
+
+  /** One durable close while `questionTransitionTail` is held. */
+  private async abandonQuestionNow(
+    requestId: string,
+    entry: PendingQuestion,
+    reason: string,
+  ): Promise<void> {
+    try {
+      await this.ingest({
+        t: 'question_resolved',
+        requestId,
+        toolId: entry.request.toolId,
+        optionIds: [],
+        abandoned: true,
+      }, true);
+    } catch (error: unknown) {
+      // A tool caller that is already gone must never stay blocked on a logging
+      // failure. A handoff stays in memory so a failed Stop can be retried.
+      if (this.isToolQuestion(entry)) {
+        entry.resolve({ labels: [], error: reason });
+        this.questions.delete(requestId);
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn(`chat ${this.ref.id}: question abandonment was not durable: ${detail}`);
+      if (this.isToolQuestion(entry)) return;
+      throw error;
+    }
+    if (this.isToolQuestion(entry)) entry.resolve({ labels: [], error: reason });
     this.questions.delete(requestId);
-    this.ingest({
-      t: 'question_resolved',
-      requestId,
-      toolId: entry.request.toolId,
-      optionIds: picked.map((option) => option.optionId),
-      skipped: !answered,
-    });
-    return true;
+    // Nothing left to wait for. Said here rather than left to the next event,
+    // because a conversation that goes on reporting `awaiting_answer` with no
+    // card to answer is one whose composer stays out of the user's way.
+    if (this.questions.size === 0 && this.state === 'awaiting_answer') {
+      this.setState(this.live ? 'running' : 'idle');
+    }
   }
 
   /**
@@ -2246,6 +4253,247 @@ export class ChatSession {
     if (!this.adapter?.alive || !this.adapter.setModel) return false;
     await this.adapter.setModel(model);
     return true;
+  }
+
+  /** Read the latest submitted plan once per process, then keep the cache current. */
+  async planDocument(): Promise<PlanDocument | null> {
+    if (this.planDocumentCache !== undefined) return this.planDocumentCache;
+    this.planDocumentCache = (await this.deps.store.planDocument?.(this.ref)) ?? null;
+    return this.planDocumentCache;
+  }
+
+  /** Put every Plan read/change decision behind one per-session boundary. */
+  private mutatePlan<T>(operation: () => Promise<T>): Promise<T> {
+    const queued = this.planMutation.catch(() => undefined).then(operation);
+    this.planMutation = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  /** Persist one complete numbered revision from the MCP tool or response fallback. */
+  async submitPlan(input: { markdown?: unknown; source?: 'tool' | 'response' }): Promise<PlanSubmissionResult> {
+    const markdown = typeof input.markdown === 'string' ? input.markdown.trim() : '';
+    if (!this.planMode) {
+      return { accepted: false, detail: 'Plan mode is not active for this conversation.' };
+    }
+    if (!markdown) {
+      return { accepted: false, detail: 'A submitted plan cannot be empty.' };
+    }
+    if (markdown.length > MAX_PLAN_TEXT) {
+      return {
+        accepted: false,
+        detail: `The plan is too large; the limit is ${MAX_PLAN_TEXT} characters.`,
+      };
+    }
+    if (!this.deps.store.setPlanDocument) {
+      return { accepted: false, detail: 'This server cannot persist Plan documents.' };
+    }
+    const generation = this.planGeneration;
+    return this.mutatePlan(async () => {
+      // The mode and generation are checked again after waiting for earlier
+      // Plan actions. Otherwise a submission already in line could write after
+      // Accept or /clear had ended the planning conversation.
+      if (!this.planMode || generation !== this.planGeneration) {
+        return { accepted: false, detail: 'Plan mode is no longer active for this conversation.' };
+      }
+      try {
+        const previous = await this.planDocument();
+        if (!this.planMode || generation !== this.planGeneration) {
+          return { accepted: false, detail: 'The planning conversation ended before this plan could be stored.' };
+        }
+        const plan: PlanDocument = {
+          markdown,
+          revision: (previous?.revision ?? 0) + 1,
+          ts: Date.now(),
+        };
+        await this.deps.store.setPlanDocument!(this.ref, plan);
+        if (generation !== this.planGeneration) {
+          // A clear waited for this operation and removes the sidecar next; do
+          // not republish it into the new conversation while that happens.
+          return { accepted: false, detail: 'The planning conversation ended before this plan could be published.' };
+        }
+        this.planDocumentCache = plan;
+        this.planSubmittedThisTurn = true;
+        this.deps.broadcast(this.ref.id, {
+          type: 'chat_plan_document',
+          sessionId: this.ref.id,
+          plan,
+        });
+        return {
+          accepted: true,
+          revision: plan.revision,
+          detail: `Plan saved as revision ${plan.revision}.`,
+        };
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return { accepted: false, detail: `The plan could not be stored: ${detail}` };
+      }
+    });
+  }
+
+  /** Turn the conversation-level mode on or off while no turn is active. */
+  async setPlanMode(on: boolean): Promise<PlanModeResult> {
+    return this.mutatePlan(async () => {
+      if (this.live && (this.state !== 'idle' || this.draining || this.queue.length > 0)) {
+        return {
+          planMode: this.planMode,
+          changed: false,
+          detail: 'Wait for the active turn and queued messages to finish before changing Plan mode.',
+        };
+      }
+      if (this.planMode === on) {
+        return {
+          planMode: this.planMode,
+          changed: false,
+          detail: on ? 'Plan mode is already on.' : 'Plan mode is already off.',
+        };
+      }
+      this.planMode = on;
+      this.rememberPlanMode(on);
+      if (!on) {
+        this.planResponseBlocks.clear();
+        this.planResponseCandidate = '';
+      }
+      return {
+        planMode: on,
+        changed: true,
+        detail: on ? 'Plan mode is on.' : 'Plan mode is off. The latest plan was kept.',
+      };
+    });
+  }
+
+  /** Carry Plan mode through an in-place process restart. */
+  rememberPlanMode(on: boolean): void {
+    if (!this.lastStartOptions) return;
+    this.lastStartOptions = { ...this.lastStartOptions, planMode: on };
+  }
+
+  /**
+   * Accept only the latest revision, then immediately start its implementation.
+   * The prompt is internal runtime context: no user-authored transcript bubble
+   * is manufactured for an action the user took through the Plan control.
+   */
+  async acceptPlan(revision: number): Promise<PlanActionResult> {
+    return this.mutatePlan(async () => {
+      const plan = await this.planDocument();
+      if (!this.planMode) {
+        return { accepted: false, action: 'accept', planMode: false, detail: 'Plan mode is not active.' };
+      }
+      if (!plan) {
+        return { accepted: false, action: 'accept', planMode: true, detail: 'There is no plan to accept.' };
+      }
+      if (revision !== plan.revision) {
+        return {
+          accepted: false,
+          action: 'accept',
+          planMode: true,
+          revision: plan.revision,
+          detail: `Revision ${revision} is stale. Review revision ${plan.revision} before accepting.`,
+        };
+      }
+      if (!this.adapter?.alive || this.state !== 'idle' || this.draining || this.queue.length > 0) {
+        return {
+          accepted: false,
+          action: 'accept',
+          planMode: true,
+          revision: plan.revision,
+          detail: 'The conversation must be live and idle before the plan can be accepted.',
+        };
+      }
+
+      const generation = this.planGeneration;
+      this.planMode = false;
+      this.rememberPlanMode(false);
+      this.turnInFlightId = `turn-${crypto.randomUUID()}`;
+      // A few runtimes echo their prompt. This sentinel makes that internal copy
+      // pass through the same duplicate-user-message filter as ordinary turns.
+      this.ownUserMessageId = `internal-${crypto.randomUUID()}`;
+      this.droppedUserEchoes.clear();
+      // Accept is an internal new turn. End resume replay before any event from
+      // its implementation can pass through the replayable-event gate.
+      this.replaying = false;
+      this.setState('thinking');
+      try {
+        const deadline = Date.now() + QUEUE_READY_TIMEOUT_MS;
+        while (!this.adapterReady && this.adapter?.alive && Date.now() < deadline) {
+          await new Promise<void>((resolve) => setTimeout(resolve, QUEUE_READY_POLL_MS));
+        }
+        if (!this.adapter?.alive || !this.adapterReady) {
+          throw new Error(`the ${this.runtime || 'agent'} process was not ready for another turn`);
+        }
+        const questionInstruction = this.questionToolEnabled
+          ? questionToolDirective()
+          : this.questionFallbackEnabled
+            ? questionFallbackDirective()
+            : null;
+        await this.adapter.send({
+          text: [questionInstruction, acceptedPlanDirective(plan)].filter(Boolean).join('\n\n'),
+        });
+      } catch (error: unknown) {
+        const sameConversation = generation === this.planGeneration;
+        if (sameConversation) {
+          this.planMode = true;
+          this.rememberPlanMode(true);
+          this.turnInFlightId = null;
+          this.ownUserMessageId = null;
+          this.setState('idle');
+        }
+        const detail = error instanceof Error ? error.message : String(error);
+        return {
+          accepted: false,
+          action: 'accept',
+          planMode: this.planMode,
+          revision: plan.revision,
+          detail: sameConversation
+            ? `The plan was not accepted because implementation could not start: ${detail}`
+            : 'The plan was not accepted because a new conversation started first.',
+        };
+      }
+      return {
+        accepted: true,
+        action: 'accept',
+        planMode: false,
+        revision: plan.revision,
+        detail: `Plan revision ${plan.revision} accepted. Implementation started.`,
+      };
+    });
+  }
+
+  /** Reject the latest revision without leaving Plan mode or deleting it. */
+  async rejectPlan(revision: number): Promise<PlanActionResult> {
+    return this.mutatePlan(async () => {
+      const plan = await this.planDocument();
+      if (!this.planMode) {
+        return { accepted: false, action: 'reject', planMode: false, detail: 'Plan mode is not active.' };
+      }
+      if (!plan) {
+        return { accepted: false, action: 'reject', planMode: true, detail: 'There is no plan to reject.' };
+      }
+      if (revision !== plan.revision) {
+        return {
+          accepted: false,
+          action: 'reject',
+          planMode: true,
+          revision: plan.revision,
+          detail: `Revision ${revision} is stale. Review revision ${plan.revision} instead.`,
+        };
+      }
+      if (this.live && this.state !== 'idle') {
+        return {
+          accepted: false,
+          action: 'reject',
+          planMode: true,
+          revision: plan.revision,
+          detail: 'Wait for the active planning turn to finish before rejecting its plan.',
+        };
+      }
+      return {
+        accepted: true,
+        action: 'reject',
+        planMode: true,
+        revision: plan.revision,
+        detail: `Plan revision ${plan.revision} rejected. Add feedback in the composer to request a revision.`,
+      };
+    });
   }
 
   /**
@@ -2299,7 +4547,7 @@ export class ChatSession {
   }
 
   snapshot(): Promise<ChatSnapshot> {
-    return this.deps.store.snapshot(this.ref).then((snapshot) => ({
+    return Promise.all([this.deps.store.snapshot(this.ref), this.planDocument()]).then(([snapshot, planDocument]) => ({
       ...snapshot,
       runtime: this.runtime || snapshot.runtime,
       // The replayed state is computed by the same reducer the browser runs,
@@ -2313,7 +4561,27 @@ export class ChatSession {
       state: this.live ? snapshot.state : 'exited',
       capabilities: this.capabilities || snapshot.capabilities,
       pendingPermissions: Array.from(this.pending.values()).map((entry) => entry.request),
-      pendingQuestions: Array.from(this.questions.values()).map((entry) => entry.request),
+      pendingQuestions: [
+        ...(snapshot.pendingQuestions || []),
+        ...Array.from(this.questions.values()).map((entry) => entry.request),
+      ].filter((request, index, all) => (
+        all.findIndex((candidate) => candidate.requestId === request.requestId) === index
+      )),
+      pendingQuestionContinuations: [
+        ...(snapshot.pendingQuestionContinuations || []),
+        ...Array.from(this.questionContinuations.values()),
+      ].filter((continuation, index, all) => (
+        all.findIndex((candidate) => (
+          candidate.continuationId === continuation.continuationId
+        )) === index
+      )),
+      questionHistory: [
+        ...(snapshot.questionHistory || []),
+        ...Array.from(this.questions.values())
+          .map((entry) => entry.request)
+          .filter((request) => !(snapshot.questionHistory || [])
+            .some((recorded) => recorded.requestId === request.requestId)),
+      ],
       // `answeredQuestions` is deliberately NOT overridden here. This map holds
       // only the questions still waiting; what was picked for the ones already
       // answered is in the log, and the store's replay of it is the authority
@@ -2324,10 +4592,16 @@ export class ChatSession {
       nativeSessionId: this.nativeSessionId || undefined,
       bypassPermissions: this.bypass,
       limits: this.limits || snapshot.limits,
+      planMode: this.planMode,
+      planDocument,
     }));
   }
 
-  async stop(): Promise<void> {
+  async stop({ preserveHandoffs = false }: { preserveHandoffs?: boolean } = {}): Promise<void> {
+    this.acceptingQuestionTransitions = false;
+    this.questionStopIntent = preserveHandoffs ? 'preserve' : 'abandon';
+    this.questionContinuationGeneration += 1;
+    this.adapter?.cancelPendingSendAcceptance?.('the session stopped before acceptance was confirmed');
     for (const [, approval] of this.pending) {
       approval.resolve?.({ allow: false, reason: 'the session was stopped' });
     }
@@ -2336,10 +4610,36 @@ export class ChatSession {
     // one waiting on these promises: resolving them here is what turns a
     // shutdown into a tool result rather than a connection that simply stops
     // answering.
-    for (const [, entry] of this.questions) {
-      entry.resolve({ labels: [], error: 'the session was stopped' });
+    // Written to the log as well as resolved, which it was not before: a browser
+    // already watching this conversation is told the card is over, instead of
+    // going on offering buttons until something makes it rejoin and rebuild.
+    await this.questionTransitionTail.catch(() => undefined);
+    await Promise.allSettled([...this.questionDispatches.values()]);
+    if (preserveHandoffs) {
+      // A withdrawal may have lost one transient store write while Stop was
+      // already waiting on its dispatch task. Retry it here and do not clear
+      // the in-memory fact if durability is still unavailable: returning a
+      // successful shutdown would make recovery discard a provably unsent
+      // accepted answer as ambiguous.
+      for (const continuationId of [...this.knownUnsentQuestionContinuations]) {
+        await this.markQuestionContinuationPending(continuationId);
+      }
     }
+    await this.mutateQuestions(async () => {
+      for (const [requestId, entry] of [...this.questions]) {
+        if (preserveHandoffs && entry.kind === 'structured_handoff') continue;
+        await this.abandonQuestionNow(requestId, entry, 'the session was stopped');
+      }
+      if (!preserveHandoffs) {
+        await this.abandonQuestionContinuationsNow('the session was stopped');
+      }
+    });
+    // Preserved handoffs remain in the event log, not in a process that is
+    // about to die. The replacement session rehydrates them after its adapter
+    // has successfully resumed.
     this.questions.clear();
+    this.questionContinuations.clear();
+    this.knownUnsentQuestionContinuations.clear();
     this.clearQueue();
 
     // Before the adapter goes: a turn that was still running when someone hit
@@ -2349,13 +4649,19 @@ export class ChatSession {
     this.accountant = null;
 
     const adapter = this.adapter;
-    this.adapter = null;
-    if (adapter) {
-      await adapter.stop().catch(() => undefined);
+    try {
+      if (adapter) {
+        // Resolving is a lifecycle guarantee: the local child and, for a
+        // container, its identity-bound remote process group are both gone.
+        await adapter.stop();
+        if (this.adapter === adapter) this.adapter = null;
+      }
+    } finally {
+      this.broker?.close();
+      this.broker = null;
+      await this.fileBroker?.close().catch(() => undefined);
+      this.fileBroker = null;
     }
-
-    this.broker?.close();
-    this.broker = null;
   }
 }
 

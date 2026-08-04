@@ -116,6 +116,94 @@ describe('SessionStore', function() {
       assert.strictEqual(loaded.get('chat').ownerSessionId, undefined);
     });
 
+    it('remembers whether a conversation is in the account tab strip', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['closed', createSessionRecord({
+          id: 'closed',
+          ownerUserId,
+          surface: 'chat',
+          tabOpen: false,
+        })],
+        ['legacy-open', createSessionRecord({
+          id: 'legacy-open',
+          ownerUserId,
+          surface: 'chat',
+        })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('closed').tabOpen, false);
+      assert.strictEqual(
+        loaded.get('legacy-open').tabOpen,
+        undefined,
+        'a pre-feature record remains visibly open but available for one-time migration',
+      );
+    });
+
+    it('remembers the account-owned tab order while leaving legacy rows unordered', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['first', createSessionRecord({ id: 'first', ownerUserId, tabOrder: 0 })],
+        ['second', createSessionRecord({ id: 'second', ownerUserId, tabOrder: 1 })],
+        ['legacy', createSessionRecord({ id: 'legacy', ownerUserId })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('first').tabOrder, 0);
+      assert.strictEqual(loaded.get('second').tabOrder, 1);
+      assert.strictEqual(
+        loaded.get('legacy').tabOrder,
+        undefined,
+        'an upgraded database preserves the pre-feature stable load order',
+      );
+    });
+
+    it('keeps project container paths distinct from host paths', async function() {
+      const insertProject = sessionStore.database.raw.prepare(`
+        INSERT INTO projects (
+          id, owner_user_id, name, state, last_activity_at, created_at, updated_at
+        ) VALUES (?, ?, ?, 'stopped', ?, ?, ?)
+      `);
+      const now = new Date().toISOString();
+      for (const id of ['project-1', 'project-2', 'project-3']) {
+        insertProject.run(id, ownerUserId, id, now, now, now);
+      }
+
+      await sessionStore.saveSessions(new Map([
+        ['container', createSessionRecord({
+          id: 'container',
+          ownerUserId,
+          projectId: 'project-1',
+          workingDir: '/opt/disposable-work',
+          projectWorkingDirKind: 'container',
+        })],
+        ['host', createSessionRecord({
+          id: 'host',
+          ownerUserId,
+          projectId: 'project-2',
+          workingDir: '/host/project-workspace',
+          projectWorkingDirKind: 'host',
+        })],
+        ['legacy', createSessionRecord({
+          id: 'legacy',
+          ownerUserId,
+          projectId: 'project-3',
+          workingDir: '/host/legacy-project-workspace',
+        })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+
+      const loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('container').projectWorkingDirKind, 'container');
+      assert.strictEqual(loaded.get('container').workingDir, '/opt/disposable-work');
+      assert.strictEqual(loaded.get('host').projectWorkingDirKind, 'host');
+      assert.strictEqual(loaded.get('legacy').projectWorkingDirKind, undefined);
+    });
+
     it('remembers the approval mode a conversation was running in', async function() {
       // The mode is part of how the user set the conversation up. Lost across a
       // restart, a chat started with approvals bypassed comes back asking for
@@ -137,6 +225,24 @@ describe('SessionStore', function() {
       // Absent, not false: this record has never been launched at all, so
       // nothing has been granted to it either way.
       assert.strictEqual(loaded.get('manual').chatBypassPermissions, undefined);
+    });
+
+    it('round-trips plan mode and reads a pre-migration row as off', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['planning', createSessionRecord({ id: 'planning', ownerUserId, surface: 'chat', chatPlanMode: true })],
+        ['ordinary', createSessionRecord({ id: 'ordinary', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      let loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('planning').chatPlanMode, true);
+      assert.strictEqual(loaded.get('ordinary').chatPlanMode, false);
+
+      sessionStore.database.raw.exec('ALTER TABLE runtime_sessions DROP COLUMN chat_plan_mode');
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      loaded = await sessionStore.loadSessions();
+      assert.strictEqual(loaded.get('planning').chatPlanMode, false, 'a pre-plan row must never be restored in plan mode');
     });
 
     it('keeps “granted approvals” apart from “nothing granted”', async function () {
@@ -259,6 +365,28 @@ describe('SessionStore', function() {
 
       assert.strictEqual(loaded.size, 1, 'the upgrade must not cost the user their sessions');
       assert.strictEqual(loaded.get('old').customName, undefined);
+    });
+
+    it('adds the tab-open column to a database that predates it', async function () {
+      await sessionStore.saveSessions(new Map([
+        ['old', createSessionRecord({ id: 'old', ownerUserId, surface: 'chat' })],
+      ]));
+      sessionStore.database.raw.exec('ALTER TABLE runtime_sessions DROP COLUMN tab_open');
+      sessionStore.database.close();
+
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      const loaded = await sessionStore.loadSessions();
+
+      assert.strictEqual(loaded.size, 1, 'the upgrade must not cost the user their sessions');
+      assert.strictEqual(
+        loaded.get('old').tabOpen,
+        undefined,
+        'every pre-feature tab remains visibly open and marked as not yet migrated',
+      );
+
+      sessionStore.database.close();
+      sessionStore = new SessionStore({ dataDir: tempDir });
+      assert.strictEqual((await sessionStore.loadSessions()).get('old').tabOpen, undefined);
     });
 
     it('adds the model-override column to a database that predates it', async function () {

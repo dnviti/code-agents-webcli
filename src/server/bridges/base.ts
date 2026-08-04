@@ -1,7 +1,29 @@
 import { spawn as spawnPty, IPty } from '../services/pty.js';
 import * as path from 'path';
 import * as fs from 'fs';
-import { execFileSync } from 'child_process';
+import {
+  execFileSync as defaultExecFileSync,
+  type ExecFileSyncOptionsWithStringEncoding,
+} from 'child_process';
+import {
+  UserEnvironment,
+  WrappedProcessControl,
+} from '../services/environments/types.js';
+import { HostEnvironment, wrapHostCommand } from '../services/environments/manager.js';
+
+type ExecFileText = (
+  file: string,
+  args: readonly string[],
+  options: ExecFileSyncOptionsWithStringEncoding,
+) => string;
+
+export interface BaseBridgeOptions {
+  /** Injectable for deterministic Windows resolution tests. */
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  existsSync?: (candidate: string) => boolean;
+  execFileSync?: ExecFileText;
+}
 
 export interface BridgeSession {
   process: IPty;
@@ -9,8 +31,20 @@ export interface BridgeSession {
   created: Date;
   active: boolean;
   killTimeout: ReturnType<typeof setTimeout> | null;
+  closeTimeout: ReturnType<typeof setTimeout> | null;
   stopRequested: boolean;
   finalized: boolean;
+  clientExited: boolean;
+  closed: Promise<void>;
+  resolveClosed: () => void;
+  stopPromise: Promise<void> | null;
+  processControl?: WrappedProcessControl;
+  terminalEvent:
+    | { kind: 'exit'; exitCode: number; signal: number }
+    | { kind: 'error'; error: Error }
+    | null;
+  onExit: (exitCode: number, signal: number) => void;
+  onError: (error: Error) => void;
 }
 
 export interface SessionInfo {
@@ -22,6 +56,13 @@ export interface SessionInfo {
 
 export interface StartSessionOptions {
   workingDir?: string;
+  /** Whether workingDir is already an absolute path inside the container. */
+  cwdKind?: 'host' | 'container';
+  /**
+   * Where this agent runs. Absent means the host, which is what every caller
+   * passed before per-user environments existed.
+   */
+  environment?: UserEnvironment;
   dangerouslySkipPermissions?: boolean;
   /**
    * Free-text model id from the active runtime profile. Passed via the
@@ -42,8 +83,16 @@ export interface StartSessionOptions {
 export abstract class BaseBridge {
   protected sessions: Map<string, BridgeSession> = new Map();
   protected resolvedCommand: string;
+  protected readonly platform: NodeJS.Platform;
+  protected readonly hostEnv: NodeJS.ProcessEnv;
+  private readonly pathExists: (candidate: string) => boolean;
+  private readonly execFile: ExecFileText;
 
-  constructor() {
+  constructor(options: BaseBridgeOptions = {}) {
+    this.platform = options.platform || process.platform;
+    this.hostEnv = options.env || process.env;
+    this.pathExists = options.existsSync || fs.existsSync;
+    this.execFile = options.execFileSync || defaultExecFileSync;
     this.resolvedCommand = this.findCommand(this.getCommandCandidates());
   }
 
@@ -52,6 +101,17 @@ export abstract class BaseBridge {
 
   /** Return the fallback command name when none of the candidates are found. */
   protected abstract getDefaultCommand(): string;
+
+  /**
+   * The CLI's plain name, for callers that must not use a host path.
+   *
+   * A container resolves the command through the image's PATH; the absolute
+   * path this bridge found on the server's own filesystem would simply not be
+   * there. Public because chat sessions need it and they do not extend this.
+   */
+  get defaultCommand(): string {
+    return this.getDefaultCommand();
+  }
 
   /** Return a human-readable name for log messages (e.g. "Claude", "Codex"). */
   protected abstract getDisplayName(): string;
@@ -110,9 +170,10 @@ export abstract class BaseBridge {
   protected findCommand(possibleCommands: string[]): string {
     for (const cmd of possibleCommands) {
       try {
-        if (fs.existsSync(cmd) || this.commandExists(cmd)) {
-          console.log(`Found ${this.getDisplayName()} command at: ${cmd}`);
-          return cmd;
+        const resolved = this.pathExists(cmd) ? cmd : this.locateCommand(cmd);
+        if (resolved) {
+          console.log(`Found ${this.getDisplayName()} command at: ${resolved}`);
+          return resolved;
         }
       } catch {
         continue;
@@ -127,12 +188,31 @@ export abstract class BaseBridge {
   }
 
   protected commandExists(command: string): boolean {
+    return this.locateCommand(command) !== null;
+  }
+
+  /** Resolve the real Windows shim path; a boolean is not enough to launch it. */
+  private locateCommand(command: string): string | null {
     try {
-      execFileSync('which', [command], { stdio: 'ignore' });
-      return true;
+      const output = this.execFile(
+        this.platform === 'win32' ? 'where.exe' : 'which',
+        [command],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+      );
+      if (this.platform !== 'win32') return command;
+      return String(output).split(/\r?\n/).map((line) => line.trim()).find(Boolean) || null;
     } catch {
-      return false;
+      return null;
     }
+  }
+
+  /** Run a synchronous probe through the same Windows shim rules as a session. */
+  protected resolvedCommandOutput(
+    args: string[],
+    options: ExecFileSyncOptionsWithStringEncoding,
+  ): string {
+    const launch = wrapHostCommand(this.resolvedCommand, args, this.platform, this.hostEnv);
+    return this.execFile(launch.command, launch.args, options);
   }
 
   async startSession(
@@ -177,10 +257,21 @@ export abstract class BaseBridge {
         console.log(`Args: ${args.join(' ')}`);
       }
 
-      const ptyProcess = spawnPty(this.resolvedCommand, args, {
+      // The environment decides *where* this runs; on the host it is the
+      // identity, so this is the same spawn it has always been.
+      const environment = options.environment || new HostEnvironment(workingDir);
+      // `resolvedCommand` is an absolute path found on *this* machine at
+      // construction time. Inside a container it is very likely a path that
+      // does not exist, so the plain name is used and the image's own PATH
+      // resolves it — which is also what makes the base image the place where
+      // an administrator decides which agents exist.
+      const command = environment.kind === 'container'
+        ? this.getDefaultCommand()
+        : this.resolvedCommand;
+      const launch = environment.wrap(command, args, {
         cwd: workingDir,
+        cwdKind: options.cwdKind,
         env: {
-          ...process.env,
           // Profile variables sit between the inherited environment and the
           // terminal settings: they may override an inherited value (that is
           // the point) but never TERM/COLORTERM, which describe this PTY rather
@@ -190,19 +281,44 @@ export abstract class BaseBridge {
           FORCE_COLOR: '1',
           COLORTERM: 'truecolor',
         },
+        tty: true,
+        trackProcess: true,
+      });
+      if (environment.kind === 'container' && !launch.processControl) {
+        throw new Error('Container environment did not provide verified process control');
+      }
+
+      const ptyProcess = spawnPty(launch.command, launch.args, {
+        // In a container the engine sets the working directory itself, and the
+        // host path means nothing to the engine client.
+        cwd: environment.kind === 'container' ? undefined : workingDir,
+        env: launch.env,
         cols,
         rows,
         name: 'xterm-color',
       });
 
+      let resolveClosed!: () => void;
+      const closed = new Promise<void>((resolve) => {
+        resolveClosed = resolve;
+      });
       const session: BridgeSession = {
         process: ptyProcess,
         workingDir,
         created: new Date(),
         active: true,
         killTimeout: null,
+        closeTimeout: null,
         stopRequested: false,
         finalized: false,
+        clientExited: false,
+        closed,
+        resolveClosed,
+        stopPromise: null,
+        processControl: launch.processControl,
+        terminalEvent: null,
+        onExit,
+        onError,
       };
 
       this.sessions.set(sessionId, session);
@@ -228,14 +344,21 @@ export abstract class BaseBridge {
       });
 
       ptyProcess.onExit(({ exitCode, signal }) => {
-        if (!this.finalizeSession(sessionId, session)) {
-          return;
+        if (!session.clientExited) {
+          session.clientExited = true;
+          session.terminalEvent ||= {
+            kind: 'exit',
+            exitCode: exitCode ?? 0,
+            signal: signal ?? 0,
+          };
+          session.resolveClosed();
         }
-
-        console.log(
-          `${displayName} session ${sessionId} exited with code ${exitCode}, signal ${signal}`,
-        );
-        onExit(exitCode ?? 0, signal ?? 0);
+        void this.stopAndFinalizeSession(sessionId, session).catch((error) => {
+          console.error(
+            `${displayName} session ${sessionId} could not verify shutdown:`,
+            error,
+          );
+        });
       });
 
       (ptyProcess as any).on('error', (error: Error) => {
@@ -243,15 +366,17 @@ export abstract class BaseBridge {
           return;
         }
 
-        if (!this.finalizeSession(sessionId, session)) {
-          return;
-        }
-
         console.error(
           `${displayName} session ${sessionId} error:`,
           error,
         );
-        onError(error);
+        session.terminalEvent ||= { kind: 'error', error };
+        void this.stopAndFinalizeSession(sessionId, session).catch((stopError) => {
+          console.error(
+            `${displayName} session ${sessionId} could not verify shutdown:`,
+            stopError,
+          );
+        });
       });
 
       console.log(
@@ -312,45 +437,7 @@ export abstract class BaseBridge {
     if (!session) {
       return;
     }
-
-    try {
-      if (session.killTimeout) {
-        clearTimeout(session.killTimeout);
-        session.killTimeout = null;
-      }
-
-      if (session.active && session.process) {
-        session.stopRequested = true;
-        session.active = false;
-        session.process.kill('SIGTERM');
-
-        session.killTimeout = setTimeout(() => {
-          if (!session.finalized && session.process) {
-            try {
-              session.process.kill('SIGKILL');
-            } catch {
-              // Process is already gone.
-            }
-          }
-        }, 5000);
-        session.killTimeout.unref?.();
-      }
-    } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : String(error);
-      console.warn(`Error stopping session ${sessionId}:`, message);
-    }
-
-    session.stopRequested = true;
-    session.active = false;
-
-    // Free the id now rather than when the PTY finally dies, so restarting the
-    // same session immediately after a stop does not hit "already exists".
-    // The captured `session` object keeps the kill timer and exit handlers
-    // working, and finalizeSession only deletes an entry it still owns.
-    if (this.sessions.get(sessionId) === session) {
-      this.sessions.delete(sessionId);
-    }
+    await this.stopAndFinalizeSession(sessionId, session);
   }
 
   /**
@@ -400,6 +487,10 @@ export abstract class BaseBridge {
       clearTimeout(session.killTimeout);
       session.killTimeout = null;
     }
+    if (session.closeTimeout) {
+      clearTimeout(session.closeTimeout);
+      session.closeTimeout = null;
+    }
 
     session.active = false;
     // Only drop the map entry if it still belongs to this run: a restart under
@@ -408,6 +499,117 @@ export abstract class BaseBridge {
       this.sessions.delete(sessionId);
     }
     return true;
+  }
+
+  /**
+   * Stop both halves of a container-backed run: the local engine client and
+   * the identity-bound process group inside the container. The shared promise
+   * makes explicit stops, PTY exits and PTY errors one teardown rather than
+   * three racing lifecycle notifications.
+   */
+  private async stopAndFinalizeSession(
+    sessionId: string,
+    session: BridgeSession,
+  ): Promise<void> {
+    if (session.finalized) return;
+    if (session.stopPromise) return session.stopPromise;
+
+    const attempt = (async () => {
+      session.stopRequested = true;
+      session.active = false;
+
+      const localStop = this.stopLocalClient(sessionId, session);
+      const remoteStop = session.processControl?.stop() ?? Promise.resolve();
+      const [localResult, remoteResult] = await Promise.allSettled([
+        localStop,
+        remoteStop,
+      ]);
+
+      if (remoteResult.status === 'rejected') throw remoteResult.reason;
+      if (localResult.status === 'rejected') throw localResult.reason;
+      if (!this.finalizeSession(sessionId, session)) return;
+
+      const event = session.terminalEvent;
+      if (event?.kind === 'error') {
+        try {
+          session.onError(event.error);
+        } catch (error) {
+          console.error(`Session ${sessionId} error callback failed:`, error);
+        }
+        return;
+      }
+
+      const exitCode = event?.kind === 'exit' ? event.exitCode : 0;
+      const signal = event?.kind === 'exit' ? event.signal : 0;
+      console.log(
+        `${this.getDisplayName()} session ${sessionId} exited with code ${exitCode}, signal ${signal}`,
+      );
+      try {
+        session.onExit(exitCode, signal);
+      } catch (error) {
+        console.error(`Session ${sessionId} exit callback failed:`, error);
+      }
+    })();
+
+    session.stopPromise = attempt;
+    try {
+      await attempt;
+    } catch (error) {
+      // Fail closed, but allow an explicit later stop to retry a transient
+      // engine failure while the bridge still owns this session id.
+      if (session.stopPromise === attempt) session.stopPromise = null;
+      throw error;
+    }
+  }
+
+  private async stopLocalClient(
+    sessionId: string,
+    session: BridgeSession,
+  ): Promise<void> {
+    if (session.clientExited) return;
+
+    try {
+      session.process.kill('SIGTERM');
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`Error sending SIGTERM to session ${sessionId}:`, message);
+    }
+
+    if (!session.killTimeout) {
+      session.killTimeout = setTimeout(() => {
+        if (!session.clientExited) {
+          try {
+            session.process.kill('SIGKILL');
+          } catch {
+            // A concurrent exit won the race; its callback resolves `closed`.
+          }
+        }
+      }, 5000);
+      session.killTimeout.unref?.();
+    }
+
+    const failed = new Promise<never>((_resolve, reject) => {
+      if (session.closeTimeout) clearTimeout(session.closeTimeout);
+      session.closeTimeout = setTimeout(() => {
+        reject(new Error(
+          `Could not verify that the ${this.getDisplayName()} client for session ${sessionId} closed`,
+        ));
+      }, 10_000);
+      session.closeTimeout.unref?.();
+    });
+
+    try {
+      await Promise.race([session.closed, failed]);
+    } finally {
+      if (session.killTimeout) {
+        clearTimeout(session.killTimeout);
+        session.killTimeout = null;
+      }
+      if (session.closeTimeout) {
+        clearTimeout(session.closeTimeout);
+        session.closeTimeout = null;
+      }
+    }
   }
 
   private shouldIgnorePtyError(

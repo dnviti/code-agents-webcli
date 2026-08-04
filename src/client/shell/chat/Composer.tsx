@@ -3,6 +3,7 @@ import {
   ChatAttachment,
   ChatCapabilities,
   ChatModelDefault,
+  ChatModelOrigin,
   ChatUsage,
   EffortChoice,
   ModelChoice,
@@ -156,6 +157,18 @@ export interface ComposerProps {
    */
   modelPinned?: string | null;
   /**
+   * Where the model in force came from — the ladder and its rung, the profile,
+   * the account's standing choice, or the runtime's own default.
+   *
+   * The fourth, and the only one that answers *why*. The three above each name
+   * a model; this names the thing that chose it, which is what a person with a
+   * ladder configured needs in order to tell a ladder that is working from one
+   * something else has quietly overridden (#171).
+   */
+  modelOrigin?: ChatModelOrigin | null;
+  /** Why this conversation's ladder was not applied, when it was not. */
+  ladderError?: string | null;
+  /**
    * The reasoning-effort level this conversation is running at.
    *
    * Distinct from `capabilities.efforts`, which is the ladder — and distinct in
@@ -174,6 +187,14 @@ export interface ComposerProps {
     applied: 'live' | 'sent' | 'pending' | 'cleared' | 'refused';
     message: string;
   } | null;
+  /** Conversation plan mode is available for every Web-chat runtime. */
+  planMode?: boolean;
+  onSetPlanMode?: (on: boolean) => void;
+  /** A planning turn already received its directive, so changing it would lie. */
+  planLocked?: boolean;
+  planFeedback?: { action: string; changed?: boolean; message: string } | null;
+  planDocument?: { markdown: string; revision: number; ts: number } | null;
+  onOpenPlan?: () => void;
   /** Drives what the permission chip reports. */
   bypassPermissions?: boolean;
   /**
@@ -311,9 +332,17 @@ export function Composer({
   modelDefault,
   modelOverride,
   modelPinned,
+  modelOrigin,
+  ladderError,
   effort,
   onSetEffort,
   effortFeedback,
+  planMode = false,
+  onSetPlanMode,
+  planLocked = false,
+  planFeedback,
+  planDocument,
+  onOpenPlan,
   bypassPermissions = false,
   terminalOpen = false,
   onNewChat,
@@ -1190,6 +1219,8 @@ export function Composer({
                 fallback={modelDefault}
                 override={modelOverride}
                 pinned={modelPinned}
+                origin={modelOrigin}
+                ladderError={ladderError}
                 onPick={(value) => onSetModel?.(value)}
               />
 
@@ -1204,6 +1235,21 @@ export function Composer({
                 feedback={effortFeedback}
                 onPick={(value) => onSetEffort?.(value)}
               />
+
+              {onSetPlanMode ? (
+                <PlanModeChip
+                  on={planMode}
+                  locked={planLocked}
+                  feedback={planFeedback}
+                  onToggle={onSetPlanMode}
+                />
+              ) : null}
+
+              {planDocument && onOpenPlan ? (
+                <ChipButton label="Read the submitted plan" text="Plan" onClick={onOpenPlan}>
+                  <Icon name="list-todo" size={13} />
+                </ChipButton>
+              ) : null}
 
               <PermissionChip bypassPermissions={bypassPermissions} />
             </>
@@ -1545,7 +1591,54 @@ function describeModelDefault(fallback: ChatModelDefault): string {
       ? `From the "${fallback.profileName}" runtime profile: ${fallback.model}.`
       : `From the active runtime profile: ${fallback.model}.`;
   }
+  if (fallback.source === 'ladder' && fallback.model) {
+    const ladder = fallback.profileName ? `the "${fallback.profileName}" ladder` : 'the active ladder';
+    return `The ${fallback.tier} rung of ${ladder}: ${fallback.model}.`;
+  }
   return 'No default set — this runtime picks for itself.';
+}
+
+/**
+ * What *this* conversation is running, and why it is on it.
+ *
+ * The question the chip could not answer before the ladder existed, and the one
+ * the issue asks for by name: the model in use, the rung it corresponds to, and
+ * which of four things chose it. Separate from the default above because the
+ * two are routinely different and stating either as the other is the whole of
+ * #135.
+ */
+function describeModelOriginLine(origin: ChatModelOrigin, chosen: boolean): string | null {
+  if (!origin.model) {
+    return origin.source === 'runtime' ? 'Running on this runtime’s own default.' : null;
+  }
+  switch (origin.source) {
+    case 'ladder': {
+      const ladder = origin.profileName ? `the "${origin.profileName}" ladder` : 'the active ladder';
+      const fell = origin.requestedTier
+        ? ` (${origin.requestedTier} is blank, so the nearest filled rung answered)`
+        : '';
+      return `Running on the ${origin.tier} rung of ${ladder}${fell}.`;
+    }
+    case 'profile':
+      return origin.profileName
+        ? `Running on the model set by the "${origin.profileName}" runtime profile.`
+        : 'Running on the model set by the active runtime profile.';
+    case 'personal':
+      return 'Running on your standing choice for this runtime.';
+    case 'override':
+      // Two different facts arrive under this one source, and only one of them
+      // is a choice. A conversation that has an override in force was told to
+      // run this model and can be told to stop; a conversation that merely
+      // *launched* on one is fixed to it because that is what it started with —
+      // a profile's model, an account's standing choice, or a branch's source —
+      // and calling that "chosen" credits the user with a decision they never
+      // made, next to a Clear that would not undo it.
+      return chosen
+        ? 'Chosen for this conversation only.'
+        : `Staying on ${origin.model}, the model it launched on.`;
+    default:
+      return 'Running on this runtime’s own default.';
+  }
 }
 
 /**
@@ -1578,6 +1671,8 @@ function ModelChip({
   fallback,
   override,
   pinned,
+  origin,
+  ladderError,
 }: {
   /** What the session reported it is running, when it reported anything. */
   current: string | undefined;
@@ -1599,6 +1694,10 @@ function ModelChip({
    * running, that is what the next new chat would open on.
    */
   pinned?: string | null;
+  /** Where the model in force came from, and which rung it is; null when unsaid. */
+  origin?: ChatModelOrigin | null;
+  /** Why the ladder was not applied, when it was not. */
+  ladderError?: string | null;
 }): React.JSX.Element {
   const [open, setOpen] = React.useState(false);
   const [customValue, setCustomValue] = React.useState('');
@@ -1679,7 +1778,14 @@ function ModelChip({
   // The others are counted, not named: three model ids do not fit on a chip,
   // and picking one of them to show would undo the point of reporting a split.
   const others = (alsoRan ?? []).filter((model) => model !== current);
-  const label = others.length > 0 ? `${named} +${others.length}` : named;
+  // The rung rides on the chip rather than only in the menu, because "which
+  // model is this on" and "how expensive is that" are one glance for anybody
+  // who built a ladder — and the menu is two clicks away.
+  const rung = origin?.source === 'ladder' && origin.tier && origin.model === effective
+    ? origin.tier
+    : null;
+  const withRung = rung ? `${named} · ${rung}` : named;
+  const label = others.length > 0 ? `${withRung} +${others.length}` : withRung;
 
   /**
    * Why this model and not another — the question the picker could not answer.
@@ -1696,12 +1802,16 @@ function ModelChip({
    */
   const clearPhrase = fallback ? describeModelClear(fallback) : null;
   const staysOn = pinned && pinned !== fallback?.model ? `Staying on ${pinned}.` : null;
+  // The origin answers "why is this conversation on this model" outright, so it
+  // replaces the inference `staysOn` was making from a mismatch. A server that
+  // predates it sends nothing and the older wording still applies.
+  const inForce = origin ? describeModelOriginLine(origin, Boolean(override)) : staysOn;
   const sourceLine = !fallback
-    ? null
+    ? inForce
     : override
       ? `Chosen for this conversation only. ${clearPhrase}`
-      : staysOn
-        ? `${staysOn} ${describeModelDefault(fallback)}`
+      : inForce
+        ? `${inForce} ${describeModelDefault(fallback)}`
         : describeModelDefault(fallback);
 
   React.useEffect(() => {
@@ -1848,6 +1958,23 @@ function ModelChip({
               }}
             >
               {sourceLine}
+            </div>
+          ) : null}
+
+          {/* A ladder that could not be applied. Said here rather than swallowed:
+              the settings page reported it as saved, and without this the only
+              evidence is a model nobody chose. */}
+          {ladderError ? (
+            <div
+              data-ladder-error=""
+              style={{
+                padding: '2px 4px 6px',
+                color: 'var(--destructive)',
+                fontSize: isPhone ? PHONE_TEXT.body : 'var(--text-xs)',
+                lineHeight: 1.4,
+              }}
+            >
+              {ladderError}
             </div>
           ) : null}
 
@@ -2412,6 +2539,48 @@ function EffortMeter({ filled, tone }: { filled: number; tone: string }): React.
  * made. A picker here that silently did nothing would be the worst of the three
  * options available.
  */
+function PlanModeChip({
+  on,
+  locked,
+  feedback,
+  onToggle,
+}: {
+  on: boolean;
+  locked: boolean;
+  feedback?: { action: string; changed?: boolean; message: string } | null;
+  onToggle: (on: boolean) => void;
+}): React.JSX.Element {
+  const isPhone = usePhone();
+  const label = on
+    ? 'Plan mode is on — the agent must submit a plan before implementation'
+    : 'Plan mode — ask the agent to prepare a plan first';
+  const refusal = feedback?.action === 'mode' && feedback.changed === false ? feedback.message : '';
+  const reason = locked
+    ? 'The agent is preparing a plan right now. This control is available when that turn ends.'
+    : refusal;
+  return (
+    <button
+      type="button"
+      onClick={() => onToggle(!on)}
+      disabled={locked}
+      aria-pressed={on}
+      aria-label={label}
+      title={reason ? `${label}. ${reason}` : label}
+      style={{
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: '0 0 auto', gap: 5,
+        height: isPhone ? TOUCH_TARGET : 26, padding: isPhone ? '0 10px' : '0 8px', whiteSpace: 'nowrap',
+        background: on ? 'var(--accent)' : 'transparent', border: `1px solid ${on ? 'var(--ring)' : 'var(--border)'}`,
+        borderRadius: 'var(--radius)', fontFamily: 'var(--font-sans)', fontSize: isPhone ? PHONE_TEXT.label : 'var(--text-2xs)',
+        color: on ? 'var(--foreground)' : 'var(--muted-foreground)', opacity: locked ? 0.5 : 1,
+        cursor: locked ? 'not-allowed' : 'pointer',
+      }}
+    >
+      <Icon name="list-todo" size={isPhone ? 14 : 12} />
+      <span>{on ? 'Plan on' : 'Plan'}</span>
+    </button>
+  );
+}
+
 function PermissionChip({ bypassPermissions }: { bypassPermissions: boolean }): React.JSX.Element {
   return (
     <Chip
