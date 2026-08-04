@@ -75,6 +75,11 @@ describe('PWA install contract', function () {
     assert.ok(MANIFEST.short_name, 'short_name');
     assert.ok(MANIFEST.start_url, 'start_url');
     assert.strictEqual(MANIFEST.display, 'standalone');
+    assert.deepStrictEqual(
+      MANIFEST.display_override,
+      ['window-controls-overlay', 'standalone', 'minimal-ui', 'browser'],
+      'WCO must be preferred while preserving progressively broader fallbacks',
+    );
     assert.ok(/^#[0-9a-f]{6}$/i.test(MANIFEST.background_color), 'background_color');
     assert.ok(/^#[0-9a-f]{6}$/i.test(MANIFEST.theme_color), 'theme_color');
   });

@@ -45,7 +45,7 @@ describe('projects client integration', function () {
         target: ['node20'],
         logLevel: 'silent',
       });
-      const { mergeProjectBuildEvents } = require(built);
+      const { mergeProjectBuildEvents, normalizeProjectAvailability } = require(built);
       const preserved = {
         t: 'preserve',
         branch: 'cc-web/wip/project-1-20260801-2',
@@ -67,6 +67,10 @@ describe('projects client integration', function () {
       assert.deepStrictEqual(twice['project-1'], [live, preserved]);
       assert.strictEqual(twice['project-1'][1].branch, 'cc-web/wip/project-1-20260801-2');
       assert.strictEqual(twice['project-1'][1].commit, '0123456789abcdef');
+      assert.deepStrictEqual(
+        normalizeProjectAvailability({ available: true, defaultExecutionKind: 'container' }),
+        { available: true, defaultExecutionKind: 'container' },
+      );
 
       const dialog = read('src/client/shell/dialogs/ProjectsDialog.tsx');
       const types = read('src/client/shell/projects-types.ts');
@@ -96,10 +100,31 @@ describe('projects client integration', function () {
     assert.match(projects, /Change repository/);
     assert.match(projects, /Projects need a deploy target/);
     assert.match(projects, /!availability\.available/);
+    assert.match(projects, /<strong>Local Projects<\/strong>/);
+    assert.match(projects, /local: attempt\.local/);
+    assert.match(projects, /project\.executionKind === 'host'/);
     assert.match(targets, /\/api\/admin\/deploy-settings/);
     assert.match(targets, /Running projects per user/);
     assert.match(targets, /Save project settings/);
     assert.match(targets, /idleReclaimMinutes <= settings\.idleStopMinutes/);
-    assert.match(targets, /Project work never falls back to this machine/);
+    assert.match(targets, /keep None to run them on this machine/);
+    assert.match(projects, /stopActive: project\.hasActiveWork/);
+    assert.doesNotMatch(projects, /project\.state !== 'running' \|\| project\.hasActiveWork/);
+    assert.doesNotMatch(projects, /mutation\.busy \|\| project\.hasActiveWork \|\| project\.state === 'inspecting'/);
+  });
+
+  it('offers projects or the normal directory picker when a new tab opens', function () {
+    const chooser = read('src/client/shell/dialogs/WorkspaceChooserDialog.tsx');
+    const tabs = read('src/client/sessions/tab-manager.ts');
+    const app = read('src/client/app.ts');
+
+    assert.match(tabs, /workspaceChooser: true/);
+    assert.match(chooser, /fetch\('\/api\/projects'/);
+    assert.match(chooser, /listed\.length === 0[\s\S]*onDirectory\(\)/);
+    assert.match(chooser, /Choose directory…/);
+    assert.match(chooser, /onProject\(project\.id\)/);
+    assert.match(chooser, /Show local projects/);
+    assert.match(chooser, /project\.executionKind === 'host'/);
+    assert.match(app, /this\.sessionTabManager\.createNewSession\(\)/);
   });
 });

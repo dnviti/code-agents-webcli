@@ -918,7 +918,7 @@ export function createSessionRoutes(deps: SessionRoutesDeps): Router {
           : (deps.getUserBaseFolder?.(user.id) ?? deps.baseFolder);
       }
 
-      if (preparedProject && validWorkingDirKind === 'container') {
+      if (preparedProject?.containerAccess && validWorkingDirKind === 'container') {
         projectWorkingDirLifetime = classifyProjectContainerPath(
           preparedProject.containerAccess,
           validWorkingDir,
@@ -1479,6 +1479,50 @@ async function collectRetiringSessionTree(
       changed = true;
     }
     if (!changed) return ids;
+  }
+}
+
+/**
+ * Stop every live runtime attached to a project while retaining its session
+ * records and transcripts. Admission is closed before any await, then socket
+ * claims are detached only after every runtime has been verified as stopped.
+ */
+export async function suspendProjectSessions(
+  deps: SessionRoutesDeps,
+  projectId: string,
+): Promise<string[]> {
+  const roots = Array.from(deps.claudeSessions.values())
+    .filter((session) => session.projectId === projectId);
+  for (const session of roots) session.retiring = true;
+  const ids = await collectRetiringSessionTree(deps, roots);
+  const sessions = Array.from(deps.claudeSessions.values())
+    .filter((session) => ids.has(session.id));
+
+  try {
+    for (const session of sessions) {
+      if (deps.stopSessionRuntime) {
+        await deps.stopSessionRuntime(session);
+      } else if (session.active && session.agent) {
+        if (session.surface === 'chat') {
+          throw new Error('Cannot stop an active chat session without a chat stop hook');
+        }
+        const bridge = deps.getRuntimeBridge(session.agent);
+        if (!bridge) throw new Error(`Cannot stop runtime ${session.agent}`);
+        await bridge.stopSession(session.id);
+        session.active = false;
+        session.agent = null;
+      }
+    }
+
+    for (const session of sessions) {
+      deps.releaseProjectSessionResources?.(session.id);
+      session.connections.clear();
+    }
+    const saved = (await deps.saveSessionsToDisk()) !== false;
+    if (!saved) throw new Error('The stopped project sessions could not be saved');
+    return sessions.map((session) => session.id);
+  } finally {
+    for (const session of sessions) session.retiring = false;
   }
 }
 

@@ -104,6 +104,19 @@ export interface Mount {
   readOnly?: boolean;
 }
 
+/**
+ * A container-local, memory-backed directory.
+ *
+ * Unlike `Mount`, this has no host path and therefore cannot accidentally
+ * persist credentials.  Modes which grant group/other access are rejected by
+ * the engines: these mounts are for short-lived, owner-only material.
+ */
+export interface MemoryMount {
+  containerPath: string;
+  /** POSIX permission bits. Defaults to 0700. */
+  mode?: number;
+}
+
 export interface EnvironmentOwner {
   id: number;
   githubLogin: string;

@@ -82,7 +82,19 @@ self.addEventListener('fetch', (event) => {
             return shell;
           }
           return new Response(
-            '<h1>Offline</h1><p>This app is not available offline yet.</p>',
+            `<!doctype html><html lang="en"><head><meta charset="utf-8">
+              <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+              <meta name="theme-color" content="#0a0a0a"><title>Offline · Code Agents</title>
+              <style>
+                :root{color-scheme:dark;--x:env(titlebar-area-x,0px);--y:env(titlebar-area-y,0px);--w:env(titlebar-area-width,100%);--h:env(titlebar-area-height,38px)}
+                *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:64px 24px 24px;background:#0a0a0a;color:#fafafa;font:14px system-ui,sans-serif}
+                .title{display:none;position:fixed;inset:0 0 auto;height:calc(var(--y) + var(--h));border-bottom:1px solid #262626;background:#0a0a0a}
+                .brand{position:absolute;left:var(--x);top:var(--y);width:var(--w);height:var(--h);display:flex;align-items:center;padding:0 12px;font:12px ui-monospace,monospace;letter-spacing:.08em;text-transform:uppercase;color:#a3a3a3;-webkit-app-region:drag;app-region:drag}
+                main{width:min(420px,100%);padding:24px;border:1px solid #262626;background:#111}h1{margin:0 0 10px;font-size:22px}p{margin:0;color:#a3a3a3;line-height:1.5}
+                @media(display-mode:window-controls-overlay){.title{display:block}}
+              </style></head><body><div class="title" aria-hidden="true"><div class="brand">Code Agents</div></div>
+              <main><h1>Offline</h1><p>Code Agents cannot reach the server. Check the connection, then reload this window.</p></main>
+              <script>(function(){var o=navigator.windowControlsOverlay;if(!o)return;function s(e){var v=o.visible===true,t=document.querySelector('.title');t.style.display=v?'block':'none';if(!v)return;var r=(e&&e.titlebarAreaRect)||o.getTitlebarAreaRect(),d=document.documentElement.style;d.setProperty('--x',r.x+'px');d.setProperty('--y',r.y+'px');d.setProperty('--w',r.width+'px');d.setProperty('--h',r.height+'px')}try{o.addEventListener('geometrychange',s);s()}catch(e){}})()<\/script></body></html>`,
             { status: 503, headers: { 'Content-Type': 'text/html' } },
           );
         }

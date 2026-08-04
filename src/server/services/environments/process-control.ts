@@ -47,7 +47,7 @@ if [ "$process_state" != "Z" ] \
   && [ "$process_group" = "$self" ] \
   && [ "$process_session" = "$self" ]; then
   exec sh -c "$anchor_wrapper" sh \
-    "$control_file" "$done_file" "$token" "$@"
+    "$tty" "$control_file" "$done_file" "$token" "$@"
 fi
 
 command -v setsid >/dev/null 2>&1 || {
@@ -58,7 +58,7 @@ command -v setsid >/dev/null 2>&1 || {
 # Keep this exec client attached if setsid has to fork. The inner session
 # leader, not this compatibility waiter, is the immutable signalling authority.
 setsid sh -c "$anchor_wrapper" sh \
-  "$control_file" "$done_file" "$token" "$@" <&0 >&1 2>&2 &
+  "$tty" "$control_file" "$done_file" "$token" "$@" <&0 >&1 2>&2 &
 launcher=$!
 status=0
 wait "$launcher" || status=$?
@@ -75,10 +75,11 @@ exit "$status"
  * merely by opening another session.
  */
 export const TRACKED_PROCESS_GROUP_WRAPPER = String.raw`
-control_file=$1
-done_file=$2
-token=$3
-shift 3
+tty=$1
+control_file=$2
+done_file=$3
+token=$4
+shift 4
 
 proc_fields() {
   stat_line=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
@@ -142,23 +143,32 @@ printf '%s %s %s %s %s\n' \
   > "$tmp_file" || exit 72
 mv "$tmp_file" "$control_file" || exit 72
 
-"$@" <&0 >&1 2>&2 &
-runtime=$!
-runtime_start=''
-remaining=3
-while [ -z "$runtime_start" ] && [ "$remaining" -gt 0 ]; do
-  if proc_fields "$runtime"; then runtime_start=$process_start; break; fi
-  sleep 1
-  remaining=$((remaining - 1))
-done
-
 status=0
-if [ -n "$runtime_start" ]; then
-  while same_process "$runtime" "$runtime_start"; do
-    wait "$runtime" || status=$?
-  done
+if [ "$tty" = "1" ]; then
+  # An interactive program must remain the foreground reader of the exec PTY.
+  # Podman closes stdin for a child launched as an asynchronous shell list,
+  # which made Bash print "exit" before the browser could send its first byte.
+  # The immutable anchor still supervises the foreground child while blocked
+  # here, and the independent stop controller identifies members by SID/token.
+  "$@" <&0 >&1 2>&2 || status=$?
 else
-  wait "$runtime" || status=$?
+  "$@" <&0 >&1 2>&2 &
+  runtime=$!
+  runtime_start=''
+  remaining=3
+  while [ -z "$runtime_start" ] && [ "$remaining" -gt 0 ]; do
+    if proc_fields "$runtime"; then runtime_start=$process_start; break; fi
+    sleep 1
+    remaining=$((remaining - 1))
+  done
+
+  if [ -n "$runtime_start" ]; then
+    while same_process "$runtime" "$runtime_start"; do
+      wait "$runtime" || status=$?
+    done
+  else
+    wait "$runtime" || status=$?
+  fi
 fi
 
 # A CLI can leave shell jobs or a detached helper behind. Keep the exec and its

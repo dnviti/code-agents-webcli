@@ -731,6 +731,23 @@ const SKILLS_LIST_TIMEOUT_MS = 5_000;
  */
 const RATE_LIMITS_TIMEOUT_MS = 5_000;
 
+/**
+ * The baseline accepted by Codex's reasoning-capable models and by both the
+ * launch config and `turn/start` protocol fields.
+ *
+ * `model/list` remains authoritative and replaces this with the selected
+ * model's exact ladder (including xhigh/max/ultra where offered). Keeping the
+ * baseline in the launch capabilities matters when discovery is slow or an
+ * installed container build omits the optional ladder metadata: the composer
+ * must not remove the effort control even though the running protocol can
+ * still apply these levels.
+ */
+const CODEX_BASE_EFFORTS: EffortChoice[] = rankedEfforts([
+  { value: 'low', description: 'Faster responses with less reasoning' },
+  { value: 'medium', description: 'Balanced speed and reasoning depth' },
+  { value: 'high', description: 'More reasoning for harder tasks' },
+]);
+
 // ------------------------------------------------------------- app-server
 
 export class CodexAppServerAdapter extends JsonRpcChatAdapter {
@@ -754,6 +771,7 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     cost: false,
     plan: true,
     commands: initialCodexCommands(this.options),
+    efforts: CODEX_BASE_EFFORTS.map((level) => ({ ...level })),
   };
 
   private threadId: string | null = null;

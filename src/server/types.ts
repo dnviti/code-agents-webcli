@@ -406,6 +406,8 @@ export interface ServerState {
   allowAnyGitHubUser: boolean;
   dataDir: string | null;
   encryptionKey: string | null;
+  /** Sole feature gate for containerized environments and deploy targets. */
+  containerizedEnvironmentsEnabled: boolean;
   sessionDurationHours: number;
   aliases: Aliases;
   startTime: number;

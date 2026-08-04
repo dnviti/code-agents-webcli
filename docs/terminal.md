@@ -134,6 +134,19 @@ independent session with its own connection — not a view onto a shared one.
 The UI is a PWA. Where the browser supports it, an **Install** action appears in
 the More sheet, in Settings, and in the command palette.
 
+On supported desktop browsers, an installed window uses the native title-bar
+space for the existing session strip. The operating system still owns the real
+window controls; drag the small **Code Agents** block to move the window. Tabs,
+New session, the command palette, theme, usage, settings and sign-out remain
+ordinary controls. At narrow widths the fixed actions move into the **More
+title bar actions** menu before tabs give up their scrolling space.
+
+The integration follows the browser's live title-bar setting. Turning Window
+Controls Overlay off immediately restores the ordinary standalone layout, and
+turning it back on restores the integrated strip without reloading or losing
+session state. Browsers and installed apps without this API silently keep the
+ordinary layout.
+
 On iOS there is no install API — use Safari's share sheet → **Add to Home
 Screen**.
 

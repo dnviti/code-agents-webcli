@@ -69,6 +69,7 @@ import { pickImage, type ImagePasteTarget } from './terminal/paste';
 import { SplitContainer } from './splits/split-container';
 import { shellStore } from './shell/store';
 import { setupInstallPrompt } from './shell/install-prompt';
+import { setupWindowControlsOverlay } from './shell/window-controls-overlay';
 import { mountShell } from './shell/mount';
 import type { HistoryView, HistoryRange } from './terminal/history-view';
 
@@ -244,6 +245,7 @@ export class App {
     // replayed, so a listener attached after a network round trip is a listener
     // that can miss it outright.
     setupInstallPrompt();
+    setupWindowControlsOverlay();
     // Same reason: a notification outlives the page that raised it, so one can
     // be clicked while this window is still fetching its session list. The
     // worker posts once and does not retry — the id is held until the tab
@@ -312,7 +314,7 @@ export class App {
         // it from here, and nothing on the screen depends on this having
         // succeeded.
       });
-      void this.folderBrowser.show();
+      this.sessionTabManager.createNewSession();
     }
 
     window.addEventListener('resize', () => this.fitTerminal());

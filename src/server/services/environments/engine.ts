@@ -13,7 +13,8 @@
 
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
-import { ContainerEngineKind, Mount } from './types.js';
+import path from 'node:path';
+import { ContainerEngineKind, MemoryMount, Mount } from './types.js';
 
 export interface RunResult {
   stdout: string;
@@ -34,6 +35,8 @@ export interface CreateContainerSpec {
   image: string;
   /** Bind mounts, the user's home first. */
   mounts: Mount[];
+  /** Owner-only scratch directories which must never survive the container. */
+  memoryMounts?: readonly MemoryMount[];
   /** The directory the environment starts in. */
   containerHome: string;
   cpus: string | null;
@@ -42,6 +45,21 @@ export interface CreateContainerSpec {
   /** Labels whose exact values must match before an existing object is adopted. */
   identityLabels?: readonly string[];
   env: Record<string, string>;
+}
+
+/** Validate and normalise one owner-only in-memory mount. */
+export function memoryMountMode(mount: MemoryMount): number {
+  if (!mount.containerPath.startsWith('/') || mount.containerPath === '/'
+    || mount.containerPath.includes('\0')
+    || path.posix.normalize(mount.containerPath) !== mount.containerPath) {
+    throw new Error('memory mount path must be absolute');
+  }
+  const mode = mount.mode ?? 0o700;
+  if (!Number.isInteger(mode) || mode < 0o100 || mode > 0o777
+    || (mode & 0o100) === 0 || (mode & 0o077) !== 0) {
+    throw new Error('memory mount mode must grant access only to its owner');
+  }
+  return mode;
 }
 
 export interface ContainerDescription {
@@ -271,6 +289,23 @@ export class ContainerEngine implements EnvironmentEngine {
       ].filter(Boolean);
       const spec_ = `${mount.hostPath}:${mount.containerPath}${suffixes.length ? `:${suffixes.join(',')}` : ''}`;
       args.push('--volume', spec_);
+    }
+
+    for (const mount of spec.memoryMounts || []) {
+      const mode = memoryMountMode(mount).toString(8).padStart(4, '0');
+      if (this.kind === 'podman') {
+        // Podman's --tmpfs parser rejects Docker's uid= and gid= options.
+        // Its tmpfs --mount form uses U=true to derive ownership from --user.
+        args.push(
+          '--mount',
+          `type=tmpfs,destination=${mount.containerPath},rw,noexec,nosuid,nodev,U=true,tmpfs-mode=${mode}`,
+        );
+      } else {
+        args.push(
+          '--tmpfs',
+          `${mount.containerPath}:rw,noexec,nosuid,nodev,uid=${this.uid},gid=${this.gid},mode=${mode}`,
+        );
+      }
     }
 
     args.push('--workdir', spec.containerHome);

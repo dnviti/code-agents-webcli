@@ -206,6 +206,27 @@ describe('project routes', function () {
     assert.strictEqual(body.project.name, 'acme');
   });
 
+  it('forwards an explicit local-project override without exposing target selection', async function () {
+    let createInput;
+    const manager = makeManager({
+      createAndStart: async (_ownerUserId, input) => {
+        createInput = input;
+        return { ok: true, project: buildProject({ executionKind: 'host' }), state: 'building' };
+      },
+    });
+    const app = makeApp({ manager });
+    serverInfo = await listen(app);
+
+    const res = await req(serverInfo.baseUrl, 'POST', '/api/projects', {
+      name: 'local acme',
+      repoUrl: null,
+      local: true,
+    });
+    assert.strictEqual(res.status, 202);
+    assert.deepStrictEqual(createInput, { name: 'local acme', repoUrl: null, local: true });
+    assert.strictEqual((await res.json()).project.executionKind, 'host');
+  });
+
   it('validates create input', async function () {
     const app = makeApp({ manager: makeManager() });
     serverInfo = await listen(app);
@@ -217,6 +238,10 @@ describe('project routes', function () {
     const badRepo = await req(serverInfo.baseUrl, 'POST', '/api/projects', { name: 'x', repoUrl: 123 });
     assert.strictEqual(badRepo.status, 400);
     assert.strictEqual((await badRepo.json()).error, 'validation');
+
+    const badLocal = await req(serverInfo.baseUrl, 'POST', '/api/projects', { name: 'x', local: 'yes' });
+    assert.strictEqual(badLocal.status, 400);
+    assert.strictEqual((await badLocal.json()).error, 'validation');
   });
 
   it('maps credential_required to 428 with host', async function () {
@@ -329,7 +354,10 @@ describe('project routes', function () {
   });
 
   it('starts, stops and releases a project', async function () {
-    const app = makeApp({ manager: makeManager() });
+    let stopOptions;
+    const app = makeApp({ manager: makeManager({
+      stop: async (_ownerUserId, _projectId, options) => { stopOptions = options; return { ok: true }; },
+    }) });
     serverInfo = await listen(app);
     const { baseUrl } = serverInfo;
 
@@ -337,11 +365,28 @@ describe('project routes', function () {
     assert.strictEqual(start.status, 202);
     assert.strictEqual((await start.json()).state, 'building');
 
-    const stop = await req(baseUrl, 'POST', '/api/projects/project-1/stop');
+    const stop = await req(baseUrl, 'POST', '/api/projects/project-1/stop', { stopActive: true });
     assert.strictEqual(stop.status, 202);
+    assert.deepStrictEqual(stopOptions, { stopActive: true });
 
     const release = await req(baseUrl, 'POST', '/api/projects/project-1/release', { discard: true });
     assert.strictEqual(release.status, 202);
+  });
+
+  it('passes confirmed active-session interruption through project deletion', async function () {
+    let removeOptions;
+    const manager = makeManager({
+      remove: async (_ownerUserId, _projectId, options) => { removeOptions = options; return { ok: true }; },
+    });
+    const app = makeApp({ manager });
+    serverInfo = await listen(app);
+
+    const response = await req(serverInfo.baseUrl, 'DELETE', '/api/projects/project-1', {
+      force: true,
+      stopActive: true,
+    });
+    assert.strictEqual(response.status, 204);
+    assert.deepStrictEqual(removeOptions, { force: true, stopActive: true });
   });
 
   it('maps start run_limit to 409', async function () {
@@ -665,7 +710,13 @@ describe('admin deploy-settings routes', function () {
     });
     assert.strictEqual(put.status, 200);
     const updated = await put.json();
-    assert.deepStrictEqual(updated, { runLimitPerUser: 5, idleStopMinutes: 30, idleReclaimMinutes: 1440 });
+    assert.deepStrictEqual(updated, {
+      runLimitPerUser: 5,
+      idleStopMinutes: 30,
+      idleReclaimMinutes: 1440,
+      usageWarnUserBytes: null,
+      usageWarnAdminBytes: null,
+    });
 
     const get2 = await req(baseUrl, 'GET', '/api/admin/deploy-settings');
     assert.deepStrictEqual(await get2.json(), updated);

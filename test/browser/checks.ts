@@ -16,6 +16,7 @@ import * as React from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { ChatController } from '../../src/client/chat/controller';
+import { AppShell, type ShellActions } from '../../src/client/shell/AppShell';
 import { forgetTerminals } from '../../src/client/chat/chat-terminal';
 import { ChatView } from '../../src/client/shell/chat/ChatView';
 import { TerminalSplit } from '../../src/client/shell/chat/TerminalSplit';
@@ -296,6 +297,8 @@ async function run(): Promise<void> {
   await wait(200);
   check('scrolling past the newest line returns to live', exited > 0 && !view.isOpen, `exited=${exited}`);
 
+  await checkAWindowSafeTabBarYieldsBeforeFixedControls();
+  await checkTheRealShellFollowsWindowControlGeometry();
   await checkModeQueriesDoNotKillTheTerminal();
   await checkAWorkflowPopupBehavesLikeTheFilePopup();
   await checkARunningWorkflowSaysWhatItIsDoing();
@@ -370,6 +373,179 @@ async function run(): Promise<void> {
   pre.id = 'results';
   pre.textContent = results.join('\n');
   document.body.appendChild(pre);
+}
+
+/**
+ * The WCO safe rectangle is the only horizontal budget the app receives.
+ * Measure the same TabBar flex mode the integrated shell uses so a regression
+ * cannot let a long tab run push a fixed action underneath native controls.
+ */
+async function checkAWindowSafeTabBarYieldsBeforeFixedControls(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:560px;height:40px;position:absolute;top:0;left:0';
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  try {
+    root.render(React.createElement(TabBar, {
+      tabs: Array.from({ length: 8 }, (_, index) => ({
+        id: `wco-${index}`,
+        title: `A deliberately long session title ${index}`,
+      })),
+      activeId: 'wco-0',
+      onSelect: () => {},
+      tabsYieldFirst: true,
+      leading: React.createElement('div', {
+        'data-wco-fixed': 'brand',
+        style: { width: 124, flex: '0 0 124px' },
+      }),
+      trailing: React.createElement('button', {
+        type: 'button',
+        'data-wco-fixed': 'actions',
+        style: { width: 34, flex: '0 0 34px' },
+      }, 'More'),
+      style: { width: '100%', height: '100%', minWidth: 0 },
+    }));
+    await wait(80);
+
+    const bar = host.firstElementChild as HTMLElement | null;
+    const tabs = host.querySelector<HTMLElement>('[role="tablist"]');
+    const brand = host.querySelector<HTMLElement>('[data-wco-fixed="brand"]');
+    const actions = host.querySelector<HTMLElement>('[data-wco-fixed="actions"]');
+    const barRect = bar?.getBoundingClientRect();
+    const tabsRect = tabs?.getBoundingClientRect();
+    const brandRect = brand?.getBoundingClientRect();
+    const actionsRect = actions?.getBoundingClientRect();
+    const contained = Boolean(
+      barRect && tabsRect && brandRect && actionsRect
+      && brandRect.left >= barRect.left - 0.5
+      && actionsRect.right <= barRect.right + 0.5
+      && tabsRect.left >= brandRect.right - 0.5
+      && tabsRect.right <= actionsRect.left + 0.5
+      && tabsRect.width > 0,
+    );
+    check(
+      'the WCO tab run yields before fixed controls leave the safe rectangle',
+      contained,
+      barRect && tabsRect && actionsRect
+        ? `bar=${barRect.width}, tabs=${tabsRect.width}, actions.right=${actionsRect.right - barRect.left}`
+        : 'missing title-bar element',
+    );
+  } finally {
+    root.unmount();
+    host.remove();
+  }
+}
+
+/** The real shell, including its brand and compact action menu, inside the safe rect. */
+async function checkTheRealShellFollowsWindowControlGeometry(): Promise<void> {
+  const host = document.createElement('div');
+  host.style.cssText = 'width:680px;height:400px;position:absolute;top:0;left:0;display:flex';
+  document.body.appendChild(host);
+  const terminalNode = document.createElement('main');
+  const invoked: string[] = [];
+  const actions = new Proxy({
+    readSettings: () => ({
+      fontSize: 14,
+      theme: 'github-dark',
+      terminalFontFamily: 'jetbrains-mono',
+      chatBypassPermissions: false,
+      notifications: DEFAULT_NOTIFICATIONS,
+    }),
+    newTab: () => invoked.push('new'),
+    loadConversations: async () => ({ projects: [], ungrouped: [] }),
+  }, {
+    get(target, key) {
+      if (key in target) return target[key as keyof typeof target];
+      return () => {};
+    },
+  }) as unknown as ShellActions;
+
+  shellStore.setState({
+    tabs: [
+      { id: 'wco-a', title: 'Alpha', kind: 'terminal', workingDir: null, status: 'idle', unread: false, attention: null },
+      { id: 'wco-b', title: 'Beta', kind: 'terminal', workingDir: null, status: 'idle', unread: false, attention: null },
+    ],
+    activeId: 'wco-a',
+    isMobile: false,
+    banner: null,
+    overlay: null,
+    chat: { active: false, sessionId: '', controller: null, runtime: '', runtimeLabel: '', workingDir: '' },
+    windowControlsOverlay: { visible: true, x: 0, y: 0, width: 560, height: 40 },
+  });
+
+  const root = createRoot(host);
+  try {
+    root.render(React.createElement(AppShell, { terminalNode, actions, launcher: null }));
+    await wait(100);
+
+    const safe = host.querySelector<HTMLElement>('[data-window-safe-area="true"]');
+    const hostRect = host.getBoundingClientRect();
+    const safeRect = safe?.getBoundingClientRect();
+    check(
+      'the real WCO shell stays inside a right-controls safe rectangle',
+      Boolean(safeRect && Math.abs(safeRect.left - hostRect.left) < 0.5
+        && Math.abs(safeRect.right - hostRect.left - 560) < 0.5),
+      safeRect ? `${safeRect.left - hostRect.left}–${safeRect.right - hostRect.left}` : 'missing safe area',
+    );
+
+    const more = host.querySelector<HTMLButtonElement>('[aria-label="More title bar actions"]');
+    more?.click();
+    await wait(30);
+    const menu = host.querySelector<HTMLElement>('[role="menu"][aria-label="Title bar actions"]');
+    check(
+      'the compact real title bar exposes every fixed action from one menu',
+      Boolean(menu && ['New session', 'All tabs', 'Command palette', 'Toggle theme', 'Usage', 'Settings']
+        .every((label) => menu.textContent?.includes(label))),
+      menu?.textContent || 'menu missing',
+    );
+    const newSession = Array.from(menu?.querySelectorAll<HTMLButtonElement>('button') || [])
+      .find((button) => button.textContent?.includes('New session'));
+    newSession?.click();
+    await wait(20);
+    check('a compact title-bar action invokes the shell action', invoked.includes('new'));
+
+    shellStore.setState({
+      windowControlsOverlay: { visible: false, x: 0, y: 0, width: 0, height: 0 },
+    });
+    await wait(40);
+    check(
+      'hiding WCO live restores ordinary chrome without losing the active tab',
+      !host.querySelector('[data-window-titlebar="true"]')
+        && host.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.includes('Alpha') === true,
+    );
+
+    shellStore.setState({
+      windowControlsOverlay: { visible: true, x: 120, y: 2, width: 440, height: 42 },
+    });
+    await wait(40);
+    const leftSafe = host.querySelector<HTMLElement>('[data-window-safe-area="true"]')?.getBoundingClientRect();
+    check(
+      'showing WCO live follows a left-controls rectangle without losing state',
+      Boolean(leftSafe
+        && Math.abs(leftSafe.left - hostRect.left - 120) < 0.5
+        && Math.abs(leftSafe.right - hostRect.left - 560) < 0.5
+        && host.querySelector('[role="tab"][aria-selected="true"]')?.textContent?.includes('Alpha')),
+      leftSafe ? `${leftSafe.left - hostRect.left}–${leftSafe.right - hostRect.left}` : 'missing safe area',
+    );
+
+    shellStore.setState({
+      windowControlsOverlay: { visible: true, x: 120, y: 2, width: 180, height: 42 },
+    });
+    await wait(40);
+    check(
+      'an ultra-narrow real safe area keeps only the shrinkable brand and overflow action',
+      !host.querySelector('[role="tablist"]')
+        && Boolean(host.querySelector('[data-window-drag="true"]'))
+        && Boolean(host.querySelector('[aria-label="More title bar actions"]')),
+    );
+  } finally {
+    root.unmount();
+    host.remove();
+    shellStore.setState({
+      tabs: [], activeId: null,
+      windowControlsOverlay: { visible: false, x: 0, y: 0, width: 0, height: 0 },
+    });
+  }
 }
 
 /**

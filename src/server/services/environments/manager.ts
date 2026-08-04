@@ -260,6 +260,8 @@ export class ContainerEnvironment implements UserEnvironment {
 export interface EnvironmentManagerOptions {
   config: ContainerConfig;
   engine?: EnvironmentEngine;
+  /** False makes every container/deploy-target path unreachable. */
+  featureEnabled?: boolean;
   /** Home directory used in host mode. Defaults to the server's working directory. */
   hostHome: string;
   now?: () => number;
@@ -289,6 +291,7 @@ export interface EnvironmentManagerOptions {
 export class EnvironmentManager {
   private readonly config: ContainerConfig;
   private readonly engine: EnvironmentEngine;
+  private readonly featureEnabled: boolean;
   private readonly hostEnvironment: HostEnvironment;
   private readonly now: () => number;
   /** In-flight `ensureFor` calls, so two tabs signing in at once make one container. */
@@ -343,6 +346,7 @@ export class EnvironmentManager {
   constructor(options: EnvironmentManagerOptions) {
     this.config = options.config;
     this.engine = options.engine || createEngine(options.config);
+    this.featureEnabled = options.featureEnabled !== false;
     this.hostEnvironment = new HostEnvironment(options.hostHome);
     this.now = options.now || (() => Date.now());
     this.getUserTier = options.getUserTier || (() => null);
@@ -434,6 +438,7 @@ export class EnvironmentManager {
    * "could containers for this target still exist?".
    */
   reachableEngines(): Map<string, EnvironmentEngine> {
+    if (!this.featureEnabled) return new Map();
     const reachable = new Map(this.engines);
     let retained = 0;
     for (const placement of this.containerPlacement.values()) {
@@ -456,6 +461,9 @@ export class EnvironmentManager {
    * target must not make an existing project's container run somewhere else.
    */
   projectTarget(targetId: string | null): ActiveTargetResolution & { engine: EnvironmentEngine } {
+    if (!this.featureEnabled) {
+      throw new Error('containerized environments are disabled by the server feature flag');
+    }
     const key = targetId || 'legacy';
     const config = key === 'legacy' ? this.configForKey(key) : this.configs.get(key);
     const engine = key === 'legacy' ? this.engineForKey(key) : this.engines.get(key);
@@ -470,6 +478,9 @@ export class EnvironmentManager {
 
   /** The only placement used for a new project. */
   activeProjectTarget(): ActiveTargetResolution & { engine: EnvironmentEngine } {
+    if (!this.featureEnabled) {
+      throw new Error('containerized environments are disabled by the server feature flag');
+    }
     const active = this.resolveActiveTarget();
     if (!active) {
       throw new Error('no active deploy target: an administrator must activate one before new work can start');
@@ -481,6 +492,16 @@ export class EnvironmentManager {
       throw new Error(`project workspaces do not support remote ${active.config.engine} bind mounts`);
     }
     return { ...active, engine: this.engineForKey(active.key) };
+  }
+
+  /** Placement for new projects; no active target is explicit host-local mode. */
+  newProjectPlacement():
+    | { kind: 'host' }
+    | { kind: 'container'; target: ActiveTargetResolution & { engine: EnvironmentEngine } } {
+    if (!this.featureEnabled) return { kind: 'host' };
+    const active = this.resolveActiveTarget();
+    if (!active || !active.config.enabled) return { kind: 'host' };
+    return { kind: 'container', target: this.activeProjectTarget() };
   }
 
   /**
@@ -588,19 +609,14 @@ export class EnvironmentManager {
   }
 
   get enabled(): boolean {
+    if (!this.featureEnabled) return false;
     // Resolved rather than read off the startup config: once deploy targets
     // exist they are the source of truth, and an install started with
     // containers off still has environments the moment a target is active.
     // On the legacy single-config path this resolves to `this.config`, so
     // behavior there is exactly what it was.
     const active = this.resolveActiveTarget();
-    if (!active) {
-      // Only multi-target mode can resolve to nothing, and null there means
-      // "targets exist, none active" — unplaceable work, not a disabled
-      // feature. Reporting disabled here would make `ensureEnvironment` hand
-      // out the host where `ensureFor` is supposed to throw its loud error.
-      return this.multiTarget;
-    }
+    if (!active) return false;
     return active.config.enabled;
   }
 
@@ -643,17 +659,6 @@ export class EnvironmentManager {
     });
     this.pending.set(owner.id, work);
     return work;
-  }
-
-  private noActiveTargetError(): Error {
-    // Targets exist but none is active: work is unplaceable, and the only
-    // honest answers are a clear error — never a quiet fall back to running
-    // on the host, which is exactly the machine containers exist to keep
-    // this work off.
-    return new Error(
-      'no active deploy target: deploy targets are configured but none is active; '
-      + 'an administrator must activate one before new work can start',
-    );
   }
 
   /** The single-flight body for one user, including restart-time discovery. */
@@ -731,9 +736,7 @@ export class EnvironmentManager {
     owner: EnvironmentOwner,
   ): Promise<ResolvedPlacement | null> {
     let active = this.resolveActiveTarget();
-    if (!active) {
-      throw this.noActiveTargetError();
-    }
+    if (!active) return null;
 
     while (true) {
       // Empty targets table plus disabled startup flags is the historical host
@@ -763,9 +766,7 @@ export class EnvironmentManager {
       // flight. Resolve it again and verify that the exact name we proved
       // absent is still the one about to be provisioned.
       const current = this.resolveActiveTarget();
-      if (!current) {
-        throw this.noActiveTargetError();
-      }
+      if (!current) return null;
       if (!current.config.enabled) {
         return null;
       }

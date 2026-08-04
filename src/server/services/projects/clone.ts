@@ -2,6 +2,8 @@
 
 import { EnvironmentEngine } from '../environments/engine.js';
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import os from 'node:os';
 
 export type RepositoryAccess =
   | { ok: true; host: string }
@@ -9,6 +11,8 @@ export type RepositoryAccess =
 
 export interface FetchResponseLike {
   status: number;
+  /** Smart-HTTP advertisements are header-only preflight data; never retain their stream. */
+  body?: { cancel(): Promise<void> } | null;
 }
 
 export type FetchLike = (url: string, init?: {
@@ -20,6 +24,16 @@ export type FetchLike = (url: string, init?: {
 
 export const REPOSITORY_PREFLIGHT_TIMEOUT_MS = 10_000;
 export const REPOSITORY_CLONE_TIMEOUT_MS = 5 * 60_000;
+
+function cancelResponseBody(response: FetchResponseLike): void {
+  try {
+    // Cancellation is initiated synchronously, but an injected or broken body
+    // must not turn a completed header check into another unbounded await.
+    void response.body?.cancel().catch(() => undefined);
+  } catch {
+    // The status result remains useful even when a non-standard body throws.
+  }
+}
 
 export function repositoryUrl(input: string): URL | null {
   try {
@@ -70,18 +84,22 @@ export async function checkRepositoryAccess(
       }),
       timedOut,
     ]);
-    if (response.status === 200) {
-      return { ok: true, host: url.host.toLowerCase() };
+    try {
+      if (response.status === 200) {
+        return { ok: true, host: url.host.toLowerCase() };
+      }
+      if (response.status === 401 || response.status === 403) {
+        return { ok: false, reason: 'credential_required', host: url.host.toLowerCase(), message: 'Repository credentials are required' };
+      }
+      if (response.status === 404) {
+        return credential
+          ? { ok: false, reason: 'repo_gone', host: url.host.toLowerCase(), message: 'Repository was not found' }
+          : { ok: false, reason: 'credential_required', host: url.host.toLowerCase(), message: 'Repository credentials may be required' };
+      }
+      return { ok: false, reason: 'unreachable', host: url.host.toLowerCase(), message: `Repository access check returned HTTP ${response.status}` };
+    } finally {
+      cancelResponseBody(response);
     }
-    if (response.status === 401 || response.status === 403) {
-      return { ok: false, reason: 'credential_required', host: url.host.toLowerCase(), message: 'Repository credentials are required' };
-    }
-    if (response.status === 404) {
-      return credential
-        ? { ok: false, reason: 'repo_gone', host: url.host.toLowerCase(), message: 'Repository was not found' }
-        : { ok: false, reason: 'credential_required', host: url.host.toLowerCase(), message: 'Repository credentials may be required' };
-    }
-    return { ok: false, reason: 'unreachable', host: url.host.toLowerCase(), message: `Repository access check returned HTTP ${response.status}` };
   } catch (error) {
     return {
       ok: false,
@@ -95,6 +113,89 @@ export async function checkRepositoryAccess(
 }
 
 export class CloneError extends Error {}
+
+/** The inspected commit could not be reproduced; the recipe must be reviewed again. */
+export class CloneSourceChangedError extends CloneError {}
+
+async function runHostGit(
+  args: string[],
+  credential: string | null | undefined,
+  timeoutMs: number,
+): Promise<string> {
+  const isolated = process.platform === 'win32'
+    ? null
+    : isolatedGitNetworkInvocation(args, credential);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: os.devNull,
+    GIT_CONFIG_SYSTEM: os.devNull,
+    GIT_ALLOW_PROTOCOL: 'http:https',
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_ASKPASS: '',
+  };
+  // POSIX uses the existing stdin-fed isolated transport below. Windows has
+  // no /bin/sh/env -i equivalent, so keep the credential in the child-only
+  // config environment there (never argv or a persisted URL).
+  if (credential && !isolated) {
+    env.GIT_CONFIG_COUNT = '1';
+    env.GIT_CONFIG_KEY_0 = 'http.extraHeader';
+    env.GIT_CONFIG_VALUE_0 = `AUTHORIZATION: bearer ${credential}`;
+  }
+  return new Promise<string>((resolve, reject) => {
+    const child = spawn(isolated?.command || 'git', isolated?.args || args, {
+      env,
+      stdio: [isolated?.input ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => child.kill('SIGKILL'), Math.max(1, timeoutMs));
+    timer.unref();
+    child.stdout!.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr!.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    if (isolated?.input) child.stdin!.end(isolated.input);
+    child.once('error', (error) => { clearTimeout(timer); reject(error); });
+    child.once('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(stdout);
+      else reject(new CloneError(redact(stderr.trim() || `git exited with status ${code}`, credential)));
+    });
+  });
+}
+
+/** Whether a valid local checkout contains tracked or untracked work. */
+export async function hostRepositoryHasChanges(checkout: string, timeoutMs = 30_000): Promise<boolean> {
+  const output = await runHostGit(['-C', checkout, 'status', '--porcelain=v1', '--untracked-files=all'], null, timeoutMs);
+  return output.length > 0;
+}
+
+/** Clone into a normal host workspace on Windows, macOS, or Linux. */
+export async function cloneRepositoryOnHost(options: {
+  repoUrl: string;
+  destination: string;
+  credential?: string | null;
+  expectedOid?: string;
+  timeoutMs?: number;
+}): Promise<void> {
+  const { repoUrl, destination, credential, expectedOid } = options;
+  const timeoutMs = options.timeoutMs ?? REPOSITORY_CLONE_TIMEOUT_MS;
+  const url = repositoryUrl(repoUrl);
+  if (!url || (credential && url.protocol !== 'https:')) throw new CloneError('Invalid repository URL');
+  if (credential && /[\r\n\0]/.test(credential)) throw new CloneError('Repository credential contains an unsafe line break');
+  if (expectedOid && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(expectedOid)) throw new CloneError('Inspected repository revision is invalid');
+  await runHostGit(['-c', 'core.hooksPath=', 'clone', ...(expectedOid ? ['--no-checkout'] : []), '--', repoUrl, destination], credential, timeoutMs);
+  if (!expectedOid) return;
+  try {
+    await runHostGit(['-C', destination, 'fetch', '--no-tags', '--no-recurse-submodules', '--depth=1', repoUrl, expectedOid], credential, timeoutMs);
+    await runHostGit(['-C', destination, 'checkout', '--detach', '--force', expectedOid], null, timeoutMs);
+    const actual = (await runHostGit(['-C', destination, 'rev-parse', '--verify', 'HEAD'], null, timeoutMs)).trim();
+    if (actual !== expectedOid) throw new CloneSourceChangedError('Repository changed after its build recipe was reviewed');
+  } catch (error) {
+    if (error instanceof CloneSourceChangedError) throw error;
+    throw new CloneSourceChangedError('The inspected repository revision is no longer available; inspect it again');
+  }
+}
 
 export function repoBaseName(repoUrl: string): string {
   const url = repositoryUrl(repoUrl);
@@ -153,9 +254,11 @@ export async function cloneRepository(options: {
   repoUrl: string;
   destination: string;
   credential?: string | null;
+  /** When present, checkout exactly the commit whose composition was shown. */
+  expectedOid?: string;
   timeoutMs?: number;
 }): Promise<void> {
-  const { engine, containerName, containerIdentity, repoUrl, destination, credential } = options;
+  const { engine, containerName, containerIdentity, repoUrl, destination, credential, expectedOid } = options;
   const timeoutMs = options.timeoutMs ?? REPOSITORY_CLONE_TIMEOUT_MS;
   if (!containerIdentity) throw new CloneError('Verified project container identity is required');
   const url = repositoryUrl(repoUrl);
@@ -163,6 +266,9 @@ export async function cloneRepository(options: {
     throw new CloneError(credential ? 'Repository credentials require HTTPS' : 'Invalid repository URL');
   }
   if (credential && /[\r\n\0]/.test(credential)) throw new CloneError('Repository credential contains an unsafe line break');
+  if (expectedOid && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(expectedOid)) {
+    throw new CloneError('Inspected repository revision is invalid');
+  }
   const controller = new AbortController();
   let timeout: NodeJS.Timeout | null = null;
   let didTimeout = false;
@@ -184,7 +290,11 @@ export async function cloneRepository(options: {
       ),
       timedOut,
     ]);
-    const transport = isolatedGitNetworkInvocation(['clone', '--', repoUrl, destination], credential);
+    const transport = isolatedGitNetworkInvocation([
+      'clone',
+      ...(expectedOid ? ['--no-checkout'] : []),
+      '--', repoUrl, destination,
+    ], credential);
     await Promise.race([
       engine.exec(
         { name: containerName, identity: containerIdentity, cwd: isolatedCwd, signal: controller.signal, input: transport.input },
@@ -193,6 +303,52 @@ export async function cloneRepository(options: {
       ),
       timedOut,
     ]);
+    if (expectedOid) {
+      // A branch may move between review and build. Fetch the inspected object
+      // explicitly and detach at it; never substitute today's remote HEAD.
+      const exact = isolatedGitNetworkInvocation([
+        '-C', destination,
+        'fetch', '--no-tags', '--no-recurse-submodules', '--depth=1',
+        repoUrl, expectedOid,
+      ], credential);
+      try {
+        await Promise.race([
+          engine.exec(
+            { name: containerName, identity: containerIdentity, cwd: isolatedCwd, signal: controller.signal, input: exact.input },
+            exact.command,
+            exact.args,
+          ),
+          timedOut,
+        ]);
+        const checkout = isolatedGitNetworkInvocation([
+          '-C', destination,
+          'checkout', '--detach', '--force', expectedOid,
+        ]);
+        await Promise.race([
+          engine.exec(
+            { name: containerName, identity: containerIdentity, cwd: isolatedCwd, signal: controller.signal },
+            checkout.command,
+            checkout.args,
+          ),
+          timedOut,
+        ]);
+        const verify = isolatedGitNetworkInvocation(['-C', destination, 'rev-parse', '--verify', 'HEAD']);
+        const verified = await Promise.race([
+          engine.exec(
+            { name: containerName, identity: containerIdentity, cwd: isolatedCwd, signal: controller.signal },
+            verify.command,
+            verify.args,
+          ),
+          timedOut,
+        ]);
+        if (verified.stdout.trim() !== expectedOid) {
+          throw new CloneSourceChangedError('Repository changed after its build recipe was reviewed');
+        }
+      } catch (error) {
+        if (error instanceof CloneSourceChangedError) throw error;
+        throw new CloneSourceChangedError('The inspected repository revision is no longer available; inspect it again');
+      }
+    }
   } catch (error) {
     if (didTimeout) throw new CloneError(`Repository clone timed out after ${timeoutMs}ms`);
     if (error instanceof CloneError) throw error;

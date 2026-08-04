@@ -149,6 +149,86 @@
   display: none;
 }
 
+/* Window Controls Overlay: only the small brand is draggable. All session and
+   app controls retain ordinary pointer behaviour, and unsupported browsers see
+   none of these declarations because the root is published as hidden. */
+html[data-window-controls-overlay="visible"] [data-window-drag="true"] {
+  -webkit-app-region: drag;
+  app-region: drag;
+  user-select: none;
+}
+
+html[data-window-controls-overlay="visible"] [data-window-no-drag="true"],
+html[data-window-controls-overlay="visible"] button,
+html[data-window-controls-overlay="visible"] a,
+html[data-window-controls-overlay="visible"] input,
+html[data-window-controls-overlay="visible"] [role="tab"] {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+/* Visible before the application bundle mounts, and reused by signed-out and
+   setup/error pages. CSS environment values avoid a first-frame jump; the
+   runtime observer replaces them with live geometry as soon as it starts. */
+.boot-titlebar {
+  display: none;
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: calc(env(titlebar-area-y, 0px) + env(titlebar-area-height, 0px));
+  z-index: 65;
+  background: var(--background);
+  border-bottom: 1px solid var(--border);
+}
+
+.boot-titlebar-safe {
+  position: absolute;
+  left: env(titlebar-area-x, 0px);
+  top: env(titlebar-area-y, 0px);
+  width: env(titlebar-area-width, 100%);
+  height: env(titlebar-area-height, 38px);
+  display: flex;
+  align-items: stretch;
+}
+
+.boot-titlebar-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px;
+  color: var(--muted-foreground);
+  border-right: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  white-space: nowrap;
+  -webkit-app-region: drag;
+  app-region: drag;
+  user-select: none;
+}
+
+html[data-window-controls-overlay="visible"] .boot-titlebar {
+  display: block;
+  height: var(--window-controls-bottom);
+}
+
+html[data-window-controls-overlay="visible"] .boot-titlebar-safe {
+  left: var(--window-controls-x);
+  top: var(--window-controls-y);
+  width: var(--window-controls-width);
+  height: var(--window-controls-height);
+}
+
+@media (display-mode: window-controls-overlay) {
+  .boot-titlebar { display: block; }
+}
+
+/* The media query describes how the app was launched, while `visible` is the
+   live user choice. Once the API has answered, its hidden state wins. */
+html[data-window-controls-overlay="hidden"] .boot-titlebar {
+  display: none;
+}
+
 /* The reading measure, published onto the chat root by the layout settings
    (see chat/view-settings.ts). A class rather than an inline style because it
    has to reach the elements the Markdown renderer generates, and because the

@@ -30,6 +30,10 @@ export async function loadConfig(app: App): Promise<void> {
       shellStore.setState({
         user: cfg?.currentUser?.githubLogin ?? null,
         logoutUrl: cfg?.logoutUrl ?? null,
+        // Missing is false so an older server cannot accidentally expose an
+        // experimental administration surface in a newer client bundle.
+        containerizedEnvironmentsEnabled:
+          cfg?.containerizedEnvironmentsEnabled === true,
         // The approval preference belongs to the account, so this — the boot
         // request every page already makes — is where it arrives. Anything
         // other than a literal `true` is "ask", which covers an older server

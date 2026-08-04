@@ -78,6 +78,30 @@ describe('an installation with no container engine configured', function () {
       assert.strictEqual(createContainerConfig({ containerTiers: 'a=1,1g' }, {}).enabled, false);
       assert.strictEqual(createContainerConfig({ kubeNamespace: 'ws' }, {}).enabled, false);
     });
+
+    it('lets the server feature gate override both legacy opt-ins', function () {
+      assert.strictEqual(
+        createContainerConfig(
+          { featureEnabled: false, containers: true },
+          { CODE_AGENTS_WEBCLI_CONTAINERS: 'true' },
+        ).enabled,
+        false,
+      );
+    });
+
+    it('makes recorded deploy-engine placement unreachable when the server gate is off', function () {
+      const config = createContainerConfig({ containers: true }, {});
+      const manager = new EnvironmentManager({
+        config,
+        engine: forbiddenEngine(),
+        featureEnabled: false,
+        hostHome: '/srv/work',
+      });
+      assert.strictEqual(manager.enabled, false);
+      assert.deepStrictEqual([...manager.reachableEngines()], []);
+      assert.throws(() => manager.projectTarget(null), /feature flag/);
+      assert.deepStrictEqual(manager.newProjectPlacement(), { kind: 'host' });
+    });
   });
 
   describe('the manager', function () {

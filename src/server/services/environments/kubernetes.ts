@@ -35,6 +35,7 @@ import {
   RunResult,
   defaultRunner,
   EnvironmentInspectionError,
+  memoryMountMode,
   parseSize,
   validateIdentityLabels,
 } from './engine.js';
@@ -80,11 +81,20 @@ export interface KubernetesOptions {
   readyTimeoutSeconds?: number;
   /** Overrides the poll interval while waiting; only tests set this. */
   pollIntervalMs?: number;
+  /** Server filesystem identity, injected in tests and observed in production. */
+  uid?: number;
+  gid?: number;
 }
 
 interface PodResources {
   requests: Record<string, string>;
   limits: Record<string, string>;
+}
+
+interface PodVolume {
+  name: string;
+  persistentVolumeClaim?: { claimName: string };
+  emptyDir?: { medium: 'Memory' };
 }
 
 function isPodNotFound(detail: string): boolean {
@@ -130,6 +140,8 @@ export class KubernetesEngine implements EnvironmentEngine {
   private readonly kubeconfigPath: string | null;
   private readonly readyTimeoutSeconds: number;
   private readonly pollIntervalMs: number;
+  private readonly uid: number;
+  private readonly gid: number;
 
   constructor(options: KubernetesOptions) {
     this.binary = options.binary || 'kubectl';
@@ -142,6 +154,10 @@ export class KubernetesEngine implements EnvironmentEngine {
     this.kubeconfigPath = options.kubeconfigPath ?? null;
     this.readyTimeoutSeconds = options.readyTimeoutSeconds ?? 120;
     this.pollIntervalMs = options.pollIntervalMs ?? 1000;
+    // These calls are absent on Windows, where Kubernetes-backed shared POSIX
+    // storage is not supported by this feature.
+    this.uid = options.uid ?? (process.getuid ? process.getuid() : 0);
+    this.gid = options.gid ?? (process.getgid ? process.getgid() : 0);
   }
 
   /** Kubeconfig, context and namespace on every call, so none can land elsewhere. */
@@ -200,10 +216,33 @@ export class KubernetesEngine implements EnvironmentEngine {
       })
       .filter((mount): mount is NonNullable<typeof mount> => mount !== null);
 
-    const volumes = volumeMounts.map((mount) => ({
+    const volumes: PodVolume[] = volumeMounts.map((mount) => ({
       name: mount.name,
       persistentVolumeClaim: { claimName: this.storageClaim },
     }));
+
+    // emptyDir itself has no defaultMode.  An init container running as the
+    // same server identity creates a 0700 child, and the workspace mounts only
+    // that child.  The volume root may be fsGroup-writable, but no other
+    // process can traverse the directory which carries forge credentials.
+    const memoryMounts = (spec.memoryMounts || []).map((mount, index) => {
+      const mode = memoryMountMode(mount).toString(8).padStart(4, '0');
+      return {
+        name: `memory-${index}`,
+        mountPath: mount.containerPath,
+        initPath: `/code-agents-memory/${index}`,
+        mode,
+      };
+    });
+    volumeMounts.push(...memoryMounts.map((mount) => ({
+      name: mount.name,
+      mountPath: mount.mountPath,
+      subPath: 'owner',
+    })));
+    volumes.push(...memoryMounts.map((mount) => ({
+      name: mount.name,
+      emptyDir: { medium: 'Memory' as const },
+    })));
 
     return {
       apiVersion: 'v1',
@@ -219,9 +258,35 @@ export class KubernetesEngine implements EnvironmentEngine {
         // Every environment is one user's, so nothing in it should be able to
         // reach the node or another pod's filesystem.
         securityContext: {
-          runAsNonRoot: false,
-          fsGroup: 0,
+          runAsNonRoot: this.uid !== 0,
+          runAsUser: this.uid,
+          runAsGroup: this.gid,
+          fsGroup: this.gid,
+          fsGroupChangePolicy: 'OnRootMismatch',
         },
+        ...(memoryMounts.length ? {
+          initContainers: [
+            {
+              name: 'memory-mount-init',
+              image: spec.image,
+              command: [
+                'sh', '-c',
+                'set -eu; while test "$#" -gt 0; do mode=$1; directory=$2; shift 2; mkdir -m "$mode" "$directory/owner"; done',
+                'sh',
+                ...memoryMounts.flatMap((mount) => [mount.mode, mount.initPath]),
+              ],
+              volumeMounts: memoryMounts.map((mount) => ({
+                name: mount.name,
+                mountPath: mount.initPath,
+              })),
+              securityContext: {
+                runAsNonRoot: this.uid !== 0,
+                runAsUser: this.uid,
+                runAsGroup: this.gid,
+              },
+            },
+          ],
+        } : {}),
         containers: [
           {
             name: WORKSPACE_CONTAINER,

@@ -53,6 +53,7 @@ async function withProjectFolders<T>(
   if (!manager.getForUser(user.id, projectId)) throw new ProjectFolderUnavailable('not_found');
   const prepared = await manager.ensureForSession(user.id, projectId);
   if (!prepared.ok) throw new ProjectFolderUnavailable(prepared.reason, prepared.detail);
+  if (!prepared.containerAccess) throw new ProjectFolderUnavailable('host_local', 'Use the normal directory picker for local projects');
   const lease: ProjectSessionLease = {
     ownerUserId: user.id,
     projectId,
@@ -279,7 +280,7 @@ export function createFolderRoutes(deps: FolderRoutesDeps): Router {
                 : await projectHostWorkingDirToContainer(prepared, restored.workingDir);
             }
             defaultPath ??= await projectHostWorkingDirToContainer(prepared, prepared.workingDir);
-            defaultPath ??= prepared.containerAccess.workspaceRoot;
+            defaultPath ??= prepared.containerAccess!.workspaceRoot;
 
             const requested = typeof req.query.path === 'string' && req.query.path
               ? req.query.path

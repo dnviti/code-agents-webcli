@@ -1,5 +1,11 @@
 # Deploy targets
 
+Deploy targets are feature-flagged for operators. Set
+`CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED=true` and restart the server before
+using this page. When it is unset (or any value other than the exact string
+`true`), the Settings row is hidden, the administration APIs return 404, stored
+targets are ignored, and their plaintext engine secrets are not materialized.
+
 A **deploy target** is one place this server runs per-user environments: a
 Docker host, a Podman machine, or a Kubernetes cluster. You can define several
 targets and switch between them without restarting the server. Only one is
@@ -21,10 +27,12 @@ Each target has:
   default tier, whether users may choose, and flat CPU/memory limits;
 - an idle timeout and an optional setup command.
 
-Every target image must be Linux-based and provide `sh`, a readable `/proc`, and
-`setsid`. Terminals and agents use them to keep remote process lifecycles tied to
-project admission; an image missing one can be created, but cannot safely run a
-session.
+Every target image must be Linux-based and provide `sh`, CA certificates, Git,
+a readable `/proc`, and `setsid`. Terminals and agents use these operating-system
+facilities to keep remote process lifecycles tied to project admission; project
+composition also needs CA certificates and Git before it can safely clone and
+provision a repository. An image missing one can be created, but
+cannot safely run a session or project.
 
 Secrets are encrypted in the database. The only place they appear on disk in
 plaintext is `<data-dir>/deploy-targets/<target-id>/`, and that is only so the
@@ -43,9 +51,9 @@ runtime-profiles route uses.
 The engine prerequisites are the same as for a legacy install. Targets add a few
 caveats that the panel shows before you save.
 
-For every engine, the selected image must be Linux-based and include `sh`, a
-readable `/proc`, and `setsid`. This prerequisite is shown beside the image field
-and in each engine's caveats.
+For every engine, the selected image must be Linux-based and include `sh`, CA
+certificates, Git, a readable `/proc`, and `setsid`. This prerequisite is shown
+beside the image field and in each engine's caveats.
 
 ### Docker and Podman
 
@@ -123,15 +131,15 @@ restart running work. If you need an existing environment on the new target,
 remove it and have the user sign in again; the new environment is created on the
 currently active target.
 
-If no target is active, or the active target has been deleted, new work fails
-loudly with "no active deploy target". The server does not fall back to the host
-or to the legacy startup flags while any target exists in the table.
+If no target is active, or the active target has been deleted, new work runs on
+the local machine. Local projects use `~/.cc-web/workspaces/<project-id>` and
+keep that persisted host placement if a container target is activated later.
 
 ## Removing a target
 
 A target that still has containers cannot be deleted. The delete button tells
 you which container names are in the way; stop or remove them first. Deleting
-the active target clears the active selection, so new work becomes unplaceable
+the active target clears the active selection, so new work becomes host-local
 until you activate another target.
 
 ## Secrets handling

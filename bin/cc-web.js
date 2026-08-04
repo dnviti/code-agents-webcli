@@ -276,7 +276,11 @@ async function main() {
       .map(([name, alias]) => `${name} → "${alias}"`)
       .join(', ');
     console.log(`Aliases: ${aliasBanner}`);
-    if (serverOptions.containers || process.env.CODE_AGENTS_WEBCLI_CONTAINERS === 'true') {
+    const deployTargetsEnabled =
+      process.env.CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED === 'true';
+    const legacyContainersRequested =
+      serverOptions.containers || process.env.CODE_AGENTS_WEBCLI_CONTAINERS === 'true';
+    if (deployTargetsEnabled && legacyContainersRequested) {
       const engine = serverOptions.containerEngine
         || process.env.CODE_AGENTS_WEBCLI_CONTAINER_ENGINE
         || 'docker';
@@ -284,6 +288,11 @@ async function main() {
         engine === 'kubernetes'
           ? `Environments: one pod per user, in namespace ${serverOptions.kubeNamespace || process.env.CODE_AGENTS_WEBCLI_KUBE_NAMESPACE || 'default'}`
           : `Environments: one container per user, via ${engine}`,
+      );
+    } else if (legacyContainersRequested) {
+      console.warn(
+        'Containerized environments are disabled. Set '
+        + 'CODE_AGENTS_WEBCLI_DEPLOY_TARGETS_ENABLED=true to enable them.',
       );
     }
 

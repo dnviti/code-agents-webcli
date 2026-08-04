@@ -6,6 +6,7 @@ const { execFileSync } = require('child_process');
 
 const { EnvironmentManager, createContainerConfig, projectContainerName } = require('../dist/server/services/environments/index.js');
 const { ProjectManager } = require('../dist/server/services/projects/manager.js');
+const { localProjectWorkspaceRoot } = require('../dist/server/services/projects/environment.js');
 const { checkRepositoryAccess, cloneRepository } = require('../dist/server/services/projects/clone.js');
 const { preserveProjectWork } = require('../dist/server/services/projects/preserve.js');
 const { ProjectStore } = require('../dist/server/services/projects/store.js');
@@ -82,12 +83,12 @@ function store(projects = [], limit = 3) {
     },
     clearSessionLeases() { const count = leases.size; leases.clear(); return count; },
     resetBuildLog(id) { get(id).buildLog = []; },
-    tryClaimStop({ projectId, ownerUserId, idleBefore }) {
+    tryClaimStop({ projectId, ownerUserId, idleBefore, allowActiveWork = false }) {
       const p = this.getProjectForUser(projectId, ownerUserId);
       if (!p) return { ok: false, reason: 'not_found' };
       if (p.state !== 'running') return { ok: false, reason: 'invalid_state' };
       if (idleBefore && p.lastActivityAt > idleBefore.toISOString()) return { ok: false, reason: 'not_idle' };
-      if (this.projectHasActiveSessions(projectId)) return { ok: false, reason: 'active_work' };
+      if (!allowActiveWork && this.projectHasActiveSessions(projectId)) return { ok: false, reason: 'active_work' };
       const snapshot = { ...p }; p.state = 'reclaiming'; return { ok: true, project: snapshot };
     },
     tryClaimIdleReclaim({ projectId, ownerUserId, idleBefore }) {
@@ -131,6 +132,7 @@ function setup(initial = [], options = {}) {
     now: options.now,
     ownerFor: options.ownerFor || ((id) => ({ id, githubLogin: 'ada' })),
     deleteProjectSessions: options.deleteProjectSessions || (() => {}),
+    suspendProjectSessions: options.suspendProjectSessions,
     fetch: options.fetch,
     preflightTimeoutMs: options.preflightTimeoutMs,
     cloneTimeoutMs: options.cloneTimeoutMs,
@@ -1853,6 +1855,33 @@ describe('project core lifecycle', function () {
     assert.strictEqual(s.getProject('one').lastActivityAt, '2026-08-01T12:00:00.000Z');
   });
 
+  it('stops active project sessions when the user explicitly confirms interruption', async function () {
+    const p = project('one', 'running'); p.container = { name: 'saved' };
+    let live = true; let suspended = false;
+    const { manager, s } = setup([p], {
+      hasLiveProjectWork: () => live,
+      suspendProjectSessions: async () => { suspended = true; live = false; },
+    });
+
+    assert.deepStrictEqual(await manager.stop(1, 'one', { stopActive: true }), { ok: true });
+    assert.strictEqual(suspended, true);
+    assert.strictEqual(s.getProject('one').state, 'stopped');
+  });
+
+  it('suspends active sessions before preserving and deleting a project', async function () {
+    const p = project('one', 'running'); p.container = { name: 'saved' };
+    let live = true; const order = [];
+    const { manager, s } = setup([p], {
+      hasLiveProjectWork: () => live,
+      suspendProjectSessions: async () => { order.push('suspend'); live = false; },
+      deleteProjectSessions: async () => { order.push('retire'); },
+    });
+
+    assert.deepStrictEqual(await manager.remove(1, 'one', { stopActive: true }), { ok: true });
+    assert.deepStrictEqual(order, ['suspend', 'retire']);
+    assert.strictEqual(s.getProject('one'), null);
+  });
+
   it('preserves before irreversibly retiring sessions during deletion', async function () {
     const p = project('one', 'running', 'https://example.test/a.git'); p.container = { name: 'saved' };
     let engineRef; let retiredAfterPush = false;
@@ -1921,6 +1950,20 @@ describe('project repository transport', function () {
     const result = await checkRepositoryAccess('https://example.test/repo', () => new Promise(() => {}), null, 5);
     assert.strictEqual(result.reason, 'unreachable');
     assert.match(result.message, /timed out/);
+  });
+  it('cancels a never-ending smart-HTTP response body before returning', async function () {
+    let cancellations = 0;
+    const result = await checkRepositoryAccess('https://example.test/repo', async () => ({
+      status: 200,
+      body: {
+        cancel() {
+          cancellations += 1;
+          return new Promise(() => {});
+        },
+      },
+    }));
+    assert.deepStrictEqual(result, { ok: true, host: 'example.test' });
+    assert.strictEqual(cancellations, 1);
   });
   it('redacts a credential echoed by a failing HTTP implementation', async function () {
     const result = await checkRepositoryAccess(
@@ -1996,6 +2039,10 @@ describe('project repository transport', function () {
 });
 
 describe('project placement guardrails', function () {
+  it('builds the app workspace root portably on Unix and Windows', function () {
+    assert.strictEqual(localProjectWorkspaceRoot('/Users/ada', path.posix), '/Users/ada/.cc-web/workspaces');
+    assert.strictEqual(localProjectWorkspaceRoot('C:\\Users\\Ada', path.win32), 'C:\\Users\\Ada\\.cc-web\\workspaces');
+  });
   it('pins the original host and container home across a login rename and restart', async function () {
     const dir = root(); const cfg = config(dir); const e = engine();
     const firstManager = new EnvironmentManager({ config: cfg, engine: e, hostHome: dir });
@@ -2032,18 +2079,50 @@ describe('project placement guardrails', function () {
     assert.deepStrictEqual(calls, []);
   });
 
-  it('rejects creation before repository preflight when no target is configured', async function () {
+  it('creates a host-local project when no target is configured', async function () {
     let fetched = false; const dir = root(); const e = engine(); const cfg = createContainerConfig({}, {});
     const environments = new EnvironmentManager({ config: cfg, engine: e, hostHome: dir });
     const s = store();
     const manager = new ProjectManager({
       store: s, environments, deployTargets: {}, authorFor: () => ({ name: 'Ada', email: 'a@b' }),
       broadcast() {}, ownerFor: (id) => ({ id, githubLogin: 'ada' }), deleteProjectSessions() {},
+      localWorkspaceRoot: path.join(dir, '.cc-web', 'workspaces'),
       fetch: async () => { fetched = true; return { status: 200 }; },
     });
-    const result = await manager.createAndStart(1, { name: 'one', repoUrl: 'https://example.test/repo.git' });
-    assert.strictEqual(result.reason, 'no_target');
-    assert.strictEqual(fetched, false); assert.strictEqual(e.calls.length, 0);
+    const result = await manager.createAndStart(1, { name: 'one' });
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.project.executionKind, 'host');
+    assert.strictEqual(fetched, false);
+    assert.strictEqual(e.calls.length, 0);
+    await manager.shutdown();
+    assert.ok(fs.existsSync(path.join(dir, '.cc-web', 'workspaces', result.project.id)));
+  });
+
+  it('creates a host-local project when a working container target is explicitly overridden', async function () {
+    const dir = root(); const e = engine(); const cfg = config(dir);
+    const environments = new EnvironmentManager({
+      config: cfg,
+      engine: e,
+      hostHome: dir,
+      engines: new Map([['legacy', e]]),
+      configs: new Map([['legacy', cfg]]),
+      activeKey: 'legacy',
+    });
+    const s = store();
+    const manager = new ProjectManager({
+      store: s, environments, deployTargets: {}, authorFor: () => ({ name: 'Ada', email: 'a@b' }),
+      broadcast() {}, ownerFor: (id) => ({ id, githubLogin: 'ada' }), deleteProjectSessions() {},
+      localWorkspaceRoot: path.join(dir, '.cc-web', 'workspaces'),
+    });
+
+    const result = await manager.createAndStart(1, { name: 'local one', local: true });
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.project.executionKind, 'host');
+    assert.strictEqual(result.project.targetId, null);
+    assert.strictEqual(result.project.tierId, null);
+    assert.strictEqual(e.calls.length, 0);
+    await manager.shutdown();
+    assert.ok(fs.existsSync(path.join(dir, '.cc-web', 'workspaces', result.project.id)));
   });
 
   it('fails loudly for remote Docker bind-mount targets', function () {

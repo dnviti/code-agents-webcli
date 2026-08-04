@@ -34,6 +34,8 @@ import {
 } from '../services/projects/store.js';
 
 export interface DeployTargetRoutesDeps {
+  /** False keeps this experimental infrastructure surface entirely unavailable. */
+  deployTargetsEnabled?: boolean;
   deployTargets: DeployTargetStore;
   /** Resolved data directory, needed to build a live engine config for checks. */
   deployTargetDataDir: string;
@@ -57,6 +59,7 @@ export interface DeployTargetRoutesDeps {
   /** Read and write deploy policy in durable app_settings. */
   getDeploySetting(key: string): string | null;
   setDeploySetting(key: string, value: string): void;
+  deleteDeploySetting?(key: string): void;
 }
 
 /**
@@ -86,6 +89,10 @@ export function createDeployTargetRoutes(deps: DeployTargetRoutesDeps): Router {
 
   /** The one gate every handler passes: signed in, and the installer. */
   const gate = (req: Request, res: Response, write: boolean): boolean => {
+    if (deps.deployTargetsEnabled === false) {
+      res.status(404).json({ error: 'not_found' });
+      return false;
+    }
     const user = requireUser(res);
     if (!user) {
       res.status(401).json({ error: 'authentication_required' });
@@ -161,6 +168,8 @@ export function createDeployTargetRoutes(deps: DeployTargetRoutesDeps): Router {
       runLimitPerUser: positiveIntSetting(deps.getDeploySetting('deploy.runLimitPerUser'), DEFAULT_RUN_LIMIT_PER_USER),
       idleStopMinutes: positiveIntSetting(deps.getDeploySetting('deploy.idleStopMinutes'), DEFAULT_IDLE_STOP_MINUTES),
       idleReclaimMinutes: positiveIntSetting(deps.getDeploySetting('deploy.idleReclaimMinutes'), DEFAULT_IDLE_RECLAIM_MINUTES),
+      usageWarnUserBytes: optionalByteSetting(deps.getDeploySetting('deploy.usageWarnUserBytes')),
+      usageWarnAdminBytes: optionalByteSetting(deps.getDeploySetting('deploy.usageWarnAdminBytes')),
     });
   });
 
@@ -171,16 +180,24 @@ export function createDeployTargetRoutes(deps: DeployTargetRoutesDeps): Router {
     const runLimitPerUser = parsePositiveInt(body.runLimitPerUser);
     const idleStopMinutes = parsePositiveInt(body.idleStopMinutes);
     const idleReclaimMinutes = parsePositiveInt(body.idleReclaimMinutes);
+    const usageWarnUserBytes = body.usageWarnUserBytes === undefined
+      ? optionalByteSetting(deps.getDeploySetting('deploy.usageWarnUserBytes'))
+      : parseOptionalBytes(body.usageWarnUserBytes);
+    const usageWarnAdminBytes = body.usageWarnAdminBytes === undefined
+      ? optionalByteSetting(deps.getDeploySetting('deploy.usageWarnAdminBytes'))
+      : parseOptionalBytes(body.usageWarnAdminBytes);
 
     if (
       runLimitPerUser === null
       || idleStopMinutes === null
       || idleReclaimMinutes === null
       || idleReclaimMinutes <= idleStopMinutes
+      || usageWarnUserBytes === 'invalid'
+      || usageWarnAdminBytes === 'invalid'
     ) {
       res.status(400).json({
         error: 'invalid_settings',
-        message: 'Values must be positive integers, and reclaim must be later than stop.',
+        message: 'Lifecycle values must be positive integers, reclaim must be later than stop, and warning bytes must be non-negative integers or null.',
       });
       return;
     }
@@ -188,11 +205,15 @@ export function createDeployTargetRoutes(deps: DeployTargetRoutesDeps): Router {
     deps.setDeploySetting('deploy.runLimitPerUser', String(runLimitPerUser));
     deps.setDeploySetting('deploy.idleStopMinutes', String(idleStopMinutes));
     deps.setDeploySetting('deploy.idleReclaimMinutes', String(idleReclaimMinutes));
+    writeOptionalSetting(deps, 'deploy.usageWarnUserBytes', usageWarnUserBytes);
+    writeOptionalSetting(deps, 'deploy.usageWarnAdminBytes', usageWarnAdminBytes);
 
     res.json({
       runLimitPerUser,
       idleStopMinutes,
       idleReclaimMinutes,
+      usageWarnUserBytes,
+      usageWarnAdminBytes,
     });
   });
 
@@ -697,4 +718,30 @@ function parsePositiveInt(value: unknown): number | null {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) return null;
   return Math.floor(parsed);
+}
+
+function optionalByteSetting(raw: string | null): number | null {
+  if (raw === null || !raw.trim()) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function parseOptionalBytes(value: unknown): number | null | 'invalid' {
+  if (value === null || value === '') return null;
+  if (typeof value !== 'number' && typeof value !== 'string') return 'invalid';
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 'invalid';
+}
+
+function writeOptionalSetting(
+  deps: DeployTargetRoutesDeps,
+  key: string,
+  value: number | null,
+): void {
+  if (value === null) {
+    if (deps.deleteDeploySetting) deps.deleteDeploySetting(key);
+    else deps.setDeploySetting(key, '-1');
+  } else {
+    deps.setDeploySetting(key, String(value));
+  }
 }
