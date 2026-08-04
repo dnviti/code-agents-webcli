@@ -51,7 +51,7 @@ describe('Electron desktop helpers', function () {
     assert.match(release, /target_commitish:\s*\$\{\{ github\.sha \}\}/);
   });
 
-  it('uses the PWA title bar in desktop windows and removes the Windows menu bar', function () {
+  it('uses native-side controls in the PWA title bar and removes the Windows menu bar', function () {
     const overlay = {
       color: '#0a0a0a',
       symbolColor: '#fafafa',
@@ -67,10 +67,15 @@ describe('Electron desktop helpers', function () {
       titleBarOverlay: overlay,
       autoHideMenuBar: true,
     });
-    assert.deepStrictEqual(desktopWindowChrome('darwin'), {
+    const macChrome = desktopWindowChrome('darwin');
+    assert.deepStrictEqual(macChrome, {
       titleBarStyle: 'hidden',
       titleBarOverlay: true,
     });
+    assert.ok(
+      !Object.hasOwn(macChrome, 'trafficLightPosition'),
+      'macOS keeps its OS-managed traffic lights in the native upper-left position',
+    );
     assert.strictEqual(titleBarSymbolColor('#ffffff'), '#0a0a0a');
     assert.strictEqual(titleBarSymbolColor('#0a0a0a'), '#fafafa');
     assert.strictEqual(titleBarSymbolColor('not-a-colour'), '#fafafa');

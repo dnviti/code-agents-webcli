@@ -19,16 +19,24 @@ const CUSTOM_TITLE_BAR_HEIGHT = 40;
  * their caption-button overlay; macOS supplies its own traffic-light styling.
  */
 function desktopWindowChrome(platform = process.platform) {
+  if (platform === 'darwin') {
+    return {
+      // `hidden` keeps the real macOS traffic lights in their native upper-left
+      // position. Do not set trafficLightPosition: the OS owns that placement,
+      // while WCO reports the safe rectangle to the web title bar.
+      titleBarStyle: 'hidden',
+      titleBarOverlay: true,
+    };
+  }
+
   return {
     titleBarStyle: 'hidden',
-    titleBarOverlay: platform === 'darwin'
-      ? true
-      : {
-          color: '#0a0a0a',
-          symbolColor: '#fafafa',
-          height: CUSTOM_TITLE_BAR_HEIGHT,
-        },
-    ...(platform === 'darwin' ? {} : { autoHideMenuBar: true }),
+    titleBarOverlay: {
+      color: '#0a0a0a',
+      symbolColor: '#fafafa',
+      height: CUSTOM_TITLE_BAR_HEIGHT,
+    },
+    autoHideMenuBar: true,
   };
 }
 

@@ -138,7 +138,7 @@ function tab(id, over) {
 }
 
 describe('shell chrome', function () {
-  it('integrates the session bar into live left- and right-control WCO geometry', function () {
+  it('reserves macOS left and Windows right controls in live WCO geometry', function () {
     const leftControls = render(reset({
       tabs: [tab('a'), tab('b')], activeId: 'a',
       windowControlsOverlay: { visible: true, x: 138, y: 0, width: 886, height: 40 },
