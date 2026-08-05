@@ -258,6 +258,13 @@ describe('launcher maintenance binding source', function () {
 });
 
 describe('active-session automatic restart gate', function () {
+  const source = fs.readFileSync(path.join(ROOT, 'src/client/shell/ActiveAgentMaintenance.tsx'), 'utf8');
+
+  it('clears durable operation ids after completion or cancellation, but restarts only on completion', function () {
+    assert.match(source, /\['complete', 'cancelled'\]\.includes\(operation\.phase\)/);
+    assert.match(source, /removeItem\(operationKey\)[\s\S]*operation\.phase !== 'complete'/);
+  });
+
   function controller(overrides = {}) {
     return {
       transcript: {

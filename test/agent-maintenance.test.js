@@ -176,7 +176,18 @@ describe('agent maintenance foundation', () => {
     const app = express(); app.use(express.json()); app.use((_req, res, next) => { res.locals.authContext = { user: { id: 7 }, authSessionId: 's' }; next(); });
     app.use(createAgentMaintenanceRoutes({ maintenance: service, getInstallerUserId: () => 7, resolveTarget: async () => target() }));
     const server = await new Promise((resolve) => { const listening = app.listen(0, '127.0.0.1', () => resolve(listening)); });
-    try { const base = `http://127.0.0.1:${server.address().port}`; const response = await fetch(`${base}/api/agent-maintenance/claude/install`, { method: 'POST', headers: { 'content-type': 'application/json', Origin: 'https://evil.example' }, body: JSON.stringify({ targetId: 'bound-target' }) }); assert.equal(response.status, 403); }
+    try {
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const body = JSON.stringify({ targetId: 'bound-target' });
+      const response = await fetch(`${base}/api/agent-maintenance/claude/install`, { method: 'POST', headers: { 'content-type': 'application/json', Origin: 'https://evil.example' }, body });
+      assert.equal(response.status, 403);
+      const wrongScheme = await fetch(`${base}/api/agent-maintenance/claude/install`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', Origin: base.replace('http:', 'https:') },
+        body,
+      });
+      assert.equal(wrongScheme.status, 403, 'matching hosts with a different scheme are cross-origin');
+    }
     finally { await new Promise((resolve) => server.close(resolve)); }
   });
 

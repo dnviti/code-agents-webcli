@@ -40,6 +40,22 @@ function chat() {
 }
 
 describe('agent-update chat restart', function () {
+  it('rejects invalid session ids before entering the restart single-flight map', async function () {
+    const sent = [];
+    const processor = new MessageProcessor({
+      claudeSessions: new Map(),
+      webSocketConnections: new Map([['ws-1', {
+        ws: { readyState: WebSocket.OPEN, send: (value) => sent.push(JSON.parse(value)) },
+        userId: 7,
+      }]]),
+    });
+    await Promise.all([
+      processor.handleMessage('ws-1', { type: 'runtime_restart' }),
+      processor.handleMessage('ws-1', { type: 'runtime_restart', sessionId: null }),
+    ]);
+    assert.deepEqual(sent.map((message) => message.reason), ['invalid_session', 'invalid_session']);
+  });
+
   it('probes the catalog executable with a fully scrubbed process environment', async function () {
     const wraps = [];
     const runs = [];
@@ -113,6 +129,45 @@ describe('agent-update chat restart', function () {
     assert.equal(sent.at(-1).reason, 'version_verification_failed');
     assert.equal(record.runningAgentVersion, '1.0.0');
     assert.equal(record.runningManagedAgentVersion, null);
+  });
+
+  it('returns stable error codes without exposing environment or restart failures', async function () {
+    const sent = [];
+    const record = { id: 'maintained-chat', ownerUserId: 7, active: true, agent: 'claude', lastAgent: 'claude', surface: 'chat' };
+    const connection = {
+      ws: { readyState: WebSocket.OPEN, send: (value) => sent.push(JSON.parse(value)) },
+      userId: 7,
+      claudeSessionId: record.id,
+    };
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      const environmentFailure = new MessageProcessor({
+        claudeSessions: new Map([[record.id, record]]),
+        webSocketConnections: new Map([['ws-1', connection]]),
+        resolveAgentEnvironment: async () => { throw new Error('/secret/container/path'); },
+      });
+      await environmentFailure.handleMessage('ws-1', {
+        type: 'runtime_restart', sessionId: record.id, automatic: false, allowFreshContext: true,
+      });
+      assert.equal(sent.at(-1).reason, 'environment_unavailable');
+
+      const environment = { kind: 'container', identity: 'immutable-a', name: 'env', homeDir: '/tmp', containerHome: '/tmp', shells: [], mounts: [], nodePath: 'node', wrap: (command, args) => ({ command, args, env: {} }), toContainerPath: (value) => value, toHostPath: (value) => value };
+      const restartFailure = new MessageProcessor({
+        claudeSessions: new Map([[record.id, record]]),
+        webSocketConnections: new Map([['ws-1', connection]]),
+        resolveAgentEnvironment: async () => environment,
+        resolveAgentLaunch: () => ({ command: '/managed/claude', version: '2.0.0' }),
+        chatManager: { restartForAgentUpdate: async () => { throw new Error('private runtime detail'); } },
+      });
+      await restartFailure.handleMessage('ws-1', {
+        type: 'runtime_restart', sessionId: record.id, automatic: false, allowFreshContext: true,
+      });
+      assert.equal(sent.at(-1).reason, 'restart_failed');
+      assert.doesNotMatch(JSON.stringify(sent), /secret|private runtime detail/);
+    } finally {
+      console.error = originalError;
+    }
   });
 
   it('atomically keeps the session and transcript while resuming on the managed command', async function () {

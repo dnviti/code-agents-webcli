@@ -10,7 +10,18 @@ export interface AgentMaintenanceRoutesDeps {
   /** Must bind the requested server/environment/ownership identity, never controller selection. */
   resolveTarget(input: { userId: number; targetId: string }): Promise<AgentMaintenanceTarget | null>;
 }
-function sameOrigin(req: Request): boolean { const origin = req.headers.origin; if (!origin) return true; try { return new URL(origin).host === req.headers.host; } catch { return false; } }
+function sameOrigin(req: Request): boolean {
+  const origin = req.headers.origin;
+  const host = req.headers.host;
+  if (!origin) return true;
+  if (!host) return false;
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === `${req.protocol}:` && parsed.host === host;
+  } catch {
+    return false;
+  }
+}
 function user(req: Request, res: Response, write = false): number | null { const account = requireUser(res); if (!account) { res.status(401).json({ error: 'authentication_required' }); return null; } if (write && !sameOrigin(req)) { res.status(403).json({ error: 'cross_origin' }); return null; } return account.id; }
 function agent(value: unknown): AgentMaintenanceId | null { return typeof value === 'string' && (AGENT_MAINTENANCE_IDS as readonly string[]).includes(value) ? value as AgentMaintenanceId : null; }
 function targetId(value: unknown): string | null { return typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,256}$/u.test(value) ? value : null; }

@@ -272,9 +272,12 @@ export class MessageHandler {
           const reasons: Record<string, string> = {
             busy: 'The agent became busy before it could restart. Try again when the current turn is idle.',
             cannot_resume: 'This agent cannot resume its native context automatically. Use Restart… to review the consequence first.',
+            environment_unavailable: 'The agent environment is unavailable. Reconnect the server and try again.',
+            invalid_session: 'The restart request did not identify a valid session.',
             manual_required: 'This terminal agent needs confirmation before it can restart.',
             no_managed_update: 'There is no verified managed agent copy to restart onto.',
             project_managed: 'This agent belongs to the project. Update it through the project rebuild flow.',
+            restart_failed: 'The agent could not be restarted. Try again.',
           };
           showError(reasons[message.reason || ''] || message.reason || 'The agent could not be restarted.');
         }

@@ -47,7 +47,9 @@ describe('desktop controller LAN discovery client', function () {
       timeoutMs: 100,
       createSocket: factory,
       parseResponse(message) {
-        try { return JSON.parse(message.toString('utf8')); } catch { return null; }
+        const text = message.toString('utf8');
+        if (text === 'parser-crash') throw new Error('unexpected parser input');
+        try { return JSON.parse(text); } catch { return null; }
       },
     });
     assert.strictEqual(created, 1);
@@ -58,6 +60,7 @@ describe('desktop controller LAN discovery client', function () {
       { message: 'CODE_AGENTS_DISCOVERY/1', port: 32353, address: '255.255.255.255' },
       { message: 'CODE_AGENTS_DISCOVERY/1', port: 32353, address: '192.168.1.255' },
     ]);
+    socket.emit('message', Buffer.from('parser-crash'), { address: '192.168.1.7' });
     socket.emit('message', Buffer.from('not-json'), { address: '192.168.1.8' });
     socket.emit('message', Buffer.from(JSON.stringify({ address: 'https://b.example', serverName: 'Beta' })), { address: '192.168.1.9' });
     socket.emit('message', Buffer.from(JSON.stringify({ address: 'https://a.example', serverName: 'Alpha' })), { address: '192.168.1.10' });

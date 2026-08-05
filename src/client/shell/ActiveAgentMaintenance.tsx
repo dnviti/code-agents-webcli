@@ -78,9 +78,10 @@ export function ActiveAgentMaintenance({
     try { return localStorage.getItem(operationKey); } catch { return null; }
   });
   const operationSettled = React.useCallback((operation: AgentMaintenanceOperation): void => {
-    if (operation.phase !== 'complete') return;
+    if (!['complete', 'cancelled'].includes(operation.phase)) return;
     setOperationId(null);
     try { localStorage.removeItem(operationKey); } catch { /* optional */ }
+    if (operation.phase !== 'complete') return;
     if (surface === 'chat' && chatLooksAutomaticSafe(chatController)) {
       restartAgent(sessionId, true, false);
     }

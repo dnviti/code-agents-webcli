@@ -1758,6 +1758,12 @@ export class MessageProcessor {
     data: IncomingMessage,
   ): Promise<void> {
     const sessionId = typeof data.sessionId === 'string' ? data.sessionId : '';
+    if (!sessionId) {
+      sendToWebSocket(wsInfo.ws, {
+        type: 'runtime_restart_result', sessionId, ok: false, reason: 'invalid_session',
+      });
+      return;
+    }
     if (this.agentUpdateRestarts.has(sessionId)) {
       sendToWebSocket(wsInfo.ws, { type: 'runtime_restart_result', sessionId, ok: false, reason: 'busy' });
       return;
@@ -1804,9 +1810,10 @@ export class MessageProcessor {
         ? await this.deps.resolveAgentEnvironment(session)
         : await this.userEnvironment(session.ownerUserId);
     } catch (error) {
+      console.error(`Could not resolve the environment for agent restart ${sessionId}:`, error);
       sendToWebSocket(wsInfo.ws, {
         type: 'runtime_restart_result', sessionId, ok: false,
-        reason: error instanceof Error ? error.message : 'environment_unavailable',
+        reason: 'environment_unavailable',
       });
       return;
     }
@@ -1874,9 +1881,10 @@ export class MessageProcessor {
         resumed: false, version: selected.version,
       });
     } catch (error) {
+      console.error(`Could not restart agent for session ${sessionId}:`, error);
       sendToWebSocket(wsInfo.ws, {
         type: 'runtime_restart_result', sessionId, ok: false,
-        reason: error instanceof Error ? error.message : 'restart_failed',
+        reason: 'restart_failed',
       });
     }
   }
