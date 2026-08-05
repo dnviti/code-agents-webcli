@@ -580,6 +580,10 @@ export class WorkspaceSessionDatabase implements SessionPersistenceDatabase {
       'rollback_recovery_pending',
       'INTEGER NOT NULL DEFAULT 0',
     );
+    // Provenance of a codex cost estimate (issue #182); see the app-db column
+    // of the same name. Travels with the row, so removing a usage record
+    // removes its estimate.
+    this.addColumnIfMissing('usage_jobs', 'cost_estimate', 'TEXT');
   }
 
   /** Additive, nullable and safe to run again after an interrupted upgrade. */

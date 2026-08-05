@@ -21,6 +21,7 @@
  */
 
 import { ChatUsage } from '../../shared/chat-events.js';
+import type { CodexCostEstimate, CodexCostEstimator } from '../../shared/codex-pricing.js';
 import { AppDatabase } from './database.js';
 import { SessionPersistenceDatabase } from './workspace-session-database.js';
 import {
@@ -68,6 +69,8 @@ export interface UsageJobInput {
   reasoningTokens: number | null;
   totalTokens: number | null;
   costUsd: number | null;
+  /** issue #182: the full provenance of a codex estimate, when one was computed. */
+  costEstimate?: CodexCostEstimate | null;
   reportsUsage: boolean;
   reportsCost: boolean;
   tools: Array<{ tool: string; calls: number }>;
@@ -143,6 +146,7 @@ interface JobRow {
   reasoning_tokens: number | null;
   total_tokens: number | null;
   cost_usd: number | null;
+  cost_estimate: string | null;
   reports_usage: number;
   reports_cost: number;
 }
@@ -238,9 +242,9 @@ export class UsageStore {
           agent, model, project, project_source, started_at, ended_at, duration_ms, outcome,
           turns, model_turns, tool_calls,
           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-          reasoning_tokens, total_tokens, cost_usd,
+          reasoning_tokens, total_tokens, cost_usd, cost_estimate,
           reports_usage, reports_cost
-        ) VALUES (${Array.from({ length: 26 + ownerValues.length }, () => '?').join(', ')})
+        ) VALUES (${Array.from({ length: 27 + ownerValues.length }, () => '?').join(', ')})
       `).run(
         ...ownerValues,
         id,
@@ -259,8 +263,8 @@ export class UsageStore {
         job.durationMs,
         job.outcome,
         // The superseded column, kept satisfiable rather than meaningful: it is
-        // NOT NULL and a build from before #86 opening this file still reads it.
-        // The nearest honest thing to put there is the figure that replaced it.
+        // NOT NULL and a build from before #86 opening this same file still reads
+        // it. The nearest honest thing to put there is the figure that replaced it.
         job.modelTurns ?? 0,
         job.modelTurns ?? null,
         job.toolCalls,
@@ -271,6 +275,7 @@ export class UsageStore {
         job.reasoningTokens,
         job.totalTokens,
         job.costUsd,
+        job.costEstimate ? JSON.stringify(job.costEstimate) : null,
         job.reportsUsage ? 1 : 0,
         job.reportsCost ? 1 : 0,
       );
@@ -392,7 +397,7 @@ export class UsageStore {
     const rows = this.database.raw
       .prepare(`
         SELECT turn_id, input_tokens, output_tokens, cache_read_tokens,
-               cache_write_tokens, reasoning_tokens, total_tokens, cost_usd
+               cache_write_tokens, reasoning_tokens, total_tokens, cost_usd, cost_estimate
         FROM usage_jobs WHERE session_id = ? AND user_id = ?${this.ownerKey ? ' AND owner_key = ?' : ''}
       `)
       .all(sessionId, userId, ...(this.ownerKey ? [this.ownerKey] : [])) as Array<Record<string, number | string | null>>;
@@ -404,6 +409,8 @@ export class UsageStore {
       // the surface showing it says "not reported" rather than "$0.00".
       const figure = (value: number | string | null): number | undefined =>
         typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+      const estimateRaw = typeof row.cost_estimate === 'string' ? row.cost_estimate : null;
+      const estimate = estimateRaw ? safeParseEstimate(estimateRaw) : null;
       spend.set(String(row.turn_id), {
         inputTokens: figure(row.input_tokens),
         outputTokens: figure(row.output_tokens),
@@ -412,6 +419,8 @@ export class UsageStore {
         reasoningTokens: figure(row.reasoning_tokens),
         totalTokens: figure(row.total_tokens),
         costUsd: figure(row.cost_usd),
+        // An estimated figure still needs its provenance label on the turn row.
+        ...(estimate ? { costEstimate: estimate, costSource: 'estimated' as const } : {}),
       });
     }
     return spend;
@@ -470,6 +479,71 @@ export class UsageStore {
       .prepare(`UPDATE usage_jobs SET project = ?, project_source = ? WHERE ${where.join(' AND ')}`)
       .run(project, source, ...whereParams);
     return result.changes ?? 0;
+  }
+
+  /**
+   * One-time retrospective backfill of codex cost estimates (issue #182).
+   *
+   * Every codex row that has a confirmed model, sufficient token detail and
+   * *no* cost figure yet is priced at the official list rate the estimator
+   * holds, marked `retrospective` and stamped with the date the estimate was
+   * made. The guards are the whole of the "never overwrite" contract:
+   *
+   *   - `cost_estimate IS NULL` keeps a later price change from rewriting a
+   *     live or previously backfilled estimate (acceptance: "A later price
+   *     change does not rewrite a previously recorded live or retrospective
+   *     estimate");
+   *   - `cost_usd IS NULL` leaves a runtime-reported figure alone and never
+   *     prices a row whose runtime already priced it;
+   *   - `agent = 'codex'` confines the pass to the one runtime this app prices.
+   *
+   * Rows without a confirmable rate (or without token detail) stay unpriced —
+   * "price unavailable" — and are left for a later run once a price exists.
+   * Idempotent: re-running touches only rows still missing an estimate.
+   */
+  backfillCodexEstimates(estimator: CodexCostEstimator): number {
+    if (!estimator || typeof estimator.estimate !== 'function') return 0;
+    const rows = this.database.raw
+      .prepare(`
+        SELECT id, model, input_tokens, cache_read_tokens, output_tokens
+        FROM usage_jobs
+        WHERE agent = 'codex'
+          AND cost_estimate IS NULL
+          AND cost_usd IS NULL
+          AND model IS NOT NULL
+          AND (input_tokens IS NOT NULL OR output_tokens IS NOT NULL OR cache_read_tokens IS NOT NULL)
+      `)
+      .all() as Array<{
+        id: string;
+        model: string;
+        input_tokens: number | null;
+        cache_read_tokens: number | null;
+        output_tokens: number | null;
+      }>;
+
+    let updated = 0;
+    const update = this.database.raw.prepare(
+      'UPDATE usage_jobs SET cost_usd = ?, cost_estimate = ? WHERE id = ?',
+    );
+    const write = this.database.raw.transaction(() => {
+      for (const row of rows) {
+        const estimate = estimator.estimate(
+          {
+            inputTokens: row.input_tokens ?? undefined,
+            cacheReadTokens: row.cache_read_tokens ?? undefined,
+            outputTokens: row.output_tokens ?? undefined,
+          },
+          row.model,
+          { retrospective: true },
+        );
+        // No rate for this model: leave it unpriced rather than guessing.
+        if (!estimate) continue;
+        update.run(estimate.costUsd, JSON.stringify(estimate), row.id);
+        updated += 1;
+      }
+    });
+    write();
+    return updated;
   }
 
   // ------------------------------------------------------------------ reading
@@ -1146,9 +1220,23 @@ function mapJob(row: JobRow): UsageJobSummary {
     reasoningTokens: row.reasoning_tokens,
     totalTokens: row.total_tokens,
     costUsd: row.cost_usd,
+    costEstimate: row.cost_estimate ? safeParseEstimate(row.cost_estimate) : null,
     reportsUsage: row.reports_usage === 1,
     reportsCost: row.reports_cost === 1,
   };
+}
+
+/** Parse a stored estimate leniently: a corrupt row must not break the history. */
+function safeParseEstimate(raw: string): CodexCostEstimate | null {
+  try {
+    const parsed = JSON.parse(raw) as CodexCostEstimate;
+    if (parsed && typeof parsed.costUsd === 'number' && typeof parsed.model === 'string') {
+      return parsed;
+    }
+  } catch {
+    // fall through
+  }
+  return null;
 }
 
 function mapTotals(row: TotalsRow): UsageTotals {

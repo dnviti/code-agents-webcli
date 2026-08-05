@@ -20,6 +20,7 @@ import {
 } from '../../../shared/chat-events.js';
 import { blockHasContent } from '../../../shared/chat-visibility.js';
 import { mergeSlashCommands } from '../../../shared/slash-commands.js';
+import type { CodexCostEstimator, CodexTokenInput } from '../../../shared/codex-pricing.js';
 import { AccountLimitTracker, resetIsoFromEpochSeconds } from '../account-limits.js';
 import {
   AdapterChild,
@@ -767,8 +768,11 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     fork: false,
     attachments: true,
     usage: true,
-    // Tokens only -- nothing in the generated schema prices a turn.
-    cost: false,
+    // Tokens always; cost as an API-list-price estimate computed by this app
+    // from the confirmed model and reported tokens (issue #182). The runtime
+    // itself never prices a turn; the estimated figure is stamped with its
+    // provenance and never presented as a bill.
+    cost: true,
     plan: true,
     commands: initialCodexCommands(this.options),
     efforts: CODEX_BASE_EFFORTS.map((level) => ({ ...level })),
@@ -1859,17 +1863,34 @@ export class CodexAppServerAdapter extends JsonRpcChatAdapter {
     // sums). Attaching it to msg_end/turn_end as well -- which merge
     // *additively* -- would double-count on top of this on every turn, so
     // this is the only channel usage travels on for this adapter.
-    this.emit({
-      t: 'usage',
-      usage: {
-        inputTokens: num(total.inputTokens),
-        outputTokens: num(total.outputTokens),
-        cacheReadTokens: num(total.cachedInputTokens),
-        reasoningTokens: num(total.reasoningOutputTokens),
-        totalTokens: num(total.totalTokens),
-        ...contextReading(usage, total, this.model),
-      },
-    });
+    const emitted: ChatUsage = {
+      inputTokens: num(total.inputTokens),
+      outputTokens: num(total.outputTokens),
+      cacheReadTokens: num(total.cachedInputTokens),
+      reasoningTokens: num(total.reasoningOutputTokens),
+      totalTokens: num(total.totalTokens),
+      ...contextReading(usage, total, this.model),
+    };
+
+    // Price the cumulative usage this report describes against the confirmed
+    // model, when there is an estimator to ask. The figure is a cumulative
+    // estimate (like the tokens beside it), labelled 'estimated' so every
+    // surface that shows money knows it was computed, not reported. Absent an
+    // estimator or a rate for the model, the event stays tokens-only and the
+    // client shows price-unavailable rather than a guessed number.
+    if (this.options.codexPricing) {
+      const estimate = this.options.codexPricing.estimate(
+        emitted as CodexTokenInput,
+        this.model,
+      );
+      if (estimate) {
+        emitted.costUsd = estimate.costUsd;
+        emitted.costSource = 'estimated';
+        emitted.costEstimate = estimate;
+      }
+    }
+
+    this.emit({ t: 'usage', usage: emitted });
   }
 
   private onTurnCompleted(params: Record<string, unknown>): void {

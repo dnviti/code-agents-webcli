@@ -20,6 +20,8 @@ import {
 import { ChatTranscript } from '../../chat/transcript.js';
 import { safeAttachmentDownloadUrl } from '../../chat/attachments-api.js';
 import { compactCount, formatDuration } from '../../chat/tool-meta.js';
+import { describeCodexEstimate } from '../../../shared/codex-pricing.js';
+import { markEstimatedCost } from '../../../shared/usage-records.js';
 import { Icon } from '../../ui/relay/Icon.js';
 import { PHONE_TEXT, TOUCH_GAP, TOUCH_TARGET, usePhone } from '../../ui/touch.js';
 import { Markdown, markdownText } from './Markdown.js';
@@ -1001,13 +1003,21 @@ function ActionButton({
 
 function Footer({ model, usage }: { model?: string; usage?: ChatUsage }) {
   const isPhone = usePhone();
-  const bits: string[] = [];
-  if (model) bits.push(model);
+  const bits: Array<{ text: string; title?: string }> = [];
+  if (model) bits.push({ text: model });
   if (usage) {
-    if (usage.inputTokens !== undefined) bits.push(`${compactCount(usage.inputTokens)} in`);
-    if (usage.outputTokens !== undefined) bits.push(`${compactCount(usage.outputTokens)} out`);
-    if (usage.cacheReadTokens) bits.push(`${compactCount(usage.cacheReadTokens)} cached`);
-    if (usage.costUsd !== undefined) bits.push(`$${usage.costUsd.toFixed(4)}`);
+    if (usage.inputTokens !== undefined) bits.push({ text: `${compactCount(usage.inputTokens)} in` });
+    if (usage.outputTokens !== undefined) bits.push({ text: `${compactCount(usage.outputTokens)} out` });
+    if (usage.cacheReadTokens) bits.push({ text: `${compactCount(usage.cacheReadTokens)} cached` });
+    if (usage.costUsd !== undefined) {
+      const estimated = Boolean(usage.costEstimate) || usage.costSource === 'estimated';
+      bits.push({
+        text: estimated
+          ? markEstimatedCost(`$${usage.costUsd.toFixed(4)}`)
+          : `$${usage.costUsd.toFixed(4)}`,
+        title: estimated && usage.costEstimate ? describeCodexEstimate(usage.costEstimate) : undefined,
+      });
+    }
   }
   if (!bits.length) return null;
 
@@ -1027,7 +1037,7 @@ function Footer({ model, usage }: { model?: string; usage?: ChatUsage }) {
       }}
     >
       {bits.map((bit, i) => (
-        <span key={i}>{bit}</span>
+        <span key={i} title={bit.title}>{bit.text}</span>
       ))}
     </footer>
   );
