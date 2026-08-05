@@ -140,6 +140,7 @@ export function NewSessionDialog({
               autoFocus
               required
               aria-describedby={serverStatusId}
+              style={{ minHeight: TOUCH_TARGET }}
               options={
                 serverTargets.length === 0
                   ? [{ value: '', label: 'No configured servers', disabled: true }]
