@@ -7,6 +7,13 @@ import { Button } from '../ui/relay/Button';
 import { Icon } from '../ui/relay/Icon';
 import { LaunchCard } from '../ui/relay/LaunchCard';
 import { CHAT_LAUNCH_LABEL, chatUnavailableReason } from '../../shared/chat-runtimes';
+import {
+  AGENT_MAINTENANCE_IDS,
+  type AgentMaintenanceId,
+  type AgentMaintenanceOperation,
+  type AgentMaintenanceStatus,
+} from '../../shared/agent-maintenance';
+import { AgentMaintenancePickerRow } from './AgentMaintenanceStrip';
 
 export interface RuntimeLauncherProps {
   aliases: Aliases;
@@ -42,6 +49,20 @@ export interface RuntimeLauncherProps {
   /** True while that list is still being fetched. */
   conversationsLoading?: boolean;
   onResume?(conversation: ResumableConversation): void;
+  maintenance?: {
+    targetName: string;
+    statuses: Partial<Record<AgentMaintenanceId, AgentMaintenanceStatus>>;
+    operation?: AgentMaintenanceOperation | null;
+    checking?: readonly AgentMaintenanceId[];
+    errors?: Partial<Record<AgentMaintenanceId, string>>;
+    error?: string | null;
+    operationBusyReason?: string | null;
+    onInstall(agentId: AgentMaintenanceId): void | Promise<void>;
+    /** Update actions belong only to the fixed notice above an opened session. */
+    onUpdate?(agentId: AgentMaintenanceId): void | Promise<void>;
+    onRetry(agentId: AgentMaintenanceId): void | Promise<void>;
+    onCancel(): void | Promise<void>;
+  };
 }
 
 /**
@@ -83,6 +104,12 @@ const RUNTIMES: RuntimeEntry[] = [
   },
 ];
 
+function maintenanceAgent(kind: AgentKind): AgentMaintenanceId | null {
+  return (AGENT_MAINTENANCE_IDS as readonly string[]).includes(kind)
+    ? kind as AgentMaintenanceId
+    : null;
+}
+
 /**
  * Opens a runtime as a web chat instead of a terminal.
  *
@@ -101,6 +128,7 @@ function ChatLaunchButton({
   compact,
   bypass,
   onStart,
+  disabledReason,
 }: {
   label: string;
   kind: AgentKind;
@@ -111,20 +139,22 @@ function ChatLaunchButton({
    */
   bypass?: boolean;
   onStart(kind: AgentKind, options?: RuntimeStartOptions): void;
+  disabledReason?: string;
 }): React.JSX.Element {
   const unavailable = chatUnavailableReason(kind);
+  const disabled = disabledReason || unavailable;
 
   return (
     <Button
       variant="outline"
       size="sm"
-      disabled={Boolean(unavailable)}
+      disabled={Boolean(disabled)}
       // Blue, from the one blue the design system already has. `--info` flips
       // between a light blue on dark and a dark blue on light, and pairing it
       // with `--background` as the foreground keeps the contrast right in both
       // directions — a fixed white or black would fail one of the two themes.
       style={
-        unavailable
+        disabled
           ? undefined
           : {
               background: 'var(--info)',
@@ -133,8 +163,10 @@ function ChatLaunchButton({
             }
       }
       title={
-        unavailable
-          ? `${CHAT_LAUNCH_LABEL} is unavailable for ${label}. ${unavailable}`
+        disabledReason
+          ? disabledReason
+          : unavailable
+            ? `${CHAT_LAUNCH_LABEL} is unavailable for ${label}. ${unavailable}`
           : bypass
             ? `Open ${label} as a chat in the browser. Tool approvals are bypassed for new chats `
               + '(change that in Settings). This surface is in beta.'
@@ -147,7 +179,7 @@ function ChatLaunchButton({
       }
       onClick={(event: React.MouseEvent<HTMLButtonElement>) => {
         event.stopPropagation();
-        if (unavailable) return;
+        if (disabled) return;
         // No mode is asked for. The server decides it from the preference it
         // holds for this account, which is the whole point of #134: the button
         // *reports* what is about to happen rather than requesting it, the same
@@ -290,6 +322,7 @@ export function RuntimeLauncher({
   conversations,
   conversationsLoading = false,
   onResume,
+  maintenance,
 }: RuntimeLauncherProps): React.JSX.Element {
   const resumable = onResume ? conversations || [] : [];
   return (
@@ -375,12 +408,22 @@ export function RuntimeLauncher({
           // straight through and would have said "Start undefined" for a
           // runtime whose alias was missing while the card still read fine.
           const label = aliases[runtime.kind] || runtime.kind;
+          const maintenanceId = maintenanceAgent(runtime.kind);
+          const maintenanceStatus = maintenanceId
+            ? maintenance?.statuses[maintenanceId]
+            : undefined;
+          const launchDisabled = maintenanceStatus?.state === 'missing';
+          const launchDisabledReason = launchDisabled
+            ? `${label} is not installed on ${maintenance?.targetName || 'this target'}. Install it below before starting a session.`
+            : undefined;
           return (
+          <div key={runtime.kind} style={{ display: 'grid' }}>
           <LaunchCard
-            key={runtime.kind}
             icon="cpu"
             label={label}
             meta={runtime.binary}
+            disabled={launchDisabled}
+            disabledReason={launchDisabledReason}
             onClick={() => onStart(runtime.kind)}
             action={
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -390,11 +433,13 @@ export function RuntimeLauncher({
                   compact={compact}
                   bypass={chatBypass}
                   onStart={onStart}
+                  disabledReason={launchDisabledReason}
                 />
                 {runtime.dangerous ? (
                   <Button
                     variant="destructive"
                     size="sm"
+                    disabled={launchDisabled}
                     // The card itself starts the runtime safely; this is a
                     // separate target so the bypass cannot be hit by aiming at
                     // the card. The title states the actual consequence rather
@@ -414,6 +459,26 @@ export function RuntimeLauncher({
               </div>
             }
           />
+          {maintenance && maintenanceStatus && maintenanceId ? (
+            <AgentMaintenancePickerRow
+              status={maintenanceStatus}
+              targetName={maintenance.targetName}
+              operation={maintenance.operation?.agentId === maintenanceId
+                ? maintenance.operation
+                : null}
+              checking={maintenance.checking?.includes(maintenanceId)}
+              error={maintenance.errors?.[maintenanceId]
+                || (maintenance.operation?.agentId === maintenanceId ? maintenance.error : null)}
+              blockedReason={maintenance.operation?.agentId === maintenanceId
+                ? null
+                : maintenance.operationBusyReason}
+              onInstall={maintenance.onInstall}
+              onUpdate={maintenance.onUpdate}
+              onRetry={maintenance.onRetry}
+              onCancel={maintenance.onCancel}
+            />
+          ) : null}
+          </div>
           );
         })}
       </div>

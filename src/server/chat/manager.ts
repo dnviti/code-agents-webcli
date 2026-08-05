@@ -490,6 +490,15 @@ export class ChatSessionManager {
     }
   }
 
+  restartForAgentUpdate(
+    sessionId: string,
+    input: { automatic: boolean; allowFreshContext: boolean; command?: string },
+  ): Promise<import('./session.js').AgentUpdateRestartResult> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return Promise.resolve({ ok: false, reason: 'not_running' });
+    return session.restartForAgentUpdate(input);
+  }
+
   async stopAll(options: { preserveHandoffs?: boolean } = {}): Promise<void> {
     const ids = Array.from(this.sessions.keys());
     await Promise.all(ids.map((id) => this.stop(id, options)));

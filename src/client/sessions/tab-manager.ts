@@ -45,6 +45,8 @@ interface TabRecord {
    * user is looking at a different one.
    */
   surface: 'terminal' | 'chat';
+  /** Runtime currently or most recently associated with this tab. */
+  kind: string;
   projectId?: string | null;
   projectName?: string | null;
   projectWorkingDirKind?: 'host' | 'container';
@@ -79,6 +81,8 @@ export interface ListedSession {
   workingDir: string | null;
   active?: boolean;
   surface?: 'terminal' | 'chat';
+  agent?: string | null;
+  lastAgent?: string | null;
   customName?: string | null;
   bypassPermissions?: boolean;
   projectId?: string | null;
@@ -380,9 +384,7 @@ export class SessionTabManager {
           title: record.displayName,
           surface: record.surface,
           status,
-          // Not yet tracked per session; the server's SessionRecord.agent would
-          // have to be plumbed through the list endpoint first.
-          kind: '',
+          kind: record.kind,
           workingDir: session.workingDir,
           projectWorkingDirKind: session.projectWorkingDirKind,
           unread: session.unreadOutput,
@@ -739,6 +741,7 @@ export class SessionTabManager {
       session.projectName,
       session.projectWorkingDirKind,
     );
+    this.setTabRuntime(session.id, session.agent || session.lastAgent || '');
 
     if (session.surface !== 'chat') return;
 
@@ -871,6 +874,7 @@ export class SessionTabManager {
       displayName,
       customName,
       surface: 'terminal',
+      kind: '',
       projectId,
       projectName,
       projectWorkingDirKind,
@@ -918,6 +922,14 @@ export class SessionTabManager {
     if (surface === 'chat') {
       this.app.chats.subscribe(sessionId);
     }
+    this.syncShell();
+  }
+
+  /** Keep maintenance status attached to the tab whose runtime owns it. */
+  setTabRuntime(sessionId: string, kind: string): void {
+    const record = this.tabs.get(sessionId);
+    if (!record || record.kind === kind) return;
+    record.kind = kind;
     this.syncShell();
   }
 

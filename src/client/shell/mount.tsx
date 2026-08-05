@@ -23,7 +23,8 @@ import { RuntimeLauncher, type ResumableConversation } from './RuntimeLauncher';
 import { readStoredTheme, setThemeMode, watchSystemTheme, type RelayTheme } from './theme';
 import { shellStore } from './store';
 import { relayTerminalTheme } from './terminal-theme';
-import { rememberNewSessionServer } from '../controller/transport';
+import { parseQualifiedSessionId, rememberNewSessionServer } from '../controller/transport';
+import { useAgentMaintenance } from '../agent-maintenance/useAgentMaintenance';
 
 /** The live terminal, so a theme change can reach it. Set once at mount. */
 let themedApp: App | null = null;
@@ -435,6 +436,95 @@ function buildLauncher(app: App): React.ReactNode {
   // follow the viewport: `buildLauncher` runs once, but whether the buttons
   // have room for their labels changes every time the window is resized or the
   // phone is rotated.
+  function MaintenanceBoundLauncher({
+    targetId,
+    serverId,
+    targetName,
+    compact,
+    chatBypass,
+    conversations,
+    loading,
+  }: {
+    targetId: string;
+    serverId: string;
+    targetName: string;
+    compact: boolean;
+    chatBypass: boolean;
+    conversations: ResumableConversation[];
+    loading: boolean;
+  }): React.JSX.Element {
+    const operationKey = `cc-agent-maintenance-operation:${encodeURIComponent(serverId)}:${encodeURIComponent(targetId)}`;
+    const [operationId, setOperationId] = React.useState<string | null>(() => {
+      try { return localStorage.getItem(operationKey); } catch { return null; }
+    });
+    const rememberOperation = React.useCallback((id: string): void => {
+      setOperationId(id);
+      try { localStorage.setItem(operationKey, id); } catch { /* optional */ }
+    }, [operationKey]);
+    const forgetSettledOperation = React.useCallback((operation: import('../../shared/agent-maintenance').AgentMaintenanceOperation): void => {
+      if (operation.phase !== 'complete' && operation.phase !== 'cancelled') return;
+      setOperationId(null);
+      try { localStorage.removeItem(operationKey); } catch { /* optional */ }
+    }, [operationKey]);
+    const maintenance = useAgentMaintenance({
+      targetId,
+      serverId,
+      operationId,
+      onOperationId: rememberOperation,
+      onOperationSettled: forgetSettledOperation,
+    });
+    const beginMaintenance = React.useCallback(async (
+      agentId: import('../../shared/agent-maintenance').AgentMaintenanceId,
+      kind: 'install' | 'update',
+    ): Promise<void> => {
+      const status = maintenance.statuses[agentId];
+      let confirmed = false;
+      if (status?.requiresConfirmation) {
+        confirmed = await showConfirm({
+          title: `${kind === 'update' ? 'Update' : 'Install'} ${agentId} on this shared host?`,
+          description: 'This changes the installer-owned agent copy for every session using this shared host. Running sessions keep their current process until restarted.',
+          confirmLabel: kind === 'update' ? 'Update shared copy' : 'Install shared copy',
+          serverId,
+        });
+        if (!confirmed) return;
+      }
+      if (kind === 'update') await maintenance.update(agentId, confirmed);
+      else await maintenance.install(agentId, confirmed);
+    }, [maintenance, serverId]);
+
+    return (
+      <RuntimeLauncher
+        aliases={app.aliases}
+        onStart={start}
+        onTerminal={onTerminal}
+        onCancel={() => void app.cancelStartPrompt()}
+        compact={compact}
+        chatBypass={chatBypass}
+        conversations={conversations}
+        conversationsLoading={loading}
+        onResume={(conversation) => void resumeConversation(app, conversation)}
+        maintenance={{
+          targetName,
+          statuses: maintenance.statuses,
+          operation: maintenance.operation,
+          operationBusyReason: maintenance.operationBusyReason,
+          checking: maintenance.checking,
+          errors: maintenance.errors,
+          error: maintenance.error,
+          onInstall: (agentId) => beginMaintenance(agentId, 'install'),
+          onRetry: async (agentId) => {
+            if (maintenance.operation?.agentId === agentId && maintenance.operation.retryable) {
+              await beginMaintenance(agentId, maintenance.operation.kind);
+              return;
+            }
+            await maintenance.check(agentId, true);
+          },
+          onCancel: () => maintenance.cancel(),
+        }}
+      />
+    );
+  }
+
   function LauncherHost(): React.JSX.Element {
     const state = React.useSyncExternalStore(
       shellStore.subscribe,
@@ -452,6 +542,8 @@ function buildLauncher(app: App): React.ReactNode {
       : 'host';
     const [conversations, setConversations] = React.useState<ResumableConversation[]>([]);
     const [loading, setLoading] = React.useState(false);
+    const targetId = active?.id || '';
+    const serverId = active?.serverId || parseQualifiedSessionId(targetId)?.serverId || 'local';
 
     // Asked each time the launcher opens on a folder, not cached: an agent may
     // have been running in another tab since the last time, and a stale list
@@ -480,7 +572,7 @@ function buildLauncher(app: App): React.ReactNode {
       };
     }, [workingDir, projectId, workingDirKind]);
 
-    return (
+    const launcher = (
       <RuntimeLauncher
         aliases={app.aliases}
         onStart={start}
@@ -491,6 +583,19 @@ function buildLauncher(app: App): React.ReactNode {
         conversations={conversations}
         conversationsLoading={loading}
         onResume={(conversation) => void resumeConversation(app, conversation)}
+      />
+    );
+    if (!targetId) return launcher;
+    return (
+      <MaintenanceBoundLauncher
+        key={JSON.stringify([serverId, targetId])}
+        targetId={targetId}
+        serverId={serverId}
+        targetName={active?.projectName || active?.serverName || 'This server'}
+        compact={state.isMobile}
+        chatBypass={state.chatBypassPermissions}
+        conversations={conversations}
+        loading={loading}
       />
     );
   }
@@ -645,5 +750,8 @@ function buildActions(app: App): ShellActions {
     updateAction: (serverId) => void onBannerAction(serverId),
     updateToggleLog: (serverId) => onBannerToggleLog(serverId),
     updateDismiss: (serverId) => onBannerDismiss(serverId),
+    restartAgent: (sessionId, automatic, allowFreshContext) => {
+      app.send({ type: 'runtime_restart', sessionId, automatic, allowFreshContext });
+    },
   };
 }

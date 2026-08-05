@@ -161,7 +161,10 @@ export class HostEnvironment implements UserEnvironment {
 
   wrap(command: string, args: string[], options: WrapOptions = {}): WrappedCommand {
     const launch = wrapHostCommand(command, args);
-    return { ...launch, env: mergedEnv(options.env) };
+    return {
+      ...launch,
+      env: options.inheritHostEnv === false ? { ...(options.env || {}) } : mergedEnv(options.env),
+    };
   }
 }
 

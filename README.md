@@ -137,7 +137,7 @@ The image ships the web server only — the agent CLIs are not bundled. See
 | [Installation](docs/installation.md) | Every install path, platform support, uninstalling, install troubleshooting |
 | [GitHub OAuth](docs/github-oauth.md) | Creating the OAuth App, the allow-list, the installer account |
 | [Configuration](docs/configuration.md) | Every CLI flag and environment variable, the setup wizard, where state is stored |
-| [Runtimes and profiles](docs/runtimes.md) | The supported agent CLIs, launch profiles, models, capability tiers |
+| [Runtimes and profiles](docs/runtimes.md) | The supported agent CLIs, managed install/update lifecycle, launch profiles, models, capability tiers |
 | [Using the terminal](docs/terminal.md) | Scrollback and history, copy/paste, images, mobile, the PWA |
 | [HTTPS and certificates](docs/https-and-certificates.md) | Why HTTPS-only, the local CA, trusting it per device, using your own certificate |
 | [Running as a service](docs/running-as-a-service.md) | systemd, Docker and Compose, reverse proxies, ngrok |

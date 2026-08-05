@@ -88,6 +88,7 @@ export class MessageHandler {
     if (message.type === 'chat_started') {
       const startedId = message.sessionId || '';
       if (startedId) this.app.sessionTabManager?.setTabSurface(startedId, 'chat');
+      if (startedId) this.app.sessionTabManager?.setTabRuntime(startedId, message.agent || '');
 
       if (!startedId || startedId === this.app.currentClaudeSessionId) {
         // Settled here for the same reason onRuntimeStarted settles the
@@ -107,6 +108,10 @@ export class MessageHandler {
         hideOverlay();
       }
     } else if (message.type === 'session_joined') {
+      this.app.sessionTabManager?.setTabRuntime(
+        message.sessionId,
+        message.agent || message.lastAgent || '',
+      );
       if (message.surface === 'chat') {
         this.app.sessionTabManager?.setTabSurface(message.sessionId, 'chat');
         setChatSurface(this.app, {
@@ -251,6 +256,28 @@ export class MessageHandler {
 
       case 'error':
         this.onError(message);
+        break;
+
+      case 'runtime_restart_result':
+        if (message.ok) {
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new window.CustomEvent('cc-agent-maintenance-changed', {
+              detail: { sessionId: message.sessionId },
+            }));
+          }
+          showNotification(message.resumed
+            ? `Agent restarted on ${message.version || 'the managed version'} with its conversation resumed.`
+            : `Agent restarted on ${message.version || 'the managed version'}.`);
+        } else {
+          const reasons: Record<string, string> = {
+            busy: 'The agent became busy before it could restart. Try again when the current turn is idle.',
+            cannot_resume: 'This agent cannot resume its native context automatically. Use Restart… to review the consequence first.',
+            manual_required: 'This terminal agent needs confirmation before it can restart.',
+            no_managed_update: 'There is no verified managed agent copy to restart onto.',
+            project_managed: 'This agent belongs to the project. Update it through the project rebuild flow.',
+          };
+          showError(reasons[message.reason || ''] || message.reason || 'The agent could not be restarted.');
+        }
         break;
 
       case 'info':
@@ -517,6 +544,7 @@ export class MessageHandler {
     workingDir: string;
     active: boolean;
     outputBuffer?: string[];
+    agent?: string;
     lastAgent?: string;
     runtimeLabel?: string;
     history?: { firstLine: number; totalLines: number };
@@ -639,6 +667,10 @@ export class MessageHandler {
     }
 
     if (this.app.sessionTabManager && this.app.currentClaudeSessionId) {
+      this.app.sessionTabManager.setTabRuntime(
+        this.app.currentClaudeSessionId,
+        message.agent || '',
+      );
       this.app.sessionTabManager.updateTabStatus(this.app.currentClaudeSessionId, 'active');
     }
   }

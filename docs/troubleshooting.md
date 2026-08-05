@@ -89,6 +89,34 @@ That CLI is not installed, or not where the app looks. See
 unit, note that `~/.local/bin` is often missing from `PATH` — the app searches it
 directly for that reason.
 
+**The agent version row says "Unable to check".**
+The publisher check is deliberately short (five seconds) and is nonblocking.
+Check the network and the publisher's official installer page, then use
+**Retry**. The app keeps a successful check for up to 24 hours; Retry asks again
+without waiting for that cache to expire.
+
+**Install is unavailable, or the row names a platform/architecture.**
+The automatic managed installer only runs on publisher-supported targets. See
+the exact WSL, Bash, Git for Windows, Windows arm64, and Alpine guidance in
+[platform and prerequisite guidance](runtimes.md#platform-and-prerequisite-guidance).
+The app will not provision WSL, Git Bash, Git for Windows, or system libraries.
+
+**The row says "External copy" and there is no update button.**
+That executable belongs to your existing package-manager or manual installation.
+CODE AGENTS will not modify it. Use that installer's update mechanism, or choose
+**Install managed copy** to create a separate app-owned copy.
+
+**The row says "Project managed".**
+The runtime is pinned by the project's reviewed build recipe. Rebuild the
+project to update it; the agent-maintenance control does not alter a project
+environment.
+
+**An agent update finished but the old version is still running.**
+Use the version row above that terminal or conversation. An idle resumable WebUI
+conversation can restart safely; a busy/non-resumable conversation and every
+terminal require confirmation. A terminal keeps its tab, directory, and
+scrollback, but its agent interaction may not resume.
+
 **Dragging does not select text.**
 Agents enable mouse tracking, so the drag goes to the program. **Hold Shift**
 while dragging. See [copy and paste](terminal.md#copy-and-paste).
@@ -132,6 +160,11 @@ handed them, so a message shown in the conversation was genuinely sent.
 Expected. The record, history and transcript persist; the live process does not.
 
 ## Updating
+
+**I expected the CODE AGENTS update banner to update an agent CLI.**
+They are different operations. The banner updates the web application and may
+restart the service. The runtime version row updates only a managed agent copy;
+see [runtimes](runtimes.md#installing-and-updating-an-agent).
 
 **No update button.**
 Either you are not the installer, or this install
