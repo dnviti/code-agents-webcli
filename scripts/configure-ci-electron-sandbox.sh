@@ -25,7 +25,16 @@ if [ ! -f "$electron_candidate" ] || [ -L "$electron_candidate" ]; then
   exit 1
 fi
 electron_executable="$(realpath -e -- "$electron_candidate")"
-dist_root="$(realpath -e -- "$package_root/dist")"
+dist_candidate="$package_root/dist"
+if [ ! -d "$dist_candidate" ] || [ -L "$dist_candidate" ]; then
+  echo "Electron distribution is missing, non-directory, or symbolic: $dist_candidate" >&2
+  exit 1
+fi
+dist_root="$(realpath -e -- "$dist_candidate")"
+if [ "$dist_root" != "$dist_candidate" ]; then
+  echo "Electron distribution resolves outside its exact package path: $dist_root" >&2
+  exit 1
+fi
 if [ "$(dirname -- "$electron_executable")" != "$dist_root" ] \
   || [ ! -f "$electron_executable" ]; then
   echo "Electron executable is not a regular immediate child of its distribution: $electron_executable" >&2

@@ -115,7 +115,10 @@ describe('Electron desktop helpers', function () {
     assert.match(ciSandbox, /electron_candidate="\$\(node -p 'require\("electron"\)'\)"/);
     assert.match(ciSandbox, /\[ ! -f "\$electron_candidate" \] \|\| \[ -L "\$electron_candidate" \]/);
     assert.match(ciSandbox, /electron_executable="\$\(realpath -e -- "\$electron_candidate"\)"/);
-    assert.match(ciSandbox, /dist_root="\$\(realpath -e -- "\$package_root\/dist"\)"/);
+    assert.match(ciSandbox, /dist_candidate="\$package_root\/dist"/);
+    assert.match(ciSandbox, /\[ ! -d "\$dist_candidate" \] \|\| \[ -L "\$dist_candidate" \]/);
+    assert.match(ciSandbox, /dist_root="\$\(realpath -e -- "\$dist_candidate"\)"/);
+    assert.match(ciSandbox, /"\$dist_root" != "\$dist_candidate"/);
     assert.match(ciSandbox, /dirname -- "\$electron_executable"\)" != "\$dist_root"/);
     assert.match(ciSandbox, /candidate="\$dist_root\/chrome-sandbox"/);
     assert.match(ciSandbox, /\[ ! -f "\$candidate" \] \|\| \[ -L "\$candidate" \]/);
