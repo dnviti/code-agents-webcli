@@ -1,4 +1,5 @@
 import path from 'node:path';
+import type { CodexCostEstimator } from '../../shared/codex-pricing.js';
 import { ChatUsage } from '../../shared/chat-events.js';
 import {
   EMPTY_TOTALS,
@@ -53,6 +54,15 @@ interface LocatedJob {
  */
 export class WorkspaceUsageCoordinator {
   private readonly entries = new Map<string, WorkspaceUsageEntry>();
+  /**
+   * The codex list-price estimator (issue #182), attached once the server has
+   * one. Any workspace registered after this is backfilled as it opens, not
+   * only at server boot — otherwise history in a workspace that was not open
+   * at startup would never be priced.
+   */
+  private codexEstimator: CodexCostEstimator | null = null;
+  /** Which workspace keys have already had their codex history backfilled. */
+  private readonly backfilled = new Set<string>();
 
   register(scope: SessionStorageScope, database: SessionPersistenceDatabase): UsageStore {
     const boundScope = freezeScope(scope);
@@ -63,6 +73,16 @@ export class WorkspaceUsageCoordinator {
 
     const store = new UsageStore({ database, ownerKey: boundScope.ownerKey });
     this.entries.set(key, { key, scope: boundScope, database, store });
+    // Price eligible codex history the moment this workspace is opened (once).
+    // The pass is guarded and idempotent, so re-registration is a no-op.
+    if (this.codexEstimator && !this.backfilled.has(key)) {
+      this.backfilled.add(key);
+      try {
+        store.backfillCodexEstimates(this.codexEstimator);
+      } catch {
+        // A backfill failure must not block workspace registration.
+      }
+    }
     return store;
   }
 
@@ -303,6 +323,29 @@ export class WorkspaceUsageCoordinator {
     return matches.length === 1
       ? matches[0].store.spendByTurn(scopeOrSessionId, userId)
       : new Map();
+  }
+
+  /**
+   * Retrospective codex cost backfill (issue #182), across every registered
+   * workspace. Returns how many rows gained an estimate.
+   */
+  backfillCodex(estimator: CodexCostEstimator): number {
+    let total = 0;
+    for (const entry of this.entries.values()) {
+      total += entry.store.backfillCodexEstimates(estimator);
+    }
+    return total;
+  }
+
+  /**
+   * Bind the codex list-price estimator (issue #182) and invalidate the
+   * per-workspace "already backfilled" marks, so workspaces registered from
+   * here on — and any already registered — have their eligible codex history
+   * priced.
+   */
+  attachCodexEstimator(estimator: CodexCostEstimator): void {
+    this.codexEstimator = estimator;
+    this.backfilled.clear();
   }
 
   close(): void {

@@ -303,7 +303,9 @@ export function foldSessionUsage(usage: ChatUsage, event: ChatEvent): ChatUsage 
       // header and the history end up saying different things about one
       // conversation.
       if (carriesTokens(event.usage)) next.usageSource = 'agent';
-      if (carriesCost(event.usage)) next.costSource = 'agent';
+      // An estimated figure stays labelled estimated (issue #182); only a
+      // runtime-reported one becomes the generic 'agent'.
+      if (carriesCost(event.usage)) next.costSource = event.usage.costEstimate ? 'estimated' : 'agent';
       return next;
     }
     default:
@@ -390,6 +392,9 @@ function clearedUsage(usage: ChatUsage): ChatUsage {
   // quiet again until the next turn ended.
   if (usage.usageSource === 'none') next.usageSource = 'none';
   if (usage.costSource === 'none') next.costSource = 'none';
+  // The estimate's provenance describes the work that cleared: it must not
+  // survive onto a fresh conversation any more than the cost figure it prices.
+  delete next.costEstimate;
   return next;
 }
 

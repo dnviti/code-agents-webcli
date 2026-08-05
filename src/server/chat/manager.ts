@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import type { CodexCostEstimator } from '../../shared/codex-pricing.js';
 import { ChatSnapshot, UserTurn } from '../../shared/chat-events.js';
 import { LadderRung, ModelTier } from '../../shared/runtime-profiles.js';
 import { SessionRecord } from '../types.js';
@@ -64,6 +65,8 @@ export interface ChatManagerDeps {
   usage?: ChatUsageSink;
   /** Workspace-aware composition can bind accounting to this exact record. */
   usageFor?: (record: SessionRecord) => ChatUsageSink;
+  /** Passed through to every session; see ChatSessionDeps.codexPricing. */
+  codexPricing?: CodexCostEstimator;
   /**
    * The folder a given user is allowed to browse, and now the outer edge of
    * what a conversation of theirs may read and write. See `confine`.
@@ -150,6 +153,7 @@ export class ChatSessionManager {
           this.deps.chatBypassPreference?.(record.ownerUserId) === true,
         usage: this.deps.usageFor?.(record) ?? this.deps.usage,
         capacity: this.capacity,
+        codexPricing: this.deps.codexPricing,
       },
     );
 

@@ -13,7 +13,8 @@ import {
 import { compactCount } from '../../chat/tool-meta.js';
 import { MAX_ATTACHMENT_BYTES, safeAttachmentDownloadUrl } from '../../chat/attachments-api.js';
 import { mentionAtCaret } from '../../../shared/file-match.js';
-import { tokenTotal } from '../../../shared/usage-records.js';
+import { describeCodexEstimate } from '../../../shared/codex-pricing.js';
+import { markEstimatedCost, tokenTotal } from '../../../shared/usage-records.js';
 import {
   classifyPaste,
   MAX_IMAGES_PER_PASTE,
@@ -1495,7 +1496,10 @@ export function Composer({
             ? hintFor({ isMobile, busy, findFailed, filesEnabled, terminalOpen })
             : null}
         </span>
-        <span style={{ marginLeft: 'auto', flex: '0 0 auto', whiteSpace: 'nowrap' }}>
+        <span
+          style={{ marginLeft: 'auto', flex: '0 0 auto', whiteSpace: 'nowrap' }}
+          title={usage?.costEstimate ? describeCodexEstimate(usage.costEstimate) : undefined}
+        >
           {sessionReadout(turnLabel, usage)}
         </span>
       </div>
@@ -1623,7 +1627,12 @@ function sessionReadout(turnLabel: string | undefined, usage: ChatUsage | undefi
     // different answers about one conversation (#80).
     const total = tokenTotal(usage);
     if (total !== null) bits.push(`${compactCount(total)} tok`);
-    if (usage.costUsd !== undefined) bits.push(`$${usage.costUsd.toFixed(4)}`);
+    if (usage.costUsd !== undefined) {
+      // A codex price is an estimate at OpenAI's list price (#182); mark it
+      // with a `~` and let the session line's tooltip carry the provenance.
+      const isEstimated = usage.costEstimate !== undefined || usage.costSource === 'estimated';
+      bits.push(isEstimated ? markEstimatedCost(`$${usage.costUsd.toFixed(4)}`) : `$${usage.costUsd.toFixed(4)}`);
+    }
     // Otherwise this line degrades to a bare `turn 3` against a runtime that
     // reports nothing, which reads as a session that has spent nothing. Only
     // ever off a spoken absence — the session states it after watching a turn

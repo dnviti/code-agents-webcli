@@ -18,6 +18,8 @@ import {
   mergeUsage,
 } from '../../shared/chat-events.js';
 import { TurnOutcome } from '../../shared/turn-outcome.js';
+import { describeCodexEstimate, type CodexCostEstimate } from '../../shared/codex-pricing.js';
+import { markEstimatedCost } from '../../shared/usage-records.js';
 import { compactCount, formatDuration } from './tool-meta.js';
 
 /**
@@ -441,6 +443,8 @@ export interface TurnIndexRow {
    * not zero and the row says so by showing nothing.
    */
   costUsd?: number;
+  /** Provenance when this app priced the turn's cost (issue #182). */
+  costEstimate?: CodexCostEstimate | null;
 }
 
 /**
@@ -478,6 +482,7 @@ export function turnIndexRows(
       status: loaded ? loaded.status : turn.outcome ?? 'done',
       loaded: Boolean(loaded),
       costUsd: spend?.get(turn.turnId)?.costUsd,
+      costEstimate: spend?.get(turn.turnId)?.costEstimate,
     });
   }
 
@@ -490,6 +495,7 @@ export function turnIndexRows(
       status: turn.status,
       loaded: true,
       costUsd: spend?.get(turn.turnId)?.costUsd ?? turn.usage.costUsd,
+      costEstimate: spend?.get(turn.turnId)?.costEstimate ?? turn.usage.costEstimate,
     });
   }
   // Live turns the recording has not heard of are appended, and they are almost
@@ -531,6 +537,8 @@ export interface TurnMeta {
   duration: string;
   cost: string;
   tokens: string;
+  /** Provenance tooltip for an estimated cost, when this turn's is one. */
+  costTitle?: string;
 }
 
 /**
@@ -556,11 +564,19 @@ export function formatTurnCost(costUsd: number): string {
 
 export function formatTurnMeta(turn: TurnSummary): TurnMeta {
   const out = turn.usage.outputTokens;
+  const estimated = Boolean(turn.usage.costEstimate) || turn.usage.costSource === 'estimated';
   return {
     tools: turn.toolCount ? `${turn.toolCount} tool${turn.toolCount === 1 ? '' : 's'}` : '',
     reasoning: turn.reasoningCount ? `${turn.reasoningCount} reasoning` : '',
     duration: turn.durationMs === undefined ? '' : formatDuration(turn.durationMs),
-    cost: turn.usage.costUsd === undefined ? '' : formatTurnCost(turn.usage.costUsd),
+    cost: turn.usage.costUsd === undefined
+      ? ''
+      : estimated
+        ? markEstimatedCost(formatTurnCost(turn.usage.costUsd))
+        : formatTurnCost(turn.usage.costUsd),
+    costTitle: estimated && turn.usage.costEstimate
+      ? describeCodexEstimate(turn.usage.costEstimate)
+      : undefined,
     tokens: out === undefined ? '' : `${compactCount(out)} out`,
   };
 }

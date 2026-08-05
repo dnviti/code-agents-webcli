@@ -115,7 +115,7 @@ own figure or nothing at all, which is why they have a column of their own.
 | Agent | Tool calls | Model turns | Tokens | Cost | Model |
 | --- | --- | --- | --- | --- | --- |
 | Claude | counted here | reported (`num_turns`) | reported | reported (see below) | reported, per message and per model |
-| Codex (app-server) | counted here | **not reported** | reported | **not reported** — nothing in the schema prices a turn | reported, per session |
+| Codex (app-server) | counted here | **not reported** | reported | **estimated by this app** at OpenAI list price (see below) — the runtime itself reports no price | reported, per session |
 | Codex (`exec` fallback) | counted here | **not reported** | **not reported** | **not reported** | **not reported** |
 | pi | counted here | **not reported** | reported | reported | reported, per message |
 | Grok (ACP) | counted here | only where a per-model call count arrives | reported | reported, in ticks — see below | the runtime's current selection |
@@ -157,8 +157,10 @@ which.
 **The usage dashboard reads history**, and every job in it was filed with the
 capability flags of the runtime that ran it. It can therefore separate the two
 facts and does: `n/a` means *this agent cannot report that figure at all* (kimi
-for both, Codex for cost), and **"not reported"** means *this job, from an agent
-that can report, carried no figure*. Both are shown in preference to a zero.
+for both), **"not reported"** means *this job, from an agent
+that can report, carried no figure*, and a codex job carries an **estimate**
+(this app prices it) when a price exists for its model. Both the `n/a` and the
+"not reported" forms are shown in preference to a zero.
 
 **A live conversation reads one turn at a time**, and has only ever made one
 claim: this runtime has now finished a turn and said nothing about tokens
@@ -310,7 +312,52 @@ jobs filed before this derived their totals from what was already in the row,
 once, on the next start — no period of the dashboard is built on a different
 rule from any other, and nothing was estimated to get there.
 
+## Codex cost is estimated at list price, not billed
+
+Codex is the one runtime that reports a confirmed model and complete token
+buckets yet never a dollar figure. So, unlike every other agent where a cost is
+something the runtime *said*, a codex cost is something this app **computes**
+(issue #182): it multiplies the reported tokens by OpenAI's published API list
+price for the model that actually ran.
+
+That makes codex figures a different kind of number, and the app says so:
+
+- **Estimated, not billed.** Every codex cost is `~`-prefixed and labelled as
+  an estimate. It is the API-equivalent dollar amount — what that usage would
+  have cost at list price. It is *not* a ChatGPT or API invoice charge, not a
+  subscription allowance, and not a bill. The distinction is stated on every
+  surface and in every export's caveat.
+- **Priced at the model that ran.** The effective model from `thread/start`
+  (never merely the requested one) drives the rate. Switching models prices
+  later turns at the new model's rate without changing estimates already
+  recorded.
+- **The arithmetic is exact.** Un-cached input, cached input and output are
+  billed at their own rates; reasoning output is counted once as part of output
+  (codex counts cached input inside its input, so the cached slice is not
+  double-billed).
+- **Provenance is kept.** Every estimate records the effective model, the
+  applied input/cached/output rate, the source (the official OpenAI list, or
+  the bundled snapshot) and the pricing date. Hover any `~` cost for the
+  sentence; the job detail and the export carry the structured fields.
+- **Automatic refresh.** The app re-reads OpenAI's public pricing document
+  daily and adopts published changes. During an outage the last known official
+  rate stays in use, marked stale with its date disclosed. When no price has
+  ever been obtained for a model, the figure shows **price unavailable** and
+  the token counts remain — never a zero, never a neighbour's rate.
+- **Historical backfill.** On upgrade, eligible existing codex jobs (a
+  confirmed model and token detail, and no cost yet) get a retrospective
+  estimate, marked as such. A later price change never rewrites an estimate
+  already recorded — live or backfilled.
+- **Removal follows the record.** The estimate is a column on the job row, so
+  the existing data lifecycle that removes or migrates a job removes its
+  estimate with it.
+
+The refresh makes a single request to the public pricing endpoint and sends no
+conversation, usage, account, model-selection or user data.
+
 ## Which model actually ran
+
+A model name in a spend record is only worth having if the runtime said it.
 
 A model name in a spend record is only worth having if the runtime said it.
 There are two quite different claims that can hide behind one: the model this
@@ -950,9 +997,14 @@ GET /api/usage/export?from=2026-07-01T00:00:00.000Z&to=2026-08-01T00:00:00.000Z&
 ```
 
 ```csv
-id,sessionId,nativeSessionId,turnId,userId,userLogin,agent,model,project,projectSource,startedAt,endedAt,durationMs,outcome,turns,toolCalls,inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens,reasoningTokens,totalTokens,costUsd,reportsUsage,reportsCost
-sess-abc:turn-9,sess-abc,claude-native-id,turn-9,7,dnviti,claude,claude-opus-5,billing-api,observed,2026-07-27T09:14:02.000Z,2026-07-27T09:14:41.000Z,39000,completed,3,5,1200,640,40000,900,,42740,0.0612,true,true
+id,sessionId,nativeSessionId,turnId,userId,userLogin,agent,model,project,projectSource,startedAt,endedAt,durationMs,outcome,turns,toolCalls,inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens,reasoningTokens,totalTokens,costUsd,costEstimateModel,costEstimateRateIn,costEstimateRateCached,costEstimateRateOut,costEstimateSource,costEstimatePricingDate,costEstimateStale,costEstimateRetrospective,reportsUsage,reportsCost
+sess-abc:turn-9,sess-abc,claude-native-id,turn-9,7,dnviti,claude,claude-opus-5,billing-api,observed,2026-07-27T09:14:02.000Z,2026-07-27T09:14:41.000Z,39000,completed,3,5,1200,640,40000,900,,42740,0.0612,,,,,,,,,,true,true
 ```
+
+The `costEstimate*` columns are empty for runtime-reported and unavailable
+costs, and carry the effective model, applied per-million rates, source,
+pricing date and flags for a codex estimate — so an export can be reconciled
+against the list price a figure was computed from.
 
 `format=json` returns the same rows as a JSON array instead, with the usual
 `null` for a figure nobody reported.

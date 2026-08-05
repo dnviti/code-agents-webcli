@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { UsageStore, UsageHistoryQuery } from '../services/usage-store.js';
 import { AuthenticatedUser } from '../types.js';
-import { UsageFilters, UsagePeriod, UsageScope } from '../../shared/usage-records.js';
+import { UsageFilters, UsageJobSummary, UsagePeriod, UsageScope } from '../../shared/usage-records.js';
 import { requireUser } from './helpers.js';
 
 export interface UsageRoutesDeps {
@@ -127,6 +127,29 @@ function csvCell(value: string | number | boolean | null): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
+/**
+ * One CSV cell for a job, resolving the flat estimate-provenance columns
+ * (`costEstimateModel`, …) from the job's `costEstimate` object, which is not
+ * itself a flat field on the summary. Ordinary columns pass through untouched.
+ */
+function exportCell(job: UsageJobSummary, column: string): string | number | boolean | null {
+  if (column in job) {
+    return (job as Record<string, unknown>)[column] as string | number | boolean | null;
+  }
+  const estimate = job.costEstimate;
+  switch (column) {
+    case 'costEstimateModel': return estimate?.model ?? null;
+    case 'costEstimateRateIn': return estimate?.rates.inputPerM ?? null;
+    case 'costEstimateRateCached': return estimate?.rates.cachedInputPerM ?? null;
+    case 'costEstimateRateOut': return estimate?.rates.outputPerM ?? null;
+    case 'costEstimateSource': return estimate?.source ?? null;
+    case 'costEstimatePricingDate': return estimate?.pricingDate ?? null;
+    case 'costEstimateStale': return estimate ? (estimate.stale ?? false) : null;
+    case 'costEstimateRetrospective': return estimate ? (estimate.retrospective ?? false) : null;
+    default: return null;
+  }
+}
+
 const EXPORT_COLUMNS = [
   'id',
   'sessionId',
@@ -157,6 +180,17 @@ const EXPORT_COLUMNS = [
   'reasoningTokens',
   'totalTokens',
   'costUsd',
+  // issue #182: provenance of a codex estimate, so anyone reconciling an export
+  // can see which money was computed and from what. Empty for runtime-reported
+  // and unavailable costs.
+  'costEstimateModel',
+  'costEstimateRateIn',
+  'costEstimateRateCached',
+  'costEstimateRateOut',
+  'costEstimateSource',
+  'costEstimatePricingDate',
+  'costEstimateStale',
+  'costEstimateRetrospective',
   'reportsUsage',
   'reportsCost',
 ] as const;
@@ -345,9 +379,7 @@ export function createUsageRoutes(deps: UsageRoutesDeps): Router {
     const lines = [EXPORT_COLUMNS.join(',')];
     for (const job of jobs) {
       lines.push(
-        EXPORT_COLUMNS.map((column) => csvCell(job[column] as string | number | boolean | null)).join(
-          ',',
-        ),
+        EXPORT_COLUMNS.map((column) => csvCell(exportCell(job, column))).join(','),
       );
     }
     const csv = lines.join('\n');

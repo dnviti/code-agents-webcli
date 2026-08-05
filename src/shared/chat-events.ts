@@ -26,6 +26,7 @@
 
 import { ModelTier, ResolvedProfile } from './runtime-profiles.js';
 import { TurnOutcome } from './turn-outcome.js';
+import type { CodexCostEstimate } from './codex-pricing.js';
 
 export type { TurnOutcome };
 
@@ -491,6 +492,12 @@ export interface ChatUsage {
   usageSource?: SpendSource;
   /** The same, for money. Codex reports tokens and prices nothing. */
   costSource?: SpendSource;
+  /**
+   * The full provenance of a codex cost estimate, present only when this app
+   * computed the cost figure (issue #182): effective model, applied rate,
+   * source and pricing date. Absent for a figure a runtime reported directly.
+   */
+  costEstimate?: CodexCostEstimate;
   /** Context window size, when known, so the UI can show how full it is. */
   contextWindow?: number;
   /** Context currently occupied, when the runtime reports it directly. */
@@ -569,10 +576,16 @@ export type ContextWindowSource = 'agent' | 'provider' | 'unknown';
 /**
  * Who gave a spend figure, or that nobody will.
  *
+ * `agent` is a figure the runtime reported. `estimated` is a figure this app
+ * computed for codex from the reported tokens and a published list price
+ * (issue #182) — real money-shaped but never a bill, and labelled as such
+ * wherever it is shown. `none` means nobody priced the turn.
+ *
  * There is no `provider` here on purpose: nothing outside the runtime can say
- * what a turn cost, and this app deliberately buys no price list to guess with.
+ * what a turn cost, and until codex this app bought no price list to guess
+ * with.
  */
-export type SpendSource = 'agent' | 'none';
+export type SpendSource = 'agent' | 'estimated' | 'none';
 
 /**
  * One rate-limit window, exactly as the provider stated it.
@@ -2108,6 +2121,18 @@ export function mergeUsage(base: ChatUsage | undefined, next: ChatUsage | undefi
   // arrived afterwards. Otherwise the last thing anybody said carries, which is
   // how a spoken silence survives the turns that follow it.
   merged.usageSource = carriesTokens(merged) ? 'agent' : (b.usageSource ?? a.usageSource);
-  merged.costSource = carriesCost(merged) ? 'agent' : (b.costSource ?? a.costSource);
+  // An estimate is genuinely reported money (shaped) and so survives the sum,
+  // but its source label is the point of it and must not be flattened to the
+  // generic 'agent' — an estimated figure that silently becomes an agent figure
+  // is the exact honesty this field exists to protect.
+  merged.costSource = carriesCost(merged)
+    ? b.costEstimate !== undefined || a.costEstimate !== undefined
+      ? 'estimated'
+      : 'agent'
+    : (b.costSource ?? a.costSource);
+  // Not additive — it is the provenance of the latest estimate, like the
+  // window fields above, and a later turn that only refreshed the figure keeps
+  // the newer estimate's metadata.
+  merged.costEstimate = b.costEstimate ?? a.costEstimate;
   return merged;
 }

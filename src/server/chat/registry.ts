@@ -133,6 +133,9 @@ const RUNTIMES: Record<string, RuntimeChatEntry> = {
       interrupt: true,
       resume: true,
       usage: true,
+      // cost is an API-list-price estimate this app computes (issue #182):
+      // codex reports tokens and a confirmed model but never prices a turn.
+      cost: true,
       questions: true,
     },
   },

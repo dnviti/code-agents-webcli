@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import type { CodexCostEstimator } from '../../shared/codex-pricing.js';
 import {
   AccountLimits,
   ChatAttachment,
@@ -189,6 +190,14 @@ export interface ChatSessionDeps {
    * that publish none.
    */
   capacity?: ModelCapacitySource;
+  /**
+   * Prices codex turns at OpenAI list price (issue #182). Handed to the codex
+   * adapter so the live header can show a cumulative estimate, and used here to
+   * stamp a per-turn estimate onto the durable record. Absent in tests or
+   * deployments without it — codex then records tokens with no cost, exactly
+   * as before.
+   */
+  codexPricing?: CodexCostEstimator;
 }
 
 /** Asked only for models no agent described; see `model-capacity.ts`. */
@@ -1387,6 +1396,7 @@ export class ChatSession {
       writeFile: this.deps.writeFile
         ? (filePath, contents) => this.deps.writeFile!(this.ref.id, filePath, contents)
         : undefined,
+      codexPricing: this.deps.codexPricing,
     });
 
     if (!adapter) {
@@ -2824,6 +2834,31 @@ export class ChatSession {
     if (!usage) return;
     const numeric = (value: number | undefined): number | null =>
       typeof value === 'number' && Number.isFinite(value) ? value : null;
+
+    // issue #182: codex never prices a turn itself, so this app prices the
+    // turn's *incremental* usage against the confirmed model at OpenAI list
+    // price. The accountant already reduced the cumulative usage event to this
+    // turn's portion; stamping the estimate here keeps the durable record and
+    // the live per-turn figure founded on the same number. Null/absent when no
+    // price is obtainable for the model — the client then shows price
+    // unavailable rather than a guessed figure.
+    let costEstimate;
+    if (this.runtime === 'codex' && this.deps.codexPricing) {
+      costEstimate = this.deps.codexPricing.estimate(
+        {
+          inputTokens: numeric(job.usage.inputTokens) ?? undefined,
+          cacheReadTokens: numeric(job.usage.cacheReadTokens) ?? undefined,
+          outputTokens: numeric(job.usage.outputTokens) ?? undefined,
+        },
+        job.model ?? undefined,
+      );
+      if (costEstimate) {
+        job.usage.costUsd = costEstimate.costUsd;
+        job.usage.costSource = 'estimated';
+        job.usage.costEstimate = costEstimate;
+      }
+    }
+
     try {
       usage.record({
         sessionId: this.ref.id,
@@ -2858,6 +2893,7 @@ export class ChatSession {
         // unchanged, so nothing here invents a figure: it adds one up.
         totalTokens: numeric(tokenTotal(job.usage) ?? undefined),
         costUsd: numeric(job.usage.costUsd),
+        costEstimate,
         reportsUsage: this.capabilities?.usage === true,
         reportsCost: this.capabilities?.cost === true,
         tools: job.tools,

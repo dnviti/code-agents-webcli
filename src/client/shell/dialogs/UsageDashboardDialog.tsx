@@ -16,7 +16,8 @@ import type {
   UsageToolUse,
   UsageTotals,
 } from '../../../shared/usage-records.js';
-import { UNATTRIBUTED } from '../../../shared/usage-records.js';
+import { UNATTRIBUTED, formatCostUsd, markEstimatedCost } from '../../../shared/usage-records.js';
+import { describeCodexEstimate } from '../../../shared/codex-pricing.js';
 import {
   attributeUsageProject,
   exportUsage,
@@ -365,6 +366,12 @@ function jobCostFigure(job: UsageJobSummary): Figure {
   if (job.costUsd === null) {
     return { text: 'not reported', muted: true, title: 'This job reported no cost' };
   }
+  if (job.costEstimate) {
+    return {
+      text: markEstimatedCost(formatCostUsd(job.costUsd)),
+      title: describeCodexEstimate(job.costEstimate),
+    };
+  }
   return { text: formatCost(job.costUsd) };
 }
 
@@ -447,7 +454,8 @@ function CostCaveat(): React.JSX.Element {
     <div style={{ fontSize: 'var(--text-xs)', color: 'var(--muted-foreground)', lineHeight: 1.5 }}>
       Cost is the API list price each runtime reports for the tokens it used. On a subscription plan
       (Claude Max, ChatGPT Plus and the like) nothing is billed per job — read these figures as what
-      the same work would have cost through the API, not as what you were charged.
+      the same work would have cost through the API, not as what you were charged. Codex figures are
+      estimates at OpenAI's published list price (priced per-model, see job details), not a bill.
     </div>
   );
 }
@@ -1445,6 +1453,29 @@ function JobDetail({
             </div>
           </div>
 
+          {/* The provenance of an estimated cost, on screen rather than only
+              on hover: the effective model, the applied per-million rates, and
+              the dated source a reader would need to re-derive the figure.
+              Present only for codex work this app priced itself. */}
+          {job.costEstimate ? (
+            <div>
+              <h3 style={sectionTitleStyle}>Estimated at</h3>
+              <Table
+                columns={['Model', 'Input /M', 'Cached /M', 'Output /M', 'Source', 'Pricing date']}
+                rows={[[
+                  job.costEstimate.model,
+                  `$${job.costEstimate.rates.inputPerM}`,
+                  `$${job.costEstimate.rates.cachedInputPerM}`,
+                  `$${job.costEstimate.rates.outputPerM}`,
+                  job.costEstimate.source === 'openai-list'
+                    ? 'OpenAI published list price'
+                    : 'Bundled list snapshot',
+                  `${job.costEstimate.pricingDate}${job.costEstimate.stale ? ' (last known)' : ''}${job.costEstimate.retrospective ? ' (retrospective)' : ''}`,
+                ]]}
+              />
+            </div>
+          ) : null}
+
           {/* Defended rather than assumed: this dialog is served to whatever
               server answers, and one older than this page returns a job record
               with no split at all. Reading `.length` off that is a blank
@@ -1465,7 +1496,15 @@ function JobDetail({
                   split.calls ?? '—',
                   split.inputTokens === null ? '—' : formatTokens(split.inputTokens),
                   split.outputTokens === null ? '—' : formatTokens(split.outputTokens),
-                  split.costUsd === null ? '—' : formatCost(split.costUsd),
+                  split.costUsd === null
+                    ? '—'
+                    : split.costEstimate
+                      ? (
+                        <Tooltip label={describeCodexEstimate(split.costEstimate)}>
+                          {markEstimatedCost(formatCostUsd(split.costUsd))}
+                        </Tooltip>
+                      )
+                      : formatCost(split.costUsd),
                 ])}
               />
             </div>

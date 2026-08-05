@@ -3,6 +3,7 @@ import { Readable } from 'stream';
 import { UserEnvironment } from '../services/environments/types.js';
 import { HostEnvironment } from '../services/environments/manager.js';
 import { WrappedProcessControl } from '../services/environments/types.js';
+import type { CodexCostEstimator } from '../../shared/codex-pricing.js';
 import {
   ChatCapabilities,
   ChatEvent,
@@ -132,6 +133,13 @@ export interface ChatAdapterOptions {
    * the session owner's environment.
    */
   installedSkills?: Array<{ name: string; path: string }>;
+  /**
+   * The codex cost estimator (issue #182), injected so the adapter can price
+   * the cumulative usage it reports. Absent on runtimes that are not codex and
+   * in tests that construct an adapter directly; codex built without one simply
+   * keeps reporting tokens with no cost, exactly as before.
+   */
+  codexPricing?: CodexCostEstimator;
 }
 
 export interface ChatAdapter {

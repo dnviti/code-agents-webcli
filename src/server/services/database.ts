@@ -454,6 +454,19 @@ export class AppDatabase {
         PRIMARY KEY (job_id, tool)
       );
 
+      /* Refreshed OpenAI list prices for codex cost estimation (issue #182).
+         Written only by the daily pricing refresh; read by the codex pricing
+         service as the durable, last-known-official-rate fallback. */
+      CREATE TABLE IF NOT EXISTS codex_prices (
+        model TEXT PRIMARY KEY,
+        input_per_m REAL NOT NULL,
+        cached_input_per_m REAL NOT NULL,
+        output_per_m REAL NOT NULL,
+        source TEXT NOT NULL,
+        pricing_date TEXT NOT NULL,
+        fetched_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_usage_jobs_user_ended
         ON usage_jobs(user_id, ended_at);
 
@@ -829,6 +842,16 @@ export class AppDatabase {
     // apart. Rows from before this change read "not reported", which is what
     // they are.
     this.addColumnIfMissing('usage_jobs', 'model_turns', 'INTEGER');
+
+    // The provenance of a codex cost estimate (issue #182): a JSON snapshot of
+    // the effective model, applied rate, source and pricing date behind a
+    // `cost_usd` this app computed rather than a runtime reported. Null for
+    // every runtime that prices its own turns, and for codex rows no price
+    // could be obtained for. Kept on the row so history, dashboard, backfill
+    // and export can all re-derive how a number was reached without re-calling
+    // any service, and it travels with the row: removing the record removes
+    // the estimate with it.
+    this.addColumnIfMissing('usage_jobs', 'cost_estimate', 'TEXT');
 
     // Declared here rather than with the other indexes above, because the
     // column it covers is only guaranteed to exist by the line before it.

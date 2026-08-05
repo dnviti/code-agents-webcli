@@ -15,6 +15,19 @@
  * carries the count of records that actually contributed to it.
  */
 
+import type { CodexCostEstimate } from './codex-pricing.js';
+
+/** Money at whatever precision keeps it meaningful (a turn can cost fractions of a cent). */
+export function formatCostUsd(n: number): string {
+  if (n === 0) return '$0.00';
+  return n >= 1 ? `$${n.toFixed(2)}` : `$${n.toFixed(4)}`;
+}
+
+/** A formatted cost figure marked as an estimate, for any cost surface. */
+export function markEstimatedCost(dollar: string): string {
+  return dollar.startsWith('~') ? dollar : `~${dollar}`;
+}
+
 /** How a job stopped. */
 export type UsageOutcome =
   /** The runtime ended the turn of its own accord. */
@@ -122,6 +135,14 @@ export interface UsageJobRecord {
   totalTokens: number | null;
   costUsd: number | null;
   /**
+   * The full provenance of a codex cost estimate — effective model, applied
+   * rate, source and pricing date (issue #182). Present only where this app
+   * computed the cost figure; absent for a runtime-reported cost and for codex
+   * work no price could be obtained for (which the client tells apart by the
+   * row's `agent` being codex and its `costUsd` being null).
+   */
+  costEstimate?: CodexCostEstimate | null;
+  /**
    * What the runtime *claims* it can report, from its adapter capabilities.
    *
    * Kept alongside the figures so a null can be explained rather than merely
@@ -165,6 +186,8 @@ export interface UsageModelUse {
   cacheReadTokens: number | null;
   cacheWriteTokens: number | null;
   costUsd: number | null;
+  /** As on `UsageJobRecord`: provenance when this app priced the model's work. */
+  costEstimate?: CodexCostEstimate | null;
 }
 
 /**
