@@ -71,7 +71,7 @@ export function WorkspaceChooserDialog({
       })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [open, draftServerId, serverTargets]);
+  }, [open, draftServerId, serverTargets, onDirectory]);
 
   if (!open) return null;
   const selectedTarget = serverTargets?.find((target) => target.id === draftServerId);

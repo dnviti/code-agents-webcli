@@ -4,6 +4,7 @@ import type { ServerTarget } from '../../controller/types';
 import { Button } from '../../ui/relay/Button';
 import { Dialog } from '../../ui/relay/Dialog';
 import { Input } from '../../ui/relay/Input';
+import { Select } from '../../ui/relay/Select';
 import { TOUCH_TARGET } from '../../ui/touch';
 import { ServerTargetBadge, serverTargetAvailability } from '../ServerTargetBadge';
 
@@ -124,10 +125,7 @@ export function NewSessionDialog({
         {serverTargets !== undefined ? (
           <div style={fieldStyle}>
             <label htmlFor={serverId} style={labelStyle}>Server</label>
-            {/* Native options are intentional here: unavailable targets must
-                remain visible but individually disabled, which the shared
-                Select's flat option API cannot currently express. */}
-            <select
+            <Select
               id={serverId}
               value={selectedServerId}
               onChange={(event) => {
@@ -142,28 +140,20 @@ export function NewSessionDialog({
               autoFocus
               required
               aria-describedby={serverStatusId}
-              style={{
-                width: '100%',
-                minHeight: TOUCH_TARGET,
-                padding: '0 10px',
-                border: '1px solid var(--border)',
-                borderRadius: 'var(--radius)',
-                background: 'var(--input)',
-                color: 'var(--foreground)',
-                fontFamily: 'var(--font-sans)',
-                fontSize: 'var(--text-ui)',
-              }}
-            >
-              {serverTargets.length === 0 ? <option value="">No configured servers</option> : null}
-              {serverTargets.map((target) => {
-                const reason = serverTargetAvailability(target);
-                return (
-                  <option key={target.id} value={target.id} disabled={Boolean(reason)}>
-                    {target.name}{reason ? ` — ${reason}` : ''}
-                  </option>
-                );
-              })}
-            </select>
+              style={{ minHeight: TOUCH_TARGET }}
+              options={
+                serverTargets.length === 0
+                  ? [{ value: '', label: 'No configured servers', disabled: true }]
+                  : serverTargets.map((target) => {
+                      const reason = serverTargetAvailability(target);
+                      return {
+                        value: target.id,
+                        label: reason ? `${target.name} — ${reason}` : target.name,
+                        disabled: Boolean(reason),
+                      };
+                    })
+              }
+            />
             <div id={serverStatusId}>
               {selectedServer ? (
                 <ServerTargetBadge target={selectedServer} />
