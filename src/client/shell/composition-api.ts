@@ -7,6 +7,7 @@
  */
 
 import type { ProjectSummary } from './projects-types.js';
+import { controllerFetch } from '../controller/transport.js';
 
 export interface RuntimeCatalogItem {
   id: string;
@@ -106,7 +107,7 @@ export class ApiError extends Error {
 }
 
 async function jsonRequest<T>(url: string, method = 'GET', body?: unknown): Promise<T> {
-  const response = await fetch(url, {
+  const response = await controllerFetch(url, {
     method,
     credentials: 'same-origin',
     headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },

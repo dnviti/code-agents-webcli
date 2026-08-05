@@ -26,6 +26,7 @@
 
 import { createTerminalController, type TerminalController } from '../terminal/controller.js';
 import { stripUnsupportedTerminalSequences } from '../terminal/text.js';
+import { controllerFetch } from '../controller/transport.js';
 import { attachImageDrop, attachImagePaste, type ImagePasteTarget } from '../terminal/paste.js';
 import { sendMobileKeyTo, withCtrlLatch, type KeyTarget, type MobileKey } from '../ui/mobile.js';
 import { summonKeyboard } from '../terminal/keyboard.js';
@@ -154,7 +155,7 @@ export class ChatTerminal {
   /** Create the session, join it, and start a shell in it. */
   async start(): Promise<void> {
     try {
-      const response = await fetch('/api/sessions/create', {
+      const response = await controllerFetch('/api/sessions/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -407,7 +408,7 @@ export class ChatTerminal {
     const sessionId = this.sessionId;
     this.dispose();
     if (!sessionId) return;
-    void fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }).catch(() => {
+    void controllerFetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }).catch(() => {
       // The pane is gone either way; a session that outlives it is a tidiness
       // problem, not something worth an error in the user's face.
     });

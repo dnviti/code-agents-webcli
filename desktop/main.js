@@ -18,25 +18,38 @@ const {
 const {
   CUSTOM_TITLE_BAR_HEIGHT,
   desktopWindowChrome,
-  desktopCookie,
   isSafeExternalUrl,
   loginShellPath,
   readWindowState,
-  shutdownAfterStartupFailure,
   titleBarSymbolColor,
   writeWindowState,
 } = require('./lib.js');
+const { ControllerCatalog } = require('./controller-catalog.js');
+const { readControllerPort, writeControllerPort } = require('./controller-endpoint.js');
+const { findLanServers } = require('./controller-discovery.js');
+const { createElectronControllerSessions } = require('./controller-electron.js');
+const { createControllerGateway } = require('./controller-gateway.js');
+const { createControllerRuntime } = require('./controller-runtime.js');
+const {
+  completeLegacyRendererPreferences,
+  prepareLegacyRendererPreferences,
+  rendererPreferenceArgument,
+} = require('./legacy-renderer-preferences.js');
 
 const APP_NAME = 'Code Agents Web CLI';
 const DOCUMENTATION_URL = 'https://github.com/dnviti/code-agents-webcli/blob/main/docs/desktop.md';
 const RELEASES_URL = 'https://github.com/dnviti/code-agents-webcli/releases';
 
 let embeddedServer = null;
-let localOrigin = null;
+let controllerGateway = null;
+let controllerOrigin = null;
+let controllerRuntime = null;
 let mainWindow = null;
 let stateSaveTimer = null;
 let shutdownStarted = false;
 let shutdownComplete = false;
+let legacyRendererPreferences = {};
+let legacyRendererMigrationPending = false;
 
 function serverClass() {
   return require('../dist/server/index.js').ClaudeCodeWebServer;
@@ -87,7 +100,7 @@ async function startEmbeddedServer({ dataDir, baseFolder }) {
     dataDir,
     desktop: { authToken, ...localIdentity() },
   });
-  await server.start();
+  const listener = await server.start();
 
   const url = server.localUrl;
   const auth = server.desktopAuthCookie;
@@ -101,7 +114,7 @@ async function startEmbeddedServer({ dataDir, baseFolder }) {
     throw new Error(`Refusing unsafe desktop listener ${parsed.origin}.`);
   }
 
-  return { server, url: parsed.origin, auth };
+  return { server, listener, url: parsed.origin, auth };
 }
 
 function scheduleWindowStateSave(filename) {
@@ -240,7 +253,7 @@ function protectNavigation(win, origin) {
 }
 
 async function createWindow() {
-  if (!localOrigin || !embeddedServer) throw new Error('Desktop server is not ready.');
+  if (!controllerOrigin || !controllerGateway) throw new Error('Desktop controller is not ready.');
   if (mainWindow && !mainWindow.isDestroyed()) {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
@@ -268,6 +281,8 @@ async function createWindow() {
       webSecurity: true,
       allowRunningInsecureContent: false,
       webviewTag: false,
+      preload: path.join(__dirname, 'legacy-renderer-preferences-preload.js'),
+      additionalArguments: [rendererPreferenceArgument(legacyRendererPreferences)].filter(Boolean),
     },
   });
   if (process.platform !== 'darwin') {
@@ -284,7 +299,7 @@ async function createWindow() {
   }
   if (isMaximized) mainWindow.maximize();
 
-  protectNavigation(mainWindow, localOrigin);
+  protectNavigation(mainWindow, controllerOrigin);
   mainWindow.on('resize', () => scheduleWindowStateSave(stateFile));
   mainWindow.on('move', () => scheduleWindowStateSave(stateFile));
   mainWindow.on('maximize', () => scheduleWindowStateSave(stateFile));
@@ -308,7 +323,7 @@ async function createWindow() {
     dialog.showErrorBox('The application window stopped', `Renderer reason: ${details.reason}`);
   });
 
-  await mainWindow.loadURL(localOrigin);
+  await mainWindow.loadURL(controllerOrigin);
   return mainWindow;
 }
 
@@ -456,14 +471,12 @@ async function boot() {
 
   const smoke = process.env.CODE_AGENTS_WEBCLI_DESKTOP_SMOKE === '1';
   const smokeRoot = smoke ? fs.mkdtempSync(path.join(os.tmpdir(), 'cc-web-electron-smoke-')) : null;
-  const started = await startEmbeddedServer({
-    dataDir: smokeRoot ? path.join(smokeRoot, 'data') : path.join(app.getPath('userData'), 'server'),
-    baseFolder: smokeRoot || app.getPath('home'),
-  });
-  embeddedServer = started.server;
-  localOrigin = started.url;
-
   if (smoke) {
+    const started = await startEmbeddedServer({
+      dataDir: path.join(smokeRoot, 'data'),
+      baseFolder: smokeRoot,
+    });
+    embeddedServer = started.server;
     try {
       await runSmokeCheck(started);
     } finally {
@@ -476,16 +489,92 @@ async function boot() {
     return;
   }
 
-  const cookie = {
-    ...desktopCookie(localOrigin, started.auth.value, started.auth.name),
-    httpOnly: started.auth.httpOnly,
-    sameSite: started.auth.sameSite,
-  };
-  await session.defaultSession.cookies.set(cookie);
-  installSessionPolicy(session.defaultSession, localOrigin);
+  const userData = app.getPath('userData');
+  const legacyPreferences = prepareLegacyRendererPreferences(userData);
+  legacyRendererPreferences = legacyPreferences.preferences;
+  legacyRendererMigrationPending = legacyPreferences.pending;
+  const controllerEndpointFile = path.join(userData, 'controller', 'gateway.json');
+  const controllerPort = readControllerPort(controllerEndpointFile);
+  const catalog = new ControllerCatalog({
+    filename: path.join(userData, 'controller', 'servers.json'),
+  });
+  const remoteSessions = createElectronControllerSessions({ session, BrowserWindow });
+  controllerRuntime = createControllerRuntime({
+    catalog,
+    electronSessions: remoteSessions,
+    findLanServers,
+  });
+  controllerGateway = createControllerGateway({
+    publicDir: path.join(__dirname, '..', 'dist', 'public'),
+    controller: controllerRuntime,
+    port: controllerPort,
+  });
+  const controllerEndpoint = await controllerGateway.listen();
+  controllerOrigin = controllerEndpoint.origin;
+  if (controllerPort === 0) writeControllerPort(controllerEndpointFile, controllerEndpoint.port);
+  const controllerAuthentication = controllerGateway.authentication();
+  const controllerUrls = [
+    `${controllerAuthentication.origin}/*`,
+    `${controllerAuthentication.origin.replace('http:', 'ws:')}/*`,
+  ];
+  session.defaultSession.webRequest.onBeforeSendHeaders({ urls: controllerUrls }, (details, callback) => {
+    const requestHeaders = Object.fromEntries(Object.entries(details.requestHeaders || {}).filter(
+      ([name]) => name.toLowerCase() !== controllerAuthentication.header,
+    ));
+    requestHeaders[controllerAuthentication.header] = controllerAuthentication.value;
+    callback({ requestHeaders });
+  });
+  controllerRuntime.start();
+
+  try {
+    const started = await startEmbeddedServer({
+      dataDir: path.join(userData, 'server'),
+      baseFolder: app.getPath('home'),
+    });
+    embeddedServer = started.server;
+    controllerRuntime.attachLocal({ origin: started.url, auth: started.auth });
+    started.listener.on('error', (error) => controllerRuntime?.reportLocalFailure(error));
+    started.listener.on('close', () => {
+      if (!shutdownStarted) {
+        controllerRuntime?.reportLocalFailure(Object.assign(
+          new Error('The Local computer server stopped.'),
+          { code: 'LOCAL_SERVER_STOPPED' },
+        ));
+      }
+    });
+  } catch (error) {
+    controllerRuntime.reportLocalFailure(error);
+    console.error('Local computer server could not start; remote controller remains available:', error);
+  }
+
+  installSessionPolicy(session.defaultSession, controllerOrigin);
   installMenu();
   await createWindow();
+  // `loadURL` resolves only after the isolated preload has had its opportunity
+  // to fill absent keys. A startup failure before that point must retry next
+  // launch instead of recording a migration that never reached the renderer.
+  if (legacyRendererMigrationPending) {
+    completeLegacyRendererPreferences(userData);
+    legacyRendererMigrationPending = false;
+  }
   await showFlatpakNotice();
+}
+
+async function shutdownDesktop() {
+  controllerRuntime?.stop();
+  const gateway = controllerGateway;
+  const server = embeddedServer;
+  controllerGateway = null;
+  controllerOrigin = null;
+  controllerRuntime = null;
+  embeddedServer = null;
+  const results = await Promise.allSettled([
+    gateway?.close(),
+    server?.shutdown(),
+  ].filter(Boolean));
+  for (const result of results) {
+    if (result.status === 'rejected') console.error('Desktop shutdown failed:', result.reason);
+  }
 }
 
 const hasLock = app.requestSingleInstanceLock();
@@ -504,14 +593,11 @@ if (!hasLock) {
     if (process.platform !== 'darwin') app.quit();
   });
   app.on('before-quit', (event) => {
-    if (shutdownComplete || !embeddedServer) return;
+    if (shutdownComplete) return;
     event.preventDefault();
     if (shutdownStarted) return;
     shutdownStarted = true;
-    void embeddedServer.shutdown().catch((error) => {
-      console.error('Desktop server shutdown failed:', error);
-    }).finally(() => {
-      embeddedServer = null;
+    void shutdownDesktop().finally(() => {
       shutdownComplete = true;
       app.quit();
     });
@@ -523,12 +609,7 @@ if (!hasLock) {
       `${APP_NAME} could not start`,
       error instanceof Error ? error.message : String(error),
     );
-    if (embeddedServer) {
-      await shutdownAfterStartupFailure(embeddedServer, (shutdownError) => {
-        console.error('Desktop server shutdown after startup failure failed:', shutdownError);
-      });
-      embeddedServer = null;
-    }
+    await shutdownDesktop();
     shutdownComplete = true;
     app.quit();
   });

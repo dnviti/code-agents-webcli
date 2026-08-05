@@ -14,6 +14,7 @@ import { Button } from '../../ui/relay/Button';
 import { Dialog } from '../../ui/relay/Dialog';
 import { Input } from '../../ui/relay/Input';
 import { Select } from '../../ui/relay/Select';
+import { controllerFetch } from '../../controller/transport';
 
 /**
  * Runtimes a profile can target. `terminal` is excluded: it spawns the user's
@@ -107,7 +108,7 @@ export function RuntimeProfilesDialog({
     let cancelled = false;
     setError(null);
     setReport(null);
-    fetch('/api/runtime-profiles', { credentials: 'same-origin' })
+    controllerFetch('/api/runtime-profiles', { credentials: 'same-origin' })
       .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
       .then((data) => {
         if (cancelled) return;
@@ -157,7 +158,7 @@ export function RuntimeProfilesDialog({
     if (!state) return;
     setSaving(true);
     setError(null);
-    fetch('/api/runtime-profiles', {
+    controllerFetch('/api/runtime-profiles', {
       method: 'PUT',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },

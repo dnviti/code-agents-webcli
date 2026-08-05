@@ -12,9 +12,11 @@ npx --allow-git=all github:dnviti/code-agents-webcli
 That is the whole install. Nothing compiles, nothing needs a C++ toolchain, and
 there is no second command.
 
-Prefer a local native window? Download the **[desktop app](docs/desktop.md)**
-for Linux, Windows or macOS. It is self-contained: no terminal, Node.js,
-separately running server or GitHub OAuth is needed to launch it.
+Prefer one native window for work across machines? Download the
+**[desktop app](docs/desktop.md)** for Linux, Windows or macOS. It is a
+self-contained controller for its permanent Local computer and the remote CODE
+AGENTS servers you save; no terminal, Node.js, separately running server, or
+GitHub OAuth is needed to launch the local experience.
 
 ---
 
@@ -34,6 +36,9 @@ separately running server or GitHub OAuth is needed to launch it.
   Each is optional; the app only ever runs what is on the host's `PATH`.
 - **Multi-user, properly isolated.** GitHub OAuth, an explicit allow-list, and
   sessions keyed to the account that made them.
+- **One desktop, several servers.** The installed app combines labeled local
+  and remote sessions, keeps each server's sign-in and certificate decision
+  isolated, and makes the target explicit before new work is created.
 - **Sessions that outlive the tab.** Reload, switch devices, come back tomorrow —
   the session is still there, with its scrollback.
 - **Scrollback that does not melt the browser.** The recent tail stays live;
@@ -128,7 +133,7 @@ The image ships the web server only — the agent CLIs are not bundled. See
 
 | Guide | What is in it |
 | --- | --- |
-| [Desktop app](docs/desktop.md) | Native Linux, Windows and macOS downloads, local-only use, updates and troubleshooting |
+| [Desktop app](docs/desktop.md) | Native downloads, the local-and-remote controller, sign-in and certificate isolation, LAN discovery, updates and troubleshooting |
 | [Installation](docs/installation.md) | Every install path, platform support, uninstalling, install troubleshooting |
 | [GitHub OAuth](docs/github-oauth.md) | Creating the OAuth App, the allow-list, the installer account |
 | [Configuration](docs/configuration.md) | Every CLI flag and environment variable, the setup wizard, where state is stored |

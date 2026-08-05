@@ -4,6 +4,7 @@ import type { App } from '../app';
 import type { AgentKind, RuntimeStartOptions } from '../types';
 import { shellStore } from '../shell/store';
 import { hideOverlay, showOverlay, showError } from '../ui/overlay';
+import { getControllerSnapshot, parseQualifiedSessionId } from '../controller/transport';
 
 async function stabilizeTerminalSize(
   app: App,
@@ -103,8 +104,8 @@ export async function joinSession(app: App, sessionId: string): Promise<void> {
   });
 }
 
-export function leaveSession(app: App): void {
-  app.send({ type: 'leave_session' });
+export function leaveSession(app: App, serverId?: string): void {
+  app.send({ type: 'leave_session', ...(serverId ? { serverId } : {}) });
 }
 
 /**
@@ -121,10 +122,14 @@ export async function deleteSession(
   options: { confirm?: boolean } = {},
 ): Promise<boolean> {
   const { confirm: requireConfirm = true } = options;
+  const owner = parseQualifiedSessionId(sessionId)?.serverId;
+  const serverName = owner
+    ? getControllerSnapshot().targets.find((target) => target.id === owner)?.name
+    : undefined;
 
   if (
     requireConfirm &&
-    !confirm('Are you sure you want to delete this session? This will stop any running Claude process.')
+    !confirm(`Are you sure you want to delete this session${serverName ? ` on ${serverName}` : ''}? This will stop any running agent process on that server.`)
   ) {
     return false;
   }
@@ -304,14 +309,16 @@ export function startTerminalSession(app: App, options: RuntimeStartOptions = {}
 
 export async function closeSession(app: App): Promise<void> {
   try {
+    const sessionId = app.currentClaudeSessionId;
+    const owner = sessionId ? parseQualifiedSessionId(sessionId)?.serverId : undefined;
     if (app.socket && app.socket.readyState === WebSocket.OPEN) {
-      app.send({ type: 'close_session' });
+      app.send({ type: 'close_session', ...(sessionId ? { sessionId } : owner ? { serverId: owner } : {}) });
     }
 
     const response = await app.authFetch('/api/close-session', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-    });
+    }, owner);
 
     if (!response.ok) {
       const error = await response.json();

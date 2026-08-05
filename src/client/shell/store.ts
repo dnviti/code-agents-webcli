@@ -40,6 +40,10 @@ export interface ShellTab {
   attention: ConversationAttention | null;
   projectId: string | null | undefined;
   projectName: string | null | undefined;
+  /** Installed-controller provenance; omitted in an ordinary browser. */
+  serverId?: string;
+  serverName?: string;
+  serverInsecure?: boolean;
   /**
    * Which surface this session runs on, fixed when it was started.
    *
@@ -120,6 +124,8 @@ export type OverlayView = 'loading' | 'start' | 'error' | null;
 
 export interface ShellDialogs {
   settings: boolean;
+  /** Installed desktop server catalog and trust controls. */
+  servers: boolean;
   /** Per-runtime launch configuration: model, args, env, tiers. */
   runtimeProfiles: boolean;
   /** Where containers run: the installer's deploy target editor. */
@@ -191,6 +197,8 @@ export interface ToastItem {
  * object stays one level deep, which is all `shallowEqual` below compares.
  */
 export interface BannerView {
+  /** Exact server owner in controller mode; null in an ordinary browser. */
+  ownerId: string | null;
   tone: string;
   text: string;
   actionLabel: string | null;
@@ -247,6 +255,8 @@ export interface ShellState {
    */
   confirm: ConfirmRequest | null;
   banner: BannerView | null;
+  /** Installed desktop package update, independent of the selected server notice. */
+  desktopBanner: BannerView | null;
   /** GitHub login of the signed-in user, when the server reports one. */
   user: string | null;
   /** Sign-out URL, when the deployment has auth enabled. */
@@ -311,6 +321,7 @@ const INITIAL: ShellState = {
   ctrlLatched: false,
   dialogs: {
     settings: false,
+    servers: false,
     runtimeProfiles: false,
     deployTargets: false,
     projects: false,
@@ -354,6 +365,7 @@ const INITIAL: ShellState = {
   sessionList: [],
   confirm: null,
   banner: null,
+  desktopBanner: null,
   user: null,
   logoutUrl: null,
   containerizedEnvironmentsEnabled: false,

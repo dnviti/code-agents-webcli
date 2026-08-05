@@ -5,6 +5,7 @@ import { Dialog } from '../../ui/relay/Dialog';
 import { Input } from '../../ui/relay/Input';
 import { Select } from '../../ui/relay/Select';
 import { usePhone } from '../../ui/touch';
+import { controllerFetch } from '../../controller/transport';
 
 /**
  * Deploy targets: the places this server runs containers, edited by the
@@ -188,8 +189,8 @@ export function DeployTargetsDialog({
 
   const load = React.useCallback((): void => {
     Promise.all([
-      fetch('/api/admin/deploy-targets', { credentials: 'same-origin' }),
-      fetch('/api/admin/deploy-settings', { credentials: 'same-origin' }),
+      controllerFetch('/api/admin/deploy-targets', { credentials: 'same-origin' }),
+      controllerFetch('/api/admin/deploy-settings', { credentials: 'same-origin' }),
     ])
       .then(async ([targetsResponse, settingsResponse]) => {
         if (targetsResponse.status === 403 || settingsResponse.status === 403) {
@@ -234,7 +235,7 @@ export function DeployTargetsDialog({
   const readOnly = !state?.canEdit;
 
   const request = (url: string, method: string, body?: unknown): Promise<Record<string, unknown>> =>
-    fetch(url, {
+    controllerFetch(url, {
       method,
       credentials: 'same-origin',
       headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },

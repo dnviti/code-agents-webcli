@@ -23,6 +23,7 @@ import { RuntimeLauncher, type ResumableConversation } from './RuntimeLauncher';
 import { readStoredTheme, setThemeMode, watchSystemTheme, type RelayTheme } from './theme';
 import { shellStore } from './store';
 import { relayTerminalTheme } from './terminal-theme';
+import { rememberNewSessionServer } from '../controller/transport';
 
 /** The live terminal, so a theme change can reach it. Set once at mount. */
 let themedApp: App | null = null;
@@ -198,8 +199,8 @@ async function resumeConversation(app: App, conversation: ResumableConversation)
  * grouped, searchable list, and a missing `projects` array would be a TypeError
  * inside a dialog the user opened to find something.
  */
-async function fetchConversations(app: App): Promise<ConversationList> {
-  const response = await app.authFetch('/api/sessions/conversations');
+async function fetchConversations(app: App, serverId?: string): Promise<ConversationList> {
+  const response = await app.authFetch('/api/sessions/conversations', {}, serverId);
   if (!response.ok) {
     // The server is a version behind this page more often than it is broken, and
     // that is worth saying: the endpoint is new, and the process loads its code
@@ -319,6 +320,7 @@ async function removeConversation(
       + 'along with anything still running it. This cannot be undone.',
     confirmLabel: 'Delete',
     tone: 'danger',
+    sessionId: conversation.id,
   });
   if (!confirmed) return false;
 
@@ -497,13 +499,13 @@ function buildLauncher(app: App): React.ReactNode {
 }
 
 /** Create and focus a session whose workspace is resolved by the project manager. */
-async function createProjectSession(app: App, projectId: string): Promise<void> {
+async function createProjectSession(app: App, projectId: string, serverId?: string): Promise<void> {
   try {
     const response = await app.authFetch('/api/sessions/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ projectId }),
-    });
+      body: JSON.stringify({ projectId, ...(serverId ? { serverId } : {}) }),
+    }, serverId);
     if (!response.ok) throw new Error('Failed to create project session');
     const data = await response.json() as {
       sessionId: string;
@@ -534,6 +536,7 @@ async function createProjectSession(app: App, projectId: string): Promise<void> 
     } else {
       await app.joinSession(data.sessionId);
     }
+    if (serverId) rememberNewSessionServer(serverId);
     app.loadSessions();
     app.isCreatingNewSession = false;
   } catch (error) {
@@ -587,11 +590,11 @@ function buildActions(app: App): ShellActions {
     saveSettings: (next) => saveSettings(app, next),
     openSettings: () => app.showSettings(),
 
-    createSession: (name, workingDir) => void createNewSession(app, name, workingDir),
-    openProjectSession: (projectId) => void createProjectSession(app, projectId),
-    chooseNewTabDirectory: () => {
+    createSession: (name, workingDir, serverId) => void createNewSession(app, name, workingDir, serverId),
+    openProjectSession: (projectId, serverId) => void createProjectSession(app, projectId, serverId),
+    chooseNewTabDirectory: (serverId) => {
       shellStore.patchSlice('dialogs', { workspaceChooser: false });
-      void app.folderBrowser.show({ host: true });
+      void app.folderBrowser.show({ host: true, serverId });
     },
     cancelNewTab: () => {
       app.isCreatingNewSession = false;
@@ -621,12 +624,16 @@ function buildActions(app: App): ShellActions {
         void app.joinSession(id);
       }
     },
-    leaveSession: () => app.leaveSession(),
+    leaveSession: (serverId) => app.leaveSession(serverId),
+    retireServerSessions: (serverId) => {
+      app.sessionTabManager.retireServer(serverId);
+      void app.loadSessions();
+    },
     // The dialog does not confirm; deleting another user's session in a shared
     // deployment is not something to do on a single tap.
     deleteSession: (id) => void app.deleteSession(id),
 
-    loadConversations: () => fetchConversations(app),
+    loadConversations: (serverId) => fetchConversations(app, serverId),
     openStoredConversation: (conversation) => void openStoredConversation(app, conversation),
     deleteConversation: (conversation) => removeConversation(app, conversation),
 
@@ -635,8 +642,8 @@ function buildActions(app: App): ShellActions {
 
     retryConnection: () => app.reconnect(),
 
-    updateAction: () => onBannerAction(),
-    updateToggleLog: () => onBannerToggleLog(),
-    updateDismiss: () => onBannerDismiss(),
+    updateAction: (serverId) => void onBannerAction(serverId),
+    updateToggleLog: (serverId) => onBannerToggleLog(serverId),
+    updateDismiss: (serverId) => onBannerDismiss(serverId),
   };
 }

@@ -284,6 +284,10 @@ function snapshotFor(sessionId, text) {
   };
 }
 
+function qualified(serverId, sessionId) {
+  return `ccs1.${Buffer.from(JSON.stringify([serverId, sessionId])).toString('base64url')}`;
+}
+
 describe('the chat controller registry', function () {
   /** Every `chat_*` the controller's own switch answers to, read from it. */
   function handledTypes() {
@@ -507,6 +511,43 @@ describe('the chat controller registry', function () {
     reg.drop('a');
 
     assert.deepStrictEqual(sent, []);
+  });
+
+  it('keeps feature negotiation isolated between controller servers', function () {
+    const sent = [];
+    const reg = new mod.ChatRegistry({ send: (message) => sent.push(message), onChange() {} });
+    const oldSession = qualified('old', 'same');
+    const newSession = qualified('new', 'same');
+
+    reg.setFeatures([], 'old');
+    reg.setFeatures(['chat_subscribe', 'chat_draft', 'chat_builtin_workflow'], 'new');
+    const oldController = reg.ensure(oldSession);
+    const newController = reg.ensure(newSession);
+    sent.length = 0;
+
+    reg.subscribe(oldSession);
+    reg.subscribe(newSession);
+    reg.resubscribeAll();
+
+    assert.ok(sent.length >= 1);
+    assert.ok(sent.every((message) => message.sessionId === newSession));
+    assert.strictEqual(oldController.builtInWorkflowsAvailable, false);
+    assert.strictEqual(newController.builtInWorkflowsAvailable, true);
+
+    reg.connectionLost('old');
+    assert.strictEqual(oldController.connectionAvailable, false);
+    assert.strictEqual(newController.connectionAvailable, true);
+    oldController.sendTurn('must stay local');
+    newController.sendTurn('still connected');
+    assert.ok(!sent.some((message) => message.text === 'must stay local'));
+    assert.ok(sent.some((message) => message.text === 'still connected'));
+    reg.connectionRestored('old');
+    assert.strictEqual(oldController.connectionAvailable, true);
+
+    sent.length = 0;
+    reg.drop(oldSession);
+    reg.drop(newSession);
+    assert.deepStrictEqual(sent, [{ type: 'chat_unsubscribe', sessionId: newSession }]);
   });
 
   it('negotiates the built-in workflow protocol before a controller can use it', async function () {

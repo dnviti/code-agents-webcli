@@ -2,6 +2,7 @@ import * as React from 'react';
 
 import type { AppSettings } from '../types';
 import { Badge } from '../ui/relay/Badge';
+import { Button } from '../ui/relay/Button';
 import { CommandPalette, type CommandPaletteGroup } from '../ui/relay/CommandPalette';
 import { Icon, type IconName } from '../ui/relay/Icon';
 import { PhoneContext } from '../ui/touch';
@@ -24,6 +25,8 @@ import { SessionsDialog } from './dialogs/SessionsDialog';
 import { ConversationsDialog } from './dialogs/ConversationsDialog';
 import { ChatSettingsDialog } from './dialogs/ChatSettingsDialog';
 import { SettingsDialog } from './dialogs/SettingsDialog';
+import { removalDescription, ServerManagerDialog } from './dialogs/ServerManagerDialog';
+import { ServerTargetBadge, serverTargetAvailability } from './ServerTargetBadge';
 import { UsageDashboardDialog } from './dialogs/UsageDashboardDialog';
 import { TerminalOptionsDialog } from './dialogs/TerminalOptionsDialog';
 import { BottomNav, type BottomNavDestination } from './BottomNav';
@@ -38,6 +41,7 @@ import { AppContextMenu } from './AppContextMenu.js';
 import { downloadFile, uploadIntoWorkspace } from '../chat/workspace-api';
 import { showConfirm } from '../ui/confirm';
 import { showError } from '../ui/overlay';
+import { showNotification } from '../ui/notifications';
 import { TabContextMenu } from './TabContextMenu';
 import { TerminalHost } from './TerminalHost';
 import { ChatView } from './chat/ChatView';
@@ -48,6 +52,15 @@ import { CHAT_PANEL_ICONS, type ChatPanelId, type ChatViewSettings } from '../ch
 import { Toasts } from './Toasts';
 import { UpdateBannerView } from './UpdateBannerView';
 import { shellStore, type ShellState, type ShellTab } from './store';
+import {
+  controllerActions,
+  controllerFetch,
+  getControllerSnapshot,
+  lastNewSessionServerId,
+  parseQualifiedSessionId,
+  selectControllerServer,
+  subscribeController,
+} from '../controller/transport';
 
 /**
  * What the shell needs from the imperative App, named rather than passing App
@@ -86,12 +99,12 @@ export interface ShellActions {
   openSettings(): void;
 
   // Session creation
-  createSession(name: string, workingDir: string): void;
+  createSession(name: string, workingDir: string, serverId?: string): void;
   startShell(shell: string): void;
   runCommand(command: string): void;
   /** Create a session inside a project and focus it. */
-  openProjectSession(projectId: string): void;
-  chooseNewTabDirectory(): void;
+  openProjectSession(projectId: string, serverId?: string): void;
+  chooseNewTabDirectory(serverId?: string): void;
   cancelNewTab(): void;
 
   // Folder browser
@@ -108,12 +121,13 @@ export interface ShellActions {
   // Session list
   openSessions(): void;
   joinSession(id: string): void;
-  leaveSession(): void;
+  leaveSession(serverId?: string): void;
+  retireServerSessions(serverId: string): void;
   deleteSession(id: string): void;
 
   // Conversations
   /** Every conversation this user has, grouped by project. */
-  loadConversations(): Promise<ConversationList>;
+  loadConversations(serverId?: string): Promise<ConversationList>;
   /**
    * Put a stored conversation back on screen.
    *
@@ -145,9 +159,9 @@ export interface ShellActions {
   openConversation(conversation: BranchedConversation): void;
 
   // Update banner
-  updateAction(): void;
-  updateToggleLog(): void;
-  updateDismiss(): void;
+  updateAction(serverId?: string): void;
+  updateToggleLog(serverId?: string): void;
+  updateDismiss(serverId?: string): void;
 }
 
 export interface AppShellProps {
@@ -164,6 +178,18 @@ function tabItems(tabs: ShellTab[]): TabItem[] {
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{tab.title}</span>
         <span style={{ fontSize: 'var(--text-2xs)', color: 'var(--primary)', flex: '0 0 auto' }}>{tab.projectName || tab.projectId}</span>
+        {tab.serverName ? (
+          <span style={{ fontSize: 'var(--text-2xs)', color: tab.serverInsecure ? 'var(--warning)' : 'var(--muted-foreground)', flex: '0 0 auto' }}>
+            {tab.serverInsecure ? '⚠ ' : ''}{tab.serverName}
+          </span>
+        ) : null}
+      </span>
+    ) : tab.serverName ? (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{tab.title}</span>
+        <span style={{ fontSize: 'var(--text-2xs)', color: tab.serverInsecure ? 'var(--warning)' : 'var(--muted-foreground)', flex: '0 0 auto' }}>
+          {tab.serverInsecure ? '⚠ ' : ''}{tab.serverName}
+        </span>
       </span>
     ) : tab.title,
     status: tab.status,
@@ -171,7 +197,7 @@ function tabItems(tabs: ShellTab[]): TabItem[] {
     attention: tab.attention,
     tooltip: tab.projectName || tab.projectId
       ? `${tab.projectName || tab.projectId} · ${tab.workingDir ?? tab.title}`
-      : (tab.workingDir ?? tab.title),
+      : `${tab.serverName ? `${tab.serverName} · ` : ''}${tab.workingDir ?? tab.title}`,
   }));
 }
 
@@ -310,7 +336,7 @@ function closeDialogs(patch: Parameters<typeof shellStore.patchSlice<'dialogs'>>
  * installation to show a line that almost never moves. The one case that *does*
  * move on its own — automatic sizing — announces itself over the socket.
  */
-function useEnvironment(visible: boolean): {
+function useEnvironment(visible: boolean, serverId?: string | null): {
   info: EnvironmentInfo | null;
   error: string | null;
   busy: boolean;
@@ -324,14 +350,14 @@ function useEnvironment(visible: boolean): {
 
   const read = React.useCallback(async (): Promise<void> => {
     try {
-      const response = await fetch('/api/environment', { credentials: 'same-origin' });
+      const response = await controllerFetch('/api/environment', { credentials: 'same-origin' }, serverId);
       if (!response.ok) throw new Error(String(response.status));
       setInfo((await response.json()) as EnvironmentInfo);
       setError(null);
     } catch {
       setError('Could not read your environment from the server.');
     }
-  }, []);
+  }, [serverId]);
 
   React.useEffect(() => {
     if (visible) void read();
@@ -348,12 +374,12 @@ function useEnvironment(visible: boolean): {
     setBusy(true);
     setNotice(null);
     try {
-      const response = await fetch('/api/environment/tier', {
+      const response = await controllerFetch('/api/environment/tier', {
         method: 'PUT',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tier }),
-      });
+      }, serverId);
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
         setError(payload.message || 'The size could not be changed.');
@@ -367,7 +393,7 @@ function useEnvironment(visible: boolean): {
     } finally {
       setBusy(false);
     }
-  }, [read]);
+  }, [read, serverId]);
 
   return { info, error, busy, notice, apply };
 }
@@ -378,9 +404,44 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
     shellStore.getSnapshot,
     shellStore.getSnapshot,
   );
+  const controller = React.useSyncExternalStore(
+    subscribeController,
+    getControllerSnapshot,
+    getControllerSnapshot,
+  );
+  const selectedControllerTarget = controller.targets.find(
+    (target) => target.id === controller.selectedServerId,
+  ) || null;
+  const rememberedNewSessionServerId = controller.enabled ? lastNewSessionServerId() : null;
 
   const active = state.tabs.find((t) => t.id === state.activeId) || null;
-  const environment = useEnvironment(state.dialogs.settings || state.dialogs.environment);
+  const activeControllerServerId = active?.id ? parseQualifiedSessionId(active.id)?.serverId : null;
+  const activeControllerTarget = controller.targets.find((target) => target.id === activeControllerServerId) || null;
+  const activeServerUnavailable = Boolean(
+    controller.enabled
+    && activeControllerServerId
+    && (!activeControllerTarget || serverTargetAvailability(activeControllerTarget)),
+  );
+  const activeServerName = activeControllerTarget?.name || active?.serverName || 'Unknown server';
+  const workSurfaceRef = React.useRef<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    const surface = workSurfaceRef.current;
+    if (!surface) return;
+    if (activeServerUnavailable) {
+      surface.setAttribute('inert', '');
+      if (typeof document !== 'undefined') {
+        const focused = document.activeElement;
+        if (focused instanceof HTMLElement) focused.blur();
+      }
+    } else {
+      surface.removeAttribute('inert');
+    }
+    return () => surface.removeAttribute('inert');
+  }, [activeControllerServerId, activeServerUnavailable]);
+  const environment = useEnvironment(
+    state.dialogs.settings || state.dialogs.environment,
+    controller.selectedServerId,
+  );
 
   // The chat surface is decided by the server and published into the store; the
   // controller is carried as an opaque handle because its transcript mutates
@@ -451,6 +512,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
     state.isMobile,
     state.keysVisible,
     state.banner !== null,
+    state.desktopBanner !== null,
     titleBarGeometry.visible,
     titleBarGeometry.height,
     titleBarGeometry.y,
@@ -541,7 +603,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         },
         // Offered only while the browser is actually holding a deferred
         // prompt, so the entry is never a control that does nothing.
-        ...(state.install === 'available'
+        ...(!controller.enabled && state.install === 'available'
           ? [{
               label: 'Install app',
               icon: <Icon name="download" size={13} />,
@@ -764,7 +826,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       <IconButton label="Settings" size="sm" onClick={actions.openSettings}>
         <Icon name="settings" />
       </IconButton>
-      {state.logoutUrl && (!state.isMobile || integratedTitleBar) ? (
+      {!controller.enabled && state.logoutUrl && (!state.isMobile || integratedTitleBar) ? (
         <a
           href={state.logoutUrl}
           title="Sign out"
@@ -788,7 +850,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       onTheme={toggleTheme}
       onUsage={() => closeDialogs({ usage: true })}
       onSettings={actions.openSettings}
-      logoutUrl={state.logoutUrl}
+      logoutUrl={controller.enabled ? null : state.logoutUrl}
     />
   ) : fullBarActions;
 
@@ -888,14 +950,78 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
     >
       {titleBar}
 
+      {controller.enabled && selectedControllerTarget ? (
+        <div
+          role="region"
+          aria-label={`Current server: ${selectedControllerTarget.name}`}
+          style={{
+            minHeight: 44,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            padding: '4px 8px',
+            borderBottom: '1px solid var(--border)',
+            background: 'color-mix(in srgb, var(--secondary) 70%, var(--background))',
+            flexWrap: 'wrap',
+          }}
+        >
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-2xs)', letterSpacing: 'var(--tracking-caps)', textTransform: 'uppercase', color: 'var(--muted-foreground)' }}>
+            Target
+          </span>
+          <select
+            aria-label="Current server"
+            value={controller.selectedServerId || ''}
+            onChange={(event) => selectControllerServer(event.target.value)}
+            style={{
+              maxWidth: 190,
+              minHeight: 44,
+              padding: '0 8px',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--radius)',
+              background: 'var(--input)',
+              color: 'var(--foreground)',
+              fontSize: 'var(--text-sm)',
+            }}
+          >
+            {controller.targets.map((target) => (
+              <option key={target.id} value={target.id}>{target.name}</option>
+            ))}
+          </select>
+          <ServerTargetBadge target={selectedControllerTarget} compact />
+          <span style={{ flex: 1, minWidth: 120, fontSize: 'var(--text-xs)', color: 'var(--muted-foreground)' }}>
+            Server-owned dialogs use this target. Active-session commands and files stay on the tab's server.
+          </span>
+          {activeControllerTarget && activeControllerTarget.id !== selectedControllerTarget?.id ? (
+            <span aria-label={`Active tab server: ${activeControllerTarget.name}`} style={{ fontSize: 'var(--text-xs)' }}>
+              Active tab: <ServerTargetBadge target={activeControllerTarget} compact />
+            </span>
+          ) : null}
+          <Button size="sm" variant="ghost" onClick={() => closeDialogs({ servers: true })}>
+            Manage
+          </Button>
+        </div>
+      ) : null}
+
+      <UpdateBannerView
+        banner={state.desktopBanner}
+        onAction={() => actions.updateAction('local')}
+        onToggleLog={() => actions.updateToggleLog('local')}
+        onDismiss={() => actions.updateDismiss('local')}
+      />
+
       <UpdateBannerView
         banner={state.banner}
-        onAction={actions.updateAction}
-        onToggleLog={actions.updateToggleLog}
-        onDismiss={actions.updateDismiss}
+        onAction={() => actions.updateAction(state.banner?.ownerId || undefined)}
+        onToggleLog={() => actions.updateToggleLog(state.banner?.ownerId || undefined)}
+        onDismiss={() => actions.updateDismiss(state.banner?.ownerId || undefined)}
       />
 
       <div style={{ flex: 1, display: 'flex', minHeight: 0, position: 'relative' }}>
+        <div
+          ref={workSurfaceRef}
+          aria-disabled={activeServerUnavailable || undefined}
+          style={{ flex: 1, display: 'flex', minHeight: 0, minWidth: 0, position: 'relative' }}
+        >
         {/*
           The terminal stays mounted even while the chat surface is showing.
           xterm is imperative and owns a live DOM node; unmounting it to swap
@@ -923,6 +1049,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
             runtime={state.chat.runtime}
             runtimeLabel={state.chat.runtimeLabel || state.chat.runtime}
             workingDir={state.chat.workingDir || active?.workingDir || ''}
+            serverName={activeControllerTarget?.name || active?.serverName}
             isMobile={state.isMobile}
             // For the recovery notice's labels only. The conversation's own
             // mode is on the transcript; this is what a *new* one would get.
@@ -946,6 +1073,38 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
           onRetry={actions.retryConnection}
           launcher={launcher}
         />
+        </div>
+        {activeServerUnavailable ? (
+          <div
+            role="alert"
+            aria-label={`${activeServerName} is unavailable`}
+            style={{
+              position: 'absolute', inset: 0, zIndex: 'var(--z-overlay)' as unknown as number,
+              display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
+              padding: 18, background: 'color-mix(in srgb, var(--background) 42%, transparent)',
+            }}
+          >
+            <div style={{
+              width: 'min(560px, 100%)', padding: 14, border: '1px solid var(--destructive)',
+              borderRadius: 'var(--radius)', background: 'var(--card)', boxShadow: 'var(--shadow-lg)',
+            }}>
+              <strong>{activeServerName} is unavailable</strong>
+              <p style={{ margin: '6px 0 12px', color: 'var(--muted-foreground)' }}>
+                Cached session history remains visible, but commands, files, approvals, and other server actions are disabled until it reconnects.
+              </p>
+              <div style={{ display: 'flex', gap: 8 }}>
+                {activeControllerTarget?.canRetry ? (
+                  <Button size="sm" variant="primary" onClick={() => void controllerActions.retry(activeControllerTarget.id)}>
+                    Retry {activeServerName}
+                  </Button>
+                ) : null}
+                <Button size="sm" variant="secondary" onClick={() => closeDialogs({ servers: true })}>
+                  Manage servers
+                </Button>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {/* Not over a conversation: the strip sends terminal control codes, and
@@ -989,9 +1148,11 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       />
 
       <SettingsDialog
+        key={`settings-${controller.selectedServerId || 'browser'}`}
         open={state.dialogs.settings}
         settings={actions.readSettings()}
-        install={state.install}
+        install={controller.enabled ? 'unsupported' : state.install}
+        isElectronController={controller.enabled}
         onInstall={() => void installHint()}
         onOpenRuntimeProfiles={() => closeDialogs({ settings: false, runtimeProfiles: true })}
         onOpenDeployTargets={() => closeDialogs({ settings: false, deployTargets: true })}
@@ -999,6 +1160,10 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         environmentsEnabled={environment.info?.enabled === true}
         onOpenEnvironment={() => closeDialogs({ settings: false, environment: true })}
         onOpenProjects={() => closeDialogs({ settings: false, projects: true })}
+        controllerTargets={controller.enabled ? controller.targets : undefined}
+        onOpenServerManager={controller.enabled
+          ? () => closeDialogs({ settings: false, servers: true })
+          : undefined}
         onPreview={actions.previewSettings}
         onSave={(next) => { actions.saveSettings(next); closeDialogs({ settings: false }); }}
         onClose={() => {
@@ -1011,22 +1176,115 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         }}
       />
 
+      {controller.enabled ? (
+        <ServerManagerDialog
+          open={state.dialogs.servers}
+          targets={controller.targets}
+          candidates={controller.candidates}
+          onClose={() => closeDialogs({ servers: false })}
+          onAdd={async (target) => {
+            try {
+              const result = await controllerActions.add(target);
+              const id = (result.target as { id?: string } | undefined)?.id;
+              return {
+                success: result.success !== false,
+                requiresApproval: result.requiresApproval === true,
+                target: id ? getControllerSnapshot().targets.find((item) => item.id === id) : undefined,
+                message: (result.error as { message?: string } | undefined)?.message,
+              };
+            } catch (error) {
+              return { success: false, message: error instanceof Error ? error.message : 'The server could not be added.' };
+            }
+          }}
+          onEdit={async (serverId, target) => {
+            try {
+              const result = await controllerActions.update(serverId, target);
+              return {
+                success: result.success !== false,
+                requiresApproval: result.requiresApproval === true,
+                target: getControllerSnapshot().targets.find((item) => item.id === serverId),
+                message: (result.error as { message?: string } | undefined)?.message,
+              };
+            } catch (error) {
+              return { success: false, message: error instanceof Error ? error.message : 'The server could not be updated.' };
+            }
+          }}
+          onTest={(serverId) => {
+            const target = controller.targets.find((item) => item.id === serverId);
+            if (target?.origin) void controllerActions.test({ serverId: target.id })
+              .then((result) => {
+                if (result.success === false) showError((result.error as { message?: string } | undefined)?.message || 'The connection test failed.');
+                else showNotification(`${target.name} is compatible and reachable.`);
+              })
+              .catch((error: Error) => showError(error.message));
+          }}
+          onRetry={(serverId) => void controllerActions.retry(serverId).then((result) => {
+            if (result.success === false) showError((result.error as { message?: string } | undefined)?.message || 'The server is still unavailable.');
+          }).catch((error: Error) => showError(error.message))}
+          onSignIn={(serverId) => void controllerActions.signIn(serverId).then((result) => {
+            if (result.success === false) showError(typeof result.message === 'string' ? result.message : 'Sign-in did not complete.');
+          }).catch((error: Error) => showError(error.message))}
+          onSignOut={(serverId) => void controllerActions.signOut(serverId).then((result) => {
+            if (result.success === false) {
+              showError(typeof result.message === 'string' ? result.message : 'The server could not be signed out.');
+              return;
+            }
+            actions.retireServerSessions(serverId);
+          }).catch((error: Error) => showError(error.message))}
+          onRemove={(target) => void (async () => {
+            try {
+              let result = await controllerActions.remove(target.id, (target.runningWorkCount ?? 0) > 0);
+              if (result.requiresConfirmation === true) {
+                const confirmed = await showConfirm({
+                  title: `Remove ${target.name}?`,
+                  description: removalDescription(target),
+                  confirmLabel: 'Remove server',
+                  tone: 'danger',
+                  serverId: target.id,
+                });
+                if (!confirmed) return;
+                result = await controllerActions.remove(target.id, true);
+              }
+              if (result.success === false) showError('The server could not be removed.');
+              else actions.retireServerSessions(target.id);
+            } catch (error) {
+              showError(error instanceof Error ? error.message : 'The server could not be removed.');
+            }
+          })()}
+          onOverrideCertificate={(serverId, fingerprint) => {
+            if (!fingerprint) {
+              showError('Retry the server to read its current certificate fingerprint first.');
+              return;
+            }
+            void controllerActions.approveCertificate(serverId, fingerprint)
+              .catch((error: Error) => showError(error.message));
+          }}
+          onRequireValidCertificate={(serverId) => void controllerActions.requireValidCertificate(serverId)
+            .catch((error: Error) => showError(error.message))}
+          onFindServers={() => void controllerActions.discover().catch((error: Error) => showError(error.message))}
+        />
+      ) : null}
+
       <UsageDashboardDialog
+        key={`usage-${controller.selectedServerId || 'browser'}`}
         open={state.dialogs.usage}
         onClose={() => closeDialogs({ usage: false })}
       />
 
       <RuntimeProfilesDialog
+        key={`runtime-profiles-${controller.selectedServerId || 'browser'}`}
         open={state.dialogs.runtimeProfiles}
         onClose={() => closeDialogs({ runtimeProfiles: false })}
       />
 
       <DeployTargetsDialog
+        key={`deploy-targets-${controller.selectedServerId || 'browser'}`}
         open={state.containerizedEnvironmentsEnabled && state.dialogs.deployTargets}
         onClose={() => closeDialogs({ deployTargets: false })}
       />
 
       <EnvironmentDialog
+        key={`environment-${controller.selectedServerId || 'browser'}`}
         open={state.dialogs.environment}
         info={environment.info}
         error={environment.error}
@@ -1037,6 +1295,7 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       />
 
       <ProjectsDialog
+        key={`projects-${controller.selectedServerId || 'browser'}`}
         open={state.dialogs.projects}
         repositoryInspectionSupported={state.repositoryInspectionSupported}
         onClose={() => closeDialogs({ projects: false })}
@@ -1048,11 +1307,17 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
 
       <WorkspaceChooserDialog
         open={state.dialogs.workspaceChooser}
-        onProject={(projectId) => {
+        serverTargets={controller.enabled ? controller.targets : undefined}
+        selectedServerId={rememberedNewSessionServerId || controller.selectedServerId}
+        onProject={(projectId, serverId) => {
+          if (serverId) selectControllerServer(serverId);
           closeDialogs({ workspaceChooser: false });
-          actions.openProjectSession(projectId);
+          actions.openProjectSession(projectId, serverId);
         }}
-        onDirectory={actions.chooseNewTabDirectory}
+        onDirectory={(serverId) => {
+          if (serverId) selectControllerServer(serverId);
+          actions.chooseNewTabDirectory(serverId);
+        }}
         onClose={actions.cancelNewTab}
       />
 
@@ -1065,8 +1330,16 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
 
       <NewSessionDialog
         open={state.dialogs.newSession}
-        defaultWorkingDir={state.folder.path}
-        onCreate={(name, workingDir) => actions.createSession(name, workingDir)}
+        defaultWorkingDir={
+          controller.enabled
+          && rememberedNewSessionServerId
+          && rememberedNewSessionServerId !== controller.selectedServerId
+            ? null
+            : state.folder.path
+        }
+        onCreate={(name, workingDir, serverId) => actions.createSession(name, workingDir, serverId)}
+        serverTargets={controller.enabled ? controller.targets : undefined}
+        lastUsedServerId={rememberedNewSessionServerId || controller.selectedServerId}
         onClose={() => closeDialogs({ newSession: false })}
       />
 
@@ -1103,16 +1376,27 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
         open={state.dialogs.sessions}
         sessions={state.sessionList}
         activeId={state.activeId}
+        activeServerId={state.activeId ? parseQualifiedSessionId(state.activeId)?.serverId : undefined}
         onJoin={(id) => { closeDialogs({ sessions: false }); actions.joinSession(id); }}
-        onLeave={() => { closeDialogs({ sessions: false }); actions.leaveSession(); }}
+        onLeave={(serverId) => { closeDialogs({ sessions: false }); actions.leaveSession(serverId); }}
         onDelete={actions.deleteSession}
         onNew={() => { closeDialogs({ sessions: false }); actions.newTab(); }}
+        serverTargets={controller.enabled ? controller.targets : undefined}
+        onRetryServer={(serverId) => void controllerActions.retry(serverId)
+          .catch((error: Error) => showError(error.message))}
+        onEditServer={(serverId) => {
+          selectControllerServer(serverId);
+          closeDialogs({ sessions: false, servers: true });
+        }}
         onClose={() => closeDialogs({ sessions: false })}
       />
 
       <ConversationsDialog
+        key={`conversations-${controller.selectedServerId || 'browser'}`}
         open={state.dialogs.conversations}
         load={actions.loadConversations}
+        serverTargets={controller.enabled ? controller.targets : undefined}
+        selectedServerId={controller.selectedServerId}
         // Every tab, not only the ones known to be chats: a tab whose surface has
         // not come back from the server yet is still a tab, and a row that says
         // "open" about it is right either way — picking it switches to that tab.
@@ -1140,6 +1424,8 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       <PlanDialog
         open={state.plan !== null}
         content={state.plan ?? ''}
+        serverName={activeControllerTarget?.name || active?.serverName}
+        disabled={activeServerUnavailable}
         onAccept={actions.acceptPlan}
         onReject={actions.rejectPlan}
         onClose={() => shellStore.setState({ plan: null })}
@@ -1161,9 +1447,9 @@ export function AppShell({ terminalNode, actions, launcher }: AppShellProps): Re
       <MoreSheet
         open={state.dialogs.more}
         theme={state.theme}
-        logoutUrl={state.logoutUrl}
+        logoutUrl={controller.enabled ? null : state.logoutUrl}
         canCloseSession={active !== null}
-        install={state.install}
+        install={controller.enabled ? 'unsupported' : state.install}
         onInstall={() => void installHint()}
         onClose={() => closeDialogs({ more: false })}
         onReconnect={actions.reconnect}
@@ -1260,6 +1546,7 @@ async function pickAndUpload(sessionId: string, directory: string): Promise<void
           description: `A file called ${file.name} is already in that folder. Replacing it cannot be undone from here.`,
           confirmLabel: 'Replace',
           tone: 'danger',
+          sessionId,
         });
         if (!replace) continue;
         try {

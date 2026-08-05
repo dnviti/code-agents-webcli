@@ -28,6 +28,7 @@ import { alertForEvent, endsAlert, type ConversationAttention } from '../../shar
 import type { ChatEvent } from '../../shared/chat-events.js';
 import { shellStore } from '../shell/store';
 import { clearAlert, raiseAlert } from '../ui/notify';
+import { getControllerSnapshot, parseQualifiedSessionId } from '../controller/transport';
 
 /**
  * One conversation event, on its way to the user's attention.
@@ -151,6 +152,12 @@ function announce(
       name: app.sessionTabManager?.conversationLabel(sessionId) ?? 'Conversation',
       detail,
       subject,
+      serverName: (() => {
+        const owner = parseQualifiedSessionId(sessionId)?.serverId;
+        return owner
+          ? getControllerSnapshot().targets.find((target) => target.id === owner)?.name
+          : undefined;
+      })(),
     },
     settings.details,
   );

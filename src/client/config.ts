@@ -3,12 +3,35 @@
 import type { App } from './app';
 import type { AgentKind, RuntimeStartOptions } from './types';
 import { shellStore } from './shell/store';
+import { getControllerSnapshot } from './controller/transport';
 
 export async function loadConfig(app: App): Promise<void> {
+  const initialController = getControllerSnapshot();
+  const controllerMode = initialController.enabled;
+  const owner = controllerMode ? initialController.selectedServerId : null;
+  if (controllerMode) {
+    // A target switch must not leave account, feature, or platform state from
+    // the previous server visible while the new request is in flight or fails.
+    app.aliases = {
+      claude: 'Claude', codex: 'Codex', agent: 'Cursor', pi: 'Pi', grok: 'Grok',
+      qwen: 'Qwen', kimi: 'Kimi', omp: 'Oh My Pi', antigravity: 'Antigravity',
+      terminal: 'Terminal',
+    };
+    app.folderMode = true;
+    shellStore.setState({
+      user: null,
+      logoutUrl: null,
+      containerizedEnvironmentsEnabled: false,
+      terminalShells: [],
+      repositoryInspectionSupported: false,
+      chatBypassPermissions: false,
+    });
+  }
   try {
-    const res = await app.authFetch('/api/config');
+    const res = await app.authFetch('/api/config', {}, owner);
     if (res.ok) {
       const cfg = await res.json();
+      if (controllerMode && getControllerSnapshot().selectedServerId !== owner) return;
       if (cfg?.aliases) {
         app.aliases = {
           claude: cfg.aliases.claude || 'Claude',
@@ -29,7 +52,7 @@ export async function loadConfig(app: App): Promise<void> {
 
       shellStore.setState({
         user: cfg?.currentUser?.githubLogin ?? null,
-        logoutUrl: cfg?.logoutUrl ?? null,
+        logoutUrl: controllerMode ? null : cfg?.logoutUrl ?? null,
         // Missing is false so an older server cannot accidentally expose an
         // experimental administration surface in a newer client bundle.
         containerizedEnvironmentsEnabled:

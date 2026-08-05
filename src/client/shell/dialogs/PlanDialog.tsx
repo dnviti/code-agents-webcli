@@ -7,6 +7,8 @@ export interface PlanDialogProps {
   open: boolean;
   /** Raw plan text captured from the terminal. Untrusted. */
   content: string;
+  serverName?: string;
+  disabled?: boolean;
   onAccept(): void;
   onReject(): void;
   onClose(): void;
@@ -139,6 +141,8 @@ function renderPlan(content: string): React.ReactNode[] {
 export function PlanDialog({
   open,
   content,
+  serverName,
+  disabled = false,
   onAccept,
   onReject,
   onClose,
@@ -153,10 +157,10 @@ export function PlanDialog({
       width={640}
       footer={
         <>
-          <Button variant="destructive" onClick={onReject}>
+          <Button variant="destructive" disabled={disabled} onClick={onReject}>
             Reject plan
           </Button>
-          <Button variant="primary" onClick={onAccept}>
+          <Button variant="primary" disabled={disabled} onClick={onAccept}>
             Accept plan
           </Button>
         </>
@@ -181,8 +185,13 @@ export function PlanDialog({
             flex: '0 0 auto',
           }}
         />
-        Plan mode active
+        {serverName ? `Plan mode active · Server: ${serverName}` : 'Plan mode active'}
       </div>
+      {disabled ? (
+        <p role="alert" style={{ margin: '0 0 12px', color: 'var(--destructive)' }}>
+          This server is unavailable. Reconnect it before accepting or rejecting this plan.
+        </p>
+      ) : null}
       <div style={{ maxHeight: '60vh', overflowY: 'auto' }}>{renderPlan(content)}</div>
     </Dialog>
   );

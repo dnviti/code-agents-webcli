@@ -15,7 +15,10 @@ import { Dialog } from '../../ui/relay/Dialog';
 import { Icon } from '../../ui/relay/Icon';
 import { IconButton } from '../../ui/relay/IconButton';
 import { Input } from '../../ui/relay/Input';
+import { Select } from '../../ui/relay/Select';
 import { PHONE_SPACE, PHONE_TEXT, TOUCH_TARGET, usePhone } from '../../ui/touch';
+import type { ServerTarget } from '../../controller/types';
+import { ServerTargetBadge, serverTargetAvailability } from '../ServerTargetBadge';
 
 /**
  * Every conversation you have, grouped by project, narrowed by typing.
@@ -57,7 +60,10 @@ export interface ConversationsDialogProps {
    * never cached — because a conversation may have been started, finished or
    * deleted in another window since the last look.
    */
-  load(): Promise<ConversationList>;
+  load(serverId?: string): Promise<ConversationList>;
+  /** Installed controller targets; when present, one must be chosen explicitly. */
+  serverTargets?: ServerTarget[];
+  selectedServerId?: string | null;
   /** Session ids this browser already has a tab for, so a row can say so. */
   openIds?: readonly string[];
   /** The tab in focus, when it is one of these. */
@@ -89,6 +95,8 @@ export function ConversationsDialog({
   onOpen,
   onDelete,
   onClose,
+  serverTargets,
+  selectedServerId,
 }: ConversationsDialogProps): React.JSX.Element | null {
   const isPhone = usePhone();
   const [state, setState] = React.useState<LoadState>({ status: 'loading' });
@@ -97,6 +105,7 @@ export function ConversationsDialog({
   // Bumped by Reload. A separate value from `open` so re-reading does not also
   // throw away what the user has typed.
   const [reload, setReload] = React.useState(0);
+  const [targetServerId, setTargetServerId] = React.useState(selectedServerId || '');
 
   // A query and a set of folded groups belong to one visit. Left behind, a search
   // typed last time would open the dialog showing three of two hundred
@@ -105,7 +114,8 @@ export function ConversationsDialog({
     if (!open) return;
     setQuery('');
     setCollapsed(NO_COLLAPSE);
-  }, [open]);
+    setTargetServerId(selectedServerId || '');
+  }, [open, selectedServerId]);
 
   // Held in a ref rather than depended on.
   //
@@ -118,10 +128,21 @@ export function ConversationsDialog({
 
   React.useEffect(() => {
     if (!open) return;
+    const target = serverTargets?.find((item) => item.id === targetServerId);
+    const unavailable = target ? serverTargetAvailability(target) : null;
+    if (serverTargets && (!target || unavailable)) {
+      setState({
+        status: 'error',
+        message: target
+          ? `${target.name} is unavailable. Choose another server or reconnect it.`
+          : 'Choose a server to list its conversations.',
+      });
+      return;
+    }
     let live = true;
     setState({ status: 'loading' });
     Promise.resolve()
-      .then(() => loader.current())
+      .then(() => loader.current(serverTargets ? targetServerId : undefined))
       .then((list) => {
         if (live) setState({ status: 'ready', list });
       })
@@ -135,7 +156,7 @@ export function ConversationsDialog({
     return () => {
       live = false;
     };
-  }, [open, reload]);
+  }, [open, reload, serverTargets, targetServerId]);
 
   const remove = React.useCallback(
     (conversation: ConversationSummary) => {
@@ -188,6 +209,31 @@ export function ConversationsDialog({
       }
     >
       <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, gap: 10 }}>
+        {serverTargets ? (
+          <div style={{ display: 'grid', gap: 6, flex: '0 0 auto' }}>
+            <label htmlFor="conversation-server" style={{ fontSize: 'var(--text-sm)', color: 'var(--muted-foreground)' }}>
+              Conversation server
+            </label>
+            <Select
+              id="conversation-server"
+              required
+              value={targetServerId}
+              options={serverTargets.map((target) => {
+                const unavailable = serverTargetAvailability(target);
+                return {
+                  value: target.id,
+                  label: unavailable ? `${target.name} — ${unavailable}` : target.name,
+                  disabled: Boolean(unavailable),
+                };
+              })}
+              onChange={(event) => setTargetServerId(event.target.value)}
+              style={{ minHeight: TOUCH_TARGET }}
+            />
+            {serverTargets.find((target) => target.id === targetServerId) ? (
+              <ServerTargetBadge target={serverTargets.find((target) => target.id === targetServerId)!} />
+            ) : null}
+          </div>
+        ) : null}
         <div style={{ flex: '0 0 auto' }}>
           <Input
             // The dialog hands focus to the panel unless a child has claimed it,

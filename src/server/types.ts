@@ -40,6 +40,12 @@ export interface ServerOptions {
   ompAlias?: string;
   antigravityAlias?: string;
   publicBaseUrl?: string;
+  /** Human-readable, public metadata; never derived from a machine hostname. */
+  serverName?: string;
+  /** Canonical HTTPS origin published by the unauthenticated identity endpoint. */
+  publicDiscoverableUrl?: string;
+  /** Opt in to answering LAN discovery probes. Disabled by default. */
+  lanDiscoverable?: boolean;
   githubClientId?: string;
   githubClientSecret?: string;
   githubAppToken?: string;
@@ -420,6 +426,9 @@ export interface ServerState {
   selectedWorkingDir: string | null;
   baseFolder: string;
   publicBaseUrl: string | null;
+  serverName: string;
+  publicDiscoverableUrl: string | null;
+  lanDiscoverable: boolean;
   githubClientId: string | null;
   githubClientSecret: string | null;
   githubAppToken: string | null;

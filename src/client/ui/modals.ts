@@ -7,6 +7,7 @@
 import type { App } from '../app';
 import { shellStore } from '../shell/store';
 import { showError } from './overlay';
+import { rememberNewSessionServer, selectControllerServer } from '../controller/transport';
 
 // ---------------------------------------------------------------------------
 // New Session Modal
@@ -24,6 +25,7 @@ export async function createNewSession(
   app: App,
   name: string,
   workingDir: string,
+  serverId?: string,
 ): Promise<void> {
   const sessionName = name.trim() || `Session ${new Date().toLocaleString()}`;
   const dir = workingDir.trim() || app.selectedWorkingDir;
@@ -36,15 +38,17 @@ export async function createNewSession(
   }
 
   try {
+    if (serverId) selectControllerServer(serverId);
     const response = await app.authFetch('/api/sessions/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: sessionName, workingDir: dir }),
-    });
+      body: JSON.stringify({ name: sessionName, workingDir: dir, ...(serverId ? { serverId } : {}) }),
+    }, serverId);
 
     if (!response.ok) throw new Error('Failed to create session');
 
     const data = await response.json();
+    if (serverId) rememberNewSessionServer(serverId);
 
     hideNewSessionModal();
     app.startPromptRequested = true;

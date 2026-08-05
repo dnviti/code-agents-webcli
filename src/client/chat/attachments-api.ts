@@ -1,4 +1,5 @@
 import type { ChatAttachment } from '../../shared/chat-events.js';
+import { controllerFetch } from '../controller/transport.js';
 
 /**
  * The browser's half of the chat attachment route.
@@ -60,7 +61,7 @@ export async function uploadAttachment(sessionId: string, file: File): Promise<C
     `/api/sessions/${encodeURIComponent(sessionId)}/chat-attachments`
     + `?name=${encodeURIComponent(file.name || 'attachment')}`;
 
-  const response = await fetch(url, {
+  const response = await controllerFetch(url, {
     method: 'POST',
     // The browser's guess at the type. The server records it for display and
     // never serves it back as a content type.

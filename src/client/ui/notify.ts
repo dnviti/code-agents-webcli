@@ -62,6 +62,8 @@ export interface RaisedAlert {
   detail?: string;
   /** What failed, when it was not the turn itself. See `ChatAlert.subject`. */
   subject?: string;
+  /** Always safe to show: identifies the machine/account, not conversation content. */
+  serverName?: string;
 }
 
 /** Alerts raised and not yet acted on, oldest first — `Map` keeps insertion order. */
@@ -283,7 +285,15 @@ export function compose(
     const title = waiting.length
       ? `${list.length} conversations need you`
       : `${list.length} conversations finished`;
-    return { title, body: details ? list.map((alert) => alert.name).join(', ') : '' };
+    const servers = [...new Set(list.map((alert) => alert.serverName).filter(Boolean))];
+    return {
+      title,
+      body: details
+        ? list.map((alert) => alert.serverName
+          ? `${alert.name} — ${alert.serverName}`
+          : alert.name).join(', ')
+        : servers.length ? `Servers: ${servers.join(', ')}` : '',
+    };
   }
 
   const [alert] = list;
@@ -292,11 +302,15 @@ export function compose(
     // actionable is lost by not putting it on a lock screen.
     return {
       title: isBlockingAlert(alert.kind) ? 'A conversation needs you' : 'A conversation finished',
-      body: '',
+      body: alert.serverName ? `Server: ${alert.serverName}` : '',
     };
   }
 
-  return { title: alert.name, body: describe(alert) };
+  const description = describe(alert);
+  return {
+    title: alert.name,
+    body: alert.serverName ? `Server: ${alert.serverName}. ${description}` : description,
+  };
 }
 
 function describe(alert: RaisedAlert): string {

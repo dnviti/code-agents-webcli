@@ -6,6 +6,7 @@
 
 import { classifyPaste, MAX_IMAGES_PER_PASTE, PasteCandidate } from '../../shared/paste-classify';
 import { showNotification } from '../ui/notifications';
+import { controllerFetch, getControllerSnapshot, parseQualifiedSessionId } from '../controller/transport';
 
 /** Must match PASTE_MAX_BYTES on the server. */
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -71,7 +72,7 @@ async function upload(sessionId: string, file: File): Promise<string | null> {
   const timer = setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
 
   try {
-    const response = await fetch(
+    const response = await controllerFetch(
       `/api/sessions/${encodeURIComponent(sessionId)}/paste-image`,
       {
         method: 'POST',
@@ -87,6 +88,13 @@ async function upload(sessionId: string, file: File): Promise<string | null> {
     }
 
     if (response.status === 401) {
+      const controllerState = getControllerSnapshot();
+      if (controllerState.enabled) {
+        const owner = parseQualifiedSessionId(sessionId)?.serverId;
+        const target = controllerState.targets.find((item) => item.id === owner);
+        showNotification(`Sign in to ${target?.name || 'this server'} to upload the image.`, 'error');
+        return null;
+      }
       const next = encodeURIComponent(window.location.pathname + window.location.search);
       window.location.href = `/login?next=${next}`;
       return null;

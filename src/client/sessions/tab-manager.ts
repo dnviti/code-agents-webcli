@@ -16,6 +16,11 @@ import { releaseTerminals } from '../chat/chat-terminal';
 import { shellStore, type ShellTab } from '../shell/store';
 import { playNotificationSound, showNotification } from '../ui/notifications';
 import { takeRequestedConversation } from '../ui/notify';
+import {
+  getControllerSnapshot,
+  parseQualifiedSessionId,
+  selectControllerServer,
+} from '../controller/transport';
 
 /** What the strip needs about a tab that `SessionInfo` does not already say. */
 interface TabRecord {
@@ -79,6 +84,8 @@ export interface ListedSession {
   projectId?: string | null;
   projectName?: string | null;
   projectWorkingDirKind?: 'host' | 'container';
+  /** Metadata cached by the desktop controller; never a live tab to join. */
+  offline?: boolean;
 }
 
 /**
@@ -202,7 +209,6 @@ export class SessionTabManager {
   activeTabId: string | null;
   tabOrder: string[];
   tabHistory: string[];
-  notificationsEnabled: boolean;
   /** How many tabs this screen has ever opened; see `TabRecord.openedSeq`. */
   private tabsOpened = 0;
   /** Invalidates a session-list photograph when membership changed in flight. */
@@ -239,8 +245,6 @@ export class SessionTabManager {
     this.activeTabId = null;
     this.tabOrder = [];
     this.tabHistory = [];
-    this.notificationsEnabled = false;
-    this.requestNotificationPermission();
   }
 
   getAlias(kind: string): string {
@@ -251,25 +255,29 @@ export class SessionTabManager {
   // Notifications
   // ---------------------------------------------------------------------------
 
-  requestNotificationPermission(): void {
-    if (!('Notification' in window)) return;
-    if (Notification.permission === 'granted') {
-      this.notificationsEnabled = true;
-    } else if (Notification.permission === 'default') {
-      Notification.requestPermission().then((permission) => {
-        this.notificationsEnabled = permission === 'granted';
-      });
-    }
-  }
-
-  sendNotification(title: string, body: string, sessionId: string): void {
+  sendNotification(
+    title: string,
+    body: string,
+    sessionId: string,
+    kind: 'finished' | 'failed' = 'finished',
+  ): void {
+    const preferences = shellStore.getSnapshot().notifications;
+    if (!preferences.enabled || !preferences[kind]) return;
     if (sessionId === this.activeTabId) return;
     if (document.visibilityState === 'visible') return;
 
+    const owner = parseQualifiedSessionId(sessionId)?.serverId;
+    const serverName = owner
+      ? getControllerSnapshot().targets.find((target) => target.id === owner)?.name
+      : undefined;
+    const visibleTitle = preferences.details ? title : kind === 'failed' ? 'A task failed' : 'A task finished';
+    const visibleBody = preferences.details ? body : '';
+    const targetedTitle = serverName ? `${visibleTitle} · ${serverName}` : visibleTitle;
+
     if ('Notification' in window && Notification.permission === 'granted') {
       try {
-        const notification = new Notification(title, {
-          body,
+        const notification = new Notification(targetedTitle, {
+          body: visibleBody,
           icon: '/favicon.ico',
           tag: sessionId,
           requireInteraction: false,
@@ -291,7 +299,7 @@ export class SessionTabManager {
       }
     }
 
-    this.showInPageNotification(title, body);
+    this.showInPageNotification(targetedTitle, visibleBody);
   }
 
   /**
@@ -317,7 +325,7 @@ export class SessionTabManager {
       try { navigator.vibrate([200, 100, 200]); } catch { /* unsupported */ }
     }
 
-    showNotification(`${title} — ${body}`);
+    showNotification([title, body].filter(Boolean).join(' — '));
     playNotificationSound();
   }
 
@@ -333,6 +341,7 @@ export class SessionTabManager {
    * into one render.
    */
   syncShell(): void {
+    const controller = getControllerSnapshot();
     const tabs: ShellTab[] = this.getOrderedTabIds()
       .map((id): ShellTab | null => {
         const session = this.activeSessions.get(id);
@@ -364,6 +373,8 @@ export class SessionTabManager {
                     ? 'running'
                     : 'idle';
 
+        const owner = parseQualifiedSessionId(id)?.serverId;
+        const target = owner ? controller.targets.find((item) => item.id === owner) : undefined;
         return {
           id,
           title: record.displayName,
@@ -378,6 +389,11 @@ export class SessionTabManager {
           attention: session.attention ?? null,
           projectId: record.projectId,
           projectName: record.projectName,
+          ...(target ? {
+            serverId: target.id,
+            serverName: target.name,
+            serverInsecure: target.insecure === true,
+          } : {}),
         };
       })
       .filter((tab): tab is ShellTab => tab !== null);
@@ -413,7 +429,19 @@ export class SessionTabManager {
   applyRemoteOrder(ids: string[]): void {
     this.membershipRevision++;
     if (this.pendingTabOrderMutations > 0) return;
-    this.setTabOrder(this.mergeTabOrder(ids));
+    const controller = getControllerSnapshot();
+    const owner = controller.enabled ? parseQualifiedSessionId(ids[0] || '')?.serverId : null;
+    if (!owner || ids.some((id) => parseQualifiedSessionId(id)?.serverId !== owner)) {
+      this.setTabOrder(this.mergeTabOrder(ids));
+      return;
+    }
+    const ordered = ids.filter((id, index) => this.tabs.has(id) && ids.indexOf(id) === index);
+    const remaining = [...ordered];
+    const next = this.tabOrder.map((id) => (
+      parseQualifiedSessionId(id)?.serverId === owner ? remaining.shift() || id : id
+    ));
+    for (const id of remaining) if (!next.includes(id)) next.push(id);
+    this.setTabOrder(next);
   }
 
   /** Merge an older strip snapshot without losing tabs it did not know yet. */
@@ -439,12 +467,22 @@ export class SessionTabManager {
     const mutation = this.tabOrderMutationTail
       .catch(() => undefined)
       .then(async () => {
-        const response = await this.app.authFetch('/api/sessions/tabs/order', {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionIds }),
-        });
-        if (!response.ok) throw new Error(`Tab order was refused (${response.status})`);
+        const controller = getControllerSnapshot();
+        const groups = new Map<string | null, string[]>();
+        for (const sessionId of sessionIds) {
+          const owner = controller.enabled ? parseQualifiedSessionId(sessionId)?.serverId || null : null;
+          const values = groups.get(owner) || [];
+          values.push(sessionId);
+          groups.set(owner, values);
+        }
+        const responses = await Promise.all([...groups].map(([serverId, ids]) =>
+          this.app.authFetch('/api/sessions/tabs/order', {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionIds: ids }),
+          }, serverId)));
+        const refused = responses.find((response) => !response.ok);
+        if (refused) throw new Error(`Tab order was refused (${refused.status})`);
       });
 
     this.tabOrderMutationTail = mutation;
@@ -578,6 +616,8 @@ export class SessionTabManager {
         ? readLegacyClosedTabs()
         : new Set<string>();
       const sessions = snapshot.listed.filter((session) => (
+        session.offline !== true
+        &&
         !this.pendingTabCloses.has(session.id)
         && !(session.surface === 'chat' && compatibilityClosed.has(session.id))
       ));
@@ -639,6 +679,8 @@ export class SessionTabManager {
       ? readLegacyClosedTabs()
       : new Set<string>();
     const visible = snapshot.listed.filter((session) => (
+      session.offline !== true
+      &&
       !this.pendingTabCloses.has(session.id)
       && !(session.surface === 'chat' && compatibilityClosed.has(session.id))
     ));
@@ -661,6 +703,10 @@ export class SessionTabManager {
 
     for (const record of Array.from(this.tabs.values())) {
       if (live.has(record.id) || record.openedSeq > snapshot.asked) continue;
+      const owner = parseQualifiedSessionId(record.id)?.serverId;
+      const target = owner
+        ? getControllerSnapshot().targets.find((item) => item.id === owner) : undefined;
+      if (target && target.connection !== 'connected') continue;
       this.closeSession(record.id, { skipServerRequest: true });
     }
 
@@ -896,6 +942,8 @@ export class SessionTabManager {
     }
 
     this.activeTabId = sessionId;
+    const owner = parseQualifiedSessionId(sessionId)?.serverId;
+    if (owner) selectControllerServer(owner);
     rememberActiveTab(sessionId);
 
     const session = this.activeSessions.get(sessionId);
@@ -1307,7 +1355,7 @@ export class SessionTabManager {
     // refuses — a session that has since been deleted, a name it will not take —
     // the old label goes back, so the strip never keeps a name that was not
     // stored.
-    void fetch(`/api/sessions/${sessionId}/name`, {
+    void this.app.authFetch(`/api/sessions/${sessionId}/name`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name }),
@@ -1366,6 +1414,22 @@ export class SessionTabManager {
     this.getOrderedTabIds().forEach((id) => {
       if (id !== sessionId) this.closeSession(id);
     });
+  }
+
+  /** Drop only local visibility for a server whose auth or catalog entry went away. */
+  retireServer(serverId: string): void {
+    for (const sessionId of Array.from(this.tabs.keys())) {
+      if (parseQualifiedSessionId(sessionId)?.serverId !== serverId) continue;
+      this.closeSession(sessionId, { skipServerRequest: true });
+    }
+    if (parseQualifiedSessionId(this.app.currentClaudeSessionId || '')?.serverId === serverId) {
+      this.app.currentClaudeSessionId = null;
+      this.app.currentClaudeSessionName = null;
+      this.app.terminal?.reset();
+      shellStore.setState({
+        connection: { state: 'disconnected', workingDir: null },
+      });
+    }
   }
 
   createNewSession(): void {
@@ -1587,8 +1651,12 @@ export class SessionTabManager {
    */
   conversationLabel(sessionId: string): string {
     const record = this.tabs.get(sessionId);
-    if (record?.displayName) return record.displayName;
-    return this.activeSessions.get(sessionId)?.name || 'Conversation';
+    const label = record?.displayName || this.activeSessions.get(sessionId)?.name || 'Conversation';
+    const owner = parseQualifiedSessionId(sessionId)?.serverId;
+    const serverName = owner
+      ? getControllerSnapshot().targets.find((target) => target.id === owner)?.name
+      : undefined;
+    return serverName ? `${label} · ${serverName}` : label;
   }
 
   markSessionError(sessionId: string, hasError = true): void {
@@ -1602,6 +1670,7 @@ export class SessionTabManager {
         `Error in ${session.name || 'Session'}`,
         'A command has failed or the session encountered an error',
         sessionId,
+        'failed',
       );
     } else {
       this.syncShell();
