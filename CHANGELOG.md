@@ -1,6 +1,6 @@
 # Changelog
 
-## [6.1.0] - 2026-08-04
+## [6.1.0] - 2026-08-05
 
 ### Added
 - **Agent runtimes can now be checked, installed, and updated as verified,
@@ -35,7 +35,7 @@
 ### Changed
 - Prepare release 6.1.0.
 
-## [6.0.0] - unreleased
+## [6.0.0] - 2026-08-05
 
 ### Added
 - **Code Agents Web CLI now has self-contained desktop downloads** for Linux
