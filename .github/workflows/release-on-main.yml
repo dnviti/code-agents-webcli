@@ -130,6 +130,15 @@ jobs:
             "$RUNNER_TEMP/previous-electron-builder.yml" electron-builder.yml \
             "$GITHUB_REF_NAME" "$UPDATER_BRIDGE_TAG"
       - run: npm ci
+      - name: Configure Electron sandbox helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          sandbox='node_modules/electron/dist/chrome-sandbox'
+          test -f "$sandbox"
+          sudo chown root:root "$sandbox"
+          sudo chmod 4755 "$sandbox"
+          test "$(stat -c '%U:%G %a' "$sandbox")" = 'root:root 4755'
       - run: npm run typecheck
       - run: npm test
 
@@ -207,6 +216,16 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
+      - name: Configure Electron sandbox helper
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sandbox='node_modules/electron/dist/chrome-sandbox'
+          test -f "$sandbox"
+          sudo chown root:root "$sandbox"
+          sudo chmod 4755 "$sandbox"
+          test "$(stat -c '%U:%G %a' "$sandbox")" = 'root:root 4755'
       - name: Require Windows release identity
         if: runner.os == 'Windows'
         shell: bash

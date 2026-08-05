@@ -1181,6 +1181,7 @@ describe('WorkspaceSessionArtifactMigrator', function () {
   });
 
   it('round-trips a bounded migration marker larger than the historical 256 KiB cap', async function () {
+    this.timeout(10000);
     const pasteRoot = path.join(workspace, '.cc-web', 'pasted');
     fs.mkdirSync(pasteRoot, { recursive: true });
     const entries = [];

@@ -36,6 +36,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Ubuntu's AppArmor policy disables Chromium's unprivileged-user-
+      # namespace fallback. Keep the real Electron renderer test sandboxed by
+      # configuring the helper exactly as Chromium requires.
+      - name: Configure Electron sandbox helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          sandbox='node_modules/electron/dist/chrome-sandbox'
+          test -f "$sandbox"
+          sudo chown root:root "$sandbox"
+          sudo chmod 4755 "$sandbox"
+          test "$(stat -c '%U:%G %a' "$sandbox")" = 'root:root 4755'
+
       - name: Typecheck
         run: npm run typecheck
 

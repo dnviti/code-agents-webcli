@@ -59,6 +59,16 @@ describe('Electron desktop helpers', function () {
       path.join(__dirname, '..', '.github', 'workflows', 'release-on-main.yml'),
       'utf8',
     );
+    const ci = fs.readFileSync(
+      path.join(__dirname, '..', '.github', 'workflows', 'ci.yml'),
+      'utf8',
+    );
+    for (const workflow of [ci, release]) {
+      assert.match(workflow, /sandbox='node_modules\/electron\/dist\/chrome-sandbox'/);
+      assert.match(workflow, /sudo chown root:root "\$sandbox"/);
+      assert.match(workflow, /sudo chmod 4755 "\$sandbox"/);
+      assert.match(workflow, /stat -c '%U:%G %a' "\$sandbox"/);
+    }
     assert.match(release, /push:\s*\n\s*tags:\s*\n\s*- ['"]v\*\.\*\.\*['"]/);
     assert.match(release, /- ['"]!v\*\.\*\.\*-staging['"]/);
     assert.doesNotMatch(release, /push:\s*\n\s*branches:/);
